@@ -9123,9 +9123,10 @@ header('Content-Type: text/html; charset=utf-8');
         <?php
           // Same unified feed as Ice Cubes: follows, likes, boosts, mentions, quotes…
           $adminNotifs = [];
+          $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
           try {
               $adminNotifs = function_exists('ap_masto_notifications_fetch')
-                  ? ap_masto_notifications_fetch(60)
+                  ? ap_masto_notifications_fetch(60, $notifMaxId)
                   : [];
           } catch (Throwable $e) {
               error_log('[ap-admin] notifications fetch: ' . $e->getMessage());
@@ -9281,6 +9282,14 @@ header('Content-Type: text/html; charset=utf-8');
               }
             ?>
           <?php endforeach; ?>
+          <?php if (count($adminNotifs) >= 60): ?>
+            <?php $olderNotifId = (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? ''); ?>
+            <?php if ($olderNotifId !== ''): ?>
+              <div style="text-align:center;margin:1rem 0 .25rem">
+                <a class="btn btn-ghost" href="?view=mentions&amp;notifications_max_id=<?= urlencode($olderNotifId) ?>">Load older notifications</a>
+              </div>
+            <?php endif; ?>
+          <?php endif; ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'dms'): ?>
