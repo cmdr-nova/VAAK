@@ -2637,11 +2637,21 @@ function ap_local_accept_and_follow_back(array $activity): bool
 
     $username = isset($followerDoc['preferredUsername']) && is_string($followerDoc['preferredUsername'])
         ? $followerDoc['preferredUsername'] : null;
-    // Record follower immediately so fan-out works even if Accept delivery flaps
-    ap_follower_upsert($follower, $personalInbox, $sharedInbox, $username, $localId);
 
     $localKey = (string) (ap_request_actor_get()['key'] ?? 'cmdr_nova');
     $followId = ap_as_id($activity) ?: ($follower . '#follows/' . $localKey . '/' . bin2hex(random_bytes(6)));
+    $profile = function_exists('ap_profile_get') ? ap_profile_get($localKey) : [];
+    if (!empty($profile['manually_approves'])) {
+        $stored = function_exists('ap_follow_request_upsert')
+            ? ap_follow_request_upsert($localId, $follower, $personalInbox, $sharedInbox, $username, $followId)
+            : false;
+        ap_log('local_follow_pending follower=' . ap_short($follower) . ' stored=' . ($stored ? '1' : '0') . ' actor=' . ap_short($localId));
+        return $stored;
+    }
+
+    // Record follower immediately so fan-out works even if Accept delivery flaps
+    ap_follower_upsert($follower, $personalInbox, $sharedInbox, $username, $localId);
+
     // Always use a plain URI string for Follow.object — never an array
     $accept = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
@@ -2692,6 +2702,50 @@ function ap_local_accept_and_follow_back(array $activity): bool
     ));
     // Follower is stored either way; remotes can retry Accept if delivery flapped.
     return true;
+}
+
+/** Approve or reject a stored follow request and notify the remote actor. */
+function ap_follow_request_decide(array $request, bool $approve): array
+{
+    $owner = rtrim((string) ($request['owner_actor_id'] ?? ''), '/');
+    $follower = rtrim((string) ($request['actor_id'] ?? ''), '/');
+    $inbox = (string) ($request['inbox'] ?? '');
+    $sharedInbox = (string) ($request['shared_inbox'] ?? '');
+    $followId = (string) ($request['follow_activity_id'] ?? '');
+    if ($owner === '' || $follower === '' || $inbox === '') {
+        return ['ok' => false, 'error' => 'Follow request is incomplete.'];
+    }
+    $ownerKey = rawurldecode(basename(parse_url($owner, PHP_URL_PATH) ?: ''));
+    if ($ownerKey === '') {
+        return ['ok' => false, 'error' => 'Follow request owner is invalid.'];
+    }
+    ap_request_actor_set($ownerKey);
+    $localId = ap_local_actor_id();
+    $activity = [
+        '@context' => 'https://www.w3.org/ns/activitystreams',
+        'id' => $localId . '/' . ($approve ? 'accepts' : 'rejects') . '/' . bin2hex(random_bytes(10)),
+        'type' => $approve ? 'Accept' : 'Reject',
+        'actor' => $localId,
+        'object' => [
+            'id' => $followId !== '' ? $followId : ($follower . '#follow'),
+            'type' => 'Follow',
+            'actor' => $follower,
+            'object' => $localId,
+        ],
+        'to' => [$follower],
+    ];
+    $ok = ap_deliver_signed_json($inbox, $activity, ap_local_key_id(), ap_local_priv_path(), 5.0);
+    if (!$ok && $sharedInbox !== '' && $sharedInbox !== $inbox) {
+        $ok = ap_deliver_signed_json($sharedInbox, $activity, ap_local_key_id(), ap_local_priv_path(), 5.0);
+    }
+    if ($approve) {
+        ap_follower_upsert($follower, $inbox, $sharedInbox, (string) ($request['username'] ?? ''), $localId);
+    }
+    $status = $approve ? 'accepted' : 'rejected';
+    $saved = function_exists('ap_follow_request_set_status')
+        ? ap_follow_request_set_status((int) ($request['id'] ?? 0), $owner, $status)
+        : false;
+    return ['ok' => $saved, 'delivered' => $ok, 'status' => $status];
 }
 
 /**

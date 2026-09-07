@@ -153,7 +153,7 @@ function ap_db_migrate_postgres(PDO $db): void
         'ap_mutes', 'ap_post_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
         'ap_sl_links', 'ap_user_blocks', 'ap_users', 'app_auth', 'direct_messages',
-        'events', 'followers', 'following', 'link_preview_cards', 'masto_account_actors',
+        'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
@@ -269,6 +269,22 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_host ON events(host);
+
+CREATE TABLE IF NOT EXISTS ap_follow_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_actor_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    inbox TEXT,
+    shared_inbox TEXT,
+    username TEXT,
+    follow_activity_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_actor_id, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_follow_requests_owner_status
+    ON ap_follow_requests(owner_actor_id, status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS followers (
     actor_id TEXT PRIMARY KEY,
@@ -3646,6 +3662,90 @@ function ap_follower_remove(string $actorId, ?string $ownerActorId = null): void
         'DELETE FROM followers WHERE owner_actor_id = ? AND (actor_id = ? OR actor_id = ?)'
     )->execute([$owner, $actorId, $actorId . '/']);
     ap_follow_lists_reset_memo();
+}
+
+/** Store an inbound Follow until the local account approves or rejects it. */
+function ap_follow_request_upsert(
+    string $ownerActorId,
+    string $actorId,
+    ?string $inbox,
+    ?string $sharedInbox,
+    ?string $username,
+    ?string $followActivityId
+): bool {
+    $ownerActorId = rtrim(trim($ownerActorId), '/');
+    $actorId = rtrim(trim($actorId), '/');
+    if ($ownerActorId === '' || $actorId === '') {
+        return false;
+    }
+    try {
+        $now = ap_db_now();
+        ap_db()->prepare(
+            'INSERT INTO ap_follow_requests
+               (owner_actor_id, actor_id, inbox, shared_inbox, username, follow_activity_id, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?)
+             ON CONFLICT(owner_actor_id, actor_id) DO UPDATE SET
+               inbox = excluded.inbox,
+               shared_inbox = excluded.shared_inbox,
+               username = COALESCE(excluded.username, ap_follow_requests.username),
+               follow_activity_id = excluded.follow_activity_id,
+               status = \'pending\',
+               updated_at = excluded.updated_at'
+        )->execute([$ownerActorId, $actorId, $inbox, $sharedInbox, $username, $followActivityId, $now, $now]);
+        return true;
+    } catch (Throwable $e) {
+        error_log('[ap-db] follow_request_upsert: ' . $e->getMessage());
+        return false;
+    }
+}
+
+/** @return list<array<string,mixed>> */
+function ap_follow_requests_list(string $ownerActorId): array
+{
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM ap_follow_requests WHERE owner_actor_id = ? AND status = 'pending'
+             ORDER BY created_at ASC, id ASC"
+        );
+        $st->execute([rtrim($ownerActorId, '/')]);
+        return $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        error_log('[ap-db] follow_requests_list: ' . $e->getMessage());
+        return [];
+    }
+}
+
+function ap_follow_request_get(int $id, string $ownerActorId): ?array
+{
+    if ($id < 1) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM ap_follow_requests
+             WHERE id = ? AND owner_actor_id = ? AND status = 'pending' LIMIT 1"
+        );
+        $st->execute([$id, rtrim($ownerActorId, '/')]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function ap_follow_request_set_status(int $id, string $ownerActorId, string $status): bool
+{
+    $status = in_array($status, ['accepted', 'rejected'], true) ? $status : 'pending';
+    try {
+        $st = ap_db()->prepare(
+            'UPDATE ap_follow_requests SET status = ?, updated_at = ? WHERE id = ? AND owner_actor_id = ?'
+        );
+        $st->execute([$status, ap_db_now(), $id, rtrim($ownerActorId, '/')]);
+        return $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        error_log('[ap-db] follow_request_status: ' . $e->getMessage());
+        return false;
+    }
 }
 
 function ap_following_upsert(string $actorId, ?string $ownerActorId = null): void

@@ -1970,6 +1970,32 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } else {
             $error = $result['error'] ?? 'Could not remove phrase.';
         }
+    } elseif ($action === 'follow_request_decide') {
+        $view = 'profile';
+        $requestId = (int) ($_POST['id'] ?? 0);
+        $approve = (($_POST['decision'] ?? '') === 'approve');
+        $ownerActor = rtrim((string) ($vaakUser['actor_id'] ?? $vaakActorId), '/');
+        $request = function_exists('ap_follow_request_get')
+            ? ap_follow_request_get($requestId, $ownerActor)
+            : null;
+        if (!is_array($request)) {
+            $error = 'Follow request not found.';
+        } else {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+            $result = function_exists('ap_follow_request_decide')
+                ? ap_follow_request_decide($request, $approve)
+                : ['ok' => false, 'error' => 'Follow approval unavailable.'];
+            $notice = !empty($result['ok'])
+                ? ($approve ? 'Follower approved.' : 'Follow request rejected.')
+                : ($result['error'] ?? 'Could not update follow request.');
+            if (empty($result['ok'])) {
+                $error = $notice;
+                $notice = null;
+            }
+        }
     } elseif ($action === 'user_block_add') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'profile')) ?: 'profile';
         if ($view === 'blocks' || $view === 'muted_words') {
@@ -2004,8 +2030,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         if ($result !== null) {
             if (!empty($result['ok'])) {
                 admin_tl_cache_clear();
-                $notice = 'Personal ' . $kind . ' for ' . ($result['scope'] ?? '') . ' ' . ($result['value'] ?? '')
-                    . ' (hides from your timelines only — not server-wide).';
+                $notice = 'Personal ' . $kind . ' saved for ' . ($result['scope'] ?? '') . ' ' . ($result['value'] ?? '') . '.';
             } else {
                 $error = $result['error'] ?? 'Personal block failed.';
             }
@@ -3322,6 +3347,9 @@ if ($view === 'profile') {
     $mutes = function_exists('ap_mutes_list') ? ap_mutes_list(admin_owner_user_id()) : [];
     $userBlocks = function_exists('ap_user_blocks_list') ? ap_user_blocks_list(admin_owner_user_id()) : [];
     $mutedWordRows = function_exists('ap_muted_words_list') ? ap_muted_words_list(admin_owner_user_id()) : [];
+    $followRequests = function_exists('ap_follow_requests_list')
+        ? ap_follow_requests_list(rtrim((string) ($vaakUser['actor_id'] ?? $vaakActorId), '/'))
+        : [];
 }
 
 // Federation feed — only when viewing Federated (was previously built on every click)
@@ -9990,6 +10018,32 @@ header('Content-Type: text/html; charset=utf-8');
             </div>
           <?php endif; ?>
 
+          <?php if (!empty($followRequests)): ?>
+            <div class="composer" style="margin:0 0 1rem">
+              <h3 style="margin-top:0">Pending follower requests</h3>
+              <div class="meta" style="margin-bottom:.65rem">Approve requests to add the account to your followers, or reject them without accepting the follow.</div>
+              <?php foreach ($followRequests as $request):
+                  $requestActor = (string) ($request['actor_id'] ?? '');
+                  $requestName = trim((string) ($request['username'] ?? ''));
+                  $requestLabel = $requestName !== '' ? '@' . $requestName : $requestActor;
+              ?>
+                <div class="row" style="justify-content:space-between;gap:.75rem;align-items:center;margin:.55rem 0">
+                  <a href="?view=remote_profile&amp;actor=<?= h(rawurlencode($requestActor)) ?>"><?= h($requestLabel) ?></a>
+                  <span style="display:flex;gap:.45rem;flex-wrap:wrap">
+                    <form method="post" action="?view=profile" style="display:inline">
+                      <input type="hidden" name="action" value="follow_request_decide"><input type="hidden" name="id" value="<?= (int) ($request['id'] ?? 0) ?>"><input type="hidden" name="decision" value="approve">
+                      <button class="btn btn-primary" type="submit">Approve</button>
+                    </form>
+                    <form method="post" action="?view=profile" style="display:inline">
+                      <input type="hidden" name="action" value="follow_request_decide"><input type="hidden" name="id" value="<?= (int) ($request['id'] ?? 0) ?>"><input type="hidden" name="decision" value="reject">
+                      <button class="btn" type="submit">Reject</button>
+                    </form>
+                  </span>
+                </div>
+              <?php endforeach; ?>
+            </div>
+          <?php endif; ?>
+
           <label for="pf-name">Display name</label>
           <input id="pf-name" type="text" name="name" maxlength="100" required value="<?= h($profile['name']) ?>">
 
@@ -10052,7 +10106,7 @@ header('Content-Type: text/html; charset=utf-8');
           <div class="checks">
             <label><input type="checkbox" name="discoverable" value="1" <?= !empty($profile['discoverable']) ? 'checked' : '' ?>> Show in profile directories / discovery</label>
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
-            <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Manually approve followers</label>
+            <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
             <label><input type="checkbox" name="anti_ai_marker" value="1" <?= !empty($profile['anti_ai_marker']) ? 'checked' : '' ?>> Highlight anti-AI posters in my timelines</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
@@ -10062,6 +10116,10 @@ header('Content-Type: text/html; charset=utf-8');
             <b style="color:var(--primary)">Follow back</b> —
             when on, accepting a Follow also sends a Follow to them (same as the old single-user habit).
             Off by default for every account — turn on only if you want that behavior.
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Private account</b> —
+            new followers remain pending until you approve them. Your ActivityPub actor is advertised as locked/private.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Anti-AI highlight</b> —
