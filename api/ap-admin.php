@@ -2940,6 +2940,19 @@ function admin_timeline_row_hidden(array $row, int $ownerUserId): bool
             return true;
         }
     }
+    $type = strtolower((string) ($row['type'] ?? ''));
+    if (in_array($type, ['quote', 'quotepost'], true)
+        && function_exists('ap_quote_post_parent_url')
+        && function_exists('ap_masto_actor_url_from_object_url')) {
+        $parent = ap_quote_post_parent_url((string) ($row['object_id'] ?? ''));
+        $quotedActor = $parent !== null ? ap_masto_actor_url_from_object_url($parent) : null;
+        if (is_string($quotedActor) && $quotedActor !== ''
+            && (function_exists('ap_row_is_hidden')
+                ? ap_row_is_hidden($quotedActor, null, $ownerUserId)
+                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($quotedActor, null)))) {
+            return true;
+        }
+    }
     return false;
 }
 
