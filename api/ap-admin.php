@@ -4144,6 +4144,15 @@ function mention_media_urls(?string $json): array
     return $out;
 }
 
+/** Hide placeholder summaries emitted by remote servers when a post is media-only. */
+function admin_media_placeholder_summary(string $summary, array $mediaUrls): string
+{
+    if ($mediaUrls !== [] && preg_match('/^\((?:attachment|media)\)$/i', trim(strip_tags($summary)))) {
+        return '';
+    }
+    return $summary;
+}
+
 function view_title(string $view): string
 {
     return match ($view) {
@@ -5433,6 +5442,8 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
             <?php
               $cwSpoiler = trim((string) ($e['spoiler_text'] ?? ''));
               $cwSensitive = !empty($e['sensitive']) || $cwSpoiler !== '';
+              $eMedia = mention_media_urls($e['media_urls'] ?? null);
+              $summaryRaw = admin_media_placeholder_summary($summaryRaw, $eMedia);
               $bodyChunk = '';
               // Resolve bare @user → full acct via cache (same path Ice Cubes uses), so
               // timeline summaries that lost @host still get clickable profile links.
@@ -5459,7 +5470,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $bodyChunk .= '<div class="body feed-body">'
                       . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions) . '</div>';
               }
-              $eMedia = mention_media_urls($e['media_urls'] ?? null);
               $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
             ?>
@@ -6234,6 +6244,8 @@ function admin_render_remote_boost_card(
         $summaryRaw = ap_masto_clean_mention_text($summaryRaw);
     }
     $mediaRow = is_array($innerEvent) ? ($innerEvent['media_urls'] ?? null) : ($e['media_urls'] ?? null);
+    $mediaUrls = mention_media_urls($mediaRow);
+    $summaryRaw = admin_media_placeholder_summary($summaryRaw, $mediaUrls);
     $eventId = (int) ($e['id'] ?? 0);
     $statusId = $eventId > 0
         ? ap_masto_event_status_id($eventId, $created !== '' ? $created : null)
@@ -6312,7 +6324,7 @@ function admin_render_remote_boost_card(
               } else {
                   $boostInner .= '<div class="meta">(boost)</div>';
               }
-              $boostMedia = mention_media_urls($mediaRow);
+              $boostMedia = $mediaUrls;
               if ($boostMedia) {
                   $boostInner .= admin_media_row_html($boostMedia);
               }
@@ -6414,6 +6426,8 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
             $targetActor = $aid !== '' ? $aid : $targetActor;
         }
     }
+    $innerMedia = is_array($innerEvent) ? mention_media_urls($innerEvent['media_urls'] ?? null) : [];
+    $innerSummary = admin_media_placeholder_summary($innerSummary, $innerMedia);
     $alreadyFollowing = $targetActor !== '' && (
         !empty($followingIds[$targetActor]) || !empty($followingIds[rtrim($targetActor, '/')])
     );
@@ -6442,11 +6456,8 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               } else {
                   $boostInner .= '<div class="meta" style="margin-top:.35rem">Boosted post unavailable.</div>';
               }
-              if (is_array($innerEvent)) {
-                  $boostMedia = mention_media_urls($innerEvent['media_urls'] ?? null);
-                  if ($boostMedia) {
-                      $boostInner .= admin_media_row_html($boostMedia);
-                  }
+              if ($innerMedia) {
+                  $boostInner .= admin_media_row_html($innerMedia);
               }
               echo admin_tweet_content_wrap($boostInner);
             ?>
