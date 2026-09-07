@@ -9250,9 +9250,7 @@ header('Content-Type: text/html; charset=utf-8');
                   <div class="meta"><?= ($last['direction'] ?? '') === 'out' ? 'You' : 'Them' ?> · <?= h(relative_time((string) ($last['created_at'] ?? ''))) ?></div>
                 </div>
               </div>
-              <div class="dm-bubble<?= ($last['direction'] ?? '') === 'out' ? ' dm-out' : ' dm-in' ?>">
-                <?= $previewHtml !== '' ? $previewHtml : '<span class="meta">(no text)</span>' ?>
-              </div>
+              <div class="dm-bubble<?= ($last['direction'] ?? '') === 'out' ? ' dm-out' : ' dm-in' ?>"><?= $previewHtml !== '' ? $previewHtml : '<span class="meta">(no text)</span>' ?></div>
               <div class="tweet-actions">
                 <a class="btn btn-primary" href="?view=dms&amp;peer=<?= urlencode($peerId) ?>" style="padding:.35rem .9rem;font-size:.85rem">Open thread</a>
                 <?= block_quick_actions($peerId, short_host($peerId), 'dms', $vaakOwnerId, !empty($vaakIsAdmin), 'dms') ?>
@@ -9297,9 +9295,7 @@ header('Content-Type: text/html; charset=utf-8');
                   </div>
                 </div>
               </div>
-              <div class="dm-bubble<?= $isOut ? ' dm-out' : ' dm-in' ?>">
-                <?= $msgHtml !== '' ? $msgHtml : '<span class="meta">(no text in this message)</span>' ?>
-              </div>
+              <div class="dm-bubble<?= $isOut ? ' dm-out' : ' dm-in' ?>"><?= $msgHtml !== '' ? $msgHtml : '<span class="meta">(no text in this message)</span>' ?></div>
               <?php
                 $dMedia = mention_media_urls($m['media_urls'] ?? null);
                 if ($dMedia) {
