@@ -1579,12 +1579,12 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
     $actorKey = preg_replace('/[^a-z0-9_]/', '', $actorKey) ?: 'cmdr_nova';
     $isCmdr = ($actorKey === 'cmdr_nova');
     if ($isCmdr) {
-        $summary = '<p>Local ActivityPub presence for mkultra.monster.</p><p>Also <a href="https://cmplxdecay.space/@valerie" rel="nofollow noopener noreferrer">@valerie@cmplxdecay.space</a>. Site bridge handle: <code>@val3r1e@mkultra.monster</code> (Bridgy Fed).</p>';
+        $summary = '<p>Local ActivityPub presence for mkultra.monster.</p><p>Also <a href="https://mkultra.monster/users/cmdr_nova" rel="nofollow noopener noreferrer">@valerie@cmplxdecay.space</a>. Site bridge handle: <code>@val3r1e@mkultra.monster</code> (Bridgy Fed).</p>';
         $attachment = [
             [
                 'type' => 'PropertyValue',
                 'name' => 'Also',
-                'value' => '<a href="https://cmplxdecay.space/@valerie" rel="me">@valerie@cmplxdecay.space</a>',
+                'value' => '<a href="https://mkultra.monster/users/cmdr_nova" rel="me">@valerie@cmplxdecay.space</a>',
             ],
             [
                 'type' => 'PropertyValue',

@@ -31,7 +31,7 @@ if (!$wantsAp && strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET') {
     echo '</head><body><main><div class="card">';
     echo '<h1>Instance actor</h1>';
     echo '<p>This is the server Application actor used only for <strong>HTTP Signature / authorized-fetch</strong> key exchange (e.g. Threads).</p>';
-    echo '<p class="muted">It is not a personal account. Local AP: <a href="https://mkultra.monster/users/cmdr_nova">@cmdr_nova@mkultra.monster</a>. Bridgy site handle stays @val3r1e@mkultra.monster. Also <a href="https://cmplxdecay.space/@valerie">@valerie@cmplxdecay.space</a>.</p>';
+    echo '<p class="muted">It is not a personal account. Local AP: <a href="https://mkultra.monster/users/cmdr_nova">@cmdr_nova@mkultra.monster</a>. Bridgy site handle stays @val3r1e@mkultra.monster. Also <a href="https://mkultra.monster/users/cmdr_nova">@valerie@cmplxdecay.space</a>.</p>';
     echo '</div></main></body></html>';
     exit;
 }
