@@ -2916,6 +2916,33 @@ function admin_timeline_item_muted_by_words(array $item): bool
     );
 }
 
+/** Hide a timeline row when either its visible actor or boosted original is blocked. */
+function admin_timeline_row_hidden(array $row, int $ownerUserId): bool
+{
+    $actor = (string) ($row['actor_id'] ?? '');
+    $host = $row['host'] ?? null;
+    if (function_exists('ap_row_is_hidden')
+        ? ap_row_is_hidden($actor !== '' ? $actor : null, $host, $ownerUserId)
+        : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($actor !== '' ? $actor : null, $host))) {
+        return true;
+    }
+    if (strtolower((string) ($row['type'] ?? '')) === 'announce') {
+        $original = function_exists('ap_masto_announce_original_actor')
+            ? ap_masto_announce_original_actor($row)
+            : null;
+        if (($original === null || $original === '') && !empty($row['target_actor'])) {
+            $original = (string) $row['target_actor'];
+        }
+        if ($original !== null && $original !== ''
+            && (function_exists('ap_row_is_hidden')
+                ? ap_row_is_hidden($original, null, $ownerUserId)
+                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($original, null)))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * @return list<array{k:string,id:string,t?:int}>|null
  */
@@ -3176,9 +3203,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 if ($eid === '0' || isset($seenIds[$eid])) {
                     continue;
                 }
-                if (function_exists('ap_row_is_hidden')
-                    ? ap_row_is_hidden($erow['actor_id'] ?? null, $erow['host'] ?? null, admin_owner_user_id())
-                    : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($erow['actor_id'] ?? null, $erow['host'] ?? null))) {
+                if (admin_timeline_row_hidden($erow, admin_owner_user_id())) {
                     continue;
                 }
                 if (function_exists('ap_row_matches_muted_words')
@@ -3234,9 +3259,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             if ($eid === '0' || isset($seenIds[$eid])) {
                 continue;
             }
-            if (function_exists('ap_row_is_hidden')
-                ? ap_row_is_hidden($e['actor_id'] ?? null, $e['host'] ?? null, admin_owner_user_id())
-                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($e['actor_id'] ?? null, $e['host'] ?? null))) {
+            if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
                 continue;
             }
             if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], admin_owner_user_id())) {
@@ -3301,9 +3324,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 continue;
             }
             $aid = (string) ($e['actor_id'] ?? '');
-            if ($aid === '' || (function_exists('ap_row_is_hidden')
-                ? ap_row_is_hidden($aid, $e['host'] ?? null, admin_owner_user_id())
-                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($aid, $e['host'] ?? null)))) {
+            if ($aid === '' || admin_timeline_row_hidden($e, admin_owner_user_id())) {
                 continue;
             }
             if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], admin_owner_user_id())) {
@@ -3381,9 +3402,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
         error_log('[ap-admin] feed events: ' . $e->getMessage());
     }
     foreach ($feedEventsRaw as $e) {
-        if (function_exists('ap_row_is_hidden')
-            ? ap_row_is_hidden($e['actor_id'] ?? null, $e['host'] ?? null, admin_owner_user_id())
-            : ap_row_is_blocked($e['actor_id'] ?? null, $e['host'] ?? null)) {
+        if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
             continue;
         }
         if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], admin_owner_user_id())) {
@@ -3531,9 +3550,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         }
         foreach ($homeRaw as $e) {
             $aid = (string) ($e['actor_id'] ?? '');
-            if ($aid === '' || (function_exists('ap_row_is_hidden')
-                ? ap_row_is_hidden($aid, $e['host'] ?? null, $homeOwnerId)
-                : ap_row_is_blocked($aid, $e['host'] ?? null))) {
+            if ($aid === '' || admin_timeline_row_hidden($e, $homeOwnerId)) {
                 continue;
             }
             if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], $homeOwnerId)) {
@@ -3584,9 +3601,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if ($aid === '' || vaak_is_own_url($aid)) {
                 continue;
             }
-            if (function_exists('ap_row_is_hidden')
-                ? ap_row_is_hidden($aid, $e['host'] ?? null, $homeOwnerId)
-                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($aid, $e['host'] ?? null))) {
+            if (admin_timeline_row_hidden($e, $homeOwnerId)) {
                 continue;
             }
             if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], $homeOwnerId)) {
@@ -6137,6 +6152,10 @@ function admin_render_remote_boost_card(
         $origActor = (string) ($e['target_actor'] ?? '');
     }
     $origActor = rtrim($origActor, '/');
+    if ($origActor !== '' && function_exists('ap_row_is_hidden')
+        && ap_row_is_hidden($origActor, null, admin_owner_user_id())) {
+        return;
+    }
     // Prefer Create/Update note row — never treat the Announce itself as the inner post
     // (ap_event_by_object_id falls back to Announce when Create was never enriched).
     $innerEvent = null;
@@ -6428,6 +6447,10 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     }
     $innerMedia = is_array($innerEvent) ? mention_media_urls($innerEvent['media_urls'] ?? null) : [];
     $innerSummary = admin_media_placeholder_summary($innerSummary, $innerMedia);
+    if ($targetActor !== '' && function_exists('ap_row_is_hidden')
+        && ap_row_is_hidden($targetActor, null, admin_owner_user_id())) {
+        return;
+    }
     $alreadyFollowing = $targetActor !== '' && (
         !empty($followingIds[$targetActor]) || !empty($followingIds[rtrim($targetActor, '/')])
     );
@@ -7059,9 +7082,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     $seen = [];
 
     $pushEvent = static function (array $e) use (&$out, &$seen, $ownerId): void {
-        if (function_exists('ap_row_is_hidden')
-            ? ap_row_is_hidden($e['actor_id'] ?? null, $e['host'] ?? null, $ownerId)
-            : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($e['actor_id'] ?? null, $e['host'] ?? null))) {
+        if (admin_timeline_row_hidden($e, $ownerId)) {
             return;
         }
         if (function_exists('ap_row_matches_muted_words')
