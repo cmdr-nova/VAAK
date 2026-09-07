@@ -3853,11 +3853,13 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
         }
         $localTimeline[] = $outItem;
     }
-    // Local users boosting other *local* posts (skip remote boosts — Local stays instance-only)
+    // Local users' boosts (including boosts of remote posts). The booster is
+    // local; the target can be anywhere, while the Local view remains
+    // instance-scoped by who performed the action.
     try {
         $stRb = $db->prepare(
             "SELECT * FROM masto_reblogs
-             WHERE object_id LIKE 'https://mkultra.monster/users/%'
+             WHERE owner_actor_id LIKE 'https://mkultra.monster/users/%'
              ORDER BY created_at DESC LIMIT 120"
         );
         $stRb->execute();
