@@ -543,6 +543,16 @@ function ap_sl_profile_url(string $agentId): string
     return 'https://world.secondlife.com/resident/' . $agentId;
 }
 
+/** Open an avatar directly in the installed Second Life viewer. */
+function ap_sl_viewer_profile_url(string $agentId): string
+{
+    $agentId = strtolower(trim($agentId));
+    if (!ap_sl_valid_agent_id($agentId)) {
+        return 'https://secondlife.com/';
+    }
+    return 'secondlife:///app/agent/' . rawurlencode($agentId) . '/about';
+}
+
 function ap_sl_maps_name_url(string $username): string
 {
     // my.secondlife.com uses First.Last style

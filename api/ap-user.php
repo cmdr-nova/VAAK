@@ -486,15 +486,16 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     if (is_array($slLink) && !empty($slLink['sl_username'])) {
         $slName = htmlspecialchars((string) $slLink['sl_username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $slHref = htmlspecialchars(
-            function_exists('ap_sl_profile_url')
-                ? ap_sl_profile_url((string) ($slLink['sl_agent_id'] ?? ''))
+            function_exists('ap_sl_viewer_profile_url')
+                ? ap_sl_viewer_profile_url((string) ($slLink['sl_agent_id'] ?? ''))
                 : 'https://secondlife.com/',
             ENT_QUOTES,
             'UTF-8'
         );
-        echo '<p class="muted" style="margin:.35rem 0 0">'
-            . 'Second Life resident: '
-            . '<a href="' . $slHref . '" rel="noopener noreferrer me">' . $slName . '</a></p>';
+        echo '<p class="sl-link" style="margin:.55rem 0 0">'
+            . '<a href="' . $slHref . '" rel="noopener noreferrer me" aria-label="Open ' . $slName . ' in Second Life">'
+            . '<img src="/vaak/second-life.svg" alt="" width="34" height="34" loading="lazy">'
+            . '<span>Second Life<span class="sl-name">' . $slName . '</span></span></a></p>';
     }
     echo '</div></div>';
     if (trim(strip_tags($summary)) !== '') {
@@ -754,6 +755,10 @@ function ap_user_html_shell_start(string $title): void
       a{color:#7ee0ff}.muted{color:#999}
       h1{margin:.2rem 0;font-size:1.45rem}
       .row{display:flex;gap:1rem;align-items:center}
+      .sl-link a{display:inline-flex;align-items:center;gap:.55rem;color:#ddd;text-decoration:none;font-weight:650}
+      .sl-link a:hover{color:#fff}
+      .sl-link img{display:block;border-radius:50%;flex:0 0 auto}
+      .sl-name{display:block;color:#999;font-size:.8rem;font-weight:500}
       .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#1a1a1a}
       .av-fallback{display:flex;align-items:center;justify-content:center;font-size:1.6rem;font-weight:700;color:#00ff9f}
       .banner{height:120px;border-radius:12px;background-size:cover;background-position:center;margin:-.25rem -.25rem 1rem;border:1px solid #2a2a2a}
