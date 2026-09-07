@@ -6316,7 +6316,7 @@ function admin_render_remote_boost_card(
                   }
                   $boostInner .= '<div class="body feed-body">'
                       . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions) . '</div>';
-              } elseif ($objectId !== '') {
+              } elseif ($objectId !== '' && $mediaUrls === []) {
                   $boostInner .= '<div class="meta boost-hydrate-pending" style="margin-top:.35rem">'
                       . '<span class="boost-hydrate-status">Loading boosted post…</span>'
                       . ' · <a href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
