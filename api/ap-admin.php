@@ -1135,6 +1135,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'vanity_verified' => !empty($_POST['vanity_verified']),
                 'auto_follow_back' => !empty($_POST['auto_follow_back']),
                 'anti_ai_marker' => !empty($_POST['anti_ai_marker']),
+                'auto_unblur_sensitive' => !empty($_POST['auto_unblur_sensitive']),
             ], $vaakActorKey);
             if (empty($saved['ok'])) {
                 $error = $saved['error'] ?? 'Profile save failed.';
@@ -4503,7 +4504,9 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
     $handle = $actorId !== '' ? actor_handle($actorId) : '';
     $count = count($media);
     $isVideo = !empty($thumb['is_video']);
-    $cw = $sensitive || $spoiler !== '';
+    $autoUnblur = $sensitive && $spoiler === '' && function_exists('ap_profile_get')
+        && !empty(ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))['auto_unblur_sensitive']);
+    $cw = ($sensitive && !$autoUnblur) || $spoiler !== '';
     ?>
     <a class="gallery-cell<?= $cw ? ' gallery-cell-cw' : '' ?>" href="<?= h($href) ?>" title="<?= h($handle !== '' ? $handle : 'Open') ?>">
       <?php if ($isVideo): ?>
@@ -5232,6 +5235,8 @@ function admin_tweet_content_wrap(string $innerHtml): string
 function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerHtml): string
 {
     $spoilerText = trim($spoilerText);
+    $autoUnblur = $sensitive && $spoilerText === '' && function_exists('ap_profile_get')
+        && !empty(ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))['auto_unblur_sensitive']);
     if ($innerHtml === '') {
         // Still show a CW shell for sensitive/spoiler posts with no extractable body/media
         // (e.g. gifv filtered before fix) so the card isn't invisible.
@@ -5241,7 +5246,7 @@ function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerH
         $innerHtml = '<div class="meta">(sensitive media — open post on remote if nothing appears)</div>';
     }
     $wrapped = admin_tweet_content_wrap($innerHtml);
-    if (!$sensitive && $spoilerText === '') {
+    if ((!$sensitive || $autoUnblur) && $spoilerText === '') {
         return $wrapped;
     }
     $label = $spoilerText !== '' ? $spoilerText : 'Sensitive content';
@@ -10111,6 +10116,7 @@ header('Content-Type: text/html; charset=utf-8');
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
             <label><input type="checkbox" name="anti_ai_marker" value="1" <?= !empty($profile['anti_ai_marker']) ? 'checked' : '' ?>> Highlight anti-AI posters in my timelines</label>
+            <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
             <label><input type="checkbox" name="vanity_verified" value="1" <?= !empty($profile['vanity_verified']) ? 'checked' : '' ?>> Vanity verified checkmark <span class="vanity-verified" aria-hidden="true">✓</span></label>
           </div>
@@ -10129,6 +10135,10 @@ header('Content-Type: text/html; charset=utf-8');
             who’ve used slang like “slop” / “clanker” in <b>3+ cached posts</b> (job rescans periodically;
             mark clears if that usage drops off for ~90 days). A single matching post can also tag early.
             Nothing is appended to federated outbound posts.
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Sensitive media</b> —
+            when enabled, media marked sensitive is shown without the blur gate in your timelines and gallery. Content warnings with custom text still remain collapsible.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Vanity verified</b> —

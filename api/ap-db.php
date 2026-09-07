@@ -189,6 +189,11 @@ function ap_db_migrate_postgres(PDO $db): void
     } catch (Throwable $e) {
         error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
     }
+    try {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN IF NOT EXISTS auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
+    } catch (Throwable $e) {
+        error_log('[ap-db] auto-unblur profile column not provisioned: ' . $e->getMessage());
+    }
 
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
@@ -347,6 +352,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     image_url TEXT,
     manually_approves INTEGER NOT NULL DEFAULT 0,
     discoverable INTEGER NOT NULL DEFAULT 1,
+    auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 SQL);
@@ -382,6 +388,9 @@ SQL);
     // Viewer preference: highlight anti-AI posters (slop/clanker heuristic) in timelines
     if (!in_array('anti_ai_marker', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN anti_ai_marker INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('auto_unblur_sensitive', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -1663,6 +1672,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'vanity_verified' => false,
         'auto_follow_back' => false,
         'anti_ai_marker' => false,
+        'auto_unblur_sensitive' => false,
         'updated_at' => null,
     ];
 }
@@ -1729,6 +1739,9 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
             : false,
         'anti_ai_marker' => array_key_exists('anti_ai_marker', $row)
             ? !empty($row['anti_ai_marker'])
+            : false,
+        'auto_unblur_sensitive' => array_key_exists('auto_unblur_sensitive', $row)
+            ? !empty($row['auto_unblur_sensitive'])
             : false,
         'updated_at' => $row['updated_at'] ?? null,
     ];
@@ -1941,10 +1954,13 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     } else {
         $antiAiMarker = !empty($existingProfile['anti_ai_marker']) ? 1 : 0;
     }
+    $autoUnblurSensitive = array_key_exists('auto_unblur_sensitive', $fields)
+        ? (!empty($fields['auto_unblur_sensitive']) ? 1 : 0)
+        : (!empty($existingProfile['auto_unblur_sensitive']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -1958,6 +1974,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            vanity_verified = excluded.vanity_verified,
            auto_follow_back = excluded.auto_follow_back,
            anti_ai_marker = excluded.anti_ai_marker,
+           auto_unblur_sensitive = excluded.auto_unblur_sensitive,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -1974,6 +1991,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $vanityVerified,
         $autoFollowBack,
         $antiAiMarker,
+        $autoUnblurSensitive,
         ap_db_now(),
     ]);
 
