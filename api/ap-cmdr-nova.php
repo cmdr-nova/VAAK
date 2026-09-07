@@ -1285,7 +1285,7 @@ function ap_cmdr_html(): void
         );
         echo '<p class="sl-link" style="margin:.55rem 0 0">'
             . '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
-            . '<img src="/vaak/second-life.svg" alt="" width="34" height="34" loading="lazy">'
+            . '<img src="/vaak/second-life.png" alt="" width="34" height="34" loading="lazy">'
             . '</a></p>';
     }
     echo '</div></div>';
