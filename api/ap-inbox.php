@@ -1054,15 +1054,18 @@ function ap_route_verified_activity(array $activity, int $bytes): string
                 return 'local_unfollow';
             }
         }
-        if (in_array($innerType, ['Like', 'EmojiReact', 'Announce'], true)) {
+        if (in_array($innerType, ['Like', 'EmojiReact', 'Announce', 'Quote', 'QuotePost'], true)) {
             $who = ap_as_id(is_array($inner) ? ($inner['actor'] ?? $activity['actor'] ?? null) : ($activity['actor'] ?? null));
             $target = ap_as_id($innerObj);
-            $kind = ($innerType === 'Announce') ? 'reblog' : 'like';
+            $kind = ($innerType === 'Announce') ? 'reblog' : (($innerType === 'Like' || $innerType === 'EmojiReact') ? 'like' : 'quote');
             $n = 0;
             if (function_exists('ap_mention_soft_delete_interaction') && $who && $target) {
                 $n = ap_mention_soft_delete_interaction($who, $target, $kind, $innerActId);
             } elseif (function_exists('ap_mention_soft_delete_interaction') && $innerActId) {
                 $n = ap_mention_soft_delete_interaction((string) ($who ?: ''), '', $kind, $innerActId);
+            }
+            if ($who && function_exists('ap_events_mark_interaction_undone')) {
+                ap_events_mark_interaction_undone($innerType, $who, $target, $innerActId);
             }
             ap_metrics_record('Undo', $actorId, $objectId, LOCAL_ACTOR, $bytes, 'local_undo_' . $kind, null);
             ap_log('local_undo_' . $kind . ' actor=' . ap_short((string) $who) . ' n=' . $n);

@@ -3505,6 +3505,57 @@ function ap_events_mark_object_deleted(string $objectId): int
 }
 
 /**
+ * Hide a firehose interaction when its author sends Undo(Announce/Quote).
+ * Interaction rows use the original target object as object_id, while some
+ * implementations send the Undo object as the activity URL, so accept both
+ * the target and activity identifiers when available.
+ */
+function ap_events_mark_interaction_undone(
+    string $type,
+    string $actorId,
+    ?string $objectId = null,
+    ?string $activityId = null
+): int {
+    $types = match ($type) {
+        'Announce' => ['Announce'],
+        'Quote', 'QuotePost' => ['Quote', 'QuotePost'],
+        default => [],
+    };
+    $actorId = rtrim(trim($actorId), '/');
+    $objectId = $objectId !== null ? rtrim(trim($objectId), '/') : '';
+    $activityId = $activityId !== null ? rtrim(trim($activityId), '/') : '';
+    if ($types === [] || $actorId === '' || ($objectId === '' && $activityId === '')) {
+        return 0;
+    }
+    try {
+        $typePh = implode(',', array_fill(0, count($types), '?'));
+        $where = ["type IN ($typePh)", 'rtrim(actor_id, \'/\') = ?'];
+        $params = $types;
+        $params[] = $actorId;
+        $target = [];
+        if ($objectId !== '') {
+            $target[] = '(rtrim(object_id, \'/\') = ?)';
+            $params[] = $objectId;
+        }
+        if ($activityId !== '') {
+            $target[] = '(rtrim(object_id, \'/\') = ?)';
+            $params[] = $activityId;
+        }
+        $where[] = '(' . implode(' OR ', $target) . ')';
+        $st = ap_db()->prepare(
+            "UPDATE events SET action_taken = 'deleted'
+             WHERE " . implode(' AND ', $where) . "
+               AND action_taken IN ('log', 'local_observe', 'local_fav_update')"
+        );
+        $st->execute($params);
+        return (int) $st->rowCount();
+    } catch (Throwable $e) {
+        error_log('[ap-db] events_mark_interaction_undone: ' . $e->getMessage());
+        return 0;
+    }
+}
+
+/**
  * Apply an inbound Update onto the existing Create row so timelines show new text/media/CW.
  *
  * @param list<string>|null $mediaUrls
