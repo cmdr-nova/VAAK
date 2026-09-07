@@ -697,10 +697,11 @@ function ap_auth_register(string $inviteCode, string $username, string $password
              ON CONFLICT(actor_key) DO NOTHING'
         )->execute([$username, $username, '', '[]', $now]);
         $inviteId = (int) (($inv['invite']['id'] ?? 0));
-        $db->prepare(
+        $inviteUse = $db->prepare(
             'UPDATE ap_invite_codes SET used_by = ?, used_at = ? WHERE id = ? AND used_at IS NULL'
-        )->execute([$uid, $now, $inviteId]);
-        if ($db->query('SELECT changes()')->fetchColumn() < 1) {
+        );
+        $inviteUse->execute([$uid, $now, $inviteId]);
+        if ($inviteUse->rowCount() < 1) {
             throw new RuntimeException('Invite race — already used.');
         }
         $db->commit();
