@@ -206,6 +206,50 @@ function ap_auth_user_by_id(int $id): ?array
     return is_array($row) ? $row : null;
 }
 
+/** @return list<array<string,mixed>> */
+function ap_auth_users_list(int $limit = 200): array
+{
+    $limit = max(1, min(500, $limit));
+    $st = ap_db()->query(
+        'SELECT u.id, u.username, u.email, u.actor_key, u.actor_id, u.is_admin,
+                u.created_at, u.updated_at, u.disabled_at,
+                p.name AS profile_name, p.icon_url
+           FROM ap_users u
+           LEFT JOIN actor_profile p ON p.actor_key = u.actor_key
+          ORDER BY u.created_at DESC, u.id DESC
+          LIMIT ' . $limit
+    );
+    $rows = $st->fetchAll() ?: [];
+    return is_array($rows) ? $rows : [];
+}
+
+/** @return array{ok:bool,error?:string,disabled?:bool} */
+function ap_auth_user_set_disabled(int $id, bool $disabled): array
+{
+    if ($id < 1) {
+        return ['ok' => false, 'error' => 'Invalid user.'];
+    }
+    $st = ap_db()->prepare('SELECT actor_key, is_admin FROM ap_users WHERE id = ? LIMIT 1');
+    $st->execute([$id]);
+    $row = $st->fetch();
+    if (!is_array($row)) {
+        return ['ok' => false, 'error' => 'User not found.'];
+    }
+    if ((string) ($row['actor_key'] ?? '') === 'cmdr_nova' || !empty($row['is_admin'])) {
+        return ['ok' => false, 'error' => 'The operator account cannot be banned here.'];
+    }
+    $now = ap_db_now();
+    $when = $disabled ? $now : null;
+    ap_db()->prepare('UPDATE ap_users SET disabled_at = ?, updated_at = ? WHERE id = ?')
+        ->execute([$when, $now, $id]);
+    if ($disabled) {
+        // Cut off API clients immediately as well as blocking future web logins.
+        ap_db()->prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL')
+            ->execute([$now, $id]);
+    }
+    return ['ok' => true, 'disabled' => $disabled];
+}
+
 /**
  * Update account email (login alias). Empty clears it.
  *

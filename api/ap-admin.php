@@ -154,7 +154,7 @@ if ($view === 'muted_words') {
 }
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
-    'moderation', 'blocks', 'relays', 'stats', 'invites', 'policies',
+    'moderation', 'blocks', 'relays', 'stats', 'invites', 'users', 'policies',
     'guestbook', 'support', 'analytics',
 ];
 // Security is under You for every account (own OAuth tokens / password).
@@ -601,6 +601,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         'relay_add', 'relay_enable', 'relay_disable', 'relay_remove',
         'report_dismiss', 'report_ignore',
         'invite_create',
+        'user_ban', 'user_unban',
         'policies_save_privacy', 'policies_save_conduct', 'policies_save_rules',
     ];
     // revoke_oauth_token + change_password are per-user (scoped in handlers)
@@ -2104,6 +2105,20 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = 'Invite created: ' . ($res['code'] ?? '');
             } else {
                 $error = $res['error'] ?? 'Could not create invite.';
+            }
+        }
+    } elseif ($action === 'user_ban' || $action === 'user_unban') {
+        $view = 'users';
+        if (!$vaakIsAdmin) {
+            $error = 'Admin only.';
+        } else {
+            $userId = (int) ($_POST['user_id'] ?? 0);
+            $disable = $action === 'user_ban';
+            $res = ap_auth_user_set_disabled($userId, $disable);
+            if (!empty($res['ok'])) {
+                $notice = $disable ? 'User banned and OAuth tokens revoked.' : 'User unbanned.';
+            } else {
+                $error = $res['error'] ?? 'Could not update user status.';
             }
         }
     } elseif ($action === 'policies_save_privacy' || $action === 'policies_save_conduct' || $action === 'policies_save_rules') {
@@ -4135,6 +4150,7 @@ function view_title(string $view): string
         'guestbook' => 'Guestbook',
         'support' => 'Support',
         'analytics' => 'Analytics',
+        'users' => 'Users',
         default => ucfirst($view),
     };
 }
@@ -8579,7 +8595,7 @@ header('Content-Type: text/html; charset=utf-8');
       $dmUnreadNav = ap_dm_unread_count();
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
       $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'import_export', 'security'], true);
-      $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'policies'], true);
+      $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
     ?>
     <nav class="nav">
@@ -8644,6 +8660,7 @@ header('Content-Type: text/html; charset=utf-8');
           </a>
           <a class="<?= $view === 'blocks' ? 'active' : '' ?>" href="?view=blocks"><span class="ico">⊘</span><span class="label">Server blocks</span></a>
           <a class="<?= $view === 'invites' ? 'active' : '' ?>" href="?view=invites"><span class="ico">✦</span><span class="label">Invites</span></a>
+          <a class="<?= $view === 'users' ? 'active' : '' ?>" href="?view=users"><span class="ico"><i class="ph ph-users-three" aria-hidden="true"></i></span><span class="label">Users</span></a>
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>
           <a class="<?= $view === 'relays' ? 'active' : '' ?>" href="?view=relays"><span class="ico">⇄</span><span class="label">Relays</span></a>
           <a class="<?= $view === 'stats' ? 'active' : '' ?>" href="?view=stats"><span class="ico">▤</span><span class="label">AP stats</span></a>
@@ -8804,7 +8821,7 @@ header('Content-Type: text/html; charset=utf-8');
     <div class="topbar">
       <h1><?= h(view_title($view)) ?></h1>
       <div class="topbar-actions">
-        <?php if (in_array($view, ['home', 'local', 'feed', 'gallery', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile'], true)): ?>
+        <?php if (in_array($view, ['home', 'local', 'feed', 'gallery', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile', 'users'], true)): ?>
           <a class="btn btn-ghost" href="?view=<?= h($view) ?><?= $view === 'dms' && !empty($_GET['peer']) ? '&amp;peer=' . urlencode((string) $_GET['peer']) : '' ?>&amp;_r=<?= time() ?>" title="Reload this view">↻ Refresh</a>
         <?php endif; ?>
       </div>
@@ -9558,6 +9575,65 @@ header('Content-Type: text/html; charset=utf-8');
             </div>
           </article>
         <?php endforeach; ?>
+
+      <?php elseif ($view === 'users'): ?>
+        <?php if (empty($vaakIsAdmin)): ?>
+          <div class="empty">Admin only.</div>
+        <?php else: ?>
+          <?php $localUsers = ap_auth_users_list(200); ?>
+          <div class="meta" style="margin-bottom:1rem">
+            Local VAAK accounts. Banning disables web login, rejects future API
+            authentication, and revokes the user’s OAuth tokens. The operator account
+            cannot be banned from this page.
+          </div>
+          <?php if (!$localUsers): ?>
+            <div class="empty">No local users found.</div>
+          <?php else: ?>
+            <div style="display:flex;flex-direction:column;gap:.7rem">
+            <?php foreach ($localUsers as $localUser): ?>
+              <?php
+                $uid = (int) ($localUser['id'] ?? 0);
+                $ukey = (string) ($localUser['actor_key'] ?? '');
+                $uname = (string) ($localUser['profile_name'] ?? '') ?: (string) ($localUser['username'] ?? $ukey);
+                $disabled = !empty($localUser['disabled_at']);
+                $isOperator = $ukey === 'cmdr_nova' || !empty($localUser['is_admin']);
+              ?>
+              <article class="tweet">
+                <div class="tweet-hd">
+                  <div style="display:flex;align-items:center;gap:.65rem;min-width:0">
+                    <?php if (!empty($localUser['icon_url'])): ?>
+                      <img src="<?= h((string) $localUser['icon_url']) ?>" alt="" width="42" height="42"
+                           style="width:42px;height:42px;border-radius:50%;object-fit:cover;border:1px solid var(--border);flex:0 0 auto"
+                           loading="lazy" referrerpolicy="no-referrer">
+                    <?php endif; ?>
+                    <div style="min-width:0">
+                      <div class="who" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= h($uname) ?></div>
+                      <div class="meta">@<?= h((string) ($localUser['username'] ?? $ukey)) ?>@mkultra.monster</div>
+                    </div>
+                  </div>
+                  <div class="meta" style="text-align:right">
+                    <?= $isOperator ? '<span class="tag">operator</span>' : ($disabled ? '<span class="tag" style="color:var(--danger)">banned</span>' : '<span class="tag">active</span>') ?>
+                  </div>
+                </div>
+                <div class="meta" style="margin-top:.55rem">
+                  Joined <?= h(relative_time((string) ($localUser['created_at'] ?? ''))) ?>
+                  <?php if ($disabled): ?> · banned <?= h(relative_time((string) $localUser['disabled_at'])) ?><?php endif; ?>
+                </div>
+                <div class="tweet-actions" style="flex-wrap:wrap">
+                  <a href="/users/<?= h(rawurlencode($ukey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
+                  <?php if (!$isOperator): ?>
+                    <form method="post" action="?view=users" style="display:inline" onsubmit="return confirm('<?= $disabled ? 'Unban' : 'Ban' ?> this local user?');">
+                      <input type="hidden" name="action" value="<?= $disabled ? 'user_unban' : 'user_ban' ?>">
+                      <input type="hidden" name="user_id" value="<?= $uid ?>">
+                      <button class="btn <?= $disabled ? 'btn-primary' : 'btn-ghost' ?>" type="submit" style="padding:.25rem .7rem;font-size:.8rem;<?= !$disabled ? 'color:var(--danger)' : '' ?>"><?= $disabled ? 'Unban user' : 'Ban user' ?></button>
+                    </form>
+                  <?php endif; ?>
+                </div>
+              </article>
+            <?php endforeach; ?>
+            </div>
+          <?php endif; ?>
+        <?php endif; ?>
 
       <?php elseif ($view === 'policies'): ?>
         <?php if (empty($vaakIsAdmin)): ?>
