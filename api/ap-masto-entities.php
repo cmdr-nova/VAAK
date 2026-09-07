@@ -6177,7 +6177,7 @@ function ap_masto_tag_entity(string $name, ?array $history = null): array
 }
 
 /** Shared trends cache TTL (admin sidebar + Ice Cubes /api/v1/trends/*). */
-const AP_MASTO_TRENDS_CACHE_TTL = 3600; // 1 hour
+const AP_MASTO_TRENDS_CACHE_TTL = 900; // 15 minutes
 
 /**
  * @return array{path:string,ttl:int}
