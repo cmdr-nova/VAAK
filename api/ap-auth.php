@@ -207,20 +207,57 @@ function ap_auth_user_by_id(int $id): ?array
 }
 
 /** @return list<array<string,mixed>> */
-function ap_auth_users_list(int $limit = 200): array
+function ap_auth_users_list(int $limit = 20, string $search = '', int $offset = 0): array
 {
-    $limit = max(1, min(500, $limit));
-    $st = ap_db()->query(
+    $limit = max(1, min(100, $limit));
+    $offset = max(0, $offset);
+    $where = '';
+    $params = [];
+    $search = trim($search);
+    if ($search !== '') {
+        $where = 'WHERE LOWER(COALESCE(u.username, \'\')) LIKE LOWER(?)
+               OR LOWER(COALESCE(u.email, \'\')) LIKE LOWER(?)
+               OR LOWER(COALESCE(u.actor_key, \'\')) LIKE LOWER(?)
+               OR LOWER(COALESCE(p.name, \'\')) LIKE LOWER(?)';
+        $needle = '%' . $search . '%';
+        $params = [$needle, $needle, $needle, $needle];
+    }
+    $st = ap_db()->prepare(
         'SELECT u.id, u.username, u.email, u.actor_key, u.actor_id, u.is_admin,
                 u.created_at, u.updated_at, u.disabled_at,
                 p.name AS profile_name, p.icon_url
            FROM ap_users u
            LEFT JOIN actor_profile p ON p.actor_key = u.actor_key
+          ' . $where . '
           ORDER BY u.created_at DESC, u.id DESC
-          LIMIT ' . $limit
+          LIMIT ' . $limit . ' OFFSET ' . $offset
     );
+    $st->execute($params);
     $rows = $st->fetchAll() ?: [];
     return is_array($rows) ? $rows : [];
+}
+
+function ap_auth_users_count(string $search = ''): int
+{
+    $search = trim($search);
+    $where = '';
+    $params = [];
+    if ($search !== '') {
+        $where = 'WHERE LOWER(COALESCE(u.username, \'\')) LIKE LOWER(?)
+               OR LOWER(COALESCE(u.email, \'\')) LIKE LOWER(?)
+               OR LOWER(COALESCE(u.actor_key, \'\')) LIKE LOWER(?)
+               OR LOWER(COALESCE(p.name, \'\')) LIKE LOWER(?)';
+        $needle = '%' . $search . '%';
+        $params = [$needle, $needle, $needle, $needle];
+    }
+    $st = ap_db()->prepare(
+        'SELECT COUNT(*)
+           FROM ap_users u
+           LEFT JOIN actor_profile p ON p.actor_key = u.actor_key
+          ' . $where
+    );
+    $st->execute($params);
+    return max(0, (int) $st->fetchColumn());
 }
 
 /** @return array{ok:bool,error?:string,disabled?:bool} */
@@ -755,6 +792,7 @@ function ap_auth_register(string $inviteCode, string $username, string $password
         }
         // Operator monitoring: cmdr_nova follows the new account (not the reverse).
         ap_auth_operator_follow_new_user($username);
+        ap_auth_notify_operator_registration($username, $uid);
         $user = ap_auth_user_by_id($uid);
         if ($user === null) {
             return ['ok' => false, 'error' => 'Account created but could not load user.'];
@@ -767,6 +805,55 @@ function ap_auth_register(string $inviteCode, string $username, string $password
         }
         error_log('[ap-auth] register: ' . $e->getMessage());
         return ['ok' => false, 'error' => 'Registration failed.'];
+    }
+}
+
+/** Notify only cmdr_nova when an invite creates a new local account. */
+function ap_auth_notify_operator_registration(string $username, int $userId): void
+{
+    if ($userId < 1 || strtolower(trim($username)) === 'cmdr_nova') {
+        return;
+    }
+    $operatorUserId = function_exists('ap_db_cmdr_nova_user_id')
+        ? (int) ap_db_cmdr_nova_user_id()
+        : 0;
+    if ($operatorUserId < 1) {
+        return;
+    }
+    $username = strtolower(trim($username));
+    $actorId = 'https://mkultra.monster/users/' . rawurlencode($username);
+    $objectId = $actorId . '#registration-' . $userId;
+    $activityId = 'https://mkultra.monster/vaak/registrations/' . $userId;
+    try {
+        ap_mention_store([
+            'owner_user_id' => $operatorUserId,
+            'owner_actor_id' => 'https://mkultra.monster/users/cmdr_nova',
+            'activity_id' => $activityId,
+            'activity_type' => 'Registration',
+            'type' => 'Note',
+            'actor_id' => $actorId,
+            'object_id' => $objectId,
+            'content' => '@cmdr_nova@mkultra.monster — New VAAK user @' . $username . ' registered using an invite.',
+            'in_reply_to' => null,
+            'media_urls' => [],
+            'spoiler_text' => '',
+            'sensitive' => false,
+        ]);
+
+        // Best-effort push notification for cmdr_nova's subscribed clients.
+        require_once __DIR__ . '/ap-masto-entities.php';
+        require_once __DIR__ . '/ap-webpush.php';
+        $st = ap_db()->prepare('SELECT id, created_at FROM mentions WHERE owner_user_id = ? AND object_id = ? LIMIT 1');
+        $st->execute([$operatorUserId, $objectId]);
+        $row = $st->fetch();
+        $nid = is_array($row) && function_exists('ap_masto_notification_id_for_mention')
+            ? ap_masto_notification_id_for_mention((int) ($row['id'] ?? 0), (string) ($row['created_at'] ?? ''))
+            : null;
+        if (function_exists('ap_webpush_notify_event')) {
+            ap_webpush_notify_event('mention', $actorId, $nid, 'New VAAK user @' . $username . ' registered using an invite.', $operatorUserId);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-auth] registration notification failed for ' . $username . ': ' . $e->getMessage());
     }
 }
 

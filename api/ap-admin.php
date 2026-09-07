@@ -9583,11 +9583,32 @@ header('Content-Type: text/html; charset=utf-8');
         <?php if (empty($vaakIsAdmin)): ?>
           <div class="empty">Admin only.</div>
         <?php else: ?>
-          <?php $localUsers = ap_auth_users_list(200); ?>
+          <?php
+            $usersSearch = trim((string) ($_GET['q'] ?? $_POST['users_q'] ?? ''));
+            $usersPage = max(1, (int) ($_GET['page'] ?? $_POST['users_page'] ?? 1));
+            $usersPerPage = 20;
+            $usersTotal = function_exists('ap_auth_users_count') ? ap_auth_users_count($usersSearch) : 0;
+            $usersPages = max(1, (int) ceil($usersTotal / $usersPerPage));
+            if ($usersPage > $usersPages) {
+                $usersPage = $usersPages;
+            }
+            $usersOffset = ($usersPage - 1) * $usersPerPage;
+            $localUsers = ap_auth_users_list($usersPerPage, $usersSearch, $usersOffset);
+            $usersQuery = $usersSearch !== '' ? '&amp;q=' . rawurlencode($usersSearch) : '';
+          ?>
           <div class="meta" style="margin-bottom:1rem">
             Local VAAK accounts. Banning disables web login, rejects future API
             authentication, and revokes the user’s OAuth tokens. The operator account
             cannot be banned from this page.
+          </div>
+          <form method="get" action="" style="display:flex;gap:.5rem;align-items:center;margin-bottom:1rem">
+            <input type="hidden" name="view" value="users">
+            <input type="search" name="q" value="<?= h($usersSearch) ?>" placeholder="Search username, email, or display name" aria-label="Search users" style="flex:1;min-width:0">
+            <button class="btn btn-ghost" type="submit">Search</button>
+            <?php if ($usersSearch !== ''): ?><a class="btn btn-ghost" href="?view=users">Clear</a><?php endif; ?>
+          </form>
+          <div class="meta" style="margin-bottom:.75rem">
+            <?= $usersTotal ?> account<?= $usersTotal === 1 ? '' : 's' ?><?= $usersSearch !== '' ? ' matching “' . h($usersSearch) . '”' : '' ?>
           </div>
           <?php if (!$localUsers): ?>
             <div class="empty">No local users found.</div>
@@ -9628,6 +9649,9 @@ header('Content-Type: text/html; charset=utf-8');
                     <form method="post" action="?view=users" style="display:inline" onsubmit="return confirm('<?= $disabled ? 'Unban' : 'Ban' ?> this local user?');">
                       <input type="hidden" name="action" value="<?= $disabled ? 'user_unban' : 'user_ban' ?>">
                       <input type="hidden" name="user_id" value="<?= $uid ?>">
+                      <input type="hidden" name="return_view" value="users">
+                      <input type="hidden" name="users_q" value="<?= h($usersSearch) ?>">
+                      <input type="hidden" name="users_page" value="<?= (int) $usersPage ?>">
                       <button class="btn <?= $disabled ? 'btn-primary' : 'btn-ghost' ?>" type="submit" style="padding:.25rem .7rem;font-size:.8rem;<?= !$disabled ? 'color:var(--danger)' : '' ?>"><?= $disabled ? 'Unban user' : 'Ban user' ?></button>
                     </form>
                   <?php endif; ?>
@@ -9635,6 +9659,13 @@ header('Content-Type: text/html; charset=utf-8');
               </article>
             <?php endforeach; ?>
             </div>
+            <?php if ($usersPages > 1): ?>
+              <nav class="composer-actions" aria-label="Users pages" style="margin-top:1rem;justify-content:center;gap:.5rem">
+                <?php if ($usersPage > 1): ?><a class="btn btn-ghost" href="?view=users&amp;page=<?= $usersPage - 1 ?><?= $usersQuery ?>">Previous</a><?php endif; ?>
+                <span class="meta">Page <?= $usersPage ?> of <?= $usersPages ?></span>
+                <?php if ($usersPage < $usersPages): ?><a class="btn btn-ghost" href="?view=users&amp;page=<?= $usersPage + 1 ?><?= $usersQuery ?>">Next</a><?php endif; ?>
+              </nav>
+            <?php endif; ?>
           <?php endif; ?>
         <?php endif; ?>
 
