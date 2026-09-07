@@ -8931,7 +8931,9 @@ function ap_emoji_html(string $text, ?string $actorId = null): string
         $h = parse_url($actorId, PHP_URL_HOST);
         $host = is_string($h) ? strtolower($h) : null;
         if ($host && str_contains($text, ':')) {
-            ap_remote_emoji_ensure_for_display($actorId, $text);
+            // Fetch the host emoji map once when a display name introduces an
+            // unfamiliar shortcode; subsequent renders use the local cache.
+            ap_remote_emoji_ensure_for_display($actorId, $text, true);
         }
     }
     $map = $host ? ap_remote_emoji_map_for_host($host) : [];
