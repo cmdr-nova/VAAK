@@ -184,13 +184,22 @@ function ap_db_migrate_postgres(PDO $db): void
     // Timeline queries constrain actor/type/action and then sort by recency.
     // Keep this best-effort because the PHP-FPM role may not own indexes.
     try {
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_type_action_created ON events(actor_id, type, action_taken, created_at DESC, id DESC)');
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_action_created ON events(type, action_taken, created_at DESC, id DESC)');
+        $idx = $db->query("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname IN ('idx_events_actor_type_action_created', 'idx_events_type_action_created')")->fetchAll(PDO::FETCH_COLUMN);
+        $idx = array_fill_keys(array_map('strval', $idx), true);
+        if (empty($idx['idx_events_actor_type_action_created'])) {
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_type_action_created ON events(actor_id, type, action_taken, created_at DESC, id DESC)');
+        }
+        if (empty($idx['idx_events_type_action_created'])) {
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_action_created ON events(type, action_taken, created_at DESC, id DESC)');
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
     }
     try {
-        $db->exec('ALTER TABLE actor_profile ADD COLUMN IF NOT EXISTS auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'auto_unblur_sensitive'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] auto-unblur profile column not provisioned: ' . $e->getMessage());
     }
