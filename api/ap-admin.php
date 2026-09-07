@@ -9985,9 +9985,10 @@ header('Content-Type: text/html; charset=utf-8');
           <input id="pf-image" type="url" name="image_url" placeholder="https://…" value="<?= h((string) ($profile['image_url'] ?? '')) ?>">
           <div class="meta" style="margin:.25rem 0 .75rem">Same storage rules as avatar. Remotes may cache until they process the profile Update (Bridgy: use ↻ Update profile below).</div>
 
-          <label>Profile fields (up to 4 · https URLs can get a verified checkmark via rel=me)</label>
+          <label>Verified creator links / profile fields (up to 4)</label>
           <div class="meta" style="margin:0 0 .55rem">
-            Verification: the linked page must include
+            Add a website or post URL you control. For a verified creator check,
+            the linked page must include
             <code>&lt;a rel="me" href="<?= h($vaakActorId) ?>"&gt;</code>
             (or a <code>&lt;link rel="me"&gt;</code>). Ice Cubes / Mastodon show a green check when <code>verified_at</code> is set.
           </div>
