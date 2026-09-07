@@ -184,15 +184,21 @@ function ap_db_migrate_postgres(PDO $db): void
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
     // deliberately, so ensure PostgreSQL can generate it after the cutover.
-    $idDefault = $db->query(
-        "SELECT column_default FROM information_schema.columns
-         WHERE table_schema = current_schema() AND table_name = 'ap_user_blocks' AND column_name = 'id'"
-    )->fetchColumn();
-    if (!is_string($idDefault) || !str_contains($idDefault, 'ap_user_blocks_id_seq')) {
-        $db->exec('CREATE SEQUENCE IF NOT EXISTS ap_user_blocks_id_seq');
-        $db->exec("SELECT setval('ap_user_blocks_id_seq', GREATEST(COALESCE((SELECT MAX(id) FROM ap_user_blocks), 0) + 1, 1), false)");
-        $db->exec("ALTER SEQUENCE ap_user_blocks_id_seq OWNED BY ap_user_blocks.id");
-        $db->exec("ALTER TABLE ap_user_blocks ALTER COLUMN id SET DEFAULT nextval('ap_user_blocks_id_seq')");
+    try {
+        $idDefault = $db->query(
+            "SELECT column_default FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'ap_user_blocks' AND column_name = 'id'"
+        )->fetchColumn();
+        if (!is_string($idDefault) || !str_contains($idDefault, 'ap_user_blocks_id_seq')) {
+            $db->exec('CREATE SEQUENCE IF NOT EXISTS ap_user_blocks_id_seq');
+            $db->exec("SELECT setval('ap_user_blocks_id_seq', GREATEST(COALESCE((SELECT MAX(id) FROM ap_user_blocks), 0) + 1, 1), false)");
+            $db->exec("ALTER SEQUENCE ap_user_blocks_id_seq OWNED BY ap_user_blocks.id");
+            $db->exec("ALTER TABLE ap_user_blocks ALTER COLUMN id SET DEFAULT nextval('ap_user_blocks_id_seq')");
+        }
+    } catch (Throwable $e) {
+        // The application role may not have DDL privileges; provisioning can
+        // apply this one-time sequence guard separately as the DB owner.
+        error_log('[ap-db] personal-block id sequence not provisioned: ' . $e->getMessage());
     }
 }
 
