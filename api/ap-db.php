@@ -181,6 +181,15 @@ function ap_db_migrate_postgres(PDO $db): void
         throw new RuntimeException('PostgreSQL search schema is incomplete; run the staging bootstrap first');
     }
 
+    // Timeline queries constrain actor/type/action and then sort by recency.
+    // Keep this best-effort because the PHP-FPM role may not own indexes.
+    try {
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_type_action_created ON events(actor_id, type, action_taken, created_at DESC, id DESC)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_action_created ON events(type, action_taken, created_at DESC, id DESC)');
+    } catch (Throwable $e) {
+        error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
+    }
+
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
     // deliberately, so ensure PostgreSQL can generate it after the cutover.
@@ -435,6 +444,8 @@ SQL);
     // Home/Federated snappiness: actor filter + type+time sort without temp B-tree storms
     $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_created ON events(actor_id, created_at DESC, id DESC)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at DESC, id DESC)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_type_action_created ON events(actor_id, type, action_taken, created_at DESC, id DESC)');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_action_created ON events(type, action_taken, created_at DESC, id DESC)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_following_host ON following(host)');
 
     // Mentions: same CW fields for Notifications view
