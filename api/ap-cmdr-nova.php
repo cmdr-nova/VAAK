@@ -679,6 +679,10 @@ function ap_cmdr_shell_start(string $title): void
 
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</title>';
+    echo '<link rel="icon" href="/vaak/favicon.svg?v=20260907" type="image/svg+xml">';
+    echo '<link rel="icon" href="/vaak/favicon.ico?v=20260907" sizes="any">';
+    echo '<link rel="icon" href="/vaak/favicon-32x32.png?v=20260907" type="image/png" sizes="32x32">';
+    echo '<link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">';
     echo '<style>
       body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#e8e8e8;line-height:1.55}
       main{max-width:36rem;margin:3rem auto;padding:0 1.25rem}
@@ -837,6 +841,10 @@ function ap_cmdr_site_shell_start(string $title): void
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
     echo '<meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>' . $safeTitle . '</title>';
+    echo '<link rel="icon" href="/vaak/favicon.svg?v=20260907" type="image/svg+xml">';
+    echo '<link rel="icon" href="/vaak/favicon.ico?v=20260907" sizes="any">';
+    echo '<link rel="icon" href="/vaak/favicon-32x32.png?v=20260907" type="image/png" sizes="32x32">';
+    echo '<link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">';
     echo '<link rel="stylesheet" href="/assets/main.css">';
     echo '<link rel="stylesheet" href="/assets/css/operator-roster.css?v=20260805">';
     echo '<link rel="stylesheet" href="/assets/modal.css">';
