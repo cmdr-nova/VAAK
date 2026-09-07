@@ -2611,6 +2611,38 @@ if ($hydrateBoost) {
     }
     require_once __DIR__ . '/ap-inbox.php';
     require_once __DIR__ . '/ap-masto-entities.php';
+    $hydrateLocalBoost = (string) ($_GET['hydrate_local_boost'] ?? '') === '1';
+    if ($hydrateLocalBoost) {
+        $ownerId = admin_owner_user_id();
+        $localRow = null;
+        if ($objectId !== '' && str_starts_with($objectId, 'https://')) {
+            try {
+                $st = ap_db()->prepare(
+                    "SELECT * FROM masto_reblogs
+                     WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)
+                     ORDER BY id DESC LIMIT 1"
+                );
+                $st->execute([$ownerId, rtrim($objectId, '/'), rtrim($objectId, '/') . '/']);
+                $row = $st->fetch();
+                $localRow = is_array($row) ? $row : null;
+            } catch (Throwable $ex) {
+                $localRow = null;
+            }
+        }
+        if (!is_array($localRow)) {
+            http_response_code(404);
+            echo '<div class="meta">Boost not found.</div>';
+            exit;
+        }
+        $GLOBALS['admin_boost_fetch_budget'] = 1;
+        if ($followingIds === [] || count($followingIds) < 3) {
+            $followingIds = $adminIndexActorMap($following, true);
+        }
+        ob_start();
+        admin_render_boost_card($localRow, $followingIds, $returnView);
+        echo ob_get_clean();
+        exit;
+    }
     $e = null;
     if ($eventId > 0) {
         try {
@@ -6448,6 +6480,27 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     if ($objectId !== '' && function_exists('ap_event_by_object_id')) {
         $innerEvent = ap_event_by_object_id($objectId);
     }
+    // Local boosts can point at a remote object that was only recorded as a
+    // thin interaction stub. Hydrate at most one object when the async
+    // partial endpoint asks us to, keeping normal timeline renders cheap.
+    $innerType = is_array($innerEvent) ? strtolower((string) ($innerEvent['type'] ?? '')) : '';
+    $innerSummaryRaw = is_array($innerEvent) ? trim((string) ($innerEvent['summary'] ?? '')) : '';
+    if ($objectId !== ''
+        && str_starts_with($objectId, 'https://')
+        && (!in_array($innerType, ['create', 'update'], true) || $innerSummaryRaw === '')
+        && function_exists('ap_masto_ensure_remote_note_event')) {
+        $fetchBudget = &$GLOBALS['admin_boost_fetch_budget'];
+        if (!is_int($fetchBudget)) {
+            $fetchBudget = 0;
+        }
+        if ($fetchBudget > 0) {
+            $fetchBudget--;
+            $fetched = ap_masto_ensure_remote_note_event($objectId);
+            if (is_array($fetched)) {
+                $innerEvent = $fetched;
+            }
+        }
+    }
     if (is_array($innerEvent)) {
         $innerSummary = trim(html_entity_decode((string) ($innerEvent['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         $innerHost = (string) ($innerEvent['host'] ?? '');
@@ -6471,7 +6524,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $bm = $statusId !== '' && ap_masto_status_is_bookmarked($statusId);
     $boosted = true;
     ?>
-          <article class="tweet tweet-boost">
+          <article class="tweet tweet-boost"<?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
             <div class="meta" style="margin-bottom:.45rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
             <div class="tweet-hd">
               <?= admin_avatar_img($targetActor !== '' ? $targetActor : null) ?>
@@ -6490,7 +6543,9 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               if ($innerSummary !== '') {
                   $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView) . '</div>';
               } else {
-                  $boostInner .= '<div class="meta" style="margin-top:.35rem">Boosted post unavailable.</div>';
+                  $pending = $objectId !== '' && str_starts_with($objectId, 'https://');
+                  $boostInner .= '<div class="meta boost-hydrate-status" style="margin-top:.35rem">'
+                      . h($pending ? 'Loading boosted post…' : 'Boosted post unavailable.') . '</div>';
               }
               if ($innerMedia) {
                   $boostInner .= admin_media_row_html($innerMedia);
@@ -13332,17 +13387,20 @@ window.apAdminToast = function (msg, isErr) {
   function pumpBoostHydrate() {
     while (boostActive < BOOST_CONCURRENCY && boostQueue.length) {
       const card = boostQueue.shift();
-      if (!card || !card.isConnected || card.dataset.boostHydrate !== '1') continue;
+      if (!card || !card.isConnected
+        || (card.dataset.boostHydrate !== '1' && card.dataset.boostHydrateLocal !== '1')) continue;
       if (card.dataset.boostHydrating === '1') continue;
       card.dataset.boostHydrating = '1';
       boostActive++;
       const eventId = card.dataset.eventId || '';
       const objectId = card.dataset.objectId || '';
+      const isLocal = card.dataset.boostHydrateLocal === '1';
       const from = card.dataset.returnView || 'home';
       const statusEl = card.querySelector('.boost-hydrate-status');
       if (statusEl) statusEl.textContent = 'Loading boosted post…';
       const url = '?view=' + encodeURIComponent(from)
         + '&partial=1&hydrate_boost=1'
+        + (isLocal ? '&hydrate_local_boost=1' : '')
         + '&event_id=' + encodeURIComponent(eventId)
         + '&object_id=' + encodeURIComponent(objectId)
         + '&from=' + encodeURIComponent(from);
@@ -13354,7 +13412,7 @@ window.apAdminToast = function (msg, isErr) {
         .then((html) => {
           const neu = replaceCardInPlace(card, html);
           // If still marked pending (fetch failed), leave a soft retry.
-          if (neu && neu.dataset.boostHydrate === '1') {
+          if (neu && (neu.dataset.boostHydrate === '1' || neu.dataset.boostHydrateLocal === '1')) {
             const st = neu.querySelector('.boost-hydrate-status');
             if (st) {
               st.textContent = 'Still loading…';
@@ -13377,7 +13435,7 @@ window.apAdminToast = function (msg, isErr) {
 
   function enqueueBoostHydrates(root) {
     const scope = root || document;
-    scope.querySelectorAll('article.tweet-boost[data-boost-hydrate="1"]').forEach((card) => {
+    scope.querySelectorAll('article.tweet-boost[data-boost-hydrate="1"], article.tweet-boost[data-boost-hydrate-local="1"]').forEach((card) => {
       if (card.dataset.boostQueued === '1') return;
       card.dataset.boostQueued = '1';
       boostQueue.push(card);
