@@ -690,6 +690,8 @@ function ap_cmdr_shell_start(string $title): void
       .banner{margin:-1.35rem -1.35rem 1rem;height:120px;background:#1a1a1a;background-size:cover;background-position:center}
       .row{display:flex;gap:1rem;align-items:flex-start}
       .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#222;flex-shrink:0}
+      .sl-link a{display:inline-flex;align-items:center;text-decoration:none}
+      .sl-link img{display:block;border-radius:50%;width:34px;height:34px}
       a{color:#7ee0ff;text-decoration:underline;text-underline-offset:2px} a:hover{color:#b7f3ff}
       .muted{color:#999} h1{font-size:1.35rem;margin:0 0 .35rem}
       .profile-bio{margin-top:1rem}
@@ -1274,10 +1276,17 @@ function ap_cmdr_html(): void
     $slLink = ap_sl_link_for_actor_key('cmdr_nova');
     if (is_array($slLink) && !empty($slLink['sl_username'])) {
         $slName = htmlspecialchars((string) $slLink['sl_username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $slHref = htmlspecialchars(ap_sl_profile_url((string) ($slLink['sl_agent_id'] ?? '')), ENT_QUOTES, 'UTF-8');
-        echo '<p class="muted" style="margin:.35rem 0 0">'
-            . 'Second Life resident: '
-            . '<a href="' . $slHref . '" rel="noopener noreferrer me">' . $slName . '</a></p>';
+        $slHref = htmlspecialchars(
+            function_exists('ap_sl_viewer_profile_url')
+                ? ap_sl_viewer_profile_url((string) ($slLink['sl_agent_id'] ?? ''))
+                : 'https://secondlife.com/',
+            ENT_QUOTES,
+            'UTF-8'
+        );
+        echo '<p class="sl-link" style="margin:.55rem 0 0">'
+            . '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
+            . '<img src="/vaak/second-life.svg" alt="" width="34" height="34" loading="lazy">'
+            . '</a></p>';
     }
     echo '</div></div>';
     $summary = function_exists('ap_profile_normalize_summary_html')
