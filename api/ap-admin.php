@@ -8850,7 +8850,7 @@ header('Content-Type: text/html; charset=utf-8');
           <div style="margin:0 0 .65rem;line-height:1.35">
             <div class="meta" style="margin-bottom:.15rem"><?= h($who) ?><?php if ($eng > 0): ?> · <?= $eng ?><?php endif; ?></div>
             <?php if ($surl !== ''): ?>
-              <a href="<?= h($surl) ?>" target="_blank" rel="noopener noreferrer" style="color:var(--text);text-decoration:none"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></a>
+              <a href="<?= h(admin_status_href($surl, $view)) ?>" style="color:var(--text);text-decoration:none"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></a>
             <?php else: ?>
               <span><?= h($excerpt !== '' ? $excerpt : '(media)') ?></span>
             <?php endif; ?>
