@@ -4765,7 +4765,29 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     $st->execute($params);
     $out = [];
     $seenUri = [];
+    $ownerUserId = ap_db_masto_owner_user_id();
     foreach ($st->fetchAll() as $row) {
+        // Apply the authenticated user's personal blocks and mutes to both
+        // sides of a boost: the booster and the original author. This mirrors
+        // Mastodon timeline behavior and prevents blocked originals returning
+        // through someone else's Announce.
+        $rowActor = (string) ($row['actor_id'] ?? '');
+        $hidden = function_exists('ap_row_is_hidden')
+            && ap_row_is_hidden($rowActor, (string) ($row['host'] ?? ''), $ownerUserId);
+        if (!$hidden && strtolower((string) ($row['type'] ?? '')) === 'announce') {
+            $originalActor = function_exists('ap_masto_announce_original_actor')
+                ? ap_masto_announce_original_actor($row)
+                : null;
+            if ((!is_string($originalActor) || $originalActor === '') && !empty($row['target_actor'])) {
+                $originalActor = (string) $row['target_actor'];
+            }
+            if (is_string($originalActor) && $originalActor !== '') {
+                $hidden = ap_row_is_hidden($originalActor, null, $ownerUserId);
+            }
+        }
+        if ($hidden) {
+            continue;
+        }
         $status = ap_masto_status_from_event($row);
         if ($status === null) {
             continue;
@@ -7798,6 +7820,11 @@ function ap_masto_own_reblogs_as_statuses(int $limit = 40, ?string $maxId = null
     $limit = max(1, min(80, $limit));
     $out = [];
     foreach (ap_masto_reblog_rows($limit, $maxId, $ownerUserId) as $row) {
+        $targetActor = (string) ($row['target_actor'] ?? '');
+        if ($targetActor !== '' && function_exists('ap_row_is_hidden')
+            && ap_row_is_hidden($targetActor, null, $ownerUserId)) {
+            continue;
+        }
         $original = null;
         $sid = (int) ($row['status_id'] ?? 0);
         if ($sid > 0) {
