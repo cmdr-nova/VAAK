@@ -7756,7 +7756,14 @@ header('Content-Type: text/html; charset=utf-8');
       line-height: 1.45;
       font-size: .98rem;
       text-align: left;
+      text-indent: 0;
     }
+    .dm-bubble p { margin: .3rem 0; padding: 0; text-indent: 0; white-space: normal; }
+    .dm-bubble p:first-child { margin-top: 0; }
+    .dm-bubble p:last-child { margin-bottom: 0; }
+    .dm-bubble > :first-child { margin-top: 0; }
+    .dm-bubble > :last-child { margin-bottom: 0; }
+    .dm-bubble ul,.dm-bubble ol { margin: .4rem 0 .2rem 1.1rem; padding: 0; text-indent: 0; }
     .dm-bubble.dm-out {
       background: rgba(0, 255, 159, .08);
       border-color: rgba(0, 255, 159, .28);
@@ -7777,14 +7784,9 @@ header('Content-Type: text/html; charset=utf-8');
       border-top: 1px dashed var(--border);
       font-size: .9rem;
     }
-    .dm-bubble ul { margin: .4rem 0 .2rem 1.1rem; padding: 0; }
     .dm-bubble li { margin: .25rem 0; }
     .dm-thread { display: flex; flex-direction: column; gap: .35rem; }
     .dm-thread .tweet { margin-bottom: 0; padding: .7rem .8rem; }
-    .dm-thread .dm-bubble p { margin: .3rem 0; }
-    .dm-thread .dm-bubble p:first-child { margin-top: 0; }
-    .dm-thread .dm-bubble p:last-child { margin-bottom: 0; }
-    .dm-thread .dm-bubble p { text-indent: 0; }
     .link-card {
       display: flex; gap: .75rem; margin: .65rem 0 0; padding: 0;
       border-radius: 12px; border: 1px solid var(--border); background: var(--panel-2);
