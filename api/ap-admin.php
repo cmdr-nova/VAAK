@@ -13576,25 +13576,38 @@ window.apAdminToast = function (msg, isErr) {
     loading = true;
     if (status) status.textContent = 'Loading…';
     try {
-      const url = '?view=' + encodeURIComponent(viewName)
-        + '&partial=1&offset=' + offset + '&limit=' + limit;
-      const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } });
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const html = await res.text();
-      hasMore = res.headers.get('X-Has-More') === '1';
-      const next = parseInt(res.headers.get('X-Next-Offset') || String(offset), 10);
-      if (html.trim()) {
-        items.insertAdjacentHTML('beforeend', html);
-        offset = next;
+      // A page may render no HTML when every row was filtered or deduplicated.
+      // Keep the pagination cursor independent from rendered card count (as
+      // Mastodon does) and skip through a few such pages in one request.
+      let attempts = 0;
+      let inserted = false;
+      while (hasMore && attempts < 4) {
+        attempts++;
+        const requestOffset = offset;
+        const url = '?view=' + encodeURIComponent(viewName)
+          + '&partial=1&offset=' + requestOffset + '&limit=' + limit;
+        const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const html = await res.text();
+        hasMore = res.headers.get('X-Has-More') === '1';
+        const next = parseInt(res.headers.get('X-Next-Offset') || String(requestOffset), 10);
+        // Guard against a broken cursor causing a tight request loop.
+        offset = next > requestOffset ? next : requestOffset + limit;
         items.dataset.offset = String(offset);
-        if (typeof window.novaEnhanceTweetFolds === 'function') {
-          window.novaEnhanceTweetFolds(items);
+        if (html.trim()) {
+          items.insertAdjacentHTML('beforeend', html);
+          inserted = true;
+          if (typeof window.novaEnhanceTweetFolds === 'function') {
+            window.novaEnhanceTweetFolds(items);
+          }
+          if (typeof window.novaEnqueueBoostHydrates === 'function') {
+            window.novaEnqueueBoostHydrates(items);
+          }
+          break;
         }
-        if (typeof window.novaEnqueueBoostHydrates === 'function') {
-          window.novaEnqueueBoostHydrates(items);
-        }
-      } else {
-        hasMore = false;
+      }
+      if (!inserted && hasMore) {
+        if (status) status.textContent = 'Scroll for more…';
       }
       items.dataset.hasMore = hasMore ? '1' : '0';
       if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of timeline';
