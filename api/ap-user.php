@@ -749,7 +749,7 @@ function ap_user_html_shell_start(string $title): void
     echo '<style>
       :root{color-scheme:dark}
       body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#ddd}
-      main{max-width:40rem;margin:0 auto;padding:1.25rem}
+      main{max-width:42rem;margin:0 auto;padding:1.25rem;box-sizing:border-box}
       .card{border:1px solid #2a2a2a;border-radius:14px;padding:1.25rem;background:#121212}
       a{color:#7ee0ff}.muted{color:#999}
       h1{margin:.2rem 0;font-size:1.45rem}
@@ -803,6 +803,13 @@ function ap_user_html_shell_start(string $title): void
       .ap-footer nav{display:flex;flex-wrap:wrap;gap:.25rem .15rem;margin-bottom:.2rem}
       .ap-footer a{color:#9ad4e8;text-decoration:none}.ap-footer a:hover{text-decoration:underline;text-underline-offset:2px}
       .ap-footer .muted{color:#777}
+      @media (max-width:600px){
+        main{width:100%;padding:.75rem}
+        .card{padding:1rem}
+        .row{align-items:flex-start;flex-wrap:wrap;gap:.75rem}
+        .fields{grid-template-columns:minmax(0,auto) minmax(0,1fr);overflow-wrap:anywhere}
+        .follow-row input{width:100%;min-width:0}
+      }
     </style></head><body><main><div class="card">';
 }
 

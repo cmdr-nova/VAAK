@@ -685,7 +685,7 @@ function ap_cmdr_shell_start(string $title): void
     echo '<link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">';
     echo '<style>
       body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#e8e8e8;line-height:1.55}
-      main{max-width:36rem;margin:3rem auto;padding:0 1.25rem}
+      main{max-width:42rem;margin:3rem auto;padding:0 1.25rem;box-sizing:border-box}
       .card{border:1px solid #333;border-radius:12px;padding:1.35rem;background:#121212;overflow:hidden}
       .banner{margin:-1.35rem -1.35rem 1rem;height:120px;background:#1a1a1a;background-size:cover;background-position:center}
       .row{display:flex;gap:1rem;align-items:flex-start}
@@ -807,6 +807,13 @@ function ap_cmdr_shell_start(string $title): void
       .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.55)}
       .ap-img-lightbox__close{position:absolute;top:max(.75rem,env(safe-area-inset-top));right:max(.75rem,env(safe-area-inset-right));appearance:none;border:0;border-radius:999px;width:2.4rem;height:2.4rem;background:rgba(255,255,255,.14);color:#fff;font-size:1.4rem;line-height:1;cursor:pointer}
       .ap-img-lightbox__close:hover{background:rgba(255,255,255,.24)}
+      @media (max-width:640px){
+        main{width:100%;max-width:none;margin:1rem auto;padding:0 .75rem}
+        .card{padding:1rem}
+        .row{flex-wrap:wrap;gap:.75rem}
+        .fields{overflow-wrap:anywhere}
+        .follow-row input,.reply-row input{width:100%;min-width:0}
+      }
     </style></head><body><main><div class="card">';
 }
 
@@ -856,7 +863,7 @@ function ap_cmdr_site_shell_start(string $title): void
     echo '<style>
       /* AP profile inside site shell — widen center a bit for the fold experiment */
       body.ap-site-shell #main{
-        min-width:0;max-width:820px;width:100%;
+        min-width:0;max-width:920px;width:100%;
         padding:12px 14px 28px;box-sizing:border-box;
       }
       body.ap-site-shell .ap-site-banner{
@@ -915,7 +922,10 @@ function ap_cmdr_site_shell_start(string $title): void
       @media (max-width:900px){
         body.ap-site-shell{display:block!important}
         body.ap-site-shell #sidebar, body.ap-site-shell footer{display:none!important}
-        body.ap-site-shell #main{max-width:100%!important;min-width:0!important}
+        body.ap-site-shell #main{max-width:100%!important;min-width:0!important;padding:8px 10px 20px}
+        body.ap-site-shell .ap-site-main{min-width:0;width:100%}
+        body.ap-site-shell .ap-site-main .card{box-sizing:border-box;padding:1rem}
+        body.ap-site-shell .ap-site-main .row{flex-wrap:wrap;gap:.75rem}
       }
     </style>';
     echo '<script src="/assets/js/dynamic-avatar.js" defer></script>';
