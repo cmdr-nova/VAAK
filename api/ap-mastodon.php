@@ -1085,6 +1085,55 @@ function ap_masto_api(string $method, string $path): void
         return;
     }
 
+    // Personal blocks (Ice Cubes / Mastodon-compatible API). These are local
+    // per-user timeline filters; they do not federate or affect other users.
+    if (preg_match('#^/api/v1/accounts/(\d+)/(block|unblock)$#', $path, $bm) && $method === 'POST') {
+        ap_masto_require_token('write:blocks');
+        $ownerId = ap_db_masto_owner_user_id();
+        $accountId = (string) $bm[1];
+        $actor = ap_masto_actor_id_from_account_id($accountId);
+        if (!$actor) {
+            ap_masto_json(['error' => 'Record not found'], 404);
+            return;
+        }
+        if ($bm[2] === 'block') {
+            $res = ap_user_block_add($ownerId, 'actor', $actor, 'block');
+            if (empty($res['ok'])) {
+                ap_masto_json(['error' => $res['error'] ?? 'Block failed'], 422);
+                return;
+            }
+        } else {
+            $row = ap_user_block_find($actor, null, $ownerId);
+            if (is_array($row)) {
+                $res = ap_user_block_remove($ownerId, (int) ($row['id'] ?? 0));
+                if (empty($res['ok'])) {
+                    ap_masto_json(['error' => $res['error'] ?? 'Unblock failed'], 422);
+                    return;
+                }
+            }
+        }
+        ap_masto_json(ap_masto_relationship_for_account_id($accountId));
+        return;
+    }
+
+    if ($path === '/api/v1/blocks' && $method === 'GET') {
+        ap_masto_require_token('read:blocks');
+        $ownerId = ap_db_masto_owner_user_id();
+        $limit = isset($_GET['limit']) ? max(1, min(80, (int) $_GET['limit'])) : 40;
+        $out = [];
+        foreach (array_slice(ap_user_blocks_list($ownerId), 0, $limit) as $row) {
+            if (!is_array($row) || (string) ($row['scope'] ?? '') !== 'actor') {
+                continue;
+            }
+            $actor = rtrim((string) ($row['value'] ?? ''), '/');
+            if ($actor !== '') {
+                $out[] = ap_masto_remote_account($actor);
+            }
+        }
+        ap_masto_json($out);
+        return;
+    }
+
     if ($path === '/api/v1/preferences' && $method === 'GET') {
         ap_masto_require_token('read');
         ap_masto_json([

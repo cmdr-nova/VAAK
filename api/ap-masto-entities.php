@@ -1326,7 +1326,12 @@ function ap_masto_relationship_for_account_id(string $accountId): array
                 }
             }
         }
-        $blocking = ap_is_blocked_actor($actor);
+        // Mastodon clients expect this relationship flag to reflect the
+        // authenticated user's personal block, not a server-wide block.
+        $ownerId = ap_db_masto_owner_user_id();
+        $blocking = function_exists('ap_user_is_blocked')
+            ? ap_user_is_blocked($actor, null, $ownerId)
+            : false;
         $muting = function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, ap_db_masto_owner_user_id());
     }
 
