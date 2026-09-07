@@ -10088,7 +10088,7 @@ header('Content-Type: text/html; charset=utf-8');
           </div>
 
           <div class="composer-actions">
-            <span class="meta">Saves to SQLite and sends an ActivityPub <code>Update</code> (no <code>movedTo</code>). Handle stays <b><?= h($vaakUsername) ?></b>.</span>
+            <span class="meta">Saves to the shared database and sends an ActivityPub <code>Update</code> (no <code>movedTo</code>). Handle stays <b><?= h($vaakUsername) ?></b>.</span>
             <a class="btn btn-ghost" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>">View public profile</a>
             <button class="btn btn-primary" type="submit">Save profile</button>
           </div>
