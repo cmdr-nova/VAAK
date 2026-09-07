@@ -691,7 +691,7 @@ function ap_cmdr_shell_start(string $title): void
       .row{display:flex;gap:1rem;align-items:flex-start}
       .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#222;flex-shrink:0}
       .sl-link a{display:inline-flex;align-items:center;text-decoration:none}
-      .sl-link img{display:block;border-radius:50%;width:34px;height:34px}
+      .sl-link img{display:block;border-radius:8px;width:43px;height:34px}
       a{color:#7ee0ff;text-decoration:underline;text-underline-offset:2px} a:hover{color:#b7f3ff}
       .muted{color:#999} h1{font-size:1.35rem;margin:0 0 .35rem}
       .profile-bio{margin-top:1rem}
@@ -1285,7 +1285,7 @@ function ap_cmdr_html(): void
         );
         echo '<p class="sl-link" style="margin:.55rem 0 0">'
             . '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
-            . '<img src="/vaak/second-life.jpg" alt="" width="34" height="34" loading="lazy">'
+            . '<img src="/vaak/second-life.jpg" alt="" width="43" height="34" loading="lazy">'
             . '</a></p>';
     }
     echo '</div></div>';

@@ -494,7 +494,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         );
         echo '<p class="sl-link" style="margin:.55rem 0 0">'
             . '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
-            . '<img src="/vaak/second-life.jpg" alt="" width="34" height="34" loading="lazy">'
+            . '<img src="/vaak/second-life.jpg" alt="" width="43" height="34" loading="lazy">'
             . '</a></p>';
     }
     echo '</div></div>';
@@ -757,7 +757,7 @@ function ap_user_html_shell_start(string $title): void
       .row{display:flex;gap:1rem;align-items:center}
       .sl-link a{display:inline-flex;align-items:center;gap:.55rem;color:#ddd;text-decoration:none;font-weight:650}
       .sl-link a:hover{color:#fff}
-      .sl-link img{display:block;border-radius:50%;flex:0 0 auto}
+      .sl-link img{display:block;border-radius:8px;flex:0 0 auto}
       .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#1a1a1a}
       .av-fallback{display:flex;align-items:center;justify-content:center;font-size:1.6rem;font-weight:700;color:#00ff9f}
       .banner{height:120px;border-radius:12px;background-size:cover;background-position:center;margin:-.25rem -.25rem 1rem;border:1px solid #2a2a2a}
