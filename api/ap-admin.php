@@ -8546,6 +8546,9 @@ header('Content-Type: text/html; charset=utf-8');
     .profile-form .field-row {
       display: grid; grid-template-columns: 1fr 2fr auto; gap: .5rem; margin-top: .5rem; align-items: center;
     }
+    .profile-form .field-status {
+      display: inline-block; min-width: 5.5rem; white-space: nowrap;
+    }
     .profile-form .checks {
       display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0;
       color: var(--muted); font-size: .9rem;
@@ -10007,10 +10010,12 @@ header('Content-Type: text/html; charset=utf-8');
               <input type="text" name="field_value[]" maxlength="500" placeholder="Value or https://…" value="<?= h($avPlain) ?>">
               <?php if ($an !== '' || $avPlain !== ''): ?>
                 <?php if ($isVerified): ?>
-                  <span class="tag" style="background:rgba(0,255,159,.15);color:var(--primary);white-space:nowrap" title="<?= h($verifiedAt) ?>">✓ verified</span>
-                <?php elseif (function_exists('ap_profile_coerce_https_url') && ap_profile_coerce_https_url($avPlain) !== null): ?>
-                  <span class="meta" style="white-space:nowrap" title="No rel=me backlink found yet">unverified</span>
+                  <span class="tag field-status" style="background:rgba(0,255,159,.15);color:var(--primary)" title="<?= h($verifiedAt) ?>">✓ verified</span>
+                <?php else: ?>
+                  <span class="meta field-status" title="No rel=me backlink found yet">unverified</span>
                 <?php endif; ?>
+              <?php else: ?>
+                <span class="field-status" aria-hidden="true"></span>
               <?php endif; ?>
             </div>
           <?php endfor; ?>
