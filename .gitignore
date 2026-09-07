@@ -1,0 +1,24 @@
+# Runtime and deployment secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+*.token
+*-credentials
+*-credentials.*
+
+# Local/runtime data
+api/sl_visitors.json
+api/.gts-config.php
+api/test-gts.php
+storage/
+var/
+vendor/
+node_modules/
+.DS_Store
