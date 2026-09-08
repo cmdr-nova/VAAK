@@ -548,7 +548,8 @@ function ap_auth_username_ok(string $username): bool
     if (!preg_match('/^[a-z][a-z0-9_]*$/', $username)) {
         return false;
     }
-    $reserved = ['cmdr_nova', 'admin', 'administrator', 'vaak', 'api', 'inbox', 'actor', 'null', 'undefined', 'root', 'support', 'www'];
+    // Keep protocol/system identities unavailable to invite registrations.
+    $reserved = ['cmdr_nova', 'admin', 'administrator', 'deleteduser', 'vaak', 'api', 'inbox', 'actor', 'null', 'undefined', 'root', 'support', 'www'];
     return !in_array($username, $reserved, true);
 }
 
