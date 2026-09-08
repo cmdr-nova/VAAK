@@ -8412,7 +8412,7 @@ header('Content-Type: text/html; charset=utf-8');
       border-radius: 999px; border: 1px solid transparent;
       font-size: 1rem; line-height: 1;
     }
-    .tweet-actions .icon-btn:hover { border-color: var(--border); background: #1a1a1a; }
+    .tweet-actions .icon-btn:hover { border-color: transparent; background: transparent; }
     .tweet-actions .icon-btn.on { color: var(--primary); }
     .post-action-menu { position: relative; display: inline-block; }
     .post-action-menu > summary { list-style: none; cursor: pointer; }
@@ -14079,14 +14079,13 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (composeMode === 'edit_status') return false;
     const ta = document.getElementById('compose-content');
     const spoiler = form.querySelector('input[name="spoiler_text"]');
-    const replyTo = document.getElementById('compose-in-reply-to');
-    const quoteField = form.querySelector('input[name="quote_object"]');
     const text = ((ta && ta.value) || '').trim();
     const cw = ((spoiler && spoiler.value) || '').trim();
-    const reply = ((replyTo && replyTo.value) || '').trim();
-    const quote = ((quoteField && quoteField.value) || '').trim();
     const existingMedia = ((draftMediaField && draftMediaField.value) || '').trim();
-    return !!(text || cw || reply || quote || existingMedia || (files && files.length));
+    // Reply/quote targets are composer context, not user-authored content.
+    // Do not create a draft merely because the composer was opened from a
+    // Reply or Quote action and then closed without text or media.
+    return !!(text || cw || existingMedia || (files && files.length));
   }
   function updateDraftsBadge(count) {
     const badge = document.getElementById('nav-drafts-badge');
