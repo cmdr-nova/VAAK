@@ -1568,6 +1568,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         'blocked_domains' => ap_ie_import_blocked_domains($rows),
                         'bookmarks' => ap_ie_import_bookmarks($rows),
                         'lists' => ap_ie_import_lists($rows),
+                        'followed_tags' => ap_ie_import_followed_tags($rows),
                         default => ['ok' => false, 'errors' => ['Unknown import type'], 'imported' => 0, 'skipped' => 0, 'failed' => 0],
                     };
                     if (!empty($res['ok'])) {
@@ -11789,6 +11790,7 @@ function admin_render_home_suggestions(array $suggestions): void
           <a class="btn btn-ghost" href="?view=import_export&amp;export=blocked_domains">blocked_domains.csv</a>
           <a class="btn btn-ghost" href="?view=import_export&amp;export=bookmarks">bookmarks.csv</a>
           <a class="btn btn-ghost" href="?view=import_export&amp;export=lists">lists.csv</a>
+          <a class="btn btn-ghost" href="?view=import_export&amp;export=followed_tags">followed_tags.csv</a>
         </div>
 
         <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Import (merge)</h3>
@@ -11802,6 +11804,7 @@ function admin_render_home_suggestions(array $suggestions): void
             <option value="blocked_domains">Blocked domains</option>
             <option value="bookmarks">Bookmarks (#uri)</option>
             <option value="lists">Lists (List name, Account address)</option>
+            <option value="followed_tags">Followed hashtags (#hashtag)</option>
           </select>
           <input type="file" name="csv" accept=".csv,text/csv,text/plain" required>
           <div class="composer-actions">

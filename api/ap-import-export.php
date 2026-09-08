@@ -316,6 +316,23 @@ function ap_ie_export_lists_rows(): array
     return $rows;
 }
 
+/** @return list<list<string>> */
+function ap_ie_export_followed_tags_rows(): array
+{
+    $rows = [];
+    if (!function_exists('ap_masto_followed_tags')) {
+        return $rows;
+    }
+    $owner = function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : null;
+    foreach (ap_masto_followed_tags(0, $owner) as $tag) {
+        $name = trim((string) ($tag['name'] ?? ''));
+        if ($name !== '') {
+            $rows[] = ['#' . ltrim($name, '#')];
+        }
+    }
+    return $rows;
+}
+
 function ap_ie_handle_export(string $kind): void
 {
     switch ($kind) {
@@ -344,6 +361,9 @@ function ap_ie_handle_export(string $kind): void
             break;
         case 'lists':
             ap_ie_stream_csv('lists.csv', ['List name', 'Account address'], ap_ie_export_lists_rows());
+            break;
+        case 'followed_tags':
+            ap_ie_stream_csv('followed_tags.csv', ['#hashtag'], ap_ie_export_followed_tags_rows());
             break;
         default:
             http_response_code(400);
@@ -606,6 +626,54 @@ function ap_ie_import_lists(array $rows): array
         'errors' => $errors,
         'rate_limited' => $rateLimited,
     ];
+}
+
+/**
+ * Import followed hashtags without changing existing follows.
+ * @param list<list<string>> $rows
+ * @return array{ok:bool,imported:int,skipped:int,failed:int,errors:list<string>}
+ */
+function ap_ie_import_followed_tags(array $rows): array
+{
+    $imported = 0;
+    $skipped = 0;
+    $failed = 0;
+    $errors = [];
+    if (!function_exists('ap_masto_tag_follow')) {
+        return ['ok' => false, 'imported' => 0, 'skipped' => 0, 'failed' => 0, 'errors' => ['Followed-tag helper unavailable']];
+    }
+    $start = ($rows && ap_ie_looks_like_header($rows[0])) ? 1 : 0;
+    for ($i = $start; $i < count($rows); $i++) {
+        $raw = trim((string) ($rows[$i][0] ?? ''));
+        $name = ltrim($raw, '#');
+        if ($name === '') {
+            $skipped++;
+            continue;
+        }
+        if (function_exists('ap_masto_normalize_tag_name')) {
+            $name = ap_masto_normalize_tag_name($name);
+        } else {
+            $name = strtolower($name);
+        }
+        if ($name === '' || !preg_match('/^[\p{L}\p{N}_-]{1,100}$/u', $name)) {
+            $failed++;
+            $errors[] = "Invalid hashtag: $raw";
+            continue;
+        }
+        try {
+            $res = ap_masto_tag_follow($name, function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : null);
+            if (!empty($res['ok'])) {
+                $imported++;
+            } else {
+                $failed++;
+                $errors[] = "#$name: " . ($res['error'] ?? 'follow failed');
+            }
+        } catch (Throwable $e) {
+            $failed++;
+            $errors[] = "#$name: " . $e->getMessage();
+        }
+    }
+    return ['ok' => true, 'imported' => $imported, 'skipped' => $skipped, 'failed' => $failed, 'errors' => $errors];
 }
 
 /* ===================== Follow import (rate-limited job) ===================== */
