@@ -9456,11 +9456,31 @@ header('Content-Type: text/html; charset=utf-8');
       <?php elseif ($view === 'mentions'): ?>
         <?php
           // Same unified feed as Ice Cubes: follows, likes, boosts, mentions, quotes…
+          $notifFilter = strtolower(trim((string) ($_GET['notification_filter'] ?? 'all')));
+          $notifFilterOptions = [
+              'all' => ['label' => 'All', 'types' => []],
+              'mentions' => ['label' => 'Mentions', 'types' => ['mention']],
+              'favourites' => ['label' => 'Favourites', 'types' => ['favourite']],
+              'boosts_quotes' => ['label' => 'Boosts/Quotes', 'types' => ['reblog', 'quote']],
+          ];
+          if (!isset($notifFilterOptions[$notifFilter])) {
+              $notifFilter = 'all';
+          }
+          $notifTypes = $notifFilterOptions[$notifFilter]['types'];
+          $notifFilterHref = static function (string $filter): string {
+              return '?view=mentions&notification_filter=' . rawurlencode($filter);
+          };
+          echo '<nav class="notification-tabs" aria-label="Notification filters" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
+          foreach ($notifFilterOptions as $filterKey => $filterOption) {
+              $active = $notifFilter === $filterKey;
+              echo '<a class="btn ' . ($active ? 'btn-primary' : 'btn-ghost') . '" role="tab" aria-selected="' . ($active ? 'true' : 'false') . '" href="' . $notifFilterHref($filterKey) . '">' . h((string) $filterOption['label']) . '</a>';
+          }
+          echo '</nav>';
           $adminNotifs = [];
           $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
           try {
               $adminNotifs = function_exists('ap_masto_notifications_fetch')
-                  ? ap_masto_notifications_fetch(60, $notifMaxId)
+                  ? ap_masto_notifications_fetch(60, $notifMaxId, null, $notifTypes)
                   : [];
           } catch (Throwable $e) {
               error_log('[ap-admin] notifications fetch: ' . $e->getMessage());
@@ -9620,7 +9640,7 @@ header('Content-Type: text/html; charset=utf-8');
             <?php $olderNotifId = (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? ''); ?>
             <?php if ($olderNotifId !== ''): ?>
               <div style="text-align:center;margin:1rem 0 .25rem">
-                <a class="btn btn-ghost" href="?view=mentions&amp;notifications_max_id=<?= urlencode($olderNotifId) ?>">Load older notifications</a>
+              <a class="btn btn-ghost" href="<?= h($notifFilterHref($notifFilter)) ?>&amp;notifications_max_id=<?= urlencode($olderNotifId) ?>">Load older notifications</a>
               </div>
             <?php endif; ?>
           <?php endif; ?>
