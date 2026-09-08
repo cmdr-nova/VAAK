@@ -1,7 +1,7 @@
 <?php
 /**
  * WebFinger for mkultra.monster.
- * Local: any active ap_users username @ mkultra.monster (+ cmdr-nova alias).
+ * Local: any active ap_users username @ mkultra.monster.
  * Everything else (including val3r1e@mkultra.monster) → Bridgy Fed.
  */
 declare(strict_types=1);
@@ -17,7 +17,8 @@ $norm = strtolower($resource);
 
 $username = null;
 
-// acct:user@mkultra.monster (cmdr-nova hyphen alias → cmdr_nova)
+// acct:user@mkultra.monster (accept cmdr-nova as an input alias, but always
+// return the canonical underscore subject and actor URL).
 if (preg_match('/^acct:([a-z0-9_-]+)@mkultra\.monster$/i', $norm, $m)) {
     $candidate = str_replace('-', '_', $m[1]);
     if ($candidate === 'cmdr_nova' || preg_match('/^[a-z][a-z0-9_]{1,29}$/', $candidate)) {
@@ -69,10 +70,6 @@ $aliases = [
     $actor,
     'https://mkultra.monster/@' . rawurlencode($actorKey),
 ];
-if ($actorKey === 'cmdr_nova') {
-    $aliases[] = 'acct:cmdr-nova@mkultra.monster';
-}
-
 $jrd = [
     'subject' => $subject,
     'aliases' => $aliases,
