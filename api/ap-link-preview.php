@@ -252,38 +252,66 @@ function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxByte
     if (!ap_link_preview_url_allowed($url)) {
         return null;
     }
-    $ch = curl_init($url);
-    if ($ch === false) {
-        return null;
-    }
-    $buf = '';
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => false,
-        // Never follow redirects — initial URL is SSRF-checked; Location targets are not.
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_CONNECTTIMEOUT => $timeoutSec,
-        CURLOPT_TIMEOUT => $timeoutSec,
-        CURLOPT_USERAGENT => 'mkultra.monster-link-preview/1.0 (+https://mkultra.monster)',
-        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$buf, $maxBytes): int {
-            $buf .= $data;
-            if (strlen($buf) > $maxBytes) {
-                return 0; // abort
+    // Follow only a small number of redirects, validating every destination.
+    // This handles common canonical-host redirects without reopening SSRF.
+    for ($hop = 0; $hop < 3; $hop++) {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return null;
+        }
+        $buf = '';
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => $timeoutSec,
+            CURLOPT_TIMEOUT => $timeoutSec,
+            CURLOPT_USERAGENT => 'mkultra.monster-link-preview/1.0 (+https://mkultra.monster)',
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$buf, $maxBytes): int {
+                $buf .= $data;
+                if (strlen($buf) > $maxBytes) {
+                    return 0; // abort
+                }
+                return strlen($data);
+            },
+            CURLOPT_HTTPHEADER => [
+                'Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+            ],
+        ]);
+        $ok = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $next = (string) (curl_getinfo($ch, CURLINFO_REDIRECT_URL) ?: '');
+        curl_close($ch);
+        if ($ok === false) {
+            return null;
+        }
+        if ($code >= 300 && $code < 400 && $next !== '') {
+            if (!str_starts_with(strtolower($next), 'http://') && !str_starts_with(strtolower($next), 'https://')) {
+                $base = parse_url($url);
+                if (!is_array($base) || empty($base['scheme']) || empty($base['host'])) {
+                    return null;
+                }
+                if (str_starts_with($next, '/')) {
+                    $next = $base['scheme'] . '://' . $base['host'] . $next;
+                } else {
+                    $basePath = (string) ($base['path'] ?? '/');
+                    $dir = rtrim(str_replace('\\', '/', dirname($basePath)), '/');
+                    $next = $base['scheme'] . '://' . $base['host'] . ($dir !== '' ? $dir . '/' : '/') . ltrim($next, '/');
+                }
             }
-            return strlen($data);
-        },
-        CURLOPT_HTTPHEADER => [
-            'Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
-        ],
-    ]);
-    $ok = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($ok === false || $code < 200 || $code >= 400 || $buf === '') {
-        return null;
+            if (!ap_link_preview_url_allowed($next)) {
+                return null;
+            }
+            $url = $next;
+            continue;
+        }
+        if ($code < 200 || $code >= 400 || $buf === '') {
+            return null;
+        }
+        return $buf;
     }
-    return $buf;
+    return null;
 }
 
 /**
@@ -423,7 +451,7 @@ function ap_link_preview_for_url(string $url, bool $allowFetch = true): ?array
             'provider_url' => null,
             'type' => 'link',
             'status' => 'fail',
-        ], 86400);
+        ], 900);
         return null;
     }
     ap_link_preview_cache_put($card, 7 * 86400);
