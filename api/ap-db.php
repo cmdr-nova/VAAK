@@ -191,7 +191,8 @@ SQL);
         $discussTablesReady = (bool) $db->query(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_categories')
                     AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_topics')
-                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_posts')"
+                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_posts')
+                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_reads')"
         )->fetchColumn();
     } catch (Throwable $e) {
         error_log('[ap-db] discussion table probe failed: ' . $e->getMessage());
@@ -232,6 +233,15 @@ CREATE TABLE IF NOT EXISTS ap_discuss_posts (
 SQL);
         $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_discuss_topics_category ON ap_discuss_topics(category_id, updated_at DESC, id DESC)');
         $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_discuss_posts_topic ON ap_discuss_posts(topic_id, created_at ASC, id ASC)');
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_discuss_reads (
+    owner_user_id BIGINT NOT NULL,
+    topic_id BIGINT NOT NULL,
+    last_read_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, topic_id)
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_discuss_reads_topic ON ap_discuss_reads(topic_id, last_read_at)');
         $db->exec("INSERT INTO ap_discuss_categories (slug, name, description, position, created_at, updated_at) VALUES
             ('general', 'General', 'Open discussion for local VAAK users.', 10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
             ('help', 'Help & support', 'Questions, troubleshooting, and practical help.', 20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
@@ -255,7 +265,7 @@ SQL);
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies',
-        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts',
+        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta',
         'remote_media_cache', 'site_syndications',
     ];
@@ -853,6 +863,13 @@ CREATE TABLE IF NOT EXISTS ap_discuss_posts (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_discuss_topics_category ON ap_discuss_topics(category_id, updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_ap_discuss_posts_topic ON ap_discuss_posts(topic_id, created_at ASC, id ASC);
+CREATE TABLE IF NOT EXISTS ap_discuss_reads (
+    owner_user_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    last_read_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, topic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_discuss_reads_topic ON ap_discuss_reads(topic_id, last_read_at);
 INSERT OR IGNORE INTO ap_discuss_categories (slug, name, description, position, created_at, updated_at) VALUES
     ('general', 'General', 'Open discussion for local VAAK users.', 10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
     ('help', 'Help & support', 'Questions, troubleshooting, and practical help.', 20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),

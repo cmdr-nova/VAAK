@@ -8823,6 +8823,7 @@ header('Content-Type: text/html; charset=utf-8');
     </div>
     <?php
       $dmUnreadNav = ap_dm_unread_count();
+      $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
       $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'import_export', 'security'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
@@ -8836,7 +8837,7 @@ header('Content-Type: text/html; charset=utf-8');
       <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local"><span class="ico">◎</span><span class="label">Local</span></a>
       <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed"><span class="ico">◈</span><span class="label">Federated</span></a>
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
-      <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span></a>
+      <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span><span class="nav-badge"<?= $discussUnreadNav > 0 ? '' : ' hidden' ?>><?= $discussUnreadNav > 99 ? '99+' : (string) (int) $discussUnreadNav ?></span></a>
       <a class="<?= $view === 'foryou' ? 'active' : '' ?>" href="?view=foryou"><span class="ico">✦</span><span class="label">For You</span></a>
       <a class="nav-search-narrow <?= $view === 'search' ? 'active' : '' ?>" href="?view=search"><span class="ico">⌕</span><span class="label">Search</span></a>
       <hr class="nav-sep">
@@ -9071,6 +9072,7 @@ header('Content-Type: text/html; charset=utf-8');
           $discussCategorySlug = strtolower(trim((string) ($_GET['category'] ?? '')));
           if ($discussTopic !== null) {
               $discussCategorySlug = (string) ($discussTopic['category_slug'] ?? $discussCategorySlug);
+              ap_discuss_mark_read($discussTopicId, $vaakOwnerId);
           }
           $discussCategory = $discussCategorySlug !== '' ? ap_discuss_category($discussCategorySlug) : null;
         ?>
@@ -9130,7 +9132,7 @@ header('Content-Type: text/html; charset=utf-8');
             </section>
           <?php endif; ?>
         <?php else: ?>
-          <?php $discussCategories = ap_discuss_categories(); ?>
+          <?php $discussCategories = ap_discuss_categories($vaakOwnerId); ?>
           <section class="side-card" style="margin-bottom:1rem">
             <h1 style="margin:.1rem 0 .35rem;font-size:1.35rem">Discuss</h1>
             <p class="meta" style="margin:0">Local discussion forums for VAAK users. Posts and replies stay inside this interface.</p>
@@ -9138,7 +9140,7 @@ header('Content-Type: text/html; charset=utf-8');
           <section class="side-card" style="padding:0;overflow:hidden">
             <?php foreach ($discussCategories as $dc): ?>
               <a href="?view=discuss&amp;category=<?= h(rawurlencode((string) ($dc['slug'] ?? ''))) ?>" style="display:block;padding:1rem;border-bottom:1px solid var(--border);text-decoration:none;color:inherit">
-                <div style="display:flex;justify-content:space-between;gap:1rem;align-items:baseline;flex-wrap:wrap"><strong><?= h((string) ($dc['name'] ?? '')) ?></strong><span class="meta"><?= (int) ($dc['topic_count'] ?? 0) ?> <?= ((int) ($dc['topic_count'] ?? 0) === 1 ? 'topic' : 'topics') ?></span></div>
+                <div style="display:flex;justify-content:space-between;gap:1rem;align-items:center;flex-wrap:wrap"><strong><?= h((string) ($dc['name'] ?? '')) ?></strong><span style="display:flex;align-items:center;gap:.5rem"><span class="meta"><?= (int) ($dc['topic_count'] ?? 0) ?> <?= ((int) ($dc['topic_count'] ?? 0) === 1 ? 'topic' : 'topics') ?></span><?php $categoryUnread = (int) ($dc['unread_count'] ?? 0); ?><?php if ($categoryUnread > 0): ?><span class="nav-badge" style="position:static"><?= $categoryUnread > 99 ? '99+' : $categoryUnread ?> new</span><?php endif; ?></span></div>
                 <div class="meta" style="margin-top:.3rem"><?= h((string) ($dc['description'] ?? '')) ?></div>
               </a>
             <?php endforeach; ?>

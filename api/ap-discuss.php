@@ -2,22 +2,85 @@
 /** Local-only discussion forums for authenticated VAAK users. */
 declare(strict_types=1);
 
+function ap_discuss_now(): string
+{
+    return (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('Y-m-d\\TH:i:s.uP');
+}
+
 /** @return list<array<string,mixed>> */
-function ap_discuss_categories(): array
+function ap_discuss_categories(?int $ownerUserId = null): array
 {
     try {
-        return ap_db()->query(
+        $ownerUserId = max(0, (int) $ownerUserId);
+        $st = ap_db()->prepare(
             'SELECT c.id, c.slug, c.name, c.description, c.position, c.updated_at,
                     COUNT(t.id) AS topic_count,
-                    MAX(t.updated_at) AS latest_at
+                    MAX(t.updated_at) AS latest_at,
+                    (SELECT COUNT(*)
+                       FROM ap_discuss_topics ut
+                       LEFT JOIN ap_discuss_reads ur
+                         ON ur.topic_id = ut.id AND ur.owner_user_id = ?
+                      WHERE ut.category_id = c.id
+                        AND (ur.last_read_at IS NULL OR ut.updated_at > ur.last_read_at)
+                    ) AS unread_count
              FROM ap_discuss_categories c
              LEFT JOIN ap_discuss_topics t ON t.category_id = c.id
              GROUP BY c.id, c.slug, c.name, c.description, c.position, c.updated_at
              ORDER BY c.position ASC, c.id ASC'
-        )->fetchAll() ?: [];
+        );
+        $st->execute([$ownerUserId]);
+        return $st->fetchAll() ?: [];
     } catch (Throwable $e) {
         error_log('[ap-discuss] categories: ' . $e->getMessage());
         return [];
+    }
+}
+
+function ap_discuss_unread_topic_count(int $ownerUserId): int
+{
+    if ($ownerUserId < 1) {
+        return 0;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT COUNT(*)
+               FROM ap_discuss_topics t
+               LEFT JOIN ap_discuss_reads r
+                 ON r.topic_id = t.id AND r.owner_user_id = ?
+              WHERE r.last_read_at IS NULL OR t.updated_at > r.last_read_at'
+        );
+        $st->execute([$ownerUserId]);
+        return max(0, (int) $st->fetchColumn());
+    } catch (Throwable $e) {
+        error_log('[ap-discuss] unread count: ' . $e->getMessage());
+        return 0;
+    }
+}
+
+function ap_discuss_mark_read(int $topicId, int $ownerUserId): void
+{
+    if ($topicId < 1 || $ownerUserId < 1) {
+        return;
+    }
+    try {
+        $db = ap_db();
+        $check = $db->prepare('SELECT 1 FROM ap_discuss_topics WHERE id = ? LIMIT 1');
+        $check->execute([$topicId]);
+        if (!$check->fetchColumn()) {
+            return;
+        }
+        $now = ap_discuss_now();
+        $existing = $db->prepare('SELECT 1 FROM ap_discuss_reads WHERE owner_user_id = ? AND topic_id = ? LIMIT 1');
+        $existing->execute([$ownerUserId, $topicId]);
+        if ($existing->fetchColumn()) {
+            $db->prepare('UPDATE ap_discuss_reads SET last_read_at = ? WHERE owner_user_id = ? AND topic_id = ?')
+                ->execute([$now, $ownerUserId, $topicId]);
+        } else {
+            $db->prepare('INSERT INTO ap_discuss_reads (owner_user_id, topic_id, last_read_at) VALUES (?, ?, ?)')
+                ->execute([$ownerUserId, $topicId, $now]);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-discuss] mark read: ' . $e->getMessage());
     }
 }
 
@@ -129,7 +192,7 @@ function ap_discuss_topic_create(int $categoryId, int $ownerUserId, string $titl
         if (!$check->fetchColumn()) {
             return ['ok' => false, 'error' => 'Discussion category not found.'];
         }
-        $now = ap_db_now();
+        $now = ap_discuss_now();
         $db->beginTransaction();
         $st = $db->prepare(
             'INSERT INTO ap_discuss_topics (category_id, owner_user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
@@ -171,7 +234,7 @@ function ap_discuss_post_create(int $topicId, int $ownerUserId, string $body): a
         if (!empty($locked)) {
             return ['ok' => false, 'error' => 'This discussion is locked.'];
         }
-        $now = ap_db_now();
+        $now = ap_discuss_now();
         $db->beginTransaction();
         $st = $db->prepare(
             'INSERT INTO ap_discuss_posts (topic_id, owner_user_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
