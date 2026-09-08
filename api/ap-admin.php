@@ -10157,6 +10157,17 @@ function admin_render_home_suggestions(array $suggestions): void
                           $nSnippet = preg_replace('#^RE:\s*https://\S+#u', '', $nSnippet) ?? $nSnippet;
                           $nSnippet = trim($nSnippet);
                       }
+                      // Wafrn may glue the first commentary word onto our local
+                      // domain: @cmdr_nova@mkultra.monsteraudio posts… Preserve
+                      // that word before mention normalization can consume it.
+                      $localHostForSnippet = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
+                      if ($localHostForSnippet !== '') {
+                          $nSnippet = preg_replace(
+                              '/^(@[A-Za-z0-9_]+@' . preg_quote($localHostForSnippet, '/') . ')([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=\s|$)/iu',
+                              '$1 $2',
+                              $nSnippet
+                          ) ?? $nSnippet;
+                      }
                       foreach (($nStatus['mentions'] ?? []) as $nMention) {
                           if (!is_array($nMention)) {
                               continue;
