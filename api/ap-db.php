@@ -157,7 +157,7 @@ function ap_db_migrate_postgres(PDO $db): void
         error_log('[ap-db] notice table probe failed: ' . $e->getMessage());
     }
     if (!$noticeTablesReady) {
-      try {
+        try {
         $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS ap_notices (
     id BIGSERIAL PRIMARY KEY,
@@ -183,6 +183,63 @@ SQL);
         // Production PHP roles may have DML but not public-schema DDL.
         // The required-table check below still fails safely if provisioning is incomplete.
         error_log('[ap-db] notice tables not provisioned by runtime role: ' . $e->getMessage());
+        }
+    }
+
+    $discussTablesReady = false;
+    try {
+        $discussTablesReady = (bool) $db->query(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_categories')
+                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_topics')
+                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_posts')"
+        )->fetchColumn();
+    } catch (Throwable $e) {
+        error_log('[ap-db] discussion table probe failed: ' . $e->getMessage());
+    }
+    if (!$discussTablesReady) {
+      try {
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_discuss_categories (
+    id BIGSERIAL PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_discuss_topics (
+    id BIGSERIAL PRIMARY KEY,
+    category_id BIGINT NOT NULL,
+    owner_user_id BIGINT NOT NULL,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    locked INTEGER NOT NULL DEFAULT 0
+)
+SQL);
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_discuss_posts (
+    id BIGSERIAL PRIMARY KEY,
+    topic_id BIGINT NOT NULL,
+    owner_user_id BIGINT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_discuss_topics_category ON ap_discuss_topics(category_id, updated_at DESC, id DESC)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_discuss_posts_topic ON ap_discuss_posts(topic_id, created_at ASC, id ASC)');
+        $db->exec("INSERT INTO ap_discuss_categories (slug, name, description, position, created_at, updated_at) VALUES
+            ('general', 'General', 'Open discussion for local VAAK users.', 10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+            ('help', 'Help & support', 'Questions, troubleshooting, and practical help.', 20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+            ('fediverse', 'Fediverse', 'ActivityPub, apps, federation, and the wider network.', 30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+            ('virtual-worlds', 'Virtual worlds', 'OpenSim, Second Life, and related projects.', 40, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (slug) DO NOTHING");
+      } catch (Throwable $e) {
+        error_log('[ap-db] discussion tables not provisioned by runtime role: ' . $e->getMessage());
       }
     }
     $requiredTables = [
@@ -198,6 +255,7 @@ SQL);
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies',
+        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta',
         'remote_media_cache', 'site_syndications',
     ];
@@ -766,6 +824,40 @@ CREATE TABLE IF NOT EXISTS ap_notice_replies (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ap_notice_replies_notice ON ap_notice_replies(notice_id, created_at ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS ap_discuss_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ap_discuss_topics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    locked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ap_discuss_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic_id INTEGER NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_discuss_topics_category ON ap_discuss_topics(category_id, updated_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_ap_discuss_posts_topic ON ap_discuss_posts(topic_id, created_at ASC, id ASC);
+INSERT OR IGNORE INTO ap_discuss_categories (slug, name, description, position, created_at, updated_at) VALUES
+    ('general', 'General', 'Open discussion for local VAAK users.', 10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('help', 'Help & support', 'Questions, troubleshooting, and practical help.', 20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('fediverse', 'Fediverse', 'ActivityPub, apps, federation, and the wider network.', 30, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+    ('virtual-worlds', 'Virtual worlds', 'OpenSim, Second Life, and related projects.', 40, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
 
 CREATE TABLE IF NOT EXISTS ap_invite_codes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

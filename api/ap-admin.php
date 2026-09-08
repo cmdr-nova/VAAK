@@ -25,6 +25,7 @@ require_once __DIR__ . '/ap-queue.php'; // posting queue / scheduler
 require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
+require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -2121,6 +2122,29 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } else {
             $error = $res['error'] ?? 'Could not clear API key.';
         }
+    } elseif ($action === 'discuss_topic_create') {
+        $view = 'discuss';
+        $categorySlug = strtolower(trim((string) ($_POST['category_slug'] ?? '')));
+        $category = ap_discuss_category($categorySlug);
+        $res = $category
+            ? ap_discuss_topic_create((int) $category['id'], $vaakOwnerId, (string) ($_POST['topic_title'] ?? ''), (string) ($_POST['topic_body'] ?? ''))
+            : ['ok' => false, 'error' => 'Discussion category not found.'];
+        if (!empty($res['ok'])) {
+            header('Location: ?view=discuss&topic=' . (int) ($res['id'] ?? 0));
+            exit;
+        }
+        $error = $res['error'] ?? 'Could not create discussion.';
+        $_GET['category'] = $categorySlug;
+    } elseif ($action === 'discuss_post_create') {
+        $view = 'discuss';
+        $topicId = (int) ($_POST['topic_id'] ?? 0);
+        $res = ap_discuss_post_create($topicId, $vaakOwnerId, (string) ($_POST['post_body'] ?? ''));
+        if (!empty($res['ok'])) {
+            header('Location: ?view=discuss&topic=' . $topicId . '#post-' . (int) ($res['id'] ?? 0));
+            exit;
+        }
+        $error = $res['error'] ?? 'Could not save reply.';
+        $_GET['topic'] = (string) $topicId;
     } elseif ($action === 'notice_reply') {
         $view = 'notices';
         $res = ap_notice_reply_add(
@@ -4256,6 +4280,7 @@ function view_title(string $view): string
 {
     return match ($view) {
         'notices' => 'Notices',
+        'discuss' => 'Discuss',
         'home' => 'Home',
         'local' => 'Local',
         'feed' => 'Federation feed',
@@ -8786,6 +8811,7 @@ header('Content-Type: text/html; charset=utf-8');
       <hr class="nav-sep">
       <div class="nav-label">Social</div>
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
+      <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span></a>
       <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local"><span class="ico">◎</span><span class="label">Local</span></a>
       <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed"><span class="ico">◈</span><span class="label">Federated</span></a>
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
@@ -9016,7 +9042,88 @@ header('Content-Type: text/html; charset=utf-8');
     <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
 
     <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?>">
-      <?php if ($view === 'notices'): ?>
+      <?php if ($view === 'discuss'): ?>
+        <?php
+          $discussTopicId = (int) ($_GET['topic'] ?? 0);
+          $discussTopic = $discussTopicId > 0 ? ap_discuss_topic($discussTopicId) : null;
+          $discussCategorySlug = strtolower(trim((string) ($_GET['category'] ?? '')));
+          if ($discussTopic !== null) {
+              $discussCategorySlug = (string) ($discussTopic['category_slug'] ?? $discussCategorySlug);
+          }
+          $discussCategory = $discussCategorySlug !== '' ? ap_discuss_category($discussCategorySlug) : null;
+        ?>
+        <?php if ($discussTopic !== null): ?>
+          <?php $discussPosts = ap_discuss_posts($discussTopicId); ?>
+          <p class="meta" style="margin:0 0 .8rem"><a href="?view=discuss">Discuss</a> <span aria-hidden="true">/</span> <a href="?view=discuss&amp;category=<?= h(rawurlencode((string) ($discussTopic['category_slug'] ?? ''))) ?>"><?= h((string) ($discussTopic['category_name'] ?? 'Category')) ?></a></p>
+          <article class="forum-topic-head side-card" style="margin-bottom:1rem">
+            <div class="meta">Discussion</div>
+            <h1 style="margin:.15rem 0 .35rem;font-size:1.35rem"><?= h((string) ($discussTopic['title'] ?? '')) ?></h1>
+            <div class="meta">Started by <b>@<?= h((string) ($discussTopic['username'] ?? 'local user')) ?></b> · <?= h(relative_time((string) ($discussTopic['created_at'] ?? ''))) ?><?= !empty($discussTopic['locked']) ? ' · locked' : '' ?></div>
+          </article>
+          <?php foreach ($discussPosts as $dp): ?>
+            <article id="post-<?= (int) ($dp['id'] ?? 0) ?>" class="side-card" style="margin-bottom:.75rem">
+              <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:baseline;flex-wrap:wrap">
+                <div><b>@<?= h((string) ($dp['username'] ?? 'local user')) ?></b><span class="meta"> · <?= h(relative_time((string) ($dp['created_at'] ?? ''))) ?></span></div>
+                <a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a>
+              </div>
+              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= nl2br(h((string) ($dp['body'] ?? ''))) ?></div>
+            </article>
+          <?php endforeach; ?>
+          <?php if (empty($discussTopic['locked'])): ?>
+            <form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" class="side-card composer" style="margin-top:1rem">
+              <input type="hidden" name="action" value="discuss_post_create">
+              <input type="hidden" name="topic_id" value="<?= $discussTopicId ?>">
+              <h2 style="margin-top:0;font-size:1rem">Reply</h2>
+              <textarea name="post_body" maxlength="20000" rows="6" placeholder="Write a reply…" required></textarea>
+              <div class="composer-actions"><span class="meta">Posted as @<?= h($vaakUsername) ?> · local to VAAK</span><button class="btn btn-primary" type="submit">Post reply</button></div>
+            </form>
+          <?php endif; ?>
+        <?php elseif ($discussCategory !== null): ?>
+          <?php $discussTopics = ap_discuss_topics((int) $discussCategory['id'], 100); ?>
+          <p class="meta" style="margin:0 0 .8rem"><a href="?view=discuss">Discuss</a> <span aria-hidden="true">/</span> <?= h((string) $discussCategory['name']) ?></p>
+          <section class="side-card" style="margin-bottom:1rem">
+            <h1 style="margin:.1rem 0 .35rem;font-size:1.35rem"><?= h((string) $discussCategory['name']) ?></h1>
+            <p class="meta" style="margin:0"><?= h((string) ($discussCategory['description'] ?? '')) ?></p>
+          </section>
+          <section class="side-card" style="margin-bottom:1rem">
+            <h2 style="margin:.1rem 0 .7rem;font-size:1rem">Start a discussion</h2>
+            <form method="post" action="?view=discuss&amp;category=<?= h(rawurlencode($discussCategorySlug)) ?>" class="composer">
+              <input type="hidden" name="action" value="discuss_topic_create">
+              <input type="hidden" name="category_slug" value="<?= h($discussCategorySlug) ?>">
+              <input name="topic_title" maxlength="180" placeholder="Topic title" required>
+              <textarea name="topic_body" maxlength="20000" rows="5" placeholder="What would you like to discuss?" required></textarea>
+              <div class="composer-actions"><span class="meta">Posted as @<?= h($vaakUsername) ?> · local to VAAK</span><button class="btn btn-primary" type="submit">Create discussion</button></div>
+            </form>
+          </section>
+          <?php if (!$discussTopics): ?>
+            <div class="empty">No discussions here yet.</div>
+          <?php else: ?>
+            <section class="side-card" style="padding:0;overflow:hidden">
+              <?php foreach ($discussTopics as $dt): ?>
+                <a href="?view=discuss&amp;topic=<?= (int) ($dt['id'] ?? 0) ?>" style="display:block;padding:.9rem 1rem;border-bottom:1px solid var(--border);text-decoration:none;color:inherit">
+                  <div style="display:flex;justify-content:space-between;gap:1rem;align-items:baseline;flex-wrap:wrap"><strong><?= h((string) ($dt['title'] ?? '')) ?></strong><span class="meta"><?= (int) ($dt['post_count'] ?? 0) ?> <?= ((int) ($dt['post_count'] ?? 0) === 1 ? 'post' : 'posts') ?></span></div>
+                  <div class="meta" style="margin-top:.25rem">Started by @<?= h((string) ($dt['username'] ?? 'local user')) ?> · <?= h(relative_time((string) ($dt['updated_at'] ?? ''))) ?></div>
+                </a>
+              <?php endforeach; ?>
+            </section>
+          <?php endif; ?>
+        <?php else: ?>
+          <?php $discussCategories = ap_discuss_categories(); ?>
+          <section class="side-card" style="margin-bottom:1rem">
+            <h1 style="margin:.1rem 0 .35rem;font-size:1.35rem">Discuss</h1>
+            <p class="meta" style="margin:0">Local discussion forums for VAAK users. Posts and replies stay inside this interface.</p>
+          </section>
+          <section class="side-card" style="padding:0;overflow:hidden">
+            <?php foreach ($discussCategories as $dc): ?>
+              <a href="?view=discuss&amp;category=<?= h(rawurlencode((string) ($dc['slug'] ?? ''))) ?>" style="display:block;padding:1rem;border-bottom:1px solid var(--border);text-decoration:none;color:inherit">
+                <div style="display:flex;justify-content:space-between;gap:1rem;align-items:baseline;flex-wrap:wrap"><strong><?= h((string) ($dc['name'] ?? '')) ?></strong><span class="meta"><?= (int) ($dc['topic_count'] ?? 0) ?> <?= ((int) ($dc['topic_count'] ?? 0) === 1 ? 'topic' : 'topics') ?></span></div>
+                <div class="meta" style="margin-top:.3rem"><?= h((string) ($dc['description'] ?? '')) ?></div>
+              </a>
+            <?php endforeach; ?>
+          </section>
+        <?php endif; ?>
+
+      <?php elseif ($view === 'notices'): ?>
         <?php $noticeRows = ap_notices_list($vaakActorKey === 'cmdr_nova', 100); ?>
         <?php if ($vaakActorKey === 'cmdr_nova'): ?>
           <section class="side-card" style="margin-bottom:1rem">
