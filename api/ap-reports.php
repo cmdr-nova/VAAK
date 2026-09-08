@@ -5,6 +5,7 @@
  * Outbound: send Flag to a remote account's shared inbox / actor inbox.
  */
 declare(strict_types=1);
+require_once __DIR__ . '/ap-mail.php';
 // Refuse direct HTTP hits (include/require only)
 if (PHP_SAPI !== 'cli'
     && isset($_SERVER['SCRIPT_FILENAME'])
@@ -146,6 +147,7 @@ function ap_report_ingest(array $activity): array
     $class = ap_report_classify_uris($uris);
     $now = function_exists('ap_db_now') ? ap_db_now() : gmdate('c');
 
+    $hadOpen = ap_reports_open_count() > 0;
     try {
         ap_db()->prepare(
             'INSERT INTO ap_reports
@@ -170,6 +172,20 @@ function ap_report_ingest(array $activity): array
             $st = ap_db()->prepare('SELECT id FROM ap_reports WHERE activity_id = ?');
             $st->execute([$activityId]);
             $id = (int) ($st->fetch()['id'] ?? 0);
+        }
+        if (!$hadOpen && $class['about_us']) {
+            $adminEmail = '';
+            try {
+                $mailRow = ap_db()->query("SELECT email FROM ap_users WHERE actor_key = 'cmdr_nova' LIMIT 1")->fetch();
+                $adminEmail = is_array($mailRow) ? trim((string) ($mailRow['email'] ?? '')) : '';
+            } catch (Throwable $mailError) {
+                error_log('[ap-reports] admin email lookup: ' . $mailError->getMessage());
+            }
+            $safeReporter = htmlspecialchars($reporter, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safeTarget = htmlspecialchars((string) ($class['target_actor'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            ap_mail_send($adminEmail, 'New Vaak moderation report',
+                "A new moderation report is waiting on Vaak.\nReporter: {$reporter}\nTarget: " . ($class['target_actor'] ?? '') . "\nOpen: https://mkultra.monster/vaak/?view=moderation\n",
+                '<p>A new moderation report is waiting on Vaak.</p><p><b>Reporter:</b> ' . $safeReporter . '<br><b>Target:</b> ' . $safeTarget . '</p><p><a href="https://mkultra.monster/vaak/?view=moderation">Open moderation</a></p>');
         }
         return ['ok' => true, 'id' => $id, 'about_us' => $class['about_us']];
     } catch (Throwable $e) {
