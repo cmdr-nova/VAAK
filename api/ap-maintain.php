@@ -16,6 +16,7 @@
  *   15 5 * * 0 www-data php /srv/mkultra/html/api/ap-maintain.php --vacuum-only >> /var/log/mkultra/ap-maintain.log 2>&1
  *
  * Related (separate cron): ap-media-cleanup.php purges unused R2 avatar/header blobs (30d).
+ * Local post retention is opt-in per profile and disabled by default.
  */
 declare(strict_types=1);
 
@@ -79,6 +80,8 @@ $stats = [
     'emoji_deleted' => 0,
     'emoji_meta_deleted' => 0,
     'actors_deleted' => 0,
+    'retention_deleted' => 0,
+    'retention_errors' => 0,
     'link_previews_deleted' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
@@ -95,6 +98,94 @@ try {
     $isPostgres = ap_db_driver() === 'pgsql';
 
     if (!$vacuumOnly) {
+        // --- Optional per-account local post retention ---
+        // This is deliberately opt-in. Only notes under the enabled local
+        // actor's own /users/{key}/notes/ namespace are eligible.
+        try {
+            $profiles = $db->query(
+                "SELECT actor_key FROM actor_profile
+                 WHERE COALESCE(auto_delete_posts_7d, 0) = 1"
+            )->fetchAll() ?: [];
+            if ($profiles) {
+                require_once __DIR__ . '/ap-inbox.php';
+            }
+            $retentionCutoff = $nowUtc->modify('-7 days')->format('c');
+            foreach ($profiles as $profileRow) {
+                $actorKey = strtolower(trim((string) ($profileRow['actor_key'] ?? '')));
+                if ($actorKey === '' || !preg_match('/^[a-z0-9_]+$/', $actorKey)) {
+                    continue;
+                }
+                $actorId = 'https://mkultra.monster/users/' . $actorKey;
+                $stOld = $db->prepare(
+                    'SELECT local_id, note_id FROM masto_statuses
+                     WHERE note_id LIKE ? AND published < ?
+                     ORDER BY published ASC, local_id ASC LIMIT 50'
+                );
+                $stOld->execute([$actorId . '/notes/%', $retentionCutoff]);
+                $oldRows = $stOld->fetchAll() ?: [];
+                if (!$oldRows) {
+                    continue;
+                }
+                if ($dryRun) {
+                    $log("would_delete local_posts actor=$actorKey count=" . count($oldRows) . " older_than=$retentionCutoff");
+                    continue;
+                }
+                // Bind signing/delivery to the account being retained, not the
+                // default operator account, before federating Delete activities.
+                if (function_exists('ap_request_actor_set')) {
+                    ap_request_actor_set($actorKey);
+                }
+                foreach ($oldRows as $oldRow) {
+                    $mediaRows = [];
+                    try {
+                        $mediaSt = $db->prepare('SELECT local_id, s3_key FROM masto_media WHERE status_local_id = ?');
+                        $mediaSt->execute([(int) ($oldRow['local_id'] ?? 0)]);
+                        $mediaRows = $mediaSt->fetchAll() ?: [];
+                    } catch (Throwable $e) {
+                        $mediaRows = [];
+                    }
+                    $res = function_exists('ap_delete_local_status')
+                        ? ap_delete_local_status((int) ($oldRow['local_id'] ?? 0))
+                        : ['ok' => false, 'error' => 'Delete helper unavailable'];
+                    if (!empty($res['ok'])) {
+                        $stats['retention_deleted']++;
+                        foreach ($mediaRows as $mediaRow) {
+                            $mediaKey = (string) ($mediaRow['s3_key'] ?? '');
+                            if ($mediaKey !== '' && function_exists('ap_r2_delete_object')) {
+                                ap_r2_delete_object($mediaKey, true);
+                                // Video posters use the same key with a
+                                // -preview.jpg suffix and are safe to remove
+                                // only within the local-media prefix too.
+                                if (preg_match('/\.[a-z0-9]+$/i', $mediaKey)) {
+                                    $posterKey = preg_replace('/\.[a-z0-9]+$/i', '-preview.jpg', $mediaKey);
+                                    if (is_string($posterKey)) {
+                                        ap_r2_delete_object($posterKey, true);
+                                    }
+                                }
+                            }
+                            try {
+                                $db->prepare('DELETE FROM masto_media WHERE local_id = ?')->execute([(int) ($mediaRow['local_id'] ?? 0)]);
+                            } catch (Throwable $e) {
+                                $stats['retention_errors']++;
+                            }
+                        }
+                    } else {
+                        $stats['retention_errors']++;
+                        $log('local retention error actor=' . $actorKey . ': ' . (string) ($res['error'] ?? 'delete failed'));
+                    }
+                }
+                if (function_exists('ap_request_actor_set')) {
+                    ap_request_actor_set(null);
+                }
+            }
+            if ($profiles) {
+                $log('local post retention deleted=' . $stats['retention_deleted'] . ' errors=' . $stats['retention_errors']);
+            }
+        } catch (Throwable $e) {
+            $stats['retention_errors']++;
+            $log('local post retention error: ' . $e->getMessage());
+        }
+
         // --- Firehose / Home events retention ---
         $eventsCutoff = $nowUtc->modify('-' . $eventsDays . ' days')->format('c');
         $st = $db->prepare('SELECT COUNT(*) FROM events WHERE created_at < ?');

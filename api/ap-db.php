@@ -5,6 +5,21 @@
  */
 declare(strict_types=1);
 
+/**
+ * Runtime feature switches. Values come from the process environment so an
+ * expensive enrichment path can be disabled without changing database data.
+ * Names are normalized to VAAK_FEATURE_<NAME>.
+ */
+function ap_feature_enabled(string $name, bool $default = true): bool
+{
+    $key = 'VAAK_FEATURE_' . strtoupper(preg_replace('/[^A-Z0-9]+/i', '_', trim($name)) ?: 'UNKNOWN');
+    $raw = getenv($key);
+    if ($raw === false || trim((string) $raw) === '') {
+        return $default;
+    }
+    return !in_array(strtolower(trim((string) $raw)), ['0', 'false', 'off', 'no'], true);
+}
+
 const AP_DB_PATH = '/var/lib/mkultra/ap/ap.sqlite';
 
 /**
@@ -328,6 +343,14 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] auto-unblur profile column not provisioned: ' . $e->getMessage());
     }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'auto_delete_posts_7d'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_delete_posts_7d INTEGER NOT NULL DEFAULT 0');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] retention profile column not provisioned: ' . $e->getMessage());
+    }
 
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
@@ -525,6 +548,9 @@ SQL);
     }
     if (!in_array('auto_unblur_sensitive', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('auto_delete_posts_7d', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_delete_posts_7d INTEGER NOT NULL DEFAULT 0');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -1867,6 +1893,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'auto_follow_back' => false,
         'anti_ai_marker' => false,
         'auto_unblur_sensitive' => false,
+        'auto_delete_posts_7d' => false,
         'updated_at' => null,
     ];
 }
@@ -1936,6 +1963,9 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
             : false,
         'auto_unblur_sensitive' => array_key_exists('auto_unblur_sensitive', $row)
             ? !empty($row['auto_unblur_sensitive'])
+            : false,
+        'auto_delete_posts_7d' => array_key_exists('auto_delete_posts_7d', $row)
+            ? !empty($row['auto_delete_posts_7d'])
             : false,
         'updated_at' => $row['updated_at'] ?? null,
     ];
@@ -2019,7 +2049,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2151,10 +2181,13 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $autoUnblurSensitive = array_key_exists('auto_unblur_sensitive', $fields)
         ? (!empty($fields['auto_unblur_sensitive']) ? 1 : 0)
         : (!empty($existingProfile['auto_unblur_sensitive']) ? 1 : 0);
+    $autoDeletePosts7d = array_key_exists('auto_delete_posts_7d', $fields)
+        ? (!empty($fields['auto_delete_posts_7d']) ? 1 : 0)
+        : (!empty($existingProfile['auto_delete_posts_7d']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2169,6 +2202,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            auto_follow_back = excluded.auto_follow_back,
            anti_ai_marker = excluded.anti_ai_marker,
            auto_unblur_sensitive = excluded.auto_unblur_sensitive,
+           auto_delete_posts_7d = excluded.auto_delete_posts_7d,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2186,6 +2220,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $autoFollowBack,
         $antiAiMarker,
         $autoUnblurSensitive,
+        $autoDeletePosts7d,
         ap_db_now(),
     ]);
 
@@ -4699,7 +4734,7 @@ function ap_block_normalize_actor(string $raw): ?string
 function ap_block_upsert(string $scope, string $value, string $kind = 'block', ?string $reason = null): array
 {
     $scope = $scope === 'domain' ? 'domain' : 'actor';
-    $kind = $kind === 'suspend' ? 'suspend' : 'block';
+    $kind = in_array($kind, ['block', 'suspend', 'mute'], true) ? $kind : 'block';
     if ($scope === 'domain') {
         $norm = ap_block_normalize_domain($value);
         if ($norm === null) {
@@ -4729,7 +4764,7 @@ function ap_block_upsert(string $scope, string $value, string $kind = 'block', ?
     );
     $stmt->execute([$now, $now, $scope, $value, $kind, $reason, 'admin']);
     ap_block_cache_clear();
-    $side = ap_block_apply_side_effects($scope, $value);
+    $side = ap_block_apply_side_effects($scope, $value, $kind);
     $idRow = $db->prepare('SELECT id FROM ap_blocks WHERE scope = ? AND value = ?');
     $idRow->execute([$scope, $value]);
     $id = (int) ($idRow->fetch()['id'] ?? 0);
@@ -4782,7 +4817,7 @@ function ap_is_blocked_host(?string $host): bool
     }
     $host = strtolower($host);
     foreach (ap_block_list_cached() as $b) {
-        if (($b['scope'] ?? '') !== 'domain') {
+        if (($b['scope'] ?? '') !== 'domain' || ($b['kind'] ?? 'block') === 'mute') {
             continue;
         }
         $blocked = strtolower((string) ($b['value'] ?? ''));
@@ -4808,11 +4843,38 @@ function ap_is_blocked_actor(?string $actorId): bool
         return true;
     }
     foreach (ap_block_list_cached() as $b) {
-        if (($b['scope'] ?? '') !== 'actor') {
+        if (($b['scope'] ?? '') !== 'actor' || ($b['kind'] ?? 'block') === 'mute') {
             continue;
         }
         if (rtrim((string) $b['value'], '/') === $actorId) {
             return true;
+        }
+    }
+    return false;
+}
+
+/** True when an actor/domain is hidden from all local timelines, but still federates. */
+function ap_is_globally_muted_actor(?string $actorId, ?string $host = null): bool
+{
+    $actorId = $actorId !== null ? rtrim(trim($actorId), '/') : '';
+    $host = $host !== null ? strtolower(trim($host)) : '';
+    if ($host === '' && $actorId !== '') {
+        $parsed = parse_url($actorId, PHP_URL_HOST);
+        $host = is_string($parsed) ? strtolower($parsed) : '';
+    }
+    foreach (ap_block_list_cached() as $b) {
+        if (($b['kind'] ?? '') !== 'mute') {
+            continue;
+        }
+        if (($b['scope'] ?? '') === 'actor' && $actorId !== ''
+            && rtrim((string) ($b['value'] ?? ''), '/') === $actorId) {
+            return true;
+        }
+        if (($b['scope'] ?? '') === 'domain' && $host !== '') {
+            $domain = strtolower((string) ($b['value'] ?? ''));
+            if ($domain !== '' && ($host === $domain || str_ends_with($host, '.' . $domain))) {
+                return true;
+            }
         }
     }
     return false;
@@ -4832,7 +4894,7 @@ function ap_is_blocked_inbox(?string $inboxUrl): bool
  *
  * @return array{followers_removed:int,following_removed:int,mentions_hidden:int}
  */
-function ap_block_apply_side_effects(string $scope, string $value): array
+function ap_block_apply_side_effects(string $scope, string $value, string $kind = 'block'): array
 {
     $db = ap_db();
     $followers = 0;
@@ -4841,12 +4903,14 @@ function ap_block_apply_side_effects(string $scope, string $value): array
     $now = ap_db_now();
 
     if ($scope === 'domain') {
-        $st = $db->prepare('DELETE FROM followers WHERE host = ? OR host LIKE ?');
-        $st->execute([$value, '%.' . $value]);
-        $followers = $st->rowCount();
-        $st = $db->prepare('DELETE FROM following WHERE host = ? OR host LIKE ?');
-        $st->execute([$value, '%.' . $value]);
-        $following = $st->rowCount();
+        if ($kind !== 'mute') {
+            $st = $db->prepare('DELETE FROM followers WHERE host = ? OR host LIKE ?');
+            $st->execute([$value, '%.' . $value]);
+            $followers = $st->rowCount();
+            $st = $db->prepare('DELETE FROM following WHERE host = ? OR host LIKE ?');
+            $st->execute([$value, '%.' . $value]);
+            $following = $st->rowCount();
+        }
         // Exact host + subdomains
         $st = $db->prepare(
             "UPDATE mentions SET deleted_at = ? WHERE deleted_at IS NULL
@@ -4855,15 +4919,17 @@ function ap_block_apply_side_effects(string $scope, string $value): array
         $st->execute([$now, 'https://' . $value . '/%', 'https://%.' . $value . '/%']);
         $mentions = $st->rowCount();
     } else {
-        $st = $db->prepare('DELETE FROM followers WHERE actor_id = ?');
-        $st->execute([$value]);
-        $followers = $st->rowCount();
-        // also try with/without trailing slash variance
         $alt = str_ends_with($value, '/') ? rtrim($value, '/') : ($value . '/');
-        $db->prepare('DELETE FROM followers WHERE actor_id = ?')->execute([$alt]);
-        $st = $db->prepare('DELETE FROM following WHERE actor_id = ? OR actor_id = ?');
-        $st->execute([$value, $alt]);
-        $following = $st->rowCount();
+        if ($kind !== 'mute') {
+            $st = $db->prepare('DELETE FROM followers WHERE actor_id = ?');
+            $st->execute([$value]);
+            $followers = $st->rowCount();
+            // also try with/without trailing slash variance
+            $db->prepare('DELETE FROM followers WHERE actor_id = ?')->execute([$alt]);
+            $st = $db->prepare('DELETE FROM following WHERE actor_id = ? OR actor_id = ?');
+            $st->execute([$value, $alt]);
+            $following = $st->rowCount();
+        }
         $st = $db->prepare(
             'UPDATE mentions SET deleted_at = ? WHERE deleted_at IS NULL AND (actor_id = ? OR actor_id = ?)'
         );
@@ -5034,6 +5100,40 @@ function ap_bridgy_bsky_profile_web_url(string $actorId, ?string $username = nul
     }
     // did:plc:… — keep colons (bsky.app expects them unencoded)
     return 'https://bsky.app/profile/' . $did;
+}
+
+/**
+ * Return the Bluesky handle associated with a local profile, when known.
+ * This is intentionally conservative: the HTML profile uses it only for an
+ * additive, client-side count lookup and falls back to local AP counts.
+ */
+function ap_profile_bsky_handle(string $actorKey, array $profile = []): ?string
+{
+    $actorKey = strtolower(trim($actorKey));
+    // Bridgy's current Bluesky identity for the primary local account.
+    if ($actorKey === 'cmdr_nova') {
+        return 'cmdr-nova.mkultra.monster.ap.brid.gy';
+    }
+    $attachments = is_array($profile['attachment'] ?? null) ? $profile['attachment'] : [];
+    foreach ($attachments as $att) {
+        if (!is_array($att)) {
+            continue;
+        }
+        $value = trim((string) ($att['value'] ?? ''));
+        if ($value === '') {
+            continue;
+        }
+        if (preg_match('#(?:https?://)?(?:www\.)?bsky\.app/profile/([^/?#\s]+)#i', $value, $m)) {
+            $handle = trim($m[1]);
+            if ($handle !== '' && !str_starts_with(strtolower($handle), 'did:')) {
+                return $handle;
+            }
+        }
+        if (preg_match('/@([a-z0-9][a-z0-9.-]*\.[a-z]{2,})/i', $value, $m)) {
+            return strtolower($m[1]);
+        }
+    }
+    return null;
 }
 
 /**
@@ -6062,6 +6162,9 @@ function ap_user_block_remove(int $ownerUserId, int $id): array
 function ap_row_is_hidden(?string $actorId, ?string $host = null, ?int $ownerUserId = null): bool
 {
     if (ap_row_is_blocked($actorId, $host)) {
+        return true;
+    }
+    if (ap_is_globally_muted_actor($actorId, $host)) {
         return true;
     }
     if ($ownerUserId === null || $ownerUserId < 1) {

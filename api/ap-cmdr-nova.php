@@ -752,6 +752,11 @@ function ap_cmdr_shell_start(string $title): void
       .media-row.media-count-1 .note-media-trigger{height:auto}
       .media-row.media-count-1 img,.media-row.media-count-1 .thumb{height:auto;object-fit:contain;max-height:min(62vh,560px);min-height:0;background:transparent}
       .media-row video,.media-row .media-video{object-fit:contain;max-height:min(62vh,560px);background:#000;cursor:default}
+      .media-audio-card{position:relative;display:flex;align-items:flex-end;min-height:220px;overflow:hidden;background:#050505}
+      .media-audio-art{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.72}
+      .media-audio-card::after{content:"";position:absolute;inset:35% 0 0;background:linear-gradient(transparent,rgba(0,0,0,.86));pointer-events:none}
+      .media-audio{position:relative;z-index:1;width:calc(100% - 1.5rem);margin:.75rem}
+      .audio-thumb{object-fit:cover !important}
       .post .thumb{margin-top:.55rem;max-width:100%;max-height:min(62vh,560px);width:100%;border-radius:12px;border:1px solid #333;object-fit:contain;display:block;background:#0a0a0a}
       .post video.thumb{width:100%;max-height:min(62vh,560px);object-fit:contain;background:#0a0a0a}
       .pager{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:.45rem;margin-top:1.35rem;padding-top:1rem;border-top:1px solid #2a2a2a}
@@ -1043,6 +1048,25 @@ function ap_cmdr_note_html(array $row, array $create): void
             $mt = strtolower((string) ($att['mediaType'] ?? ''));
             $atype = (string) ($att['type'] ?? '');
             $safe = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
+            $thumb = $att['thumbnail'] ?? ($att['preview'] ?? null);
+            $poster = is_string($thumb)
+                ? $thumb
+                : (is_array($thumb) ? (string) ($thumb['url'] ?? $thumb['href'] ?? '') : '');
+            $safePoster = str_starts_with($poster, 'https://')
+                ? htmlspecialchars($poster, ENT_QUOTES, 'UTF-8')
+                : '';
+            if ($safePoster === '') {
+                try {
+                    $pst = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
+                    $pst->execute([$url]);
+                    $dbPoster = $pst->fetchColumn();
+                    if (is_string($dbPoster) && str_starts_with($dbPoster, 'https://')) {
+                        $safePoster = htmlspecialchars($dbPoster, ENT_QUOTES, 'UTF-8');
+                    }
+                } catch (Throwable $e) {
+                    // Legacy or remote attachments may not have a local poster row.
+                }
+            }
             $altRaw = (string) ($att['name'] ?? $att['summary'] ?? '');
             $alt = htmlspecialchars($altRaw, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
             $isVideo = str_starts_with($mt, 'video/') || $atype === 'Video'
@@ -1055,10 +1079,17 @@ function ap_cmdr_note_html(array $row, array $create): void
                     $mediaAlts[] = 'Alt: ' . $alt;
                 }
             } elseif ($isVideo) {
-                $mediaCells[] = '<video class="media-video" src="' . $safe . '" controls playsinline preload="metadata" referrerpolicy="no-referrer"></video>';
+                $mediaCells[] = '<video class="media-video" src="' . $safe . '" controls loop playsinline preload="metadata"'
+                    . ($safePoster !== '' ? ' poster="' . $safePoster . '"' : '')
+                    . ' referrerpolicy="no-referrer"></video>';
                 if ($altRaw !== '') {
                     $mediaAlts[] = $alt;
                 }
+            } elseif (str_starts_with($mt, 'audio/') || $atype === 'Audio') {
+                $mediaCells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
+                    . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
+                    . '<audio class="media-audio" src="' . $safe . '" controls preload="auto"></audio>'
+                    . '</div>';
             } else {
                 $mediaHtml .= '<p class="media"><a href="' . $safe . '" target="_blank" rel="noopener">' . ($alt !== '' ? $alt : $safe) . '</a></p>';
             }
@@ -1344,6 +1375,9 @@ function ap_cmdr_html(): void
         ? ap_featured_cards_for_actor_key('cmdr_nova')
         : [];
     $featuredCount = count($featuredCards);
+    $bskyHandle = function_exists('ap_profile_bsky_handle')
+        ? ap_profile_bsky_handle('cmdr_nova', $p)
+        : null;
     // HTML profile feed = site blogs + notes + AP compose (no federation side effects).
     // Featured tab still needs post counts for the other tab badges.
     $feedTab = $tab === 'featured' ? 'posts' : $tab;
@@ -1355,9 +1389,14 @@ function ap_cmdr_html(): void
 
     echo '<div class="stats">';
     echo '<div><span class="n">' . $statPosts . '</span><span class="l">Posts</span></div>';
-    echo '<a href="/users/cmdr_nova/following"><span class="n">' . (int) $followingCount . '</span><span class="l">Following</span></a>';
-    echo '<a href="/users/cmdr_nova/followers"><span class="n">' . (int) $followerCount . '</span><span class="l">Followers</span></a>';
+    $bskyAttr = $bskyHandle !== null ? ' data-bsky-handle="' . htmlspecialchars($bskyHandle, ENT_QUOTES, 'UTF-8') . '"' : '';
+    $bskyTitle = $bskyHandle !== null ? ' title="Includes local and Bluesky counts"' : '';
+    echo '<a href="/users/cmdr_nova/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $followingCount . '</span><span class="l">Following</span></a>';
+    echo '<a href="/users/cmdr_nova/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $followerCount . '</span><span class="l">Followers</span></a>';
     echo '</div>';
+    if ($bskyHandle !== null) {
+        echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
+    }
 
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
@@ -2097,6 +2136,25 @@ function ap_cmdr_post_preview_html(array $n): string
                     $mt = strtolower((string) ($att['mediaType'] ?? ''));
                     $atype = (string) ($att['type'] ?? '');
                     $safe = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
+                    $thumbUrl = $att['thumbnail'] ?? ($att['preview'] ?? null);
+                    $poster = is_string($thumbUrl)
+                        ? $thumbUrl
+                        : (is_array($thumbUrl) ? (string) ($thumbUrl['url'] ?? $thumbUrl['href'] ?? '') : '');
+                    $safePoster = str_starts_with($poster, 'https://')
+                        ? htmlspecialchars($poster, ENT_QUOTES, 'UTF-8')
+                        : '';
+                    if ($safePoster === '') {
+                        try {
+                            $pst = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
+                            $pst->execute([$url]);
+                            $dbPoster = $pst->fetchColumn();
+                            if (is_string($dbPoster) && str_starts_with($dbPoster, 'https://')) {
+                                $safePoster = htmlspecialchars($dbPoster, ENT_QUOTES, 'UTF-8');
+                            }
+                        } catch (Throwable $e) {
+                            // Legacy or remote attachments may not have a local poster row.
+                        }
+                    }
                     $alt = htmlspecialchars((string) ($att['name'] ?? $att['summary'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
                     $isVideo = str_starts_with($mt, 'video/') || $atype === 'Video'
                         || (bool) preg_match('/\.(mp4|webm|mov|m4v)(\?|$)/i', (string) (parse_url($url, PHP_URL_PATH) ?? ''));
@@ -2105,7 +2163,11 @@ function ap_cmdr_post_preview_html(array $n): string
                         $thumbCells[] = '<img class="thumb" src="' . $safe . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer">';
                     } elseif ($isVideo) {
                         // Preview inside the card link — muted, metadata only (full controls on note page)
-                        $thumbCells[] = '<video class="thumb" src="' . $safe . '" muted playsinline preload="metadata" referrerpolicy="no-referrer"></video>';
+                        $thumbCells[] = '<video class="thumb" src="' . $safe . '" muted playsinline preload="metadata"'
+                            . ($safePoster !== '' ? ' poster="' . $safePoster . '"' : '')
+                            . ' referrerpolicy="no-referrer"></video>';
+                    } elseif (str_starts_with($mt, 'audio/') || $atype === 'Audio') {
+                        $thumbCells[] = '<img class="thumb audio-thumb" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">';
                     }
                     if (count($thumbCells) >= 4) {
                         break;

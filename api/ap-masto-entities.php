@@ -674,6 +674,9 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
     }
     if ($attachQuote) {
         // Timelines: cache-only quotes (no sync HTTP). Detail views may pass allowQuoteFetch.
+        if ($allowQuoteFetch && function_exists('ap_feature_enabled')) {
+            $allowQuoteFetch = ap_feature_enabled('detail_quote_hydration', true);
+        }
         $quote = ap_masto_quote_entity($quoteObjectUrl, 0, $allowQuoteFetch);
         if ($quote !== null) {
             $status['quote'] = $quote;
@@ -959,10 +962,13 @@ function ap_masto_status_from_as2_note(array $note, string $fallbackUrl): ?array
             }
             $i++;
             $mt = strtolower((string) ($att['mediaType'] ?? ''));
-            $type = str_starts_with($mt, 'video/') ? 'video' : 'image';
+            $type = str_starts_with($mt, 'video/')
+                ? 'video'
+                : (str_starts_with($mt, 'audio/') ? 'audio' : 'image');
             $media[] = [
                 'id' => ap_masto_synthetic_object_status_id($objectUrl) . $i,
                 'type' => $type,
+                'mediaType' => $mt !== '' ? $mt : null,
                 'url' => $u,
                 'preview_url' => $u,
                 'remote_url' => $u,
@@ -4440,7 +4446,8 @@ function ap_masto_status_from_event(array $row): ?array
     $inReplyToUrl = rtrim((string) ($row['in_reply_to'] ?? ''), '/');
     if ($inReplyToUrl !== '' && str_starts_with($inReplyToUrl, 'https://')) {
         // Optionally fetch missing parent (detail/context paths set _fetch_reply_parent)
-        if (!empty($row['_fetch_reply_parent'])) {
+        if (!empty($row['_fetch_reply_parent'])
+            && (!function_exists('ap_feature_enabled') || ap_feature_enabled('detail_parent_hydration', true))) {
             $parentPack = ap_masto_resolve_object_url_to_status_ref($inReplyToUrl);
             if ($parentPack === null) {
                 ap_masto_ensure_remote_note_event($inReplyToUrl);
@@ -4642,8 +4649,108 @@ function ap_masto_status_from_event(array $row): ?array
  * @param 'federated'|'home' $mode
  * @return list<array<string,mixed>>
  */
+/**
+ * Log only slow timeline stages. The timing call itself is cheap, while the
+ * threshold keeps normal request logs quiet and makes regressions visible.
+ */
+function ap_timeline_perf_log(string $stage, float $startedAt, array $fields = []): void
+{
+    $elapsedMs = (microtime(true) - $startedAt) * 1000.0;
+    if ($elapsedMs < 250.0) {
+        return;
+    }
+    $fields = ['ms' => round($elapsedMs, 1)] + $fields;
+    error_log('[vaak-timeline] ' . $stage . ' ' . (json_encode($fields, JSON_UNESCAPED_SLASHES) ?: '{}'));
+}
+
+/** Hide a timeline row when its visible actor or related original is hidden. */
+function ap_timeline_row_is_hidden(array $row, int $ownerUserId): bool
+{
+    $actor = (string) ($row['actor_id'] ?? '');
+    $host = $row['host'] ?? null;
+    $hidden = function_exists('ap_row_is_hidden')
+        ? ap_row_is_hidden($actor !== '' ? $actor : null, $host, $ownerUserId)
+        : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($actor !== '' ? $actor : null, $host));
+    if ($hidden) {
+        return true;
+    }
+    $type = strtolower((string) ($row['type'] ?? ''));
+    if ($type === 'announce') {
+        $original = function_exists('ap_masto_announce_original_actor')
+            ? ap_masto_announce_original_actor($row)
+            : null;
+        if (($original === null || $original === '') && !empty($row['target_actor'])) {
+            $original = (string) $row['target_actor'];
+        }
+        if (is_string($original) && $original !== '') {
+            return function_exists('ap_row_is_hidden')
+                ? ap_row_is_hidden($original, null, $ownerUserId)
+                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($original, null));
+        }
+    }
+    if (in_array($type, ['quote', 'quotepost'], true)
+        && function_exists('ap_quote_post_parent_url')
+        && function_exists('ap_masto_actor_url_from_object_url')) {
+        $parent = ap_quote_post_parent_url((string) ($row['object_id'] ?? ''));
+        $quotedActor = $parent !== null ? ap_masto_actor_url_from_object_url($parent) : null;
+        if (is_string($quotedActor) && $quotedActor !== '') {
+            return function_exists('ap_row_is_hidden')
+                ? ap_row_is_hidden($quotedActor, null, $ownerUserId)
+                : (function_exists('ap_row_is_blocked') && ap_row_is_blocked($quotedActor, null));
+        }
+    }
+    return false;
+}
+
+/**
+ * Optional lightweight diversity pass for discovery/federated views only.
+ * Home remains chronological. The switch is off by default until measured.
+ *
+ * @param list<array<string,mixed>> $statuses
+ * @return list<array<string,mixed>>
+ */
+function ap_timeline_author_diversity(array $statuses, int $limit): array
+{
+    if (!function_exists('ap_feature_enabled')
+        || !ap_feature_enabled('federated_author_diversity', false)
+        || count($statuses) < 2) {
+        return array_slice($statuses, 0, $limit);
+    }
+    $out = [];
+    $deferred = [];
+    $lastActor = '';
+    $run = 0;
+    foreach ($statuses as $status) {
+        $actor = (string) (($status['account']['id'] ?? '') ?: ($status['account']['acct'] ?? ''));
+        if ($actor !== '' && $actor === $lastActor && $run >= 3) {
+            $deferred[] = $status;
+            continue;
+        }
+        $out[] = $status;
+        if ($actor !== '' && $actor === $lastActor) {
+            $run++;
+        } else {
+            $lastActor = $actor;
+            $run = 1;
+        }
+        if (count($out) >= $limit) {
+            break;
+        }
+    }
+    if (count($out) < $limit) {
+        foreach ($deferred as $status) {
+            $out[] = $status;
+            if (count($out) >= $limit) {
+                break;
+            }
+        }
+    }
+    return $out;
+}
+
 function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId = null, ?string $sinceId = null, bool $onlyMedia = false): array
 {
+    $startedAt = microtime(true);
     $limit = max(1, min(80, $limit));
     $params = [];
     // Home includes Creates + Announces (boosts) from people we follow.
@@ -4761,31 +4868,21 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // Over-fetch ×2 (was ×4) — enough for block/dedupe without converting hundreds of rows.
     $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
         . ' ORDER BY created_at DESC, id DESC LIMIT ' . (int) max($limit * 2, $limit + 10);
+    $queryStartedAt = microtime(true);
     $st = ap_db()->prepare($sql);
     $st->execute($params);
     $out = [];
     $seenUri = [];
     $ownerUserId = ap_db_masto_owner_user_id();
-    foreach ($st->fetchAll() as $row) {
+    $rows = $st->fetchAll();
+    $hiddenCount = 0;
+    foreach ($rows as $row) {
         // Apply the authenticated user's personal blocks and mutes to both
         // sides of a boost: the booster and the original author. This mirrors
         // Mastodon timeline behavior and prevents blocked originals returning
         // through someone else's Announce.
-        $rowActor = (string) ($row['actor_id'] ?? '');
-        $hidden = function_exists('ap_row_is_hidden')
-            && ap_row_is_hidden($rowActor, (string) ($row['host'] ?? ''), $ownerUserId);
-        if (!$hidden && strtolower((string) ($row['type'] ?? '')) === 'announce') {
-            $originalActor = function_exists('ap_masto_announce_original_actor')
-                ? ap_masto_announce_original_actor($row)
-                : null;
-            if ((!is_string($originalActor) || $originalActor === '') && !empty($row['target_actor'])) {
-                $originalActor = (string) $row['target_actor'];
-            }
-            if (is_string($originalActor) && $originalActor !== '') {
-                $hidden = ap_row_is_hidden($originalActor, null, $ownerUserId);
-            }
-        }
-        if ($hidden) {
+        if (ap_timeline_row_is_hidden($row, $ownerUserId)) {
+            $hiddenCount++;
             continue;
         }
         $status = ap_masto_status_from_event($row);
@@ -4803,9 +4900,20 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
             $seenUri[$uriKey] = true;
         }
         $out[] = $status;
-        if (count($out) >= $limit) {
+        // Keep a small overflow for the optional federated diversity pass.
+        if (count($out) >= ($mode === 'home' ? $limit : $limit * 2)) {
             break;
         }
+    }
+    ap_timeline_perf_log('events', $startedAt, [
+        'mode' => $mode,
+        'query_ms' => round((microtime(true) - $queryStartedAt) * 1000.0, 1),
+        'fetched' => count($rows),
+        'hidden' => $hiddenCount,
+        'returned' => count($out),
+    ]);
+    if ($mode !== 'home') {
+        $out = ap_timeline_author_diversity($out, $limit);
     }
     return $out;
 }
@@ -4996,6 +5104,7 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
  */
 function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?string $sinceId = null): array
 {
+    $startedAt = microtime(true);
     $limit = max(1, min(80, $limit));
 
     // Translate Mastodon max_id/since_id into time bounds (our ids are not snowflakes).
@@ -5168,6 +5277,14 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
             break;
         }
     }
+    ap_timeline_perf_log('home-merge', $startedAt, [
+        'limit' => $limit,
+        'remote' => count($remote),
+        'local' => count($local),
+        'boosts' => count($boosts),
+        'tags' => count($tagPosts),
+        'returned' => count($out),
+    ]);
     return $out;
 }
 

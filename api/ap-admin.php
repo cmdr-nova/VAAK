@@ -1139,6 +1139,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'auto_follow_back' => !empty($_POST['auto_follow_back']),
                 'anti_ai_marker' => !empty($_POST['anti_ai_marker']),
                 'auto_unblur_sensitive' => !empty($_POST['auto_unblur_sensitive']),
+                'auto_delete_posts_7d' => !empty($_POST['auto_delete_posts_7d']),
             ], $vaakActorKey);
             if (empty($saved['ok'])) {
                 $error = $saved['error'] ?? 'Profile save failed.';
@@ -1149,7 +1150,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
                 require_once __DIR__ . '/ap-inbox.php';
                 $fan = function_exists('ap_publish_profile_update')
-                    ? ap_publish_profile_update($vaakActorKey)
+                    ? ap_publish_profile_update($vaakActorKey, true)
                     : ap_cmdr_publish_profile_update($vaakActorKey);
                 $notice = 'Profile saved.';
                 if (!empty($_POST['vanity_verified'])) {
@@ -1167,7 +1168,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($verCount > 0) {
                     $notice .= ' ' . $verCount . ' field' . ($verCount === 1 ? '' : 's') . ' verified (rel=me).';
                 }
-                if (!empty($fan['ok'])) {
+                if (!empty($fan['queued'])) {
+                    $notice .= ' Update queued for background delivery to ' . (int) $fan['queued'] . ' inbox(es).';
+                } elseif (!empty($fan['ok'])) {
                     $notice .= ' Update delivered to ' . (int) ($fan['delivered'] ?? 0) . ' inbox(es).';
                 } else {
                     $notice .= ' (follower Update skipped: ' . ($fan['error'] ?? 'unknown') . ')';
@@ -1335,7 +1338,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
         }
     } elseif ($action === 'suggestion_follow' || $action === 'suggestion_dismiss') {
-        $view = 'foryou';
+        $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $actor = trim((string) ($_POST['actor_id'] ?? ''));
         if ($action === 'suggestion_dismiss') {
             ap_masto_suggestion_dismiss($actor);
@@ -1675,7 +1678,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
     } elseif ($action === 'block_add' || $action === 'block_actor' || $action === 'block_domain') {
         $view = preg_replace('/[^a-z]/', '', (string) ($_POST['return_view'] ?? 'blocks')) ?: 'blocks';
-        $kind = (($_POST['kind'] ?? '') === 'suspend') ? 'suspend' : 'block';
+        $postedKind = (string) ($_POST['kind'] ?? 'block');
+        $kind = in_array($postedKind, ['block', 'suspend', 'mute'], true) ? $postedKind : 'block';
         $reason = trim((string) ($_POST['reason'] ?? ''));
         $result = null;
 
@@ -1708,7 +1712,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } else {
             // block_add: auto-detect domain vs actor/handle
             $input = trim((string) ($_POST['target'] ?? ''));
-            $kind = (($_POST['kind'] ?? '') === 'suspend') ? 'suspend' : 'block';
+            $postedKind = (string) ($_POST['kind'] ?? 'block');
+            $kind = in_array($postedKind, ['block', 'suspend', 'mute'], true) ? $postedKind : 'block';
             if ($input === '') {
                 $error = 'Enter a domain (example.com) or @user@host / actor URL.';
             } elseif (str_starts_with($input, 'https://') || str_starts_with($input, '@') || str_contains($input, '@')) {
@@ -1746,7 +1751,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         if ($result !== null) {
             if (!empty($result['ok'])) {
                 $side = $result['side_effects'] ?? [];
-                $notice = ucfirst($kind) . 'ed ' . ($result['scope'] ?? '') . ' ' . ($result['value'] ?? '')
+                $verb = $kind === 'mute' ? 'Muted' : ucfirst($kind) . 'ed';
+                $notice = $verb . ' ' . ($result['scope'] ?? '') . ' ' . ($result['value'] ?? '')
                     . ' · removed followers ' . (int) ($side['followers_removed'] ?? 0)
                     . ', following ' . (int) ($side['following_removed'] ?? 0)
                     . ', hid mentions ' . (int) ($side['mentions_hidden'] ?? 0);
@@ -1763,7 +1769,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } else {
             $removed = ap_block_remove($id);
             if (!empty($removed['ok'])) {
-                $notice = 'Unblocked ' . ($removed['scope'] ?? '') . ' '
+                $notice = 'Removed server-wide control for ' . ($removed['scope'] ?? '') . ' '
                     . ($removed['value'] ?? ('#' . $id))
                     . ' · restored mentions ' . (int) ($removed['mentions_restored'] ?? 0)
                     . ' (follows are not auto-restored — re-follow if you want them back).';
@@ -2554,7 +2560,7 @@ $db = ap_db();
 $since24 = gmdate('c', time() - 86400);
 $since7 = gmdate('c', time() - 7 * 86400);
 
-$tlLimit = isset($_GET['limit']) ? (int) $_GET['limit'] : (($view ?? '') === 'gallery' ? 16 : 15);
+$tlLimit = isset($_GET['limit']) ? (int) $_GET['limit'] : (in_array(($view ?? ''), ['gallery', 'vakktok'], true) ? 16 : 15);
 $tlLimit = max(1, min(40, $tlLimit));
 $tlOffset = isset($_GET['offset']) ? max(0, (int) $_GET['offset']) : 0;
 $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
@@ -2562,7 +2568,7 @@ $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
 $wantNewerPoll = $isPartial
     && isset($_GET['newer'])
     && (string) $_GET['newer'] === '1'
-    && in_array($view, ['home', 'feed', 'local', 'gallery'], true);
+    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true);
 
 // Cheap topbar counts (retry on lock). Skip on infinite-scroll partials.
 $total24 = 0;
@@ -2800,7 +2806,7 @@ if ($hydrateBoost) {
 $adminTlCacheKey = '';
 $adminTlRankedCached = null;
 $adminTlFromCache = false;
-if (!$wantNewerPoll && $isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true) && $tlOffset > 0) {
+if (!$wantNewerPoll && $isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true) && $tlOffset > 0) {
     $adminTlCacheKey = admin_tl_cache_key($view, $following);
     $adminTlRankedCached = admin_tl_cache_get($adminTlCacheKey);
     $adminTlFromCache = is_array($adminTlRankedCached);
@@ -2812,8 +2818,8 @@ $outbox = [];
 $GLOBALS['admin_masto_by_note'] = [];
 $needOutboxBuild = !$wantNewerPoll && !$adminTlFromCache && (
     in_array($view, ['outbox', 'queue'], true)
-    || in_array($view, ['home', 'feed', 'local', 'gallery'], true)
-    || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true))
+    || in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
+    || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true))
 );
 if ($needOutboxBuild) {
     $outbox = ap_outbox_list(40, $vaakActorKey);
@@ -2931,12 +2937,14 @@ function admin_tl_cache_key(string $view, array $following): string
         $view = 'local';
     } elseif ($view === 'gallery') {
         $view = 'gallery';
+    } elseif ($view === 'vakktok') {
+        $view = 'vakktok';
     } else {
         $view = 'home';
     }
     $parts = [];
-    // Local + Gallery are follow-set independent (instance / media firehose).
-    if ($view !== 'local' && $view !== 'gallery') {
+    // Local, Gallery, and VakkTok are follow-set independent (instance/media firehose).
+    if ($view !== 'local' && $view !== 'gallery' && $view !== 'vakktok') {
         foreach ($following as $f) {
             $aid = rtrim((string) ($f['actor_id'] ?? ''), '/');
             if ($aid !== '') {
@@ -3063,6 +3071,9 @@ function admin_timeline_item_muted_by_words(array $item): bool
 /** Hide a timeline row when either its visible actor or boosted original is blocked. */
 function admin_timeline_row_hidden(array $row, int $ownerUserId): bool
 {
+    if (function_exists('ap_timeline_row_is_hidden')) {
+        return ap_timeline_row_is_hidden($row, $ownerUserId);
+    }
     $actor = (string) ($row['actor_id'] ?? '');
     $host = $row['host'] ?? null;
     if (function_exists('ap_row_is_hidden')
@@ -3340,7 +3351,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         return $added === [] ? null : array_merge($ranked, $added);
     }
 
-    if ($view === 'gallery') {
+    if ($view === 'gallery' || $view === 'vakktok') {
         try {
             $st = $db->prepare(
                 "SELECT * FROM events
@@ -4062,7 +4073,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
 
 // Gallery: media-only posts (federated Creates with attachments + local outbox with media).
 $galleryTimeline = [];
-if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'gallery' || ($isPartial && $view === 'gallery'))) {
+$GLOBALS['admin_vakktok_mode'] = ($view === 'vakktok');
+if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakktok'], true)) {
     $galOwnerId = admin_owner_user_id();
     $galSeen = [];
     try {
@@ -4089,6 +4101,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'gallery' || ($isPartial
                 continue;
             }
             if (!admin_gallery_event_has_media($e)) {
+                continue;
+            }
+            if ($view === 'vakktok' && (!admin_vakktok_item_has_video(['row' => $e]) || admin_vakktok_item_is_sensitive(['row' => $e]))) {
                 continue;
             }
             $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
@@ -4132,6 +4147,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'gallery' || ($isPartial
             if (!admin_gallery_outbox_has_media($n)) {
                 continue;
             }
+            if ($view === 'vakktok' && admin_vakktok_item_is_sensitive(['kind' => 'outbox', 'row' => $n])) {
+                continue;
+            }
             $galSeen[$nid] = true;
             $item = [
                 'kind' => 'outbox',
@@ -4148,7 +4166,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'gallery' || ($isPartial
     }
     usort($galleryTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     if ($galleryTimeline !== []) {
-        $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('gallery', $following);
+        $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key($view, $following);
         admin_tl_cache_put($ck, admin_tl_rank_from_timeline($galleryTimeline));
     }
 }
@@ -4219,6 +4237,41 @@ if ($prefillDraftId > 0 && $prefillEditNote === '') {
         $composerForceOpen = true;
     } else {
         $prefillDraftId = 0;
+    }
+}
+// Replies inherit the parent's content-warning state. This lookup is local
+// and keeps the composer fields correct before the reply is submitted.
+if ($prefillReplyTo !== '' && $prefillEditNote === '' && $prefillDraftId <= 0) {
+    try {
+        $parentUri = rtrim($prefillReplyTo, '/');
+        $parentRow = null;
+        $pst = ap_db()->prepare(
+            'SELECT spoiler_text, sensitive FROM masto_statuses
+             WHERE note_id = ? OR note_id = ? LIMIT 1'
+        );
+        $pst->execute([$parentUri, $parentUri . '/']);
+        $parentRow = $pst->fetch();
+        if (!is_array($parentRow)) {
+            $pst = ap_db()->prepare(
+                'SELECT spoiler_text, sensitive FROM events
+                 WHERE object_id = ? OR object_id = ?
+                 ORDER BY id DESC LIMIT 1'
+            );
+            $pst->execute([$parentUri, $parentUri . '/']);
+            $parentRow = $pst->fetch();
+        }
+        if (is_array($parentRow)) {
+            $parentSpoiler = trim((string) ($parentRow['spoiler_text'] ?? ''));
+            $parentSensitive = !empty($parentRow['sensitive']) || $parentSpoiler !== '';
+            if ($parentSpoiler !== '') {
+                $prefillEditSpoiler = $parentSpoiler;
+            }
+            if ($parentSensitive) {
+                $prefillEditSensitive = true;
+            }
+        }
+    } catch (Throwable $e) {
+        // A missing cache row should not prevent opening the composer.
     }
 }
 $autoOpenComposer = $composerForceOpen
@@ -4411,6 +4464,16 @@ function admin_media_is_video(string $url, ?string $mediaType = null): bool
     }
     $path = (string) (parse_url($url, PHP_URL_PATH) ?? '');
     return (bool) preg_match('/\.(mp4|webm|mov|m4v)(\?|$)/i', $path);
+}
+
+function admin_media_is_audio(string $url, ?string $mediaType = null): bool
+{
+    $mt = strtolower(trim((string) $mediaType));
+    if (str_starts_with($mt, 'audio/')) {
+        return true;
+    }
+    $path = (string) (parse_url($url, PHP_URL_PATH) ?? '');
+    return (bool) preg_match('/\.(mp3|m4a|aac|ogg|oga|wav|flac|webm)(\?|$)/i', $path);
 }
 
 /**
@@ -4612,8 +4675,9 @@ function admin_gallery_normalize_media_list(array $items): array
             continue;
         }
         $isVideo = admin_media_is_video($url, $mt);
-        // Keep Gallery image-focused and cheap; videos remain available from the post detail.
-        if ($isVideo) {
+        // Gallery stays image-focused; VakkTok opts into the same source rows
+        // but keeps only video cells at render time.
+        if ($isVideo && empty($GLOBALS['admin_vakktok_mode'])) {
             continue;
         }
         // Gallery prefers visual media; skip obvious non-image docs
@@ -4711,6 +4775,64 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
     <?php
 }
 
+/** Render one full-screen, video-only VakkTok item. */
+function admin_vakktok_item_has_video(array $item): bool
+{
+    foreach (admin_gallery_item_media($item) as $media) {
+        if (!empty($media['is_video'])) return true;
+    }
+    return false;
+}
+
+/** VakkTok intentionally omits sensitive/CW media from its autoplay reel. */
+function admin_vakktok_item_is_sensitive(array $item): bool
+{
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if (!empty($row['sensitive']) || trim((string) ($row['spoiler_text'] ?? '')) !== '') {
+        return true;
+    }
+    if (($item['kind'] ?? '') === 'outbox') {
+        $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+        $obj = is_array($raw['object'] ?? null) ? $raw['object'] : $raw;
+        if (is_array($obj) && (!empty($obj['sensitive']) || trim((string) ($obj['summary'] ?? $obj['contentWarning'] ?? '')) !== '')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function admin_render_vakktok_cell(array $item): void
+{
+    $media = admin_gallery_item_media($item);
+    $video = null;
+    foreach ($media as $candidate) {
+        if (!empty($candidate['is_video'])) {
+            $video = $candidate;
+            break;
+        }
+    }
+    if (!is_array($video) || empty($video['url'])) {
+        return;
+    }
+    $url = (string) $video['url'];
+    $poster = '';
+    try {
+        $st = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
+        $st->execute([$url]);
+        $poster = (string) ($st->fetchColumn() ?: '');
+    } catch (Throwable $e) {
+        // Remote videos may not have a local poster.
+    }
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    echo '<article class="vakktok-item" data-vakktok-video="1">';
+    echo '<video class="vakktok-video" controls loop playsinline preload="metadata" src="' . h($url) . '"';
+    if (str_starts_with($poster, 'https://')) {
+        echo ' poster="' . h($poster) . '"';
+    }
+    echo '></video>';
+    echo '</article>';
+}
+
 function admin_media_row_html(array $items, string $hint = ''): string
 {
     if (!$items) {
@@ -4728,16 +4850,38 @@ function admin_media_row_html(array $items, string $hint = ''): string
         } elseif (is_array($item)) {
             $url = (string) ($item['url'] ?? $item['preview_url'] ?? '');
             $mt = isset($item['mediaType']) ? (string) $item['mediaType'] : null;
+            if ($mt === null && strtolower((string) ($item['type'] ?? '')) === 'audio') {
+                $mt = 'audio/*';
+            }
             $preview = (string) ($item['preview_url'] ?? $item['poster'] ?? '');
         }
         if ($url === '' || !str_starts_with($url, 'https://')) {
             continue;
         }
+        // Older cached event/attachment payloads only kept the media URL.
+        // Recover locally generated video posters from the authoritative media row.
+        if ($preview === '') {
+            try {
+                $pst = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
+                $pst->execute([$url]);
+                $dbPreview = $pst->fetchColumn();
+                if (is_string($dbPreview) && str_starts_with($dbPreview, 'https://')) {
+                    $preview = $dbPreview;
+                }
+            } catch (Throwable $e) {
+                // Remote media and older schemas simply have no local poster row.
+            }
+        }
         if (admin_media_is_video($url, $mt)) {
             $hasVideo = true;
-            $cells[] = '<video class="media-video" src="' . h($url) . '" controls playsinline preload="none"'
+            $cells[] = '<video class="media-video" src="' . h($url) . '" controls loop playsinline preload="none"'
                 . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
+        } elseif (admin_media_is_audio($url, $mt)) {
+            $cells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
+                . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
+                . '<audio class="media-audio" src="' . h($url) . '" controls preload="auto"></audio>'
+                . '</div>';
         } else {
             $hasImage = true;
             $cells[] = '<button type="button" class="media-lightbox-trigger" data-full="' . h($url) . '" title="View image">'
@@ -5717,6 +5861,41 @@ function admin_is_home_instance_host(?string $host): bool
     return $host === 'mkultra.monster' || str_ends_with($host, '.mkultra.monster');
 }
 
+/** Return the current server-wide actor control without querying per menu item. */
+function admin_global_actor_control(string $actorId): ?array
+{
+    static $controls = null;
+    if ($controls === null) {
+        $controls = [];
+        foreach (function_exists('ap_block_list') ? ap_block_list() : [] as $row) {
+            if (($row['scope'] ?? '') === 'actor') {
+                $controls[rtrim((string) ($row['value'] ?? ''), '/')] = $row;
+            }
+        }
+    }
+    $key = rtrim($actorId, '/');
+    return $key !== '' && isset($controls[$key]) && is_array($controls[$key])
+        ? $controls[$key]
+        : null;
+}
+
+function admin_global_domain_control(string $host): ?array
+{
+    static $controls = null;
+    if ($controls === null) {
+        $controls = [];
+        foreach (function_exists('ap_block_list') ? ap_block_list() : [] as $row) {
+            if (($row['scope'] ?? '') === 'domain') {
+                $controls[strtolower((string) ($row['value'] ?? ''))] = $row;
+            }
+        }
+    }
+    $key = strtolower(trim($host));
+    return $key !== '' && isset($controls[$key]) && is_array($controls[$key])
+        ? $controls[$key]
+        : null;
+}
+
 /** Permission-aware actor actions used by posts, profiles, and DMs. */
 function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = ''): string
 {
@@ -5735,6 +5914,9 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isMuted = $actorId !== '' && function_exists('ap_is_muted_actor')
         ? ap_is_muted_actor($actorId, $ownerUserId)
         : false;
+    $globalControl = ($isAdmin && !$isLocal && $actorId !== '')
+        ? admin_global_actor_control($actorId)
+        : null;
     $menu = '';
     // Don't offer personal actions for the signed-in actor itself.
     if ($actorId !== '' && str_starts_with($actorId, 'https://') && !$isSelf) {
@@ -5764,15 +5946,67 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
             $menu .= '<a class="menu-action" href="' . h(admin_report_href($actorId, $objectId, $returnFrom !== '' ? $returnFrom : $returnView)) . '">Report user</a>';
         }
     }
-    // Server-wide instance blocks are an explicit admin-only action.
-    if ($host !== '' && !admin_is_home_instance_host($host) && !$isLocal && $isAdmin && !ap_is_blocked_host($host)) {
-        $menu .= '<form method="post" action="?view=blocks">'
-            . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
-            . '<input type="hidden" name="action" value="block_domain">'
-            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
-            . '<input type="hidden" name="domain" value="' . h($host) . '">'
-            . '<button class="menu-action danger" type="submit">Block instance</button>'
-            . '</form>';
+    if ($isAdmin && !$isLocal && $actorId !== '') {
+        $globalKind = is_array($globalControl) ? (string) ($globalControl['kind'] ?? '') : '';
+        if ($globalKind === 'mute') {
+            $menu .= '<form method="post" action="?view=blocks">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="unblock">'
+                . '<input type="hidden" name="id" value="' . (int) ($globalControl['id'] ?? 0) . '">'
+                . '<button class="menu-action" type="submit">Remove global mute</button></form>';
+        } else {
+            $menu .= '<form method="post" action="?view=blocks" onsubmit="return confirm(\'Mute this user for everyone on Vaak?\');">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="block_actor">'
+                . '<input type="hidden" name="kind" value="mute">'
+                . '<input type="hidden" name="actor_id" value="' . h($actorId) . '">'
+                . '<button class="menu-action" type="submit">Global mute user</button></form>';
+        }
+        if ($globalKind === 'block' || $globalKind === 'suspend') {
+            $menu .= '<form method="post" action="?view=blocks">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="unblock">'
+                . '<input type="hidden" name="id" value="' . (int) ($globalControl['id'] ?? 0) . '">'
+                . '<button class="menu-action" type="submit">Remove server block</button></form>';
+        } else {
+            $menu .= '<form method="post" action="?view=blocks" onsubmit="return confirm(\'Block this user from federating with Vaak?\');">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="block_actor">'
+                . '<input type="hidden" name="kind" value="block">'
+                . '<input type="hidden" name="actor_id" value="' . h($actorId) . '">'
+                . '<button class="menu-action danger" type="submit">Block user server-wide</button></form>';
+        }
+        $menu .= '<a class="menu-action" href="/vaak/?view=moderation&amp;actor=' . rawurlencode($actorId) . '&amp;from=' . rawurlencode($returnView) . '">Open in moderation panel</a>';
+    }
+    if ($isAdmin && $isLocal && $actorId !== '') {
+        $menu .= '<a class="menu-action" href="/vaak/?view=moderation&amp;actor=' . rawurlencode($actorId) . '&amp;from=' . rawurlencode($returnView) . '">Open in moderation panel</a>';
+    }
+    // Server-wide instance controls are explicit admin-only actions.
+    if ($host !== '' && !admin_is_home_instance_host($host) && !$isLocal && $isAdmin) {
+        $domainControl = admin_global_domain_control($host);
+        $domainKind = is_array($domainControl) ? (string) ($domainControl['kind'] ?? '') : '';
+        if ($domainKind !== 'mute') {
+            $menu .= '<form method="post" action="?view=blocks" onsubmit="return confirm(\'Mute this instance for everyone on Vaak?\');">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="block_domain">'
+                . '<input type="hidden" name="kind" value="mute">'
+                . '<input type="hidden" name="domain" value="' . h($host) . '">'
+                . '<button class="menu-action" type="submit">Global mute instance</button></form>';
+        } else {
+            $menu .= '<form method="post" action="?view=blocks">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="unblock">'
+                . '<input type="hidden" name="id" value="' . (int) ($domainControl['id'] ?? 0) . '">'
+                . '<button class="menu-action" type="submit">Remove global instance mute</button></form>';
+        }
+        if ($domainKind !== 'block' && $domainKind !== 'suspend') {
+            $menu .= '<form method="post" action="?view=blocks" onsubmit="return confirm(\'Block this instance from federating with Vaak?\');">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="block_domain">'
+                . '<input type="hidden" name="kind" value="block">'
+                . '<input type="hidden" name="domain" value="' . h($host) . '">'
+                . '<button class="menu-action danger" type="submit">Block instance server-wide</button></form>';
+        }
     }
     if ($menu === '') {
         return '';
@@ -5842,12 +6076,41 @@ function admin_actor_avatar_url(?string $actorId): string
                 return $u;
             }
         }
+        // Mastodon-compatible instances may emit a different actor IRI in
+        // notifications than the profile URL we fetched. Reuse the same
+        // media cache across those known aliases.
+        if (function_exists('ap_masto_actor_id_aliases')) {
+            foreach (ap_masto_actor_id_aliases($actorId) as $alias) {
+                $alias = rtrim((string) $alias, '/');
+                if ($alias === '' || $alias === $actorId) {
+                    continue;
+                }
+                $aliasCached = ap_remote_media_get($alias, 'avatar');
+                if (is_array($aliasCached) && !empty($aliasCached['public_url'])) {
+                    $u = ap_profile_sanitize_https_url($aliasCached['public_url']);
+                    if ($u !== null) {
+                        $memo[$actorId] = $u;
+                        return $u;
+                    }
+                }
+            }
+        }
     }
     // Queue a background warm when we know a source URL, but still show fallback now.
     if (function_exists('ap_remote_media_warm_async')) {
         $ra = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
         if (is_array($ra) && !empty($ra['icon_source_url'])) {
             ap_remote_media_warm_async($actorId);
+        }
+    }
+    // Until the async warm finishes, use the known remote icon rather than
+    // rendering the generic fallback. onerror still protects the UI if the
+    // remote host rejects the image request.
+    if (is_array($ra ?? null) && !empty($ra['icon_source_url'])) {
+        $source = ap_profile_sanitize_https_url((string) $ra['icon_source_url']);
+        if ($source !== null) {
+            $memo[$actorId] = $source;
+            return $source;
         }
     }
     $memo[$actorId] = $remoteFallback;
@@ -6077,9 +6340,12 @@ function admin_render_masto_status_card(
             continue;
         }
         $atype = strtolower((string) ($att['type'] ?? ''));
+        $attMime = strtolower((string) ($att['mediaType'] ?? ''));
         $media[] = [
             'url' => $u,
-            'mediaType' => in_array($atype, ['video', 'gifv'], true) ? 'video/mp4' : null,
+            'mediaType' => in_array($atype, ['video', 'gifv'], true)
+                ? ($attMime !== '' ? $attMime : 'video/mp4')
+                : ($atype === 'audio' ? ($attMime !== '' ? $attMime : 'audio/mpeg') : null),
             'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
         ];
     }
@@ -6760,6 +7026,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 if (
                     str_starts_with($mt, 'image/') || $type === 'Image'
                     || str_starts_with($mt, 'video/') || $type === 'Video'
+                    || str_starts_with($mt, 'audio/') || $type === 'Audio'
                     || admin_media_is_video($url, $mt)
                 ) {
                     $mediaItems[] = ['url' => $url, 'mediaType' => $mt !== '' ? $mt : null];
@@ -7320,7 +7587,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     break;
                 }
             }
-        } elseif ($view === 'gallery') {
+        } elseif ($view === 'gallery' || $view === 'vakktok') {
             $st = $db->prepare(
                 "SELECT * FROM events
                  WHERE type IN ('Create', 'Quote', 'QuotePost')
@@ -7333,6 +7600,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             $st->execute([$sinceAt, $limit * 3]);
             foreach ($st->fetchAll() ?: [] as $e) {
                 if (!is_array($e) || !admin_gallery_event_has_media($e)) {
+                    continue;
+                }
+                if ($view === 'vakktok' && (!admin_vakktok_item_has_video(['row' => $e]) || admin_vakktok_item_is_sensitive(['row' => $e]))) {
                     continue;
                 }
                 $pushEvent($e);
@@ -7423,7 +7693,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
 }
 
 // AJAX fragment for Home / Local / Federated / Gallery infinite scroll
-if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
+if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)) {
     // Live poll: items newer than the client's current head (no scroll jump on server).
     $wantNewer = isset($_GET['newer']) && (string) $_GET['newer'] === '1';
     $sinceTs = isset($_GET['since']) ? (int) $_GET['since'] : 0;
@@ -7451,11 +7721,18 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
             }
             if ($view === 'gallery') {
                 admin_render_gallery_cell($item, $followingIds, 'gallery');
+            } elseif ($view === 'vakktok') {
+                admin_render_vakktok_cell($item);
             } else {
                 admin_render_timeline_item($item, $followingIds, $view);
             }
         }
         exit;
+    }
+    if ($view === 'vakktok') {
+        // VakkTok has a media-only projection; never serve mixed gallery cache keys.
+        $adminTlFromCache = false;
+        $adminTlRankedCached = null;
     }
     if ($adminTlFromCache && is_array($adminTlRankedCached)) {
         $totalRanked = count($adminTlRankedCached);
@@ -7519,7 +7796,10 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
             ? $feedTimeline
             : ($view === 'local'
                 ? $localTimeline
-                : ($view === 'gallery' ? $galleryTimeline : $homeTimeline));
+                : (in_array($view, ['gallery', 'vakktok'], true) ? $galleryTimeline : $homeTimeline));
+        if ($view === 'vakktok') {
+            $timeline = array_values(array_filter($timeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
+        }
         $rankedMiss = admin_tl_rank_from_timeline($timeline);
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.
         while ($tlOffset + $tlLimit > count($rankedMiss) && $rankedMiss !== []) {
@@ -7561,6 +7841,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
         }
         if ($view === 'gallery') {
             admin_render_gallery_cell($item, $followingIds, 'gallery');
+        } elseif ($view === 'vakktok') {
+            admin_render_vakktok_cell($item);
         } else {
             admin_render_timeline_item($item, $followingIds, $view);
         }
@@ -7626,12 +7908,54 @@ try {
 }
 
 header('Content-Type: text/html; charset=utf-8');
+
+/** Render a compact, Mastodon-style recommendation break in Home. */
+function admin_render_home_suggestions(array $suggestions): void
+{
+    if (!$suggestions) {
+        return;
+    }
+    shuffle($suggestions);
+    $suggestions = array_slice($suggestions, 0, 3);
+    echo '<section class="home-suggestions" aria-label="Suggested accounts">';
+    echo '<div class="meta home-suggestions-title">Suggested accounts</div>';
+    echo '<div class="home-suggestions-grid">';
+    foreach ($suggestions as $sug) {
+        $acc = is_array($sug['account'] ?? null) ? $sug['account'] : [];
+        // Account.url is often an HTML profile page; uri is the AP actor IRI
+        // that Follow delivery and actor-document fetching require.
+        $actorUrl = (string) ($acc['uri'] ?? $acc['url'] ?? '');
+        if ($actorUrl === '') {
+            continue;
+        }
+        $display = trim((string) ($acc['display_name'] ?? $acc['username'] ?? 'account')) ?: 'account';
+        $acct = (string) ($acc['acct'] ?? '');
+        $av = (string) ($acc['avatar'] ?? '');
+        echo '<article class="home-suggestion">';
+        echo $av !== ''
+            ? '<img class="tweet-av" src="' . h($av) . '" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer">'
+            : admin_avatar_img($actorUrl);
+        echo '<div class="home-suggestion-main"><a class="who" href="?view=remote_profile&amp;actor=' . rawurlencode($actorUrl) . '">' . h($display) . '</a>';
+        if ($acct !== '') {
+            echo '<div class="meta home-suggestion-handle" title="@' . h($acct) . '">@' . h($acct) . '</div>';
+        }
+        echo '<form method="post" action="?view=home" class="home-suggestion-form">'
+            . '<input type="hidden" name="action" value="suggestion_follow">'
+            . '<input type="hidden" name="return_view" value="home">'
+            . '<input type="hidden" name="actor_id" value="' . h($actorUrl) . '">'
+            . '<button class="btn btn-primary" type="submit">Follow</button></form></div></article>';
+    }
+    echo '</div></section>';
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="color-scheme" content="dark">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="csrf-token" content="<?= h(ap_auth_csrf_token()) ?>">
   <title><?= $notifUnreadNav > 0 ? '(' . h($notifBadgeLabel) . ') ' : '' ?>VAAK · <?= h(view_title($view)) ?></title>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
@@ -7642,10 +7966,19 @@ header('Content-Type: text/html; charset=utf-8');
   <link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/regular/style.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.1/src/fill/style.css">
+  <script>
+    (function () {
+      const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
+      const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink'];
+      const value = localStorage.getItem(key);
+      if (allowed.includes(value)) document.documentElement.dataset.accent = value;
+    }());
+  </script>
   <style>
     :root {
       --primary: #00ff9f;
       --primary-dim: rgba(0,255,159,.15);
+      --bg-glow: #102018;
       --bg: #0a0a0a;
       --panel: #121212;
       --panel-2: #1a1a1a;
@@ -7657,15 +7990,22 @@ header('Content-Type: text/html; charset=utf-8');
       --radius: 14px;
       --shadow: 0 8px 30px rgba(0,0,0,.35);
     }
+    :root[data-accent="yellow"] { --primary:#ffd400; --primary-dim:rgba(255,212,0,.15); --bg-glow:#201e10; }
+    :root[data-accent="blue"] { --primary:#5aa9ff; --primary-dim:rgba(90,169,255,.15); --bg-glow:#101820; }
+    :root[data-accent="red"] { --primary:#ff6b6b; --primary-dim:rgba(255,107,107,.15); --bg-glow:#201010; }
+    :root[data-accent="purple"] { --primary:#c084fc; --primary-dim:rgba(192,132,252,.15); --bg-glow:#181020; }
+    :root[data-accent="orange"] { --primary:#ff9f43; --primary-dim:rgba(255,159,67,.15); --bg-glow:#201810; }
+    :root[data-accent="pink"] { --primary:#ff70c7; --primary-dim:rgba(255,112,199,.15); --bg-glow:#201018; }
     * { box-sizing: border-box; }
+    html { background: #0a0a0a; color-scheme: dark; }
     body {
       margin: 0;
       font-family: "Segoe UI", system-ui, sans-serif;
-      background: radial-gradient(1200px 600px at 10% -10%, #102018 0%, var(--bg) 45%);
+      background: radial-gradient(1200px 600px at 10% -10%, var(--bg-glow) 0%, var(--bg) 45%);
       color: var(--text);
       min-height: 100vh;
     }
-    a { color: var(--info); text-decoration: none; }
+    a { color: var(--primary); text-decoration: none; }
     a:hover { text-decoration: underline; }
 
     .shell {
@@ -7779,6 +8119,17 @@ header('Content-Type: text/html; charset=utf-8');
         text-overflow: ellipsis;
       }
       .mobile-topbar__title span { color: var(--primary); }
+      /* Keep timeline navigation reachable while the feed scrolls. The
+         mobile menu/search bar occupies the first row, so the timeline bar
+         sticks directly beneath it. */
+      .main > .topbar { position: sticky; top: calc(3.45rem + env(safe-area-inset-top)); z-index: 55; padding: .45rem .65rem; background: rgba(10,10,10,.98); }
+      .main > .topbar h1 { display: none; }
+      .main > .topbar .topbar-actions { width: 100%; justify-content: space-between; gap: .35rem; flex-wrap: nowrap; }
+      .main > .topbar .timeline-tabs { flex: 0 1 auto; min-width: 0; max-width: calc(100% - 3rem); overflow-x: auto; justify-content: flex-start; scrollbar-width: none; }
+      .main > .topbar .timeline-tabs::-webkit-scrollbar { display: none; }
+      .main > .topbar .timeline-tabs a { flex: 0 0 auto; padding: .28rem .5rem; font-size: .74rem; }
+      .main > .topbar .topbar-actions > .btn { flex: 0 0 2.25rem; width: 2.25rem; padding: .35rem 0; font-size: 0; }
+      .main > .topbar .topbar-actions > .btn::before { content: '↻'; font-size: 1.05rem; }
 
       .mobile-nav-backdrop {
         display: block;
@@ -7867,8 +8218,10 @@ header('Content-Type: text/html; charset=utf-8');
         bottom: max(.85rem, env(safe-area-inset-bottom));
       }
       .feed-top-btn {
-        right: .85rem;
-        bottom: 5.1rem;
+        position: fixed;
+        right: max(.85rem, env(safe-area-inset-right));
+        bottom: max(5.25rem, calc(env(safe-area-inset-bottom) + 4.65rem));
+        z-index: 75;
       }
       .link-card { max-width: 100%; }
       .link-card__media { flex-basis: 96px; }
@@ -7882,6 +8235,9 @@ header('Content-Type: text/html; charset=utf-8');
       backdrop-filter: blur(8px);
     }
     .rail-right { border-right: none; border-left: 1px solid var(--border); padding: 1rem; }
+    .rail-right a { color: var(--primary); }
+    .rail-right a:hover { color: var(--primary); text-decoration: underline; }
+    .rail-right a[style*="color:var(--text)"] { color: var(--primary) !important; }
     .brand {
       padding: 1.1rem 1rem .95rem;
       border-bottom: 1px solid var(--border);
@@ -7895,7 +8251,7 @@ header('Content-Type: text/html; charset=utf-8');
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: .52rem; line-height: 1.05;
       color: var(--primary);
-      text-shadow: 0 0 18px rgba(0,255,159,.22);
+      text-shadow: 0 0 18px color-mix(in srgb, var(--primary) 22%, transparent);
       white-space: pre;
       user-select: none;
     }
@@ -7940,7 +8296,7 @@ header('Content-Type: text/html; charset=utf-8');
     .nav a:hover { background: var(--panel-2); text-decoration: none; }
     .nav a.active {
       background: var(--primary-dim);
-      border-color: rgba(0,255,159,.35);
+      border-color: color-mix(in srgb, var(--primary) 35%, transparent);
       color: var(--primary);
       font-weight: 600;
     }
@@ -8041,7 +8397,7 @@ header('Content-Type: text/html; charset=utf-8');
       border-radius: 12px; border: 1px solid var(--border); background: var(--panel-2);
       overflow: hidden; text-decoration: none; color: inherit; max-width: 520px;
     }
-    .link-card:hover { border-color: rgba(0,255,159,.35); text-decoration: none; }
+    .link-card:hover { border-color: color-mix(in srgb, var(--primary) 35%, transparent); text-decoration: none; }
     .link-card__media { flex: 0 0 120px; max-height: 120px; overflow: hidden; background: #0a0a0a; }
     .link-card__media img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .link-card__body { padding: .65rem .75rem; min-width: 0; flex: 1; }
@@ -8073,10 +8429,15 @@ header('Content-Type: text/html; charset=utf-8');
       white-space: nowrap;
       line-height: 1.2;
     }
+    .topbar-timeline h1 { display: none; }
     .topbar-actions {
       display: flex; align-items: center; justify-content: flex-end;
       gap: .55rem; flex: 1 1 auto; flex-wrap: wrap; min-width: 0;
     }
+    .topbar-timeline .topbar-actions { position: relative; justify-content: center; }
+    .topbar-timeline .topbar-actions > .timeline-tabs { margin-inline: auto; }
+    .topbar-timeline .topbar-actions > .btn { position: absolute; right: 0; width: 2.4rem; height: 2.25rem; min-height: 0; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 0; line-height: 1; }
+    .topbar-timeline .topbar-actions > .btn::before { content: '↻'; display: block; font-size: 1.2rem; line-height: 1; }
     .pill {
       display: inline-flex; gap: .5rem; align-items: center;
       padding: .35rem .7rem; border-radius: 999px;
@@ -8097,7 +8458,7 @@ header('Content-Type: text/html; charset=utf-8');
     }
     .composer { padding: 1rem; margin-bottom: 1rem; }
     .composer textarea {
-      width: 100%; min-height: 96px; resize: vertical;
+      width: 100%; min-height: 96px; max-height: 500px; resize: none;
       box-sizing: border-box;
       background: #0c0c0c; color: var(--text);
       border: 1px solid var(--border); border-radius: 10px;
@@ -8132,6 +8493,18 @@ header('Content-Type: text/html; charset=utf-8');
       border-radius: 12px;
       background: #0c0c0c;
     }
+    .compose-inline-panel .compose-emoji-wrap { position: relative; }
+    .compose-inline-panel .compose-emoji-picker {
+      position: absolute; left: 0; bottom: calc(100% + .5rem); z-index: 70;
+      width: min(23rem, calc(100vw - 2rem)); box-sizing: border-box;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+    }
+    .compose-emoji-search {
+      grid-column: 1 / -1; width: 100%; box-sizing: border-box;
+      margin: 0 0 .25rem; padding: .45rem .55rem;
+      background: #111; color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; font: inherit; font-size: .85rem;
+    }
     .compose-emoji-picker[hidden] { display: none !important; }
     .compose-emoji-picker button {
       appearance: none;
@@ -8159,6 +8532,15 @@ header('Content-Type: text/html; charset=utf-8');
       display: flex; justify-content: space-between; align-items: center;
       gap: 1rem; margin-top: .75rem; flex-wrap: wrap;
     }
+    .compose-submit-progress {
+      display: none; flex: 1 1 100%; gap: .5rem; align-items: center;
+      color: var(--muted); font-size: .78rem;
+    }
+    .compose-submit-progress.is-visible { display: flex; }
+    .compose-submit-progress progress {
+      width: min(15rem, 100%); height: .45rem; accent-color: var(--primary);
+    }
+    .compose-submit-progress.is-indeterminate progress { opacity: .55; }
     .compose-modal__panel > .composer > .meta,
     .compose-modal__panel > .composer > .quote-block,
     .compose-modal__panel > .composer > .composer-check,
@@ -8179,16 +8561,112 @@ header('Content-Type: text/html; charset=utf-8');
       margin-bottom: 0;
       border-top: 1px solid rgba(255,255,255,.06);
     }
+    /* Normal timeline posting uses an inline, X-style composer at the feed
+       top. Focused reply/quote/edit flows continue using the modal shell. */
+    .compose-inline-shell { display: none !important; }
+    .compose-inline-panel {
+      width: 100% !important; max-width: none !important; padding: 0 !important;
+      margin: 0 0 .75rem !important;
+      background: transparent !important; border: 0 !important;
+      border-radius: 0; box-shadow: none !important;
+    }
+    .compose-inline-panel > .compose-modal__hd { display: none; }
+    .compose-inline-panel > .composer {
+      position: relative; margin: 0; padding: .75rem; overflow: visible;
+      border-radius: var(--radius);
+    }
+    .compose-inline-panel .composer textarea { min-height: 5.5rem; }
+    .compose-inline-panel .composer textarea { overflow-y: hidden; }
+    .compose-inline-panel .compose-textarea-wrap {
+      flex: 0 0 auto; max-height: none; overflow: visible;
+    }
+    .compose-inline-panel #compose-content {
+      height: auto; max-height: 500px; field-sizing: content;
+      overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+    }
+    .compose-inline-panel .compose-inline-options {
+      margin-top: .55rem; border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+    .compose-inline-panel .compose-inline-options > summary {
+      cursor: pointer; list-style: none; padding: .45rem 0;
+      color: var(--muted); font-size: .86rem; font-weight: 600;
+    }
+    .compose-inline-panel .compose-inline-options > summary::-webkit-details-marker { display: none; }
+    .compose-inline-panel .compose-inline-options > summary::before { content: '＋ '; color: var(--primary); }
+    .compose-inline-panel .compose-inline-options[open] > summary::before { content: '− '; }
+    .compose-inline-panel .compose-inline-options-body { padding: 0 0 .35rem; }
+    .compose-inline-panel .compose-inline-visibility {
+      display: inline-flex !important; flex-direction: row !important;
+      align-items: center; gap: .35rem;
+      position: absolute; top: .25rem; right: .75rem;
+      margin: 0; color: var(--muted); font-size: .82rem;
+    }
+    .compose-inline-panel .composer > .meta[style*="margin-bottom"] {
+      display: flex !important; align-items: center; width: 100%;
+      column-gap: .3rem;
+    }
+    .compose-inline-panel .composer > .meta[style*="margin-bottom"] > b { margin-left: .2rem; }
+    .compose-inline-panel .composer > input[name="spoiler_text"] { margin-top: 1rem !important; }
+    .compose-inline-panel .compose-inline-visibility select {
+      width: auto; max-width: 10rem; margin: 0; padding: .25rem .45rem;
+      font-size: .82rem;
+    }
+    .compose-inline-panel .compose-inline-tools {
+      display: flex; align-items: center; gap: .45rem;
+      margin-top: .65rem;
+    }
+    .compose-inline-panel .compose-inline-tools .compose-emoji-wrap { margin: 0 !important; }
+    .compose-inline-panel .compose-inline-tools .composer-check {
+      margin: 0; padding: 0; width: auto; position: relative;
+    }
+    .compose-inline-panel .compose-inline-tools .composer-check input {
+      position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+    }
+    .compose-inline-panel .compose-tool {
+      width: 2.25rem; height: 2.25rem; padding: 0;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid var(--border); border-radius: 999px;
+      background: transparent; color: var(--muted); cursor: pointer;
+      font-size: 1.15rem;
+    }
+    .compose-inline-panel .compose-tool.is-recording {
+      width: auto; min-width: 8.5rem; padding: 0 .7rem;
+      gap: .35rem; white-space: nowrap; font-size: .8rem;
+    }
+    .compose-inline-panel .compose-tool:hover,
+    .compose-inline-panel .compose-tool[aria-pressed="true"] {
+      color: var(--primary); border-color: var(--primary);
+      background: var(--primary-dim);
+    }
+    .compose-inline-panel .compose-media-tool { margin: 0; }
+    .compose-inline-panel .compose-media-tool input { display: none; }
+    .compose-inline-panel .compose-options-legacy { display: none !important; }
+    .compose-inline-slot { width: 100%; margin: 0 0 .75rem; }
+    .compose-inline-skeleton {
+      height: 12rem; border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--panel); opacity: .72;
+      background-image: linear-gradient(90deg, transparent, rgba(255,255,255,.045), transparent);
+      background-size: 200% 100%; animation: compose-skeleton 1.4s ease-in-out infinite;
+    }
+    @keyframes compose-skeleton { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+    .compose-inline-panel .composer-actions {
+      margin-top: .75rem; padding-top: .7rem;
+      border-top: 1px solid var(--border);
+    }
     /* Floating compose FAB + modal */
     .compose-fab {
       position: fixed; right: 1.25rem; bottom: 1.25rem; z-index: 80;
       width: 3.4rem; height: 3.4rem; border-radius: 999px;
       border: none; cursor: pointer;
-      background: linear-gradient(135deg, #00ff9f, #00cc7f);
+      background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 78%, #000));
       color: #04140c; font-size: 1.75rem; font-weight: 700; line-height: 1;
       box-shadow: 0 8px 28px rgba(0, 255, 159, 0.28);
     }
     .compose-fab:hover { filter: brightness(1.06); }
+    /* The composer is inline at the feed top; keep the floating FAB out of
+       the way so the back-to-top control owns the lower corner. */
+    .compose-fab { display: none !important; }
     .main { position: relative; }
     .feed-top-btn {
       /* Bottom-right of the feed column (not the viewport FAB corner) */
@@ -8205,23 +8683,35 @@ header('Content-Type: text/html; charset=utf-8');
       opacity: 1; pointer-events: auto; transform: translateY(0);
     }
     .feed-top-btn:hover { border-color: var(--primary); }
+    @media (max-width: 700px) {
+      /* Keep this above the compose FAB in the viewport, not at the end of
+         the document's feed column. */
+      .main .feed-top-btn {
+        position: fixed;
+        right: max(.85rem, env(safe-area-inset-right));
+        bottom: max(1rem, env(safe-area-inset-bottom));
+        z-index: 75;
+        width: 2.9rem; height: 2.9rem;
+        background: var(--primary); color: #04140c;
+        border-color: var(--primary);
+      }
+    }
     .feed-new-btn {
-      position: absolute; left: 50%; top: .85rem; z-index: 45;
-      transform: translateX(-50%) translateY(-8px);
-      padding: .45rem 1rem; border-radius: 999px;
-      border: 1px solid var(--border); cursor: pointer;
-      background: rgba(18,18,18,.96); color: var(--primary);
+      display: block; width: 100%;
+      padding: .7rem 1rem; margin: 0 0 .75rem;
+      border: 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+      border-radius: 0; cursor: pointer;
+      background: transparent; color: var(--primary);
       font: inherit; font-size: .85rem; font-weight: 600;
-      box-shadow: 0 8px 24px rgba(0,0,0,.4);
       opacity: 0; pointer-events: none;
-      transition: opacity .18s ease, transform .18s ease;
+      transition: opacity .18s ease, background .18s ease;
       white-space: nowrap;
     }
+    .feed-new-btn[hidden] { display: none !important; }
     .feed-new-btn.show {
       opacity: 1; pointer-events: auto;
-      transform: translateX(-50%) translateY(0);
     }
-    .feed-new-btn:hover { border-color: var(--primary); }
+    .feed-new-btn:hover { background: var(--primary-dim); }
     .feed-ptr {
       display: flex; align-items: center; justify-content: center;
       gap: .45rem; height: 0; overflow: hidden;
@@ -8326,10 +8816,10 @@ header('Content-Type: text/html; charset=utf-8');
       overflow: hidden; text-overflow: ellipsis;
     }
     .compose-media-card .alt-btn.has-alt {
-      color: var(--primary); border-color: rgba(0,255,159,.35);
+      color: var(--primary); border-color: color-mix(in srgb, var(--primary) 35%, transparent);
     }
     .compose-media-card .alt-btn:hover {
-      border-color: rgba(0,255,159,.45); color: var(--text);
+      border-color: color-mix(in srgb, var(--primary) 45%, transparent); color: var(--text);
     }
     .compose-media-card .rm {
       display: block; width: 100%; margin-top: .25rem; font-size: .7rem;
@@ -8384,7 +8874,7 @@ header('Content-Type: text/html; charset=utf-8');
       font-weight: 600; font: inherit;
     }
     .btn-primary {
-      background: linear-gradient(135deg, #00ff9f, #00cc7f);
+      background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 78%, #000));
       color: #04140c;
     }
     .btn-primary:hover { filter: brightness(1.05); }
@@ -8454,6 +8944,9 @@ header('Content-Type: text/html; charset=utf-8');
       background: rgba(0,0,0,.25);
       pointer-events: none;
     }
+    .vakktok-feed { height: calc(100vh - 7rem); min-height: 28rem; overflow-y: auto; scroll-snap-type: y mandatory; overscroll-behavior: contain; background: #050505; border: 1px solid var(--border); border-radius: 12px; }
+    .vakktok-item { position: relative; height: 100%; min-height: 28rem; scroll-snap-align: start; display: grid; place-items: center; background: #050505; }
+    .vakktok-video { display: block; width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; object-fit: contain; object-position: center; aspect-ratio: auto; background: #000; }
     .tweet-hd {
       display: flex; align-items: flex-start; gap: .75rem;
       margin-bottom: .45rem;
@@ -8695,7 +9188,7 @@ header('Content-Type: text/html; charset=utf-8');
       cursor: pointer;
     }
     .tweet-content-more:hover {
-      border-color: rgba(0,255,159,.45);
+      border-color: color-mix(in srgb, var(--primary) 45%, transparent);
       background: var(--primary-dim);
     }
     .tweet-content.has-fold + .tweet-content-more,
@@ -8749,6 +9242,40 @@ header('Content-Type: text/html; charset=utf-8');
       max-height: min(62vh, 560px);
       object-fit: contain; cursor: default; background: #000;
     }
+    .media-row .media-audio {
+      display: block;
+      width: calc(100% - 1rem);
+      margin: .5rem;
+    }
+    .media-audio-card {
+      position: relative;
+      display: flex;
+      align-items: flex-end;
+      min-height: 220px;
+      overflow: hidden;
+      background: #050505;
+    }
+    .media-audio-art {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: .72;
+    }
+    .media-audio-card::after {
+      content: '';
+      position: absolute;
+      inset: 35% 0 0;
+      background: linear-gradient(transparent, rgba(0,0,0,.86));
+      pointer-events: none;
+    }
+    .media-audio-card .media-audio {
+      position: relative;
+      z-index: 1;
+      margin: .75rem;
+      width: calc(100% - 1.5rem);
+    }
     .media-row.media-count-1 .media-video { min-height: 200px; }
     .media-hint { font-size: .75rem; color: var(--muted); margin-top: .35rem; }
     .notification-media { max-width: 300px; margin-top: .55rem; }
@@ -8778,6 +9305,30 @@ header('Content-Type: text/html; charset=utf-8');
       margin-bottom: .75rem;
     }
     .feed-toolbar .meta { color: var(--muted); font-size: .85rem; }
+    .timeline-tabs { display:flex; gap:.25rem; align-items:center; padding:.2rem; border:1px solid var(--border); border-radius:999px; background:var(--panel-2); }
+    .timeline-tabs a { padding:.3rem .65rem; border-radius:999px; color:var(--muted); text-decoration:none; font-size:.8rem; }
+    .timeline-tabs a:hover, .timeline-tabs a.active { background:var(--primary); color:#04140c; }
+    .timeline-skeleton { display:grid; gap:.6rem; margin:.5rem 0; }
+    .timeline-skeleton-row { height:7.5rem; border:1px solid var(--border); border-radius:12px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
+    @keyframes timeline-shimmer { to { background-position:-220% 0; } }
+    .keyboard-selected { outline:2px solid var(--primary); outline-offset:2px; }
+    .media-row { gap:.45rem; }
+    .media-row img, .media-row .media-video { aspect-ratio:4/3; object-fit:cover; }
+    .media-row .media-video { aspect-ratio:auto; object-fit:contain; height:auto; }
+    .media-row.media-count-1 .media-video { max-height:min(80vh,900px); }
+    .compose-fab { z-index: 110; }
+    @media (max-width: 700px) { .compose-fab { width:3.35rem; height:3.35rem; bottom:max(1rem, env(safe-area-inset-bottom)); right:1rem; font-size:1.7rem; } .timeline-tabs { width:auto; justify-content:flex-start; } .timeline-tabs a { flex:0 0 auto; text-align:center; } }
+    .home-suggestions { margin: 1rem 0; padding: .8rem; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-2); }
+    .home-suggestions-title { margin-bottom: .55rem; }
+    .home-suggestions-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .55rem; }
+    .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
+    .home-suggestion .tweet-av { width: 40px; height: 40px; flex: 0 0 40px; }
+    .home-suggestion-main { min-width: 0; min-height: 5.6rem; display: flex; flex: 1; flex-direction: column; overflow-wrap: anywhere; }
+    .home-suggestion-main .who { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .home-suggestion-handle { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .home-suggestion-form { margin-top: auto; padding-top: .4rem; }
+    .home-suggestion-form .btn { padding: .25rem .65rem; font-size: .78rem; }
+    @media (max-width: 700px) { .home-suggestions-grid { grid-template-columns: 1fr; } }
     .quote-block {
       margin-top: .55rem; padding: .65rem .8rem;
       border-left: 3px solid var(--primary);
@@ -8830,6 +9381,7 @@ header('Content-Type: text/html; charset=utf-8');
       padding: .25rem .55rem;
       font-size: .72rem;
     }
+    .brand-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); display: block; margin: .4rem auto .45rem; }
   </style>
 </head>
 <body>
@@ -8851,6 +9403,7 @@ header('Content-Type: text/html; charset=utf-8');
   ╚═══╝</pre>
         <strong>VAAK</strong>
       </a>
+      <?= admin_avatar_img($vaakActorId, 'brand-avatar') ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
     </div>
@@ -8860,19 +9413,16 @@ header('Content-Type: text/html; charset=utf-8');
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
       $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'import_export', 'security'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
+      $navSiteOpen = in_array($view, ['guestbook', 'support', 'analytics'], true);
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
     ?>
     <nav class="nav">
+      <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
       <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span></a>
       <hr class="nav-sep">
-      <div class="nav-label">Social</div>
-      <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
-      <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local"><span class="ico">◎</span><span class="label">Local</span></a>
-      <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed"><span class="ico">◈</span><span class="label">Federated</span></a>
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
+      <a class="<?= $view === 'vakktok' ? 'active' : '' ?>" href="?view=vakktok"><span class="ico">▶</span><span class="label">VakkTok</span></a>
       <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span><span class="nav-badge"<?= $discussUnreadNav > 0 ? '' : ' hidden' ?>><?= $discussUnreadNav > 99 ? '99+' : (string) (int) $discussUnreadNav ?></span></a>
-      <a class="<?= $view === 'foryou' ? 'active' : '' ?>" href="?view=foryou"><span class="ico">✦</span><span class="label">For You</span></a>
-      <a class="nav-search-narrow <?= $view === 'search' ? 'active' : '' ?>" href="?view=search"><span class="ico">⌕</span><span class="label">Search</span></a>
       <hr class="nav-sep">
       <a class="<?= $view === 'mentions' ? 'active' : '' ?>" href="?view=mentions" id="nav-notifications">
         <span class="ico">＠</span><span class="label">Notifications</span>
@@ -8935,13 +9485,17 @@ header('Content-Type: text/html; charset=utf-8');
       </details>
       <?php endif; ?>
       <hr class="nav-sep">
-      <div class="nav-label">Site</div>
-      <?php if (!empty($vaakIsAdmin)): ?>
-      <a class="<?= $view === 'guestbook' ? 'active' : '' ?>" href="?view=guestbook"><span class="ico">✉</span><span class="label">Guestbook</span></a>
-      <a class="<?= $view === 'support' ? 'active' : '' ?>" href="?view=support"><span class="ico">$</span><span class="label">Support</span></a>
-      <a class="<?= $view === 'analytics' ? 'active' : '' ?>" href="?view=analytics"><span class="ico">◔</span><span class="label">Analytics</span></a>
-      <?php endif; ?>
-      <a href="/"><span class="ico">←</span><span class="label">View site</span></a>
+      <details class="nav-group" data-nav-key="site" <?= $navSiteOpen ? 'open' : '' ?>>
+        <summary><span class="ico">▤</span><span class="label">Site</span></summary>
+        <div class="nav-sub">
+          <?php if (!empty($vaakIsAdmin)): ?>
+          <a class="<?= $view === 'guestbook' ? 'active' : '' ?>" href="?view=guestbook"><span class="ico">✉</span><span class="label">Guestbook</span></a>
+          <a class="<?= $view === 'support' ? 'active' : '' ?>" href="?view=support"><span class="ico">$</span><span class="label">Support</span></a>
+          <a class="<?= $view === 'analytics' ? 'active' : '' ?>" href="?view=analytics"><span class="ico">◔</span><span class="label">Analytics</span></a>
+          <?php endif; ?>
+          <a href="/"><span class="ico">←</span><span class="label">View site</span></a>
+        </div>
+      </details>
       <a href="/vaak/?logout=1"><span class="ico">⎋</span><span class="label">Log out</span></a>
     </nav>
   </aside>
@@ -9085,9 +9639,16 @@ header('Content-Type: text/html; charset=utf-8');
   </aside>
 
   <section class="main">
-    <div class="topbar">
+    <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
       <h1><?= h(view_title($view)) ?></h1>
       <div class="topbar-actions">
+        <?php if (in_array($view, ['home', 'local', 'feed'], true)): ?>
+          <nav class="timeline-tabs" aria-label="Timeline views">
+            <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home">Home</a>
+            <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local">Local</a>
+            <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed">Federated</a>
+          </nav>
+        <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed', 'gallery', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile', 'users'], true)): ?>
           <a class="btn btn-ghost" href="?view=<?= h($view) ?><?= $view === 'dms' && !empty($_GET['peer']) ? '&amp;peer=' . urlencode((string) $_GET['peer']) : '' ?>&amp;_r=<?= time() ?>" title="Reload this view">↻ Refresh</a>
         <?php endif; ?>
@@ -9098,6 +9659,11 @@ header('Content-Type: text/html; charset=utf-8');
     <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
 
     <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?>">
+      <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
+        <div class="compose-inline-slot" id="compose-inline-slot" aria-label="Loading composer">
+          <div class="compose-inline-skeleton" aria-hidden="true"></div>
+        </div>
+      <?php endif; ?>
       <?php if ($view === 'discuss'): ?>
         <?php
           $discussTopicId = (int) ($_GET['topic'] ?? 0);
@@ -9260,6 +9826,9 @@ header('Content-Type: text/html; charset=utf-8');
         <?php
           $homePage = array_slice($homeTimeline, 0, $tlLimit);
           $homeHasMore = count($homeTimeline) > $tlLimit;
+          $homeSuggestions = function_exists('ap_masto_suggestions_v2')
+              ? ap_masto_suggestions_v2(12)
+              : [];
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($homePage));
           }
@@ -9268,14 +9837,22 @@ header('Content-Type: text/html; charset=utf-8');
           <div class="empty">Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</div>
         <?php endif; ?>
         <div id="timeline-items" data-view="home" data-offset="<?= (int) count($homePage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($homePage[0]['sort']) ? $homePage[0]['sort'] : time()) ?>">
-          <?php foreach ($homePage as $item): ?>
+          <?php foreach ($homePage as $homeIndex => $item): ?>
             <?php
               if (admin_timeline_item_muted_by_words($item)) {
                   continue;
               }
               admin_render_timeline_item($item, $followingIds, 'home');
+              // Keep recommendations out of the chronological data stream,
+              // but show them as an occasional break after a few posts.
+              if ($homeIndex === 5 && $homeSuggestions) {
+                  admin_render_home_suggestions($homeSuggestions);
+              }
             ?>
           <?php endforeach; ?>
+          <?php if (count($homePage) < 6 && $homeSuggestions): ?>
+            <?php admin_render_home_suggestions($homeSuggestions); ?>
+          <?php endif; ?>
         </div>
         <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeHasMore ? 'Scroll for more…' : ($homeTimeline ? 'End of timeline' : '') ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
@@ -9324,6 +9901,22 @@ header('Content-Type: text/html; charset=utf-8');
           <?php endforeach; ?>
         </div>
         <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $feedHasMore ? 'Scroll for more…' : ($feedTimeline ? 'End of timeline' : '') ?></div>
+        <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
+
+      <?php elseif ($view === 'vakktok'): ?>
+        <?php
+          $tokLimit = max($tlLimit, 8);
+          $tokTimeline = array_values(array_filter($galleryTimeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
+          $tokPage = array_slice($tokTimeline, 0, $tokLimit);
+          $tokHasMore = count($tokTimeline) > $tokLimit;
+        ?>
+        <?php if (!$tokTimeline): ?><div class="empty">No videos are available yet.</div><?php endif; ?>
+        <div id="timeline-items" class="vakktok-feed" data-view="vakktok" data-offset="<?= (int) count($tokPage) ?>" data-limit="<?= (int) $tokLimit ?>" data-has-more="<?= $tokHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($tokPage[0]['sort']) ? $tokPage[0]['sort'] : time()) ?>">
+          <?php foreach ($tokPage as $item): ?>
+            <?php if (!admin_timeline_item_muted_by_words($item)) { admin_render_vakktok_cell($item); } ?>
+          <?php endforeach; ?>
+        </div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $tokHasMore ? 'Scroll for more…' : '' ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'gallery'): ?>
@@ -9865,7 +10458,71 @@ header('Content-Type: text/html; charset=utf-8');
           if ($reportTargetPrefill !== '' && str_starts_with($reportTargetPrefill, 'https://')) {
               $reportTargetDisplay = actor_handle($reportTargetPrefill) ?: $reportTargetPrefill;
           }
+          // An account deep-link from a post/profile overflow menu. Keep this
+          // on the moderation surface instead of silently returning to the
+          // ordinary remote-profile view.
+          $modActor = trim((string) ($_GET['actor'] ?? ''));
+          if ($modActor !== '' && !str_starts_with($modActor, 'https://')) {
+              $modActorResolved = function_exists('ap_resolve_actor_ref') ? ap_resolve_actor_ref($modActor) : null;
+              if (is_string($modActorResolved) && $modActorResolved !== '') {
+                  $modActor = $modActorResolved;
+              }
+          }
+          $modActor = rtrim($modActor, '/');
+          $modActorControl = ($modActor !== '' && str_starts_with($modActor, 'https://'))
+              ? admin_global_actor_control($modActor)
+              : null;
         ?>
+        <?php if ($modActor !== ''): ?>
+          <article class="tweet" style="margin-bottom:1.25rem;border-color:var(--primary)">
+            <div class="tweet-hd">
+              <div>
+                <div class="who">Account moderation</div>
+                <div class="meta"><?= h(actor_handle($modActor) ?: $modActor) ?></div>
+              </div>
+              <div class="meta">admin only</div>
+            </div>
+            <div class="body meta" style="margin-top:.5rem">
+              Apply a server-wide control to this account, or inspect its cached profile and recent activity.
+            </div>
+            <div class="tweet-actions" style="flex-wrap:wrap">
+              <?php if ($modActorControl && ($modActorControl['kind'] ?? '') === 'mute'): ?>
+                <form method="post" action="?view=moderation&amp;actor=<?= rawurlencode($modActor) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="unblock">
+                  <input type="hidden" name="id" value="<?= (int) ($modActorControl['id'] ?? 0) ?>">
+                  <button class="btn btn-ghost" type="submit">Remove global mute</button>
+                </form>
+              <?php else: ?>
+                <form method="post" action="?view=moderation&amp;actor=<?= rawurlencode($modActor) ?>" style="display:inline" onsubmit="return confirm('Mute this user for everyone on Vaak?');">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="block_actor">
+                  <input type="hidden" name="kind" value="mute">
+                  <input type="hidden" name="actor_id" value="<?= h($modActor) ?>">
+                  <button class="btn btn-ghost" type="submit">Global mute</button>
+                </form>
+              <?php endif; ?>
+              <?php if ($modActorControl && in_array((string) ($modActorControl['kind'] ?? ''), ['block', 'suspend'], true)): ?>
+                <form method="post" action="?view=moderation&amp;actor=<?= rawurlencode($modActor) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="unblock">
+                  <input type="hidden" name="id" value="<?= (int) ($modActorControl['id'] ?? 0) ?>">
+                  <button class="btn btn-ghost" type="submit">Remove server block</button>
+                </form>
+              <?php else: ?>
+                <form method="post" action="?view=moderation&amp;actor=<?= rawurlencode($modActor) ?>" style="display:inline" onsubmit="return confirm('Block this user from federating with Vaak?');">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="block_actor">
+                  <input type="hidden" name="kind" value="block">
+                  <input type="hidden" name="actor_id" value="<?= h($modActor) ?>">
+                  <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Block server-wide</button>
+                </form>
+              <?php endif; ?>
+              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= rawurlencode($modActor) ?>&amp;from=moderation">Open profile</a>
+              <a class="btn btn-ghost" href="?view=moderation">Clear account</a>
+            </div>
+          </article>
+        <?php endif; ?>
         <div class="meta" style="margin-bottom:.75rem">
           Open queue includes inbound Flags and reports filed by local users awaiting review.
           Use <b>Dismiss</b> / <b>Ignore</b> to clear items from the queue (clears the Moderation badge).
@@ -9936,6 +10593,7 @@ header('Content-Type: text/html; charset=utf-8');
               $reporter = (string) ($rep['reporter_actor_id'] ?? '');
               $target = (string) ($rep['target_actor_id'] ?? '');
               $aboutUs = !empty($rep['about_us']);
+              $priority = (int) ($rep['priority_score'] ?? 0);
               $comment = trim((string) ($rep['comment'] ?? ''));
               $statusUris = [];
               $rawJson = (string) ($rep['status_uris_json'] ?? '');
@@ -9965,6 +10623,7 @@ header('Content-Type: text/html; charset=utf-8');
                     <span class="who"><?= h($repLabel) ?></span>
                     <span class="tag"><?= h($state) ?></span>
                     <?php if ($aboutUs): ?><span class="tag">about you</span><?php endif; ?>
+                    <span class="tag" title="Transparent triage score; does not auto-moderate">priority <?= $priority ?></span>
                     <?php if ($isLocalFiled): ?><span class="tag">needs review</span><?php endif; ?>
                     <span class="meta"> · <?= h(relative_time((string) ($rep['created_at'] ?? ''))) ?></span>
                   </div>
@@ -10015,13 +10674,13 @@ header('Content-Type: text/html; charset=utf-8');
 
       <?php elseif ($view === 'blocks'): ?>
         <div class="meta" style="margin-bottom:1rem">
-          <b>Server-wide blocks</b> drop inbound ActivityPub and remove follows for the whole instance.
+          <b>Server-wide controls</b> can mute content locally or block/suspend federation for the whole instance.
           Personal mutes, muted words, and timeline-only blocks live under <a href="?view=profile">Profile</a>.
         </div>
         <form class="composer" method="post" action="?view=blocks" style="margin-bottom:1rem">
           <input type="hidden" name="action" value="block_add">
           <div class="meta" style="margin-bottom:.5rem">
-            Block or suspend a <b>domain</b> (<code>example.com</code>) or <b>user</b> (<code>@user@host</code> / actor URL).
+            Mute, block, or suspend a <b>domain</b> (<code>example.com</code>) or <b>user</b> (<code>@user@host</code> / actor URL).
           </div>
           <input name="target" type="text" required placeholder="example.com  or  @user@instance  or  https://…/users/…">
           <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:.5rem 0">
@@ -10031,15 +10690,18 @@ header('Content-Type: text/html; charset=utf-8');
             <label class="meta" style="display:flex;gap:.35rem;align-items:center;color:var(--text)">
               <input type="radio" name="kind" value="suspend"> Suspend
             </label>
+            <label class="meta" style="display:flex;gap:.35rem;align-items:center;color:var(--text)">
+              <input type="radio" name="kind" value="mute"> Global mute
+            </label>
           </div>
           <input name="reason" type="text" maxlength="500" placeholder="Optional note (spam, harassment, …)">
           <div class="composer-actions">
-            <span class="meta"><?= count($blocks) ?> blocks · suspend = same enforcement, different label</span>
-            <button class="btn btn-primary" type="submit">Add block</button>
+            <span class="meta"><?= count($blocks) ?> controls · mute hides locally; block/suspend stops federation</span>
+            <button class="btn btn-primary" type="submit">Add control</button>
           </div>
         </form>
 
-        <h2 style="font-size:1rem;margin:1.25rem 0 .5rem">Blocked users &amp; domains</h2>
+        <h2 style="font-size:1rem;margin:1.25rem 0 .5rem">Server-wide user &amp; domain controls</h2>
         <?php if (!$blocks): ?>
           <div class="empty">No server blocks yet.</div>
         <?php endif; ?>
@@ -10522,6 +11184,33 @@ header('Content-Type: text/html; charset=utf-8');
             Leave blank to clear.
           </div>
 
+          <label for="vaak-accent-select">VAAK accent color</label>
+          <select id="vaak-accent-select" style="max-width:18rem">
+            <option value="green">Green</option>
+            <option value="yellow">Yellow</option>
+            <option value="blue">Blue</option>
+            <option value="red">Red</option>
+            <option value="purple">Purple</option>
+            <option value="orange">Orange</option>
+            <option value="pink">Pink</option>
+          </select>
+          <script>
+            (function () {
+              const select = document.getElementById('vaak-accent-select');
+              if (!select) return;
+              const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
+              const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink'];
+              const current = localStorage.getItem(key);
+              select.value = allowed.includes(current) ? current : 'green';
+              select.addEventListener('change', function () {
+                const value = allowed.includes(select.value) ? select.value : 'green';
+                document.documentElement.dataset.accent = value;
+                localStorage.setItem(key, value);
+              });
+            }());
+          </script>
+          <div class="meta" style="margin:.25rem 0 .75rem">Changes the accent used throughout Vaak. This is private to your account and browser.</div>
+
           <label for="pf-summary">Bio (plain text or simple HTML: p, br, a, code, strong, em)</label>
           <textarea id="pf-summary" name="summary" maxlength="4000" required><?= h($summaryForForm) ?></textarea>
 
@@ -10559,7 +11248,7 @@ header('Content-Type: text/html; charset=utf-8');
               <input type="text" name="field_value[]" maxlength="500" placeholder="Value or https://…" value="<?= h($avPlain) ?>">
               <?php if ($an !== '' || $avPlain !== ''): ?>
                 <?php if ($isVerified): ?>
-                  <span class="tag field-status" style="background:rgba(0,255,159,.15);color:var(--primary)" title="<?= h($verifiedAt) ?>">✓ verified</span>
+                  <span class="tag field-status" style="background:var(--primary-dim);color:var(--primary)" title="<?= h($verifiedAt) ?>">✓ verified</span>
                 <?php else: ?>
                   <span class="meta field-status" title="No rel=me backlink found yet">unverified</span>
                 <?php endif; ?>
@@ -10576,6 +11265,7 @@ header('Content-Type: text/html; charset=utf-8');
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
             <label><input type="checkbox" name="anti_ai_marker" value="1" <?= !empty($profile['anti_ai_marker']) ? 'checked' : '' ?>> Highlight anti-AI posters in my timelines</label>
             <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
+            <label><input type="checkbox" name="auto_delete_posts_7d" value="1" <?= !empty($profile['auto_delete_posts_7d']) ? 'checked' : '' ?>> Automatically delete my posts older than 7 days</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
             <label><input type="checkbox" name="vanity_verified" value="1" <?= !empty($profile['vanity_verified']) ? 'checked' : '' ?>> Vanity verified checkmark <span class="vanity-verified" aria-hidden="true">✓</span></label>
           </div>
@@ -10598,6 +11288,10 @@ header('Content-Type: text/html; charset=utf-8');
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Sensitive media</b> —
             when enabled, media marked sensitive is shown without the blur gate in your timelines and gallery. Content warnings with custom text still remain collapsible.
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Post retention</b> —
+            when enabled, VAAK permanently deletes this account’s local posts after 7 days and sends ActivityPub <code>Delete</code> activities. Off by default; remote posts and other users are never affected.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Vanity verified</b> —
@@ -11725,7 +12419,7 @@ header('Content-Type: text/html; charset=utf-8');
           <?php foreach ($suggestions as $sug): ?>
             <?php
               $acc = is_array($sug['account'] ?? null) ? $sug['account'] : [];
-              $actorUrl = (string) ($acc['url'] ?? $acc['uri'] ?? '');
+              $actorUrl = (string) ($acc['uri'] ?? $acc['url'] ?? '');
               $src = (string) ($sug['source'] ?? 'global');
               $srcLabel = $src === 'past_interactions' ? 'From your interactions' : 'Popular on your timeline';
               $display = (string) ($acc['display_name'] ?? $acc['username'] ?? 'account');
@@ -12490,6 +13184,13 @@ header('Content-Type: text/html; charset=utf-8');
                       $rpHeader = (is_array($ch) ? ($ch['public_url'] ?? null) : null)
                           ?: (is_array($rpMeta) ? ($rpMeta['image_source_url'] ?? null) : null)
                           ?: $rpAvatar;
+                      // A profile view is an explicit signal that this
+                      // account matters to the user. Warm both media slots
+                      // asynchronously so later Notifications/timelines can
+                      // use the cached avatar instead of the default.
+                      if ((!$ca || !$ch) && function_exists('ap_remote_media_warm_async')) {
+                          ap_remote_media_warm_async($rpActor);
+                      }
                   }
                   if ($rpActor !== '') {
                       // Mastodon: /users/name vs /ap/users/{id} — posts often live under only one IRI
@@ -13015,7 +13716,7 @@ header('Content-Type: text/html; charset=utf-8');
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
     <?php endif; ?>
@@ -13032,6 +13733,22 @@ header('Content-Type: text/html; charset=utf-8');
     }
     return fd;
   };
+
+  // Progressive mobile haptics: Android browsers may support Vibration API;
+  // iOS Safari simply ignores this enhancement.
+  window.vaakHaptic = function (pattern) {
+    try {
+      if (navigator.vibrate) navigator.vibrate(pattern || 8);
+    } catch (e) {}
+  };
+  document.addEventListener('click', function (ev) {
+    const el = ev.target && ev.target.closest
+      ? ev.target.closest('button, .btn, .icon-btn, .compose-tool, .timeline-tabs a, .nav a')
+      : null;
+    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return;
+    const strong = el.classList.contains('btn-primary') || el.type === 'submit';
+    window.vaakHaptic(strong ? 12 : 7);
+  }, { passive: true, capture: true });
 
   // Close post overflow menus when the user clicks elsewhere on the page.
   document.addEventListener('click', function (ev) {
@@ -13755,7 +14472,7 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
-<?php if (in_array($view, ['home', 'feed', 'local', 'gallery'], true)): ?>
+<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)): ?>
 <script>
 (function () {
   /** Replace a timeline card in place without jumping scroll to the top. */
@@ -13851,6 +14568,14 @@ window.apAdminToast = function (msg, isErr) {
   const status = document.getElementById('timeline-status');
   const topBtn = document.getElementById('feed-top-btn');
   const newBtn = document.getElementById('feed-new-btn');
+  const feedRoot = document.querySelector('.feed');
+  if (newBtn && feedRoot) {
+    // Keep the new-post row in normal feed flow; it must never cover the
+    // sticky timeline tabs above it.
+    const composeSlot = feedRoot.querySelector('#compose-inline-slot');
+    if (composeSlot) feedRoot.insertBefore(newBtn, composeSlot.nextSibling);
+    else feedRoot.insertBefore(newBtn, feedRoot.firstChild);
+  }
   if (!root || !items || !sentinel) return;
 
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
@@ -13892,8 +14617,87 @@ window.apAdminToast = function (msg, isErr) {
   let pendingHtml = '';
   let pendingCount = 0;
   let pollBusy = false;
-  const POLL_MS = 45000;
+  const POLL_MS = 120000;
   const AT_TOP_PX = 120;
+
+  // VakkTok behaves like a focused video reel: the visible video plays muted,
+  // while videos leaving the viewport are paused so background media does not
+  // consume CPU or memory.
+  if (viewName === 'vakktok') {
+    const tokRoot = items.classList.contains('vakktok-feed') ? items : null;
+    let activeTokVideo = null;
+    const syncTokPlayback = () => {
+      if (!tokRoot) return;
+      const rootRect = tokRoot.getBoundingClientRect();
+      let best = null;
+      let bestRatio = 0;
+      items.querySelectorAll('.vakktok-video').forEach((video) => {
+        const rect = video.getBoundingClientRect();
+        const visible = Math.max(0, Math.min(rect.bottom, rootRect.bottom) - Math.max(rect.top, rootRect.top));
+        const ratio = rect.height > 0 ? visible / rect.height : 0;
+        if (ratio > bestRatio) { best = video; bestRatio = ratio; }
+        if (video !== activeTokVideo && ratio < 0.55) {
+          video.pause();
+          try { video.currentTime = 0; } catch (e) {}
+        }
+      });
+      if (best && bestRatio >= 0.7) {
+        if (activeTokVideo && activeTokVideo !== best) {
+          activeTokVideo.pause();
+          try { activeTokVideo.currentTime = 0; } catch (e) {}
+        }
+        activeTokVideo = best;
+        best.muted = false;
+        best.play().catch(() => {});
+      }
+    };
+    const tokObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        const video = entry.target;
+        if (!(video instanceof HTMLVideoElement)) return;
+        if (entry.isIntersecting && entry.intersectionRatio >= 0.7) {
+          items.querySelectorAll('.vakktok-video').forEach((other) => {
+            if (other !== video) {
+              other.pause();
+              try { other.currentTime = 0; } catch (e) {}
+            }
+          });
+          activeTokVideo = video;
+          video.muted = false;
+          video.play().catch(() => {});
+        } else {
+          video.pause();
+          try { video.currentTime = 0; } catch (e) {}
+        }
+      });
+    }, { root: tokRoot, threshold: [0.7] });
+    const observeTokVideos = (scope) => {
+      if (!scope || !scope.querySelectorAll) return;
+      scope.querySelectorAll('.vakktok-video').forEach((video) => {
+        if (video.dataset.tokObserved === '1') return;
+        video.dataset.tokObserved = '1';
+        video.addEventListener('loadedmetadata', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
+        video.addEventListener('canplay', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
+        tokObserver.observe(video);
+      });
+    };
+    observeTokVideos(items);
+    if (tokRoot) {
+      tokRoot.addEventListener('scroll', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
+      tokRoot.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowDown' || event.key === 'PageDown') {
+          window.requestAnimationFrame(syncTokPlayback);
+        }
+      });
+      window.addEventListener('resize', syncTokPlayback, { passive: true });
+    }
+    const tokMutationObserver = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => mutation.addedNodes.forEach((node) => observeTokVideos(node)));
+      window.requestAnimationFrame(syncTokPlayback);
+    });
+    tokMutationObserver.observe(items, { childList: true, subtree: true });
+    window.requestAnimationFrame(syncTokPlayback);
+  }
 
   // Pull-to-refresh indicator (mobile / window scroll)
   let ptrEl = root.querySelector('.feed-ptr');
@@ -13951,7 +14755,7 @@ window.apAdminToast = function (msg, isErr) {
 
   function updateNewBtn() {
     if (!newBtn) return;
-    if (pendingCount <= 0) {
+    if (pendingCount <= 0 || !nearTop()) {
       newBtn.hidden = true;
       newBtn.classList.remove('show');
       newBtn.textContent = 'New posts';
@@ -13959,7 +14763,7 @@ window.apAdminToast = function (msg, isErr) {
     }
     newBtn.hidden = false;
     newBtn.classList.add('show');
-    newBtn.textContent = pendingCount === 1 ? '1 new post' : (pendingCount + ' new posts');
+    newBtn.textContent = pendingCount === 1 ? 'Show 1 post' : ('Show ' + pendingCount + ' posts');
   }
 
   function insertPending(opts) {
@@ -14012,15 +14816,9 @@ window.apAdminToast = function (msg, isErr) {
       if (!raw || !raw.trim()) return;
       const filtered = filterNewHtml(raw);
       if (!filtered.count) return;
-      if (nearTop() && pendingCount === 0) {
-        pendingHtml = filtered.html;
-        pendingCount = filtered.count;
-        insertPending({ scrollToTop: false });
-      } else {
-        pendingHtml = filtered.html + pendingHtml;
-        pendingCount += filtered.count;
-        updateNewBtn();
-      }
+      pendingHtml = filtered.html + pendingHtml;
+      pendingCount += filtered.count;
+      updateNewBtn();
     } catch (e) {
       // quiet — Refresh still works
     } finally {
@@ -14031,6 +14829,11 @@ window.apAdminToast = function (msg, isErr) {
   async function loadMore() {
     if (!hasMore || loading) return;
     loading = true;
+    const skeleton = document.createElement('div');
+    skeleton.className = 'timeline-skeleton';
+    skeleton.setAttribute('aria-hidden', 'true');
+    skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
+    if (status && status.parentNode) status.parentNode.insertBefore(skeleton, status);
     if (status) status.textContent = 'Loading…';
     try {
       // A page may render no HTML when every row was filtered or deduplicated.
@@ -14067,11 +14870,12 @@ window.apAdminToast = function (msg, isErr) {
         if (status) status.textContent = 'Scroll for more…';
       }
       items.dataset.hasMore = hasMore ? '1' : '0';
-      if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of timeline';
+      if (status) status.textContent = hasMore ? 'Scroll for more…' : (viewName === 'vakktok' ? '' : 'End of timeline');
     } catch (e) {
       if (status) status.textContent = 'Could not load more — try Refresh';
       hasMore = false;
     } finally {
+      if (skeleton && skeleton.parentNode) skeleton.remove();
       loading = false;
     }
   }
@@ -14093,12 +14897,13 @@ window.apAdminToast = function (msg, isErr) {
     io.observe(sentinel);
     sc.onScroll(updateTopBtn);
     updateTopBtn();
-  }, { passive: true });
+  }, { passive: true, capture: true });
 
   function updateTopBtn() {
     if (!topBtn) return;
     if (sc.top() > 280) topBtn.classList.add('show');
     else topBtn.classList.remove('show');
+    updateNewBtn();
   }
   sc.onScroll(updateTopBtn);
   updateTopBtn();
@@ -14117,22 +14922,26 @@ window.apAdminToast = function (msg, isErr) {
   let ptrDy = 0;
   let ptrTracking = false;
   let ptrArmed = false;
+  let ptrLastHaptic = 0;
   const PTR_READY = 72;
   function ptrReset() {
     ptrTracking = false;
     ptrArmed = false;
     ptrDy = 0;
+    ptrLastHaptic = 0;
     if (ptrEl) {
       ptrEl.style.height = '0px';
       ptrEl.classList.remove('show', 'ready');
       ptrEl.textContent = 'Pull to refresh';
     }
   }
-  function ptrCanStart() {
+  function ptrCanStart(ev) {
+    const target = ev && ev.target;
+    if (target && target.closest && target.closest('textarea, input, select, button')) return false;
     return nearTop() && !document.body.classList.contains('mobile-nav-open');
   }
   document.addEventListener('touchstart', (ev) => {
-    if (!ev.touches || !ev.touches[0] || !ptrCanStart()) {
+    if (!ev.touches || !ev.touches[0] || !ptrCanStart(ev)) {
       ptrTracking = false;
       return;
     }
@@ -14140,7 +14949,7 @@ window.apAdminToast = function (msg, isErr) {
     ptrArmed = false;
     ptrStartY = ev.touches[0].clientY;
     ptrDy = 0;
-  }, { passive: true });
+  }, { passive: true, capture: true });
   document.addEventListener('touchmove', (ev) => {
     if (!ptrTracking || !ev.touches || !ev.touches[0]) return;
     if (sc.top() > 4) {
@@ -14149,15 +14958,20 @@ window.apAdminToast = function (msg, isErr) {
     }
     ptrDy = ev.touches[0].clientY - ptrStartY;
     if (ptrDy < 8) return;
+    ev.preventDefault();
     const pull = Math.min(110, ptrDy * 0.55);
     ptrArmed = pull >= PTR_READY;
+    if (pull - ptrLastHaptic >= 16 || (ptrArmed && ptrLastHaptic < PTR_READY)) {
+      window.vaakHaptic(ptrArmed ? 14 : 4);
+      ptrLastHaptic = pull;
+    }
     if (ptrEl) {
       ptrEl.style.height = pull + 'px';
       ptrEl.classList.add('show');
       ptrEl.classList.toggle('ready', ptrArmed);
       ptrEl.textContent = ptrArmed ? 'Release to refresh' : 'Pull to refresh';
     }
-  }, { passive: true });
+  }, { passive: false, capture: true });
   document.addEventListener('touchend', () => {
     if (!ptrTracking) return;
     const doRefresh = ptrArmed;
@@ -14177,7 +14991,10 @@ window.apAdminToast = function (msg, isErr) {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') pollNewer();
   });
-  setTimeout(pollNewer, 12000);
+  // Prime shortly after paint; subsequent checks use the two-minute cadence.
+  setTimeout(pollNewer, 5000);
+  window.novaPollTimeline = pollNewer;
+  window.novaInsertPendingTimeline = insertPending;
 })();
 </script>
 <?php endif; ?>
@@ -14340,8 +15157,13 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       </label>
       <div class="compose-media-row" id="compose-media-previews"></div>
       <label class="meta" style="display:block;margin:.55rem 0 .35rem<?= $composeIsEdit ? ';display:none' : '' ?>">
-        <input type="file" name="media[]" id="compose-media-input" accept="image/*,video/mp4,video/webm,video/quicktime" multiple style="max-width:100%">
+        <input type="file" name="media[]" id="compose-media-input" accept="image/*,video/mp4,video/webm,video/quicktime,audio/*" multiple style="max-width:100%">
       </label>
+      <?php if (!$composeIsEdit): ?>
+        <button type="button" class="btn btn-ghost compose-record-btn" id="compose-record-btn" title="Record up to 60 seconds of audio" aria-label="Record audio">
+          <i class="ph ph-microphone" aria-hidden="true"></i>
+        </button>
+      <?php endif; ?>
       <?php if ($prefillQuoteObject === '' && !$composeIsEdit): ?>
         <input name="in_reply_to" id="compose-in-reply-to" value="<?= h($prefillReplyTo) ?>" placeholder="Reply-to object URL (optional)"<?= $composeIsSelfReply ? ' readonly' : '' ?>>
         <?php if (!$composeIsSelfReply): ?>
@@ -14351,6 +15173,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         <?php endif; ?>
       <?php endif; ?>
       <div class="composer-actions">
+        <div class="compose-submit-progress" id="compose-submit-progress" role="status" aria-live="polite">
+          <progress id="compose-submit-progress-bar" max="100" value="0"></progress>
+          <span id="compose-submit-progress-label">Uploading media…</span>
+        </div>
         <span class="meta" id="compose-media-hint"><?php
           if ($composeIsEdit) {
               echo 'Media stays attached; text/CW edit only for now';
@@ -14408,10 +15234,238 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const altAiBtn = document.getElementById('alt-modal-ai');
   const altAiStatus = document.getElementById('alt-modal-ai-status');
   const MAX = 4;
+  const timelineFeed = document.querySelector('.feed');
+  const timelineItems = document.getElementById('timeline-items');
+  const inlineTimelineComposer = !!(modal && timelineFeed && timelineItems
+    && ['home', 'local', 'feed'].includes(timelineItems.dataset.view || '')
+    && !modal.classList.contains('open'));
+  if (inlineTimelineComposer) {
+    const panel = modal.querySelector('.compose-modal__panel');
+    const newPostsRow = document.getElementById('feed-new-btn');
+    if (panel) {
+      panel.classList.add('compose-inline-panel');
+      panel.setAttribute('role', 'region');
+      panel.removeAttribute('aria-modal');
+      // Keep the new-post divider immediately below the composer.
+      const composeSlot = document.getElementById('compose-inline-slot');
+      if (composeSlot) {
+        composeSlot.replaceChildren(panel);
+        composeSlot.style.marginBottom = '0';
+        composeSlot.removeAttribute('aria-label');
+      } else {
+        timelineFeed.insertBefore(panel, newPostsRow || timelineItems);
+      }
+      const inlineForm = panel.querySelector('#compose-form');
+      const inlineActions = inlineForm && inlineForm.querySelector('.composer-actions');
+      if (inlineForm && inlineActions) {
+        const asMeta = inlineForm.querySelector('.meta[style*="margin-bottom"]');
+        const visibility = inlineForm.querySelector('#compose-visibility');
+        const visibilityWrap = visibility && visibility.closest('label');
+        if (asMeta && visibilityWrap) {
+          visibilityWrap.classList.add('compose-inline-visibility');
+          visibilityWrap.childNodes.forEach((node) => {
+            if (node.nodeType === Node.TEXT_NODE) node.textContent = '';
+          });
+          asMeta.appendChild(document.createTextNode(' '));
+          asMeta.appendChild(visibilityWrap);
+        }
+        // Manual object/actor targets belong to reply actions on posts, not
+        // the normal top-of-feed composer.
+        ['#compose-in-reply-to', '#compose-to-actor'].forEach((sel) => {
+          const field = inlineForm.querySelector(sel);
+          if (field) field.remove();
+        });
+        const tools = document.createElement('div');
+        tools.className = 'compose-inline-tools';
+        inlineForm.insertBefore(tools, inlineActions);
+        const emojiWrap = inlineForm.querySelector('.compose-emoji-wrap');
+        if (emojiWrap) {
+          const emojiBtn = emojiWrap.querySelector('#compose-emoji-toggle');
+          if (emojiBtn) {
+            emojiBtn.className = 'compose-tool';
+            emojiBtn.innerHTML = '<i class="ph ph-smiley" aria-hidden="true"></i>';
+            emojiBtn.title = 'Add emoji';
+            emojiBtn.setAttribute('aria-label', 'Add emoji');
+          }
+          tools.appendChild(emojiWrap);
+        }
+        const sensitiveLabel = inlineForm.querySelector('.composer-check');
+        if (sensitiveLabel) {
+          const sensitiveInput = sensitiveLabel.querySelector('input[name="sensitive"]');
+          const sensitiveBtn = document.createElement('button');
+          sensitiveBtn.type = 'button';
+          sensitiveBtn.className = 'compose-tool';
+          sensitiveBtn.innerHTML = '<i class="ph ph-eye-slash" aria-hidden="true"></i>';
+          sensitiveBtn.title = 'Mark as sensitive';
+          sensitiveBtn.setAttribute('aria-label', 'Mark as sensitive');
+          sensitiveBtn.setAttribute('aria-pressed', sensitiveInput && sensitiveInput.checked ? 'true' : 'false');
+          sensitiveBtn.addEventListener('click', () => {
+            if (!sensitiveInput) return;
+            sensitiveInput.checked = !sensitiveInput.checked;
+            sensitiveBtn.setAttribute('aria-pressed', sensitiveInput.checked ? 'true' : 'false');
+          });
+          sensitiveLabel.innerHTML = '';
+          if (sensitiveInput) sensitiveLabel.appendChild(sensitiveInput);
+          sensitiveLabel.appendChild(sensitiveBtn);
+          tools.appendChild(sensitiveLabel);
+        }
+        const mediaInputForToolbar = inlineForm.querySelector('#compose-media-input');
+        const mediaLabel = mediaInputForToolbar && mediaInputForToolbar.closest('label');
+        if (mediaLabel) {
+          mediaLabel.classList.add('compose-media-tool');
+          const mediaInput = mediaInputForToolbar;
+          const mediaBtn = document.createElement('button');
+          mediaBtn.type = 'button';
+          mediaBtn.className = 'compose-tool';
+          mediaBtn.innerHTML = '<i class="ph ph-image" aria-hidden="true"></i>';
+          mediaBtn.title = 'Add media';
+          mediaBtn.setAttribute('aria-label', 'Add media');
+          mediaBtn.addEventListener('click', () => { if (mediaInput) mediaInput.click(); });
+          mediaLabel.insertBefore(mediaBtn, mediaInput);
+          tools.appendChild(mediaLabel);
+        }
+        const pollBtn = document.createElement('button');
+        pollBtn.type = 'button';
+        pollBtn.className = 'compose-tool';
+        pollBtn.innerHTML = '<i class="ph ph-chart-bar" aria-hidden="true"></i>';
+        pollBtn.title = 'Create poll';
+        pollBtn.setAttribute('aria-label', 'Create poll');
+        pollBtn.addEventListener('click', () => {
+          if (window.apAdminToast) window.apAdminToast('Polls are not supported by Vaak yet.', true);
+        });
+        tools.appendChild(pollBtn);
+        const recordBtn = inlineForm.querySelector('#compose-record-btn');
+        if (recordBtn) {
+          recordBtn.className = 'compose-tool';
+          recordBtn.title = 'Record audio (up to 60 seconds)';
+          tools.appendChild(recordBtn);
+        }
+        const composeText = inlineForm.querySelector('#compose-content');
+        if (composeText) {
+          const count = document.createElement('span');
+          count.className = 'meta compose-char-count';
+          count.style.marginRight = 'auto';
+          const updateCount = () => { count.textContent = (composeText.value || '').length + ' / 2,000'; };
+          updateCount();
+          composeText.addEventListener('input', updateCount);
+          inlineActions.insertBefore(count, inlineActions.firstChild);
+        }
+      }
+      modal.hidden = true;
+      modal.setAttribute('aria-hidden', 'true');
+      if (fab) fab.setAttribute('aria-hidden', 'true');
+    }
+  }
   let files = [];
   let alts = [];
   let altEditIdx = -1;
   let altAiBusy = false;
+  const recordBtn = document.getElementById('compose-record-btn');
+  let mediaRecorder = null;
+  let recordStream = null;
+  let recordChunks = [];
+  let recordTimer = null;
+  let recordStartedAt = 0;
+
+  function stopAudioRecording() {
+    if (recordTimer) {
+      clearInterval(recordTimer);
+      recordTimer = null;
+    }
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.stop();
+    }
+    if (recordStream) {
+      recordStream.getTracks().forEach((track) => track.stop());
+      recordStream = null;
+    }
+  }
+
+  function updateRecordButton(elapsedMs) {
+    if (!recordBtn) return;
+    const seconds = Math.min(60, Math.floor((elapsedMs || 0) / 1000));
+    const label = mediaRecorder && mediaRecorder.state === 'recording'
+      ? ('Stop recording (' + seconds + '/60)')
+      : 'Record audio';
+    recordBtn.innerHTML = mediaRecorder && mediaRecorder.state === 'recording'
+      ? '<i class="ph ph-stop-circle" aria-hidden="true"></i> <span>' + label + '</span>'
+      : '<i class="ph ph-microphone" aria-hidden="true"></i>';
+    recordBtn.classList.toggle('is-recording', !!(mediaRecorder && mediaRecorder.state === 'recording'));
+    recordBtn.setAttribute('aria-label', label);
+  }
+
+  if (recordBtn) {
+    recordBtn.addEventListener('click', async () => {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        stopAudioRecording();
+        return;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+        if (window.apAdminToast) window.apAdminToast('Audio recording is not supported by this browser.', true);
+        return;
+      }
+      if (files.length >= MAX) {
+        if (window.apAdminToast) window.apAdminToast('Remove an attachment before recording audio.', true);
+        return;
+      }
+      try {
+        recordStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            channelCount: 1
+          }
+        });
+        const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find((type) => MediaRecorder.isTypeSupported(type));
+        mediaRecorder = preferred ? new MediaRecorder(recordStream, { mimeType: preferred }) : new MediaRecorder(recordStream);
+        recordChunks = [];
+        recordStartedAt = Date.now();
+        mediaRecorder.addEventListener('dataavailable', (event) => {
+          if (event.data && event.data.size) recordChunks.push(event.data);
+        });
+        mediaRecorder.addEventListener('stop', () => {
+          const mime = mediaRecorder && mediaRecorder.mimeType ? mediaRecorder.mimeType : (preferred || 'audio/webm');
+          const duration = Date.now() - recordStartedAt;
+          const blob = new Blob(recordChunks, { type: mime });
+          recordChunks = [];
+          const oldRecorder = mediaRecorder;
+          mediaRecorder = null;
+          updateRecordButton(0);
+          if (duration > 60500) {
+            if (window.apAdminToast) window.apAdminToast('Recordings must be one minute or shorter.', true);
+            return;
+          }
+          const ext = mime.includes('mp4') ? 'm4a' : 'webm';
+          files.push(new File([blob], 'voice-note-' + Date.now() + '.' + ext, { type: mime }));
+          alts.push('');
+          syncInput();
+          render();
+          void oldRecorder;
+        });
+        updateRecordButton(0);
+        recordBtn.disabled = true;
+        recordBtn.innerHTML = '<i class="ph ph-spinner-gap ph-spin" aria-hidden="true"></i>';
+        // Give Safari/desktop input devices a short warm-up before the first
+        // encoded sample. This avoids clipping the first spoken syllable.
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        if (!mediaRecorder || !recordStream) return;
+        mediaRecorder.start();
+        recordBtn.disabled = false;
+        updateRecordButton(0);
+        recordTimer = setInterval(() => {
+          const elapsed = Date.now() - recordStartedAt;
+          updateRecordButton(elapsed);
+          if (elapsed >= 60000) stopAudioRecording();
+        }, 250);
+      } catch (e) {
+        if (recordStream) recordStream.getTracks().forEach((track) => track.stop());
+        recordStream = null;
+        mediaRecorder = null;
+        if (window.apAdminToast) window.apAdminToast('Microphone permission is required to record audio.', true);
+      }
+    });
+  }
 
   const draftIdField = document.getElementById('compose-draft-id');
   const draftMediaField = document.getElementById('compose-draft-media-ids');
@@ -14431,15 +15485,26 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       ta.style.height = max + 'px';
     }
   }
+  function autoGrowComposeTextarea() {
+    const ta = document.getElementById('compose-content');
+    if (!ta) return;
+    ta.style.height = '0px';
+    const max = 500;
+    const contentHeight = ta.scrollHeight;
+    const next = Math.min(Math.max(contentHeight, 96), max);
+    ta.style.height = next + 'px';
+    ta.style.overflowY = contentHeight > max ? 'auto' : 'hidden';
+  }
   function openModal() {
     modal.classList.add('open');
     modal.setAttribute('aria-hidden', 'false');
     const ta = document.getElementById('compose-content');
     if (ta) {
-      setTimeout(() => {
+      requestAnimationFrame(() => {
         clampComposeTextarea();
+        autoGrowComposeTextarea();
         ta.focus();
-      }, 50);
+      });
     }
   }
   function composeHasDraftableContent() {
@@ -14566,6 +15631,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     } catch (e) {}
   }
   async function closeModal() {
+    if (mediaRecorder && mediaRecorder.state === 'recording') stopAudioRecording();
     if (altModal && altModal.classList.contains('open')) {
       closeAltEditor(false);
       return;
@@ -14612,12 +15678,33 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const seen = {};
     const list = [];
     EMOJIS.forEach((e) => { if (!seen[e]) { seen[e] = 1; list.push(e); } });
+    const names = {
+      '😀':'grinning smile', '😂':'joy laugh', '😊':'smile', '😍':'heart eyes',
+      '🥰':'love', '😎':'sunglasses cool', '😢':'cry sad', '😭':'sob',
+      '😡':'angry', '🤔':'thinking', '😴':'sleep', '👀':'eyes', '✨':'sparkles',
+      '🔥':'fire', '💯':'hundred', '❤️':'heart', '⭐':'star', '🌈':'rainbow',
+      '🐱':'cat', '🐶':'dog', '🦄':'unicorn', '🍕':'pizza', '☕':'coffee',
+      '🎉':'party', '🎊':'confetti', '💀':'skull', '👻':'ghost', '👽':'alien',
+      '🤖':'robot', '👍':'thumbs up', '👎':'thumbs down', '👏':'clap',
+      '🙏':'pray', '💪':'strong', '💬':'speech', '📌':'pin'
+    };
     picker.innerHTML = '';
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'compose-emoji-search';
+    search.placeholder = 'Search emoji';
+    search.setAttribute('aria-label', 'Search emoji');
+    picker.appendChild(search);
+    const grid = document.createElement('div');
+    grid.style.display = 'contents';
+    picker.appendChild(grid);
+    const buttons = [];
     list.forEach((emo) => {
       const b = document.createElement('button');
       b.type = 'button';
       b.setAttribute('role', 'option');
       b.title = emo;
+      b.dataset.search = (emo + ' ' + (names[emo] || '')).toLowerCase();
       b.textContent = emo;
       b.addEventListener('click', () => {
         const start = ta.selectionStart ?? ta.value.length;
@@ -14630,12 +15717,30 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         try { ta.setSelectionRange(pos, pos); } catch (_) {}
         ta.dispatchEvent(new Event('input', { bubbles: true }));
       });
-      picker.appendChild(b);
+      grid.appendChild(b);
+      buttons.push(b);
+    });
+    search.addEventListener('input', () => {
+      const q = search.value.trim().toLowerCase();
+      buttons.forEach((b) => { b.hidden = !!q && !b.dataset.search.includes(q); });
     });
     toggle.addEventListener('click', () => {
       const open = picker.hidden;
       picker.hidden = !open;
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (open) search.focus();
+    });
+    document.addEventListener('click', (event) => {
+      if (picker.hidden) return;
+      if (event.target === picker || picker.contains(event.target) || event.target === toggle) return;
+      picker.hidden = true;
+      toggle.setAttribute('aria-expanded', 'false');
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || picker.hidden) return;
+      picker.hidden = true;
+      toggle.setAttribute('aria-expanded', 'false');
+      toggle.focus();
     });
   })();
   function updateAltCount() {
@@ -14654,6 +15759,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const url = URL.createObjectURL(file);
     altPreview.innerHTML = '';
     const isVideo = file.type.startsWith('video/');
+    const isAudio = file.type.startsWith('audio/');
     if (isVideo) {
       const v = document.createElement('video');
       v.className = 'alt-modal__preview';
@@ -14661,6 +15767,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       v.controls = true;
       v.muted = true;
       altPreview.appendChild(v);
+    } else if (isAudio) {
+      const a = document.createElement('audio');
+      a.className = 'alt-modal__preview';
+      a.src = url;
+      a.controls = true;
+      altPreview.appendChild(a);
     } else {
       const img = document.createElement('img');
       img.className = 'alt-modal__preview';
@@ -14672,7 +15784,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     updateAltCount();
     setAltAiStatus('');
     if (altAiBtn) {
-      altAiBtn.style.display = isVideo ? 'none' : '';
+      altAiBtn.style.display = (isVideo || isAudio) ? 'none' : '';
       altAiBtn.disabled = false;
     }
     altModal.classList.add('open');
@@ -14733,27 +15845,45 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (altAiBtn) altAiBtn.disabled = false;
     }
   }
-  if (fab) fab.addEventListener('click', openModal);
+  if (fab) fab.addEventListener('click', () => {
+    if (inlineTimelineComposer) {
+      const target = document.querySelector('.compose-inline-panel');
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const ta = document.getElementById('compose-content');
+      if (ta) setTimeout(() => ta.focus(), 260);
+      return;
+    }
+    openModal();
+  });
   if (closeBtn) closeBtn.addEventListener('click', closeModal);
   modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
   // Keep textarea resize inside its flex slot (avoids modal/form scrollbars)
   (function bindComposeResizeClamp() {
     const ta = document.getElementById('compose-content');
     if (!ta) return;
-    const clampSoon = () => requestAnimationFrame(clampComposeTextarea);
+    const clampSoon = () => requestAnimationFrame(() => {
+      clampComposeTextarea();
+      autoGrowComposeTextarea();
+    });
+    ta.addEventListener('input', autoGrowComposeTextarea);
     ta.addEventListener('mouseup', clampSoon);
     ta.addEventListener('pointerup', clampSoon);
-    ta.addEventListener('blur', clampComposeTextarea);
-    window.addEventListener('resize', clampComposeTextarea);
+    ta.addEventListener('blur', autoGrowComposeTextarea);
+    window.addEventListener('resize', () => {
+      clampComposeTextarea();
+      autoGrowComposeTextarea();
+    });
     if (typeof ResizeObserver !== 'undefined') {
       let clamping = false;
       new ResizeObserver(() => {
         if (clamping) return;
         clamping = true;
         clampComposeTextarea();
+        autoGrowComposeTextarea();
         clamping = false;
       }).observe(ta);
     }
+    autoGrowComposeTextarea();
   })();
   if (altSave) altSave.addEventListener('click', () => closeAltEditor(true));
   if (altCancel) altCancel.addEventListener('click', () => closeAltEditor(false));
@@ -14792,6 +15922,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       const url = URL.createObjectURL(file);
       if (file.type.startsWith('video/')) {
         card.innerHTML = '<video src="' + url + '" muted></video>';
+      } else if (file.type.startsWith('audio/')) {
+        card.innerHTML = '<audio src="' + url + '" controls></audio>';
       } else {
         card.innerHTML = '<img src="' + url + '" alt="">';
       }
@@ -14840,9 +15972,50 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const queueBtn = document.getElementById('compose-queue-btn');
   const mediaInput = document.getElementById('compose-media-input');
   const mediaHint = document.getElementById('compose-media-hint');
+  const submitProgress = document.getElementById('compose-submit-progress');
+  const submitProgressBar = document.getElementById('compose-submit-progress-bar');
+  const submitProgressLabel = document.getElementById('compose-submit-progress-label');
   const visibilityWrap = document.getElementById('compose-visibility')
     ? document.getElementById('compose-visibility').closest('label')
     : null;
+  function setSubmitProgress(state, percent) {
+    if (!submitProgress) return;
+    const active = state !== 'hidden';
+    submitProgress.classList.toggle('is-visible', active);
+    submitProgress.classList.toggle('is-indeterminate', state === 'finalizing' || state === 'posting');
+    if (submitProgressBar) {
+      submitProgressBar.value = Math.max(0, Math.min(100, Number(percent) || 0));
+    }
+    if (submitProgressLabel) {
+      submitProgressLabel.textContent = state === 'uploading'
+        ? ('Uploading media… ' + Math.round(Number(percent) || 0) + '%')
+        : (state === 'finalizing' ? 'Media uploaded — posting…' : (state === 'posting' ? 'Posting…' : ''));
+    }
+  }
+  function submitComposeRequest(url, fd, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader('Accept', 'application/json');
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+      xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable && typeof onProgress === 'function') {
+          onProgress((event.loaded / event.total) * 100);
+        }
+      });
+      xhr.addEventListener('load', () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText || ''); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+        else resolve(data || { ok: false, error: 'Upload failed (HTTP ' + xhr.status + ').' });
+      });
+      xhr.addEventListener('error', () => reject(new Error('network')));
+      xhr.addEventListener('timeout', () => reject(new Error('timeout')));
+      xhr.timeout = 0;
+      xhr.send(fd);
+    });
+  }
   // PHP-prefilled edit: keep mode sticky so AJAX save hits edit_status
   if (composeMode === 'edit_status' && actionField) {
     actionField.value = 'edit_status';
@@ -15015,16 +16188,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       fd.set('action', actionName);
       if (window.vaakCsrfApply) window.vaakCsrfApply(fd);
       else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
-      const res = await fetch(form.getAttribute('action') || '?view=outbox', {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-        headers: {
-          'Accept': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest'
-        }
+      const hasMedia = !!(mediaInput && mediaInput.files && mediaInput.files.length);
+      setSubmitProgress(hasMedia ? 'uploading' : 'posting', hasMedia ? 0 : 0);
+      const data = await submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, (percent) => {
+        if (hasMedia) setSubmitProgress('uploading', percent);
       });
-      const data = await res.json().catch(() => null);
+      setSubmitProgress(hasMedia ? 'finalizing' : 'posting', hasMedia ? 100 : 100);
       if (!data || !data.ok) {
         const failMsg = mode === 'queue_post' ? 'Queue failed.' : (mode === 'edit_status' ? 'Edit failed.' : 'Post failed.');
         if (window.apAdminToast) {
@@ -15081,11 +16250,19 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         window.location.href = '?view=queue';
         return;
       }
-      // Reload so edited HTML shows up
-      window.location.reload();
+      // Refresh only the timeline fragment after a normal post. Edits still
+      // reload because their existing card may be outside the current window.
+      if (mode !== 'edit_status' && typeof window.novaPollTimeline === 'function') {
+        await window.novaPollTimeline();
+        if (typeof window.novaInsertPendingTimeline === 'function') {
+          window.novaInsertPendingTimeline({ scrollToTop: false });
+        }
+      } else {
+        window.location.reload();
+      }
     } catch (err) {
-      if (window.apAdminToast) window.apAdminToast('Network error — try again.', true);
-      else alert('Network error — try again.');
+      if (window.apAdminToast) window.apAdminToast('Upload or network error — try again.', true);
+      else alert('Upload or network error — try again.');
     } finally {
       composeMode = 'reply';
       if (actionField) actionField.value = 'reply';
@@ -15093,6 +16270,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (submitBtn) submitBtn.disabled = false;
       if (queueBtn) queueBtn.disabled = false;
       if (draftBtn) draftBtn.disabled = false;
+      setSubmitProgress('hidden', 0);
     }
   });
 })();
@@ -15227,6 +16405,43 @@ if (VIEW === 'support') loadSupport();
 if (VIEW === 'analytics') loadAnalytics();
 </script>
 <?php endif; ?>
+<script>
+// Small, opt-in keyboard layer for fast timeline navigation (X-style, but
+// limited to familiar actions and disabled while typing in a form control).
+(function () {
+  let selected = -1;
+  function cards() { return Array.from(document.querySelectorAll('#timeline-items article.tweet')); }
+  document.addEventListener('keydown', function (ev) {
+    const el = ev.target;
+    if (el && (el.matches('input, textarea, select, button, [contenteditable="true"]'))) return;
+    if (ev.key === 'n') {
+      const fab = document.getElementById('compose-fab');
+      if (fab) { ev.preventDefault(); fab.click(); }
+      return;
+    }
+    if (ev.key === '/') {
+      const search = document.querySelector('input[name="q"][type="search"], input[placeholder*="@user@instance"]');
+      if (search) { ev.preventDefault(); search.focus(); }
+      return;
+    }
+    if (ev.key !== 'j' && ev.key !== 'k') return;
+    const list = cards();
+    if (!list.length) return;
+    ev.preventDefault();
+    selected = Math.max(0, Math.min(list.length - 1, selected + (ev.key === 'j' ? 1 : -1)));
+    list.forEach((card, i) => card.classList.toggle('keyboard-selected', i === selected));
+    list[selected].scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'r' || selected < 0) return;
+    const list = cards();
+    const card = list[selected];
+    if (!card) return;
+    const reply = card.querySelector('a[title="Reply"], a[aria-label="Reply"]');
+    if (reply) { ev.preventDefault(); reply.click(); }
+  });
+})();
+</script>
 </body>
 </html>
 <?php

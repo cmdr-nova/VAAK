@@ -548,12 +548,21 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_featured_cards_for_actor_key($actorKey)
         : [];
     $featuredCount = count($featuredCards);
+    $bskyHandle = function_exists('ap_profile_bsky_handle')
+        ? ap_profile_bsky_handle($actorKey, $p)
+        : null;
 
     echo '<div class="stats">';
     echo '<div><span class="n">' . count($publicNotes) . '</span><span class="l">Posts</span></div>';
-    echo '<a href="/users/' . $safe . '/following"><span class="n">' . count($following) . '</span><span class="l">Following</span></a>';
-    echo '<a href="/users/' . $safe . '/followers"><span class="n">' . count($followers) . '</span><span class="l">Followers</span></a>';
+    $bskyAttr = $bskyHandle !== null ? ' data-bsky-handle="' . htmlspecialchars($bskyHandle, ENT_QUOTES, 'UTF-8') . '"' : '';
+    $bskyTitle = $bskyHandle !== null ? ' title="Includes local and Bluesky counts"' : '';
+    echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . count($following) . '</span><span class="l">Following</span></a>';
+    echo '<a href="/users/' . $safe . '/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . count($followers) . '</span><span class="l">Followers</span></a>';
     echo '</div>';
+
+    if ($bskyHandle !== null) {
+        echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
+    }
 
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
@@ -636,7 +645,18 @@ function ap_user_note_media_html(array $note, bool $interactive = true): string
         }
         $mt = strtolower((string) ($att['mediaType'] ?? ''));
         $atype = (string) ($att['type'] ?? '');
+        $poster = '';
+        $thumb = $att['thumbnail'] ?? ($att['preview'] ?? null);
+        if (is_string($thumb)) {
+            $poster = $thumb;
+        } elseif (is_array($thumb)) {
+            $poster = (string) ($thumb['url'] ?? $thumb['href'] ?? '');
+        }
+        if (!str_starts_with($poster, 'https://')) {
+            $poster = '';
+        }
         $safe = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
+        $safePoster = $poster !== '' ? htmlspecialchars($poster, ENT_QUOTES, 'UTF-8') : '';
         $alt = htmlspecialchars((string) ($att['name'] ?? $att['summary'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $isVideo = str_starts_with($mt, 'video/') || $atype === 'Video'
             || (bool) preg_match('/\.(mp4|webm|mov|m4v)(\?|$)/i', (string) (parse_url($url, PHP_URL_PATH) ?? ''));
@@ -651,7 +671,14 @@ function ap_user_note_media_html(array $note, bool $interactive = true): string
         } elseif ($isVideo) {
             $cells[] = '<video class="media-video" src="' . $safe . '" '
                 . ($interactive ? 'controls ' : 'muted ')
-                . 'playsinline preload="metadata" referrerpolicy="no-referrer"></video>';
+                . 'playsinline loop preload="metadata"'
+                . ($safePoster !== '' ? ' poster="' . $safePoster . '"' : '')
+                . ' referrerpolicy="no-referrer"></video>';
+        } elseif (str_starts_with($mt, 'audio/') || $atype === 'Audio') {
+            $cells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
+                . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
+                . '<audio class="media-audio" src="' . $safe . '" controls preload="auto"></audio>'
+                . '</div>';
         }
         if (count($cells) >= 4) {
             break;
@@ -797,6 +824,11 @@ function ap_user_html_shell_start(string $title): void
       .media-row.media-count-1 .media-cell{height:auto}
       .media-row.media-count-1 img{height:auto;object-fit:contain;max-height:min(62vh,560px);min-height:0;background:transparent}
       .media-row video{object-fit:contain;max-height:min(62vh,560px);background:#000}
+      .media-row.media-count-1 video{height:auto;aspect-ratio:auto;object-fit:contain;max-height:min(80vh,900px)}
+      .media-audio-card{position:relative;display:flex;align-items:flex-end;min-height:220px;overflow:hidden;background:#050505}
+      .media-audio-art{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.72}
+      .media-audio-card::after{content:"";position:absolute;inset:35% 0 0;background:linear-gradient(transparent,rgba(0,0,0,.86));pointer-events:none}
+      .media-audio{position:relative;z-index:1;width:calc(100% - 1.5rem);margin:.75rem}
       .btn-follow{appearance:none;border:0;border-radius:999px;padding:.55rem 1.15rem;font:inherit;font-weight:600;cursor:pointer;background:#8bf;color:#061018;margin-top:.75rem}
       .follow-panel{margin-top:.75rem;padding:.85rem;border:1px solid #2a2e37;border-radius:12px;background:#0c0c0c}
       .follow-panel[hidden]{display:none!important}

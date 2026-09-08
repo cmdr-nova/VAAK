@@ -1,6 +1,8 @@
 <?php
 /**
- * CLI: purge unused remote avatar/header cache from R2 + SQLite.
+ * CLI: purge unused remote avatar/header cache from R2 + the database.
+ * This job is intentionally limited to mkultra/cache/; it never deletes
+ * attached local post media (mkultra/media/).
  *
  * Usage:
  *   php ap-media-cleanup.php           # 30-day unused (default)

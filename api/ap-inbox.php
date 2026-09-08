@@ -5058,9 +5058,11 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
  * Fan out ActivityPub Update(Person) for a local actor.
  * Defaults to the VAAK/OAuth session actor (not hard-coded cmdr_nova).
  *
- * @return array{ok:bool,error?:string,delivered?:int,update_id?:string,targets?:int}
+ * @param bool $background Queue delivery in the detached worker instead of
+ *                         waiting on remote inboxes (used by profile saves).
+ * @return array{ok:bool,error?:string,delivered?:int,queued?:int,update_id?:string,targets?:int}
  */
-function ap_publish_profile_update(?string $actorKey = null): array
+function ap_publish_profile_update(?string $actorKey = null, bool $background = false): array
 {
     $actorKey = strtolower(trim((string) $actorKey));
     $actorKey = preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '';
@@ -5132,6 +5134,30 @@ function ap_publish_profile_update(?string $actorKey = null): array
             ap_followers_list($actorId),
             $actorKey === 'cmdr_nova' ? ap_known_shared_inboxes(40) : []
         );
+
+        // Profile saves should not hold the browser open while every remote
+        // inbox responds. The detached worker signs and delivers the exact
+        // same Update after the local profile has already been persisted.
+        if ($background && $targets !== [] && function_exists('ap_deliver_fanout_background')) {
+            $queued = ap_deliver_fanout_background($update, $targets, $keyId, $priv);
+            ap_metrics_record(
+                'Update',
+                $actorId,
+                $updateId,
+                null,
+                strlen(json_encode($actor) ?: ''),
+                'profile_update',
+                $actor['name'] ?? $actorKey
+            );
+            ap_log("profile_update actor=$actorKey id=$updateId background=" . ($queued ? '1' : '0') . ' targets=' . count($targets));
+            return [
+                'ok' => true,
+                'delivered' => 0,
+                'queued' => $queued ? count($targets) : 0,
+                'update_id' => $updateId,
+                'targets' => count($targets),
+            ];
+        }
 
         $delivered = 0;
         $n = 0;

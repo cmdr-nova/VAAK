@@ -105,12 +105,44 @@ function ap_r2_put_object(string $key, string $body, string $contentType): array
         'x-amz-date: ' . $amzDate,
         'Authorization: ' . $authorization,
     ];
+    // cURL provides reliable status/error reporting for large video PUTs;
+    // the stream wrapper can return an empty status after its short timeout.
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch !== false) {
+            curl_setopt_array($ch, [
+                CURLOPT_CUSTOMREQUEST => 'PUT',
+                CURLOPT_HTTPHEADER => $headers,
+                CURLOPT_POSTFIELDS => $body,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_CONNECTTIMEOUT => 20,
+                CURLOPT_TIMEOUT => 300,
+                CURLOPT_FAILONERROR => false,
+            ]);
+            $resp = curl_exec($ch);
+            $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $curlError = curl_error($ch);
+            curl_close($ch);
+            if ($status >= 200 && $status < 300) {
+                $publicUrl = 'https://' . $hostPub . '/' . $key;
+                return [
+                    'ok' => true,
+                    'key' => $key,
+                    'public_url' => $publicUrl,
+                    'etag' => null,
+                ];
+            }
+            $detail = $status > 0 ? ('HTTP ' . $status) : ($curlError !== '' ? $curlError : 'no response');
+            error_log('[ap-r2] cURL put fail ' . $detail . ' body=' . substr((string) $resp, 0, 300));
+            return ['ok' => false, 'error' => 'R2 upload failed (' . $detail . ')'];
+        }
+    }
     $ctx = stream_context_create([
         'http' => [
             'method' => 'PUT',
             'header' => implode("\r\n", $headers) . "\r\n",
             'content' => $body,
-            'timeout' => 60,
+            'timeout' => 300,
             'ignore_errors' => true,
         ],
         'ssl' => [
@@ -119,11 +151,17 @@ function ap_r2_put_object(string $key, string $body, string $contentType): array
         ],
     ]);
     $resp = @file_get_contents($url, false, $ctx);
-    $statusLine = $http_response_header[0] ?? '';
-    $ok = is_string($statusLine) && preg_match('/\s(200|201|204)\s/', $statusLine);
+    $statusLine = '';
+    foreach (($http_response_header ?? []) as $line) {
+        if (preg_match('/^HTTP\/\S+\s+(\d{3})\b/', (string) $line, $m)) {
+            $statusLine = (string) $line;
+        }
+    }
+    $ok = $statusLine !== '' && (bool) preg_match('/\s(200|201|204)\s/', $statusLine);
     if (!$ok) {
-        error_log('[ap-r2] put fail status=' . $statusLine . ' body=' . substr((string) $resp, 0, 300));
-        return ['ok' => false, 'error' => 'R2 upload failed (' . trim($statusLine) . ')'];
+        $detail = trim($statusLine) !== '' ? trim($statusLine) : 'no response (timeout or network error)';
+        error_log('[ap-r2] put fail status=' . $detail . ' body=' . substr((string) $resp, 0, 300));
+        return ['ok' => false, 'error' => 'R2 upload failed (' . $detail . ')'];
     }
     $publicUrl = 'https://' . $hostPub . '/' . $key;
     return [
@@ -157,6 +195,16 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     $finfo = new finfo(FILEINFO_MIME_TYPE);
     $mime = $finfo->file($tmp) ?: ((string) ($file['type'] ?? 'application/octet-stream'));
     $mime = strtolower($mime);
+
+    // WebM is a container: finfo often labels audio-only MediaRecorder
+    // output as video/webm. Inspect the streams before choosing federation
+    // metadata so voice recordings are not published as silent video files.
+    if ($mime === 'video/webm' && trim((string) shell_exec('command -v ffprobe')) !== '') {
+        $streams = trim((string) shell_exec('ffprobe -v error -show_entries stream=codec_type -of csv=p=0 ' . escapeshellarg($tmp) . ' 2>/dev/null'));
+        if ($streams !== '' && !preg_match('/(^|\n)video(\n|$)/', $streams) && preg_match('/(^|\n)audio(\n|$)/', $streams)) {
+            $mime = 'audio/webm';
+        }
+    }
 
     $kind = 'unknown';
     $max = 0;
@@ -203,6 +251,26 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
         return ['ok' => false, 'error' => 'File too large (max ' . (int) ($max / 1024 / 1024) . 'MB)'];
     }
 
+    if ($kind === 'audio' && trim((string) shell_exec('command -v ffprobe')) !== '') {
+        $probe = trim((string) shell_exec('ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 ' . escapeshellarg($tmp) . ' 2>/dev/null'));
+        if ($probe !== '' && is_numeric($probe) && (float) $probe > 60.5) {
+            return ['ok' => false, 'error' => 'Audio recordings must be one minute or shorter'];
+        }
+    }
+
+    // Normalize browser recordings (usually WebM/Opus) to MP3 for reliable
+    // playback across Mastodon, Wafrn, Safari, and other fediverse clients.
+    if ($kind === 'audio' && $mime !== 'audio/mpeg' && trim((string) shell_exec('command -v ffmpeg')) !== '') {
+        $converted = ap_media_audio_to_mp3($tmp);
+        if ($converted === null) {
+            return ['ok' => false, 'error' => 'Could not encode audio for federation'];
+        }
+        $tmp = $converted['path'];
+        $bodyOverride = $converted['body'];
+        $mime = 'audio/mpeg';
+        $size = strlen($bodyOverride);
+    }
+
     $ext = match ($mime) {
         'image/jpeg' => 'jpg',
         'image/png' => 'png',
@@ -211,6 +279,13 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
         'video/mp4' => 'mp4',
         'video/webm' => 'webm',
         'video/quicktime' => 'mov',
+        'audio/mpeg', 'audio/mp3' => 'mp3',
+        'audio/ogg' => 'ogg',
+        'audio/mp4' => 'm4a',
+        'audio/aac' => 'aac',
+        'audio/webm' => 'webm',
+        'audio/wav', 'audio/x-wav' => 'wav',
+        'audio/flac' => 'flac',
         default => 'bin',
     };
     $body = isset($bodyOverride) ? $bodyOverride : file_get_contents($tmp);
@@ -220,6 +295,7 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
 
     $width = null;
     $height = null;
+    $previewUrl = null;
     if ($kind === 'image') {
         $info = @getimagesizefromstring($body);
         if (is_array($info)) {
@@ -232,6 +308,16 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     $put = ap_r2_put_object($key, $body, $mime);
     if (empty($put['ok'])) {
         return ['ok' => false, 'error' => $put['error'] ?? 'Upload failed'];
+    }
+    if ($kind === 'video') {
+        $posterBody = ap_media_video_poster_body($tmp);
+        if ($posterBody !== null) {
+            $posterKey = preg_replace('/\.[a-z0-9]+$/i', '-preview.jpg', $key) ?: ($key . '-preview.jpg');
+            $posterPut = ap_r2_put_object($posterKey, $posterBody, 'image/jpeg');
+            if (!empty($posterPut['ok']) && !empty($posterPut['public_url'])) {
+                $previewUrl = (string) $posterPut['public_url'];
+            }
+        }
     }
 
     $desc = $description !== null ? mb_substr(trim(ap_fix_utf8($description)), 0, 1500) : null;
@@ -247,7 +333,7 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
         ap_db_now(),
         $put['key'],
         $put['public_url'],
-        $put['public_url'],
+        $previewUrl ?: $put['public_url'],
         $kind,
         $mime,
         $size,
@@ -262,6 +348,71 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
         'local_id' => $localId,
         'attachment' => $row ? ap_masto_media_entity($row) : null,
     ];
+}
+
+/** @return array{path:string,body:string}|null */
+function ap_media_audio_to_mp3(string $path): ?array
+{
+    if ($path === '' || !is_file($path) || trim((string) shell_exec('command -v ffmpeg')) === '') {
+        return null;
+    }
+    $out = tempnam(sys_get_temp_dir(), 'ap-audio');
+    if ($out === false) {
+        return null;
+    }
+    $mp3 = $out . '.mp3';
+    @unlink($out);
+    $cmd = 'ffmpeg -hide_banner -loglevel error -y -i ' . escapeshellarg($path)
+        . ' -vn -codec:a libmp3lame -b:a 128k ' . escapeshellarg($mp3) . ' 2>/dev/null';
+    exec($cmd, $ignored, $status);
+    if ($status !== 0 || !is_file($mp3)) {
+        @unlink($mp3);
+        return null;
+    }
+    $body = file_get_contents($mp3);
+    @unlink($mp3);
+    return is_string($body) && $body !== '' ? ['path' => $path, 'body' => $body] : null;
+}
+
+/**
+ * Generate a small representative JPEG for local video attachments.
+ *
+ * The literal first frame is often a black/fade-in frame. The thumbnail
+ * filter chooses a representative frame from the opening segment instead,
+ * while the fallback still handles very short or unusual videos.
+ */
+function ap_media_video_poster_body(string $path): ?string
+{
+    if ($path === '' || !is_file($path) || trim((string) shell_exec('command -v ffmpeg')) === '') {
+        return null;
+    }
+    $out = tempnam(sys_get_temp_dir(), 'ap-poster');
+    if ($out === false) {
+        return null;
+    }
+    @unlink($out);
+    $out .= '.jpg';
+    $filter = 'thumbnail=30,scale=min(1280\,iw):-2';
+    $cmd = 'ffmpeg -nostdin -y -ss 0.5 -i ' . escapeshellarg($path)
+        . ' -map 0:v:0 -an -sn -frames:v 1 -vf ' . escapeshellarg($filter)
+        . ' -q:v 5 ' . escapeshellarg($out) . ' 2>/dev/null';
+    exec($cmd, $unused, $code);
+    if ($code !== 0 || !is_file($out)) {
+        // Some short/variable-frame-rate files cannot satisfy thumbnail=50.
+        $fallback = 'ffmpeg -nostdin -y -ss 1.0 -i ' . escapeshellarg($path)
+            . ' -map 0:v:0 -an -sn -frames:v 1 -vf ' . escapeshellarg('scale=min(1280\,iw):-2')
+            . ' -q:v 5 ' . escapeshellarg($out) . ' 2>/dev/null';
+        exec($fallback, $unused, $code);
+    }
+    if ($code !== 0 || !is_file($out)) {
+        $fallback = 'ffmpeg -nostdin -y -ss 0.1 -i ' . escapeshellarg($path)
+            . ' -map 0:v:0 -an -sn -frames:v 1 -vf ' . escapeshellarg('scale=min(1280\,iw):-2')
+            . ' -q:v 5 ' . escapeshellarg($out) . ' 2>/dev/null';
+        exec($fallback, $unused, $code);
+    }
+    $body = ($code === 0 && is_file($out)) ? @file_get_contents($out) : false;
+    @unlink($out);
+    return is_string($body) && $body !== '' ? $body : null;
 }
 
 /**
@@ -415,12 +566,38 @@ function ap_media_as2_attachments(array $rows): array
         if ($url === '') {
             continue;
         }
-        $type = str_starts_with($mime, 'image/') ? 'Image' : 'Document';
+        $type = str_starts_with($mime, 'image/')
+            ? 'Image'
+            : (str_starts_with($mime, 'audio/') ? 'Audio' : 'Document');
         $att = [
             'type' => $type,
             'mediaType' => $mime,
             'url' => $url,
         ];
+        $preview = trim((string) ($row['preview_url'] ?? ''));
+        if ($type === 'Document' && str_starts_with($preview, 'https://') && $preview !== $url) {
+            $att['thumbnail'] = [
+                'type' => 'Image',
+                'mediaType' => 'image/jpeg',
+                'url' => $preview,
+            ];
+        }
+        // Mastodon expects a named attachment and handles remote audio more
+        // consistently when a thumbnail is available. Keep this fallback
+        // deterministic for recordings that have no uploaded artwork.
+        if ($type === 'Audio') {
+            $att['name'] = 'Audio recording';
+            $att['summary'] = 'Audio recording';
+            $audioArt = [
+                'type' => 'Image',
+                'mediaType' => 'image/jpeg',
+                'url' => 'https://mkultra.monster/api/assets/audio-post-default.jpg',
+            ];
+            // Mastodon uses AS2 `icon` for remote audio artwork (rather than
+            // the `thumbnail` property used by some other implementations).
+            $att['icon'] = $audioArt;
+            $att['thumbnail'] = $audioArt;
+        }
         // Alt text: Mastodon clients use media description; AS2 Image uses name
         // (and summary as a widely understood fallback).
         $desc = trim((string) ($row['description'] ?? ''));
@@ -444,7 +621,7 @@ function ap_media_as2_attachments(array $rows): array
  *
  * @return array{ok:bool,error?:string}
  */
-function ap_r2_delete_object(string $key): array
+function ap_r2_delete_object(string $key, bool $allowLocalMedia = false): array
 {
     $cfg = ap_r2_config();
     if ($cfg === null) {
@@ -455,9 +632,12 @@ function ap_r2_delete_object(string $key): array
         $key = ltrim($prefix, '/') . ltrim($key, '/');
     }
     $key = ltrim($key, '/');
-    if ($key === '' || str_contains($key, '..') || !str_starts_with($key, 'mkultra/cache/')) {
-        // Safety: cleanup may only delete under our remote-cache prefix
-        return ['ok' => false, 'error' => 'Refusing to delete key outside mkultra/cache/'];
+    $isCache = str_starts_with($key, 'mkultra/cache/');
+    $isLocalMedia = str_starts_with($key, 'mkultra/media/');
+    if ($key === '' || str_contains($key, '..') || (!$isCache && !($allowLocalMedia && $isLocalMedia))) {
+        // Scheduled cleanup may only delete remote cache objects. Local media
+        // is permitted only from an explicit per-user retention action.
+        return ['ok' => false, 'error' => 'Refusing to delete key outside allowed media prefixes'];
     }
 
     $bucket = $cfg['S3_BUCKET'];
@@ -774,6 +954,9 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
  */
 function ap_remote_media_warm_async(string $actorId): void
 {
+    if (function_exists('ap_feature_enabled') && !ap_feature_enabled('remote_media_warm', true)) {
+        return;
+    }
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return;
@@ -846,6 +1029,13 @@ function ap_remote_media_cleanup(int $unusedDays = 7, int $limit = 200): array
     $errors = 0;
     foreach ($rows as $row) {
         $key = (string) ($row['s3_key'] ?? '');
+        // Remote avatar/header cache only. Local post media uses mkultra/media/
+        // and must never be swept by this scheduled cleanup.
+        if ($key !== '' && !str_starts_with(ltrim($key, '/'), 'mkultra/cache/')) {
+            $errors++;
+            error_log('[ap-r2] refusing remote cleanup key outside mkultra/cache/: ' . $key);
+            continue;
+        }
         if ($key !== '') {
             $res = ap_r2_delete_object($key);
             if (empty($res['ok'])) {

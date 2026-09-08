@@ -366,10 +366,38 @@ function ap_reports_list(string $filter = 'open', int $limit = 80): array
             );
             $st->execute([$limit]);
         }
-        return $st->fetchAll() ?: [];
+        $rows = $st->fetchAll() ?: [];
+        foreach ($rows as &$row) {
+            if (is_array($row)) {
+                $row['priority_score'] = ap_report_priority_score($row);
+            }
+        }
+        unset($row);
+        usort($rows, static function (array $a, array $b): int {
+            $score = ((int) ($b['priority_score'] ?? 0)) <=> ((int) ($a['priority_score'] ?? 0));
+            return $score !== 0 ? $score : ((int) ($b['id'] ?? 0) <=> (int) ($a['id'] ?? 0));
+        });
+        return $rows;
     } catch (Throwable $e) {
         return [];
     }
+}
+
+/** Transparent admin-only triage hint; this never changes moderation state. */
+function ap_report_priority_score(array $row): int
+{
+    $score = !empty($row['about_us']) ? 5 : 0;
+    $score += ((string) ($row['direction'] ?? '')) === 'in' ? 2 : 1;
+    $uris = json_decode((string) ($row['status_uris_json'] ?? '[]'), true);
+    if (is_array($uris)) {
+        $score += min(3, count($uris));
+    }
+    $created = strtotime((string) ($row['created_at'] ?? ''));
+    if ($created !== false) {
+        $ageHours = max(0, (time() - $created) / 3600);
+        $score += max(0, 3 - (int) floor($ageHours / 24));
+    }
+    return $score;
 }
 
 function ap_reports_open_count(): int
