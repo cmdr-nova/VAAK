@@ -94,4 +94,5 @@ $jrd = [
 
 header('Content-Type: application/jrd+json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
+header('Cache-Control: no-cache, max-age=0, must-revalidate');
 echo json_encode($jrd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
