@@ -700,6 +700,7 @@ function ap_cmdr_shell_start(string $title): void
       .profile-bio p{margin:0 0 .55em}
       .profile-bio p:last-child{margin-bottom:0}
       .vanity-verified{display:inline-flex;align-items:center;justify-content:center;width:1.05em;height:1.05em;margin-left:.2rem;border-radius:50%;background:#1d9bf0;color:#fff;font-size:.72em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.08em}
+      .operator-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(0,255,159,.45);border-radius:999px;background:rgba(0,255,159,.1);color:#8fffc8;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:normal}
       .fields{margin-top:1rem;font-size:.9rem} .fields dt{color:#999;margin-top:.5rem} .fields dd{margin:.15rem 0 0}
       .field-verified{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;margin-left:.35rem;border-radius:50%;background:rgba(0,255,159,.2);color:#00ff9f;font-size:.75em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.05em}
       .stats{display:flex;gap:1.25rem;margin:1.1rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a}
@@ -886,6 +887,7 @@ function ap_cmdr_site_shell_start(string $title): void
       body.ap-site-shell .ap-site-main .profile-bio p{margin:0 0 .55em}
       body.ap-site-shell .ap-site-main .profile-bio p:last-child{margin-bottom:0}
       body.ap-site-shell .ap-site-main .field-verified{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;margin-left:.35rem;border-radius:50%;background:rgba(0,255,159,.2);color:#00ff9f;font-size:.75em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.05em}
+      body.ap-site-shell .ap-site-main .operator-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(0,255,159,.45);border-radius:999px;background:rgba(0,255,159,.1);color:#8fffc8;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:normal}
       body.ap-site-shell .ap-site-main .row{display:flex;gap:1rem;align-items:flex-start}
       body.ap-site-shell .ap-site-main .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#222;flex-shrink:0}
       body.ap-site-shell .ap-site-main h1{font-size:1.35rem;margin:0 0 .35rem;color:#e8e8e8}
@@ -1011,6 +1013,7 @@ function ap_cmdr_note_html(array $row, array $create): void
     $vanityBadge = !empty($p['vanity_verified'])
         ? ' <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span>'
         : '';
+    $operatorBadge = ' <span class="operator-badge" title="Administrator and operator of this VAAK server" aria-label="Server operator">Server operator</span>';
     $avatar = htmlspecialchars((string) ($p['icon_url'] ?: '/img/avatar/current-wafrn-avatar.webp'), ENT_QUOTES, 'UTF-8');
     $noteId = htmlspecialchars((string) ($row['id'] ?? ''), ENT_QUOTES, 'UTF-8');
 
@@ -1271,7 +1274,7 @@ function ap_cmdr_html(): void
     if (!empty($p['icon_url'])) {
         echo '<img class="av" src="' . htmlspecialchars($p['icon_url'], ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
     }
-    echo '<div><h1>' . $name . $vanityBadge . '</h1>';
+    echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@cmdr_nova@mkultra.monster</p>';
     if (!function_exists('ap_sl_link_for_actor_key')) {
         require_once __DIR__ . '/ap-sl-link.php';
