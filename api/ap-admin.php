@@ -8833,10 +8833,10 @@ header('Content-Type: text/html; charset=utf-8');
       <hr class="nav-sep">
       <div class="nav-label">Social</div>
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
-      <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span></a>
       <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local"><span class="ico">◎</span><span class="label">Local</span></a>
       <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed"><span class="ico">◈</span><span class="label">Federated</span></a>
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
+      <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span></a>
       <a class="<?= $view === 'foryou' ? 'active' : '' ?>" href="?view=foryou"><span class="ico">✦</span><span class="label">For You</span></a>
       <a class="nav-search-narrow <?= $view === 'search' ? 'active' : '' ?>" href="?view=search"><span class="ico">⌕</span><span class="label">Search</span></a>
       <hr class="nav-sep">
