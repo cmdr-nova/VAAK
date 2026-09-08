@@ -4621,7 +4621,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
         }
         if (admin_media_is_video($url, $mt)) {
             $hasVideo = true;
-            $cells[] = '<video class="media-video" src="' . h($url) . '" controls playsinline preload="metadata"'
+            $cells[] = '<video class="media-video" src="' . h($url) . '" controls playsinline preload="none"'
                 . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
         } else {
@@ -8547,6 +8547,9 @@ header('Content-Type: text/html; charset=utf-8');
       white-space: pre-wrap;
       line-height: 1.45;
     }
+    /* Let the browser skip layout/paint work for cards far outside the viewport
+       while retaining their DOM, controls, and scroll position. */
+    article.tweet { content-visibility: auto; contain-intrinsic-size: 420px; }
     /* Long posts: fold text + media + cards together (no inner scrollbar) */
     .tweet-content {
       position: relative;
