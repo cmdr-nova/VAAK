@@ -8751,6 +8751,12 @@ header('Content-Type: text/html; charset=utf-8');
     }
     .media-row.media-count-1 .media-video { min-height: 200px; }
     .media-hint { font-size: .75rem; color: var(--muted); margin-top: .35rem; }
+    .notification-media { max-width: 300px; margin-top: .55rem; }
+    .notification-media .media-row { margin-top: 0; }
+    .notification-media .media-row.media-count-1 img,
+    .notification-media .media-row.media-count-1 .media-video {
+      min-height: 0; max-height: 190px;
+    }
     .img-lightbox {
       display: none; position: fixed; inset: 0; z-index: 12000;
       background: rgba(0,0,0,.88); align-items: center; justify-content: center;
@@ -9507,6 +9513,7 @@ header('Content-Type: text/html; charset=utf-8');
                   $nStatus = (isset($n['status']) && is_array($n['status'])) ? $n['status'] : null;
                   $nStatusUri = is_array($nStatus) ? (string) ($nStatus['uri'] ?? $nStatus['url'] ?? '') : '';
                   $nSnippet = '';
+                  $nMedia = [];
                   if (is_array($nStatus)) {
                       $nSnippet = trim(admin_html_to_plain((string) ($nStatus['content'] ?? '')));
                       $nSnippet = preg_replace('/^\h+/mu', '', $nSnippet) ?? $nSnippet;
@@ -9515,6 +9522,36 @@ header('Content-Type: text/html; charset=utf-8');
                       } else {
                           $nSnippet = preg_replace('#^RE:\s*https://\S+#u', '', $nSnippet) ?? $nSnippet;
                           $nSnippet = trim($nSnippet);
+                      }
+                      foreach (($nStatus['mentions'] ?? []) as $nMention) {
+                          if (!is_array($nMention)) {
+                              continue;
+                          }
+                          $nAcctKnown = ltrim(trim((string) ($nMention['acct'] ?? '')), '@');
+                          if ($nAcctKnown !== '' && str_contains($nAcctKnown, '@') && str_starts_with($nSnippet, '@' . $nAcctKnown)) {
+                              $afterMention = strlen($nAcctKnown) + 1;
+                              if (isset($nSnippet[$afterMention]) && !preg_match('/\s/u', $nSnippet[$afterMention])) {
+                                  $nSnippet = substr($nSnippet, 0, $afterMention) . ' ' . substr($nSnippet, $afterMention);
+                              }
+                              break;
+                          }
+                      }
+                      foreach (($nStatus['media_attachments'] ?? []) as $nAttachment) {
+                          if (!is_array($nAttachment)) {
+                              continue;
+                          }
+                          $nUrl = (string) ($nAttachment['url'] ?? $nAttachment['preview_url'] ?? '');
+                          if (!str_starts_with($nUrl, 'https://')) {
+                              continue;
+                          }
+                          $nMedia[] = [
+                              'url' => $nUrl,
+                              'mediaType' => in_array(strtolower((string) ($nAttachment['type'] ?? '')), ['video', 'gifv'], true) ? 'video/mp4' : null,
+                              'preview_url' => (string) ($nAttachment['preview_url'] ?? ''),
+                          ];
+                          if (count($nMedia) >= 4) {
+                              break;
+                          }
                       }
                   }
                   $typeLabel = match ($nType) {
@@ -9584,6 +9621,7 @@ header('Content-Type: text/html; charset=utf-8');
               <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'quote', 'update', 'poll', 'status'], true)): ?>
                 <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
               <?php endif; ?>
+              <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
               <div class="tweet-actions">
                 <?php if ($profileHref !== ''): ?>
                   <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
