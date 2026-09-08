@@ -12844,21 +12844,39 @@ header('Content-Type: text/html; charset=utf-8');
   let lastNotifCount = <?= (int) $notifUnreadNav ?>;
   let lastDmCount = <?= (int) $dmUnreadNav ?>;
   let notifSoundUnlocked = false;
-  // Cache-bust so browsers pick up the AIM imrcv.wav swap
+  // Cache-bust so browsers pick up the AIM imrcv.wav swap. Safari requires an
+  // actual play() during a user gesture; loading the resource alone is not
+  // enough to authorize later timer-driven playback.
   const notifAudio = new Audio('?ajax=notif_sound&v=imrcv1');
   notifAudio.preload = 'auto';
   notifAudio.volume = 0.9;
-  // Browsers block autoplay until a user gesture — unlock on first click/key.
+  notifAudio.setAttribute('playsinline', '');
+  // Browsers block autoplay until a user gesture. Prime the element with a
+  // muted play/pause cycle so Safari grants permission for future chimes.
   const unlockNotifSound = () => {
-    notifSoundUnlocked = true;
+    if (notifSoundUnlocked) return;
     try {
-      notifAudio.load();
-    } catch (e) {}
-    document.removeEventListener('pointerdown', unlockNotifSound);
-    document.removeEventListener('keydown', unlockNotifSound);
+      notifAudio.muted = true;
+      notifAudio.currentTime = 0;
+      const p = notifAudio.play();
+      if (p && typeof p.then === 'function') {
+        p.then(() => {
+          notifAudio.pause();
+          notifAudio.currentTime = 0;
+          notifAudio.muted = false;
+          notifSoundUnlocked = true;
+          document.removeEventListener('pointerdown', unlockNotifSound);
+          document.removeEventListener('keydown', unlockNotifSound);
+        }).catch(() => {
+          notifAudio.muted = false;
+        });
+      }
+    } catch (e) {
+      notifAudio.muted = false;
+    }
   };
-  document.addEventListener('pointerdown', unlockNotifSound, { once: true });
-  document.addEventListener('keydown', unlockNotifSound, { once: true });
+  document.addEventListener('pointerdown', unlockNotifSound);
+  document.addEventListener('keydown', unlockNotifSound);
 
   function playNotifSound() {
     if (!notifSoundUnlocked) return;
