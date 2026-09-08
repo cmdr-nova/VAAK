@@ -5372,6 +5372,56 @@ function ap_db_default_owner_user_id(): int
     return ap_db_cmdr_nova_user_id();
 }
 
+/** Fetch verified external Webmentions for a local public target. */
+function ap_webmention_rows_for_target(string $targetUrl, int $limit = 6): array
+{
+    $targetUrl = trim($targetUrl);
+    if ($targetUrl === '' || !str_starts_with($targetUrl, 'https://mkultra.monster/users/')) {
+        return [];
+    }
+    $limit = max(1, min($limit, 20));
+    try {
+        $st = ap_db()->prepare(
+            'SELECT id, source_url, source_title, source_content, source_author, source_published, verified_at
+             FROM webmentions WHERE target_url = ? ORDER BY verified_at DESC, id DESC LIMIT ?'
+        );
+        $st->execute([$targetUrl, $limit]);
+        $rows = $st->fetchAll();
+        return is_array($rows) ? $rows : [];
+    } catch (Throwable $e) {
+        error_log('[ap-db] webmention read failed: ' . $e->getMessage());
+        return [];
+    }
+}
+
+function ap_webmention_cards_html(string $targetUrl): string
+{
+    $rows = ap_webmention_rows_for_target($targetUrl);
+    if (!$rows) {
+        return '';
+    }
+    $html = '<section class="webmention-cards" aria-label="Webmentions"><h3>Webmentions</h3>';
+    foreach ($rows as $row) {
+        $source = htmlspecialchars((string) ($row['source_url'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $title = trim((string) ($row['source_title'] ?? ''));
+        $author = trim((string) ($row['source_author'] ?? ''));
+        $body = trim((string) ($row['source_content'] ?? ''));
+        $label = $title !== '' ? $title : ($author !== '' ? $author : 'External response');
+        $date = trim((string) ($row['source_published'] ?? $row['verified_at'] ?? ''));
+        $html .= '<article class="webmention-card"><a href="' . $source . '" rel="nofollow noopener noreferrer" target="_blank">'
+            . htmlspecialchars($label, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>';
+        if ($body !== '') {
+            $html .= '<p>' . htmlspecialchars(mb_strimwidth($body, 0, 500, '…', 'UTF-8'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+        }
+        if ($date !== '') {
+            $html .= '<time datetime="' . htmlspecialchars($date, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">'
+                . htmlspecialchars($date, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</time>';
+        }
+        $html .= '</article>';
+    }
+    return $html . '</section>';
+}
+
 /**
  * Mastodon API owner for the current request (token-bound user).
  * Same fail-closed rules as ap_db_default_owner_user_id().

@@ -1403,7 +1403,7 @@ function ap_cmdr_html(): void
     echo '<a href="/users/cmdr_nova/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $followingCount . '</span><span class="l">Following</span></a>';
     echo '<a href="/users/cmdr_nova/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $followerCount . '</span><span class="l">Followers</span></a>';
     echo '</div>';
-    echo '<p class="feed-links"><a href="/users/cmdr_nova/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/cmdr_nova/feed.atom" type="application/atom+xml">Atom</a></p>';
+    echo '<p class="feed-links"><a href="/users/cmdr_nova/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/cmdr_nova/feed.atom" type="application/atom+xml">Atom</a> · <a href="/api/ap-webmention.php?target=https%3A%2F%2Fmkultra.monster%2Fusers%2Fcmdr_nova">Webmentions</a></p>';
     if ($bskyHandle !== null) {
         echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
     }
@@ -2055,7 +2055,8 @@ function ap_cmdr_post_preview_html(array $n): string
             . $boostLine
             . $body
             . '<div class="meta">' . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8')
-            . ' · <span class="badge">boost</span></div></a>';
+            . ' · <span class="badge">boost</span></div></a>'
+            . ap_webmention_cards_html($hrefRaw);
     }
 
     // No <a> in list bodies: the card is already wrapped in <a class="post">.
@@ -2298,6 +2299,7 @@ function ap_cmdr_post_preview_html(array $n): string
     $html .= $linkCardHtml;
     $html .= '<div class="meta">' . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8') . $badge;
     $html .= '</div></a>';
+    $html .= ap_webmention_cards_html($hrefRaw);
     return $html;
 }
 
