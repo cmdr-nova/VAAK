@@ -2468,9 +2468,31 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
         ? ap_masto_notifications_unread_count(80)
         : 0;
     $dmCount = function_exists('ap_dm_unread_count') ? ap_dm_unread_count() : 0;
+    $latestNotifId = '';
+    try {
+        $latest = function_exists('ap_masto_notifications_fetch') ? ap_masto_notifications_fetch(1) : [];
+        $latestNotifId = (string) ($latest[0]['id'] ?? '');
+    } catch (Throwable $e) {
+        // Keep the lightweight badge endpoint usable if a remote actor is stale.
+    }
+    $latestDmId = '';
+    try {
+        $ownerForDm = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
+        $dmLatest = ap_db()->prepare(
+            "SELECT id FROM direct_messages
+             WHERE owner_user_id = ? AND direction = 'in' AND read_at IS NULL AND deleted_at IS NULL
+             ORDER BY id DESC LIMIT 1"
+        );
+        $dmLatest->execute([$ownerForDm]);
+        $latestDmId = (string) ($dmLatest->fetchColumn() ?: '');
+    } catch (Throwable $e) {
+        // Keep the badge endpoint usable if DM metadata is temporarily busy.
+    }
     echo json_encode([
         'count' => (int) $count,
         'dm_count' => (int) $dmCount,
+        'latest_id' => $latestNotifId,
+        'latest_dm_id' => $latestDmId,
     ], JSON_UNESCAPED_SLASHES);
     exit;
 }
@@ -13060,6 +13082,10 @@ header('Content-Type: text/html; charset=utf-8');
   const dmBadge = document.getElementById('dm-badge');
   let lastNotifCount = <?= (int) $notifUnreadNav ?>;
   let lastDmCount = <?= (int) $dmUnreadNav ?>;
+  // Event IDs prevent a transient/stale aggregate count from producing a
+  // chime after the underlying row has already been read or filtered.
+  let lastNotifEventId = '';
+  let lastDmEventId = '';
   let notifSoundUnlocked = false;
   // Cache-bust so browsers pick up the AIM imrcv.wav swap. Safari requires an
   // actual play() during a user gesture; loading the resource alone is not
@@ -13095,13 +13121,14 @@ header('Content-Type: text/html; charset=utf-8');
   document.addEventListener('pointerdown', unlockNotifSound);
   document.addEventListener('keydown', unlockNotifSound);
 
-  function playNotifSound() {
+  function playNotifSound(eventKey) {
     if (!notifSoundUnlocked) return;
     // Avoid duplicate chimes when Safari has two Vaak tabs polling at
     // different times, or when an unread counter briefly resets and rises
     // again for the same notification set.
     try {
-      const signature = String(lastNotifCount) + ':' + String(lastDmCount);
+      const signature = String(eventKey || '');
+      if (!signature) return;
       const key = 'vaak-notif-chime-v1';
       const now = Date.now();
       const prior = JSON.parse(localStorage.getItem(key) || 'null');
@@ -13133,6 +13160,8 @@ header('Content-Type: text/html; charset=utf-8');
     const play = !!(opts && opts.play);
     const n = Math.max(0, parseInt(notifCount, 10) || 0);
     const d = Math.max(0, parseInt(dmCount, 10) || 0);
+    const notifEventId = String((opts && opts.notifId) || '');
+    const dmEventId = String((opts && opts.dmId) || '');
     setBadge(notifBadge, n);
     setBadge(dmBadge, d);
     const titleBits = [];
@@ -13144,13 +13173,20 @@ header('Content-Type: text/html; charset=utf-8');
     // AIM receive: new DM always chimes; new notification chimes when not already
     // chimed for a simultaneous DM bump.
     let shouldPlay = false;
+    let eventKey = '';
     if (play) {
-      if (d > lastDmCount) shouldPlay = true;
-      else if (n > lastNotifCount) shouldPlay = true;
+      const dmAdvanced = d > lastDmCount && dmEventId !== '' && dmEventId !== lastDmEventId;
+      const notifAdvanced = n > lastNotifCount && notifEventId !== '' && notifEventId !== lastNotifEventId;
+      if (dmAdvanced || notifAdvanced) {
+        shouldPlay = true;
+        eventKey = (dmAdvanced ? 'dm:' + dmEventId : '') + (notifAdvanced ? '|notif:' + notifEventId : '');
+      }
     }
-    if (shouldPlay) playNotifSound();
+    if (shouldPlay) playNotifSound(eventKey);
     lastNotifCount = n;
     lastDmCount = d;
+    if (notifEventId !== '') lastNotifEventId = notifEventId;
+    if (dmEventId !== '') lastDmEventId = dmEventId;
   }
   applyInboxUnread(<?= (int) $notifUnreadNav ?>, <?= (int) $dmUnreadNav ?>, { play: false });
   const pollNotif = async () => {
@@ -13162,7 +13198,11 @@ header('Content-Type: text/html; charset=utf-8');
       });
       if (!res.ok) return;
       const data = await res.json();
-      applyInboxUnread(data && data.count, data && data.dm_count, { play: true });
+      applyInboxUnread(data && data.count, data && data.dm_count, {
+        play: true,
+        notifId: data && data.latest_id,
+        dmId: data && data.latest_dm_id,
+      });
     } catch (e) {}
   };
   setInterval(pollNotif, 30000);
