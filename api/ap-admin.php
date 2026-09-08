@@ -184,7 +184,10 @@ function admin_xai_config(): array
     $userModel = '';
 
     $user = $GLOBALS['vaak_user'] ?? null;
-    $actorKey = strtolower(trim((string) ($GLOBALS['vaak_actor_key'] ?? (is_array($user) ? ($user['actor_key'] ?? '') : ''))));
+    // Derive host-key authorization from the authenticated user row itself.
+    // Request globals can be temporarily switched by federation helpers and
+    // must never decide who may read the operator-only environment key.
+    $actorKey = strtolower(trim((string) (is_array($user) ? ($user['actor_key'] ?? '') : '')));
     // Host xAI key is operator-only — not shared with other is_admin rows
     $mayUseHostXai = ($actorKey === 'cmdr_nova');
 
