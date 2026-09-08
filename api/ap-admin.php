@@ -5633,6 +5633,8 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
         }
     }
     $quoteParts = null;
+    $quotedStatus = null;
+    $quotedStatusUrl = '';
     if ($summaryRaw !== '' && str_contains($summaryRaw, '↪ QT')) {
         $chunks = preg_split('/\n\n↪ QT/u', $summaryRaw, 2);
         if (!is_array($chunks) || count($chunks) !== 2) {
@@ -5652,6 +5654,15 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 'commentary' => $commentary,
                 'quoted' => $quoted,
             ];
+            // Wafrn and older Mastodon-compatible servers often provide only
+            // a QT marker plus the quoted object URL. Hydrate from Vaak's
+            // cache when possible; otherwise keep the fallback compact.
+            if (preg_match('#https://[^\s<>]+#u', $quoted, $qm)) {
+                $quotedStatusUrl = rtrim((string) $qm[0], '.,);]');
+                if ($quotedStatusUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
+                    $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
+                }
+            }
         }
     }
     $aid = (string) ($e['actor_id'] ?? '');
@@ -5782,8 +5793,29 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   if ($quoteParts['quoted'] !== '' && function_exists('ap_masto_content_with_mentions')) {
                       $qMentions = ap_masto_content_with_mentions($quoteParts['quoted'], [])['mentions'] ?? [];
                   }
-                  $bodyChunk .= '<div class="quote-block"><span class="qt-label">Quoted</span><br>'
-                      . admin_linkify_body_html($quoteParts['quoted'], $returnView, $qMentions) . '</div>';
+                  $bodyChunk .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+                  if (is_array($quotedStatus)) {
+                      $qAcct = (string) ($quotedStatus['account']['acct'] ?? '');
+                      $qText = admin_html_to_plain((string) ($quotedStatus['content'] ?? ''));
+                      if ($qAcct !== '') {
+                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qAcct) . '</div>';
+                      }
+                      if ($qText !== '') {
+                          $bodyChunk .= '<div style="margin-top:.25rem">'
+                              . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView, [])
+                              . '</div>';
+                      }
+                      if ($quotedStatusUrl !== '') {
+                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
+                              . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted</a></div>';
+                      }
+                  } elseif ($quotedStatusUrl !== '') {
+                      $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
+                          . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted post</a></div>';
+                  } else {
+                      $bodyChunk .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
+                  }
+                  $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
                       . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions) . '</div>';
