@@ -5600,6 +5600,14 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     $canReply = feed_event_can_reply($e);
     $replyObjectId = feed_event_reply_object_id($e);
     $summaryRaw = html_entity_decode((string) ($e['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    // Wafrn can concatenate a full local handle with the first word of its
+    // commentary (for example `@cmdr_nova@mkultra.monsteraudio`). Restore the
+    // missing separator before quote/mention parsing.
+    $summaryRaw = preg_replace(
+        '/(@[A-Za-z0-9_]+@mkultra\.monster)(?=[\p{L}\p{N}])/u',
+        '$1 ',
+        $summaryRaw
+    ) ?? $summaryRaw;
     // Nuke dumped ActivityPub JSON anywhere in the feed summary (broken quote enrichment)
     $summaryIsAs2Dump = static function (string $t): bool {
         return str_contains($t, '"@context"')
