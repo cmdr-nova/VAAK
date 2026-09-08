@@ -3949,6 +3949,25 @@ function ap_handle_quote_request(array $activity): ?string
         return 'quote_request_blocked';
     }
 
+    // Respect the account-level quote audience before minting an authorization.
+    // Compatible clients also receive this policy in the Note interactionPolicy;
+    // this check protects the server when a remote instance sends a request anyway.
+    $quotePolicy = (string) (ap_profile_get($ownerKey)['quote_policy'] ?? 'anyone');
+    if ($quotePolicy === 'nobody') {
+        ap_log('quote_request_policy_denied nobody actor=' . ap_short($actorId));
+        return 'quote_request_policy_denied';
+    }
+    if ($quotePolicy === 'followers') {
+        $st = ap_db()->prepare(
+            'SELECT 1 FROM followers WHERE owner_actor_id IN (?, ?) AND (actor_id = ? OR actor_id = ?) LIMIT 1'
+        );
+        $st->execute([$ownerActor, $ownerActor . '/', $actorId, $actorId . '/']);
+        if (!$st->fetchColumn()) {
+            ap_log('quote_request_policy_denied followers actor=' . ap_short($actorId));
+            return 'quote_request_policy_denied';
+        }
+    }
+
     $instrument = $activity['instrument'] ?? null;
     $quotingId = ap_as_id($instrument);
     if (!$quotingId && is_array($instrument) && isset($instrument['id'])) {
@@ -4213,7 +4232,9 @@ function ap_publish_status_text(
         'cc' => $cc,
         'url' => $noteId,
         'sensitive' => $isSensitive,
-        'interactionPolicy' => ap_note_interaction_policy_public(),
+        'interactionPolicy' => function_exists('ap_note_interaction_policy_for_actor')
+            ? ap_note_interaction_policy_for_actor((string) (basename(rtrim($actor, '/')) ?: 'cmdr_nova'))
+            : ap_note_interaction_policy_public(),
     ];
     if ($spoilerText !== '') {
         // ActivityPub / Mastodon CW text

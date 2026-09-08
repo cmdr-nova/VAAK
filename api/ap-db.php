@@ -377,6 +377,12 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] retention profile column not provisioned: ' . $e->getMessage());
     }
+    foreach (['reply_policy', 'quote_policy'] as $policyColumn) {
+        try {
+            $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = '{$policyColumn}'")->fetchColumn();
+            if (!$hasColumn) $db->exec("ALTER TABLE actor_profile ADD COLUMN {$policyColumn} TEXT NOT NULL DEFAULT 'anyone'");
+        } catch (Throwable $e) { error_log('[ap-db] interaction policy column not provisioned: ' . $e->getMessage()); }
+    }
 
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
@@ -536,6 +542,8 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     manually_approves INTEGER NOT NULL DEFAULT 0,
     discoverable INTEGER NOT NULL DEFAULT 1,
     auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0,
+    reply_policy TEXT NOT NULL DEFAULT 'anyone',
+    quote_policy TEXT NOT NULL DEFAULT 'anyone',
     updated_at TEXT NOT NULL
 );
 SQL);
@@ -577,6 +585,12 @@ SQL);
     }
     if (!in_array('auto_delete_posts_7d', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_delete_posts_7d INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('reply_policy', $profileNames, true)) {
+        $db->exec("ALTER TABLE actor_profile ADD COLUMN reply_policy TEXT NOT NULL DEFAULT 'anyone'");
+    }
+    if (!in_array('quote_policy', $profileNames, true)) {
+        $db->exec("ALTER TABLE actor_profile ADD COLUMN quote_policy TEXT NOT NULL DEFAULT 'anyone'");
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -1946,6 +1960,8 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'anti_ai_marker' => false,
         'auto_unblur_sensitive' => false,
         'auto_delete_posts_7d' => false,
+        'reply_policy' => 'anyone',
+        'quote_policy' => 'anyone',
         'updated_at' => null,
     ];
 }
@@ -2019,6 +2035,8 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'auto_delete_posts_7d' => array_key_exists('auto_delete_posts_7d', $row)
             ? !empty($row['auto_delete_posts_7d'])
             : false,
+        'reply_policy' => in_array((string) ($row['reply_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['reply_policy'] : 'anyone',
+        'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
         'updated_at' => $row['updated_at'] ?? null,
     ];
 }
@@ -2101,7 +2119,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2236,10 +2254,14 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $autoDeletePosts7d = array_key_exists('auto_delete_posts_7d', $fields)
         ? (!empty($fields['auto_delete_posts_7d']) ? 1 : 0)
         : (!empty($existingProfile['auto_delete_posts_7d']) ? 1 : 0);
+    $replyPolicy = in_array((string) ($fields['reply_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
+        ? (string) $fields['reply_policy'] : (string) ($existingProfile['reply_policy'] ?? 'anyone');
+    $quotePolicy = in_array((string) ($fields['quote_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
+        ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2255,6 +2277,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            anti_ai_marker = excluded.anti_ai_marker,
            auto_unblur_sensitive = excluded.auto_unblur_sensitive,
            auto_delete_posts_7d = excluded.auto_delete_posts_7d,
+           reply_policy = excluded.reply_policy,
+           quote_policy = excluded.quote_policy,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2273,6 +2297,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $antiAiMarker,
         $autoUnblurSensitive,
         $autoDeletePosts7d,
+        $replyPolicy,
+        $quotePolicy,
         ap_db_now(),
     ]);
 
@@ -8239,6 +8265,22 @@ function ap_note_interaction_policy_public(): array
         'canQuote' => [
             'automaticApproval' => ['https://www.w3.org/ns/activitystreams#Public'],
         ],
+    ];
+}
+
+function ap_note_interaction_policy_for_actor(string $actorKey): array
+{
+    $p = ap_profile_get($actorKey);
+    $approval = static function (string $policy): array {
+        return match ($policy) {
+            'followers' => ['https://www.w3.org/ns/activitystreams#Followers'],
+            'nobody' => [],
+            default => ['https://www.w3.org/ns/activitystreams#Public'],
+        };
+    };
+    return [
+        'canReply' => ['automaticApproval' => $approval((string) ($p['reply_policy'] ?? 'anyone'))],
+        'canQuote' => ['automaticApproval' => $approval((string) ($p['quote_policy'] ?? 'anyone'))],
     ];
 }
 

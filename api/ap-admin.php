@@ -1140,6 +1140,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'anti_ai_marker' => !empty($_POST['anti_ai_marker']),
                 'auto_unblur_sensitive' => !empty($_POST['auto_unblur_sensitive']),
                 'auto_delete_posts_7d' => !empty($_POST['auto_delete_posts_7d']),
+                'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
+                'quote_policy' => (string) ($_POST['quote_policy'] ?? 'anyone'),
             ], $vaakActorKey);
             if (empty($saved['ok'])) {
                 $error = $saved['error'] ?? 'Profile save failed.';
@@ -11314,6 +11316,21 @@ function admin_render_home_suggestions(array $suggestions): void
             <label><input type="checkbox" name="discoverable" value="1" <?= !empty($profile['discoverable']) ? 'checked' : '' ?>> Show in profile directories / discovery</label>
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
+            <label>Who can reply
+              <select name="reply_policy">
+                <option value="anyone" <?= ($profile['reply_policy'] ?? 'anyone') === 'anyone' ? 'selected' : '' ?>>Anyone</option>
+                <option value="followers" <?= ($profile['reply_policy'] ?? '') === 'followers' ? 'selected' : '' ?>>Followers</option>
+                <option value="nobody" <?= ($profile['reply_policy'] ?? '') === 'nobody' ? 'selected' : '' ?>>Nobody</option>
+              </select>
+            </label>
+            <label>Who can quote
+              <select name="quote_policy">
+                <option value="anyone" <?= ($profile['quote_policy'] ?? 'anyone') === 'anyone' ? 'selected' : '' ?>>Anyone</option>
+                <option value="followers" <?= ($profile['quote_policy'] ?? '') === 'followers' ? 'selected' : '' ?>>Followers</option>
+                <option value="nobody" <?= ($profile['quote_policy'] ?? '') === 'nobody' ? 'selected' : '' ?>>Nobody</option>
+              </select>
+            </label>
+            <div class="meta" style="grid-column:1/-1">These defaults are published with your posts and are enforced for incoming quote requests. You can still choose a post's visibility when composing.</div>
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
             <label><input type="checkbox" name="anti_ai_marker" value="1" <?= !empty($profile['anti_ai_marker']) ? 'checked' : '' ?>> Highlight anti-AI posters in my timelines</label>
             <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
