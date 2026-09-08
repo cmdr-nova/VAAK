@@ -145,6 +145,46 @@ function ap_db(): PDO
  */
 function ap_db_migrate_postgres(PDO $db): void
 {
+    // Local-only operator notices shown inside the authenticated VAAK shell.
+    // They are intentionally not ActivityPub objects or federation content.
+    $noticeTablesReady = false;
+    try {
+        $noticeTablesReady = (bool) $db->query(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_notices')
+                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_notice_replies')"
+        )->fetchColumn();
+    } catch (Throwable $e) {
+        error_log('[ap-db] notice table probe failed: ' . $e->getMessage());
+    }
+    if (!$noticeTablesReady) {
+      try {
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_notices (
+    id BIGSERIAL PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    published INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_notice_replies (
+    id BIGSERIAL PRIMARY KEY,
+    notice_id BIGINT NOT NULL,
+    owner_user_id BIGINT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_notices_published ON ap_notices(published, updated_at DESC)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_notice_replies_notice ON ap_notice_replies(notice_id, created_at ASC, id ASC)');
+      } catch (Throwable $e) {
+        // Production PHP roles may have DML but not public-schema DDL.
+        // The required-table check below still fails safely if provisioning is incomplete.
+        error_log('[ap-db] notice tables not provisioned by runtime role: ' . $e->getMessage());
+      }
+    }
     $requiredTables = [
         'account_aliases', 'actor_profile', 'ap_account_move', 'ap_anti_ai_actors',
         'ap_anti_ai_hits', 'ap_bites', 'ap_blocks', 'ap_collection_items',
@@ -157,7 +197,7 @@ function ap_db_migrate_postgres(PDO $db): void
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
-        'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions',
+        'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta',
         'remote_media_cache', 'site_syndications',
     ];
@@ -707,6 +747,25 @@ CREATE TABLE IF NOT EXISTS ap_users (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_users_email ON ap_users(email);
 CREATE INDEX IF NOT EXISTS idx_ap_users_actor_key ON ap_users(actor_key);
+
+CREATE TABLE IF NOT EXISTS ap_notices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    published INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_notices_published ON ap_notices(published, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS ap_notice_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    notice_id INTEGER NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_notice_replies_notice ON ap_notice_replies(notice_id, created_at ASC, id ASC);
 
 CREATE TABLE IF NOT EXISTS ap_invite_codes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

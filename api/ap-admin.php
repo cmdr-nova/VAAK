@@ -24,6 +24,7 @@ require_once __DIR__ . '/ap-masto-entities.php'; // status ids, favourites/bookm
 require_once __DIR__ . '/ap-queue.php'; // posting queue / scheduler
 require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
+require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -2119,6 +2120,43 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     : '');
         } else {
             $error = $res['error'] ?? 'Could not clear API key.';
+        }
+    } elseif ($action === 'notice_reply') {
+        $view = 'notices';
+        $res = ap_notice_reply_add(
+            (int) ($_POST['notice_id'] ?? 0),
+            $vaakOwnerId,
+            (string) ($_POST['notice_reply_body'] ?? '')
+        );
+        if (!empty($res['ok'])) {
+            $notice = 'Reply saved locally in VAAK.';
+        } else {
+            $error = $res['error'] ?? 'Could not save reply.';
+        }
+    } elseif ($action === 'notice_save' || $action === 'notice_delete') {
+        $view = 'notices';
+        if ($vaakActorKey !== 'cmdr_nova') {
+            $error = 'Only the server operator can change notices.';
+        } elseif ($action === 'notice_delete') {
+            $res = ap_notice_delete((int) ($_POST['notice_id'] ?? 0));
+            if (!empty($res['ok'])) {
+                $notice = !empty($res['deleted']) ? 'Notice deleted.' : 'Notice was already gone.';
+            } else {
+                $error = $res['error'] ?? 'Could not delete notice.';
+            }
+        } else {
+            $noticeId = (int) ($_POST['notice_id'] ?? 0);
+            $res = ap_notice_save(
+                $noticeId > 0 ? $noticeId : null,
+                (string) ($_POST['notice_title'] ?? ''),
+                (string) ($_POST['notice_body'] ?? ''),
+                !empty($_POST['notice_published'])
+            );
+            if (!empty($res['ok'])) {
+                $notice = $noticeId > 0 ? 'Notice updated.' : 'Notice published.';
+            } else {
+                $error = $res['error'] ?? 'Could not save notice.';
+            }
         }
     } elseif ($action === 'invite_create') {
         $view = 'invites';
@@ -4217,6 +4255,7 @@ function admin_media_placeholder_summary(string $summary, array $mediaUrls): str
 function view_title(string $view): string
 {
     return match ($view) {
+        'notices' => 'Notices',
         'home' => 'Home',
         'local' => 'Local',
         'feed' => 'Federation feed',
@@ -8743,6 +8782,8 @@ header('Content-Type: text/html; charset=utf-8');
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
     ?>
     <nav class="nav">
+      <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span></a>
+      <hr class="nav-sep">
       <div class="nav-label">Social</div>
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
       <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local"><span class="ico">◎</span><span class="label">Local</span></a>
@@ -8975,7 +9016,73 @@ header('Content-Type: text/html; charset=utf-8');
     <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
 
     <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?>">
-      <?php if ($view === 'home'): ?>
+      <?php if ($view === 'notices'): ?>
+        <?php $noticeRows = ap_notices_list($vaakActorKey === 'cmdr_nova', 100); ?>
+        <?php if ($vaakActorKey === 'cmdr_nova'): ?>
+          <section class="side-card" style="margin-bottom:1rem">
+            <h2 style="margin-top:0">Write a notice</h2>
+            <form method="post" action="?view=notices" class="composer">
+              <input type="hidden" name="action" value="notice_save">
+              <input name="notice_title" maxlength="160" placeholder="Title (optional)">
+              <textarea name="notice_body" maxlength="20000" rows="6" placeholder="Announcement or explanation for local VAAK users…" required></textarea>
+              <label class="composer-check"><input type="checkbox" name="notice_published" value="1" checked><span>Visible to local users</span></label>
+              <div class="composer-actions"><span class="meta">Notices and replies stay inside VAAK.</span><button class="btn btn-primary" type="submit">Publish notice</button></div>
+            </form>
+          </section>
+        <?php endif; ?>
+        <?php if (!$noticeRows): ?>
+          <div class="empty">No notices have been posted.</div>
+        <?php else: ?>
+          <?php foreach ($noticeRows as $nr): ?>
+            <?php
+              $nid = (int) ($nr['id'] ?? 0);
+              $ntitle = trim((string) ($nr['title'] ?? ''));
+              $nbody = (string) ($nr['body'] ?? '');
+              $nreplies = ap_notice_replies($nid);
+            ?>
+            <article class="side-card" style="margin-bottom:1rem">
+              <div class="meta" style="margin-bottom:.35rem">Server notice · <?= h(relative_time((string) ($nr['updated_at'] ?? ''))) ?><?= empty($nr['published']) ? ' · unpublished' : '' ?></div>
+              <?php if ($ntitle !== ''): ?><h2 style="margin:.1rem 0 .55rem"><?= h($ntitle) ?></h2><?php endif; ?>
+              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere"><?= nl2br(h($nbody)) ?></div>
+              <?php if ($nreplies): ?>
+                <div style="margin-top:1rem;padding-top:.75rem;border-top:1px solid var(--border)">
+                  <div class="meta" style="margin-bottom:.45rem">Local replies</div>
+                  <?php foreach ($nreplies as $reply): ?>
+                    <div style="padding:.55rem 0;border-top:1px solid rgba(255,255,255,.08)">
+                      <div class="meta"><b>@<?= h((string) ($reply['username'] ?? 'local user')) ?></b> · <?= h(relative_time((string) ($reply['created_at'] ?? ''))) ?></div>
+                      <div style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.2rem"><?= nl2br(h((string) ($reply['body'] ?? ''))) ?></div>
+                    </div>
+                  <?php endforeach; ?>
+                </div>
+              <?php endif; ?>
+              <form method="post" action="?view=notices" class="composer" style="margin-top:1rem">
+                <input type="hidden" name="action" value="notice_reply">
+                <input type="hidden" name="notice_id" value="<?= $nid ?>">
+                <textarea name="notice_reply_body" maxlength="5000" rows="2" placeholder="Reply locally…" required></textarea>
+                <div class="composer-actions"><span class="meta">Your reply is visible only to local VAAK users.</span><button class="btn btn-ghost" type="submit">Reply</button></div>
+              </form>
+              <?php if ($vaakActorKey === 'cmdr_nova'): ?>
+                <details style="margin-top:.75rem">
+                  <summary class="meta" style="cursor:pointer">Edit notice</summary>
+                  <form method="post" action="?view=notices" class="composer" style="margin-top:.5rem">
+                    <input type="hidden" name="action" value="notice_save">
+                    <input type="hidden" name="notice_id" value="<?= $nid ?>">
+                    <input name="notice_title" maxlength="160" value="<?= h($ntitle) ?>">
+                    <textarea name="notice_body" maxlength="20000" rows="5" required><?= h($nbody) ?></textarea>
+                    <label class="composer-check"><input type="checkbox" name="notice_published" value="1"<?= !empty($nr['published']) ? ' checked' : '' ?>><span>Visible to local users</span></label>
+                    <div class="composer-actions"><button class="btn btn-primary" type="submit">Save changes</button></div>
+                  </form>
+                  <form method="post" action="?view=notices" style="margin-top:.5rem" onsubmit="return confirm('Delete this notice and its local replies?');">
+                    <input type="hidden" name="action" value="notice_delete"><input type="hidden" name="notice_id" value="<?= $nid ?>">
+                    <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete notice</button>
+                  </form>
+                </details>
+              <?php endif; ?>
+            </article>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
+      <?php elseif ($view === 'home'): ?>
         <?php
           $homePage = array_slice($homeTimeline, 0, $tlLimit);
           $homeHasMore = count($homeTimeline) > $tlLimit;
