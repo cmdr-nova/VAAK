@@ -794,7 +794,8 @@ function ap_user_html_shell_start(string $title): void
       .media-row.media-count-4{grid-template-columns:1fr 1fr;grid-template-rows:minmax(120px,1fr) minmax(120px,1fr)}
       .media-row .media-cell{display:block;width:100%;height:100%;min-height:0;background:#0c0c0c}
       .media-row img,.media-row video{display:block;width:100%;height:100%;max-height:min(58vh,520px);object-fit:cover;background:#0c0c0c;border:0}
-      .media-row.media-count-1 img{object-fit:contain;max-height:min(62vh,560px);min-height:160px}
+      .media-row.media-count-1 .media-cell{height:auto}
+      .media-row.media-count-1 img{height:auto;object-fit:contain;max-height:min(62vh,560px);min-height:0;background:transparent}
       .media-row video{object-fit:contain;max-height:min(62vh,560px);background:#000}
       .btn-follow{appearance:none;border:0;border-radius:999px;padding:.55rem 1.15rem;font:inherit;font-weight:600;cursor:pointer;background:#8bf;color:#061018;margin-top:.75rem}
       .follow-panel{margin-top:.75rem;padding:.85rem;border:1px solid #2a2e37;border-radius:12px;background:#0c0c0c}

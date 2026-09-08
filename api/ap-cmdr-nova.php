@@ -749,7 +749,8 @@ function ap_cmdr_shell_start(string $title): void
       .media-row.media-count-4{grid-template-columns:1fr 1fr;grid-template-rows:minmax(120px,1fr) minmax(120px,1fr)}
       .media-row .note-media-trigger,.media-row a.media-cell{display:block;width:100%;height:100%;min-height:0;min-width:0;padding:0;margin:0;border:0;background:#0c0c0c;cursor:zoom-in;overflow:hidden}
       .media-row img,.media-row .thumb,.media-row video,.media-row .media-video{display:block;width:100%;height:100%;max-height:min(58vh,520px);object-fit:cover;background:#0c0c0c;border:0;border-radius:0;margin:0}
-      .media-row.media-count-1 img,.media-row.media-count-1 .thumb{object-fit:contain;max-height:min(62vh,560px);min-height:160px}
+      .media-row.media-count-1 .note-media-trigger{height:auto}
+      .media-row.media-count-1 img,.media-row.media-count-1 .thumb{height:auto;object-fit:contain;max-height:min(62vh,560px);min-height:0;background:transparent}
       .media-row video,.media-row .media-video{object-fit:contain;max-height:min(62vh,560px);background:#000;cursor:default}
       .post .thumb{margin-top:.55rem;max-width:100%;max-height:min(62vh,560px);width:100%;border-radius:12px;border:1px solid #333;object-fit:contain;display:block;background:#0a0a0a}
       .post video.thumb{width:100%;max-height:min(62vh,560px);object-fit:contain;background:#0a0a0a}
@@ -922,6 +923,8 @@ function ap_cmdr_site_shell_start(string $title): void
       body.ap-site-shell .ap-site-main .note-media-trigger{appearance:none;display:block;width:100%;margin:0;padding:0;border:0;background:transparent;cursor:zoom-in}
       body.ap-site-shell .ap-site-main .note-media-trigger img{display:block;width:100%;max-width:100%;height:auto;max-height:min(62vh,560px);object-fit:contain;border-radius:12px;border:1px solid #333;background:#0a0a0a}
       body.ap-site-shell .ap-site-main .media-row{width:100%}
+      body.ap-site-shell .ap-site-main .media-row.media-count-1 .note-media-trigger{height:auto}
+      body.ap-site-shell .ap-site-main .media-row.media-count-1 img,body.ap-site-shell .ap-site-main .media-row.media-count-1 .thumb{height:auto;min-height:0;background:transparent}
       .ap-img-lightbox{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;padding:1rem;background:rgba(0,0,0,.88)}
       .ap-img-lightbox.open{display:flex}
       .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px}
