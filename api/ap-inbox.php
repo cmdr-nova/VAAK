@@ -1541,6 +1541,9 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
             if ($objActor && isset($obj['tag']) && is_array($obj['tag'])) {
                 ap_remote_emoji_ingest_actor_doc($objActor, $obj);
             }
+            if ($objActor && isset($obj['object']) && is_array($obj['object']) && isset($obj['object']['tag']) && is_array($obj['object']['tag'])) {
+                ap_remote_emoji_ingest_actor_doc($objActor, $obj['object']);
+            }
         }
         $media = ap_extract_media_urls($obj);
         $inReplyTo = ap_as_id($obj['inReplyTo'] ?? null);
@@ -1590,6 +1593,9 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
                     $remoteActor = ap_as_id($activity['actor'] ?? null);
                     if ($remoteActor && isset($remote['tag']) && is_array($remote['tag'])) {
                         ap_remote_emoji_ingest_actor_doc($remoteActor, $remote);
+                    }
+                    if ($remoteActor && isset($remote['object']) && is_array($remote['object']) && isset($remote['object']['tag']) && is_array($remote['object']['tag'])) {
+                        ap_remote_emoji_ingest_actor_doc($remoteActor, $remote['object']);
                     }
                 }
                 $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($remote))));
