@@ -9629,7 +9629,9 @@ header('Content-Type: text/html; charset=utf-8');
                 <div class="meta" style="margin-top:.55rem;color:var(--muted)">No associated post</div>
               <?php elseif ($nSnippet !== '' && $nType === 'mention'): ?>
                 <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
-              <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'quote', 'update', 'poll', 'status'], true)): ?>
+              <?php elseif ($nSnippet !== '' && $nType === 'quote'): ?>
+                <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
+              <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
                 <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
               <?php endif; ?>
               <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
