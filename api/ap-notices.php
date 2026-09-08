@@ -95,6 +95,78 @@ function ap_notice_replies(int $noticeId): array
     }
 }
 
+/**
+ * Unread published notices for a local user (created after their last Notices visit).
+ * Users with no read cursor yet get 0 so old notices don't suddenly badge everyone.
+ */
+function ap_notices_unread_count(int $ownerUserId): int
+{
+    if ($ownerUserId < 1) {
+        return 0;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT last_read_at FROM ap_notice_reads WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        $last = $st->fetchColumn();
+        if (!is_string($last) || $last === '') {
+            return 0;
+        }
+        $cnt = ap_db()->prepare(
+            'SELECT COUNT(*) FROM ap_notices
+             WHERE published = 1 AND created_at > ?'
+        );
+        $cnt->execute([$last]);
+        return max(0, (int) $cnt->fetchColumn());
+    } catch (Throwable $e) {
+        error_log('[ap-notices] unread count: ' . $e->getMessage());
+        return 0;
+    }
+}
+
+/** Mark Notices as caught up for this user (clears the nav badge). */
+function ap_notices_mark_read(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    $now = ap_db_now();
+    try {
+        $existing = ap_db()->prepare('SELECT 1 FROM ap_notice_reads WHERE owner_user_id = ? LIMIT 1');
+        $existing->execute([$ownerUserId]);
+        if ($existing->fetchColumn()) {
+            ap_db()->prepare('UPDATE ap_notice_reads SET last_read_at = ? WHERE owner_user_id = ?')
+                ->execute([$now, $ownerUserId]);
+        } else {
+            ap_db()->prepare('INSERT INTO ap_notice_reads (owner_user_id, last_read_at) VALUES (?, ?)')
+                ->execute([$ownerUserId, $now]);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-notices] mark read: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Ensure a read cursor exists so future notices can badge.
+ * Called on normal authenticated page loads (not only Notices).
+ */
+function ap_notices_ensure_read_cursor(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT 1 FROM ap_notice_reads WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        if ($st->fetchColumn()) {
+            return;
+        }
+        ap_db()->prepare('INSERT INTO ap_notice_reads (owner_user_id, last_read_at) VALUES (?, ?)')
+            ->execute([$ownerUserId, ap_db_now()]);
+    } catch (Throwable $e) {
+        error_log('[ap-notices] ensure cursor: ' . $e->getMessage());
+    }
+}
+
 function ap_notice_reply_add(int $noticeId, int $ownerUserId, string $body): array
 {
     $body = trim($body);

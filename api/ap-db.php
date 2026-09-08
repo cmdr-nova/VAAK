@@ -220,11 +220,41 @@ CREATE TABLE IF NOT EXISTS ap_notice_replies (
 SQL);
         $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_notices_published ON ap_notices(published, updated_at DESC)');
         $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_notice_replies_notice ON ap_notice_replies(notice_id, created_at ASC, id ASC)');
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_notice_reads (
+    owner_user_id BIGINT NOT NULL PRIMARY KEY,
+    last_read_at TEXT NOT NULL
+)
+SQL);
       } catch (Throwable $e) {
         // Production PHP roles may have DML but not public-schema DDL.
         // The required-table check below still fails safely if provisioning is incomplete.
         error_log('[ap-db] notice tables not provisioned by runtime role: ' . $e->getMessage());
         }
+    }
+    // Additive notice-read cursor (may exist on older installs that already have ap_notices).
+    try {
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_notice_reads (
+    owner_user_id BIGINT NOT NULL PRIMARY KEY,
+    last_read_at TEXT NOT NULL
+)
+SQL);
+    } catch (Throwable $e) {
+        // ignore — postgres role may lack DDL; provisioned via migrate/ops
+    }
+    // Home soft-demote list (VAAK overflow "Deprioritize").
+    try {
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_deprioritized_actors (
+    owner_user_id BIGINT NOT NULL,
+    actor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, actor_id)
+)
+SQL);
+    } catch (Throwable $e) {
+        // ignore — provision via ops when runtime role lacks DDL
     }
 
     $discussTablesReady = false;
@@ -298,14 +328,14 @@ SQL);
         'ap_anti_ai_hits', 'ap_bites', 'ap_blocks', 'ap_collection_items',
         'ap_collection_memberships', 'ap_collections', 'ap_drafts', 'ap_featured_accounts',
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
-        'ap_mutes', 'ap_post_queue', 'ap_post_subscriptions', 'ap_queue_settings',
+        'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
         'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
-        'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies',
+        'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
         'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
         'remote_media_cache', 'site_syndications',
@@ -848,6 +878,14 @@ CREATE TABLE IF NOT EXISTS ap_mutes (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_mutes_host ON ap_mutes(host);
 
+CREATE TABLE IF NOT EXISTS ap_deprioritized_actors (
+    owner_user_id INTEGER NOT NULL,
+    actor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_deprioritized_owner ON ap_deprioritized_actors(owner_user_id);
+
 CREATE TABLE IF NOT EXISTS ap_muted_words (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_user_id INTEGER NOT NULL,
@@ -921,6 +959,11 @@ CREATE TABLE IF NOT EXISTS ap_notice_replies (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ap_notice_replies_notice ON ap_notice_replies(notice_id, created_at ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS ap_notice_reads (
+    owner_user_id INTEGER NOT NULL PRIMARY KEY,
+    last_read_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS ap_discuss_categories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5702,6 +5745,146 @@ function ap_unmute(string $actorId, int $ownerUserId): array
     return ['ok' => true, 'actor_id' => $actorId];
 }
 
+/* ----------------- Deprioritize (Home soft-rank only; Federated unchanged) ----------------- */
+
+/**
+ * @return list<array{owner_user_id:int,actor_id:string,created_at:string}>
+ */
+function ap_deprioritized_list(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT * FROM ap_deprioritized_actors WHERE owner_user_id = ? ORDER BY created_at DESC'
+        );
+        $st->execute([$ownerUserId]);
+        return $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        error_log('[ap-db] deprioritized list: ' . $e->getMessage());
+        return [];
+    }
+}
+
+/** @return array<string,bool> */
+function ap_deprioritized_set_cached(int $ownerUserId, bool $refresh = false): array
+{
+    static $cache = [];
+    if ($ownerUserId < 1) {
+        if ($refresh) {
+            $cache = [];
+        }
+        return [];
+    }
+    if ($refresh) {
+        unset($cache[$ownerUserId]);
+    }
+    if (!isset($cache[$ownerUserId])) {
+        $cache[$ownerUserId] = [];
+        foreach (ap_deprioritized_list($ownerUserId) as $row) {
+            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($id !== '') {
+                $cache[$ownerUserId][$id] = true;
+                $cache[$ownerUserId][$id . '/'] = true;
+            }
+        }
+    }
+    return $cache[$ownerUserId];
+}
+
+function ap_deprioritized_cache_clear(?int $ownerUserId = null): void
+{
+    if ($ownerUserId === null || $ownerUserId < 1) {
+        ap_deprioritized_set_cached(0, true);
+        return;
+    }
+    ap_deprioritized_set_cached($ownerUserId, true);
+}
+
+function ap_is_deprioritized_actor(?string $actorId, int $ownerUserId): bool
+{
+    if ($actorId === null || $actorId === '' || $ownerUserId < 1) {
+        return false;
+    }
+    $actorId = rtrim($actorId, '/');
+    $set = ap_deprioritized_set_cached($ownerUserId);
+    return !empty($set[$actorId]) || !empty($set[$actorId . '/']);
+}
+
+/** Seconds subtracted from Home rank timestamp for deprioritized authors. */
+function ap_deprioritize_penalty_seconds(): int
+{
+    return 6 * 3600;
+}
+
+/**
+ * @return array{ok:bool,error?:string,actor_id?:string,already?:bool}
+ */
+function ap_deprioritize_upsert(string $actorId, int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return ['ok' => false, 'error' => 'Missing owner user.'];
+    }
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return ['ok' => false, 'error' => 'Deprioritize needs an https actor URL.'];
+    }
+    try {
+        $st = ap_db()->prepare('SELECT actor_id FROM ap_users WHERE id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        $own = rtrim((string) ($st->fetch()['actor_id'] ?? ''), '/');
+        if ($own !== '' && ($actorId === $own || str_starts_with($actorId, $own))) {
+            return ['ok' => false, 'error' => 'Cannot deprioritize yourself.'];
+        }
+    } catch (Throwable $e) {
+        // fall through
+    }
+    if (ap_is_deprioritized_actor($actorId, $ownerUserId)) {
+        return ['ok' => true, 'actor_id' => $actorId, 'already' => true];
+    }
+    try {
+        ap_db()->prepare(
+            'INSERT INTO ap_deprioritized_actors (owner_user_id, actor_id, created_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (owner_user_id, actor_id) DO NOTHING'
+        )->execute([$ownerUserId, $actorId, ap_db_now()]);
+    } catch (Throwable $e) {
+        error_log('[ap-db] deprioritize upsert: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not save deprioritize.'];
+    }
+    ap_deprioritized_cache_clear($ownerUserId);
+    return ['ok' => true, 'actor_id' => $actorId];
+}
+
+/**
+ * @return array{ok:bool,error?:string,actor_id?:string}
+ */
+function ap_deprioritize_remove(string $actorId, int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return ['ok' => false, 'error' => 'Missing owner user.'];
+    }
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return ['ok' => false, 'error' => 'Missing actor.'];
+    }
+    try {
+        $st = ap_db()->prepare(
+            'DELETE FROM ap_deprioritized_actors WHERE owner_user_id = ? AND (actor_id = ? OR actor_id = ?)'
+        );
+        $st->execute([$ownerUserId, $actorId, $actorId . '/']);
+        ap_deprioritized_cache_clear($ownerUserId);
+        if ($st->rowCount() < 1) {
+            return ['ok' => false, 'error' => 'Not deprioritized.'];
+        }
+        return ['ok' => true, 'actor_id' => $actorId];
+    } catch (Throwable $e) {
+        error_log('[ap-db] deprioritize remove: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not remove deprioritize.'];
+    }
+}
+
 /* ----------------- Anti-AI actor marks (cached-post heuristic) ----------------- */
 
 /** Regex of slang that anti-AI posters tend to lean on. */
@@ -7884,6 +8067,15 @@ function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null): v
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     ap_db()->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?')
         ->execute([$ownerUserId, $statusId]);
+    // VAAK folder overlay — keep memberships from orphaning after any client unbookmarks
+    if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
+        vaak_bookmark_folders_on_unbookmark($statusId, $ownerUserId);
+    } elseif (is_file(__DIR__ . '/ap-bookmark-folders.php')) {
+        require_once __DIR__ . '/ap-bookmark-folders.php';
+        if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
+            vaak_bookmark_folders_on_unbookmark($statusId, $ownerUserId);
+        }
+    }
 }
 
 /**

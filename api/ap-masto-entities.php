@@ -5366,16 +5366,55 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
         // ignore
     }
 
-    $rankTs = static function (array $status): string {
+    $ownerForDeprio = function_exists('ap_db_masto_owner_user_id')
+        ? (int) ap_db_masto_owner_user_id()
+        : (function_exists('ap_db_default_owner_user_id') ? (int) ap_db_default_owner_user_id() : 0);
+    $deprioSet = ($ownerForDeprio > 0 && function_exists('ap_deprioritized_set_cached'))
+        ? ap_deprioritized_set_cached($ownerForDeprio)
+        : [];
+    $deprioPenaltyHours = function_exists('ap_deprioritize_penalty_seconds')
+        ? max(1, (int) round(ap_deprioritize_penalty_seconds() / 3600))
+        : 6;
+
+    $statusActorUrl = static function (array $status): string {
+        $acct = is_array($status['account'] ?? null) ? $status['account'] : [];
+        $acctId = (string) ($acct['id'] ?? '');
+        if ($acctId !== '' && function_exists('ap_masto_actor_id_from_account_id')) {
+            $url = (string) (ap_masto_actor_id_from_account_id($acctId) ?? '');
+            if ($url !== '') {
+                return rtrim($url, '/');
+            }
+        }
+        foreach (['url', 'uri'] as $k) {
+            $u = (string) ($acct[$k] ?? '');
+            if (str_starts_with($u, 'https://')) {
+                return rtrim($u, '/');
+            }
+        }
+        return '';
+    };
+
+    $rankTs = static function (array $status) use ($deprioSet, $deprioPenaltyHours, $statusActorUrl): string {
         $ts = (string) ($status['created_at'] ?? '');
         if ($ts === '') {
             return '';
         }
+        $penaltyH = 0;
         // Tag-only posts sort as if ~4h older so follows stay more prominent.
         if (!empty($status['_from_followed_tag'])) {
+            $penaltyH += 4;
+        }
+        // Overflow "Deprioritize" — Home soft-rank only (Federated uses a different path).
+        if ($deprioSet) {
+            $actorUrl = $statusActorUrl($status);
+            if ($actorUrl !== '' && (!empty($deprioSet[$actorUrl]) || !empty($deprioSet[$actorUrl . '/']))) {
+                $penaltyH += $deprioPenaltyHours;
+            }
+        }
+        if ($penaltyH > 0) {
             try {
                 $dt = new DateTimeImmutable($ts);
-                return $dt->modify('-4 hours')->format('Y-m-d\TH:i:s.000\Z');
+                return $dt->modify('-' . $penaltyH . ' hours')->format('Y-m-d\TH:i:s.000\Z');
             } catch (Throwable $e) {
                 return $ts;
             }
@@ -5400,6 +5439,8 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     $ownLocalEmitted = 0;
     $ownBoostEmitted = 0;
     $maxTagShare = 0.25;
+    $deprioEmitted = 0;
+    $primarySinceDeprio = 0;
     // Exclusive lists: members are removed from Home (Mastodon exclusive lists).
     $exclusiveActors = function_exists('ap_list_exclusive_actor_map')
         ? ap_list_exclusive_actor_map()
@@ -5452,12 +5493,25 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
             $seenUri[$uri] = true;
         }
         $isTag = !empty($status['_from_followed_tag']);
+        $actorUrl = $statusActorUrl($status);
+        $isDeprio = $deprioSet
+            && $actorUrl !== ''
+            && (!empty($deprioSet[$actorUrl]) || !empty($deprioSet[$actorUrl . '/']));
         if ($isTag) {
             // Prefer follows: require a few primary posts between tags + hard ratio cap.
             if ($primarySinceTag < 3 && count($out) > 0) {
                 continue;
             }
             if (($tagEmitted + 1) / max(1, count($out) + 1) > $maxTagShare) {
+                continue;
+            }
+        }
+        if ($isDeprio && !$isTag) {
+            // At most ~1 deprioritized post per 5 Home slots.
+            if ($primarySinceDeprio < 4 && count($out) > 0) {
+                continue;
+            }
+            if (($deprioEmitted + 1) / max(1, count($out) + 1) > 0.2) {
                 continue;
             }
         }
@@ -5469,6 +5523,12 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
             $primarySinceTag = 0;
         } else {
             $primarySinceTag++;
+        }
+        if ($isDeprio) {
+            $deprioEmitted++;
+            $primarySinceDeprio = 0;
+        } else {
+            $primarySinceDeprio++;
         }
         if ($isOwnLocal) {
             $ownLocalEmitted++;
@@ -6758,6 +6818,16 @@ function ap_masto_trends_link_entity(string $url, array $history, bool $allowFet
         }
     }
     if ($card === null && $allowFetch && function_exists('ap_link_preview_for_url')) {
+        // Bypass a stale "fail" row so trends can retry after redirect/UA fixes.
+        try {
+            ap_db()->prepare(
+                "DELETE FROM link_preview_cards WHERE url = ? AND status = 'fail'"
+            )->execute([function_exists('ap_link_preview_normalize_url')
+                ? ap_link_preview_normalize_url($url)
+                : $url]);
+        } catch (Throwable $e) {
+            // non-fatal
+        }
         $fetched = ap_link_preview_for_url($url, true);
         if (is_array($fetched)) {
             $card = ap_masto_preview_card($fetched);
@@ -6768,9 +6838,14 @@ function ap_masto_trends_link_entity(string $url, array $history, bool $allowFet
         if (str_starts_with(strtolower($host), 'www.')) {
             $host = substr($host, 4);
         }
+        $slugTitle = function_exists('ap_link_preview_title_from_url')
+            ? ap_link_preview_title_from_url($url)
+            : null;
         $card = [
             'url' => $url,
-            'title' => $host !== '' ? $host : $url,
+            'title' => $slugTitle !== null && $slugTitle !== ''
+                ? $slugTitle
+                : ($host !== '' ? $host : $url),
             'description' => '',
             'type' => 'link',
             'author_name' => '',
@@ -6928,7 +7003,8 @@ function ap_masto_trends_links(int $limit = 10): array
     arsort($scored, SORT_NUMERIC);
 
     $out = [];
-    $fetchBudget = 3; // warm a few OG cards for News UI without stalling the request
+    // Deferred ajax trends + 15m cache: warm titles for the sidebar (5) plus a few more.
+    $fetchBudget = 8;
     foreach ($scored as $url => $score) {
         $s = $stats[$url];
         $history = [];
@@ -6940,7 +7016,11 @@ function ap_masto_trends_links(int $limit = 10): array
             ];
         }
         $cached = function_exists('ap_link_preview_cache_get') ? ap_link_preview_cache_get((string) $url) : null;
-        $allowFetch = $fetchBudget > 0 && $cached === null;
+        $hasOkTitle = is_array($cached)
+            && ($cached['status'] ?? '') === 'ok'
+            && trim((string) ($cached['title'] ?? '')) !== '';
+        // Retry when missing or previously failed (fail rows used to block refetch).
+        $allowFetch = $fetchBudget > 0 && !$hasOkTitle;
         if ($allowFetch) {
             $fetchBudget--;
         }

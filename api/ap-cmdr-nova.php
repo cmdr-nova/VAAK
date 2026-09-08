@@ -53,8 +53,17 @@ if (preg_match('#^/users/cmdr_nova/inbox$#', $path)) {
     exit;
 }
 
+// Owner-only profile actions (e.g. unpin) — VAAK session required.
+if (
+    $method === 'POST'
+    && ($path === '/users/cmdr_nova' || $path === '/users/cmdr_nova/')
+) {
+    ap_cmdr_handle_profile_owner_post();
+    exit;
+}
+
 if ($method !== 'GET' && $method !== 'HEAD') {
-    header('Allow: GET, HEAD');
+    header('Allow: GET, HEAD, POST');
     http_response_code(405);
     exit;
 }
@@ -434,6 +443,91 @@ ap_cmdr_json($actor, $accept);
  * q may appear after other parameters — parse the whole media-range, not just
  * ";q=" immediately after the type (that bug made HTML look like q=1.0).
  */
+/**
+ * True when the current VAAK session is the cmdr_nova profile owner.
+ * Call before any HTML output so the session cookie can be read reliably.
+ */
+function ap_cmdr_profile_owner_session(): bool
+{
+    if (array_key_exists('ap_cmdr_is_owner', $GLOBALS)) {
+        return (bool) $GLOBALS['ap_cmdr_is_owner'];
+    }
+    $GLOBALS['ap_cmdr_is_owner'] = false;
+    try {
+        require_once __DIR__ . '/ap-auth.php';
+        // Explicit boot — do not rely on side effects inside current_user alone.
+        ap_auth_bootstrap();
+        ap_auth_start_session();
+        $user = ap_auth_current_user();
+        if (!is_array($user)) {
+            return false;
+        }
+        $key = strtolower((string) ($user['actor_key'] ?? ''));
+        $ok = ($key === 'cmdr_nova' && empty($user['disabled_at']));
+        $GLOBALS['ap_cmdr_is_owner'] = $ok;
+        if ($ok) {
+            $GLOBALS['vaak_user'] = $user;
+            $GLOBALS['vaak_owner_id'] = (int) ($user['id'] ?? 0);
+            $GLOBALS['vaak_actor_key'] = 'cmdr_nova';
+            $GLOBALS['vaak_actor_id'] = CMDR_ACTOR_ID;
+            if (function_exists('ap_request_actor_set')) {
+                ap_request_actor_set('cmdr_nova');
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-cmdr] owner session: ' . $e->getMessage());
+        $GLOBALS['ap_cmdr_is_owner'] = false;
+    }
+    return (bool) $GLOBALS['ap_cmdr_is_owner'];
+}
+
+/** Handle POST /users/cmdr_nova owner actions (unpin). */
+function ap_cmdr_handle_profile_owner_post(): void
+{
+    if (!ap_cmdr_profile_owner_session()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Sign in to VAAK as cmdr_nova to manage pins.';
+        exit;
+    }
+    if (!function_exists('ap_auth_csrf_ok')) {
+        require_once __DIR__ . '/ap-auth.php';
+    }
+    $csrf = (string) ($_POST['csrf'] ?? '');
+    if (!ap_auth_csrf_ok($csrf)) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Invalid CSRF token.';
+        exit;
+    }
+    $action = (string) ($_POST['action'] ?? '');
+    $noteId = rtrim(trim((string) ($_POST['note_id'] ?? '')), '/');
+    $tab = preg_replace('/[^a-z]/', '', (string) ($_POST['tab'] ?? 'posts')) ?: 'posts';
+    $redir = '/users/cmdr_nova' . ($tab !== 'posts' ? ('?tab=' . rawurlencode($tab)) : '');
+
+    if ($action === 'unpin_note' || $action === 'unpin_status') {
+        if ($noteId === '' || !str_starts_with($noteId, CMDR_ACTOR_ID . '/notes/')) {
+            header('Location: ' . $redir, true, 303);
+            exit;
+        }
+        if (!function_exists('ap_masto_status_by_note_id')) {
+            require_once __DIR__ . '/ap-masto-entities.php';
+        }
+        $row = function_exists('ap_masto_status_by_note_id') ? ap_masto_status_by_note_id($noteId) : null;
+        $localId = is_array($row) ? (int) ($row['local_id'] ?? 0) : 0;
+        if ($localId > 0 && function_exists('ap_masto_status_unpin')) {
+            ap_masto_status_unpin($localId);
+        }
+        header('Location: ' . $redir, true, 303);
+        exit;
+    }
+
+    http_response_code(400);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo 'Unknown action.';
+    exit;
+}
+
 function ap_cmdr_wants_activitypub(string $accept): bool
 {
     $accept = strtolower(trim($accept));
@@ -743,9 +837,17 @@ function ap_cmdr_shell_start(string $title): void
       .post{display:block;padding:.9rem 0;border-bottom:1px solid #2a2a2a;color:inherit;text-decoration:none}
       .post:last-child{border-bottom:none}
       .post:hover{background:rgba(126,224,255,.04);margin:0 -.5rem;padding-left:.5rem;padding-right:.5rem;border-radius:8px}
+      .post-wrap{position:relative;margin:0}
       .post.is-pinned{position:relative}
       /* Decorative pin on the top border — out of flow, no text shift */
       .post-pin{position:absolute;top:-0.45rem;left:0;font-size:12px;line-height:1;color:#7ee0ff;opacity:.9;pointer-events:none;z-index:2;filter:grayscale(0.15)}
+      .post-unpin-form{position:absolute;top:-0.55rem;left:0;z-index:3;margin:0}
+      .post-pin--action{
+        pointer-events:auto;cursor:pointer;border:0;background:transparent;padding:0;
+        font-size:12px;line-height:1;color:#7ee0ff;filter:grayscale(0.15);
+      }
+      .post-pin--action:hover{filter:none;transform:scale(1.08)}
+      .post-unpin-hint{position:absolute;top:-0.35rem;left:1.15rem;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
       .post .body{color:#e8e8e8}
       .post .body p,.note-body p{margin:0 0 .45em}
       .post .body p:last-child,.note-body p:last-child{margin-bottom:0}
@@ -912,8 +1014,12 @@ function ap_cmdr_site_shell_start(string $title): void
       body.ap-site-shell .ap-site-main .posts{margin-top:1.5rem;padding-top:1.25rem;border-top:1px solid #2a2a2a}
       body.ap-site-shell .ap-site-main .post{display:block;padding:.9rem 0;border-bottom:1px solid #2a2a2a;color:inherit;text-decoration:none}
       body.ap-site-shell .ap-site-main .post:hover{background:rgba(126,224,255,.04)}
+      body.ap-site-shell .ap-site-main .post-wrap{position:relative;margin:0}
       body.ap-site-shell .ap-site-main .post.is-pinned{position:relative}
       body.ap-site-shell .ap-site-main .post-pin{position:absolute;top:-0.45rem;left:0;font-size:12px;line-height:1;color:#7ee0ff;opacity:.9;pointer-events:none;z-index:2}
+      body.ap-site-shell .ap-site-main .post-unpin-form{position:absolute;top:-0.55rem;left:0;z-index:3;margin:0}
+      body.ap-site-shell .ap-site-main .post-pin--action{pointer-events:auto;cursor:pointer;border:0;background:transparent;padding:0;font-size:12px;line-height:1;color:#7ee0ff}
+      body.ap-site-shell .ap-site-main .post-unpin-hint{position:absolute;top:-0.35rem;left:1.15rem;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
       body.ap-site-shell .ap-site-main .stats{display:flex;gap:1.25rem;margin:1.1rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a}
       body.ap-site-shell .ap-site-main .stats .n{font-size:1.25rem;font-weight:700;color:#00ff9f}
       body.ap-site-shell .ap-site-main .stats .l{font-size:.8rem;color:#999;text-transform:uppercase}
@@ -1275,6 +1381,9 @@ function ap_cmdr_note_html(array $row, array $create): void
 
 function ap_cmdr_html(): void
 {
+    // Resolve VAAK session before any HTML so pin/unpin owner chrome works.
+    $isOwner = ap_cmdr_profile_owner_session();
+
     $p = ap_profile_get('cmdr_nova');
     $followers = [];
     $following = [];
@@ -1310,6 +1419,12 @@ function ap_cmdr_html(): void
     ) ?? $summary;
 
     ap_cmdr_shell_start('@cmdr_nova@mkultra.monster');
+    if ($isOwner) {
+        echo '<div class="owner-bar" style="margin:0 0 .85rem;padding:.55rem .75rem;border:1px solid #2a4a3a;border-radius:10px;background:rgba(80,160,120,.1);font-size:.86rem;color:#bfe;text-align:center">'
+            . 'Signed in as <b>@cmdr_nova</b> — '
+            . '<a href="/vaak/?view=outbox" style="color:#7ee0ff">Open VAAK</a>'
+            . '</div>';
+    }
     if (!empty($p['image_url'])) {
         $banner = htmlspecialchars($p['image_url'], ENT_QUOTES, 'UTF-8');
         echo '<div class="banner" style="background-image:url(\'' . $banner . '\')"></div>';
@@ -2284,26 +2399,53 @@ function ap_cmdr_post_preview_html(array $n): string
         }
     }
 
-    // Tiny thumbtack — absolute on the card edge (out of flow, no text reflow)
-    $pinIcon = $isPinned
-        ? '<span class="post-pin" title="Pinned" aria-hidden="true">📌</span>'
-        : '';
-
-    $html = '<a class="post' . ($isPinned ? ' is-pinned' : '') . '" href="' . $href . '"'
-        . ($isPinned ? ' aria-label="Pinned post"' : '') . '>';
-    $html .= $pinIcon;
-    $html .= $replyHtml;
-    if ($content !== '') {
-        $html .= '<div class="body">' . $content . '</div>';
-    } elseif ($quoteHtml === '' && $pollHtml === '' && $thumb === '' && $linkCardHtml === '') {
-        $html .= '<div class="body muted">(no text)</div>';
+    // Tiny thumbtack — absolute on the card edge (out of flow, no text reflow).
+    // When the profile owner is signed into VAAK, the pin becomes an Unpin control
+    // (outside the card <a> so it stays clickable).
+    $canUnpin = $isPinned
+        && !$isSite
+        && str_starts_with(rtrim($id, '/'), CMDR_ACTOR_ID . '/notes/')
+        && ap_cmdr_profile_owner_session();
+    $pinIcon = '';
+    $unpinForm = '';
+    if ($isPinned && $canUnpin) {
+        $noteId = rtrim($id, '/');
+        $tab = preg_replace('/[^a-z]/', '', (string) ($_GET['tab'] ?? 'posts')) ?: 'posts';
+        $csrf = function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : '';
+        $unpinForm = '<form method="post" action="/users/cmdr_nova" class="post-unpin-form" '
+            . 'onsubmit="return confirm(\'Unpin this post from your profile?\');">'
+            . '<input type="hidden" name="csrf" value="' . htmlspecialchars($csrf, ENT_QUOTES, 'UTF-8') . '">'
+            . '<input type="hidden" name="action" value="unpin_note">'
+            . '<input type="hidden" name="note_id" value="' . htmlspecialchars($noteId, ENT_QUOTES, 'UTF-8') . '">'
+            . '<input type="hidden" name="tab" value="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '">'
+            . '<button type="submit" class="post-pin post-pin--action" title="Unpin from profile" aria-label="Unpin from profile">📌</button>'
+            . '<span class="post-unpin-hint">unpin</span>'
+            . '</form>';
+    } elseif ($isPinned) {
+        $pinIcon = '<span class="post-pin" title="Pinned" aria-hidden="true">📌</span>';
     }
-    $html .= $quoteHtml;
-    $html .= $pollHtml;
-    $html .= $thumb;
-    $html .= $linkCardHtml;
-    $html .= '<div class="meta">' . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8') . $badge;
-    $html .= '</div></a>';
+
+    $card = '<a class="post' . ($isPinned ? ' is-pinned' : '') . '" href="' . $href . '"'
+        . ($isPinned ? ' aria-label="Pinned post"' : '') . '>';
+    $card .= $pinIcon;
+    $card .= $replyHtml;
+    if ($content !== '') {
+        $card .= '<div class="body">' . $content . '</div>';
+    } elseif ($quoteHtml === '' && $pollHtml === '' && $thumb === '' && $linkCardHtml === '') {
+        $card .= '<div class="body muted">(no text)</div>';
+    }
+    $card .= $quoteHtml;
+    $card .= $pollHtml;
+    $card .= $thumb;
+    $card .= $linkCardHtml;
+    $card .= '<div class="meta">' . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8') . $badge;
+    $card .= '</div></a>';
+
+    if ($unpinForm !== '') {
+        $html = '<div class="post-wrap is-pinned">' . $unpinForm . $card . '</div>';
+    } else {
+        $html = $card;
+    }
     $html .= ap_webmention_cards_html($hrefRaw);
     return $html;
 }

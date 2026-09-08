@@ -40,6 +40,11 @@ function ap_link_preview_extract_all_urls(string $textOrHtml, bool $skipLocalNot
             $url = $um[1];
         }
         $url = rtrim($url, '.,);]!?\'"');
+        // Split glued absolute URLs (e.g. article URL + http://techmeme.com/… in one token)
+        if (preg_match('#^(https://.+?)(?=https?://)#i', $url, $cut)) {
+            $url = $cut[1];
+        }
+        $url = rtrim($url, '.,);]!?\'"/');
         if (!str_starts_with(strtolower($url), 'https://')) {
             continue;
         }
@@ -69,6 +74,10 @@ function ap_link_preview_extract_all_urls(string $textOrHtml, bool $skipLocalNot
 function ap_link_preview_normalize_url(string $url): string
 {
     $url = trim($url);
+    // Glued second absolute URL (article + tracker) → keep the first
+    if (preg_match('#^(https?://.+?)(?=https?://)#i', $url, $cut)) {
+        $url = rtrim($cut[1], '.,);]!?\'"/');
+    }
     // Expand youtu.be → watch URL for consistent cache keys
     if (preg_match('~^https?://(?:www\.)?youtu\.be/([A-Za-z0-9_-]{6,})~i', $url, $m)) {
         return 'https://www.youtube.com/watch?v=' . $m[1];
@@ -247,43 +256,160 @@ function ap_link_preview_cache_put(array $card, int $ttlSeconds): void
     }
 }
 
+/**
+ * Resolve a redirect Location against the current request URL.
+ */
+function ap_link_preview_resolve_redirect(string $fromUrl, string $location): ?string
+{
+    $location = trim($location);
+    if ($location === '') {
+        return null;
+    }
+    if (str_starts_with($location, 'https://') || str_starts_with($location, 'http://')) {
+        $next = $location;
+    } elseif (str_starts_with($location, '//')) {
+        $scheme = parse_url($fromUrl, PHP_URL_SCHEME) ?: 'https';
+        $next = $scheme . ':' . $location;
+    } else {
+        $parts = parse_url($fromUrl);
+        if (!is_array($parts) || empty($parts['scheme']) || empty($parts['host'])) {
+            return null;
+        }
+        $origin = $parts['scheme'] . '://' . $parts['host']
+            . (isset($parts['port']) ? (':' . $parts['port']) : '');
+        if (str_starts_with($location, '/')) {
+            $next = $origin . $location;
+        } else {
+            $path = (string) ($parts['path'] ?? '/');
+            $dir = preg_replace('#/[^/]*$#', '/', $path) ?: '/';
+            $next = $origin . $dir . $location;
+        }
+    }
+    $next = ap_link_preview_normalize_url($next);
+    if ($next === '' || !ap_link_preview_url_allowed($next)) {
+        return null;
+    }
+    return $next;
+}
+
+/**
+ * Human title guess from a URL path slug when OG fetch is blocked/unavailable.
+ * e.g. /story/meta-failed-to-catch-… → "Meta Failed To Catch…"
+ */
+function ap_link_preview_title_from_url(string $url): ?string
+{
+    $path = (string) (parse_url($url, PHP_URL_PATH) ?: '');
+    $path = rawurldecode($path);
+    $segments = array_values(array_filter(explode('/', $path), static fn($s) => $s !== ''));
+    if (!$segments) {
+        return null;
+    }
+    // Prefer the last meaningful segment (article slug), skip boring tails.
+    $skip = ['index.html', 'index.htm', 'amp', 'amp.html'];
+    $slug = '';
+    for ($i = count($segments) - 1; $i >= 0; $i--) {
+        $cand = strtolower($segments[$i]);
+        if (in_array($cand, $skip, true) || preg_match('/^\d+$/', $cand)) {
+            continue;
+        }
+        $slug = $segments[$i];
+        break;
+    }
+    if ($slug === '') {
+        return null;
+    }
+    $slug = preg_replace('/\.(html?|php|aspx?)$/i', '', $slug) ?? $slug;
+    $slug = str_replace(['-', '_', '+'], ' ', $slug);
+    $slug = preg_replace('/\s+/', ' ', trim($slug)) ?? '';
+    if (strlen($slug) < 8) {
+        return null;
+    }
+    // Title-case lightly; keep short all-caps tokens (DHS, AI, LGBTQ).
+    $words = explode(' ', $slug);
+    $out = [];
+    foreach ($words as $w) {
+        if ($w === '') {
+            continue;
+        }
+        if (strlen($w) <= 4 && strtoupper($w) === $w) {
+            $out[] = $w;
+        } else {
+            $out[] = mb_strtoupper(mb_substr($w, 0, 1)) . mb_strtolower(mb_substr($w, 1));
+        }
+    }
+    $title = implode(' ', $out);
+    if (mb_strlen($title) > 120) {
+        $title = mb_substr($title, 0, 117) . '…';
+    }
+    return $title !== '' ? $title : null;
+}
+
 function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxBytes = 524288): ?string
 {
     if (!ap_link_preview_url_allowed($url)) {
         return null;
     }
-    $ch = curl_init($url);
-    if ($ch === false) {
-        return null;
-    }
-    $buf = '';
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => false,
-        // Never follow redirects — initial URL is SSRF-checked; Location targets are not.
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_CONNECTTIMEOUT => $timeoutSec,
-        CURLOPT_TIMEOUT => $timeoutSec,
-        CURLOPT_USERAGENT => 'mkultra.monster-link-preview/1.0 (+https://mkultra.monster)',
-        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$buf, $maxBytes): int {
-            $buf .= $data;
-            if (strlen($buf) > $maxBytes) {
-                return 0; // abort
+    // Manual redirects only — each Location is SSRF-checked (never CURLOPT_FOLLOWLOCATION).
+    $current = ap_link_preview_normalize_url($url);
+    $maxHops = 5;
+    for ($hop = 0; $hop <= $maxHops; $hop++) {
+        if ($current === '' || !ap_link_preview_url_allowed($current)) {
+            return null;
+        }
+        $ch = curl_init($current);
+        if ($ch === false) {
+            return null;
+        }
+        $buf = '';
+        $headers = '';
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HEADERFUNCTION => static function ($ch, string $header) use (&$headers): int {
+                $headers .= $header;
+                return strlen($header);
+            },
+            CURLOPT_CONNECTTIMEOUT => min(4, $timeoutSec),
+            CURLOPT_TIMEOUT => $timeoutSec,
+            // Identifiable, but browser-compatible enough to clear soft bot walls.
+            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; mkultra.monster-link-preview/1.1; +https://mkultra.monster)',
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_WRITEFUNCTION => static function ($ch, string $data) use (&$buf, $maxBytes): int {
+                $buf .= $data;
+                if (strlen($buf) > $maxBytes) {
+                    return 0; // abort
+                }
+                return strlen($data);
+            },
+            CURLOPT_HTTPHEADER => [
+                'Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+                'Accept-Language: en-US,en;q=0.8',
+            ],
+        ]);
+        $ok = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($code >= 300 && $code < 400) {
+            if ($hop >= $maxHops) {
+                return null;
             }
-            return strlen($data);
-        },
-        CURLOPT_HTTPHEADER => [
-            'Accept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
-        ],
-    ]);
-    $ok = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($ok === false || $code < 200 || $code >= 400 || $buf === '') {
-        return null;
+            if (!preg_match('/^Location:\s*(.+)$/im', $headers, $lm)) {
+                return null;
+            }
+            $next = ap_link_preview_resolve_redirect($current, trim($lm[1]));
+            if ($next === null || $next === $current) {
+                return null;
+            }
+            $current = $next;
+            continue;
+        }
+        if ($ok === false || $code < 200 || $code >= 400 || $buf === '') {
+            return null;
+        }
+        return $buf;
     }
-    return $buf;
+    return null;
 }
 
 /**
@@ -414,6 +540,7 @@ function ap_link_preview_for_url(string $url, bool $allowFetch = true): ?array
         $card = ap_link_preview_fetch_og($url);
     }
     if ($card === null) {
+        // Short fail TTL — many "fails" are soft blocks/redirects that recover.
         ap_link_preview_cache_put([
             'url' => $url,
             'title' => null,
@@ -423,7 +550,7 @@ function ap_link_preview_for_url(string $url, bool $allowFetch = true): ?array
             'provider_url' => null,
             'type' => 'link',
             'status' => 'fail',
-        ], 86400);
+        ], 2 * 3600);
         return null;
     }
     ap_link_preview_cache_put($card, 7 * 86400);

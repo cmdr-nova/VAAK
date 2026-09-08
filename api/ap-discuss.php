@@ -101,23 +101,58 @@ function ap_discuss_category(string $slug): ?array
     }
 }
 
-/** @return list<array<string,mixed>> */
-function ap_discuss_topics(int $categoryId, int $limit = 100): array
+/**
+ * Topics in a category. When $ownerUserId is set, includes is_unread (1/0)
+ * and sorts unread threads first so new activity is easy to find.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_discuss_topics(int $categoryId, int $limit = 100, ?int $ownerUserId = null): array
 {
     $limit = max(1, min(200, $limit));
+    $categoryId = (int) $categoryId;
+    if ($categoryId < 1) {
+        return [];
+    }
+    $ownerUserId = max(0, (int) ($ownerUserId ?? 0));
     try {
-        $st = ap_db()->query(
-            'SELECT t.id, t.category_id, t.owner_user_id, t.title, t.created_at, t.updated_at, t.locked,
-                    COALESCE(u.username, \'local user\') AS username,
-                    COUNT(p.id) AS post_count
-             FROM ap_discuss_topics t
-             LEFT JOIN ap_users u ON u.id = t.owner_user_id
-             LEFT JOIN ap_discuss_posts p ON p.topic_id = t.id
-             WHERE t.category_id = ' . (int) $categoryId . '
-             GROUP BY t.id, t.category_id, t.owner_user_id, t.title, t.created_at, t.updated_at, t.locked, u.username
-             ORDER BY t.updated_at DESC, t.id DESC
-             LIMIT ' . $limit
-        );
+        if ($ownerUserId > 0) {
+            $st = ap_db()->prepare(
+                'SELECT t.id, t.category_id, t.owner_user_id, t.title, t.created_at, t.updated_at, t.locked,
+                        COALESCE(u.username, \'local user\') AS username,
+                        COUNT(p.id) AS post_count,
+                        CASE
+                          WHEN r.last_read_at IS NULL OR t.updated_at > r.last_read_at THEN 1
+                          ELSE 0
+                        END AS is_unread
+                 FROM ap_discuss_topics t
+                 LEFT JOIN ap_users u ON u.id = t.owner_user_id
+                 LEFT JOIN ap_discuss_posts p ON p.topic_id = t.id
+                 LEFT JOIN ap_discuss_reads r
+                   ON r.topic_id = t.id AND r.owner_user_id = ?
+                 WHERE t.category_id = ?
+                 GROUP BY t.id, t.category_id, t.owner_user_id, t.title, t.created_at, t.updated_at, t.locked,
+                          u.username, r.last_read_at
+                 ORDER BY is_unread DESC, t.updated_at DESC, t.id DESC
+                 LIMIT ' . $limit
+            );
+            $st->execute([$ownerUserId, $categoryId]);
+        } else {
+            $st = ap_db()->prepare(
+                'SELECT t.id, t.category_id, t.owner_user_id, t.title, t.created_at, t.updated_at, t.locked,
+                        COALESCE(u.username, \'local user\') AS username,
+                        COUNT(p.id) AS post_count,
+                        0 AS is_unread
+                 FROM ap_discuss_topics t
+                 LEFT JOIN ap_users u ON u.id = t.owner_user_id
+                 LEFT JOIN ap_discuss_posts p ON p.topic_id = t.id
+                 WHERE t.category_id = ?
+                 GROUP BY t.id, t.category_id, t.owner_user_id, t.title, t.created_at, t.updated_at, t.locked, u.username
+                 ORDER BY t.updated_at DESC, t.id DESC
+                 LIMIT ' . $limit
+            );
+            $st->execute([$categoryId]);
+        }
         return $st->fetchAll() ?: [];
     } catch (Throwable $e) {
         error_log('[ap-discuss] topics: ' . $e->getMessage());
@@ -204,6 +239,8 @@ function ap_discuss_topic_create(int $categoryId, int $ownerUserId, string $titl
         );
         $post->execute([$topicId, $ownerUserId, $body, $now, $now]);
         $db->commit();
+        // Author has already seen their own new thread
+        ap_discuss_mark_read((int) $topicId, $ownerUserId);
         return ['ok' => true, 'id' => $topicId];
     } catch (Throwable $e) {
         if (isset($db) && $db instanceof PDO && $db->inTransaction()) {
@@ -243,6 +280,8 @@ function ap_discuss_post_create(int $topicId, int $ownerUserId, string $body): a
         $postId = ap_db_last_insert_id('ap_discuss_posts', 'id', $db);
         $db->prepare('UPDATE ap_discuss_topics SET updated_at = ? WHERE id = ?')->execute([$now, $topicId]);
         $db->commit();
+        // Author has already seen the thread they just replied to
+        ap_discuss_mark_read($topicId, $ownerUserId);
         return ['ok' => true, 'id' => $postId];
     } catch (Throwable $e) {
         if (isset($db) && $db instanceof PDO && $db->inTransaction()) {

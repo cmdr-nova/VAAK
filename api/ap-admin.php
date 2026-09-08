@@ -21,6 +21,7 @@ require_once __DIR__ . '/ap-relays.php'; // Admin → Relays (Mastodon-compatibl
 require_once __DIR__ . '/ap-import-export.php'; // You → Import/Export + Move/aliases
 require_once __DIR__ . '/ap-r2.php'; // avatar URL helpers / async warm
 require_once __DIR__ . '/ap-masto-entities.php'; // status ids, favourites/bookmarks
+require_once __DIR__ . '/ap-bookmark-folders.php'; // VAAK bookmark folders (API-safe overlay)
 require_once __DIR__ . '/ap-queue.php'; // posting queue / scheduler
 require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
@@ -699,6 +700,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         if ($wantJson) {
             header('Content-Type: application/json; charset=utf-8');
             header('Cache-Control: no-store');
+            $folderIds = [];
+            if ($interactOk && $interactKind === 'bookmark' && $interactActive && $statusId !== '') {
+                $folderIds = function_exists('vaak_bookmark_folders_for_status')
+                    ? vaak_bookmark_folders_for_status($statusId, $vaakOwnerId)
+                    : [];
+            }
             echo json_encode([
                 'ok' => $interactOk && $error === null,
                 'error' => $error,
@@ -707,7 +714,73 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'kind' => $interactKind,
                 'active' => $interactActive,
                 'status_id' => $statusId,
+                'object_id' => $objectId,
+                'folder_ids' => $folderIds,
+                'open_folder_picker' => $interactOk && $interactKind === 'bookmark' && $interactActive,
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+    } elseif (in_array($action, ['bookmark_folder_create', 'bookmark_folder_delete', 'bookmark_folder_add', 'bookmark_folder_remove'], true)) {
+        $wantJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'bookmarks')) ?: 'bookmarks';
+        $payload = ['ok' => false];
+        if ($action === 'bookmark_folder_create') {
+            $res = vaak_bookmark_folder_create($vaakOwnerId, (string) ($_POST['title'] ?? ''));
+            $payload = $res;
+            if (!empty($res['ok'])) {
+                $notice = 'Folder created.';
+            } else {
+                $error = $res['error'] ?? 'Could not create folder.';
+            }
+        } elseif ($action === 'bookmark_folder_delete') {
+            $res = vaak_bookmark_folder_delete((int) ($_POST['folder_id'] ?? 0), $vaakOwnerId);
+            $payload = $res;
+            if (!empty($res['ok'])) {
+                $notice = 'Folder deleted.';
+            } else {
+                $error = $res['error'] ?? 'Could not delete folder.';
+            }
+        } elseif ($action === 'bookmark_folder_add') {
+            $res = vaak_bookmark_folder_add_status(
+                (int) ($_POST['folder_id'] ?? 0),
+                (string) ($_POST['status_id'] ?? ''),
+                $vaakOwnerId,
+                trim((string) ($_POST['object_id'] ?? '')) ?: null
+            );
+            $payload = $res + [
+                'status_id' => (string) ($_POST['status_id'] ?? ''),
+                'folder_id' => (int) ($_POST['folder_id'] ?? 0),
+            ];
+            if (!empty($res['ok'])) {
+                $notice = !empty($res['already']) ? 'Already in that folder.' : 'Saved to folder.';
+            } else {
+                $error = $res['error'] ?? 'Could not add to folder.';
+            }
+        } else {
+            $res = vaak_bookmark_folder_remove_status(
+                (int) ($_POST['folder_id'] ?? 0),
+                (string) ($_POST['status_id'] ?? ''),
+                $vaakOwnerId
+            );
+            $payload = $res + [
+                'status_id' => (string) ($_POST['status_id'] ?? ''),
+                'folder_id' => (int) ($_POST['folder_id'] ?? 0),
+            ];
+            if (!empty($res['ok'])) {
+                $notice = 'Removed from folder.';
+            } else {
+                $error = $res['error'] ?? 'Could not remove from folder.';
+            }
+        }
+        if ($wantJson) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            $payload['notice'] = $notice;
+            $payload['error'] = $error;
+            $payload['folders'] = vaak_bookmark_folders_list($vaakOwnerId);
+            echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             exit;
         }
     } elseif ($action === 'reply') {
@@ -1926,6 +1999,59 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $_GET['actor'] = $returnActor;
             $_GET['from'] = (string) ($_POST['return_from'] ?? ($_GET['from'] ?? ''));
         }
+    } elseif ($action === 'deprioritize_remote' || $action === 'undeprioritize_remote') {
+        $target = trim((string) ($_POST['actor_id'] ?? ''));
+        $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
+        if ($view === 'blocks' || $view === 'muted_words') {
+            $view = 'profile';
+        }
+        $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
+        if ($target === '') {
+            $error = 'Missing actor to deprioritize.';
+        } elseif (!str_starts_with($target, 'https://')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+            $resolved = ap_resolve_actor_ref($target);
+            if (is_string($resolved) && $resolved !== '') {
+                $target = $resolved;
+            } else {
+                $error = 'Could not resolve handle via WebFinger.';
+            }
+        }
+        if ($error === null) {
+            if ($action === 'deprioritize_remote') {
+                $result = function_exists('ap_deprioritize_upsert')
+                    ? ap_deprioritize_upsert($target, $vaakOwnerId)
+                    : ['ok' => false, 'error' => 'Deprioritize unavailable.'];
+                if (!empty($result['ok'])) {
+                    admin_tl_cache_clear();
+                    $notice = !empty($result['already'])
+                        ? 'Already deprioritized on Home.'
+                        : 'Deprioritized on Home (still shows on Federated / Local).';
+                } else {
+                    $error = $result['error'] ?? 'Deprioritize failed.';
+                }
+            } else {
+                $result = function_exists('ap_deprioritize_remove')
+                    ? ap_deprioritize_remove($target, $vaakOwnerId)
+                    : ['ok' => false, 'error' => 'Deprioritize unavailable.'];
+                if (!empty($result['ok'])) {
+                    admin_tl_cache_clear();
+                    $notice = 'Removed Home deprioritize.';
+                } else {
+                    $error = $result['error'] ?? 'Could not remove deprioritize.';
+                }
+            }
+        }
+        if ($returnActor === '' && str_starts_with($target, 'https://')) {
+            $returnActor = $target;
+        }
+        if ($view === 'remote_profile' && $returnActor !== '' && str_starts_with($returnActor, 'https://')) {
+            $_GET['actor'] = $returnActor;
+            $_GET['from'] = (string) ($_POST['return_from'] ?? ($_GET['from'] ?? ''));
+        }
     } elseif ($action === 'subscribe_posts' || $action === 'unsubscribe_posts') {
         $target = trim((string) ($_POST['actor_id'] ?? ''));
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'remote_profile')) ?: 'remote_profile';
@@ -2496,6 +2622,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     }
 }
 
+// Bookmark folder list for one-tap picker (VAAK-only; not Mastodon API)
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $statusId = trim((string) ($_GET['status_id'] ?? ''));
+    $folders = function_exists('vaak_bookmark_folders_list')
+        ? vaak_bookmark_folders_list($vaakOwnerId)
+        : [];
+    $selected = ($statusId !== '' && function_exists('vaak_bookmark_folders_for_status'))
+        ? vaak_bookmark_folders_for_status($statusId, $vaakOwnerId)
+        : [];
+    echo json_encode([
+        'ok' => true,
+        'folders' => $folders,
+        'selected' => $selected,
+        'status_id' => $statusId,
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 // Lightweight JSON for nav badge / tab title polling (before heavy feed queries)
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     header('Content-Type: application/json; charset=utf-8');
@@ -2609,7 +2755,10 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
         foreach ($trendStatuses as $ts) {
             $acct = is_array($ts['account'] ?? null) ? $ts['account'] : [];
             $who = (string) ($acct['acct'] ?? $acct['username'] ?? 'someone');
-            $content = trim(strip_tags((string) ($ts['content'] ?? '')));
+            // Decode &#039; / &amp; / curly quotes — bare strip_tags left entities visible.
+            $content = function_exists('admin_html_to_plain')
+                ? admin_html_to_plain((string) ($ts['content'] ?? ''))
+                : trim(html_entity_decode(strip_tags((string) ($ts['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
             $excerpt = $admin_strim($content, 96);
             $surl = (string) ($ts['url'] ?? $ts['uri'] ?? '');
             echo '<div style="margin:0 0 .65rem;line-height:1.35">';
@@ -3650,6 +3799,7 @@ $blocks = [];
 $mutes = [];
 $userBlocks = [];
 $mutedWordRows = [];
+$deprioritizedRows = [];
 if (in_array($view, ['blocks', 'remote_profile', 'dms', 'security', 'profile'], true)) {
     if ($view === 'blocks' || $view === 'remote_profile' || $view === 'dms' || $view === 'security') {
         $blocks = ap_block_list();
@@ -3662,6 +3812,9 @@ if ($view === 'profile') {
     $mutes = function_exists('ap_mutes_list') ? ap_mutes_list(admin_owner_user_id()) : [];
     $userBlocks = function_exists('ap_user_blocks_list') ? ap_user_blocks_list(admin_owner_user_id()) : [];
     $mutedWordRows = function_exists('ap_muted_words_list') ? ap_muted_words_list(admin_owner_user_id()) : [];
+    $deprioritizedRows = function_exists('ap_deprioritized_list')
+        ? ap_deprioritized_list(admin_owner_user_id())
+        : [];
     $followRequests = function_exists('ap_follow_requests_list')
         ? ap_follow_requests_list(rtrim((string) ($vaakUser['actor_id'] ?? $vaakActorId), '/'))
         : [];
@@ -3867,10 +4020,21 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if ($oid !== '') {
                 $homeSeenObject[$oid] = true;
             }
+            $sortTs = strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0);
+            if (
+                function_exists('ap_is_deprioritized_actor')
+                && ap_is_deprioritized_actor($aid, $homeOwnerId)
+            ) {
+                $sortTs -= function_exists('ap_deprioritize_penalty_seconds')
+                    ? ap_deprioritize_penalty_seconds()
+                    : (6 * 3600);
+            }
             $homeTimeline[] = [
                 'kind' => 'event',
-                'sort' => strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0),
+                'sort' => $sortTs,
                 'row' => $e,
+                'deprioritized' => function_exists('ap_is_deprioritized_actor')
+                    && ap_is_deprioritized_actor($aid, $homeOwnerId),
             ];
         }
     }
@@ -3912,10 +4076,21 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if ($oid !== '') {
                 $homeSeenObject[$oid] = true;
             }
+            $sortTs = strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0);
+            if (
+                function_exists('ap_is_deprioritized_actor')
+                && ap_is_deprioritized_actor($aid, $homeOwnerId)
+            ) {
+                $sortTs -= function_exists('ap_deprioritize_penalty_seconds')
+                    ? ap_deprioritize_penalty_seconds()
+                    : (6 * 3600);
+            }
             $homeTimeline[] = [
                 'kind' => 'event',
-                'sort' => strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0),
+                'sort' => $sortTs,
                 'row' => $e,
+                'deprioritized' => function_exists('ap_is_deprioritized_actor')
+                    && ap_is_deprioritized_actor($aid, $homeOwnerId),
             ];
             $localAdded++;
         }
@@ -4089,6 +4264,29 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             $tagEmitted++;
         }
         $homeTimeline = $merged;
+    }
+    // Cap deprioritized authors to ~1 in 5 Home slots (still visible, less loud).
+    if ($homeTimeline) {
+        $capped = [];
+        $deprioEmitted = 0;
+        $sinceDeprio = 0;
+        foreach ($homeTimeline as $item) {
+            $isDep = !empty($item['deprioritized']);
+            if ($isDep) {
+                if ($sinceDeprio < 4 && count($capped) > 0) {
+                    continue;
+                }
+                if (($deprioEmitted + 1) / max(1, count($capped) + 1) > 0.2) {
+                    continue;
+                }
+                $deprioEmitted++;
+                $sinceDeprio = 0;
+            } else {
+                $sinceDeprio++;
+            }
+            $capped[] = $item;
+        }
+        $homeTimeline = $capped;
     }
     // Seed ranked cache for subsequent infinite-scroll pages
     if ($homeTimeline !== []) {
@@ -6068,7 +6266,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
                   <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
-                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
               <?= block_quick_actions($aid, short_host($aid), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $objectId) ?>
@@ -6140,6 +6338,9 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isMuted = $actorId !== '' && function_exists('ap_is_muted_actor')
         ? ap_is_muted_actor($actorId, $ownerUserId)
         : false;
+    $isDeprioritized = $actorId !== '' && function_exists('ap_is_deprioritized_actor')
+        ? ap_is_deprioritized_actor($actorId, $ownerUserId)
+        : false;
     $globalControl = ($isAdmin && !$isLocal && $actorId !== '')
         ? admin_global_actor_control($actorId)
         : null;
@@ -6167,6 +6368,19 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
             . '<input type="hidden" name="return_actor" value="' . h($actorId) . '">'
             . '<input type="hidden" name="actor_id" value="' . h($actorId) . '">'
             . '<button class="menu-action" type="submit">' . ($isMuted ? 'Unmute user' : 'Mute user') . '</button>'
+            . '</form>';
+        // Soft-rank on Home only — still shows on Federated / Local / notifications.
+        $menu .= '<form method="post" action="?view=' . h($returnView) . '">'
+            . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+            . '<input type="hidden" name="action" value="'
+            . ($isDeprioritized ? 'undeprioritize_remote' : 'deprioritize_remote') . '">'
+            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+            . '<input type="hidden" name="return_from" value="' . h($returnFrom) . '">'
+            . '<input type="hidden" name="return_actor" value="' . h($actorId) . '">'
+            . '<input type="hidden" name="actor_id" value="' . h($actorId) . '">'
+            . '<button class="menu-action" type="submit">'
+            . ($isDeprioritized ? 'Stop deprioritizing' : 'Deprioritize on Home')
+            . '</button>'
             . '</form>';
         if (!$isLocal) {
             $menu .= '<a class="menu-action" href="' . h(admin_report_href($actorId, $objectId, $returnFrom !== '' ? $returnFrom : $returnView)) . '">Report user</a>';
@@ -6760,7 +6974,7 @@ function admin_render_masto_status_card(
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                   <input type="hidden" name="object_id" value="<?= h($uri) ?>">
-                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
               <?php if ($actorRef !== '' && !$following && !$isLocal): ?>
@@ -7047,7 +7261,7 @@ function admin_render_remote_boost_card(
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
                   <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
-                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
               <?= block_quick_actions($origActor, short_host($origActor), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $objectId) ?>
@@ -7193,7 +7407,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
                   <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
-                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
               <?= block_quick_actions($targetActor, short_host($targetActor), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $objectId) ?>
@@ -8195,6 +8409,24 @@ try {
     $notifUnreadNav = 0;
 }
 $notifBadgeLabel = $notifUnreadNav > 99 ? '99+' : (string) (int) $notifUnreadNav;
+
+// Notices badge: baseline cursor on first auth page load; clear when opening Notices.
+$noticesUnreadNav = 0;
+try {
+    if ($vaakOwnerId > 0 && function_exists('ap_notices_ensure_read_cursor')) {
+        if ($view === 'notices' && function_exists('ap_notices_mark_read')) {
+            ap_notices_mark_read($vaakOwnerId);
+        } else {
+            ap_notices_ensure_read_cursor($vaakOwnerId);
+            $noticesUnreadNav = function_exists('ap_notices_unread_count')
+                ? ap_notices_unread_count($vaakOwnerId)
+                : 0;
+        }
+    }
+} catch (Throwable $e) {
+    error_log('[ap-admin] notices badge: ' . $e->getMessage());
+    $noticesUnreadNav = 0;
+}
 
 // Opening a DM thread marks that peer read before nav/unread counts render
 try {
@@ -9631,6 +9863,23 @@ function admin_render_home_suggestions(array $suggestions): void
     }
     .flash.ok { background: #0a2a18; border: 1px solid #1f5a3a; color: #b6f5d0; }
     .flash.err { background: #2a1010; border: 1px solid #5a2a2a; color: #ffc9c9; }
+    .bm-folder-popover {
+      position: fixed; z-index: 80; min-width: 220px; max-width: min(320px, 92vw);
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      box-shadow: 0 12px 40px rgba(0,0,0,.45); padding: .65rem .7rem; color: var(--text);
+    }
+    .bm-folder-popover h4 { margin: 0 0 .45rem; font-size: .85rem; }
+    .bm-folder-popover label {
+      display: flex; gap: .45rem; align-items: center; padding: .28rem 0;
+      font-size: .86rem; cursor: pointer;
+    }
+    .bm-folder-popover .bm-folder-actions {
+      display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .55rem;
+    }
+    .bm-folder-popover input[type="text"] {
+      width: 100%; margin-top: .35rem; padding: .35rem .5rem;
+      border-radius: 8px; border: 1px solid var(--border); background: #121212; color: var(--text);
+    }
     .ap-toast-stack {
       position: fixed; bottom: 1.4rem; left: 50%; transform: translateX(-50%);
       z-index: 12000; display: flex; flex-direction: column; gap: .45rem;
@@ -9925,6 +10174,7 @@ function admin_render_home_suggestions(array $suggestions): void
     <?php
       $dmUnreadNav = ap_dm_unread_count();
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
+      $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
       $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'import_export', 'security'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
@@ -9933,7 +10183,7 @@ function admin_render_home_suggestions(array $suggestions): void
     ?>
     <nav class="nav">
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
-      <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span></a>
+      <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span><span class="nav-badge"<?= $noticesUnreadNav > 0 ? '' : ' hidden' ?>><?= $noticesUnreadNav > 99 ? '99+' : (string) (int) $noticesUnreadNav ?></span></a>
       <hr class="nav-sep">
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
       <a class="<?= $view === 'vakktok' ? 'active' : '' ?>" href="?view=vakktok"><span class="ico">▶</span><span class="label">VakkTok</span></a>
@@ -10129,10 +10379,23 @@ function admin_render_home_suggestions(array $suggestions): void
             </form>
           <?php endif; ?>
         <?php elseif ($discussCategory !== null): ?>
-          <?php $discussTopics = ap_discuss_topics((int) $discussCategory['id'], 100); ?>
+          <?php
+            $discussTopics = ap_discuss_topics((int) $discussCategory['id'], 100, $vaakOwnerId);
+            $discussCategoryUnread = 0;
+            foreach ($discussTopics as $dtUnread) {
+                if (!empty($dtUnread['is_unread'])) {
+                    $discussCategoryUnread++;
+                }
+            }
+          ?>
           <p class="meta" style="margin:0 0 .8rem"><a href="?view=discuss">Discuss</a> <span aria-hidden="true">/</span> <?= h((string) $discussCategory['name']) ?></p>
           <section class="side-card" style="margin-bottom:1rem">
-            <h1 style="margin:.1rem 0 .35rem;font-size:1.35rem"><?= h((string) $discussCategory['name']) ?></h1>
+            <div style="display:flex;justify-content:space-between;gap:1rem;align-items:center;flex-wrap:wrap">
+              <h1 style="margin:.1rem 0 .35rem;font-size:1.35rem"><?= h((string) $discussCategory['name']) ?></h1>
+              <?php if ($discussCategoryUnread > 0): ?>
+                <span class="nav-badge" style="position:static"><?= $discussCategoryUnread > 99 ? '99+' : (string) $discussCategoryUnread ?> new</span>
+              <?php endif; ?>
+            </div>
             <p class="meta" style="margin:0"><?= h((string) ($discussCategory['description'] ?? '')) ?></p>
           </section>
           <section class="side-card" style="margin-bottom:1rem">
@@ -10150,8 +10413,15 @@ function admin_render_home_suggestions(array $suggestions): void
           <?php else: ?>
             <section class="side-card" style="padding:0;overflow:hidden">
               <?php foreach ($discussTopics as $dt): ?>
-                <a href="?view=discuss&amp;topic=<?= (int) ($dt['id'] ?? 0) ?>" style="display:block;padding:.9rem 1rem;border-bottom:1px solid var(--border);text-decoration:none;color:inherit">
-                  <div style="display:flex;justify-content:space-between;gap:1rem;align-items:baseline;flex-wrap:wrap"><strong><?= h((string) ($dt['title'] ?? '')) ?></strong><span class="meta"><?= (int) ($dt['post_count'] ?? 0) ?> <?= ((int) ($dt['post_count'] ?? 0) === 1 ? 'post' : 'posts') ?></span></div>
+                <?php $topicUnread = !empty($dt['is_unread']); ?>
+                <a href="?view=discuss&amp;topic=<?= (int) ($dt['id'] ?? 0) ?>" style="display:block;padding:.9rem 1rem;border-bottom:1px solid var(--border);text-decoration:none;color:inherit<?= $topicUnread ? ';background:rgba(120,200,140,.06)' : '' ?>">
+                  <div style="display:flex;justify-content:space-between;gap:1rem;align-items:center;flex-wrap:wrap">
+                    <strong><?= h((string) ($dt['title'] ?? '')) ?></strong>
+                    <span style="display:flex;align-items:center;gap:.5rem">
+                      <?php if ($topicUnread): ?><span class="nav-badge" style="position:static">new</span><?php endif; ?>
+                      <span class="meta"><?= (int) ($dt['post_count'] ?? 0) ?> <?= ((int) ($dt['post_count'] ?? 0) === 1 ? 'post' : 'posts') ?></span>
+                    </span>
+                  </div>
                   <div class="meta" style="margin-top:.25rem">Started by @<?= h((string) ($dt['username'] ?? 'local user')) ?> · <?= h(relative_time((string) ($dt['updated_at'] ?? ''))) ?></div>
                 </a>
               <?php endforeach; ?>
@@ -10424,10 +10694,53 @@ function admin_render_home_suggestions(array $suggestions): void
       <?php elseif ($view === 'bookmarks'): ?>
 
         <?php
-          $bmList = ap_masto_bookmarks_list(60, null);
-          if (!$bmList):
+          $bmFolders = function_exists('vaak_bookmark_folders_list')
+              ? vaak_bookmark_folders_list($vaakOwnerId)
+              : [];
+          $bmFolderFilter = (int) ($_GET['folder'] ?? 0);
+          $bmList = ap_masto_bookmarks_list(80, null);
+          if ($bmFolderFilter > 0 && function_exists('vaak_bookmark_folder_status_ids')) {
+              $allowed = array_fill_keys(
+                  vaak_bookmark_folder_status_ids($bmFolderFilter, $vaakOwnerId, 500),
+                  true
+              );
+              $bmList = array_values(array_filter(
+                  $bmList,
+                  static fn($st) => isset($allowed[(string) ($st['id'] ?? '')])
+              ));
+          }
         ?>
-          <div class="empty">No bookmarks yet.</div>
+        <section class="side-card" style="margin-bottom:1rem">
+          <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
+            <a class="btn <?= $bmFolderFilter < 1 ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>
+            <?php foreach ($bmFolders as $bf): ?>
+              <?php $bfid = (int) ($bf['id'] ?? 0); ?>
+              <a class="btn <?= $bmFolderFilter === $bfid ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks&amp;folder=<?= $bfid ?>" style="padding:.3rem .7rem;font-size:.82rem">
+                <?= h((string) ($bf['title'] ?? 'Folder')) ?>
+                <span class="meta">(<?= (int) ($bf['item_count'] ?? 0) ?>)</span>
+              </a>
+            <?php endforeach; ?>
+          </div>
+          <form method="post" action="?view=bookmarks" class="composer" style="margin:0;display:flex;gap:.5rem;flex-wrap:wrap;align-items:center">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <input type="hidden" name="action" value="bookmark_folder_create">
+            <input type="hidden" name="return_view" value="bookmarks">
+            <input name="title" maxlength="80" placeholder="New folder name…" required style="flex:1;min-width:10rem">
+            <button class="btn btn-ghost" type="submit">Create folder</button>
+          </form>
+          <div class="meta" style="margin-top:.55rem">Folders are VAAK-only. Ice Cubes still sees one flat bookmark list.</div>
+        </section>
+        <?php if ($bmFolderFilter > 0): ?>
+          <form method="post" action="?view=bookmarks" style="margin:0 0 1rem" onsubmit="return confirm('Delete this folder? Bookmarks stay saved under All.');">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <input type="hidden" name="action" value="bookmark_folder_delete">
+            <input type="hidden" name="return_view" value="bookmarks">
+            <input type="hidden" name="folder_id" value="<?= $bmFolderFilter ?>">
+            <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
+          </form>
+        <?php endif; ?>
+        <?php if (!$bmList): ?>
+          <div class="empty"><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
         <?php else: ?>
           <?php foreach ($bmList as $st): ?>
             <?php
@@ -10463,12 +10776,12 @@ function admin_render_home_suggestions(array $suggestions): void
                   <a href="<?= h(admin_remote_object_href($oid)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
                 <?php endif; ?>
                 <?php if ($sid !== ''): ?>
-                  <form method="post" action="?view=bookmarks" style="display:inline">
+                  <form method="post" action="?view=bookmarks" style="display:inline" class="bm-folder-trigger">
                     <input type="hidden" name="action" value="unbookmark_status">
                     <input type="hidden" name="return_view" value="bookmarks">
                     <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                     <input type="hidden" name="object_id" value="<?= h($oid) ?>">
-                    <button class="icon-btn on" type="submit" title="Remove bookmark" aria-label="Remove bookmark"><i class="ph-fill ph-bookmark-simple" aria-hidden="true"></i></button>
+                    <button class="icon-btn on" type="submit" title="Bookmark folders" aria-label="Bookmark folders" data-bm-picker="1"><i class="ph-fill ph-bookmark-simple" aria-hidden="true"></i></button>
                   </form>
                 <?php endif; ?>
               </div>
@@ -11836,6 +12149,35 @@ function admin_render_home_suggestions(array $suggestions): void
                   <input type="hidden" name="return_view" value="profile">
                   <input type="hidden" name="actor_id" value="<?= h($muActor) ?>">
                   <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Unmute</button>
+                </form>
+              </div>
+            </article>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
+        <h2 style="font-size:1rem;margin:2rem 0 .5rem">Deprioritized on Home</h2>
+        <div class="meta" style="margin-bottom:.75rem">
+          Soft-rank these accounts lower on <b>Home</b> only (⋯ → Deprioritize). They still appear on Federated, Local, and notifications. Mute/block still fully hide.
+        </div>
+        <?php if (!$deprioritizedRows): ?>
+          <div class="empty" style="margin-bottom:1.25rem">Nobody deprioritized yet — use ⋯ on a post.</div>
+        <?php else: ?>
+          <?php foreach ($deprioritizedRows as $dpRow): ?>
+            <?php $dpActor = rtrim((string) ($dpRow['actor_id'] ?? ''), '/'); ?>
+            <article class="tweet">
+              <div class="tweet-hd">
+                <div>
+                  <span class="who"><?= h($dpActor) ?></span>
+                  <span class="meta"> · <?= h(relative_time((string) ($dpRow['created_at'] ?? ''))) ?></span>
+                </div>
+              </div>
+              <div class="tweet-actions">
+                <form method="post" action="?view=profile" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="undeprioritize_remote">
+                  <input type="hidden" name="return_view" value="profile">
+                  <input type="hidden" name="actor_id" value="<?= h($dpActor) ?>">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Stop deprioritizing</button>
                 </form>
               </div>
             </article>
@@ -14318,6 +14660,137 @@ window.apAdminToast = function (msg, isErr) {
     'bookmark_status', 'unbookmark_status',
     'reblog_status', 'unreblog_status'
   ]);
+  let folderPopover = null;
+
+  function closeFolderPopover() {
+    if (folderPopover) {
+      folderPopover.remove();
+      folderPopover = null;
+    }
+  }
+
+  async function postFolderAction(action, fields) {
+    const fd = new FormData();
+    fd.set('action', action);
+    fd.set('ajax', '1');
+    fd.set('return_view', 'bookmarks');
+    if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    Object.keys(fields || {}).forEach((k) => fd.set(k, fields[k]));
+    const res = await fetch(window.location.pathname + (window.location.search || ''), {
+      method: 'POST',
+      body: fd,
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+    });
+    return res.json().catch(() => null);
+  }
+
+  async function openBookmarkFolderPicker(anchorBtn, statusId, objectId, selectedIds) {
+    closeFolderPopover();
+    const rect = anchorBtn.getBoundingClientRect();
+    const pop = document.createElement('div');
+    pop.className = 'bm-folder-popover';
+    pop.setAttribute('role', 'dialog');
+    pop.innerHTML = '<h4>Save bookmark</h4><div class="meta">Loading folders…</div>';
+    document.body.appendChild(pop);
+    folderPopover = pop;
+    const left = Math.min(window.innerWidth - 240, Math.max(8, rect.left));
+    const top = Math.min(window.innerHeight - 200, rect.bottom + 6);
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+
+    let data = null;
+    try {
+      const res = await fetch('?ajax=bookmark_folders&status_id=' + encodeURIComponent(statusId), {
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json' }
+      });
+      data = await res.json();
+    } catch (e) {
+      data = null;
+    }
+    if (!folderPopover) return;
+    const selected = new Set((selectedIds || (data && data.selected) || []).map(String));
+    const folders = (data && data.folders) || [];
+    let html = '<h4>Save to folder</h4>';
+    html += '<div class="meta" style="margin-bottom:.35rem">Stays in All bookmarks either way.</div>';
+    if (!folders.length) {
+      html += '<div class="meta">No folders yet — create one below.</div>';
+    } else {
+      folders.forEach((f) => {
+        const id = String(f.id || '');
+        const checked = selected.has(id) ? ' checked' : '';
+        html += '<label><input type="checkbox" data-folder-id="' + id + '"' + checked + '> '
+          + String(f.title || 'Folder').replace(/</g, '&lt;') + '</label>';
+      });
+    }
+    html += '<input type="text" id="bm-new-folder-name" maxlength="80" placeholder="New folder name…">';
+    html += '<div class="bm-folder-actions">'
+      + '<button type="button" class="btn btn-primary" data-bm-done="1">Done</button>'
+      + '<button type="button" class="btn btn-ghost" data-bm-unbookmark="1">Remove bookmark</button>'
+      + '</div>';
+    pop.innerHTML = html;
+
+    pop.addEventListener('change', async (ev) => {
+      const input = ev.target;
+      if (!(input instanceof HTMLInputElement) || input.type !== 'checkbox') return;
+      const fid = input.getAttribute('data-folder-id');
+      if (!fid) return;
+      const action = input.checked ? 'bookmark_folder_add' : 'bookmark_folder_remove';
+      const res = await postFolderAction(action, {
+        folder_id: fid,
+        status_id: statusId,
+        object_id: objectId || ''
+      });
+      if (!res || !res.ok) {
+        input.checked = !input.checked;
+        window.apAdminToast((res && res.error) || 'Folder update failed.', true);
+      }
+    });
+
+    pop.addEventListener('click', async (ev) => {
+      const t = ev.target;
+      if (!(t instanceof HTMLElement)) return;
+      if (t.getAttribute('data-bm-done') === '1') {
+        const nameInput = pop.querySelector('#bm-new-folder-name');
+        const name = nameInput instanceof HTMLInputElement ? nameInput.value.trim() : '';
+        if (name) {
+          const created = await postFolderAction('bookmark_folder_create', { title: name });
+          if (created && created.ok && created.id) {
+            await postFolderAction('bookmark_folder_add', {
+              folder_id: String(created.id),
+              status_id: statusId,
+              object_id: objectId || ''
+            });
+            window.apAdminToast('Saved to “' + name + '”.');
+          } else {
+            window.apAdminToast((created && created.error) || 'Could not create folder.', true);
+            return;
+          }
+        }
+        closeFolderPopover();
+        return;
+      }
+      if (t.getAttribute('data-bm-unbookmark') === '1') {
+        const form = anchorBtn.closest('form');
+        if (form) {
+          const actionInput = form.querySelector('input[name="action"]');
+          if (actionInput) actionInput.value = 'unbookmark_status';
+          form.requestSubmit ? form.requestSubmit() : form.submit();
+        }
+        closeFolderPopover();
+      }
+    });
+  }
+
+  document.addEventListener('click', (ev) => {
+    if (folderPopover && !folderPopover.contains(ev.target)) {
+      closeFolderPopover();
+    }
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') closeFolderPopover();
+  });
 
   function applyInteractButton(form, data) {
     const btn = form.querySelector('button[type="submit"]');
@@ -14334,8 +14807,9 @@ window.apAdminToast = function (msg, isErr) {
     } else if (kind === 'bookmark') {
       btn.innerHTML = '<i class="ph' + (active ? '-fill' : '') + ' ph-bookmark-simple" aria-hidden="true"></i>';
       btn.classList.toggle('on', active);
-      btn.title = active ? 'Remove bookmark' : 'Bookmark';
-      btn.setAttribute('aria-label', active ? 'Remove bookmark' : 'Bookmark');
+      btn.title = active ? 'Bookmark folders' : 'Bookmark';
+      btn.setAttribute('aria-label', active ? 'Bookmark folders' : 'Bookmark');
+      btn.setAttribute('data-bm-picker', active ? '1' : '0');
       actionInput.value = active ? 'unbookmark_status' : 'bookmark_status';
     } else if (kind === 'reblog') {
       btn.classList.toggle('on', active);
@@ -14351,10 +14825,18 @@ window.apAdminToast = function (msg, isErr) {
     const actionInput = form.querySelector('input[name="action"]');
     const action = actionInput ? actionInput.value : '';
     if (!INTERACT.has(action)) return;
+    const btn = form.querySelector('button[type="submit"]');
+    // Already bookmarked: open folder picker instead of immediately removing
+    if (action === 'unbookmark_status' && btn && btn.getAttribute('data-bm-picker') === '1') {
+      ev.preventDefault();
+      const sid = (form.querySelector('input[name="status_id"]') || {}).value || '';
+      const oid = (form.querySelector('input[name="object_id"]') || {}).value || '';
+      if (sid) openBookmarkFolderPicker(btn, sid, oid, null);
+      return;
+    }
     ev.preventDefault();
     if (form.dataset.busy === '1') return;
     form.dataset.busy = '1';
-    const btn = form.querySelector('button[type="submit"]');
     if (btn) btn.disabled = true;
     try {
       const fd = new FormData(form);
@@ -14385,7 +14867,14 @@ window.apAdminToast = function (msg, isErr) {
           setTimeout(() => card.remove(), 220);
         }
       }
-      if (data.kind === 'reblog' || data.kind === 'bookmark') {
+      if (data.kind === 'bookmark' && data.active && data.open_folder_picker && btn) {
+        openBookmarkFolderPicker(
+          btn,
+          String(data.status_id || ''),
+          String(data.object_id || ''),
+          data.folder_ids || []
+        );
+      } else if (data.kind === 'reblog' || (data.kind === 'bookmark' && !data.active)) {
         window.apAdminToast(data.notice || (data.active ? 'Saved.' : 'Removed.'));
       }
       // favourite: icon fill only — no toast, no scroll jump
