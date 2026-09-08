@@ -35,6 +35,11 @@ Public profiles advertise the Webmention endpoint at
 `/api/ap-webmention.php`. Verified mentions can be read as JSON with a
 `target` query parameter; unverified or blocked sources are rejected.
 
+Clients that need instance-wide moderation policy can read the public JSON
+feed at `/api/ap-moderation-feed.php`. It contains only active global actor and
+domain blocks; personal mutes, report details, and moderation notes are never
+included. Responses support ETags and short-lived caching.
+
 The admin Import/Export screen supports Mastodon-compatible CSV portability
 for follows, mutes, blocks, blocked domains, bookmarks, lists, and followed
 hashtags (`followed_tags.csv`). Imports merge into the current account and do
