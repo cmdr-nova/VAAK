@@ -19,6 +19,7 @@ if (PHP_SAPI !== 'cli'
 
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-mail.php';
 
 const AP_AUTH_SESSION_NAME = 'vaak_sess';
 const AP_AUTH_CSRF_KEY = '_vaak_csrf';
@@ -350,6 +351,51 @@ function ap_auth_user_set_password(int $userId, string $newPassword): array
     } catch (Throwable $e) {
         error_log('[ap-auth] set_password: ' . $e->getMessage());
         return ['ok' => false, 'error' => 'Could not save password.'];
+    }
+}
+
+/** Request a one-time password reset. Always returns a generic result. */
+function ap_auth_request_password_reset(string $login): void
+{
+    $user = ap_auth_user_by_login($login);
+    if (!is_array($user) || trim((string) ($user['email'] ?? '')) === '') {
+        return;
+    }
+    $token = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+    $hash = hash('sha256', $token);
+    $now = ap_db_now();
+    $expires = gmdate('c', time() + 1800);
+    try {
+        ap_db()->prepare('DELETE FROM ap_password_resets WHERE user_id = ? OR expires_at < ?')->execute([(int) $user['id'], $now]);
+        ap_db()->prepare('INSERT INTO ap_password_resets (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
+            ->execute([(int) $user['id'], $hash, $now, $expires]);
+        $url = 'https://mkultra.monster/vaak/?mode=reset&token=' . rawurlencode($token);
+        $name = htmlspecialchars((string) ($user['username'] ?? 'there'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        ap_mail_send((string) $user['email'], 'Reset your Vaak password',
+            "A Vaak password reset was requested for your account.\n\nOpen this link within 30 minutes:\n{$url}\n\nIf you did not request this, ignore this email.\n",
+            '<p>A Vaak password reset was requested for <b>' . $name . '</b>.</p><p><a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">Reset your password</a></p><p>This link expires in 30 minutes and can only be used once.</p>');
+    } catch (Throwable $e) {
+        error_log('[ap-auth] password reset request: ' . $e->getMessage());
+    }
+}
+
+/** Consume a reset token and set the new password. */
+function ap_auth_consume_password_reset(string $token, string $newPassword): array
+{
+    if ($token === '' || strlen($token) > 200) return ['ok' => false, 'error' => 'Invalid or expired reset link.'];
+    $hash = hash('sha256', $token);
+    try {
+        $st = ap_db()->prepare('SELECT * FROM ap_password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > ? LIMIT 1');
+        $st->execute([$hash, ap_db_now()]);
+        $row = $st->fetch();
+        if (!is_array($row)) return ['ok' => false, 'error' => 'Invalid or expired reset link.'];
+        $res = ap_auth_user_set_password((int) $row['user_id'], $newPassword);
+        if (empty($res['ok'])) return $res;
+        ap_db()->prepare('UPDATE ap_password_resets SET used_at = ? WHERE id = ? AND used_at IS NULL')->execute([ap_db_now(), (int) $row['id']]);
+        return ['ok' => true];
+    } catch (Throwable $e) {
+        error_log('[ap-auth] password reset consume: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not reset password.'];
     }
 }
 

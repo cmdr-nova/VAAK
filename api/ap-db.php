@@ -300,7 +300,7 @@ SQL);
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
         'ap_mutes', 'ap_post_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
-        'ap_sl_links', 'ap_user_blocks', 'ap_users', 'app_auth', 'direct_messages',
+        'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
@@ -878,6 +878,16 @@ CREATE TABLE IF NOT EXISTS ap_users (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_users_email ON ap_users(email);
 CREATE INDEX IF NOT EXISTS idx_ap_users_actor_key ON ap_users(actor_key);
+
+CREATE TABLE IF NOT EXISTS ap_password_resets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ap_password_resets_user ON ap_password_resets(user_id, expires_at);
 
 CREATE TABLE IF NOT EXISTS ap_notices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

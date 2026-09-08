@@ -169,7 +169,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET' && ($_GET['mode'] ?? '') ===
 $notice = null;
 $error = null;
 $mode = preg_replace('/[^a-z]/', '', (string) ($_GET['mode'] ?? '')) ?: '';
-if ($mode !== 'register' && $mode !== 'login') {
+if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset') {
     $mode = '';
 }
 
@@ -214,6 +214,30 @@ if ($isAuthPost) {
         }
         $error = $res['error'] ?? 'Registration failed.';
         $mode = 'register';
+    }
+}
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['action'] ?? '') === 'forgot') {
+    if (ap_auth_csrf_ok((string) ($_POST['csrf'] ?? ''))) {
+        ap_auth_request_password_reset((string) ($_POST['login'] ?? ''));
+        $notice = 'If that account has an email address, a reset link is on its way.';
+    } else {
+        $error = 'Session expired — try again.';
+    }
+    $mode = 'forgot';
+}
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['action'] ?? '') === 'reset') {
+    if (!ap_auth_csrf_ok((string) ($_POST['csrf'] ?? ''))) {
+        $error = 'Session expired — try again.';
+    } else {
+        $res = ap_auth_consume_password_reset((string) ($_POST['token'] ?? ''), (string) ($_POST['password'] ?? ''));
+        if (!empty($res['ok'])) {
+            $notice = 'Password updated. You can now log in.';
+            $mode = 'login';
+        } else {
+            $error = $res['error'] ?? 'Could not reset password.';
+            $mode = 'reset';
+        }
     }
 }
 
@@ -367,7 +391,26 @@ ASCII;
     <?php if ($error): ?><div class="flash err"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div><?php endif; ?>
     <?php if ($notice): ?><div class="flash ok"><?= htmlspecialchars($notice, ENT_QUOTES, 'UTF-8') ?></div><?php endif; ?>
 
-    <?php if ($mode === 'register'): ?>
+    <?php if ($mode === 'forgot'): ?>
+      <form method="post" action="/vaak/?mode=forgot">
+        <input type="hidden" name="csrf" value="<?= $csrf ?>">
+        <input type="hidden" name="action" value="forgot">
+        <label for="login">Username or email</label>
+        <input id="login" name="login" required autocomplete="username" placeholder="username or email">
+        <button type="submit">Email reset link</button>
+      </form>
+      <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
+    <?php elseif ($mode === 'reset'): ?>
+      <form method="post" action="/vaak/?mode=reset">
+        <input type="hidden" name="csrf" value="<?= $csrf ?>">
+        <input type="hidden" name="action" value="reset">
+        <input type="hidden" name="token" value="<?= htmlspecialchars((string) ($_GET['token'] ?? $_POST['token'] ?? ''), ENT_QUOTES, 'UTF-8') ?>">
+        <label for="password">New password</label>
+        <input id="password" name="password" type="password" required minlength="10" autocomplete="new-password" placeholder="at least 10 characters">
+        <button type="submit">Set new password</button>
+      </form>
+      <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
+    <?php elseif ($mode === 'register'): ?>
       <form method="post" action="/vaak/?mode=register" autocomplete="on">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
         <input type="hidden" name="action" value="register">
@@ -400,7 +443,7 @@ ASCII;
                placeholder="••••••••••">
         <button type="submit">Log in</button>
       </form>
-      <p class="switch">Have an invite? <a href="/vaak/?mode=register">Register</a></p>
+      <p class="switch"><a href="/vaak/?mode=forgot">Forgot password?</a> · Have an invite? <a href="/vaak/?mode=register">Register</a></p>
     <?php endif; ?>
 
     <nav class="policies" aria-label="Policies">
