@@ -1536,6 +1536,12 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
         || ($objectId !== null && str_ends_with(rtrim($objectId, '/'), '/QuotePost'));
 
     if (is_array($obj)) {
+        if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
+            $objActor = ap_as_id($activity['actor'] ?? null);
+            if ($objActor && isset($obj['tag']) && is_array($obj['tag'])) {
+                ap_remote_emoji_ingest_actor_doc($objActor, $obj);
+            }
+        }
         $media = ap_extract_media_urls($obj);
         $inReplyTo = ap_as_id($obj['inReplyTo'] ?? null);
         if (($type === 'Announce' || $isQuoteActivity) && isset($obj['object']) && is_array($obj['object'])) {
@@ -1580,6 +1586,12 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
                 }
             }
             if (is_array($remote)) {
+                if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
+                    $remoteActor = ap_as_id($activity['actor'] ?? null);
+                    if ($remoteActor && isset($remote['tag']) && is_array($remote['tag'])) {
+                        ap_remote_emoji_ingest_actor_doc($remoteActor, $remote);
+                    }
+                }
                 $media = array_values(array_unique(array_merge($media, ap_extract_media_urls($remote))));
                 if (($summary === null || $summary === '') && isset($remote['content']) && is_string($remote['content'])) {
                     $summary = ap_fix_utf8($remote['content']);

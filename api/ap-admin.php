@@ -5079,7 +5079,7 @@ function admin_account_actor_ref(array $account): string
  *
  * @param list<array{url?:string,acct?:string,username?:string,uri?:string}> $mentions
  */
-function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = []): string
+function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = [], ?string $actorId = null): string
 {
     $plain = html_entity_decode(trim($plain), ENT_QUOTES | ENT_HTML5, 'UTF-8');
     if ($plain === '') {
@@ -5260,6 +5260,44 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
     };
     $plainProtected = $protect($plain);
     $escaped = htmlspecialchars($plainProtected, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+    // Resolve custom shortcodes from the post author and mentioned actors after
+    // escaping, while keeping the resulting images protected from link parsing.
+    $emojiHosts = [];
+    foreach (array_merge($actorId !== null ? [$actorId] : [], array_map(
+        static fn($m) => is_array($m) ? (string) ($m['url'] ?? $m['uri'] ?? '') : '',
+        $mentions
+    )) as $emojiActor) {
+        $emojiHost = parse_url((string) $emojiActor, PHP_URL_HOST);
+        if (is_string($emojiHost) && $emojiHost !== '') {
+            $emojiHosts[strtolower($emojiHost)] = true;
+        }
+    }
+    $emojiMap = [];
+    foreach (array_keys($emojiHosts) as $emojiHost) {
+        if ($actorId !== null && function_exists('ap_remote_emoji_ensure_for_display') && str_contains($plain, ':')) {
+            ap_remote_emoji_ensure_for_display($actorId, $plain, true);
+        }
+        if (function_exists('ap_remote_emoji_map_for_host')) {
+            $emojiMap += ap_remote_emoji_map_for_host($emojiHost);
+        }
+    }
+    if ($emojiMap && preg_match('/:[A-Za-z0-9_-]{1,80}:/', $plain)) {
+        $escaped = preg_replace_callback(
+            '/:([A-Za-z0-9_-]{1,80}):/',
+            static function (array $m) use (&$placeholders, $emojiMap): string {
+                $url = $emojiMap[$m[1]] ?? null;
+                if (!is_string($url) || !str_starts_with($url, 'https://')) {
+                    return $m[0];
+                }
+                $key = "\x01E" . count($placeholders) . "\x01";
+                $alt = ':' . $m[1] . ':';
+                $placeholders[$key] = '<img class="custom-emoji" src="' . h($url) . '" alt="' . h($alt) . '" title="' . h($alt) . '" loading="lazy" decoding="async">';
+                return $key;
+            },
+            $escaped
+        ) ?? $escaped;
+    }
 
     $profileHref = static function (string $actorUrl) use ($returnView): array {
         // [href, external?]
@@ -5798,7 +5836,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               if ($quoteParts !== null) {
                   if ($quoteParts['commentary'] !== '') {
                       $bodyChunk .= '<div class="body feed-body">'
-                          . admin_linkify_body_html($quoteParts['commentary'], $returnView, $eventMentions) . '</div>';
+                          . admin_linkify_body_html($quoteParts['commentary'], $returnView, $eventMentions, $aid) . '</div>';
                   }
                   $qMentions = [];
                   if ($quoteParts['quoted'] !== '' && function_exists('ap_masto_content_with_mentions')) {
@@ -5829,7 +5867,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions) . '</div>';
+                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid) . '</div>';
               }
               $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
@@ -6404,7 +6442,7 @@ function admin_render_masto_status_card(
     $bodyInner = '';
     if ($plain !== '') {
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
-            . admin_linkify_body_html($plain, $returnView, $stMentions) . '</div>';
+            . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef) . '</div>';
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
@@ -6802,7 +6840,7 @@ function admin_render_remote_boost_card(
                       )['mentions'] ?? [];
                   }
                   $boostInner .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions) . '</div>';
+                      . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions, $origActor) . '</div>';
               } elseif ($objectId !== '' && $mediaUrls === []) {
                   $boostInner .= '<div class="meta boost-hydrate-pending" style="margin-top:.35rem">'
                       . '<span class="boost-hydrate-status">Loading boosted post…</span>'
@@ -6964,7 +7002,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
             <?php
               $boostInner = '';
               if ($innerSummary !== '') {
-                  $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView) . '</div>';
+                  $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView, [], $targetActor) . '</div>';
               } else {
                   $pending = $objectId !== '' && str_starts_with($objectId, 'https://');
                   $boostInner .= '<div class="meta boost-hydrate-status" style="margin-top:.35rem">'
@@ -10016,7 +10054,7 @@ function admin_render_home_suggestions(array $suggestions): void
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
                     $favPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions) . '</div>'
+                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl) . '</div>'
                         : ''
                 );
               ?>
@@ -10072,7 +10110,7 @@ function admin_render_home_suggestions(array $suggestions): void
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
                     $bmPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions) . '</div>'
+                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions, $actorUrl) . '</div>'
                         : ''
                 );
               ?>
@@ -13193,10 +13231,19 @@ function admin_render_home_suggestions(array $suggestions): void
                   }
               } else {
                   $rpMeta = $rpActor !== '' ? ap_remote_actor_get($rpActor) : null;
+                  if (is_array($rpMeta) && !empty($rpMeta['profile_json'])) {
+                      $cachedProfile = json_decode((string) $rpMeta['profile_json'], true);
+                      $rpDoc = is_array($cachedProfile) ? $cachedProfile : null;
+                      if (is_array($rpDoc) && !empty($rpDoc['summary']) && is_string($rpDoc['summary'])) {
+                          $rpBio = function_exists('ap_html_to_plain_text')
+                              ? ap_html_to_plain_text($rpDoc['summary'])
+                              : trim(html_entity_decode(strip_tags($rpDoc['summary']), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                      }
+                  }
                   // Cache-first: only sync-fetch AS2 on miss or explicit Refresh (was every open).
                   $rpNeedFetch = $rpActor !== ''
                       && function_exists('ap_fetch_as2_object')
-                      && ($rpForceRefresh || !is_array($rpMeta) || empty($rpMeta['username']));
+                      && ($rpForceRefresh || !is_array($rpMeta) || empty($rpMeta['username']) || !is_array($rpDoc));
                   if ($rpNeedFetch) {
                       $rpDoc = ap_fetch_as2_object($rpActor);
                       if (is_array($rpDoc)) {
@@ -13232,6 +13279,7 @@ function admin_render_home_suggestions(array $suggestions): void
                                   'host' => parse_url($rpActor, PHP_URL_HOST) ?: null,
                                   'icon_source_url' => $icon,
                                   'image_source_url' => $image,
+                                  'profile_json' => json_encode($rpDoc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                               ]);
                               if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
                                   ap_remote_emoji_ingest_actor_doc($rpActor, $rpDoc);
@@ -13358,6 +13406,22 @@ function admin_render_home_suggestions(array $suggestions): void
             $rpPostSub = $rpIsLocal && !$rpIsOwn
                 && function_exists('ap_post_subscription_is')
                 && ap_post_subscription_is($rpActor, admin_owner_user_id());
+            $rpFields = [];
+            if (!$rpIsLocal && is_array($rpDoc) && is_array($rpDoc['attachment'] ?? null)) {
+                foreach ($rpDoc['attachment'] as $field) {
+                    if (!is_array($field) || trim((string) ($field['name'] ?? '')) === '') {
+                        continue;
+                    }
+                    $rpFields[] = [
+                        'name' => trim((string) $field['name']),
+                        'value' => function_exists('ap_html_to_plain_text')
+                            ? ap_html_to_plain_text((string) ($field['value'] ?? ''))
+                            : trim(html_entity_decode(strip_tags((string) ($field['value'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8')),
+                    ];
+                }
+            }
+            $rpFollowersCount = is_array($rpDoc) && isset($rpDoc['followersCount']) && is_numeric($rpDoc['followersCount']) ? (int) $rpDoc['followersCount'] : null;
+            $rpFollowingCount = is_array($rpDoc) && isset($rpDoc['followingCount']) && is_numeric($rpDoc['followingCount']) ? (int) $rpDoc['followingCount'] : null;
           ?>
           <article class="tweet">
             <div class="tweet-hd" style="align-items:center;gap:.75rem">
@@ -13384,11 +13448,27 @@ function admin_render_home_suggestions(array $suggestions): void
               </div>
             </div>
             <?php if ($rpBio !== ''): ?>
-              <div class="body" style="margin-top:.75rem;white-space:pre-wrap"><?= h($rpBio) ?></div>
+              <div class="body feed-body" style="margin-top:.75rem"><?= admin_linkify_body_html($rpBio, 'remote_profile', [], $rpActor) ?></div>
             <?php elseif ($rpIsLocal): ?>
               <div class="meta" style="margin-top:.75rem">No bio set.</div>
             <?php else: ?>
               <div class="meta" style="margin-top:.75rem">No bio available from this instance’s cache / remote fetch.</div>
+            <?php endif; ?>
+            <?php if ($rpFollowersCount !== null || $rpFollowingCount !== null || $rpFields): ?>
+              <div class="meta" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem">
+                <?php if ($rpFollowersCount !== null): ?><span><b><?= number_format($rpFollowersCount) ?></b> followers</span><?php endif; ?>
+                <?php if ($rpFollowingCount !== null): ?><span><b><?= number_format($rpFollowingCount) ?></b> following</span><?php endif; ?>
+              </div>
+              <?php if ($rpFields): ?>
+                <dl class="profile-fields" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.45rem;margin:.75rem 0 0">
+                  <?php foreach ($rpFields as $field): ?>
+                    <div style="padding:.45rem .6rem;background:var(--panel-2);border-radius:8px">
+                      <dt class="meta"><?= h($field['name']) ?></dt>
+                      <dd style="margin:.15rem 0 0"><?= admin_linkify_body_html($field['value'], 'remote_profile', [], $rpActor) ?></dd>
+                    </div>
+                  <?php endforeach; ?>
+                </dl>
+              <?php endif; ?>
             <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
