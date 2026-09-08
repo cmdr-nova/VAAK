@@ -16018,6 +16018,29 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const submitProgress = document.getElementById('compose-submit-progress');
   const submitProgressBar = document.getElementById('compose-submit-progress-bar');
   const submitProgressLabel = document.getElementById('compose-submit-progress-label');
+  const postAudio = new Audio('/api/assets/post.wav?v=1');
+  postAudio.preload = 'auto';
+  postAudio.volume = 0.9;
+  postAudio.setAttribute('playsinline', '');
+  let postAudioUnlocked = false;
+  function unlockPostAudio() {
+    if (postAudioUnlocked) return;
+    try {
+      postAudio.muted = true;
+      postAudio.currentTime = 0;
+      const p = postAudio.play();
+      if (p && typeof p.then === 'function') p.then(() => {
+        postAudio.pause(); postAudio.currentTime = 0; postAudio.muted = false; postAudioUnlocked = true;
+      }).catch(() => { postAudio.muted = false; });
+    } catch (e) { postAudio.muted = false; }
+  }
+  function playPostAudio() {
+    try {
+      postAudio.currentTime = 0;
+      const p = postAudio.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (e) {}
+  }
   const visibilityWrap = document.getElementById('compose-visibility')
     ? document.getElementById('compose-visibility').closest('label')
     : null;
@@ -16216,6 +16239,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (form.dataset.busy === '1') return;
     form.dataset.busy = '1';
     const submitBtn = document.getElementById('compose-submit-btn') || form.querySelector('button[type="submit"]');
+    unlockPostAudio();
     const mode = composeMode;
     const actionName = mode === 'queue_post' ? 'queue_post' : (mode === 'edit_status' ? 'edit_status' : 'reply');
     if (actionField) actionField.value = actionName;
@@ -16252,6 +16276,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
           : (mode === 'edit_status' ? 'Post updated.' : (data.kind === 'quote' ? 'Quote posted.' : 'Posted.'));
         window.apAdminToast(data.notice || okMsg);
       }
+      if (mode === 'reply') playPostAudio();
       // Posted/queued — don't re-save as draft on close
       skipDraftOnClose = true;
       if (draftIdField) draftIdField.value = '';
