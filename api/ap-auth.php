@@ -361,21 +361,75 @@ function ap_auth_request_password_reset(string $login): void
     if (!is_array($user) || trim((string) ($user['email'] ?? '')) === '') {
         return;
     }
-    $token = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
-    $hash = hash('sha256', $token);
+    $userId = (int) $user['id'];
     $now = ap_db_now();
     $expires = gmdate('c', time() + 1800);
+    $db = ap_db();
+    $startedTx = false;
+    $lockPath = '/var/lib/mkultra/ap';
+    if (!is_dir($lockPath) || !is_writable($lockPath)) {
+        $lockPath = sys_get_temp_dir();
+    }
+    $lockFile = $lockPath . '/password-reset-' . $userId . '.lock';
+    $lockFh = @fopen($lockFile, 'c+');
+    if ($lockFh !== false) {
+        // Cross-process lock covers double-clicks even if DB advisory locks race.
+        if (!flock($lockFh, LOCK_EX)) {
+            fclose($lockFh);
+            $lockFh = false;
+        }
+    }
     try {
-        ap_db()->prepare('DELETE FROM ap_password_resets WHERE user_id = ? OR expires_at < ?')->execute([(int) $user['id'], $now]);
-        ap_db()->prepare('INSERT INTO ap_password_resets (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
-            ->execute([(int) $user['id'], $hash, $now, $expires]);
+        // Serialize parallel double-submits for the same account.
+        if ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql') {
+            $db->beginTransaction();
+            $startedTx = true;
+            $lock = $db->prepare('SELECT pg_advisory_xact_lock(872314, ?)');
+            $lock->execute([$userId]);
+        }
+
+        // Cooldown: if an unused reset was created in the last 5 minutes, skip mail.
+        $recent = $db->prepare(
+            'SELECT id, created_at FROM ap_password_resets
+             WHERE user_id = ? AND used_at IS NULL AND expires_at > ?
+             ORDER BY id DESC LIMIT 1'
+        );
+        $recent->execute([$userId, $now]);
+        $existing = $recent->fetch();
+        if (is_array($existing)) {
+            $createdTs = strtotime((string) ($existing['created_at'] ?? '')) ?: 0;
+            if ($createdTs > 0 && (time() - $createdTs) < 300) {
+                if ($startedTx) {
+                    $db->commit();
+                }
+                return;
+            }
+        }
+
+        $token = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+        $hash = hash('sha256', $token);
+        $db->prepare('DELETE FROM ap_password_resets WHERE user_id = ? OR expires_at < ?')->execute([$userId, $now]);
+        $db->prepare('INSERT INTO ap_password_resets (user_id, token_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
+            ->execute([$userId, $hash, $now, $expires]);
+        if ($startedTx) {
+            $db->commit();
+            $startedTx = false;
+        }
         $url = 'https://mkultra.monster/vaak/?mode=reset&token=' . rawurlencode($token);
         $name = htmlspecialchars((string) ($user['username'] ?? 'there'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         ap_mail_send((string) $user['email'], 'Reset your Vaak password',
             "A Vaak password reset was requested for your account.\n\nOpen this link within 30 minutes:\n{$url}\n\nIf you did not request this, ignore this email.\n",
             '<p>A Vaak password reset was requested for <b>' . $name . '</b>.</p><p><a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">Reset your password</a></p><p>This link expires in 30 minutes and can only be used once.</p>');
     } catch (Throwable $e) {
+        if ($startedTx && $db->inTransaction()) {
+            $db->rollBack();
+        }
         error_log('[ap-auth] password reset request: ' . $e->getMessage());
+    } finally {
+        if ($lockFh !== false) {
+            flock($lockFh, LOCK_UN);
+            fclose($lockFh);
+        }
     }
 }
 

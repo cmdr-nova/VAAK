@@ -202,6 +202,105 @@ function ap_masto_json_timeline(array $statuses, string $path, int $limit, array
     ap_masto_json($statuses);
 }
 
+/** Short-lived timeline JSON cache dir (Ice Cubes polls aggressively). */
+function ap_masto_timeline_cache_dir(): string
+{
+    $dir = '/var/lib/mkultra/ap/timeline-json-cache';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0750, true);
+    }
+    return is_dir($dir) && is_writable($dir) ? $dir : sys_get_temp_dir();
+}
+
+/**
+ * Serve a cached timeline JSON body when fresh. Returns true if responded.
+ *
+ * @param array<string,scalar|null> $extraQuery
+ */
+function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?string $sinceId, array $extraQuery = [], int $ttlSec = 20): bool
+{
+    // Only cache "head" polls (no max_id scroll pages) — those are Ice Cubes' frequent refresh.
+    if ($maxId !== null && $maxId !== '') {
+        return false;
+    }
+    $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+    $key = hash('sha256', json_encode([
+        'u' => $owner,
+        'p' => $path,
+        'l' => $limit,
+        's' => $sinceId,
+        'x' => $extraQuery,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+    $file = ap_masto_timeline_cache_dir() . '/tl_' . $key . '.json';
+    if (!is_file($file)) {
+        return false;
+    }
+    $age = time() - (int) @filemtime($file);
+    if ($age < 0 || $age >= $ttlSec) {
+        return false;
+    }
+    $raw = @file_get_contents($file);
+    if (!is_string($raw) || $raw === '') {
+        return false;
+    }
+    $metaFile = $file . '.link';
+    $link = is_file($metaFile) ? trim((string) @file_get_contents($metaFile)) : '';
+    http_response_code(200);
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-VAAK-TL-Cache: hit');
+    if ($link !== '') {
+        header('Link: ' . $link);
+    }
+    echo $raw;
+    exit;
+}
+
+/**
+ * @param list<array<string,mixed>> $statuses
+ * @param array<string,scalar|null> $extraQuery
+ */
+function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit, ?string $maxId, ?string $sinceId, array $extraQuery = []): void
+{
+    if ($maxId !== null && $maxId !== '') {
+        return;
+    }
+    $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+    $key = hash('sha256', json_encode([
+        'u' => $owner,
+        'p' => $path,
+        'l' => $limit,
+        's' => $sinceId,
+        'x' => $extraQuery,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+    $file = ap_masto_timeline_cache_dir() . '/tl_' . $key . '.json';
+    $json = json_encode(
+        $statuses,
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE
+    );
+    if (!is_string($json) || $json === '') {
+        return;
+    }
+    @file_put_contents($file, $json, LOCK_EX);
+    // Persist Link header bits for cache hits.
+    $link = '';
+    if ($statuses) {
+        $first = (string) ($statuses[0]['id'] ?? '');
+        $last = (string) ($statuses[count($statuses) - 1]['id'] ?? '');
+        $base = 'https://mkultra.monster' . $path;
+        $parts = [];
+        if ($last !== '') {
+            $q = array_merge(['limit' => $limit, 'max_id' => $last], $extraQuery);
+            $parts[] = '<' . $base . '?' . http_build_query($q) . '>; rel="next"';
+        }
+        if ($first !== '') {
+            $q = array_merge(['limit' => $limit, 'min_id' => $first], $extraQuery);
+            $parts[] = '<' . $base . '?' . http_build_query($q) . '>; rel="prev"';
+        }
+        $link = implode(', ', $parts);
+    }
+    @file_put_contents($file . '.link', $link, LOCK_EX);
+}
+
 function ap_masto_input(): array
 {
     $ct = strtolower($_SERVER['CONTENT_TYPE'] ?? $_SERVER['HTTP_CONTENT_TYPE'] ?? '');
@@ -1337,12 +1436,13 @@ function ap_masto_api(string $method, string $path): void
         if (($sinceId === null || $sinceId === '') && isset($_GET['min_id'])) {
             $sinceId = (string) $_GET['min_id'];
         }
+        if (ap_masto_timeline_cache_try('/api/v1/timelines/home', $limit, $maxId, $sinceId)) {
+            return;
+        }
         // Home = people you follow + your own posts (never DMs)
-        ap_masto_json_timeline(
-            ap_masto_timeline_home_merged($limit, $maxId, $sinceId),
-            '/api/v1/timelines/home',
-            $limit
-        );
+        $homeStatuses = ap_masto_timeline_home_merged($limit, $maxId, $sinceId);
+        ap_masto_timeline_cache_store($homeStatuses, '/api/v1/timelines/home', $limit, $maxId, $sinceId);
+        ap_masto_json_timeline($homeStatuses, '/api/v1/timelines/home', $limit);
         return;
     }
 
@@ -1500,12 +1600,16 @@ function ap_masto_api(string $method, string $path): void
 
         // Federated/public = remote firehose + our own public posts (single-user
         // shim: Ice Cubes Local/Federated should still show admin/Ice Cubes composes).
-        ap_masto_json_timeline(
-            ap_masto_timeline_public_merged($limit, $maxId, $sinceId, $onlyMedia),
-            '/api/v1/timelines/public',
-            $limit,
-            ['local' => 'false']
-        );
+        $extraQ = ['local' => 'false'];
+        if ($onlyMedia) {
+            $extraQ['only_media'] = 'true';
+        }
+        if (ap_masto_timeline_cache_try('/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ)) {
+            return;
+        }
+        $fedStatuses = ap_masto_timeline_public_merged($limit, $maxId, $sinceId, $onlyMedia);
+        ap_masto_timeline_cache_store($fedStatuses, '/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ);
+        ap_masto_json_timeline($fedStatuses, '/api/v1/timelines/public', $limit, $extraQ);
         return;
     }
 
@@ -1999,6 +2103,21 @@ function ap_masto_api(string $method, string $path): void
                     ap_masto_json($status);
                     return;
                 }
+            }
+            // Legacy boost-inner phantoms (type=1 + crc32) looked like missing events
+            $inner = ap_masto_resolve_announce_inner_interaction($sid);
+            if ($inner !== null) {
+                ap_masto_json($inner['status']);
+                return;
+            }
+        }
+        // Boosted Note with no local Create (type-8 announce_inner snowflake)
+        $parsedSid = ap_masto_parse_public_status_id($sid);
+        if ($parsedSid && ($parsedSid['type'] ?? '') === 'announce_inner') {
+            $inner = ap_masto_resolve_announce_inner_interaction($sid);
+            if ($inner !== null) {
+                ap_masto_json($inner['status']);
+                return;
             }
         }
         // Direct messages use synthetic ids 4000000+

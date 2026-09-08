@@ -287,7 +287,8 @@ function ap_masto_account_from_user(array $user): array
  * Time-ordered public status ids so Ice Cubes (which assumes Mastodon snowflake
  * ordering) does not pin tiny local ids above newer federated posts.
  * type: 0=local, 1=event, 2=mention-status, 3=dm, 4=reblog-wrapper,
- *       5=notif(mention-row), 6=notif(follow), 7=notif(poll)
+ *       5=notif(mention-row), 6=notif(follow), 7=notif(poll),
+ *       8=announce_inner (boosted Note with no local Create row)
  *
  * v2 (2026-08): sec * 1e9 + type * 1e8 + dbId (full id up to 1e8-1).
  * Fixes home/federated taps opening the wrong post — v1 used dbId%10000 and
@@ -302,6 +303,20 @@ function ap_masto_snowflake_id(string $iso, int $dbId, int $type = 0): string
     }
     // Keep within signed 64-bit: sec(~2e9) * 1e9 = ~2e18
     return (string) (((int) $t) * 1000000000 + (($type % 10) * 100000000) + ($dbId % 100000000));
+}
+
+/**
+ * Stable snowflake for an Announce's inner Note when no Create event exists.
+ * db slot = crc32(object_id) % 1e8; type 8 so it never collides with real events.
+ */
+function ap_masto_announce_inner_synth_id(string $createdAt, string $objectId): string
+{
+    $objectId = rtrim($objectId, '/');
+    return ap_masto_snowflake_id(
+        $createdAt !== '' ? $createdAt : gmdate('c'),
+        abs(crc32($objectId)) % 100000000,
+        8
+    );
 }
 
 /**
@@ -332,6 +347,7 @@ function ap_masto_parse_public_status_id(int $id): ?array
             2 => 'mention',
             3 => 'dm',
             4 => 'reblog',
+            8 => 'announce_inner',
             default => 'local',
         };
     };
@@ -2179,7 +2195,8 @@ function ap_masto_resolve_bare_username(string $username): ?array
         return $cache[$needle] = ap_masto_mention_from_actor('https://mkultra.monster/users/cmdr_nova');
     }
     try {
-        // Prefer remote_actors exact username
+        // Prefer remote_actors exact username (indexed). Never LIKE-scan events —
+        // that was a multi-second seq scan on every unknown @bare handle in timelines.
         $st = ap_db()->prepare(
             'SELECT actor_id FROM remote_actors WHERE lower(username) = ? ORDER BY updated_at DESC LIMIT 3'
         );
@@ -2189,23 +2206,12 @@ function ap_masto_resolve_bare_username(string $username): ?array
             // If multiple hosts share the username, still use the most recently updated
             return $cache[$needle] = ap_masto_mention_from_actor((string) $rows[0]['actor_id']);
         }
-        // Recent event actors whose path ends with /users/Username
-        $st = ap_db()->prepare(
-            "SELECT actor_id FROM events
-             WHERE actor_id IS NOT NULL
-               AND lower(actor_id) LIKE ?
-             ORDER BY id DESC LIMIT 1"
-        );
-        $st->execute(['%/users/' . $needle]);
-        $row = $st->fetch();
-        if (is_array($row) && !empty($row['actor_id'])) {
-            return $cache[$needle] = ap_masto_mention_from_actor((string) $row['actor_id']);
-        }
-        // Following list
-        foreach (ap_following_list() as $r) {
-            $u = strtolower((string) ($r['username'] ?? ''));
-            if ($u === $needle && !empty($r['actor_id'])) {
-                return $cache[$needle] = ap_masto_mention_from_actor((string) $r['actor_id']);
+        // Local instance account
+        if (preg_match('/^[A-Za-z0-9_]{2,32}$/', $username)
+            && function_exists('ap_auth_user_by_username')) {
+            $local = ap_auth_user_by_username($username);
+            if (is_array($local) && !empty($local['actor_id'])) {
+                return $cache[$needle] = ap_masto_mention_from_actor((string) $local['actor_id']);
             }
         }
     } catch (Throwable $e) {
@@ -4114,6 +4120,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
 /**
  * Unread notification count vs masto_markers.notifications.last_read_id.
  * Same logic Ice Cubes uses via /api/v1/notifications/unread_count.
+ *
+ * Fast path: light ID-only scan + short file cache. Avoids building full
+ * notification entities (remote account hydration) on every admin page load.
  */
 function ap_masto_notifications_unread_count(int $scan = 80): int
 {
@@ -4126,12 +4135,121 @@ function ap_masto_notifications_unread_count(int $scan = 80): int
     } elseif (is_object($nMark) && isset($nMark->last_read_id)) {
         $lastRead = (string) $nMark->last_read_id;
     }
-    $all = ap_masto_notifications_fetch($scan);
-    $count = 0;
     // Compare as digit strings — snowflake ids can exceed float precision if cast poorly.
     $lastRead = preg_replace('/\D+/', '', $lastRead) ?: '0';
-    foreach ($all as $n) {
-        $nid = preg_replace('/\D+/', '', (string) ($n['id'] ?? '0')) ?: '0';
+
+    $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+        ? ap_db_masto_owner_user_id()
+        : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+    $cacheTtl = 45;
+    $cacheDir = '/var/lib/mkultra/ap';
+    if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
+        $cacheDir = sys_get_temp_dir();
+    }
+    $cachePath = $cacheDir . '/notif_unread_' . (int) $ownerUserId . '_' . substr(sha1($lastRead), 0, 12) . '.json';
+    if (is_file($cachePath)) {
+        $age = time() - (int) @filemtime($cachePath);
+        if ($age >= 0 && $age < $cacheTtl) {
+            $raw = @file_get_contents($cachePath);
+            if (is_string($raw) && $raw !== '') {
+                $decoded = json_decode($raw, true);
+                if (is_array($decoded) && isset($decoded['c'])) {
+                    return max(0, min($scan, (int) $decoded['c']));
+                }
+            }
+        }
+    }
+
+    $ownerActorId = function_exists('ap_db_owner_actor_id_for_user_id')
+        ? ap_db_owner_actor_id_for_user_id($ownerUserId)
+        : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
+    $ownerActorId = rtrim((string) $ownerActorId, '/');
+
+    $ids = [];
+    try {
+        // Mentions / favs / boosts / quotes / bites / updates — light rows (no entity hydrate).
+        $st = ap_db()->prepare(
+            'SELECT id, created_at, type, object_type, activity_id, activity_type,
+                    object_id, owner_actor_id, actor_id, content, in_reply_to, owner_user_id
+             FROM mentions
+             WHERE owner_user_id = ? AND deleted_at IS NULL
+             ORDER BY id DESC LIMIT 250'
+        );
+        $st->execute([$ownerUserId]);
+        $seenActivityIds = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $activityId = trim((string) ($row['activity_id'] ?? ''));
+            if ($activityId !== '') {
+                if (isset($seenActivityIds[$activityId])) {
+                    continue;
+                }
+                $seenActivityIds[$activityId] = true;
+            }
+            if (function_exists('ap_masto_mention_notif_type') && ap_masto_mention_notif_type($row) === null) {
+                continue;
+            }
+            $ids[] = ap_masto_notification_id_for_mention(
+                (int) ($row['id'] ?? 0),
+                isset($row['created_at']) ? (string) $row['created_at'] : null
+            );
+        }
+    } catch (Throwable $e) {
+        // fall through
+    }
+
+    try {
+        $st = ap_db()->prepare(
+            "SELECT id, created_at, actor_id FROM events
+             WHERE type = 'Follow' AND action_taken = 'local_accept_followback'
+               AND (target_actor = ? OR target_actor = ?)
+             ORDER BY id DESC LIMIT 100"
+        );
+        $st->execute([$ownerActorId, $ownerActorId . '/']);
+        $followerSet = [];
+        try {
+            foreach (ap_followers_list($ownerActorId) as $fr) {
+                $aid = rtrim((string) ($fr['actor_id'] ?? ''), '/');
+                if ($aid !== '') {
+                    $followerSet[$aid] = true;
+                }
+            }
+        } catch (Throwable $e) {
+            $followerSet = [];
+        }
+        foreach ($st->fetchAll() ?: [] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $fa = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
+                continue;
+            }
+            $ids[] = ap_masto_notification_id_for_follow_event(
+                (int) ($row['id'] ?? 0),
+                isset($row['created_at']) ? (string) $row['created_at'] : null
+            );
+        }
+    } catch (Throwable $e) {
+        // fall through
+    }
+
+    // Newest-first by snowflake string length then lexicographic compare.
+    usort($ids, static function (string $a, string $b): int {
+        $la = strlen($a);
+        $lb = strlen($b);
+        if ($la !== $lb) {
+            return $lb <=> $la;
+        }
+        return $b <=> $a;
+    });
+    $ids = array_slice($ids, 0, $scan);
+
+    $count = 0;
+    foreach ($ids as $nidRaw) {
+        $nid = preg_replace('/\D+/', '', (string) $nidRaw) ?: '0';
         if (strlen($nid) === strlen($lastRead)) {
             if ($nid > $lastRead) {
                 $count++;
@@ -4140,6 +4258,8 @@ function ap_masto_notifications_unread_count(int $scan = 80): int
             $count++;
         }
     }
+
+    @file_put_contents($cachePath, json_encode(['c' => $count, 'ts' => time()]), LOCK_EX);
     return $count;
 }
 
@@ -4157,6 +4277,21 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
         return '0';
     }
     ap_masto_markers_set(['notifications' => ['last_read_id' => $lastId]]);
+    // Drop short-lived unread badge cache so the nav clears immediately.
+    try {
+        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+            ? ap_db_masto_owner_user_id()
+            : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+        $cacheDir = '/var/lib/mkultra/ap';
+        if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
+            $cacheDir = sys_get_temp_dir();
+        }
+        foreach (glob($cacheDir . '/notif_unread_' . (int) $ownerUserId . '_*.json') ?: [] as $path) {
+            @unlink($path);
+        }
+    } catch (Throwable $e) {
+        // non-fatal
+    }
     return $lastId;
 }
 
@@ -4490,7 +4625,44 @@ function ap_masto_status_from_event(array $row): ?array
     if (is_string($replyParentActor) && $replyParentActor !== '') {
         $extraActors[] = $replyParentActor;
     }
-    $pack = ap_masto_content_with_mentions($text, $extraActors);
+    // Fast path: no @mentions → skip the expensive mention resolver (timeline hot path).
+    if ($text === '' || !str_contains($text, '@')) {
+        $escaped = htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $escaped = preg_replace_callback(
+            '/(^|[^A-Za-z0-9_&\/%])#([\p{L}\p{N}_]{1,100})/u',
+            static function (array $m): string {
+                $tag = $m[2];
+                $href = 'https://mkultra.monster/tags/' . rawurlencode(mb_strtolower($tag));
+                return $m[1] . '<a href="' . htmlspecialchars($href, ENT_QUOTES, 'UTF-8')
+                    . '" class="mention hashtag" rel="tag">#<span>'
+                    . htmlspecialchars($tag, ENT_QUOTES, 'UTF-8') . '</span></a>';
+            },
+            $escaped
+        ) ?? $escaped;
+        $pack = [
+            'content' => $escaped !== '' ? ('<p>' . nl2br($escaped) . '</p>') : '',
+            'mentions' => [],
+            'tags' => [],
+        ];
+        if (preg_match_all('/#([\p{L}\p{N}_]{1,100})/u', $text, $tm)) {
+            $seenTag = [];
+            foreach ($tm[1] as $rawTag) {
+                $tn = function_exists('ap_masto_normalize_tag_name')
+                    ? ap_masto_normalize_tag_name((string) $rawTag)
+                    : mb_strtolower((string) $rawTag);
+                if ($tn === '' || isset($seenTag[$tn])) {
+                    continue;
+                }
+                $seenTag[$tn] = true;
+                $pack['tags'][] = [
+                    'name' => $tn,
+                    'url' => 'https://mkultra.monster/tags/' . rawurlencode($tn),
+                ];
+            }
+        }
+    } else {
+        $pack = ap_masto_content_with_mentions($text, $extraActors);
+    }
     // Ice Cubes StatusRowReplyView: mentions must include in_reply_to_account_id
     if ($replyAccountId !== null && $replyParentActor) {
         $has = false;
@@ -4596,16 +4768,20 @@ function ap_masto_status_from_event(array $row): ?array
         }
         // Always uniquify inner vs outer — Ice Cubes Identifiable / SearchResults
         // choke when boost wrapper and reblog share the same id.
+        // Use type-8 announce_inner snowflakes (not type-1 event) so favourite /
+        // bookmark / GET status can resolve them without inventing fake event rows.
         if ($innerId === $status['id'] || $innerId === '') {
-            $innerId = ap_masto_event_status_id($eventId, isset($row['created_at']) ? (string) $row['created_at'] : null);
-            // Derive a distinct snowflake-ish id for the inner Note
-            $innerId = (string) ((int) $innerId + 1);
             if ($objectId !== '') {
-                $innerId = ap_masto_snowflake_id(
-                    (string) ($status['created_at'] ?? gmdate('c')),
-                    abs(crc32($objectId)) % 100000000,
-                    1
+                $innerId = ap_masto_announce_inner_synth_id(
+                    (string) ($status['created_at'] ?? $row['created_at'] ?? gmdate('c')),
+                    $objectId
                 );
+            } else {
+                $innerId = ap_masto_event_status_id(
+                    $eventId,
+                    isset($row['created_at']) ? (string) $row['created_at'] : null
+                );
+                $innerId = (string) ((int) $innerId + 1);
             }
         }
         $inner['id'] = $innerId;
@@ -4879,11 +5055,29 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     $queryStartedAt = microtime(true);
     $st = ap_db()->prepare($sql);
     $st->execute($params);
+    $rows = $st->fetchAll();
+    $queryMs = (microtime(true) - $queryStartedAt) * 1000.0;
+    $hydrateStartedAt = microtime(true);
     $out = [];
     $seenUri = [];
     $ownerUserId = ap_db_masto_owner_user_id();
-    $rows = $st->fetchAll();
     $hiddenCount = 0;
+    // Prefetch remote_actors for this window so per-card account builds stay in-memory.
+    if (function_exists('ap_remote_actors_prefetch')) {
+        $prefetchIds = [];
+        foreach ($rows as $row) {
+            $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($aid !== '') {
+                $prefetchIds[$aid] = true;
+                $prefetchIds[$aid . '/'] = true;
+            }
+        }
+        if ($prefetchIds !== []) {
+            ap_remote_actors_prefetch(array_keys($prefetchIds));
+        }
+    }
+    // Federated only needs a small overflow for diversity — converting 2×limit was expensive.
+    $hydrateCap = $mode === 'home' ? $limit : min(count($rows), $limit + 8);
     foreach ($rows as $row) {
         // Apply the authenticated user's personal blocks and mutes to both
         // sides of a boost: the booster and the original author. This mirrors
@@ -4908,14 +5102,14 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
             $seenUri[$uriKey] = true;
         }
         $out[] = $status;
-        // Keep a small overflow for the optional federated diversity pass.
-        if (count($out) >= ($mode === 'home' ? $limit : $limit * 2)) {
+        if (count($out) >= $hydrateCap) {
             break;
         }
     }
     ap_timeline_perf_log('events', $startedAt, [
         'mode' => $mode,
-        'query_ms' => round((microtime(true) - $queryStartedAt) * 1000.0, 1),
+        'query_ms' => round($queryMs, 1),
+        'hydrate_ms' => round((microtime(true) - $hydrateStartedAt) * 1000.0, 1),
         'fetched' => count($rows),
         'hidden' => $hiddenCount,
         'returned' => count($out),
@@ -6337,7 +6531,12 @@ const AP_MASTO_TRENDS_CACHE_TTL = 900; // 15 minutes
 function ap_masto_trends_cache_info(string $kind): array
 {
     $kind = preg_replace('/[^a-z]/', '', strtolower($kind)) ?: 'tags';
-    $dir = sys_get_temp_dir();
+    // Prefer the durable AP state dir (www-data writable). /tmp was leaving
+    // root-owned stale files that FPM workers could not refresh.
+    $dir = '/var/lib/mkultra/ap';
+    if (!is_dir($dir) || !is_writable($dir)) {
+        $dir = sys_get_temp_dir();
+    }
     return [
         'path' => rtrim($dir, '/') . '/mkultra-ap-trends-' . $kind . '.json',
         'ttl' => AP_MASTO_TRENDS_CACHE_TTL,
@@ -7732,6 +7931,118 @@ function ap_masto_search_tag_seen(string $name): bool
 }
 
 /**
+ * Find an Announce whose fabricated inner Note id matches $statusId.
+ * Covers type-8 announce_inner ids and legacy type-1 crc32 phantoms (pre-fix).
+ *
+ * @return array<string,mixed>|null events row
+ */
+function ap_masto_announce_row_for_inner_synth_id(int $statusId): ?array
+{
+    $p = ap_masto_parse_public_status_id($statusId);
+    if (!$p || (int) ($p['ver'] ?? 0) !== 2) {
+        return null;
+    }
+    $type = (string) ($p['type'] ?? '');
+    // type 8 = current; type event with missing row = legacy phantom inners
+    if ($type !== 'announce_inner' && $type !== 'event') {
+        return null;
+    }
+    $dbMod = (int) ($p['db_id'] ?? 0);
+    $sec = (int) ($p['sec'] ?? 0);
+    if ($dbMod < 0 || $sec < 1) {
+        return null;
+    }
+    $from = gmdate('c', max(0, $sec - 2));
+    $to = gmdate('c', $sec + 2);
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM events
+             WHERE type = 'Announce'
+               AND created_at >= ? AND created_at <= ?
+             ORDER BY id DESC
+             LIMIT 80"
+        );
+        $st->execute([$from, $to]);
+        $rows = $st->fetchAll();
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_array($rows) || !$rows) {
+        return null;
+    }
+    $wantType = $type === 'announce_inner' ? 8 : 1;
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
+        if ($oid === '') {
+            continue;
+        }
+        $created = (string) ($row['created_at'] ?? '');
+        $cand = ap_masto_snowflake_id($created !== '' ? $created : gmdate('c', $sec), abs(crc32($oid)) % 100000000, $wantType);
+        if ((int) $cand === $statusId) {
+            return $row;
+        }
+        // Also accept type-8 match when client still holds a legacy type-1 id
+        // for the same object (or vice versa) within the same second window.
+        $altType = $wantType === 8 ? 1 : 8;
+        $alt = ap_masto_snowflake_id($created !== '' ? $created : gmdate('c', $sec), abs(crc32($oid)) % 100000000, $altType);
+        if ((int) $alt === $statusId) {
+            return $row;
+        }
+    }
+    return null;
+}
+
+/**
+ * Build interaction pack for a synthetic boost-inner status id.
+ *
+ * @return array{status:array<string,mixed>,object_id:string,target_actor:?string,is_ours:bool}|null
+ */
+function ap_masto_resolve_announce_inner_interaction(int $statusId): ?array
+{
+    $erow = ap_masto_announce_row_for_inner_synth_id($statusId);
+    if ($erow === null) {
+        return null;
+    }
+    $full = ap_masto_status_from_event($erow);
+    if (!$full) {
+        return null;
+    }
+    // Prefer the inner Note entity — Ice Cubes bookmarks/favourites that id.
+    $status = $full;
+    if (!empty($full['reblog']) && is_array($full['reblog'])) {
+        $status = $full['reblog'];
+    }
+    $status['id'] = (string) $statusId;
+    $objectId = rtrim((string) ($status['uri'] ?? $erow['object_id'] ?? ''), '/');
+    $actor = null;
+    if (!empty($status['account']['url']) && is_string($status['account']['url'])) {
+        $actor = (string) $status['account']['url'];
+    } elseif (!empty($status['account']['uri']) && is_string($status['account']['uri'])) {
+        $actor = (string) $status['account']['uri'];
+    } else {
+        $orig = ap_masto_announce_original_actor($erow);
+        $actor = is_string($orig) && $orig !== '' ? $orig : null;
+    }
+    $ourPrefix = ap_masto_session_actor_id();
+    $isOurs = $objectId !== '' && (
+        $objectId === $ourPrefix
+        || str_starts_with($objectId, $ourPrefix . '/')
+    );
+    if (!$isOurs && is_string($actor) && rtrim($actor, '/') === $ourPrefix) {
+        $isOurs = true;
+    }
+    return [
+        'status' => $status,
+        'object_id' => $objectId,
+        'target_actor' => $actor,
+        'is_ours' => $isOurs,
+    ];
+}
+
+/**
  * Resolve a public Mastodon status id for favourite/bookmark (local, event, mention, DM).
  *
  * @return array{status:array<string,mixed>,object_id:string,target_actor:?string,is_ours:bool}|null
@@ -7799,6 +8110,20 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
                 return $pack($status, $objectId, $actor !== '' ? $actor : null);
             }
         }
+        // Legacy: boost inners used type=1 + crc32(object) and looked like missing events.
+        $synth = ap_masto_resolve_announce_inner_interaction($statusId);
+        if ($synth !== null) {
+            return $synth;
+        }
+    }
+
+    // Current type-8 announce_inner snowflakes
+    $parsed = ap_masto_parse_public_status_id($statusId);
+    if ($parsed && ($parsed['type'] ?? '') === 'announce_inner') {
+        $synth = ap_masto_resolve_announce_inner_interaction($statusId);
+        if ($synth !== null) {
+            return $synth;
+        }
     }
 
     $dmId = ap_masto_dm_id_from_status_id($statusId);
@@ -7823,22 +8148,92 @@ function ap_masto_favourites_list(int $limit = 40, ?string $maxId = null): array
     $limit = max(1, min(80, $limit));
     $out = [];
     foreach (ap_masto_favourite_rows($limit, $maxId) as $row) {
-        $sid = (int) ($row['status_id'] ?? 0);
-        if ($sid <= 0) {
+        $status = ap_masto_interaction_row_to_status($row, 'favourited');
+        if ($status === null) {
             continue;
         }
-        $resolved = ap_masto_resolve_status_interaction($sid);
-        if ($resolved === null) {
-            continue;
-        }
-        $status = $resolved['status'];
-        $status['favourited'] = true;
         $out[] = $status;
         if (count($out) >= $limit) {
             break;
         }
     }
     return $out;
+}
+
+/**
+ * Hydrate a favourite/bookmark DB row into a Mastodon status.
+ * Prefers status_id resolve; falls back to stored object_id when the snowflake
+ * no longer maps (deleted event, legacy boost-inner phantom, etc.).
+ *
+ * @param array<string,mixed> $row
+ * @param 'favourited'|'bookmarked' $flag
+ * @return array<string,mixed>|null
+ */
+function ap_masto_interaction_row_to_status(array $row, string $flag): ?array
+{
+    $sid = (int) ($row['status_id'] ?? 0);
+    $status = null;
+    if ($sid > 0) {
+        $resolved = ap_masto_resolve_status_interaction($sid);
+        if ($resolved !== null) {
+            $status = $resolved['status'];
+        }
+    }
+    if ($status === null) {
+        $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
+        if ($oid !== '' && str_starts_with($oid, 'https://')) {
+            $status = ap_masto_lookup_status_by_object_url($oid, 0, false);
+            if ($status === null && function_exists('ap_masto_status_from_as2_note')) {
+                // Minimal stub so the bookmark/favourite still appears in VAAK
+                $actor = (string) ($row['target_actor'] ?? '');
+                $status = [
+                    'id' => (string) ($row['status_id'] ?? '0'),
+                    'created_at' => ap_masto_format_time((string) ($row['created_at'] ?? gmdate('c'))),
+                    'in_reply_to_id' => null,
+                    'in_reply_to_account_id' => null,
+                    'sensitive' => false,
+                    'spoiler_text' => '',
+                    'visibility' => 'public',
+                    'language' => null,
+                    'uri' => $oid,
+                    'url' => $oid,
+                    'replies_count' => 0,
+                    'reblogs_count' => 0,
+                    'favourites_count' => 0,
+                    'edited_at' => null,
+                    'favourited' => false,
+                    'reblogged' => false,
+                    'muted' => false,
+                    'bookmarked' => false,
+                    'pinned' => false,
+                    'content' => '<p><a href="' . htmlspecialchars($oid, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">'
+                        . htmlspecialchars($oid, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></p>',
+                    'reblog' => null,
+                    'application' => null,
+                    'account' => $actor !== ''
+                        ? (ap_masto_local_actor_key_from_url($actor) !== null
+                            ? ap_masto_account_for_local_url($actor)
+                            : ap_masto_remote_account($actor))
+                        : ap_masto_remote_account($oid),
+                    'media_attachments' => [],
+                    'mentions' => [],
+                    'tags' => [],
+                    'emojis' => [],
+                    'card' => null,
+                    'poll' => null,
+                ];
+            }
+        }
+    }
+    if (!is_array($status)) {
+        return null;
+    }
+    if ($flag === 'favourited') {
+        $status['favourited'] = true;
+    } else {
+        $status['bookmarked'] = true;
+    }
+    return $status;
 }
 
 /**
@@ -7849,16 +8244,10 @@ function ap_masto_bookmarks_list(int $limit = 40, ?string $maxId = null): array
     $limit = max(1, min(80, $limit));
     $out = [];
     foreach (ap_masto_bookmark_rows($limit, $maxId) as $row) {
-        $sid = (int) ($row['status_id'] ?? 0);
-        if ($sid <= 0) {
+        $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
+        if ($status === null) {
             continue;
         }
-        $resolved = ap_masto_resolve_status_interaction($sid);
-        if ($resolved === null) {
-            continue;
-        }
-        $status = $resolved['status'];
-        $status['bookmarked'] = true;
         $out[] = $status;
         if (count($out) >= $limit) {
             break;

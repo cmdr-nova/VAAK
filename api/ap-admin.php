@@ -2533,6 +2533,101 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     exit;
 }
 
+// Deferred Home suggestions (keeps first paint off the suggestion scorer).
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    $suggestions = function_exists('ap_masto_suggestions_v2') ? ap_masto_suggestions_v2(12) : [];
+    if ($suggestions) {
+        admin_render_home_suggestions($suggestions);
+    }
+    exit;
+}
+
+// Deferred trends sidebar (recompute / OG fetch happens here, not on every nav).
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    $trendTags = [];
+    $trendLinks = [];
+    $trendStatuses = [];
+    try {
+        $trendTags = function_exists('ap_masto_trends_tags') ? ap_masto_trends_tags(5) : [];
+        $trendLinks = function_exists('ap_masto_trends_links') ? ap_masto_trends_links(5) : [];
+        $trendStatuses = function_exists('ap_masto_trends_statuses') ? ap_masto_trends_statuses(5) : [];
+    } catch (Throwable $e) {
+        error_log('[ap-admin] ajax trends: ' . $e->getMessage());
+    }
+    $admin_strim = static function (string $s, int $width): string {
+        if (function_exists('mb_strimwidth')) {
+            return mb_strimwidth($s, 0, $width, '…');
+        }
+        return strlen($s) > $width ? (substr($s, 0, max(0, $width - 1)) . '…') : $s;
+    };
+    $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+    echo '<div class="side-card"><h3>Trending tags</h3>';
+    if (!$trendTags) {
+        echo '<div class="meta">No hashtag signal yet…</div>';
+    } else {
+        foreach ($trendTags as $tg) {
+            $tname = (string) ($tg['name'] ?? '');
+            $usesToday = !empty($tg['history'][0]['uses']) ? (int) $tg['history'][0]['uses'] : 0;
+            $usesWeek = 0;
+            if (!empty($tg['history']) && is_array($tg['history'])) {
+                foreach ($tg['history'] as $hday) {
+                    $usesWeek += (int) ($hday['uses'] ?? 0);
+                }
+            }
+            echo '<div class="bar-row"><span><a href="?view=search&amp;q='
+                . urlencode('#' . $tname) . '">#' . h($tname) . '</a></span>'
+                . '<span class="meta" title="uses today / 7d">' . $usesToday . '/' . $usesWeek . '</span></div>';
+        }
+    }
+    echo '</div>';
+    echo '<div class="side-card"><h3>Trending links</h3>';
+    if (!$trendLinks) {
+        echo '<div class="meta">No link signal yet…</div>';
+    } else {
+        foreach ($trendLinks as $ln) {
+            $title = (string) ($ln['title'] ?? $ln['url'] ?? 'link');
+            $url = (string) ($ln['url'] ?? '');
+            echo '<div style="margin:0 0 .55rem;line-height:1.35">';
+            if ($url !== '') {
+                echo '<a href="' . h($url) . '" rel="noopener noreferrer" target="_blank">'
+                    . h($admin_strim($title, 72)) . '</a>';
+            } else {
+                echo h($admin_strim($title, 72));
+            }
+            echo '</div>';
+        }
+    }
+    echo '</div>';
+    echo '<div class="side-card"><h3>Trending posts</h3>';
+    if (!$trendStatuses) {
+        echo '<div class="meta">No post signal yet…</div>';
+    } else {
+        foreach ($trendStatuses as $ts) {
+            $acct = is_array($ts['account'] ?? null) ? $ts['account'] : [];
+            $who = (string) ($acct['acct'] ?? $acct['username'] ?? 'someone');
+            $content = trim(strip_tags((string) ($ts['content'] ?? '')));
+            $excerpt = $admin_strim($content, 96);
+            $surl = (string) ($ts['url'] ?? $ts['uri'] ?? '');
+            echo '<div style="margin:0 0 .65rem;line-height:1.35">';
+            echo '<div class="meta" style="margin-bottom:.15rem">' . h($who) . '</div>';
+            if ($surl !== '') {
+                echo '<a href="' . h(admin_status_href($surl, $viewForTrends))
+                    . '" style="color:var(--text);text-decoration:none">'
+                    . h($excerpt !== '' ? $excerpt : '(media)') . '</a>';
+            } else {
+                echo '<span>' . h($excerpt !== '' ? $excerpt : '(media)') . '</span>';
+            }
+            echo '</div>';
+        }
+    }
+    echo '</div>';
+    exit;
+}
+
 // AIM imrcv.wav for new DMs / notifications (admin-auth protected)
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_sound') {
     $candidates = [
@@ -2573,13 +2668,13 @@ $wantNewerPoll = $isPartial
     && (string) $_GET['newer'] === '1'
     && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true);
 
-// Cheap topbar counts (retry on lock). Skip on infinite-scroll partials.
+// Stats-only event COUNTs (were previously paid on every full-page nav click).
 $total24 = 0;
 $total7 = 0;
 $typeRows = [];
 $actionRows = [];
 $hostRows = [];
-if (!$isPartial) {
+if ($view === 'stats') {
     try {
         $st = ap_db_execute_retry('SELECT COUNT(*) AS c FROM events WHERE created_at >= ?', [$since7]);
         if ($st) {
@@ -2589,12 +2684,6 @@ if (!$isPartial) {
         if ($st) {
             $total24 = (int) ($st->fetch()['c'] ?? 0);
         }
-    } catch (Throwable $e) {
-        error_log('[ap-admin] topbar counts: ' . $e->getMessage());
-    }
-}
-if ($view === 'stats') {
-    try {
         $st = ap_db_execute_retry(
             'SELECT type, COUNT(*) AS c FROM events WHERE created_at >= ? GROUP BY type ORDER BY c DESC LIMIT 12',
             [$since24]
@@ -2645,30 +2734,54 @@ if ($view === 'stats') {
 // Follow graphs: full pages need rich URL aliases; partials only need actor_id keys.
 $followers = $isPartial ? [] : ap_followers_list($vaakActorId);
 $following = ap_following_list($vaakActorId);
-/** @param list<array<string,mixed>> $rows */
-$adminIndexActorMap = static function (array $rows, bool $richAliases = true): array {
-    $map = [];
-    // Prefer preferredUsername from remote_actors (Mastodon /ap/users/{snowflake} ≠ handle)
-    $unameByActor = [];
-    if ($richAliases) {
+// Scope remote_actors username lookups to the follow graph (not the whole table).
+$adminUnameByActor = [];
+if (!$isPartial) {
+    $aliasActorIds = [];
+    foreach (array_merge($followers, $following) as $grow) {
+        if (!is_array($grow)) {
+            continue;
+        }
+        $ga = rtrim((string) ($grow['actor_id'] ?? ''), '/');
+        if ($ga !== '') {
+            $aliasActorIds[$ga] = true;
+            $aliasActorIds[$ga . '/'] = true;
+        }
+    }
+    if ($aliasActorIds !== []) {
         try {
-            foreach (ap_db()->query(
-                'SELECT actor_id, username, host FROM remote_actors
-                 WHERE username IS NOT NULL AND username != \'\''
-            )->fetchAll() ?: [] as $ra) {
-                $rid = rtrim((string) ($ra['actor_id'] ?? ''), '/');
-                $ru = trim((string) ($ra['username'] ?? ''));
-                if ($rid !== '' && $ru !== '' && !ctype_digit($ru)) {
-                    $unameByActor[$rid] = [
-                        'username' => $ru,
-                        'host' => strtolower(trim((string) ($ra['host'] ?? ''))),
-                    ];
+            foreach (array_chunk(array_keys($aliasActorIds), 400) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT actor_id, username, host FROM remote_actors
+                     WHERE actor_id IN ($ph)
+                       AND username IS NOT NULL AND username != ''"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll() ?: [] as $ra) {
+                    if (!is_array($ra)) {
+                        continue;
+                    }
+                    $rid = rtrim((string) ($ra['actor_id'] ?? ''), '/');
+                    $ru = trim((string) ($ra['username'] ?? ''));
+                    if ($rid !== '' && $ru !== '' && !ctype_digit($ru)) {
+                        $adminUnameByActor[$rid] = [
+                            'username' => $ru,
+                            'host' => strtolower(trim((string) ($ra['host'] ?? ''))),
+                        ];
+                    }
                 }
             }
         } catch (Throwable $e) {
             // table may be empty on first boot
         }
     }
+}
+/** @param list<array<string,mixed>> $rows */
+$adminIndexActorMap = static function (array $rows, bool $richAliases = true) use ($adminUnameByActor): array {
+    $map = [];
+    // Prefer preferredUsername from remote_actors (Mastodon /ap/users/{snowflake} ≠ handle)
+    $unameByActor = $richAliases ? $adminUnameByActor : [];
     foreach ($rows as $row) {
         if (empty($row['actor_id'])) {
             continue;
@@ -2805,11 +2918,20 @@ if ($hydrateBoost) {
     exit;
 }
 
-// Phase 2: short-lived ranked timeline index so infinite scroll doesn't rebuild Home/Federated
+// Phase 2: short-lived ranked timeline index so first paint + infinite scroll
+// can hydrate a window instead of rebuilding Home/Local/Federated.
+// Refresh (?_r=) bypasses cache so operators still get a hard rebuild.
 $adminTlCacheKey = '';
 $adminTlRankedCached = null;
 $adminTlFromCache = false;
-if (!$wantNewerPoll && $isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true) && $tlOffset > 0) {
+$adminTlForceRefresh = isset($_GET['_r']);
+$adminTlCachedHasMore = false;
+$adminTlCachedTotal = 0;
+if (
+    !$wantNewerPoll
+    && !$adminTlForceRefresh
+    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
+) {
     $adminTlCacheKey = admin_tl_cache_key($view, $following);
     $adminTlRankedCached = admin_tl_cache_get($adminTlCacheKey);
     $adminTlFromCache = is_array($adminTlRankedCached);
@@ -3565,7 +3687,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
                  OR (sensitive IS NOT NULL AND sensitive != 0)
                )
                AND (actor_id IS NULL OR actor_id NOT LIKE ?)
-             ORDER BY created_at DESC, id DESC LIMIT 320"
+             ORDER BY created_at DESC, id DESC LIMIT 100"
         );
         $stFeed->execute([$ownActorLike]);
         $feedEventsRaw = $stFeed->fetchAll() ?: [];
@@ -3584,7 +3706,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
             'sort' => strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0),
             'row' => $e,
         ];
-        if (count($feedTimeline) >= 250) {
+        if (count($feedTimeline) >= 80) {
             break;
         }
     }
@@ -3700,7 +3822,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                            AND (action_taken = 'log' OR action_taken = 'local_observe')
                            AND actor_id IN ($ph)
                          ORDER BY created_at DESC, id DESC
-                         LIMIT 250"
+                         LIMIT 100"
                     );
                     $st->execute($chunk);
                     foreach ($st->fetchAll() ?: [] as $erow) {
@@ -3717,7 +3839,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 }
                 return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
             });
-            $homeRaw = array_slice($homeRaw, 0, 250);
+            $homeRaw = array_slice($homeRaw, 0, 100);
         }
         foreach ($homeRaw as $e) {
             $aid = (string) ($e['actor_id'] ?? '');
@@ -3985,7 +4107,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
             "SELECT * FROM outbox_notes
              WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
              ORDER BY published DESC
-             LIMIT 250"
+             LIMIT 100"
         );
         $stLocalTl->execute();
         $localNotes = $stLocalTl->fetchAll() ?: [];
@@ -4171,6 +4293,67 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
     if ($galleryTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key($view, $following);
         admin_tl_cache_put($ck, admin_tl_rank_from_timeline($galleryTimeline));
+    }
+}
+
+// Full-page first paint: when ranked cache hits, hydrate only the visible window
+// (builders above were skipped via $adminTlFromCache). Partials hydrate later.
+if (
+    !$isPartial
+    && $adminTlFromCache
+    && is_array($adminTlRankedCached)
+    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
+) {
+    $adminTlCachedTotal = count($adminTlRankedCached);
+    $sliceKeys = array_slice($adminTlRankedCached, 0, $tlLimit);
+    $hydrated = admin_tl_hydrate($sliceKeys);
+    $hydrateNotes = [];
+    foreach ($hydrated as $it) {
+        if (($it['kind'] ?? '') === 'outbox') {
+            $nid = rtrim((string) ($it['row']['id'] ?? ''), '/');
+            if ($nid !== '') {
+                $hydrateNotes[$nid] = true;
+                $hydrateNotes[$nid . '/'] = true;
+            }
+        }
+    }
+    if ($hydrateNotes !== []) {
+        try {
+            foreach (array_chunk(array_keys($hydrateNotes), 400) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT note_id, local_id, content_text, spoiler_text, sensitive, visibility
+                     FROM masto_statuses WHERE note_id IN ($ph)"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll() ?: [] as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $key = rtrim((string) ($row['note_id'] ?? ''), '/');
+                    if ($key !== '') {
+                        $GLOBALS['admin_masto_by_note'][$key] = $row;
+                        $GLOBALS['admin_masto_by_note'][$key . '/'] = $row;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // per-card fallback
+        }
+    }
+    $adminTlCachedHasMore = $adminTlCachedTotal > $tlLimit;
+    if ($view === 'home') {
+        $homeTimeline = $hydrated;
+    } elseif ($view === 'feed') {
+        $feedTimeline = $hydrated;
+        $feedEvents = array_map(
+            static fn($i) => $i['row'],
+            array_filter($feedTimeline, static fn($i) => ($i['kind'] ?? '') === 'event')
+        );
+    } elseif ($view === 'local') {
+        $localTimeline = $hydrated;
+    } elseif (in_array($view, ['gallery', 'vakktok'], true)) {
+        $galleryTimeline = $hydrated;
     }
 }
 
@@ -5079,7 +5262,7 @@ function admin_account_actor_ref(array $account): string
  *
  * @param list<array{url?:string,acct?:string,username?:string,uri?:string}> $mentions
  */
-function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = [], ?string $actorId = null): string
+function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = []): string
 {
     $plain = html_entity_decode(trim($plain), ENT_QUOTES | ENT_HTML5, 'UTF-8');
     if ($plain === '') {
@@ -5261,44 +5444,6 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
     $plainProtected = $protect($plain);
     $escaped = htmlspecialchars($plainProtected, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
-    // Resolve custom shortcodes from the post author and mentioned actors after
-    // escaping, while keeping the resulting images protected from link parsing.
-    $emojiHosts = [];
-    foreach (array_merge($actorId !== null ? [$actorId] : [], array_map(
-        static fn($m) => is_array($m) ? (string) ($m['url'] ?? $m['uri'] ?? '') : '',
-        $mentions
-    )) as $emojiActor) {
-        $emojiHost = parse_url((string) $emojiActor, PHP_URL_HOST);
-        if (is_string($emojiHost) && $emojiHost !== '') {
-            $emojiHosts[strtolower($emojiHost)] = true;
-        }
-    }
-    $emojiMap = [];
-    foreach (array_keys($emojiHosts) as $emojiHost) {
-        if ($actorId !== null && function_exists('ap_remote_emoji_ensure_for_display') && str_contains($plain, ':')) {
-            ap_remote_emoji_ensure_for_display($actorId, $plain, true);
-        }
-        if (function_exists('ap_remote_emoji_map_for_host')) {
-            $emojiMap += ap_remote_emoji_map_for_host($emojiHost);
-        }
-    }
-    if ($emojiMap && preg_match('/:[A-Za-z0-9_-]{1,80}:/', $plain)) {
-        $escaped = preg_replace_callback(
-            '/:([A-Za-z0-9_-]{1,80}):/',
-            static function (array $m) use (&$placeholders, $emojiMap): string {
-                $url = $emojiMap[$m[1]] ?? null;
-                if (!is_string($url) || !str_starts_with($url, 'https://')) {
-                    return $m[0];
-                }
-                $key = "\x01E" . count($placeholders) . "\x01";
-                $alt = ':' . $m[1] . ':';
-                $placeholders[$key] = '<img class="custom-emoji" src="' . h($url) . '" alt="' . h($alt) . '" title="' . h($alt) . '" loading="lazy" decoding="async">';
-                return $key;
-            },
-            $escaped
-        ) ?? $escaped;
-    }
-
     $profileHref = static function (string $actorUrl) use ($returnView): array {
         // [href, external?]
         if (str_starts_with($actorUrl, 'search://')) {
@@ -5455,10 +5600,9 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
             $html = ap_dm_linkify_html($html);
             $html = function_exists('ap_dm_sanitize_html') ? ap_dm_sanitize_html($html) : $html;
         }
-        // Remove template indentation around structural tags, but preserve
-        // spaces around inline anchors (for example "see <a>this</a> here").
-        $html = preg_replace('/(^|>)[\h]+(?=<(?:p|ul|ol|li|br)\b)/iu', '$1', $html) ?? $html;
-        $html = preg_replace('/[\h]+(?=<\/?(?:p|ul|ol|li|br)\b|$)/iu', '', $html) ?? $html;
+        // Remove template indentation around tags without changing paragraph breaks.
+        $html = preg_replace('/(^|>)[\h]+/u', '$1', $html) ?? $html;
+        $html = preg_replace('/[\h]+(<|$)/u', '$1', $html) ?? $html;
         if ($extra !== '' && !str_contains($html, 'class="dm-actions"')) {
             $html .= "\n" . $extra;
         }
@@ -5837,7 +5981,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               if ($quoteParts !== null) {
                   if ($quoteParts['commentary'] !== '') {
                       $bodyChunk .= '<div class="body feed-body">'
-                          . admin_linkify_body_html($quoteParts['commentary'], $returnView, $eventMentions, $aid) . '</div>';
+                          . admin_linkify_body_html($quoteParts['commentary'], $returnView, $eventMentions) . '</div>';
                   }
                   $qMentions = [];
                   if ($quoteParts['quoted'] !== '' && function_exists('ap_masto_content_with_mentions')) {
@@ -5868,7 +6012,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid) . '</div>';
+                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions) . '</div>';
               }
               $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
@@ -6443,7 +6587,7 @@ function admin_render_masto_status_card(
     $bodyInner = '';
     if ($plain !== '') {
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
-            . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef) . '</div>';
+            . admin_linkify_body_html($plain, $returnView, $stMentions) . '</div>';
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
@@ -6841,7 +6985,7 @@ function admin_render_remote_boost_card(
                       )['mentions'] ?? [];
                   }
                   $boostInner .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions, $origActor) . '</div>';
+                      . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions) . '</div>';
               } elseif ($objectId !== '' && $mediaUrls === []) {
                   $boostInner .= '<div class="meta boost-hydrate-pending" style="margin-top:.35rem">'
                       . '<span class="boost-hydrate-status">Loading boosted post…</span>'
@@ -7003,7 +7147,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
             <?php
               $boostInner = '';
               if ($innerSummary !== '') {
-                  $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView, [], $targetActor) . '</div>';
+                  $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView) . '</div>';
               } else {
                   $pending = $objectId !== '' && str_starts_with($objectId, 'https://');
                   $boostInner .= '<div class="meta boost-hydrate-status" style="margin-top:.35rem">'
@@ -7173,8 +7317,18 @@ function admin_render_outbox_card(array $n, string $returnView): void
                         }
                     }
                 }
-                if ($plain === '' && $qDoc === null && function_exists('ap_fetch_as2_object')) {
-                    $qDoc = ap_fetch_as2_object($qUrl);
+                // Never sync-fetch quoted remotes on timeline paint — that stalls
+                // Federated tab swaps for seconds. Local/event cache above is enough;
+                // remaining quotes render as a link stub (same idea as boost hydrate).
+                if ($plain === '' && $qDoc === null) {
+                    $quoteFetchBudget = &$GLOBALS['admin_quote_fetch_budget'];
+                    if (!isset($quoteFetchBudget) || !is_int($quoteFetchBudget)) {
+                        $quoteFetchBudget = 0;
+                    }
+                    if ($quoteFetchBudget > 0 && function_exists('ap_fetch_as2_object')) {
+                        $quoteFetchBudget--;
+                        $qDoc = ap_fetch_as2_object($qUrl);
+                    }
                 }
             }
             if ($plain === '' && is_array($qDoc) && function_exists('ap_unwrap_as2_object')) {
@@ -7816,6 +7970,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         $adminTlFromCache = false;
         $adminTlRankedCached = null;
     }
+    $adminTlPerfT0 = microtime(true);
+    $adminTlPerfHydrateMs = 0.0;
     if ($adminTlFromCache && is_array($adminTlRankedCached)) {
         $totalRanked = count($adminTlRankedCached);
         // Past the cached head → re-query older remotes by created_at cursor and append.
@@ -7834,6 +7990,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             }
         }
         $sliceKeys = array_slice($adminTlRankedCached, $tlOffset, $tlLimit);
+        $hydrateT0 = microtime(true);
         $slice = admin_tl_hydrate($sliceKeys);
         // Prefetch masto rows for any outbox cards in this window
         $hydrateNotes = [];
@@ -7871,6 +8028,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
                 // per-card fallback
             }
         }
+        $adminTlPerfHydrateMs = (microtime(true) - $hydrateT0) * 1000.0;
         $hasMore = ($tlOffset + $tlLimit) < $totalRanked;
         $nextOffset = $tlOffset + $tlLimit;
     } else {
@@ -7909,14 +8067,13 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             $nextOffset = $tlOffset + count($slice);
         }
     }
+    $flagsT0 = microtime(true);
     if (function_exists('ap_masto_status_flags_prefetch')) {
         ap_masto_status_flags_prefetch(admin_timeline_status_ids($slice));
     }
-    header('Content-Type: text/html; charset=utf-8');
-    header('Cache-Control: no-store');
-    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
-    header('X-Next-Offset: ' . $nextOffset);
-    header('X-TL-Cache: ' . ($adminTlFromCache ? 'hit' : 'miss'));
+    $adminTlPerfFlagsMs = (microtime(true) - $flagsT0) * 1000.0;
+    $renderT0 = microtime(true);
+    ob_start();
     foreach ($slice as $item) {
         if (admin_timeline_item_muted_by_words($item)) {
             continue;
@@ -7927,6 +8084,68 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             admin_render_vakktok_cell($item);
         } else {
             admin_render_timeline_item($item, $followingIds, $view);
+        }
+    }
+    $body = ob_get_clean();
+    $adminTlPerfRenderMs = (microtime(true) - $renderT0) * 1000.0;
+    $adminTlPerfTotalMs = (microtime(true) - $adminTlPerfT0) * 1000.0;
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    header('X-Next-Offset: ' . $nextOffset);
+    header('X-TL-Cache: ' . ($adminTlFromCache ? 'hit' : 'miss'));
+    header('X-TL-Hydrate-Ms: ' . (string) (int) round($adminTlPerfHydrateMs));
+    header('X-TL-Flags-Ms: ' . (string) (int) round($adminTlPerfFlagsMs));
+    header('X-TL-Render-Ms: ' . (string) (int) round($adminTlPerfRenderMs));
+    header('X-TL-Partial-Ms: ' . (string) (int) round($adminTlPerfTotalMs));
+    echo $body;
+    exit;
+}
+
+// AJAX fragment for Notifications infinite scroll (append older cards; keep scroll place).
+if ($isPartial && $view === 'mentions') {
+    $notifFilter = strtolower(trim((string) ($_GET['notification_filter'] ?? 'all')));
+    $notifFilterOptions = [
+        'all' => ['types' => []],
+        'mentions' => ['types' => ['mention']],
+        'favourites' => ['types' => ['favourite']],
+        'boosts_quotes' => ['types' => ['reblog', 'quote']],
+    ];
+    if (!isset($notifFilterOptions[$notifFilter])) {
+        $notifFilter = 'all';
+    }
+    $notifTypes = $notifFilterOptions[$notifFilter]['types'];
+    $notifLimit = isset($_GET['limit']) ? max(1, min(40, (int) $_GET['limit'])) : 20;
+    $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
+    // Partials skip followers by default — restore for Follow/relationship badges.
+    if ($followerIds === []) {
+        try {
+            $followers = ap_followers_list($vaakActorId);
+            $followerIds = $adminIndexActorMap($followers, true);
+        } catch (Throwable $e) {
+            $followerIds = [];
+        }
+    }
+    $adminNotifs = [];
+    try {
+        $adminNotifs = function_exists('ap_masto_notifications_fetch')
+            ? ap_masto_notifications_fetch($notifLimit, $notifMaxId, null, $notifTypes)
+            : [];
+    } catch (Throwable $e) {
+        error_log('[ap-admin] notifications partial: ' . $e->getMessage());
+    }
+    $nextMaxId = '';
+    if ($adminNotifs !== []) {
+        $nextMaxId = preg_replace('/\D+/', '', (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? '')) ?: '';
+    }
+    $hasMore = count($adminNotifs) >= $notifLimit && $nextMaxId !== '';
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    header('X-Next-Max-Id: ' . $nextMaxId);
+    foreach ($adminNotifs as $n) {
+        if (is_array($n)) {
+            admin_render_notification_card($n, $followingIds, $followerIds);
         }
     }
     exit;
@@ -7992,6 +8211,217 @@ try {
 header('Content-Type: text/html; charset=utf-8');
 
 /** Render a compact, Mastodon-style recommendation break in Home. */
+/**
+ * Render one admin notification card (Notifications timeline).
+ *
+ * @param array<string,mixed> $n Mastodon notification entity
+ * @param array<string,bool> $followingIds
+ * @param array<string,bool> $followerIds
+ */
+function admin_render_notification_card(array $n, array $followingIds, array $followerIds): void
+{
+    try {
+        if (!is_array($n)) {
+            return;
+        }
+        $nType = (string) ($n['type'] ?? 'mention');
+        $nAcct = (string) ($n['account']['acct'] ?? '?');
+        $nDisplay = (string) ($n['account']['display_name'] ?? '');
+        $nWebUrl = (string) ($n['account']['url'] ?? '');
+        $nActorUri = (string) ($n['account']['uri'] ?? '');
+        $nActorRef = function_exists('admin_account_actor_ref')
+            ? admin_account_actor_ref(is_array($n['account'] ?? null) ? $n['account'] : [])
+            : ($nActorUri !== '' ? $nActorUri : $nWebUrl);
+        $nCreated = (string) ($n['created_at'] ?? '');
+        $nStatus = (isset($n['status']) && is_array($n['status'])) ? $n['status'] : null;
+        $nStatusUri = is_array($nStatus) ? (string) ($nStatus['uri'] ?? $nStatus['url'] ?? '') : '';
+        $nSnippet = '';
+        $nMedia = [];
+        if (is_array($nStatus)) {
+            $nSnippet = trim(admin_html_to_plain((string) ($nStatus['content'] ?? '')));
+            $nSnippet = preg_replace('/^\h+/mu', '', $nSnippet) ?? $nSnippet;
+            if (function_exists('ap_masto_clean_mention_text')) {
+                $nSnippet = ap_masto_clean_mention_text($nSnippet);
+            } else {
+                $nSnippet = preg_replace('#^RE:\s*https://\S+#u', '', $nSnippet) ?? $nSnippet;
+                $nSnippet = trim($nSnippet);
+            }
+            // Wafrn may glue the first commentary word onto our local
+            // domain: @cmdr_nova@mkultra.monsteraudio posts… Preserve
+            // that word before mention normalization can consume it.
+            $localHostForSnippet = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
+            if ($localHostForSnippet !== '') {
+                $nSnippet = preg_replace(
+                    '/^(@[A-Za-z0-9_]+@' . preg_quote($localHostForSnippet, '/') . ')([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=\s|$)/iu',
+                    '$1 $2',
+                    $nSnippet
+                ) ?? $nSnippet;
+            }
+            foreach (($nStatus['mentions'] ?? []) as $nMention) {
+                if (!is_array($nMention)) {
+                    continue;
+                }
+                $nAcctKnown = ltrim(trim((string) ($nMention['acct'] ?? '')), '@');
+                if ($nAcctKnown !== '' && str_contains($nAcctKnown, '@') && str_starts_with($nSnippet, '@' . $nAcctKnown)) {
+                    // Some Wafrn payloads glue the local domain to the first word
+                    // after the handle (for example: mkultra.monsterone more).
+                    $nParts = explode('@', $nAcctKnown, 2);
+                    $nLocalHost = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
+                    $nMentionHost = strtolower((string) ($nParts[1] ?? ''));
+                    if ($nLocalHost !== '' && str_starts_with($nMentionHost, $nLocalHost) && strlen($nMentionHost) > strlen($nLocalHost)) {
+                        $nAcctDisplay = $nParts[0] . '@' . $nLocalHost;
+                        $nSuffix = substr($nMentionHost, strlen($nLocalHost));
+                        $nSnippet = '@' . $nAcctDisplay . ' ' . $nSuffix . substr($nSnippet, strlen($nAcctKnown) + 1);
+                        break;
+                    }
+                    $afterMention = strlen($nAcctKnown) + 1;
+                    if (isset($nSnippet[$afterMention]) && !preg_match('/\s/u', $nSnippet[$afterMention])) {
+                        $nSnippet = substr($nSnippet, 0, $afterMention) . ' ' . substr($nSnippet, $afterMention);
+                    }
+                    break;
+                }
+            }
+            foreach (($nStatus['media_attachments'] ?? []) as $nAttachment) {
+                if (!is_array($nAttachment)) {
+                    continue;
+                }
+                $nUrl = (string) ($nAttachment['url'] ?? $nAttachment['preview_url'] ?? '');
+                if (!str_starts_with($nUrl, 'https://')) {
+                    continue;
+                }
+                $nMedia[] = [
+                    'url' => $nUrl,
+                    'mediaType' => in_array(strtolower((string) ($nAttachment['type'] ?? '')), ['video', 'gifv'], true) ? 'video/mp4' : null,
+                    'preview_url' => (string) ($nAttachment['preview_url'] ?? ''),
+                ];
+                if (count($nMedia) >= 4) {
+                    break;
+                }
+            }
+        }
+        $typeLabel = match ($nType) {
+            'follow' => '👤 followed you',
+            'favourite' => '★ liked your post',
+            'reblog' => '🔁 boosted your post',
+            'mention' => '＠ mentioned you',
+            'quote' => '💬 quoted your post',
+            'poll' => '📊 poll ended',
+            'update' => '✏️ edited a post you liked',
+            'bite' => '🦷 bit you / your post',
+            'status' => '✉ posted',
+            default => $nType,
+        };
+        // Account-targeted bites use synthetic /bites-received/ URIs (no real post).
+        $biteHasPost = false;
+        if ($nType === 'bite') {
+            $biteTarget = $nStatusUri;
+            if (function_exists('ap_masto_mention_target_object_id')) {
+                $biteTarget = ap_masto_mention_target_object_id($biteTarget);
+            }
+            $biteHasPost = $biteTarget !== ''
+                && !str_contains($biteTarget, '/bites-received/')
+                && (str_contains($biteTarget, '/notes/')
+                    || str_contains($biteTarget, '/statuses/')
+                    || str_contains($biteTarget, '/objects/'));
+            $typeLabel = $biteHasPost ? '🦷 bit your post' : '🦷 bit you';
+        }
+        $nRel = $nActorRef !== ''
+            ? admin_rel_state($followingIds, $followerIds, $nActorRef, $nWebUrl, $nActorUri)
+            : 'none';
+        $alreadyFollowing = $nRel === 'mutual' || $nRel === 'following';
+        $snipShow = $nSnippet;
+        if (function_exists('mb_strlen') && function_exists('mb_substr') && is_string($nSnippet) && mb_strlen($nSnippet) > 280) {
+            $snipShow = mb_substr($nSnippet, 0, 280) . '…';
+        } elseif (is_string($nSnippet) && strlen($nSnippet) > 280) {
+            $snipShow = substr($nSnippet, 0, 280) . '…';
+        }
+        $profileHref = $nActorRef !== ''
+            ? ('?view=remote_profile&actor=' . rawurlencode($nActorRef) . '&from=mentions')
+            : '';
+    ?>
+    <article class="tweet tweet-notif tweet-notif-<?= h($nType) ?>">
+    <div class="tweet-hd">
+      <?php if ($profileHref !== ''): ?>
+        <a href="<?= h($profileHref) ?>" title="Open profile" style="text-decoration:none"><?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?></a>
+      <?php else: ?>
+        <?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?>
+      <?php endif; ?>
+      <div class="tweet-hd-main">
+        <div>
+          <?php if ($profileHref !== ''): ?>
+            <a class="who" href="<?= h($profileHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($nDisplay !== '' ? $nDisplay : $nAcct, $nActorRef !== '' ? $nActorRef : null) ?></a>
+            <a class="meta" href="<?= h($profileHref) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($nAcct) ?></a>
+          <?php else: ?>
+            <span class="who"><?= h($nAcct) ?></span>
+          <?php endif; ?>
+          <span class="meta"> · <?= h(relative_time($nCreated)) ?></span>
+        </div>
+        <div class="meta" style="color:var(--primary);margin-top:.2rem"><?= h($typeLabel) ?></div>
+      </div>
+    </div>
+    <?php if ($nType === 'bite' && !$biteHasPost): ?>
+      <div class="meta" style="margin-top:.55rem;color:var(--muted)">No associated post</div>
+    <?php elseif ($nSnippet !== '' && $nType === 'mention'): ?>
+      <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
+    <?php elseif ($nSnippet !== '' && $nType === 'quote'): ?>
+      <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
+    <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
+      <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
+    <?php endif; ?>
+    <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
+    <div class="tweet-actions">
+      <?php if ($profileHref !== ''): ?>
+        <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
+      <?php endif; ?>
+      <?php if ($nType === 'mention' && $nStatusUri !== ''): ?>
+        <a class="icon-btn" href="?view=mentions&amp;compose=1&amp;reply_to=<?= urlencode($nStatusUri) ?>&amp;to=<?= urlencode($nActorRef) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+      <?php endif; ?>
+      <?php
+        // Bite user-target uses synthetic /bites-received/ URIs — Open would 404/white-screen.
+        // Post bites keep a real note/status URI (with #bite- fragment stripped upstream).
+        $notifOpenUri = $nStatusUri;
+        if ($nType === 'bite') {
+            if (!$biteHasPost || str_contains($notifOpenUri, '/bites-received/')) {
+                $notifOpenUri = '';
+            } elseif (function_exists('ap_masto_mention_target_object_id')) {
+                $notifOpenUri = ap_masto_mention_target_object_id($notifOpenUri);
+            }
+        }
+      ?>
+      <?php if ($notifOpenUri !== '' && vaak_is_own_url($notifOpenUri) && str_contains($notifOpenUri, '/notes/')): ?>
+        <a class="btn btn-ghost" href="?view=outbox&amp;focus=<?= urlencode($notifOpenUri) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open in Your posts</a>
+      <?php elseif ($notifOpenUri !== '' && !str_contains($notifOpenUri, '/bites-received/')): ?>
+        <a class="btn btn-ghost" href="<?= h(admin_status_href($notifOpenUri, 'mentions')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
+        <a href="<?= h(admin_remote_object_href($notifOpenUri)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
+      <?php endif; ?>
+      <?php if ($nRel !== 'none'): ?>
+        <?= admin_rel_badge($nRel) ?>
+      <?php endif; ?>
+      <?php if ($nActorRef !== '' && !$alreadyFollowing && $nType === 'follow'): ?>
+        <form method="post" action="?view=mentions" style="display:inline">
+          <input type="hidden" name="action" value="follow_remote">
+          <input type="hidden" name="return_view" value="mentions">
+          <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
+          <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow back</button>
+        </form>
+      <?php elseif ($nActorRef !== '' && !$alreadyFollowing): ?>
+        <form method="post" action="?view=mentions" style="display:inline">
+          <input type="hidden" name="action" value="follow_remote">
+          <input type="hidden" name="return_view" value="mentions">
+          <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
+          <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
+        </form>
+      <?php endif; ?>
+    </div>
+    </article>
+    <?php
+    } catch (Throwable $e) {
+        error_log('[ap-admin] notif row: ' . $e->getMessage());
+        echo '<div class="meta" style="padding:.5rem 0;color:var(--muted)">Skipped a notification (temporary error).</div>';
+    }
+
+}
+
 function admin_render_home_suggestions(array $suggestions): void
 {
     if (!$suggestions) {
@@ -9392,6 +9822,9 @@ function admin_render_home_suggestions(array $suggestions): void
     .timeline-tabs a:hover, .timeline-tabs a.active { background:var(--primary); color:#04140c; }
     .timeline-skeleton { display:grid; gap:.6rem; margin:.5rem 0; }
     .timeline-skeleton-row { height:7.5rem; border:1px solid var(--border); border-radius:12px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
+    .trends-skeleton { display:grid; gap:.45rem; margin:.35rem 0 0; }
+    .trends-skeleton-row { height:1.15rem; border:1px solid var(--border); border-radius:8px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
+    .trends-skeleton-row.wide { height:2.4rem; }
     @keyframes timeline-shimmer { to { background-position:-220% 0; } }
     .keyboard-selected { outline:2px solid var(--primary); outline-offset:2px; }
     .media-row { gap:.45rem; }
@@ -9592,131 +10025,33 @@ function admin_render_home_suggestions(array $suggestions): void
       </form>
     </div>
     <?php
-      $trendTags = [];
-      $trendLinks = [];
-      $trendStatuses = [];
-      try {
-          $trendTags = function_exists('ap_masto_trends_tags') ? ap_masto_trends_tags(5) : [];
-          $trendLinks = function_exists('ap_masto_trends_links') ? ap_masto_trends_links(5) : [];
-          $trendStatuses = function_exists('ap_masto_trends_statuses') ? ap_masto_trends_statuses(5) : [];
-      } catch (Throwable $e) {
-          error_log('[ap-admin] trends sidebar: ' . $e->getMessage());
-      }
-      $admin_strim = static function (string $s, int $width): string {
-          if (function_exists('mb_strimwidth')) {
-              return mb_strimwidth($s, 0, $width, '…');
-          }
-          return strlen($s) > $width ? (substr($s, 0, max(0, $width - 1)) . '…') : $s;
-      };
+      // Always paint a shimmer shell first; JS fills via ?ajax=trends after paint
+      // (even on a warm cache) so every page shows a brief loading state.
     ?>
-    <div class="side-card">
-      <h3>Trending tags</h3>
-      <?php if (!$trendTags): ?>
-        <div class="meta">No hashtag signal yet…</div>
-      <?php else: ?>
-        <?php foreach ($trendTags as $tg): ?>
-          <?php
-            $tname = (string) ($tg['name'] ?? '');
-            $usesToday = 0;
-            if (!empty($tg['history'][0]['uses'])) {
-                $usesToday = (int) $tg['history'][0]['uses'];
-            }
-            $usesWeek = 0;
-            if (!empty($tg['history']) && is_array($tg['history'])) {
-                foreach ($tg['history'] as $hday) {
-                    $usesWeek += (int) ($hday['uses'] ?? 0);
-                }
-            }
-          ?>
-          <div class="bar-row">
-            <span>
-              <a href="?view=search&amp;q=<?= urlencode('#' . $tname) ?>">#<?= h($tname) ?></a>
-            </span>
-            <span class="meta" title="uses today / 7d"><?= $usesToday ?>/<?= $usesWeek ?></span>
-          </div>
-        <?php endforeach; ?>
-        <?php
-          $trendAge = function_exists('ap_masto_trends_cache_mtime') ? ap_masto_trends_cache_mtime('tags') : 0;
-          if ($trendAge > 0):
-              $mins = max(0, (int) floor((time() - $trendAge) / 60));
-              $ageLabel = $mins < 1 ? 'just now' : ($mins < 60 ? ($mins . 'm ago') : ((int) floor($mins / 60) . 'h ago'));
-        ?>
-          <div class="meta" style="margin-top:.55rem" title="Recalculates about once an hour">Updated <?= h($ageLabel) ?></div>
-        <?php endif; ?>
-      <?php endif; ?>
-    </div>
-    <div class="side-card">
-      <h3>Trending links</h3>
-      <?php if (!$trendLinks): ?>
-        <div class="meta">No link signal yet…</div>
-      <?php else: ?>
-        <?php foreach ($trendLinks as $ln): ?>
-          <?php
-            $lurl = (string) ($ln['url'] ?? '');
-            $ltitle = trim((string) ($ln['title'] ?? ''));
-            if ($ltitle === '') {
-                $ltitle = (string) (parse_url($lurl, PHP_URL_HOST) ?: $lurl);
-            }
-            $luses = 0;
-            if (!empty($ln['history']) && is_array($ln['history'])) {
-                foreach ($ln['history'] as $hday) {
-                    $luses += (int) ($hday['uses'] ?? 0);
-                }
-            }
-          ?>
-          <div class="bar-row" style="align-items:flex-start;gap:.4rem">
-            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis">
-              <a href="<?= h($lurl) ?>" target="_blank" rel="noopener noreferrer" title="<?= h($lurl) ?>"><?= h($admin_strim($ltitle, 42)) ?></a>
-            </span>
-            <span class="meta" title="shares / 7d"><?= $luses ?></span>
-          </div>
-        <?php endforeach; ?>
-        <?php
-          $trendLinkAge = function_exists('ap_masto_trends_cache_mtime') ? ap_masto_trends_cache_mtime('links') : 0;
-          if ($trendLinkAge > 0):
-              $mins = max(0, (int) floor((time() - $trendLinkAge) / 60));
-              $ageLabel = $mins < 1 ? 'just now' : ($mins < 60 ? ($mins . 'm ago') : ((int) floor($mins / 60) . 'h ago'));
-        ?>
-          <div class="meta" style="margin-top:.55rem" title="Recalculates about once an hour">Updated <?= h($ageLabel) ?></div>
-        <?php endif; ?>
-      <?php endif; ?>
-    </div>
-    <div class="side-card">
-      <h3>Trending posts</h3>
-      <?php if (!$trendStatuses): ?>
-        <div class="meta">No post signal yet…</div>
-      <?php else: ?>
-        <?php foreach ($trendStatuses as $ts): ?>
-          <?php
-            $acct = is_array($ts['account'] ?? null) ? $ts['account'] : [];
-            $who = (string) ($acct['display_name'] ?? '');
-            if ($who === '') {
-                $who = (string) ($acct['username'] ?? $acct['acct'] ?? 'unknown');
-            }
-            $plain = admin_html_to_plain((string) ($ts['content'] ?? ''));
-            $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
-            $excerpt = $admin_strim($plain, 72);
-            $surl = (string) ($ts['url'] ?? $ts['uri'] ?? '');
-            $eng = (int) ($ts['reblogs_count'] ?? 0) + (int) ($ts['favourites_count'] ?? 0) + (int) ($ts['replies_count'] ?? 0);
-          ?>
-          <div style="margin:0 0 .65rem;line-height:1.35">
-            <div class="meta" style="margin-bottom:.15rem;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word"><?= h($who) ?><?php if ($eng > 0): ?> · <?= $eng ?><?php endif; ?></div>
-            <?php if ($surl !== ''): ?>
-              <a href="<?= h(admin_status_href($surl, $view)) ?>" style="display:block;min-width:0;max-width:100%;color:var(--text);text-decoration:none;overflow-wrap:anywhere;word-break:break-word"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></a>
-            <?php else: ?>
-              <span style="display:block;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></span>
-            <?php endif; ?>
-          </div>
-        <?php endforeach; ?>
-        <?php
-          $trendStatusAge = function_exists('ap_masto_trends_cache_mtime') ? ap_masto_trends_cache_mtime('statuses') : 0;
-          if ($trendStatusAge > 0):
-              $mins = max(0, (int) floor((time() - $trendStatusAge) / 60));
-              $ageLabel = $mins < 1 ? 'just now' : ($mins < 60 ? ($mins . 'm ago') : ((int) floor($mins / 60) . 'h ago'));
-        ?>
-          <div class="meta" style="margin-top:.55rem" title="Recalculates about once an hour">Updated <?= h($ageLabel) ?></div>
-        <?php endif; ?>
-      <?php endif; ?>
+    <div id="trends-sidebar" data-deferred="1" data-from="<?= h($view) ?>">
+      <div class="side-card" aria-busy="true" aria-label="Loading trending tags">
+        <h3>Trending tags</h3>
+        <div class="trends-skeleton" aria-hidden="true">
+          <div class="trends-skeleton-row"></div>
+          <div class="trends-skeleton-row"></div>
+          <div class="trends-skeleton-row" style="width:72%"></div>
+        </div>
+      </div>
+      <div class="side-card" aria-busy="true" aria-label="Loading trending links">
+        <h3>Trending links</h3>
+        <div class="trends-skeleton" aria-hidden="true">
+          <div class="trends-skeleton-row wide"></div>
+          <div class="trends-skeleton-row wide" style="width:88%"></div>
+        </div>
+      </div>
+      <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
+        <h3>Trending posts</h3>
+        <div class="trends-skeleton" aria-hidden="true">
+          <div class="trends-skeleton-row wide"></div>
+          <div class="trends-skeleton-row wide" style="width:80%"></div>
+          <div class="trends-skeleton-row" style="width:60%"></div>
+        </div>
+      </div>
     </div>
   </aside>
 
@@ -9907,10 +10242,10 @@ function admin_render_home_suggestions(array $suggestions): void
       <?php elseif ($view === 'home'): ?>
         <?php
           $homePage = array_slice($homeTimeline, 0, $tlLimit);
-          $homeHasMore = count($homeTimeline) > $tlLimit;
-          $homeSuggestions = function_exists('ap_masto_suggestions_v2')
-              ? ap_masto_suggestions_v2(12)
-              : [];
+          $homeHasMore = $adminTlFromCache
+              ? $adminTlCachedHasMore
+              : (count($homeTimeline) > $tlLimit);
+          // Suggestions are deferred after first paint (see ajax=home_suggestions).
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($homePage));
           }
@@ -9925,15 +10260,14 @@ function admin_render_home_suggestions(array $suggestions): void
                   continue;
               }
               admin_render_timeline_item($item, $followingIds, 'home');
-              // Keep recommendations out of the chronological data stream,
-              // but show them as an occasional break after a few posts.
-              if ($homeIndex === 5 && $homeSuggestions) {
-                  admin_render_home_suggestions($homeSuggestions);
+              // Placeholder after a few posts; filled async so Home first paint stays light.
+              if ($homeIndex === 5) {
+                  echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
               }
             ?>
           <?php endforeach; ?>
-          <?php if (count($homePage) < 6 && $homeSuggestions): ?>
-            <?php admin_render_home_suggestions($homeSuggestions); ?>
+          <?php if (count($homePage) < 6): ?>
+            <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
           <?php endif; ?>
         </div>
         <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeHasMore ? 'Scroll for more…' : ($homeTimeline ? 'End of timeline' : '') ?></div>
@@ -9942,7 +10276,9 @@ function admin_render_home_suggestions(array $suggestions): void
       <?php elseif ($view === 'local'): ?>
         <?php
           $localPage = array_slice($localTimeline, 0, $tlLimit);
-          $localHasMore = count($localTimeline) > $tlLimit;
+          $localHasMore = $adminTlFromCache
+              ? $adminTlCachedHasMore
+              : (count($localTimeline) > $tlLimit);
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($localPage));
           }
@@ -9966,7 +10302,9 @@ function admin_render_home_suggestions(array $suggestions): void
       <?php elseif ($view === 'feed'): ?>
         <?php
           $feedPage = array_slice($feedTimeline, 0, $tlLimit);
-          $feedHasMore = count($feedTimeline) > $tlLimit;
+          $feedHasMore = $adminTlFromCache
+              ? $adminTlCachedHasMore
+              : (count($feedTimeline) > $tlLimit);
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($feedPage));
           }
@@ -9990,7 +10328,9 @@ function admin_render_home_suggestions(array $suggestions): void
           $tokLimit = max($tlLimit, 8);
           $tokTimeline = array_values(array_filter($galleryTimeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
           $tokPage = array_slice($tokTimeline, 0, $tokLimit);
-          $tokHasMore = count($tokTimeline) > $tokLimit;
+          $tokHasMore = $adminTlFromCache
+              ? $adminTlCachedHasMore
+              : (count($tokTimeline) > $tokLimit);
         ?>
         <?php if (!$tokTimeline): ?><div class="empty">No videos are available yet.</div><?php endif; ?>
         <div id="timeline-items" class="vakktok-feed" data-view="vakktok" data-offset="<?= (int) count($tokPage) ?>" data-limit="<?= (int) $tokLimit ?>" data-has-more="<?= $tokHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($tokPage[0]['sort']) ? $tokPage[0]['sort'] : time()) ?>">
@@ -10005,7 +10345,9 @@ function admin_render_home_suggestions(array $suggestions): void
         <?php
           $galLimit = max($tlLimit, 16);
           $galleryPage = array_slice($galleryTimeline, 0, $galLimit);
-          $galleryHasMore = count($galleryTimeline) > $galLimit;
+          $galleryHasMore = $adminTlFromCache
+              ? $adminTlCachedHasMore
+              : (count($galleryTimeline) > $galLimit);
         ?>
         <?php if (!$galleryTimeline): ?>
           <div class="empty">No images in the cache yet. Posts with media from the firehose and local users show up here.</div>
@@ -10055,7 +10397,7 @@ function admin_render_home_suggestions(array $suggestions): void
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
                     $favPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl) . '</div>'
+                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions) . '</div>'
                         : ''
                 );
               ?>
@@ -10111,7 +10453,7 @@ function admin_render_home_suggestions(array $suggestions): void
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
                     $bmPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions, $actorUrl) . '</div>'
+                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions) . '</div>'
                         : ''
                 );
               ?>
@@ -10157,230 +10499,32 @@ function admin_render_home_suggestions(array $suggestions): void
               echo '<a class="btn ' . ($active ? 'btn-primary' : 'btn-ghost') . '" role="tab" aria-selected="' . ($active ? 'true' : 'false') . '" href="' . $notifFilterHref($filterKey) . '">' . h((string) $filterOption['label']) . '</a>';
           }
           echo '</nav>';
+          $notifLimit = 20;
           $adminNotifs = [];
-          $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
+          // First page only — older pages append via ?partial=1 (keeps scroll place).
           try {
               $adminNotifs = function_exists('ap_masto_notifications_fetch')
-                  ? ap_masto_notifications_fetch(60, $notifMaxId, null, $notifTypes)
+                  ? ap_masto_notifications_fetch($notifLimit, null, null, $notifTypes)
                   : [];
           } catch (Throwable $e) {
               error_log('[ap-admin] notifications fetch: ' . $e->getMessage());
           }
+          $notifNextMaxId = '';
+          if ($adminNotifs !== []) {
+              $notifNextMaxId = preg_replace('/\D+/', '', (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? '')) ?: '';
+          }
+          $notifHasMore = count($adminNotifs) >= $notifLimit && $notifNextMaxId !== '';
           if (!$adminNotifs):
         ?>
           <div class="empty">No notifications yet.</div>
         <?php else: ?>
-          <?php foreach ($adminNotifs as $n): ?>
-            <?php
-              try {
-                  if (!is_array($n)) {
-                      continue;
-                  }
-                  $nType = (string) ($n['type'] ?? 'mention');
-                  $nAcct = (string) ($n['account']['acct'] ?? '?');
-                  $nDisplay = (string) ($n['account']['display_name'] ?? '');
-                  $nWebUrl = (string) ($n['account']['url'] ?? '');
-                  $nActorUri = (string) ($n['account']['uri'] ?? '');
-                  $nActorRef = function_exists('admin_account_actor_ref')
-                      ? admin_account_actor_ref(is_array($n['account'] ?? null) ? $n['account'] : [])
-                      : ($nActorUri !== '' ? $nActorUri : $nWebUrl);
-                  $nCreated = (string) ($n['created_at'] ?? '');
-                  $nStatus = (isset($n['status']) && is_array($n['status'])) ? $n['status'] : null;
-                  $nStatusUri = is_array($nStatus) ? (string) ($nStatus['uri'] ?? $nStatus['url'] ?? '') : '';
-                  $nSnippet = '';
-                  $nMedia = [];
-                  if (is_array($nStatus)) {
-                      $nSnippet = trim(admin_html_to_plain((string) ($nStatus['content'] ?? '')));
-                      $nSnippet = preg_replace('/^\h+/mu', '', $nSnippet) ?? $nSnippet;
-                      if (function_exists('ap_masto_clean_mention_text')) {
-                          $nSnippet = ap_masto_clean_mention_text($nSnippet);
-                      } else {
-                          $nSnippet = preg_replace('#^RE:\s*https://\S+#u', '', $nSnippet) ?? $nSnippet;
-                          $nSnippet = trim($nSnippet);
-                      }
-                      // Wafrn may glue the first commentary word onto our local
-                      // domain: @cmdr_nova@mkultra.monsteraudio posts… Preserve
-                      // that word before mention normalization can consume it.
-                      $localHostForSnippet = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
-                      if ($localHostForSnippet !== '') {
-                          $nSnippet = preg_replace(
-                              '/^(@[A-Za-z0-9_]+@' . preg_quote($localHostForSnippet, '/') . ')([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=\s|$)/iu',
-                              '$1 $2',
-                              $nSnippet
-                          ) ?? $nSnippet;
-                      }
-                      foreach (($nStatus['mentions'] ?? []) as $nMention) {
-                          if (!is_array($nMention)) {
-                              continue;
-                          }
-                          $nAcctKnown = ltrim(trim((string) ($nMention['acct'] ?? '')), '@');
-                          if ($nAcctKnown !== '' && str_contains($nAcctKnown, '@') && str_starts_with($nSnippet, '@' . $nAcctKnown)) {
-                              // Some Wafrn payloads glue the local domain to the first word
-                              // after the handle (for example: mkultra.monsterone more).
-                              $nParts = explode('@', $nAcctKnown, 2);
-                              $nLocalHost = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
-                              $nMentionHost = strtolower((string) ($nParts[1] ?? ''));
-                              if ($nLocalHost !== '' && str_starts_with($nMentionHost, $nLocalHost) && strlen($nMentionHost) > strlen($nLocalHost)) {
-                                  $nAcctDisplay = $nParts[0] . '@' . $nLocalHost;
-                                  $nSuffix = substr($nMentionHost, strlen($nLocalHost));
-                                  $nSnippet = '@' . $nAcctDisplay . ' ' . $nSuffix . substr($nSnippet, strlen($nAcctKnown) + 1);
-                                  break;
-                              }
-                              $afterMention = strlen($nAcctKnown) + 1;
-                              if (isset($nSnippet[$afterMention]) && !preg_match('/\s/u', $nSnippet[$afterMention])) {
-                                  $nSnippet = substr($nSnippet, 0, $afterMention) . ' ' . substr($nSnippet, $afterMention);
-                              }
-                              break;
-                          }
-                      }
-                      foreach (($nStatus['media_attachments'] ?? []) as $nAttachment) {
-                          if (!is_array($nAttachment)) {
-                              continue;
-                          }
-                          $nUrl = (string) ($nAttachment['url'] ?? $nAttachment['preview_url'] ?? '');
-                          if (!str_starts_with($nUrl, 'https://')) {
-                              continue;
-                          }
-                          $nMedia[] = [
-                              'url' => $nUrl,
-                              'mediaType' => in_array(strtolower((string) ($nAttachment['type'] ?? '')), ['video', 'gifv'], true) ? 'video/mp4' : null,
-                              'preview_url' => (string) ($nAttachment['preview_url'] ?? ''),
-                          ];
-                          if (count($nMedia) >= 4) {
-                              break;
-                          }
-                      }
-                  }
-                  $typeLabel = match ($nType) {
-                      'follow' => '👤 followed you',
-                      'favourite' => '★ liked your post',
-                      'reblog' => '🔁 boosted your post',
-                      'mention' => '＠ mentioned you',
-                      'quote' => '💬 quoted your post',
-                      'poll' => '📊 poll ended',
-                      'update' => '✏️ edited a post you liked',
-                      'bite' => '🦷 bit you / your post',
-                      'status' => '✉ posted',
-                      default => $nType,
-                  };
-                  // Account-targeted bites use synthetic /bites-received/ URIs (no real post).
-                  $biteHasPost = false;
-                  if ($nType === 'bite') {
-                      $biteTarget = $nStatusUri;
-                      if (function_exists('ap_masto_mention_target_object_id')) {
-                          $biteTarget = ap_masto_mention_target_object_id($biteTarget);
-                      }
-                      $biteHasPost = $biteTarget !== ''
-                          && !str_contains($biteTarget, '/bites-received/')
-                          && (str_contains($biteTarget, '/notes/')
-                              || str_contains($biteTarget, '/statuses/')
-                              || str_contains($biteTarget, '/objects/'));
-                      $typeLabel = $biteHasPost ? '🦷 bit your post' : '🦷 bit you';
-                  }
-                  $nRel = $nActorRef !== ''
-                      ? admin_rel_state($followingIds, $followerIds, $nActorRef, $nWebUrl, $nActorUri)
-                      : 'none';
-                  $alreadyFollowing = $nRel === 'mutual' || $nRel === 'following';
-                  $snipShow = $nSnippet;
-                  if (function_exists('mb_strlen') && function_exists('mb_substr') && is_string($nSnippet) && mb_strlen($nSnippet) > 280) {
-                      $snipShow = mb_substr($nSnippet, 0, 280) . '…';
-                  } elseif (is_string($nSnippet) && strlen($nSnippet) > 280) {
-                      $snipShow = substr($nSnippet, 0, 280) . '…';
-                  }
-                  $profileHref = $nActorRef !== ''
-                      ? ('?view=remote_profile&actor=' . rawurlencode($nActorRef) . '&from=mentions')
-                      : '';
-            ?>
-            <article class="tweet tweet-notif tweet-notif-<?= h($nType) ?>">
-              <div class="tweet-hd">
-                <?php if ($profileHref !== ''): ?>
-                  <a href="<?= h($profileHref) ?>" title="Open profile" style="text-decoration:none"><?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?></a>
-                <?php else: ?>
-                  <?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?>
-                <?php endif; ?>
-                <div class="tweet-hd-main">
-                  <div>
-                    <?php if ($profileHref !== ''): ?>
-                      <a class="who" href="<?= h($profileHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($nDisplay !== '' ? $nDisplay : $nAcct, $nActorRef !== '' ? $nActorRef : null) ?></a>
-                      <a class="meta" href="<?= h($profileHref) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($nAcct) ?></a>
-                    <?php else: ?>
-                      <span class="who"><?= h($nAcct) ?></span>
-                    <?php endif; ?>
-                    <span class="meta"> · <?= h(relative_time($nCreated)) ?></span>
-                  </div>
-                  <div class="meta" style="color:var(--primary);margin-top:.2rem"><?= h($typeLabel) ?></div>
-                </div>
-              </div>
-              <?php if ($nType === 'bite' && !$biteHasPost): ?>
-                <div class="meta" style="margin-top:.55rem;color:var(--muted)">No associated post</div>
-              <?php elseif ($nSnippet !== '' && $nType === 'mention'): ?>
-                <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
-              <?php elseif ($nSnippet !== '' && $nType === 'quote'): ?>
-                <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
-              <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
-                <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
-              <?php endif; ?>
-              <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
-              <div class="tweet-actions">
-                <?php if ($profileHref !== ''): ?>
-                  <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
-                <?php endif; ?>
-                <?php if ($nType === 'mention' && $nStatusUri !== ''): ?>
-                  <a class="icon-btn" href="?view=mentions&amp;compose=1&amp;reply_to=<?= urlencode($nStatusUri) ?>&amp;to=<?= urlencode($nActorRef) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
-                <?php endif; ?>
-                <?php
-                  // Bite user-target uses synthetic /bites-received/ URIs — Open would 404/white-screen.
-                  // Post bites keep a real note/status URI (with #bite- fragment stripped upstream).
-                  $notifOpenUri = $nStatusUri;
-                  if ($nType === 'bite') {
-                      if (!$biteHasPost || str_contains($notifOpenUri, '/bites-received/')) {
-                          $notifOpenUri = '';
-                      } elseif (function_exists('ap_masto_mention_target_object_id')) {
-                          $notifOpenUri = ap_masto_mention_target_object_id($notifOpenUri);
-                      }
-                  }
-                ?>
-                <?php if ($notifOpenUri !== '' && vaak_is_own_url($notifOpenUri) && str_contains($notifOpenUri, '/notes/')): ?>
-                  <a class="btn btn-ghost" href="?view=outbox&amp;focus=<?= urlencode($notifOpenUri) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open in Your posts</a>
-                <?php elseif ($notifOpenUri !== '' && !str_contains($notifOpenUri, '/bites-received/')): ?>
-                  <a class="btn btn-ghost" href="<?= h(admin_status_href($notifOpenUri, 'mentions')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                  <a href="<?= h(admin_remote_object_href($notifOpenUri)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
-                <?php endif; ?>
-                <?php if ($nRel !== 'none'): ?>
-                  <?= admin_rel_badge($nRel) ?>
-                <?php endif; ?>
-                <?php if ($nActorRef !== '' && !$alreadyFollowing && $nType === 'follow'): ?>
-                  <form method="post" action="?view=mentions" style="display:inline">
-                    <input type="hidden" name="action" value="follow_remote">
-                    <input type="hidden" name="return_view" value="mentions">
-                    <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
-                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow back</button>
-                  </form>
-                <?php elseif ($nActorRef !== '' && !$alreadyFollowing): ?>
-                  <form method="post" action="?view=mentions" style="display:inline">
-                    <input type="hidden" name="action" value="follow_remote">
-                    <input type="hidden" name="return_view" value="mentions">
-                    <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
-                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                  </form>
-                <?php endif; ?>
-              </div>
-            </article>
-            <?php
-              } catch (Throwable $e) {
-                  error_log('[ap-admin] notif row: ' . $e->getMessage());
-                  echo '<div class="meta" style="padding:.5rem 0;color:var(--muted)">Skipped a notification (temporary error).</div>';
-              }
-            ?>
-          <?php endforeach; ?>
-          <?php if (count($adminNotifs) >= 60): ?>
-            <?php $olderNotifId = (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? ''); ?>
-            <?php if ($olderNotifId !== ''): ?>
-              <div style="text-align:center;margin:1rem 0 .25rem">
-              <a class="btn btn-ghost" href="<?= h($notifFilterHref($notifFilter)) ?>&amp;notifications_max_id=<?= urlencode($olderNotifId) ?>">Load older notifications</a>
-              </div>
-            <?php endif; ?>
-          <?php endif; ?>
+          <div id="timeline-items" data-view="mentions" data-filter="<?= h($notifFilter) ?>" data-limit="<?= (int) $notifLimit ?>" data-max-id="<?= h($notifNextMaxId) ?>" data-has-more="<?= $notifHasMore ? '1' : '0' ?>" data-offset="0" data-newest="0">
+            <?php foreach ($adminNotifs as $n): ?>
+              <?php admin_render_notification_card(is_array($n) ? $n : [], $followingIds, $followerIds); ?>
+            <?php endforeach; ?>
+          </div>
+          <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $notifHasMore ? 'Scroll for more…' : 'End of notifications' ?></div>
+          <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
         <?php endif; ?>
 
       <?php elseif ($view === 'dms'): ?>
@@ -13232,19 +13376,10 @@ function admin_render_home_suggestions(array $suggestions): void
                   }
               } else {
                   $rpMeta = $rpActor !== '' ? ap_remote_actor_get($rpActor) : null;
-                  if (is_array($rpMeta) && !empty($rpMeta['profile_json'])) {
-                      $cachedProfile = json_decode((string) $rpMeta['profile_json'], true);
-                      $rpDoc = is_array($cachedProfile) ? $cachedProfile : null;
-                      if (is_array($rpDoc) && !empty($rpDoc['summary']) && is_string($rpDoc['summary'])) {
-                          $rpBio = function_exists('ap_html_to_plain_text')
-                              ? ap_html_to_plain_text($rpDoc['summary'])
-                              : trim(html_entity_decode(strip_tags($rpDoc['summary']), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                      }
-                  }
                   // Cache-first: only sync-fetch AS2 on miss or explicit Refresh (was every open).
                   $rpNeedFetch = $rpActor !== ''
                       && function_exists('ap_fetch_as2_object')
-                      && ($rpForceRefresh || !is_array($rpMeta) || empty($rpMeta['username']) || !is_array($rpDoc));
+                      && ($rpForceRefresh || !is_array($rpMeta) || empty($rpMeta['username']));
                   if ($rpNeedFetch) {
                       $rpDoc = ap_fetch_as2_object($rpActor);
                       if (is_array($rpDoc)) {
@@ -13280,7 +13415,6 @@ function admin_render_home_suggestions(array $suggestions): void
                                   'host' => parse_url($rpActor, PHP_URL_HOST) ?: null,
                                   'icon_source_url' => $icon,
                                   'image_source_url' => $image,
-                                  'profile_json' => json_encode($rpDoc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                               ]);
                               if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
                                   ap_remote_emoji_ingest_actor_doc($rpActor, $rpDoc);
@@ -13407,22 +13541,6 @@ function admin_render_home_suggestions(array $suggestions): void
             $rpPostSub = $rpIsLocal && !$rpIsOwn
                 && function_exists('ap_post_subscription_is')
                 && ap_post_subscription_is($rpActor, admin_owner_user_id());
-            $rpFields = [];
-            if (!$rpIsLocal && is_array($rpDoc) && is_array($rpDoc['attachment'] ?? null)) {
-                foreach ($rpDoc['attachment'] as $field) {
-                    if (!is_array($field) || trim((string) ($field['name'] ?? '')) === '') {
-                        continue;
-                    }
-                    $rpFields[] = [
-                        'name' => trim((string) $field['name']),
-                        'value' => function_exists('ap_html_to_plain_text')
-                            ? ap_html_to_plain_text((string) ($field['value'] ?? ''))
-                            : trim(html_entity_decode(strip_tags((string) ($field['value'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8')),
-                    ];
-                }
-            }
-            $rpFollowersCount = is_array($rpDoc) && isset($rpDoc['followersCount']) && is_numeric($rpDoc['followersCount']) ? (int) $rpDoc['followersCount'] : null;
-            $rpFollowingCount = is_array($rpDoc) && isset($rpDoc['followingCount']) && is_numeric($rpDoc['followingCount']) ? (int) $rpDoc['followingCount'] : null;
           ?>
           <article class="tweet">
             <div class="tweet-hd" style="align-items:center;gap:.75rem">
@@ -13449,27 +13567,11 @@ function admin_render_home_suggestions(array $suggestions): void
               </div>
             </div>
             <?php if ($rpBio !== ''): ?>
-              <div class="body feed-body" style="margin-top:.75rem"><?= admin_linkify_body_html($rpBio, 'remote_profile', [], $rpActor) ?></div>
+              <div class="body" style="margin-top:.75rem;white-space:pre-wrap"><?= h($rpBio) ?></div>
             <?php elseif ($rpIsLocal): ?>
               <div class="meta" style="margin-top:.75rem">No bio set.</div>
             <?php else: ?>
               <div class="meta" style="margin-top:.75rem">No bio available from this instance’s cache / remote fetch.</div>
-            <?php endif; ?>
-            <?php if ($rpFollowersCount !== null || $rpFollowingCount !== null || $rpFields): ?>
-              <div class="meta" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem">
-                <?php if ($rpFollowersCount !== null): ?><span><b><?= number_format($rpFollowersCount) ?></b> followers</span><?php endif; ?>
-                <?php if ($rpFollowingCount !== null): ?><span><b><?= number_format($rpFollowingCount) ?></b> following</span><?php endif; ?>
-              </div>
-              <?php if ($rpFields): ?>
-                <dl class="profile-fields" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.45rem;margin:.75rem 0 0">
-                  <?php foreach ($rpFields as $field): ?>
-                    <div style="padding:.45rem .6rem;background:var(--panel-2);border-radius:8px">
-                      <dt class="meta"><?= h($field['name']) ?></dt>
-                      <dd style="margin:.15rem 0 0"><?= admin_linkify_body_html($field['value'], 'remote_profile', [], $rpActor) ?></dd>
-                    </div>
-                  <?php endforeach; ?>
-                </dl>
-              <?php endif; ?>
             <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
@@ -14624,7 +14726,7 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
-<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)): ?>
+<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'mentions'], true)): ?>
 <script>
 (function () {
   /** Replace a timeline card in place without jumping scroll to the top. */
@@ -14715,9 +14817,9 @@ window.apAdminToast = function (msg, isErr) {
   enqueueBoostHydrates(document.getElementById('timeline-items') || document);
 
   const root = document.querySelector('.feed');
-  const items = document.getElementById('timeline-items');
-  const sentinel = document.getElementById('timeline-sentinel');
-  const status = document.getElementById('timeline-status');
+  let items = document.getElementById('timeline-items');
+  let sentinel = document.getElementById('timeline-sentinel');
+  let status = document.getElementById('timeline-status');
   const topBtn = document.getElementById('feed-top-btn');
   const newBtn = document.getElementById('feed-new-btn');
   const feedRoot = document.querySelector('.feed');
@@ -14761,16 +14863,21 @@ window.apAdminToast = function (msg, isErr) {
   let sc = scrollApi();
 
   let offset = parseInt(items.dataset.offset || '0', 10);
-  const limit = parseInt(items.dataset.limit || '15', 10);
-  const viewName = items.dataset.view || 'home';
+  let limit = parseInt(items.dataset.limit || '15', 10);
+  let viewName = items.dataset.view || 'home';
   let hasMore = items.dataset.hasMore === '1';
+  let notifMaxId = items.dataset.maxId || '';
+  let notifFilter = items.dataset.filter || 'all';
   let loading = false;
   let newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
   let pendingHtml = '';
   let pendingCount = 0;
   let pollBusy = false;
+  let tabSwapBusy = false;
   const POLL_MS = 120000;
   const AT_TOP_PX = 120;
+  const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
+  const isNotifTimeline = viewName === 'mentions';
 
   // VakkTok behaves like a focused video reel: the visible video plays muted,
   // while videos leaving the viewport are paused so background media does not
@@ -14949,6 +15056,7 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function pollNewer() {
+    if (isNotifTimeline) return; // Notifications use max_id pages, not newer polls.
     if (pollBusy || document.hidden) return;
     pollBusy = true;
     try {
@@ -14987,6 +15095,9 @@ window.apAdminToast = function (msg, isErr) {
     skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
     if (status && status.parentNode) status.parentNode.insertBefore(skeleton, status);
     if (status) status.textContent = 'Loading…';
+    // Capture scroll anchor before append so desktop .feed scroll doesn't jump.
+    const prevTop = sc.top();
+    const prevHeight = sc.height();
     try {
       // A page may render no HTML when every row was filtered or deduplicated.
       // Keep the pagination cursor independent from rendered card count (as
@@ -14995,20 +15106,46 @@ window.apAdminToast = function (msg, isErr) {
       let inserted = false;
       while (hasMore && attempts < 4) {
         attempts++;
-        const requestOffset = offset;
-        const url = '?view=' + encodeURIComponent(viewName)
-          + '&partial=1&offset=' + requestOffset + '&limit=' + limit;
+        let url;
+        if (isNotifTimeline) {
+          if (!notifMaxId) { hasMore = false; break; }
+          url = '?view=mentions&partial=1'
+            + '&notification_filter=' + encodeURIComponent(notifFilter || 'all')
+            + '&notifications_max_id=' + encodeURIComponent(notifMaxId)
+            + '&limit=' + encodeURIComponent(String(limit || 20));
+        } else {
+          const requestOffset = offset;
+          url = '?view=' + encodeURIComponent(viewName)
+            + '&partial=1&offset=' + requestOffset + '&limit=' + limit;
+        }
         const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const html = await res.text();
         hasMore = res.headers.get('X-Has-More') === '1';
-        const next = parseInt(res.headers.get('X-Next-Offset') || String(requestOffset), 10);
-        // Guard against a broken cursor causing a tight request loop.
-        offset = next > requestOffset ? next : requestOffset + limit;
-        items.dataset.offset = String(offset);
+        if (isNotifTimeline) {
+          const nextMax = (res.headers.get('X-Next-Max-Id') || '').replace(/\D+/g, '');
+          if (!nextMax || nextMax === notifMaxId) {
+            hasMore = false;
+          } else {
+            notifMaxId = nextMax;
+            items.dataset.maxId = notifMaxId;
+          }
+        } else {
+          const requestOffset = offset;
+          const next = parseInt(res.headers.get('X-Next-Offset') || String(requestOffset), 10);
+          // Guard against a broken cursor causing a tight request loop.
+          offset = next > requestOffset ? next : requestOffset + limit;
+          items.dataset.offset = String(offset);
+        }
         if (html.trim()) {
           items.insertAdjacentHTML('beforeend', html);
           inserted = true;
+          // Keep visual place: if scroll container grew upward relative to the
+          // viewport (rare), compensate; otherwise stay where you were reading.
+          const delta = sc.height() - prevHeight;
+          if (delta > 0 && sc.top() + 2 < prevTop) {
+            sc.setTop(prevTop + delta, false);
+          }
           if (typeof window.novaEnhanceTweetFolds === 'function') {
             window.novaEnhanceTweetFolds(items);
           }
@@ -15022,7 +15159,12 @@ window.apAdminToast = function (msg, isErr) {
         if (status) status.textContent = 'Scroll for more…';
       }
       items.dataset.hasMore = hasMore ? '1' : '0';
-      if (status) status.textContent = hasMore ? 'Scroll for more…' : (viewName === 'vakktok' ? '' : 'End of timeline');
+      if (status) {
+        if (hasMore) status.textContent = 'Scroll for more…';
+        else if (viewName === 'vakktok') status.textContent = '';
+        else if (isNotifTimeline) status.textContent = 'End of notifications';
+        else status.textContent = 'End of timeline';
+      }
     } catch (e) {
       if (status) status.textContent = 'Could not load more — try Refresh';
       hasMore = false;
@@ -15147,9 +15289,198 @@ window.apAdminToast = function (msg, isErr) {
   setTimeout(pollNewer, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
+
+  function loadDeferredSuggestions() {
+    const slot = document.getElementById('home-suggestions-slot');
+    if (!slot || slot.dataset.deferred !== '1') return;
+    slot.dataset.deferred = '0';
+    fetch('?ajax=home_suggestions', {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'text/html' },
+      cache: 'no-store'
+    }).then((res) => res.ok ? res.text() : '')
+      .then((html) => {
+        if (!html || !html.trim()) {
+          slot.remove();
+          return;
+        }
+        slot.hidden = false;
+        slot.outerHTML = html;
+      })
+      .catch(() => { try { slot.remove(); } catch (e) {} });
+  }
+
+  async function swapTimelineView(nextView, push) {
+    if (tabSwapBusy) return;
+    nextView = String(nextView || '');
+    if (!['home', 'local', 'feed'].includes(nextView)) {
+      window.location.href = '?view=' + encodeURIComponent(nextView);
+      return;
+    }
+    if (nextView === viewName && !push) return;
+    tabSwapBusy = true;
+    if (status) status.textContent = 'Loading…';
+    items.classList.add('timeline-swapping');
+    try {
+      const url = '?view=' + encodeURIComponent(nextView)
+        + '&partial=1&offset=0&limit=' + encodeURIComponent(String(limit || 15));
+      const res = await fetch(url, {
+        credentials: 'same-origin',
+        headers: { 'Accept': 'text/html' },
+        cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const html = await res.text();
+      hasMore = res.headers.get('X-Has-More') === '1';
+      const nextOff = parseInt(res.headers.get('X-Next-Offset') || String(limit), 10);
+      offset = nextOff > 0 ? nextOff : limit;
+      viewName = nextView;
+      pendingHtml = '';
+      pendingCount = 0;
+      updateNewBtn();
+      items.innerHTML = html;
+      items.dataset.view = nextView;
+      items.dataset.offset = String(offset);
+      items.dataset.hasMore = hasMore ? '1' : '0';
+      // Prefer first card sort when present; fall back to "now".
+      const firstSort = items.querySelector('article.tweet[data-sort], article.tweet');
+      newestTs = Math.floor(Date.now() / 1000);
+      items.dataset.newest = String(newestTs);
+      if (status) {
+        status.textContent = hasMore ? 'Scroll for more…' : (html.trim() ? 'End of timeline' : '');
+      }
+      // Empty-state hint when the partial returns nothing.
+      if (!html.trim()) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        if (nextView === 'local') {
+          empty.textContent = 'No local posts yet. When anyone on this instance posts, it shows up here.';
+        } else if (nextView === 'feed') {
+          empty.textContent = 'No federation events yet.';
+        } else {
+          empty.innerHTML = 'Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.';
+        }
+        items.appendChild(empty);
+      }
+      if (nextView === 'home') {
+        const slot = document.createElement('div');
+        slot.id = 'home-suggestions-slot';
+        slot.className = 'home-suggestions-slot';
+        slot.dataset.deferred = '1';
+        slot.hidden = true;
+        items.appendChild(slot);
+        loadDeferredSuggestions();
+      }
+      document.querySelectorAll('.timeline-tabs a').forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/[?&]view=([a-z_]+)/);
+        const v = m ? m[1] : '';
+        a.classList.toggle('active', v === nextView);
+      });
+      document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        if (!/[?&]view=(home|local|feed)(?:&|$)/.test(href)) return;
+        const m = href.match(/[?&]view=([a-z_]+)/);
+        a.classList.toggle('active', (m ? m[1] : '') === nextView);
+      });
+      const h1 = document.querySelector('.main > .topbar h1');
+      if (h1) h1.textContent = TL_TITLES[nextView] || nextView;
+      const refresh = document.querySelector('.topbar-actions a.btn[title="Reload this view"]');
+      if (refresh) {
+        refresh.setAttribute('href', '?view=' + encodeURIComponent(nextView) + '&_r=' + Date.now());
+      }
+      if (typeof window.novaEnhanceTweetFolds === 'function') {
+        window.novaEnhanceTweetFolds(items);
+      }
+      if (typeof window.novaEnqueueBoostHydrates === 'function') {
+        window.novaEnqueueBoostHydrates(items);
+      }
+      sc.setTop(0, false);
+      if (push !== false) {
+        const u = new URL(window.location.href);
+        u.searchParams.set('view', nextView);
+        u.searchParams.delete('_r');
+        history.pushState({ vaakTl: nextView }, '', u.pathname + u.search);
+      }
+      document.title = (TL_TITLES[nextView] || nextView) + ' · VAAK';
+    } catch (e) {
+      window.location.href = '?view=' + encodeURIComponent(nextView);
+      return;
+    } finally {
+      items.classList.remove('timeline-swapping');
+      tabSwapBusy = false;
+      loading = false;
+    }
+  }
+
+  document.querySelectorAll('.timeline-tabs a').forEach((a) => {
+    a.addEventListener('click', (ev) => {
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || a.target === '_blank') return;
+      const href = a.getAttribute('href') || '';
+      const m = href.match(/[?&]view=([a-z_]+)/);
+      const next = m ? m[1] : '';
+      if (!['home', 'local', 'feed'].includes(next)) return;
+      ev.preventDefault();
+      swapTimelineView(next, true);
+    });
+  });
+  window.addEventListener('popstate', () => {
+    const u = new URL(window.location.href);
+    const next = u.searchParams.get('view') || 'home';
+    if (['home', 'local', 'feed'].includes(next) && next !== viewName) {
+      swapTimelineView(next, false);
+    }
+  });
+
+  // After first paint: Home suggestions (trends load via global script below).
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(() => { loadDeferredSuggestions(); }, { timeout: 2500 });
+  } else {
+    setTimeout(() => { loadDeferredSuggestions(); }, 400);
+  }
 })();
 </script>
 <?php endif; ?>
+
+<script>
+// Deferred trends for every view that shows the right rail (Home, Notices, Discuss, …).
+// Always starts as a shimmer shell; keep it visible briefly even on a warm cache
+// so the sidebar clearly "loads" instead of popping in instantly.
+(function () {
+  const MIN_SKELETON_MS = 420;
+  function loadDeferredTrends() {
+    const box = document.getElementById('trends-sidebar');
+    if (!box || box.dataset.deferred !== '1') return;
+    box.dataset.deferred = 'loading';
+    const from = box.dataset.from || 'home';
+    const started = Date.now();
+    const apply = (html) => {
+      const wait = Math.max(0, MIN_SKELETON_MS - (Date.now() - started));
+      window.setTimeout(() => {
+        if (html && html.trim()) {
+          box.innerHTML = html;
+          box.dataset.deferred = '0';
+        } else {
+          box.dataset.deferred = '1';
+        }
+      }, wait);
+    };
+    fetch('?ajax=trends&from=' + encodeURIComponent(from), {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'text/html' },
+      cache: 'no-store'
+    }).then((res) => res.ok ? res.text() : '')
+      .then((html) => apply(html))
+      .catch(() => apply(''));
+  }
+  window.novaLoadDeferredTrends = loadDeferredTrends;
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(loadDeferredTrends, { timeout: 1200 });
+  } else {
+    setTimeout(loadDeferredTrends, 120);
+  }
+})();
+</script>
 
 <?php
 $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
@@ -15361,7 +15692,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     <div class="alt-modal__ft">
       <span class="meta" id="alt-modal-count">0 / 1500</span>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-ghost" id="alt-modal-ai" title="Generate a draft description with AI (review before saving)" data-ai-available="<?= admin_xai_config()['api_key'] !== '' ? '1' : '0' ?>">✦ Generate with AI</button>
+        <button type="button" class="btn btn-ghost" id="alt-modal-ai" title="Generate a draft description with Grok (review before saving)">✦ Generate with AI</button>
         <button type="button" class="btn btn-ghost" id="alt-modal-cancel">Cancel</button>
         <button type="button" class="btn btn-primary" id="alt-modal-save">Save</button>
       </div>
@@ -15385,7 +15716,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const altClose = document.getElementById('alt-modal-close');
   const altAiBtn = document.getElementById('alt-modal-ai');
   const altAiStatus = document.getElementById('alt-modal-ai-status');
-  const altAiAvailable = !!(altAiBtn && altAiBtn.dataset.aiAvailable === '1');
   const MAX = 4;
   const timelineFeed = document.querySelector('.feed');
   const timelineItems = document.getElementById('timeline-items');
@@ -15648,14 +15978,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     ta.style.height = next + 'px';
     ta.style.overflowY = contentHeight > max ? 'auto' : 'hidden';
   }
-  function resetComposeTextareaLayout() {
-    const ta = document.getElementById('compose-content');
-    if (!ta) return;
-    ta.style.height = '';
-    ta.style.overflowY = '';
-    ta.scrollTop = 0;
-    autoGrowComposeTextarea();
-  }
   function openModal() {
     modal.classList.add('open');
     modal.setAttribute('aria-hidden', 'false');
@@ -15767,7 +16089,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   function clearComposeFieldsAfterClose() {
     const ta = document.getElementById('compose-content');
     if (ta) ta.value = '';
-    resetComposeTextareaLayout();
     const spoiler = form.querySelector('input[name="spoiler_text"]');
     if (spoiler) spoiler.value = '';
     const sens = form.querySelector('input[name="sensitive"]');
@@ -15947,10 +16268,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     setAltAiStatus('');
     if (altAiBtn) {
       altAiBtn.style.display = (isVideo || isAudio) ? 'none' : '';
-      altAiBtn.disabled = !altAiAvailable;
-      altAiBtn.title = altAiAvailable
-        ? 'Generate a draft description with AI (review before saving)'
-        : 'Add an AI API key in Profile settings to generate descriptions';
+      altAiBtn.disabled = false;
     }
     altModal.classList.add('open');
     altModal.setAttribute('aria-hidden', 'false');
@@ -15971,10 +16289,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
   async function generateAltWithAi() {
     if (altAiBusy || altEditIdx < 0 || altEditIdx >= files.length) return;
-    if (!altAiAvailable) {
-      setAltAiStatus('Add an AI API key in Profile settings to use AI describe.', true);
-      return;
-    }
     const file = files[altEditIdx];
     if (!file || !file.type.startsWith('image/')) {
       setAltAiStatus('AI describe works on images only (not video).', true);
@@ -15982,7 +16296,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     }
     altAiBusy = true;
     if (altAiBtn) altAiBtn.disabled = true;
-    setAltAiStatus('Generating …');
+    setAltAiStatus('Generating with Grok…');
     try {
       const fd = new FormData();
       fd.set('action', 'ai_alt_text');
@@ -16412,7 +16726,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       // Clear compose state for next open (strip quote prefills via soft reset)
       const ta = document.getElementById('compose-content');
       if (ta) ta.value = '';
-      resetComposeTextareaLayout();
       const spoiler = form.querySelector('input[name="spoiler_text"]');
       if (spoiler) spoiler.value = '';
       const sens = form.querySelector('input[name="sensitive"]');

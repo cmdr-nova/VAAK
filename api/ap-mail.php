@@ -11,8 +11,10 @@ function ap_mail_send(string $to, string $subject, string $text, string $html): 
     if (!is_file($configPath)) {
         $configPath = '/srv/mkultra/html/clearance/config.local.php';
     }
-    $cfg = is_file($configPath) ? require $configPath : [];
-    if (!is_array($cfg) || empty($cfg['smtp_user']) || empty($cfg['smtp_pass'])) {
+    /** @var mixed $cfgRaw */
+    $cfgRaw = is_file($configPath) ? require $configPath : [];
+    $cfg = is_array($cfgRaw) ? $cfgRaw : [];
+    if ($cfg === [] || empty($cfg['smtp_user']) || empty($cfg['smtp_pass'])) {
         error_log('[ap-mail] SMTP configuration unavailable');
         return false;
     }
@@ -20,6 +22,7 @@ function ap_mail_send(string $to, string $subject, string $text, string $html): 
     $port = (int) ($cfg['smtp_port'] ?? 587);
     $from = (string) ($cfg['smtp_from_email'] ?? 'clearance@mkultra.monster');
     $fromName = (string) ($cfg['smtp_from_name'] ?? 'Vaak');
+    $messageId = sprintf('<%s.%s@mkultra.monster>', bin2hex(random_bytes(8)), gmdate('YmdHis'));
     $fp = @stream_socket_client("tcp://{$host}:{$port}", $errno, $errstr, 20, STREAM_CLIENT_CONNECT);
     if (!$fp) {
         error_log('[ap-mail] SMTP connect failed: ' . $errstr);
@@ -49,10 +52,28 @@ function ap_mail_send(string $to, string $subject, string $text, string $html): 
         $write(base64_encode((string) $cfg['smtp_user'])); $expect('334'); $write(base64_encode((string) $cfg['smtp_pass'])); $expect('235');
         $write('MAIL FROM:<' . $from . '>'); $expect('250'); $write('RCPT TO:<' . $to . '>'); $expect('250'); $write('DATA'); $expect('354');
         $boundary = 'b_' . bin2hex(random_bytes(8));
-        $headers = ['Date: ' . date('r'), 'From: ' . $fromName . ' <' . $from . '>', 'To: <' . $to . '>', 'Subject: ' . $subject, 'MIME-Version: 1.0', 'Content-Type: multipart/alternative; boundary="' . $boundary . '"'];
-        $body = implode("\r\n", $headers) . "\r\n\r\n--{$boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{$text}\r\n--{$boundary}\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n{$html}\r\n--{$boundary}--\r\n";
+        $headers = [
+            'Date: ' . date('r'),
+            'From: ' . $fromName . ' <' . $from . '>',
+            'To: <' . $to . '>',
+            'Subject: ' . $subject,
+            'Message-ID: ' . $messageId,
+            'MIME-Version: 1.0',
+            'Content-Type: multipart/alternative; boundary="' . $boundary . '"',
+        ];
+        $body = implode("\r\n", $headers) . "\r\n\r\n"
+            . '--' . $boundary . "\r\n"
+            . "Content-Type: text/plain; charset=UTF-8\r\n"
+            . "Content-Transfer-Encoding: 8bit\r\n\r\n"
+            . $text . "\r\n"
+            . '--' . $boundary . "\r\n"
+            . "Content-Type: text/html; charset=UTF-8\r\n"
+            . "Content-Transfer-Encoding: 8bit\r\n\r\n"
+            . $html . "\r\n"
+            . '--' . $boundary . "--\r\n";
         $body = preg_replace('/^\./m', '..', $body) ?? $body;
         fwrite($fp, $body . "\r\n.\r\n"); $expect('250'); $write('QUIT'); fclose($fp);
+        error_log('[ap-mail] sent to=' . $to . ' subject=' . $subject . ' id=' . $messageId);
         return true;
     } catch (Throwable $e) {
         fclose($fp); error_log('[ap-mail] ' . $e->getMessage()); return false;

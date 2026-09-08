@@ -163,17 +163,8 @@ function ap_db_migrate_postgres(PDO $db): void
     // Verified Webmentions are public responses to local profile/post URLs.
     // Keep this table separate from ActivityPub notifications so external
     // mentions cannot enter the authenticated timeline or notification feed.
-    $webmentionsReady = false;
     try {
-        $webmentionsReady = (bool) $db->query(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'webmentions')"
-        )->fetchColumn();
-    } catch (Throwable $e) {
-        error_log('[ap-db] webmention table probe failed: ' . $e->getMessage());
-    }
-    if (!$webmentionsReady) {
-        try {
-            $db->exec(<<<'SQL'
+        $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS webmentions (
     id BIGSERIAL PRIMARY KEY,
     source_url TEXT NOT NULL,
@@ -189,11 +180,10 @@ CREATE TABLE IF NOT EXISTS webmentions (
     UNIQUE (source_url, target_url)
 )
 SQL);
-            $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
-            $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
-        } catch (Throwable $e) {
-            error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
-        }
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
+    } catch (Throwable $e) {
+        error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
     }
 
     // Local-only operator notices shown inside the authenticated VAAK shell.
@@ -393,10 +383,6 @@ SQL);
             if (!$hasColumn) $db->exec("ALTER TABLE actor_profile ADD COLUMN {$policyColumn} TEXT NOT NULL DEFAULT 'anyone'");
         } catch (Throwable $e) { error_log('[ap-db] interaction policy column not provisioned: ' . $e->getMessage()); }
     }
-    try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'remote_actors' AND column_name = 'profile_json'")->fetchColumn();
-        if (!$hasColumn) $db->exec('ALTER TABLE remote_actors ADD COLUMN profile_json TEXT');
-    } catch (Throwable $e) { error_log('[ap-db] remote profile cache column not provisioned: ' . $e->getMessage()); }
 
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
@@ -605,11 +591,6 @@ SQL);
     }
     if (!in_array('quote_policy', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN quote_policy TEXT NOT NULL DEFAULT 'anyone'");
-    }
-    $remoteActorCols = $db->query('PRAGMA table_info(remote_actors)')->fetchAll();
-    $remoteActorNames = array_column($remoteActorCols, 'name');
-    if (!in_array('profile_json', $remoteActorNames, true)) {
-        $db->exec('ALTER TABLE remote_actors ADD COLUMN profile_json TEXT');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -1036,7 +1017,6 @@ CREATE TABLE IF NOT EXISTS remote_actors (
     host TEXT,
     icon_source_url TEXT,
     image_source_url TEXT,
-    profile_json TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -9009,10 +8989,92 @@ function ap_dm_peer_from_conversation_id(string $id, ?int $ownerUserId = null): 
 function ap_remote_actor_get(string $actorId): ?array
 {
     $actorId = rtrim(trim($actorId), '/');
-    $st = ap_db()->prepare('SELECT * FROM remote_actors WHERE actor_id = ?');
-    $st->execute([$actorId]);
+    if ($actorId === '') {
+        return null;
+    }
+    if (!isset($GLOBALS['ap_remote_actor_memo']) || !is_array($GLOBALS['ap_remote_actor_memo'])) {
+        $GLOBALS['ap_remote_actor_memo'] = [];
+    }
+    /** @var array<string,array<string,mixed>|null> $memo */
+    $memo = &$GLOBALS['ap_remote_actor_memo'];
+    if (array_key_exists($actorId, $memo)) {
+        return $memo[$actorId];
+    }
+    $st = ap_db()->prepare('SELECT * FROM remote_actors WHERE actor_id = ? OR actor_id = ? LIMIT 1');
+    $st->execute([$actorId, $actorId . '/']);
     $row = $st->fetch();
-    return is_array($row) ? $row : null;
+    $memo[$actorId] = is_array($row) ? $row : null;
+    if (is_array($row)) {
+        $rid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if ($rid !== '' && $rid !== $actorId) {
+            $memo[$rid] = $row;
+        }
+    }
+    return $memo[$actorId];
+}
+
+/**
+ * Batch-load remote_actors into the request memo (timeline hydration hot path).
+ *
+ * @param list<string> $actorIds
+ */
+function ap_remote_actors_prefetch(array $actorIds): void
+{
+    $want = [];
+    foreach ($actorIds as $aid) {
+        $aid = rtrim(trim((string) $aid), '/');
+        if ($aid !== '' && str_starts_with($aid, 'https://')) {
+            $want[$aid] = true;
+            $want[$aid . '/'] = true;
+        }
+    }
+    if ($want === []) {
+        return;
+    }
+    if (!isset($GLOBALS['ap_remote_actor_memo']) || !is_array($GLOBALS['ap_remote_actor_memo'])) {
+        $GLOBALS['ap_remote_actor_memo'] = [];
+    }
+    /** @var array<string,array<string,mixed>|null> $memo */
+    $memo = &$GLOBALS['ap_remote_actor_memo'];
+    $missing = [];
+    foreach (array_keys($want) as $aid) {
+        $root = rtrim($aid, '/');
+        if (!array_key_exists($root, $memo)) {
+            $missing[$root] = true;
+            $missing[$root . '/'] = true;
+        }
+    }
+    if ($missing === []) {
+        return;
+    }
+    try {
+        foreach (array_chunk(array_keys($missing), 400) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $st = ap_db()->prepare("SELECT * FROM remote_actors WHERE actor_id IN ($ph)");
+            $st->execute($chunk);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $rid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($rid === '') {
+                    continue;
+                }
+                $memo[$rid] = $row;
+                $memo[$rid . '/'] = $row;
+                unset($missing[$rid], $missing[$rid . '/']);
+            }
+        }
+        // Remember misses so we don't re-query.
+        foreach (array_keys($missing) as $aid) {
+            $root = rtrim($aid, '/');
+            if (!array_key_exists($root, $memo)) {
+                $memo[$root] = null;
+            }
+        }
+    } catch (Throwable $e) {
+        // leave memo unchanged; per-card lookups still work
+    }
 }
 
 /** True when a cached username is useless (path DID, empty, etc.). */
@@ -9033,7 +9095,7 @@ function ap_remote_actor_username_is_placeholder(?string $username): bool
 }
 
 /**
- * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string,profile_json?:?string} $fields
+ * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string} $fields
  */
 function ap_remote_actor_upsert(string $actorId, array $fields): void
 {
@@ -9061,27 +9123,23 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     $host = $fields['host'] ?? ($existing['host'] ?? null);
     $icon = $fields['icon_source_url'] ?? ($existing['icon_source_url'] ?? null);
     $image = $fields['image_source_url'] ?? ($existing['image_source_url'] ?? null);
-    $profileJson = isset($fields['profile_json']) && is_string($fields['profile_json']) && $fields['profile_json'] !== ''
-        ? $fields['profile_json']
-        : (is_array($existing) ? ($existing['profile_json'] ?? null) : null);
     if (is_string($icon)) {
         $icon = ap_profile_sanitize_https_url($icon);
     }
     if (is_string($image)) {
         $image = ap_profile_sanitize_https_url($image);
     }
-    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, profile_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_id) DO UPDATE SET
            username = COALESCE(excluded.username, remote_actors.username),
            display_name = COALESCE(excluded.display_name, remote_actors.display_name),
            host = COALESCE(excluded.host, remote_actors.host),
            icon_source_url = COALESCE(excluded.icon_source_url, remote_actors.icon_source_url),
            image_source_url = COALESCE(excluded.image_source_url, remote_actors.image_source_url),
-           profile_json = COALESCE(excluded.profile_json, remote_actors.profile_json),
            updated_at = excluded.updated_at';
     // Best-effort cache write: never take down admin HTML mid-render on lock.
-    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, $profileJson, ap_db_now()]) === false) {
+    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, ap_db_now()]) === false) {
         error_log('[ap-db] remote_actor_upsert skipped (locked): ' . $actorId);
     }
 }
@@ -9148,7 +9206,6 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                     'host' => is_string($host) ? strtolower($host) : null,
                     'icon_source_url' => $icon,
                     'image_source_url' => $image,
-                    'profile_json' => json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                 ]);
                 if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
                     ap_remote_emoji_ingest_actor_doc($actorId, $doc);
@@ -9178,7 +9235,7 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
  *
  * @return array{username:string,display_name:string,host:string,handle:string,acct:string}
  */
-function ap_remote_actor_label(string $actorId, bool $allowFetch = true): array
+function ap_remote_actor_label(string $actorId, bool $allowFetch = false): array
 {
     $actorId = rtrim(trim($actorId), '/');
     $host = parse_url($actorId, PHP_URL_HOST);
@@ -9475,7 +9532,7 @@ function ap_remote_emoji_ensure_for_display(string $actorId, string $displayName
 /**
  * HTML-escape text and replace :shortcode: with <img class="custom-emoji"> when known.
  */
-function ap_emoji_html(string $text, ?string $actorId = null): string
+function ap_emoji_html(string $text, ?string $actorId = null, bool $allowFetch = false): string
 {
     if ($text === '') {
         return '';
@@ -9485,9 +9542,10 @@ function ap_emoji_html(string $text, ?string $actorId = null): string
         $h = parse_url($actorId, PHP_URL_HOST);
         $host = is_string($h) ? strtolower($h) : null;
         if ($host && str_contains($text, ':')) {
-            // Fetch the host emoji map once when a display name introduces an
-            // unfamiliar shortcode; subsequent renders use the local cache.
-            ap_remote_emoji_ensure_for_display($actorId, $text, true);
+            // Cache-only by default. Sync emoji HTTP on Federated timelines
+            // was adding ~2s per unfamiliar host (transfem.social etc.).
+            // Opt in with $allowFetch=true on profile/detail views if needed.
+            ap_remote_emoji_ensure_for_display($actorId, $text, $allowFetch);
         }
     }
     $map = $host ? ap_remote_emoji_map_for_host($host) : [];

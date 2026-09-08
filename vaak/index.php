@@ -172,6 +172,16 @@ $mode = preg_replace('/[^a-z]/', '', (string) ($_GET['mode'] ?? '')) ?: '';
 if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset') {
     $mode = '';
 }
+// Flash messages from PRG redirects (forgot / reset password).
+ap_auth_start_session();
+if (!empty($_SESSION['vaak_flash_ok']) && is_string($_SESSION['vaak_flash_ok'])) {
+    $notice = (string) $_SESSION['vaak_flash_ok'];
+    unset($_SESSION['vaak_flash_ok']);
+}
+if (!empty($_SESSION['vaak_flash_err']) && is_string($_SESSION['vaak_flash_err'])) {
+    $error = (string) $_SESSION['vaak_flash_err'];
+    unset($_SESSION['vaak_flash_err']);
+}
 
 if (isset($_GET['logout'])) {
     ap_auth_logout();
@@ -220,24 +230,29 @@ if ($isAuthPost) {
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['action'] ?? '') === 'forgot') {
     if (ap_auth_csrf_ok((string) ($_POST['csrf'] ?? ''))) {
         ap_auth_request_password_reset((string) ($_POST['login'] ?? ''));
-        $notice = 'If that account has an email address, a reset link is on its way.';
-    } else {
-        $error = 'Session expired — try again.';
+        // PRG: avoid duplicate sends if the browser retries the POST.
+        ap_auth_start_session();
+        $_SESSION['vaak_flash_ok'] = 'If that account has an email address, a reset link is on its way.';
+        header('Location: /vaak/?mode=forgot', true, 303);
+        exit;
     }
+    $error = 'Session expired — try again.';
     $mode = 'forgot';
 }
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['action'] ?? '') === 'reset') {
     if (!ap_auth_csrf_ok((string) ($_POST['csrf'] ?? ''))) {
         $error = 'Session expired — try again.';
+        $mode = 'reset';
     } else {
         $res = ap_auth_consume_password_reset((string) ($_POST['token'] ?? ''), (string) ($_POST['password'] ?? ''));
         if (!empty($res['ok'])) {
-            $notice = 'Password updated. You can now log in.';
-            $mode = 'login';
-        } else {
-            $error = $res['error'] ?? 'Could not reset password.';
-            $mode = 'reset';
+            ap_auth_start_session();
+            $_SESSION['vaak_flash_ok'] = 'Password updated. You can now log in.';
+            header('Location: /vaak/?mode=login', true, 303);
+            exit;
         }
+        $error = $res['error'] ?? 'Could not reset password.';
+        $mode = 'reset';
     }
 }
 
@@ -392,14 +407,26 @@ ASCII;
     <?php if ($notice): ?><div class="flash ok"><?= htmlspecialchars($notice, ENT_QUOTES, 'UTF-8') ?></div><?php endif; ?>
 
     <?php if ($mode === 'forgot'): ?>
-      <form method="post" action="/vaak/?mode=forgot">
+      <form method="post" action="/vaak/?mode=forgot" id="forgot-form">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
         <input type="hidden" name="action" value="forgot">
         <label for="login">Username or email</label>
         <input id="login" name="login" required autocomplete="username" placeholder="username or email">
-        <button type="submit">Email reset link</button>
+        <button type="submit" id="forgot-submit">Email reset link</button>
       </form>
       <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
+      <script>
+        (function () {
+          const form = document.getElementById('forgot-form');
+          const btn = document.getElementById('forgot-submit');
+          if (!form || !btn) return;
+          form.addEventListener('submit', () => {
+            if (btn.disabled) return;
+            btn.disabled = true;
+            btn.textContent = 'Sending…';
+          });
+        })();
+      </script>
     <?php elseif ($mode === 'reset'): ?>
       <form method="post" action="/vaak/?mode=reset">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
