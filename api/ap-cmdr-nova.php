@@ -1013,7 +1013,6 @@ function ap_cmdr_note_html(array $row, array $create): void
     $vanityBadge = !empty($p['vanity_verified'])
         ? ' <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span>'
         : '';
-    $operatorBadge = ' <span class="operator-badge" title="Administrator and operator of this VAAK server" aria-label="Server operator">Server operator</span>';
     $avatar = htmlspecialchars((string) ($p['icon_url'] ?: '/img/avatar/current-wafrn-avatar.webp'), ENT_QUOTES, 'UTF-8');
     $noteId = htmlspecialchars((string) ($row['id'] ?? ''), ENT_QUOTES, 'UTF-8');
 
@@ -1248,6 +1247,7 @@ function ap_cmdr_html(): void
     $vanityBadge = !empty($p['vanity_verified'])
         ? ' <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span>'
         : '';
+    $operatorBadge = ' <span class="operator-badge" title="Administrator and operator of this VAAK server" aria-label="Server operator">Server operator</span>';
     // Keep anchors clickable; force safe rel on any <a>
     $summary = strip_tags($p['summary'], '<p><br><a><code><strong><em><b><i>');
     $summary = preg_replace_callback(
