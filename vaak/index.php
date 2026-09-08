@@ -443,7 +443,7 @@ ASCII;
                placeholder="••••••••••">
         <button type="submit">Log in</button>
       </form>
-      <p class="switch"><a href="/vaak/?mode=forgot">Forgot password?</a> · Have an invite? <a href="/vaak/?mode=register">Register</a></p>
+      <p class="switch">Have an invite? <a href="/vaak/?mode=register">Register</a><br><a href="/vaak/?mode=forgot">Forgot password?</a></p>
     <?php endif; ?>
 
     <nav class="policies" aria-label="Policies">
