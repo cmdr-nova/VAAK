@@ -15646,6 +15646,14 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     ta.style.height = next + 'px';
     ta.style.overflowY = contentHeight > max ? 'auto' : 'hidden';
   }
+  function resetComposeTextareaLayout() {
+    const ta = document.getElementById('compose-content');
+    if (!ta) return;
+    ta.style.height = '';
+    ta.style.overflowY = '';
+    ta.scrollTop = 0;
+    autoGrowComposeTextarea();
+  }
   function openModal() {
     modal.classList.add('open');
     modal.setAttribute('aria-hidden', 'false');
@@ -15757,6 +15765,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   function clearComposeFieldsAfterClose() {
     const ta = document.getElementById('compose-content');
     if (ta) ta.value = '';
+    resetComposeTextareaLayout();
     const spoiler = form.querySelector('input[name="spoiler_text"]');
     if (spoiler) spoiler.value = '';
     const sens = form.querySelector('input[name="sensitive"]');
@@ -16394,6 +16403,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       // Clear compose state for next open (strip quote prefills via soft reset)
       const ta = document.getElementById('compose-content');
       if (ta) ta.value = '';
+      resetComposeTextareaLayout();
       const spoiler = form.querySelector('input[name="spoiler_text"]');
       if (spoiler) spoiler.value = '';
       const sens = form.querySelector('input[name="sensitive"]');
