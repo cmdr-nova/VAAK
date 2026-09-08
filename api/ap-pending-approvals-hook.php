@@ -16,7 +16,7 @@
  * }
  *
  * Stores an inbound DM for @cmdr_nova so VAAK / Ice Cubes surface it like the
- * Mastodon @approvals → @valerie direct messages.
+ * Mastodon @approvals → @cmdr_nova direct messages.
  */
 declare(strict_types=1);
 

@@ -1,7 +1,7 @@
 <?php
 /**
  * Live local actor @cmdr_nova@mkultra.monster
- * Accept + follow-back, outbox, observe — Bridgy keeps val3r1e@mkultra.monster.
+ * Accept + follow-back, outbox, and observe for the local cmdr_nova account.
  * Profile fields come from SQLite (editable via /admin?view=profile).
  */
 declare(strict_types=1);

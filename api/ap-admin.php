@@ -30,9 +30,7 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
 }
 require_once __DIR__ . '/ap-inbox.php';
 
-const VALERIE_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
-const VALERIE_PRIV = '/etc/mkultra/ap-inbox/cmdr_nova_private.pem';
-const VALERIE_KEY_ID = 'https://mkultra.monster/users/cmdr_nova#main-key';
+const LOCAL_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
 
 // --- Session gate (login at /vaak/) ---
 // Never auto-login from HTTP Basic — that ignored the password and bound cmdr_nova.
@@ -761,7 +759,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 define('AP_INBOX_LIB_ONLY', true);
             }
             require_once __DIR__ . '/ap-inbox.php';
-            $result = ap_valerie_post_reply(
+            $result = ap_local_post_reply(
                 $content,
                 $inReplyTo,
                 $toActor !== '' ? $toActor : null,
@@ -2266,7 +2264,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
             require_once __DIR__ . '/ap-inbox.php';
             $mediaIds = ap_draft_media_ids($draft);
-            $result = ap_valerie_post_reply(
+            $result = ap_local_post_reply(
                 (string) ($draft['content'] ?? ''),
                 (string) ($draft['in_reply_to'] ?? ''),
                 (($ta = trim((string) ($draft['to_actor'] ?? ''))) !== '' ? $ta : null),
@@ -14839,7 +14837,7 @@ if (VIEW === 'analytics') loadAnalytics();
 /**
  * @return array{ok:bool,error?:string,create_id?:string,delivered?:int,queued?:int}
  */
-function ap_valerie_post_reply(
+function ap_local_post_reply(
     string $content,
     string $inReplyTo,
     ?string $toActor,
@@ -14849,9 +14847,9 @@ function ap_valerie_post_reply(
     array $mediaLocalIds = [],
     string $visibility = 'public'
 ): array {
-    $localActor = function_exists('ap_local_actor_id') ? ap_local_actor_id() : VALERIE_ACTOR;
+    $localActor = function_exists('ap_local_actor_id') ? ap_local_actor_id() : LOCAL_ACTOR;
     $replyTo = ($inReplyTo === ''
-        || $inReplyTo === VALERIE_ACTOR
+        || $inReplyTo === LOCAL_ACTOR
         || $inReplyTo === $localActor
         || (function_exists('vaak_actor_id') && $inReplyTo === vaak_actor_id())
     ) ? null : $inReplyTo;

@@ -963,7 +963,7 @@ function ap_as_id($value): ?string
 }
 
 /**
- * Route a verified activity to cmdr_nova / valerie handlers; always returns action label.
+ * Route a verified activity to the local cmdr_nova handler; always returns an action label.
  */
 function ap_route_verified_activity(array $activity, int $bytes): string
 {
