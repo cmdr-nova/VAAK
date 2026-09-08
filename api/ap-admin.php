@@ -9701,9 +9701,9 @@ function admin_render_home_suggestions(array $suggestions): void
           <div style="margin:0 0 .65rem;line-height:1.35">
             <div class="meta" style="margin-bottom:.15rem;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word"><?= h($who) ?><?php if ($eng > 0): ?> · <?= $eng ?><?php endif; ?></div>
             <?php if ($surl !== ''): ?>
-              <a href="<?= h(admin_status_href($surl, $view)) ?>" style="color:var(--text);text-decoration:none"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></a>
+              <a href="<?= h(admin_status_href($surl, $view)) ?>" style="display:block;min-width:0;max-width:100%;color:var(--text);text-decoration:none;overflow-wrap:anywhere;word-break:break-word"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></a>
             <?php else: ?>
-              <span><?= h($excerpt !== '' ? $excerpt : '(media)') ?></span>
+              <span style="display:block;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></span>
             <?php endif; ?>
           </div>
         <?php endforeach; ?>
