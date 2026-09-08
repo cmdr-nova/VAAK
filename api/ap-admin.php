@@ -15360,7 +15360,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     <div class="alt-modal__ft">
       <span class="meta" id="alt-modal-count">0 / 1500</span>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-ghost" id="alt-modal-ai" title="Generate a draft description with Grok (review before saving)">✦ Generate with AI</button>
+        <button type="button" class="btn btn-ghost" id="alt-modal-ai" title="Generate a draft description with AI (review before saving)" data-ai-available="<?= admin_xai_config()['api_key'] !== '' ? '1' : '0' ?>">✦ Generate with AI</button>
         <button type="button" class="btn btn-ghost" id="alt-modal-cancel">Cancel</button>
         <button type="button" class="btn btn-primary" id="alt-modal-save">Save</button>
       </div>
@@ -15384,6 +15384,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const altClose = document.getElementById('alt-modal-close');
   const altAiBtn = document.getElementById('alt-modal-ai');
   const altAiStatus = document.getElementById('alt-modal-ai-status');
+  const altAiAvailable = !!(altAiBtn && altAiBtn.dataset.aiAvailable === '1');
   const MAX = 4;
   const timelineFeed = document.querySelector('.feed');
   const timelineItems = document.getElementById('timeline-items');
@@ -15945,7 +15946,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     setAltAiStatus('');
     if (altAiBtn) {
       altAiBtn.style.display = (isVideo || isAudio) ? 'none' : '';
-      altAiBtn.disabled = false;
+      altAiBtn.disabled = !altAiAvailable;
+      altAiBtn.title = altAiAvailable
+        ? 'Generate a draft description with AI (review before saving)'
+        : 'Add an AI API key in Profile settings to generate descriptions';
     }
     altModal.classList.add('open');
     altModal.setAttribute('aria-hidden', 'false');
@@ -15966,6 +15970,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
   async function generateAltWithAi() {
     if (altAiBusy || altEditIdx < 0 || altEditIdx >= files.length) return;
+    if (!altAiAvailable) {
+      setAltAiStatus('Add an AI API key in Profile settings to use AI describe.', true);
+      return;
+    }
     const file = files[altEditIdx];
     if (!file || !file.type.startsWith('image/')) {
       setAltAiStatus('AI describe works on images only (not video).', true);
@@ -15973,7 +15981,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     }
     altAiBusy = true;
     if (altAiBtn) altAiBtn.disabled = true;
-    setAltAiStatus('Generating with Grok…');
+    setAltAiStatus('Generating …');
     try {
       const fd = new FormData();
       fd.set('action', 'ai_alt_text');
