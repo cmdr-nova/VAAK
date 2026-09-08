@@ -17,6 +17,7 @@ require_once __DIR__ . '/ap-import-export.php'; // alsoKnownAs / movedTo on acto
 require_once __DIR__ . '/ap-link-preview.php';
 require_once __DIR__ . '/ap-featured.php'; // Profile Featured accounts tab
 require_once __DIR__ . '/ap-sl-link.php';
+require_once __DIR__ . '/ap-feeds.php';
 
 $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
@@ -55,6 +56,12 @@ if (preg_match('#^/users/cmdr_nova/inbox$#', $path)) {
 if ($method !== 'GET' && $method !== 'HEAD') {
     header('Allow: GET, HEAD');
     http_response_code(405);
+    exit;
+}
+
+if ($path === '/users/cmdr_nova/feed.xml' || $path === '/users/cmdr_nova/feed.atom') {
+    $profile = function_exists('ap_profile_get') ? ap_profile_get('cmdr_nova') : [];
+    ap_feed_render('cmdr_nova', (string) ($profile['name'] ?? '@cmdr_nova'), str_ends_with($path, '.atom') ? 'atom' : 'rss');
     exit;
 }
 
@@ -708,6 +715,7 @@ function ap_cmdr_shell_start(string $title): void
       .stats a:hover .n{color:#7ee0ff}
       .stats .n{font-size:1.25rem;font-weight:700;color:#00ff9f}
       .stats .l{font-size:.8rem;color:#999;text-transform:uppercase;letter-spacing:.04em}
+      .feed-links{font-size:.8rem;margin:.65rem 0 0}.feed-links a{color:#999}.feed-links a:hover{color:#7ee0ff}
       .profile-tabs{display:flex;gap:.35rem;margin:1.15rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a;flex-wrap:wrap}
       .profile-tabs a{appearance:none;text-decoration:none;color:#aaa;font-size:.9rem;font-weight:600;padding:.45rem .9rem;border-radius:999px;border:1px solid transparent;background:transparent}
       .profile-tabs a:hover{color:#eee;background:#1a1a1a}
@@ -1394,6 +1402,7 @@ function ap_cmdr_html(): void
     echo '<a href="/users/cmdr_nova/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $followingCount . '</span><span class="l">Following</span></a>';
     echo '<a href="/users/cmdr_nova/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $followerCount . '</span><span class="l">Followers</span></a>';
     echo '</div>';
+    echo '<p class="feed-links"><a href="/users/cmdr_nova/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/cmdr_nova/feed.atom" type="application/atom+xml">Atom</a></p>';
     if ($bskyHandle !== null) {
         echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
     }

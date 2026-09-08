@@ -24,3 +24,9 @@ keys, bearer tokens, database URLs, or user/runtime data.
 
 Deployment routing and service configuration remain environment-specific and are
 not included here.
+
+## Public Feeds
+
+Local actor profiles expose public outbox feeds at `/users/{username}/feed.xml`
+(RSS 2.0) and `/users/{username}/feed.atom` (Atom 1.0). Private and
+followers-only posts are excluded.

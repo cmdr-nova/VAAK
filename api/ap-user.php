@@ -13,6 +13,7 @@ require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-import-export.php'; // alsoKnownAs / movedTo on multi-user actor docs
 require_once __DIR__ . '/ap-sl-link.php';
 require_once __DIR__ . '/ap-featured.php';
+require_once __DIR__ . '/ap-feeds.php';
 
 $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
@@ -82,6 +83,12 @@ if ($sub === 'inbox') {
 if ($method !== 'GET' && $method !== 'HEAD') {
     header('Allow: GET, HEAD');
     http_response_code(405);
+    exit;
+}
+
+if ($sub === 'feed.xml' || $sub === 'feed.atom') {
+    $feedProfile = function_exists('ap_profile_get') ? ap_profile_get($actorKey) : [];
+    ap_feed_render($actorKey, (string) ($feedProfile['name'] ?? ('@' . $actorKey)), $sub === 'feed.atom' ? 'atom' : 'rss');
     exit;
 }
 
@@ -559,6 +566,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . count($following) . '</span><span class="l">Following</span></a>';
     echo '<a href="/users/' . $safe . '/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . count($followers) . '</span><span class="l">Followers</span></a>';
     echo '</div>';
+    echo '<p class="feed-links"><a href="/users/' . $safe . '/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/' . $safe . '/feed.atom" type="application/atom+xml">Atom</a></p>';
 
     if ($bskyHandle !== null) {
         echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
@@ -796,6 +804,7 @@ function ap_user_html_shell_start(string $title): void
       .stats a{text-decoration:none;color:inherit}
       .stats .n{display:block;font-size:1.25rem;font-weight:700;color:#00ff9f}
       .stats .l{font-size:.8rem;color:#999;text-transform:uppercase}
+      .feed-links{font-size:.8rem;margin:.65rem 0 0}.feed-links a{color:#999}.feed-links a:hover{color:#7ee0ff}
       .profile-tabs{display:flex;gap:.35rem;margin:1.15rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a;flex-wrap:wrap}
       .profile-tabs a{text-decoration:none;color:#aaa;font-size:.9rem;font-weight:600;padding:.45rem .9rem;border-radius:999px}
       .profile-tabs a:hover{color:#eee;background:#1a1a1a}
