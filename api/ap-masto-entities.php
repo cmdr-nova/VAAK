@@ -3989,7 +3989,15 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 250'
         );
         $st->execute([$ownerUserId]);
+        $seenActivityIds = [];
         foreach ($st->fetchAll() as $row) {
+            $activityId = trim((string) ($row['activity_id'] ?? ''));
+            if ($activityId !== '') {
+                if (isset($seenActivityIds[$activityId])) {
+                    continue;
+                }
+                $seenActivityIds[$activityId] = true;
+            }
             $t = ap_masto_mention_notif_type($row);
             if ($t === null || !in_array($t, $want, true)) {
                 continue;

@@ -4142,6 +4142,26 @@ function ap_mention_store(array $row): void
     if ($activityType === '') {
         $activityType = null;
     }
+    // ActivityPub senders may retry the same activity with a different
+    // wrapper/object URL. Reuse the existing canonical object key so one
+    // action cannot create two notification rows.
+    $activityId = trim((string) ($row['activity_id'] ?? ''));
+    if ($activityId !== '') {
+        try {
+            $dup = ap_db()->prepare(
+                'SELECT object_id FROM mentions
+                 WHERE owner_user_id = ? AND activity_id = ? AND deleted_at IS NULL
+                 ORDER BY id ASC LIMIT 1'
+            );
+            $dup->execute([$ownerUserId, $activityId]);
+            $existingObjectId = trim((string) ($dup->fetchColumn() ?: ''));
+            if ($existingObjectId !== '') {
+                $objectId = $existingObjectId;
+            }
+        } catch (Throwable $e) {
+            // Keep notification storage best-effort on older schemas.
+        }
+    }
     $db = ap_db();
     $stmt = $db->prepare(
         'INSERT INTO mentions (owner_user_id, owner_actor_id, created_at, activity_id, object_id, actor_id, type, content, in_reply_to, deleted_at, media_urls, activity_type, spoiler_text, sensitive)
