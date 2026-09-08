@@ -4655,7 +4655,7 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
         $typeClause,
         // Allow media-only posts (empty text summary) onto timelines
         "( (summary IS NOT NULL AND summary != '') OR (media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]') OR (spoiler_text IS NOT NULL AND spoiler_text != '') OR (sensitive IS NOT NULL AND sensitive != 0) )",
-        "(action_taken = 'log' OR action_taken = 'local_observe')",
+        "action_taken IN ('log', 'local_observe')",
     ];
 
     if ($mode === 'home') {

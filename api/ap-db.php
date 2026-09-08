@@ -184,13 +184,19 @@ function ap_db_migrate_postgres(PDO $db): void
     // Timeline queries constrain actor/type/action and then sort by recency.
     // Keep this best-effort because the PHP-FPM role may not own indexes.
     try {
-        $idx = $db->query("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname IN ('idx_events_actor_type_action_created', 'idx_events_type_action_created')")->fetchAll(PDO::FETCH_COLUMN);
+        $idx = $db->query("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname IN ('idx_events_actor_type_action_created', 'idx_events_type_action_created', 'idx_events_timeline_actor_created', 'idx_events_timeline_created')")->fetchAll(PDO::FETCH_COLUMN);
         $idx = array_fill_keys(array_map('strval', $idx), true);
         if (empty($idx['idx_events_actor_type_action_created'])) {
             $db->exec('CREATE INDEX IF NOT EXISTS idx_events_actor_type_action_created ON events(actor_id, type, action_taken, created_at DESC, id DESC)');
         }
         if (empty($idx['idx_events_type_action_created'])) {
             $db->exec('CREATE INDEX IF NOT EXISTS idx_events_type_action_created ON events(type, action_taken, created_at DESC, id DESC)');
+        }
+        if (empty($idx['idx_events_timeline_actor_created'])) {
+            $db->exec("CREATE INDEX IF NOT EXISTS idx_events_timeline_actor_created ON events(actor_id, created_at DESC, id DESC) WHERE type IN ('Create','Announce') AND action_taken IN ('log','local_observe')");
+        }
+        if (empty($idx['idx_events_timeline_created'])) {
+            $db->exec("CREATE INDEX IF NOT EXISTS idx_events_timeline_created ON events(created_at DESC, id DESC) WHERE type IN ('Create','Announce') AND action_taken IN ('log','local_observe')");
         }
     } catch (Throwable $e) {
         error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
