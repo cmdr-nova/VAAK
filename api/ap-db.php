@@ -163,8 +163,17 @@ function ap_db_migrate_postgres(PDO $db): void
     // Verified Webmentions are public responses to local profile/post URLs.
     // Keep this table separate from ActivityPub notifications so external
     // mentions cannot enter the authenticated timeline or notification feed.
+    $webmentionsReady = false;
     try {
-        $db->exec(<<<'SQL'
+        $webmentionsReady = (bool) $db->query(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'webmentions')"
+        )->fetchColumn();
+    } catch (Throwable $e) {
+        error_log('[ap-db] webmention table probe failed: ' . $e->getMessage());
+    }
+    if (!$webmentionsReady) {
+        try {
+            $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS webmentions (
     id BIGSERIAL PRIMARY KEY,
     source_url TEXT NOT NULL,
@@ -180,10 +189,11 @@ CREATE TABLE IF NOT EXISTS webmentions (
     UNIQUE (source_url, target_url)
 )
 SQL);
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
-    } catch (Throwable $e) {
-        error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
+        } catch (Throwable $e) {
+            error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
+        }
     }
 
     // Local-only operator notices shown inside the authenticated VAAK shell.
