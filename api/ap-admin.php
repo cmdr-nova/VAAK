@@ -9699,7 +9699,7 @@ function admin_render_home_suggestions(array $suggestions): void
             $eng = (int) ($ts['reblogs_count'] ?? 0) + (int) ($ts['favourites_count'] ?? 0) + (int) ($ts['replies_count'] ?? 0);
           ?>
           <div style="margin:0 0 .65rem;line-height:1.35">
-            <div class="meta" style="margin-bottom:.15rem"><?= h($who) ?><?php if ($eng > 0): ?> · <?= $eng ?><?php endif; ?></div>
+            <div class="meta" style="margin-bottom:.15rem;min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word"><?= h($who) ?><?php if ($eng > 0): ?> · <?= $eng ?><?php endif; ?></div>
             <?php if ($surl !== ''): ?>
               <a href="<?= h(admin_status_href($surl, $view)) ?>" style="color:var(--text);text-decoration:none"><?= h($excerpt !== '' ? $excerpt : '(media)') ?></a>
             <?php else: ?>
