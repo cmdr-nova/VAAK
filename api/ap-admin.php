@@ -2145,6 +2145,33 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
         $error = $res['error'] ?? 'Could not save reply.';
         $_GET['topic'] = (string) $topicId;
+    } elseif ($action === 'discuss_topic_delete' || $action === 'discuss_post_delete') {
+        $view = 'discuss';
+        if ($vaakActorKey !== 'cmdr_nova') {
+            $error = 'Only the server operator can moderate discussions.';
+        } elseif ($action === 'discuss_topic_delete') {
+            $topicId = (int) ($_POST['topic_id'] ?? 0);
+            $categorySlug = strtolower(trim((string) ($_POST['category_slug'] ?? '')));
+            $res = ap_discuss_topic_delete($topicId);
+            if (!empty($res['ok'])) {
+                $notice = 'Discussion deleted.';
+                header('Location: ?view=discuss' . ($categorySlug !== '' ? '&category=' . rawurlencode($categorySlug) : ''));
+                exit;
+            }
+            $error = $res['error'] ?? 'Could not delete discussion.';
+            $_GET['topic'] = (string) $topicId;
+        } else {
+            $postId = (int) ($_POST['post_id'] ?? 0);
+            $res = ap_discuss_post_delete($postId);
+            if (!empty($res['ok'])) {
+                $topicId = (int) ($res['topic_id'] ?? 0);
+                $notice = 'Reply deleted.';
+                header('Location: ?view=discuss&topic=' . $topicId);
+                exit;
+            }
+            $error = $res['error'] ?? 'Could not delete reply.';
+            $_GET['topic'] = (string) ($res['topic_id'] ?? ($_POST['topic_id'] ?? 0));
+        }
     } elseif ($action === 'notice_reply') {
         $view = 'notices';
         $res = ap_notice_reply_add(
@@ -9082,13 +9109,23 @@ header('Content-Type: text/html; charset=utf-8');
           <article class="forum-topic-head side-card" style="margin-bottom:1rem">
             <div class="meta">Discussion</div>
             <h1 style="margin:.15rem 0 .35rem;font-size:1.35rem"><?= h((string) ($discussTopic['title'] ?? '')) ?></h1>
-            <div class="meta">Started by <b>@<?= h((string) ($discussTopic['username'] ?? 'local user')) ?></b> · <?= h(relative_time((string) ($discussTopic['created_at'] ?? ''))) ?><?= !empty($discussTopic['locked']) ? ' · locked' : '' ?></div>
+            <div style="display:flex;justify-content:space-between;gap:1rem;align-items:center;flex-wrap:wrap">
+              <div class="meta">Started by <b>@<?= h((string) ($discussTopic['username'] ?? 'local user')) ?></b> · <?= h(relative_time((string) ($discussTopic['created_at'] ?? ''))) ?><?= !empty($discussTopic['locked']) ? ' · locked' : '' ?></div>
+              <?php if ($vaakActorKey === 'cmdr_nova'): ?>
+                <form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this discussion and all of its replies?');">
+                  <input type="hidden" name="action" value="discuss_topic_delete">
+                  <input type="hidden" name="topic_id" value="<?= $discussTopicId ?>">
+                  <input type="hidden" name="category_slug" value="<?= h((string) ($discussTopic['category_slug'] ?? '')) ?>">
+                  <button class="btn btn-ghost" type="submit">Delete discussion</button>
+                </form>
+              <?php endif; ?>
+            </div>
           </article>
           <?php foreach ($discussPosts as $dp): ?>
             <article id="post-<?= (int) ($dp['id'] ?? 0) ?>" class="side-card" style="margin-bottom:.75rem">
               <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:baseline;flex-wrap:wrap">
                 <div><b>@<?= h((string) ($dp['username'] ?? 'local user')) ?></b><span class="meta"> · <?= h(relative_time((string) ($dp['created_at'] ?? ''))) ?></span></div>
-                <a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a>
+                <div style="display:flex;gap:.65rem;align-items:center"><a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a><?php if ($vaakActorKey === 'cmdr_nova'): ?><form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this reply?');"><input type="hidden" name="action" value="discuss_post_delete"><input type="hidden" name="post_id" value="<?= (int) ($dp['id'] ?? 0) ?>"><input type="hidden" name="topic_id" value="<?= $discussTopicId ?>"><button class="btn btn-ghost" type="submit">Delete</button></form><?php endif; ?></div>
               </div>
               <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= nl2br(h((string) ($dp['body'] ?? ''))) ?></div>
             </article>

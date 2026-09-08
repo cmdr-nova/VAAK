@@ -252,3 +252,51 @@ function ap_discuss_post_create(int $topicId, int $ownerUserId, string $body): a
         return ['ok' => false, 'error' => 'Could not save reply.'];
     }
 }
+
+function ap_discuss_topic_delete(int $topicId): array
+{
+    if ($topicId < 1) {
+        return ['ok' => false, 'error' => 'Invalid discussion.'];
+    }
+    try {
+        $db = ap_db();
+        $check = $db->prepare('SELECT 1 FROM ap_discuss_topics WHERE id = ? LIMIT 1');
+        $check->execute([$topicId]);
+        if (!$check->fetchColumn()) {
+            return ['ok' => false, 'error' => 'Discussion not found.'];
+        }
+        $db->beginTransaction();
+        $db->prepare('DELETE FROM ap_discuss_posts WHERE topic_id = ?')->execute([$topicId]);
+        $db->prepare('DELETE FROM ap_discuss_reads WHERE topic_id = ?')->execute([$topicId]);
+        $db->prepare('DELETE FROM ap_discuss_topics WHERE id = ?')->execute([$topicId]);
+        $db->commit();
+        return ['ok' => true];
+    } catch (Throwable $e) {
+        if (isset($db) && $db instanceof PDO && $db->inTransaction()) {
+            $db->rollBack();
+        }
+        error_log('[ap-discuss] topic_delete: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not delete discussion.'];
+    }
+}
+
+function ap_discuss_post_delete(int $postId): array
+{
+    if ($postId < 1) {
+        return ['ok' => false, 'error' => 'Invalid reply.'];
+    }
+    try {
+        $db = ap_db();
+        $check = $db->prepare('SELECT topic_id FROM ap_discuss_posts WHERE id = ? LIMIT 1');
+        $check->execute([$postId]);
+        $topicId = (int) $check->fetchColumn();
+        if ($topicId < 1) {
+            return ['ok' => false, 'error' => 'Reply not found.'];
+        }
+        $db->prepare('DELETE FROM ap_discuss_posts WHERE id = ?')->execute([$postId]);
+        return ['ok' => true, 'topic_id' => $topicId];
+    } catch (Throwable $e) {
+        error_log('[ap-discuss] post_delete: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not delete reply.'];
+    }
+}
