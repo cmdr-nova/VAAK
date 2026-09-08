@@ -3,8 +3,8 @@
  * CLI: purge unused remote avatar/header cache from R2 + SQLite.
  *
  * Usage:
- *   php ap-media-cleanup.php           # 7-day unused (default)
- *   php ap-media-cleanup.php --days=7 --limit=200
+ *   php ap-media-cleanup.php           # 30-day unused (default)
+ *   php ap-media-cleanup.php --days=30 --limit=200
  *
  * Cron (recommended daily):
  *   30 4 * * * www-data php /srv/mkultra/html/api/ap-media-cleanup.php >> /var/log/mkultra-ap-media-cleanup.log 2>&1
@@ -19,7 +19,7 @@ if (PHP_SAPI !== 'cli') {
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-r2.php';
 
-$days = 7;
+$days = 30;
 $limit = 200;
 foreach ($argv as $arg) {
     if (preg_match('/^--days=(\d+)$/', $arg, $m)) {

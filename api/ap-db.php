@@ -8612,10 +8612,15 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
         return $memo[$actorId];
     }
     $row = ap_remote_actor_get($actorId);
+    // Refresh profile metadata periodically even when a usable row exists.
+    // Timeline requests pass allowFetch=false, while background warmers and
+    // profile views can keep names/bios/media source URLs current.
+    $updatedAt = is_array($row) ? (strtotime((string) ($row['updated_at'] ?? '')) ?: 0) : 0;
     $needsFetch = $allowFetch && (
         $row === null
         || ap_remote_actor_username_is_placeholder($row['username'] ?? null)
         || (str_contains($actorId, 'bsky.brid.gy/ap/did:') && ap_remote_actor_username_is_placeholder($row['username'] ?? null))
+        || $updatedAt < (time() - 12 * 3600)
     );
     if ($needsFetch && function_exists('ap_fetch_as2_object')) {
         try {

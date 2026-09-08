@@ -15,7 +15,7 @@
  *   45 4 * * * www-data php /srv/mkultra/html/api/ap-maintain.php --events-days=14 >> /var/log/mkultra/ap-maintain.log 2>&1
  *   15 5 * * 0 www-data php /srv/mkultra/html/api/ap-maintain.php --vacuum-only >> /var/log/mkultra/ap-maintain.log 2>&1
  *
- * Related (separate cron): ap-media-cleanup.php purges unused R2 avatar/header blobs (7d).
+ * Related (separate cron): ap-media-cleanup.php purges unused R2 avatar/header blobs (30d).
  */
 declare(strict_types=1);
 

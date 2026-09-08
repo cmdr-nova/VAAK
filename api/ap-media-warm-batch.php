@@ -69,7 +69,7 @@ function warm_batch_log(string $msg): void
 /**
  * @return list<string>
  */
-function warm_batch_collect_actors(int $eventsScan): array
+function warm_batch_collect_actors(int $eventsScan, int $staleDays): array
 {
     $seen = [];
     $out = [];
@@ -113,6 +113,18 @@ function warm_batch_collect_actors(int $eventsScan): array
         $add((string) ($r['actor_id'] ?? ''));
     }
 
+    // Refresh older profile metadata too, even when its media blob is still
+    // present. This keeps names, handles, and changed avatar/header URLs from
+    // going stale indefinitely.
+    $cutoff = gmdate('c', time() - max(1, $staleDays) * 86400);
+    $stale = ap_db()->prepare(
+        'SELECT actor_id FROM remote_actors WHERE updated_at < ? ORDER BY updated_at ASC LIMIT 200'
+    );
+    $stale->execute([$cutoff]);
+    foreach ($stale->fetchAll() as $r) {
+        $add((string) ($r['actor_id'] ?? ''));
+    }
+
     return $out;
 }
 
@@ -135,7 +147,7 @@ function warm_batch_needs(string $actorId, string $kind, int $staleDays, bool $f
     return (time() - $fetched) >= ($staleDays * 86400);
 }
 
-$actors = warm_batch_collect_actors($eventsScan);
+$actors = warm_batch_collect_actors($eventsScan, $staleDays);
 warm_batch_log(sprintf(
     'start candidates=%d limit=%d stale_days=%d force=%s sleep_ms=%d',
     count($actors),
@@ -155,6 +167,14 @@ $failed = 0;
 foreach ($actors as $actorId) {
     if ($attempted >= $limit) {
         break;
+    }
+    // Metadata refresh is intentionally separate from media freshness.
+    if (!$force && function_exists('ap_remote_actor_ensure')) {
+        try {
+            ap_remote_actor_ensure($actorId, true);
+        } catch (Throwable $e) {
+            warm_batch_log('actor_refresh_failed actor=' . $actorId . ' error=' . $e->getMessage());
+        }
     }
     $needA = warm_batch_needs($actorId, 'avatar', $staleDays, $force);
     $needH = warm_batch_needs($actorId, 'header', $staleDays, $force);

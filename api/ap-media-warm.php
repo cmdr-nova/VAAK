@@ -23,6 +23,12 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
 }
 require_once __DIR__ . '/ap-inbox.php';
 
+// Refresh the actor document even when avatar/header blobs are still fresh.
+// This keeps cached names, handles, and source URLs current without making
+// timeline requests perform synchronous remote fetches.
+if (function_exists('ap_remote_actor_ensure')) {
+    ap_remote_actor_ensure($actor, true);
+}
 $a = ap_remote_media_ensure($actor, 'avatar', false);
 $h = ap_remote_media_ensure($actor, 'header', false);
 fwrite(STDOUT, 'warm ' . $actor . ' avatar=' . ($a ? 'ok' : 'no') . ' header=' . ($h ? 'ok' : 'no') . "\n");
