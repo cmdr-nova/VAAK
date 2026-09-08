@@ -9529,6 +9529,17 @@ header('Content-Type: text/html; charset=utf-8');
                           }
                           $nAcctKnown = ltrim(trim((string) ($nMention['acct'] ?? '')), '@');
                           if ($nAcctKnown !== '' && str_contains($nAcctKnown, '@') && str_starts_with($nSnippet, '@' . $nAcctKnown)) {
+                              // Some Wafrn payloads glue the local domain to the first word
+                              // after the handle (for example: mkultra.monsterone more).
+                              $nParts = explode('@', $nAcctKnown, 2);
+                              $nLocalHost = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
+                              $nMentionHost = strtolower((string) ($nParts[1] ?? ''));
+                              if ($nLocalHost !== '' && str_starts_with($nMentionHost, $nLocalHost) && strlen($nMentionHost) > strlen($nLocalHost)) {
+                                  $nAcctDisplay = $nParts[0] . '@' . $nLocalHost;
+                                  $nSuffix = substr($nMentionHost, strlen($nLocalHost));
+                                  $nSnippet = '@' . $nAcctDisplay . ' ' . $nSuffix . substr($nSnippet, strlen($nAcctKnown) + 1);
+                                  break;
+                              }
                               $afterMention = strlen($nAcctKnown) + 1;
                               if (isset($nSnippet[$afterMention]) && !preg_match('/\s/u', $nSnippet[$afterMention])) {
                                   $nSnippet = substr($nSnippet, 0, $afterMention) . ' ' . substr($nSnippet, $afterMention);
