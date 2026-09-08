@@ -12880,6 +12880,19 @@ header('Content-Type: text/html; charset=utf-8');
 
   function playNotifSound() {
     if (!notifSoundUnlocked) return;
+    // Avoid duplicate chimes when Safari has two Vaak tabs polling at
+    // different times, or when an unread counter briefly resets and rises
+    // again for the same notification set.
+    try {
+      const signature = String(lastNotifCount) + ':' + String(lastDmCount);
+      const key = 'vaak-notif-chime-v1';
+      const now = Date.now();
+      const prior = JSON.parse(localStorage.getItem(key) || 'null');
+      if (prior && prior.signature === signature && (now - Number(prior.at || 0)) < 10 * 60 * 1000) {
+        return;
+      }
+      localStorage.setItem(key, JSON.stringify({ signature, at: now }));
+    } catch (e) {}
     try {
       notifAudio.currentTime = 0;
       const p = notifAudio.play();
