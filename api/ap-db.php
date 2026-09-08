@@ -309,6 +309,17 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
     }
+    // Notification feeds filter by account and soft-delete state, then page by id.
+    try {
+        $hasNotifIndex = (bool) $db->query(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_mentions_owner_deleted_id'"
+        )->fetchColumn();
+        if (!$hasNotifIndex) {
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_mentions_owner_deleted_id ON mentions(owner_user_id, deleted_at, id DESC)');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] notification index not provisioned: ' . $e->getMessage());
+    }
     try {
         $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'auto_unblur_sensitive'")->fetchColumn();
         if (!$hasColumn) {
