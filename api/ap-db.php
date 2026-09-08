@@ -160,6 +160,31 @@ function ap_db(): PDO
  */
 function ap_db_migrate_postgres(PDO $db): void
 {
+    // Verified Webmentions are public responses to local profile/post URLs.
+    // Keep this table separate from ActivityPub notifications.
+    try {
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS webmentions (
+    id BIGSERIAL PRIMARY KEY,
+    source_url TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    source_title TEXT NOT NULL DEFAULT '',
+    source_content TEXT NOT NULL DEFAULT '',
+    source_author TEXT NOT NULL DEFAULT '',
+    source_published TEXT,
+    source_host TEXT NOT NULL DEFAULT '',
+    verified_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source_url, target_url)
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
+    } catch (Throwable $e) {
+        error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
+    }
+
     // Local-only operator notices shown inside the authenticated VAAK shell.
     // They are intentionally not ActivityPub objects or federation content.
     $noticeTablesReady = false;
@@ -281,7 +306,7 @@ SQL);
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies',
         'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
-        'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta',
+        'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
         'remote_media_cache', 'site_syndications',
     ];
     $st = $db->query("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()");
@@ -907,6 +932,22 @@ CREATE TABLE IF NOT EXISTS ap_discuss_reads (
     PRIMARY KEY (owner_user_id, topic_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ap_discuss_reads_topic ON ap_discuss_reads(topic_id, last_read_at);
+CREATE TABLE IF NOT EXISTS webmentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_url TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    source_title TEXT NOT NULL DEFAULT '',
+    source_content TEXT NOT NULL DEFAULT '',
+    source_author TEXT NOT NULL DEFAULT '',
+    source_published TEXT,
+    source_host TEXT NOT NULL DEFAULT '',
+    verified_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source_url, target_url)
+);
+CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC);
 INSERT OR IGNORE INTO ap_discuss_categories (slug, name, description, position, created_at, updated_at) VALUES
     ('general', 'General', 'Open discussion for local VAAK users.', 10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
     ('help', 'Help & support', 'Questions, troubleshooting, and practical help.', 20, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),

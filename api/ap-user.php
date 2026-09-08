@@ -783,6 +783,7 @@ function ap_user_html_shell_start(string $title): void
     echo '<link rel="icon" href="/vaak/profile-favicon.ico?v=20260907b" sizes="any">';
     echo '<link rel="icon" href="/vaak/profile-favicon-32x32.png?v=20260907b" type="image/png" sizes="32x32">';
     echo '<link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">';
+    echo '<link rel="webmention" href="https://mkultra.monster/api/ap-webmention.php">';
     echo '<style>
       :root{color-scheme:dark}
       body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#ddd}

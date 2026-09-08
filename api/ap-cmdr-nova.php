@@ -691,6 +691,7 @@ function ap_cmdr_shell_start(string $title): void
     echo '<link rel="icon" href="/vaak/profile-favicon.ico?v=20260907b" sizes="any">';
     echo '<link rel="icon" href="/vaak/profile-favicon-32x32.png?v=20260907b" type="image/png" sizes="32x32">';
     echo '<link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">';
+    echo '<link rel="webmention" href="https://mkultra.monster/api/ap-webmention.php">';
     echo '<style>
       body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#e8e8e8;line-height:1.55}
       main{max-width:42rem;margin:3rem auto;padding:0 1.25rem;box-sizing:border-box}

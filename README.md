@@ -30,3 +30,7 @@ not included here.
 Local actor profiles expose public outbox feeds at `/users/{username}/feed.xml`
 (RSS 2.0) and `/users/{username}/feed.atom` (Atom 1.0). Private and
 followers-only posts are excluded.
+
+Public profiles advertise the Webmention endpoint at
+`/api/ap-webmention.php`. Verified mentions can be read as JSON with a
+`target` query parameter; unverified or blocked sources are rejected.
