@@ -161,7 +161,8 @@ function ap_db(): PDO
 function ap_db_migrate_postgres(PDO $db): void
 {
     // Verified Webmentions are public responses to local profile/post URLs.
-    // Keep this table separate from ActivityPub notifications.
+    // Keep this table separate from ActivityPub notifications so external
+    // mentions cannot enter the authenticated timeline or notification feed.
     try {
         $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS webmentions (
@@ -3009,6 +3010,27 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
         $ctxExtra['FeaturedCollection'] = 'https://w3id.org/fep/7aa9#FeaturedCollection';
         $ctxExtra['canFeature'] = 'https://w3id.org/fep/7aa9#canFeature';
     }
+    $actorAttachments = ap_cmdr_actor_attachments_with_policies(
+        is_array($p['attachment'] ?? null) ? $p['attachment'] : []
+    );
+    // Advertise the public Bridgy/Bluesky identity to ActivityPub clients.
+    // This is metadata only; no Bluesky credentials or private state is exposed.
+    if ($actorKey === 'cmdr_nova') {
+        $hasBluesky = false;
+        foreach ($actorAttachments as $item) {
+            if (strtolower(trim((string) ($item['name'] ?? ''))) === 'bluesky') {
+                $hasBluesky = true;
+                break;
+            }
+        }
+        if (!$hasBluesky) {
+            $actorAttachments[] = [
+                'type' => 'PropertyValue',
+                'name' => 'Bluesky',
+                'value' => '<a href="https://bsky.app/profile/cmdr-nova.mkultra.monster.ap.brid.gy" rel="me">@cmdr-nova.mkultra.monster.ap.brid.gy</a>',
+            ];
+        }
+    }
     $actor = [
         '@context' => [
             'https://www.w3.org/ns/activitystreams',
@@ -3044,9 +3066,7 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
                 ],
         ],
         'published' => '2018-01-01T00:00:00Z',
-        'attachment' => ap_cmdr_actor_attachments_with_policies(
-            is_array($p['attachment'] ?? null) ? $p['attachment'] : []
-        ),
+        'attachment' => $actorAttachments,
         'publicKey' => [
             'id' => $id . '#main-key',
             'owner' => $id,
@@ -5394,6 +5414,7 @@ function ap_webmention_rows_for_target(string $targetUrl, int $limit = 6): array
     }
 }
 
+/** Small, safe HTML presentation for verified mentions on public pages. */
 function ap_webmention_cards_html(string $targetUrl): string
 {
     $rows = ap_webmention_rows_for_target($targetUrl);
@@ -5408,7 +5429,8 @@ function ap_webmention_cards_html(string $targetUrl): string
         $body = trim((string) ($row['source_content'] ?? ''));
         $label = $title !== '' ? $title : ($author !== '' ? $author : 'External response');
         $date = trim((string) ($row['source_published'] ?? $row['verified_at'] ?? ''));
-        $html .= '<article class="webmention-card"><a href="' . $source . '" rel="nofollow noopener noreferrer" target="_blank">'
+        $html .= '<article class="webmention-card">';
+        $html .= '<a href="' . $source . '" rel="nofollow noopener noreferrer" target="_blank">'
             . htmlspecialchars($label, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>';
         if ($body !== '') {
             $html .= '<p>' . htmlspecialchars(mb_strimwidth($body, 0, 500, '…', 'UTF-8'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
