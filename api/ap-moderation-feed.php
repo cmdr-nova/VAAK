@@ -18,36 +18,42 @@ if ($method !== 'GET') {
 
 $actors = [];
 $domains = [];
+$domainPolicies = [];
 foreach (function_exists('ap_block_list') ? ap_block_list() : [] as $row) {
-    if (!is_array($row) || (string) ($row['action'] ?? '') !== 'block') {
+    if (!is_array($row)) {
         continue;
     }
     $scope = (string) ($row['scope'] ?? '');
+    $kind = strtolower(trim((string) ($row['kind'] ?? 'block')));
     $value = trim((string) ($row['value'] ?? ''));
     if ($value === '') {
         continue;
     }
-    if ($scope === 'actor' && str_starts_with($value, 'https://')) {
+    if ($scope === 'actor' && $kind === 'block' && str_starts_with($value, 'https://')) {
         $actors[] = rtrim($value, '/');
-    } elseif ($scope === 'domain') {
-        $domains[] = strtolower(ltrim($value, '.'));
+    } elseif ($scope === 'domain' && in_array($kind, ['block', 'suspend'], true)) {
+        $domain = strtolower(ltrim($value, '.'));
+        $domains[] = $domain;
+        $domainPolicies[] = ['domain' => $domain, 'action' => $kind];
     }
 }
 $actors = array_values(array_unique($actors));
 $domains = array_values(array_unique($domains));
 sort($actors, SORT_STRING);
 sort($domains, SORT_STRING);
+usort($domainPolicies, static fn(array $a, array $b): int => [$a['domain'], $a['action']] <=> [$b['domain'], $b['action']]);
 $doc = [
     'version' => 1,
     'instance' => 'https://mkultra.monster',
     'policy' => [
         'scope' => 'global',
-        'actions' => ['block'],
+        'actions' => ['block', 'suspend'],
         'personal_mutes_excluded' => true,
         'report_details_excluded' => true,
     ],
     'blocked_actors' => $actors,
     'blocked_domains' => $domains,
+    'domain_policies' => $domainPolicies,
 ];
 $json = json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 $etag = '"' . sha1((string) $json) . '"';
