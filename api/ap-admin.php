@@ -5455,9 +5455,10 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
             $html = ap_dm_linkify_html($html);
             $html = function_exists('ap_dm_sanitize_html') ? ap_dm_sanitize_html($html) : $html;
         }
-        // Remove template indentation around tags without changing paragraph breaks.
-        $html = preg_replace('/(^|>)[\h]+/u', '$1', $html) ?? $html;
-        $html = preg_replace('/[\h]+(<|$)/u', '$1', $html) ?? $html;
+        // Remove template indentation around structural tags, but preserve
+        // spaces around inline anchors (for example "see <a>this</a> here").
+        $html = preg_replace('/(^|>)[\h]+(?=<(?:p|ul|ol|li|br)\b)/iu', '$1', $html) ?? $html;
+        $html = preg_replace('/[\h]+(?=<\/?(?:p|ul|ol|li|br)\b|$)/iu', '', $html) ?? $html;
         if ($extra !== '' && !str_contains($html, 'class="dm-actions"')) {
             $html .= "\n" . $extra;
         }
