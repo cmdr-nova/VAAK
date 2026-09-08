@@ -9127,7 +9127,7 @@ header('Content-Type: text/html; charset=utf-8');
                 <div><b>@<?= h((string) ($dp['username'] ?? 'local user')) ?></b><span class="meta"> · <?= h(relative_time((string) ($dp['created_at'] ?? ''))) ?></span></div>
                 <div style="display:flex;gap:.65rem;align-items:center"><a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a><?php if ($vaakActorKey === 'cmdr_nova'): ?><form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this reply?');"><input type="hidden" name="action" value="discuss_post_delete"><input type="hidden" name="post_id" value="<?= (int) ($dp['id'] ?? 0) ?>"><input type="hidden" name="topic_id" value="<?= $discussTopicId ?>"><button class="btn btn-ghost" type="submit">Delete</button></form><?php endif; ?></div>
               </div>
-              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= nl2br(h((string) ($dp['body'] ?? ''))) ?></div>
+              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= h((string) ($dp['body'] ?? '')) ?></div>
             </article>
           <?php endforeach; ?>
           <?php if (empty($discussTopic['locked'])): ?>
@@ -9211,14 +9211,14 @@ header('Content-Type: text/html; charset=utf-8');
             <article class="side-card" style="margin-bottom:1rem">
               <div class="meta" style="margin-bottom:.35rem">Server notice · <?= h(relative_time((string) ($nr['updated_at'] ?? ''))) ?><?= empty($nr['published']) ? ' · unpublished' : '' ?></div>
               <?php if ($ntitle !== ''): ?><h2 style="margin:.1rem 0 .55rem"><?= h($ntitle) ?></h2><?php endif; ?>
-              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere"><?= nl2br(h($nbody)) ?></div>
+              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere"><?= h($nbody) ?></div>
               <?php if ($nreplies): ?>
                 <div style="margin-top:1rem;padding-top:.75rem;border-top:1px solid var(--border)">
                   <div class="meta" style="margin-bottom:.45rem">Local replies</div>
                   <?php foreach ($nreplies as $reply): ?>
                     <div style="padding:.55rem 0;border-top:1px solid rgba(255,255,255,.08)">
                       <div class="meta"><b>@<?= h((string) ($reply['username'] ?? 'local user')) ?></b> · <?= h(relative_time((string) ($reply['created_at'] ?? ''))) ?></div>
-                      <div style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.2rem"><?= nl2br(h((string) ($reply['body'] ?? ''))) ?></div>
+                      <div style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.2rem"><?= h((string) ($reply['body'] ?? '')) ?></div>
                     </div>
                   <?php endforeach; ?>
                 </div>
