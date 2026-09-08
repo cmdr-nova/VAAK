@@ -34,3 +34,8 @@ followers-only posts are excluded.
 Public profiles advertise the Webmention endpoint at
 `/api/ap-webmention.php`. Verified mentions can be read as JSON with a
 `target` query parameter; unverified or blocked sources are rejected.
+
+The admin Import/Export screen supports Mastodon-compatible CSV portability
+for follows, mutes, blocks, blocked domains, bookmarks, lists, and followed
+hashtags (`followed_tags.csv`). Imports merge into the current account and do
+not delete existing relationships.
