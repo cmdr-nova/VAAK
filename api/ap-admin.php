@@ -27,6 +27,7 @@ require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
+require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -589,13 +590,21 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $wantJsonCsrf = !empty($_POST['ajax'])
             || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
             || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        // PHP empties $_POST/$_FILES when the body exceeds post_max_size or
+        // max_input_time — the browser still shows 100% uploaded, then we used
+        // to mis-report that as "session expired" because csrf was missing.
+        $contentLen = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+        $postLooksTruncated = $contentLen > 65536 && empty($_POST) && empty($_FILES);
+        $csrfError = $postLooksTruncated
+            ? 'Upload too large or timed out while the server was receiving it. Videos must be under 50MB (images 10MB). Try a shorter/compressed clip, or upload on Wi‑Fi.'
+            : 'Session expired — refresh the page and try again.';
         if ($wantJsonCsrf) {
             header('Content-Type: application/json; charset=utf-8');
-            http_response_code(403);
-            echo json_encode(['ok' => false, 'error' => 'Session expired — refresh and try again.']);
+            http_response_code($postLooksTruncated ? 413 : 403);
+            echo json_encode(['ok' => false, 'error' => $csrfError]);
             exit;
         }
-        $error = 'Session expired — refresh the page and try again.';
+        $error = $csrfError;
         $action = '';
     }
     // Server-wide / operator-only mutations (UI views are gated; POSTs must be too)
@@ -1144,7 +1153,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $fieldValues = $_POST['field_value'] ?? [];
         $attachment = [];
         if (is_array($fieldNames) && is_array($fieldValues)) {
-            $n = min(count($fieldNames), count($fieldValues), 4);
+            $n = min(count($fieldNames), count($fieldValues), 8);
             for ($i = 0; $i < $n; $i++) {
                 $attachment[] = [
                     'name' => (string) $fieldNames[$i],
@@ -2400,6 +2409,60 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
             }
         }
+    } elseif ($action === 'upload_media') {
+        // Pre-upload a single attachment so compose/post bodies stay small on mobile.
+        $wantJsonUp = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        $altOne = trim((string) ($_POST['description'] ?? $_POST['media_alt'] ?? ''));
+        $file = $_FILES['file'] ?? $_FILES['media'] ?? null;
+        $upError = null;
+        $upId = 0;
+        $upType = '';
+        $upUrl = '';
+        $upPreview = '';
+        if (!is_array($file) || !isset($file['tmp_name'])) {
+            $upError = 'No file uploaded.';
+        } else {
+            // Normalize multi-file shape to one file (first only).
+            if (is_array($file['tmp_name'] ?? null)) {
+                $file = [
+                    'name' => (string) ($file['name'][0] ?? ''),
+                    'type' => (string) ($file['type'][0] ?? ''),
+                    'tmp_name' => (string) ($file['tmp_name'][0] ?? ''),
+                    'error' => (int) ($file['error'][0] ?? UPLOAD_ERR_NO_FILE),
+                    'size' => (int) ($file['size'][0] ?? 0),
+                ];
+            }
+            $resUp = function_exists('ap_media_ingest_upload')
+                ? ap_media_ingest_upload($file, $altOne !== '' ? $altOne : null)
+                : ['ok' => false, 'error' => 'Media upload unavailable.'];
+            if (empty($resUp['ok'])) {
+                $upError = (string) ($resUp['error'] ?? 'Media upload failed');
+            } else {
+                $upId = (int) ($resUp['local_id'] ?? 0);
+                $att = is_array($resUp['attachment'] ?? null) ? $resUp['attachment'] : [];
+                $upType = (string) ($att['type'] ?? '');
+                $upUrl = (string) ($att['url'] ?? '');
+                $upPreview = (string) ($att['preview_url'] ?? $upUrl);
+            }
+        }
+        if ($wantJsonUp) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            http_response_code($upError === null ? 200 : 400);
+            echo json_encode([
+                'ok' => $upError === null && $upId > 0,
+                'error' => $upError,
+                'media_id' => $upId > 0 ? $upId : null,
+                'type' => $upType !== '' ? $upType : null,
+                'url' => $upUrl !== '' ? $upUrl : null,
+                'preview_url' => $upPreview !== '' ? $upPreview : null,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $error = $upError ?? 'Media upload requires AJAX.';
+        $composerForceOpen = true;
     } elseif ($action === 'save_draft') {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? ($_POST['compose_return_view'] ?? 'home'))) ?: 'home';
         $view = $returnView;
@@ -2646,17 +2709,25 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
-    $count = function_exists('ap_masto_notifications_unread_count')
-        ? ap_masto_notifications_unread_count(80)
-        : 0;
-    $dmCount = function_exists('ap_dm_unread_count') ? ap_dm_unread_count() : 0;
-    $latestNotifId = '';
+    // Bypass the short file cache so mobile polls see new mentions promptly.
+    // latest_unread_id (not overall latest) drives the AIM chime — hydration
+    // of the full notifications feed used to make overall latest_id jump around.
+    $state = [
+        'count' => 0,
+        'last_read_id' => '0',
+        'latest_unread_id' => '',
+        'latest_id' => '',
+    ];
     try {
-        $latest = function_exists('ap_masto_notifications_fetch') ? ap_masto_notifications_fetch(1) : [];
-        $latestNotifId = (string) ($latest[0]['id'] ?? '');
+        if (function_exists('ap_masto_notifications_unread_state')) {
+            $state = ap_masto_notifications_unread_state(80, true);
+        } elseif (function_exists('ap_masto_notifications_unread_count')) {
+            $state['count'] = ap_masto_notifications_unread_count(80);
+        }
     } catch (Throwable $e) {
         // Keep the lightweight badge endpoint usable if a remote actor is stale.
     }
+    $dmCount = function_exists('ap_dm_unread_count') ? ap_dm_unread_count() : 0;
     $latestDmId = '';
     try {
         $ownerForDm = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
@@ -2670,12 +2741,106 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     } catch (Throwable $e) {
         // Keep the badge endpoint usable if DM metadata is temporarily busy.
     }
+    $latestUnread = preg_replace('/\D+/', '', (string) ($state['latest_unread_id'] ?? '')) ?: '';
+    $latestAny = preg_replace('/\D+/', '', (string) ($state['latest_id'] ?? '')) ?: '';
     echo json_encode([
-        'count' => (int) $count,
+        'count' => (int) ($state['count'] ?? 0),
         'dm_count' => (int) $dmCount,
-        'latest_id' => $latestNotifId,
+        'latest_unread_id' => $latestUnread,
+        // Keep latest_id as an alias of the unread tip for older cached JS.
+        'latest_id' => $latestUnread !== '' ? $latestUnread : $latestAny,
+        'last_read_id' => preg_replace('/\D+/', '', (string) ($state['last_read_id'] ?? '0')) ?: '0',
         'latest_dm_id' => $latestDmId,
     ], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+// Browser Web Push (VAAK session → oauth token → push_subscriptions)
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'push_vapid') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $pub = function_exists('ap_webpush_vapid_public_key') ? ap_webpush_vapid_public_key() : '';
+    echo json_encode([
+        'ok' => $pub !== '',
+        'publicKey' => $pub,
+        'error' => $pub === '' ? 'VAPID keys not configured on this server.' : null,
+    ], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'push_status') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $uid = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
+    $enabled = $uid > 0 && function_exists('ap_webpush_user_has_subscription')
+        ? ap_webpush_user_has_subscription($uid)
+        : false;
+    echo json_encode(['ok' => true, 'subscribed' => $enabled], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+if (
+    ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+    && isset($_GET['ajax'])
+    && in_array((string) $_GET['ajax'], ['push_subscribe', 'push_unsubscribe'], true)
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $csrfTok = (string) ($_POST['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
+    if (!ap_auth_csrf_ok($csrfTok)) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Session expired — refresh and try again.']);
+        exit;
+    }
+    $uid = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
+    if ($uid < 1) {
+        http_response_code(401);
+        echo json_encode(['ok' => false, 'error' => 'Not signed in.']);
+        exit;
+    }
+    $ajaxPush = (string) $_GET['ajax'];
+    try {
+        if ($ajaxPush === 'push_unsubscribe') {
+            $tokPack = ap_webpush_vaak_web_token_for_user($uid);
+            if (!empty($tokPack['ok']) && !empty($tokPack['token_row']['id'])) {
+                ap_webpush_subscription_delete((int) $tokPack['token_row']['id']);
+            }
+            echo json_encode(['ok' => true, 'subscribed' => false]);
+            exit;
+        }
+        $raw = file_get_contents('php://input');
+        $in = [];
+        if (is_string($raw) && $raw !== '' && str_starts_with(ltrim($raw), '{')) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $in = $decoded;
+            }
+        }
+        if ($in === [] && !empty($_POST['subscription'])) {
+            $subRaw = $_POST['subscription'];
+            if (is_string($subRaw)) {
+                $decoded = json_decode($subRaw, true);
+                if (is_array($decoded)) {
+                    $in['subscription'] = $decoded;
+                }
+            } elseif (is_array($subRaw)) {
+                $in['subscription'] = $subRaw;
+            }
+        }
+        $tokPack = ap_webpush_vaak_web_token_for_user($uid);
+        if (empty($tokPack['ok'])) {
+            echo json_encode(['ok' => false, 'error' => $tokPack['error'] ?? 'Could not mint push token.']);
+            exit;
+        }
+        $entity = ap_webpush_subscription_upsert(
+            $tokPack['token_row'],
+            (string) $tokPack['access_token'],
+            $in
+        );
+        echo json_encode(['ok' => true, 'subscribed' => true, 'subscription' => $entity], JSON_UNESCAPED_SLASHES);
+    } catch (Throwable $e) {
+        error_log('[ap-admin] push ajax: ' . $e->getMessage());
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Could not update push subscription.']);
+    }
     exit;
 }
 
@@ -2735,14 +2900,31 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
         echo '<div class="meta">No link signal yet…</div>';
     } else {
         foreach ($trendLinks as $ln) {
-            $title = (string) ($ln['title'] ?? $ln['url'] ?? 'link');
-            $url = (string) ($ln['url'] ?? '');
-            echo '<div style="margin:0 0 .55rem;line-height:1.35">';
-            if ($url !== '') {
-                echo '<a href="' . h($url) . '" rel="noopener noreferrer" target="_blank">'
-                    . h($admin_strim($title, 72)) . '</a>';
+            $title = trim((string) ($ln['title'] ?? ''));
+            $url = trim((string) ($ln['url'] ?? ''));
+            $host = $url !== '' ? strtolower((string) (parse_url($url, PHP_URL_HOST) ?: '')) : '';
+            // When OG title is missing we used to dump the raw URL as the label —
+            // unbroken query strings blew out the right rail. Prefer host + short path.
+            $titleIsUrl = $title === '' || $title === $url
+                || str_starts_with($title, 'http://') || str_starts_with($title, 'https://');
+            if ($titleIsUrl && $url !== '') {
+                $path = (string) (parse_url($url, PHP_URL_PATH) ?: '');
+                $label = $host !== '' ? $host : $url;
+                if ($path !== '' && $path !== '/') {
+                    $label .= $admin_strim($path, 36);
+                }
             } else {
-                echo h($admin_strim($title, 72));
+                $label = $admin_strim($title !== '' ? $title : ($host !== '' ? $host : 'link'), 72);
+            }
+            echo '<div class="trend-link">';
+            if ($url !== '') {
+                echo '<a href="' . h($url) . '" rel="noopener noreferrer" target="_blank" title="' . h($url) . '">'
+                    . h($label) . '</a>';
+                if (!$titleIsUrl && $host !== '') {
+                    echo '<span class="trend-link-host">' . h($host) . '</span>';
+                }
+            } else {
+                echo h($label);
             }
             echo '</div>';
         }
@@ -5477,6 +5659,9 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
     if (function_exists('ap_plain_unglue_mentions')) {
         $plain = ap_plain_unglue_mentions($plain);
     }
+    if (function_exists('ap_masto_unglue_host_mentions')) {
+        $plain = ap_masto_unglue_host_mentions($plain);
+    }
     if (function_exists('ap_masto_unglue_bare_handles')) {
         $plain = ap_masto_unglue_bare_handles($plain);
     }
@@ -5504,7 +5689,8 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
         foreach ($mm as $hit) {
             $user = $hit[2];
             $host = strtolower($hit[3]);
-            $acctKey = strtolower($user . '@' . $host);
+            $acctFull = $user . '@' . $host;
+            $acctKey = strtolower($acctFull);
             if (isset($byAcct[$acctKey])) {
                 continue;
             }
@@ -5516,12 +5702,14 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
             if (function_exists('ap_masto_mention_from_actor')) {
                 $resolved = ap_masto_mention_from_actor($actor);
                 $byAcct[$acctKey] = [
-                    'acct' => (string) ($resolved['acct'] ?? ($user . '@' . $host)),
+                    // Prefer the written @user@host so the whole handle is linked
+                    // (local actors otherwise collapse to bare username).
+                    'acct' => $acctFull,
                     'username' => (string) ($resolved['username'] ?? $user),
                     'url' => (string) ($resolved['url'] ?? $actor),
                 ];
             } else {
-                $byAcct[$acctKey] = ['acct' => $user . '@' . $host, 'username' => $user, 'url' => $actor];
+                $byAcct[$acctKey] = ['acct' => $acctFull, 'username' => $user, 'url' => $actor];
             }
         }
     }
@@ -5661,9 +5849,14 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
     if ($byAcct) {
         $list = array_values($byAcct);
         usort($list, static fn($a, $b) => strlen($b['acct']) <=> strlen($a['acct']));
+        // Pass 1: full @user@host only. Never str_replace bare @user here —
+        // that nested <@cmdr_nova> inside <@cmdr_nova@mkultra.monster> and made
+        // Wafrn mentions look like only the local part was linked.
         foreach ($list as $m) {
             $acct = (string) $m['acct'];
-            $user = (string) $m['username'];
+            if (!str_contains($acct, '@')) {
+                continue;
+            }
             [$hrefRaw, $ext] = $profileHref((string) $m['url']);
             $href = htmlspecialchars($hrefRaw, ENT_QUOTES, 'UTF-8');
             $needleFull = '@' . htmlspecialchars($acct, ENT_QUOTES, 'UTF-8');
@@ -5687,7 +5880,14 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
         $byUser = [];
         foreach ($list as $m) {
             $u = strtolower((string) $m['username']);
-            $byUser[$u] = isset($byUser[$u]) ? false : $m;
+            // Prefer the entry whose acct is bare (or any unique username).
+            if (!isset($byUser[$u])) {
+                $byUser[$u] = $m;
+            } elseif (is_array($byUser[$u]) && str_contains((string) $byUser[$u]['acct'], '@') && !str_contains((string) $m['acct'], '@')) {
+                $byUser[$u] = $m;
+            } elseif (is_array($byUser[$u]) && (string) $byUser[$u]['url'] !== (string) $m['url']) {
+                $byUser[$u] = false; // ambiguous username across hosts
+            }
         }
         foreach ($byUser as $u => $m) {
             if (!is_array($m)) {
@@ -5698,7 +5898,7 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
             $uname = htmlspecialchars((string) $m['username'], ENT_QUOTES, 'UTF-8');
             $extra = $ext ? ' target="_blank" rel="noopener noreferrer"' : '';
             $link = '<a class="mention" href="' . $href . '"' . $extra . '>@' . $uname . '</a>';
-            // Allow dots in Bluesky handles; don't match mid-handle
+            // Allow dots in Bluesky handles; don't match mid-handle or @user@host
             $escaped = preg_replace(
                 '/(^|[^A-Za-z0-9_\/])@' . preg_quote($uname, '/') . '(?![A-Za-z0-9_.@])/u',
                 '$1' . $link,
@@ -8133,6 +8333,40 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                 }
                 $pushEvent($e);
             }
+            // Own compose posts live in outbox_notes (events use action_taken=compose
+            // and are skipped by the query above). Without this, soft-refresh after
+            // posting never shows your own card until a hard refresh.
+            $ownActor = rtrim((string) ($GLOBALS['vaak_actor_id'] ?? ''), '/');
+            if ($ownActor !== '' && str_starts_with($ownActor, 'https://mkultra.monster/users/')) {
+                $prefix = $ownActor . '/notes/%';
+                $st = $db->prepare(
+                    "SELECT * FROM outbox_notes
+                     WHERE id LIKE ?
+                       AND published > ?
+                     ORDER BY published DESC
+                     LIMIT ?"
+                );
+                $st->execute([$prefix, $sinceAt, $limit]);
+                foreach ($st->fetchAll() ?: [] as $n) {
+                    if (!is_array($n)) {
+                        continue;
+                    }
+                    $nid = rtrim((string) ($n['id'] ?? ''), '/');
+                    if ($nid === '' || isset($seen['o:' . $nid])) {
+                        continue;
+                    }
+                    $item = [
+                        'kind' => 'outbox',
+                        'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
+                        'row' => $n,
+                    ];
+                    if ($item['sort'] <= $sinceTs || admin_timeline_item_muted_by_words($item)) {
+                        continue;
+                    }
+                    $seen['o:' . $nid] = true;
+                    $out[] = $item;
+                }
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-admin] newer poll: ' . $e->getMessage());
@@ -8395,20 +8629,62 @@ if (!$isPartial && $view === 'search') {
 }
 
 // Notification unread badge (nav + browser tab). Opening Notifications clears it.
+// Seed chime from latest_unread_id (same light scan as the ajax poll) so we never
+// chime on hydration-order flicker from the full notifications feed.
+$notifUnreadNav = 0;
+$notifLatestUnreadIdNav = '';
+$notifLatestIdNav = '';
+$notifLastReadIdNav = '0';
 try {
     if ($view === 'mentions' && function_exists('ap_masto_notifications_mark_read')) {
-        ap_masto_notifications_mark_read(null);
+        // Prefer the newest id the Notifications UI will actually render, then
+        // mark_read still maxes with the light scan so badge + list stay aligned.
+        $markTip = null;
+        try {
+            if (function_exists('ap_masto_notifications_fetch')) {
+                $markNewest = ap_masto_notifications_fetch(1);
+                $markTip = (string) ($markNewest[0]['id'] ?? '');
+            }
+        } catch (Throwable $e) {
+            $markTip = null;
+        }
+        ap_masto_notifications_mark_read($markTip !== '' ? $markTip : null);
     }
-    $notifUnreadNav = ($view === 'mentions')
-        ? 0
-        : (function_exists('ap_masto_notifications_unread_count')
-            ? ap_masto_notifications_unread_count(80)
-            : 0);
+    if ($view !== 'mentions' && function_exists('ap_masto_notifications_unread_state')) {
+        $notifStateNav = ap_masto_notifications_unread_state(80, false);
+        $notifUnreadNav = (int) ($notifStateNav['count'] ?? 0);
+        $notifLatestUnreadIdNav = preg_replace('/\D+/', '', (string) ($notifStateNav['latest_unread_id'] ?? '')) ?: '';
+        $notifLatestIdNav = preg_replace('/\D+/', '', (string) ($notifStateNav['latest_id'] ?? '')) ?: '';
+        $notifLastReadIdNav = preg_replace('/\D+/', '', (string) ($notifStateNav['last_read_id'] ?? '0')) ?: '0';
+    } elseif ($view !== 'mentions' && function_exists('ap_masto_notifications_unread_count')) {
+        $notifUnreadNav = ap_masto_notifications_unread_count(80);
+    }
 } catch (Throwable $e) {
     error_log('[ap-admin] notif badge: ' . $e->getMessage());
     $notifUnreadNav = 0;
 }
 $notifBadgeLabel = $notifUnreadNav > 99 ? '99+' : (string) (int) $notifUnreadNav;
+// Chime seed prefers the newest unread tip; fall back to overall latest when caught up.
+if ($notifLatestUnreadIdNav === '') {
+    $notifLatestUnreadIdNav = $notifLatestIdNav;
+}
+$notifLastReadIdNav = preg_replace('/\D+/', '', $notifLastReadIdNav) ?: '0';
+// Seed unread DM tip so the first poll cannot chime for already-open DMs.
+$dmLatestIdNav = '';
+try {
+    $ownerForDmSeed = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
+    if ($ownerForDmSeed > 0) {
+        $dmSeedSt = ap_db()->prepare(
+            "SELECT id FROM direct_messages
+             WHERE owner_user_id = ? AND direction = 'in' AND read_at IS NULL AND deleted_at IS NULL
+             ORDER BY id DESC LIMIT 1"
+        );
+        $dmSeedSt->execute([$ownerForDmSeed]);
+        $dmLatestIdNav = (string) ($dmSeedSt->fetchColumn() ?: '');
+    }
+} catch (Throwable $e) {
+    $dmLatestIdNav = '';
+}
 
 // Notices badge: baseline cursor on first auth page load; clear when opening Notices.
 $noticesUnreadNav = 0;
@@ -8469,6 +8745,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         $nStatusUri = is_array($nStatus) ? (string) ($nStatus['uri'] ?? $nStatus['url'] ?? '') : '';
         $nSnippet = '';
         $nMedia = [];
+        $nStatusMentions = [];
         if (is_array($nStatus)) {
             $nSnippet = trim(admin_html_to_plain((string) ($nStatus['content'] ?? '')));
             $nSnippet = preg_replace('/^\h+/mu', '', $nSnippet) ?? $nSnippet;
@@ -8478,34 +8755,20 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                 $nSnippet = preg_replace('#^RE:\s*https://\S+#u', '', $nSnippet) ?? $nSnippet;
                 $nSnippet = trim($nSnippet);
             }
-            // Wafrn may glue the first commentary word onto our local
-            // domain: @cmdr_nova@mkultra.monsteraudio posts… Preserve
-            // that word before mention normalization can consume it.
-            $localHostForSnippet = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
-            if ($localHostForSnippet !== '') {
-                $nSnippet = preg_replace(
-                    '/^(@[A-Za-z0-9_]+@' . preg_quote($localHostForSnippet, '/') . ')([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=\s|$)/iu',
-                    '$1 $2',
-                    $nSnippet
-                ) ?? $nSnippet;
+            // Wafrn may glue the first commentary word onto our local domain
+            // (@cmdr_nova@mkultra.monsteraudio / @…monsterone). Shared unglue
+            // restores the real handle before we linkify the snippet.
+            if (function_exists('ap_masto_unglue_host_mentions')) {
+                $nSnippet = ap_masto_unglue_host_mentions($nSnippet);
             }
+            $nStatusMentions = [];
             foreach (($nStatus['mentions'] ?? []) as $nMention) {
                 if (!is_array($nMention)) {
                     continue;
                 }
+                $nStatusMentions[] = $nMention;
                 $nAcctKnown = ltrim(trim((string) ($nMention['acct'] ?? '')), '@');
                 if ($nAcctKnown !== '' && str_contains($nAcctKnown, '@') && str_starts_with($nSnippet, '@' . $nAcctKnown)) {
-                    // Some Wafrn payloads glue the local domain to the first word
-                    // after the handle (for example: mkultra.monsterone more).
-                    $nParts = explode('@', $nAcctKnown, 2);
-                    $nLocalHost = strtolower((string) (parse_url(vaak_actor_id(), PHP_URL_HOST) ?? ''));
-                    $nMentionHost = strtolower((string) ($nParts[1] ?? ''));
-                    if ($nLocalHost !== '' && str_starts_with($nMentionHost, $nLocalHost) && strlen($nMentionHost) > strlen($nLocalHost)) {
-                        $nAcctDisplay = $nParts[0] . '@' . $nLocalHost;
-                        $nSuffix = substr($nMentionHost, strlen($nLocalHost));
-                        $nSnippet = '@' . $nAcctDisplay . ' ' . $nSuffix . substr($nSnippet, strlen($nAcctKnown) + 1);
-                        break;
-                    }
                     $afterMention = strlen($nAcctKnown) + 1;
                     if (isset($nSnippet[$afterMention]) && !preg_match('/\s/u', $nSnippet[$afterMention])) {
                         $nSnippet = substr($nSnippet, 0, $afterMention) . ' ' . substr($nSnippet, $afterMention);
@@ -8567,6 +8830,10 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         } elseif (is_string($nSnippet) && strlen($nSnippet) > 280) {
             $snipShow = substr($nSnippet, 0, 280) . '…';
         }
+        // Clickable @handles in mention/quote bodies (full @user@host when present).
+        $nSnippetHtml = $snipShow !== ''
+            ? admin_linkify_body_html($snipShow, 'mentions', $nStatusMentions ?? [])
+            : '';
         $profileHref = $nActorRef !== ''
             ? ('?view=remote_profile&actor=' . rawurlencode($nActorRef) . '&from=mentions')
             : '';
@@ -8593,10 +8860,10 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
     </div>
     <?php if ($nType === 'bite' && !$biteHasPost): ?>
       <div class="meta" style="margin-top:.55rem;color:var(--muted)">No associated post</div>
-    <?php elseif ($nSnippet !== '' && $nType === 'mention'): ?>
-      <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
-    <?php elseif ($nSnippet !== '' && $nType === 'quote'): ?>
-      <div class="body feed-body notification-post"><?= h($snipShow) ?></div>
+    <?php elseif ($nSnippetHtml !== '' && $nType === 'mention'): ?>
+      <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
+    <?php elseif ($nSnippetHtml !== '' && $nType === 'quote'): ?>
+      <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
     <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
       <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
     <?php endif; ?>
@@ -8699,10 +8966,13 @@ function admin_render_home_suggestions(array $suggestions): void
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0a0a0a">
   <meta name="color-scheme" content="dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="VAAK">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="csrf-token" content="<?= h(ap_auth_csrf_token()) ?>">
   <title><?= $notifUnreadNav > 0 ? '(' . h($notifBadgeLabel) . ') ' : '' ?>VAAK · <?= h(view_title($view)) ?></title>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
+  <link rel="manifest" href="/vaak/manifest.webmanifest?v=20260909">
   <link rel="icon" href="/vaak/favicon.svg?v=20260907" type="image/svg+xml">
   <link rel="icon" href="/vaak/favicon.ico?v=20260907" sizes="any">
   <link rel="icon" href="/vaak/favicon-32x32.png?v=20260907" type="image/png" sizes="32x32">
@@ -8978,7 +9248,7 @@ function admin_render_home_suggestions(array $suggestions): void
       border-right: 1px solid var(--border);
       backdrop-filter: blur(8px);
     }
-    .rail-right { border-right: none; border-left: 1px solid var(--border); padding: 1rem; }
+    .rail-right { border-right: none; border-left: 1px solid var(--border); padding: 1rem; min-width: 0; }
     .rail-right a { color: var(--primary); }
     .rail-right a:hover { color: var(--primary); text-decoration: underline; }
     .rail-right a[style*="color:var(--text)"] { color: var(--primary) !important; }
@@ -9830,10 +10100,37 @@ function admin_render_home_suggestions(array $suggestions): void
     .side-card {
       background: var(--panel); border: 1px solid var(--border);
       border-radius: var(--radius); padding: .9rem; margin-bottom: .75rem;
+      /* Grid/flex kids default min-width:auto — long unbroken URLs otherwise
+         expand the whole right rail past the viewport. */
+      min-width: 0;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     .side-card h3 {
       margin: 0 0 .6rem; font-size: .85rem; color: var(--muted);
       text-transform: uppercase; letter-spacing: .06em;
+    }
+    .trend-link {
+      margin: 0 0 .55rem;
+      line-height: 1.35;
+      min-width: 0;
+      max-width: 100%;
+    }
+    .trend-link a {
+      display: inline-block;
+      max-width: 100%;
+      /* Break inside long path/query strings that have no spaces */
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }
+    .trend-link .trend-link-host {
+      display: block;
+      font-size: .72rem;
+      color: var(--muted);
+      margin-top: .15rem;
+      overflow-wrap: anywhere;
+      word-break: break-all;
     }
     details.side-drop {
       padding: 0;
@@ -10728,7 +11025,7 @@ function admin_render_home_suggestions(array $suggestions): void
             <input name="title" maxlength="80" placeholder="New folder name…" required style="flex:1;min-width:10rem">
             <button class="btn btn-ghost" type="submit">Create folder</button>
           </form>
-          <div class="meta" style="margin-top:.55rem">Folders are VAAK-only. Ice Cubes still sees one flat bookmark list.</div>
+          <div class="meta" style="margin-top:.55rem">Folders are VAAK-only.</div>
         </section>
         <?php if ($bmFolderFilter > 0): ?>
           <form method="post" action="?view=bookmarks" style="margin:0 0 1rem" onsubmit="return confirm('Delete this folder? Bookmarks stay saved under All.');">
@@ -11580,6 +11877,24 @@ function admin_render_home_suggestions(array $suggestions): void
           </div>
         </form>
 
+        <div class="tweet" style="margin-bottom:1.25rem" id="vaak-push-card">
+          <div class="who">Browser notifications</div>
+          <div class="body meta" style="margin-top:.5rem">
+            Get OS alerts for mentions, favs, boosts, follows, and DMs while VAAK is in the background.
+            Ice Cubes push (if you use the app) is separate.
+          </div>
+          <div class="body meta" style="margin-top:.45rem" id="vaak-push-safari-hint" hidden>
+            <strong>iPhone / iPad Safari:</strong> Web Push only works after
+            <b>Share → Add to Home Screen</b>, then open VAAK from that icon (not a Safari tab), then tap Enable here.
+            Desktop Safari / Chrome / Firefox can Enable directly.
+          </div>
+          <div class="meta" id="vaak-push-status" style="margin-top:.55rem">Checking…</div>
+          <div class="tweet-actions" style="margin-top:.75rem;display:flex;gap:.5rem;flex-wrap:wrap">
+            <button type="button" class="btn btn-primary" id="vaak-push-enable" style="padding:.35rem .85rem;font-size:.85rem">Enable</button>
+            <button type="button" class="btn btn-ghost" id="vaak-push-disable" style="padding:.35rem .85rem;font-size:.85rem" hidden>Disable</button>
+          </div>
+        </div>
+
         <?php if ($isCmdrSecurity && !empty($vaakIsAdmin)): ?>
         <div class="tweet" style="margin-bottom:1rem">
           <div class="who">Operator app password</div>
@@ -11656,7 +11971,7 @@ function admin_render_home_suggestions(array $suggestions): void
       <?php elseif ($view === 'profile'): ?>
         <?php
           $atts = is_array($profile['attachment'] ?? null) ? $profile['attachment'] : [];
-          while (count($atts) < 4) {
+          while (count($atts) < 8) {
               $atts[] = ['name' => '', 'value' => ''];
           }
           // Bio editor: keep HTML when links/markup matter; otherwise plain text
@@ -11691,7 +12006,7 @@ function admin_render_home_suggestions(array $suggestions): void
             </div>
           </div>
           <?php if (!empty($profile['image_url'])): ?>
-            <div class="profile-header-preview" style="margin:.75rem 0 1rem;border-radius:12px;overflow:hidden;border:1px solid var(--border);max-height:140px">
+            <div class="profile-header-preview" style="margin:.75rem 0 1rem;border-radius:12px;overflow:hidden;border:1px solid var(--border);height:180px;max-height:180px">
               <img src="<?= h($profile['image_url']) ?>" alt="" loading="lazy" referrerpolicy="no-referrer" style="display:block;width:100%;height:140px;object-fit:cover">
             </div>
           <?php endif; ?>
@@ -11776,14 +12091,14 @@ function admin_render_home_suggestions(array $suggestions): void
           <input id="pf-image" type="url" name="image_url" placeholder="https://…" value="<?= h((string) ($profile['image_url'] ?? '')) ?>">
           <div class="meta" style="margin:.25rem 0 .75rem">Same storage rules as avatar. Remotes may cache until they process the profile Update (Bridgy: use ↻ Update profile below).</div>
 
-          <label>Verified creator links / profile fields (up to 4)</label>
+          <label>Verified creator links / profile fields (up to 8)</label>
           <div class="meta" style="margin:0 0 .55rem">
             Add a website or post URL you control. For a verified creator check,
             the linked page must include
             <code>&lt;a rel="me" href="<?= h($vaakActorId) ?>"&gt;</code>
             (or a <code>&lt;link rel="me"&gt;</code>). Ice Cubes / Mastodon show a green check when <code>verified_at</code> is set.
           </div>
-          <?php for ($i = 0; $i < 4; $i++):
+          <?php for ($i = 0; $i < 8; $i++):
               $an = (string) ($atts[$i]['name'] ?? '');
               $av = (string) ($atts[$i]['value'] ?? '');
               $avPlain = trim(html_entity_decode(strip_tags($av), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -14505,24 +14820,40 @@ function admin_render_home_suggestions(array $suggestions): void
   const dmBadge = document.getElementById('dm-badge');
   let lastNotifCount = <?= (int) $notifUnreadNav ?>;
   let lastDmCount = <?= (int) $dmUnreadNav ?>;
-  // Event IDs prevent a transient/stale aggregate count from producing a
-  // chime after the underlying row has already been read or filtered.
-  let lastNotifEventId = '';
-  let lastDmEventId = '';
+  // Digit-only snowflake compare — never chime for an id at/under the read marker,
+  // and never for an id we already announced (count flicker used to false-trigger).
+  const snowflakeDigits = (v) => String(v || '').replace(/\D+/g, '') || '0';
+  const snowflakeNewer = (a, b) => {
+    const x = snowflakeDigits(a);
+    const y = snowflakeDigits(b);
+    if (x.length !== y.length) return x.length > y.length;
+    return x > y;
+  };
+  let lastReadNotifId = <?= json_encode($notifLastReadIdNav) ?>;
+  // Track the newest *unread* tip only — overall latest used to false-chime when
+  // the heavy notifications fetch hydrated in a different order than the light scan.
+  let lastNotifEventId = <?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>;
+  let lastDmEventId = <?= json_encode($dmLatestIdNav) ?>;
+  let notifPollReady = false; // skip chime on the first poll after page load
+  let notifPollTimer = null;
+  // Foreground AIM chime — background tabs rely on Web Push instead.
+  const NOTIF_SOUND_ENABLED = true;
   let notifSoundUnlocked = false;
-  // Cache-bust so browsers pick up the AIM imrcv.wav swap. Safari requires an
-  // actual play() during a user gesture; loading the resource alone is not
-  // enough to authorize later timer-driven playback.
-  const notifAudio = new Audio('?ajax=notif_sound&v=imrcv1');
-  notifAudio.preload = 'auto';
-  notifAudio.volume = 0.9;
-  notifAudio.setAttribute('playsinline', '');
+  let lastPushSuppressAt = 0;
+  let lastPushSuppressId = '';
+  const notifAudio = NOTIF_SOUND_ENABLED ? new Audio('?ajax=notif_sound&v=imrcv5') : null;
+  if (notifAudio) {
+    notifAudio.preload = 'auto';
+    notifAudio.volume = 0.9;
+    notifAudio.setAttribute('playsinline', '');
+  }
   // Browsers block autoplay until a user gesture. Prime the element with a
   // muted play/pause cycle so Safari grants permission for future chimes.
   const unlockNotifSound = () => {
-    if (notifSoundUnlocked) return;
+    if (!NOTIF_SOUND_ENABLED || !notifAudio || notifSoundUnlocked) return;
     try {
       notifAudio.muted = true;
+      notifAudio.volume = 0;
       notifAudio.currentTime = 0;
       const p = notifAudio.play();
       if (p && typeof p.then === 'function') {
@@ -14530,30 +14861,44 @@ function admin_render_home_suggestions(array $suggestions): void
           notifAudio.pause();
           notifAudio.currentTime = 0;
           notifAudio.muted = false;
+          notifAudio.volume = 0.9;
           notifSoundUnlocked = true;
           document.removeEventListener('pointerdown', unlockNotifSound);
           document.removeEventListener('keydown', unlockNotifSound);
         }).catch(() => {
           notifAudio.muted = false;
+          notifAudio.volume = 0.9;
         });
       }
     } catch (e) {
       notifAudio.muted = false;
+      notifAudio.volume = 0.9;
     }
   };
-  document.addEventListener('pointerdown', unlockNotifSound);
-  document.addEventListener('keydown', unlockNotifSound);
+  if (NOTIF_SOUND_ENABLED) {
+    document.addEventListener('pointerdown', unlockNotifSound);
+    document.addEventListener('keydown', unlockNotifSound);
+  }
 
   function playNotifSound(eventKey) {
-    if (!notifSoundUnlocked) return;
+    if (!NOTIF_SOUND_ENABLED || !notifAudio || !notifSoundUnlocked) return;
+    // Background / unfocused tab: OS Web Push covers alerts — don't double-chime.
+    if (document.visibilityState !== 'visible' || (typeof document.hasFocus === 'function' && !document.hasFocus())) {
+      return;
+    }
+    // Suppress if a service-worker push just landed for this tip.
+    const now = Date.now();
+    if (lastPushSuppressAt && (now - lastPushSuppressAt) < 60 * 1000) {
+      const tip = String(eventKey || '');
+      if (!lastPushSuppressId || tip.includes(lastPushSuppressId)) return;
+    }
     // Avoid duplicate chimes when Safari has two Vaak tabs polling at
     // different times, or when an unread counter briefly resets and rises
     // again for the same notification set.
     try {
       const signature = String(eventKey || '');
       if (!signature) return;
-      const key = 'vaak-notif-chime-v1';
-      const now = Date.now();
+      const key = 'vaak-notif-chime-v5';
       const prior = JSON.parse(localStorage.getItem(key) || 'null');
       if (prior && prior.signature === signature && (now - Number(prior.at || 0)) < 10 * 60 * 1000) {
         return;
@@ -14561,10 +14906,21 @@ function admin_render_home_suggestions(array $suggestions): void
       localStorage.setItem(key, JSON.stringify({ signature, at: now }));
     } catch (e) {}
     try {
+      notifAudio.muted = false;
+      notifAudio.volume = 0.9;
       notifAudio.currentTime = 0;
       const p = notifAudio.play();
       if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch (e) {}
+  }
+  if (navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('message', (ev) => {
+      const data = ev && ev.data;
+      if (!data || data.type !== 'vaak-push') return;
+      lastPushSuppressAt = Date.now();
+      lastPushSuppressId = String(data.notification_id || '');
+      if (typeof window.vaakPollNotif === 'function') window.vaakPollNotif();
+    });
   }
 
   function setBadge(el, n) {
@@ -14581,10 +14937,16 @@ function admin_render_home_suggestions(array $suggestions): void
 
   function applyInboxUnread(notifCount, dmCount, opts) {
     const play = !!(opts && opts.play);
-    const n = Math.max(0, parseInt(notifCount, 10) || 0);
-    const d = Math.max(0, parseInt(dmCount, 10) || 0);
-    const notifEventId = String((opts && opts.notifId) || '');
+    // While reading Notifications the server marks them read — never resurrect
+    // the badge/chime from a racing poll on this same page.
+    let n = notifView ? 0 : Math.max(0, parseInt(notifCount, 10) || 0);
+    const d = dmView ? 0 : Math.max(0, parseInt(dmCount, 10) || 0);
+    const notifEventId = snowflakeDigits((opts && opts.notifId) || '');
     const dmEventId = String((opts && opts.dmId) || '');
+    if (opts && opts.lastReadId != null && String(opts.lastReadId) !== '') {
+      const lr = snowflakeDigits(opts.lastReadId);
+      if (lr !== '0') lastReadNotifId = lr;
+    }
     setBadge(notifBadge, n);
     setBadge(dmBadge, d);
     const titleBits = [];
@@ -14593,13 +14955,25 @@ function admin_render_home_suggestions(array $suggestions): void
     document.title = titleBits.length
       ? ('(' + titleBits.join(' · ') + ') ' + notifBaseTitle)
       : notifBaseTitle;
-    // AIM receive: new DM always chimes; new notification chimes when not already
-    // chimed for a simultaneous DM bump.
+    // Chime only when a real unread tip advances past both the read marker and
+    // the tip we already announced — never on count flicker or overall-latest fallback.
     let shouldPlay = false;
     let eventKey = '';
-    if (play) {
-      const dmAdvanced = d > lastDmCount && dmEventId !== '' && dmEventId !== lastDmEventId;
-      const notifAdvanced = n > lastNotifCount && notifEventId !== '' && notifEventId !== lastNotifEventId;
+    if (play && notifPollReady) {
+      const dmAdvanced = d > 0
+        && dmEventId !== ''
+        && lastDmEventId !== ''
+        && lastDmEventId !== '0'
+        && dmEventId !== lastDmEventId
+        && Number(dmEventId) > Number(lastDmEventId)
+        && d >= lastDmCount;
+      const notifAdvanced = n > 0
+        && notifEventId !== '0'
+        && lastNotifEventId !== ''
+        && lastNotifEventId !== '0'
+        && notifEventId !== lastNotifEventId
+        && snowflakeNewer(notifEventId, lastReadNotifId)
+        && snowflakeNewer(notifEventId, lastNotifEventId);
       if (dmAdvanced || notifAdvanced) {
         shouldPlay = true;
         eventKey = (dmAdvanced ? 'dm:' + dmEventId : '') + (notifAdvanced ? '|notif:' + notifEventId : '');
@@ -14608,10 +14982,28 @@ function admin_render_home_suggestions(array $suggestions): void
     if (shouldPlay) playNotifSound(eventKey);
     lastNotifCount = n;
     lastDmCount = d;
-    if (notifEventId !== '') lastNotifEventId = notifEventId;
-    if (dmEventId !== '') lastDmEventId = dmEventId;
+    // Tip tracking: only advance from a real unread tip; when caught up, pin to read marker.
+    if (n > 0 && notifEventId !== '0') {
+      if (lastNotifEventId === '' || lastNotifEventId === '0'
+          || snowflakeNewer(notifEventId, lastNotifEventId)
+          || notifEventId === lastNotifEventId) {
+        lastNotifEventId = notifEventId;
+      }
+    } else if (n === 0 && lastReadNotifId !== '0') {
+      lastNotifEventId = lastReadNotifId;
+    }
+    if (d > 0 && dmEventId !== '') {
+      lastDmEventId = dmEventId;
+    } else if (d === 0) {
+      lastDmEventId = lastDmEventId || '0';
+    }
   }
-  applyInboxUnread(<?= (int) $notifUnreadNav ?>, <?= (int) $dmUnreadNav ?>, { play: false });
+  applyInboxUnread(<?= (int) $notifUnreadNav ?>, <?= (int) $dmUnreadNav ?>, {
+    play: false,
+    notifId: <?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,
+    lastReadId: <?= json_encode($notifLastReadIdNav) ?>,
+    dmId: <?= json_encode($dmLatestIdNav) ?>,
+  });
   const pollNotif = async () => {
     try {
       const res = await fetch('?ajax=notif_unread', {
@@ -14621,17 +15013,202 @@ function admin_render_home_suggestions(array $suggestions): void
       });
       if (!res.ok) return;
       const data = await res.json();
-      applyInboxUnread(data && data.count, data && data.dm_count, {
+      const count = data && data.count;
+      // Never fall back to overall latest_id when count is 0 — that was false-chiming
+      // and re-badging already-read Wafrn mentions after mark-read.
+      const unreadTip = (parseInt(count, 10) > 0 && data && data.latest_unread_id)
+        ? data.latest_unread_id
+        : '';
+      applyInboxUnread(count, data && data.dm_count, {
         play: true,
-        notifId: data && data.latest_id,
+        notifId: unreadTip,
+        lastReadId: data && data.last_read_id,
         dmId: data && data.latest_dm_id,
       });
-    } catch (e) {}
+    } catch (e) {
+    } finally {
+      notifPollReady = true;
+    }
   };
-  setInterval(pollNotif, 30000);
+  const notifPollMs = () => (document.visibilityState === 'visible' ? 12000 : 45000);
+  const scheduleNotifPoll = () => {
+    if (notifPollTimer) clearTimeout(notifPollTimer);
+    notifPollTimer = setTimeout(async () => {
+      await pollNotif();
+      scheduleNotifPoll();
+    }, notifPollMs());
+  };
+  scheduleNotifPoll();
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') pollNotif();
+    if (document.visibilityState === 'visible') {
+      pollNotif();
+      scheduleNotifPoll();
+    }
   });
+  // Mobile Safari often throttles timers; refresh badges when the hamburger opens.
+  window.addEventListener('vaak:mobile-nav-open', () => { pollNotif(); });
+  window.vaakPollNotif = pollNotif;
+})();
+
+// VAAK browser Web Push (Security panel + SW registration)
+(function () {
+  const statusEl = document.getElementById('vaak-push-status');
+  const enableBtn = document.getElementById('vaak-push-enable');
+  const disableBtn = document.getElementById('vaak-push-disable');
+  const safariHint = document.getElementById('vaak-push-safari-hint');
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+    || window.navigator.standalone === true;
+  const supported = !!(window.isSecureContext && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window);
+  if (safariHint && isIOS) safariHint.hidden = false;
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(base64);
+    const out = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+    return out;
+  }
+
+  async function ensureSw() {
+    return navigator.serviceWorker.register('/vaak/sw.js', { scope: '/vaak/' });
+  }
+
+  function setStatus(text, subscribed) {
+    if (statusEl) statusEl.textContent = text;
+    if (enableBtn) enableBtn.hidden = !!subscribed;
+    if (disableBtn) disableBtn.hidden = !subscribed;
+  }
+
+  async function refreshStatus() {
+    if (isIOS && !isStandalone) {
+      setStatus('On iPhone/iPad: Share → Add to Home Screen, open VAAK from that icon, then tap Enable. (Safari tabs cannot show the permission prompt.)', false);
+      // Keep Enable clickable so we can show the same guidance on tap.
+      if (enableBtn) enableBtn.disabled = false;
+      return;
+    }
+    if (!supported) {
+      setStatus('Not supported in this browser (needs HTTPS + Push API). Try desktop Chrome/Firefox, or Home Screen VAAK on iOS 16.4+.', false);
+      if (enableBtn) enableBtn.disabled = true;
+      return;
+    }
+    try {
+      const res = await fetch('?ajax=push_status', { credentials: 'same-origin', cache: 'no-store' });
+      const data = await res.json().catch(() => null);
+      const perm = Notification.permission;
+      if (data && data.subscribed) {
+        setStatus('Enabled (' + perm + '). Background alerts are on for this account.', true);
+      } else if (perm === 'denied') {
+        setStatus('Blocked by the browser — reset notification permission for mkultra.monster, then try Enable again.', false);
+      } else {
+        setStatus('Off. Tap Enable to allow alerts while VAAK is in the background.', false);
+      }
+    } catch (e) {
+      setStatus('Could not check push status.', false);
+    }
+  }
+
+  async function enablePush() {
+    try {
+      if (enableBtn) enableBtn.disabled = true;
+      if (isIOS && !isStandalone) {
+        setStatus('iPhone/iPad: Add VAAK to the Home Screen first, open it from that icon, then tap Enable again.', false);
+        if (window.apAdminToast) {
+          window.apAdminToast('Add VAAK to your Home Screen, open it from there, then Enable.', true);
+        }
+        return;
+      }
+      if (!supported) {
+        setStatus('Push API not available in this browser.', false);
+        return;
+      }
+      // Safari requires requestPermission() in the same turn as the user gesture.
+      // Awaiting serviceWorker.ready first cancels the prompt entirely.
+      let perm = Notification.permission;
+      if (perm !== 'granted') {
+        perm = await Notification.requestPermission();
+      }
+      if (perm !== 'granted') {
+        setStatus('Permission not granted (' + perm + '). Check site settings for mkultra.monster.', false);
+        return;
+      }
+      const reg = await ensureSw();
+      await navigator.serviceWorker.ready;
+      const vapidRes = await fetch('?ajax=push_vapid', { credentials: 'same-origin', cache: 'no-store' });
+      const vapid = await vapidRes.json();
+      if (!vapid || !vapid.ok || !vapid.publicKey) {
+        setStatus((vapid && vapid.error) || 'VAPID key missing on server.', false);
+        return;
+      }
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(vapid.publicKey),
+        });
+      }
+      const res = await fetch('?ajax=push_subscribe', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-VAAK-CSRF': window.VAAK_CSRF || '',
+        },
+        body: JSON.stringify({ subscription: sub.toJSON(), csrf: window.VAAK_CSRF || '' }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok) {
+        setStatus((data && data.error) || 'Subscribe failed.', false);
+        if (window.apAdminToast) window.apAdminToast((data && data.error) || 'Push subscribe failed.', true);
+        return;
+      }
+      setStatus('Enabled. You’ll get alerts while VAAK is in the background.', true);
+      if (window.apAdminToast) window.apAdminToast('Browser notifications enabled.');
+    } catch (e) {
+      setStatus('Could not enable notifications.', false);
+      if (window.apAdminToast) window.apAdminToast('Could not enable notifications.', true);
+    } finally {
+      if (enableBtn) enableBtn.disabled = false;
+    }
+  }
+
+  async function disablePush() {
+    try {
+      if (disableBtn) disableBtn.disabled = true;
+      const reg = await navigator.serviceWorker.getRegistration('/vaak/');
+      const sub = reg ? await reg.pushManager.getSubscription() : null;
+      if (sub) await sub.unsubscribe();
+      const fd = new FormData();
+      fd.set('csrf', window.VAAK_CSRF || '');
+      await fetch('?ajax=push_unsubscribe', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-VAAK-CSRF': window.VAAK_CSRF || '' },
+        body: fd,
+      });
+      setStatus('Disabled for this browser.', false);
+      if (window.apAdminToast) window.apAdminToast('Browser notifications disabled.');
+    } catch (e) {
+      setStatus('Could not disable notifications.', true);
+    } finally {
+      if (disableBtn) disableBtn.disabled = false;
+    }
+  }
+
+  if (enableBtn) enableBtn.addEventListener('click', () => { enablePush(); });
+  if (disableBtn) disableBtn.addEventListener('click', () => { disablePush(); });
+  if (statusEl || enableBtn) refreshStatus();
+  // Quietly register SW if already subscribed so push clicks work from any view.
+  if (supported) {
+    fetch('?ajax=push_status', { credentials: 'same-origin', cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d) => { if (d && d.subscribed) ensureSw().catch(() => {}); })
+      .catch(() => {});
+  }
 })();
 
 window.apAdminToast = function (msg, isErr) {
@@ -16028,6 +16605,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     document.body.classList.add('mobile-nav-open');
     btn.setAttribute('aria-expanded', 'true');
     btn.setAttribute('aria-label', 'Close menu');
+    try { window.dispatchEvent(new CustomEvent('vaak:mobile-nav-open')); } catch (e) {}
   }
   function closeNav() {
     rail.classList.remove('mobile-open');
@@ -16110,6 +16688,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       <input name="spoiler_text" maxlength="500" placeholder="Content warning (optional)" style="margin-bottom:.5rem;flex:0 0 auto" value="<?= h($prefillEditSpoiler) ?>">
       <div class="compose-textarea-wrap">
         <textarea name="content" id="compose-content" maxlength="2000" placeholder="<?= h($composePlaceholder) ?>"><?= h($prefillEditContent) ?></textarea>
+        <div class="meta compose-char-count" id="compose-char-count" style="margin-top:.35rem;text-align:right">0 / 2,000</div>
       </div>
       <div class="compose-emoji-wrap" style="margin:.45rem 0 .25rem;flex:0 0 auto">
         <button type="button" class="btn btn-ghost" id="compose-emoji-toggle" aria-expanded="false" aria-controls="compose-emoji-picker" style="padding:.3rem .75rem;font-size:.85rem">😀 Emoji</button>
@@ -16206,6 +16785,30 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const altAiBtn = document.getElementById('alt-modal-ai');
   const altAiStatus = document.getElementById('alt-modal-ai-status');
   const MAX = 4;
+  // Match ap_media_ingest_upload caps — reject before wasting a mobile upload.
+  const MEDIA_LIMITS = {
+    image: 10 * 1024 * 1024,
+    video: 50 * 1024 * 1024,
+    audio: 20 * 1024 * 1024,
+  };
+  function mediaKindForFile(file) {
+    const t = String((file && file.type) || '').toLowerCase();
+    if (t.startsWith('video/')) return 'video';
+    if (t.startsWith('audio/')) return 'audio';
+    if (t.startsWith('image/') || /\.(heic|heif)$/i.test(String((file && file.name) || ''))) return 'image';
+    return '';
+  }
+  function mediaLimitError(file) {
+    const kind = mediaKindForFile(file);
+    if (!kind) return 'Unsupported media type.';
+    const max = MEDIA_LIMITS[kind] || 0;
+    if (file && file.size > max) {
+      return kind.charAt(0).toUpperCase() + kind.slice(1)
+        + ' too large (max ' + Math.round(max / (1024 * 1024)) + 'MB).';
+    }
+    return '';
+  }
+  const COMPOSE_LS_KEY = 'vaak-compose-draft-v1';
   const timelineFeed = document.querySelector('.feed');
   const timelineItems = document.getElementById('timeline-items');
   const inlineTimelineComposer = !!(modal && timelineFeed && timelineItems
@@ -16312,22 +16915,23 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
           recordBtn.title = 'Record audio (up to 60 seconds)';
           tools.appendChild(recordBtn);
         }
-        const composeText = inlineForm.querySelector('#compose-content');
-        if (composeText) {
-          const count = document.createElement('span');
-          count.className = 'meta compose-char-count';
-          count.style.marginRight = 'auto';
-          const updateCount = () => { count.textContent = (composeText.value || '').length + ' / 2,000'; };
-          updateCount();
-          composeText.addEventListener('input', updateCount);
-          inlineActions.insertBefore(count, inlineActions.firstChild);
-        }
       }
       modal.hidden = true;
       modal.setAttribute('aria-hidden', 'true');
       if (fab) fab.setAttribute('aria-hidden', 'true');
     }
   }
+  // Shared 2000-char counter for inline + pop-out composers (same textarea).
+  (function bindComposeCharCount() {
+    const composeText = document.getElementById('compose-content');
+    const count = document.getElementById('compose-char-count');
+    if (!composeText || !count) return;
+    const updateCount = () => {
+      count.textContent = (composeText.value || '').length + ' / 2,000';
+    };
+    updateCount();
+    composeText.addEventListener('input', updateCount);
+  })();
   let files = [];
   let alts = [];
   let altEditIdx = -1;
@@ -16467,7 +17071,66 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     ta.style.height = next + 'px';
     ta.style.overflowY = contentHeight > max ? 'auto' : 'hidden';
   }
+  function saveComposeLocalBackup() {
+    if (composeMode === 'edit_status') return;
+    try {
+      const ta = document.getElementById('compose-content');
+      const spoiler = form.querySelector('input[name="spoiler_text"]');
+      const vis = form.querySelector('select[name="visibility"], input[name="visibility"]');
+      const sens = form.querySelector('input[name="sensitive"]');
+      const replyTo = document.getElementById('compose-in-reply-to');
+      const payload = {
+        at: Date.now(),
+        content: (ta && ta.value) || '',
+        spoiler: (spoiler && spoiler.value) || '',
+        visibility: (vis && vis.value) || 'public',
+        sensitive: !!(sens && sens.checked),
+        reply_to: (replyTo && replyTo.value) || '',
+        draft_id: (draftIdField && draftIdField.value) || '',
+        draft_media_ids: (draftMediaField && draftMediaField.value) || '',
+      };
+      if (!(payload.content.trim() || payload.spoiler.trim() || payload.draft_media_ids)) {
+        localStorage.removeItem(COMPOSE_LS_KEY);
+        return;
+      }
+      localStorage.setItem(COMPOSE_LS_KEY, JSON.stringify(payload));
+    } catch (e) {}
+  }
+  function restoreComposeLocalBackup() {
+    if (composeMode === 'edit_status') return;
+    try {
+      const raw = localStorage.getItem(COMPOSE_LS_KEY);
+      if (!raw) return;
+      const payload = JSON.parse(raw);
+      if (!payload || !payload.at || (Date.now() - Number(payload.at)) > 7 * 24 * 3600 * 1000) {
+        localStorage.removeItem(COMPOSE_LS_KEY);
+        return;
+      }
+      const ta = document.getElementById('compose-content');
+      if (ta && !(ta.value || '').trim() && payload.content) ta.value = String(payload.content);
+      const spoiler = form.querySelector('input[name="spoiler_text"]');
+      if (spoiler && !(spoiler.value || '').trim() && payload.spoiler) spoiler.value = String(payload.spoiler);
+      if (draftIdField && !draftIdField.value && payload.draft_id) draftIdField.value = String(payload.draft_id);
+      if (draftMediaField && !draftMediaField.value && payload.draft_media_ids) {
+        draftMediaField.value = String(payload.draft_media_ids);
+      }
+    } catch (e) {}
+  }
+  setInterval(() => {
+    if (modal && modal.classList.contains('open') && composeHasDraftableContent()) {
+      saveComposeLocalBackup();
+    }
+  }, 20000);
+  window.addEventListener('pagehide', () => { saveComposeLocalBackup(); });
+  window.addEventListener('beforeunload', (e) => {
+    if (!composeHasDraftableContent()) return;
+    if (draftIdField && draftIdField.value) return;
+    saveComposeLocalBackup();
+    e.preventDefault();
+    e.returnValue = '';
+  });
   function openModal() {
+    restoreComposeLocalBackup();
     modal.classList.add('open');
     modal.setAttribute('aria-hidden', 'false');
     const ta = document.getElementById('compose-content');
@@ -16616,11 +17279,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     }
     if (!skipDraftOnClose && composeHasDraftableContent()) {
       const saved = await saveComposeDraft({ silent: false });
-      // Even if save failed, still close — user can retry from Drafts if partial
-      if (saved && saved.ok && window.apAdminToast) {
-        // toast already shown in saveComposeDraft
-      } else if (saved && saved.skipped) {
-        // nothing
+      // Never wipe the composer after a failed draft — mobile users lose videos that way.
+      if (saved && saved.ok) {
+        try { localStorage.removeItem(COMPOSE_LS_KEY); } catch (e) {}
+      } else if (!(saved && saved.skipped)) {
+        return;
       }
     }
     skipDraftOnClose = false;
@@ -16929,11 +17592,23 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
   input.addEventListener('change', () => {
     const picked = Array.from(input.files || []);
+    const existingCount = ((draftMediaField && draftMediaField.value) || '')
+      .split(/[\s,]+/).filter((x) => parseInt(x, 10) > 0).length;
     for (const f of picked) {
-      if (files.length >= MAX) break;
+      if (files.length + existingCount >= MAX) {
+        if (window.apAdminToast) window.apAdminToast('Too many media attachments (max ' + MAX + ').', true);
+        break;
+      }
+      const lim = mediaLimitError(f);
+      if (lim) {
+        if (window.apAdminToast) window.apAdminToast(lim, true);
+        continue;
+      }
       files.push(f);
       alts.push('');
     }
+    // Clear the native input so the same file can be re-picked; we own `files`.
+    try { input.value = ''; } catch (e) {}
     syncInput();
     render();
   });
@@ -16977,15 +17652,58 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (!submitProgress) return;
     const active = state !== 'hidden';
     submitProgress.classList.toggle('is-visible', active);
-    submitProgress.classList.toggle('is-indeterminate', state === 'finalizing' || state === 'posting');
+    submitProgress.classList.toggle('is-indeterminate', state === 'finalizing' || state === 'posting' || state === 'processing');
     if (submitProgressBar) {
       submitProgressBar.value = Math.max(0, Math.min(100, Number(percent) || 0));
     }
     if (submitProgressLabel) {
       submitProgressLabel.textContent = state === 'uploading'
         ? ('Uploading media… ' + Math.round(Number(percent) || 0) + '%')
-        : (state === 'finalizing' ? 'Media uploaded — posting…' : (state === 'posting' ? 'Posting…' : ''));
+        : (state === 'processing'
+          ? 'Processing video on server…'
+          : (state === 'finalizing' ? 'Media uploaded — posting…' : (state === 'posting' ? 'Posting…' : '')));
     }
+  }
+  async function uploadOneComposeFile(file, altText, onProgress) {
+    const fd = new FormData();
+    fd.set('action', 'upload_media');
+    fd.set('ajax', '1');
+    fd.set('file', file, file.name || 'upload.bin');
+    if (altText) fd.set('description', altText);
+    if (window.vaakCsrfApply) window.vaakCsrfApply(fd);
+    else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    return submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, onProgress);
+  }
+  async function preUploadPendingComposeFiles() {
+    if (!files.length) return { ok: true };
+    const existing = ((draftMediaField && draftMediaField.value) || '')
+      .split(/[\s,]+/).map((x) => parseInt(x, 10)).filter((n) => n > 0);
+    if (existing.length + files.length > MAX) {
+      return { ok: false, error: 'Too many media attachments (max ' + MAX + ').' };
+    }
+    const ids = existing.slice();
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const lim = mediaLimitError(f);
+      if (lim) return { ok: false, error: lim };
+      setSubmitProgress('uploading', Math.round((i / Math.max(files.length, 1)) * 100));
+      const data = await uploadOneComposeFile(f, alts[i] || '', (pct) => {
+        const base = (i / Math.max(files.length, 1)) * 100;
+        const slice = (1 / Math.max(files.length, 1)) * 100;
+        setSubmitProgress('uploading', base + (pct / 100) * slice);
+      });
+      if (!data || !data.ok || !data.media_id) {
+        return { ok: false, error: (data && data.error) || 'Media upload failed.' };
+      }
+      ids.push(Number(data.media_id));
+      setSubmitProgress('processing', 100);
+    }
+    if (draftMediaField) draftMediaField.value = ids.join(',');
+    files = [];
+    alts = [];
+    syncInput();
+    render();
+    return { ok: true, media_ids: ids };
   }
   function submitComposeRequest(url, fd, onProgress) {
     return new Promise((resolve, reject) => {
@@ -17179,17 +17897,28 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (queueBtn) queueBtn.disabled = true;
     if (draftBtn) draftBtn.disabled = true;
     try {
+      // Pre-upload local files so the publish POST stays small (avoids mobile
+      // “session expired” when PHP empties a huge multipart body).
+      if (files.length && mode !== 'edit_status') {
+        const up = await preUploadPendingComposeFiles();
+        if (!up.ok) {
+          if (window.apAdminToast) window.apAdminToast(up.error || 'Media upload failed.', true);
+          else alert(up.error || 'Media upload failed.');
+          return;
+        }
+      }
       const fd = new FormData(form);
       fd.set('ajax', '1');
       fd.set('action', actionName);
       if (window.vaakCsrfApply) window.vaakCsrfApply(fd);
       else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
-      const hasMedia = !!(mediaInput && mediaInput.files && mediaInput.files.length);
-      setSubmitProgress(hasMedia ? 'uploading' : 'posting', hasMedia ? 0 : 0);
-      const data = await submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, (percent) => {
-        if (hasMedia) setSubmitProgress('uploading', percent);
-      });
-      setSubmitProgress(hasMedia ? 'finalizing' : 'posting', hasMedia ? 100 : 100);
+      // Drop any leftover file inputs — media already lives in draft_media_ids.
+      fd.delete('media[]');
+      if (draftMediaField) fd.set('draft_media_ids', draftMediaField.value || '');
+      const hadMedia = !!(((draftMediaField && draftMediaField.value) || '').trim());
+      setSubmitProgress(hadMedia ? 'finalizing' : 'posting', hadMedia ? 100 : 0);
+      const data = await submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, null);
+      setSubmitProgress(hadMedia ? 'finalizing' : 'posting', 100);
       if (!data || !data.ok) {
         const failMsg = mode === 'queue_post' ? 'Queue failed.' : (mode === 'edit_status' ? 'Edit failed.' : 'Post failed.');
         if (window.apAdminToast) {
@@ -17197,6 +17926,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         } else {
           alert((data && data.error) || failMsg);
         }
+        // Keep text + already-uploaded media_ids for retry.
         return;
       }
       if (window.apAdminToast) {
@@ -17247,12 +17977,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         window.location.href = '?view=queue';
         return;
       }
-      // Refresh only the timeline fragment after a normal post. Edits still
-      // reload because their existing card may be outside the current window.
+      // Soft-insert own post into the live timeline (home newer-poll now includes
+      // outbox_notes). Scroll to top so the card is visible without Refresh.
       if (mode !== 'edit_status' && typeof window.novaPollTimeline === 'function') {
         await window.novaPollTimeline();
         if (typeof window.novaInsertPendingTimeline === 'function') {
-          window.novaInsertPendingTimeline({ scrollToTop: false });
+          window.novaInsertPendingTimeline({ scrollToTop: true });
         }
       } else {
         window.location.reload();
@@ -17509,6 +18239,12 @@ function ap_admin_collect_media_uploads(): array
         $err = (int) ($files['error'][$i] ?? UPLOAD_ERR_NO_FILE);
         if ($err === UPLOAD_ERR_NO_FILE) {
             continue;
+        }
+        if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) {
+            return ['ids' => [], 'error' => 'File too large for the server (video max 50MB, images 10MB, audio 20MB).'];
+        }
+        if ($err === UPLOAD_ERR_PARTIAL) {
+            return ['ids' => [], 'error' => 'Upload was interrupted — try again on Wi‑Fi.'];
         }
         $file = [
             'name' => (string) ($files['name'][$i] ?? ''),

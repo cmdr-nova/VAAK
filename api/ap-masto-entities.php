@@ -1976,6 +1976,8 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
     if (function_exists('ap_plain_unglue_mentions')) {
         $plainText = ap_plain_unglue_mentions($plainText, $knownUsers);
     }
+    // Wafrn glues the next word onto @user@mkultra.monster — split before host parse.
+    $plainText = ap_masto_unglue_host_mentions($plainText);
     // Opportunistic split of glued bare @handles via known actors ("@ElizafoxIf")
     $plainText = ap_masto_unglue_bare_handles($plainText);
 
@@ -1984,12 +1986,19 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
         foreach ($mm as $hit) {
             $user = $hit[2];
             $host = strtolower($hit[3]);
-            $acctKey = strtolower($user . '@' . $host);
+            $acctFull = $user . '@' . $host;
+            $acctKey = strtolower($acctFull);
             if (isset($byAcct[$acctKey])) {
                 continue;
             }
             $actor = 'https://' . $host . '/users/' . rawurlencode($user);
-            $byAcct[$acctKey] = ap_masto_mention_from_actor($actor);
+            $resolved = ap_masto_mention_from_actor($actor);
+            // Keep the written @user@host as acct so linkify wraps the whole
+            // handle. Local actors otherwise collapse to bare username and leave
+            // "@mkultra.monster" sitting outside the link.
+            $resolved['acct'] = $acctFull;
+            $resolved['username'] = $user;
+            $byAcct[$acctKey] = $resolved;
         }
     }
 
@@ -2047,13 +2056,20 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
     if ($mentions) {
         // Longer accts first so @user@host beats partials
         usort($mentions, static fn ($a, $b) => strlen($b['acct']) <=> strlen($a['acct']));
+        // Pass 1: full @user@host only — never bare str_replace (nests inside full handles).
         foreach ($mentions as $m) {
             $acct = (string) $m['acct'];
+            if (!str_contains($acct, '@')) {
+                continue;
+            }
             $user = (string) $m['username'];
             $url = htmlspecialchars((string) $m['url'], ENT_QUOTES, 'UTF-8');
             $needleFull = '@' . htmlspecialchars($acct, ENT_QUOTES, 'UTF-8');
+            $acctParts = explode('@', $acct, 2);
+            $labelUser = htmlspecialchars((string) ($acctParts[0] !== '' ? $acctParts[0] : $user), ENT_QUOTES, 'UTF-8');
+            $labelHost = htmlspecialchars((string) ($acctParts[1] ?? ''), ENT_QUOTES, 'UTF-8');
             $link = '<span class="h-card"><a href="' . $url . '" class="u-url mention">@<span>'
-                . htmlspecialchars($user, ENT_QUOTES, 'UTF-8') . '</span></a></span>';
+                . $labelUser . '</span>@<span>' . $labelHost . '</span></a></span>';
             $escaped = str_replace($needleFull, $link, $escaped);
         }
 
@@ -2074,7 +2090,13 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
         $byUser = [];
         foreach ($mentions as $m) {
             $u = strtolower((string) $m['username']);
-            $byUser[$u] = isset($byUser[$u]) ? false : $m; // false = ambiguous
+            if (!isset($byUser[$u])) {
+                $byUser[$u] = $m;
+            } elseif (is_array($byUser[$u]) && str_contains((string) $byUser[$u]['acct'], '@') && !str_contains((string) $m['acct'], '@')) {
+                $byUser[$u] = $m;
+            } elseif (is_array($byUser[$u]) && (string) $byUser[$u]['url'] !== (string) $m['url']) {
+                $byUser[$u] = false; // ambiguous
+            }
         }
         foreach ($byUser as $u => $m) {
             if (!is_array($m)) {
@@ -2084,7 +2106,7 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
             $uname = htmlspecialchars((string) $m['username'], ENT_QUOTES, 'UTF-8');
             $link = '<span class="h-card"><a href="' . $url . '" class="u-url mention">@<span>'
                 . $uname . '</span></a></span>';
-            // Don't match @user inside URLs (…/@user) or emails
+            // Don't match @user inside URLs (…/@user), emails, or @user@host
             $escaped = preg_replace(
                 '/(^|[^A-Za-z0-9_\/])@' . preg_quote($uname, '/') . '(?![A-Za-z0-9_.@])/u',
                 '$1' . $link,
@@ -2173,6 +2195,55 @@ function ap_masto_unglue_bare_handles(string $text): string
         },
         $text
     ) ?? $text;
+}
+
+/**
+ * Wafrn (and some other writers) glue the next word onto a full @user@host
+ * mention: "@cmdr_nova@mkultra.monsterone more" / "@user@hostaudio posts".
+ * Split known hosts back out so linkify can wrap the whole real handle.
+ *
+ * @param list<string> $extraHosts Optional extra hosts to protect (lowercase).
+ */
+function ap_masto_unglue_host_mentions(string $text, array $extraHosts = []): string
+{
+    if ($text === '' || !str_contains($text, '@')) {
+        return $text;
+    }
+    $hosts = [];
+    foreach ($extraHosts as $h) {
+        $h = strtolower(trim((string) $h));
+        if ($h !== '' && str_contains($h, '.')) {
+            $hosts[$h] = true;
+        }
+    }
+    $actorId = '';
+    if (function_exists('ap_masto_session_actor_id')) {
+        $actorId = (string) ap_masto_session_actor_id();
+    }
+    if ($actorId === '' && !empty($GLOBALS['vaak_actor_id'])) {
+        $actorId = (string) $GLOBALS['vaak_actor_id'];
+    }
+    if ($actorId === '' && function_exists('ap_db_cmdr_nova_user_id') && function_exists('ap_db_owner_actor_id_for_user_id')) {
+        $actorId = (string) ap_db_owner_actor_id_for_user_id(ap_db_cmdr_nova_user_id());
+    }
+    $localHost = strtolower((string) (parse_url($actorId, PHP_URL_HOST) ?? ''));
+    if ($localHost !== '') {
+        $hosts[$localHost] = true;
+    }
+    // Always protect this instance host even if session actor is unset.
+    $hosts['mkultra.monster'] = true;
+
+    // Longest hosts first so mkultra.monster beats mkultra.mon
+    $hostList = array_keys($hosts);
+    usort($hostList, static fn ($a, $b) => strlen($b) <=> strlen($a));
+    foreach ($hostList as $host) {
+        $text = preg_replace(
+            '/(^|[^A-Za-z0-9_])(@[A-Za-z0-9_]+@' . preg_quote($host, '/') . ')([\p{L}\p{N}][\p{L}\p{N}_-]*)(?=[\s[:punct:]]|$)/u',
+            '$1$2 $3',
+            $text
+        ) ?? $text;
+    }
+    return $text;
 }
 
 /**
@@ -4118,13 +4189,11 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
 }
 
 /**
- * Unread notification count vs masto_markers.notifications.last_read_id.
- * Same logic Ice Cubes uses via /api/v1/notifications/unread_count.
+ * Unread notification state vs masto_markers.notifications.last_read_id.
  *
- * Fast path: light ID-only scan + short file cache. Avoids building full
- * notification entities (remote account hydration) on every admin page load.
+ * @return array{count:int,last_read_id:string,latest_unread_id:string,latest_id:string}
  */
-function ap_masto_notifications_unread_count(int $scan = 80): int
+function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache = false): array
 {
     $scan = max(1, min(80, $scan));
     $markers = ap_masto_markers_get();
@@ -4141,20 +4210,26 @@ function ap_masto_notifications_unread_count(int $scan = 80): int
     $ownerUserId = function_exists('ap_db_masto_owner_user_id')
         ? ap_db_masto_owner_user_id()
         : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
-    $cacheTtl = 45;
+    // Keep page-load badge snappy, but ajax polling must not sit on a 45s lie.
+    $cacheTtl = $bypassCache ? 0 : 12;
     $cacheDir = '/var/lib/mkultra/ap';
     if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
         $cacheDir = sys_get_temp_dir();
     }
     $cachePath = $cacheDir . '/notif_unread_' . (int) $ownerUserId . '_' . substr(sha1($lastRead), 0, 12) . '.json';
-    if (is_file($cachePath)) {
+    if ($cacheTtl > 0 && is_file($cachePath)) {
         $age = time() - (int) @filemtime($cachePath);
         if ($age >= 0 && $age < $cacheTtl) {
             $raw = @file_get_contents($cachePath);
             if (is_string($raw) && $raw !== '') {
                 $decoded = json_decode($raw, true);
                 if (is_array($decoded) && isset($decoded['c'])) {
-                    return max(0, min($scan, (int) $decoded['c']));
+                    return [
+                        'count' => max(0, min($scan, (int) $decoded['c'])),
+                        'last_read_id' => $lastRead,
+                        'latest_unread_id' => (string) ($decoded['u'] ?? ''),
+                        'latest_id' => (string) ($decoded['l'] ?? ''),
+                    ];
                 }
             }
         }
@@ -4168,8 +4243,11 @@ function ap_masto_notifications_unread_count(int $scan = 80): int
     $ids = [];
     try {
         // Mentions / favs / boosts / quotes / bites / updates — light rows (no entity hydrate).
+        // Column list must match the real mentions schema (there is no object_type).
+        // A bad SELECT here was swallowed by the catch below and left the nav badge stuck at 0
+        // while the full notifications view (SELECT *) still showed new mentions.
         $st = ap_db()->prepare(
-            'SELECT id, created_at, type, object_type, activity_id, activity_type,
+            'SELECT id, created_at, type, activity_id, activity_type,
                     object_id, owner_actor_id, actor_id, content, in_reply_to, owner_user_id
              FROM mentions
              WHERE owner_user_id = ? AND deleted_at IS NULL
@@ -4248,35 +4326,124 @@ function ap_masto_notifications_unread_count(int $scan = 80): int
     $ids = array_slice($ids, 0, $scan);
 
     $count = 0;
+    $latestId = '';
+    $latestUnreadId = '';
     foreach ($ids as $nidRaw) {
         $nid = preg_replace('/\D+/', '', (string) $nidRaw) ?: '0';
+        if ($latestId === '') {
+            $latestId = $nid;
+        }
+        $isUnread = false;
         if (strlen($nid) === strlen($lastRead)) {
             if ($nid > $lastRead) {
-                $count++;
+                $isUnread = true;
             }
         } elseif (strlen($nid) > strlen($lastRead)) {
+            $isUnread = true;
+        }
+        if ($isUnread) {
             $count++;
+            if ($latestUnreadId === '') {
+                $latestUnreadId = $nid;
+            }
         }
     }
 
-    @file_put_contents($cachePath, json_encode(['c' => $count, 'ts' => time()]), LOCK_EX);
-    return $count;
+    $payload = [
+        'c' => $count,
+        'u' => $latestUnreadId,
+        'l' => $latestId,
+        'ts' => time(),
+    ];
+    @file_put_contents($cachePath, json_encode($payload), LOCK_EX);
+    return [
+        'count' => $count,
+        'last_read_id' => $lastRead,
+        'latest_unread_id' => $latestUnreadId,
+        'latest_id' => $latestId,
+    ];
+}
+
+/**
+ * Unread notification count vs masto_markers.notifications.last_read_id.
+ * Same logic Ice Cubes uses via /api/v1/notifications/unread_count.
+ */
+function ap_masto_notifications_unread_count(int $scan = 80): int
+{
+    $state = ap_masto_notifications_unread_state($scan, false);
+    return (int) ($state['count'] ?? 0);
+}
+
+/**
+ * Newest snowflake among digit-only ids (length then lexicographic).
+ */
+function ap_masto_snowflake_newest(string ...$ids): string
+{
+    $best = '0';
+    foreach ($ids as $raw) {
+        $id = preg_replace('/\D+/', '', (string) $raw) ?: '0';
+        if ($id === '0') {
+            continue;
+        }
+        if ($best === '0') {
+            $best = $id;
+            continue;
+        }
+        $lb = strlen($best);
+        $li = strlen($id);
+        if ($li > $lb || ($li === $lb && $id > $best)) {
+            $best = $id;
+        }
+    }
+    return $best;
 }
 
 /**
  * Mark notifications timeline read up to $lastId (or the newest notification).
  * Returns the last_read_id that was written.
+ *
+ * Always takes the max of: explicit id, light-scan tip, hydrated fetch tip, and
+ * the existing marker — never regress. A wrong/older snowflake for the same
+ * mention id (clock skew / now()-fallback) used to leave real newer ids unread
+ * so the badge came back after leaving Notifications.
  */
 function ap_masto_notifications_mark_read(?string $lastId = null): string
 {
-    if ($lastId === null || $lastId === '') {
-        $latest = ap_masto_notifications_fetch(1);
-        $lastId = (string) ($latest[0]['id'] ?? '0');
+    $candidates = [];
+    if ($lastId !== null && $lastId !== '') {
+        $candidates[] = $lastId;
     }
-    if ($lastId === '' || $lastId === '0') {
+    try {
+        $state = ap_masto_notifications_unread_state(80, true);
+        $candidates[] = (string) ($state['latest_id'] ?? '');
+        $candidates[] = (string) ($state['latest_unread_id'] ?? '');
+        $candidates[] = (string) ($state['last_read_id'] ?? '');
+    } catch (Throwable $e) {
+        // fall through
+    }
+    try {
+        $latest = ap_masto_notifications_fetch(1);
+        $candidates[] = (string) ($latest[0]['id'] ?? '');
+    } catch (Throwable $e) {
+        // fall through
+    }
+    try {
+        $markers = ap_masto_markers_get();
+        $nMark = $markers->notifications ?? null;
+        if (is_array($nMark) && isset($nMark['last_read_id'])) {
+            $candidates[] = (string) $nMark['last_read_id'];
+        } elseif (is_object($nMark) && isset($nMark->last_read_id)) {
+            $candidates[] = (string) $nMark->last_read_id;
+        }
+    } catch (Throwable $e) {
+        // fall through
+    }
+
+    $best = ap_masto_snowflake_newest(...$candidates);
+    if ($best === '' || $best === '0') {
         return '0';
     }
-    ap_masto_markers_set(['notifications' => ['last_read_id' => $lastId]]);
+    ap_masto_markers_set(['notifications' => ['last_read_id' => $best]]);
     // Drop short-lived unread badge cache so the nav clears immediately.
     try {
         $ownerUserId = function_exists('ap_db_masto_owner_user_id')
@@ -4292,7 +4459,7 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
     } catch (Throwable $e) {
         // non-fatal
     }
-    return $lastId;
+    return $best;
 }
 
 /**
@@ -5550,38 +5717,74 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     return $out;
 }
 
+/**
+ * Write timeline markers. Notification (and home) last_read_id only advances —
+ * never regresses. Ice Cubes / other clients often POST a stale last_read after
+ * VAAK already marked newer items read, which resurrected the nav badge.
+ */
 function ap_masto_markers_set(array $input, ?int $ownerUserId = null): object
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    $writeMarker = static function (int $ownerUserId, string $tl, string $last) : void {
+        $last = preg_replace('/\D+/', '', $last) ?: '';
+        if ($last === '' || $last === '0') {
+            return;
+        }
+        $now = ap_db_now();
+        // Read existing so we can keep the newer snowflake.
+        $existing = '0';
+        try {
+            $st = ap_db()->prepare(
+                'SELECT last_read_id FROM masto_markers WHERE owner_user_id = ? AND timeline = ? LIMIT 1'
+            );
+            $st->execute([$ownerUserId, $tl]);
+            $existing = preg_replace('/\D+/', '', (string) ($st->fetchColumn() ?: '0')) ?: '0';
+        } catch (Throwable $e) {
+            $existing = '0';
+        }
+        $best = function_exists('ap_masto_snowflake_newest')
+            ? ap_masto_snowflake_newest($existing, $last)
+            : $last;
+        if ($best === '' || $best === '0') {
+            return;
+        }
+        ap_db()->prepare(
+            'INSERT INTO masto_markers (owner_user_id, timeline, last_read_id, updated_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(owner_user_id, timeline) DO UPDATE SET
+               last_read_id = excluded.last_read_id, updated_at = excluded.updated_at'
+        )->execute([$ownerUserId, $tl, $best, $now]);
+        // Drop unread badge caches when notifications marker moves forward.
+        if ($tl === 'notifications' && $best !== $existing) {
+            try {
+                $cacheDir = '/var/lib/mkultra/ap';
+                if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
+                    $cacheDir = sys_get_temp_dir();
+                }
+                foreach (glob($cacheDir . '/notif_unread_' . (int) $ownerUserId . '_*.json') ?: [] as $path) {
+                    @unlink($path);
+                }
+            } catch (Throwable $e) {
+                // non-fatal
+            }
+        }
+    };
+
     foreach (['notifications', 'home'] as $tl) {
         if (!isset($input[$tl]) || !is_array($input[$tl])) {
-            // form style: notifications[last_read_id]
             continue;
         }
         $last = (string) ($input[$tl]['last_read_id'] ?? '');
         if ($last === '') {
             continue;
         }
-        ap_db()->prepare(
-            'INSERT INTO masto_markers (owner_user_id, timeline, last_read_id, updated_at) VALUES (?, ?, ?, ?)
-             ON CONFLICT(owner_user_id, timeline) DO UPDATE SET
-               last_read_id = excluded.last_read_id, updated_at = excluded.updated_at'
-        )->execute([$ownerUserId, $tl, $last, ap_db_now()]);
-    }
-    // Also accept flat notifications[last_read_id] from multipart
-    if (isset($input['notifications']) && is_string($input['notifications'])) {
-        // ignore
+        $writeMarker($ownerUserId, $tl, $last);
     }
     foreach ($input as $key => $val) {
         if (!is_string($key)) {
             continue;
         }
         if (preg_match('/^(notifications|home)\[last_read_id\]$/', $key, $m) && is_string($val) && $val !== '') {
-            ap_db()->prepare(
-                'INSERT INTO masto_markers (owner_user_id, timeline, last_read_id, updated_at) VALUES (?, ?, ?, ?)
-                 ON CONFLICT(owner_user_id, timeline) DO UPDATE SET
-                   last_read_id = excluded.last_read_id, updated_at = excluded.updated_at'
-            )->execute([$ownerUserId, $m[1], $val, ap_db_now()]);
+            $writeMarker($ownerUserId, $m[1], $val);
         }
     }
     return ap_masto_markers_get($ownerUserId);

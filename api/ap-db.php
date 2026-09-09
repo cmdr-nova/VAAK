@@ -2208,7 +2208,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $attachment = [];
     $rawAtt = $fields['attachment'] ?? [];
     if (is_array($rawAtt)) {
-        foreach (array_slice($rawAtt, 0, 4) as $item) {
+        foreach (array_slice($rawAtt, 0, 8) as $item) {
             if (!is_array($item)) {
                 continue;
             }
@@ -2552,7 +2552,7 @@ function ap_profile_verify_rel_me_url(string $pageUrl, ?string $profileUrl = nul
 function ap_profile_verify_attachments(array $attachments, bool $doFetch = true): array
 {
     $out = [];
-    foreach (array_slice($attachments, 0, 4) as $item) {
+    foreach (array_slice($attachments, 0, 8) as $item) {
         if (!is_array($item)) {
             continue;
         }
@@ -2587,7 +2587,7 @@ function ap_profile_reverify_fields(string $actorKey = 'cmdr_nova'): array
     // Normalize bare domains → https <a rel=me> before checking
     $normalized = [];
     $checked = 0;
-    foreach (array_slice($atts, 0, 4) as $item) {
+    foreach (array_slice($atts, 0, 8) as $item) {
         if (!is_array($item)) {
             continue;
         }
@@ -2641,7 +2641,7 @@ function ap_profile_masto_fields(bool $forSource = false, string $actorKey = 'cm
     $p = ap_profile_get($actorKey);
     $atts = is_array($p['attachment'] ?? null) ? $p['attachment'] : [];
     $out = [];
-    foreach (array_slice($atts, 0, 4) as $item) {
+    foreach (array_slice($atts, 0, 8) as $item) {
         if (!is_array($item)) {
             continue;
         }
@@ -9003,6 +9003,23 @@ function ap_dm_store(array $row): array
         );
         $st->execute([$ownerUserId, $objectId]);
         $id = (int) ($st->fetch()['id'] ?? 0);
+        // Inbound DMs: push to the owner's browsers/apps (best-effort).
+        if ($id > 0 && $direction === 'in') {
+            try {
+                if (!function_exists('ap_webpush_notify_event')) {
+                    $wp = __DIR__ . '/ap-webpush.php';
+                    if (is_file($wp)) {
+                        require_once $wp;
+                    }
+                }
+                if (function_exists('ap_webpush_notify_event')) {
+                    $snippet = is_string($content) ? trim(strip_tags($content)) : '';
+                    ap_webpush_notify_event('dm', $peer, (string) $id, $snippet !== '' ? $snippet : null, $ownerUserId);
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-dm] webpush: ' . $e->getMessage());
+            }
+        }
         return ['ok' => true, 'id' => $id];
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => $e->getMessage()];

@@ -302,6 +302,8 @@ function ap_webpush_alert_enabled(array $sub, string $type): bool
         'favourite' => !empty($sub['alert_favourite']),
         'reblog' => !empty($sub['alert_reblog']),
         'mention', 'quote', 'bite' => !empty($sub['alert_mention']),
+        // DMs are high-signal — always push when a subscription exists.
+        'dm' => true,
         'poll' => !empty($sub['alert_poll']),
         'status' => !empty($sub['alert_status']),
         'update' => !empty($sub['alert_update']),
@@ -375,7 +377,7 @@ function ap_webpush_dispatch(array $event): void
                 'access_token' => (string) $sub['access_token'],
                 'preferred_locale' => 'en',
                 'notification_id' => $notifIdNum,
-                'notification_type' => $type === 'quote' ? 'mention' : $type,
+                'notification_type' => ($type === 'quote' || $type === 'dm') ? 'mention' : $type,
                 'icon' => (string) ($event['icon'] ?? 'https://mkultra.monster/img/avatar/default.jpg'),
                 'title' => (string) ($event['title'] ?? 'Nova'),
                 'body' => (string) ($event['body'] ?? ''),
@@ -503,6 +505,7 @@ function ap_webpush_notify_event(
             'update' => 'edited a post',
             'status' => 'posted',
             'bite' => 'bit you',
+            'dm' => 'sent you a DM',
             default => $type,
         };
         $bodyText = $body !== null ? trim(strip_tags($body)) : '';
@@ -521,5 +524,130 @@ function ap_webpush_notify_event(
         ]);
     } catch (Throwable $e) {
         error_log('[ap-webpush] notify_event: ' . $e->getMessage());
+    }
+}
+
+/** Stable OAuth client_id for VAAK browser push (not Ice Cubes). */
+const AP_WEBPUSH_VAAK_WEB_CLIENT_ID = 'vaak-web-push';
+
+/**
+ * Ensure the VAAK Web OAuth app exists (for session-native PushManager subs).
+ *
+ * @return array<string,mixed>|null oauth_apps row
+ */
+function ap_webpush_ensure_vaak_web_app(): ?array
+{
+    $existing = function_exists('ap_oauth_app_by_client_id')
+        ? ap_oauth_app_by_client_id(AP_WEBPUSH_VAAK_WEB_CLIENT_ID)
+        : null;
+    if (is_array($existing)) {
+        return $existing;
+    }
+    try {
+        $secret = bin2hex(random_bytes(32));
+        $hash = password_hash($secret, PASSWORD_DEFAULT);
+        ap_db()->prepare(
+            'INSERT INTO oauth_apps (client_name, client_id, client_secret_hash, redirect_uris, scopes, website, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )->execute([
+            'VAAK Web',
+            AP_WEBPUSH_VAAK_WEB_CLIENT_ID,
+            $hash,
+            'https://mkultra.monster/vaak/',
+            'read push',
+            'https://mkultra.monster/vaak/',
+            ap_db_now(),
+        ]);
+    } catch (Throwable $e) {
+        error_log('[ap-webpush] ensure vaak web app: ' . $e->getMessage());
+    }
+    return function_exists('ap_oauth_app_by_client_id')
+        ? ap_oauth_app_by_client_id(AP_WEBPUSH_VAAK_WEB_CLIENT_ID)
+        : null;
+}
+
+/**
+ * Mint or reuse a VAAK Web oauth token for browser push.
+ *
+ * @return array{ok:bool,error?:string,token_row?:array,access_token?:string}
+ */
+function ap_webpush_vaak_web_token_for_user(int $userId): array
+{
+    if ($userId < 1) {
+        return ['ok' => false, 'error' => 'Not signed in.'];
+    }
+    ap_webpush_migrate();
+    $app = ap_webpush_ensure_vaak_web_app();
+    if (!is_array($app)) {
+        return ['ok' => false, 'error' => 'Could not provision VAAK Web push app.'];
+    }
+    $clientId = AP_WEBPUSH_VAAK_WEB_CLIENT_ID;
+    // Prefer an existing non-revoked token that already has a push subscription
+    // (we still have the plain access_token there).
+    try {
+        $st = ap_db()->prepare(
+            'SELECT t.*, s.access_token AS push_access_token
+             FROM oauth_tokens t
+             LEFT JOIN push_subscriptions s ON s.token_id = t.id
+             WHERE t.user_id = ? AND t.client_id = ? AND t.revoked_at IS NULL
+             ORDER BY t.id DESC LIMIT 5'
+        );
+        $st->execute([$userId, $clientId]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $plain = trim((string) ($row['push_access_token'] ?? ''));
+            if ($plain !== '') {
+                return ['ok' => true, 'token_row' => $row, 'access_token' => $plain];
+            }
+        }
+        // No reusable plain token — revoke leftovers and mint a fresh one.
+        ap_db()->prepare(
+            'UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL'
+        )->execute([ap_db_now(), $userId, $clientId]);
+    } catch (Throwable $e) {
+        error_log('[ap-webpush] vaak web token lookup: ' . $e->getMessage());
+    }
+    if (!function_exists('ap_oauth_token_create')) {
+        return ['ok' => false, 'error' => 'OAuth unavailable.'];
+    }
+    $created = ap_oauth_token_create($clientId, 'read push', $userId);
+    $plain = (string) ($created['access_token'] ?? '');
+    if ($plain === '') {
+        return ['ok' => false, 'error' => 'Could not mint push token.'];
+    }
+    $hash = hash('sha256', $plain);
+    $st2 = ap_db()->prepare('SELECT * FROM oauth_tokens WHERE access_token_hash = ? LIMIT 1');
+    $st2->execute([$hash]);
+    $tokenRow = $st2->fetch();
+    if (!is_array($tokenRow)) {
+        return ['ok' => false, 'error' => 'Token created but not found.'];
+    }
+    return ['ok' => true, 'token_row' => $tokenRow, 'access_token' => $plain];
+}
+
+/**
+ * Whether this user currently has any active browser/app push subscription.
+ */
+function ap_webpush_user_has_subscription(int $userId): bool
+{
+    if ($userId < 1) {
+        return false;
+    }
+    try {
+        ap_webpush_migrate();
+        $cmdrId = function_exists('ap_db_cmdr_nova_user_id') ? ap_db_cmdr_nova_user_id() : 1;
+        $st = ap_db()->prepare(
+            'SELECT 1 FROM push_subscriptions s
+             INNER JOIN oauth_tokens t ON t.id = s.token_id
+             WHERE t.revoked_at IS NULL
+               AND (t.user_id = ? OR (t.user_id IS NULL AND ? = ?))
+             LIMIT 1'
+        );
+        $st->execute([$userId, $userId, $cmdrId]);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
     }
 }

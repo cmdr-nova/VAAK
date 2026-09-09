@@ -791,7 +791,7 @@ function ap_cmdr_shell_start(string $title): void
       body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#e8e8e8;line-height:1.55}
       main{max-width:42rem;margin:3rem auto;padding:0 1.25rem;box-sizing:border-box}
       .card{border:1px solid #333;border-radius:12px;padding:1.35rem;background:#121212;overflow:hidden}
-      .banner{margin:-1.35rem -1.35rem 1rem;height:120px;background:#1a1a1a;background-size:cover;background-position:center}
+      .banner{margin:-1.35rem -1.35rem 1rem;height:180px;background:#1a1a1a;background-size:cover;background-position:center}
       .row{display:flex;gap:1rem;align-items:flex-start}
       .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#222;flex-shrink:0}
       .sl-link a{display:inline-flex;align-items:center;padding:.2rem .3rem;border:1px solid #333;border-radius:8px;background:#121212;text-decoration:none}
@@ -804,7 +804,12 @@ function ap_cmdr_shell_start(string $title): void
       .profile-bio p:last-child{margin-bottom:0}
       .vanity-verified{display:inline-flex;align-items:center;justify-content:center;width:1.05em;height:1.05em;margin-left:.2rem;border-radius:50%;background:#1d9bf0;color:#fff;font-size:.72em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.08em}
       .operator-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(0,255,159,.45);border-radius:999px;background:rgba(0,255,159,.1);color:#8fffc8;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:normal}
-      .fields{margin-top:1rem;font-size:.9rem} .fields dt{color:#999;margin-top:.5rem} .fields dd{margin:.15rem 0 0}
+      .fields{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .85rem;margin-top:1rem;font-size:.88rem}
+      .fields .field{min-width:0;overflow:hidden}
+      .fields .field-label{display:block;color:#999;font-size:.75rem;margin:0 0 .2rem}
+      .fields .field-value{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .fields .field-value a{display:inline;overflow:hidden;text-overflow:ellipsis}
+      @media (max-width:520px){.fields{grid-template-columns:1fr}}
       .field-verified{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;margin-left:.35rem;border-radius:50%;background:rgba(0,255,159,.2);color:#00ff9f;font-size:.75em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.05em}
       .stats{display:flex;gap:1.25rem;margin:1.1rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a}
       .stats a,.stats > div{color:inherit;text-decoration:none;display:flex;flex-direction:column;gap:.15rem}
@@ -1472,7 +1477,7 @@ function ap_cmdr_html(): void
     echo '</form></div></div>';
 
     if (!empty($p['attachment'])) {
-        echo '<dl class="fields">';
+        echo '<div class="fields">';
         foreach ($p['attachment'] as $att) {
             if (!is_array($att)) {
                 continue;
@@ -1488,9 +1493,10 @@ function ap_cmdr_html(): void
                     (!empty($att['verified_at']) ? (' · ' . htmlspecialchars((string) $att['verified_at'], ENT_QUOTES, 'UTF-8')) : '') .
                     '" aria-label="Verified">✓</span>'
                 : '';
-            echo '<dt>' . $ln . '</dt><dd>' . $lv . $verMark . '</dd>';
+            echo '<div class="field"><span class="field-label">' . $ln . $verMark . '</span>'
+                . '<div class="field-value">' . $lv . '</div></div>';
         }
-        echo '</dl>';
+        echo '</div>';
     }
 
     $perPage = 20;
@@ -1519,7 +1525,7 @@ function ap_cmdr_html(): void
     echo '<a href="/users/cmdr_nova/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $followingCount . '</span><span class="l">Following</span></a>';
     echo '<a href="/users/cmdr_nova/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $followerCount . '</span><span class="l">Followers</span></a>';
     echo '</div>';
-    echo '<p class="feed-links"><a href="/users/cmdr_nova/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/cmdr_nova/feed.atom" type="application/atom+xml">Atom</a> · <a href="/api/ap-webmention.php?target=https%3A%2F%2Fmkultra.monster%2Fusers%2Fcmdr_nova">Webmentions</a>';
+    echo '<p class="feed-links"><a href="/users/cmdr_nova/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/cmdr_nova/feed.atom" type="application/atom+xml">Atom</a>';
     if ($bskyHandle !== null) {
         echo ' · <a href="https://bsky.app/profile/' . rawurlencode($bskyHandle) . '" rel="me noopener noreferrer" target="_blank">Bluesky</a>';
     }

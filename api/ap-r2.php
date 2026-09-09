@@ -181,8 +181,18 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     if ($ownerUserId < 1) {
         return ['ok' => false, 'error' => 'Not signed in'];
     }
-    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
-        return ['ok' => false, 'error' => 'Upload failed (code ' . (int) ($file['error'] ?? -1) . ')'];
+    $uploadErr = (int) ($file['error'] ?? UPLOAD_ERR_NO_FILE);
+    if ($uploadErr !== UPLOAD_ERR_OK) {
+        $errMsg = match ($uploadErr) {
+            UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE
+                => 'File too large for the server (video max 50MB, images 10MB, audio 20MB).',
+            UPLOAD_ERR_PARTIAL => 'Upload was interrupted — try again on Wi‑Fi.',
+            UPLOAD_ERR_NO_TMP_DIR, UPLOAD_ERR_CANT_WRITE
+                => 'Server could not store the upload. Try again in a moment.',
+            UPLOAD_ERR_EXTENSION => 'Upload blocked by the server.',
+            default => 'Upload failed (code ' . $uploadErr . ').',
+        };
+        return ['ok' => false, 'error' => $errMsg];
     }
     $tmp = (string) ($file['tmp_name'] ?? '');
     if ($tmp === '' || !is_uploaded_file($tmp)) {

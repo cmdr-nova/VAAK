@@ -289,8 +289,13 @@ ASCII;
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="robots" content="noindex,nofollow">
+  <meta name="theme-color" content="#00ff9f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="VAAK">
   <title>VAAK</title>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
+  <link rel="manifest" href="/vaak/manifest.webmanifest?v=20260909">
   <link rel="icon" href="/vaak/favicon.svg?v=20260907" type="image/svg+xml">
   <link rel="icon" href="/vaak/favicon.ico?v=20260907" sizes="any">
   <link rel="icon" href="/vaak/favicon-32x32.png?v=20260907" type="image/png" sizes="32x32">

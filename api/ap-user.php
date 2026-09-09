@@ -520,7 +520,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<p class="follow-hint">Opens your instance’s follow dialog.</p></form></div></div>';
 
     if (!empty($p['attachment']) && is_array($p['attachment'])) {
-        echo '<dl class="fields">';
+        echo '<div class="fields">';
         foreach ($p['attachment'] as $att) {
             if (!is_array($att)) {
                 continue;
@@ -532,9 +532,10 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             if ($ln === '' || $lv === '') {
                 continue;
             }
-            echo '<dt>' . $ln . '</dt><dd>' . $lv . '</dd>';
+            echo '<div class="field"><span class="field-label">' . $ln . '</span>'
+                . '<div class="field-value">' . $lv . '</div></div>';
         }
-        echo '</dl>';
+        echo '</div>';
     }
 
     $notes = ap_outbox_list(40, $actorKey);
@@ -566,7 +567,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . count($following) . '</span><span class="l">Following</span></a>';
     echo '<a href="/users/' . $safe . '/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . count($followers) . '</span><span class="l">Followers</span></a>';
     echo '</div>';
-    echo '<p class="feed-links"><a href="/users/' . $safe . '/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/' . $safe . '/feed.atom" type="application/atom+xml">Atom</a> · <a href="/api/ap-webmention.php?target=' . rawurlencode('https://mkultra.monster/users/' . $safe) . '">Webmentions</a>';
+    echo '<p class="feed-links"><a href="/users/' . $safe . '/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/' . $safe . '/feed.atom" type="application/atom+xml">Atom</a>';
     if ($bskyHandle !== null) {
         echo ' · <a href="https://bsky.app/profile/' . rawurlencode($bskyHandle) . '" rel="me noopener noreferrer" target="_blank">Bluesky</a>';
     }
@@ -804,10 +805,14 @@ function ap_user_html_shell_start(string $title): void
       .sl-link img{display:block;border-radius:8px;flex:0 0 auto}
       .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#1a1a1a}
       .av-fallback{display:flex;align-items:center;justify-content:center;font-size:1.6rem;font-weight:700;color:#00ff9f}
-      .banner{height:120px;border-radius:12px;background-size:cover;background-position:center;margin:-.25rem -.25rem 1rem;border:1px solid #2a2a2a}
+      .banner{height:180px;border-radius:12px;background-size:cover;background-position:center;margin:-.25rem -.25rem 1rem;border:1px solid #2a2a2a}
       .profile-bio{margin:1rem 0;line-height:1.45}
-      .fields{display:grid;grid-template-columns:auto 1fr;gap:.35rem .75rem;margin:1rem 0}
-      .fields dt{color:#999;font-size:.8rem}.fields dd{margin:0}
+      .fields{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .85rem;margin:1rem 0;font-size:.88rem}
+      .fields .field{min-width:0;overflow:hidden}
+      .fields .field-label{display:block;color:#999;font-size:.75rem;margin:0 0 .2rem}
+      .fields .field-value{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .fields .field-value a{overflow:hidden;text-overflow:ellipsis}
+      @media (max-width:520px){.fields{grid-template-columns:1fr}}
       .stats{display:flex;gap:1.25rem;margin:1.1rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a}
       .stats a{text-decoration:none;color:inherit}
       .stats .n{display:block;font-size:1.25rem;font-weight:700;color:#00ff9f}
