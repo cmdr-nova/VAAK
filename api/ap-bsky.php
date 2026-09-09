@@ -1398,15 +1398,20 @@ function ap_bsky_index_feed_items(array $feed, ?int $ownerUserId = null, int $sy
 /**
  * Recent cached Bluesky posts for Home mix (posts this owner last warmed/saw).
  *
+ * @param ?string $beforeIndexedAt Exclusive upper bound (ISO-8601) for infinite-scroll extend.
  * @return list<array{post:array,reason?:?array,bsky_uri:string,indexed_at:?string,fediverse_id:?string}>
  */
-function ap_bsky_posts_for_home(int $ownerUserId, int $limit = 40, ?string $excludeAuthorDid = null): array
-{
+function ap_bsky_posts_for_home(
+    int $ownerUserId,
+    int $limit = 40,
+    ?string $excludeAuthorDid = null,
+    ?string $beforeIndexedAt = null
+): array {
     if ($ownerUserId < 1) {
         return [];
     }
     ap_bsky_posts_migrate();
-    $limit = max(1, min(80, $limit));
+    $limit = max(1, min(120, $limit));
     try {
         $sql = 'SELECT p.bsky_uri, p.raw_json, p.reason_json, p.indexed_at, p.author_did,
                        l.fediverse_id
@@ -1418,6 +1423,11 @@ function ap_bsky_posts_for_home(int $ownerUserId, int $limit = 40, ?string $excl
         if (is_string($excludeAuthorDid) && str_starts_with($excludeAuthorDid, 'did:')) {
             $sql .= ' AND p.author_did <> ?';
             $bind[] = $excludeAuthorDid;
+        }
+        $beforeIndexedAt = is_string($beforeIndexedAt) ? trim($beforeIndexedAt) : '';
+        if ($beforeIndexedAt !== '') {
+            $sql .= ' AND p.indexed_at < ?';
+            $bind[] = $beforeIndexedAt;
         }
         $sql .= ' ORDER BY p.indexed_at DESC, p.updated_at DESC LIMIT ?';
         $bind[] = $limit;

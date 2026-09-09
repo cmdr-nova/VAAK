@@ -4048,12 +4048,15 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
     $beforeAt = gmdate('c', $beforeTs);
     $seenIds = [];
     $seenOutbox = [];
+    $seenBsky = [];
     foreach ($ranked as $entry) {
         $ek = (string) ($entry['k'] ?? '');
         if ($ek === 'event' && isset($entry['id'])) {
             $seenIds[(string) $entry['id']] = true;
         } elseif ($ek === 'outbox' && isset($entry['id'])) {
             $seenOutbox[rtrim((string) $entry['id'], '/')] = true;
+        } elseif ($ek === 'bsky' && isset($entry['id'])) {
+            $seenBsky[(string) $entry['id']] = true;
         }
     }
 
@@ -4221,6 +4224,8 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             }
             return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
         });
+        /** @var list<array{k:string,id:string,sort:int}> $homeCand */
+        $homeCand = [];
         foreach ($homeRaw as $e) {
             $eid = (string) (int) ($e['id'] ?? 0);
             if ($eid === '0' || isset($seenIds[$eid])) {
@@ -4243,9 +4248,98 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 continue;
             }
             $seenIds[$eid] = true;
-            $added[] = ['k' => 'event', 'id' => $eid];
+            $homeCand[] = [
+                'k' => 'event',
+                'id' => $eid,
+                'sort' => strtotime((string) ($e['created_at'] ?? '')) ?: 0,
+            ];
+            if (count($homeCand) >= $want * 2) {
+                break;
+            }
+        }
+        // Older Bluesky cache rows so deep Home scroll keeps the mix.
+        if (
+            function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+            && function_exists('ap_bsky_posts_for_home')
+            && function_exists('ap_bsky_session_row')
+        ) {
+            $ownerId = admin_owner_user_id();
+            $sess = $ownerId > 0 ? ap_bsky_session_row($ownerId) : null;
+            if (is_array($sess)) {
+                $ownDid = (string) ($sess['did'] ?? '');
+                $bskyOlder = ap_bsky_posts_for_home(
+                    $ownerId,
+                    max(20, min(60, $want)),
+                    $ownDid !== '' ? $ownDid : null,
+                    $beforeAt
+                );
+                foreach ($bskyOlder as $bItem) {
+                    if (!is_array($bItem)) {
+                        continue;
+                    }
+                    $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
+                    if ($bUri === '' || isset($seenBsky[$bUri])) {
+                        continue;
+                    }
+                    $authorDid = (string) ($bItem['post']['author']['did'] ?? '');
+                    if ($authorDid !== '' && function_exists('ap_bsky_filter_hidden_authors')) {
+                        $filtered = ap_bsky_filter_hidden_authors($ownerId, [['post' => $bItem['post']]]);
+                        if ($filtered === []) {
+                            continue;
+                        }
+                    }
+                    $indexed = (string) ($bItem['indexed_at'] ?? ($bItem['post']['indexedAt'] ?? ''));
+                    $sortTs = strtotime($indexed) ?: 0;
+                    if ($sortTs <= 0 || $sortTs >= $beforeTs) {
+                        continue;
+                    }
+                    $seenBsky[$bUri] = true;
+                    $homeCand[] = ['k' => 'bsky', 'id' => $bUri, 'sort' => $sortTs];
+                }
+            }
+        }
+        usort($homeCand, static fn($a, $b) => ($b['sort'] ?? 0) <=> ($a['sort'] ?? 0));
+        // Soft-space Bluesky in the extend window (~30%, ≥2 fedi between).
+        $bskyEmitted = 0;
+        $sinceBsky = 2; // allow a Bluesky card first in the extend window
+        $deferred = [];
+        foreach ($homeCand as $cand) {
+            $isBsky = ((string) ($cand['k'] ?? '')) === 'bsky';
+            if ($isBsky) {
+                if (($sinceBsky < 2 && $added !== [])
+                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.30)
+                ) {
+                    $deferred[] = $cand;
+                    continue;
+                }
+                $bskyEmitted++;
+                $sinceBsky = 0;
+            } else {
+                $sinceBsky++;
+                while ($deferred !== []) {
+                    if ($sinceBsky < 2) {
+                        break;
+                    }
+                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.30) {
+                        break;
+                    }
+                    $d = array_shift($deferred);
+                    $added[] = ['k' => (string) $d['k'], 'id' => (string) $d['id']];
+                    $bskyEmitted++;
+                    $sinceBsky = 0;
+                }
+            }
+            $added[] = ['k' => (string) $cand['k'], 'id' => (string) $cand['id']];
             if (count($added) >= $want) {
                 break;
+            }
+        }
+        if (count($added) < $want) {
+            foreach ($deferred as $d) {
+                $added[] = ['k' => (string) $d['k'], 'id' => (string) $d['id']];
+                if (count($added) >= $want) {
+                    break;
+                }
             }
         }
     }
@@ -4698,7 +4792,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         if (is_array($bskySessHome)) {
             $ownBskyDid = (string) ($bskySessHome['did'] ?? '');
         }
-        $bskyHomeItems = ap_bsky_posts_for_home($homeOwnerId, 40, $ownBskyDid !== '' ? $ownBskyDid : null);
+        $bskyHomeItems = ap_bsky_posts_for_home($homeOwnerId, 80, $ownBskyDid !== '' ? $ownBskyDid : null);
         $bskyCandidates = [];
         foreach ($bskyHomeItems as $bItem) {
             if (!is_array($bItem) || empty($bItem['post']) || !is_array($bItem['post'])) {
@@ -4747,25 +4841,55 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     // Soft cap Bluesky share (~30%) so Home stays fedi-first when AT cache is busy.
+    // Defer surplus Bluesky (don't drop) so later pages / deeper scroll still get them.
     if ($homeTimeline) {
         $cappedBsky = [];
+        $deferredBsky = [];
         $bskyEmitted = 0;
         $sinceBsky = 0;
+        $flushDeferredBsky = static function () use (&$cappedBsky, &$deferredBsky, &$bskyEmitted, &$sinceBsky): void {
+            while ($deferredBsky !== []) {
+                if ($sinceBsky < 2 && $cappedBsky !== []) {
+                    break;
+                }
+                if (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.30) {
+                    break;
+                }
+                $cappedBsky[] = array_shift($deferredBsky);
+                $bskyEmitted++;
+                $sinceBsky = 0;
+            }
+        };
         foreach ($homeTimeline as $item) {
             $isBsky = ((string) ($item['kind'] ?? '')) === 'bsky';
             if ($isBsky) {
-                if ($sinceBsky < 2 && count($cappedBsky) > 0) {
-                    continue;
-                }
-                if (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.30) {
+                if (($sinceBsky < 2 && $cappedBsky !== [])
+                    || (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.30)
+                ) {
+                    $deferredBsky[] = $item;
                     continue;
                 }
                 $bskyEmitted++;
                 $sinceBsky = 0;
+                $cappedBsky[] = $item;
             } else {
                 $sinceBsky++;
+                $cappedBsky[] = $item;
+                $flushDeferredBsky();
             }
-            $cappedBsky[] = $item;
+        }
+        // Remaining deferred Bluesky go on the tail (later infinite-scroll pages).
+        while ($deferredBsky !== []) {
+            if ($sinceBsky < 2 && $cappedBsky !== []) {
+                // No more fedi to create gaps — append the rest so they still appear.
+                foreach ($deferredBsky as $d) {
+                    $cappedBsky[] = $d;
+                }
+                $deferredBsky = [];
+                break;
+            }
+            $cappedBsky[] = array_shift($deferredBsky);
+            $sinceBsky = 0;
         }
         $homeTimeline = $cappedBsky;
     }
