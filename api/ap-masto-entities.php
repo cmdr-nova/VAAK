@@ -840,6 +840,31 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
 }
 
 /**
+ * Alternate forms of a status/object URL for cache hits without HTTP.
+ * Prefers shared ap_object_url_lookup_candidates() from ap-inbox.php when loaded.
+ *
+ * @return list<string>
+ */
+function ap_masto_object_url_lookup_candidates(string $objectUrl): array
+{
+    if (function_exists('ap_object_url_lookup_candidates')) {
+        return ap_object_url_lookup_candidates($objectUrl);
+    }
+    $objectUrl = rtrim(trim($objectUrl), '/');
+    if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return [];
+    }
+    $cands = [$objectUrl];
+    if (preg_match('#^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $cands[] = $m[1] . '/users/' . rawurlencode($m[2]) . '/statuses/' . $m[3];
+    }
+    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/statuses/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $cands[] = $m[1] . '/@' . rawurldecode($m[2]) . '/' . $m[3];
+    }
+    return array_values(array_unique($cands));
+}
+
+/**
  * Resolve an ActivityPub object URL to a Mastodon Status entity (local, event, or live fetch).
  *
  * @return array<string,mixed>|null
@@ -851,42 +876,49 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
         return null;
     }
 
-    // Local note
-    $local = ap_masto_status_by_note_id($objectUrl);
-    if (is_array($local)) {
-        // Nested embeds skip further quote attachment
-        return ap_masto_status_from_row($local, false);
+    $candidates = ap_masto_object_url_lookup_candidates($objectUrl);
+    if ($candidates === []) {
+        $candidates = [$objectUrl];
     }
 
-    // Inbound event (federated Create/etc.)
-    $st = ap_db()->prepare(
-        'SELECT * FROM events WHERE object_id = ? OR object_id = ? ORDER BY id DESC LIMIT 1'
-    );
-    $st->execute([$objectUrl, $objectUrl . '/']);
-    $erow = $st->fetch();
-    if (is_array($erow)) {
-        $status = ap_masto_status_from_event($erow);
-        if (is_array($status)) {
-            // Prefer the inner reblog payload when the event was an Announce
-            if (!empty($status['reblog']) && is_array($status['reblog'])) {
-                $status = $status['reblog'];
-            }
-            unset($status['quote']);
-            return $status;
+    foreach ($candidates as $cand) {
+        // Local note
+        $local = ap_masto_status_by_note_id($cand);
+        if (is_array($local)) {
+            // Nested embeds skip further quote attachment
+            return ap_masto_status_from_row($local, false);
         }
-    }
 
-    // Mentions table
-    $st = ap_db()->prepare(
-        'SELECT * FROM mentions WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL ORDER BY id DESC LIMIT 1'
-    );
-    $st->execute([$objectUrl, $objectUrl . '/']);
-    $mrow = $st->fetch();
-    if (is_array($mrow) && function_exists('ap_masto_status_from_mention')) {
-        $status = ap_masto_status_from_mention($mrow);
-        if (is_array($status)) {
-            unset($status['quote']);
-            return $status;
+        // Inbound event (federated Create/etc.)
+        $st = ap_db()->prepare(
+            'SELECT * FROM events WHERE object_id = ? OR object_id = ? ORDER BY id DESC LIMIT 1'
+        );
+        $st->execute([$cand, $cand . '/']);
+        $erow = $st->fetch();
+        if (is_array($erow)) {
+            $status = ap_masto_status_from_event($erow);
+            if (is_array($status)) {
+                // Prefer the inner reblog payload when the event was an Announce
+                if (!empty($status['reblog']) && is_array($status['reblog'])) {
+                    $status = $status['reblog'];
+                }
+                unset($status['quote']);
+                return $status;
+            }
+        }
+
+        // Mentions table
+        $st = ap_db()->prepare(
+            'SELECT * FROM mentions WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL ORDER BY id DESC LIMIT 1'
+        );
+        $st->execute([$cand, $cand . '/']);
+        $mrow = $st->fetch();
+        if (is_array($mrow) && function_exists('ap_masto_status_from_mention')) {
+            $status = ap_masto_status_from_mention($mrow);
+            if (is_array($status)) {
+                unset($status['quote']);
+                return $status;
+            }
         }
     }
 
@@ -900,7 +932,15 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
         }
         require_once __DIR__ . '/ap-inbox.php';
     }
-    $doc = ap_fetch_as2_object($objectUrl);
+    $doc = null;
+    $fetchedAs = $objectUrl;
+    foreach ($candidates as $cand) {
+        $doc = ap_fetch_as2_object($cand);
+        if (is_array($doc)) {
+            $fetchedAs = $cand;
+            break;
+        }
+    }
     if (!is_array($doc)) {
         return null;
     }
@@ -908,7 +948,7 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
     if (($doc['type'] ?? '') === 'Create' && isset($doc['object']) && is_array($doc['object'])) {
         $doc = $doc['object'];
     }
-    return ap_masto_status_from_as2_note($doc, $objectUrl);
+    return ap_masto_status_from_as2_note($doc, $fetchedAs);
 }
 
 /**
@@ -2171,8 +2211,11 @@ function ap_masto_unglue_bare_handles(string $text): string
     if ($text === '' || !str_contains($text, '@')) {
         return $text;
     }
+    // Only bare @user tokens — never touch @user@host (negative lookahead for @).
+    // Without that, "@aliceamour@beige.party" was split into "@alice amour@…" whenever
+    // a shorter bare username like "alice" existed in the actor cache (aceofcosmicspace posts).
     return preg_replace_callback(
-        '/(^|[^\w@])@([A-Za-z][\w]{1,40})/u',
+        '/(^|[^\w@])@([A-Za-z][\w]{1,40})(?![@\w])/u',
         static function (array $m): string {
             $token = $m[2];
             // Real camelCase / multi-cap handles that exist as-is
@@ -2185,6 +2228,10 @@ function ap_masto_unglue_bare_handles(string $text): string
                 $prefix = mb_substr($token, 0, $n);
                 $rest = mb_substr($token, $n);
                 if ($rest === '' || !preg_match('/^[\p{L}\p{N}]/u', $rest)) {
+                    continue;
+                }
+                // Don't invent splits that leave a host-looking remainder ("amour@beige.party")
+                if (str_contains($rest, '@')) {
                     continue;
                 }
                 if (ap_masto_resolve_bare_username($prefix) !== null) {
@@ -3354,7 +3401,14 @@ function ap_masto_status_from_mention(array $row): array
     $account = $actorId !== '' ? ap_masto_remote_account($actorId) : ap_masto_account();
     $text = ap_masto_clean_mention_text((string) ($row['content'] ?? ''));
     $objectId = (string) ($row['object_id'] ?? '');
-    $url = $objectId !== '' ? $objectId : $actorId;
+    // Strip interaction hash suffixes (#like-… / #reblog-… / #quote-…) for the public URL.
+    $urlBase = ap_masto_mention_target_object_id($objectId);
+    if (str_starts_with($urlBase, 'at://') && function_exists('ap_bsky_https_url_from_at_uri')) {
+        $urlBase = ap_bsky_https_url_from_at_uri($urlBase, null);
+    } elseif (str_starts_with($urlBase, 'bsky:') && function_exists('ap_bsky_https_url_from_at_uri')) {
+        $urlBase = ap_bsky_https_url_from_at_uri(substr($urlBase, 5), null);
+    }
+    $url = $urlBase !== '' ? $urlBase : $actorId;
     $media = [];
     if (!empty($row['media_urls'])) {
         $decoded = json_decode((string) $row['media_urls'], true);
@@ -3714,6 +3768,24 @@ function ap_masto_mention_is_quote_of_ours(array $row): bool
     return false;
 }
 
+/** True when a mentions row was ingested from a connected Bluesky account. */
+function ap_masto_mention_is_bluesky(array $row): bool
+{
+    $activityId = (string) ($row['activity_id'] ?? '');
+    $actorId = rtrim((string) ($row['actor_id'] ?? ''), '/');
+    $objectId = (string) ($row['object_id'] ?? '');
+    if (str_starts_with($activityId, 'at://')) {
+        return true;
+    }
+    if (str_starts_with($actorId, 'https://bsky.app/')) {
+        return true;
+    }
+    if (str_starts_with($objectId, 'https://bsky.app/') || str_starts_with($objectId, 'bsky:')) {
+        return true;
+    }
+    return false;
+}
+
 function ap_masto_mention_notif_type(array $row): ?string
 {
     $activity = strtolower((string) ($row['activity_type'] ?? ''));
@@ -3732,6 +3804,26 @@ function ap_masto_mention_notif_type(array $row): ?string
 
     // Never surface our own posts/replies as notifications (self-thread loopback).
     if ($isSelf) {
+        return null;
+    }
+
+    // Bluesky-connected ingest: map by activity_type without requiring local AP note URLs.
+    if (ap_masto_mention_is_bluesky($row)) {
+        if ($activity === 'like' || $objType === 'like') {
+            return 'favourite';
+        }
+        if ($activity === 'announce' || $objType === 'announce') {
+            return 'reblog';
+        }
+        if ($activity === 'quote' || $activity === 'quotepost' || $objType === 'quote' || $objType === 'quotepost'
+            || str_contains((string) ($row['object_id'] ?? ''), '#quote-')
+            || str_contains((string) ($row['content'] ?? ''), '↪ QT')) {
+            return 'quote';
+        }
+        // mention / reply Creates
+        if ($activity === 'create' || $activity === 'mention' || $objType === 'note' || ($row['content'] ?? '') !== '') {
+            return 'mention';
+        }
         return null;
     }
 
@@ -3930,8 +4022,61 @@ function ap_masto_notification_entity(array $item): ?array
     $account = $actorId !== '' ? ap_masto_remote_account($actorId) : ap_masto_account();
     $status = null;
     $objectId = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
+    $isBsky = ap_masto_mention_is_bluesky($row);
     if ($type === 'favourite' || $type === 'reblog') {
         $status = ap_masto_resolve_our_liked_status($objectId);
+        // Bluesky likes/reposts: prefer the mapped VAAK post body when this was a cross-post.
+        if ($status === null && $isBsky) {
+            $subjectKey = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
+            $mappedNote = null;
+            if (str_starts_with($subjectKey, 'https://mkultra.monster/users/')
+                && function_exists('ap_masto_status_by_note_id')) {
+                $mappedNote = ap_masto_status_by_note_id($subjectKey);
+            } else {
+                if (!function_exists('ap_bsky_local_note_id_for_at_uri')) {
+                    $bskyLib = __DIR__ . '/ap-bsky.php';
+                    if (is_file($bskyLib)) {
+                        require_once $bskyLib;
+                    }
+                }
+                if (function_exists('ap_bsky_local_note_id_for_at_uri')) {
+                    $noteId = ap_bsky_local_note_id_for_at_uri($subjectKey, (int) ($row['owner_user_id'] ?? 0));
+                    if (is_string($noteId) && $noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
+                        $mappedNote = ap_masto_status_by_note_id($noteId);
+                    }
+                }
+            }
+            if (is_array($mappedNote) && function_exists('ap_masto_status_from_row')) {
+                $status = ap_masto_status_from_row($mappedNote);
+            }
+        }
+        if ($status === null && $isBsky) {
+            $status = ap_masto_status_from_mention($row);
+            // Favourite/reblog status must be *our* post; account on the notification
+            // remains the remote actor. Rewrite the embedded status author to us.
+            $ownerAcct = null;
+            $ownerActor = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+            if ($ownerActor !== '' && function_exists('ap_masto_account_for_local_url')) {
+                $ownerAcct = ap_masto_account_for_local_url($ownerActor);
+            }
+            if (!is_array($ownerAcct) && function_exists('ap_masto_account')) {
+                $ownerAcct = ap_masto_account();
+            }
+            if (is_array($ownerAcct)) {
+                $status['account'] = $ownerAcct;
+            }
+            $subjectUrl = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
+            if (str_starts_with($subjectUrl, 'https://bsky.app/')
+                || str_starts_with($subjectUrl, 'https://mkultra.monster/')) {
+                $status['url'] = $subjectUrl;
+                $status['uri'] = $subjectUrl;
+            }
+            // Placeholder only when we truly have no local body.
+            if (trim(strip_tags((string) ($status['content'] ?? ''))) === ''
+                || str_contains((string) ($row['content'] ?? ''), 'your Bluesky post')) {
+                $status['content'] = '<p>Bluesky post</p>';
+            }
+        }
         // Liked/boosted post gone (deleted) → drop the notification entirely
         if ($status === null) {
             return null;
@@ -4090,14 +4235,17 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
 
     if (in_array('follow', $want, true)) {
         // Follow events must target THIS session actor only (never NULL/empty — that leaked).
+        // Include Bluesky follows (action_taken=bsky_follow) — those are not in AP followers[].
+        $bskyFollowAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
         $st = ap_db()->prepare(
-            "SELECT id, created_at, actor_id, target_actor FROM events
-             WHERE type = 'Follow' AND action_taken = 'local_accept_followback'
+            "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
+             WHERE type = 'Follow'
+               AND action_taken IN ('local_accept_followback', ?)
                AND (target_actor = ? OR target_actor = ?)
              ORDER BY id DESC LIMIT 100"
         );
-        $st->execute([$ownerActorId, $ownerActorId . '/']);
-        // Drop follow notifs once the actor has unfollowed (Undo Follow).
+        $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
+        // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
         $followerSet = [];
         try {
             foreach (ap_followers_list($ownerActorId) as $fr) {
@@ -4111,7 +4259,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
         foreach ($st->fetchAll() as $row) {
             $fa = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
+            $action = (string) ($row['action_taken'] ?? '');
+            if ($action === 'local_accept_followback'
+                && $fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
                 continue;
             }
             $nid = 1000000 + (int) $row['id'];
@@ -8761,6 +8911,20 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
     $fan = ap_cmdr_send_announce($objectId, is_string($targetActor) ? $targetActor : null);
     if (empty($fan['ok']) || empty($fan['announce_id'])) {
         return ['ok' => false, 'error' => $fan['error'] ?? 'Could not boost'];
+    }
+    // Best-effort Bluesky repost when the target has an AT twin (or is a bsky URL).
+    try {
+        if (!function_exists('ap_bsky_repost_object')) {
+            require_once __DIR__ . '/ap-bsky.php';
+        }
+        if (function_exists('ap_bsky_repost_object') && function_exists('ap_db_masto_owner_user_id')) {
+            $bskyOwner = ap_db_masto_owner_user_id();
+            if ($bskyOwner > 0) {
+                ap_bsky_repost_object($bskyOwner, $objectId);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-masto] bsky_repost: ' . $e->getMessage());
     }
     $created = gmdate('c');
     // Provisional id until we know DB id — insert then update boost_status_id

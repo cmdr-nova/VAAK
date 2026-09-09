@@ -83,6 +83,8 @@ $stats = [
     'retention_deleted' => 0,
     'retention_errors' => 0,
     'link_previews_deleted' => 0,
+    'bsky_posts_deleted' => 0,
+    'bsky_post_links_deleted' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
     'errors' => 0,
@@ -204,6 +206,30 @@ try {
             $log("events prune: nothing older than $eventsCutoff");
         }
 
+        // --- Bluesky durable post cache (same retention window as events) ---
+        try {
+            if (is_file(__DIR__ . '/ap-bsky.php')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            if (function_exists('ap_bsky_posts_prune')) {
+                $bskyPrune = ap_bsky_posts_prune($eventsCutoff, $dryRun);
+                $stats['bsky_posts_deleted'] = (int) ($bskyPrune['posts'] ?? 0);
+                $stats['bsky_post_links_deleted'] = (int) ($bskyPrune['links'] ?? 0);
+                if ($stats['bsky_posts_deleted'] > 0 || $stats['bsky_post_links_deleted'] > 0) {
+                    $log(
+                        ($dryRun ? 'would_delete' : 'deleted')
+                        . " bsky_posts older_than=$eventsCutoff count={$stats['bsky_posts_deleted']}"
+                        . " orphan_links={$stats['bsky_post_links_deleted']}"
+                    );
+                } else {
+                    $log("bsky_posts prune: nothing older than $eventsCutoff");
+                }
+            }
+        } catch (Throwable $e) {
+            $stats['errors']++;
+            $log('bsky_posts prune error: ' . $e->getMessage());
+        }
+
         // --- Soft-deleted mentions (keep live notification history) ---
         $mentionCutoff = $nowUtc->modify('-' . $mentionGoneDays . ' days')->format('c');
         try {
@@ -272,8 +298,13 @@ try {
             $log('oauth purge error: ' . $e->getMessage());
         }
 
-        // --- Tmp key + rate caches ---
-        foreach (['/tmp/ap-inbox-keys', '/tmp/ap-inbox-rate'] as $dir) {
+        // --- Tmp key + rate caches (+ short Bluesky head cache files) ---
+        foreach ([
+            '/tmp/ap-inbox-keys',
+            '/tmp/ap-inbox-rate',
+            '/var/lib/mkultra/ap/bsky-tl-cache',
+            sys_get_temp_dir() . '/vaak-bsky-tl-cache',
+        ] as $dir) {
             if (!is_dir($dir)) {
                 continue;
             }

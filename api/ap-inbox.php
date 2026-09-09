@@ -124,6 +124,17 @@ if ($algo !== 'rsa-sha256' && $algo !== 'hs2019') {
     ap_fail('Unsupported signature algorithm', 401);
 }
 
+// Server-wide instance block: reject before key fetch / crypto.
+$keyHostEarly = parse_url($sig['keyId'], PHP_URL_HOST);
+if (is_string($keyHostEarly) && ap_is_blocked_host(strtolower($keyHostEarly))) {
+    ap_log(sprintf(
+        'blocked_reject_keyhost ip=%s keyId=%s',
+        $ip,
+        ap_short($sig['keyId'])
+    ));
+    ap_fail('Instance blocked', 403);
+}
+
 $pem = ap_fetch_actor_pubkey($sig['keyId']);
 if ($pem === null) {
     ap_fail('Unable to fetch key', 401);
@@ -145,19 +156,16 @@ if (is_array($json) && isset($json['type']) && is_string($json['type'])) {
     $type = preg_replace('/[^A-Za-z0-9._-]/', '', $json['type']) ?: 'unknown';
 }
 
-// Defense in depth: drop if signing key host is a blocked instance.
+// Defense in depth (post-verify): signing key host still blocked → hard reject.
 $keyHost = parse_url($sig['keyId'], PHP_URL_HOST);
 if (is_string($keyHost) && ap_is_blocked_host(strtolower($keyHost))) {
     ap_log(sprintf(
-        'blocked_drop_keyhost ip=%s type=%s keyId=%s',
+        'blocked_reject_keyhost_postverify ip=%s type=%s keyId=%s',
         $ip,
         $type,
         ap_short($sig['keyId'])
     ));
-    http_response_code(202);
-    header('Content-Type: application/json');
-    echo json_encode(['status' => 'accepted', 'action' => 'blocked'], JSON_UNESCAPED_SLASHES);
-    exit;
+    ap_fail('Instance blocked', 403);
 }
 
 ap_log(sprintf(
@@ -971,10 +979,19 @@ function ap_route_verified_activity(array $activity, int $bytes): string
     $actorId = ap_as_id($activity['actor'] ?? null);
     $objectId = ap_as_id($activity['object'] ?? null);
 
-    // Moderation: drop blocked actors / instance traffic (still HTTP 202 to avoid retries).
+    // Server-wide actor/instance block: hard-reject federation (403), do not process.
     if ($actorId && ap_is_blocked_actor($actorId)) {
-        ap_log('blocked_drop type=' . $type . ' actor=' . ap_short($actorId));
-        return 'blocked';
+        ap_log('blocked_reject type=' . $type . ' actor=' . ap_short($actorId));
+        ap_fail('Actor or instance blocked', 403);
+    }
+    // Also reject when the object itself lives on a blocked host (e.g. relay-forwarded
+    // Create whose signing relay is allowed but the note URI is on a blocked domain).
+    if ($objectId && str_starts_with($objectId, 'https://')) {
+        $objectHost = parse_url($objectId, PHP_URL_HOST);
+        if (is_string($objectHost) && ap_is_blocked_host(strtolower($objectHost))) {
+            ap_log('blocked_reject_object type=' . $type . ' object=' . ap_short($objectId));
+            ap_fail('Object instance blocked', 403);
+        }
     }
 
     // FEP-044f QuoteRequest — auto-approve public quotes of our notes.
@@ -1403,6 +1420,21 @@ function ap_route_verified_activity(array $activity, int $bytes): string
     // Generic log: never store content summaries for non-public activities
     $summary = ap_activity_is_public($activity) ? $summaryForEvent : null;
     $vis = ap_visibility_from_activity($activity);
+    // Followers-only Creates/Announces on the firehose are stored without text
+    // (privacy). Logging them as timeline `log` rows produces empty
+    // "reply to parent post" cards on Federated — skip those stubs.
+    // Real followers-only posts from people we follow are handled above via
+    // local_followers_only_observe (with content kept).
+    if (
+        $summary === null
+        && in_array($type, ['Create', 'Announce', 'Update', 'Quote', 'QuotePost'], true)
+        && ($vis === 'private' || !ap_activity_is_public($activity))
+        && (!$mediaForEvent)
+    ) {
+        ap_metrics_record($type, $actorId, $objectId, LOCAL_ACTOR, $bytes, 'private_firehose_skipped', null);
+        ap_log('private_firehose_skipped type=' . $type . ' actor=' . ap_short((string) $actorId));
+        return 'private_firehose_skipped';
+    }
     if (
         $type === 'Update'
         && is_string($objectId)
@@ -1620,6 +1652,33 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
         }
     }
 
+    // Wafrn-style inbound dedupe: index FEP-fffd / blueskyUri on remote Notes.
+    try {
+        if (!function_exists('ap_bsky_index_as2_note_links')) {
+            $bskyLib = __DIR__ . '/ap-bsky.php';
+            if (is_file($bskyLib)) {
+                require_once $bskyLib;
+            }
+        }
+        if (function_exists('ap_bsky_index_as2_note_links')) {
+            foreach ([$obj, $remote] as $cand) {
+                if (!is_array($cand)) {
+                    continue;
+                }
+                $noteDoc = $cand;
+                if (isset($cand['object']) && is_array($cand['object'])
+                    && in_array((string) ($cand['type'] ?? ''), ['Create', 'Announce', 'Update'], true)) {
+                    $noteDoc = $cand['object'];
+                }
+                if (is_array($noteDoc)) {
+                    ap_bsky_index_as2_note_links($noteDoc);
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        // best-effort
+    }
+
     // Attach quoted post preview (commentary already in $summary when present).
     $quoteSource = is_array($remote) ? $remote : (is_array($obj) ? $obj : null);
     if (is_array($quoteSource) && isset($quoteSource['object']) && is_array($quoteSource['object'])
@@ -1646,15 +1705,75 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
                 $fetchUrl = $maybeNote;
             }
         }
-        // Local notes: read from outbox DB (avoid self-HTTP / wrong Accept quirks)
-        if ($quotedDoc === null && is_string($fetchUrl)
-            && str_starts_with($fetchUrl, 'https://mkultra.monster/users/cmdr_nova/notes/')) {
-            $quotedDoc = ap_local_note_as2_doc($fetchUrl);
+        $fetchCandidates = [];
+        if (is_string($fetchUrl) && $fetchUrl !== '') {
+            if (function_exists('ap_object_url_lookup_candidates')) {
+                $fetchCandidates = ap_object_url_lookup_candidates($fetchUrl);
+            }
+            if ($fetchCandidates === []) {
+                $fetchCandidates = [rtrim($fetchUrl, '/')];
+            }
         }
-        if ($fetchUrl !== null && ($quotedDoc === null || (!isset($quotedDoc['content']) && !ap_quote_is_tombstone($quotedDoc)))) {
-            $fetched = ap_fetch_as2_object($fetchUrl);
-            if (is_array($fetched)) {
+        // Local notes: read from outbox DB (avoid self-HTTP / wrong Accept quirks)
+        if ($quotedDoc === null) {
+            foreach ($fetchCandidates as $cand) {
+                if (str_starts_with($cand, 'https://mkultra.monster/users/') && str_contains($cand, '/notes/')
+                    && function_exists('ap_local_note_as2_doc')) {
+                    $localDoc = ap_local_note_as2_doc($cand);
+                    if (is_array($localDoc)) {
+                        $quotedDoc = $localDoc;
+                        break;
+                    }
+                }
+            }
+        }
+        // Already-cached remote Create/Update — rebuild a thin AS2 doc from events
+        // so we avoid a second HTTP round-trip when the quoted post is known.
+        if (($quotedDoc === null || (!isset($quotedDoc['content']) && !ap_quote_is_tombstone($quotedDoc)))
+            && function_exists('ap_event_by_object_id')) {
+            foreach ($fetchCandidates as $cand) {
+                $ev = ap_event_by_object_id($cand);
+                if (!is_array($ev)) {
+                    continue;
+                }
+                $evType = strtolower((string) ($ev['type'] ?? ''));
+                if (!in_array($evType, ['create', 'update'], true)) {
+                    continue;
+                }
+                $evSummary = trim((string) ($ev['summary'] ?? ''));
+                // Skip summaries that are themselves QT blocks or AS2 dumps
+                if ($evSummary === '' || str_contains($evSummary, '↪ QT')
+                    || (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($evSummary))) {
+                    continue;
+                }
+                $actor = (string) ($ev['actor_id'] ?? '');
+                $oid = rtrim((string) ($ev['object_id'] ?? $cand), '/');
+                $quotedDoc = [
+                    'id' => $oid,
+                    'type' => 'Note',
+                    'attributedTo' => $actor !== '' ? $actor : null,
+                    'content' => $evSummary,
+                ];
+                if ($quotedUrl === null && $oid !== '') {
+                    $quotedUrl = $oid;
+                }
+                break;
+            }
+        }
+        if ($fetchCandidates !== []
+            && ($quotedDoc === null || (!isset($quotedDoc['content']) && !ap_quote_is_tombstone($quotedDoc)))) {
+            foreach ($fetchCandidates as $cand) {
+                $fetched = ap_fetch_as2_object($cand);
+                if (!is_array($fetched)) {
+                    continue;
+                }
                 $quotedDoc = $fetched;
+                // Prefer canonical Note id when the fetch redirected/resolved
+                $fetchedId = ap_as_id($fetched);
+                if (is_string($fetchedId) && str_starts_with($fetchedId, 'https://')) {
+                    $quotedUrl = rtrim($fetchedId, '/');
+                }
+                break;
             }
         }
         if (is_array($quotedDoc)) {
@@ -2439,6 +2558,50 @@ function ap_quote_target_url(mixed $object): ?string
 }
 
 /**
+ * Alternate forms of a status/object URL for cache hits / quote fetch without guessing hosts.
+ * Covers trailing slash, /activity wrappers, QuotePost parents, and Mastodon public ↔ AP permalinks.
+ *
+ * @return list<string>
+ */
+function ap_object_url_lookup_candidates(string $objectUrl): array
+{
+    $objectUrl = rtrim(trim($objectUrl), '/');
+    if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return [];
+    }
+    $cands = [$objectUrl];
+    if (str_ends_with($objectUrl, '/activity')) {
+        $note = substr($objectUrl, 0, -strlen('/activity'));
+        if (is_string($note) && $note !== '') {
+            $cands[] = rtrim($note, '/');
+        }
+    }
+    // https://host/@user/123 ↔ https://host/users/user/statuses/123
+    if (preg_match('#^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $cands[] = $m[1] . '/users/' . rawurlencode($m[2]) . '/statuses/' . $m[3];
+        $cands[] = $m[1] . '/ap/users/' . rawurlencode($m[2]) . '/statuses/' . $m[3];
+    }
+    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/statuses/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $user = rawurldecode($m[2]);
+        $cands[] = $m[1] . '/@' . $user . '/' . $m[3];
+        $cands[] = $m[1] . '/users/' . $m[2] . '/statuses/' . $m[3];
+        $cands[] = $m[1] . '/ap/users/' . $m[2] . '/statuses/' . $m[3];
+    }
+    $parent = ap_quote_post_parent_url($objectUrl);
+    if (is_string($parent) && $parent !== '') {
+        $cands[] = rtrim($parent, '/');
+    }
+    $out = [];
+    foreach ($cands as $c) {
+        $c = rtrim((string) $c, '/');
+        if ($c !== '' && str_starts_with($c, 'https://') && !isset($out[$c])) {
+            $out[$c] = true;
+        }
+    }
+    return array_keys($out);
+}
+
+/**
  * If object_id is a Mastodon-style …/statuses/{id}/QuotePost URL, return the parent status URL.
  */
 function ap_quote_post_parent_url(?string $objectId): ?string
@@ -3081,6 +3244,182 @@ function ap_unfollow_remote_actor(string $actorId): array
     ap_metrics_record('Undo', $localId, $targetId, $targetId, 0, 'manual_unfollow', null);
     ap_log('unfollow_remote_ok target=' . ap_short($targetId));
     return ['ok' => true, 'already' => false];
+}
+
+/**
+ * Federate a personal Block (Mastodon-compatible). Required for Bridgy Fed opt-out:
+ * blocking @bsky.brid.gy@bsky.brid.gy must deliver an ActivityPub Block.
+ *
+ * Also severs local follow relationships with the target for this actor.
+ *
+ * @return array{ok:bool,error?:string,delivered?:bool,already_local?:bool}
+ */
+function ap_block_remote_actor(string $actorId): array
+{
+    $rawInput = trim($actorId);
+    $resolved = ap_resolve_actor_ref($rawInput);
+    if ($resolved === null && str_starts_with($rawInput, 'https://')) {
+        $resolved = rtrim($rawInput, '/');
+    }
+    if ($resolved === null) {
+        return ['ok' => false, 'error' => 'Could not resolve actor to block'];
+    }
+    $targetId = rtrim($resolved, '/');
+    $ident = ap_outbound_identity();
+    $localId = rtrim((string) ($ident['id'] ?? ''), '/');
+    if ($localId === '' || !str_starts_with($localId, 'https://')) {
+        return ['ok' => false, 'error' => 'Not signed in as a local account'];
+    }
+    if ($targetId === $localId) {
+        return ['ok' => false, 'error' => 'Cannot block yourself'];
+    }
+
+    // Sever local relationships either way (Mastodon-style).
+    ap_following_remove($targetId, $localId);
+    ap_follower_remove($targetId, $localId);
+    $alt = $targetId . '/';
+    ap_following_remove($alt, $localId);
+    ap_follower_remove($alt, $localId);
+
+    // Same-instance: local-only (no HTTP Block to ourselves).
+    if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $targetId)) {
+        ap_metrics_record('Block', $localId, $targetId, $targetId, 0, 'manual_block_local', null);
+        ap_log('block_local_ok target=' . ap_short($targetId) . ' from=' . ap_short($localId));
+        return ['ok' => true, 'delivered' => false];
+    }
+
+    $doc = ap_fetch_actor_doc($targetId);
+    $personalInbox = is_array($doc) ? ap_resolve_personal_inbox_from_actor_doc($doc) : null;
+    $sharedInbox = is_array($doc) ? ap_resolve_inbox_from_actor_doc($doc) : null;
+    if (is_array($doc)) {
+        $canon = ap_as_id($doc['id'] ?? null);
+        if (is_string($canon) && $canon !== '') {
+            $targetId = rtrim($canon, '/');
+        }
+    }
+
+    $blockId = $localId . '/blocks/' . bin2hex(random_bytes(10));
+    $block = [
+        '@context' => 'https://www.w3.org/ns/activitystreams',
+        'id' => $blockId,
+        'type' => 'Block',
+        'actor' => $localId,
+        'object' => $targetId,
+        'to' => [$targetId],
+    ];
+
+    $delivered = false;
+    $usedInbox = '';
+    // Prefer personal inbox (Bridgy Fed + Mastodon expect Block there).
+    foreach (array_filter([$personalInbox, $sharedInbox]) as $inbox) {
+        if (!is_string($inbox) || !str_starts_with($inbox, 'https://')) {
+            continue;
+        }
+        if (ap_is_blocked_inbox($inbox)) {
+            continue;
+        }
+        if (ap_deliver_signed_json($inbox, $block, $ident['key_id'], $ident['priv'], 8.0)) {
+            $delivered = true;
+            $usedInbox = $inbox;
+            break;
+        }
+    }
+
+    ap_metrics_record(
+        'Block',
+        $localId,
+        $blockId,
+        $targetId,
+        strlen(json_encode($block) ?: ''),
+        $delivered ? 'manual_block' : 'manual_block_undelivered',
+        null
+    );
+    ap_log(
+        'block_remote target=' . ap_short($targetId)
+        . ' delivered=' . ($delivered ? '1' : '0')
+        . ' inbox=' . ap_short($usedInbox)
+    );
+
+    // Local hide still applies even if remote delivery fails; Bridgy needs delivery.
+    if (!$delivered) {
+        return [
+            'ok' => true,
+            'delivered' => false,
+            'error' => 'Saved locally, but Block activity was not accepted by the remote inbox',
+        ];
+    }
+    return ['ok' => true, 'delivered' => true];
+}
+
+/**
+ * Federate Undo(Block) when a personal block is removed.
+ *
+ * @return array{ok:bool,error?:string,delivered?:bool}
+ */
+function ap_unblock_remote_actor(string $actorId): array
+{
+    $rawInput = trim($actorId);
+    $resolved = ap_resolve_actor_ref($rawInput);
+    if ($resolved === null && str_starts_with($rawInput, 'https://')) {
+        $resolved = rtrim($rawInput, '/');
+    }
+    if ($resolved === null) {
+        return ['ok' => false, 'error' => 'Could not resolve actor to unblock'];
+    }
+    $targetId = rtrim($resolved, '/');
+    $ident = ap_outbound_identity();
+    $localId = rtrim((string) ($ident['id'] ?? ''), '/');
+    if ($localId === '' || !str_starts_with($localId, 'https://')) {
+        return ['ok' => false, 'error' => 'Not signed in as a local account'];
+    }
+
+    if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $targetId)) {
+        ap_metrics_record('Undo', $localId, $targetId, $targetId, 0, 'manual_unblock_local', null);
+        return ['ok' => true, 'delivered' => false];
+    }
+
+    $doc = ap_fetch_actor_doc($targetId);
+    $personalInbox = is_array($doc) ? ap_resolve_personal_inbox_from_actor_doc($doc) : null;
+    $sharedInbox = is_array($doc) ? ap_resolve_inbox_from_actor_doc($doc) : null;
+    if (is_array($doc)) {
+        $canon = ap_as_id($doc['id'] ?? null);
+        if (is_string($canon) && $canon !== '') {
+            $targetId = rtrim($canon, '/');
+        }
+    }
+
+    $undoId = $localId . '/undos/' . bin2hex(random_bytes(10));
+    $blockId = $localId . '/blocks/undo-' . bin2hex(random_bytes(6));
+    $undo = [
+        '@context' => 'https://www.w3.org/ns/activitystreams',
+        'id' => $undoId,
+        'type' => 'Undo',
+        'actor' => $localId,
+        'to' => [$targetId],
+        'object' => [
+            'id' => $blockId,
+            'type' => 'Block',
+            'actor' => $localId,
+            'object' => $targetId,
+        ],
+    ];
+
+    $delivered = false;
+    foreach (array_filter([$personalInbox, $sharedInbox]) as $inbox) {
+        if (!is_string($inbox) || !str_starts_with($inbox, 'https://')) {
+            continue;
+        }
+        if (ap_is_blocked_inbox($inbox)) {
+            continue;
+        }
+        if (ap_deliver_signed_json($inbox, $undo, $ident['key_id'], $ident['priv'], 8.0)) {
+            $delivered = true;
+            break;
+        }
+    }
+    ap_metrics_record('Undo', $localId, $undoId, $targetId, strlen(json_encode($undo) ?: ''), 'manual_unblock', null);
+    ap_log('unblock_remote target=' . ap_short($targetId) . ' delivered=' . ($delivered ? '1' : '0'));
+    return ['ok' => true, 'delivered' => $delivered];
 }
 
 /**
@@ -4302,6 +4641,12 @@ function ap_publish_status_text(
         $note['attachment'] = $attachments;
     }
 
+    // Wafrn semantics: ActivityPub Note is canonical ("I'm actually me").
+    // Bluesky is a mirror ("I'm just mirroring") stamped with fediverseId → note id.
+    // Publish/sign fedi first, then mirror to Bluesky (Wafrn order; they sign both sides).
+    $bsky = null;
+    $bskyOwnerId = 0;
+
     $create = ap_create_finalize([
         'id' => $createId,
         'type' => 'Create',
@@ -4438,6 +4783,99 @@ function ap_publish_status_text(
     ap_log("publish_status create=$createId local_id=$localId visibility=$visibility delivered=$delivered queued=$queued bridgy=" . ($fan['bridgy'] ? '1' : '0')
         . ' kind=' . ($pollNorm !== null ? 'poll' : ($attachments ? 'media' : 'text')));
 
+    // Bluesky mirror *after* fedi Create (canonical AP id already exists + was signed/delivered).
+    // Record.fediverseId = noteId ("mirroring this fedi post"). Then stamp local Note with
+    // FEP-fffd / blueskyUri so later fetches + optional Update can merge.
+    try {
+        if (!function_exists('ap_bsky_crosspost_status')) {
+            require_once __DIR__ . '/ap-bsky.php';
+        }
+        if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+            && function_exists('ap_bsky_crosspost_status')) {
+            if (function_exists('ap_db_owner_user_id_for_actor')) {
+                $bskyOwnerId = ap_db_owner_user_id_for_actor($actor);
+            }
+            if ($bskyOwnerId < 1 && function_exists('ap_db_masto_owner_user_id')) {
+                $bskyOwnerId = ap_db_masto_owner_user_id();
+            }
+            if ($bskyOwnerId > 0) {
+                $bsky = ap_bsky_crosspost_status(
+                    $bskyOwnerId,
+                    $content,
+                    $visibility,
+                    $mediaLocalIds,
+                    $spoilerText,
+                    $inReplyTo !== '' ? $inReplyTo : null,
+                    $quoteObjectId !== '' ? $quoteObjectId : null,
+                    $noteId // fediverseId: Bluesky post is a mirror of this AP Note
+                );
+                if (!empty($bsky['ok']) && empty($bsky['skipped'])
+                    && !empty($bsky['uri']) && is_string($bsky['uri'])
+                    && function_exists('ap_note_attach_bsky_proxy')) {
+                    $note = ap_note_attach_bsky_proxy(
+                        $note,
+                        (string) $bsky['uri'],
+                        isset($bsky['cid']) ? (string) $bsky['cid'] : null
+                    );
+                    if (function_exists('ap_bsky_crosspost_save')) {
+                        ap_bsky_crosspost_save(
+                            $noteId,
+                            (string) $bsky['uri'],
+                            isset($bsky['cid']) ? (string) $bsky['cid'] : null,
+                            $bskyOwnerId
+                        );
+                    }
+                    // Refresh stored Create/Note so GETs include FEP-fffd + blueskyUri.
+                    $create['object'] = $note;
+                    try {
+                        ap_db()->prepare(
+                            'UPDATE outbox_notes SET raw_create_json = ? WHERE id = ? OR id = ?'
+                        )->execute([
+                            json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                            $noteId,
+                            $noteId . '/',
+                        ]);
+                    } catch (Throwable $e) {
+                        error_log('[ap-inbox] bsky stamp outbox: ' . $e->getMessage());
+                    }
+                    // Best-effort Update so remotes that already stored Create learn the proxy link.
+                    if (in_array($visibility, ['public', 'unlisted'], true)) {
+                        try {
+                            $update = [
+                                '@context' => 'https://www.w3.org/ns/activitystreams',
+                                'id' => $actor . '/updates/' . bin2hex(random_bytes(8)),
+                                'type' => 'Update',
+                                'actor' => $actor,
+                                'published' => gmdate('c'),
+                                'to' => $to,
+                                'cc' => $cc,
+                                'object' => $note,
+                            ];
+                            if ($visibility === 'public') {
+                                ap_deliver_public_activity($update, []);
+                            } else {
+                                ap_deliver_followers_activity($update, []);
+                            }
+                        } catch (Throwable $e) {
+                            error_log('[ap-inbox] bsky proxy Update: ' . $e->getMessage());
+                        }
+                    }
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] bsky_crosspost: ' . $e->getMessage());
+        $bsky = ['ok' => false, 'error' => $e->getMessage()];
+    }
+    if (is_array($bsky) && !empty($bsky['ok']) && empty($bsky['skipped'])) {
+        ap_log('bsky_crosspost local_id=' . $localId
+            . ' posts=' . (int) ($bsky['posts'] ?? 0)
+            . ' uris=' . implode(',', array_map('strval', $bsky['uris'] ?? []))
+            . ' mirror=1 fedi_first=1');
+    } elseif (is_array($bsky) && !empty($bsky['error']) && empty($bsky['skipped'])) {
+        ap_log('bsky_crosspost_fail local_id=' . $localId . ' err=' . ap_short((string) $bsky['error']));
+    }
+
     // Warm link-preview cache for the first URL (best-effort; don't fail the post)
     if ($content !== '' && !$mediaRows && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_for_url')) {
         try {
@@ -4461,6 +4899,7 @@ function ap_publish_status_text(
         'visibility' => $visibility,
         'delivered' => $delivered,
         'queued' => $queued,
+        'bsky' => $bsky,
     ];
 }
 

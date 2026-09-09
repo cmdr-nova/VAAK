@@ -26,6 +26,22 @@ if (!$isCli) {
     header('X-Robots-Tag: noindex, nofollow');
 }
 
+// Production VAAK is on Postgres. A bare CLI `php` without AP_DB_DSN silently
+// writes to the legacy SQLite file, so posts "succeed" then vanish from timelines.
+if ((!defined('AP_SITE_PUBLISH_LIB_ONLY') || !AP_SITE_PUBLISH_LIB_ONLY)
+    && ap_db_driver() !== 'pgsql') {
+    $msg = 'ap-site-publish requires AP_DB_DSN=pgsql:… (refusing SQLite fallback)';
+    if ($isCli) {
+        fwrite(STDERR, $msg . "\n");
+        echo json_encode(['ok' => false, 'error' => $msg], JSON_UNESCAPED_SLASHES) . "\n";
+        exit(1);
+    }
+    http_response_code(500);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => false, 'error' => $msg], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
 /**
  * @return array{title:string,url:string,summary:string,kind:string,content:string,tags:list<string>}
  */
@@ -121,7 +137,8 @@ function ap_publish_load_key(): string
 
 function ap_publish_migrate(): void
 {
-    ap_db()->exec(<<<'SQL'
+    try {
+        ap_db()->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS site_syndications (
     url TEXT PRIMARY KEY,
     note_id TEXT NOT NULL,
@@ -131,6 +148,27 @@ CREATE TABLE IF NOT EXISTS site_syndications (
     published_at TEXT NOT NULL
 );
 SQL);
+    } catch (Throwable $e) {
+        // www-data on Postgres often cannot CREATE; table is already provisioned.
+        try {
+            ap_db()->query('SELECT 1 FROM site_syndications LIMIT 1');
+        } catch (Throwable $e2) {
+            throw $e;
+        }
+    }
+}
+
+/** HTML → plain text, keeping paragraph/line breaks for timeline display. */
+function ap_publish_html_to_plain(string $html): string
+{
+    $html = preg_replace('#</p>\s*<p[^>]*>#i', "\n\n", $html) ?? $html;
+    $html = preg_replace('#<br\s*/?>#i', "\n", $html) ?? $html;
+    $html = preg_replace('#</(p|div|h[1-6]|li|blockquote)>#i', "$0\n", $html) ?? $html;
+    $text = trim(html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    // Collapse runs of spaces/tabs, but keep newlines (paragraph returns).
+    $text = preg_replace('/[^\S\n]+/u', ' ', $text) ?? $text;
+    $text = preg_replace('/\n{3,}/u', "\n\n", $text) ?? $text;
+    return trim($text);
 }
 
 /**
@@ -196,8 +234,7 @@ function ap_site_publish_note(
             $published = is_array($ob) && !empty($ob['published'])
                 ? (string) $ob['published']
                 : gmdate('c');
-            $text = trim(html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-            $text = preg_replace('/\s+/u', ' ', $text) ?? $text;
+            $text = ap_publish_html_to_plain($html);
             if ($text === '') {
                 $text = $title !== '' ? $title : '(shared post)';
             }
@@ -235,7 +272,9 @@ function ap_site_publish_note(
             }
             $parts[] = '<p>' . implode(' ', $tagHtml) . '</p>';
         }
-        $contentHtml = implode('', $parts);
+        // Separate <p> blocks with newlines so plain-text extraction keeps returns
+        // after title, summary, and link.
+        $contentHtml = implode("\n", $parts);
     } else {
         // Plain status like admin compose (Mastodon-style paragraphs)
         $contentHtml = function_exists('ap_plain_text_to_html')
@@ -296,8 +335,8 @@ function ap_site_publish_note(
     ]);
 
     // Ice Cubes / Mastodon API timelines read masto_statuses, not outbox alone.
-    $plain = trim(html_entity_decode(strip_tags($contentHtml), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
+    // Keep paragraph returns (title / summary / link) — do not collapse to one line.
+    $plain = ap_publish_html_to_plain($contentHtml);
     if ($plain === '') {
         $plain = $title !== '' ? $title : '(shared post)';
     }
@@ -334,6 +373,10 @@ function ap_site_publish_note(
         'delivered' => $delivered,
         'duplicate' => false,
     ];
+}
+
+if (defined('AP_SITE_PUBLISH_LIB_ONLY') && AP_SITE_PUBLISH_LIB_ONLY) {
+    return;
 }
 
 $input = ap_publish_parse_input($isCli);

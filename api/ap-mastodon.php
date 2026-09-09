@@ -1184,8 +1184,8 @@ function ap_masto_api(string $method, string $path): void
         return;
     }
 
-    // Personal blocks (Ice Cubes / Mastodon-compatible API). These are local
-    // per-user timeline filters; they do not federate or affect other users.
+    // Personal blocks (Ice Cubes / Mastodon-compatible API). Local timeline hide
+    // plus federated Block/Undo (needed for Bridgy Fed opt-out).
     if (preg_match('#^/api/v1/accounts/(\d+)/(block|unblock)$#', $path, $bm) && $method === 'POST') {
         ap_masto_require_token('write:blocks');
         $ownerId = ap_db_masto_owner_user_id();
@@ -2072,10 +2072,23 @@ function ap_masto_api(string $method, string $path): void
     if (preg_match('#^/api/v1/statuses/(\d+)$#', $path, $m) && $method === 'GET') {
         ap_masto_require_token('read');
         $sid = (int) $m[1];
+        $ownerId = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+        $hideBlockedStatus = static function (?array $status) use ($ownerId): bool {
+            if (!is_array($status) || !function_exists('ap_actor_is_content_blocked') || $ownerId < 1) {
+                return false;
+            }
+            $uri = rtrim((string) (($status['account']['uri'] ?? null) ?: ($status['account']['url'] ?? '')), '/');
+            return $uri !== '' && ap_actor_is_content_blocked($uri, null, $ownerId);
+        };
         $row = ap_masto_local_row_from_public_id($sid) ?? (($sid < 2000000) ? ap_masto_status_by_local_id($sid) : null);
         if ($row) {
             // Detail view may sync-fetch a missing quote target; timelines never do.
-            ap_masto_json(ap_masto_status_from_row($row, true, true));
+            $status = ap_masto_status_from_row($row, true, true);
+            if ($hideBlockedStatus(is_array($status) ? $status : null)) {
+                ap_masto_json(['error' => 'Record not found'], 404);
+                return;
+            }
+            ap_masto_json($status);
             return;
         }
         // Remote mention statuses
@@ -2085,7 +2098,12 @@ function ap_masto_api(string $method, string $path): void
             $st->execute([$mentionId]);
             $mrow = $st->fetch();
             if (is_array($mrow)) {
-                ap_masto_json(ap_masto_status_from_mention($mrow));
+                $status = ap_masto_status_from_mention($mrow);
+                if ($hideBlockedStatus(is_array($status) ? $status : null)) {
+                    ap_masto_json(['error' => 'Record not found'], 404);
+                    return;
+                }
+                ap_masto_json($status);
                 return;
             }
         }
@@ -2096,6 +2114,11 @@ function ap_masto_api(string $method, string $path): void
             $st->execute([$eventId]);
             $erow = $st->fetch();
             if (is_array($erow)) {
+                if (function_exists('ap_actor_is_content_blocked') && $ownerId > 0
+                    && ap_actor_is_content_blocked((string) ($erow['actor_id'] ?? ''), $erow['host'] ?? null, $ownerId)) {
+                    ap_masto_json(['error' => 'Record not found'], 404);
+                    return;
+                }
                 // Detail view: fetch missing reply parent so in_reply_to_id + mentions work
                 $erow['_fetch_reply_parent'] = true;
                 $status = ap_masto_status_from_event($erow);

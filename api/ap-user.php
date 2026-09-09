@@ -559,23 +559,31 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle($actorKey, $p)
         : null;
+    $apFollowing = count($following);
+    $apFollowers = count($followers);
+    $combined = function_exists('ap_profile_combined_follow_counts')
+        ? ap_profile_combined_follow_counts($actorKey, $apFollowers, $apFollowing)
+        : [
+            'followers' => $apFollowers,
+            'following' => $apFollowing,
+            'bsky_handle' => $bskyHandle,
+        ];
+    if ($bskyHandle === null && !empty($combined['bsky_handle'])) {
+        $bskyHandle = (string) $combined['bsky_handle'];
+    }
 
     echo '<div class="stats">';
     echo '<div><span class="n">' . count($publicNotes) . '</span><span class="l">Posts</span></div>';
     $bskyAttr = $bskyHandle !== null ? ' data-bsky-handle="' . htmlspecialchars($bskyHandle, ENT_QUOTES, 'UTF-8') . '"' : '';
-    $bskyTitle = $bskyHandle !== null ? ' title="Includes local and Bluesky counts"' : '';
-    echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . count($following) . '</span><span class="l">Following</span></a>';
-    echo '<a href="/users/' . $safe . '/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . count($followers) . '</span><span class="l">Followers</span></a>';
+    $bskyTitle = $bskyHandle !== null ? ' title="Includes ActivityPub and connected Bluesky counts"' : '';
+    echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $combined['following'] . '</span><span class="l">Following</span></a>';
+    echo '<a href="/users/' . $safe . '/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $combined['followers'] . '</span><span class="l">Followers</span></a>';
     echo '</div>';
     echo '<p class="feed-links"><a href="/users/' . $safe . '/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/' . $safe . '/feed.atom" type="application/atom+xml">Atom</a>';
     if ($bskyHandle !== null) {
         echo ' · <a href="https://bsky.app/profile/' . rawurlencode($bskyHandle) . '" rel="me noopener noreferrer" target="_blank">Bluesky</a>';
     }
     echo '</p>';
-
-    if ($bskyHandle !== null) {
-        echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
-    }
 
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (

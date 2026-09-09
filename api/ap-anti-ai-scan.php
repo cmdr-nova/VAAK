@@ -1,9 +1,12 @@
 <?php
 /**
- * Scan cached Create events for anti-AI slang and mark remote actors.
+ * Scan cached Create events + durable Bluesky posts for anti-AI slang
+ * and mark remote actors.
  *
  * Marks when an actor has >= 3 distinct matching posts in the retention window
  * (default 90 days). Clears the mark when recent hits drop below that threshold.
+ * Bluesky DIDs are stored as Bridgy Fed AP actor URLs so native AT cache hits
+ * unify with Bridgy Creates for the same person.
  *
  * Usage:
  *   php ap-anti-ai-scan.php
@@ -52,9 +55,9 @@ if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
 
 $ts = gmdate('c');
 if ($dryRun) {
-    // Count matching Creates without writing
-    $regex = ap_anti_ai_keyword_regex();
+    // Count matching Creates + Bluesky posts without writing
     $scanned = 0;
+    $bskyScanned = 0;
     $matches = 0;
     $byActor = [];
     $st = ap_db()->prepare(
@@ -73,12 +76,50 @@ if ($dryRun) {
         if (!ap_text_looks_anti_ai($summary)) {
             continue;
         }
-        $aid = rtrim((string) ($row['actor_id'] ?? ''), '/');
-        if ($aid === '' || preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $aid)) {
+        $aid = ap_anti_ai_actor_key((string) ($row['actor_id'] ?? ''));
+        if ($aid === '' || ap_anti_ai_actor_is_local($aid)) {
             continue;
         }
         $matches++;
         $byActor[$aid] = ($byActor[$aid] ?? 0) + 1;
+    }
+    $ownDids = [];
+    try {
+        foreach (ap_db()->query("SELECT did FROM bsky_sessions WHERE did IS NOT NULL AND did <> ''")->fetchAll() ?: [] as $sr) {
+            $did = trim((string) ($sr['did'] ?? ''));
+            if (str_starts_with($did, 'did:')) {
+                $ownDids[$did] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+    try {
+        $bst = ap_db()->prepare(
+            "SELECT author_did, text
+             FROM bsky_posts
+             WHERE text IS NOT NULL AND text <> ''
+               AND author_did IS NOT NULL AND author_did <> ''
+             ORDER BY indexed_at DESC NULLS LAST
+             LIMIT ?"
+        );
+        $bst->bindValue(1, max(1000, min(100000, $eventLimit)), PDO::PARAM_INT);
+        $bst->execute();
+        while ($row = $bst->fetch()) {
+            $bskyScanned++;
+            $did = trim((string) ($row['author_did'] ?? ''));
+            if ($did === '' || isset($ownDids[$did]) || !ap_text_looks_anti_ai((string) ($row['text'] ?? ''))) {
+                continue;
+            }
+            $aid = ap_anti_ai_actor_key($did);
+            if ($aid === '') {
+                continue;
+            }
+            $matches++;
+            $byActor[$aid] = ($byActor[$aid] ?? 0) + 1;
+        }
+    } catch (Throwable $e) {
+        // bsky_posts may be missing
     }
     $wouldMark = 0;
     foreach ($byActor as $n) {
@@ -87,9 +128,10 @@ if ($dryRun) {
         }
     }
     fwrite(STDOUT, sprintf(
-        "[%s] anti_ai_scan dry_run=1 scanned=%d matches=%d actors=%d would_mark=%d threshold=%d\n",
+        "[%s] anti_ai_scan dry_run=1 scanned=%d bsky_scanned=%d matches=%d actors=%d would_mark=%d threshold=%d\n",
         $ts,
         $scanned,
+        $bskyScanned,
         $matches,
         count($byActor),
         $wouldMark,
@@ -102,10 +144,11 @@ if ($dryRun) {
 
 $res = ap_anti_ai_scan_cached_posts($threshold, $retentionDays, $eventLimit);
 fwrite(STDOUT, sprintf(
-    "[%s] anti_ai_scan ok=%d scanned=%d new_hits=%d actors=%d newly_marked=%d cleared=%d marked_total=%d threshold=%d retention_days=%d\n",
+    "[%s] anti_ai_scan ok=%d scanned=%d bsky_scanned=%d new_hits=%d actors=%d newly_marked=%d cleared=%d marked_total=%d threshold=%d retention_days=%d\n",
     $ts,
     !empty($res['ok']) ? 1 : 0,
     (int) ($res['scanned'] ?? 0),
+    (int) ($res['bsky_scanned'] ?? 0),
     (int) ($res['new_hits'] ?? 0),
     (int) ($res['actors_touched'] ?? 0),
     (int) ($res['newly_marked'] ?? 0),

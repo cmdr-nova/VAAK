@@ -257,6 +257,24 @@ SQL);
         // ignore — provision via ops when runtime role lacks DDL
     }
 
+    // Phase A Bluesky tab — per-user encrypted ATProto session (opt-in).
+    try {
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_sessions (
+    owner_user_id BIGINT PRIMARY KEY,
+    handle TEXT NOT NULL,
+    did TEXT NOT NULL,
+    pds_host TEXT NOT NULL DEFAULT 'https://bsky.social',
+    access_jwt_enc TEXT NOT NULL,
+    refresh_jwt_enc TEXT NOT NULL,
+    connected_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+    } catch (Throwable $e) {
+        error_log('[ap-db] bsky_sessions not provisioned: ' . $e->getMessage());
+    }
+
     $discussTablesReady = false;
     try {
         $discussTablesReady = (bool) $db->query(
@@ -3200,11 +3218,36 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
             require_once $ie;
         }
     }
+    $aka = [];
     if (function_exists('ap_alias_also_known_as_urls')) {
         $aka = ap_alias_also_known_as_urls($actorKey);
-        if ($aka !== []) {
-            $actor['alsoKnownAs'] = array_values($aka);
+    }
+    // Linked Bluesky identity (Wafrn / multi-protocol clients merge AP+AT follows).
+    // FEP-fffd / alsoKnownAs: at://did:plc:… is the ATProto actor URI.
+    try {
+        if (!function_exists('ap_profile_bsky_handle')) {
+            // defined in this file further below — always available after load
         }
+        $st = ap_db()->prepare(
+            'SELECT s.did
+             FROM bsky_sessions s
+             INNER JOIN ap_users u ON u.id = s.owner_user_id
+             WHERE lower(u.actor_key) = ? OR lower(u.username) = ?
+             LIMIT 1'
+        );
+        $st->execute([strtolower($actorKey), strtolower($actorKey)]);
+        $did = trim((string) ($st->fetchColumn() ?: ''));
+        if ($did !== '' && str_starts_with($did, 'did:')) {
+            $atActor = 'at://' . $did;
+            if (!in_array($atActor, $aka, true)) {
+                $aka[] = $atActor;
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore — alsoKnownAs stays AP-only
+    }
+    if ($aka !== []) {
+        $actor['alsoKnownAs'] = array_values($aka);
     }
     $movedTo = function_exists('ap_move_active_target') ? ap_move_active_target($actorKey) : null;
     if (is_string($movedTo) && $movedTo !== '') {
@@ -3609,6 +3652,12 @@ function ap_html_to_plain_text(string $html): string
     $html = trim($html);
     // Repair already-glued @user@hostWord / @UserWord (common in older rows)
     $html = ap_plain_unglue_mentions($html);
+    // Bare @user → @user@host when a profile/status URL in the same text names them
+    // (quote RE: https://mastodon.art/@welshpixie/… + "advise @welshpixie").
+    $html = ap_plain_expand_bare_mentions_from_urls($html);
+    // Repair "loaf#catsofmastodon" / "tadaaa#pastpuzzle" (Mastodon <a class="hashtag">
+    // sits flush against the previous text node; strip_tags fuses them).
+    $html = ap_plain_unglue_hashtags($html);
     // Repair "@#tag@host" if a hashtag link was ever mistaken for a mention
     if (function_exists('ap_masto_repair_at_hash_tags')) {
         $html = ap_masto_repair_at_hash_tags($html);
@@ -3617,6 +3666,86 @@ function ap_html_to_plain_text(string $html): string
         $html = preg_replace('/@#([\p{L}\p{N}_]+)/u', '#$1', $html) ?? $html;
     }
     return $html;
+}
+
+/**
+ * Upgrade bare @user mentions to @user@host when the same text already
+ * contains a profile/status URL for that user (common in quote RE: lines).
+ * Example: "RE: https://mastodon.art/@welshpixie/123 … advise @welshpixie"
+ *       →  "… advise @welshpixie@mastodon.art"
+ */
+function ap_plain_expand_bare_mentions_from_urls(string $text): string
+{
+    if ($text === '' || !str_contains($text, '@') || !str_contains($text, 'https://')) {
+        return $text;
+    }
+    /** @var array<string, list<string>> $hostsByUser lower(user) => list of hosts */
+    $hostsByUser = [];
+    $add = static function (string $host, string $user) use (&$hostsByUser): void {
+        $host = strtolower(rtrim($host, '.'));
+        $user = ltrim(rawurldecode($user), '@');
+        if ($host === '' || $user === '' || preg_match('/^\d+$/', $user)) {
+            return; // GTS numeric /ap/users/{id} — not a handle
+        }
+        if (!preg_match('/^[A-Za-z0-9_]+$/', $user)) {
+            return;
+        }
+        $key = strtolower($user);
+        if (!isset($hostsByUser[$key])) {
+            $hostsByUser[$key] = [];
+        }
+        if (!in_array($host, $hostsByUser[$key], true)) {
+            $hostsByUser[$key][] = $host;
+        }
+    };
+    if (preg_match_all('#https://([^/\s]+)(/[^\s<]*)?#iu', $text, $um, PREG_SET_ORDER)) {
+        foreach ($um as $hit) {
+            $host = $hit[1];
+            $path = $hit[2] ?? '';
+            if (preg_match('#/@([^/]+)(?:/|$)#u', $path, $pm)) {
+                $add($host, $pm[1]);
+            } elseif (preg_match('#/(?:users)/([^/]+)(?:/|$)#u', $path, $pm)) {
+                $add($host, $pm[1]);
+            }
+        }
+    }
+    if ($hostsByUser === []) {
+        return $text;
+    }
+    // Do not rewrite @user inside URLs (…/@welshpixie/123…); exclude '/' before @.
+    return preg_replace_callback(
+        '/(^|[^A-Za-z0-9_@\/])@([A-Za-z0-9_]{2,40})(?![A-Za-z0-9_@])/u',
+        static function (array $m) use ($hostsByUser): string {
+            $user = $m[2];
+            $key = strtolower($user);
+            $hosts = $hostsByUser[$key] ?? [];
+            if (count($hosts) !== 1) {
+                return $m[0]; // ambiguous or unknown — leave bare
+            }
+            return $m[1] . '@' . $user . '@' . $hosts[0];
+        },
+        $text
+    ) ?? $text;
+}
+
+/**
+ * Insert a space when a #hashtag is glued to the previous word
+ * ("loaf#catsofmastodon" → "loaf #catsofmastodon").
+ * Skips URL fragments (…/page#section) and already-spaced tags.
+ */
+function ap_plain_unglue_hashtags(string $text): string
+{
+    if ($text === '' || !str_contains($text, '#')) {
+        return $text;
+    }
+    // Letter (or common closing punct) flush against #tag → insert a space so
+    // linkify can match (^|[^A-Za-z0-9_])#tag. Digits are excluded so URL
+    // fragments like …/status/123#m stay intact.
+    return preg_replace(
+        '/(?<=[\p{L}\"\'\)\]\}])#(?=[\p{L}\p{N}_])/u',
+        ' #',
+        $text
+    ) ?? $text;
 }
 
 /**
@@ -4308,7 +4437,9 @@ function ap_mention_store(array $row): void
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
          ON CONFLICT(owner_user_id, object_id) DO UPDATE SET
            owner_actor_id = COALESCE(excluded.owner_actor_id, mentions.owner_actor_id),
-           created_at = excluded.created_at,
+           created_at = CASE
+             WHEN mentions.deleted_at IS NOT NULL THEN excluded.created_at
+             ELSE mentions.created_at END,
            activity_id = excluded.activity_id,
            actor_id = COALESCE(excluded.actor_id, mentions.actor_id),
            content = excluded.content,
@@ -4323,6 +4454,11 @@ function ap_mention_store(array $row): void
            deleted_at = NULL'
     );
     $createdAt = ap_db_now();
+    $incomingCreated = trim((string) ($row['created_at'] ?? ''));
+    if ($incomingCreated !== '' && preg_match('/^\d{4}-\d{2}-\d{2}/', $incomingCreated)) {
+        // Prefer the remote event time (Bluesky indexedAt) on first insert.
+        $createdAt = $incomingCreated;
+    }
     $stmt->execute([
         $ownerUserId,
         $ownerActorId,
@@ -5263,37 +5399,159 @@ function ap_bridgy_bsky_profile_web_url(string $actorId, ?string $username = nul
 }
 
 /**
- * Return the Bluesky handle associated with a local profile, when known.
- * This is intentionally conservative: the HTML profile uses it only for an
- * additive, client-side count lookup and falls back to local AP counts.
+ * Return the Bluesky handle for a local VAAK account when they have connected
+ * (or created) a native Bluesky/PDS login in VAAK. Used for the public HTML
+ * profile “Bluesky” link → https://bsky.app/profile/{handle}.
+ * Bridgy Fed handles are intentionally not used here.
  */
 function ap_profile_bsky_handle(string $actorKey, array $profile = []): ?string
 {
-    $actorKey = strtolower(trim($actorKey));
-    // Bridgy's current Bluesky identity for the primary local account.
-    if ($actorKey === 'cmdr_nova') {
-        return 'cmdr-nova.mkultra.monster.ap.brid.gy';
+    $actorKey = strtolower(trim(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? ''));
+    if ($actorKey === '') {
+        return null;
     }
-    $attachments = is_array($profile['attachment'] ?? null) ? $profile['attachment'] : [];
-    foreach ($attachments as $att) {
-        if (!is_array($att)) {
-            continue;
-        }
-        $value = trim((string) ($att['value'] ?? ''));
-        if ($value === '') {
-            continue;
-        }
-        if (preg_match('#(?:https?://)?(?:www\.)?bsky\.app/profile/([^/?#\s]+)#i', $value, $m)) {
-            $handle = trim($m[1]);
-            if ($handle !== '' && !str_starts_with(strtolower($handle), 'did:')) {
-                return $handle;
+    // Prefer the live VAAK ↔ Bluesky session (Profile → Bluesky connect).
+    try {
+        $st = ap_db()->prepare(
+            'SELECT s.handle
+             FROM bsky_sessions s
+             INNER JOIN ap_users u ON u.id = s.owner_user_id
+             WHERE lower(u.actor_key) = ? OR lower(u.username) = ?
+             LIMIT 1'
+        );
+        $st->execute([$actorKey, $actorKey]);
+        $row = $st->fetch();
+        $handle = is_array($row) ? trim((string) ($row['handle'] ?? '')) : '';
+        if ($handle !== '') {
+            $handle = ltrim($handle, '@');
+            // Never surface deactivated Bridgy Fed identities on HTML profiles.
+            if (str_ends_with(strtolower($handle), '.ap.brid.gy')
+                || str_ends_with(strtolower($handle), '.brid.gy')) {
+                return null;
             }
+            return $handle;
         }
-        if (preg_match('/@([a-z0-9][a-z0-9.-]*\.[a-z]{2,})/i', $value, $m)) {
-            return strtolower($m[1]);
-        }
+    } catch (Throwable $e) {
+        // Table missing / DSN issues — fall through
     }
     return null;
+}
+
+/**
+ * Public AppView counts for a Bluesky handle (followers / following / posts).
+ * Short file cache so HTML profiles and /stats stay snappy.
+ *
+ * @return array{ok:bool,followers:int,following:int,posts:int,handle?:string,error?:string}
+ */
+function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
+{
+    $handle = ltrim(trim($handle), '@');
+    if ($handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'error' => 'Invalid handle'];
+    }
+    // Bridgy identities are not used for HTML profile totals.
+    $lower = strtolower($handle);
+    if (str_ends_with($lower, '.ap.brid.gy') || str_ends_with($lower, '.brid.gy')) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'error' => 'Bridgy handle skipped'];
+    }
+
+    $cacheDir = sys_get_temp_dir() . '/vaak-bsky-counts';
+    if (!is_dir($cacheDir)) {
+        @mkdir($cacheDir, 0700, true);
+    }
+    $cachePath = $cacheDir . '/' . hash('sha256', strtolower($handle)) . '.json';
+    $ttlSec = max(30, min(900, $ttlSec));
+    if (is_file($cachePath)) {
+        $age = time() - (int) @filemtime($cachePath);
+        if ($age >= 0 && $age < $ttlSec) {
+            $raw = @file_get_contents($cachePath);
+            $cached = is_string($raw) ? json_decode($raw, true) : null;
+            if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
+                return [
+                    'ok' => !empty($cached['ok']),
+                    'followers' => (int) $cached['followers'],
+                    'following' => (int) $cached['following'],
+                    'posts' => (int) ($cached['posts'] ?? 0),
+                    'handle' => (string) ($cached['handle'] ?? $handle),
+                ];
+            }
+        }
+    }
+
+    $url = 'https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' . rawurlencode($handle);
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'error' => 'curl_init failed'];
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 2,
+        CURLOPT_CONNECTTIMEOUT => 4,
+        CURLOPT_TIMEOUT => 6,
+        CURLOPT_HTTPHEADER => [
+            'Accept: application/json',
+            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        ],
+    ]);
+    $body = curl_exec($ch);
+    $errno = curl_errno($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($errno !== 0 || !is_string($body) || $status < 200 || $status >= 300) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'error' => 'HTTP ' . $status];
+    }
+    $json = json_decode($body, true);
+    if (!is_array($json)) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'error' => 'Bad JSON'];
+    }
+    $out = [
+        'ok' => true,
+        'followers' => max(0, (int) ($json['followersCount'] ?? 0)),
+        'following' => max(0, (int) ($json['followsCount'] ?? 0)),
+        'posts' => max(0, (int) ($json['postsCount'] ?? 0)),
+        'handle' => (string) ($json['handle'] ?? $handle),
+    ];
+    @file_put_contents($cachePath, json_encode($out, JSON_UNESCAPED_SLASHES), LOCK_EX);
+    return $out;
+}
+
+/**
+ * Combined ActivityPub + connected Bluesky follow totals for an HTML profile.
+ *
+ * @return array{
+ *   followers:int,
+ *   following:int,
+ *   ap_followers:int,
+ *   ap_following:int,
+ *   bsky_followers:int,
+ *   bsky_following:int,
+ *   bsky_handle:?string
+ * }
+ */
+function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, int $apFollowing): array
+{
+    $apFollowers = max(0, $apFollowers);
+    $apFollowing = max(0, $apFollowing);
+    $handle = function_exists('ap_profile_bsky_handle') ? ap_profile_bsky_handle($actorKey) : null;
+    $bskyFollowers = 0;
+    $bskyFollowing = 0;
+    if (is_string($handle) && $handle !== '') {
+        $remote = ap_bsky_public_profile_counts($handle);
+        if (!empty($remote['ok'])) {
+            $bskyFollowers = (int) $remote['followers'];
+            $bskyFollowing = (int) $remote['following'];
+        }
+    }
+    return [
+        'followers' => $apFollowers + $bskyFollowers,
+        'following' => $apFollowing + $bskyFollowing,
+        'ap_followers' => $apFollowers,
+        'ap_following' => $apFollowing,
+        'bsky_followers' => $bskyFollowers,
+        'bsky_following' => $bskyFollowing,
+        'bsky_handle' => $handle,
+    ];
 }
 
 /**
@@ -5719,6 +5977,20 @@ function ap_mute_upsert(string $actorId, bool $notifications, int $ownerUserId):
          VALUES (?, ?, ?, ?, ?)'
     )->execute([$ownerUserId, $actorId, $now, $notifications ? 1 : 0, $host]);
     ap_mutes_cache_clear($ownerUserId);
+    // Best-effort: mirror mute to connected Bluesky account when DID is known.
+    try {
+        if (!function_exists('ap_bsky_sync_moderation_from_vaak')) {
+            $bskyLib = __DIR__ . '/ap-bsky.php';
+            if (is_file($bskyLib)) {
+                require_once $bskyLib;
+            }
+        }
+        if (function_exists('ap_bsky_sync_moderation_from_vaak')) {
+            ap_bsky_sync_moderation_from_vaak($ownerUserId, $actorId, 'mute');
+        }
+    } catch (Throwable $e) {
+        // never fail VAAK mute
+    }
     return ['ok' => true, 'actor_id' => $actorId];
 }
 
@@ -5741,6 +6013,19 @@ function ap_unmute(string $actorId, int $ownerUserId): array
     ap_mutes_cache_clear($ownerUserId);
     if ($st->rowCount() < 1) {
         return ['ok' => false, 'error' => 'Not muted.'];
+    }
+    try {
+        if (!function_exists('ap_bsky_sync_moderation_from_vaak')) {
+            $bskyLib = __DIR__ . '/ap-bsky.php';
+            if (is_file($bskyLib)) {
+                require_once $bskyLib;
+            }
+        }
+        if (function_exists('ap_bsky_sync_moderation_from_vaak')) {
+            ap_bsky_sync_moderation_from_vaak($ownerUserId, $actorId, 'unmute');
+        }
+    } catch (Throwable $e) {
+        // ignore
     }
     return ['ok' => true, 'actor_id' => $actorId];
 }
@@ -5907,44 +6192,120 @@ function ap_text_looks_anti_ai(string $text): bool
     return (bool) preg_match(ap_anti_ai_keyword_regex(), $text);
 }
 
+/**
+ * Canonical actor key for anti-AI hits/marks.
+ * Bluesky DIDs map to Bridgy Fed AP actor URLs so native AT cache + Bridgy
+ * Creates for the same person share one mark.
+ */
+function ap_anti_ai_actor_key(string $actorId): string
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return '';
+    }
+    if (str_starts_with($actorId, 'did:')) {
+        return 'https://bsky.brid.gy/ap/' . $actorId;
+    }
+    // at://did:… → Bridgy AP actor
+    if (preg_match('#^at://(did:[^/]+)#', $actorId, $m)) {
+        return 'https://bsky.brid.gy/ap/' . $m[1];
+    }
+    // Already Bridgy AP / other https actor
+    return $actorId;
+}
+
+/**
+ * Lookup aliases when checking marks (DID ↔ Bridgy AP).
+ *
+ * @return list<string>
+ */
+function ap_anti_ai_actor_lookup_keys(string $actorId): array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return [];
+    }
+    $keys = [$actorId];
+    $canon = ap_anti_ai_actor_key($actorId);
+    if ($canon !== '' && $canon !== $actorId) {
+        $keys[] = $canon;
+    }
+    // Bridgy AP → also try raw DID
+    if (preg_match('#^https://bsky\.brid\.gy/ap/(did:[^/\s]+)$#i', $actorId, $m)
+        || preg_match('#^https://bsky\.brid\.gy/ap/(did:[^/\s]+)$#i', $canon, $m)
+    ) {
+        $keys[] = $m[1];
+    }
+    $out = [];
+    foreach ($keys as $k) {
+        $k = rtrim($k, '/');
+        if ($k !== '' && !isset($out[$k])) {
+            $out[$k] = true;
+        }
+    }
+    return array_keys($out);
+}
+
+/** True when this actor key is a local mkultra account (never mark). */
+function ap_anti_ai_actor_is_local(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    return (bool) preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $actorId);
+}
+
 /** Fast lookup: actor currently carries the anti-AI mark. */
 function ap_anti_ai_actor_is_marked(string $actorId, bool $bypassCache = false): bool
 {
     $actorId = rtrim(trim($actorId), '/');
-    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+    if ($actorId === '') {
         return false;
     }
     // Never mark local instance accounts
-    if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $actorId)) {
+    if (ap_anti_ai_actor_is_local($actorId)) {
+        return false;
+    }
+    $keys = ap_anti_ai_actor_lookup_keys($actorId);
+    if ($keys === []) {
         return false;
     }
     static $memo = [];
-    if (!$bypassCache && array_key_exists($actorId, $memo)) {
-        return $memo[$actorId];
+    $memoKey = $keys[0];
+    if (!$bypassCache && array_key_exists($memoKey, $memo)) {
+        return $memo[$memoKey];
     }
     try {
-        $st = ap_db()->prepare('SELECT marked FROM ap_anti_ai_actors WHERE actor_id = ? OR actor_id = ? LIMIT 1');
-        $st->execute([$actorId, $actorId . '/']);
-        $row = $st->fetch();
-        return $memo[$actorId] = is_array($row) && !empty($row['marked']);
+        foreach ($keys as $key) {
+            $st = ap_db()->prepare('SELECT marked FROM ap_anti_ai_actors WHERE actor_id = ? OR actor_id = ? LIMIT 1');
+            $st->execute([$key, $key . '/']);
+            $row = $st->fetch();
+            if (is_array($row) && !empty($row['marked'])) {
+                return $memo[$memoKey] = true;
+            }
+        }
+        return $memo[$memoKey] = false;
     } catch (Throwable $e) {
-        return $memo[$actorId] = false;
+        return $memo[$memoKey] = false;
     }
 }
 
 /**
- * Record a keyword hit for a remote Create (idempotent per object_id).
+ * Record a keyword hit for a remote Create / Bluesky post (idempotent per object_id).
+ * Accepts https:// ActivityPub actors or Bluesky DIDs (normalized to Bridgy AP).
  *
  * @return array{ok:bool,inserted?:bool}
  */
 function ap_anti_ai_hit_record(string $actorId, string $objectId, ?string $hitAt = null): array
 {
-    $actorId = rtrim(trim($actorId), '/');
+    $actorId = ap_anti_ai_actor_key($actorId);
     $objectId = rtrim(trim($objectId), '/');
-    if ($actorId === '' || $objectId === '' || !str_starts_with($actorId, 'https://')) {
+    if ($actorId === '' || $objectId === '') {
         return ['ok' => false];
     }
-    if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $actorId)) {
+    // https ActivityPub actors, or Bridgy-normalized DID keys
+    if (!str_starts_with($actorId, 'https://') && !str_starts_with($actorId, 'did:')) {
+        return ['ok' => false];
+    }
+    if (ap_anti_ai_actor_is_local($actorId)) {
         return ['ok' => false];
     }
     $hitAt = $hitAt !== null && $hitAt !== '' ? $hitAt : ap_db_now();
@@ -5972,7 +6333,7 @@ function ap_anti_ai_actor_recompute(
     int $threshold = 3,
     int $retentionDays = 90
 ): array {
-    $actorId = rtrim(trim($actorId), '/');
+    $actorId = ap_anti_ai_actor_key($actorId);
     if ($actorId === '') {
         return ['ok' => false];
     }
@@ -6044,11 +6405,13 @@ function ap_anti_ai_actor_recompute(
 }
 
 /**
- * Scan cached Create events for anti-AI slang and refresh actor marks.
+ * Scan cached Create events + durable Bluesky posts for anti-AI slang
+ * and refresh actor marks.
  *
  * @return array{
  *   ok:bool,
  *   scanned:int,
+ *   bsky_scanned:int,
  *   new_hits:int,
  *   actors_touched:int,
  *   newly_marked:int,
@@ -6067,6 +6430,7 @@ function ap_anti_ai_scan_cached_posts(
     $out = [
         'ok' => true,
         'scanned' => 0,
+        'bsky_scanned' => 0,
         'new_hits' => 0,
         'actors_touched' => 0,
         'newly_marked' => 0,
@@ -6101,24 +6465,73 @@ function ap_anti_ai_scan_cached_posts(
                 isset($row['created_at']) ? (string) $row['created_at'] : null
             );
             if (!empty($res['ok'])) {
-                $touched[$actorId] = true;
+                $touched[ap_anti_ai_actor_key($actorId)] = true;
                 if (!empty($res['inserted'])) {
                     $out['new_hits']++;
                 }
             }
         }
 
+        // Durable Bluesky post cache (same slang heuristic).
+        $ownDids = [];
+        try {
+            foreach (ap_db()->query('SELECT did FROM bsky_sessions WHERE did IS NOT NULL AND did <> \'\'')->fetchAll() ?: [] as $sr) {
+                $did = trim((string) ($sr['did'] ?? ''));
+                if (str_starts_with($did, 'did:')) {
+                    $ownDids[$did] = true;
+                }
+            }
+        } catch (Throwable $e) {
+            // sessions table may be missing on fresh installs
+        }
+        $bskyLimit = max(1000, min(100000, $eventLimit));
+        try {
+            $bst = ap_db()->prepare(
+                "SELECT author_did, bsky_uri, text, indexed_at, published_at
+                 FROM bsky_posts
+                 WHERE text IS NOT NULL AND text <> ''
+                   AND author_did IS NOT NULL AND author_did <> ''
+                   AND bsky_uri IS NOT NULL AND bsky_uri <> ''
+                 ORDER BY indexed_at DESC NULLS LAST
+                 LIMIT ?"
+            );
+            $bst->bindValue(1, $bskyLimit, PDO::PARAM_INT);
+            $bst->execute();
+            while ($row = $bst->fetch()) {
+                $out['bsky_scanned']++;
+                $did = trim((string) ($row['author_did'] ?? ''));
+                $uri = trim((string) ($row['bsky_uri'] ?? ''));
+                $text = (string) ($row['text'] ?? '');
+                if ($did === '' || $uri === '' || isset($ownDids[$did])) {
+                    continue;
+                }
+                if (!ap_text_looks_anti_ai($text)) {
+                    continue;
+                }
+                $hitAt = (string) ($row['published_at'] ?? $row['indexed_at'] ?? '');
+                $res = ap_anti_ai_hit_record($did, $uri, $hitAt !== '' ? $hitAt : null);
+                if (!empty($res['ok'])) {
+                    $touched[ap_anti_ai_actor_key($did)] = true;
+                    if (!empty($res['inserted'])) {
+                        $out['new_hits']++;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // bsky_posts may not exist yet
+        }
+
         // Also recompute every currently marked actor (so decay works even if
         // they have no matching Creates left in the events window).
         foreach (ap_db()->query('SELECT actor_id FROM ap_anti_ai_actors WHERE marked = 1')->fetchAll() as $r) {
-            $aid = rtrim((string) ($r['actor_id'] ?? ''), '/');
+            $aid = ap_anti_ai_actor_key((string) ($r['actor_id'] ?? ''));
             if ($aid !== '') {
                 $touched[$aid] = true;
             }
         }
         // Anyone with residual hits
         foreach (ap_db()->query('SELECT DISTINCT actor_id FROM ap_anti_ai_hits')->fetchAll() as $r) {
-            $aid = rtrim((string) ($r['actor_id'] ?? ''), '/');
+            $aid = ap_anti_ai_actor_key((string) ($r['actor_id'] ?? ''));
             if ($aid !== '') {
                 $touched[$aid] = true;
             }
@@ -6413,9 +6826,10 @@ function ap_user_block_find(?string $actorId, ?string $host, int $ownerUserId): 
 }
 
 /**
- * Personal block — hides from this user's timelines only (no inbox / follow side effects).
+ * Personal block — hides from this user's timelines and, for actor scope, federates
+ * an ActivityPub Block (needed for Bridgy Fed opt-out) and severs local follows.
  *
- * @return array{ok:bool,error?:string,id?:int,scope?:string,value?:string,already?:bool}
+ * @return array{ok:bool,error?:string,id?:int,scope?:string,value?:string,already?:bool,delivered?:bool}
  */
 function ap_user_block_add(
     int $ownerUserId,
@@ -6471,7 +6885,7 @@ function ap_user_block_add(
             'SELECT id FROM ap_user_blocks WHERE owner_user_id = ? AND scope = ? AND value = ?'
         );
         $idRow->execute([$ownerUserId, $scope, $value]);
-        return [
+        $out = [
             'ok' => true,
             'id' => (int) ($idRow->fetch()['id'] ?? 0),
             'scope' => $scope,
@@ -6481,10 +6895,42 @@ function ap_user_block_add(
         error_log('[ap-db] user_block_add: ' . $e->getMessage());
         return ['ok' => false, 'error' => 'Could not save personal block.'];
     }
+
+    // Actor blocks federate Block + sever follows (Bridgy Fed / Mastodon-compatible).
+    if ($scope === 'actor' && $kind === 'block') {
+        if (!function_exists('ap_block_remote_actor')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+        }
+        if (function_exists('ap_block_remote_actor')) {
+            $fed = ap_block_remote_actor($value);
+            $out['delivered'] = !empty($fed['delivered']);
+            if (!empty($fed['error']) && empty($fed['delivered'])) {
+                $out['error'] = (string) $fed['error'];
+            }
+        }
+        // Best-effort: also create app.bsky.graph.block when target has a DID.
+        try {
+            if (!function_exists('ap_bsky_sync_moderation_from_vaak')) {
+                $bskyLib = __DIR__ . '/ap-bsky.php';
+                if (is_file($bskyLib)) {
+                    require_once $bskyLib;
+                }
+            }
+            if (function_exists('ap_bsky_sync_moderation_from_vaak')) {
+                ap_bsky_sync_moderation_from_vaak($ownerUserId, $value, 'block');
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+    }
+    return $out;
 }
 
 /**
- * @return array{ok:bool,error?:string,scope?:string,value?:string}
+ * @return array{ok:bool,error?:string,scope?:string,value?:string,delivered?:bool}
  */
 function ap_user_block_remove(int $ownerUserId, int $id): array
 {
@@ -6501,11 +6947,37 @@ function ap_user_block_remove(int $ownerUserId, int $id): array
     $del = $db->prepare('DELETE FROM ap_user_blocks WHERE id = ? AND owner_user_id = ?');
     $del->execute([$id, $ownerUserId]);
     ap_user_blocks_cache_clear($ownerUserId);
-    return [
+    $out = [
         'ok' => true,
         'scope' => (string) ($row['scope'] ?? ''),
         'value' => (string) ($row['value'] ?? ''),
     ];
+    if ($out['scope'] === 'actor' && ($row['kind'] ?? 'block') === 'block' && $out['value'] !== '') {
+        if (!function_exists('ap_unblock_remote_actor')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+        }
+        if (function_exists('ap_unblock_remote_actor')) {
+            $fed = ap_unblock_remote_actor($out['value']);
+            $out['delivered'] = !empty($fed['delivered']);
+        }
+        try {
+            if (!function_exists('ap_bsky_sync_moderation_from_vaak')) {
+                $bskyLib = __DIR__ . '/ap-bsky.php';
+                if (is_file($bskyLib)) {
+                    require_once $bskyLib;
+                }
+            }
+            if (function_exists('ap_bsky_sync_moderation_from_vaak')) {
+                ap_bsky_sync_moderation_from_vaak($ownerUserId, $out['value'], 'unblock');
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+    }
+    return $out;
 }
 
 /**
@@ -6524,6 +6996,22 @@ function ap_row_is_hidden(?string $actorId, ?string $host = null, ?int $ownerUse
     }
     if ($actorId !== null && $actorId !== '' && ap_is_muted_actor($actorId, $ownerUserId)) {
         return true;
+    }
+    return ap_user_is_blocked($actorId, $host, $ownerUserId);
+}
+
+/**
+ * True when an account's content must be fully hidden for this viewer.
+ * Personal block + server-wide block count; mute alone does not (profile/posts
+ * stay openable — mute only filters timelines / notifications).
+ */
+function ap_actor_is_content_blocked(?string $actorId, ?string $host = null, ?int $ownerUserId = null): bool
+{
+    if (ap_row_is_blocked($actorId, $host)) {
+        return true;
+    }
+    if ($ownerUserId === null || $ownerUserId < 1) {
+        return false;
     }
     return ap_user_is_blocked($actorId, $host, $ownerUserId);
 }

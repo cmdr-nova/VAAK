@@ -321,7 +321,13 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
     if ($delivered < 1) {
         return ['ok' => false, 'error' => 'Delivery failed', 'id' => $id, 'activity_id' => $activityId, 'delivered' => 0];
     }
-    return ['ok' => true, 'id' => $id, 'activity_id' => $activityId, 'delivered' => $delivered];
+    return [
+        'ok' => true,
+        'id' => $id,
+        'activity_id' => $activityId,
+        'delivered' => $delivered,
+        'local_peer' => $isLocalPeer,
+    ];
 }
 
 /**

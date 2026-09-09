@@ -308,6 +308,19 @@ if (preg_match('#^/users/cmdr_nova/collections/(\d+)$#', $path, $cm)) {
 if ($path === '/users/cmdr_nova/stats') {
     $site = ap_site_content_counts();
     $compose = ap_compose_post_count();
+    $apFollowers = count(ap_followers_list(CMDR_ACTOR_ID));
+    $apFollowing = count(ap_following_list(CMDR_ACTOR_ID));
+    $combined = function_exists('ap_profile_combined_follow_counts')
+        ? ap_profile_combined_follow_counts('cmdr_nova', $apFollowers, $apFollowing)
+        : [
+            'followers' => $apFollowers,
+            'following' => $apFollowing,
+            'ap_followers' => $apFollowers,
+            'ap_following' => $apFollowing,
+            'bsky_followers' => 0,
+            'bsky_following' => 0,
+            'bsky_handle' => (function_exists('ap_profile_bsky_handle') ? ap_profile_bsky_handle('cmdr_nova') : null),
+        ];
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-cache, max-age=0, must-revalidate');
     echo json_encode([
@@ -315,8 +328,14 @@ if ($path === '/users/cmdr_nova/stats') {
         'blog_posts' => (int) $site['blog_posts'],
         'notes' => (int) $site['notes'],
         'compose' => $compose,
-        'followers' => count(ap_followers_list(CMDR_ACTOR_ID)),
-        'following' => count(ap_following_list(CMDR_ACTOR_ID)),
+        // Combined AP + connected Bluesky totals (HTML profile / homepage).
+        'followers' => (int) $combined['followers'],
+        'following' => (int) $combined['following'],
+        'ap_followers' => (int) ($combined['ap_followers'] ?? $apFollowers),
+        'ap_following' => (int) ($combined['ap_following'] ?? $apFollowing),
+        'bsky_followers' => (int) ($combined['bsky_followers'] ?? 0),
+        'bsky_following' => (int) ($combined['bsky_following'] ?? 0),
+        'bsky_handle' => $combined['bsky_handle'] ?? null,
     ], JSON_UNESCAPED_SLASHES);
     exit;
 }
@@ -1509,6 +1528,16 @@ function ap_cmdr_html(): void
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle('cmdr_nova', $p)
         : null;
+    $combined = function_exists('ap_profile_combined_follow_counts')
+        ? ap_profile_combined_follow_counts('cmdr_nova', (int) $followerCount, (int) $followingCount)
+        : [
+            'followers' => (int) $followerCount,
+            'following' => (int) $followingCount,
+            'bsky_handle' => $bskyHandle,
+        ];
+    if ($bskyHandle === null && !empty($combined['bsky_handle'])) {
+        $bskyHandle = (string) $combined['bsky_handle'];
+    }
     // HTML profile feed = site blogs + notes + AP compose (no federation side effects).
     // Featured tab still needs post counts for the other tab badges.
     $feedTab = $tab === 'featured' ? 'posts' : $tab;
@@ -1521,18 +1550,15 @@ function ap_cmdr_html(): void
     echo '<div class="stats">';
     echo '<div><span class="n">' . $statPosts . '</span><span class="l">Posts</span></div>';
     $bskyAttr = $bskyHandle !== null ? ' data-bsky-handle="' . htmlspecialchars($bskyHandle, ENT_QUOTES, 'UTF-8') . '"' : '';
-    $bskyTitle = $bskyHandle !== null ? ' title="Includes local and Bluesky counts"' : '';
-    echo '<a href="/users/cmdr_nova/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $followingCount . '</span><span class="l">Following</span></a>';
-    echo '<a href="/users/cmdr_nova/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $followerCount . '</span><span class="l">Followers</span></a>';
+    $bskyTitle = $bskyHandle !== null ? ' title="Includes ActivityPub and connected Bluesky counts"' : '';
+    echo '<a href="/users/cmdr_nova/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $combined['following'] . '</span><span class="l">Following</span></a>';
+    echo '<a href="/users/cmdr_nova/followers"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="followers">' . (int) $combined['followers'] . '</span><span class="l">Followers</span></a>';
     echo '</div>';
     echo '<p class="feed-links"><a href="/users/cmdr_nova/feed.xml" type="application/rss+xml">RSS</a> · <a href="/users/cmdr_nova/feed.atom" type="application/atom+xml">Atom</a>';
     if ($bskyHandle !== null) {
         echo ' · <a href="https://bsky.app/profile/' . rawurlencode($bskyHandle) . '" rel="me noopener noreferrer" target="_blank">Bluesky</a>';
     }
     echo '</p>';
-    if ($bskyHandle !== null) {
-        echo '<script>(function(){var els=document.querySelectorAll("[data-bsky-handle]");if(!els.length)return;var h=els[0].getAttribute("data-bsky-handle");if(!h)return;fetch("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor="+encodeURIComponent(h),{credentials:"omit"}).then(function(r){return r.ok?r.json():null;}).then(function(p){if(!p)return;[["followers","followersCount"],["following","followsCount"]].forEach(function(pair){var k=pair[0],field=pair[1],n=document.querySelector("[data-bsky-count=\""+k+"\"]");var local=n?parseInt(n.textContent||"0",10):0;var remote=parseInt(p[field]||"0",10);if(n&&isFinite(local)&&isFinite(remote))n.textContent=String(local+remote);});}).catch(function(){});})();</script>';
-    }
 
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
