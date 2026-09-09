@@ -3216,9 +3216,9 @@ function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
 }
 
 /**
- * Pull Bluesky blocks, mutes, and subscribed modlist members into hide set.
+ * Pull Bluesky blocks, mutes, and subscribed block/mute modlist members into hide set.
  *
- * @return array{ok:bool,error?:string,blocks?:int,mutes?:int,list_members?:int}
+ * @return array{ok:bool,error?:string,blocks?:int,mutes?:int,list_members?:int,list_block_members?:int,list_mute_members?:int,cached?:bool}
  */
 function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
 {
@@ -3265,7 +3265,8 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
     $now = gmdate('c');
     $blockCount = 0;
     $muteCount = 0;
-    $listCount = 0;
+    $listBlockCount = 0;
+    $listMuteCount = 0;
 
     // Replace pull-sourced rows for this owner (keep vaak-pushed hide rows that might not be in pull yet).
     try {
@@ -3326,68 +3327,96 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         }
     }
 
-    // Subscribed blocklists (listblocks)
-    $listUris = [];
-    $cursor = null;
-    for ($page = 0; $page < 10; $page++) {
-        $q = ['limit' => 50];
-        if ($cursor) {
-            $q['cursor'] = $cursor;
-        }
-        $j = $fetchPage('app.bsky.graph.getListBlocks', $q);
-        if ($j === null) {
-            break;
-        }
-        foreach ((array) ($j['lists'] ?? []) as $list) {
-            $uri = (string) ($list['uri'] ?? '');
-            if ($uri !== '') {
-                $listUris[] = $uri;
+    /**
+     * Expand subscribed mod lists (block or mute) into hide DIDs.
+     *
+     * @param string $listsNsid getListBlocks | getListMutes
+     * @param string $reason listblock | listmute
+     */
+    $expandSubscribedLists = static function (string $listsNsid, string $reason) use (
+        $fetchPage,
+        $ownerUserId,
+        &$listBlockCount,
+        &$listMuteCount
+    ): void {
+        $listUris = [];
+        $cursor = null;
+        for ($page = 0; $page < 10; $page++) {
+            $q = ['limit' => 50];
+            if ($cursor) {
+                $q['cursor'] = $cursor;
             }
-        }
-        $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
-        if ($cursor === null) {
-            break;
-        }
-    }
-    foreach (array_slice(array_unique($listUris), 0, 30) as $listUri) {
-        $lCursor = null;
-        for ($page = 0; $page < 30; $page++) {
-            $q = ['list' => $listUri, 'limit' => 100];
-            if ($lCursor) {
-                $q['cursor'] = $lCursor;
-            }
-            $j = $fetchPage('app.bsky.graph.getList', $q);
+            $j = $fetchPage($listsNsid, $q);
             if ($j === null) {
                 break;
             }
-            foreach ((array) ($j['items'] ?? []) as $item) {
-                $subj = is_array($item['subject'] ?? null) ? $item['subject'] : [];
-                $did = (string) ($subj['did'] ?? '');
-                if ($did === '') {
-                    continue;
+            foreach ((array) ($j['lists'] ?? []) as $list) {
+                $uri = (string) ($list['uri'] ?? '');
+                if ($uri !== '') {
+                    $listUris[] = $uri;
                 }
-                ap_bsky_hide_did_add($ownerUserId, $did, 'listblock', $listUri);
-                $listCount++;
             }
-            $lCursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
-            if ($lCursor === null) {
+            $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
+            if ($cursor === null) {
                 break;
             }
         }
-    }
+        foreach (array_slice(array_unique($listUris), 0, 30) as $listUri) {
+            $lCursor = null;
+            for ($page = 0; $page < 30; $page++) {
+                $q = ['list' => $listUri, 'limit' => 100];
+                if ($lCursor) {
+                    $q['cursor'] = $lCursor;
+                }
+                $j = $fetchPage('app.bsky.graph.getList', $q);
+                if ($j === null) {
+                    break;
+                }
+                foreach ((array) ($j['items'] ?? []) as $item) {
+                    $subj = is_array($item['subject'] ?? null) ? $item['subject'] : [];
+                    $did = (string) ($subj['did'] ?? '');
+                    if ($did === '') {
+                        continue;
+                    }
+                    ap_bsky_hide_did_add($ownerUserId, $did, $reason, $listUri);
+                    if ($reason === 'listmute') {
+                        $listMuteCount++;
+                    } else {
+                        $listBlockCount++;
+                    }
+                }
+                $lCursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
+                if ($lCursor === null) {
+                    break;
+                }
+            }
+        }
+    };
 
+    // Subscribed blocklists + mutelists
+    $expandSubscribedLists('app.bsky.graph.getListBlocks', 'listblock');
+    $expandSubscribedLists('app.bsky.graph.getListMutes', 'listmute');
+
+    $listCount = $listBlockCount + $listMuteCount;
     @file_put_contents($cachePath, json_encode([
         'at' => $now,
         'blocks' => $blockCount,
         'mutes' => $muteCount,
         'list_members' => $listCount,
+        'list_block_members' => $listBlockCount,
+        'list_mute_members' => $listMuteCount,
     ], JSON_UNESCAPED_SLASHES), LOCK_EX);
+
+    // Hide-set memo can be stale within this long request — clear request cache.
+    ap_bsky_hide_did_set_clear_cache($ownerUserId);
 
     return [
         'ok' => true,
         'blocks' => $blockCount,
         'mutes' => $muteCount,
         'list_members' => $listCount,
+        'list_block_members' => $listBlockCount,
+        'list_mute_members' => $listMuteCount,
     ];
 }
 

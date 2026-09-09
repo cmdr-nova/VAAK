@@ -11310,6 +11310,31 @@ function admin_render_home_suggestions(array $suggestions): void
     .timeline-tabs { display:flex; gap:.25rem; align-items:center; padding:.2rem; border:1px solid var(--border); border-radius:999px; background:var(--panel-2); }
     .timeline-tabs a { padding:.3rem .65rem; border-radius:999px; color:var(--muted); text-decoration:none; font-size:.8rem; }
     .timeline-tabs a:hover, .timeline-tabs a.active { background:var(--primary); color:#04140c; }
+    /* Bluesky pinned/saved feeds: one horizontal scroll row with edge padding */
+    .bsky-feed-tabs {
+      display: flex;
+      flex-wrap: nowrap;
+      align-items: center;
+      gap: .4rem;
+      margin: 0 0 .85rem;
+      padding: .35rem .55rem;
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+      overscroll-behavior-x: contain;
+    }
+    .bsky-feed-tabs::-webkit-scrollbar { height: 6px; }
+    .bsky-feed-tabs::-webkit-scrollbar-thumb {
+      background: color-mix(in srgb, var(--muted) 45%, transparent);
+      border-radius: 999px;
+    }
+    .bsky-feed-tabs > .btn {
+      flex: 0 0 auto;
+      white-space: nowrap;
+      padding: .3rem .75rem;
+      font-size: .82rem;
+    }
     .timeline-skeleton { display:grid; gap:.6rem; margin:.5rem 0; }
     .timeline-skeleton-row { height:7.5rem; border:1px solid var(--border); border-radius:12px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
     .trends-skeleton { display:grid; gap:.45rem; margin:.35rem 0 0; }
@@ -14440,20 +14465,14 @@ function admin_render_home_suggestions(array $suggestions): void
                 $nextCursor = is_string($tl['cursor'] ?? null) ? (string) $tl['cursor'] : '';
                 $pinnedTabs = is_array($bskyPrefs['pinned'] ?? null) ? $bskyPrefs['pinned'] : [];
                 $mergePending = !empty($tl['merge_pending']);
-                $bskyCache = (string) ($tl['cache'] ?? 'miss');
         ?>
           <div class="meta" style="margin:0 0 .65rem">
             Bluesky for <b>@<?= h((string) ($bskySess['handle'] ?? '')) ?></b>
-            · interactive
-            <?php if (!empty($bskyPrefs['mergeFeedEnabled'])): ?>
-              · saved-feed samples load after paint
-            <?php endif; ?>
-            · cache <?= h($bskyCache) ?>
             ·
             <a href="https://bsky.app/profile/<?= h(rawurlencode((string) ($bskySess['handle'] ?? ''))) ?>" target="_blank" rel="noopener noreferrer">Open profile</a>
           </div>
           <?php if ($pinnedTabs !== []): ?>
-            <nav class="timeline-tabs" aria-label="Bluesky feeds" style="margin:0 0 .85rem;display:flex;flex-wrap:wrap;gap:.4rem">
+            <nav class="bsky-feed-tabs" aria-label="Bluesky feeds">
               <?php foreach ($pinnedTabs as $tab): ?>
                 <?php
                   $tType = (string) ($tab['type'] ?? '');
@@ -14464,7 +14483,7 @@ function admin_render_home_suggestions(array $suggestions): void
                       : (str_contains($tVal, '/') ? basename($tVal) : $tVal);
                   $active = ($bskyFeedKey === $tabKey) || ($bskyFeedKey === 'following' && $tabKey === 'following');
                 ?>
-                <a class="btn <?= $active ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bluesky&amp;feed=<?= h(rawurlencode($tabKey)) ?>" style="padding:.3rem .75rem;font-size:.82rem"><?= h($tabLabel) ?></a>
+                <a class="btn <?= $active ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bluesky&amp;feed=<?= h(rawurlencode($tabKey)) ?>"><?= h($tabLabel) ?></a>
               <?php endforeach; ?>
             </nav>
           <?php endif; ?>
