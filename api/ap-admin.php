@@ -8558,6 +8558,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $av = (string) ($author['avatar'] ?? '');
     $text = function_exists('ap_bsky_post_text') ? ap_bsky_post_text($post) : '';
     $imgs = function_exists('ap_bsky_post_image_urls') ? ap_bsky_post_image_urls($post) : [];
+    $external = function_exists('ap_bsky_post_external') ? ap_bsky_post_external($post) : null;
     $openUrl = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : 'https://bsky.app/';
     $created = (string) ($post['indexedAt'] ?? ($post['record']['createdAt'] ?? ''));
     $uri = (string) ($post['uri'] ?? '');
@@ -8638,8 +8639,9 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         }
         $qText = trim((string) ($quote['text'] ?? ''));
         if ($qText !== '') {
+            $qTextLink = preg_replace('#(?<![\w./:@])(www\.[^\s<]+)#iu', 'https://$1', $qText) ?? $qText;
             $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
-                . admin_linkify_body_html(mb_substr($qText, 0, 400), 'bluesky')
+                . admin_linkify_body_html(mb_substr($qTextLink, 0, 400), 'bluesky')
                 . '</div>';
         }
         $qUrl = (string) ($quote['url'] ?? '');
@@ -8652,6 +8654,10 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
 
     // Same lightbox triggers as federated cards (not raw <a target=_blank>).
     $mediaHtml = $imgs !== [] ? admin_media_row_html($imgs) : '';
+    $linkCardHtml = '';
+    if (is_array($external) && function_exists('ap_bsky_external_link_card_html')) {
+        $linkCardHtml = ap_bsky_external_link_card_html($external);
+    }
     $isHome = ($context === 'home');
     $linkView = $isHome ? 'home' : 'bluesky';
     // Stay on the current surface (Home mix vs Bluesky tab). reply_to / quote_object
@@ -8664,8 +8670,18 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $authorProfileHref = $authorProfileUrl !== ''
         ? ('?view=remote_profile&actor=' . rawurlencode($authorProfileUrl) . '&from=' . rawurlencode($linkView))
         : '';
+    // Bluesky often truncates URLs as www.host/... without a scheme; prepend https://
+    // so admin_linkify_body_html can turn them into clickable links.
+    $textForLink = $text;
+    if ($textForLink !== '') {
+        $textForLink = preg_replace(
+            '#(?<![\w./:@])(www\.[^\s<]+)#iu',
+            'https://$1',
+            $textForLink
+        ) ?? $textForLink;
+    }
     // Home: linkify as home so mentions/hashtags stay in-app like federated cards.
-    $bodyHtml = $text !== '' ? admin_linkify_body_html($text, $linkView) : '';
+    $bodyHtml = $textForLink !== '' ? admin_linkify_body_html($textForLink, $linkView) : '';
     if ($quote !== null && is_array($quote) && $quoteHtml !== '') {
         // Re-linkify quote body with home context when mixed into Home.
         if ($isHome && ($quote['text'] ?? '') !== '') {
@@ -8738,6 +8754,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
       <?php endif; ?>
       <?= $quoteHtml ?>
       <?= $mediaHtml ?>
+      <?= $linkCardHtml ?>
       <div class="tweet-actions">
         <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
         <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>

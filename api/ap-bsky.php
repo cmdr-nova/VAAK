@@ -2300,6 +2300,16 @@ function ap_bsky_quote_preview(array $post): ?array
             'url' => 'https://bsky.app/',
         ];
     }
+    // Custom feeds often embed feed generators / lists / starter packs as record#view.
+    // Those are not quote-posts — don't render an empty "Open quoted" shell.
+    if ($vType !== '' && (
+        str_contains($vType, 'generatorView')
+        || str_contains($vType, 'listView')
+        || str_contains($vType, 'starterPack')
+        || str_contains($vType, 'labelerView')
+    )) {
+        return null;
+    }
     $author = is_array($viewRecord['author'] ?? null) ? $viewRecord['author'] : [];
     $handle = (string) ($author['handle'] ?? '');
     $display = trim((string) ($author['displayName'] ?? ''));
@@ -2309,14 +2319,46 @@ function ap_bsky_quote_preview(array $post): ?array
     $value = is_array($viewRecord['value'] ?? null)
         ? $viewRecord['value']
         : (is_array($viewRecord['record'] ?? null) ? $viewRecord['record'] : []);
+    $valueType = (string) ($value['$type'] ?? '');
+    if ($valueType !== '' && !str_contains($valueType, 'feed.post')) {
+        return null;
+    }
     // Live XRPC uses value.text; our durable compact cache may put text on the record root.
     $text = trim((string) ($value['text'] ?? $viewRecord['text'] ?? ''));
+    // Image/video-only quotes: surface a short placeholder so the block isn't just "Open quoted".
+    if ($text === '') {
+        $embeds = is_array($viewRecord['embeds'] ?? null) ? $viewRecord['embeds'] : [];
+        foreach ($embeds as $em) {
+            if (!is_array($em)) {
+                continue;
+            }
+            $et = (string) ($em['$type'] ?? '');
+            if (str_contains($et, 'images') || !empty($em['images'])) {
+                $text = '📷 Image';
+                break;
+            }
+            if (str_contains($et, 'video') || isset($em['playlist']) || isset($em['thumbnail'])) {
+                $text = '🎬 Video';
+                break;
+            }
+            if (str_contains($et, 'external') && is_array($em['external'] ?? null)) {
+                $extTitle = trim((string) ($em['external']['title'] ?? ''));
+                $extUri = trim((string) ($em['external']['uri'] ?? ''));
+                $text = $extTitle !== '' ? $extTitle : ($extUri !== '' ? $extUri : '🔗 Link');
+                break;
+            }
+        }
+    }
     $uri = (string) ($viewRecord['uri'] ?? '');
     $url = $uri !== ''
         ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null)
         : 'https://bsky.app/';
     // No usable quote payload (common with broken compact cache) — don't render an empty shell.
     if ($text === '' && $handle === '' && ($uri === '' || $url === 'https://bsky.app/')) {
+        return null;
+    }
+    // Generator-style records sometimes lack author; skip empty shells.
+    if ($text === '' && $handle === '') {
         return null;
     }
     return [
@@ -3451,6 +3493,87 @@ function ap_bsky_filter_hidden_authors(int $ownerUserId, array $feed): array
         $out[] = $item;
     }
     return $out;
+}
+
+/**
+ * External link embed from a PostView (shared links / link cards).
+ *
+ * @return array{uri:string,title:string,description:string,thumb:string}|null
+ */
+function ap_bsky_post_external(array $post): ?array
+{
+    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : null;
+    if ($embed === null) {
+        return null;
+    }
+    $type = (string) ($embed['$type'] ?? '');
+    $ext = null;
+    if ((str_contains($type, 'external') || isset($embed['external'])) && is_array($embed['external'] ?? null)) {
+        $ext = $embed['external'];
+    } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['external'] ?? null)) {
+        $ext = $embed['media']['external'];
+    }
+    if (!is_array($ext)) {
+        return null;
+    }
+    $uri = trim((string) ($ext['uri'] ?? ''));
+    if ($uri === '' || !preg_match('#^https?://#i', $uri)) {
+        return null;
+    }
+    $thumb = (string) ($ext['thumb'] ?? '');
+    if ($thumb !== '' && !str_starts_with($thumb, 'https://') && !str_starts_with($thumb, 'http://')) {
+        $thumb = '';
+    }
+    return [
+        'uri' => $uri,
+        'title' => trim((string) ($ext['title'] ?? '')),
+        'description' => trim((string) ($ext['description'] ?? '')),
+        'thumb' => $thumb,
+    ];
+}
+
+/**
+ * HTML link-card for a Bluesky external embed (no network fetch).
+ */
+function ap_bsky_external_link_card_html(?array $ext): string
+{
+    if ($ext === null) {
+        return '';
+    }
+    $uri = (string) ($ext['uri'] ?? '');
+    if ($uri === '' || !preg_match('#^https?://#i', $uri)) {
+        return '';
+    }
+    $title = trim((string) ($ext['title'] ?? ''));
+    $desc = trim((string) ($ext['description'] ?? ''));
+    $thumb = (string) ($ext['thumb'] ?? '');
+    $host = parse_url($uri, PHP_URL_HOST);
+    $host = is_string($host) ? strtolower($host) : '';
+    if ($title === '') {
+        $title = $host !== '' ? $host : $uri;
+    }
+    if (function_exists('ap_link_preview_html')) {
+        return ap_link_preview_html([
+            'status' => 'ok',
+            'url' => $uri,
+            'title' => $title,
+            'description' => mb_substr($desc, 0, 280),
+            'provider_name' => $host,
+            'image' => $thumb !== '' ? $thumb : null,
+            'type' => 'link',
+        ], true);
+    }
+    $href = htmlspecialchars($uri, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $titleH = htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $descH = $desc !== '' ? '<div class="link-card__desc">' . htmlspecialchars(mb_substr($desc, 0, 280), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>' : '';
+    $provH = $host !== '' ? '<div class="link-card__provider">' . htmlspecialchars($host, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>' : '';
+    $imgH = ($thumb !== '' && str_starts_with($thumb, 'http'))
+        ? '<div class="link-card__media"><img src="' . htmlspecialchars($thumb, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>'
+        : '';
+    return '<a class="link-card" href="' . $href . '" target="_blank" rel="nofollow noopener noreferrer">'
+        . $imgH
+        . '<div class="link-card__body">' . $provH . '<div class="link-card__title">' . $titleH . '</div>' . $descH . '</div>'
+        . '</a>';
 }
 
 /**
