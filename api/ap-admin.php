@@ -4009,7 +4009,10 @@ function admin_tl_hydrate(array $slice): array
             if (!is_array($bItem)) {
                 continue;
             }
-            $indexed = (string) ($bItem['post']['indexedAt'] ?? ($bItem['post']['record']['createdAt'] ?? ''));
+            $indexed = (string) (
+                $bItem['indexed_at']
+                ?? ($bItem['post']['indexedAt'] ?? ($bItem['post']['record']['createdAt'] ?? ''))
+            );
             $items[] = [
                 'kind' => 'bsky',
                 'sort' => strtotime($indexed) ?: 0,
@@ -4334,14 +4337,8 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 break;
             }
         }
-        if (count($added) < $want) {
-            foreach ($deferred as $d) {
-                $added[] = ['k' => (string) $d['k'], 'id' => (string) $d['id']];
-                if (count($added) >= $want) {
-                    break;
-                }
-            }
-        }
+        // Leave excess deferred Bluesky for a later extend window (keeps mix
+        // chronological with fedi still available in the retention window).
     }
 
     if ($added === []) {
@@ -4524,13 +4521,15 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             foreach ($chunks as $chunk) {
                 $ph = implode(',', array_fill(0, count($chunk), '?'));
                 try {
+                    // Deep enough that infinite scroll can keep mixing fedi within
+                    // the retention window before falling through to Bluesky-only.
                     $st = $db->prepare(
                         "SELECT * FROM events
                          WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
                            AND (action_taken = 'log' OR action_taken = 'local_observe')
                            AND actor_id IN ($ph)
                          ORDER BY created_at DESC, id DESC
-                         LIMIT 100"
+                         LIMIT 300"
                     );
                     $st->execute($chunk);
                     foreach ($st->fetchAll() ?: [] as $erow) {
@@ -4547,7 +4546,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 }
                 return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
             });
-            $homeRaw = array_slice($homeRaw, 0, 100);
+            $homeRaw = array_slice($homeRaw, 0, 300);
         }
         foreach ($homeRaw as $e) {
             $aid = (string) ($e['actor_id'] ?? '');
@@ -4878,19 +4877,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 $flushDeferredBsky();
             }
         }
-        // Remaining deferred Bluesky go on the tail (later infinite-scroll pages).
-        while ($deferredBsky !== []) {
-            if ($sinceBsky < 2 && $cappedBsky !== []) {
-                // No more fedi to create gaps — append the rest so they still appear.
-                foreach ($deferredBsky as $d) {
-                    $cappedBsky[] = $d;
-                }
-                $deferredBsky = [];
-                break;
-            }
-            $cappedBsky[] = array_shift($deferredBsky);
-            $sinceBsky = 0;
-        }
+        // Do NOT dump leftover Bluesky onto the tail — that created a
+        // Bluesky-only cliff after old local posts. Surplus stays out of this
+        // ranked head; deep scroll re-pulls older bsky_posts via extend, mixed
+        // chronologically with older following events still in the retention window.
         $homeTimeline = $cappedBsky;
     }
     // Hard cap: tag-only posts ≤ ~25% of the ranked list (still keep some spice).
