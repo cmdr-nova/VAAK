@@ -10309,7 +10309,7 @@ function admin_render_home_suggestions(array $suggestions): void
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0a0a0a">
   <meta name="color-scheme" content="dark">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -10425,16 +10425,20 @@ function admin_render_home_suggestions(array $suggestions): void
     /* Mobile: drawer nav (desktop / tablet rails unchanged above 700px) */
     .mobile-topbar { display: none; }
     .mobile-nav-backdrop { display: none; }
-    @media (max-width: 700px) {
+    /* Phones (incl. landscape): short height catches ~844×390 class viewports that
+   otherwise fall into the 72px tablet icon-rail and look “squished right”. */
+@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
       .shell {
-        grid-template-columns: 1fr;
-        grid-template-areas: "main";
+        grid-template-columns: minmax(0, 1fr) !important;
+        grid-template-areas: "main" !important;
         height: auto;
         overflow: visible;
         max-width: 100%;
       }
       body { height: auto; overflow: auto; }
-      body.mobile-nav-open { overflow: hidden; }
+      body.mobile-nav-open { overflow: hidden; touch-action: none; }
+      /* Never leave the tablet 72px icon column reserved on phones. */
+      .rail-right { display: none !important; }
 
       .mobile-topbar {
         display: flex;
@@ -10523,12 +10527,20 @@ function admin_render_home_suggestions(array $suggestions): void
         overscroll-behavior: contain;
         border-right: 1px solid var(--border);
         border-bottom: none;
-        transform: translateX(-105%);
-        transition: transform .2s ease;
+        /* translate3d avoids some iOS Safari resume compositor glitches */
+        transform: translate3d(-105%, 0, 0);
+        transition: transform .2s ease, visibility .2s ease;
         padding-bottom: env(safe-area-inset-bottom);
         -webkit-overflow-scrolling: touch;
+        visibility: hidden;
+        pointer-events: none;
       }
-      .rail-left.mobile-open { transform: translateX(0); box-shadow: 8px 0 32px rgba(0,0,0,.45); }
+      .rail-left.mobile-open {
+        transform: translate3d(0, 0, 0);
+        box-shadow: 8px 0 32px rgba(0,0,0,.45);
+        visibility: visible;
+        pointer-events: auto;
+      }
 
       /* Restore readable labels inside the drawer (tablet icon-rail hides them) */
       .rail-left .nav span.label,
@@ -11065,7 +11077,9 @@ function admin_render_home_suggestions(array $suggestions): void
       opacity: 1; pointer-events: auto; transform: translateY(0);
     }
     .feed-top-btn:hover { border-color: var(--primary); }
-    @media (max-width: 700px) {
+    /* Phones (incl. landscape): short height catches ~844×390 class viewports that
+   otherwise fall into the 72px tablet icon-rail and look “squished right”. */
+@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
       /* Keep this above the compose FAB in the viewport, not at the end of
          the document's feed column. */
       .main .feed-top-btn {
@@ -11147,7 +11161,9 @@ function admin_render_home_suggestions(array $suggestions): void
       flex-direction: column;
       overflow: hidden; /* desktop: never scroll the form — textarea is capped instead */
     }
-    @media (max-width: 700px) {
+    /* Phones (incl. landscape): short height catches ~844×390 class viewports that
+   otherwise fall into the 72px tablet icon-rail and look “squished right”. */
+@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
       .compose-modal__panel {
         max-height: min(90dvh, 720px);
         overflow-y: auto;
@@ -11803,7 +11819,9 @@ function admin_render_home_suggestions(array $suggestions): void
     .media-row .media-video { aspect-ratio:auto; object-fit:contain; height:auto; }
     .media-row.media-count-1 .media-video { max-height:min(80vh,900px); }
     .compose-fab { z-index: 110; }
-    @media (max-width: 700px) { .compose-fab { width:3.35rem; height:3.35rem; bottom:max(1rem, env(safe-area-inset-bottom)); right:1rem; font-size:1.7rem; } .timeline-tabs { width:auto; justify-content:flex-start; } .timeline-tabs a { flex:0 0 auto; text-align:center; } }
+    /* Phones (incl. landscape): short height catches ~844×390 class viewports that
+   otherwise fall into the 72px tablet icon-rail and look “squished right”. */
+@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) { .compose-fab { width:3.35rem; height:3.35rem; bottom:max(1rem, env(safe-area-inset-bottom)); right:1rem; font-size:1.7rem; } .timeline-tabs { width:auto; justify-content:flex-start; } .timeline-tabs a { flex:0 0 auto; text-align:center; } }
     .home-suggestions { margin: 1rem 0; padding: .8rem; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-2); }
     .home-suggestions-title { margin-bottom: .55rem; }
     .home-suggestions-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .55rem; }
@@ -11814,7 +11832,9 @@ function admin_render_home_suggestions(array $suggestions): void
     .home-suggestion-handle { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .home-suggestion-form { margin-top: auto; padding-top: .4rem; }
     .home-suggestion-form .btn { padding: .25rem .65rem; font-size: .78rem; }
-    @media (max-width: 700px) { .home-suggestions-grid { grid-template-columns: 1fr; } }
+    /* Phones (incl. landscape): short height catches ~844×390 class viewports that
+   otherwise fall into the 72px tablet icon-rail and look “squished right”. */
+@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) { .home-suggestions-grid { grid-template-columns: 1fr; } }
     .quote-block {
       margin-top: .55rem; padding: .65rem .8rem;
       border-left: 3px solid var(--primary);
@@ -18997,7 +19017,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const backdrop = document.getElementById('mobile-nav-backdrop');
   if (!rail || !btn || !backdrop) return;
 
-  const mq = window.matchMedia('(max-width: 700px)');
+  // Keep in sync with the CSS mobile drawer media query.
+  const mq = window.matchMedia('(max-width: 700px), (max-width: 950px) and (max-height: 520px)');
   function isMobile() { return mq.matches; }
 
   function openNav() {
@@ -19025,6 +19046,23 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     else openNav();
   }
 
+  // Safari (esp. iOS) can restore a half-broken layout after backgrounding:
+  // stuck drawer transform, body.mobile-nav-open lock, or a transient width that
+  // activates the tablet 72px icon rail. Reset chrome whenever we become visible.
+  function resetMobileChrome() {
+    closeNav();
+    document.body.classList.remove('mobile-nav-open');
+    // Nudge layout/compositor after bfcache / visualViewport changes.
+    try {
+      const y = window.scrollY || 0;
+      window.scrollTo(0, y);
+    } catch (e) {}
+    if (rail) {
+      // Force a style recalc so translate3d isn't stuck mid-frame after resume.
+      void rail.offsetWidth;
+    }
+  }
+
   btn.addEventListener('click', toggleNav);
   backdrop.addEventListener('click', closeNav);
   rail.querySelectorAll('a[href]').forEach((a) => {
@@ -19034,8 +19072,27 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (e.key === 'Escape' && rail.classList.contains('mobile-open')) closeNav();
   });
   mq.addEventListener('change', () => {
-    if (!mq.matches) closeNav();
+    closeNav();
   });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') resetMobileChrome();
+  });
+  window.addEventListener('pageshow', (ev) => {
+    // bfcache restores (persisted) are the usual Safari resume path.
+    resetMobileChrome();
+    if (ev && ev.persisted) {
+      requestAnimationFrame(resetMobileChrome);
+    }
+  });
+  if (window.visualViewport) {
+    let vvTimer = 0;
+    window.visualViewport.addEventListener('resize', () => {
+      window.clearTimeout(vvTimer);
+      vvTimer = window.setTimeout(() => {
+        if (document.visibilityState === 'visible') resetMobileChrome();
+      }, 120);
+    });
+  }
 })();
 </script>
 
