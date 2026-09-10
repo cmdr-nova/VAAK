@@ -1,8 +1,28 @@
 # VAAK
 
+**Status:** alpha  
+**Version:** `0.1.0` · `2026-09-10`
+
 VAAK is the multi-user ActivityPub/Mastodon-compatible web application used by
 the Vaak instance. This repository contains only the VAAK application and its
 PHP API libraries; the surrounding NovaLandia website is intentionally excluded.
+
+While VAAK is in **alpha**, expect breaking changes, incomplete surfaces, and
+frequent polish as federation, Bluesky integration, and multi-user flows settle.
+The in-app login page and sidebar show the same release label.
+
+### Version numbering
+
+| Field | Source of truth | Notes |
+|--------|------------------|--------|
+| Channel | `api/ap-version.php` → `VAAK_CHANNEL` | Currently `alpha` |
+| Semver | `VAAK_VERSION` | `0.x` while alpha; bump when shipping a meaningful batch |
+| Date stamp | `VAAK_VERSION_DATE` | Calendar date of the labeled release (`YYYY-MM-DD`) |
+
+UI helper: `vaak_version_label()` → e.g. `VAAK alpha 0.1.0 · 2026-09-10`.
+
+Bump those three constants together when cutting a public sync. Prefer one
+version bump per published batch rather than per tiny commit.
 
 ## Configuration
 
