@@ -7676,13 +7676,93 @@ function ap_masto_suggestions_v2(int $limit = 40): array
     $local = ap_masto_session_actor_id();
     $dismissed = ap_masto_suggestion_dismissed_set();
     $following = [];
+    /** @var array<string,true> $followingKeys bare did / handle keys for Bluesky alias matching */
+    $followingKeys = [];
     foreach (ap_following_list() as $row) {
         $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
         if ($id !== '') {
             $following[$id] = true;
         }
     }
-    $skip = static function (string $actorId) use ($local, $dismissed, $following): bool {
+    // Bluesky follows live outside the AP following table — include them so
+    // Home suggestions don't keep offering accounts you already follow there.
+    $ownerUserId = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+    if ($ownerUserId > 0) {
+        try {
+            if (function_exists('ap_bsky_graph_sync_migrate')) {
+                ap_bsky_graph_sync_migrate();
+            }
+            $gst = ap_db()->prepare(
+                "SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follow'"
+            );
+            $gst->execute([$ownerUserId]);
+            foreach ($gst->fetchAll() as $grow) {
+                $did = trim((string) ($grow['target_did'] ?? ''));
+                if ($did === '' || !str_starts_with($did, 'did:')) {
+                    continue;
+                }
+                $followingKeys[strtolower($did)] = true;
+                $following['https://bsky.app/profile/' . $did] = true;
+                $following['https://bsky.app/profile/' . rawurlencode($did)] = true;
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+        try {
+            $bskyAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
+            $est = ap_db()->prepare(
+                'SELECT DISTINCT actor_id FROM events WHERE action_taken = ? AND actor_id IS NOT NULL'
+            );
+            $est->execute([$bskyAction]);
+            foreach ($est->fetchAll() as $erow) {
+                $aid = rtrim((string) ($erow['actor_id'] ?? ''), '/');
+                if ($aid === '') {
+                    continue;
+                }
+                $following[$aid] = true;
+                if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $aid, $bm)) {
+                    $followingKeys[strtolower(rawurldecode($bm[1]))] = true;
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+        // Map followed DIDs → known handles so handle-form suggestions also skip.
+        if ($followingKeys !== []) {
+            try {
+                $dids = [];
+                foreach (array_keys($followingKeys) as $k) {
+                    if (str_starts_with($k, 'did:')) {
+                        $dids[] = $k;
+                    }
+                }
+                if ($dids !== []) {
+                    // Chunk to keep IN lists reasonable.
+                    foreach (array_chunk($dids, 40) as $chunk) {
+                        $ph = implode(',', array_fill(0, count($chunk), '?'));
+                        $hst = ap_db()->prepare(
+                            "SELECT DISTINCT lower(author_handle) AS h, lower(author_did) AS d
+                             FROM bsky_posts
+                             WHERE lower(author_did) IN ($ph)
+                               AND author_handle IS NOT NULL AND author_handle != ''"
+                        );
+                        $hst->execute($chunk);
+                        foreach ($hst->fetchAll() as $hrow) {
+                            $h = trim((string) ($hrow['h'] ?? ''));
+                            if ($h === '') {
+                                continue;
+                            }
+                            $followingKeys[$h] = true;
+                            $following['https://bsky.app/profile/' . $h] = true;
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+    }
+    $skip = static function (string $actorId) use ($local, $dismissed, $following, $followingKeys): bool {
         $actorId = rtrim($actorId, '/');
         if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
             return true;
@@ -7693,6 +7773,12 @@ function ap_masto_suggestions_v2(int $limit = 40): array
         }
         if (isset($dismissed[$actorId]) || isset($following[$actorId])) {
             return true;
+        }
+        if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorId, $bm)) {
+            $key = strtolower(rawurldecode($bm[1]));
+            if ($key !== '' && isset($followingKeys[$key])) {
+                return true;
+            }
         }
         if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($actorId)) {
             return true;

@@ -2283,15 +2283,51 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $_GET['from'] = (string) ($_POST['return_from'] ?? ($_GET['from'] ?? ''));
         }
     } elseif (in_array($action, ['bsky_like', 'bsky_unlike', 'bsky_repost', 'bsky_unrepost', 'bsky_bookmark', 'bsky_unbookmark'], true)) {
-        $view = 'bluesky';
+        // Prefer the caller's tab (mentions/home/…) so notification likes don't bounce to Bluesky.
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? '')) ?: '';
+        $view = $returnView !== '' ? $returnView : 'bluesky';
         $subject = trim((string) ($_POST['bsky_uri'] ?? ''));
         $cid = trim((string) ($_POST['bsky_cid'] ?? ''));
         $recordUri = trim((string) ($_POST['bsky_record_uri'] ?? ''));
+        $objectRef = trim((string) ($_POST['bsky_object'] ?? ''));
         $returnFeed = trim((string) ($_POST['bsky_feed'] ?? 'following'));
         $wantAjax = isset($_GET['ajax']) || isset($_POST['ajax'])
             || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json');
-        if ($returnFeed !== '') {
+        if ($returnFeed !== '' && $view === 'bluesky') {
             $_GET['feed'] = $returnFeed;
+        }
+        // Notification cards may only have a bsky.app HTTPS URL (or bsky:at://).
+        // Resolve to a strongRef {uri,cid} before createRecord.
+        if ($objectRef !== '' && (str_starts_with($objectRef, 'bsky:') || str_starts_with($objectRef, 'at://')
+            || str_starts_with($objectRef, 'https://bsky.app/') || str_starts_with($objectRef, 'https://mkultra.monster/'))) {
+            $resolveIn = str_starts_with($objectRef, 'bsky:') ? substr($objectRef, 5) : $objectRef;
+            if (($subject === '' || $cid === '') && function_exists('ap_bsky_resolve_strong_ref')) {
+                $resolved = ap_bsky_resolve_strong_ref($resolveIn, $vaakOwnerId);
+                if (is_array($resolved)) {
+                    if ($subject === '' || !str_starts_with($subject, 'at://')) {
+                        $subject = (string) ($resolved['uri'] ?? $subject);
+                    }
+                    if ($cid === '') {
+                        $cid = (string) ($resolved['cid'] ?? '');
+                    }
+                }
+            }
+        }
+        if (($subject === '' || !str_starts_with($subject, 'at://') || $cid === '')
+            && str_starts_with($subject, 'https://') && function_exists('ap_bsky_resolve_strong_ref')) {
+            $resolved = ap_bsky_resolve_strong_ref($subject, $vaakOwnerId);
+            if (is_array($resolved)) {
+                $subject = (string) ($resolved['uri'] ?? $subject);
+                if ($cid === '') {
+                    $cid = (string) ($resolved['cid'] ?? '');
+                }
+            }
+        } elseif ($subject !== '' && str_starts_with($subject, 'at://') && $cid === ''
+            && function_exists('ap_bsky_resolve_strong_ref')) {
+            $resolved = ap_bsky_resolve_strong_ref($subject, $vaakOwnerId);
+            if (is_array($resolved) && !empty($resolved['cid'])) {
+                $cid = (string) $resolved['cid'];
+            }
         }
         $ajaxOut = ['ok' => false, 'action' => $action, 'uri' => $subject];
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
@@ -2357,6 +2393,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $ajaxOut['error'] = (string) ($res['error'] ?? '');
             $ajaxOut['liked'] = !empty($res['ok']);
             $ajaxOut['record_uri'] = (string) ($res['uri'] ?? '');
+            $ajaxOut['uri'] = $subject;
+            $ajaxOut['cid'] = $cid;
             $notice = !empty($res['ok']) ? 'Liked on Bluesky.' : ('Like failed: ' . $ajaxOut['error']);
             if (empty($res['ok'])) {
                 $error = $notice;
@@ -5214,6 +5252,7 @@ if (
 
 $prefillReplyTo = trim((string) ($_GET['reply_to'] ?? ''));
 $prefillActor = trim((string) ($_GET['to'] ?? ''));
+$prefillMention = trim((string) ($_GET['mention'] ?? ''));
 $prefillQuoteObject = trim((string) ($_GET['quote_object'] ?? ''));
 $prefillQuoteStatusId = trim((string) ($_GET['quote_status_id'] ?? ''));
 $prefillEditNote = trim((string) ($_GET['edit_note'] ?? ''));
@@ -5313,6 +5352,52 @@ if ($prefillReplyTo !== '' && $prefillEditNote === '' && $prefillDraftId <= 0) {
         }
     } catch (Throwable $e) {
         // A missing cache row should not prevent opening the composer.
+    }
+}
+// Remote replies: seed the textarea with @author (+ other mentions) so you can keep typing.
+if (
+    $prefillReplyTo !== ''
+    && $prefillQuoteObject === ''
+    && $prefillEditNote === ''
+    && $prefillDraftId <= 0
+    && $prefillEditContent === ''
+) {
+    $replyIsSelf = vaak_is_own_url($prefillReplyTo) && str_contains($prefillReplyTo, '/notes/');
+    if (!$replyIsSelf) {
+        $seedHandles = [];
+        if ($prefillMention !== '') {
+            foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
+                $part = trim((string) $part);
+                if ($part === '') {
+                    continue;
+                }
+                $h = function_exists('admin_reply_mention_handle')
+                    ? admin_reply_mention_handle(null, $part)
+                    : ('@' . ltrim($part, '@'));
+                if ($h !== '' && !(function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))) {
+                    $seedHandles[] = $h;
+                }
+            }
+        } elseif ($prefillActor !== '' && function_exists('admin_reply_mention_handle')) {
+            $h = admin_reply_mention_handle($prefillActor);
+            if ($h !== '') {
+                $seedHandles[] = $h;
+            }
+        }
+        // Dedupe while preserving order
+        $seenSeed = [];
+        $uniq = [];
+        foreach ($seedHandles as $h) {
+            $k = strtolower(ltrim($h, '@'));
+            if ($k === '' || isset($seenSeed[$k])) {
+                continue;
+            }
+            $seenSeed[$k] = true;
+            $uniq[] = $h;
+        }
+        if ($uniq !== []) {
+            $prefillEditContent = implode(' ', $uniq) . ' ';
+        }
     }
 }
 $autoOpenComposer = $composerForceOpen
@@ -7028,7 +7113,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
               <?php endif; ?>
               <?php if ($canReply): ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <?php
+                  $evMentionSeed = admin_reply_mention_seed($aid, null, is_array($eventMentions ?? null) ? $eventMentions : []);
+                ?>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?><?= admin_reply_mention_query($evMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
                 <?php if ($aid !== '' && !$alreadyFollowing): ?>
                   <form method="post" action="?view=following" style="display:inline">
                     <input type="hidden" name="action" value="follow_remote">
@@ -7400,6 +7488,203 @@ function actor_handle(?string $actorId, ?string $username = null, bool $allowFet
     return (string) $actorId;
 }
 
+/**
+ * Handle to prefill in the reply composer (@user@host), or '' for self / unknown.
+ * Optional $acctHint is a Mastodon acct / Bluesky handle without requiring a leading @.
+ */
+function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null): string
+{
+    $hint = is_string($acctHint) ? ltrim(trim($acctHint), '@') : '';
+    if ($hint !== '' && $hint !== '?') {
+        // Bluesky-style handle already includes the domain.
+        if (str_contains($hint, '.') && !str_contains($hint, '@')) {
+            return '@' . $hint;
+        }
+        return '@' . $hint;
+    }
+    $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
+    if ($actorId === '') {
+        return '';
+    }
+    // Never auto-mention ourselves when continuing a local thread.
+    if (function_exists('vaak_is_own_url') && vaak_is_own_url($actorId)) {
+        return '';
+    }
+    if (preg_match('#^https://mkultra\.monster/users/#i', $actorId)) {
+        return '';
+    }
+    $handle = trim(actor_handle($actorId));
+    if ($handle === '' || $handle === '@') {
+        return '';
+    }
+    if ($handle[0] !== '@') {
+        $handle = '@' . $handle;
+    }
+    // Prefer @alice.bsky.social over @alice.bsky.social@bsky.app
+    if (preg_match('/^@(.+)@bsky\.app$/i', $handle, $m) && str_contains($m[1], '.')) {
+        return '@' . $m[1];
+    }
+    return $handle;
+}
+
+/** @return list<string> lowercased self acct keys to skip when seeding a reply */
+function admin_reply_self_acct_keys(): array
+{
+    $keys = [];
+    $user = strtolower(function_exists('vaak_actor_key') ? vaak_actor_key() : '');
+    if ($user === '') {
+        $user = strtolower(trim((string) ($GLOBALS['vaak_actor_key'] ?? '')));
+    }
+    if ($user !== '') {
+        $keys[] = $user;
+        $keys[] = $user . '@mkultra.monster';
+    }
+    return $keys;
+}
+
+function admin_reply_mention_is_self(string $handle): bool
+{
+    $bare = strtolower(ltrim(trim($handle), '@'));
+    if ($bare === '') {
+        return true;
+    }
+    foreach (admin_reply_self_acct_keys() as $self) {
+        if ($bare === $self) {
+            return true;
+        }
+    }
+    // Local actor URL form resolved to @user@mkultra.monster already covered;
+    // also treat bare local usernames that match session.
+    return false;
+}
+
+/**
+ * Build the reply composer seed: author first, then other mentions (no duplicates, no self).
+ *
+ * @param list<array{acct?:string,username?:string,url?:string,uri?:string}|string> $extraMentions
+ * @return list<string> handles including leading @
+ */
+function admin_reply_mention_seed(?string $authorActorId, ?string $authorAcct = null, array $extraMentions = []): array
+{
+    $out = [];
+    $seen = [];
+    $push = static function (string $handle) use (&$out, &$seen): void {
+        $handle = trim($handle);
+        if ($handle === '' || $handle === '@') {
+            return;
+        }
+        if ($handle[0] !== '@') {
+            $handle = '@' . $handle;
+        }
+        if (admin_reply_mention_is_self($handle)) {
+            return;
+        }
+        $key = strtolower(ltrim($handle, '@'));
+        if ($key === '' || isset($seen[$key])) {
+            return;
+        }
+        $seen[$key] = true;
+        $out[] = $handle;
+    };
+
+    $authorHandle = admin_reply_mention_handle($authorActorId, $authorAcct);
+    if ($authorHandle !== '') {
+        $push($authorHandle);
+    }
+
+    foreach ($extraMentions as $m) {
+        if (is_string($m)) {
+            $h = admin_reply_mention_handle(null, $m);
+            if ($h !== '') {
+                $push($h);
+            }
+            continue;
+        }
+        if (!is_array($m)) {
+            continue;
+        }
+        $acct = trim((string) ($m['acct'] ?? ''));
+        $url = trim((string) ($m['url'] ?? $m['uri'] ?? ''));
+        if ($acct === '' && $url === '') {
+            continue;
+        }
+        // Skip structured mentions that point at us by URL.
+        if ($url !== '' && function_exists('vaak_is_own_url') && vaak_is_own_url($url)) {
+            continue;
+        }
+        $h = admin_reply_mention_handle($url !== '' ? $url : null, $acct !== '' ? $acct : null);
+        if ($h !== '') {
+            $push($h);
+        }
+    }
+
+    return $out;
+}
+
+/** Query-string fragment: &mention=a@host,b@host (no leading @). */
+function admin_reply_mention_query(array $handles): string
+{
+    $parts = [];
+    foreach ($handles as $h) {
+        $bare = ltrim(trim((string) $h), '@');
+        if ($bare !== '') {
+            $parts[] = $bare;
+        }
+    }
+    if ($parts === []) {
+        return '';
+    }
+    return '&mention=' . rawurlencode(implode(',', $parts));
+}
+
+/**
+ * Bluesky facet mentions from a PostView (handles as written in the post text).
+ *
+ * @param array<string,mixed> $post
+ * @return list<string>
+ */
+function admin_bsky_post_mention_accts(array $post): array
+{
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    $text = (string) ($record['text'] ?? '');
+    $facets = is_array($record['facets'] ?? null) ? $record['facets'] : [];
+    if ($text === '' || $facets === []) {
+        return [];
+    }
+    $out = [];
+    foreach ($facets as $facet) {
+        if (!is_array($facet)) {
+            continue;
+        }
+        $features = is_array($facet['features'] ?? null) ? $facet['features'] : [];
+        $isMention = false;
+        foreach ($features as $feat) {
+            if (!is_array($feat)) {
+                continue;
+            }
+            $type = (string) ($feat['$type'] ?? '');
+            if (str_contains($type, 'mention')) {
+                $isMention = true;
+                break;
+            }
+        }
+        if (!$isMention) {
+            continue;
+        }
+        $start = (int) ($facet['index']['byteStart'] ?? -1);
+        $end = (int) ($facet['index']['byteEnd'] ?? -1);
+        if ($start < 0 || $end <= $start) {
+            continue;
+        }
+        $slice = substr($text, $start, $end - $start);
+        $handle = ltrim(trim($slice), '@');
+        if ($handle !== '') {
+            $out[] = $handle;
+        }
+    }
+    return $out;
+}
+
 /** Display name for a remote actor (falls back to handle). Cache-only by default. */
 function actor_display_name(?string $actorId, bool $allowFetch = false): string
 {
@@ -7725,7 +8010,12 @@ function admin_render_masto_status_card(
                 ) ?>
               <?php endif; ?>
               <?php if ($uri !== ''): ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($uri) ?><?= $actorRef !== '' && !$isLocal ? '&amp;to=' . urlencode($actorRef) : '' ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <?php
+                  $stMentionSeed = !$isLocal
+                      ? admin_reply_mention_seed($actorRef, $acct !== '?' ? $acct : null, $stMentions)
+                      : [];
+                ?>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($uri) ?><?= $actorRef !== '' && !$isLocal ? '&amp;to=' . urlencode($actorRef) : '' ?><?= admin_reply_mention_query($stMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
               <?php endif; ?>
               <?php if ($sid !== '' && $uri !== ''): ?>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
@@ -8022,7 +8312,21 @@ function admin_render_remote_boost_card(
                 </form>
               <?php endif; ?>
               <?php if ($canReply): ?>
-                <a class="btn btn-ghost" href="?view=compose&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;from=<?= urlencode($returnView) ?>" style="padding:.25rem .7rem;font-size:.8rem">Reply</a>
+                <?php
+                  $boostExtraMentions = [];
+                  if ($summaryRaw !== '' && function_exists('ap_masto_content_with_mentions')) {
+                      $boostExtraMentions = ap_masto_content_with_mentions(
+                          $summaryRaw,
+                          $origActor !== '' ? [$origActor] : []
+                      )['mentions'] ?? [];
+                  }
+                  $boostMentionSeed = admin_reply_mention_seed(
+                      $origActor,
+                      $origHandle !== '' ? ltrim($origHandle, '@') : null,
+                      is_array($boostExtraMentions) ? $boostExtraMentions : []
+                  );
+                ?>
+                <a class="btn btn-ghost" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?><?= $origActor !== '' ? '&amp;to=' . urlencode($origActor) : '' ?><?= admin_reply_mention_query($boostMentionSeed) ?>" style="padding:.25rem .7rem;font-size:.8rem">Reply</a>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -8746,7 +9050,14 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
       <?= $mediaHtml ?>
       <?= $linkCardHtml ?>
       <div class="tweet-actions">
-        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+        <?php
+          $bskyMentionSeed = admin_reply_mention_seed(
+              $authorProfileUrl !== '' ? $authorProfileUrl : null,
+              $handle !== '' ? $handle : null,
+              admin_bsky_post_mention_accts($post)
+          );
+        ?>
+        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?><?= admin_reply_mention_query($bskyMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
         <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
         <?php if ($uri !== '' && $cid !== ''): ?>
           <?php
@@ -9807,9 +10118,108 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php if ($profileHref !== ''): ?>
         <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
       <?php endif; ?>
-      <?php if ($nType === 'mention' && $nStatusUri !== ''): ?>
-        <a class="icon-btn" href="?view=mentions&amp;compose=1&amp;reply_to=<?= urlencode($nStatusUri) ?>&amp;to=<?= urlencode($nActorRef) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+      <?php if (in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== ''): ?>
+        <?php
+          $nMentionSeed = admin_reply_mention_seed(
+              $nActorRef,
+              $nAcct !== '' && $nAcct !== '?' ? $nAcct : null,
+              is_array($nStatusMentions ?? null) ? $nStatusMentions : []
+          );
+        ?>
+        <a class="icon-btn" href="?view=mentions&amp;compose=1&amp;reply_to=<?= urlencode($nStatusUri) ?>&amp;to=<?= urlencode($nActorRef) ?><?= admin_reply_mention_query($nMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
       <?php endif; ?>
+      <?php
+        // Favourite / Bluesky like on mention + quote cards (the remote post body).
+        $nStatusId = is_array($nStatus) ? trim((string) ($nStatus['id'] ?? '')) : '';
+        $nAcctHost = (string) ($n['account']['acct'] ?? '');
+        $nIsBsky = in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== '' && (
+            str_starts_with($nStatusUri, 'https://bsky.app/')
+            || str_starts_with($nStatusUri, 'at://')
+            || str_starts_with($nStatusUri, 'bsky:')
+            || str_starts_with($nActorRef, 'https://bsky.app/')
+            || str_ends_with(strtolower($nAcctHost), '@bsky.app')
+        );
+        if ($nIsBsky && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()) {
+            $bskyObject = $nStatusUri;
+            $bskyAt = '';
+            $bskyCid = '';
+            // Prefer the stored activity AT-URI (cheap DB lookup via mention status id).
+            if ($nStatusId !== '' && preg_match('/^\d+$/', $nStatusId)
+                && function_exists('ap_masto_mention_id_from_status_id')) {
+                $mid = ap_masto_mention_id_from_status_id((int) $nStatusId);
+                if ($mid !== null) {
+                    try {
+                        $mst = ap_db()->prepare(
+                            'SELECT activity_id, object_id FROM mentions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
+                        );
+                        $mst->execute([(int) $mid]);
+                        $mrow = $mst->fetch();
+                        if (is_array($mrow)) {
+                            $act = trim((string) ($mrow['activity_id'] ?? ''));
+                            if (str_starts_with($act, 'at://') && str_contains($act, '/app.bsky.feed.post/')) {
+                                $bskyAt = $act;
+                            }
+                            $oid = ap_masto_mention_target_object_id((string) ($mrow['object_id'] ?? ''));
+                            if ($oid !== '' && (str_starts_with($oid, 'https://bsky.app/')
+                                || str_starts_with($oid, 'at://') || str_starts_with($oid, 'bsky:'))) {
+                                $bskyObject = $oid;
+                            }
+                        }
+                    } catch (Throwable $e) {
+                        // ignore — fall back to status URI
+                    }
+                }
+            }
+            if ($bskyAt === '' && str_starts_with($bskyObject, 'at://')) {
+                $bskyAt = $bskyObject;
+            } elseif ($bskyAt === '' && str_starts_with($bskyObject, 'bsky:')) {
+                $bskyAt = substr($bskyObject, 5);
+            } elseif ($bskyAt === '' && str_starts_with($bskyObject, 'https://bsky.app/')
+                && function_exists('ap_bsky_at_uri_from_https')
+                && preg_match('~^https://bsky\.app/profile/(did:[^/]+)/post/~i', $bskyObject)) {
+                // did: form converts with no network; handle form waits for click-time resolve.
+                $converted = ap_bsky_at_uri_from_https($bskyObject, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
+                if (is_string($converted) && str_starts_with($converted, 'at://')) {
+                    $bskyAt = $converted;
+                }
+            }
+            if ($bskyAt !== '' && function_exists('ap_bsky_post_link_by_uri')) {
+                $plink = ap_bsky_post_link_by_uri($bskyAt);
+                if (is_array($plink) && !empty($plink['bsky_cid'])) {
+                    $bskyCid = (string) $plink['bsky_cid'];
+                }
+            }
+            if ($bskyAt !== '' && $bskyCid === '' && function_exists('ap_bsky_crosspost_by_uri')) {
+                $cmap = ap_bsky_crosspost_by_uri($bskyAt);
+                if (is_array($cmap) && !empty($cmap['bsky_cid'])) {
+                    $bskyCid = (string) $cmap['bsky_cid'];
+                }
+            }
+            ?>
+        <button type="button" class="icon-btn bsky-action" data-bsky-action="like"
+          data-uri="<?= h($bskyAt) ?>" data-cid="<?= h($bskyCid) ?>" data-record-uri=""
+          data-object-ref="<?= h($bskyObject) ?>" data-return-view="mentions"
+          title="Like on Bluesky" aria-label="Like on Bluesky" aria-pressed="false"><i class="ph ph-heart" aria-hidden="true"></i></button>
+            <?php
+        } elseif (in_array($nType, ['mention', 'quote'], true) && $nStatusId !== ''
+            && preg_match('/^\d+$/', $nStatusId) && $nStatusUri !== ''
+            && !str_contains($nStatusUri, '/bites-received/')) {
+            $nFav = function_exists('ap_masto_status_is_favourited') && ap_masto_status_is_favourited($nStatusId);
+            $nObjectId = function_exists('ap_masto_mention_target_object_id')
+                ? ap_masto_mention_target_object_id($nStatusUri)
+                : $nStatusUri;
+            ?>
+        <form method="post" action="?view=mentions" style="display:inline">
+          <input type="hidden" name="action" value="<?= $nFav ? 'unfavourite_status' : 'favourite_status' ?>">
+          <input type="hidden" name="return_view" value="mentions">
+          <input type="hidden" name="status_id" value="<?= h($nStatusId) ?>">
+          <input type="hidden" name="object_id" value="<?= h($nObjectId) ?>">
+          <input type="hidden" name="target_actor" value="<?= h($nActorRef) ?>">
+          <button class="icon-btn<?= $nFav ? ' on' : '' ?>" type="submit" title="<?= $nFav ? 'Unlike' : 'Like' ?>" aria-label="<?= $nFav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $nFav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+        </form>
+            <?php
+        }
+      ?>
       <?php
         // Bite user-target uses synthetic /bites-received/ URIs — Open would 404/white-screen.
         // Post bites keep a real note/status URI (with #bite- fragment stripped upstream).
@@ -10298,6 +10708,12 @@ function admin_render_home_suggestions(array $suggestions): void
     .cw-gate:not([open]) > summary .cw-hint::after { content: 'Show'; }
     .cw-gate .cw-body { padding: 0 .85rem .85rem; border-top: 1px solid var(--border); }
     .cw-gate .cw-body .body { margin-top: .65rem; }
+    /* Unopened DM threads on the conversation list */
+    .tweet-dm-unread {
+      border-color: rgba(0, 255, 159, .35);
+      box-shadow: inset 3px 0 0 var(--primary);
+    }
+    .tweet-dm-unread .nav-badge { flex: 0 0 auto; }
     .dm-bubble {
       margin: .55rem 0 .35rem;
       padding: .75rem .9rem;
@@ -10561,36 +10977,43 @@ function admin_render_home_suggestions(array $suggestions): void
       width: auto; max-width: 10rem; margin: 0; padding: .25rem .45rem;
       font-size: .82rem;
     }
-    .compose-inline-panel .compose-inline-tools {
-      display: flex; align-items: center; gap: .45rem;
+    /* Shared icon toolbar — inline feed composer + reply/quote pop-out modal */
+    .compose-inline-tools {
+      display: flex; align-items: center; gap: .45rem; flex-wrap: wrap;
       margin-top: .65rem;
     }
-    .compose-inline-panel .compose-inline-tools .compose-emoji-wrap { margin: 0 !important; }
-    .compose-inline-panel .compose-inline-tools .composer-check {
+    .compose-inline-tools .compose-emoji-wrap { margin: 0 !important; }
+    .compose-inline-tools .composer-check {
       margin: 0; padding: 0; width: auto; position: relative;
     }
-    .compose-inline-panel .compose-inline-tools .composer-check input {
+    .compose-inline-tools .composer-check input {
       position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
     }
-    .compose-inline-panel .compose-tool {
+    .compose-tool {
       width: 2.25rem; height: 2.25rem; padding: 0;
       display: inline-flex; align-items: center; justify-content: center;
       border: 1px solid var(--border); border-radius: 999px;
       background: transparent; color: var(--muted); cursor: pointer;
       font-size: 1.15rem;
     }
-    .compose-inline-panel .compose-tool.is-recording {
+    .compose-tool.is-recording {
       width: auto; min-width: 8.5rem; padding: 0 .7rem;
       gap: .35rem; white-space: nowrap; font-size: .8rem;
     }
-    .compose-inline-panel .compose-tool:hover,
-    .compose-inline-panel .compose-tool[aria-pressed="true"] {
+    .compose-tool:hover,
+    .compose-tool[aria-pressed="true"] {
       color: var(--primary); border-color: var(--primary);
       background: var(--primary-dim);
     }
-    .compose-inline-panel .compose-media-tool { margin: 0; }
-    .compose-inline-panel .compose-media-tool input { display: none; }
-    .compose-inline-panel .compose-options-legacy { display: none !important; }
+    .compose-media-tool { margin: 0; }
+    .compose-media-tool input { display: none; }
+    .compose-options-legacy { display: none !important; }
+    /* Pop-out: keep reply/quote target URLs in the form, but out of the chrome */
+    .compose-modal__panel.compose-tools-ready #compose-in-reply-to,
+    .compose-modal__panel.compose-tools-ready #compose-to-actor {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
     .compose-inline-slot { width: 100%; margin: 0 0 .75rem; }
     .compose-inline-skeleton {
       height: 12rem; border: 1px solid var(--border); border-radius: var(--radius);
@@ -10665,11 +11088,27 @@ function admin_render_home_suggestions(array $suggestions): void
       display: flex; align-items: center; justify-content: center;
       gap: .45rem; height: 0; overflow: hidden;
       color: var(--muted); font-size: .85rem; font-weight: 600;
-      transition: height .12s ease, opacity .12s ease;
       opacity: 0; pointer-events: none;
+      will-change: height, opacity;
+      /* No height transition while dragging — that fights the finger and feels rigid. */
     }
     .feed-ptr.show { opacity: 1; }
     .feed-ptr.ready { color: var(--primary); }
+    .feed-ptr.settling {
+      transition: height .28s cubic-bezier(.22, 1, .36, 1), opacity .22s ease;
+    }
+    .feed-ptr.refreshing {
+      opacity: 1;
+      color: var(--primary);
+      transition: height .2s ease, opacity .2s ease;
+    }
+    .feed-ptr__spinner {
+      width: .85rem; height: .85rem; border-radius: 50%;
+      border: 2px solid currentColor; border-right-color: transparent;
+      animation: feed-ptr-spin .7s linear infinite;
+      flex: 0 0 auto;
+    }
+    @keyframes feed-ptr-spin { to { transform: rotate(360deg); } }
     .compose-modal {
       position: fixed; inset: 0; z-index: 90;
       display: none; align-items: flex-end; justify-content: center;
@@ -11475,7 +11914,7 @@ function admin_render_home_suggestions(array $suggestions): void
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
       <a class="<?= $view === 'vakktok' ? 'active' : '' ?>" href="?view=vakktok"><span class="ico">▶</span><span class="label">VakkTok</span></a>
       <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
-      <a class="<?= $view === 'bluesky' ? 'active' : '' ?>" href="?view=bluesky"><span class="ico">☁</span><span class="label">Bluesky</span></a>
+      <a class="<?= $view === 'bluesky' ? 'active' : '' ?>" href="?view=bluesky"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">Bluesky</span></a>
       <?php endif; ?>
       <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span><span class="nav-badge"<?= $discussUnreadNav > 0 ? '' : ' hidden' ?>><?= $discussUnreadNav > 99 ? '99+' : (string) (int) $discussUnreadNav ?></span></a>
       <hr class="nav-sep">
@@ -12140,10 +12579,13 @@ function admin_render_home_suggestions(array $suggestions): void
           $dmConversations = ap_dm_conversations(60);
           $dmUnread = ap_dm_unread_count();
         ?>
-        <?php if ($dmUnread > 0): ?>
-          <div class="meta" style="margin-bottom:.75rem">Unread <b><?= (int) $dmUnread ?></b></div>
-        <?php endif; ?>
         <?php if ($dmPeer === ''): ?>
+          <?php if ($dmUnread > 0): ?>
+            <div class="meta" style="margin-bottom:.75rem;display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
+              <span class="nav-badge" style="position:static"><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span>
+              <span>unread <?= $dmUnread === 1 ? 'message' : 'messages' ?> — open a thread to clear its badge</span>
+            </div>
+          <?php endif; ?>
           <form class="composer" method="post" action="?view=dms" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="dm_send">
             <div class="meta" style="margin-bottom:.5rem">New direct message</div>
@@ -12162,16 +12604,17 @@ function admin_render_home_suggestions(array $suggestions): void
               $last = $c['last'];
               $previewHtml = admin_dm_html($last['content'] ?? null, is_array($last) ? $last : null);
               $peerId = (string) $c['peer_actor_id'];
+              $peerUnread = (int) ($c['unread'] ?? 0);
             ?>
-            <article class="tweet">
+            <article class="tweet<?= $peerUnread > 0 ? ' tweet-dm-unread' : '' ?>">
               <div class="tweet-hd">
                 <?= admin_avatar_img($peerId) ?>
                 <div class="tweet-hd-main">
-                  <div>
+                  <div style="display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
                     <span class="who"><?= actor_display_name_html($peerId) ?></span>
                     <span class="meta"> <?= h(actor_handle($peerId)) ?></span>
-                    <?php if (((int) $c['unread']) > 0): ?>
-                      <span class="tag">unread <?= (int) $c['unread'] ?></span>
+                    <?php if ($peerUnread > 0): ?>
+                      <span class="nav-badge" style="position:static" title="<?= (int) $peerUnread ?> unread"><?= $peerUnread > 99 ? '99+' : (string) $peerUnread ?></span>
                     <?php endif; ?>
                   </div>
                   <div class="meta"><?= ($last['direction'] ?? '') === 'out' ? 'You' : 'Them' ?> · <?= h(relative_time((string) ($last['created_at'] ?? ''))) ?></div>
@@ -12179,7 +12622,7 @@ function admin_render_home_suggestions(array $suggestions): void
               </div>
               <div class="dm-bubble<?= ($last['direction'] ?? '') === 'out' ? ' dm-out' : ' dm-in' ?>"><?= $previewHtml !== '' ? $previewHtml : '<span class="meta">(no text)</span>' ?></div>
               <div class="tweet-actions">
-                <a class="btn btn-primary" href="?view=dms&amp;peer=<?= urlencode($peerId) ?>" style="padding:.35rem .9rem;font-size:.85rem">Open thread</a>
+                <a class="btn btn-primary" href="?view=dms&amp;peer=<?= urlencode($peerId) ?>" style="padding:.35rem .9rem;font-size:.85rem"><?= $peerUnread > 0 ? 'Open unread' : 'Open thread' ?></a>
                 <?= block_quick_actions($peerId, short_host($peerId), 'dms', $vaakOwnerId, !empty($vaakIsAdmin), 'dms') ?>
               </div>
             </article>
@@ -17505,14 +17948,19 @@ window.apAdminToast = function (msg, isErr) {
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
       const recordUri = btn.dataset.recordUri || '';
+      const objectRef = btn.dataset.objectRef || '';
+      const returnView = btn.dataset.returnView || '';
       const body = new URLSearchParams();
       body.set('action', postAction);
       if (uri) body.set('bsky_uri', uri);
       if (cid) body.set('bsky_cid', cid);
       if (recordUri) body.set('bsky_record_uri', recordUri);
+      if (objectRef) body.set('bsky_object', objectRef);
+      if (returnView) body.set('return_view', returnView);
       body.set('ajax', '1');
       if (window.VAAK_CSRF) body.set('csrf', window.VAAK_CSRF);
-      const res = await fetch('?view=bluesky&ajax=1', {
+      const viewQ = returnView ? ('view=' + encodeURIComponent(returnView) + '&') : 'view=bluesky&';
+      const res = await fetch('?' + viewQ + 'ajax=1', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {
@@ -17550,6 +17998,7 @@ window.apAdminToast = function (msg, isErr) {
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
       const recordUri = btn.dataset.recordUri || '';
+      const objectRef = btn.dataset.objectRef || '';
       const isOn = btn.classList.contains('on');
       if (!action) return;
 
@@ -17585,7 +18034,11 @@ window.apAdminToast = function (msg, isErr) {
       else if (action === 'repost') postAction = isOn ? 'bsky_unrepost' : 'bsky_repost';
       else if (action === 'bookmark') postAction = 'bsky_bookmark';
       else return;
-      if ((postAction === 'bsky_like' || postAction === 'bsky_repost' || postAction === 'bsky_bookmark') && (!uri || !cid)) return;
+      // Timeline buttons have uri+cid. Notification like buttons may only have
+      // objectRef (https://bsky.app/…); the server resolves the CID on click.
+      if (postAction === 'bsky_like' && !(uri || objectRef)) return;
+      if ((postAction === 'bsky_repost' || postAction === 'bsky_bookmark')
+          && !((uri && cid) || objectRef)) return;
       if ((postAction === 'bsky_unlike' || postAction === 'bsky_unrepost') && !recordUri) {
         btn.title = 'Refresh the page to undo this action';
         return;
@@ -17598,6 +18051,8 @@ window.apAdminToast = function (msg, isErr) {
           const on = !!data.liked;
           setBskyIcon(btn, 'heart', on, { on: 'Unlike', off: 'Like on Bluesky' });
           btn.dataset.recordUri = on ? (data.record_uri || '') : '';
+          if (data.uri) btn.dataset.uri = String(data.uri);
+          if (data.cid) btn.dataset.cid = String(data.cid);
         } else if (action === 'repost') {
           const on = !!data.reposted;
           // Match federated boosts: color via .on, no fill variant for ph-repeat.
@@ -18121,74 +18576,167 @@ window.apAdminToast = function (msg, isErr) {
     else window.addEventListener('load', scheduleMerge, { once: true });
   }
 
-  // Pull-to-refresh (mainly mobile window scroll; desktop .feed overscroll is rare).
+  // Pull-to-refresh (mobile): rubber-band pull, settle animation, soft poll when possible.
   let ptrStartY = 0;
   let ptrDy = 0;
+  let ptrPull = 0;
   let ptrTracking = false;
+  let ptrDragging = false;
   let ptrArmed = false;
-  let ptrLastHaptic = 0;
-  const PTR_READY = 72;
-  function ptrReset() {
-    ptrTracking = false;
-    ptrArmed = false;
-    ptrDy = 0;
-    ptrLastHaptic = 0;
-    if (ptrEl) {
-      ptrEl.style.height = '0px';
-      ptrEl.classList.remove('show', 'ready');
-      ptrEl.textContent = 'Pull to refresh';
+  let ptrBusy = false;
+  let ptrWasArmed = false;
+  const PTR_READY = 64;
+  const PTR_MAX = 120;
+  const PTR_HOLD = 52; // height while “Refreshing…”
+
+  function ptrLabel(text, spinning) {
+    if (!ptrEl) return;
+    if (spinning) {
+      ptrEl.innerHTML = '<span class="feed-ptr__spinner" aria-hidden="true"></span><span>' + text + '</span>';
+    } else {
+      ptrEl.textContent = text;
     }
   }
+
+  function ptrRubber(dy) {
+    // Ease toward PTR_MAX so the end of the pull feels soft, not clamped.
+    const t = Math.max(0, dy);
+    return PTR_MAX * (1 - Math.exp(-t / (PTR_MAX * 1.15)));
+  }
+
+  function ptrResetInstant() {
+    ptrTracking = false;
+    ptrDragging = false;
+    ptrArmed = false;
+    ptrWasArmed = false;
+    ptrDy = 0;
+    ptrPull = 0;
+    if (!ptrEl || ptrBusy) return;
+    ptrEl.classList.remove('show', 'ready', 'settling', 'refreshing');
+    ptrEl.style.height = '0px';
+    ptrLabel('Pull to refresh', false);
+  }
+
+  function ptrCollapse(then) {
+    if (!ptrEl) {
+      if (typeof then === 'function') then();
+      return;
+    }
+    ptrEl.classList.remove('ready', 'refreshing');
+    ptrEl.classList.add('settling', 'show');
+    // Force style flush so the transition runs from current height → 0.
+    void ptrEl.offsetHeight;
+    ptrEl.style.height = '0px';
+    window.setTimeout(() => {
+      if (!ptrBusy) {
+        ptrEl.classList.remove('show', 'settling');
+        ptrLabel('Pull to refresh', false);
+      }
+      if (typeof then === 'function') then();
+    }, 300);
+  }
+
   function ptrCanStart(ev) {
+    if (ptrBusy) return false;
     const target = ev && ev.target;
-    if (target && target.closest && target.closest('textarea, input, select, button')) return false;
+    if (target && target.closest && target.closest('textarea, input, select, button, a, .compose-modal')) return false;
     return nearTop() && !document.body.classList.contains('mobile-nav-open');
   }
+
   document.addEventListener('touchstart', (ev) => {
     if (!ev.touches || !ev.touches[0] || !ptrCanStart(ev)) {
       ptrTracking = false;
       return;
     }
     ptrTracking = true;
+    ptrDragging = false;
     ptrArmed = false;
+    ptrWasArmed = false;
     ptrStartY = ev.touches[0].clientY;
     ptrDy = 0;
+    ptrPull = 0;
+    if (ptrEl) ptrEl.classList.remove('settling', 'refreshing');
   }, { passive: true, capture: true });
+
   document.addEventListener('touchmove', (ev) => {
-    if (!ptrTracking || !ev.touches || !ev.touches[0]) return;
-    if (sc.top() > 4) {
-      ptrReset();
+    if (!ptrTracking || ptrBusy || !ev.touches || !ev.touches[0]) return;
+    if (sc.top() > 6) {
+      if (ptrDragging) ptrCollapse();
+      ptrTracking = false;
+      ptrDragging = false;
       return;
     }
     ptrDy = ev.touches[0].clientY - ptrStartY;
-    if (ptrDy < 8) return;
+    if (ptrDy < 10 && !ptrDragging) return;
+    // Only claim the gesture once we're clearly pulling down at the top.
+    if (!ptrDragging && ptrDy >= 10) ptrDragging = true;
+    if (!ptrDragging) return;
     ev.preventDefault();
-    const pull = Math.min(110, ptrDy * 0.55);
-    ptrArmed = pull >= PTR_READY;
-    if (pull - ptrLastHaptic >= 16 || (ptrArmed && ptrLastHaptic < PTR_READY)) {
-      window.vaakHaptic(ptrArmed ? 14 : 4);
-      ptrLastHaptic = pull;
+    ptrPull = ptrRubber(ptrDy);
+    const nowArmed = ptrPull >= PTR_READY;
+    if (nowArmed && !ptrWasArmed) {
+      window.vaakHaptic && window.vaakHaptic(12);
     }
+    ptrWasArmed = nowArmed;
+    ptrArmed = nowArmed;
     if (ptrEl) {
-      ptrEl.style.height = pull + 'px';
+      ptrEl.style.height = ptrPull.toFixed(1) + 'px';
       ptrEl.classList.add('show');
       ptrEl.classList.toggle('ready', ptrArmed);
-      ptrEl.textContent = ptrArmed ? 'Release to refresh' : 'Pull to refresh';
+      ptrLabel(ptrArmed ? 'Release to refresh' : 'Pull to refresh', false);
     }
   }, { passive: false, capture: true });
+
   document.addEventListener('touchend', () => {
     if (!ptrTracking) return;
-    const doRefresh = ptrArmed;
-    ptrReset();
-    if (doRefresh) {
-      // Same as ↻ Refresh — full reload of the current feed view.
+    const doRefresh = ptrDragging && ptrArmed && !ptrBusy;
+    ptrTracking = false;
+    ptrDragging = false;
+    ptrArmed = false;
+    if (!doRefresh) {
+      ptrCollapse();
+      return;
+    }
+    ptrBusy = true;
+    if (ptrEl) {
+      ptrEl.classList.remove('ready', 'settling');
+      ptrEl.classList.add('show', 'refreshing');
+      ptrEl.style.height = PTR_HOLD + 'px';
+      ptrLabel('Refreshing…', true);
+    }
+    window.vaakHaptic && window.vaakHaptic(18);
+    // Soft refresh when the live poller is available; otherwise hard reload.
+    const soft = typeof pollNewer === 'function';
+    const finish = () => {
+      ptrBusy = false;
+      ptrCollapse();
+    };
+    if (soft) {
+      Promise.resolve()
+        .then(() => pollNewer())
+        .then(() => {
+          if (pendingCount > 0 && typeof insertPending === 'function') {
+            insertPending({ scrollToTop: true });
+          } else if (nearTop()) {
+            sc.setTop(0, true);
+          }
+        })
+        .catch(() => {})
+        .then(() => window.setTimeout(finish, 180));
+    } else {
       const u = new URL(window.location.href);
       u.searchParams.set('view', viewName);
       u.searchParams.set('_r', String(Date.now()));
       window.location.href = u.pathname + u.search;
     }
   }, { passive: true });
-  document.addEventListener('touchcancel', ptrReset, { passive: true });
+  document.addEventListener('touchcancel', () => {
+    if (ptrBusy) return;
+    ptrTracking = false;
+    ptrDragging = false;
+    ptrArmed = false;
+    ptrCollapse();
+  }, { passive: true });
 
   // Auto-hydrate: poll for newer posts; keep ↻ Refresh for a full reload.
   setInterval(pollNewer, POLL_MS);
@@ -18659,7 +19207,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   // or pop-out modal for reply/quote/edit. Must be moved back to the slot on close.
   const supportsInlineComposer = !!(modal && timelineFeed && timelineItems
     && ['home', 'local', 'feed'].includes(timelineItems.dataset.view || ''));
-  let inlineChromeApplied = false;
   function getComposePanel() {
     return document.querySelector('.compose-modal__panel');
   }
@@ -18667,34 +19214,42 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const panel = getComposePanel();
     return !!(panel && panel.classList.contains('compose-inline-panel'));
   }
-  function applyInlineComposerChrome(panel) {
-    if (!panel || inlineChromeApplied) return;
-    const inlineForm = panel.querySelector('#compose-form');
-    const inlineActions = inlineForm && inlineForm.querySelector('.composer-actions');
-    if (!inlineForm || !inlineActions) return;
-    inlineChromeApplied = true;
-    const asMeta = inlineForm.querySelector('.meta[style*="margin-bottom"]');
-    const visibility = inlineForm.querySelector('#compose-visibility');
-    const visibilityWrap = visibility && visibility.closest('label');
-    if (asMeta && visibilityWrap && !visibilityWrap.classList.contains('compose-inline-visibility')) {
-      visibilityWrap.classList.add('compose-inline-visibility');
-      visibilityWrap.childNodes.forEach((node) => {
-        if (node.nodeType === Node.TEXT_NODE) node.textContent = '';
+  function applyComposerToolbarChrome(panel) {
+    if (!panel) return;
+    const composeForm = panel.querySelector('#compose-form');
+    const composeActions = composeForm && composeForm.querySelector('.composer-actions');
+    if (!composeForm || !composeActions) return;
+    panel.classList.add('compose-tools-ready');
+
+    // Audience select rides next to "As @handle" on the inline feed composer.
+    if (panel.classList.contains('compose-inline-panel')) {
+      const asMeta = composeForm.querySelector('.meta[style*="margin-bottom"]');
+      const visibility = composeForm.querySelector('#compose-visibility');
+      const visibilityWrap = visibility && visibility.closest('label');
+      if (asMeta && visibilityWrap && !visibilityWrap.classList.contains('compose-inline-visibility')) {
+        visibilityWrap.classList.add('compose-inline-visibility');
+        visibilityWrap.childNodes.forEach((node) => {
+          if (node.nodeType === Node.TEXT_NODE) node.textContent = '';
+        });
+        asMeta.appendChild(document.createTextNode(' '));
+        asMeta.appendChild(visibilityWrap);
+      }
+      // Manual object/actor targets belong to reply/quote pop-outs, not the
+      // top-of-feed composer — hide (don't remove) so Reply can reopen them.
+      ['#compose-in-reply-to', '#compose-to-actor'].forEach((sel) => {
+        const field = composeForm.querySelector(sel);
+        if (field) {
+          field.dataset.inlineHidden = '1';
+          field.style.display = 'none';
+        }
       });
-      asMeta.appendChild(document.createTextNode(' '));
-      asMeta.appendChild(visibilityWrap);
     }
-    // Manual object/actor targets belong to reply actions on posts, not
-    // the normal top-of-feed composer.
-    ['#compose-in-reply-to', '#compose-to-actor'].forEach((sel) => {
-      const field = inlineForm.querySelector(sel);
-      if (field) field.remove();
-    });
-    if (inlineForm.querySelector('.compose-inline-tools')) return;
+
+    if (composeForm.querySelector('.compose-inline-tools')) return;
     const tools = document.createElement('div');
     tools.className = 'compose-inline-tools';
-    inlineForm.insertBefore(tools, inlineActions);
-    const emojiWrap = inlineForm.querySelector('.compose-emoji-wrap');
+    composeForm.insertBefore(tools, composeActions);
+    const emojiWrap = composeForm.querySelector('.compose-emoji-wrap');
     if (emojiWrap) {
       const emojiBtn = emojiWrap.querySelector('#compose-emoji-toggle');
       if (emojiBtn) {
@@ -18705,7 +19260,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       }
       tools.appendChild(emojiWrap);
     }
-    const sensitiveLabel = inlineForm.querySelector('.composer-check');
+    const sensitiveLabel = composeForm.querySelector('.composer-check');
     if (sensitiveLabel) {
       const sensitiveInput = sensitiveLabel.querySelector('input[name="sensitive"]');
       const sensitiveBtn = document.createElement('button');
@@ -18725,7 +19280,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       sensitiveLabel.appendChild(sensitiveBtn);
       tools.appendChild(sensitiveLabel);
     }
-    const mediaInputForToolbar = inlineForm.querySelector('#compose-media-input');
+    const mediaInputForToolbar = composeForm.querySelector('#compose-media-input');
     const mediaLabel = mediaInputForToolbar && mediaInputForToolbar.closest('label');
     if (mediaLabel) {
       mediaLabel.classList.add('compose-media-tool');
@@ -18750,12 +19305,16 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (window.apAdminToast) window.apAdminToast('Polls are not supported by Vaak yet.', true);
     });
     tools.appendChild(pollBtn);
-    const recordBtnInline = inlineForm.querySelector('#compose-record-btn');
+    const recordBtnInline = composeForm.querySelector('#compose-record-btn');
     if (recordBtnInline) {
       recordBtnInline.className = 'compose-tool';
       recordBtnInline.title = 'Record audio (up to 60 seconds)';
       tools.appendChild(recordBtnInline);
     }
+  }
+  // Back-compat alias used elsewhere in this script.
+  function applyInlineComposerChrome(panel) {
+    applyComposerToolbarChrome(panel);
   }
   function placeComposerInline() {
     if (!supportsInlineComposer || !modal) return;
@@ -18775,7 +19334,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     } else if (timelineFeed && panel.parentElement !== timelineFeed) {
       timelineFeed.insertBefore(panel, newPostsRow || timelineItems);
     }
-    applyInlineComposerChrome(panel);
+    applyComposerToolbarChrome(panel);
     modal.hidden = true;
     modal.classList.remove('open');
     modal.setAttribute('aria-hidden', 'true');
@@ -18791,12 +19350,18 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (panel.parentElement !== modal) {
       modal.appendChild(panel);
     }
+    // Same icon toolbar as the top-of-feed composer (CSS is no longer
+    // scoped only to .compose-inline-panel).
+    applyComposerToolbarChrome(panel);
     modal.hidden = false;
     if (fab) fab.removeAttribute('aria-hidden');
   }
   // Initial placement: keep pop-out when opened as reply/quote/edit; otherwise inline.
   if (supportsInlineComposer && modal && !modal.classList.contains('open')) {
     placeComposerInline();
+  } else if (modal) {
+    // Deep-link / auto-open reply: still use the shared icon toolbar.
+    applyComposerToolbarChrome(getComposePanel());
   }
   // Shared 2000-char counter for inline + pop-out composers (same textarea).
   (function bindComposeCharCount() {
@@ -19006,8 +19571,16 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     e.preventDefault();
     e.returnValue = '';
   });
-  function openModal() {
-    restoreComposeLocalBackup();
+  function openModal(opts) {
+    opts = opts || {};
+    // Keep timeline scroll locked while the pop-out opens (focus would otherwise
+    // jump the page, and a full navigation used to reset to the top entirely).
+    const feedEl = document.querySelector('.feed');
+    const savedWindowY = window.scrollY || document.documentElement.scrollTop || 0;
+    const savedFeedTop = feedEl ? feedEl.scrollTop : 0;
+    if (!opts.skipBackup) {
+      restoreComposeLocalBackup();
+    }
     // Reply/quote/edit pop-out needs the panel back inside the modal shell.
     if (supportsInlineComposer && isComposerInline()) {
       placeComposerInModal();
@@ -19015,20 +19588,225 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     modal.hidden = false;
     modal.classList.add('open');
     modal.setAttribute('aria-hidden', 'false');
+    const restoreScroll = () => {
+      try { window.scrollTo(0, savedWindowY); } catch (e) {}
+      if (feedEl) feedEl.scrollTop = savedFeedTop;
+    };
+    restoreScroll();
     const ta = document.getElementById('compose-content');
     if (ta) {
       requestAnimationFrame(() => {
+        restoreScroll();
         clampComposeTextarea();
         autoGrowComposeTextarea();
-        ta.focus();
+        if (!opts.skipFocus) {
+          try { ta.focus({ preventScroll: true }); } catch (e) { ta.focus(); }
+        }
+        restoreScroll();
       });
     }
   }
+
+  function ensureComposeTargetFields() {
+    if (!form) return { replyTo: null, toActor: null };
+    let replyTo = document.getElementById('compose-in-reply-to');
+    let toActor = document.getElementById('compose-to-actor');
+    const actions = form.querySelector('.composer-actions');
+    if (!replyTo) {
+      replyTo = document.createElement('input');
+      replyTo.name = 'in_reply_to';
+      replyTo.id = 'compose-in-reply-to';
+      replyTo.placeholder = 'Reply-to object URL (optional)';
+      if (actions) form.insertBefore(replyTo, actions);
+      else form.appendChild(replyTo);
+    }
+    if (!toActor) {
+      toActor = document.createElement('input');
+      toActor.name = 'to_actor';
+      toActor.id = 'compose-to-actor';
+      toActor.placeholder = 'to actor URL (optional)';
+      if (actions) form.insertBefore(toActor, actions);
+      else form.appendChild(toActor);
+    }
+    return { replyTo: replyTo, toActor: toActor };
+  }
+
+  function clearQuoteChrome() {
+    const quoteField = form.querySelector('input[name="quote_object"]');
+    if (quoteField) quoteField.remove();
+    const qb = form.querySelector('.quote-block');
+    if (qb) qb.remove();
+  }
+
+  function applyReplyQuoteChrome(opts) {
+    opts = opts || {};
+    if (typeof window.__apResetComposeChrome === 'function') {
+      try { window.__apResetComposeChrome(); } catch (e) {}
+    }
+    composeMode = 'reply';
+    if (actionField) actionField.value = 'reply';
+    if (noteIdField) noteIdField.value = '';
+    if (draftIdField) draftIdField.value = '';
+    if (returnField) {
+      returnField.value = opts.returnView
+        || (timelineItems && timelineItems.dataset.view)
+        || <?= json_encode($composerReturnView) ?>;
+    }
+    const retHidden = form.querySelector('input[name="compose_return_view"]');
+    if (retHidden && returnField) retHidden.value = returnField.value;
+
+    clearQuoteChrome();
+    const fields = ensureComposeTargetFields();
+    const replyTo = fields.replyTo;
+    const toActor = fields.toActor;
+    const title = document.getElementById('compose-modal-title');
+    const submitBtn = document.getElementById('compose-submit-btn');
+    const ta = document.getElementById('compose-content');
+    const quoteObject = (opts.quoteObject || '').trim();
+    const replyUrl = (opts.replyTo || '').trim();
+    const toUrl = (opts.toActor || '').trim();
+    // mention may be "a@host" or "a@host,b@host" (from reply links).
+    const mentionRaw = String(opts.mention || '').trim();
+    const mentionParts = [];
+    const mentionSeen = {};
+    mentionRaw.split(/[,\s]+/).forEach((part) => {
+      let p = String(part || '').trim();
+      if (!p) return;
+      if (p.charAt(0) !== '@') p = '@' + p;
+      const key = p.slice(1).toLowerCase();
+      if (!key || mentionSeen[key]) return;
+      mentionSeen[key] = true;
+      mentionParts.push(p);
+    });
+    const mentionSeed = mentionParts.join(' ');
+    if (ta) {
+      delete ta.dataset.autoMention;
+    }
+
+    if (quoteObject) {
+      if (replyTo) {
+        replyTo.value = '';
+        replyTo.style.display = 'none';
+        replyTo.readOnly = false;
+      }
+      if (toActor) {
+        toActor.value = '';
+        if (toActor.type !== 'hidden') toActor.style.display = 'none';
+      }
+      if (ta) ta.value = '';
+      const qHidden = document.createElement('input');
+      qHidden.type = 'hidden';
+      qHidden.name = 'quote_object';
+      qHidden.value = quoteObject;
+      form.insertBefore(qHidden, form.firstChild);
+      const qb = document.createElement('div');
+      qb.className = 'quote-block';
+      qb.style.marginBottom = '.75rem';
+      qb.innerHTML = '<span class="qt-label">Quoting</span><br><span class="mono"></span>';
+      const mono = qb.querySelector('.mono');
+      if (mono) mono.textContent = quoteObject;
+      const asMeta = form.querySelector('.meta[style*="margin-bottom"]');
+      if (asMeta && asMeta.parentNode) asMeta.parentNode.insertBefore(qb, asMeta.nextSibling);
+      else form.insertBefore(qb, form.firstChild);
+      if (title) title.textContent = 'Quote';
+      if (submitBtn) submitBtn.textContent = 'Quote';
+      if (ta) ta.placeholder = 'Add commentary (optional)…';
+    } else {
+      const isSelf = !!replyUrl
+        && /https:\/\/mkultra\.monster\/users\/[^/]+\/notes\//i.test(replyUrl);
+      if (replyTo) {
+        replyTo.value = replyUrl;
+        replyTo.style.display = '';
+        replyTo.readOnly = !!isSelf;
+        delete replyTo.dataset.inlineHidden;
+      }
+      if (toActor) {
+        toActor.value = isSelf ? '' : toUrl;
+        if (toActor.type !== 'hidden') {
+          toActor.style.display = isSelf ? 'none' : '';
+        }
+        delete toActor.dataset.inlineHidden;
+      }
+      if (isSelf) {
+        if (ta) ta.value = '';
+        const qb = document.createElement('div');
+        qb.className = 'quote-block';
+        qb.style.marginBottom = '.75rem';
+        qb.innerHTML = '<span class="qt-label">Replying to your post</span><br><span class="mono"></span>';
+        const mono = qb.querySelector('.mono');
+        if (mono) mono.textContent = replyUrl;
+        const asMeta = form.querySelector('.meta[style*="margin-bottom"]');
+        if (asMeta && asMeta.parentNode) asMeta.parentNode.insertBefore(qb, asMeta.nextSibling);
+        else form.insertBefore(qb, form.firstChild);
+      } else if (ta) {
+        // Prefill @author (+ other mentions) with a trailing space.
+        if (mentionSeed) {
+          ta.value = mentionSeed + ' ';
+          ta.dataset.autoMention = mentionSeed;
+          const caret = mentionSeed.length + 1;
+          setTimeout(() => {
+            try { ta.setSelectionRange(caret, caret); } catch (e) {}
+          }, 40);
+        } else {
+          ta.value = '';
+        }
+      }
+      if (title) title.textContent = isSelf ? 'Continue thread' : 'Reply';
+      if (submitBtn) submitBtn.textContent = 'Reply';
+      if (ta) ta.placeholder = isSelf ? 'Add to the thread…' : 'Write your reply…';
+    }
+  }
+
+  function openComposeFromTimelineLink(url) {
+    let parsed;
+    try { parsed = new URL(url, window.location.href); } catch (e) { return false; }
+    const sp = parsed.searchParams;
+    if (!sp.has('compose') && parsed.searchParams.get('view') !== 'compose') return false;
+    // Full navigation still needed for edit/draft resume (media + server prefills).
+    if (sp.get('edit_note') || sp.get('draft_id')) return false;
+    const replyTo = (sp.get('reply_to') || '').trim();
+    const quoteObject = (sp.get('quote_object') || '').trim();
+    const toActor = (sp.get('to') || '').trim();
+    const mention = (sp.get('mention') || '').trim();
+    if (!replyTo && !quoteObject) return false;
+    applyReplyQuoteChrome({
+      replyTo: replyTo,
+      quoteObject: quoteObject,
+      toActor: toActor,
+      mention: mention,
+      returnView: (sp.get('view') === 'compose' ? null : sp.get('view')) || null,
+    });
+    // Don't restore a leftover local draft over a fresh reply/quote target.
+    openModal({ skipBackup: true });
+    return true;
+  }
+
+  // Intercept Reply/Quote compose links so the feed does not reload/scroll to top.
+  document.addEventListener('click', (ev) => {
+    if (ev.defaultPrevented) return;
+    if (ev.button !== 0) return;
+    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+    if (!a) return;
+    const href = a.getAttribute('href') || '';
+    if (!href || href.charAt(0) === '#') return;
+    if (!/[?&]compose=/.test(href) && !/[?&]view=compose(?:&|$)/.test(href)) return;
+    if (!/[?&](?:reply_to|quote_object)=/.test(href)) return;
+    if (openComposeFromTimelineLink(href)) {
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+  }, true);
   function composeHasDraftableContent() {
     if (composeMode === 'edit_status') return false;
     const ta = document.getElementById('compose-content');
     const spoiler = form.querySelector('input[name="spoiler_text"]');
-    const text = ((ta && ta.value) || '').trim();
+    let text = ((ta && ta.value) || '').trim();
+    // Ignore the auto-inserted @handle seed if the user never typed more.
+    const autoMention = (ta && ta.dataset.autoMention) ? String(ta.dataset.autoMention).trim() : '';
+    if (autoMention && (text === autoMention || text === autoMention + ' ')) {
+      text = '';
+    }
     const cw = ((spoiler && spoiler.value) || '').trim();
     const existingMedia = ((draftMediaField && draftMediaField.value) || '').trim();
     // Reply/quote targets are composer context, not user-authored content.
@@ -19122,7 +19900,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
   function clearComposeFieldsAfterClose() {
     const ta = document.getElementById('compose-content');
-    if (ta) ta.value = '';
+    if (ta) {
+      ta.value = '';
+      delete ta.dataset.autoMention;
+    }
     const spoiler = form.querySelector('input[name="spoiler_text"]');
     if (spoiler) spoiler.value = '';
     const sens = form.querySelector('input[name="sensitive"]');
@@ -19143,7 +19924,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (qb) qb.remove();
     try {
       const u = new URL(window.location.href);
-      ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+      ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
       window.history.replaceState({}, '', u.pathname + u.search + u.hash);
     } catch (e) {}
   }

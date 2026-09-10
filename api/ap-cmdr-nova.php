@@ -927,6 +927,19 @@ function ap_cmdr_shell_start(string $title): void
       .reply-line{font-size:.8rem;color:#8ab;margin:0 0 .45rem}
       .reply-line a{color:#9ad4e8;text-decoration:none}
       .reply-line a:hover{text-decoration:underline;text-underline-offset:2px}
+      .note-replies{margin-top:1.35rem;padding-top:1rem;border-top:1px solid #2a2a2a}
+      .note-replies-title{margin:0 0 .65rem;font-size:.95rem;font-weight:650;color:#ddd}
+      .note-reply{padding:.7rem 0;border-bottom:1px solid #222}
+      .note-reply:last-child{border-bottom:none}
+      .note-reply-hd{font-size:.85rem;margin:0 0 .3rem}
+      .note-reply-hd .who{font-weight:650;color:#e8e8e8}
+      .note-reply-body{font-size:.92rem;line-height:1.45;color:#ccc;white-space:pre-wrap;word-break:break-word}
+      .note-reply-cw{margin:.2rem 0 .35rem;color:#f0c674;font-size:.82rem;font-weight:650}
+      .note-reply-cw-gate>summary{cursor:pointer;list-style:none;color:#f0c674;font-size:.82rem;font-weight:650;margin:.15rem 0 .35rem}
+      .note-reply-cw-gate>summary::-webkit-details-marker{display:none}
+      .note-reply-cw-gate>summary::before{content:"▸ ";opacity:.8}
+      .note-reply-cw-gate[open]>summary::before{content:"▾ "}
+      .note-reply-cw-gate .note-reply-body{margin-top:.25rem}
       .boost-line{font-size:.8rem;color:#9ad4a8;margin:0 0 .45rem}
       .quote-block{margin:.55rem 0 0;padding:.65rem .75rem;border-radius:10px;border:1px solid #2a3340;background:#0e1218;color:#c8d2dc;font-size:.88rem;line-height:1.4;overflow-wrap:anywhere;word-break:break-word}
       .quote-block .qt-label{display:block;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:#7a8a9a;margin-bottom:.3rem}
@@ -1275,7 +1288,10 @@ function ap_cmdr_note_html(array $row, array $create): void
         $label = $rSnippet !== ''
             ? htmlspecialchars($rSnippet, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
             : $rSafe;
-        echo '<p class="reply-line">↩ reply to <a href="' . $rSafe . '" target="_blank" rel="noopener noreferrer">'
+        $localParent = str_starts_with($replyTo, 'https://mkultra.monster/users/')
+            && str_contains($replyTo, '/notes/');
+        echo '<p class="reply-line">↩ reply to <a href="' . $rSafe . '"'
+            . ($localParent ? '' : ' target="_blank" rel="noopener noreferrer"') . '>'
             . $label . '</a></p>';
     }
     if ($cw !== '') {
@@ -1368,8 +1384,89 @@ function ap_cmdr_note_html(array $row, array $create): void
     echo '</p>';
     echo '<p class="muted mono" style="font-size:.7rem">' . $noteId . '</p>';
 
-    // Remote reply: open the visitor's home instance interact dialog for this Note.
+    // Thread replies (local continues + remote fedi/Bluesky replies we store).
     $noteUriRaw = (string) ($row['id'] ?? '');
+    if ($noteUriRaw !== '' && function_exists('ap_note_public_replies')) {
+        $replies = ap_note_public_replies($noteUriRaw, 40);
+        if ($replies !== []) {
+            echo '<section class="note-replies" aria-label="Replies">';
+            echo '<h2 class="note-replies-title">Replies <span class="muted">(' . count($replies) . ')</span></h2>';
+            foreach ($replies as $rep) {
+                $rUrl = (string) ($rep['url'] ?? '');
+                $rActor = (string) ($rep['actor_id'] ?? '');
+                $rContent = (string) ($rep['content'] ?? '');
+                $rWhen = (string) ($rep['published'] ?? '');
+                $rDate = $rWhen;
+                try {
+                    if ($rWhen !== '') {
+                        $rDate = (new DateTimeImmutable($rWhen))->format('M j, Y · g:i A');
+                    }
+                } catch (Throwable $e) {
+                    // keep
+                }
+                $handle = '';
+                if ($rActor !== '' && function_exists('ap_remote_actor_label')) {
+                    $handle = (string) (ap_remote_actor_label($rActor, false)['handle'] ?? '');
+                }
+                if ($handle === '' && preg_match('#/users/([A-Za-z0-9_]+)$#', $rActor, $hm)) {
+                    $handle = '@' . $hm[1]
+                        . (str_contains($rActor, 'mkultra.monster') ? '@mkultra.monster' : '');
+                }
+                if ($handle === '' && preg_match('#bsky\.app/profile/([^/?#]+)#i', $rActor, $bm)) {
+                    $handle = '@' . rawurldecode($bm[1]);
+                }
+                if ($handle === '') {
+                    $handle = $rActor !== '' ? $rActor : 'someone';
+                }
+                $snip = $rContent;
+                if (function_exists('mb_strlen') && mb_strlen($snip) > 320) {
+                    $snip = mb_substr($snip, 0, 320) . '…';
+                } elseif (strlen($snip) > 320) {
+                    $snip = substr($snip, 0, 320) . '…';
+                }
+                $rSpoiler = trim((string) ($rep['spoiler_text'] ?? ''));
+                $rSensitive = !empty($rep['sensitive']) || $rSpoiler !== '';
+                $localReply = str_starts_with($rUrl, 'https://mkultra.monster/users/')
+                    && str_contains($rUrl, '/notes/');
+                echo '<article class="note-reply">';
+                echo '<div class="note-reply-hd"><span class="who">'
+                    . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . '</span>';
+                if ($rDate !== '') {
+                    echo ' <span class="muted">· '
+                        . htmlspecialchars($rDate, ENT_QUOTES, 'UTF-8') . '</span>';
+                }
+                echo '</div>';
+                $bodyHtml = $snip !== ''
+                    ? ('<div class="note-reply-body">'
+                        . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                        . '</div>')
+                    : '';
+                // Only gate when *this* reply still has a CW (not inherited from parent).
+                if ($rSensitive) {
+                    $cwLabel = $rSpoiler !== ''
+                        ? ('CW · ' . htmlspecialchars($rSpoiler, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+                        : 'CW · Sensitive';
+                    echo '<details class="note-reply-cw-gate"><summary>' . $cwLabel
+                        . ' <span class="muted" style="font-weight:500">· show</span></summary>';
+                    echo $bodyHtml;
+                    echo '</details>';
+                } elseif ($bodyHtml !== '') {
+                    echo $bodyHtml;
+                }
+                if ($rUrl !== '' && str_starts_with($rUrl, 'https://')) {
+                    echo '<div class="muted" style="margin-top:.35rem;font-size:.78rem"><a href="'
+                        . htmlspecialchars($rUrl, ENT_QUOTES, 'UTF-8') . '"'
+                        . ($localReply ? '' : ' target="_blank" rel="noopener noreferrer"')
+                        . '>Open reply</a></div>';
+                }
+                echo '</article>';
+            }
+            echo '</section>';
+        }
+    }
+
+    // Remote reply: open the visitor's home instance interact dialog for this Note.
     if ($noteUriRaw !== '' && str_starts_with($noteUriRaw, 'https://')) {
         echo '<div class="note-actions">';
         echo '<button type="button" class="btn-reply" id="ap-reply-toggle" aria-expanded="false" aria-controls="ap-reply-panel">Reply on your instance</button>';

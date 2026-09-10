@@ -765,6 +765,10 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     } catch (Throwable $e) {
         // keep
     }
+    $replyTo = rtrim((string) ($row['in_reply_to'] ?? ''), '/');
+    if ($replyTo === '' && !empty($note['inReplyTo']) && is_string($note['inReplyTo'])) {
+        $replyTo = rtrim($note['inReplyTo'], '/');
+    }
     ap_user_html_shell_start('Post · @' . $actorKey . '@mkultra.monster');
     echo '<div class="row" style="margin-bottom:1rem">';
     $avUrl = function_exists('ap_local_avatar_url')
@@ -773,6 +777,14 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     echo '<img class="av" src="' . htmlspecialchars($avUrl, ENT_QUOTES, 'UTF-8') . '" alt="" width="72" height="72" loading="lazy" referrerpolicy="no-referrer">';
     echo '<div><h1 style="font-size:1.1rem">' . $name . '</h1>';
     echo '<p class="muted" style="margin:0"><a href="/users/' . $safe . '">@' . $safe . '@mkultra.monster</a></p></div></div>';
+    if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+        $rSafe = htmlspecialchars($replyTo, ENT_QUOTES, 'UTF-8');
+        $localParent = str_starts_with($replyTo, 'https://mkultra.monster/users/')
+            && str_contains($replyTo, '/notes/');
+        echo '<p class="reply-line">↩ reply to <a href="' . $rSafe . '"'
+            . ($localParent ? '' : ' target="_blank" rel="noopener noreferrer"') . '>'
+            . $rSafe . '</a></p>';
+    }
     if (!empty($note['summary']) && is_string($note['summary'])) {
         echo '<p class="cw"><strong>CW</strong> · '
             . htmlspecialchars($note['summary'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
@@ -782,6 +794,71 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     echo '<p class="muted" style="margin-top:1.25rem;font-size:.85rem">'
         . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8') . '</p>';
     echo ap_webmention_cards_html((string) ($row['id'] ?? ''));
+
+    $noteUriRaw = (string) ($row['id'] ?? '');
+    if ($noteUriRaw !== '' && function_exists('ap_note_public_replies')) {
+        $replies = ap_note_public_replies($noteUriRaw, 40);
+        if ($replies !== []) {
+            echo '<section class="note-replies" aria-label="Replies">';
+            echo '<h2 class="note-replies-title">Replies <span class="muted">(' . count($replies) . ')</span></h2>';
+            foreach ($replies as $rep) {
+                $rUrl = (string) ($rep['url'] ?? '');
+                $rActor = (string) ($rep['actor_id'] ?? '');
+                $rContent = (string) ($rep['content'] ?? '');
+                $rWhen = (string) ($rep['published'] ?? '');
+                $handle = $rActor;
+                if (preg_match('#/users/([A-Za-z0-9_]+)$#', $rActor, $hm)) {
+                    $handle = '@' . $hm[1]
+                        . (str_contains($rActor, 'mkultra.monster') ? '@mkultra.monster' : '');
+                } elseif (preg_match('#bsky\.app/profile/([^/?#]+)#i', $rActor, $bm)) {
+                    $handle = '@' . rawurldecode($bm[1]);
+                }
+                $snip = $rContent;
+                if (function_exists('mb_strlen') && mb_strlen($snip) > 320) {
+                    $snip = mb_substr($snip, 0, 320) . '…';
+                } elseif (strlen($snip) > 320) {
+                    $snip = substr($snip, 0, 320) . '…';
+                }
+                $rSpoiler = trim((string) ($rep['spoiler_text'] ?? ''));
+                $rSensitive = !empty($rep['sensitive']) || $rSpoiler !== '';
+                $localReply = str_starts_with($rUrl, 'https://mkultra.monster/users/')
+                    && str_contains($rUrl, '/notes/');
+                echo '<article class="note-reply"><div class="note-reply-hd"><span class="who">'
+                    . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . '</span>';
+                if ($rWhen !== '') {
+                    echo ' <span class="muted">· '
+                        . htmlspecialchars($rWhen, ENT_QUOTES, 'UTF-8') . '</span>';
+                }
+                echo '</div>';
+                $bodyHtml = $snip !== ''
+                    ? ('<div class="note-reply-body">'
+                        . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                        . '</div>')
+                    : '';
+                if ($rSensitive) {
+                    $cwLabel = $rSpoiler !== ''
+                        ? ('CW · ' . htmlspecialchars($rSpoiler, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+                        : 'CW · Sensitive';
+                    echo '<details class="note-reply-cw-gate"><summary>' . $cwLabel
+                        . ' <span class="muted" style="font-weight:500">· show</span></summary>';
+                    echo $bodyHtml;
+                    echo '</details>';
+                } elseif ($bodyHtml !== '') {
+                    echo $bodyHtml;
+                }
+                if ($rUrl !== '' && str_starts_with($rUrl, 'https://')) {
+                    echo '<div class="muted" style="margin-top:.35rem;font-size:.78rem"><a href="'
+                        . htmlspecialchars($rUrl, ENT_QUOTES, 'UTF-8') . '"'
+                        . ($localReply ? '' : ' target="_blank" rel="noopener noreferrer"')
+                        . '>Open reply</a></div>';
+                }
+                echo '</article>';
+            }
+            echo '</section>';
+        }
+    }
+
     echo '<p class="back"><a href="/users/' . $safe . '">← profile</a></p>';
     ap_user_html_shell_end();
 }
@@ -844,6 +921,20 @@ function ap_user_html_shell_start(string $title): void
       .posts{margin-top:1.25rem;border-top:1px solid #2a2a2a;padding-top:.5rem}
       .post{padding:.9rem 0;border-bottom:1px solid #222}
       .note-body p{margin:.4rem 0}.cw{color:#f0c674;font-size:.9rem}
+      .reply-line{font-size:.8rem;color:#8ab;margin:0 0 .45rem}
+      .reply-line a{color:#9ad4e8;text-decoration:none}
+      .note-replies{margin-top:1.35rem;padding-top:1rem;border-top:1px solid #2a2a2a}
+      .note-replies-title{margin:0 0 .65rem;font-size:.95rem;font-weight:650;color:#ddd}
+      .note-reply{padding:.7rem 0;border-bottom:1px solid #222}
+      .note-reply:last-child{border-bottom:none}
+      .note-reply-hd{font-size:.85rem;margin:0 0 .3rem}
+      .note-reply-hd .who{font-weight:650;color:#e8e8e8}
+      .note-reply-body{font-size:.92rem;line-height:1.45;color:#ccc;white-space:pre-wrap;word-break:break-word}
+      .note-reply-cw-gate>summary{cursor:pointer;list-style:none;color:#f0c674;font-size:.82rem;font-weight:650;margin:.15rem 0 .35rem}
+      .note-reply-cw-gate>summary::-webkit-details-marker{display:none}
+      .note-reply-cw-gate>summary::before{content:"▸ ";opacity:.8}
+      .note-reply-cw-gate[open]>summary::before{content:"▾ "}
+      .note-reply-cw-gate .note-reply-body{margin-top:.25rem}
       .media-row{display:grid;gap:.28rem;margin-top:.55rem;width:100%;border-radius:12px;overflow:hidden;border:1px solid #2a2a2a;background:#0a0a0a}
       .media-row.media-count-1{grid-template-columns:1fr}
       .media-row.media-count-2{grid-template-columns:1fr 1fr}

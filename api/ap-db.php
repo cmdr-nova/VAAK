@@ -4665,6 +4665,208 @@ function ap_outbox_store(array $note): void
     ]);
 }
 
+/**
+ * Public replies to a local note for HTML profile permalinks.
+ * Includes local thread continues + remote Creates/mentions we have stored.
+ *
+ * @return list<array{kind:string,id:string,url:string,actor_id:string,content:string,published:string,spoiler_text:string,sensitive:bool}>
+ */
+function ap_note_public_replies(string $noteId, int $limit = 40): array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
+        return [];
+    }
+    $limit = max(1, min(80, $limit));
+    $variants = [$noteId, $noteId . '/'];
+    /** @var array<string,array{kind:string,id:string,url:string,actor_id:string,content:string,published:string,spoiler_text:string,sensitive:bool}> $byKey */
+    $byKey = [];
+
+    $push = static function (
+        string $kind,
+        string $id,
+        string $url,
+        string $actorId,
+        string $content,
+        string $published,
+        string $spoilerText = '',
+        bool $sensitive = false
+    ) use (&$byKey): void {
+        $id = rtrim($id, '/');
+        $url = rtrim($url !== '' ? $url : $id, '/');
+        if ($id === '' && $url === '') {
+            return;
+        }
+        $key = $url !== '' ? $url : $id;
+        $spoilerText = trim($spoilerText);
+        // Prefer richer CW metadata when the same reply is seen from multiple stores.
+        if (isset($byKey[$key])) {
+            $prev = $byKey[$key];
+            if ($prev['spoiler_text'] === '' && $spoilerText !== '') {
+                $byKey[$key]['spoiler_text'] = $spoilerText;
+            }
+            if (!$prev['sensitive'] && $sensitive) {
+                $byKey[$key]['sensitive'] = true;
+            }
+            if ($prev['content'] === '' && trim($content) !== '') {
+                $plain = trim(html_entity_decode(strip_tags($content), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                $byKey[$key]['content'] = $plain;
+            }
+            return;
+        }
+        $plain = trim(html_entity_decode(strip_tags($content), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $byKey[$key] = [
+            'kind' => $kind,
+            'id' => $id !== '' ? $id : $url,
+            'url' => $url !== '' ? $url : $id,
+            'actor_id' => rtrim($actorId, '/'),
+            'content' => $plain,
+            'published' => $published,
+            // Only the reply's own CW — never inherited from the parent.
+            'spoiler_text' => $spoilerText,
+            'sensitive' => $sensitive || $spoilerText !== '',
+        ];
+    };
+
+    try {
+        $st = ap_db()->prepare(
+            "SELECT o.id, o.content, o.published, o.in_reply_to, o.visibility, o.raw_create_json,
+                    m.spoiler_text AS masto_spoiler, m.sensitive AS masto_sensitive
+             FROM outbox_notes o
+             LEFT JOIN masto_statuses m
+               ON (m.note_id = o.id OR m.note_id = o.id || '/')
+             WHERE o.in_reply_to = ? OR o.in_reply_to = ?
+             ORDER BY o.published ASC
+             LIMIT 80"
+        );
+        $st->execute($variants);
+        foreach ($st->fetchAll() as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $vis = (string) ($row['visibility'] ?? 'public');
+            if ($vis === 'direct' || $vis === 'private') {
+                continue;
+            }
+            $id = (string) ($row['id'] ?? '');
+            $actor = '';
+            if (preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/notes/#', $id, $am)) {
+                $actor = $am[1];
+            }
+            $spoiler = trim((string) ($row['masto_spoiler'] ?? ''));
+            $sensitive = !empty($row['masto_sensitive']);
+            // Fallback: AS2 Note.summary in the stored Create (when masto_statuses is thin).
+            if ($spoiler === '') {
+                $raw = (string) ($row['raw_create_json'] ?? '');
+                if ($raw !== '') {
+                    $decoded = json_decode($raw, true);
+                    $obj = is_array($decoded) ? ($decoded['object'] ?? $decoded) : null;
+                    if (is_array($obj) && !empty($obj['summary']) && is_string($obj['summary'])) {
+                        $spoiler = trim($obj['summary']);
+                    }
+                    if (is_array($obj) && !empty($obj['sensitive'])) {
+                        $sensitive = true;
+                    }
+                }
+            }
+            $push(
+                'local',
+                $id,
+                $id,
+                $actor,
+                (string) ($row['content'] ?? ''),
+                (string) ($row['published'] ?? ''),
+                $spoiler,
+                $sensitive
+            );
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+
+    try {
+        $st = ap_db()->prepare(
+            "SELECT object_id, actor_id, summary, created_at, type, action_taken,
+                    spoiler_text, sensitive
+             FROM events
+             WHERE (in_reply_to = ? OR in_reply_to = ?)
+               AND type IN ('Create', 'Update')
+               AND COALESCE(action_taken, '') NOT IN ('deleted', 'blocked', 'rejected')
+             ORDER BY created_at ASC
+             LIMIT 80"
+        );
+        $st->execute($variants);
+        foreach ($st->fetchAll() as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
+            if ($oid === '' || $oid === $noteId) {
+                continue;
+            }
+            $spoiler = trim((string) ($row['spoiler_text'] ?? ''));
+            $push(
+                'remote',
+                $oid,
+                $oid,
+                (string) ($row['actor_id'] ?? ''),
+                (string) ($row['summary'] ?? ''),
+                (string) ($row['created_at'] ?? ''),
+                $spoiler,
+                !empty($row['sensitive'])
+            );
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+
+    try {
+        $st = ap_db()->prepare(
+            "SELECT object_id, actor_id, content, created_at, spoiler_text, sensitive
+             FROM mentions
+             WHERE deleted_at IS NULL
+               AND (in_reply_to = ? OR in_reply_to = ?)
+             ORDER BY created_at ASC
+             LIMIT 80"
+        );
+        $st->execute($variants);
+        foreach ($st->fetchAll() as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
+            if ($oid === '' || $oid === $noteId) {
+                continue;
+            }
+            // Strip interaction hash suffixes (#like-… etc.)
+            if (function_exists('ap_masto_mention_target_object_id')) {
+                $oid = ap_masto_mention_target_object_id($oid);
+            } elseif (preg_match('/^(https:\\/\\/.+?)#(like|reblog|update|quote|bite)-/i', $oid, $mm)) {
+                $oid = rtrim($mm[1], '/');
+            }
+            $spoiler = trim((string) ($row['spoiler_text'] ?? ''));
+            $push(
+                'mention',
+                $oid,
+                $oid,
+                (string) ($row['actor_id'] ?? ''),
+                (string) ($row['content'] ?? ''),
+                (string) ($row['created_at'] ?? ''),
+                $spoiler,
+                !empty($row['sensitive'])
+            );
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+
+    $out = array_values($byKey);
+    usort($out, static function (array $a, array $b): int {
+        return strcmp((string) ($a['published'] ?? ''), (string) ($b['published'] ?? ''));
+    });
+    return array_slice($out, 0, $limit);
+}
+
 /** Latest public outbox notes, optionally excluding kinds (e.g. blog shares). */
 function ap_outbox_list_public(int $limit = 20, array $excludeKinds = ['blog'], string $actorKey = 'cmdr_nova'): array
 {
@@ -9619,6 +9821,15 @@ function ap_dm_conversations(int $limit = 40, ?int $ownerUserId = null): array
             break;
         }
     }
+    // Unread threads first, then newest activity — makes unopened DMs obvious.
+    usort($out, static function (array $a, array $b): int {
+        $ua = ((int) ($a['unread'] ?? 0)) > 0 ? 1 : 0;
+        $ub = ((int) ($b['unread'] ?? 0)) > 0 ? 1 : 0;
+        if ($ua !== $ub) {
+            return $ub <=> $ua;
+        }
+        return ((int) ($b['last_id'] ?? 0)) <=> ((int) ($a['last_id'] ?? 0));
+    });
     return $out;
 }
 
