@@ -7,6 +7,7 @@
 declare(strict_types=1);
 
 require_once dirname(__DIR__) . '/api/ap-auth.php';
+require_once dirname(__DIR__) . '/api/ap-version.php';
 
 ap_auth_bootstrap();
 ap_auth_start_session();
@@ -344,6 +345,9 @@ ASCII;
       margin: .85rem 0 0; font-size: .95rem; font-weight: 600; letter-spacing: .35em;
       color: #8a8a8a; text-indent: .35em;
     }
+    .brand .vaak-version {
+      margin: .55rem 0 0; font-size: .72rem; color: #666; letter-spacing: .04em;
+    }
     form {
       border: 1px solid #222; border-radius: 14px; padding: 1.15rem 1.1rem 1.2rem;
       background: #0a0a0a;
@@ -379,6 +383,9 @@ ASCII;
     .policies a:hover { text-decoration: underline; text-underline-offset: 2px; }
     .policies .sep { color: #444; user-select: none; }
     .ai-disclaimer {
+      text-align: center; margin-top: .85rem; font-size: .72rem; color: #555; line-height: 1.35;
+    }
+    .vaak-version-foot {
       text-align: center; margin-top: 1.15rem; font-size: .72rem; color: #555; line-height: 1.35;
     }
     @media (max-width: 760px) {
@@ -406,6 +413,7 @@ ASCII;
     <div class="brand">
       <pre><?= htmlspecialchars($asciiV, ENT_QUOTES, 'UTF-8') ?></pre>
       <h1>VAAK</h1>
+      <p class="vaak-version"><?= htmlspecialchars(vaak_version_label(), ENT_QUOTES, 'UTF-8') ?></p>
     </div>
 
     <?php if ($error): ?><div class="flash err"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div><?php endif; ?>

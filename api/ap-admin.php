@@ -13,6 +13,7 @@ header('X-Robots-Tag: noindex, nofollow');
 
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
+require_once __DIR__ . '/ap-version.php';
 require_once __DIR__ . '/ap-collections.php'; // Library → Collections (starter packs)
 require_once __DIR__ . '/ap-lists.php'; // Library → Lists (private follow subsets)
 require_once __DIR__ . '/ap-bites.php'; // Wafrn-compatible Bite
@@ -10624,6 +10625,15 @@ function admin_render_home_suggestions(array $suggestions): void
       margin: .85rem .85rem .25rem; font-size: .7rem; letter-spacing: .08em;
       text-transform: uppercase; color: #555;
     }
+    .nav-version {
+      display: block;
+      padding: .35rem .85rem .75rem;
+      font-size: .68rem;
+      line-height: 1.35;
+      color: var(--muted);
+      letter-spacing: .02em;
+      opacity: .9;
+    }
     .nav-sep {
       height: 1px; margin: .45rem .85rem;
       background: var(--border); border: 0;
@@ -11991,6 +12001,7 @@ function admin_render_home_suggestions(array $suggestions): void
         </div>
       </details>
       <a href="/vaak/?logout=1"><span class="ico">⎋</span><span class="label">Log out</span></a>
+      <div class="nav-version" title="Release channel"><?= h(function_exists('vaak_version_label') ? vaak_version_label() : 'VAAK alpha') ?></div>
     </nav>
   </aside>
 
