@@ -9989,6 +9989,8 @@ function ap_remote_actors_prefetch(array $actorIds): void
 function ap_remote_actor_username_is_placeholder(?string $username): bool
 {
     $username = trim((string) $username);
+    // Pleroma / web-profile path leftovers sometimes keep a leading "@"
+    $username = ltrim($username, '@');
     if ($username === '' || $username === 'user') {
         return true;
     }
@@ -9999,7 +10001,34 @@ function ap_remote_actor_username_is_placeholder(?string $username): bool
     if (preg_match('/^did%3a/i', $username)) {
         return true;
     }
+    // Mastodon /ap/users/{snowflake} and GTS /ap/users/{id} — numeric path ≠ handle.
+    // Treat as placeholder so ensure/fetch can replace with preferredUsername.
+    if (preg_match('/^\d{6,}$/', $username)) {
+        return true;
+    }
     return false;
+}
+
+/**
+ * Normalize a remote preferredUsername / path segment for storage + display.
+ * Strips a leading "@" (common when actor IRIs are https://host/@user).
+ */
+function ap_remote_actor_normalize_username(?string $username): ?string
+{
+    if ($username === null) {
+        return null;
+    }
+    $username = trim($username);
+    if ($username === '') {
+        return null;
+    }
+    $username = ltrim($username, '@');
+    // Accidental full acct pasted as preferredUsername
+    if (str_contains($username, '@')) {
+        $username = explode('@', $username, 2)[0];
+    }
+    $username = trim($username);
+    return $username !== '' ? $username : null;
 }
 
 /**
@@ -10013,10 +10042,16 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     }
     $existing = ap_remote_actor_get($actorId);
     $incomingUser = isset($fields['username']) && is_string($fields['username']) ? trim($fields['username']) : null;
+    if ($incomingUser !== null) {
+        $incomingUser = ap_remote_actor_normalize_username($incomingUser);
+    }
     if ($incomingUser !== null && ap_remote_actor_username_is_placeholder($incomingUser)) {
         $incomingUser = null; // don't write DIDs over real handles
     }
     $existingUser = is_array($existing) && isset($existing['username']) ? (string) $existing['username'] : null;
+    if ($existingUser !== null) {
+        $existingUser = ap_remote_actor_normalize_username($existingUser);
+    }
     if ($existingUser !== null && ap_remote_actor_username_is_placeholder($existingUser)) {
         $existingUser = null;
     }
@@ -10085,7 +10120,7 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
             if (is_array($doc)) {
                 $uname = null;
                 if (!empty($doc['preferredUsername']) && is_string($doc['preferredUsername'])) {
-                    $uname = trim($doc['preferredUsername']);
+                    $uname = ap_remote_actor_normalize_username($doc['preferredUsername']);
                 }
                 $dname = null;
                 if (!empty($doc['name']) && is_string($doc['name'])) {
@@ -10108,13 +10143,24 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                     }
                 }
                 $host = parse_url($actorId, PHP_URL_HOST);
-                ap_remote_actor_upsert($actorId, [
+                $hostNorm = is_string($host) ? strtolower($host) : null;
+                $fields = [
                     'username' => ($uname !== null && $uname !== '') ? $uname : null,
                     'display_name' => ($dname !== null && $dname !== '') ? $dname : null,
-                    'host' => is_string($host) ? strtolower($host) : null,
+                    'host' => $hostNorm,
                     'icon_source_url' => $icon,
                     'image_source_url' => $image,
-                ]);
+                ];
+                ap_remote_actor_upsert($actorId, $fields);
+                // Mastodon dual IRI: seed /users/{preferredUsername} when we only
+                // knew /ap/users/{snowflake}, so later labels resolve without a fetch.
+                if (is_string($uname) && $uname !== '' && $hostNorm !== ''
+                    && !ap_remote_actor_username_is_placeholder($uname)) {
+                    $canon = 'https://' . $hostNorm . '/users/' . rawurlencode($uname);
+                    if (rtrim($canon, '/') !== $actorId) {
+                        ap_remote_actor_upsert($canon, $fields);
+                    }
+                }
                 if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
                     ap_remote_emoji_ingest_actor_doc($actorId, $doc);
                 }
@@ -10150,13 +10196,16 @@ function ap_remote_actor_label(string $actorId, bool $allowFetch = false): array
     $host = is_string($host) ? strtolower($host) : '';
     $path = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
     $seg = $path !== '' ? (basename($path) ?: 'user') : 'user';
-    $username = $seg;
-    $display = $seg;
+    // https://host/@user → basename "@user" — never keep the leading @
+    $segNorm = ap_remote_actor_normalize_username($seg) ?? 'user';
+    $username = $segNorm;
+    $display = $segNorm;
 
     $row = ap_remote_actor_ensure($actorId, $allowFetch);
     if (is_array($row)) {
-        if (!ap_remote_actor_username_is_placeholder($row['username'] ?? null)) {
-            $username = (string) $row['username'];
+        $rowUser = ap_remote_actor_normalize_username(isset($row['username']) ? (string) $row['username'] : null);
+        if ($rowUser !== null && !ap_remote_actor_username_is_placeholder($rowUser)) {
+            $username = $rowUser;
         }
         if (!empty($row['display_name']) && trim((string) $row['display_name']) !== '') {
             $display = (string) $row['display_name'];
@@ -10167,16 +10216,29 @@ function ap_remote_actor_label(string $actorId, bool $allowFetch = false): array
             $host = strtolower((string) $row['host']);
         }
     }
+    $username = ap_remote_actor_normalize_username($username) ?? 'user';
+    $userIsPlaceholder = ap_remote_actor_username_is_placeholder($username);
+    // Don't advertise snowflake path segments as the public acct/handle.
+    if ($userIsPlaceholder) {
+        $username = 'user';
+        if ($display === '' || ap_remote_actor_username_is_placeholder($display)
+            || preg_match('/^\d{6,}$/', ltrim(trim((string) $display), '@'))) {
+            $display = $host !== '' ? $host : 'user';
+        }
+    }
 
     // Bridgy Fed: preferredUsername is already alice.bsky.social — avoid @alice.bsky.social@bsky.brid.gy when possible
-    $acctHost = $host;
-    $handleUser = $username;
     if ($host !== '' && (str_ends_with($host, 'brid.gy') || $host === 'brid.gy')
         && str_contains($username, '.')
-        && !str_starts_with(strtolower($username), 'did:')) {
+        && !str_starts_with(strtolower($username), 'did:')
+        && !$userIsPlaceholder) {
         // Show @alice.bsky.social (Bluesky handle) as the primary handle text
         $handle = '@' . $username;
         $acct = $username . '@' . $host; // still unique for AP
+    } elseif ($userIsPlaceholder && $host !== '') {
+        // Interim until preferredUsername is fetched (remote_profile / media warm).
+        $handle = '@' . $host;
+        $acct = $host;
     } else {
         $handle = ($host !== '') ? ('@' . $username . '@' . $host) : ('@' . $username);
         $acct = ($host !== '') ? ($username . '@' . $host) : $username;
@@ -10331,7 +10393,8 @@ function ap_remote_emoji_http_json(string $url): ?array
 
 /**
  * Fetch Mastodon-compatible /api/v1/custom_emojis for a host (cached ~7d).
- * Wafrn etc. return 404 — actor tag ingest covers those.
+ * Also tries Pleroma/Akkoma nodeinfo-style packs when the Mastodon route 404s.
+ * Wafrn etc. still rely on Note/actor Emoji tag ingest.
  */
 function ap_remote_emoji_ensure_host(string $host, bool $force = false, bool $allowFetch = false): void
 {
@@ -10360,10 +10423,10 @@ function ap_remote_emoji_ensure_host(string $host, bool $force = false, bool $al
         return;
     }
 
-    $json = ap_remote_emoji_http_json('https://' . $host . '/api/v1/custom_emojis');
     $source = 'none';
+    $items = [];
+    $json = ap_remote_emoji_http_json('https://' . $host . '/api/v1/custom_emojis');
     if (is_array($json) && $json !== [] && array_is_list($json)) {
-        $items = [];
         foreach ($json as $em) {
             if (!is_array($em)) {
                 continue;
@@ -10375,9 +10438,41 @@ function ap_remote_emoji_ensure_host(string $host, bool $force = false, bool $al
             ];
         }
         if ($items) {
-            ap_remote_emoji_upsert_batch($host, $items);
             $source = 'masto';
         }
+    }
+    // Pleroma / Akkoma sometimes expose packs here when /api/v1/custom_emojis is thin.
+    if ($items === []) {
+        $pleroma = ap_remote_emoji_http_json('https://' . $host . '/api/pleroma/emoji');
+        if (is_array($pleroma) && $pleroma !== []) {
+            // Shape A: { "shortcode": "https://…/emoji.webp", … }
+            $isMap = !array_is_list($pleroma);
+            if ($isMap) {
+                foreach ($pleroma as $code => $url) {
+                    if (!is_string($code) || !is_string($url)) {
+                        continue;
+                    }
+                    $items[] = ['shortcode' => $code, 'url' => $url, 'static_url' => $url];
+                }
+            } else {
+                foreach ($pleroma as $em) {
+                    if (!is_array($em)) {
+                        continue;
+                    }
+                    $items[] = [
+                        'shortcode' => (string) ($em['shortcode'] ?? $em['name'] ?? ''),
+                        'url' => (string) ($em['url'] ?? $em['static_url'] ?? ''),
+                        'static_url' => (string) ($em['static_url'] ?? $em['url'] ?? ''),
+                    ];
+                }
+            }
+            if ($items) {
+                $source = 'pleroma';
+            }
+        }
+    }
+    if ($items) {
+        ap_remote_emoji_upsert_batch($host, $items);
     }
     ap_db()->prepare(
         'INSERT INTO remote_emoji_host_meta (host, fetched_at, source) VALUES (?, ?, ?)

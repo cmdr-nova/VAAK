@@ -1679,6 +1679,44 @@ function ap_enrich_activity_for_feed(array $activity, string $type, ?string $obj
         // best-effort
     }
 
+    // Cache custom emoji tags from the Note (and nested object) so timeline
+    // bodies can render :shortcode: without a sync host-catalog fetch.
+    try {
+        if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
+            $emojiActor = null;
+            if (is_string($objectId) && str_starts_with($objectId, 'https://')) {
+                $emojiActor = $objectId;
+            }
+            $act = ap_as_id($activity['actor'] ?? null);
+            if ((!is_string($emojiActor) || $emojiActor === '') && is_string($act) && $act !== '') {
+                $emojiActor = $act;
+            }
+            foreach ([$obj, $remote] as $cand) {
+                if (!is_array($cand)) {
+                    continue;
+                }
+                $noteDoc = $cand;
+                if (isset($cand['object']) && is_array($cand['object'])
+                    && in_array((string) ($cand['type'] ?? ''), ['Create', 'Announce', 'Update'], true)) {
+                    $noteDoc = $cand['object'];
+                }
+                if (!is_array($noteDoc)) {
+                    continue;
+                }
+                $hostRef = $emojiActor;
+                $attributed = ap_as_id($noteDoc['attributedTo'] ?? null);
+                if (is_string($attributed) && $attributed !== '') {
+                    $hostRef = $attributed;
+                }
+                if (is_string($hostRef) && $hostRef !== '') {
+                    ap_remote_emoji_ingest_actor_doc($hostRef, $noteDoc);
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        // best-effort
+    }
+
     // Attach quoted post preview (commentary already in $summary when present).
     $quoteSource = is_array($remote) ? $remote : (is_array($obj) ? $obj : null);
     if (is_array($quoteSource) && isset($quoteSource['object']) && is_array($quoteSource['object'])
@@ -4812,19 +4850,17 @@ function ap_publish_status_text(
                 if (!empty($bsky['ok']) && empty($bsky['skipped'])
                     && !empty($bsky['uri']) && is_string($bsky['uri'])
                     && function_exists('ap_note_attach_bsky_proxy')) {
+                    // Bidirectional signing (Wafrn / FEP-fffd):
+                    // - Bluesky root segment already has record.fediverseId = this Note
+                    // - AP Note gets blueskyUri/blueskyCid + alternate Link → Bluesky *root*
+                    // - bsky_crossposts map (tip) is written inside ap_bsky_crosspost_status
+                    //   so later VAAK replies nest under the end of long-post threads.
+                    // Do NOT overwrite that tip map with the root URI here.
                     $note = ap_note_attach_bsky_proxy(
                         $note,
                         (string) $bsky['uri'],
                         isset($bsky['cid']) ? (string) $bsky['cid'] : null
                     );
-                    if (function_exists('ap_bsky_crosspost_save')) {
-                        ap_bsky_crosspost_save(
-                            $noteId,
-                            (string) $bsky['uri'],
-                            isset($bsky['cid']) ? (string) $bsky['cid'] : null,
-                            $bskyOwnerId
-                        );
-                    }
                     // Refresh stored Create/Note so GETs include FEP-fffd + blueskyUri.
                     $create['object'] = $note;
                     try {
@@ -4871,7 +4907,13 @@ function ap_publish_status_text(
         ap_log('bsky_crosspost local_id=' . $localId
             . ' posts=' . (int) ($bsky['posts'] ?? 0)
             . ' uris=' . implode(',', array_map('strval', $bsky['uris'] ?? []))
-            . ' mirror=1 fedi_first=1');
+            . ' mirror=1 fedi_first=1'
+            . ' bskyUri=' . ap_short((string) ($bsky['uri'] ?? ''))
+            . ' tip=' . ap_short((string) ($bsky['tip_uri'] ?? $bsky['uri'] ?? ''))
+            . (!empty($bsky['reply_nested']) ? ' reply=nested' : '')
+            . (!empty($bsky['reply_fallback']) ? ' reply=fallback_re_link' : ''));
+    } elseif (is_array($bsky) && !empty($bsky['skipped']) && !empty($bsky['error'])) {
+        ap_log('bsky_crosspost_skip local_id=' . $localId . ' err=' . ap_short((string) $bsky['error']));
     } elseif (is_array($bsky) && !empty($bsky['error']) && empty($bsky['skipped'])) {
         ap_log('bsky_crosspost_fail local_id=' . $localId . ' err=' . ap_short((string) $bsky['error']));
     }

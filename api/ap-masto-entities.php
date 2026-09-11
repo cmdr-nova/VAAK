@@ -1565,8 +1565,10 @@ function ap_masto_actor_id_aliases(string $actorId): array
     }
 
     $pathUname = '';
-    if (preg_match('#/(?:users|ap/users)/([^/]+)/?$#i', $actorId, $m)) {
-        $pathUname = rawurldecode($m[1]);
+    // Include /@user web profiles — suggestions and boosts often store that form,
+    // while remote_actors is keyed on /users/user.
+    if (preg_match('#/(?:users|ap/users|@)([^/]+)/?$#i', $actorId, $m)) {
+        $pathUname = ltrim(rawurldecode($m[1]), '@');
     }
 
     $uname = '';
@@ -3208,12 +3210,19 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
         $host = is_string($host) ? strtolower($host) : 'unknown';
         $path = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
         $seg = $path !== '' ? (basename($path) ?: 'user') : 'user';
-        $username = $seg;
-        $display = $seg;
+        $username = function_exists('ap_remote_actor_normalize_username')
+            ? (ap_remote_actor_normalize_username($seg) ?? 'user')
+            : ltrim($seg, '@');
+        $display = $username;
         $ra = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
         if (is_array($ra)) {
             if (!empty($ra['username'])) {
-                $username = (string) $ra['username'];
+                $ru = function_exists('ap_remote_actor_normalize_username')
+                    ? ap_remote_actor_normalize_username((string) $ra['username'])
+                    : ltrim((string) $ra['username'], '@');
+                if (is_string($ru) && $ru !== '') {
+                    $username = $ru;
+                }
             }
             if (!empty($ra['display_name'])) {
                 $display = (string) $ra['display_name'];
@@ -3224,6 +3233,9 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
                 $host = strtolower((string) $ra['host']);
             }
         }
+        $username = function_exists('ap_remote_actor_normalize_username')
+            ? (ap_remote_actor_normalize_username($username) ?? $username)
+            : ltrim($username, '@');
         $acct = $host !== '' ? ($username . '@' . $host) : $username;
     }
 
@@ -3287,6 +3299,12 @@ function ap_masto_remote_account(string $actorId, bool $allowFetch = false): arr
         if ($username !== '' && str_contains($username, '.') && !str_starts_with(strtolower($username), 'did:')) {
             $acct = $username;
         }
+    } elseif ($host === 'bsky.app' && $username !== ''
+        && !str_starts_with(strtolower($username), 'did:')
+        && !(function_exists('ap_remote_actor_username_is_placeholder') && ap_remote_actor_username_is_placeholder($username))) {
+        // Native Bluesky profile IRIs — show the handle, not handle@bsky.app
+        $acct = $username;
+        $webUrl = 'https://bsky.app/profile/' . rawurlencode($username);
     } elseif (is_string($threadsWeb) && $threadsWeb !== '') {
         $webUrl = $threadsWeb;
     } elseif ($host !== '' && $username !== '' && $username !== 'user'
@@ -7624,6 +7642,169 @@ function ap_masto_trends_statuses(int $limit = 10): array
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Pick the cache-richest actor IRI among aliases (/@user vs /users/user, etc.).
+ * Cache-only — never sync-fetches.
+ */
+function ap_masto_suggestion_best_actor_id(string $actorId): string
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return $actorId;
+    }
+    $candidates = [$actorId];
+    if (preg_match('~^(https://[^/]+)/@([^/?#]+)$~', $actorId, $m)) {
+        $candidates[] = $m[1] . '/users/' . rawurlencode(rawurldecode($m[2]));
+    } elseif (preg_match('~^(https://[^/]+)/users/([^/?#]+)$~', $actorId, $m)) {
+        $user = rawurldecode($m[2]);
+        if ($user !== '' && !preg_match('/^\d{6,}$/', $user)) {
+            $candidates[] = $m[1] . '/@' . rawurlencode($user);
+        }
+    }
+    if (function_exists('ap_masto_actor_id_aliases')) {
+        foreach (ap_masto_actor_id_aliases($actorId) as $alias) {
+            $alias = rtrim((string) $alias, '/');
+            if ($alias !== '' && str_starts_with($alias, 'https://')) {
+                $candidates[] = $alias;
+            }
+        }
+    }
+    $bestId = $actorId;
+    $bestScore = -1;
+    foreach (array_values(array_unique($candidates)) as $cand) {
+        $row = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($cand) : null;
+        $score = 0;
+        if (is_array($row)) {
+            $uname = trim((string) ($row['username'] ?? ''));
+            if ($uname !== '' && !(function_exists('ap_remote_actor_username_is_placeholder')
+                && ap_remote_actor_username_is_placeholder($uname))) {
+                $score += 4;
+            }
+            if (trim((string) ($row['display_name'] ?? '')) !== '') {
+                $score += 2;
+            }
+            if (!empty($row['icon_source_url'])) {
+                $score += 3;
+            }
+            if (!empty($row['image_source_url'])) {
+                $score += 1;
+            }
+        }
+        if (str_contains($cand, '/users/') && !str_contains($cand, '/ap/users/')) {
+            $score += 1;
+        }
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $bestId = $cand;
+        }
+    }
+    return $bestId;
+}
+
+/**
+ * Build a suggestion Account from already-fetched profile cache only.
+ * Returns null when the profile is still too thin to show accurately.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_masto_suggestion_account(string $actorId): ?array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return null;
+    }
+    $bestId = ap_masto_suggestion_best_actor_id($actorId);
+    try {
+        $account = ap_masto_remote_account($bestId, false);
+    } catch (Throwable $e) {
+        return null;
+    }
+    if (!is_array($account) || ($account['id'] ?? '') === '') {
+        return null;
+    }
+
+    // Bluesky: prefer handle/display/avatar already indexed from the home feed.
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $bestId, $bm)
+        || preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorId, $bm)) {
+        $key = strtolower(rawurldecode($bm[1]));
+        $handle = '';
+        $display = '';
+        $avatar = '';
+        try {
+            if (str_starts_with($key, 'did:')) {
+                $st = ap_db()->prepare(
+                    "SELECT author_handle, author_display, author_avatar
+                     FROM bsky_posts
+                     WHERE lower(author_did) = ?
+                       AND author_handle IS NOT NULL AND author_handle != ''
+                     ORDER BY indexed_at DESC
+                     LIMIT 1"
+                );
+                $st->execute([$key]);
+            } else {
+                $st = ap_db()->prepare(
+                    "SELECT author_handle, author_display, author_avatar
+                     FROM bsky_posts
+                     WHERE lower(author_handle) = ?
+                     ORDER BY indexed_at DESC
+                     LIMIT 1"
+                );
+                $st->execute([$key]);
+            }
+            $row = $st->fetch();
+            if (is_array($row)) {
+                $handle = trim((string) ($row['author_handle'] ?? ''));
+                $display = trim((string) ($row['author_display'] ?? ''));
+                $avatar = trim((string) ($row['author_avatar'] ?? ''));
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+        if ($handle !== '') {
+            $account['username'] = $handle;
+            $account['acct'] = $handle;
+            $account['url'] = 'https://bsky.app/profile/' . rawurlencode($handle);
+        } elseif ($key !== '' && !str_starts_with($key, 'did:')) {
+            $account['username'] = $key;
+            $account['acct'] = $key;
+        }
+        if ($display !== '') {
+            $account['display_name'] = $display;
+        }
+        $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
+            ? AP_REMOTE_AVATAR_FALLBACK
+            : 'https://mkultra.monster/img/avatar/default.jpg';
+        if ($avatar !== '' && (string) ($account['avatar'] ?? '') === $fallback) {
+            $account['avatar'] = $avatar;
+            $account['avatar_static'] = $avatar;
+        }
+    }
+
+    // Keep uri on the richest cached actor so Follow/profile open hit real data.
+    $account['uri'] = $bestId;
+
+    $username = trim((string) ($account['username'] ?? ''));
+    $display = trim((string) ($account['display_name'] ?? ''));
+    $acct = trim((string) ($account['acct'] ?? ''));
+    $thinUser = $username === '' || $username === 'user'
+        || (function_exists('ap_remote_actor_username_is_placeholder')
+            && ap_remote_actor_username_is_placeholder($username));
+    $thinDisplay = $display === '' || $display === 'user'
+        || (function_exists('ap_remote_actor_username_is_placeholder')
+            && ap_remote_actor_username_is_placeholder($display));
+    // Skip stubs that would render as @host / @@numbers / default-only shells.
+    if ($thinUser && $thinDisplay) {
+        return null;
+    }
+    if ($acct === '' || $acct === 'user' || str_starts_with($acct, 'user@')) {
+        // Still usable if we have a real display name, but prefer skipping.
+        if ($thinUser) {
+            return null;
+        }
+    }
+    return $account;
+}
+
+/**
  * @return array<string,true> actor_id => true
  */
 function ap_masto_suggestion_dismissed_set(?int $ownerUserId = null): array
@@ -7862,16 +8043,16 @@ function ap_masto_suggestions_v2(int $limit = 40): array
     });
 
     $out = [];
+    // Oversample so we can skip thin/uncached profile shells without sync-fetching.
+    $want = $limit;
     foreach ($scores as $actorId => $meta) {
-        if (count($out) >= $limit) {
+        if (count($out) >= $want) {
             break;
         }
-        try {
-            $account = ap_masto_remote_account($actorId);
-        } catch (Throwable $e) {
-            continue;
-        }
-        if (!is_array($account) || ($account['id'] ?? '') === '') {
+        $account = function_exists('ap_masto_suggestion_account')
+            ? ap_masto_suggestion_account((string) $actorId)
+            : null;
+        if ($account === null) {
             continue;
         }
         $sources = array_keys($meta['sources']);

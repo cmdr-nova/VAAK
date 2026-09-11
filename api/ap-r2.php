@@ -993,32 +993,73 @@ function ap_remote_media_account_urls(string $actorId): array
         : 'https://mkultra.monster/img/avatar/default.jpg';
     $actorId = rtrim(trim($actorId), '/');
 
+    // Suggestions / mentions often store https://host/@user while media + remote_actors
+    // are keyed on /users/user — try both (and known aliases) before falling back.
+    $lookupIds = [$actorId];
+    if (preg_match('~^(https://[^/]+)/@([^/?#]+)$~', $actorId, $m)) {
+        $lookupIds[] = $m[1] . '/users/' . rawurlencode(rawurldecode($m[2]));
+    } elseif (preg_match('~^(https://[^/]+)/users/([^/?#]+)$~', $actorId, $m)) {
+        $lookupIds[] = $m[1] . '/@' . rawurlencode(rawurldecode($m[2]));
+    }
+    if (function_exists('ap_masto_actor_id_aliases')) {
+        foreach (ap_masto_actor_id_aliases($actorId) as $alias) {
+            $alias = rtrim((string) $alias, '/');
+            if ($alias !== '' && str_starts_with($alias, 'https://')) {
+                $lookupIds[] = $alias;
+            }
+        }
+    }
+    $lookupIds = array_values(array_unique($lookupIds));
+
     $avatar = null;
     $header = null;
+    $warmId = $actorId;
 
     // Skip last_used_at touches on the timeline hot path — cron cleanup + warm
     // batch already refresh usage; per-row UPDATEs fought inbox writers (locks).
-    $cachedA = ap_remote_media_get($actorId, 'avatar');
-    if ($cachedA) {
-        $avatar = (string) $cachedA['public_url'];
-    }
-    $cachedH = ap_remote_media_get($actorId, 'header');
-    if ($cachedH) {
-        $header = (string) $cachedH['public_url'];
+    foreach ($lookupIds as $lid) {
+        if ($avatar === null) {
+            $cachedA = ap_remote_media_get($lid, 'avatar');
+            if ($cachedA) {
+                $avatar = (string) $cachedA['public_url'];
+                $warmId = $lid;
+            }
+        }
+        if ($header === null) {
+            $cachedH = ap_remote_media_get($lid, 'header');
+            if ($cachedH) {
+                $header = (string) $cachedH['public_url'];
+                $warmId = $lid;
+            }
+        }
+        if ($avatar !== null && $header !== null) {
+            break;
+        }
     }
 
     if ($avatar === null || $header === null) {
         // Don't block the request — use known remote source URLs and warm R2 async
-        $meta = ap_remote_actor_get($actorId);
-        if ($avatar === null && is_array($meta) && !empty($meta['icon_source_url'])) {
-            $avatar = ap_profile_sanitize_https_url($meta['icon_source_url']);
+        foreach ($lookupIds as $lid) {
+            $meta = ap_remote_actor_get($lid);
+            if (!is_array($meta)) {
+                continue;
+            }
+            if ($avatar === null && !empty($meta['icon_source_url'])) {
+                $avatar = ap_profile_sanitize_https_url($meta['icon_source_url']);
+                $warmId = $lid;
+            }
+            if ($header === null && !empty($meta['image_source_url'])) {
+                $header = ap_profile_sanitize_https_url($meta['image_source_url']);
+                $warmId = $lid;
+            }
+            if ($avatar !== null && ($header !== null || !empty($meta['icon_source_url']))) {
+                break;
+            }
         }
-        if ($header === null && is_array($meta) && !empty($meta['image_source_url'])) {
-            $header = ap_profile_sanitize_https_url($meta['image_source_url']);
-        } elseif ($header === null && $avatar !== null) {
+        if ($header === null && $avatar !== null) {
             $header = $avatar;
         }
-        ap_remote_media_warm_async($actorId);
+        ap_remote_media_warm_async($warmId);
     }
 
     // Re-sanitize R2/public URLs too (defense in depth for timeline JSON)

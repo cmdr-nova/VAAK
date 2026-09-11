@@ -1,7 +1,7 @@
 # VAAK
 
 **Status:** alpha  
-**Version:** `0.1.0` · `2026-09-10`
+**Version:** `0.1.1` · `2026-09-11`
 
 VAAK is the multi-user ActivityPub/Mastodon-compatible web application used by
 the Vaak instance. This repository contains only the VAAK application and its
@@ -19,10 +19,12 @@ The in-app login page and sidebar show the same release label.
 | Semver | `VAAK_VERSION` | `0.x` while alpha; bump when shipping a meaningful batch |
 | Date stamp | `VAAK_VERSION_DATE` | Calendar date of the labeled release (`YYYY-MM-DD`) |
 
-UI helper: `vaak_version_label()` → e.g. `VAAK alpha 0.1.0 · 2026-09-10`.
+UI helper: `vaak_version_label()` → e.g. `VAAK alpha 0.1.1 · 2026-09-11`.
 
 Bump those three constants together when cutting a public sync. Prefer one
-version bump per published batch rather than per tiny commit.
+version bump per published batch rather than per tiny commit. While in alpha,
+increment the patch number (`0.1.0` → `0.1.1`) for normal fix/feature batches;
+only bump the minor (`0.1.x` → `0.2.0`) for a particularly large milestone.
 
 ## Configuration
 

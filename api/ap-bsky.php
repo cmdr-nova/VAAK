@@ -476,6 +476,60 @@ function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0): ?array
 }
 
 /**
+ * Build Bluesky reply {root,parent} from a parent strongRef.
+ * Fetches the parent record so nested replies keep the real thread root
+ * (previously we incorrectly set root=parent for every reply).
+ *
+ * @param array{uri:string,cid:string} $parent
+ * @return array{root:array{uri:string,cid:string},parent:array{uri:string,cid:string}}
+ */
+function ap_bsky_reply_ref_for_parent(array $parent, int $ownerUserId): array
+{
+    $parentUri = (string) ($parent['uri'] ?? '');
+    $parentCid = (string) ($parent['cid'] ?? '');
+    $parentRef = ['uri' => $parentUri, 'cid' => $parentCid];
+    if ($parentUri === '' || $parentCid === '' || $ownerUserId < 1) {
+        return ['root' => $parentRef, 'parent' => $parentRef];
+    }
+    if (!preg_match('~^at://([^/]+)/([^/]+)/([^/]+)$~', $parentUri, $m)) {
+        return ['root' => $parentRef, 'parent' => $parentRef];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($tok['ok'])) {
+        return ['root' => $parentRef, 'parent' => $parentRef];
+    }
+    $row = ap_bsky_session_row($ownerUserId);
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $got = null;
+    foreach (array_merge([$pds], ap_bsky_feed_hosts($pds)) as $host) {
+        $got = ap_bsky_xrpc($host, 'com.atproto.repo.getRecord', 'GET', [
+            'repo' => $m[1],
+            'collection' => $m[2],
+            'rkey' => $m[3],
+        ], null, (string) $tok['access'], 12);
+        if (!empty($got['ok'])) {
+            break;
+        }
+    }
+    $value = is_array($got['json']['value'] ?? null) ? $got['json']['value'] : null;
+    $reply = is_array($value['reply'] ?? null) ? $value['reply'] : null;
+    $root = is_array($reply['root'] ?? null) ? $reply['root'] : null;
+    $rootUri = is_array($root) ? (string) ($root['uri'] ?? '') : '';
+    $rootCid = is_array($root) ? (string) ($root['cid'] ?? '') : '';
+    if ($rootUri !== '' && $rootCid !== '' && str_starts_with($rootUri, 'at://')) {
+        return [
+            'root' => ['uri' => $rootUri, 'cid' => $rootCid],
+            'parent' => $parentRef,
+        ];
+    }
+    // Parent is a thread root (or getRecord failed) — root == parent.
+    return ['root' => $parentRef, 'parent' => $parentRef];
+}
+
+/**
  * @return array{owner_user_id:int,handle:string,did:string,pds_host:string,access_jwt_enc:string,refresh_jwt_enc:string,connected_at:string,updated_at:string}|null
  */
 function ap_bsky_session_row(int $ownerUserId): ?array
@@ -655,6 +709,52 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
 /**
  * @return array{ok:bool,error?:string,access?:string}
  */
+/**
+ * True when a JWT is missing/unreadable or past exp (with a small skew).
+ * Used to refresh before createRecord instead of posting with a dead access token.
+ */
+function ap_bsky_jwt_expired(?string $jwt, int $skewSec = 60): bool
+{
+    $jwt = is_string($jwt) ? trim($jwt) : '';
+    if ($jwt === '' || !str_contains($jwt, '.')) {
+        return true;
+    }
+    $parts = explode('.', $jwt);
+    if (count($parts) < 2) {
+        return true;
+    }
+    $payload = $parts[1];
+    $payload .= str_repeat('=', (4 - strlen($payload) % 4) % 4);
+    $json = base64_decode(strtr($payload, '-_', '+/'), true);
+    if (!is_string($json) || $json === '') {
+        return true;
+    }
+    $data = json_decode($json, true);
+    if (!is_array($data) || !isset($data['exp'])) {
+        return true;
+    }
+    $exp = (int) $data['exp'];
+    return $exp <= (time() + max(0, $skewSec));
+}
+
+/**
+ * Auth errors that mean the stored Bluesky login is dead (password reset, revoked
+ * refresh token, etc.) — clear the session so Profile shows reconnect.
+ */
+function ap_bsky_auth_error_is_fatal(?string $message): bool
+{
+    $m = strtolower(trim((string) $message));
+    if ($m === '') {
+        return false;
+    }
+    return str_contains($m, 'expired')
+        || str_contains($m, 'invalidtoken')
+        || str_contains($m, 'invalid token')
+        || str_contains($m, 'token has been revoked')
+        || str_contains($m, 'authenticationrequired')
+        || str_contains($m, 'unauthorized');
+}
+
 function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false): array
 {
     if (!function_exists('ap_auth_secret_decrypt') || !function_exists('ap_auth_secret_encrypt')) {
@@ -667,10 +767,12 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false): arr
     $access = ap_auth_secret_decrypt((string) ($row['access_jwt_enc'] ?? ''));
     $refresh = ap_auth_secret_decrypt((string) ($row['refresh_jwt_enc'] ?? ''));
     if (!is_string($refresh) || $refresh === '') {
-        return ['ok' => false, 'error' => 'Session expired — reconnect Bluesky'];
+        ap_bsky_disconnect($ownerUserId);
+        return ['ok' => false, 'error' => 'Session expired — reconnect Bluesky in Profile'];
     }
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    if (!$forceRefresh && is_string($access) && $access !== '') {
+    $accessOk = is_string($access) && $access !== '' && !ap_bsky_jwt_expired($access);
+    if (!$forceRefresh && $accessOk) {
         return ['ok' => true, 'access' => $access];
     }
     // refreshSession: Authorization = refreshJwt, POST with NO body
@@ -697,17 +799,28 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false): arr
     $j = is_string($body) ? json_decode($body, true) : null;
     if ($status < 200 || $status >= 300 || !is_array($j)) {
         $msg = is_array($j) ? (string) ($j['message'] ?? $j['error'] ?? '') : '';
+        $errCode = is_array($j) ? (string) ($j['error'] ?? '') : '';
+        $combined = trim($errCode . ' ' . $msg);
+        // Password reset / revoked refresh — drop the zombie "Connected" row.
+        if ($status === 401 || ap_bsky_auth_error_is_fatal($combined) || ap_bsky_jwt_expired($refresh, 0)) {
+            ap_bsky_disconnect($ownerUserId);
+            return [
+                'ok' => false,
+                'error' => 'Bluesky login expired (password reset or revoked session) — reconnect in Profile',
+            ];
+        }
         return [
             'ok' => false,
             'error' => $msg !== ''
                 ? ('Session refresh failed: ' . $msg)
-                : 'Session expired — reconnect Bluesky',
+                : 'Session expired — reconnect Bluesky in Profile',
         ];
     }
     $newAccess = (string) ($j['accessJwt'] ?? '');
     $newRefresh = (string) ($j['refreshJwt'] ?? $refresh);
     if ($newAccess === '') {
-        return ['ok' => false, 'error' => 'Session expired — reconnect Bluesky'];
+        ap_bsky_disconnect($ownerUserId);
+        return ['ok' => false, 'error' => 'Session expired — reconnect Bluesky in Profile'];
     }
     $accessEnc = ap_auth_secret_encrypt($newAccess);
     $refreshEnc = ap_auth_secret_encrypt($newRefresh);
@@ -4256,15 +4369,21 @@ function ap_bsky_crosspost_status(
     }
     // Resolve reply parent / quote target to Bluesky strongRefs when possible.
     $replyRef = null;
+    $replyFallbackLink = null;
     if (is_string($inReplyTo) && $inReplyTo !== '') {
-        $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId);
-        if ($parent === null) {
-            // Parent has no Bluesky twin — skip rather than create an orphan root.
-            return ['ok' => true, 'skipped' => true, 'error' => 'Reply parent not on Bluesky'];
+        // Profile URLs are not posts — don't treat as reply targets.
+        if (preg_match('~^https://bsky\.app/profile/[^/]+/?$~i', rtrim($inReplyTo, '/'))) {
+            $replyFallbackLink = $inReplyTo;
+        } else {
+            $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId);
+            if ($parent === null) {
+                // Parent has no Bluesky twin (failed earlier mirror, or pure-fedi).
+                // Still publish as a new root with a short re: link instead of dropping.
+                $replyFallbackLink = $inReplyTo;
+            } else {
+                $replyRef = ap_bsky_reply_ref_for_parent($parent, $ownerUserId);
+            }
         }
-        $replyRef = ['root' => $parent, 'parent' => $parent];
-        // If parent is itself a reply, prefer its root — best-effort getRecord reply.root.
-        // (VAAK threads onto the immediate parent as both root+parent when unknown.)
     }
     $quoteRef = null;
     if (is_string($quoteObjectId) && $quoteObjectId !== '') {
@@ -4294,6 +4413,9 @@ function ap_bsky_crosspost_status(
     // Only append quote URL as text when we could not build a native quote embed.
     if ($quoteRef === null && is_string($quoteObjectId) && $quoteObjectId !== '' && str_starts_with($quoteObjectId, 'https://')) {
         $plainText = trim($plainText . ($plainText !== '' ? "\n\n" : '') . $quoteObjectId);
+    }
+    if (is_string($replyFallbackLink) && $replyFallbackLink !== '') {
+        $plainText = trim('↩ re: ' . $replyFallbackLink . ($plainText !== '' ? "\n\n" . $plainText : ''));
     }
 
     // Upload images (first segment only)
@@ -4365,7 +4487,8 @@ function ap_bsky_crosspost_status(
         if (trim($segment) === '' && $imgs === [] && $qEmbed === null) {
             continue;
         }
-        $created = gmdate('c', time() + $i); // slight skew so ordering is stable
+        // 2s skew between long-post segments so AppView ordering stays stable.
+        $created = gmdate('c', time() + ($i * 2));
         // Only stamp fediverseId on the root post (Wafrn merge key).
         $fedi = ($i === 0) ? $fediverseId : null;
         $res = ap_bsky_create_post($pds, $access, $did, $segment, $reply, $imgs, $created, $fedi, $qEmbed);
@@ -4390,23 +4513,48 @@ function ap_bsky_crosspost_status(
         $cids[] = $ref['cid'];
         if ($root === null) {
             // For AP replies, Bluesky thread root stays the remote parent root.
+            // For long-post self-threads, first segment becomes the root.
             $root = is_array($replyRef) ? ($replyRef['root'] ?? $ref) : $ref;
         }
         $parent = $ref;
     }
 
     if ($uris !== [] && is_string($fediverseId) && $fediverseId !== '') {
-        ap_bsky_crosspost_save($fediverseId, (string) $uris[0], $cids[0] ?? null, $ownerUserId);
+        // Bidirectional map:
+        // - Note.blueskyUri (caller) + record.fediverseId on segment 0 = FEP/Wafrn pair
+        // - bsky_crossposts stores the *tip* so replies attach under the last chunk
+        // - bsky_post_links indexes the *root* AT-URI back to the AP Note
+        $tip = count($uris) - 1;
+        ap_bsky_crosspost_save(
+            $fediverseId,
+            (string) $uris[$tip],
+            $cids[$tip] ?? null,
+            $ownerUserId
+        );
         ap_bsky_post_link_upsert((string) $uris[0], $cids[0] ?? null, $fediverseId, $fediverseId);
+        if ($tip > 0) {
+            ap_bsky_post_link_upsert(
+                (string) $uris[$tip],
+                $cids[$tip] ?? null,
+                $fediverseId,
+                $fediverseId
+            );
+        }
     }
 
     return [
         'ok' => true,
+        // Root AT-URI for FEP-fffd / Note.blueskyUri (first segment).
         'uri' => $uris[0] ?? null,
         'cid' => $cids[0] ?? null,
+        // Tip used for reply nesting (same as uri when single-segment).
+        'tip_uri' => $uris !== [] ? (string) $uris[count($uris) - 1] : null,
+        'tip_cid' => $cids !== [] ? (string) $cids[count($cids) - 1] : null,
         'uris' => $uris,
         'cids' => $cids,
         'posts' => count($uris),
+        'reply_nested' => is_array($replyRef),
+        'reply_fallback' => is_string($replyFallbackLink) && $replyFallbackLink !== '',
     ];
 }
 

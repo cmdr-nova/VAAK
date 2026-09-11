@@ -2484,9 +2484,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             if ($pds === '') {
                 $pds = AP_BSKY_DEFAULT_PDS;
             }
+            $wasConnected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId));
             $res = ap_bsky_connect($vaakOwnerId, $handle, $appPass, $pds);
             if (!empty($res['ok'])) {
-                $notice = 'Bluesky connected as @' . (string) ($res['handle'] ?? $handle) . '.';
+                $notice = ($wasConnected ? 'Bluesky login updated for @' : 'Bluesky connected as @')
+                    . (string) ($res['handle'] ?? $handle) . '.';
                 if (!empty($res['profile_synced'])) {
                     $notice .= ' VAAK avatar / header / bio synced to Bluesky.';
                 } elseif (!empty($res['profile_sync_error'])) {
@@ -3139,9 +3141,15 @@ if (
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
-    $suggestions = function_exists('ap_masto_suggestions_v2') ? ap_masto_suggestions_v2(12) : [];
+    $onboard = admin_home_onboarding_state(
+        is_array($vaakUser ?? null) ? $vaakUser : null,
+        (string) ($vaakActorId ?? '')
+    );
+    $fetchN = !empty($onboard['active']) ? 24 : 12;
+    $showN = !empty($onboard['active']) ? 6 : 3;
+    $suggestions = function_exists('ap_masto_suggestions_v2') ? ap_masto_suggestions_v2($fetchN) : [];
     if ($suggestions) {
-        admin_render_home_suggestions($suggestions);
+        admin_render_home_suggestions($suggestions, $showN, !empty($onboard['active']));
     }
     exit;
 }
@@ -3296,6 +3304,13 @@ $total7 = 0;
 $typeRows = [];
 $actionRows = [];
 $hostRows = [];
+$statsLocalUsers = 0;
+$statsLocalUsersActive = 0;
+$statsLocalPosts = 0;
+$statsFollowersAll = 0;
+$statsFollowingAll = 0;
+$statsMentionsOpen = 0;
+$statsUserRows = [];
 if ($view === 'stats') {
     try {
         $st = ap_db_execute_retry('SELECT COUNT(*) AS c FROM events WHERE created_at >= ?', [$since7]);
@@ -3324,32 +3339,92 @@ if ($view === 'stats') {
     } catch (Throwable $e) {
         error_log('[ap-admin] stats rows: ' . $e->getMessage());
     }
-}
 
-// Mentions list only when Notifications / Stats need it (Ice Cubes-style feed uses API helper)
-$mentions = [];
-if ($view === 'stats') {
+    // Instance-wide local account aggregates (all users, not just the admin actor).
     try {
-        $mentionsRaw = function_exists('ap_mentions_list')
-            ? ap_mentions_list(120, admin_owner_user_id())
-            : [];
-        foreach ($mentionsRaw as $m) {
-            if (function_exists('ap_row_is_hidden')
-                ? ap_row_is_hidden($m['actor_id'] ?? null, null, admin_owner_user_id())
-                : ap_row_is_blocked($m['actor_id'] ?? null, null)) {
-                continue;
+        $db = ap_db();
+        $statsLocalUsers = (int) ($db->query('SELECT COUNT(*) AS c FROM ap_users')->fetch()['c'] ?? 0);
+        $statsLocalUsersActive = (int) ($db->query(
+            'SELECT COUNT(*) AS c FROM ap_users WHERE disabled_at IS NULL'
+        )->fetch()['c'] ?? 0);
+        $statsLocalPosts = (int) ($db->query('SELECT COUNT(*) AS c FROM outbox_notes')->fetch()['c'] ?? 0);
+        $statsFollowersAll = (int) ($db->query('SELECT COUNT(*) AS c FROM followers')->fetch()['c'] ?? 0);
+        $statsFollowingAll = (int) ($db->query('SELECT COUNT(*) AS c FROM following')->fetch()['c'] ?? 0);
+        try {
+            $statsMentionsOpen = (int) ($db->query(
+                'SELECT COUNT(*) AS c FROM mentions WHERE deleted_at IS NULL'
+            )->fetch()['c'] ?? 0);
+        } catch (Throwable $e) {
+            $statsMentionsOpen = (int) ($db->query('SELECT COUNT(*) AS c FROM mentions')->fetch()['c'] ?? 0);
+        }
+
+        // Per-user breakdown for the admin table.
+        $users = $db->query(
+            'SELECT id, username, actor_key, is_admin,
+                    CASE WHEN disabled_at IS NULL THEN 0 ELSE 1 END AS disabled
+             FROM ap_users
+             ORDER BY id ASC'
+        )->fetchAll() ?: [];
+        $postByUser = [];
+        try {
+            $st = $db->query(
+                "SELECT split_part(id, '/', 5) AS uname, COUNT(*) AS c
+                 FROM outbox_notes
+                 WHERE id LIKE 'https://mkultra.monster/users/%'
+                 GROUP BY 1"
+            );
+            foreach ($st ?: [] as $row) {
+                $u = strtolower((string) ($row['uname'] ?? ''));
+                if ($u !== '') {
+                    $postByUser[$u] = (int) ($row['c'] ?? 0);
+                }
             }
-            $mType = strtolower((string) ($m['type'] ?? ''));
-            if (in_array($mType, ['person', 'application', 'service', 'group'], true)) {
-                continue;
+        } catch (Throwable $e) {
+            // ignore
+        }
+        $followersByActor = [];
+        $followingByActor = [];
+        try {
+            foreach ($db->query(
+                'SELECT owner_actor_id, COUNT(*) AS c FROM followers GROUP BY owner_actor_id'
+            ) ?: [] as $row) {
+                $followersByActor[rtrim((string) ($row['owner_actor_id'] ?? ''), '/')] = (int) ($row['c'] ?? 0);
             }
-            $mentions[] = $m;
-            if (count($mentions) >= 60) {
-                break;
+            foreach ($db->query(
+                'SELECT owner_actor_id, COUNT(*) AS c FROM following GROUP BY owner_actor_id'
+            ) ?: [] as $row) {
+                $followingByActor[rtrim((string) ($row['owner_actor_id'] ?? ''), '/')] = (int) ($row['c'] ?? 0);
             }
+        } catch (Throwable $e) {
+            // ignore
+        }
+        $mentionsByOwner = [];
+        try {
+            foreach ($db->query(
+                'SELECT owner_user_id, COUNT(*) AS c FROM mentions WHERE deleted_at IS NULL GROUP BY owner_user_id'
+            ) ?: [] as $row) {
+                $mentionsByOwner[(int) ($row['owner_user_id'] ?? 0)] = (int) ($row['c'] ?? 0);
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+        foreach ($users as $u) {
+            $key = (string) ($u['actor_key'] ?? $u['username'] ?? '');
+            $actorId = $key !== '' ? ('https://mkultra.monster/users/' . $key) : '';
+            $statsUserRows[] = [
+                'id' => (int) ($u['id'] ?? 0),
+                'username' => (string) ($u['username'] ?? $key),
+                'actor_key' => $key,
+                'is_admin' => !empty($u['is_admin']),
+                'disabled' => !empty($u['disabled']),
+                'posts' => $postByUser[strtolower($key)] ?? 0,
+                'followers' => $followersByActor[$actorId] ?? 0,
+                'following' => $followingByActor[$actorId] ?? 0,
+                'mentions' => $mentionsByOwner[(int) ($u['id'] ?? 0)] ?? 0,
+            ];
         }
     } catch (Throwable $e) {
-        error_log('[ap-admin] mentions: ' . $e->getMessage());
+        error_log('[ap-admin] instance stats: ' . $e->getMessage());
     }
 }
 
@@ -6160,7 +6235,35 @@ function admin_remote_actor_href(string $actorId, ?string $username = null): str
             return $threads;
         }
     }
+    // Prefer the HTML profile (/@user) — that's where Mastodon/Pleroma expose "Follow Remotely".
+    $user = $username !== null ? trim($username) : '';
+    if ($user === '' && function_exists('ap_remote_actor_label')) {
+        $lab = ap_remote_actor_label($actorId, false);
+        $user = (string) ($lab['username'] ?? '');
+    }
+    if (function_exists('ap_remote_actor_normalize_username')) {
+        $user = (string) (ap_remote_actor_normalize_username($user) ?? '');
+    } else {
+        $user = ltrim($user, '@');
+    }
+    $host = parse_url($actorId, PHP_URL_HOST);
+    if (is_string($host) && $host !== '' && $user !== '' && $user !== 'user'
+        && !(function_exists('ap_remote_actor_username_is_placeholder') && ap_remote_actor_username_is_placeholder($user))) {
+        return 'https://' . strtolower($host) . '/@' . rawurlencode($user);
+    }
     return $actorId;
+}
+
+/**
+ * Mastodon-style "@acct" label without doubling a leading @ already present on acct.
+ */
+function admin_at_acct(string $acct): string
+{
+    $acct = trim($acct);
+    if ($acct === '') {
+        return '';
+    }
+    return '@' . ltrim($acct, '@');
 }
 
 /** Label for the external profile link: local instance → web profile, else remote. */
@@ -6205,7 +6308,50 @@ function admin_account_actor_ref(array $account): string
  *
  * @param list<array{url?:string,acct?:string,username?:string,uri?:string}> $mentions
  */
-function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = []): string
+/**
+ * Replace :shortcode: tokens in already-built HTML with custom-emoji <img>s.
+ * Cache-only (no sync HTTP) — packs are filled by inbox Note-tag ingest +
+ * occasional host catalog fetches.
+ */
+function admin_apply_custom_emojis_html(string $html, ?string $actorId = null): string
+{
+    if ($html === '' || !str_contains($html, ':') || !is_string($actorId) || $actorId === '') {
+        return $html;
+    }
+    $host = parse_url($actorId, PHP_URL_HOST);
+    $host = is_string($host) ? strtolower($host) : '';
+    if ($host === '') {
+        return $html;
+    }
+    if (function_exists('ap_remote_emoji_ensure_host')) {
+        // Refresh stale host catalogs without blocking when meta is missing.
+        // allowFetch=false keeps timelines snappy; inbox ingest covers Note tags.
+        ap_remote_emoji_ensure_host($host, false, false);
+    }
+    $map = function_exists('ap_remote_emoji_map_for_host')
+        ? ap_remote_emoji_map_for_host($host)
+        : [];
+    if ($map === []) {
+        return $html;
+    }
+    // Only replace shortcodes in text nodes (not inside tags / URLs).
+    return (string) preg_replace_callback(
+        '/(?<![\w\/-]):([A-Za-z0-9_-]{1,80}):(?![\w-])/',
+        static function (array $m) use ($map): string {
+            $code = $m[1];
+            if (!isset($map[$code])) {
+                return $m[0];
+            }
+            $url = htmlspecialchars($map[$code], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $alt = htmlspecialchars(':' . $code . ':', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            return '<img class="custom-emoji" src="' . $url . '" alt="' . $alt . '" title="' . $alt
+                . '" loading="lazy" decoding="async" referrerpolicy="no-referrer" width="20" height="20">';
+        },
+        $html
+    );
+}
+
+function admin_linkify_body_html(string $plain, string $returnView = 'home', array $mentions = [], ?string $emojiActorId = null): string
 {
     $plain = html_entity_decode(trim($plain), ENT_QUOTES | ENT_HTML5, 'UTF-8');
     if ($plain === '') {
@@ -6510,7 +6656,7 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
         }
     }
 
-    return $escaped;
+    return admin_apply_custom_emojis_html($escaped, $emojiActorId);
 }
 
 /** Whether a feed event is something we can reply to (has a remote object URL). */
@@ -6716,7 +6862,7 @@ function admin_tweet_content_wrap(string $innerHtml): string
  * Wrap body/media HTML in a content-warning disclosure when needed.
  * Always wraps the payload in .tweet-content (text + images + cards fold together).
  */
-function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerHtml): string
+function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerHtml, ?string $emojiActorId = null): string
 {
     $spoilerText = trim($spoilerText);
     $autoUnblur = $sensitive && $spoilerText === '' && function_exists('ap_profile_get')
@@ -6734,9 +6880,12 @@ function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerH
         return $wrapped;
     }
     $label = $spoilerText !== '' ? $spoilerText : 'Sensitive content';
+    $labelHtml = $emojiActorId
+        ? admin_emoji_html($label, $emojiActorId)
+        : h($label);
     return '<details class="cw-gate">'
         . '<summary><span class="cw-label">CW</span>'
-        . '<span class="cw-text">' . h($label) . '</span>'
+        . '<span class="cw-text">' . $labelHtml . '</span>'
         . '<span class="cw-hint"></span></summary>'
         . '<div class="cw-body">' . $wrapped . '</div>'
         . '</details>';
@@ -7011,7 +7160,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               if ($quoteParts !== null) {
                   if ($quoteParts['commentary'] !== '') {
                       $bodyChunk .= '<div class="body feed-body">'
-                          . admin_linkify_body_html($quoteParts['commentary'], $returnView, $eventMentions) . '</div>';
+                          . admin_linkify_body_html($quoteParts['commentary'], $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
                   }
                   $qMentions = [];
                   if ($quoteParts['quoted'] !== '' && function_exists('ap_masto_content_with_mentions')) {
@@ -7101,7 +7250,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions) . '</div>';
+                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
               }
               $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
@@ -7459,6 +7608,11 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av'): string
 function actor_handle(?string $actorId, ?string $username = null, bool $allowFetch = false): string
 {
     $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
+    if ($username !== null && $username !== '') {
+        $username = function_exists('ap_remote_actor_normalize_username')
+            ? (ap_remote_actor_normalize_username($username) ?? '')
+            : ltrim(trim($username), '@');
+    }
     if ($actorId !== '' && function_exists('ap_remote_actor_label')) {
         // Default: cache-only. Sync fetches on Federated (relay strangers) were
         // taking 30–50s and browsers showed "connection interrupted".
@@ -7872,7 +8026,7 @@ function admin_render_masto_status_card(
     $bodyInner = '';
     if ($plain !== '') {
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
-            . admin_linkify_body_html($plain, $returnView, $stMentions) . '</div>';
+            . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef !== '' ? $actorRef : null) . '</div>';
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
@@ -8275,7 +8429,7 @@ function admin_render_remote_boost_card(
                       )['mentions'] ?? [];
                   }
                   $boostInner .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions) . '</div>';
+                      . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions, $origActor !== '' ? $origActor : null) . '</div>';
               } elseif ($objectId !== '' && $mediaUrls === []) {
                   $boostInner .= '<div class="meta boost-hydrate-pending" style="margin-top:.35rem">'
                       . '<span class="boost-hydrate-status">Loading boosted post…</span>'
@@ -8451,7 +8605,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
             <?php
               $boostInner = '';
               if ($innerSummary !== '') {
-                  $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView) . '</div>';
+                  $boostInner .= '<div class="body feed-body">' . admin_linkify_body_html($innerSummary, $returnView, [], $origActor !== '' ? $origActor : null) . '</div>';
               } else {
                   $pending = $objectId !== '' && str_starts_with($objectId, 'https://');
                   $boostInner .= '<div class="meta boost-hydrate-status" style="margin-top:.35rem">'
@@ -8759,7 +8913,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
               $ownInner = '';
               if ($bodyPlain !== '' && $bodyPlain !== '(quote)') {
                   $ownInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
-                      . admin_linkify_body_html($bodyPlain, $returnView) . '</div>';
+                      . admin_linkify_body_html($bodyPlain, $returnView, [], $actor !== '' ? $actor : null) . '</div>';
               }
               $ownInner .= $quoteHtml . $mediaHtml;
               $linkCardHtml = '';
@@ -10079,7 +10233,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         }
         // Clickable @handles in mention/quote bodies (full @user@host when present).
         $nSnippetHtml = $snipShow !== ''
-            ? admin_linkify_body_html($snipShow, 'mentions', $nStatusMentions ?? [])
+            ? admin_linkify_body_html($snipShow, 'mentions', $nStatusMentions ?? [], $nActorRef !== '' ? $nActorRef : null)
             : '';
         $profileHref = $nActorRef !== ''
             ? ('?view=remote_profile&actor=' . rawurlencode($nActorRef) . '&from=mentions')
@@ -10267,15 +10421,50 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
 
 }
 
-function admin_render_home_suggestions(array $suggestions): void
+/**
+ * New-user Home onboarding: account age ≤ 3 days AND following fewer than 5 people.
+ *
+ * @return array{active:bool,following:int,days_left:int,age_days:float}
+ */
+function admin_home_onboarding_state(?array $user, string $actorId): array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    $followingN = 0;
+    if ($actorId !== '' && function_exists('ap_following_list')) {
+        try {
+            $followingN = count(ap_following_list($actorId));
+        } catch (Throwable $e) {
+            $followingN = 0;
+        }
+    }
+    $createdTs = strtotime((string) ($user['created_at'] ?? '')) ?: 0;
+    $ageDays = $createdTs > 0 ? max(0.0, (time() - $createdTs) / 86400.0) : 999.0;
+    $active = $followingN < 5 && $ageDays <= 3.0;
+    $daysLeft = $active ? (int) max(1, (int) ceil(3.0 - $ageDays)) : 0;
+    return [
+        'active' => $active,
+        'following' => $followingN,
+        'days_left' => $daysLeft,
+        'age_days' => $ageDays,
+    ];
+}
+
+function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool $onboarding = false): void
 {
     if (!$suggestions) {
         return;
     }
+    $limit = max(1, min(12, $limit));
     shuffle($suggestions);
-    $suggestions = array_slice($suggestions, 0, 3);
-    echo '<section class="home-suggestions" aria-label="Suggested accounts">';
-    echo '<div class="meta home-suggestions-title">Suggested accounts</div>';
+    $suggestions = array_slice($suggestions, 0, $limit);
+    $sectionClass = 'home-suggestions' . ($onboarding ? ' home-suggestions--onboarding' : '');
+    echo '<section class="' . h($sectionClass) . '" aria-label="Suggested accounts">';
+    echo '<div class="meta home-suggestions-title">'
+        . ($onboarding ? 'People to follow' : 'Suggested accounts')
+        . '</div>';
+    if ($onboarding) {
+        echo '<div class="meta" style="margin:-.15rem 0 .55rem">Tap Follow on a few accounts — your Home fills with their posts and boosts.</div>';
+    }
     echo '<div class="home-suggestions-grid">';
     foreach ($suggestions as $sug) {
         $acc = is_array($sug['account'] ?? null) ? $sug['account'] : [];
@@ -10294,7 +10483,8 @@ function admin_render_home_suggestions(array $suggestions): void
             : admin_avatar_img($actorUrl);
         echo '<div class="home-suggestion-main"><a class="who" href="?view=remote_profile&amp;actor=' . rawurlencode($actorUrl) . '">' . h($display) . '</a>';
         if ($acct !== '') {
-            echo '<div class="meta home-suggestion-handle" title="@' . h($acct) . '">@' . h($acct) . '</div>';
+            $at = admin_at_acct($acct);
+            echo '<div class="meta home-suggestion-handle" title="' . h($at) . '">' . h($at) . '</div>';
         }
         echo '<form method="post" action="?view=home" class="home-suggestion-form">'
             . '<input type="hidden" name="action" value="suggestion_follow">'
@@ -11813,6 +12003,55 @@ function admin_render_home_suggestions(array $suggestions): void
     .trends-skeleton-row { height:1.15rem; border:1px solid var(--border); border-radius:8px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
     .trends-skeleton-row.wide { height:2.4rem; }
     @keyframes timeline-shimmer { to { background-position:-220% 0; } }
+    .blocks-section {
+      margin: 1rem 0 1.25rem;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel-2);
+      overflow: hidden;
+    }
+    .blocks-section > summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: .5rem .75rem;
+      padding: .75rem .9rem;
+      user-select: none;
+    }
+    .blocks-section > summary::-webkit-details-marker { display: none; }
+    .blocks-section > summary::before {
+      content: '▸';
+      color: var(--muted);
+      font-size: .85rem;
+      transition: transform .15s ease;
+    }
+    .blocks-section[open] > summary::before { transform: rotate(90deg); }
+    .blocks-section > summary .who { font-size: .95rem; }
+    .blocks-section-body { padding: 0 .9rem .9rem; }
+    .blocks-section-search {
+      display: flex;
+      gap: .5rem;
+      align-items: center;
+      margin: 0 0 .65rem;
+    }
+    .blocks-section-search input[type="search"] {
+      flex: 1;
+      min-width: 0;
+    }
+    .blocks-section-list {
+      display: flex;
+      flex-direction: column;
+      gap: .55rem;
+      max-height: min(28rem, 55vh);
+      overflow: auto;
+      padding-right: .15rem;
+      overscroll-behavior: contain;
+    }
+    .blocks-section-list .tweet { margin: 0; }
+    .blocks-section-empty { display: none; }
+    .blocks-section-list.is-empty + .blocks-section-empty { display: block; }
     .keyboard-selected { outline:2px solid var(--primary); outline-offset:2px; }
     .media-row { gap:.45rem; }
     .media-row img, .media-row .media-video { aspect-ratio:4/3; object-fit:cover; }
@@ -11825,6 +12064,14 @@ function admin_render_home_suggestions(array $suggestions): void
     .home-suggestions { margin: 1rem 0; padding: .8rem; border: 1px solid var(--border); border-radius: 12px; background: var(--panel-2); }
     .home-suggestions-title { margin-bottom: .55rem; }
     .home-suggestions-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .55rem; }
+    .home-suggestions--onboarding { margin: .35rem 0 1rem; border-color: color-mix(in srgb, var(--primary) 35%, var(--border)); }
+    .home-suggestions--onboarding .home-suggestions-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .home-onboarding {
+      margin: 0 0 .85rem; padding: .85rem .95rem;
+      border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
+      border-radius: 12px; background: var(--panel-2);
+    }
+    .home-onboarding .who { margin-bottom: .25rem; }
     .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
     .home-suggestion .tweet-av { width: 40px; height: 40px; flex: 0 0 40px; }
     .home-suggestion-main { min-width: 0; min-height: 5.6rem; display: flex; flex: 1; flex-direction: column; overflow-wrap: anywhere; }
@@ -11834,7 +12081,10 @@ function admin_render_home_suggestions(array $suggestions): void
     .home-suggestion-form .btn { padding: .25rem .65rem; font-size: .78rem; }
     /* Phones (incl. landscape): short height catches ~844×390 class viewports that
    otherwise fall into the 72px tablet icon-rail and look “squished right”. */
-@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) { .home-suggestions-grid { grid-template-columns: 1fr; } }
+@media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
+      .home-suggestions-grid,
+      .home-suggestions--onboarding .home-suggestions-grid { grid-template-columns: 1fr; }
+    }
     .quote-block {
       margin-top: .55rem; padding: .65rem .8rem;
       border-left: 3px solid var(--primary);
@@ -12275,11 +12525,33 @@ function admin_render_home_suggestions(array $suggestions): void
           $homeHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($homeTimeline) > $tlLimit);
+          $homeOnboard = admin_home_onboarding_state(
+              is_array($vaakUser) ? $vaakUser : null,
+              (string) $vaakActorId
+          );
           // Suggestions are deferred after first paint (see ajax=home_suggestions).
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($homePage));
           }
         ?>
+        <?php if (!empty($homeOnboard['active'])): ?>
+          <div class="home-onboarding" role="status">
+            <div class="who">Welcome to your Home feed</div>
+            <div class="meta" style="line-height:1.45">
+              Home shows posts and boosts from people <b>you follow</b>
+              (<?= (int) $homeOnboard['following'] ?>/5 so far).
+              Follow a few accounts below — or browse
+              <a href="?view=local">Local</a>,
+              <a href="?view=feed">Federation</a>,
+              <a href="?view=tags">hashtags</a>,
+              and <a href="?view=search">Search</a> —
+              to fill this timeline. This tip stays for about
+              <?= (int) $homeOnboard['days_left'] ?> more day<?= ((int) $homeOnboard['days_left'] === 1) ? '' : 's' ?>
+              while you’re getting started.
+            </div>
+          </div>
+          <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" data-onboarding="1" hidden></div>
+        <?php endif; ?>
         <?php if (!$homeTimeline): ?>
           <div class="empty">Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</div>
         <?php endif; ?>
@@ -12291,12 +12563,13 @@ function admin_render_home_suggestions(array $suggestions): void
               }
               admin_render_timeline_item($item, $followingIds, 'home');
               // Placeholder after a few posts; filled async so Home first paint stays light.
-              if ($homeIndex === 5) {
+              // Onboarding already places suggestions above the feed.
+              if (empty($homeOnboard['active']) && $homeIndex === 5) {
                   echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
               }
             ?>
           <?php endforeach; ?>
-          <?php if (count($homePage) < 6): ?>
+          <?php if (empty($homeOnboard['active']) && count($homePage) < 6): ?>
             <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
           <?php endif; ?>
         </div>
@@ -12427,7 +12700,7 @@ function admin_render_home_suggestions(array $suggestions): void
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
                     $favPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions) . '</div>'
+                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
                         : ''
                 );
               ?>
@@ -12526,7 +12799,7 @@ function admin_render_home_suggestions(array $suggestions): void
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
                     $bmPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions) . '</div>'
+                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
                         : ''
                 );
               ?>
@@ -13062,42 +13335,156 @@ function admin_render_home_suggestions(array $suggestions): void
           </div>
           <input name="reason" type="text" maxlength="500" placeholder="Optional note (spam, harassment, …)">
           <div class="composer-actions">
-            <span class="meta"><?= count($blocks) ?> controls · block/suspend = reject federation (403); mute = hide only</span>
+            <?php
+              $blockActors = [];
+              $blockDomains = [];
+              foreach ($blocks as $b) {
+                  if (($b['scope'] ?? '') === 'domain') {
+                      $blockDomains[] = $b;
+                  } else {
+                      $blockActors[] = $b;
+                  }
+              }
+            ?>
+            <span class="meta"><?= count($blockActors) ?> users · <?= count($blockDomains) ?> servers · block/suspend = 403; mute = hide only</span>
             <button class="btn btn-primary" type="submit">Add control</button>
           </div>
         </form>
 
-        <h2 style="font-size:1rem;margin:1.25rem 0 .5rem">Server-wide user &amp; domain controls</h2>
-        <?php if (!$blocks): ?>
-          <div class="empty">No server blocks yet.</div>
-        <?php endif; ?>
-        <?php foreach ($blocks as $b): ?>
-          <article class="tweet">
-            <div class="tweet-hd">
-              <div>
-                <span class="who"><?= h((string) $b['value']) ?></span>
-                <span class="meta"> · <?= h((string) $b['scope']) ?> · <?= h((string) $b['kind']) ?> · <?= h(relative_time((string) $b['created_at'])) ?></span>
+        <?php
+          // $blockActors / $blockDomains already split above for the composer summary.
+          $renderServerBlockRow = static function (array $b): void {
+              $scope = (string) ($b['scope'] ?? 'actor');
+              $value = (string) ($b['value'] ?? '');
+              $kind = (string) ($b['kind'] ?? 'block');
+              $reason = trim((string) ($b['reason'] ?? ''));
+              $who = $value;
+              $handle = '';
+              if ($scope === 'actor' && $value !== '') {
+                  if (function_exists('actor_display_name')) {
+                      $who = actor_display_name($value) ?: $value;
+                  }
+                  if (function_exists('actor_handle')) {
+                      $handle = actor_handle($value);
+                  }
+              }
+              $searchBlob = strtolower(trim(implode(' ', array_filter([
+                  $value,
+                  $who,
+                  $handle,
+                  $kind,
+                  $scope,
+                  $reason,
+                  '#' . (string) ((int) ($b['id'] ?? 0)),
+              ]))));
+              ?>
+              <article class="tweet blocks-row" data-search="<?= h($searchBlob) ?>">
+                <div class="tweet-hd">
+                  <div style="min-width:0">
+                    <span class="who" style="overflow-wrap:anywhere"><?= h($who) ?></span>
+                    <?php if ($handle !== '' && $handle !== $who): ?>
+                      <span class="meta"> <?= h($handle) ?></span>
+                    <?php elseif ($scope === 'domain'): ?>
+                      <span class="meta"> server</span>
+                    <?php endif; ?>
+                    <span class="meta"> · <?= h($kind) ?> · <?= h(relative_time((string) ($b['created_at'] ?? ''))) ?></span>
+                  </div>
+                  <div class="meta">#<?= (int) ($b['id'] ?? 0) ?></div>
+                </div>
+                <?php if ($scope === 'actor' && $value !== '' && $who !== $value): ?>
+                  <div class="mono meta" style="margin-top:.25rem;overflow-wrap:anywhere"><?= h($value) ?></div>
+                <?php endif; ?>
+                <?php if ($reason !== ''): ?>
+                  <div class="body meta"><?= h($reason) ?></div>
+                <?php endif; ?>
+                <div class="tweet-actions">
+                  <form method="post" action="?view=blocks" style="display:inline">
+                    <input type="hidden" name="action" value="unblock">
+                    <input type="hidden" name="id" value="<?= (int) ($b['id'] ?? 0) ?>">
+                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Remove</button>
+                  </form>
+                  <?php if ($scope === 'actor'): ?>
+                    <a href="?view=remote_profile&amp;actor=<?= urlencode($value) ?>&amp;from=blocks">Profile</a>
+                    <a href="<?= h($value) ?>" target="_blank" rel="noopener noreferrer">Open</a>
+                  <?php else: ?>
+                    <a href="https://<?= h($value) ?>/" target="_blank" rel="noopener noreferrer">Open host</a>
+                  <?php endif; ?>
+                </div>
+              </article>
+              <?php
+          };
+        ?>
+
+        <details class="blocks-section"<?= count($blockActors) <= 80 ? ' open' : '' ?> data-blocks-section="actors">
+          <summary>
+            <span class="who">Blocked users</span>
+            <span class="tag" data-blocks-count><?= count($blockActors) ?></span>
+            <span class="meta">server-wide actor controls</span>
+          </summary>
+          <div class="blocks-section-body">
+            <div class="blocks-section-search">
+              <input type="search" data-blocks-filter placeholder="Search users, handles, URLs, notes…" aria-label="Search blocked users"<?= $blockActors ? '' : ' disabled' ?>>
+              <span class="meta" data-blocks-visible><?= count($blockActors) ?> shown</span>
+            </div>
+            <?php if (!$blockActors): ?>
+              <div class="empty">No server-wide user controls yet.</div>
+            <?php else: ?>
+              <div class="blocks-section-list" data-blocks-list>
+                <?php foreach ($blockActors as $b) { $renderServerBlockRow($b); } ?>
               </div>
-              <div class="meta">#<?= (int) $b['id'] ?></div>
-            </div>
-            <?php if (!empty($b['reason'])): ?>
-              <div class="body meta"><?= h((string) $b['reason']) ?></div>
+              <div class="empty blocks-section-empty">No users match this search.</div>
             <?php endif; ?>
-            <div class="tweet-actions">
-              <form method="post" action="?view=blocks" style="display:inline">
-                <input type="hidden" name="action" value="unblock">
-                <input type="hidden" name="id" value="<?= (int) $b['id'] ?>">
-                <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Unblock</button>
-              </form>
-              <?php if (($b['scope'] ?? '') === 'actor'): ?>
-                <a href="?view=remote_profile&amp;actor=<?= urlencode((string) $b['value']) ?>&amp;from=blocks">Profile</a>
-                <a href="<?= h((string) $b['value']) ?>" target="_blank" rel="noopener noreferrer">Open</a>
-              <?php else: ?>
-                <a href="https://<?= h((string) $b['value']) ?>/" target="_blank" rel="noopener noreferrer">Open host</a>
-              <?php endif; ?>
+          </div>
+        </details>
+
+        <details class="blocks-section"<?= count($blockDomains) <= 80 ? ' open' : '' ?> data-blocks-section="domains">
+          <summary>
+            <span class="who">Blocked servers</span>
+            <span class="tag" data-blocks-count><?= count($blockDomains) ?></span>
+            <span class="meta">server-wide domain controls — click to expand</span>
+          </summary>
+          <div class="blocks-section-body">
+            <div class="blocks-section-search">
+              <input type="search" data-blocks-filter placeholder="Search domains, notes…" aria-label="Search blocked servers"<?= $blockDomains ? '' : ' disabled' ?>>
+              <span class="meta" data-blocks-visible><?= count($blockDomains) ?> shown</span>
             </div>
-          </article>
-        <?php endforeach; ?>
+            <?php if (!$blockDomains): ?>
+              <div class="empty">No server-wide domain controls yet.</div>
+            <?php else: ?>
+              <div class="blocks-section-list" data-blocks-list>
+                <?php foreach ($blockDomains as $b) { $renderServerBlockRow($b); } ?>
+              </div>
+              <div class="empty blocks-section-empty">No servers match this search.</div>
+            <?php endif; ?>
+          </div>
+        </details>
+        <script>
+        (function () {
+          document.querySelectorAll('[data-blocks-section]').forEach((section) => {
+            const input = section.querySelector('[data-blocks-filter]');
+            const list = section.querySelector('[data-blocks-list]');
+            const visibleEl = section.querySelector('[data-blocks-visible]');
+            if (!input || !list) return;
+            const rows = Array.from(list.querySelectorAll('.blocks-row'));
+            const apply = () => {
+              const q = String(input.value || '').trim().toLowerCase();
+              let shown = 0;
+              rows.forEach((row) => {
+                const hay = row.getAttribute('data-search') || '';
+                const ok = !q || hay.includes(q);
+                row.hidden = !ok;
+                if (ok) shown += 1;
+              });
+              list.classList.toggle('is-empty', shown === 0);
+              if (visibleEl) {
+                visibleEl.textContent = shown + ' shown';
+              }
+            };
+            input.addEventListener('input', apply);
+            input.addEventListener('search', apply);
+          });
+        })();
+        </script>
 
       <?php elseif ($view === 'users'): ?>
         <?php if (empty($vaakIsAdmin)): ?>
@@ -13930,6 +14317,23 @@ function admin_render_home_suggestions(array $suggestions): void
         <?php
           $bskyRow = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($vaakOwnerId) : null;
           $bskyHandle = is_array($bskyRow) ? (string) ($bskyRow['handle'] ?? '') : '';
+          $bskyPds = is_array($bskyRow)
+              ? rtrim((string) ($bskyRow['pds_host'] ?? ''), '/')
+              : '';
+          if ($bskyPds === '') {
+              $bskyPds = defined('AP_BSKY_DEFAULT_PDS') ? (string) AP_BSKY_DEFAULT_PDS : 'https://bsky.mkultra.monster';
+          }
+          // Detect a dead/expired stored login without a network round-trip when possible.
+          $bskySessionStale = false;
+          if ($bskyHandle !== '' && function_exists('ap_bsky_access_token')) {
+              $probe = ap_bsky_access_token($vaakOwnerId, false);
+              if (empty($probe['ok'])) {
+                  $bskySessionStale = true;
+                  // Fatal expiry clears the row — re-read so the full connect form shows.
+                  $bskyRow = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($vaakOwnerId) : null;
+                  $bskyHandle = is_array($bskyRow) ? (string) ($bskyRow['handle'] ?? '') : '';
+              }
+          }
         ?>
         <div class="tweet" style="margin-top:1rem">
           <div class="tweet-hd"><div class="who">Bluesky</div></div>
@@ -13937,14 +14341,22 @@ function admin_render_home_suggestions(array $suggestions): void
             Optional Bluesky home timeline in VAAK via a native Bluesky / PDS login.
             Connected accounts mirror your VAAK <b>avatar</b>, <b>header</b>, and <b>bio</b>
             (long bios are truncated with a link to your full HTML profile).
-            Create an app password under
-            <a href="https://bsky.app/settings/app-passwords" target="_blank" rel="noopener noreferrer">Bluesky settings</a>
-            (or use your <code>bsky.mkultra.monster</code> account password).
+            Use an
+            <a href="https://bsky.app/settings/app-passwords" target="_blank" rel="noopener noreferrer">app password</a>
+            for <code>*.bsky.social</code>, or your account password for
+            <code>bsky.mkultra.monster</code>.
+            After a PDS password reset, re-enter the password below so mirrors work again.
           </div>
           <?php if ($bskyHandle !== ''): ?>
             <div class="meta" style="margin:.5rem 0">Connected as <b>@<?= h($bskyHandle) ?></b>
               · <a href="?view=bluesky">Open Bluesky tab</a>
             </div>
+            <?php if ($bskySessionStale): ?>
+              <div class="notice" style="margin:.5rem 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+                Bluesky login looks expired (common after a password reset). Enter your
+                password below to refresh the session — posts will not mirror until you do.
+              </div>
+            <?php endif; ?>
             <div style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.5rem">
               <form method="post" action="?view=profile" style="display:inline">
                 <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
@@ -13959,7 +14371,39 @@ function admin_render_home_suggestions(array $suggestions): void
                 <button class="btn btn-ghost" type="submit">Disconnect Bluesky</button>
               </form>
             </div>
+            <form class="composer" method="post" action="?view=profile" style="margin-top:1rem">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <input type="hidden" name="action" value="bsky_connect">
+              <input type="hidden" name="return_view" value="profile">
+              <div class="meta" style="margin-bottom:.55rem">
+                <b>Update Bluesky login</b> — after a password reset or if mirrors stop,
+                paste your account password (or a Bluesky app password) here.
+              </div>
+              <div style="display:block;max-width:22rem;margin:0 0 .85rem">
+                <label for="bsky-handle-reconnect" style="display:block;margin:0 0 .3rem">Handle</label>
+                <input id="bsky-handle-reconnect" name="bsky_handle" type="text" required autocomplete="username"
+                       value="<?= h($bskyHandle) ?>" placeholder="you.bsky.social" style="max-width:22rem;margin-top:0">
+              </div>
+              <div style="display:block;max-width:22rem;margin:0 0 .85rem">
+                <label for="bsky-password-reconnect" style="display:block;margin:0 0 .3rem">Password</label>
+                <input id="bsky-password-reconnect" name="bsky_app_password" type="password" required autocomplete="current-password"
+                       placeholder="Account password or app password" style="max-width:22rem;margin-top:0">
+              </div>
+              <div style="display:block;max-width:22rem;margin:0 0 .5rem">
+                <label for="bsky-pds-reconnect" style="display:block;margin:0 0 .3rem">PDS</label>
+                <input id="bsky-pds-reconnect" name="bsky_pds" type="url" value="<?= h($bskyPds) ?>"
+                       placeholder="https://bsky.mkultra.monster" style="max-width:22rem;margin-top:0">
+              </div>
+              <div class="composer-actions" style="margin-top:.75rem">
+                <button class="btn btn-primary" type="submit">Update Bluesky login</button>
+              </div>
+            </form>
           <?php else: ?>
+            <?php if ($bskySessionStale): ?>
+              <div class="notice" style="margin:.5rem 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+                Previous Bluesky session was cleared after it expired. Connect again below.
+              </div>
+            <?php endif; ?>
             <form class="composer" method="post" action="?view=profile" style="margin-top:.75rem">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="bsky_connect">
@@ -13970,9 +14414,9 @@ function admin_render_home_suggestions(array $suggestions): void
                        placeholder="you.bsky.social" style="max-width:22rem;margin-top:0">
               </div>
               <div style="display:block;max-width:22rem;margin:0 0 .85rem">
-                <label for="bsky-app-password" style="display:block;margin:0 0 .3rem">App password</label>
-                <input id="bsky-app-password" name="bsky_app_password" type="password" required autocomplete="new-password"
-                       placeholder="xxxx-xxxx-xxxx-xxxx" style="max-width:22rem;margin-top:0">
+                <label for="bsky-app-password" style="display:block;margin:0 0 .3rem">Password</label>
+                <input id="bsky-app-password" name="bsky_app_password" type="password" required autocomplete="current-password"
+                       placeholder="Account password or app password" style="max-width:22rem;margin-top:0">
               </div>
               <div style="display:block;max-width:22rem;margin:0 0 .5rem">
                 <label for="bsky-pds" style="display:block;margin:0 0 .3rem">PDS</label>
@@ -15041,7 +15485,7 @@ function admin_render_home_suggestions(array $suggestions): void
                   <div>
                     <span class="who"><?= h($display) ?></span>
                     <?php if ($acct !== ''): ?>
-                      <span class="meta"> @<?= h($acct) ?></span>
+                      <span class="meta"> <?= h(admin_at_acct($acct)) ?></span>
                     <?php endif; ?>
                     <span class="tag"><?= h($srcLabel) ?></span>
                   </div>
@@ -15914,17 +16358,23 @@ function admin_render_home_suggestions(array $suggestions): void
                   }
               } elseif (!$rpIsBsky) {
                   $rpMeta = $rpActor !== '' ? ap_remote_actor_get($rpActor) : null;
-                  // Cache-first: only sync-fetch AS2 on miss or explicit Refresh (was every open).
+                  // Cache-first: only sync-fetch AS2 on miss, snowflake placeholder, or Refresh.
+                  $rpUserCached = is_array($rpMeta) ? trim((string) ($rpMeta['username'] ?? '')) : '';
+                  $rpUserPlaceholder = $rpUserCached === ''
+                      || (function_exists('ap_remote_actor_username_is_placeholder')
+                          && ap_remote_actor_username_is_placeholder($rpUserCached));
                   $rpNeedFetch = $rpActor !== ''
                       && function_exists('ap_fetch_as2_object')
-                      && ($rpForceRefresh || !is_array($rpMeta) || empty($rpMeta['username']));
+                      && ($rpForceRefresh || !is_array($rpMeta) || $rpUserPlaceholder);
                   if ($rpNeedFetch) {
                       $rpDoc = ap_fetch_as2_object($rpActor);
                       if (is_array($rpDoc)) {
                           // Cache/refresh basic fields
                           $uname = null;
                           if (!empty($rpDoc['preferredUsername']) && is_string($rpDoc['preferredUsername'])) {
-                              $uname = $rpDoc['preferredUsername'];
+                              $uname = function_exists('ap_remote_actor_normalize_username')
+                                  ? ap_remote_actor_normalize_username($rpDoc['preferredUsername'])
+                                  : ltrim(trim($rpDoc['preferredUsername']), '@');
                           }
                           $dname = null;
                           if (!empty($rpDoc['name']) && is_string($rpDoc['name'])) {
@@ -15947,13 +16397,26 @@ function admin_render_home_suggestions(array $suggestions): void
                               }
                           }
                           try {
-                              ap_remote_actor_upsert($rpActor, [
+                              $rpHost = parse_url($rpActor, PHP_URL_HOST) ?: null;
+                              $rpHost = is_string($rpHost) ? strtolower($rpHost) : null;
+                              $fields = [
                                   'username' => $uname,
                                   'display_name' => $dname,
-                                  'host' => parse_url($rpActor, PHP_URL_HOST) ?: null,
+                                  'host' => $rpHost,
                                   'icon_source_url' => $icon,
                                   'image_source_url' => $image,
-                              ]);
+                              ];
+                              ap_remote_actor_upsert($rpActor, $fields);
+                              // Mastodon dual IRI: also cache /users/{preferredUsername}
+                              // so timelines that only saw /ap/users/{snowflake} resolve.
+                              if (is_string($uname) && $uname !== '' && $rpHost !== ''
+                                  && !(function_exists('ap_remote_actor_username_is_placeholder')
+                                      && ap_remote_actor_username_is_placeholder($uname))) {
+                                  $canon = 'https://' . $rpHost . '/users/' . rawurlencode($uname);
+                                  if (rtrim($canon, '/') !== rtrim($rpActor, '/')) {
+                                      ap_remote_actor_upsert($canon, $fields);
+                                  }
+                              }
                               if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
                                   ap_remote_emoji_ingest_actor_doc($rpActor, $rpDoc);
                               }
@@ -16111,6 +16574,11 @@ function admin_render_home_suggestions(array $suggestions): void
             </div>
           </article>
           <?php else: ?>
+          <?php if (!$rpIsBsky && !$rpIsLocal && !$rpIsOwn && !$rpFollowing && isset($_GET['intent']) && (string) $_GET['intent'] === 'follow'): ?>
+            <div class="notice" style="margin:0 0 .75rem;padding:.65rem .8rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+              Remote follow request — confirm with <b>Follow</b> below to follow this account from your VAAK actor.
+            </div>
+          <?php endif; ?>
           <?php if ($rpHeader): ?>
             <div style="height:120px;border-radius:12px;overflow:hidden;margin-bottom:.75rem;background:#111">
               <img src="<?= h((string) $rpHeader) ?>" alt="" style="width:100%;height:100%;object-fit:cover" loading="lazy" referrerpolicy="no-referrer">
@@ -16215,6 +16683,15 @@ function admin_render_home_suggestions(array $suggestions): void
                 <?= block_quick_actions($rpActor, short_host($rpActor), 'remote_profile', $vaakOwnerId, !empty($vaakIsAdmin), $rpFrom) ?>
               <?php endif; ?>
               <a href="<?= h($rpIsBsky ? $rpActor : admin_remote_actor_href($rpActor)) ?>" target="_blank" rel="noopener noreferrer"><?= $rpIsBsky ? 'Open on Bluesky' : h(admin_open_profile_label($rpActor)) ?></a>
+              <?php if (!$rpIsBsky && !$rpIsLocal && !$rpIsOwn): ?>
+                <?php
+                  $rpRemoteFollowHref = admin_remote_actor_href(
+                      $rpActor,
+                      is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null
+                  );
+                ?>
+                <a href="<?= h($rpRemoteFollowHref) ?>" target="_blank" rel="noopener noreferrer" title="Opens their instance’s profile — use Follow Remotely there with your @user@mkultra.monster address">Follow on their instance</a>
+              <?php endif; ?>
             </div>
           </article>
           <h2 style="font-size:1rem;margin:1.25rem 0 .5rem"><?= $rpIsBsky ? 'Recent Bluesky posts' : ($rpIsLocal ? 'Recent posts' : 'Recent posts we’ve seen on this instance') ?></h2>
@@ -16491,26 +16968,84 @@ function admin_render_home_suggestions(array $suggestions): void
         <?php endforeach; ?>
 
       <?php elseif ($view === 'stats'): ?>
-        <div class="stat-grid">
-          <div class="stat"><div class="n"><?= $total24 ?></div><div class="l">Events (24h)</div></div>
-          <div class="stat"><div class="n"><?= $total7 ?></div><div class="l">Events (7d)</div></div>
-          <div class="stat"><div class="n"><?= count($followers) ?></div><div class="l">Followers</div></div>
-          <div class="stat"><div class="n"><?= count($mentions) ?></div><div class="l">Open mentions</div></div>
+        <div class="meta" style="margin-bottom:.85rem">
+          Instance-wide ActivityPub stats across <b>all local users</b>, plus the shared federation firehose.
         </div>
+        <div class="stat-grid">
+          <div class="stat"><div class="n"><?= (int) $statsLocalUsersActive ?></div><div class="l">Active local users</div></div>
+          <div class="stat"><div class="n"><?= (int) $statsLocalUsers ?></div><div class="l">Local accounts</div></div>
+          <div class="stat"><div class="n"><?= (int) $statsLocalPosts ?></div><div class="l">Local posts</div></div>
+          <div class="stat"><div class="n"><?= (int) $statsFollowersAll ?></div><div class="l">Followers (all users)</div></div>
+          <div class="stat"><div class="n"><?= (int) $statsFollowingAll ?></div><div class="l">Following (all users)</div></div>
+          <div class="stat"><div class="n"><?= (int) $statsMentionsOpen ?></div><div class="l">Open mentions (all)</div></div>
+          <div class="stat"><div class="n"><?= (int) $total24 ?></div><div class="l">Firehose events (24h)</div></div>
+          <div class="stat"><div class="n"><?= (int) $total7 ?></div><div class="l">Firehose events (7d)</div></div>
+        </div>
+
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Local users</h3>
+          <?php if (!$statsUserRows): ?>
+            <div class="empty">No local users found.</div>
+          <?php else: ?>
+            <div style="overflow-x:auto">
+              <table style="width:100%;border-collapse:collapse;font-size:.88rem">
+                <thead>
+                  <tr class="meta" style="text-align:left">
+                    <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">User</th>
+                    <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Posts</th>
+                    <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Followers</th>
+                    <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Following</th>
+                    <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Mentions</th>
+                    <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Flags</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <?php foreach ($statsUserRows as $su): ?>
+                    <tr>
+                      <td style="padding:.4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent);overflow-wrap:anywhere">
+                        <span class="who">@<?= h((string) $su['username']) ?></span>
+                      </td>
+                      <td style="padding:.4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $su['posts'] ?></td>
+                      <td style="padding:.4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $su['followers'] ?></td>
+                      <td style="padding:.4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $su['following'] ?></td>
+                      <td style="padding:.4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $su['mentions'] ?></td>
+                      <td style="padding:.4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)" class="meta">
+                        <?php
+                          $flags = [];
+                          if (!empty($su['is_admin'])) {
+                              $flags[] = 'admin';
+                          }
+                          if (!empty($su['disabled'])) {
+                              $flags[] = 'disabled';
+                          }
+                          echo $flags ? h(implode(' · ', $flags)) : '—';
+                        ?>
+                      </td>
+                    </tr>
+                  <?php endforeach; ?>
+                </tbody>
+              </table>
+            </div>
+          <?php endif; ?>
+        </div>
+
         <div class="side-card">
-          <h3>Activity types (24h)</h3>
+          <h3>Activity types (24h firehose)</h3>
+          <?php if (!$typeRows): ?>
+            <div class="empty">No events in the last 24h.</div>
+          <?php endif; ?>
           <?php foreach ($typeRows as $r): ?>
             <div class="bar-row"><span><?= h($r['type']) ?></span><span><?= (int) $r['c'] ?></span></div>
           <?php endforeach; ?>
         </div>
         <div class="side-card">
-          <h3>Actions (24h)</h3>
+          <h3>Actions (24h firehose)</h3>
           <?php foreach ($actionRows as $r): ?>
             <div class="bar-row"><span><?= h((string) $r['action_taken']) ?></span><span><?= (int) $r['c'] ?></span></div>
           <?php endforeach; ?>
         </div>
         <div class="side-card">
-          <h3>Top hosts (24h)</h3>
+          <h3>Top hosts (24h firehose)</h3>
           <?php foreach ($hostRows as $r): ?>
             <div class="bar-row"><span><?= h((string) $r['host']) ?></span><span><?= (int) $r['c'] ?></span></div>
           <?php endforeach; ?>
@@ -18196,6 +18731,9 @@ window.apAdminToast = function (msg, isErr) {
   let pendingCount = 0;
   let pollBusy = false;
   let tabSwapBusy = false;
+  // ↑ button: ignore infinite-scroll fights until the user leaves the top (or pin expires).
+  let stickToTop = false;
+  let stickToTopTimer = 0;
   const POLL_MS = 120000;
   const AT_TOP_PX = 120;
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
@@ -18410,8 +18948,21 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  function armStickToTop() {
+    stickToTop = true;
+    if (stickToTopTimer) window.clearTimeout(stickToTopTimer);
+    // Keep the pin long enough to outlast an in-flight loadMore + smooth scroll.
+    stickToTopTimer = window.setTimeout(() => {
+      stickToTop = false;
+      stickToTopTimer = 0;
+    }, 2000);
+  }
+
   async function loadMore() {
     if (!hasMore || loading) return;
+    // Don't keep paging while the user is explicitly going back to the top —
+    // that was yanking the viewport back to the sentinel in a loop.
+    if (stickToTop) return;
     loading = true;
     const skeleton = document.createElement('div');
     skeleton.className = 'timeline-skeleton';
@@ -18419,9 +18970,6 @@ window.apAdminToast = function (msg, isErr) {
     skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
     if (status && status.parentNode) status.parentNode.insertBefore(skeleton, status);
     if (status) status.textContent = 'Loading…';
-    // Capture scroll anchor before append so desktop .feed scroll doesn't jump.
-    const prevTop = sc.top();
-    const prevHeight = sc.height();
     try {
       // A page may render no HTML when every row was filtered or deduplicated.
       // Keep the pagination cursor independent from rendered card count (as
@@ -18429,6 +18977,7 @@ window.apAdminToast = function (msg, isErr) {
       let attempts = 0;
       let inserted = false;
       while (hasMore && attempts < 4) {
+        if (stickToTop) break;
         attempts++;
         let url;
         if (isNotifTimeline) {
@@ -18483,14 +19032,11 @@ window.apAdminToast = function (msg, isErr) {
           items.dataset.offset = String(offset);
         }
         if (html.trim()) {
+          // Append-only: do NOT "restore" scroll after the await. That fought the
+          // ↑ button — user scrolls up during loadMore, then we yanked them back
+          // to the sentinel and IntersectionObserver looped.
           items.insertAdjacentHTML('beforeend', html);
           inserted = true;
-          // Keep visual place: if scroll container grew upward relative to the
-          // viewport (rare), compensate; otherwise stay where you were reading.
-          const delta = sc.height() - prevHeight;
-          if (delta > 0 && sc.top() + 2 < prevTop) {
-            sc.setTop(prevTop + delta, false);
-          }
           if (typeof window.novaEnhanceTweetFolds === 'function') {
             window.novaEnhanceTweetFolds(items);
           }
@@ -18517,10 +19063,14 @@ window.apAdminToast = function (msg, isErr) {
     } finally {
       if (skeleton && skeleton.parentNode) skeleton.remove();
       loading = false;
+      if (stickToTop) {
+        sc.setTop(0, false);
+      }
     }
   }
 
   let io = new IntersectionObserver((entries) => {
+    if (stickToTop) return;
     if (entries.some((en) => en.isIntersecting)) loadMore();
   }, { root: sc.ioRoot, rootMargin: '180px', threshold: 0 });
   io.observe(sentinel);
@@ -18532,6 +19082,7 @@ window.apAdminToast = function (msg, isErr) {
     io.disconnect();
     sc = next;
     io = new IntersectionObserver((entries) => {
+      if (stickToTop) return;
       if (entries.some((en) => en.isIntersecting)) loadMore();
     }, { root: sc.ioRoot, rootMargin: '180px', threshold: 0 });
     io.observe(sentinel);
@@ -18541,20 +19092,37 @@ window.apAdminToast = function (msg, isErr) {
 
   function updateTopBtn() {
     if (!topBtn) return;
-    if (sc.top() > 280) topBtn.classList.add('show');
+    const y = sc.top();
+    if (y > 280) topBtn.classList.add('show');
     else topBtn.classList.remove('show');
+    // User scrolled away from the top on purpose — drop the pin.
+    if (stickToTop && y > NEAR_TOP_PX + 80) {
+      stickToTop = false;
+      if (stickToTopTimer) {
+        window.clearTimeout(stickToTopTimer);
+        stickToTopTimer = 0;
+      }
+    }
     updateNewBtn();
   }
   sc.onScroll(updateTopBtn);
   updateTopBtn();
   if (topBtn) {
     topBtn.addEventListener('click', () => {
+      armStickToTop();
       insertPending({ scrollToTop: true });
-      sc.setTop(0, true);
+      // Instant first so an in-flight loadMore can't win the race against smooth.
+      sc.setTop(0, false);
+      window.requestAnimationFrame(() => {
+        if (stickToTop) sc.setTop(0, false);
+      });
     });
   }
   if (newBtn) {
-    newBtn.addEventListener('click', () => insertPending({ scrollToTop: true }));
+    newBtn.addEventListener('click', () => {
+      armStickToTop();
+      insertPending({ scrollToTop: true });
+    });
   }
 
   // Bluesky: first paint is Following-only; saved-feed samples load after paint
@@ -20675,6 +21243,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         window.apAdminToast(data.notice || okMsg);
       }
       if (mode === 'reply') playPostAudio();
+      // Capture before we clear fields — replies must not yank the feed to top.
+      const replyToBeforeClear = document.getElementById('compose-in-reply-to');
+      const wasFeedReply = !!(replyToBeforeClear && String(replyToBeforeClear.value || '').trim());
+      const wasQuotePost = data.kind === 'quote'
+        || !!(form.querySelector('input[name="quote_object"]')
+          && String(form.querySelector('input[name="quote_object"]').value || '').trim());
       // Posted/queued — don't re-save as draft on close
       skipDraftOnClose = true;
       if (draftIdField) draftIdField.value = '';
@@ -20717,11 +21291,23 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         return;
       }
       // Soft-insert own post into the live timeline (home newer-poll now includes
-      // outbox_notes). Scroll to top so the card is visible without Refresh.
+      // outbox_notes). New roots/quotes jump to top so the card is visible;
+      // replies stay put so users can keep scrolling the feed.
       if (mode !== 'edit_status' && typeof window.novaPollTimeline === 'function') {
+        const feedEl = document.querySelector('.feed');
+        const savedWindowY = window.scrollY || document.documentElement.scrollTop || 0;
+        const savedFeedTop = feedEl ? feedEl.scrollTop : 0;
         await window.novaPollTimeline();
         if (typeof window.novaInsertPendingTimeline === 'function') {
-          window.novaInsertPendingTimeline({ scrollToTop: true });
+          window.novaInsertPendingTimeline({ scrollToTop: !wasFeedReply });
+        }
+        if (wasFeedReply) {
+          const restore = () => {
+            try { window.scrollTo(0, savedWindowY); } catch (e) {}
+            if (feedEl) feedEl.scrollTop = savedFeedTop;
+          };
+          restore();
+          requestAnimationFrame(restore);
         }
       } else {
         window.location.reload();

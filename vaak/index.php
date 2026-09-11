@@ -207,6 +207,20 @@ if ($isAuthPost) {
         );
         if (!empty($res['ok'])) {
             $next = preg_replace('/[^a-z_]/', '', (string) ($_GET['next'] ?? $_POST['next'] ?? '')) ?: 'home';
+            // Resume /authorize_interaction after login (stashed actor URI).
+            if ($next === 'remote_profile') {
+                ap_auth_start_session();
+                $authUri = (string) ($_SESSION['vaak_authorize_uri'] ?? '');
+                unset($_SESSION['vaak_authorize_uri']);
+                if ($authUri !== '' && str_starts_with($authUri, 'https://')) {
+                    header(
+                        'Location: /vaak/?view=remote_profile&actor=' . rawurlencode($authUri) . '&intent=follow',
+                        true,
+                        302
+                    );
+                    exit;
+                }
+            }
             header('Location: /vaak/?view=' . rawurlencode($next), true, 302);
             exit;
         }
