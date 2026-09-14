@@ -4921,7 +4921,7 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
                AND type IN ('Create', 'Update')
                AND COALESCE(action_taken, '') NOT IN ('deleted', 'blocked', 'rejected')
              ORDER BY created_at ASC
-             LIMIT 80"
+             LIMIT 5000"
         );
         $st->execute();
         $eventChildren = [];
@@ -4968,7 +4968,7 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
              WHERE deleted_at IS NULL
                AND in_reply_to IS NOT NULL
              ORDER BY created_at ASC
-             LIMIT 80"
+             LIMIT 5000"
         );
         $st->execute();
         $mentionChildren = [];
