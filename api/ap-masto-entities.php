@@ -2453,11 +2453,39 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
         return null;
     }
     $existing = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($objectUrl) : null;
+    // PeerTube also emits View events for the same video URL. A generic latest
+    // lookup can therefore hide the older authoritative Create/Update row.
+    $isPeerTubeObject = (bool) preg_match('#/(?:videos/watch|w)/[^/]+$#i', $objectUrl);
+    if ($isPeerTubeObject) {
+        try {
+            $pst = ap_db()->prepare(
+                "SELECT * FROM events
+                 WHERE (object_id = ? OR object_id = ?)
+                   AND type IN ('Create', 'Update')
+                   AND action_taken IN ('log', 'local_observe')
+                 ORDER BY CASE type WHEN 'Create' THEN 0 ELSE 1 END, id DESC
+                 LIMIT 1"
+            );
+            $pst->execute([$objectUrl, $objectUrl . '/']);
+            $peerTubeExisting = $pst->fetch();
+            if (is_array($peerTubeExisting)) {
+                $existing = $peerTubeExisting;
+            }
+        } catch (Throwable $e) {
+            // Keep the generic lookup fallback.
+        }
+    }
     $existingType = is_array($existing) ? strtolower((string) ($existing['type'] ?? '')) : '';
     $isNoteRow = in_array($existingType, ['create', 'update'], true);
-    $needsReplyBackfill = $isNoteRow && empty($existing['in_reply_to']);
+    // PeerTube Video objects are top-level publications, not reply Notes; an
+    // empty in_reply_to must not force a network fetch on every Open.
+    $needsReplyBackfill = $isNoteRow && !$isPeerTubeObject && empty($existing['in_reply_to']);
+    $existingMedia = is_array($existing) ? (string) ($existing['media_urls'] ?? '') : '';
+    $needsPeerTubeMediaBackfill = $isNoteRow
+        && $isPeerTubeObject
+        && ($existingMedia === '' || str_contains($existingMedia, '/static/web-videos/'));
     // Announce/Like stubs are not enough — fetch the real Note when missing.
-    if ($isNoteRow && !$needsReplyBackfill) {
+    if ($isNoteRow && !$needsReplyBackfill && !$needsPeerTubeMediaBackfill) {
         return $existing;
     }
 
@@ -2473,7 +2501,9 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
 
     $doc = ap_fetch_as2_object($objectUrl);
     if (!is_array($doc)) {
-        return null;
+        // A slow/unavailable remote must not erase an otherwise usable cached
+        // focus post. PeerTube transcoding endpoints can be particularly slow.
+        return $isNoteRow ? $existing : null;
     }
     if (($doc['type'] ?? '') === 'Create' && isset($doc['object']) && is_array($doc['object'])) {
         $doc = $doc['object'];
@@ -2489,6 +2519,16 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
     $actorId = null;
     if (function_exists('ap_as_id')) {
         $actorId = ap_as_id($doc['attributedTo'] ?? null) ?: ap_as_id($doc['actor'] ?? null);
+        // PeerTube attributes Videos to both an account and a channel.
+        if ((!is_string($actorId) || $actorId === '') && is_array($doc['attributedTo'] ?? null)) {
+            foreach ($doc['attributedTo'] as $attributed) {
+                $candidateActor = ap_as_id($attributed);
+                if (is_string($candidateActor) && str_starts_with($candidateActor, 'https://')) {
+                    $actorId = $candidateActor;
+                    break;
+                }
+            }
+        }
     }
     if (!is_string($actorId) || !str_starts_with($actorId, 'https://')) {
         return null;
@@ -2519,6 +2559,22 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
     $published = (!empty($doc['published']) && is_string($doc['published'])) ? $doc['published'] : null;
     $oid = function_exists('ap_as_id') ? (ap_as_id($doc['id'] ?? null) ?: $objectUrl) : $objectUrl;
     $oid = rtrim((string) $oid, '/');
+
+    // Repair older PeerTube rows that cached the first advertised web-video
+    // MP4, which may be explicitly audio-only. The extractor now selects an
+    // audio+video rendition nested under the HLS master link.
+    if ($needsPeerTubeMediaBackfill && function_exists('ap_events_refresh_create_from_update')) {
+        ap_events_refresh_create_from_update(
+            $oid,
+            is_string($summary) ? $summary : null,
+            is_array($media) ? $media : null,
+            $inReplyTo,
+            '',
+            !empty($doc['sensitive']),
+            'public'
+        );
+        return function_exists('ap_event_by_object_id') ? ap_event_by_object_id($oid) : $existing;
+    }
 
     ap_metrics_record(
         'Create',
@@ -5346,6 +5402,48 @@ function ap_timeline_author_diversity(array $statuses, int $limit): array
     return $out;
 }
 
+/**
+ * Collapse PeerTube's account Create + immediate video-channel Announce into
+ * the original status for Mastodon-compatible timelines.
+ *
+ * @param array<string,mixed> $row
+ * @return array<string,mixed>
+ */
+function ap_masto_peertube_prefer_create_event(array $row): array
+{
+    if (strcasecmp((string) ($row['type'] ?? ''), 'Announce') !== 0) {
+        return $row;
+    }
+    $objectId = rtrim((string) ($row['object_id'] ?? ''), '/');
+    $actorId = rtrim((string) ($row['actor_id'] ?? ''), '/');
+    if (
+        $objectId === '' || $actorId === ''
+        || !preg_match('#/(?:videos/watch|w)/[^/]+$#i', $objectId)
+        || !str_contains((string) (parse_url($actorId, PHP_URL_PATH) ?: ''), '/video-channels/')
+        || strcasecmp((string) parse_url($objectId, PHP_URL_HOST), (string) parse_url($actorId, PHP_URL_HOST)) !== 0
+    ) {
+        return $row;
+    }
+    static $memo = [];
+    if (!array_key_exists($objectId, $memo)) {
+        try {
+            $st = ap_db()->prepare(
+                "SELECT * FROM events
+                 WHERE (object_id = ? OR object_id = ?)
+                   AND type = 'Create'
+                   AND action_taken IN ('log', 'local_observe')
+                 ORDER BY id DESC LIMIT 1"
+            );
+            $st->execute([$objectId, $objectId . '/']);
+            $found = $st->fetch();
+            $memo[$objectId] = is_array($found) ? $found : false;
+        } catch (Throwable $e) {
+            $memo[$objectId] = false;
+        }
+    }
+    return is_array($memo[$objectId]) ? $memo[$objectId] : $row;
+}
+
 function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId = null, ?string $sinceId = null, bool $onlyMedia = false): array
 {
     $startedAt = microtime(true);
@@ -5493,6 +5591,14 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // Federated only needs a small overflow for diversity — converting 2×limit was expensive.
     $hydrateCap = $mode === 'home' ? $limit : min(count($rows), $limit + 8);
     foreach ($rows as $row) {
+        $sourceRow = $row;
+        if ($mode === 'home') {
+            if (ap_timeline_row_is_hidden($sourceRow, $ownerUserId)) {
+                $hiddenCount++;
+                continue;
+            }
+            $row = ap_masto_peertube_prefer_create_event($row);
+        }
         // Apply the authenticated user's personal blocks and mutes to both
         // sides of a boost: the booster and the original author. This mirrors
         // Mastodon timeline behavior and prevents blocked originals returning

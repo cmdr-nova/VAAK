@@ -3393,19 +3393,56 @@ function ap_extract_media_urls(mixed $object): array
             return $node['url']['href'];
         }
         $candidates = [];
-        foreach ($node['url'] as $u) {
+        $nodeType = strtolower((string) ($node['type'] ?? ''));
+        $collect = static function (mixed $u) use (&$collect, &$candidates, $nodeType): void {
             if (is_string($u) && str_starts_with($u, 'https://')) {
-                $candidates[] = ['href' => $u, 'mediaType' => '', 'name' => ''];
-                continue;
+                $candidates[] = [
+                    'href' => $u, 'mediaType' => '', 'name' => '',
+                    'width' => 0, 'height' => 0, 'audio_only' => false, 'has_video' => false,
+                ];
+                return;
             }
-            if (!is_array($u) || empty($u['href']) || !is_string($u['href'])) {
-                continue;
+            if (!is_array($u)) {
+                return;
             }
-            $candidates[] = [
-                'href' => $u['href'],
-                'mediaType' => strtolower((string) ($u['mediaType'] ?? '')),
-                'name' => strtolower((string) ($u['name'] ?? '')),
-            ];
+            $href = isset($u['href']) && is_string($u['href']) ? $u['href'] : '';
+            if ($href !== '' && str_starts_with($href, 'https://')) {
+                $codecTypes = [];
+                $props = $u['attachment'] ?? [];
+                if (is_array($props) && isset($props['type'])) {
+                    $props = [$props];
+                }
+                if (is_array($props)) {
+                    foreach ($props as $prop) {
+                        if (!is_array($prop) || strtolower((string) ($prop['name'] ?? '')) !== 'ffprobe_codec_type') {
+                            continue;
+                        }
+                        $codec = strtolower(trim((string) ($prop['value'] ?? '')));
+                        if ($codec !== '') {
+                            $codecTypes[$codec] = true;
+                        }
+                    }
+                }
+                $candidates[] = [
+                    'href' => $href,
+                    'mediaType' => strtolower((string) ($u['mediaType'] ?? '')),
+                    'name' => strtolower((string) ($u['name'] ?? '')),
+                    'width' => max(0, (int) ($u['width'] ?? 0)),
+                    'height' => max(0, (int) ($u['height'] ?? 0)),
+                    // PeerTube can advertise an audio-only fallback as video/mp4.
+                    'audio_only' => $nodeType === 'video' && isset($codecTypes['audio']) && !isset($codecTypes['video']),
+                    'has_video' => isset($codecTypes['video']),
+                ];
+            }
+            // PeerTube nests its real HLS renditions under the master Link's tag.
+            if ($nodeType === 'video' && is_array($u['tag'] ?? null)) {
+                foreach ($u['tag'] as $nested) {
+                    $collect($nested);
+                }
+            }
+        };
+        foreach ($node['url'] as $u) {
+            $collect($u);
         }
         if ($candidates === []) {
             return null;
@@ -3432,6 +3469,15 @@ function ap_extract_media_urls(mixed $object): array
             }
             if (preg_match('/\.(mp4|webm|mov|m4v)(\?|#|$)/i', $href)) {
                 $s += 15;
+            }
+            if (!empty($c['width']) && !empty($c['height'])) {
+                $s += 60;
+            }
+            if (!empty($c['has_video'])) {
+                $s += 50;
+            }
+            if (!empty($c['audio_only'])) {
+                $s -= 120;
             }
             return $s;
         };

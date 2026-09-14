@@ -4033,6 +4033,51 @@ function admin_mark_dual_publish_seen(array &$seen, string $objectId): void
 }
 
 /**
+ * PeerTube publishes a Video Create from the account and immediately Announces
+ * the same object from its video-channel actor. Treat that pair as one original
+ * post while retaining the Announce when no matching Create reached us.
+ *
+ * @param array<string,mixed> $event
+ * @return array<string,mixed>
+ */
+function admin_peertube_prefer_create(array $event): array
+{
+    if (strcasecmp((string) ($event['type'] ?? ''), 'Announce') !== 0) {
+        return $event;
+    }
+    $objectId = rtrim((string) ($event['object_id'] ?? ''), '/');
+    $actorId = rtrim((string) ($event['actor_id'] ?? ''), '/');
+    if (
+        $objectId === '' || $actorId === ''
+        || !preg_match('#/(?:videos/watch|w)/[^/]+$#i', $objectId)
+        || !str_contains(parse_url($actorId, PHP_URL_PATH) ?: '', '/video-channels/')
+        || strcasecmp((string) parse_url($objectId, PHP_URL_HOST), (string) parse_url($actorId, PHP_URL_HOST)) !== 0
+    ) {
+        return $event;
+    }
+    static $memo = [];
+    if (array_key_exists($objectId, $memo)) {
+        return is_array($memo[$objectId]) ? $memo[$objectId] : $event;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM events
+             WHERE (object_id = ? OR object_id = ?)
+               AND type = 'Create'
+               AND action_taken IN ('log', 'local_observe')
+             ORDER BY id DESC LIMIT 1"
+        );
+        $st->execute([$objectId, $objectId . '/']);
+        $create = $st->fetch();
+        $memo[$objectId] = is_array($create) ? $create : false;
+        return is_array($create) ? $create : $event;
+    } catch (Throwable $e) {
+        $memo[$objectId] = false;
+        return $event;
+    }
+}
+
+/**
  * Prefer a native Fediverse object id over Bridgy convert mirrors for the same Bluesky post.
  */
 function admin_prefer_fedi_object_id(string $objectId): string
@@ -4452,6 +4497,10 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             if (!is_array($e)) {
                 continue;
             }
+            if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
+                continue;
+            }
+            $e = admin_peertube_prefer_create($e);
             $eid = (string) (int) ($e['id'] ?? 0);
             if ($eid === '0' || isset($seenIds[$eid])) {
                 continue;
@@ -4518,6 +4567,10 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         /** @var list<array{k:string,id:string,sort:int}> $homeCand */
         $homeCand = [];
         foreach ($homeRaw as $e) {
+            if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
+                continue;
+            }
+            $e = admin_peertube_prefer_create($e);
             $eid = (string) (int) ($e['id'] ?? 0);
             if ($eid === '0' || isset($seenIds[$eid])) {
                 continue;
@@ -4688,6 +4741,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
         error_log('[ap-admin] feed events: ' . $e->getMessage());
     }
     foreach ($feedEventsRaw as $e) {
+        if (is_array($e) && admin_timeline_row_hidden($e, admin_owner_user_id())) {
+            continue;
+        }
+        $e = is_array($e) ? admin_peertube_prefer_create($e) : $e;
         if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
             continue;
         }
@@ -4859,6 +4916,11 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             $homeRaw = array_slice($homeRaw, 0, 300);
         }
         foreach ($homeRaw as $e) {
+            $sourceAid = rtrim((string) ($e['actor_id'] ?? ''), '/');
+            if (admin_timeline_row_hidden($e, $homeOwnerId)) {
+                continue;
+            }
+            $e = is_array($e) ? admin_peertube_prefer_create($e) : $e;
             $aid = (string) ($e['actor_id'] ?? '');
             if ($aid === '' || admin_timeline_row_hidden($e, $homeOwnerId)) {
                 continue;
@@ -4866,7 +4928,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], $homeOwnerId)) {
                 continue;
             }
-            if (empty($followingIds[$aid]) && empty($followingIds[rtrim($aid, '/')])) {
+            if (
+                empty($followingIds[$aid]) && empty($followingIds[rtrim($aid, '/')])
+                && ($sourceAid === '' || (empty($followingIds[$sourceAid]) && empty($followingIds[$sourceAid . '/'])))
+            ) {
                 continue;
             }
             $sum = trim(html_entity_decode((string) ($e['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -4881,6 +4946,12 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 continue;
             }
             $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
+            if (
+                $oid !== '' && isset($homeSeenObject[$oid])
+                && (bool) preg_match('#/(?:videos/watch|w)/[^/]+$#i', $oid)
+            ) {
+                continue;
+            }
             if ($oid !== '') {
                 admin_mark_dual_publish_seen($homeSeenObject, $oid);
             }
@@ -9840,6 +9911,10 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     $seen = [];
 
     $pushEvent = static function (array $e) use (&$out, &$seen, $ownerId): void {
+        if (admin_timeline_row_hidden($e, $ownerId)) {
+            return;
+        }
+        $e = admin_peertube_prefer_create($e);
         if (admin_timeline_row_hidden($e, $ownerId)) {
             return;
         }
