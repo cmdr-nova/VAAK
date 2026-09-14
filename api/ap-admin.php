@@ -824,6 +824,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
     } elseif ($action === 'reply') {
         $composeToast = null;
+        $composeSuccessToast = null;
         $inReplyTo = trim((string) ($_POST['in_reply_to'] ?? ''));
         $content = trim((string) ($_POST['content'] ?? ''));
         $toActor = trim((string) ($_POST['to_actor'] ?? ''));
@@ -909,6 +910,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $composeToast = 'Rate Limit Exceeded - Post added to queue';
                     $notice .= ' Bluesky rate-limited — mirror queued.';
                 }
+                $successMessages = $isQuote
+                    ? ['Quote sent!', 'Sent that quote into orbit!', 'Quote posted!']
+                    : ['Post sent!', 'You farted!', 'Shot that one into space!'];
+                $composeSuccessToast = $successMessages[array_rand($successMessages)];
                 $view = $returnView !== '' ? $returnView : 'outbox';
             } else {
                 $error = $result['error'] ?? 'Reply failed.';
@@ -927,6 +932,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'error' => $error,
                 'notice' => $notice,
                 'toast' => $composeToast,
+                'success_toast' => $composeSuccessToast,
                 'action' => 'reply',
                 'kind' => $isQuote ? 'quote' : 'post',
                 'return_view' => $returnView,
@@ -5487,6 +5493,44 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
     } catch (Throwable $e) {
         error_log('[ap-admin] gallery outbox: ' . $e->getMessage());
     }
+    // Bluesky image posts from this user's durable warmed feed cache. Gallery is
+    // per-owner, and dual-published posts keep their ActivityPub card above.
+    if (
+        $view === 'gallery'
+        && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+        && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($galOwnerId))
+        && function_exists('ap_bsky_posts_for_home')
+        && function_exists('ap_bsky_post_image_urls')
+    ) {
+        try {
+            foreach (ap_bsky_posts_for_home($galOwnerId, 120) as $bItem) {
+                if (!is_array($bItem) || !is_array($bItem['post'] ?? null)) {
+                    continue;
+                }
+                $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
+                if ($bUri === '' || ap_bsky_post_image_urls($bItem['post']) === []) {
+                    continue;
+                }
+                $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
+                if ($fediTwin !== '') {
+                    continue;
+                }
+                $seenKey = 'bsky:' . $bUri;
+                if (isset($galSeen[$seenKey])) {
+                    continue;
+                }
+                $galSeen[$seenKey] = true;
+                $indexed = (string) ($bItem['indexed_at'] ?? ($bItem['post']['indexedAt'] ?? ($bItem['post']['record']['createdAt'] ?? '')));
+                $galleryTimeline[] = [
+                    'kind' => 'bsky',
+                    'sort' => strtotime($indexed) ?: 0,
+                    'row' => $bItem,
+                ];
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-admin] gallery bluesky: ' . $e->getMessage());
+        }
+    }
     usort($galleryTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     if ($galleryTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key($view, $following);
@@ -5836,6 +5880,7 @@ function view_title(string $view): string
         'search' => 'Search',
         'foryou' => 'For You',
         'bluesky' => 'Bluesky',
+        'atmosphere' => 'ATmosphere',
         'tags' => 'Hashtags',
         'collections' => 'Collections',
         'lists' => 'Lists',
@@ -6145,6 +6190,13 @@ function admin_gallery_item_media(array $item): array
 {
     $kind = (string) ($item['kind'] ?? '');
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if ($kind === 'bsky' && function_exists('ap_bsky_post_image_urls')) {
+        $post = is_array($row['post'] ?? null) ? $row['post'] : [];
+        return array_map(
+            static fn(string $url): array => ['url' => $url, 'mediaType' => 'image/*', 'is_video' => false],
+            ap_bsky_post_image_urls($post)
+        );
+    }
     if ($kind === 'outbox') {
         return admin_gallery_media_from_outbox($row);
     }
@@ -6169,7 +6221,12 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
     $actorId = '';
     $sensitive = false;
     $spoiler = '';
-    if ($kind === 'outbox') {
+    if ($kind === 'bsky') {
+        $post = is_array($row['post'] ?? null) ? $row['post'] : [];
+        $objectId = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : '';
+        $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+        $handle = trim((string) ($author['handle'] ?? ''));
+    } elseif ($kind === 'outbox') {
         $objectId = rtrim((string) ($row['id'] ?? ''), '/');
         if ($objectId !== '' && preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/#', $objectId, $m)) {
             $actorId = $m[1];
@@ -6190,7 +6247,9 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
     }
     $thumb = $media[0];
     $href = admin_status_href($objectId, $returnView);
-    $handle = $actorId !== '' ? actor_handle($actorId) : '';
+    if ($kind !== 'bsky') {
+        $handle = $actorId !== '' ? actor_handle($actorId) : '';
+    }
     $count = count($media);
     $isVideo = !empty($thumb['is_video']);
     $autoUnblur = $sensitive && $spoiler === '' && function_exists('ap_profile_get')
@@ -12444,7 +12503,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
-      $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'import_export', 'security'], true);
+      $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'atmosphere', 'import_export', 'security'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
       $navSiteOpen = in_array($view, ['guestbook', 'support', 'analytics'], true);
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
@@ -12496,6 +12555,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Profile</span></a>
+          <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
+          <a class="<?= $view === 'atmosphere' ? 'active' : '' ?>" href="?view=atmosphere"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">ATmosphere</span></a>
+          <?php endif; ?>
           <a class="<?= $view === 'security' ? 'active' : '' ?>" href="?view=security"><span class="ico">⚿</span><span class="label">Security</span></a>
           <a class="<?= $view === 'import_export' ? 'active' : '' ?>" href="?view=import_export"><span class="ico">⇄</span><span class="label">Import / Export</span></a>
         </div>
@@ -14136,7 +14198,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endforeach; ?>
         <?php endif; ?>
 
-      <?php elseif ($view === 'profile'): ?>
+      <?php elseif ($view === 'profile' || $view === 'atmosphere'): ?>
         <?php
           $atts = is_array($profile['attachment'] ?? null) ? $profile['attachment'] : [];
           while (count($atts) < 8) {
@@ -14156,6 +14218,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $summaryForForm = preg_replace("/\n{3,}/u", "\n\n", $summaryForForm) ?? $summaryForForm;
           }
         ?>
+        <?php if ($view === 'profile'): ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
           <div class="profile-preview">
@@ -14575,7 +14638,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-ghost" type="submit">Re-push profile Update</button>
           </div>
         </form>
-        <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
+        <?php endif; ?>
+        <?php if ($view === 'atmosphere' && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
         <?php
           $bskyRow = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($vaakOwnerId) : null;
           $bskyHandle = is_array($bskyRow) ? (string) ($bskyRow['handle'] ?? '') : '';
@@ -14621,23 +14685,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </div>
             <?php endif; ?>
             <div style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.5rem">
-              <form method="post" action="?view=profile" style="display:inline">
+              <form method="post" action="?view=atmosphere" style="display:inline">
                 <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                 <input type="hidden" name="action" value="bsky_sync_profile">
-                <input type="hidden" name="return_view" value="profile">
+                <input type="hidden" name="return_view" value="atmosphere">
                 <button class="btn btn-primary" type="submit">Re-sync avatar / header / bio</button>
               </form>
-              <form method="post" action="?view=profile" style="display:inline">
+              <form method="post" action="?view=atmosphere" style="display:inline">
                 <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                 <input type="hidden" name="action" value="bsky_disconnect">
-                <input type="hidden" name="return_view" value="profile">
+                <input type="hidden" name="return_view" value="atmosphere">
                 <button class="btn btn-ghost" type="submit">Disconnect Bluesky</button>
               </form>
             </div>
-            <form class="composer" method="post" action="?view=profile" style="margin-top:1rem">
+            <form class="composer" method="post" action="?view=atmosphere" style="margin-top:1rem">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="bsky_connect">
-              <input type="hidden" name="return_view" value="profile">
+              <input type="hidden" name="return_view" value="atmosphere">
               <div class="meta" style="margin-bottom:.55rem">
                 <b>Update Bluesky login</b> — after a password reset or if mirrors stop,
                 paste your account password (or a Bluesky app password) here.
@@ -14667,10 +14731,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 Previous Bluesky session was cleared after it expired. Connect again below.
               </div>
             <?php endif; ?>
-            <form class="composer" method="post" action="?view=profile" style="margin-top:.75rem">
+            <form class="composer" method="post" action="?view=atmosphere" style="margin-top:.75rem">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="bsky_connect">
-              <input type="hidden" name="return_view" value="profile">
+              <input type="hidden" name="return_view" value="atmosphere">
               <div style="display:block;max-width:22rem;margin:0 0 .85rem">
                 <label for="bsky-handle" style="display:block;margin:0 0 .3rem">Handle</label>
                 <input id="bsky-handle" name="bsky_handle" type="text" required autocomplete="username"
@@ -14698,6 +14762,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         </div>
         <?php endif; ?>
 
+        <?php if ($view === 'profile'): ?>
         <h2 style="font-size:1rem;margin:2rem 0 .5rem">Muted accounts</h2>
         <div class="meta" style="margin-bottom:.75rem">
           Hide from <b>your</b> Home / Federated / Notifications. Follow stays. Also available on remote profiles.
@@ -14912,6 +14977,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </form>
         <?php endif; ?>
 
+        <?php endif; ?>
       <?php elseif ($view === 'import_export'): ?>
         <?php
           $followStatus = ap_ie_follow_status();
@@ -15611,7 +15677,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
           <div class="empty">
             Connect a Bluesky / PDS account in
-            <a href="?view=profile">Profile settings</a>
+            <a href="?view=atmosphere">ATmosphere settings</a>
             to load your Bluesky home timeline here.
             <div class="meta" style="margin-top:.75rem">This is separate from your ActivityPub feeds.</div>
           </div>
@@ -16550,7 +16616,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       $rpError = 'Could not load Bluesky profile: ' . (string) ($bskyProf['error'] ?? 'unknown error');
                   }
               } elseif ($rpIsBsky && !$rpIsLocal) {
-                  $rpError = 'Connect a Bluesky account in Profile settings to view and follow Bluesky profiles here.';
+                  $rpError = 'Connect a Bluesky account in ATmosphere settings to view and follow Bluesky profiles here.';
               }
 
               if ($rpIsLocal) {
@@ -21598,7 +21664,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         const okMsg = mode === 'queue_post'
           ? 'Added to queue.'
           : (mode === 'edit_status' ? 'Post updated.' : (data.kind === 'quote' ? 'Quote posted.' : 'Posted.'));
-        window.apAdminToast(data.notice || okMsg);
+        window.apAdminToast(data.success_toast || okMsg);
         // Bluesky rate-limit: fedi post succeeded; mirror was queued for later.
         if (data.toast) {
           setTimeout(() => window.apAdminToast(String(data.toast)), 350);
