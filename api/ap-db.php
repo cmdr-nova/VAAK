@@ -4914,7 +4914,7 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
 
     try {
         $st = ap_db()->prepare(
-            "SELECT object_id, actor_id, summary, created_at, type, action_taken,
+            "SELECT object_id, actor_id, in_reply_to, summary, created_at, type, action_taken,
                     spoiler_text, sensitive
              FROM events
              WHERE in_reply_to IS NOT NULL
@@ -4963,7 +4963,7 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
 
     try {
         $st = ap_db()->prepare(
-            "SELECT object_id, actor_id, content, created_at, spoiler_text, sensitive
+            "SELECT object_id, actor_id, in_reply_to, content, created_at, spoiler_text, sensitive
              FROM mentions
              WHERE deleted_at IS NULL
                AND in_reply_to IS NOT NULL
