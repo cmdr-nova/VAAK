@@ -11964,7 +11964,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: rgba(0,0,0,.25);
       pointer-events: none;
     }
-    .vakktok-feed { height: calc(100vh - 7rem); min-height: 28rem; overflow-y: auto; scroll-snap-type: y mandatory; overscroll-behavior: contain; background: #050505; border: 1px solid var(--border); border-radius: 12px; }
+    .vakktok-feed { height: calc(100vh - 7rem); min-height: 28rem; overflow-y: auto; scrollbar-width: none; -ms-overflow-style: none; scroll-snap-type: y mandatory; overscroll-behavior: contain; background: #050505; border: 1px solid var(--border); border-radius: 12px; }
+    .vakktok-feed::-webkit-scrollbar { display: none; }
     .vakktok-item { position: relative; height: 100%; min-height: 28rem; scroll-snap-align: start; display: grid; place-items: center; background: #050505; }
     .vakktok-video { display: block; width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; object-fit: contain; object-position: center; aspect-ratio: auto; background: #000; }
     .tweet-hd {
@@ -19349,20 +19350,22 @@ window.apAdminToast = function (msg, isErr) {
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
   // .feed is overflow:visible — IntersectionObserver must use the viewport.
   function feedIsScrollContainer() {
-    const style = window.getComputedStyle(root);
+    const scrollRoot = (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) ? items : root;
+    const style = window.getComputedStyle(scrollRoot);
     const oy = style.overflowY;
     if (oy !== 'auto' && oy !== 'scroll') return false;
-    return root.scrollHeight > root.clientHeight + 2;
+    return scrollRoot.scrollHeight > scrollRoot.clientHeight + 2;
   }
   function scrollApi() {
     if (feedIsScrollContainer()) {
+      const scrollRoot = (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) ? items : root;
       return {
         mode: 'feed',
-        ioRoot: root,
-        top: () => root.scrollTop,
-        height: () => root.scrollHeight,
-        setTop: (v, smooth) => root.scrollTo({ top: v, behavior: smooth ? 'smooth' : 'auto' }),
-        onScroll: (fn) => root.addEventListener('scroll', fn, { passive: true }),
+        ioRoot: scrollRoot,
+        top: () => scrollRoot.scrollTop,
+        height: () => scrollRoot.scrollHeight,
+        setTop: (v, smooth) => scrollRoot.scrollTo({ top: v, behavior: smooth ? 'smooth' : 'auto' }),
+        onScroll: (fn) => scrollRoot.addEventListener('scroll', fn, { passive: true }),
       };
     }
     return {
@@ -19373,6 +19376,9 @@ window.apAdminToast = function (msg, isErr) {
       setTop: (v, smooth) => window.scrollTo({ top: v, behavior: smooth ? 'smooth' : 'auto' }),
       onScroll: (fn) => window.addEventListener('scroll', fn, { passive: true }),
     };
+  }
+  if (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) {
+    items.appendChild(sentinel);
   }
   let sc = scrollApi();
 
