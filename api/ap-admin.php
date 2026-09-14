@@ -2674,6 +2674,30 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not create invite.';
             }
         }
+    } elseif ($action === 'pds_migration_invite_request') {
+        $view = 'atmosphere';
+        $ownerId = (int) ($vaakUser['id'] ?? 0);
+        try {
+            $check = ap_db()->prepare("SELECT code, expires_at, used_at FROM ap_invite_codes WHERE created_by = ? AND note = 'PDS migration invite' ORDER BY id ASC LIMIT 1");
+            $check->execute([$ownerId]);
+            $existing = $check->fetch();
+            $existingExpired = is_array($existing) && !empty($existing['expires_at']) && strtotime((string) $existing['expires_at']) < time();
+            if (is_array($existing) && empty($existing['used_at']) && !$existingExpired) {
+                $notice = 'Your PDS migration invite is already available below.';
+            } elseif (is_array($existing) && !empty($existing['used_at'])) {
+                $error = 'Your one-time PDS migration invite has already been used.';
+            } else {
+                $res = ap_auth_invite_create($ownerId, 'PDS migration invite', gmdate('c', time() + 7 * 86400));
+                if (!empty($res['ok'])) {
+                    $notice = 'PDS migration invite: ' . (string) ($res['code'] ?? '') . ' — save this code; it can only be issued once.';
+                } else {
+                    $error = $res['error'] ?? 'Could not create a migration invite.';
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-admin] pds migration invite request: ' . $e->getMessage());
+            $error = 'Could not create a migration invite.';
+        }
     } elseif ($action === 'user_ban' || $action === 'user_unban') {
         $view = 'users';
         if (!$vaakIsAdmin) {
@@ -14817,6 +14841,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if ($bskyPds === '') {
               $bskyPds = defined('AP_BSKY_DEFAULT_PDS') ? (string) AP_BSKY_DEFAULT_PDS : 'https://bsky.mkultra.monster';
           }
+          $pdsMigrationInvite = null;
+          try {
+              $inviteStmt = ap_db()->prepare("SELECT code, expires_at, used_at FROM ap_invite_codes WHERE created_by = ? AND note = 'PDS migration invite' ORDER BY id DESC LIMIT 1");
+              $inviteStmt->execute([$vaakOwnerId]);
+              $inviteCandidate = $inviteStmt->fetch();
+              if (is_array($inviteCandidate) && empty($inviteCandidate['used_at'])
+                  && (empty($inviteCandidate['expires_at']) || strtotime((string) $inviteCandidate['expires_at']) >= time())) {
+                  $pdsMigrationInvite = $inviteCandidate;
+              }
+          } catch (Throwable $e) {
+              error_log('[ap-admin] migration invite display: ' . $e->getMessage());
+          }
           // Detect a dead/expired stored login without a network round-trip when possible.
           $bskySessionStale = false;
           if ($bskyHandle !== '' && function_exists('ap_bsky_access_token')) {
@@ -14842,6 +14878,25 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <code>bsky.mkultra.monster</code>.
             After a PDS password reset, re-enter the password below so mirrors work again.
           </div>
+          <section class="side-card" style="margin-top:1rem">
+            <h2 style="margin:.1rem 0 .45rem;font-size:1rem">Move an existing Bluesky account to the VAAK PDS</h2>
+            <div class="meta" style="line-height:1.55">
+              This is optional and separate from connecting your current account. First request the VAAK PDS invite below (it can only be issued once per VAAK account). Then open
+              <a href="https://pdsmoover.com/moover" target="_blank" rel="noopener noreferrer">PDS Moover</a>
+              and follow its migration steps, entering the invite code when asked. Keep your old account credentials available, and write down the new VAAK handle and password when the move completes. Finally return here, enter that new handle and password in the Bluesky connection fields, and set the PDS to <code>https://bsky.mkultra.monster</code>.
+            </div>
+            <form method="post" action="?view=atmosphere" style="margin-top:.75rem">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <input type="hidden" name="action" value="pds_migration_invite_request">
+              <input type="hidden" name="return_view" value="atmosphere">
+              <?php if (is_array($pdsMigrationInvite)): ?>
+                <div class="mono" style="display:inline-block;padding:.55rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--panel-2);margin-right:.5rem"><?= h((string) $pdsMigrationInvite['code']) ?></div>
+                <span class="meta">Expires <?= h((string) ($pdsMigrationInvite['expires_at'] ?? '')) ?></span>
+              <?php else: ?>
+                <button class="btn btn-ghost" type="submit">Request one-time PDS migration invite</button>
+              <?php endif; ?>
+            </form>
+          </section>
           <?php if ($bskyHandle !== ''): ?>
             <div class="meta" style="margin:.5rem 0">Connected as <b>@<?= h($bskyHandle) ?></b>
               · <a href="?view=bluesky">Open Bluesky tab</a>
