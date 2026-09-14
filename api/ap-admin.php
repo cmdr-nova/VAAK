@@ -11872,6 +11872,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
+    .relay-card .relay-meta { text-align: left; margin-left: 0; padding-left: 0; }
 
     /* Gallery — Instagram-style media grid */
     .gallery-grid {
@@ -12718,7 +12719,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <?php if ($notice): ?><div class="flash ok"><?= h($notice) ?></div><?php endif; ?>
     <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
 
-    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed'], true) ? ' timeline-feed' : '' ?>">
+    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky'], true) ? ' timeline-feed' : '' ?>">
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <div class="compose-inline-slot" id="compose-inline-slot" aria-label="Loading composer">
           <div class="compose-inline-skeleton" aria-hidden="true"></div>
@@ -13066,7 +13067,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $oid = (string) ($st['uri'] ?? '');
               $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
             ?>
-            <article class="tweet">
+            <article class="tweet relay-card">
               <div class="tweet-hd">
                 <?= admin_avatar_img($actorUrl !== '' ? $actorUrl : null) ?>
                 <div class="tweet-hd-main">
@@ -14110,7 +14111,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?= h($rin) ?>
                 <span class="tag" style="margin-left:.35rem"><?= h($badge) ?></span>
               </div>
-              <div class="body meta" style="margin-top:.35rem">
+              <div class="body meta relay-meta" style="margin-top:.35rem">
                 <?php if (!empty($rr['follow_activity_id'])): ?>
                   follow id <code style="font-size:.75rem;word-break:break-all"><?= h((string) $rr['follow_activity_id']) ?></code><br>
                 <?php endif; ?>
