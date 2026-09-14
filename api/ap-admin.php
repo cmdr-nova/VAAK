@@ -13175,6 +13175,35 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   }
               ));
           }
+          // A remote status can resolve once by ID and once by object URL;
+          // keep only one rendered card for each canonical bookmark.
+          $seenBookmarkKeys = [];
+          $bmList = array_values(array_filter($bmList, static function ($st) use (&$seenBookmarkKeys): bool {
+              $uri = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
+              $sid = trim((string) ($st['id'] ?? ''));
+              if ($uri === '' && $sid === '') {
+                  return true;
+              }
+              $keys = [];
+              if ($uri !== '') {
+                  $keys[] = 'uri:' . $uri;
+              }
+              if ($sid !== '') {
+                  $keys[] = 'id:' . $sid;
+              }
+              foreach ($keys as $key) {
+                  if (isset($seenBookmarkKeys[$key])) {
+                      return false;
+                  }
+              }
+              foreach ($keys as $key) {
+                  $seenBookmarkKeys[$key] = true;
+              }
+              if ($keys === []) {
+                  return false;
+              }
+              return true;
+          }));
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
@@ -13228,12 +13257,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php
                 $bmPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
                 $bmMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
+                $bmMedia = is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [];
+                $bmBody = $bmPlain !== ''
+                    ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
+                    : '';
+                $bmMediaHtml = $bmMedia !== [] ? admin_media_row_html($bmMedia) : '';
                 echo admin_cw_gate_html(
                     (string) ($st['spoiler_text'] ?? ''),
                     !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
-                    $bmPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
-                        : ''
+                    $bmBody . $bmMediaHtml
                 );
               ?>
               <div class="tweet-actions">
