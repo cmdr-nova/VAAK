@@ -19338,6 +19338,12 @@ window.apAdminToast = function (msg, isErr) {
   const topBtn = document.getElementById('feed-top-btn');
   const newBtn = document.getElementById('feed-new-btn');
   const feedRoot = document.querySelector('.feed');
+  // Read the timeline identity before constructing the scroll API.  The
+  // VakkTok-specific scroll container check is used during scrollApi(), so
+  // declaring this later would hit JavaScript's temporal dead zone and stop
+  // pagination setup for every timeline.
+  let viewName = items ? (items.dataset.view || 'home') : 'home';
+  let hasMore = items ? items.dataset.hasMore === '1' : false;
   if (newBtn && feedRoot) {
     // Keep the new-post row in normal feed flow; it must never cover the
     // sticky timeline tabs above it.
@@ -19380,12 +19386,8 @@ window.apAdminToast = function (msg, isErr) {
   if (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) {
     items.appendChild(sentinel);
   }
-  let sc = scrollApi();
-
   let offset = parseInt(items.dataset.offset || '0', 10);
   let limit = parseInt(items.dataset.limit || '15', 10);
-  let viewName = items.dataset.view || 'home';
-  let hasMore = items.dataset.hasMore === '1';
   let notifMaxId = items.dataset.maxId || '';
   let notifFilter = items.dataset.filter || 'all';
   let bskyCursor = items.dataset.cursor || '';
@@ -19405,6 +19407,8 @@ window.apAdminToast = function (msg, isErr) {
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
   const isNotifTimeline = viewName === 'mentions';
   const isBskyTimeline = viewName === 'bluesky';
+
+  let sc = scrollApi();
 
   // VakkTok behaves like a focused video reel: the visible video plays muted,
   // while videos leaving the viewport are paused so background media does not
