@@ -6363,6 +6363,52 @@ function ap_bsky_repost_object(int $ownerUserId, string $objectId): array
     return ap_bsky_create_repost($ownerUserId, $ref);
 }
 
+/** Remove this account's Bluesky repost for a VAAK/AP object, when present. */
+function ap_bsky_unrepost_object(int $ownerUserId, string $objectId): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
+        return ['ok' => true, 'skipped' => true];
+    }
+    $ref = ap_bsky_resolve_strong_ref($objectId, $ownerUserId);
+    if ($ref === null) {
+        return ['ok' => true, 'skipped' => true];
+    }
+    $row = ap_bsky_session_row($ownerUserId);
+    if ($row === null) {
+        return ['ok' => true, 'skipped' => true];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($tok['ok'])) {
+        return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'No session')];
+    }
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $did = (string) ($row['did'] ?? '');
+    $list = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', [
+        'repo' => $did,
+        'collection' => 'app.bsky.feed.repost',
+        'limit' => '100',
+    ], null, (string) $tok['access'], 15);
+    if (empty($list['ok'])) {
+        return ['ok' => false, 'error' => (string) ($list['error'] ?? 'Could not inspect reposts')];
+    }
+    foreach ((array) ($list['json']['records'] ?? []) as $record) {
+        $value = is_array($record['value'] ?? null) ? $record['value'] : [];
+        $subject = is_array($value['subject'] ?? null) ? $value['subject'] : [];
+        if ((string) ($subject['uri'] ?? '') !== (string) $ref['uri']) {
+            continue;
+        }
+        $rkey = (string) ($record['uri'] ?? '');
+        if (!preg_match('~/([^/]+)$~', $rkey, $m)) {
+            continue;
+        }
+        return ap_bsky_delete_record_uri($ownerUserId, 'at://' . $did . '/app.bsky.feed.repost/' . $m[1]);
+    }
+    return ['ok' => true, 'skipped' => true];
+}
+
 // ---------------------------------------------------------------------------
 // Bluesky → VAAK notifications (mentions / replies / quotes / reposts / likes)
 // ---------------------------------------------------------------------------

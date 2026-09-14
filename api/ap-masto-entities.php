@@ -9369,6 +9369,18 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
                 isset($prev['target_actor']) ? (string) $prev['target_actor'] : $targetActor
             );
         }
+        // VAAK boosts may also have created a Bluesky repost for a mapped
+        // object. Undo both sides when the target has an ATProto twin.
+        try {
+            if (!function_exists('ap_bsky_unrepost_object')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            if (function_exists('ap_bsky_unrepost_object')) {
+                ap_bsky_unrepost_object(ap_db_default_owner_user_id(), $objectId);
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-masto] bsky_unrepost: ' . $e->getMessage());
+        }
         $original['reblogged'] = false;
         return ['ok' => true, 'status' => ap_masto_apply_interaction_flags($original)];
     }
