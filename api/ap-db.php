@@ -5031,10 +5031,12 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
                 // ignore
             }
         }
-        if (is_string($bskyUri) && str_starts_with($bskyUri, 'at://') && function_exists('ap_bsky_xrpc')) {
-            if (!function_exists('ap_bsky_xrpc')) {
+        if (is_string($bskyUri) && str_starts_with($bskyUri, 'at://')) {
+            if (!function_exists('ap_bsky_xrpc') && is_file(__DIR__ . '/ap-bsky.php')) {
                 require_once __DIR__ . '/ap-bsky.php';
             }
+        }
+        if (is_string($bskyUri) && str_starts_with($bskyUri, 'at://') && function_exists('ap_bsky_xrpc')) {
             $thread = ap_bsky_xrpc('https://public.api.bsky.app', 'app.bsky.feed.getPostThread', 'GET', [
                 'uri' => $bskyUri,
                 'depth' => '1',
