@@ -7489,12 +7489,21 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               if ($replyParentUrl !== '' && str_starts_with($replyParentUrl, 'https://')):
                   $parentEvent = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($replyParentUrl) : null;
                   $parentSnippet = '';
+                  $parentHandle = '';
                   if (is_array($parentEvent) && !empty($parentEvent['summary'])) {
                       $parentSnippet = mb_substr(trim((string) $parentEvent['summary']), 0, 120);
                   }
+                  if (is_array($parentEvent) && !empty($parentEvent['actor_id'])) {
+                      $parentHandle = actor_handle((string) $parentEvent['actor_id']);
+                  }
+                  $parentIsBsky = str_contains(strtolower($replyParentUrl), 'bsky.app')
+                      || str_starts_with(strtolower($replyParentUrl), 'at://');
+                  $parentSource = $parentIsBsky ? 'Bluesky' : 'fediverse';
             ?>
               <div class="meta" style="margin:.35rem 0 .5rem">
                 ↩ reply to
+                <?php if ($parentHandle !== ''): ?><span>@<?= h(ltrim($parentHandle, '@')) ?></span><?php endif; ?>
+                <span class="tag" style="margin-left:.25rem" title="Reply source"><?= h($parentSource) ?></span>
                 <a href="<?= h(admin_status_href($replyParentUrl, $returnView)) ?>"><?= h($parentSnippet !== '' ? $parentSnippet : 'parent post') ?></a>
               </div>
             <?php endif; ?>
