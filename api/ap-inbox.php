@@ -2672,7 +2672,12 @@ function ap_text_looks_like_as2_json(string $text): bool
 function ap_format_quote_feed_summary(?string $commentary, ?array $quotedDoc, ?string $quotedUrl = null, bool $tombstone = false): ?string
 {
     $parts = [];
-    $c = $commentary !== null ? trim(html_entity_decode(strip_tags(ap_fix_utf8($commentary)), ENT_QUOTES | ENT_HTML5, 'UTF-8')) : '';
+    $c = '';
+    if ($commentary !== null) {
+        $c = function_exists('ap_html_to_plain_text')
+            ? trim(ap_html_to_plain_text(ap_fix_utf8($commentary)))
+            : trim(html_entity_decode(strip_tags(ap_fix_utf8($commentary)), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    }
     if ($c !== '' && !ap_text_looks_like_as2_json($c)) {
         $parts[] = $c;
     }
@@ -2691,7 +2696,9 @@ function ap_format_quote_feed_summary(?string $commentary, ?array $quotedDoc, ?s
             return implode("\n\n", $parts);
         }
         if (isset($quotedDoc['content']) && is_string($quotedDoc['content'])) {
-            $qText = trim(html_entity_decode(strip_tags(ap_fix_utf8($quotedDoc['content'])), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            $qText = function_exists('ap_html_to_plain_text')
+                ? trim(ap_html_to_plain_text(ap_fix_utf8($quotedDoc['content'])))
+                : trim(html_entity_decode(strip_tags(ap_fix_utf8($quotedDoc['content'])), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         }
         if ($qText !== '' && ap_text_looks_like_as2_json($qText)) {
             $qText = '';

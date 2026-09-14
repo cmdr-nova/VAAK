@@ -1108,6 +1108,14 @@ function ap_masto_status_from_as2_note(array $note, string $fallbackUrl): ?array
         'emojis' => [],
         'card' => null,
         'poll' => null,
+        // Explicit null prevents clients from carrying a stale native quote
+        // card across status updates when this remote post has no quote.
+        'quote' => null,
+        'quote_approval' => [
+            'automatic' => ['public'],
+            'manual' => [],
+            'current_user' => 'automatic',
+        ],
     ];
 }
 
@@ -3720,6 +3728,14 @@ function ap_masto_status_from_mention(array $row): array
         'emojis' => [],
         'card' => null,
         'poll' => null,
+        // Explicit null prevents clients from carrying a stale native quote
+        // card across status updates when this remote post has no quote.
+        'quote' => null,
+        'quote_approval' => [
+            'automatic' => ['public'],
+            'manual' => [],
+            'current_user' => 'automatic',
+        ],
     ];
     return ap_masto_apply_interaction_flags($status);
 }
@@ -5189,6 +5205,14 @@ function ap_masto_status_from_event(array $row): ?array
         'emojis' => [],
         'card' => null,
         'poll' => null,
+        // Explicit null prevents clients from carrying a stale native quote
+        // card across status updates when this remote post has no quote.
+        'quote' => null,
+        'quote_approval' => [
+            'automatic' => ['public'],
+            'manual' => [],
+            'current_user' => 'automatic',
+        ],
     ];
 
     // Announce → Mastodon reblog wrapper: outer = booster, inner = original author
