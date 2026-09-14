@@ -2521,9 +2521,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     } elseif ($action === 'save_ai_key' || $action === 'save_xai_key') {
         $view = 'profile';
         $key = trim((string) ($_POST['ai_api_key'] ?? $_POST['xai_api_key'] ?? ''));
+        // The profile form displays a non-secret mask when a key is already
+        // configured. Treat that mask as "leave unchanged", never as the new
+        // credential value.
+        $keyIsMask = $key !== '' && preg_match('/^[*•·]+$/u', $key) === 1;
         $apiRootIn = trim((string) ($_POST['ai_api_root'] ?? ''));
         $modelIn = trim((string) ($_POST['ai_model'] ?? ''));
-        $hasKey = $key !== '';
+        $hasKey = $key !== '' && !$keyIsMask;
         $hasEndpoint = $apiRootIn !== '' || $modelIn !== ''
             || array_key_exists('ai_api_root', $_POST)
             || array_key_exists('ai_model', $_POST);
@@ -14995,8 +14999,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         </div>
         <form class="composer" method="post" action="?view=profile" style="margin-bottom:.75rem" autocomplete="off">
           <input type="hidden" name="action" value="save_ai_key">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <label class="meta" style="display:block;margin-bottom:.35rem">API key</label>
-          <input name="ai_api_key" type="password" maxlength="500" placeholder="sk-… or provider key" autocomplete="new-password" style="margin-bottom:.65rem"<?= $aiConfigured ? '' : ' required' ?>>
+          <input name="ai_api_key" type="password" maxlength="500" placeholder="sk-… or provider key" autocomplete="new-password" style="margin-bottom:.65rem" value="<?= $aiConfigured ? '••••••••••••' : '' ?>"<?= $aiConfigured ? ' data-existing-mask="1" aria-label="Saved API key, masked. Focus to replace it."' : ' required' ?> onfocus="if(this.dataset.existingMask){this.value='';delete this.dataset.existingMask;}" onblur="if(this.value===''){this.value='<?= $aiConfigured ? '••••••••••••' : '' ?>';this.dataset.existingMask='1';}">
           <label class="meta" style="display:block;margin-bottom:.35rem">API base URL <span style="opacity:.7">(optional)</span></label>
           <input name="ai_api_root" type="url" maxlength="300" placeholder="https://api.openai.com/v1" value="<?= h($aiRootVal) ?>" style="margin-bottom:.65rem">
           <label class="meta" style="display:block;margin-bottom:.35rem">Model <span style="opacity:.7">(optional)</span></label>
@@ -15009,6 +15014,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php if ($aiConfigured): ?>
           <form method="post" action="?view=profile" style="margin-bottom:1.25rem" onsubmit="return confirm('Clear your personal AI API key?');">
             <input type="hidden" name="action" value="clear_ai_key">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
             <button class="btn btn-ghost" type="submit">Clear API key</button>
           </form>
         <?php endif; ?>
