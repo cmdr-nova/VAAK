@@ -18358,9 +18358,27 @@ window.apAdminToast = function (msg, isErr) {
 
   function closeFolderPopover() {
     if (folderPopover) {
+      if (folderPopover._vaakReposition) {
+        window.removeEventListener('scroll', folderPopover._vaakReposition, true);
+        window.removeEventListener('resize', folderPopover._vaakReposition);
+      }
       folderPopover.remove();
       folderPopover = null;
     }
+  }
+
+  function positionFolderPopover(pop, anchorBtn) {
+    const rect = anchorBtn.getBoundingClientRect();
+    const gap = 6;
+    const width = pop.offsetWidth || 240;
+    const height = pop.offsetHeight || 200;
+    const left = Math.min(window.innerWidth - width - 8, Math.max(8, rect.left));
+    const below = rect.bottom + gap;
+    const top = below + height <= window.innerHeight - 8
+      ? below
+      : Math.max(8, rect.top - height - gap);
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
   }
 
   async function postFolderAction(action, fields) {
@@ -18395,10 +18413,11 @@ window.apAdminToast = function (msg, isErr) {
     pop.innerHTML = '<h4>Save bookmark</h4><div class="meta">Loading folders…</div>';
     document.body.appendChild(pop);
     folderPopover = pop;
-    const left = Math.min(window.innerWidth - 240, Math.max(8, rect.left));
-    const top = Math.min(window.innerHeight - 200, rect.bottom + 6);
-    pop.style.left = left + 'px';
-    pop.style.top = top + 'px';
+    positionFolderPopover(pop, anchorBtn);
+    const reposition = () => { if (folderPopover === pop) positionFolderPopover(pop, anchorBtn); };
+    pop._vaakReposition = reposition;
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
 
     let data = null;
     try {
@@ -18411,6 +18430,7 @@ window.apAdminToast = function (msg, isErr) {
       data = null;
     }
     if (!folderPopover) return;
+    positionFolderPopover(pop, anchorBtn);
     const selected = new Set((selectedIds || (data && data.selected) || []).map(String));
     const folders = (data && data.folders) || [];
     let html = '<h4>Save to folder</h4>';
@@ -18482,6 +18502,7 @@ window.apAdminToast = function (msg, isErr) {
         if (form) {
           const actionInput = form.querySelector('input[name="action"]');
           if (actionInput) actionInput.value = 'unbookmark_status';
+          form.dataset.skipBmPicker = '1';
           form.requestSubmit ? form.requestSubmit() : form.submit();
         }
       }
@@ -18533,7 +18554,7 @@ window.apAdminToast = function (msg, isErr) {
     if (!INTERACT.has(action)) return;
     const btn = form.querySelector('button[type="submit"]');
     // Already bookmarked: open folder picker instead of immediately removing
-    if (action === 'unbookmark_status' && btn && btn.getAttribute('data-bm-picker') === '1') {
+    if (action === 'unbookmark_status' && btn && btn.getAttribute('data-bm-picker') === '1' && form.dataset.skipBmPicker !== '1') {
       ev.preventDefault();
       const sid = (form.querySelector('input[name="status_id"]') || {}).value || '';
       const oid = (form.querySelector('input[name="object_id"]') || {}).value || '';
@@ -18588,6 +18609,7 @@ window.apAdminToast = function (msg, isErr) {
       window.apAdminToast('Network error — try again.', true);
     } finally {
       form.dataset.busy = '0';
+      delete form.dataset.skipBmPicker;
       if (btn) btn.disabled = false;
     }
   });
