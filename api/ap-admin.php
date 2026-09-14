@@ -11410,6 +11410,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border: 1px solid var(--border); border-radius: 10px;
       padding: .6rem .75rem; font: inherit;
     }
+    /* Keep native select semantics/keyboard support while matching VAAK's
+       dark surfaces. Option popovers remain OS-controlled where browsers do
+       not allow full custom styling. */
+    select {
+      appearance: none; -webkit-appearance: none;
+      min-height: 2.25rem; padding: .5rem 2.1rem .5rem .75rem;
+      border: 1px solid var(--border); border-radius: 9px;
+      background-color: var(--panel-2); color: var(--text);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='m1 1 5 5 5-5' fill='none' stroke='%238a8a8a' stroke-width='1.6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right .7rem center;
+      background-size: .75rem auto; color-scheme: dark; font: inherit;
+    }
+    select:hover { border-color: #4a4a4a; }
+    select:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+    select option { background: #101010; color: var(--text); }
     .composer-check {
       display: flex;
       align-items: center;
