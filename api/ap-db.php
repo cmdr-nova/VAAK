@@ -4905,21 +4905,32 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
             "SELECT object_id, actor_id, summary, created_at, type, action_taken,
                     spoiler_text, sensitive
              FROM events
-             WHERE (in_reply_to = ? OR in_reply_to = ?)
+             WHERE in_reply_to IS NOT NULL
                AND type IN ('Create', 'Update')
                AND COALESCE(action_taken, '') NOT IN ('deleted', 'blocked', 'rejected')
              ORDER BY created_at ASC
              LIMIT 80"
         );
-        $st->execute($variants);
-        foreach ($st->fetchAll() as $row) {
+        $st->execute();
+        $eventChildren = [];
+        foreach ($st->fetchAll() as $candidate) {
+            if (!is_array($candidate)) continue;
+            $parent = rtrim(trim((string) ($candidate['in_reply_to'] ?? '')), '/');
+            if ($parent !== '') $eventChildren[$parent][] = $candidate;
+        }
+        $parents = [$noteId];
+        $seenEvents = [];
+        while ($parents !== [] && count($seenEvents) < 80) {
+            $parentId = array_shift($parents);
+            foreach ($eventChildren[$parentId] ?? [] as $row) {
             if (!is_array($row)) {
                 continue;
             }
             $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
-            if ($oid === '' || $oid === $noteId) {
+            if ($oid === '' || $oid === $noteId || isset($seenEvents[$oid])) {
                 continue;
             }
+            $seenEvents[$oid] = true;
             $spoiler = trim((string) ($row['spoiler_text'] ?? ''));
             $push(
                 'remote',
@@ -4931,6 +4942,8 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
                 $spoiler,
                 !empty($row['sensitive'])
             );
+            $parents[] = $oid;
+            }
         }
     } catch (Throwable $e) {
         // ignore
@@ -4941,19 +4954,30 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
             "SELECT object_id, actor_id, content, created_at, spoiler_text, sensitive
              FROM mentions
              WHERE deleted_at IS NULL
-               AND (in_reply_to = ? OR in_reply_to = ?)
+               AND in_reply_to IS NOT NULL
              ORDER BY created_at ASC
              LIMIT 80"
         );
-        $st->execute($variants);
-        foreach ($st->fetchAll() as $row) {
+        $st->execute();
+        $mentionChildren = [];
+        foreach ($st->fetchAll() as $candidate) {
+            if (!is_array($candidate)) continue;
+            $parent = rtrim(trim((string) ($candidate['in_reply_to'] ?? '')), '/');
+            if ($parent !== '') $mentionChildren[$parent][] = $candidate;
+        }
+        $parents = [$noteId];
+        $seenMentions = [];
+        while ($parents !== [] && count($seenMentions) < 80) {
+            $parentId = array_shift($parents);
+            foreach ($mentionChildren[$parentId] ?? [] as $row) {
             if (!is_array($row)) {
                 continue;
             }
             $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
-            if ($oid === '' || $oid === $noteId) {
+            if ($oid === '' || $oid === $noteId || isset($seenMentions[$oid])) {
                 continue;
             }
+            $seenMentions[$oid] = true;
             // Strip interaction hash suffixes (#like-… etc.)
             if (function_exists('ap_masto_mention_target_object_id')) {
                 $oid = ap_masto_mention_target_object_id($oid);
@@ -4971,6 +4995,8 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
                 $spoiler,
                 !empty($row['sensitive'])
             );
+            $parents[] = $oid;
+            }
         }
     } catch (Throwable $e) {
         // ignore
