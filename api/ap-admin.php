@@ -8910,7 +8910,7 @@ function admin_render_remote_boost_card(
                       is_array($boostExtraMentions) ? $boostExtraMentions : []
                   );
                 ?>
-                <a class="btn btn-ghost" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?><?= $origActor !== '' ? '&amp;to=' . urlencode($origActor) : '' ?><?= admin_reply_mention_query($boostMentionSeed) ?><?= admin_reply_cw_query($boostSpoiler, $boostSensitive) ?>" style="padding:.25rem .7rem;font-size:.8rem">Reply</a>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?><?= $origActor !== '' ? '&amp;to=' . urlencode($origActor) : '' ?><?= admin_reply_mention_query($boostMentionSeed) ?><?= admin_reply_cw_query($boostSpoiler, $boostSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
