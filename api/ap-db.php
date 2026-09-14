@@ -4780,6 +4780,11 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
     $variants = [$noteId, $noteId . '/'];
     /** @var array<string,array{kind:string,id:string,url:string,actor_id:string,content:string,published:string,spoiler_text:string,sensitive:bool}> $byKey */
     $byKey = [];
+    // HTML profile controllers do not otherwise need the Bluesky library, but
+    // linked ATProto threads are part of this public reply view.
+    if (!function_exists('ap_bsky_post_link_by_fedi') && is_file(__DIR__ . '/ap-bsky.php')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
 
     $push = static function (
         string $kind,
