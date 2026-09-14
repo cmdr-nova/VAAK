@@ -4992,13 +4992,14 @@ function ap_publish_status_text(
         ap_log('bsky_crosspost_skip local_id=' . $localId . ' err=no_owner_session_mapping');
     }
 
-    // Warm link-preview cache for the first URL (best-effort; don't fail the post)
-    if ($content !== '' && !$mediaRows && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_for_url')) {
+    // Warm link-preview cache asynchronously; remote DNS/HTTP must not hold
+    // the publish request open. The worker is deduplicated and capped.
+    if ($content !== '' && !$mediaRows && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_warm_async')) {
         try {
             require_once __DIR__ . '/ap-link-preview.php';
             $warmUrl = ap_link_preview_extract_url($content);
             if ($warmUrl !== null) {
-                ap_link_preview_for_url($warmUrl, true);
+                ap_link_preview_warm_async($warmUrl);
             }
         } catch (Throwable $e) {
             // ignore

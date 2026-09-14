@@ -653,6 +653,37 @@ function ap_link_preview_card_for_status_text(string $textOrHtml, bool $hasMedia
     return ap_masto_preview_card(ap_link_preview_for_url($url, $allowFetch));
 }
 
+/** Queue one link-preview fetch so inbound/post requests do not wait on remote DNS/HTTP. */
+function ap_link_preview_warm_async(string $url): void
+{
+    $url = trim($url);
+    if ($url === '' || !str_starts_with(strtolower($url), 'https://') || !filter_var($url, FILTER_VALIDATE_URL)) {
+        return;
+    }
+    $script = __DIR__ . '/ap-link-preview-warm.php';
+    if (!is_file($script)) {
+        return;
+    }
+    $lockPath = sys_get_temp_dir() . '/vaak-lp-' . hash('sha256', $url) . '.lock';
+    $lock = @fopen($lockPath, 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($lock)) fclose($lock);
+        return;
+    }
+    $running = trim((string) @shell_exec("pgrep -fc 'ap-link-preview-warm\\.php' 2>/dev/null"));
+    if ($running !== '' && ctype_digit($running) && (int) $running >= 3) {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        return;
+    }
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script)
+        . ' ' . escapeshellarg($url) . ' >/dev/null 2>&1 </dev/null &';
+    @exec($cmd);
+}
+
 // Direct HTTP hits disabled (SSRF surface). Link previews stay internal via require.
 if (PHP_SAPI !== 'cli'
     && isset($_SERVER['SCRIPT_FILENAME'])
