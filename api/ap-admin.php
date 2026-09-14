@@ -1237,6 +1237,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'auto_delete_posts_7d' => !empty($_POST['auto_delete_posts_7d']),
                 'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
                 'quote_policy' => (string) ($_POST['quote_policy'] ?? 'anyone'),
+                'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
             ], $vaakActorKey);
             if (empty($saved['ok'])) {
                 $error = $saved['error'] ?? 'Profile save failed.';
@@ -12802,6 +12803,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <div style="display:flex;gap:.65rem;align-items:center"><a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a><?php if ($vaakActorKey === 'cmdr_nova'): ?><form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this reply?');"><input type="hidden" name="action" value="discuss_post_delete"><input type="hidden" name="post_id" value="<?= (int) ($dp['id'] ?? 0) ?>"><input type="hidden" name="topic_id" value="<?= $discussTopicId ?>"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><button class="btn btn-ghost" type="submit">Delete</button></form><?php endif; ?></div>
                 </div>
                 <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= h((string) ($dp['body'] ?? '')) ?></div>
+                <?php if (trim((string) ($dp['forum_signature'] ?? '')) !== ''): ?>
+                  <div class="meta" style="border-top:1px solid var(--border);margin-top:.7rem;padding-top:.55rem;white-space:pre-wrap;overflow-wrap:anywhere"><?= h((string) $dp['forum_signature']) ?></div>
+                <?php endif; ?>
               </div>
             </article>
           <?php endforeach; ?>
@@ -14477,6 +14481,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
           <label for="pf-summary">Bio (plain text or simple HTML: p, br, a, code, strong, em)</label>
           <textarea id="pf-summary" name="summary" maxlength="4000" required><?= h($summaryForForm) ?></textarea>
+
+          <label for="pf-forum-signature">Forum signature <span class="meta">(optional, max 500 characters)</span></label>
+          <textarea id="pf-forum-signature" name="forum_signature" maxlength="500" rows="3" placeholder="Shown below your Discuss posts…"><?= h((string) ($profile['forum_signature'] ?? '')) ?></textarea>
+          <div class="meta" style="margin:.25rem 0 .75rem">Plain text only. HTML, scripts, and control characters are rejected.</div>
 
           <label for="pf-icon-file">Upload avatar (JPEG / PNG / WebP / GIF · max 2&nbsp;MB)</label>
           <input id="pf-icon-file" type="file" name="icon_file" accept="image/jpeg,image/png,image/webp,image/gif">

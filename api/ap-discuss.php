@@ -195,7 +195,8 @@ function ap_discuss_posts(int $topicId): array
             'SELECT p.id, p.topic_id, p.owner_user_id, p.body, p.created_at, p.updated_at,
                     COALESCE(u.username, \'local user\') AS username,
                     pstats.post_count,
-                    COALESCE(prof.icon_url, \'\') AS avatar_url
+                    COALESCE(prof.icon_url, \'\') AS avatar_url,
+                    COALESCE(prof.forum_signature, \'\') AS forum_signature
              FROM ap_discuss_posts p
              LEFT JOIN ap_users u ON u.id = p.owner_user_id
              LEFT JOIN actor_profile prof ON prof.actor_key = u.actor_key

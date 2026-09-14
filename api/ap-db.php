@@ -625,6 +625,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0,
     reply_policy TEXT NOT NULL DEFAULT 'anyone',
     quote_policy TEXT NOT NULL DEFAULT 'anyone',
+    forum_signature TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
 SQL);
@@ -672,6 +673,9 @@ SQL);
     }
     if (!in_array('quote_policy', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN quote_policy TEXT NOT NULL DEFAULT 'anyone'");
+    }
+    if (!in_array('forum_signature', $profileNames, true)) {
+        $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -2056,6 +2060,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'auto_delete_posts_7d' => false,
         'reply_policy' => 'anyone',
         'quote_policy' => 'anyone',
+        'forum_signature' => '',
         'updated_at' => null,
     ];
 }
@@ -2131,6 +2136,7 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
             : false,
         'reply_policy' => in_array((string) ($row['reply_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['reply_policy'] : 'anyone',
         'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
+        'forum_signature' => trim((string) ($row['forum_signature'] ?? '')),
         'updated_at' => $row['updated_at'] ?? null,
     ];
 }
@@ -2255,6 +2261,10 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     if ($summary === '') {
         return ['ok' => false, 'error' => 'Bio / summary required.'];
     }
+    $forumSignature = trim(ap_fix_utf8((string) ($fields['forum_signature'] ?? '')));
+    if (mb_strlen($forumSignature) > 500 || preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $forumSignature)) {
+        return ['ok' => false, 'error' => 'Forum signature must be plain text with at most 500 characters.'];
+    }
 
     $attachment = [];
     $rawAtt = $fields['attachment'] ?? [];
@@ -2354,8 +2364,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2373,6 +2383,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            auto_delete_posts_7d = excluded.auto_delete_posts_7d,
            reply_policy = excluded.reply_policy,
            quote_policy = excluded.quote_policy,
+           forum_signature = excluded.forum_signature,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2393,6 +2404,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $autoDeletePosts7d,
         $replyPolicy,
         $quotePolicy,
+        $forumSignature,
         ap_db_now(),
     ]);
 
