@@ -19121,13 +19121,16 @@ window.apAdminToast = function (msg, isErr) {
       }).then((res) => res.ok ? res.text() : Promise.reject(new Error('HTTP ' + res.status)))
         .then((html) => {
           const neu = replaceCardInPlace(card, html);
-          // If still marked pending (fetch failed), leave a soft retry.
+          // If the server still cannot resolve the target, do not leave a
+          // misleading perpetual loading message. The card remains usable as
+          // a thin boost/link stub and reports the terminal state clearly.
           if (neu && (neu.dataset.boostHydrate === '1' || neu.dataset.boostHydrateLocal === '1')) {
             const st = neu.querySelector('.boost-hydrate-status');
             if (st) {
-              st.textContent = 'Still loading…';
+              st.textContent = 'Boost details unavailable';
             }
             neu.dataset.boostHydrate = '0';
+            neu.dataset.boostHydrateLocal = '0';
           }
         })
         .catch(() => {
