@@ -14043,8 +14043,30 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'relays'): ?>
         <?php $relayRows = function_exists('ap_relays_list') ? ap_relays_list() : []; ?>
+        <?php
+          $relayCounts = ['accepted' => 0, 'pending' => 0, 'rejected' => 0, 'idle' => 0];
+          foreach ($relayRows as $relayStat) {
+              $relayState = (string) ($relayStat['state'] ?? 'idle');
+              if (!array_key_exists($relayState, $relayCounts)) {
+                  $relayState = 'idle';
+              }
+              $relayCounts[$relayState]++;
+          }
+        ?>
+        <div class="tweet" style="margin-bottom:1rem">
+          <div class="who">ActivityPub relays</div>
+          <div class="body meta" style="margin-top:.45rem">Relays receive public Follow subscriptions from VAAK. A relay remains pending until it accepts the subscription.</div>
+          <div class="tags" style="margin-top:.7rem;display:flex;gap:.4rem;flex-wrap:wrap">
+            <span class="tag">total <?= count($relayRows) ?></span>
+            <span class="tag">accepted <?= $relayCounts['accepted'] ?></span>
+            <span class="tag">pending <?= $relayCounts['pending'] ?></span>
+            <span class="tag">idle <?= $relayCounts['idle'] ?></span>
+            <?php if ($relayCounts['rejected'] > 0): ?><span class="tag">rejected <?= $relayCounts['rejected'] ?></span><?php endif; ?>
+          </div>
+        </div>
         <form class="composer" method="post" action="?view=relays" style="margin-bottom:1.25rem">
           <input type="hidden" name="action" value="relay_add">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="url" name="inbox_url" required placeholder="https://relay.example/inbox" autocomplete="off">
           <div class="composer-actions">
             <span class="meta"></span>
@@ -14082,29 +14104,34 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <form method="post" action="?view=relays" style="display:inline">
                     <input type="hidden" name="action" value="relay_enable">
                     <input type="hidden" name="relay_id" value="<?= $rid ?>">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                     <button class="btn btn-primary" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Enable</button>
                   </form>
                 <?php elseif ($rst === 'pending'): ?>
                   <form method="post" action="?view=relays" style="display:inline">
                     <input type="hidden" name="action" value="relay_enable">
                     <input type="hidden" name="relay_id" value="<?= $rid ?>">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Retry Enable</button>
                   </form>
                   <form method="post" action="?view=relays" style="display:inline">
                     <input type="hidden" name="action" value="relay_disable">
                     <input type="hidden" name="relay_id" value="<?= $rid ?>">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Cancel</button>
                   </form>
                 <?php else: ?>
                   <form method="post" action="?view=relays" style="display:inline">
                     <input type="hidden" name="action" value="relay_disable">
                     <input type="hidden" name="relay_id" value="<?= $rid ?>">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Disable</button>
                   </form>
                 <?php endif; ?>
                 <form method="post" action="?view=relays" style="display:inline" onsubmit="return confirm('Remove this relay?');">
                   <input type="hidden" name="action" value="relay_remove">
                   <input type="hidden" name="relay_id" value="<?= $rid ?>">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                   <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Remove</button>
                 </form>
               </div>
