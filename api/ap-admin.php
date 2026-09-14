@@ -7756,6 +7756,13 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isLocal = $actorId !== '' && function_exists('vaak_is_local_url') && vaak_is_local_url($actorId);
     $isSelf = $actorId !== '' && function_exists('vaak_actor_id')
         && rtrim(vaak_actor_id(), '/') === $actorId;
+    if (!$isSelf && str_contains($host, 'bsky.app') && function_exists('ap_bsky_session_row')) {
+        $bs = ap_bsky_session_row($ownerUserId);
+        $pathHandle = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
+        $pathHandle = preg_replace('~^profile/~', '', $pathHandle) ?? $pathHandle;
+        $isSelf = is_array($bs) && $pathHandle !== ''
+            && strcasecmp($pathHandle, (string) ($bs['handle'] ?? '')) === 0;
+    }
     $personalBlock = function_exists('ap_user_block_find')
         ? ap_user_block_find($actorId, $host, $ownerUserId)
         : null;
@@ -7794,7 +7801,9 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     }
     if (!$isSelf && $objectId !== '' && str_starts_with($objectId, 'https://')) {
         $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
-        $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
+        $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
+        $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">'
+            . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
     }
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
@@ -9649,13 +9658,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         <?php if (!$isHome && $fediId !== ''): ?>
           <a class="meta" href="<?= h($fediId) ?>" style="margin-left:.25rem">AP copy</a>
         <?php endif; ?>
-        <details class="post-action-menu">
-          <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
-          <div class="post-action-menu__body">
-            <a class="menu-action" href="<?= h($openUrl) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
-            <?php if ($fediId !== ''): ?><a class="menu-action" href="<?= h($fediId) ?>" target="_blank" rel="noopener noreferrer">Open AP copy</a><?php endif; ?>
-          </div>
-        </details>
+        <?= block_quick_actions($authorProfileUrl !== '' ? $authorProfileUrl : ('https://bsky.app/profile/' . rawurlencode($handle)), 'bsky.app', $composeView, (int) ($GLOBALS['vaak_owner_id'] ?? 0), false, $composeView, $openUrl) ?>
       </div>
     </article>
     <?php
