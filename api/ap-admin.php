@@ -12088,7 +12088,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet.tweet-focus {
       outline: 2px solid var(--primary);
       outline-offset: 2px;
-      background: #142014;
+      background: transparent;
     }
     /* Breathing room under ← Home / back on detail pages */
     .page-back,
@@ -16548,6 +16548,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $stAncestors = $stFilterBlocked($stAncestors);
               $stDescendants = $stFilterBlocked($stDescendants);
           }
+          // Context providers do not all guarantee a stable order. Keep the
+          // focused thread chronological: oldest ancestor first, newest reply
+          // last, matching the main timeline's ascending conversation flow.
+          $stChronological = static function (array $cards): array {
+              usort($cards, static function (array $a, array $b): int {
+                  $ta = strtotime((string) ($a['created_at'] ?? '')) ?: (int) ($a['id'] ?? 0);
+                  $tb = strtotime((string) ($b['created_at'] ?? '')) ?: (int) ($b['id'] ?? 0);
+                  return $ta <=> $tb;
+              });
+              return $cards;
+          };
+          $stAncestors = $stChronological($stAncestors);
+          $stDescendants = $stChronological($stDescendants);
           $stMaybeMoreThread = false;
           $stMaybeMoreReplies = false;
           $stMaybeHydrateFocus = false;
