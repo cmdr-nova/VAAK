@@ -5511,14 +5511,15 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
     } catch (Throwable $e) {
         error_log('[ap-admin] gallery outbox: ' . $e->getMessage());
     }
-    // Bluesky image posts from this user's durable warmed feed cache. Gallery is
+    // Bluesky media posts from this user's durable warmed feed cache. Gallery is
     // per-owner, and dual-published posts keep their ActivityPub card above.
     if (
-        $view === 'gallery'
+        in_array($view, ['gallery', 'vakktok'], true)
         && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
         && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($galOwnerId))
         && function_exists('ap_bsky_posts_for_home')
         && function_exists('ap_bsky_post_image_urls')
+        && function_exists('ap_bsky_post_video_media')
     ) {
         try {
             foreach (ap_bsky_posts_for_home($galOwnerId, 120) as $bItem) {
@@ -5526,7 +5527,18 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
                     continue;
                 }
                 $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
-                if ($bUri === '' || ap_bsky_post_image_urls($bItem['post']) === []) {
+                $bPostMedia = array_merge(
+                    array_map(static fn(string $url): array => [
+                        'url' => $url,
+                        'mediaType' => 'image/*',
+                        'is_video' => false,
+                    ], ap_bsky_post_image_urls($bItem['post'])),
+                    ap_bsky_post_video_media($bItem['post'])
+                );
+                if ($bUri === '' || $bPostMedia === []) {
+                    continue;
+                }
+                if ($view === 'vakktok' && ap_bsky_post_video_media($bItem['post']) === []) {
                     continue;
                 }
                 $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
@@ -6210,10 +6222,14 @@ function admin_gallery_item_media(array $item): array
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     if ($kind === 'bsky' && function_exists('ap_bsky_post_image_urls')) {
         $post = is_array($row['post'] ?? null) ? $row['post'] : [];
-        return array_map(
+        $images = array_map(
             static fn(string $url): array => ['url' => $url, 'mediaType' => 'image/*', 'is_video' => false],
             ap_bsky_post_image_urls($post)
         );
+        $videos = function_exists('ap_bsky_post_video_media')
+            ? ap_bsky_post_video_media($post)
+            : [];
+        return array_merge($images, $videos);
     }
     if ($kind === 'outbox') {
         return admin_gallery_media_from_outbox($row);

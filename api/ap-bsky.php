@@ -1974,6 +1974,27 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
             'thumb' => (string) ($ext['thumb'] ?? ''),
         ];
     }
+    // Bluesky video views expose an HLS playlist plus an optional poster. Keep
+    // these URLs in the durable compact cache so Gallery/VakkTok can hydrate
+    // video posts without retaining the much larger raw AppView response.
+    if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
+        $video = $embed['video'];
+        $playlist = (string) ($video['playlist'] ?? $video['url'] ?? '');
+        $thumbnail = (string) ($video['thumbnail'] ?? $video['thumb'] ?? '');
+        if (str_starts_with($playlist, 'https://') || str_starts_with($thumbnail, 'https://')) {
+            $out['video'] = [
+                'playlist' => str_starts_with($playlist, 'https://') ? $playlist : '',
+                'thumbnail' => str_starts_with($thumbnail, 'https://') ? $thumbnail : '',
+                'alt' => mb_substr((string) ($video['alt'] ?? ''), 0, 500),
+            ];
+            if (is_array($video['aspectRatio'] ?? null)) {
+                $out['video']['aspectRatio'] = [
+                    'width' => (int) ($video['aspectRatio']['width'] ?? 0),
+                    'height' => (int) ($video['aspectRatio']['height'] ?? 0),
+                ];
+            }
+        }
+    }
     // Store quote embeds in a shape ap_bsky_quote_preview understands
     // (viewRecord with author + value.text), not a flat {text} stub.
     $compactViewRecord = static function (?array $rec): ?array {
@@ -4419,6 +4440,38 @@ function ap_bsky_post_image_urls(array $post): array
         }
     }
     return $out;
+}
+
+/**
+ * @return list<array{url:string,thumbnail:string,mediaType:string,is_video:bool}>
+ */
+function ap_bsky_post_video_media(array $post): array
+{
+    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : null;
+    if ($embed === null) {
+        return [];
+    }
+    $video = null;
+    $type = (string) ($embed['$type'] ?? '');
+    if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
+        $video = $embed['video'];
+    } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['video'] ?? null)) {
+        $video = $embed['media']['video'];
+    }
+    if (!is_array($video)) {
+        return [];
+    }
+    $url = (string) ($video['playlist'] ?? $video['url'] ?? '');
+    if (!str_starts_with($url, 'https://')) {
+        return [];
+    }
+    $thumbnail = (string) ($video['thumbnail'] ?? $video['thumb'] ?? '');
+    return [[
+        'url' => $url,
+        'thumbnail' => str_starts_with($thumbnail, 'https://') ? $thumbnail : '',
+        'mediaType' => 'application/x-mpegURL',
+        'is_video' => true,
+    ]];
 }
 
 function ap_bsky_post_url(array $post): string
