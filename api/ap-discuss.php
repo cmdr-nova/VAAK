@@ -193,9 +193,17 @@ function ap_discuss_posts(int $topicId): array
     try {
         $st = ap_db()->prepare(
             'SELECT p.id, p.topic_id, p.owner_user_id, p.body, p.created_at, p.updated_at,
-                    COALESCE(u.username, \'local user\') AS username
+                    COALESCE(u.username, \'local user\') AS username,
+                    pstats.post_count,
+                    COALESCE(prof.icon_url, \'\') AS avatar_url
              FROM ap_discuss_posts p
              LEFT JOIN ap_users u ON u.id = p.owner_user_id
+             LEFT JOIN actor_profile prof ON prof.actor_key = u.actor_key
+             LEFT JOIN (
+                 SELECT owner_user_id, COUNT(*) AS post_count
+                 FROM ap_discuss_posts
+                 GROUP BY owner_user_id
+             ) pstats ON pstats.owner_user_id = p.owner_user_id
              WHERE p.topic_id = ?
              ORDER BY p.created_at ASC, p.id ASC'
         );

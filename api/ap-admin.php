@@ -11873,6 +11873,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
     .relay-card .relay-meta { text-align: left; margin-left: 0; padding-left: 0; }
+    .forum-post { display:flex; gap:.8rem; align-items:flex-start; }
+    .forum-post-avatar { width:42px; height:42px; flex:0 0 42px; border-radius:50%; object-fit:cover; background:var(--panel-2); border:1px solid var(--border); }
+    .forum-post-main { min-width:0; flex:1 1 auto; }
 
     /* Gallery — Instagram-style media grid */
     .gallery-grid {
@@ -12747,6 +12750,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php if ($vaakActorKey === 'cmdr_nova'): ?>
                 <form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this discussion and all of its replies?');">
                   <input type="hidden" name="action" value="discuss_topic_delete">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                   <input type="hidden" name="topic_id" value="<?= $discussTopicId ?>">
                   <input type="hidden" name="category_slug" value="<?= h((string) ($discussTopic['category_slug'] ?? '')) ?>">
                   <button class="btn btn-ghost" type="submit">Delete discussion</button>
@@ -12755,17 +12759,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </div>
           </article>
           <?php foreach ($discussPosts as $dp): ?>
-            <article id="post-<?= (int) ($dp['id'] ?? 0) ?>" class="side-card" style="margin-bottom:.75rem">
-              <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:baseline;flex-wrap:wrap">
-                <div><b>@<?= h((string) ($dp['username'] ?? 'local user')) ?></b><span class="meta"> · <?= h(relative_time((string) ($dp['created_at'] ?? ''))) ?></span></div>
-                <div style="display:flex;gap:.65rem;align-items:center"><a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a><?php if ($vaakActorKey === 'cmdr_nova'): ?><form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this reply?');"><input type="hidden" name="action" value="discuss_post_delete"><input type="hidden" name="post_id" value="<?= (int) ($dp['id'] ?? 0) ?>"><input type="hidden" name="topic_id" value="<?= $discussTopicId ?>"><button class="btn btn-ghost" type="submit">Delete</button></form><?php endif; ?></div>
+            <article id="post-<?= (int) ($dp['id'] ?? 0) ?>" class="side-card forum-post" style="margin-bottom:.75rem">
+              <?php $forumAvatar = trim((string) ($dp['avatar_url'] ?? '')); ?>
+              <?php if (str_starts_with($forumAvatar, 'https://')): ?><img class="forum-post-avatar" src="<?= h($forumAvatar) ?>" alt="" loading="lazy" referrerpolicy="no-referrer"><?php else: ?><span class="forum-post-avatar" aria-hidden="true"></span><?php endif; ?>
+              <div class="forum-post-main">
+                <div style="display:flex;justify-content:space-between;gap:.75rem;align-items:baseline;flex-wrap:wrap">
+                  <div><b>@<?= h((string) ($dp['username'] ?? 'local user')) ?></b><span class="meta"> · <?= (int) ($dp['post_count'] ?? 0) ?> <?= ((int) ($dp['post_count'] ?? 0) === 1 ? 'post' : 'posts') ?> · <?= h(relative_time((string) ($dp['created_at'] ?? ''))) ?></span></div>
+                  <div style="display:flex;gap:.65rem;align-items:center"><a class="meta" href="#post-<?= (int) ($dp['id'] ?? 0) ?>">#<?= (int) ($dp['id'] ?? 0) ?></a><?php if ($vaakActorKey === 'cmdr_nova'): ?><form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" onsubmit="return confirm('Delete this reply?');"><input type="hidden" name="action" value="discuss_post_delete"><input type="hidden" name="post_id" value="<?= (int) ($dp['id'] ?? 0) ?>"><input type="hidden" name="topic_id" value="<?= $discussTopicId ?>"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><button class="btn btn-ghost" type="submit">Delete</button></form><?php endif; ?></div>
+                </div>
+                <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= h((string) ($dp['body'] ?? '')) ?></div>
               </div>
-              <div class="body feed-body" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem"><?= h((string) ($dp['body'] ?? '')) ?></div>
             </article>
           <?php endforeach; ?>
           <?php if (empty($discussTopic['locked'])): ?>
             <form method="post" action="?view=discuss&amp;topic=<?= $discussTopicId ?>" class="side-card composer" style="margin-top:1rem">
               <input type="hidden" name="action" value="discuss_post_create">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="topic_id" value="<?= $discussTopicId ?>">
               <h2 style="margin-top:0;font-size:1rem">Reply</h2>
               <textarea name="post_body" maxlength="20000" rows="6" placeholder="Write a reply…" required></textarea>
@@ -12796,6 +12805,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <h2 style="margin:.1rem 0 .7rem;font-size:1rem">Start a discussion</h2>
             <form method="post" action="?view=discuss&amp;category=<?= h(rawurlencode($discussCategorySlug)) ?>" class="composer">
               <input type="hidden" name="action" value="discuss_topic_create">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="category_slug" value="<?= h($discussCategorySlug) ?>">
               <input name="topic_title" maxlength="180" placeholder="Topic title" required>
               <textarea name="topic_body" maxlength="20000" rows="5" placeholder="What would you like to discuss?" required></textarea>
