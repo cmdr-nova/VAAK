@@ -11856,6 +11856,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .tweet:hover { border-color: #3a3a3a; }
 
+    /* Mastodon-like flat timeline: the feed remains the scroll container, but
+       adjacent posts share one surface and are separated by rules. Cards in
+       Profile/Admin views and public HTML profiles are intentionally untouched. */
+    .timeline-feed .compose-inline-panel > .composer {
+      background: transparent; border: 0; border-bottom: 1px solid var(--border);
+      border-radius: 0; box-shadow: none; padding: .85rem .25rem 1rem;
+    }
+    .timeline-feed #timeline-items > article.tweet {
+      background: transparent; border: 0; border-bottom: 1px solid var(--border);
+      border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
+    }
+    .timeline-feed #timeline-items > article.tweet:hover {
+      border-color: var(--border); background: rgba(255,255,255,.025);
+    }
+    .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
+    .timeline-feed .feed-new-btn { margin-inline: .25rem; }
+
     /* Gallery — Instagram-style media grid */
     .gallery-grid {
       display: grid;
@@ -12701,7 +12718,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <?php if ($notice): ?><div class="flash ok"><?= h($notice) ?></div><?php endif; ?>
     <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
 
-    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?>">
+    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed'], true) ? ' timeline-feed' : '' ?>">
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <div class="compose-inline-slot" id="compose-inline-slot" aria-label="Loading composer">
           <div class="compose-inline-skeleton" aria-hidden="true"></div>
