@@ -888,7 +888,7 @@ function ap_user_html_shell_start(string $title): void
     echo '<link rel="alternate" type="application/json+oembed" href="https://mkultra.monster/api/ap-oembed.php?url=' . rawurlencode('https://mkultra.monster/users/' . $safe) . '&amp;format=json">';
     echo '<style>
       :root{color-scheme:dark}
-      body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#ddd}
+      body{margin:0;font-family:system-ui,sans-serif;background:#101010;color:#ddd}
       main{max-width:42rem;margin:0 auto;padding:1.25rem;box-sizing:border-box}
       .card{border:1px solid #2a2a2a;border-radius:14px;padding:1.25rem;background:#121212}
       a{color:#7ee0ff}.muted{color:#999}

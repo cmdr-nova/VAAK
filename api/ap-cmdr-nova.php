@@ -834,7 +834,7 @@ function ap_cmdr_shell_start(string $title): void
     echo '<link rel="webmention" href="https://mkultra.monster/api/ap-webmention.php">';
     echo '<link rel="alternate" type="application/json+oembed" href="https://mkultra.monster/api/ap-oembed.php?url=https%3A%2F%2Fmkultra.monster%2Fusers%2Fcmdr_nova&amp;format=json">';
     echo '<style>
-      body{margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#e8e8e8;line-height:1.55}
+      body{margin:0;font-family:system-ui,sans-serif;background:#101010;color:#e8e8e8;line-height:1.55}
       main{max-width:42rem;margin:3rem auto;padding:0 1.25rem;box-sizing:border-box}
       .card{border:1px solid #333;border-radius:12px;padding:1.35rem;background:#121212;overflow:hidden}
       .banner{margin:-1.35rem -1.35rem 1rem;height:180px;background:#1a1a1a;background-size:cover;background-position:center}
