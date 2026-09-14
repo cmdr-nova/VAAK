@@ -7453,7 +7453,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                       <span class="meta"> <?= h($whoHandle) ?></span>
                     <?php endif; ?>
                   <?php endif; ?>
-                  <span class="meta"> · <?= h((string) $e['type']) ?> · <?= h(relative_time($e['created_at'])) ?></span>
+                  <span class="meta"> · <?= h(relative_time($e['created_at'])) ?></span>
                   <?php
                     $evVis = admin_visibility_meta($e['visibility'] ?? 'public');
                     if ($evVis['key'] !== 'public'):
@@ -7481,7 +7481,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <?php endif; ?>
                   <?= admin_anti_ai_tag_html($summaryRaw, $aid !== '' ? $aid : null) ?>
                 </div>
-                <div class="meta"><?= h((string) $e['host']) ?><?= $evVis['key'] !== 'public' ? ' · ' . h($evVis['label']) : '' ?></div>
+                <div class="meta"><?= h((string) $e['host']) ?></div>
               </div>
             </div>
             <?php
