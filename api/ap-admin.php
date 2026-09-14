@@ -10892,7 +10892,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       --primary: #00ff9f;
       --primary-dim: rgba(0,255,159,.15);
       --bg-glow: #102018;
-      --bg: #0a0a0a;
+      --bg: #101010;
       --panel: #121212;
       --panel-2: #1a1a1a;
       --border: #2a2a2a;
@@ -10910,7 +10910,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     :root[data-accent="orange"] { --primary:#ff9f43; --primary-dim:rgba(255,159,67,.15); --bg-glow:#201810; }
     :root[data-accent="pink"] { --primary:#ff70c7; --primary-dim:rgba(255,112,199,.15); --bg-glow:#201018; }
     * { box-sizing: border-box; }
-    html { background: #0a0a0a; color-scheme: dark; }
+    html { background: #101010; color-scheme: dark; }
     body {
       margin: 0;
       font-family: "Segoe UI", system-ui, sans-serif;
