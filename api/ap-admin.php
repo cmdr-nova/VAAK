@@ -12147,7 +12147,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
     .flash {
       margin: 0 1.25rem 1rem; padding: .75rem 1rem; border-radius: 10px;
+      display:flex; align-items:flex-start; gap:.75rem; justify-content:space-between;
+      transition: opacity .25s ease, transform .25s ease;
     }
+    .flash.is-leaving { opacity:0; transform:translateY(-.25rem); }
+    .flash-dismiss { appearance:none; border:0; background:transparent; color:inherit; cursor:pointer; opacity:.75; font:inherit; font-size:1.1rem; line-height:1; padding:0 .15rem; }
+    .flash-dismiss:hover { opacity:1; }
     .flash.ok { background: #0a2a18; border: 1px solid #1f5a3a; color: #b6f5d0; }
     .flash.err { background: #2a1010; border: 1px solid #5a2a2a; color: #ffc9c9; }
     .bm-folder-popover {
@@ -12719,8 +12724,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </div>
     </div>
 
-    <?php if ($notice): ?><div class="flash ok"><?= h($notice) ?></div><?php endif; ?>
-    <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
+    <?php if ($notice): ?><div class="flash ok" role="status" data-flash-timeout="6000"><span><?= h($notice) ?></span><button class="flash-dismiss" type="button" aria-label="Dismiss message">×</button></div><?php endif; ?>
+    <?php if ($error): ?><div class="flash err" role="alert" data-flash-timeout="10000"><span><?= h($error) ?></span><button class="flash-dismiss" type="button" aria-label="Dismiss error">×</button></div><?php endif; ?>
+    <script>
+      (function () {
+        document.querySelectorAll('.flash[data-flash-timeout]').forEach(function (flash) {
+          var dismiss = function () {
+            if (flash.classList.contains('is-leaving')) return;
+            flash.classList.add('is-leaving');
+            window.setTimeout(function () { if (flash.parentNode) flash.parentNode.removeChild(flash); }, 280);
+          };
+          var button = flash.querySelector('.flash-dismiss');
+          if (button) button.addEventListener('click', dismiss);
+          window.setTimeout(dismiss, parseInt(flash.dataset.flashTimeout || '8000', 10));
+        });
+      }());
+    </script>
 
     <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions'], true) ? ' timeline-feed' : '' ?>">
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
