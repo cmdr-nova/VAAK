@@ -129,6 +129,15 @@ function ap_db(): PDO
         return $pdo;
     }
 
+    // Production VAAK is Postgres-only. SQLite fallback is opt-in for local/dev
+    // (AP_ALLOW_SQLITE=1). Never silently open /var/lib/mkultra/ap/ap.sqlite.
+    $allowSqlite = getenv('AP_ALLOW_SQLITE');
+    if ($allowSqlite === false || !in_array(strtolower(trim((string) $allowSqlite)), ['1', 'true', 'yes', 'on'], true)) {
+        throw new RuntimeException(
+            'AP_DB_DSN (pgsql:) is required for VAAK. SQLite fallback is disabled; set AP_ALLOW_SQLITE=1 only for local/dev.'
+        );
+    }
+
     $dir = dirname(AP_DB_PATH);
     if (!is_dir($dir)) {
         mkdir($dir, 0750, true);
@@ -160,11 +169,23 @@ function ap_db(): PDO
  */
 function ap_db_migrate_postgres(PDO $db): void
 {
+    // Runtime connections validate the already-provisioned schema.  The
+    // restricted www-data role intentionally cannot CREATE in public, and
+    // PostgreSQL still checks that permission for CREATE TABLE IF NOT EXISTS
+    // even when the table exists.  Probe once so every request / cron run does
+    // not generate failed DDL transactions and error-log writes.
+    $loadPresentTables = static function () use ($db): array {
+        $st = $db->query('SELECT tablename FROM pg_tables WHERE schemaname = current_schema()');
+        return array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+    };
+    $present = $loadPresentTables();
+
     // Verified Webmentions are public responses to local profile/post URLs.
     // Keep this table separate from ActivityPub notifications so external
     // mentions cannot enter the authenticated timeline or notification feed.
     try {
-        $db->exec(<<<'SQL'
+        if (!isset($present['webmentions'])) {
+            $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS webmentions (
     id BIGSERIAL PRIMARY KEY,
     source_url TEXT NOT NULL,
@@ -180,8 +201,9 @@ CREATE TABLE IF NOT EXISTS webmentions (
     UNIQUE (source_url, target_url)
 )
 SQL);
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_target ON webmentions(target_url, verified_at DESC, id DESC)');
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_webmentions_source_host ON webmentions(source_host, verified_at DESC)');
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] webmention table not provisioned: ' . $e->getMessage());
     }
@@ -190,10 +212,11 @@ SQL);
     // They are intentionally not ActivityPub objects or federation content.
     $noticeTablesReady = false;
     try {
-        $noticeTablesReady = (bool) $db->query(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_notices')
-                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_notice_replies')"
-        )->fetchColumn();
+        $noticeTablesReady = isset(
+            $present['ap_notices'],
+            $present['ap_notice_replies'],
+            $present['ap_notice_reads']
+        );
     } catch (Throwable $e) {
         error_log('[ap-db] notice table probe failed: ' . $e->getMessage());
     }
@@ -234,18 +257,21 @@ SQL);
     }
     // Additive notice-read cursor (may exist on older installs that already have ap_notices).
     try {
-        $db->exec(<<<'SQL'
+        if (!isset($present['ap_notice_reads'])) {
+            $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS ap_notice_reads (
     owner_user_id BIGINT NOT NULL PRIMARY KEY,
     last_read_at TEXT NOT NULL
 )
 SQL);
+        }
     } catch (Throwable $e) {
         // ignore — postgres role may lack DDL; provisioned via migrate/ops
     }
     // Home soft-demote list (VAAK overflow "Deprioritize").
     try {
-        $db->exec(<<<'SQL'
+        if (!isset($present['ap_deprioritized_actors'])) {
+            $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS ap_deprioritized_actors (
     owner_user_id BIGINT NOT NULL,
     actor_id TEXT NOT NULL,
@@ -253,13 +279,15 @@ CREATE TABLE IF NOT EXISTS ap_deprioritized_actors (
     PRIMARY KEY (owner_user_id, actor_id)
 )
 SQL);
+        }
     } catch (Throwable $e) {
         // ignore — provision via ops when runtime role lacks DDL
     }
 
     // Phase A Bluesky tab — per-user encrypted ATProto session (opt-in).
     try {
-        $db->exec(<<<'SQL'
+        if (!isset($present['bsky_sessions'])) {
+            $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_sessions (
     owner_user_id BIGINT PRIMARY KEY,
     handle TEXT NOT NULL,
@@ -271,18 +299,19 @@ CREATE TABLE IF NOT EXISTS bsky_sessions (
     updated_at TEXT NOT NULL
 )
 SQL);
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] bsky_sessions not provisioned: ' . $e->getMessage());
     }
 
     $discussTablesReady = false;
     try {
-        $discussTablesReady = (bool) $db->query(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_categories')
-                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_topics')
-                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_posts')
-                    AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ap_discuss_reads')"
-        )->fetchColumn();
+        $discussTablesReady = isset(
+            $present['ap_discuss_categories'],
+            $present['ap_discuss_topics'],
+            $present['ap_discuss_posts'],
+            $present['ap_discuss_reads']
+        );
     } catch (Throwable $e) {
         error_log('[ap-db] discussion table probe failed: ' . $e->getMessage());
     }
@@ -358,8 +387,12 @@ SQL);
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
         'remote_media_cache', 'site_syndications',
     ];
-    $st = $db->query("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()");
-    $present = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+    // Refresh only when bootstrap may have created something above.  On the
+    // normal production path the first probe is authoritative and reusable.
+    if (!$noticeTablesReady || !$discussTablesReady
+        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'])) {
+        $present = $loadPresentTables();
+    }
     $missing = array_values(array_filter($requiredTables, static fn(string $table): bool => !isset($present[$table])));
     if ($missing) {
         throw new RuntimeException('PostgreSQL staging schema is incomplete: ' . implode(', ', $missing));
@@ -4858,6 +4891,108 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
         }
     } catch (Throwable $e) {
         // ignore
+    }
+
+    // Bluesky direct replies when this Note has an ATProto twin.
+    try {
+        $bskyUri = null;
+        if (function_exists('ap_bsky_post_link_by_fedi')) {
+            $link = ap_bsky_post_link_by_fedi($noteId);
+            if (is_array($link) && !empty($link['bsky_uri'])) {
+                $bskyUri = (string) $link['bsky_uri'];
+            }
+        }
+        if (($bskyUri === null || $bskyUri === '') && function_exists('ap_bsky_crosspost_by_note_id')) {
+            $map = ap_bsky_crosspost_by_note_id($noteId);
+            if (is_array($map) && !empty($map['bsky_uri'])) {
+                $bskyUri = (string) $map['bsky_uri'];
+            }
+        }
+        if (($bskyUri === null || $bskyUri === '')) {
+            try {
+                $st = ap_db()->prepare('SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+                $st->execute([$noteId, $noteId . '/']);
+                $raw = (string) ($st->fetchColumn() ?: '');
+                $j = $raw !== '' ? json_decode($raw, true) : null;
+                $obj = is_array($j) ? ($j['object'] ?? $j) : null;
+                if (is_array($obj) && !empty($obj['blueskyUri']) && is_string($obj['blueskyUri'])) {
+                    $bskyUri = (string) $obj['blueskyUri'];
+                }
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+        if (is_string($bskyUri) && str_starts_with($bskyUri, 'at://') && function_exists('ap_bsky_xrpc')) {
+            if (!function_exists('ap_bsky_xrpc')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            $thread = ap_bsky_xrpc('https://public.api.bsky.app', 'app.bsky.feed.getPostThread', 'GET', [
+                'uri' => $bskyUri,
+                'depth' => '1',
+            ], null, null, 12);
+            $replies = [];
+            if (!empty($thread['ok']) && is_array($thread['json']['thread'] ?? null)) {
+                $replies = $thread['json']['thread']['replies'] ?? [];
+            }
+            if (is_array($replies)) {
+                foreach ($replies as $node) {
+                    if (!is_array($node)) {
+                        continue;
+                    }
+                    $post = $node['post'] ?? null;
+                    if (!is_array($post)) {
+                        continue;
+                    }
+                    $uri = rtrim((string) ($post['uri'] ?? ''), '/');
+                    if ($uri === '' || !str_starts_with($uri, 'at://')) {
+                        continue;
+                    }
+                    // Skip if we already have this reply via a dual-publish fedi twin.
+                    $fediTwin = '';
+                    if (function_exists('ap_bsky_post_link_by_uri')) {
+                        $plink = ap_bsky_post_link_by_uri($uri);
+                        if (is_array($plink)) {
+                            $fediTwin = rtrim((string) ($plink['fediverse_id'] ?? $plink['ap_object_id'] ?? ''), '/');
+                        }
+                    }
+                    if ($fediTwin !== '' && isset($byKey[$fediTwin])) {
+                        continue;
+                    }
+                    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+                    $handle = (string) ($author['handle'] ?? '');
+                    $did = (string) ($author['did'] ?? '');
+                    $actorId = $handle !== ''
+                        ? ('https://bsky.app/profile/' . rawurlencode($handle))
+                        : ($did !== '' ? ('https://bsky.app/profile/' . rawurlencode($did)) : '');
+                    $rec = is_array($post['record'] ?? null) ? $post['record'] : [];
+                    $text = trim((string) ($rec['text'] ?? ''));
+                    $published = (string) ($rec['createdAt'] ?? $post['indexedAt'] ?? '');
+                    $rkey = '';
+                    if (preg_match('~^at://[^/]+/[^/]+/([^/]+)$~', $uri, $rm)) {
+                        $rkey = $rm[1];
+                    }
+                    $url = $handle !== '' && $rkey !== ''
+                        ? ('https://bsky.app/profile/' . rawurlencode($handle) . '/post/' . rawurlencode($rkey))
+                        : $uri;
+                    // Prefer fedi twin URL when we know it (click stays on the open web).
+                    if ($fediTwin !== '' && str_starts_with($fediTwin, 'https://')) {
+                        $url = $fediTwin;
+                    }
+                    $push(
+                        'bluesky',
+                        $fediTwin !== '' ? $fediTwin : $uri,
+                        $url,
+                        $actorId,
+                        $text,
+                        $published,
+                        '',
+                        false
+                    );
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] note public bluesky replies: ' . $e->getMessage());
     }
 
     $out = array_values($byKey);

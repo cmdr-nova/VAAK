@@ -283,6 +283,42 @@ if ($user !== null && $mode === 'login') {
     exit;
 }
 
+// Logged-out AJAX / timeline partials: never return the login page HTML as 200 —
+// fetch() would inject it into the feed. Force a full-page login redirect client-side.
+if ($user === null) {
+    $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
+    $isAjaxGet = isset($_GET['ajax']);
+    $xrw = strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? ''));
+    $secDest = strtolower((string) ($_SERVER['HTTP_SEC_FETCH_DEST'] ?? ''));
+    $secMode = strtolower((string) ($_SERVER['HTTP_SEC_FETCH_MODE'] ?? ''));
+    $isFetch = ($secDest === 'empty' && in_array($secMode, ['cors', 'same-origin', 'no-cors'], true))
+        || $xrw === 'xmlhttprequest';
+    if ($isPartial || $isAjaxGet || $isFetch) {
+        $loginQs = '/vaak/?mode=login';
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? ''));
+        if ($returnView !== '' && $returnView !== 'home') {
+            $loginQs .= '&next=' . rawurlencode($returnView);
+        }
+        http_response_code(401);
+        header('Cache-Control: no-store');
+        header('X-VAAK-Auth: required');
+        header('X-VAAK-Login: ' . $loginQs);
+        $accept = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
+        if (str_contains($accept, 'application/json') || $isAjaxGet) {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode([
+                'ok' => false,
+                'error' => 'session_expired',
+                'login' => $loginQs,
+            ], JSON_UNESCAPED_SLASHES);
+        } else {
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'session_expired';
+        }
+        exit;
+    }
+}
+
 // Logged out — show login (default) or register
 if ($mode === '') {
     $mode = 'login';

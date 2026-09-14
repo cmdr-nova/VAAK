@@ -961,6 +961,7 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
 
 /**
  * Queue a background warm of avatar/header for an actor (best-effort).
+ * Concurrency-capped so a busy Home timeline cannot fork-bomb PHP/DNS.
  */
 function ap_remote_media_warm_async(string $actorId): void
 {
@@ -975,7 +976,37 @@ function ap_remote_media_warm_async(string $actorId): void
     if (!is_file($script)) {
         return;
     }
-    $cmd = 'php ' . escapeshellarg($script) . ' ' . escapeshellarg($actorId)
+
+    // Per-actor debounce: skip if a warmer for this actor already holds a lock.
+    $actorLock = sys_get_temp_dir() . '/vaak-mw-' . hash('sha256', $actorId) . '.lock';
+    $actorFh = @fopen($actorLock, 'c+');
+    if ($actorFh === false || !flock($actorFh, LOCK_EX | LOCK_NB)) {
+        if (is_resource($actorFh)) {
+            fclose($actorFh);
+        }
+        return;
+    }
+    // Stale lock cleanup happens when the child exits; parent keeps the lock
+    // file handle open only long enough to spawn, then closes (child re-locks).
+
+    // Global cap across all actors.
+    $maxConcurrent = 3;
+    $running = 0;
+    $pgrep = trim((string) @shell_exec("pgrep -fc 'ap-media-warm\\.php' 2>/dev/null"));
+    if ($pgrep !== '' && ctype_digit($pgrep)) {
+        $running = (int) $pgrep;
+    }
+    if ($running >= $maxConcurrent) {
+        flock($actorFh, LOCK_UN);
+        fclose($actorFh);
+        return;
+    }
+
+    // Child re-acquires the per-actor lock for the duration of the warm.
+    flock($actorFh, LOCK_UN);
+    fclose($actorFh);
+    $cmd = 'php ' . escapeshellarg($script)
+        . ' ' . escapeshellarg($actorId)
         . ' > /dev/null 2>&1 &';
     @exec($cmd);
 }

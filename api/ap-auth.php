@@ -91,14 +91,37 @@ function ap_auth_emit_session_cookie(): void
         return;
     }
     $params = ap_auth_cookie_params();
+    $lifetime = (int) $params['lifetime'];
     $opts = [
-        'expires' => time() + (int) $params['lifetime'],
+        'expires' => time() + $lifetime,
         'path' => $params['path'],
         'secure' => !empty($params['secure']),
         'httponly' => true,
         'samesite' => $params['samesite'],
     ];
+    // Prefer Max-Age as well — some mobile browsers treat Expires-only oddly
+    // when the device clock skews; header() lets us send both.
+    $secure = !empty($params['secure']) ? '; Secure' : '';
+    $cookie = rawurlencode(session_name()) . '=' . rawurlencode(session_id())
+        . '; Path=' . $params['path']
+        . '; Max-Age=' . $lifetime
+        . '; Expires=' . gmdate('D, d M Y H:i:s', time() + $lifetime) . ' GMT'
+        . '; HttpOnly'
+        . '; SameSite=' . $params['samesite']
+        . $secure;
+    header('Set-Cookie: ' . $cookie, false);
+    // Also call setcookie so PHP's session layer stays consistent.
     setcookie(session_name(), session_id(), $opts);
+}
+
+/** Dedicated session dir so other PHP apps' GC (default 1440s) cannot wipe VAAK. */
+function ap_auth_session_save_path(): string
+{
+    $path = '/var/lib/mkultra/ap/sessions';
+    if (!is_dir($path)) {
+        @mkdir($path, 0700, true);
+    }
+    return $path;
 }
 
 function ap_auth_start_session(): void
@@ -109,11 +132,24 @@ function ap_auth_start_session(): void
     }
     // Must exceed cookie lifetime or PHP GC deletes the session file while the
     // browser still holds the cookie — that felt like "random logouts".
+    // Also use an isolated save_path: shared /var/lib/php/sessions is GC'd by
+    // other pools/CLI with the default 1440s maxlifetime.
     @ini_set('session.gc_maxlifetime', (string) AP_AUTH_SESSION_TTL);
     @ini_set('session.cookie_lifetime', (string) AP_AUTH_SESSION_TTL);
+    @ini_set('session.use_strict_mode', '1');
+    @ini_set('session.use_only_cookies', '1');
+    $savePath = ap_auth_session_save_path();
+    if (is_dir($savePath) && is_writable($savePath)) {
+        @ini_set('session.save_path', $savePath);
+        session_save_path($savePath);
+    }
     session_name(AP_AUTH_SESSION_NAME);
     session_set_cookie_params(ap_auth_cookie_params());
     session_start();
+    // Activity stamp for idle checks + sliding cookie renewal
+    if ((int) ($_SESSION['vaak_user_id'] ?? 0) > 0) {
+        $_SESSION['_vaak_last_seen'] = time();
+    }
     ap_auth_touch_session_cookie();
 }
 
@@ -128,7 +164,9 @@ function ap_auth_touch_session_cookie(): void
         return;
     }
     $now = time();
+    $_SESSION['_vaak_last_seen'] = $now;
     $last = (int) ($_SESSION['_vaak_cookie_touched'] ?? 0);
+    // Refresh at least daily; also refresh on first touch after login.
     if ($last > 0 && ($now - $last) < AP_AUTH_COOKIE_REFRESH_EVERY) {
         return;
     }

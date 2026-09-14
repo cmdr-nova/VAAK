@@ -10,6 +10,58 @@ declare(strict_types=1);
 
 const AP_BSKY_DEFAULT_PDS = 'https://bsky.social';
 const AP_BSKY_PUBLIC_API = 'https://public.api.bsky.app';
+/** DNS/TCP connect cap — keep UI from stalling on dead resolvers. */
+const AP_BSKY_CONNECT_TIMEOUT = 2;
+/** Default XRPC total timeout (interactive reads/writes). */
+const AP_BSKY_DEFAULT_TIMEOUT = 8;
+/** Hard wall-clock budget for in-request crosspost (web). CLI retries use a longer budget. */
+const AP_BSKY_CROSSPOST_BUDGET_WEB = 8;
+const AP_BSKY_CROSSPOST_BUDGET_CLI = 180;
+
+/**
+ * Request-scoped Bluesky time budget so stacked XRPC calls cannot lock FPM workers.
+ * null = no budget (legacy / unlimited within per-call timeouts).
+ */
+function ap_bsky_budget_begin(int $seconds): void
+{
+    $seconds = max(1, $seconds);
+    $GLOBALS['ap_bsky_budget_deadline'] = microtime(true) + $seconds;
+}
+
+function ap_bsky_budget_clear(): void
+{
+    unset($GLOBALS['ap_bsky_budget_deadline']);
+}
+
+function ap_bsky_budget_remaining(): ?float
+{
+    if (!isset($GLOBALS['ap_bsky_budget_deadline'])) {
+        return null;
+    }
+    return (float) $GLOBALS['ap_bsky_budget_deadline'] - microtime(true);
+}
+
+function ap_bsky_budget_exceeded(): bool
+{
+    $left = ap_bsky_budget_remaining();
+    return $left !== null && $left <= 0.05;
+}
+
+/**
+ * Cap a requested timeout against the active budget (and floor at 1s when budget remains).
+ */
+function ap_bsky_effective_timeout(int $timeoutSec): int
+{
+    $timeoutSec = max(1, $timeoutSec);
+    $left = ap_bsky_budget_remaining();
+    if ($left === null) {
+        return $timeoutSec;
+    }
+    if ($left <= 0.05) {
+        return 0; // signal caller to abort
+    }
+    return max(1, min($timeoutSec, (int) floor($left)));
+}
 
 function ap_bsky_tab_enabled(): bool
 {
@@ -159,6 +211,468 @@ SQL);
     } catch (Throwable $e) {
         // Table may already exist via ops.
     }
+}
+
+/**
+ * Pending Bluesky mirror retries (DNS/auth blips, or reply waiting on parent mirror).
+ * Prod www-data may lack DDL — ops CREATE once; helpers degrade gracefully.
+ */
+function ap_bsky_crosspost_retries_migrate(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+    try {
+        $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
+        if ($driver === 'pgsql') {
+            $have = (bool) ap_db()->query(
+                "SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = current_schema() AND table_name = 'bsky_crosspost_retries'
+                 )"
+            )->fetchColumn();
+            if (!$have) {
+                ap_db()->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
+    id BIGSERIAL PRIMARY KEY,
+    note_id TEXT NOT NULL UNIQUE,
+    owner_user_id BIGINT NOT NULL,
+    local_id BIGINT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+                try {
+                    ap_db()->exec(
+                        'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
+                         ON bsky_crosspost_retries (status, next_attempt_at)'
+                    );
+                } catch (Throwable $e) {
+                    // ignore
+                }
+            }
+        } else {
+            ap_db()->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id TEXT NOT NULL UNIQUE,
+    owner_user_id INTEGER NOT NULL,
+    local_id INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
+    next_attempt_at TEXT NOT NULL,
+    last_error TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+            try {
+                ap_db()->exec(
+                    'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
+                     ON bsky_crosspost_retries (status, next_attempt_at)'
+                );
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+    } catch (Throwable $e) {
+        // Table may already exist via ops.
+    }
+}
+
+/**
+ * Whether a crosspost outcome should be retried in the background.
+ */
+function ap_bsky_crosspost_should_retry(?array $result): bool
+{
+    if (!is_array($result)) {
+        return true;
+    }
+    if (!empty($result['ok']) && empty($result['skipped'])) {
+        return false;
+    }
+    $err = trim((string) ($result['error'] ?? ''));
+    if ($err === '') {
+        return !empty($result['skipped']) ? false : true;
+    }
+    // Permanent / intentional skips — do not retry.
+    $permanent = [
+        'Visibility not cross-posted',
+        'Bluesky not connected',
+        'Nothing to cross-post',
+        'No owner',
+        'No Bluesky session',
+        'Missing DID',
+        'Reply parent is not a Bluesky post',
+        'no_owner_session_mapping',
+    ];
+    foreach ($permanent as $p) {
+        if (strcasecmp($err, $p) === 0) {
+            return false;
+        }
+    }
+    // Soft skip: parent may get mirrored later (or already did).
+    if (stripos($err, 'Fediverse-only') !== false) {
+        return true;
+    }
+    // Explicitly deferred (video / budget) — always backfill.
+    if (!empty($result['deferred'])) {
+        return true;
+    }
+    // Rate limits — queue until the window resets.
+    if (ap_bsky_result_is_rate_limited($result)) {
+        return true;
+    }
+    // Hard failures (timeouts, auth, DNS, createRecord errors).
+    if (empty($result['ok']) || !empty($result['error'])) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Backoff seconds by attempt number (1-indexed after increment).
+ */
+function ap_bsky_crosspost_retry_backoff_sec(int $attempt): int
+{
+    $table = [60, 120, 300, 600, 1200, 2400, 5400, 10800];
+    $idx = max(0, min(count($table) - 1, $attempt - 1));
+    return $table[$idx];
+}
+
+/**
+ * Queue / refresh a retry for a note that failed to mirror.
+ *
+ * @return array{ok:bool,queued?:bool,error?:string}
+ */
+function ap_bsky_crosspost_retry_enqueue(
+    string $noteId,
+    int $ownerUserId,
+    ?int $localId = null,
+    ?string $lastError = null,
+    int $delaySec = 60
+): array {
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_starts_with($noteId, 'https://') || $ownerUserId < 1) {
+        return ['ok' => false, 'error' => 'Invalid retry enqueue'];
+    }
+    // Already mirrored — nothing to do.
+    if (ap_bsky_crosspost_by_note_id($noteId) !== null) {
+        return ['ok' => true, 'queued' => false];
+    }
+    ap_bsky_crosspost_retries_migrate();
+    $now = gmdate('c');
+    $next = gmdate('c', time() + max(15, $delaySec));
+    $err = $lastError !== null ? mb_substr(trim($lastError), 0, 500) : null;
+    try {
+        $st = ap_db()->prepare(
+            'INSERT INTO bsky_crosspost_retries
+                (note_id, owner_user_id, local_id, attempts, max_attempts, next_attempt_at, last_error, status, created_at, updated_at)
+             VALUES (?, ?, ?, 0, 8, ?, ?, \'pending\', ?, ?)
+             ON CONFLICT (note_id) DO UPDATE SET
+               owner_user_id = excluded.owner_user_id,
+               local_id = COALESCE(excluded.local_id, bsky_crosspost_retries.local_id),
+               last_error = COALESCE(excluded.last_error, bsky_crosspost_retries.last_error),
+               status = CASE
+                 WHEN bsky_crosspost_retries.status = \'done\' THEN \'done\'
+                 ELSE \'pending\'
+               END,
+               next_attempt_at = CASE
+                 WHEN bsky_crosspost_retries.status = \'done\' THEN bsky_crosspost_retries.next_attempt_at
+                 WHEN bsky_crosspost_retries.next_attempt_at <= excluded.next_attempt_at
+                   THEN bsky_crosspost_retries.next_attempt_at
+                 ELSE excluded.next_attempt_at
+               END,
+               updated_at = excluded.updated_at'
+        );
+        $st->execute([$noteId, $ownerUserId, $localId, $next, $err, $now, $now]);
+        return ['ok' => true, 'queued' => true];
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] crosspost_retry_enqueue: ' . $e->getMessage());
+        return ['ok' => false, 'error' => $e->getMessage()];
+    }
+}
+
+/**
+ * Mark a retry row done (or drop if already mirrored).
+ */
+function ap_bsky_crosspost_retry_mark_done(string $noteId): void
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '') {
+        return;
+    }
+    ap_bsky_crosspost_retries_migrate();
+    try {
+        $st = ap_db()->prepare(
+            'UPDATE bsky_crosspost_retries
+             SET status = \'done\', updated_at = ?, last_error = NULL
+             WHERE note_id = ? OR note_id = ?'
+        );
+        $st->execute([gmdate('c'), $noteId, $noteId . '/']);
+    } catch (Throwable $e) {
+        // ignore
+    }
+}
+
+/**
+ * Reconstruct publish inputs and attempt one Bluesky mirror.
+ *
+ * @return array{ok:bool,skipped?:bool,error?:string,uri?:string,cid?:string,posts?:int}
+ */
+function ap_bsky_crosspost_retry_one(array $row): array
+{
+    $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+    $ownerUserId = (int) ($row['owner_user_id'] ?? 0);
+    if ($noteId === '' || $ownerUserId < 1) {
+        return ['ok' => false, 'error' => 'Invalid retry row'];
+    }
+    if (ap_bsky_crosspost_by_note_id($noteId) !== null) {
+        ap_bsky_crosspost_retry_mark_done($noteId);
+        return ['ok' => true, 'skipped' => true, 'error' => 'Already mirrored'];
+    }
+
+    $status = null;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT local_id, note_id, visibility, spoiler_text, content_text, in_reply_to_local_id
+             FROM masto_statuses
+             WHERE note_id = ? OR note_id = ?
+             LIMIT 1'
+        );
+        $st->execute([$noteId, $noteId . '/']);
+        $status = $st->fetch();
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Status lookup failed: ' . $e->getMessage()];
+    }
+    if (!is_array($status)) {
+        return ['ok' => false, 'skipped' => true, 'error' => 'Status missing'];
+    }
+
+    $localId = (int) ($status['local_id'] ?? 0);
+    $mediaIds = [];
+    if ($localId > 0 && function_exists('ap_media_by_local_ids')) {
+        try {
+            $m = ap_db()->prepare(
+                'SELECT local_id FROM masto_media WHERE status_local_id = ? ORDER BY local_id ASC'
+            );
+            $m->execute([$localId]);
+            foreach ($m->fetchAll() as $mr) {
+                if (is_array($mr)) {
+                    $mediaIds[] = (int) ($mr['local_id'] ?? 0);
+                }
+            }
+            $mediaIds = array_values(array_filter($mediaIds, static fn($i) => $i > 0));
+        } catch (Throwable $e) {
+            $mediaIds = [];
+        }
+    }
+
+    $inReplyTo = null;
+    $replyLocal = (int) ($status['in_reply_to_local_id'] ?? 0);
+    if ($replyLocal > 0) {
+        try {
+            $p = ap_db()->prepare('SELECT note_id FROM masto_statuses WHERE local_id = ? LIMIT 1');
+            $p->execute([$replyLocal]);
+            $parentNote = $p->fetchColumn();
+            if (is_string($parentNote) && str_starts_with($parentNote, 'https://')) {
+                $inReplyTo = $parentNote;
+            }
+        } catch (Throwable $e) {
+            $inReplyTo = null;
+        }
+    }
+
+    // Quote object from stored Note when present.
+    $quoteObjectId = null;
+    try {
+        $ost = ap_db()->prepare(
+            'SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1'
+        );
+        $ost->execute([$noteId, $noteId . '/']);
+        $orow = $ost->fetch();
+        if (is_array($orow)) {
+            $create = json_decode((string) ($orow['raw_create_json'] ?? ''), true);
+            $obj = is_array($create['object'] ?? null) ? $create['object'] : null;
+            if (is_array($obj)) {
+                $q = $obj['quote'] ?? null;
+                if (is_string($q) && str_starts_with($q, 'https://')) {
+                    $quoteObjectId = rtrim($q, '/');
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        $quoteObjectId = null;
+    }
+
+    $res = ap_bsky_crosspost_status(
+        $ownerUserId,
+        (string) ($status['content_text'] ?? ''),
+        (string) ($status['visibility'] ?? 'public'),
+        $mediaIds,
+        (string) ($status['spoiler_text'] ?? ''),
+        $inReplyTo,
+        $quoteObjectId,
+        $noteId
+    );
+
+    if (!empty($res['ok']) && empty($res['skipped']) && !empty($res['uri']) && is_string($res['uri'])) {
+        if (function_exists('ap_note_attach_bsky_proxy')) {
+            try {
+                $ost = ap_db()->prepare(
+                    'SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1'
+                );
+                $ost->execute([$noteId, $noteId . '/']);
+                $orow = $ost->fetch();
+                if (is_array($orow)) {
+                    $create = json_decode((string) ($orow['raw_create_json'] ?? ''), true);
+                    if (is_array($create) && is_array($create['object'] ?? null)) {
+                        $create['object'] = ap_note_attach_bsky_proxy(
+                            $create['object'],
+                            (string) $res['uri'],
+                            isset($res['cid']) ? (string) $res['cid'] : null
+                        );
+                        ap_db()->prepare(
+                            'UPDATE outbox_notes SET raw_create_json = ? WHERE id = ? OR id = ?'
+                        )->execute([
+                            json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                            $noteId,
+                            $noteId . '/',
+                        ]);
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-bsky] retry stamp FEP: ' . $e->getMessage());
+            }
+        }
+        ap_bsky_crosspost_retry_mark_done($noteId);
+    }
+
+    return $res;
+}
+
+/**
+ * Process due Bluesky crosspost retries.
+ *
+ * @return array{claimed:int,ok:int,failed:int,skipped:int,dead:int}
+ */
+function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
+{
+    $stats = ['claimed' => 0, 'ok' => 0, 'failed' => 0, 'skipped' => 0, 'dead' => 0];
+    ap_bsky_crosspost_retries_migrate();
+    $limit = max(1, min(20, $limit));
+    $now = gmdate('c');
+    $rows = [];
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM bsky_crosspost_retries
+             WHERE status = 'pending' AND next_attempt_at <= ?
+             ORDER BY next_attempt_at ASC
+             LIMIT ?"
+        );
+        $st->execute([$now, $limit]);
+        $rows = $st->fetchAll();
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] retry_worker list: ' . $e->getMessage());
+        return $stats;
+    }
+    if (!is_array($rows) || $rows === []) {
+        return $stats;
+    }
+
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $stats['claimed']++;
+        $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+        $attempts = (int) ($row['attempts'] ?? 0) + 1;
+        $maxAttempts = max(1, (int) ($row['max_attempts'] ?? 8));
+        $res = ap_bsky_crosspost_retry_one($row);
+
+        if (!empty($res['ok']) && empty($res['skipped'])) {
+            $stats['ok']++;
+            continue;
+        }
+        if (!empty($res['ok']) && !empty($res['skipped']) && !ap_bsky_crosspost_should_retry($res)) {
+            // Permanent skip or already mirrored.
+            ap_bsky_crosspost_retry_mark_done($noteId);
+            $stats['skipped']++;
+            continue;
+        }
+
+        $err = (string) ($res['error'] ?? 'retry failed');
+        $ownerId = (int) ($row['owner_user_id'] ?? 0);
+
+        // Rate limits: wait for the window reset and do NOT burn attempt budget.
+        if (ap_bsky_result_is_rate_limited($res)) {
+            $delay = ap_bsky_result_retry_after_sec($res, 300);
+            $next = gmdate('c', time() + $delay);
+            try {
+                $u = ap_db()->prepare(
+                    "UPDATE bsky_crosspost_retries
+                     SET next_attempt_at = ?, last_error = ?, status = 'pending', updated_at = ?
+                     WHERE note_id = ? OR note_id = ?"
+                );
+                $u->execute([
+                    $next,
+                    mb_substr('Rate limit exceeded; retry in ' . $delay . 's', 0, 500),
+                    gmdate('c'),
+                    $noteId,
+                    $noteId . '/',
+                ]);
+            } catch (Throwable $e) {
+                // ignore
+            }
+            if ($ownerId > 0) {
+                ap_bsky_crosspost_retry_pause_owner(
+                    $ownerId,
+                    $delay,
+                    'Rate limit exceeded; paused owner queue'
+                );
+            }
+            $stats['failed']++;
+            continue;
+        }
+
+        if ($attempts >= $maxAttempts || !ap_bsky_crosspost_should_retry($res)) {
+            try {
+                $u = ap_db()->prepare(
+                    "UPDATE bsky_crosspost_retries
+                     SET status = 'dead', attempts = ?, last_error = ?, updated_at = ?
+                     WHERE note_id = ? OR note_id = ?"
+                );
+                $u->execute([$attempts, mb_substr($err, 0, 500), gmdate('c'), $noteId, $noteId . '/']);
+            } catch (Throwable $e) {
+                // ignore
+            }
+            $stats['dead']++;
+            continue;
+        }
+
+        $next = gmdate('c', time() + ap_bsky_crosspost_retry_backoff_sec($attempts));
+        try {
+            $u = ap_db()->prepare(
+                "UPDATE bsky_crosspost_retries
+                 SET attempts = ?, next_attempt_at = ?, last_error = ?, status = 'pending', updated_at = ?
+                 WHERE note_id = ? OR note_id = ?"
+            );
+            $u->execute([$attempts, $next, mb_substr($err, 0, 500), gmdate('c'), $noteId, $noteId . '/']);
+        } catch (Throwable $e) {
+            // ignore
+        }
+        $stats['failed']++;
+    }
+
+    return $stats;
 }
 
 /**
@@ -428,6 +942,15 @@ function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0): ?array
                 // ignore
             }
         }
+    } elseif (str_starts_with($ref, 'https://')) {
+        // Dual-publish remotes (Wafrn / Bridgy / etc.): fediverse Note URL → AT URI map
+        if (function_exists('ap_bsky_post_link_by_fedi')) {
+            $link = ap_bsky_post_link_by_fedi($ref);
+            if (is_array($link) && !empty($link['bsky_uri'])) {
+                $uri = (string) $link['bsky_uri'];
+                $cid = isset($link['bsky_cid']) ? (string) $link['bsky_cid'] : null;
+            }
+        }
     }
     if ($uri === null || !str_starts_with($uri, 'at://')) {
         return null;
@@ -451,19 +974,23 @@ function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0): ?array
     }
     $row = ap_bsky_session_row($ownerUserId);
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    // Fail-fast: at most one host attempt under the active budget.
     $got = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
         'repo' => $m[1],
         'collection' => $m[2],
         'rkey' => $m[3],
-    ], null, (string) $tok['access'], 12);
-    if (empty($got['ok'])) {
+    ], null, (string) $tok['access'], 4);
+    if (empty($got['ok']) && !ap_bsky_budget_exceeded()) {
         foreach (ap_bsky_feed_hosts($pds) as $host) {
+            if ($host === $pds) {
+                continue;
+            }
             $got = ap_bsky_xrpc($host, 'com.atproto.repo.getRecord', 'GET', [
                 'repo' => $m[1],
                 'collection' => $m[2],
                 'rkey' => $m[3],
-            ], null, (string) $tok['access'], 12);
-            if (!empty($got['ok'])) {
+            ], null, (string) $tok['access'], 4);
+            if (!empty($got['ok']) || ap_bsky_budget_exceeded()) {
                 break;
             }
         }
@@ -571,8 +1098,15 @@ function ap_bsky_xrpc(
     ?array $query = null,
     ?array $jsonBody = null,
     ?string $bearer = null,
-    int $timeoutSec = 10
+    int $timeoutSec = AP_BSKY_DEFAULT_TIMEOUT
 ): array {
+    if (ap_bsky_budget_exceeded()) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded', 'status' => 0];
+    }
+    $timeoutSec = ap_bsky_effective_timeout($timeoutSec);
+    if ($timeoutSec < 1) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded', 'status' => 0];
+    }
     $base = rtrim($base, '/');
     if ($base === '' || !str_starts_with($base, 'https://')) {
         return ['ok' => false, 'error' => 'Invalid API host'];
@@ -604,14 +1138,20 @@ function ap_bsky_xrpc(
     if ($ch === false) {
         return ['ok' => false, 'error' => 'curl_init failed'];
     }
+    $connectTimeout = min(AP_BSKY_CONNECT_TIMEOUT, $timeoutSec);
+    $respHeaders = '';
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 3,
-        CURLOPT_CONNECTTIMEOUT => min(5, $timeoutSec),
+        CURLOPT_CONNECTTIMEOUT => $connectTimeout,
         CURLOPT_TIMEOUT => $timeoutSec,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$respHeaders): int {
+            $respHeaders .= $line;
+            return strlen($line);
+        },
     ]);
     if ($payload !== null) {
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
@@ -621,18 +1161,170 @@ function ap_bsky_xrpc(
     $err = curl_error($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
+    $rate = ap_bsky_parse_rate_limit_headers($respHeaders);
     if ($errno !== 0 || !is_string($body)) {
-        return ['ok' => false, 'error' => $err !== '' ? $err : 'HTTP request failed', 'status' => $status];
+        return ['ok' => false, 'error' => $err !== '' ? $err : 'HTTP request failed', 'status' => $status] + $rate;
     }
     $json = json_decode($body, true);
     if ($status >= 200 && $status < 300) {
-        return ['ok' => true, 'status' => $status, 'json' => $json, 'body' => $body];
+        return ['ok' => true, 'status' => $status, 'json' => $json, 'body' => $body] + $rate;
     }
     $msg = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
+    $errCode = is_array($json) ? (string) ($json['error'] ?? '') : '';
     if ($msg === '') {
         $msg = 'HTTP ' . $status;
     }
-    return ['ok' => false, 'error' => $msg, 'status' => $status, 'json' => $json, 'body' => $body];
+    $out = ['ok' => false, 'error' => $msg, 'status' => $status, 'json' => $json, 'body' => $body] + $rate;
+    if ($status === 429 || strcasecmp($errCode, 'RateLimitExceeded') === 0
+        || stripos($msg, 'rate limit') !== false || stripos($msg, 'too many requests') !== false) {
+        $out['rate_limited'] = true;
+        $out['error'] = 'Rate limit exceeded';
+        if (empty($out['retry_after_sec'])) {
+            $out['retry_after_sec'] = ap_bsky_rate_limit_fallback_delay_sec($rate);
+        }
+    }
+    return $out;
+}
+
+/**
+ * Parse ATProto / Bluesky rate-limit response headers.
+ *
+ * @return array{retry_after_sec?:int,reset_at?:int,ratelimit_remaining?:int,ratelimit_limit?:int}
+ */
+function ap_bsky_parse_rate_limit_headers(string $headerBlob): array
+{
+    $out = [];
+    if ($headerBlob === '') {
+        return $out;
+    }
+    $retryAfter = null;
+    $resetAt = null;
+    $remaining = null;
+    $limit = null;
+    foreach (preg_split("/\r\n|\n|\r/", $headerBlob) ?: [] as $line) {
+        if (!str_contains($line, ':')) {
+            continue;
+        }
+        [$name, $value] = array_map('trim', explode(':', $line, 2));
+        $lname = strtolower($name);
+        if ($lname === 'retry-after') {
+            if (ctype_digit($value)) {
+                $retryAfter = (int) $value;
+            } else {
+                $ts = strtotime($value);
+                if ($ts !== false) {
+                    $retryAfter = max(0, $ts - time());
+                }
+            }
+        } elseif ($lname === 'ratelimit-reset') {
+            // Bluesky usually sends a unix timestamp; some stacks send delta seconds.
+            if (ctype_digit($value)) {
+                $n = (int) $value;
+                $resetAt = ($n > 1_000_000_000) ? $n : (time() + $n);
+            }
+        } elseif ($lname === 'ratelimit-remaining' && ctype_digit($value)) {
+            $remaining = (int) $value;
+        } elseif ($lname === 'ratelimit-limit' && ctype_digit($value)) {
+            $limit = (int) $value;
+        }
+    }
+    if ($resetAt !== null) {
+        $out['reset_at'] = $resetAt;
+        $out['retry_after_sec'] = max(1, $resetAt - time());
+    }
+    if ($retryAfter !== null) {
+        $out['retry_after_sec'] = max(1, (int) $retryAfter);
+    }
+    if ($remaining !== null) {
+        $out['ratelimit_remaining'] = $remaining;
+    }
+    if ($limit !== null) {
+        $out['ratelimit_limit'] = $limit;
+    }
+    return $out;
+}
+
+/**
+ * When headers are missing, pick a conservative wait (hourly write window).
+ */
+function ap_bsky_rate_limit_fallback_delay_sec(array $rate = []): int
+{
+    if (!empty($rate['retry_after_sec'])) {
+        return ap_bsky_clamp_retry_delay((int) $rate['retry_after_sec']);
+    }
+    if (!empty($rate['reset_at'])) {
+        return ap_bsky_clamp_retry_delay((int) $rate['reset_at'] - time());
+    }
+    return 300; // 5 minutes
+}
+
+/** Clamp delay: at least 60s, at most 6 hours. */
+function ap_bsky_clamp_retry_delay(int $sec): int
+{
+    return max(60, min(6 * 3600, $sec));
+}
+
+function ap_bsky_result_is_rate_limited(?array $result): bool
+{
+    if (!is_array($result)) {
+        return false;
+    }
+    if (!empty($result['rate_limited'])) {
+        return true;
+    }
+    $status = (int) ($result['status'] ?? 0);
+    if ($status === 429) {
+        return true;
+    }
+    $err = (string) ($result['error'] ?? '');
+    return stripos($err, 'rate limit') !== false || stripos($err, 'too many requests') !== false;
+}
+
+/**
+ * Seconds to wait before retrying a rate-limited Bluesky call.
+ */
+function ap_bsky_result_retry_after_sec(?array $result, int $fallback = 300): int
+{
+    if (!is_array($result)) {
+        return ap_bsky_clamp_retry_delay($fallback);
+    }
+    if (!empty($result['retry_after_sec'])) {
+        return ap_bsky_clamp_retry_delay((int) $result['retry_after_sec']);
+    }
+    if (!empty($result['reset_at'])) {
+        return ap_bsky_clamp_retry_delay((int) $result['reset_at'] - time());
+    }
+    return ap_bsky_clamp_retry_delay($fallback);
+}
+
+/**
+ * Push next_attempt_at forward for all pending retries of one owner (shared rate-limit window).
+ */
+function ap_bsky_crosspost_retry_pause_owner(int $ownerUserId, int $delaySec, ?string $reason = null): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    ap_bsky_crosspost_retries_migrate();
+    $delaySec = ap_bsky_clamp_retry_delay($delaySec);
+    $next = gmdate('c', time() + $delaySec);
+    $now = gmdate('c');
+    $err = $reason !== null ? mb_substr(trim($reason), 0, 500) : null;
+    try {
+        $st = ap_db()->prepare(
+            "UPDATE bsky_crosspost_retries
+             SET next_attempt_at = CASE
+                    WHEN next_attempt_at IS NULL OR next_attempt_at < ? THEN ?
+                    ELSE next_attempt_at
+                 END,
+                 last_error = COALESCE(?, last_error),
+                 updated_at = ?
+             WHERE owner_user_id = ? AND status = 'pending'"
+        );
+        $st->execute([$next, $next, $err, $now, $ownerUserId]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] pause_owner: ' . $e->getMessage());
+    }
 }
 
 /**
@@ -755,7 +1447,7 @@ function ap_bsky_auth_error_is_fatal(?string $message): bool
         || str_contains($m, 'unauthorized');
 }
 
-function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false): array
+function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false, int $timeoutSec = 6): array
 {
     if (!function_exists('ap_auth_secret_decrypt') || !function_exists('ap_auth_secret_encrypt')) {
         require_once __DIR__ . '/ap-auth.php';
@@ -775,6 +1467,13 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false): arr
     if (!$forceRefresh && $accessOk) {
         return ['ok' => true, 'access' => $access];
     }
+    if (ap_bsky_budget_exceeded()) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded'];
+    }
+    $timeoutSec = ap_bsky_effective_timeout($timeoutSec);
+    if ($timeoutSec < 1) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded'];
+    }
     // refreshSession: Authorization = refreshJwt, POST with NO body
     // (PDS returns 400 "body provided when none was expected" if we send {}).
     $ch = curl_init($pds . '/xrpc/com.atproto.server.refreshSession');
@@ -783,8 +1482,8 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false): arr
     }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 12,
-        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_CONNECTTIMEOUT => min(AP_BSKY_CONNECT_TIMEOUT, $timeoutSec),
         CURLOPT_POST => true,
         CURLOPT_HTTPHEADER => [
             'Authorization: Bearer ' . $refresh,
@@ -886,13 +1585,13 @@ function ap_bsky_get_timeline(int $ownerUserId, int $limit = 40, ?string $cursor
     $lastErr = 'Timeline fetch failed';
     $res = null;
     foreach (ap_bsky_feed_hosts($pds) as $apiHost) {
-        $attempt = ap_bsky_xrpc($apiHost, 'app.bsky.feed.getTimeline', 'GET', $query, null, (string) $tok['access'], 12);
+        $attempt = ap_bsky_xrpc($apiHost, 'app.bsky.feed.getTimeline', 'GET', $query, null, (string) $tok['access'], 6);
         if (($attempt['status'] ?? 0) === 401) {
-            $tok = ap_bsky_access_token($ownerUserId, true);
+            $tok = ap_bsky_access_token($ownerUserId, true, 4);
             if (empty($tok['ok'])) {
                 return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Session expired')];
             }
-            $attempt = ap_bsky_xrpc($apiHost, 'app.bsky.feed.getTimeline', 'GET', $query, null, (string) $tok['access'], 12);
+            $attempt = ap_bsky_xrpc($apiHost, 'app.bsky.feed.getTimeline', 'GET', $query, null, (string) $tok['access'], 6);
         }
         if (!empty($attempt['ok']) && is_array($attempt['json'] ?? null)) {
             $res = $attempt;
@@ -3795,12 +4494,19 @@ function ap_bsky_fetch_image_bytes(string $url): array
     if ($ch === false) {
         return ['ok' => false, 'error' => 'curl_init failed'];
     }
+    if (ap_bsky_budget_exceeded()) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded'];
+    }
+    $dlTimeout = ap_bsky_effective_timeout(12);
+    if ($dlTimeout < 1) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded'];
+    }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 3,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_TIMEOUT => 20,
+        CURLOPT_CONNECTTIMEOUT => min(AP_BSKY_CONNECT_TIMEOUT, $dlTimeout),
+        CURLOPT_TIMEOUT => $dlTimeout,
         CURLOPT_USERAGENT => 'VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
     ]);
     $bytes = curl_exec($ch);
@@ -3896,17 +4602,25 @@ function ap_bsky_normalize_profile_image(string $bytes, string $mime): array
  */
 function ap_bsky_upload_blob(string $pdsHost, string $accessJwt, string $bytes, string $mime): array
 {
+    if (ap_bsky_budget_exceeded()) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded'];
+    }
+    $timeoutSec = ap_bsky_effective_timeout(20);
+    if ($timeoutSec < 1) {
+        return ['ok' => false, 'error' => 'Bluesky budget exceeded'];
+    }
     $pdsHost = rtrim($pdsHost, '/');
     $url = $pdsHost . '/xrpc/com.atproto.repo.uploadBlob';
     $ch = curl_init($url);
     if ($ch === false) {
         return ['ok' => false, 'error' => 'curl_init failed'];
     }
+    $respHeaders = '';
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_TIMEOUT => 30,
+        CURLOPT_CONNECTTIMEOUT => min(AP_BSKY_CONNECT_TIMEOUT, $timeoutSec),
+        CURLOPT_TIMEOUT => $timeoutSec,
         CURLOPT_HTTPHEADER => [
             'Authorization: Bearer ' . $accessJwt,
             'Content-Type: ' . $mime,
@@ -3914,16 +4628,346 @@ function ap_bsky_upload_blob(string $pdsHost, string $accessJwt, string $bytes, 
             'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
         ],
         CURLOPT_POSTFIELDS => $bytes,
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$respHeaders): int {
+            $respHeaders .= $line;
+            return strlen($line);
+        },
     ]);
     $body = curl_exec($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
+    $rate = ap_bsky_parse_rate_limit_headers($respHeaders);
     $json = is_string($body) ? json_decode($body, true) : null;
     if ($status < 200 || $status >= 300 || !is_array($json) || !isset($json['blob'])) {
         $msg = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
-        return ['ok' => false, 'error' => $msg !== '' ? $msg : ('uploadBlob HTTP ' . $status)];
+        $errCode = is_array($json) ? (string) ($json['error'] ?? '') : '';
+        $out = ['ok' => false, 'error' => $msg !== '' ? $msg : ('uploadBlob HTTP ' . $status), 'status' => $status] + $rate;
+        if ($status === 429 || strcasecmp($errCode, 'RateLimitExceeded') === 0
+            || stripos($msg, 'rate limit') !== false) {
+            $out['rate_limited'] = true;
+            $out['error'] = 'Rate limit exceeded';
+            if (empty($out['retry_after_sec'])) {
+                $out['retry_after_sec'] = ap_bsky_rate_limit_fallback_delay_sec($rate);
+            }
+        }
+        return $out;
     }
-    return ['ok' => true, 'blob' => $json['blob']];
+    return ['ok' => true, 'blob' => $json['blob']] + $rate;
+}
+
+/**
+ * Download a video for Bluesky crosspost (up to 100MB).
+ *
+ * @return array{ok:bool,error?:string,bytes?:string,mime?:string}
+ */
+function ap_bsky_fetch_video_bytes(string $url, string $hintMime = ''): array
+{
+    $url = trim($url);
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        return ['ok' => false, 'error' => 'Invalid video URL'];
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['ok' => false, 'error' => 'curl_init failed'];
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 120,
+        CURLOPT_USERAGENT => 'VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        CURLOPT_ENCODING => 'identity',
+    ]);
+    $bytes = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $ctype = (string) curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
+    curl_close($ch);
+    if (!is_string($bytes) || $bytes === '' || $status < 200 || $status >= 300) {
+        return ['ok' => false, 'error' => 'Video download failed (HTTP ' . $status . ')'];
+    }
+    // Soft cap: Bluesky allows up to ~100–300MB; keep PHP memory sane.
+    if (strlen($bytes) > 100 * 1024 * 1024) {
+        return ['ok' => false, 'error' => 'Video too large for Bluesky crosspost (>100MB)'];
+    }
+    $mime = strtolower(trim($hintMime));
+    if ($mime === '' || $mime === 'application/octet-stream') {
+        $mime = '';
+        if (preg_match('#^(video/[a-z0-9.+-]+)#i', $ctype, $m)) {
+            $mime = strtolower($m[1]);
+        }
+    }
+    if ($mime === '') {
+        // Sniff common containers when Content-Type is missing/wrong.
+        if (strlen($bytes) >= 12 && str_contains(substr($bytes, 4, 8), 'ftyp')) {
+            $brand = substr($bytes, 8, 4);
+            $mime = ($brand === 'qt  ') ? 'video/quicktime' : 'video/mp4';
+        } elseif (str_starts_with($bytes, "\x1A\x45\xDF\xA3")) {
+            $mime = 'video/webm';
+        } else {
+            $mime = 'video/mp4';
+        }
+    }
+    return ['ok' => true, 'bytes' => $bytes, 'mime' => $mime];
+}
+
+/**
+ * Remux/transcode to MP4 when Bluesky's video service needs video/mp4.
+ * Prefer stream-copy for H.264/AAC .mov (common from iPhone).
+ *
+ * @return array{ok:bool,error?:string,bytes?:string,mime?:string}
+ */
+function ap_bsky_video_ensure_mp4(string $bytes, string $mime, string $nameHint = 'video.mov'): array
+{
+    $mime = strtolower(trim($mime));
+    if ($mime === 'video/mp4' || $mime === 'video/m4v') {
+        return ['ok' => true, 'bytes' => $bytes, 'mime' => 'video/mp4'];
+    }
+    $ffmpeg = trim((string) shell_exec('command -v ffmpeg'));
+    if ($ffmpeg === '') {
+        // Hope the video service accepts the original container.
+        return ['ok' => true, 'bytes' => $bytes, 'mime' => ($mime !== '' ? $mime : 'video/mp4')];
+    }
+    $ext = 'bin';
+    if (str_contains($mime, 'quicktime') || str_ends_with(strtolower($nameHint), '.mov')) {
+        $ext = 'mov';
+    } elseif (str_contains($mime, 'webm') || str_ends_with(strtolower($nameHint), '.webm')) {
+        $ext = 'webm';
+    } elseif (str_contains($mime, 'mp4') || str_ends_with(strtolower($nameHint), '.mp4')) {
+        $ext = 'mp4';
+    }
+    $in = tempnam(sys_get_temp_dir(), 'vaakvid_in_');
+    $out = tempnam(sys_get_temp_dir(), 'vaakvid_out_');
+    if ($in === false || $out === false) {
+        return ['ok' => false, 'error' => 'tempnam failed for video remux'];
+    }
+    $inPath = $in . '.' . $ext;
+    $outPath = $out . '.mp4';
+    @unlink($in);
+    @unlink($out);
+    if (@file_put_contents($inPath, $bytes) === false) {
+        @unlink($inPath);
+        return ['ok' => false, 'error' => 'Could not write temp video for remux'];
+    }
+    // Fast path: remux without re-encode. Fall back to re-encode if copy fails.
+    $cmdCopy = escapeshellarg($ffmpeg)
+        . ' -y -hide_banner -loglevel error -i ' . escapeshellarg($inPath)
+        . ' -c copy -movflags +faststart ' . escapeshellarg($outPath) . ' 2>&1';
+    $outLog = [];
+    $code = 0;
+    exec($cmdCopy, $outLog, $code);
+    if ($code !== 0 || !is_file($outPath) || filesize($outPath) < 32) {
+        @unlink($outPath);
+        $cmdEnc = escapeshellarg($ffmpeg)
+            . ' -y -hide_banner -loglevel error -i ' . escapeshellarg($inPath)
+            . ' -c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -movflags +faststart '
+            . escapeshellarg($outPath) . ' 2>&1';
+        $outLog = [];
+        $code = 0;
+        exec($cmdEnc, $outLog, $code);
+    }
+    @unlink($inPath);
+    if ($code !== 0 || !is_file($outPath) || filesize($outPath) < 32) {
+        @unlink($outPath);
+        $err = trim(implode("\n", $outLog));
+        return ['ok' => false, 'error' => 'ffmpeg remux failed' . ($err !== '' ? (': ' . $err) : '')];
+    }
+    $mp4 = file_get_contents($outPath);
+    @unlink($outPath);
+    if (!is_string($mp4) || $mp4 === '') {
+        return ['ok' => false, 'error' => 'ffmpeg remux produced empty file'];
+    }
+    if (strlen($mp4) > 100 * 1024 * 1024) {
+        return ['ok' => false, 'error' => 'Remuxed MP4 still too large (>100MB)'];
+    }
+    return ['ok' => true, 'bytes' => $mp4, 'mime' => 'video/mp4'];
+}
+
+/**
+ * Service-auth JWT so video.bsky.app can uploadBlob to the user's PDS.
+ *
+ * @return array{ok:bool,error?:string,token?:string}
+ */
+function ap_bsky_get_service_auth(
+    string $pdsHost,
+    string $accessJwt,
+    string $lxm = 'com.atproto.repo.uploadBlob',
+    int $ttlSec = 1800
+): array {
+    $host = parse_url(rtrim($pdsHost, '/'), PHP_URL_HOST);
+    if (!is_string($host) || $host === '') {
+        return ['ok' => false, 'error' => 'Invalid PDS host for service auth'];
+    }
+    $exp = time() + max(60, $ttlSec);
+    $res = ap_bsky_xrpc($pdsHost, 'com.atproto.server.getServiceAuth', 'GET', [
+        'aud' => 'did:web:' . $host,
+        'lxm' => $lxm,
+        'exp' => $exp,
+    ], null, $accessJwt, 15);
+    if (empty($res['ok'])) {
+        return ['ok' => false, 'error' => (string) ($res['error'] ?? 'getServiceAuth failed')];
+    }
+    $token = (string) ($res['json']['token'] ?? '');
+    if ($token === '') {
+        return ['ok' => false, 'error' => 'getServiceAuth missing token'];
+    }
+    return ['ok' => true, 'token' => $token];
+}
+
+/**
+ * Upload video via video.bsky.app and poll until the PDS blob is ready.
+ *
+ * @return array{ok:bool,error?:string,blob?:array,jobId?:string}
+ */
+function ap_bsky_upload_video(
+    string $pdsHost,
+    string $accessJwt,
+    string $did,
+    string $bytes,
+    string $mime = 'video/mp4',
+    string $fileName = 'video.mp4',
+    int $maxWaitSec = 180
+): array {
+    $did = trim($did);
+    if ($did === '' || !str_starts_with($did, 'did:')) {
+        return ['ok' => false, 'error' => 'Missing DID for video upload'];
+    }
+    if ($bytes === '') {
+        return ['ok' => false, 'error' => 'Empty video bytes'];
+    }
+    $auth = ap_bsky_get_service_auth($pdsHost, $accessJwt);
+    if (empty($auth['ok'])) {
+        return ['ok' => false, 'error' => (string) ($auth['error'] ?? 'service auth failed')];
+    }
+    $token = (string) $auth['token'];
+    $fileName = preg_replace('/[^A-Za-z0-9._-]+/', '_', $fileName) ?: 'video.mp4';
+    if (!str_contains($fileName, '.')) {
+        $fileName .= '.mp4';
+    }
+    $uploadUrl = 'https://video.bsky.app/xrpc/app.bsky.video.uploadVideo?'
+        . http_build_query(['did' => $did, 'name' => $fileName]);
+    $ch = curl_init($uploadUrl);
+    if ($ch === false) {
+        return ['ok' => false, 'error' => 'curl_init failed'];
+    }
+    $contentType = str_starts_with(strtolower($mime), 'video/') ? $mime : 'video/mp4';
+    // Lexicon declares video/mp4; prefer that when we remuxed.
+    if ($contentType === 'video/m4v') {
+        $contentType = 'video/mp4';
+    }
+    $respHeaders = '';
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 180,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $token,
+            'Content-Type: ' . $contentType,
+            'Content-Length: ' . (string) strlen($bytes),
+            'Accept: application/json',
+            'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+        ],
+        CURLOPT_POSTFIELDS => $bytes,
+        CURLOPT_HEADERFUNCTION => static function ($ch, string $line) use (&$respHeaders): int {
+            $respHeaders .= $line;
+            return strlen($line);
+        },
+    ]);
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $cerr = curl_error($ch);
+    curl_close($ch);
+    $rate = ap_bsky_parse_rate_limit_headers($respHeaders);
+    if (!is_string($body) || $body === '') {
+        return ['ok' => false, 'error' => $cerr !== '' ? $cerr : 'uploadVideo empty response'] + $rate;
+    }
+    $json = json_decode($body, true);
+    // Some responses nest under jobStatus; others return JobStatus at the root.
+    $job = null;
+    if (is_array($json)) {
+        if (isset($json['jobStatus']) && is_array($json['jobStatus'])) {
+            $job = $json['jobStatus'];
+        } elseif (isset($json['jobId']) || isset($json['state'])) {
+            $job = $json;
+        }
+    }
+    if ($status < 200 || $status >= 300 || !is_array($job)) {
+        $msg = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
+        $errCode = is_array($json) ? (string) ($json['error'] ?? '') : '';
+        $out = ['ok' => false, 'error' => $msg !== '' ? $msg : ('uploadVideo HTTP ' . $status), 'status' => $status] + $rate;
+        if ($status === 429 || strcasecmp($errCode, 'RateLimitExceeded') === 0
+            || stripos($msg, 'rate limit') !== false) {
+            $out['rate_limited'] = true;
+            $out['error'] = 'Rate limit exceeded';
+            if (empty($out['retry_after_sec'])) {
+                $out['retry_after_sec'] = ap_bsky_rate_limit_fallback_delay_sec($rate);
+            }
+        }
+        return $out;
+    }
+    $jobId = (string) ($job['jobId'] ?? '');
+    if ($jobId === '') {
+        return ['ok' => false, 'error' => 'uploadVideo missing jobId'];
+    }
+    if (!empty($job['blob']) && is_array($job['blob'])) {
+        return ['ok' => true, 'blob' => $job['blob'], 'jobId' => $jobId];
+    }
+    $state = (string) ($job['state'] ?? '');
+    if ($state === 'JOB_STATE_FAILED') {
+        $err = (string) ($job['error'] ?? $job['message'] ?? $job['failure_code'] ?? 'JOB_STATE_FAILED');
+        return ['ok' => false, 'error' => 'Video job failed: ' . $err, 'jobId' => $jobId];
+    }
+
+    $deadline = time() + max(30, $maxWaitSec);
+    $attempt = 0;
+    while (time() < $deadline) {
+        $attempt++;
+        // Short polls early, then 2s.
+        usleep($attempt <= 3 ? 750000 : 2000000);
+        $poll = ap_bsky_xrpc('https://video.bsky.app', 'app.bsky.video.getJobStatus', 'GET', [
+            'jobId' => $jobId,
+        ], null, null, 20);
+        if (empty($poll['ok'])) {
+            continue;
+        }
+        $js = $poll['json']['jobStatus'] ?? $poll['json'] ?? null;
+        if (!is_array($js)) {
+            continue;
+        }
+        if (!empty($js['blob']) && is_array($js['blob'])) {
+            return ['ok' => true, 'blob' => $js['blob'], 'jobId' => $jobId];
+        }
+        $state = (string) ($js['state'] ?? '');
+        if ($state === 'JOB_STATE_FAILED') {
+            $err = (string) ($js['error'] ?? $js['message'] ?? $js['failure_code'] ?? 'JOB_STATE_FAILED');
+            return ['ok' => false, 'error' => 'Video job failed: ' . $err, 'jobId' => $jobId];
+        }
+    }
+    return ['ok' => false, 'error' => 'Video processing timed out (job ' . $jobId . ')', 'jobId' => $jobId];
+}
+
+/**
+ * Best-effort aspect ratio from media row / preview image.
+ *
+ * @param array<string,mixed> $mediaRow
+ * @return array{width:int,height:int}|null
+ */
+function ap_bsky_video_aspect_ratio(array $mediaRow): ?array
+{
+    $w = (int) ($mediaRow['width'] ?? 0);
+    $h = (int) ($mediaRow['height'] ?? 0);
+    if ($w >= 1 && $h >= 1) {
+        return ['width' => $w, 'height' => $h];
+    }
+    $preview = (string) ($mediaRow['preview_url'] ?? '');
+    if ($preview !== '' && str_starts_with($preview, 'https://') && function_exists('getimagesize')) {
+        $info = @getimagesize($preview);
+        if (is_array($info) && (int) ($info[0] ?? 0) >= 1 && (int) ($info[1] ?? 0) >= 1) {
+            return ['width' => (int) $info[0], 'height' => (int) $info[1]];
+        }
+    }
+    return null;
 }
 
 /**
@@ -4029,6 +5073,14 @@ function ap_bsky_sync_profile_from_vaak(int $ownerUserId, ?string $actorKey = nu
     if (is_array($bannerBlob)) {
         $record['banner'] = $bannerBlob;
     }
+    // Keep pinnedPost in sync with the newest VAAK pin that has a Bluesky twin.
+    // (Bluesky supports a single profile pin; VAAK allows up to 5.)
+    $pinRef = ap_bsky_pinned_strong_ref_from_vaak($ownerUserId);
+    if ($pinRef !== null) {
+        $record['pinnedPost'] = $pinRef;
+    } else {
+        unset($record['pinnedPost']);
+    }
 
     $put = ap_bsky_xrpc($pds, 'com.atproto.repo.putRecord', 'POST', null, [
         'repo' => $did,
@@ -4051,6 +5103,434 @@ function ap_bsky_sync_profile_from_vaak(int $ownerUserId, ?string $actorKey = nu
         return ['ok' => false, 'error' => (string) ($put['error'] ?? 'putRecord failed'), 'truncated' => !empty($bio['truncated'])];
     }
     return ['ok' => true, 'truncated' => !empty($bio['truncated'])];
+}
+
+/**
+ * Newest VAAK pin that has a Bluesky crosspost map → strongRef for profile.pinnedPost.
+ *
+ * @return array{uri:string,cid:string}|null
+ */
+function ap_bsky_pinned_strong_ref_from_vaak(int $ownerUserId): ?array
+{
+    if ($ownerUserId < 1 || !function_exists('ap_masto_pinned_statuses')) {
+        return null;
+    }
+    try {
+        $pins = ap_masto_pinned_statuses(5);
+    } catch (Throwable $e) {
+        return null;
+    }
+    foreach ($pins as $prow) {
+        if (!is_array($prow)) {
+            continue;
+        }
+        $noteId = rtrim((string) ($prow['note_id'] ?? ''), '/');
+        if ($noteId === '' || !function_exists('ap_bsky_crosspost_by_note_id')) {
+            continue;
+        }
+        $map = ap_bsky_crosspost_by_note_id($noteId);
+        if (!is_array($map) || empty($map['bsky_uri'])) {
+            // Tip map may be last segment; also try post_links by fedi id.
+            if (function_exists('ap_bsky_post_link_by_fedi')) {
+                $link = ap_bsky_post_link_by_fedi($noteId);
+                if (is_array($link) && !empty($link['bsky_uri'])) {
+                    $uri = (string) $link['bsky_uri'];
+                    $cid = (string) ($link['bsky_cid'] ?? '');
+                    if ($uri !== '' && $cid !== '') {
+                        return ['uri' => $uri, 'cid' => $cid];
+                    }
+                    if ($uri !== '') {
+                        $resolved = ap_bsky_resolve_strong_ref($uri, $ownerUserId);
+                        if ($resolved !== null) {
+                            return $resolved;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        $uri = (string) $map['bsky_uri'];
+        $cid = (string) ($map['bsky_cid'] ?? '');
+        if ($uri === '') {
+            continue;
+        }
+        if ($cid === '') {
+            $resolved = ap_bsky_resolve_strong_ref($uri, $ownerUserId);
+            if ($resolved !== null) {
+                return $resolved;
+            }
+            continue;
+        }
+        return ['uri' => $uri, 'cid' => $cid];
+    }
+    return null;
+}
+
+/**
+ * Read pinnedPost from the linked Bluesky actor profile.
+ *
+ * @return array{uri:string,cid:string}|null
+ */
+function ap_bsky_get_profile_pinned_post(int $ownerUserId): ?array
+{
+    $row = ap_bsky_session_row($ownerUserId);
+    if ($row === null) {
+        return null;
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($tok['ok'])) {
+        return null;
+    }
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $did = (string) ($row['did'] ?? '');
+    if ($did === '') {
+        return null;
+    }
+    $existing = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+        'repo' => $did,
+        'collection' => 'app.bsky.actor.profile',
+        'rkey' => 'self',
+    ], null, (string) $tok['access'], 12);
+    if (empty($existing['ok']) || !is_array($existing['json']['value'] ?? null)) {
+        return null;
+    }
+    $pin = $existing['json']['value']['pinnedPost'] ?? null;
+    if (!is_array($pin)) {
+        return null;
+    }
+    $uri = (string) ($pin['uri'] ?? '');
+    $cid = (string) ($pin['cid'] ?? '');
+    if ($uri === '' || $cid === '' || !str_starts_with($uri, 'at://')) {
+        return null;
+    }
+    return ['uri' => $uri, 'cid' => $cid];
+}
+
+/**
+ * Remove pinnedPost from the linked Bluesky actor profile.
+ *
+ * @return array{ok:bool,error?:string}
+ */
+function ap_bsky_clear_profile_pinned_post(int $ownerUserId): array
+{
+    $row = ap_bsky_session_row($ownerUserId);
+    if ($row === null) {
+        return ['ok' => false, 'error' => 'Bluesky not connected'];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($tok['ok'])) {
+        return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'No access token')];
+    }
+    $access = (string) $tok['access'];
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $did = (string) ($row['did'] ?? '');
+    if ($did === '') {
+        return ['ok' => false, 'error' => 'Missing DID'];
+    }
+    $existing = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+        'repo' => $did,
+        'collection' => 'app.bsky.actor.profile',
+        'rkey' => 'self',
+    ], null, $access, 12);
+    $record = ['$type' => 'app.bsky.actor.profile'];
+    if (!empty($existing['ok']) && is_array($existing['json']['value'] ?? null)) {
+        $record = $existing['json']['value'];
+        $record['$type'] = 'app.bsky.actor.profile';
+    }
+    unset($record['pinnedPost']);
+    $put = ap_bsky_xrpc($pds, 'com.atproto.repo.putRecord', 'POST', null, [
+        'repo' => $did,
+        'collection' => 'app.bsky.actor.profile',
+        'rkey' => 'self',
+        'record' => $record,
+    ], $access, 20);
+    if (empty($put['ok']) && (($put['status'] ?? 0) === 401)) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+        if (!empty($tok['ok'])) {
+            $put = ap_bsky_xrpc($pds, 'com.atproto.repo.putRecord', 'POST', null, [
+                'repo' => $did,
+                'collection' => 'app.bsky.actor.profile',
+                'rkey' => 'self',
+                'record' => $record,
+            ], (string) $tok['access'], 20);
+        }
+    }
+    if (empty($put['ok'])) {
+        return ['ok' => false, 'error' => (string) ($put['error'] ?? 'putRecord failed')];
+    }
+    return ['ok' => true];
+}
+
+/**
+ * Push VAAK's newest pin (with Bluesky twin) to app.bsky.actor.profile pinnedPost.
+ * Clears Bluesky pin when VAAK has no mapped pins.
+ *
+ * @return array{ok:bool,error?:string,uri?:?string,cleared?:bool}
+ */
+function ap_bsky_sync_pin_to_bluesky(int $ownerUserId): array
+{
+    $row = ap_bsky_session_row($ownerUserId);
+    if ($row === null) {
+        return ['ok' => false, 'error' => 'Bluesky not connected'];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($tok['ok'])) {
+        return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'No access token')];
+    }
+    $access = (string) $tok['access'];
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $did = (string) ($row['did'] ?? '');
+    if ($did === '') {
+        return ['ok' => false, 'error' => 'Missing DID'];
+    }
+    $existing = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+        'repo' => $did,
+        'collection' => 'app.bsky.actor.profile',
+        'rkey' => 'self',
+    ], null, $access, 12);
+    $record = ['$type' => 'app.bsky.actor.profile'];
+    if (!empty($existing['ok']) && is_array($existing['json']['value'] ?? null)) {
+        $record = $existing['json']['value'];
+        $record['$type'] = 'app.bsky.actor.profile';
+    }
+    $pinRef = ap_bsky_pinned_strong_ref_from_vaak($ownerUserId);
+    if ($pinRef !== null) {
+        $record['pinnedPost'] = $pinRef;
+    } else {
+        unset($record['pinnedPost']);
+    }
+    $put = ap_bsky_xrpc($pds, 'com.atproto.repo.putRecord', 'POST', null, [
+        'repo' => $did,
+        'collection' => 'app.bsky.actor.profile',
+        'rkey' => 'self',
+        'record' => $record,
+    ], $access, 20);
+    if (empty($put['ok']) && (($put['status'] ?? 0) === 401)) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+        if (!empty($tok['ok'])) {
+            $put = ap_bsky_xrpc($pds, 'com.atproto.repo.putRecord', 'POST', null, [
+                'repo' => $did,
+                'collection' => 'app.bsky.actor.profile',
+                'rkey' => 'self',
+                'record' => $record,
+            ], (string) $tok['access'], 20);
+        }
+    }
+    if (empty($put['ok'])) {
+        return ['ok' => false, 'error' => (string) ($put['error'] ?? 'putRecord failed')];
+    }
+    return [
+        'ok' => true,
+        'uri' => $pinRef['uri'] ?? null,
+        'cleared' => $pinRef === null,
+    ];
+}
+
+/**
+ * Pull Bluesky profile pin into VAAK when a local twin exists.
+ *
+ * @return array{ok:bool,error?:string,pinned_local_id?:int,skipped?:bool,reason?:string}
+ */
+function ap_bsky_import_pin_to_vaak(int $ownerUserId): array
+{
+    $pin = ap_bsky_get_profile_pinned_post($ownerUserId);
+    if ($pin === null) {
+        return ['ok' => true, 'skipped' => true, 'reason' => 'no_bluesky_pin'];
+    }
+    $uri = $pin['uri'];
+    $noteId = null;
+    if (function_exists('ap_bsky_post_link_by_uri')) {
+        $link = ap_bsky_post_link_by_uri($uri);
+        if (is_array($link)) {
+            $noteId = rtrim((string) ($link['fediverse_id'] ?? $link['ap_object_id'] ?? ''), '/');
+        }
+    }
+    if (($noteId === null || $noteId === '') && function_exists('ap_bsky_crosspost_by_uri')) {
+        $map = ap_bsky_crosspost_by_uri($uri);
+        if (is_array($map)) {
+            $noteId = rtrim((string) ($map['note_id'] ?? ''), '/');
+        }
+    }
+    // Record may carry fediverseId (Wafrn / VAAK dual-publish).
+    if ($noteId === null || $noteId === '' || !str_starts_with($noteId, 'https://mkultra.monster/')) {
+        $tok = ap_bsky_access_token($ownerUserId, false);
+        if (empty($tok['ok'])) {
+            $tok = ap_bsky_access_token($ownerUserId, true);
+        }
+        if (!empty($tok['ok']) && preg_match('~^at://([^/]+)/([^/]+)/([^/]+)$~', $uri, $m)) {
+            $row = ap_bsky_session_row($ownerUserId);
+            $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+            $got = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+                'repo' => $m[1],
+                'collection' => $m[2],
+                'rkey' => $m[3],
+            ], null, (string) $tok['access'], 12);
+            $fedi = is_array($got['json']['value'] ?? null)
+                ? rtrim((string) ($got['json']['value']['fediverseId'] ?? ''), '/')
+                : '';
+            if ($fedi !== '' && str_starts_with($fedi, 'https://mkultra.monster/')) {
+                $noteId = $fedi;
+            } elseif ($fedi !== '') {
+                // Index remote twin for HTML fallback; cannot masto-pin non-local notes.
+                if (function_exists('ap_bsky_post_link_upsert')) {
+                    ap_bsky_post_link_upsert($uri, $pin['cid'], $fedi, $fedi);
+                }
+                return [
+                    'ok' => true,
+                    'skipped' => true,
+                    'reason' => 'remote_fediverse_pin',
+                    'fediverse_id' => $fedi,
+                    'bsky_uri' => $uri,
+                ];
+            }
+        }
+    }
+    if ($noteId === null || $noteId === '' || !str_starts_with($noteId, 'https://mkultra.monster/')) {
+        return [
+            'ok' => true,
+            'skipped' => true,
+            'reason' => 'no_local_twin',
+            'bsky_uri' => $uri,
+        ];
+    }
+    $st = ap_db()->prepare('SELECT local_id FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1');
+    $st->execute([$noteId, $noteId . '/']);
+    $localId = (int) ($st->fetchColumn() ?: 0);
+    if ($localId < 1) {
+        return ['ok' => false, 'error' => 'Local status row missing for ' . $noteId];
+    }
+    // Pin as the owning user (not whatever request actor is active).
+    $prev = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
+    try {
+        if (preg_match('#/users/([A-Za-z0-9_]+)/notes/#', $noteId, $um)
+            && function_exists('ap_request_actor_set')) {
+            ap_request_actor_set(strtolower($um[1]));
+        }
+        $res = function_exists('ap_masto_status_pin')
+            ? ap_masto_status_pin($localId)
+            : ['ok' => false, 'error' => 'pin unavailable'];
+    } finally {
+        if (function_exists('ap_request_actor_set')) {
+            if (is_array($prev) && !empty($prev['key'])) {
+                ap_request_actor_set((string) $prev['key']);
+            } else {
+                ap_request_actor_set(null);
+            }
+        }
+    }
+    if (empty($res['ok'])) {
+        return ['ok' => false, 'error' => (string) ($res['error'] ?? 'pin failed')];
+    }
+    return ['ok' => true, 'pinned_local_id' => $localId, 'note_id' => $noteId, 'bsky_uri' => $uri];
+}
+
+/**
+ * HTML-profile helper: Bluesky pin card when the pin is not a local VAAK note
+ * (e.g. historical Wafrn dual-publish). Returns an outbox-shaped row or null.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_bsky_html_pin_row_for_owner(int $ownerUserId): ?array
+{
+    // Once the user pins via VAAK, local masto_pins are the source of truth
+    // (and sync out to Bluesky). Don't also show the legacy Bluesky/Wafrn pin.
+    try {
+        $stc = ap_db()->prepare('SELECT 1 FROM masto_pins WHERE owner_user_id = ? LIMIT 1');
+        $stc->execute([$ownerUserId]);
+        if ($stc->fetchColumn()) {
+            return null;
+        }
+    } catch (Throwable $e) {
+        // continue — still try to mirror Bluesky pin for display
+    }
+    $pin = ap_bsky_get_profile_pinned_post($ownerUserId);
+    if ($pin === null) {
+        return null;
+    }
+    $uri = $pin['uri'];
+    // If we already have a local pin twin, HTML uses masto_pins — skip synthetic.
+    if (function_exists('ap_bsky_post_link_by_uri')) {
+        $link = ap_bsky_post_link_by_uri($uri);
+        $fedi = is_array($link) ? rtrim((string) ($link['fediverse_id'] ?? $link['ap_object_id'] ?? ''), '/') : '';
+        if ($fedi !== '' && str_starts_with($fedi, 'https://mkultra.monster/users/')) {
+            return null;
+        }
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) {
+        $tok = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($tok['ok']) || !preg_match('~^at://([^/]+)/([^/]+)/([^/]+)$~', $uri, $m)) {
+        return null;
+    }
+    $row = ap_bsky_session_row($ownerUserId);
+    $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $got = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+        'repo' => $m[1],
+        'collection' => $m[2],
+        'rkey' => $m[3],
+    ], null, (string) $tok['access'], 12);
+    if (empty($got['ok']) || !is_array($got['json']['value'] ?? null)) {
+        return null;
+    }
+    $val = $got['json']['value'];
+    $text = trim((string) ($val['text'] ?? ''));
+    $created = (string) ($val['createdAt'] ?? gmdate('c'));
+    $fedi = rtrim((string) ($val['fediverseId'] ?? ''), '/');
+    $thumb = '';
+    $embed = $val['embed'] ?? null;
+    if (is_array($embed)) {
+        $images = $embed['images'] ?? null;
+        if (!is_array($images) && isset($embed['media']) && is_array($embed['media'])) {
+            $images = $embed['media']['images'] ?? null;
+        }
+        if (is_array($images) && isset($images[0]) && is_array($images[0])) {
+            $img0 = $images[0];
+            // Record embeds store blob refs; prefer AppView CDN via getPostThread when needed.
+            if (!empty($img0['image']['ref']['$link'])) {
+                $thumb = ''; // filled below via public API if possible
+            }
+        }
+    }
+    // Public AppView gives ready CDN URLs for the pin card.
+    $thread = ap_bsky_xrpc('https://public.api.bsky.app', 'app.bsky.feed.getPostThread', 'GET', [
+        'uri' => $uri,
+        'depth' => '0',
+    ], null, null, 12);
+    if (!empty($thread['ok']) && is_array($thread['json']['thread']['post'] ?? null)) {
+        $post = $thread['json']['thread']['post'];
+        $emb = $post['embed'] ?? null;
+        if (is_array($emb) && !empty($emb['images'][0]['fullsize'])) {
+            $thumb = (string) $emb['images'][0]['fullsize'];
+        } elseif (is_array($emb) && !empty($emb['media']['images'][0]['fullsize'])) {
+            $thumb = (string) $emb['media']['images'][0]['fullsize'];
+        }
+        if ($text === '' && is_array($post['record'] ?? null)) {
+            $text = trim((string) ($post['record']['text'] ?? ''));
+        }
+    }
+    // Display-only mirror of the Bluesky pin — no outbound link to Bluesky/Wafrn.
+    // Remains until the user pins/unpins via VAAK (then masto_pins take over).
+    return [
+        'id' => 'bsky-pin:' . $uri,
+        'content' => $text !== '' ? htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : '',
+        'published' => $created,
+        'kind' => 'bsky_pin',
+        '_pinned' => true,
+        '_bsky_uri' => $uri,
+        '_thumb_url' => $thumb,
+        '_external_href' => '',
+        'visibility' => 'public',
+    ];
 }
 
 /** Bluesky post text limit (grapheme clusters). */
@@ -4190,10 +5670,9 @@ function ap_bsky_build_facets(string $text): array
 
 /**
  * @param list<array{alt?:string,blob:array}> $images
- * @return array{ok:bool,error?:string,uri?:string,cid?:string}
- */
-/**
+ * @param array{blob:array,alt?:string,aspectRatio?:array{width:int,height:int}}|null $video
  * @param array{uri:string,cid:string}|null $quoteRef  Quote target strongRef
+ * @return array{ok:bool,error?:string,uri?:string,cid?:string}
  */
 function ap_bsky_create_post(
     string $pdsHost,
@@ -4204,7 +5683,8 @@ function ap_bsky_create_post(
     array $images = [],
     ?string $createdAt = null,
     ?string $fediverseId = null,
-    ?array $quoteRef = null
+    ?array $quoteRef = null,
+    ?array $video = null
 ): array {
     $record = [
         '$type' => 'app.bsky.feed.post',
@@ -4235,7 +5715,26 @@ function ap_bsky_create_post(
             ],
         ];
     }
-    if ($images !== []) {
+    // Bluesky: at most one video OR up to 4 images (not both). Prefer video when present.
+    $mediaEmbed = null;
+    if (is_array($video) && isset($video['blob']) && is_array($video['blob'])) {
+        $videoEmbed = [
+            '$type' => 'app.bsky.embed.video',
+            'video' => $video['blob'],
+        ];
+        $alt = trim((string) ($video['alt'] ?? ''));
+        if ($alt !== '') {
+            $videoEmbed['alt'] = $alt;
+        }
+        if (isset($video['aspectRatio']) && is_array($video['aspectRatio'])) {
+            $aw = (int) ($video['aspectRatio']['width'] ?? 0);
+            $ah = (int) ($video['aspectRatio']['height'] ?? 0);
+            if ($aw >= 1 && $ah >= 1) {
+                $videoEmbed['aspectRatio'] = ['width' => $aw, 'height' => $ah];
+            }
+        }
+        $mediaEmbed = $videoEmbed;
+    } elseif ($images !== []) {
         $imgs = [];
         foreach (array_slice($images, 0, 4) as $img) {
             if (!is_array($img) || !isset($img['blob']) || !is_array($img['blob'])) {
@@ -4247,24 +5746,20 @@ function ap_bsky_create_post(
             ];
         }
         if ($imgs !== []) {
-            if ($quoteEmbed !== null) {
-                $record['embed'] = [
-                    '$type' => 'app.bsky.embed.recordWithMedia',
-                    'record' => $quoteEmbed,
-                    'media' => [
-                        '$type' => 'app.bsky.embed.images',
-                        'images' => $imgs,
-                    ],
-                ];
-            } else {
-                $record['embed'] = [
-                    '$type' => 'app.bsky.embed.images',
-                    'images' => $imgs,
-                ];
-            }
-        } elseif ($quoteEmbed !== null) {
-            $record['embed'] = $quoteEmbed;
+            $mediaEmbed = [
+                '$type' => 'app.bsky.embed.images',
+                'images' => $imgs,
+            ];
         }
+    }
+    if ($mediaEmbed !== null && $quoteEmbed !== null) {
+        $record['embed'] = [
+            '$type' => 'app.bsky.embed.recordWithMedia',
+            'record' => $quoteEmbed,
+            'media' => $mediaEmbed,
+        ];
+    } elseif ($mediaEmbed !== null) {
+        $record['embed'] = $mediaEmbed;
     } elseif ($quoteEmbed !== null) {
         $record['embed'] = $quoteEmbed;
     }
@@ -4272,9 +5767,15 @@ function ap_bsky_create_post(
         'repo' => $did,
         'collection' => 'app.bsky.feed.post',
         'record' => $record,
-    ], $accessJwt, 20);
+    ], $accessJwt, 8);
     if (empty($put['ok'])) {
-        return ['ok' => false, 'error' => (string) ($put['error'] ?? 'createRecord failed')];
+        $out = ['ok' => false, 'error' => (string) ($put['error'] ?? 'createRecord failed')];
+        if (ap_bsky_result_is_rate_limited($put)) {
+            $out['rate_limited'] = true;
+            $out['retry_after_sec'] = ap_bsky_result_retry_after_sec($put);
+            $out['error'] = 'Rate limit exceeded';
+        }
+        return $out;
     }
     $uri = (string) ($put['json']['uri'] ?? '');
     $cid = (string) ($put['json']['cid'] ?? '');
@@ -4367,31 +5868,80 @@ function ap_bsky_crosspost_status(
     if ($row === null) {
         return ['ok' => true, 'skipped' => true, 'error' => 'Bluesky not connected'];
     }
+
+    // Interactive web publishes get a hard wall-clock budget so Bluesky DNS/PDS
+    // blips cannot pin PHP-FPM workers. CLI retries (backfill) get a longer budget.
+    $isCli = (PHP_SAPI === 'cli');
+    $budgetSec = $isCli ? AP_BSKY_CROSSPOST_BUDGET_CLI : AP_BSKY_CROSSPOST_BUDGET_WEB;
+    ap_bsky_budget_begin($budgetSec);
+    try {
+        return ap_bsky_crosspost_status_inner(
+            $ownerUserId,
+            $plainText,
+            $visibility,
+            $mediaLocalIds,
+            $spoilerText,
+            $inReplyTo,
+            $quoteObjectId,
+            $fediverseId,
+            $row,
+            $isCli
+        );
+    } finally {
+        ap_bsky_budget_clear();
+    }
+}
+
+/**
+ * @param array<string,mixed> $row bsky_sessions row
+ * @return array{ok:bool,skipped?:bool,error?:string,uri?:string,cid?:string,uris?:list<string>,cids?:list<string>,posts?:int,deferred?:bool}
+ */
+function ap_bsky_crosspost_status_inner(
+    int $ownerUserId,
+    string $plainText,
+    string $visibility,
+    array $mediaLocalIds,
+    string $spoilerText,
+    ?string $inReplyTo,
+    ?string $quoteObjectId,
+    ?string $fediverseId,
+    array $row,
+    bool $isCli
+): array {
     // Resolve reply parent / quote target to Bluesky strongRefs when possible.
     $replyRef = null;
     $replyFallbackLink = null;
     if (is_string($inReplyTo) && $inReplyTo !== '') {
         // Profile URLs are not posts — don't treat as reply targets.
         if (preg_match('~^https://bsky\.app/profile/[^/]+/?$~i', rtrim($inReplyTo, '/'))) {
-            $replyFallbackLink = $inReplyTo;
-        } else {
-            $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId);
-            if ($parent === null) {
-                // Parent has no Bluesky twin (failed earlier mirror, or pure-fedi).
-                // Still publish as a new root with a short re: link instead of dropping.
-                $replyFallbackLink = $inReplyTo;
-            } else {
-                $replyRef = ap_bsky_reply_ref_for_parent($parent, $ownerUserId);
-            }
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'error' => 'Reply parent is not a Bluesky post',
+            ];
         }
+        $parent = ap_bsky_resolve_strong_ref($inReplyTo, $ownerUserId);
+        if ($parent === null) {
+            // Pure Fediverse parent (Mastodon/Akkoma/etc.) with no Bluesky/Bridgy twin —
+            // keep the reply on fedi only; do not orphan a root post on Bluesky.
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'error' => 'Reply parent is Fediverse-only',
+            ];
+        }
+        $replyRef = ap_bsky_reply_ref_for_parent($parent, $ownerUserId);
     }
     $quoteRef = null;
     if (is_string($quoteObjectId) && $quoteObjectId !== '') {
         $quoteRef = ap_bsky_resolve_strong_ref($quoteObjectId, $ownerUserId);
     }
-    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (ap_bsky_budget_exceeded()) {
+        return ['ok' => false, 'deferred' => true, 'error' => 'Bluesky budget exceeded before auth'];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false, 4);
     if (empty($tok['ok'])) {
-        $tok = ap_bsky_access_token($ownerUserId, true);
+        $tok = ap_bsky_access_token($ownerUserId, true, 4);
     }
     if (empty($tok['ok'])) {
         return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'No Bluesky session')];
@@ -4404,6 +5954,11 @@ function ap_bsky_crosspost_status(
     }
 
     $plainText = trim(ap_fix_utf8($plainText));
+    // VAAK stores "(media)" / "(poll)" / "(quote)" as masto_statuses sentinels for
+    // empty commentary — never mirror those placeholders onto Bluesky.
+    if (in_array($plainText, ['(media)', '(poll)', '(quote)'], true)) {
+        $plainText = '';
+    }
     $spoilerText = trim(ap_fix_utf8($spoilerText));
     if ($spoilerText !== '') {
         $plainText = ($plainText !== '')
@@ -4418,47 +5973,145 @@ function ap_bsky_crosspost_status(
         $plainText = trim('↩ re: ' . $replyFallbackLink . ($plainText !== '' ? "\n\n" . $plainText : ''));
     }
 
-    // Upload images (first segment only)
+    // Upload media (first segment only). Bluesky allows 1 video XOR ≤4 images.
     $images = [];
+    $videoEmbed = null;
     if ($mediaLocalIds !== [] && function_exists('ap_media_by_local_ids')) {
         if (!function_exists('ap_media_by_local_ids')) {
             require_once __DIR__ . '/ap-r2.php';
         }
         $mediaRows = ap_media_by_local_ids(array_map('intval', $mediaLocalIds));
-        foreach (array_slice($mediaRows, 0, 4) as $m) {
+        // Prefer the first video when present; otherwise upload images.
+        $videoRow = null;
+        foreach ($mediaRows as $m) {
             if (!is_array($m)) {
                 continue;
             }
             $mime = strtolower((string) ($m['mime'] ?? $m['content_type'] ?? ''));
-            if ($mime !== '' && !str_starts_with($mime, 'image/')) {
-                continue; // skip video/audio for now
+            if (str_starts_with($mime, 'video/')) {
+                $videoRow = $m;
+                break;
             }
-            $url = (string) ($m['public_url'] ?? $m['url'] ?? $m['remote_url'] ?? '');
-            if ($url === '' || !str_starts_with($url, 'https://')) {
-                continue;
-            }
-            $img = ap_bsky_fetch_image_bytes($url);
-            if (empty($img['ok'])) {
-                continue;
-            }
-            $up = ap_bsky_upload_blob($pds, $access, (string) $img['bytes'], (string) $img['mime']);
-            if (empty($up['ok']) && (($up['status'] ?? 0) === 401)) {
-                $tok = ap_bsky_access_token($ownerUserId, true);
-                if (!empty($tok['ok'])) {
-                    $access = (string) $tok['access'];
-                    $up = ap_bsky_upload_blob($pds, $access, (string) $img['bytes'], (string) $img['mime']);
+        }
+        // Video upload+transcode routinely exceeds the web budget — defer to CLI retry.
+        if (is_array($videoRow) && !$isCli) {
+            return [
+                'ok' => false,
+                'deferred' => true,
+                'error' => 'Video mirror deferred to background retry',
+            ];
+        }
+        if (is_array($videoRow)) {
+            $url = (string) ($videoRow['public_url'] ?? $videoRow['url'] ?? $videoRow['remote_url'] ?? '');
+            $mime = strtolower((string) ($videoRow['mime'] ?? $videoRow['content_type'] ?? 'video/mp4'));
+            if ($url !== '' && str_starts_with($url, 'https://')) {
+                $fetched = ap_bsky_fetch_video_bytes($url, $mime);
+                if (!empty($fetched['ok'])) {
+                    $nameHint = basename(parse_url($url, PHP_URL_PATH) ?: 'video.mov');
+                    $mp4 = ap_bsky_video_ensure_mp4(
+                        (string) $fetched['bytes'],
+                        (string) ($fetched['mime'] ?? $mime),
+                        is_string($nameHint) ? $nameHint : 'video.mov'
+                    );
+                    if (!empty($mp4['ok'])) {
+                        $upName = pathinfo(is_string($nameHint) ? $nameHint : 'video', PATHINFO_FILENAME) . '.mp4';
+                        $up = ap_bsky_upload_video(
+                            $pds,
+                            $access,
+                            $did,
+                            (string) $mp4['bytes'],
+                            (string) ($mp4['mime'] ?? 'video/mp4'),
+                            $upName,
+                            180
+                        );
+                        if (empty($up['ok']) && str_contains((string) ($up['error'] ?? ''), 'Expired')) {
+                            $tok = ap_bsky_access_token($ownerUserId, true);
+                            if (!empty($tok['ok'])) {
+                                $access = (string) $tok['access'];
+                                $up = ap_bsky_upload_video(
+                                    $pds,
+                                    $access,
+                                    $did,
+                                    (string) $mp4['bytes'],
+                                    (string) ($mp4['mime'] ?? 'video/mp4'),
+                                    $upName,
+                                    180
+                                );
+                            }
+                        }
+                        if (ap_bsky_result_is_rate_limited($up)) {
+                            return [
+                                'ok' => false,
+                                'deferred' => true,
+                                'rate_limited' => true,
+                                'retry_after_sec' => ap_bsky_result_retry_after_sec($up),
+                                'error' => 'Rate limit exceeded',
+                            ];
+                        }
+                        if (!empty($up['ok']) && is_array($up['blob'] ?? null)) {
+                            $videoEmbed = [
+                                'blob' => $up['blob'],
+                                'alt' => (string) ($videoRow['description'] ?? $videoRow['alt'] ?? ''),
+                            ];
+                            $ar = ap_bsky_video_aspect_ratio($videoRow);
+                            if ($ar !== null) {
+                                $videoEmbed['aspectRatio'] = $ar;
+                            }
+                        } else {
+                            error_log('[ap-bsky] video upload failed: ' . (string) ($up['error'] ?? 'unknown'));
+                        }
+                    } else {
+                        error_log('[ap-bsky] video remux failed: ' . (string) ($mp4['error'] ?? 'unknown'));
+                    }
+                } else {
+                    error_log('[ap-bsky] video fetch failed: ' . (string) ($fetched['error'] ?? 'unknown'));
                 }
             }
-            if (!empty($up['ok']) && is_array($up['blob'] ?? null)) {
-                $images[] = [
-                    'alt' => (string) ($m['description'] ?? $m['alt'] ?? ''),
-                    'blob' => $up['blob'],
-                ];
+        } else {
+            foreach (array_slice($mediaRows, 0, 4) as $m) {
+                if (!is_array($m)) {
+                    continue;
+                }
+                $mime = strtolower((string) ($m['mime'] ?? $m['content_type'] ?? ''));
+                if ($mime !== '' && !str_starts_with($mime, 'image/')) {
+                    continue; // skip audio / non-image
+                }
+                $url = (string) ($m['public_url'] ?? $m['url'] ?? $m['remote_url'] ?? '');
+                if ($url === '' || !str_starts_with($url, 'https://')) {
+                    continue;
+                }
+                $img = ap_bsky_fetch_image_bytes($url);
+                if (empty($img['ok'])) {
+                    continue;
+                }
+                $up = ap_bsky_upload_blob($pds, $access, (string) $img['bytes'], (string) $img['mime']);
+                if (empty($up['ok']) && (($up['status'] ?? 0) === 401)) {
+                    $tok = ap_bsky_access_token($ownerUserId, true, 4);
+                    if (!empty($tok['ok'])) {
+                        $access = (string) $tok['access'];
+                        $up = ap_bsky_upload_blob($pds, $access, (string) $img['bytes'], (string) $img['mime']);
+                    }
+                }
+                if (ap_bsky_result_is_rate_limited($up)) {
+                    return [
+                        'ok' => false,
+                        'deferred' => true,
+                        'rate_limited' => true,
+                        'retry_after_sec' => ap_bsky_result_retry_after_sec($up),
+                        'error' => 'Rate limit exceeded',
+                    ];
+                }
+                if (!empty($up['ok']) && is_array($up['blob'] ?? null)) {
+                    $images[] = [
+                        'alt' => (string) ($m['description'] ?? $m['alt'] ?? ''),
+                        'blob' => $up['blob'],
+                    ];
+                }
             }
         }
     }
 
-    if ($plainText === '' && $images === []) {
+    if ($plainText === '' && $images === [] && $videoEmbed === null) {
         return ['ok' => true, 'skipped' => true, 'error' => 'Nothing to cross-post'];
     }
 
@@ -4482,31 +6135,52 @@ function ap_bsky_crosspost_status(
             $reply = ['root' => $root, 'parent' => $parent];
         }
         $imgs = ($i === 0) ? $images : [];
+        $vid = ($i === 0) ? $videoEmbed : null;
         $qEmbed = ($i === 0) ? $quoteRef : null;
         // Avoid empty text with no embed
-        if (trim($segment) === '' && $imgs === [] && $qEmbed === null) {
+        if (trim($segment) === '' && $imgs === [] && $vid === null && $qEmbed === null) {
             continue;
         }
         // 2s skew between long-post segments so AppView ordering stays stable.
         $created = gmdate('c', time() + ($i * 2));
         // Only stamp fediverseId on the root post (Wafrn merge key).
         $fedi = ($i === 0) ? $fediverseId : null;
-        $res = ap_bsky_create_post($pds, $access, $did, $segment, $reply, $imgs, $created, $fedi, $qEmbed);
-        if (empty($res['ok']) && str_contains((string) ($res['error'] ?? ''), 'Expired')) {
-            $tok = ap_bsky_access_token($ownerUserId, true);
-            if (!empty($tok['ok'])) {
-                $access = (string) $tok['access'];
-                $res = ap_bsky_create_post($pds, $access, $did, $segment, $reply, $imgs, $created, $fedi, $qEmbed);
-            }
-        }
-        if (empty($res['ok'])) {
+        if (ap_bsky_budget_exceeded()) {
             return [
                 'ok' => false,
-                'error' => (string) ($res['error'] ?? 'Bluesky create failed'),
+                'deferred' => true,
+                'error' => 'Bluesky budget exceeded before createRecord',
                 'uris' => $uris,
                 'cids' => $cids,
                 'posts' => count($uris),
             ];
+        }
+        $res = ap_bsky_create_post($pds, $access, $did, $segment, $reply, $imgs, $created, $fedi, $qEmbed, $vid);
+        if (empty($res['ok']) && str_contains((string) ($res['error'] ?? ''), 'Expired')) {
+            $tok = ap_bsky_access_token($ownerUserId, true, 4);
+            if (!empty($tok['ok'])) {
+                $access = (string) $tok['access'];
+                $res = ap_bsky_create_post($pds, $access, $did, $segment, $reply, $imgs, $created, $fedi, $qEmbed, $vid);
+            }
+        }
+        if (empty($res['ok'])) {
+            $err = (string) ($res['error'] ?? 'Bluesky create failed');
+            $deferred = str_contains($err, 'budget exceeded') || str_contains($err, 'timed out');
+            $out = [
+                'ok' => false,
+                'deferred' => $deferred,
+                'error' => $err,
+                'uris' => $uris,
+                'cids' => $cids,
+                'posts' => count($uris),
+            ];
+            if (ap_bsky_result_is_rate_limited($res)) {
+                $out['rate_limited'] = true;
+                $out['retry_after_sec'] = ap_bsky_result_retry_after_sec($res);
+                $out['error'] = 'Rate limit exceeded';
+                $out['deferred'] = true;
+            }
+            return $out;
         }
         $ref = ['uri' => (string) $res['uri'], 'cid' => (string) $res['cid']];
         $uris[] = $ref['uri'];

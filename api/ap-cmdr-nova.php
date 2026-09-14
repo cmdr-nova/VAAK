@@ -537,6 +537,33 @@ function ap_cmdr_handle_profile_owner_post(): void
         if ($localId > 0 && function_exists('ap_masto_status_unpin')) {
             ap_masto_status_unpin($localId);
         }
+        $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        if ($ownerId > 0 && function_exists('ap_bsky_sync_pin_to_bluesky')) {
+            require_once __DIR__ . '/ap-bsky.php';
+            ap_bsky_sync_pin_to_bluesky($ownerId);
+        }
+        header('Location: ' . $redir, true, 303);
+        exit;
+    }
+
+    // Clear Bluesky profile pin (legacy mirror card with no local VAAK twin).
+    if ($action === 'clear_bsky_pin') {
+        $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        if ($ownerId < 1) {
+            try {
+                $ust = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ? OR username = ? LIMIT 1');
+                $ust->execute(['cmdr_nova', 'cmdr_nova']);
+                $ownerId = (int) ($ust->fetchColumn() ?: 0);
+            } catch (Throwable $e) {
+                $ownerId = 0;
+            }
+        }
+        if ($ownerId > 0) {
+            require_once __DIR__ . '/ap-bsky.php';
+            if (function_exists('ap_bsky_clear_profile_pinned_post')) {
+                ap_bsky_clear_profile_pinned_post($ownerId);
+            }
+        }
         header('Location: ' . $redir, true, 303);
         exit;
     }
@@ -861,17 +888,19 @@ function ap_cmdr_shell_start(string $title): void
       .post{display:block;padding:.9rem 0;border-bottom:1px solid #2a2a2a;color:inherit;text-decoration:none}
       .post:last-child{border-bottom:none}
       .post:hover{background:rgba(126,224,255,.04);margin:0 -.5rem;padding-left:.5rem;padding-right:.5rem;border-radius:8px}
-      .post-wrap{position:relative;margin:0}
+      .post-wrap{position:relative;margin:0;padding:.9rem 0;border-bottom:1px solid #2a2a2a;isolation:isolate}
+      .post-wrap > .post{border-bottom:none;padding-top:0;padding-bottom:0}
+      .post-wrap > .post:hover{margin:0;padding-left:0;padding-right:0;background:transparent}
       .post.is-pinned{position:relative}
-      /* Decorative pin on the top border — out of flow, no text shift */
-      .post-pin{position:absolute;top:-0.45rem;left:0;font-size:12px;line-height:1;color:#7ee0ff;opacity:.9;pointer-events:none;z-index:2;filter:grayscale(0.15)}
-      .post-unpin-form{position:absolute;top:-0.55rem;left:0;z-index:3;margin:0}
+      .post-pin-bar{display:flex;align-items:center;gap:.4rem;margin:0 0 .4rem;min-height:1rem}
+      .post-pin{display:inline-block;position:static;font-size:12px;line-height:1;color:#7ee0ff;opacity:.9;pointer-events:none;filter:grayscale(0.15)}
+      .post-unpin-form{display:inline-flex;align-items:center;gap:.35rem;margin:0;position:static}
       .post-pin--action{
         pointer-events:auto;cursor:pointer;border:0;background:transparent;padding:0;
         font-size:12px;line-height:1;color:#7ee0ff;filter:grayscale(0.15);
       }
       .post-pin--action:hover{filter:none;transform:scale(1.08)}
-      .post-unpin-hint{position:absolute;top:-0.35rem;left:1.15rem;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
+      .post-unpin-hint{position:static;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
       .post .body{color:#e8e8e8}
       .post .body p,.note-body p{margin:0 0 .45em}
       .post .body p:last-child,.note-body p:last-child{margin-bottom:0}
@@ -1051,12 +1080,14 @@ function ap_cmdr_site_shell_start(string $title): void
       body.ap-site-shell .ap-site-main .posts{margin-top:1.5rem;padding-top:1.25rem;border-top:1px solid #2a2a2a}
       body.ap-site-shell .ap-site-main .post{display:block;padding:.9rem 0;border-bottom:1px solid #2a2a2a;color:inherit;text-decoration:none}
       body.ap-site-shell .ap-site-main .post:hover{background:rgba(126,224,255,.04)}
-      body.ap-site-shell .ap-site-main .post-wrap{position:relative;margin:0}
+      body.ap-site-shell .ap-site-main .post-wrap{position:relative;margin:0;padding:.9rem 0;border-bottom:1px solid #2a2a2a;isolation:isolate}
+      body.ap-site-shell .ap-site-main .post-wrap > .post{border-bottom:none;padding-top:0;padding-bottom:0}
       body.ap-site-shell .ap-site-main .post.is-pinned{position:relative}
-      body.ap-site-shell .ap-site-main .post-pin{position:absolute;top:-0.45rem;left:0;font-size:12px;line-height:1;color:#7ee0ff;opacity:.9;pointer-events:none;z-index:2}
-      body.ap-site-shell .ap-site-main .post-unpin-form{position:absolute;top:-0.55rem;left:0;z-index:3;margin:0}
+      body.ap-site-shell .ap-site-main .post-pin-bar{display:flex;align-items:center;gap:.4rem;margin:0 0 .4rem;min-height:1rem}
+      body.ap-site-shell .ap-site-main .post-pin{display:inline-block;position:static;font-size:12px;line-height:1;color:#7ee0ff;opacity:.9;pointer-events:none}
+      body.ap-site-shell .ap-site-main .post-unpin-form{display:inline-flex;align-items:center;gap:.35rem;margin:0;position:static}
       body.ap-site-shell .ap-site-main .post-pin--action{pointer-events:auto;cursor:pointer;border:0;background:transparent;padding:0;font-size:12px;line-height:1;color:#7ee0ff}
-      body.ap-site-shell .ap-site-main .post-unpin-hint{position:absolute;top:-0.35rem;left:1.15rem;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
+      body.ap-site-shell .ap-site-main .post-unpin-hint{position:static;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
       body.ap-site-shell .ap-site-main .stats{display:flex;gap:1.25rem;margin:1.1rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a}
       body.ap-site-shell .ap-site-main .stats .n{font-size:1.25rem;font-weight:700;color:#00ff9f}
       body.ap-site-shell .ap-site-main .stats .l{font-size:.8rem;color:#999;text-transform:uppercase}
@@ -1384,86 +1415,95 @@ function ap_cmdr_note_html(array $row, array $create): void
     echo '</p>';
     echo '<p class="muted mono" style="font-size:.7rem">' . $noteId . '</p>';
 
-    // Thread replies (local continues + remote fedi/Bluesky replies we store).
+    // Thread replies: local + remote fedi + Bluesky (when an ATProto twin exists).
     $noteUriRaw = (string) ($row['id'] ?? '');
     if ($noteUriRaw !== '' && function_exists('ap_note_public_replies')) {
         $replies = ap_note_public_replies($noteUriRaw, 40);
-        if ($replies !== []) {
-            echo '<section class="note-replies" aria-label="Replies">';
-            echo '<h2 class="note-replies-title">Replies <span class="muted">(' . count($replies) . ')</span></h2>';
-            foreach ($replies as $rep) {
-                $rUrl = (string) ($rep['url'] ?? '');
-                $rActor = (string) ($rep['actor_id'] ?? '');
-                $rContent = (string) ($rep['content'] ?? '');
-                $rWhen = (string) ($rep['published'] ?? '');
-                $rDate = $rWhen;
-                try {
-                    if ($rWhen !== '') {
-                        $rDate = (new DateTimeImmutable($rWhen))->format('M j, Y · g:i A');
-                    }
-                } catch (Throwable $e) {
-                    // keep
-                }
-                $handle = '';
-                if ($rActor !== '' && function_exists('ap_remote_actor_label')) {
-                    $handle = (string) (ap_remote_actor_label($rActor, false)['handle'] ?? '');
-                }
-                if ($handle === '' && preg_match('#/users/([A-Za-z0-9_]+)$#', $rActor, $hm)) {
-                    $handle = '@' . $hm[1]
-                        . (str_contains($rActor, 'mkultra.monster') ? '@mkultra.monster' : '');
-                }
-                if ($handle === '' && preg_match('#bsky\.app/profile/([^/?#]+)#i', $rActor, $bm)) {
-                    $handle = '@' . rawurldecode($bm[1]);
-                }
-                if ($handle === '') {
-                    $handle = $rActor !== '' ? $rActor : 'someone';
-                }
-                $snip = $rContent;
-                if (function_exists('mb_strlen') && mb_strlen($snip) > 320) {
-                    $snip = mb_substr($snip, 0, 320) . '…';
-                } elseif (strlen($snip) > 320) {
-                    $snip = substr($snip, 0, 320) . '…';
-                }
-                $rSpoiler = trim((string) ($rep['spoiler_text'] ?? ''));
-                $rSensitive = !empty($rep['sensitive']) || $rSpoiler !== '';
-                $localReply = str_starts_with($rUrl, 'https://mkultra.monster/users/')
-                    && str_contains($rUrl, '/notes/');
-                echo '<article class="note-reply">';
-                echo '<div class="note-reply-hd"><span class="who">'
-                    . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-                    . '</span>';
-                if ($rDate !== '') {
-                    echo ' <span class="muted">· '
-                        . htmlspecialchars($rDate, ENT_QUOTES, 'UTF-8') . '</span>';
-                }
-                echo '</div>';
-                $bodyHtml = $snip !== ''
-                    ? ('<div class="note-reply-body">'
-                        . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-                        . '</div>')
-                    : '';
-                // Only gate when *this* reply still has a CW (not inherited from parent).
-                if ($rSensitive) {
-                    $cwLabel = $rSpoiler !== ''
-                        ? ('CW · ' . htmlspecialchars($rSpoiler, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
-                        : 'CW · Sensitive';
-                    echo '<details class="note-reply-cw-gate"><summary>' . $cwLabel
-                        . ' <span class="muted" style="font-weight:500">· show</span></summary>';
-                    echo $bodyHtml;
-                    echo '</details>';
-                } elseif ($bodyHtml !== '') {
-                    echo $bodyHtml;
-                }
-                if ($rUrl !== '' && str_starts_with($rUrl, 'https://')) {
-                    echo '<div class="muted" style="margin-top:.35rem;font-size:.78rem"><a href="'
-                        . htmlspecialchars($rUrl, ENT_QUOTES, 'UTF-8') . '"'
-                        . ($localReply ? '' : ' target="_blank" rel="noopener noreferrer"')
-                        . '>Open reply</a></div>';
-                }
-                echo '</article>';
-            }
-            echo '</section>';
+        echo '<section class="note-replies" aria-label="Replies">';
+        echo '<h2 class="note-replies-title">Replies'
+            . ($replies !== [] ? (' <span class="muted">(' . count($replies) . ')</span>') : '')
+            . '</h2>';
+        if ($replies === []) {
+            echo '<p class="muted" style="margin:.35rem 0 0">No replies yet.</p>';
         }
+        foreach ($replies as $rep) {
+            $rUrl = (string) ($rep['url'] ?? '');
+            $rActor = (string) ($rep['actor_id'] ?? '');
+            $rContent = (string) ($rep['content'] ?? '');
+            $rWhen = (string) ($rep['published'] ?? '');
+            $rKind = (string) ($rep['kind'] ?? '');
+            $rDate = $rWhen;
+            try {
+                if ($rWhen !== '') {
+                    $rDate = (new DateTimeImmutable($rWhen))->format('M j, Y · g:i A');
+                }
+            } catch (Throwable $e) {
+                // keep
+            }
+            $handle = '';
+            if ($rActor !== '' && function_exists('ap_remote_actor_label') && $rKind !== 'bluesky') {
+                $handle = (string) (ap_remote_actor_label($rActor, false)['handle'] ?? '');
+            }
+            if ($handle === '' && preg_match('#/users/([A-Za-z0-9_]+)$#', $rActor, $hm)) {
+                $handle = '@' . $hm[1]
+                    . (str_contains($rActor, 'mkultra.monster') ? '@mkultra.monster' : '');
+            }
+            if ($handle === '' && preg_match('#bsky\.app/profile/([^/?#]+)#i', $rActor, $bm)) {
+                $handle = '@' . rawurldecode($bm[1]);
+            }
+            if ($handle === '') {
+                $handle = $rActor !== '' ? $rActor : 'someone';
+            }
+            $snip = $rContent;
+            if (function_exists('mb_strlen') && mb_strlen($snip) > 320) {
+                $snip = mb_substr($snip, 0, 320) . '…';
+            } elseif (strlen($snip) > 320) {
+                $snip = substr($snip, 0, 320) . '…';
+            }
+            $rSpoiler = trim((string) ($rep['spoiler_text'] ?? ''));
+            $rSensitive = !empty($rep['sensitive']) || $rSpoiler !== '';
+            $localReply = str_starts_with($rUrl, 'https://mkultra.monster/users/')
+                && str_contains($rUrl, '/notes/');
+            $isBsky = ($rKind === 'bluesky') || str_contains($rUrl, 'bsky.app/');
+            echo '<article class="note-reply">';
+            echo '<div class="note-reply-hd"><span class="who">'
+                . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                . '</span>';
+            if ($isBsky) {
+                echo ' <span class="badge" style="font-size:.7rem">Bluesky</span>';
+            }
+            if ($rDate !== '') {
+                echo ' <span class="muted">· '
+                    . htmlspecialchars($rDate, ENT_QUOTES, 'UTF-8') . '</span>';
+            }
+            echo '</div>';
+            $bodyHtml = $snip !== ''
+                ? ('<div class="note-reply-body">'
+                    . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . '</div>')
+                : '';
+            // Only gate when *this* reply still has a CW (not inherited from parent).
+            if ($rSensitive) {
+                $cwLabel = $rSpoiler !== ''
+                    ? ('CW · ' . htmlspecialchars($rSpoiler, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+                    : 'CW · Sensitive';
+                echo '<details class="note-reply-cw-gate"><summary>' . $cwLabel
+                    . ' <span class="muted" style="font-weight:500">· show</span></summary>';
+                echo $bodyHtml;
+                echo '</details>';
+            } elseif ($bodyHtml !== '') {
+                echo $bodyHtml;
+            }
+            if ($rUrl !== '' && str_starts_with($rUrl, 'https://')) {
+                $openLabel = $localReply ? 'Open reply' : ($isBsky ? 'Open on Bluesky' : 'Open on remote');
+                echo '<div class="muted" style="margin-top:.35rem;font-size:.78rem"><a href="'
+                    . htmlspecialchars($rUrl, ENT_QUOTES, 'UTF-8') . '"'
+                    . ($localReply ? '' : ' target="_blank" rel="noopener noreferrer"')
+                    . '>' . $openLabel . '</a></div>';
+            }
+            echo '</article>';
+        }
+        echo '</section>';
     }
 
     // Remote reply: open the visitor's home instance interact dialog for this Note.
@@ -2051,6 +2091,30 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     // Pinned posts (Ice Cubes + HTML profile) — surface at top of Posts tab
     $pinnedRows = [];
     $pinnedNoteIds = [];
+    if (($tab === 'posts' || $tab === 'all')) {
+        // Bluesky profile pin without a local VAAK twin (historical Wafrn dual-publish).
+        try {
+            require_once __DIR__ . '/ap-bsky.php';
+            if (function_exists('ap_bsky_html_pin_row_for_owner')) {
+                $ownerUid = 0;
+                try {
+                    $ust = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ? OR username = ? LIMIT 1');
+                    $ust->execute(['cmdr_nova', 'cmdr_nova']);
+                    $ownerUid = (int) ($ust->fetchColumn() ?: 0);
+                } catch (Throwable $e) {
+                    $ownerUid = 0;
+                }
+                if ($ownerUid > 0) {
+                    $bskyPinRow = ap_bsky_html_pin_row_for_owner($ownerUid);
+                    if (is_array($bskyPinRow)) {
+                        $pinnedRows[] = $bskyPinRow;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-cmdr] bsky html pin: ' . $e->getMessage());
+        }
+    }
     if (function_exists('ap_masto_pinned_statuses') && ($tab === 'posts' || $tab === 'all')) {
         try {
             foreach (ap_masto_pinned_statuses(5) as $prow) {
@@ -2257,14 +2321,65 @@ function ap_cmdr_post_preview_html(array $n): string
     $kind = (string) ($n['kind'] ?? 'compose');
     $isSite = ($kind === 'site_blog' || $kind === 'site_note');
     $isBoost = ($kind === 'boost' || $kind === 'reblog' || $kind === 'announce');
+    $isBskyPin = ($kind === 'bsky_pin');
     $id = (string) ($n['id'] ?? '');
     $hrefRaw = $isSite ? (string) ($n['site_url'] ?? $id) : $id;
+    if ($isBskyPin && !empty($n['_external_href']) && is_string($n['_external_href'])) {
+        $hrefRaw = (string) $n['_external_href'];
+    }
     $href = $hrefRaw !== '' ? htmlspecialchars($hrefRaw, ENT_QUOTES, 'UTF-8') : '#';
     $create = json_decode((string) ($n['raw_create_json'] ?? ''), true);
     $obj = (is_array($create) && is_array($create['object'] ?? null)) ? $create['object'] : [];
     $cw = '';
     if (!empty($obj['summary']) && is_string($obj['summary'])) {
         $cw = trim($obj['summary']);
+    }
+
+    // Bluesky profile pin without a local VAAK twin (historical Wafrn dual-publish).
+    // Not a link — display-only until cleared or replaced via VAAK.
+    if ($isBskyPin) {
+        $published = (string) ($n['published'] ?? '');
+        $dateLabel = $published;
+        try {
+            $dateLabel = (new DateTimeImmutable($published))->format('M j, Y · g:i A');
+        } catch (Throwable $e) {
+            // keep
+        }
+        $bodyHtml = (string) ($n['content'] ?? '');
+        $thumb = '';
+        $thumbUrl = (string) ($n['_thumb_url'] ?? '');
+        if ($thumbUrl !== '' && str_starts_with($thumbUrl, 'https://')) {
+            $safe = htmlspecialchars($thumbUrl, ENT_QUOTES, 'UTF-8');
+            $thumb = '<div class="media-row media-count-1"><img class="thumb" src="' . $safe
+                . '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>';
+        }
+        if ($bodyHtml === '' && $thumb === '') {
+            $bodyHtml = '<div class="body muted">(pinned Bluesky post)</div>';
+        } elseif ($bodyHtml !== '' && !str_starts_with(ltrim($bodyHtml), '<')) {
+            $bodyHtml = '<div class="body">' . $bodyHtml . '</div>';
+        } elseif ($bodyHtml !== '') {
+            $bodyHtml = '<div class="body">' . $bodyHtml . '</div>';
+        }
+        $pinBarInner = '<span class="post-pin" title="Pinned" aria-hidden="true">📌</span>';
+        if (ap_cmdr_profile_owner_session()) {
+            $tab = preg_replace('/[^a-z]/', '', (string) ($_GET['tab'] ?? 'posts')) ?: 'posts';
+            $csrf = function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : '';
+            $pinBarInner = '<form method="post" action="/users/cmdr_nova" class="post-unpin-form" '
+                . 'onsubmit="return confirm(\'Clear this Bluesky pin from your profile?\');">'
+                . '<input type="hidden" name="csrf" value="' . htmlspecialchars($csrf, ENT_QUOTES, 'UTF-8') . '">'
+                . '<input type="hidden" name="action" value="clear_bsky_pin">'
+                . '<input type="hidden" name="tab" value="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '">'
+                . '<button type="submit" class="post-pin post-pin--action" title="Unpin from profile" aria-label="Unpin from profile">📌</button>'
+                . '<span class="post-unpin-hint">unpin</span>'
+                . '</form>';
+        }
+        return '<div class="post-wrap is-pinned" aria-label="Pinned post">'
+            . '<div class="post-pin-bar">' . $pinBarInner . '</div>'
+            . '<div class="post is-pinned">'
+            . $bodyHtml
+            . $thumb
+            . '<div class="meta">' . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8')
+            . ' · <span class="badge">pinned</span></div></div></div>';
     }
 
     // Boost card: plain-text only inside outer <a class="post"> (no nested anchors)
@@ -2501,7 +2616,9 @@ function ap_cmdr_post_preview_html(array $n): string
 
     $badge = '';
     $isPinned = !empty($n['_pinned']);
-    if ($kind === 'site_blog') {
+    if ($kind === 'bsky_pin') {
+        $badge .= ' · <span class="badge">pinned · Bluesky</span>';
+    } elseif ($kind === 'site_blog') {
         $badge .= ' · blog';
     } elseif ($kind === 'site_note') {
         $badge .= ' · note';
@@ -2571,7 +2688,7 @@ function ap_cmdr_post_preview_html(array $n): string
     $card .= '</div></a>';
 
     if ($unpinForm !== '') {
-        $html = '<div class="post-wrap is-pinned">' . $unpinForm . $card . '</div>';
+        $html = '<div class="post-wrap is-pinned"><div class="post-pin-bar">' . $unpinForm . '</div>' . $card . '</div>';
     } else {
         $html = $card;
     }

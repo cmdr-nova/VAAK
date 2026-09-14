@@ -48,6 +48,34 @@ if ($vaakUser === null) {
     if ($returnView !== '' && $returnView !== 'home') {
         $loginQs .= '&next=' . rawurlencode($returnView);
     }
+    // AJAX / partial fetches must NOT follow a 302 into login HTML and paint it
+    // inside the feed. Return 401 so the client can do a full-page redirect.
+    $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
+    $isAjaxGet = isset($_GET['ajax']);
+    $xrw = strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? ''));
+    $secDest = strtolower((string) ($_SERVER['HTTP_SEC_FETCH_DEST'] ?? ''));
+    $secMode = strtolower((string) ($_SERVER['HTTP_SEC_FETCH_MODE'] ?? ''));
+    $isFetch = ($secDest === 'empty' && in_array($secMode, ['cors', 'same-origin', 'no-cors'], true))
+        || $xrw === 'xmlhttprequest';
+    if ($isPartial || $isAjaxGet || $isFetch) {
+        http_response_code(401);
+        header('Cache-Control: no-store');
+        header('X-VAAK-Auth: required');
+        header('X-VAAK-Login: ' . $loginQs);
+        $accept = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
+        if (str_contains($accept, 'application/json') || $isAjaxGet) {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode([
+                'ok' => false,
+                'error' => 'session_expired',
+                'login' => $loginQs,
+            ], JSON_UNESCAPED_SLASHES);
+        } else {
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'session_expired';
+        }
+        exit;
+    }
     header('Location: ' . $loginQs, true, 302);
     exit;
 }
@@ -795,6 +823,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             exit;
         }
     } elseif ($action === 'reply') {
+        $composeToast = null;
         $inReplyTo = trim((string) ($_POST['in_reply_to'] ?? ''));
         $content = trim((string) ($_POST['content'] ?? ''));
         $toActor = trim((string) ($_POST['to_actor'] ?? ''));
@@ -875,6 +904,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     }
                     $notice .= '.';
                 }
+                $bskyRes = is_array($result['bsky'] ?? null) ? $result['bsky'] : null;
+                if (is_array($bskyRes) && !empty($bskyRes['rate_limited']) && !empty($bskyRes['retry_queued'])) {
+                    $composeToast = 'Rate Limit Exceeded - Post added to queue';
+                    $notice .= ' Bluesky rate-limited — mirror queued.';
+                }
                 $view = $returnView !== '' ? $returnView : 'outbox';
             } else {
                 $error = $result['error'] ?? 'Reply failed.';
@@ -892,6 +926,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'ok' => $error === null && $notice !== null,
                 'error' => $error,
                 'notice' => $notice,
+                'toast' => $composeToast,
                 'action' => 'reply',
                 'kind' => $isQuote ? 'quote' : 'post',
                 'return_view' => $returnView,
@@ -917,6 +952,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $res = function_exists('ap_masto_status_pin') ? ap_masto_status_pin($localId) : ['ok' => false, 'error' => 'Pin unavailable'];
             if (!empty($res['ok'])) {
                 $notice = 'Pinned — shows on your HTML profile and in Ice Cubes.';
+                if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
+                    require_once __DIR__ . '/ap-bsky.php';
+                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId);
+                    if (!empty($bpin['ok']) && empty($bpin['cleared'])) {
+                        $notice .= ' Bluesky pin updated.';
+                    } elseif (!empty($bpin['ok']) && !empty($bpin['cleared'])) {
+                        // pinned a post with no Bluesky twin yet
+                    } elseif (!empty($bpin['error']) && $bpin['error'] !== 'Bluesky not connected') {
+                        $notice .= ' (Bluesky pin: ' . (string) $bpin['error'] . ')';
+                    }
+                }
             } else {
                 $error = $res['error'] ?? 'Could not pin.';
             }
@@ -924,6 +970,15 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $res = function_exists('ap_masto_status_unpin') ? ap_masto_status_unpin($localId) : ['ok' => false];
             if (!empty($res['ok'])) {
                 $notice = 'Unpinned.';
+                if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
+                    require_once __DIR__ . '/ap-bsky.php';
+                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId);
+                    if (!empty($bpin['ok'])) {
+                        $notice .= !empty($bpin['cleared'])
+                            ? ' Bluesky pin cleared.'
+                            : ' Bluesky pin updated.';
+                    }
+                }
             } else {
                 $error = $res['error'] ?? 'Could not unpin.';
             }
@@ -2494,6 +2549,15 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 } elseif (!empty($res['profile_sync_error'])) {
                     $notice .= ' (Profile sync: ' . (string) $res['profile_sync_error'] . ')';
                 }
+                if (function_exists('ap_bsky_import_pin_to_vaak')) {
+                    $imp = ap_bsky_import_pin_to_vaak($vaakOwnerId);
+                    if (!empty($imp['ok']) && empty($imp['skipped']) && !empty($imp['pinned_local_id'])) {
+                        $notice .= ' Bluesky pin imported to VAAK.';
+                    }
+                }
+                if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
+                    ap_bsky_sync_pin_to_bluesky($vaakOwnerId);
+                }
             } else {
                 $error = $res['error'] ?? 'Bluesky connect failed.';
             }
@@ -3899,6 +3963,110 @@ function admin_timeline_item_muted_by_words(array $item): bool
 }
 
 /** Hide a timeline row when either its visible actor or boosted original is blocked. */
+/**
+ * True when an AP object id is a Bridgy “convert” mirror (prefer native fedi twin).
+ */
+function admin_is_bridgy_convert_object_id(string $objectId): bool
+{
+    $objectId = strtolower(rtrim(trim($objectId), '/'));
+    return str_contains($objectId, 'bsky.brid.gy/convert/')
+        || str_contains($objectId, 'fed.brid.gy/convert/');
+}
+
+/**
+ * Look up a stored Create/Quote event for an AP object id (dual-publish twin).
+ *
+ * @return array<string,mixed>|null
+ */
+function admin_event_by_object_id(string $objectId): ?array
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM events
+             WHERE (object_id = ? OR object_id = ?)
+               AND type IN ('Create', 'Quote', 'QuotePost', 'Announce')
+             ORDER BY id DESC
+             LIMIT 1"
+        );
+        $st->execute([$objectId, $objectId . '/']);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * Mark Home/Federated seen-keys for an AP object and any linked Bluesky twin.
+ *
+ * @param array<string,true> $seen
+ */
+function admin_mark_dual_publish_seen(array &$seen, string $objectId): void
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '') {
+        return;
+    }
+    $seen[$objectId] = true;
+    $seen[$objectId . '/'] = true;
+    if (!function_exists('ap_bsky_post_link_by_fedi')) {
+        return;
+    }
+    try {
+        $link = ap_bsky_post_link_by_fedi($objectId);
+        if (is_array($link) && !empty($link['bsky_uri'])) {
+            $seen['bsky:' . (string) $link['bsky_uri']] = true;
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+}
+
+/**
+ * Prefer a native Fediverse object id over Bridgy convert mirrors for the same Bluesky post.
+ */
+function admin_prefer_fedi_object_id(string $objectId): string
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '' || !function_exists('ap_bsky_post_link_by_fedi')) {
+        return $objectId;
+    }
+    if (!admin_is_bridgy_convert_object_id($objectId)) {
+        return $objectId;
+    }
+    try {
+        // Bridgy convert ids are sometimes stored as fediverse_id — find the bsky uri, then a better twin.
+        $link = ap_bsky_post_link_by_fedi($objectId);
+        if (!is_array($link) || empty($link['bsky_uri'])) {
+            return $objectId;
+        }
+        $bskyUri = (string) $link['bsky_uri'];
+        $st = ap_db()->prepare(
+            'SELECT fediverse_id, ap_object_id FROM bsky_post_links WHERE bsky_uri = ? LIMIT 5'
+        );
+        // One row per bsky_uri typically; also scan recent links with same uri via by_uri.
+        $byUri = function_exists('ap_bsky_post_link_by_uri') ? ap_bsky_post_link_by_uri($bskyUri) : $link;
+        foreach ([$byUri] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            foreach (['fediverse_id', 'ap_object_id'] as $k) {
+                $cand = rtrim((string) ($row[$k] ?? ''), '/');
+                if ($cand !== '' && str_starts_with($cand, 'https://') && !admin_is_bridgy_convert_object_id($cand)) {
+                    return $cand;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+    return $objectId;
+}
+
 function admin_timeline_row_hidden(array $row, int $ownerUserId): bool
 {
     if (function_exists('ap_timeline_row_is_hidden')) {
@@ -4574,7 +4742,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
         $feedBoostAdded++;
     }
     usort($feedTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
-    // Dedupe: prefer outbox card when same note id appears as event
+    // Dedupe: prefer outbox card when same note id appears as event.
+    // Also collapse dual-publish twins (Wafrn/VAAK/Bridgy) onto one Fediverse card,
+    // preferring native AP object ids over Bridgy convert mirrors.
     $seenFeed = [];
     $feedDeduped = [];
     foreach ($feedTimeline as $item) {
@@ -4584,7 +4754,27 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
         } elseif ($kind === 'outbox') {
             $key = 'note:' . rtrim((string) ($item['row']['id'] ?? ''), '/');
         } else {
-            $key = 'evt:' . rtrim((string) ($item['row']['object_id'] ?? ''), '/');
+            $oid = rtrim((string) ($item['row']['object_id'] ?? ''), '/');
+            $oid = admin_prefer_fedi_object_id($oid);
+            $key = 'evt:' . $oid;
+            // Same Bluesky post federated twice (native + Bridgy convert) → one card.
+            if ($oid !== '' && function_exists('ap_bsky_post_link_by_fedi')) {
+                $plink = ap_bsky_post_link_by_fedi($oid);
+                if (is_array($plink) && !empty($plink['bsky_uri'])) {
+                    $bKey = 'bsky:' . (string) $plink['bsky_uri'];
+                    if (isset($seenFeed[$bKey])) {
+                        continue;
+                    }
+                    // Prefer native over Bridgy convert when both appear.
+                    if (admin_is_bridgy_convert_object_id($oid) && isset($seenFeed['bsky-native:' . $plink['bsky_uri']])) {
+                        continue;
+                    }
+                    $seenFeed[$bKey] = true;
+                    if (!admin_is_bridgy_convert_object_id($oid)) {
+                        $seenFeed['bsky-native:' . $plink['bsky_uri']] = true;
+                    }
+                }
+            }
         }
         if ($key !== 'note:' && $key !== 'evt:' && $key !== 'boost:' && isset($seenFeed[$key])) {
             continue;
@@ -4686,7 +4876,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             }
             $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
             if ($oid !== '') {
-                $homeSeenObject[$oid] = true;
+                admin_mark_dual_publish_seen($homeSeenObject, $oid);
             }
             $sortTs = strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0);
             if (
@@ -4742,7 +4932,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 continue;
             }
             if ($oid !== '') {
-                $homeSeenObject[$oid] = true;
+                admin_mark_dual_publish_seen($homeSeenObject, $oid);
             }
             $sortTs = strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0);
             if (
@@ -4799,7 +4989,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if ($plain === '') {
                 continue;
             }
-            $homeSeenObject[$nid] = true;
+            admin_mark_dual_publish_seen($homeSeenObject, $nid);
             $synth = [
                 'id' => 'outbox:' . $nid,
                 'type' => 'Create',
@@ -4840,7 +5030,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 continue;
             }
             if ($oid !== '') {
-                $homeSeenObject[$oid] = true;
+                admin_mark_dual_publish_seen($homeSeenObject, $oid);
             }
             $created = strtotime((string) ($e['created_at'] ?? '')) ?: (int) ($e['id'] ?? 0);
             $homeTimeline[] = [
@@ -4895,11 +5085,16 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     // Bluesky following mix from durable cache (warm cron / tab browse).
     // Soft-cap ~30% so Home stays fedi-first; skip dual-published twins already shown.
+    // Fail-open: never let Bluesky merge stall Home (budget + try/catch).
     if (
         function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
         && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($homeOwnerId))
         && function_exists('ap_bsky_posts_for_home')
     ) {
+      try {
+        if (function_exists('ap_bsky_budget_begin')) {
+            ap_bsky_budget_begin(3);
+        }
         $ownBskyDid = '';
         $bskySessHome = ap_bsky_session_row($homeOwnerId);
         if (is_array($bskySessHome)) {
@@ -4921,9 +5116,39 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 if (is_array($link) && !empty($link['fediverse_id'])) {
                     $fediTwin = rtrim((string) $link['fediverse_id'], '/');
                 }
+                if ($fediTwin === '' && is_array($link) && !empty($link['ap_object_id'])) {
+                    $fediTwin = rtrim((string) $link['ap_object_id'], '/');
+                }
             }
-            if ($fediTwin !== '' && isset($homeSeenObject[$fediTwin])) {
-                continue; // already showing the AP twin
+            if ($fediTwin !== '') {
+                $fediTwin = admin_prefer_fedi_object_id($fediTwin);
+            }
+            // Dual-publish (Wafrn / VAAK / Bridgy): prefer the Fediverse card.
+            if ($fediTwin !== '') {
+                if (isset($homeSeenObject[$fediTwin]) || isset($homeSeenObject['bsky:' . $bUri])) {
+                    continue; // AP twin already in the feed
+                }
+                $apEvent = admin_event_by_object_id($fediTwin);
+                if (is_array($apEvent) && !admin_timeline_row_hidden($apEvent, $homeOwnerId)) {
+                    if (!(function_exists('ap_row_matches_muted_words')
+                        && ap_row_matches_muted_words($apEvent, 'event', [], $homeOwnerId))) {
+                        $apSort = strtotime((string) ($apEvent['created_at'] ?? '')) ?: 0;
+                        $indexed = (string) ($bItem['indexed_at'] ?? ($bItem['post']['indexedAt'] ?? ''));
+                        $bskySort = strtotime($indexed) ?: 0;
+                        $homeTimeline[] = [
+                            'kind' => 'event',
+                            'sort' => max($apSort, $bskySort),
+                            'row' => $apEvent,
+                            'from_dual_publish' => true,
+                        ];
+                        admin_mark_dual_publish_seen($homeSeenObject, $fediTwin);
+                        $homeSeenObject['bsky:' . $bUri] = true;
+                        continue; // do not also emit the Bluesky card
+                    }
+                }
+                // Dual-published but AP twin not in events yet — fall through and
+                // show Bluesky temporarily; once the Fediverse copy arrives, the
+                // seen-map above will suppress this AT card on the next refresh.
             }
             // Hide-set / muted DIDs
             $authorDid = (string) ($bItem['post']['author']['did'] ?? '');
@@ -4938,9 +5163,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if ($sortTs <= 0) {
                 continue;
             }
-            if ($fediTwin !== '') {
-                $homeSeenObject[$fediTwin] = true;
-            }
             $homeSeenObject['bsky:' . $bUri] = true;
             $bskyCandidates[] = [
                 'kind' => 'bsky',
@@ -4951,6 +5173,13 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         foreach ($bskyCandidates as $bc) {
             $homeTimeline[] = $bc;
         }
+      } catch (Throwable $e) {
+        error_log('[ap-admin] home bsky merge skipped: ' . $e->getMessage());
+      } finally {
+        if (function_exists('ap_bsky_budget_clear')) {
+            ap_bsky_budget_clear();
+        }
+      }
     }
     usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     // Soft cap Bluesky share (~30%) so Home stays fedi-first when AT cache is busy.
@@ -5428,6 +5657,15 @@ if ($prefillReplyTo !== '' && $prefillEditNote === '' && $prefillDraftId <= 0) {
         }
     } catch (Throwable $e) {
         // A missing cache row should not prevent opening the composer.
+    }
+    // JS reply modal also passes cw=/sensitive= on the intercepted URL — honor those
+    // if the DB lookup missed (or for a full navigation of the same link).
+    $cwGet = trim((string) ($_GET['cw'] ?? ''));
+    if ($cwGet !== '' && $prefillEditSpoiler === '') {
+        $prefillEditSpoiler = mb_substr($cwGet, 0, 500);
+    }
+    if (!empty($_GET['sensitive']) || $cwGet !== '') {
+        $prefillEditSensitive = true;
     }
 }
 // Remote replies: seed the textarea with @author (+ other mentions) so you can keep typing.
@@ -7266,7 +7504,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 <?php
                   $evMentionSeed = admin_reply_mention_seed($aid, null, is_array($eventMentions ?? null) ? $eventMentions : []);
                 ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?><?= admin_reply_mention_query($evMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?><?= admin_reply_mention_query($evMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
                 <?php if ($aid !== '' && !$alreadyFollowing): ?>
                   <form method="post" action="?view=following" style="display:inline">
                     <input type="hidden" name="action" value="follow_remote">
@@ -7793,6 +8031,26 @@ function admin_reply_mention_query(array $handles): string
 }
 
 /**
+ * Append CW/sensitive hints for JS reply modal intercept (prefills composer;
+ * author can still clear before send).
+ */
+function admin_reply_cw_query(?string $spoiler, bool $sensitive = false): string
+{
+    $spoiler = trim((string) $spoiler);
+    if ($spoiler === '' && !$sensitive) {
+        return '';
+    }
+    $q = '';
+    if ($spoiler !== '') {
+        $q .= '&cw=' . rawurlencode(mb_substr($spoiler, 0, 500));
+    }
+    if ($sensitive || $spoiler !== '') {
+        $q .= '&sensitive=1';
+    }
+    return $q;
+}
+
+/**
  * Bluesky facet mentions from a PostView (handles as written in the post text).
  *
  * @param array<string,mixed> $post
@@ -8170,7 +8428,7 @@ function admin_render_masto_status_card(
                       ? admin_reply_mention_seed($actorRef, $acct !== '?' ? $acct : null, $stMentions)
                       : [];
                 ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($uri) ?><?= $actorRef !== '' && !$isLocal ? '&amp;to=' . urlencode($actorRef) : '' ?><?= admin_reply_mention_query($stMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($uri) ?><?= $actorRef !== '' && !$isLocal ? '&amp;to=' . urlencode($actorRef) : '' ?><?= admin_reply_mention_query($stMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
               <?php endif; ?>
               <?php if ($sid !== '' && $uri !== ''): ?>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
@@ -8481,7 +8739,7 @@ function admin_render_remote_boost_card(
                       is_array($boostExtraMentions) ? $boostExtraMentions : []
                   );
                 ?>
-                <a class="btn btn-ghost" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?><?= $origActor !== '' ? '&amp;to=' . urlencode($origActor) : '' ?><?= admin_reply_mention_query($boostMentionSeed) ?>" style="padding:.25rem .7rem;font-size:.8rem">Reply</a>
+                <a class="btn btn-ghost" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?><?= $origActor !== '' ? '&amp;to=' . urlencode($origActor) : '' ?><?= admin_reply_mention_query($boostMentionSeed) ?><?= admin_reply_cw_query($boostSpoiler, $boostSensitive) ?>" style="padding:.25rem .7rem;font-size:.8rem">Reply</a>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -8944,7 +9202,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   <?= admin_edit_post_button($noteId, $editPlain, $editSpoiler, $editSensitive, $returnView) ?>
                   <?= admin_pin_post_button($noteId, $returnView) ?>
                 <?php endif; ?>
-            <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?>" title="Reply / continue thread" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+            <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply / continue thread" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
                 <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL (<?= h($ownVisLabel ?? 'Public') ?>)">Note</a>
               <?php endif; ?>
             </div>
@@ -10281,7 +10539,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
               is_array($nStatusMentions ?? null) ? $nStatusMentions : []
           );
         ?>
-        <a class="icon-btn" href="?view=mentions&amp;compose=1&amp;reply_to=<?= urlencode($nStatusUri) ?>&amp;to=<?= urlencode($nActorRef) ?><?= admin_reply_mention_query($nMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+        <?php
+          $nCw = is_array($nStatus) ? trim((string) ($nStatus['spoiler_text'] ?? '')) : '';
+          $nSens = is_array($nStatus) && (!empty($nStatus['sensitive']) || $nCw !== '');
+        ?>
+        <a class="icon-btn" href="?view=mentions&amp;compose=1&amp;reply_to=<?= urlencode($nStatusUri) ?>&amp;to=<?= urlencode($nActorRef) ?><?= admin_reply_mention_query($nMentionSeed) ?><?= admin_reply_cw_query($nCw, $nSens) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
       <?php endif; ?>
       <?php
         // Favourite / Bluesky like on mention + quote cards (the remote post body).
@@ -14326,7 +14588,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           // Detect a dead/expired stored login without a network round-trip when possible.
           $bskySessionStale = false;
           if ($bskyHandle !== '' && function_exists('ap_bsky_access_token')) {
-              $probe = ap_bsky_access_token($vaakOwnerId, false);
+              // Fail-fast probe: never block Profile on a slow PDS refresh.
+              $probe = ap_bsky_access_token($vaakOwnerId, false, 3);
               if (empty($probe['ok'])) {
                   $bskySessionStale = true;
                   // Fatal expiry clears the row — re-read so the full connect form shows.
@@ -17116,6 +17379,62 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     return fd;
   };
 
+  // Session expired mid-use: never paint /vaak login HTML into the feed.
+  // Server returns 401 + X-VAAK-Auth for partial/ajax; also catch legacy login HTML.
+  window.vaakLoginUrl = '/vaak/?mode=login';
+  window.vaakRedirectToLogin = function (reason) {
+    try {
+      if (window.__vaakLoginRedirecting) return;
+      window.__vaakLoginRedirecting = true;
+      var next = '';
+      try {
+        var sp = new URLSearchParams(window.location.search || '');
+        var view = (sp.get('view') || '').replace(/[^a-z_]/g, '');
+        if (view && view !== 'home') next = '&next=' + encodeURIComponent(view);
+      } catch (e) {}
+      window.location.replace(window.vaakLoginUrl + next);
+    } catch (e2) {
+      window.location.href = '/vaak/?mode=login';
+    }
+  };
+  window.vaakLooksLikeLoginHtml = function (html) {
+    if (typeof html !== 'string' || html.length < 40) return false;
+    // Login page markers (avoid matching normal feed chrome)
+    return html.indexOf('id="login-live-feed-list"') !== -1
+      || html.indexOf('login-live-feed') !== -1
+      || (html.indexOf('name="login"') !== -1 && html.indexOf('name="password"') !== -1 && html.indexOf('/vaak/') !== -1)
+      || html.indexOf('>session_expired<') !== -1
+      || html.trim() === 'session_expired';
+  };
+  (function wrapFetchForAuth() {
+    if (typeof window.fetch !== 'function') return;
+    var orig = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      return orig(input, init).then(function (res) {
+        try {
+          var url = '';
+          if (typeof input === 'string') url = input;
+          else if (input && typeof input.url === 'string') url = input.url;
+          // Only intercept same-origin VAAK admin fetches
+          if (url && url.indexOf('http') === 0 && url.indexOf(window.location.origin) !== 0) {
+            return res;
+          }
+          if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+            var login = res.headers.get('X-VAAK-Login') || window.vaakLoginUrl;
+            window.__vaakLoginRedirecting = true;
+            window.location.replace(login);
+            return res;
+          }
+          if (res.redirected && res.url && res.url.indexOf('mode=login') !== -1) {
+            window.vaakRedirectToLogin('redirect');
+            return res;
+          }
+        } catch (e) {}
+        return res;
+      });
+    };
+  })();
+
   // Progressive mobile haptics: Android browsers may support Vibration API;
   // iOS Safari simply ignores this enhancement.
   window.vaakHaptic = function (pattern) {
@@ -18930,11 +19249,19 @@ window.apAdminToast = function (msg, isErr) {
         headers: { 'Accept': 'text/html' },
         cache: 'no-store'
       });
+      if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('poll');
+        return;
+      }
       if (!res.ok) return;
       const newestHdr = parseInt(res.headers.get('X-Newest') || '0', 10);
       if (newestHdr > newestTs) newestTs = newestHdr;
       items.dataset.newest = String(newestTs);
       const raw = await res.text();
+      if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(raw)) {
+        window.vaakRedirectToLogin('poll-html');
+        return;
+      }
       if (!raw || !raw.trim()) return;
       const filtered = filterNewHtml(raw);
       if (!filtered.count) return;
@@ -18999,8 +19326,16 @@ window.apAdminToast = function (msg, isErr) {
             + '&partial=1&offset=' + requestOffset + '&limit=' + limit;
         }
         const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } });
+        if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+          if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('loadMore');
+          return;
+        }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const html = await res.text();
+        if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
+          window.vaakRedirectToLogin('loadMore-html');
+          return;
+        }
         hasMore = res.headers.get('X-Has-More') === '1';
         if (isNotifTimeline) {
           const nextMax = (res.headers.get('X-Next-Max-Id') || '').replace(/\D+/g, '');
@@ -19386,8 +19721,16 @@ window.apAdminToast = function (msg, isErr) {
         headers: { 'Accept': 'text/html' },
         cache: 'no-store'
       });
+      if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('tabSwap');
+        return;
+      }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const html = await res.text();
+      if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
+        window.vaakRedirectToLogin('tabSwap-html');
+        return;
+      }
       hasMore = res.headers.get('X-Has-More') === '1';
       const nextOff = parseInt(res.headers.get('X-Next-Offset') || String(limit), 10);
       offset = nextOff > 0 ? nextOff : limit;
@@ -20298,9 +20641,22 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const title = document.getElementById('compose-modal-title');
     const submitBtn = document.getElementById('compose-submit-btn');
     const ta = document.getElementById('compose-content');
+    const spoilerInput = form.querySelector('input[name="spoiler_text"]');
+    const sensInput = form.querySelector('input[name="sensitive"]');
     const quoteObject = (opts.quoteObject || '').trim();
     const replyUrl = (opts.replyTo || '').trim();
     const toUrl = (opts.toActor || '').trim();
+    // Inherit parent CW into the composer (author may still clear before send).
+    const inheritCw = String(opts.cw || '').trim();
+    const inheritSensitive = !!opts.sensitive || inheritCw !== '';
+    if (!quoteObject) {
+      if (spoilerInput) spoilerInput.value = inheritCw;
+      if (sensInput) {
+        sensInput.checked = inheritSensitive;
+        const sensBtn = form.querySelector('.composer-check .compose-tool[aria-pressed]');
+        if (sensBtn) sensBtn.setAttribute('aria-pressed', inheritSensitive ? 'true' : 'false');
+      }
+    }
     // mention may be "a@host" or "a@host,b@host" (from reply links).
     const mentionRaw = String(opts.mention || '').trim();
     const mentionParts = [];
@@ -20404,12 +20760,16 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const quoteObject = (sp.get('quote_object') || '').trim();
     const toActor = (sp.get('to') || '').trim();
     const mention = (sp.get('mention') || '').trim();
+    const cw = (sp.get('cw') || '').trim();
+    const sensitive = sp.get('sensitive') === '1' || cw !== '';
     if (!replyTo && !quoteObject) return false;
     applyReplyQuoteChrome({
       replyTo: replyTo,
       quoteObject: quoteObject,
       toActor: toActor,
       mention: mention,
+      cw: cw,
+      sensitive: sensitive,
       returnView: (sp.get('view') === 'compose' ? null : sp.get('view')) || null,
     });
     // Don't restore a leftover local draft over a fresh reply/quote target.
@@ -20436,19 +20796,17 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   function composeHasDraftableContent() {
     if (composeMode === 'edit_status') return false;
     const ta = document.getElementById('compose-content');
-    const spoiler = form.querySelector('input[name="spoiler_text"]');
     let text = ((ta && ta.value) || '').trim();
     // Ignore the auto-inserted @handle seed if the user never typed more.
     const autoMention = (ta && ta.dataset.autoMention) ? String(ta.dataset.autoMention).trim() : '';
     if (autoMention && (text === autoMention || text === autoMention + ' ')) {
       text = '';
     }
-    const cw = ((spoiler && spoiler.value) || '').trim();
     const existingMedia = ((draftMediaField && draftMediaField.value) || '').trim();
-    // Reply/quote targets are composer context, not user-authored content.
-    // Do not create a draft merely because the composer was opened from a
-    // Reply or Quote action and then closed without text or media.
-    return !!(text || cw || existingMedia || (files && files.length));
+    // Reply/quote targets and inherited CW are composer context, not authored
+    // content — closing after opening Reply on a CW'd post (and changing your
+    // mind) must not create a draft. Require text and/or media.
+    return !!(text || existingMedia || (files && files.length));
   }
   function updateDraftsBadge(count) {
     const badge = document.getElementById('nav-drafts-badge');
@@ -20560,7 +20918,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (qb) qb.remove();
     try {
       const u = new URL(window.location.href);
-      ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+      ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
       window.history.replaceState({}, '', u.pathname + u.search + u.hash);
     } catch (e) {}
   }
@@ -21241,6 +21599,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
           ? 'Added to queue.'
           : (mode === 'edit_status' ? 'Post updated.' : (data.kind === 'quote' ? 'Quote posted.' : 'Posted.'));
         window.apAdminToast(data.notice || okMsg);
+        // Bluesky rate-limit: fedi post succeeded; mirror was queued for later.
+        if (data.toast) {
+          setTimeout(() => window.apAdminToast(String(data.toast)), 350);
+        }
       }
       if (mode === 'reply') playPostAudio();
       // Capture before we clear fields — replies must not yank the feed to top.
@@ -21283,7 +21645,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       // Drop compose/quote/reply query flags so refresh doesn't reopen the modal
       try {
         const u = new URL(window.location.href);
-        ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+        ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
         window.history.replaceState({}, '', u.pathname + u.search + u.hash);
       } catch (e) {}
       if (mode === 'queue_post') {

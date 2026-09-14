@@ -4824,17 +4824,30 @@ function ap_publish_status_text(
     // Bluesky mirror *after* fedi Create (canonical AP id already exists + was signed/delivered).
     // Record.fediverseId = noteId ("mirroring this fedi post"). Then stamp local Note with
     // FEP-fffd / blueskyUri so later fetches + optional Update can merge.
+    //
+    // Do NOT gate on ap_bsky_tab_enabled() here. That flag defaults false and is
+    // only set in php-fpm env — queue/CLI publishers (ap-queue-publish, ap-cli-post)
+    // were silently skipping Bluesky with no skip/fail log.
+    $bsky = null;
+    $bskyOwnerId = 0;
     try {
         if (!function_exists('ap_bsky_crosspost_status')) {
             require_once __DIR__ . '/ap-bsky.php';
         }
-        if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
-            && function_exists('ap_bsky_crosspost_status')) {
+        if (function_exists('ap_bsky_crosspost_status')) {
+            // Resolve the *publishing* actor's ap_users.id — never fall back to
+            // the default/masto owner, or another account's posts could mirror
+            // onto cmdr_nova's Bluesky (and vice versa).
+            $bskyOwnerId = 0;
             if (function_exists('ap_db_owner_user_id_for_actor')) {
                 $bskyOwnerId = ap_db_owner_user_id_for_actor($actor);
             }
-            if ($bskyOwnerId < 1 && function_exists('ap_db_masto_owner_user_id')) {
-                $bskyOwnerId = ap_db_masto_owner_user_id();
+            // Only mirror when this owner has a Bluesky session connected.
+            if ($bskyOwnerId > 0 && function_exists('ap_bsky_session_row')
+                && ap_bsky_session_row($bskyOwnerId) === null) {
+                ap_log('bsky_crosspost_skip local_id=' . $localId
+                    . ' err=no_bsky_session owner=' . $bskyOwnerId);
+                $bskyOwnerId = 0;
             }
             if ($bskyOwnerId > 0) {
                 $bsky = ap_bsky_crosspost_status(
@@ -4912,10 +4925,64 @@ function ap_publish_status_text(
             . ' tip=' . ap_short((string) ($bsky['tip_uri'] ?? $bsky['uri'] ?? ''))
             . (!empty($bsky['reply_nested']) ? ' reply=nested' : '')
             . (!empty($bsky['reply_fallback']) ? ' reply=fallback_re_link' : ''));
-    } elseif (is_array($bsky) && !empty($bsky['skipped']) && !empty($bsky['error'])) {
-        ap_log('bsky_crosspost_skip local_id=' . $localId . ' err=' . ap_short((string) $bsky['error']));
-    } elseif (is_array($bsky) && !empty($bsky['error']) && empty($bsky['skipped'])) {
-        ap_log('bsky_crosspost_fail local_id=' . $localId . ' err=' . ap_short((string) $bsky['error']));
+        if (function_exists('ap_bsky_crosspost_retry_mark_done')) {
+            ap_bsky_crosspost_retry_mark_done($noteId);
+        }
+    } elseif (is_array($bsky) && !empty($bsky['skipped'])) {
+        ap_log('bsky_crosspost_skip local_id=' . $localId
+            . ' err=' . ap_short((string) ($bsky['error'] ?? 'skipped')));
+        // Soft skips (e.g. reply parent not mirrored yet) get background retries.
+        if (function_exists('ap_bsky_crosspost_should_retry') && ap_bsky_crosspost_should_retry($bsky)
+            && function_exists('ap_bsky_crosspost_retry_enqueue') && $bskyOwnerId > 0) {
+            $enq = ap_bsky_crosspost_retry_enqueue(
+                $noteId,
+                (int) $bskyOwnerId,
+                (int) $localId,
+                (string) ($bsky['error'] ?? 'skipped'),
+                90
+            );
+            if (!empty($enq['queued'])) {
+                ap_log('bsky_crosspost_retry_queued local_id=' . $localId
+                    . ' err=' . ap_short((string) ($bsky['error'] ?? 'skipped')));
+            }
+        }
+    } elseif (is_array($bsky) && (empty($bsky['ok']) || !empty($bsky['deferred'])) && empty($bsky['skipped'])) {
+        $errLabel = !empty($bsky['deferred']) ? 'bsky_crosspost_deferred' : 'bsky_crosspost_fail';
+        ap_log($errLabel . ' local_id=' . $localId . ' err=' . ap_short((string) ($bsky['error'] ?? 'fail')));
+        // Always backfill on hard fail / deferred (video, budget, DNS, auth, rate limit).
+        if ($bskyOwnerId > 0 && function_exists('ap_bsky_crosspost_retry_enqueue')
+            && (!function_exists('ap_bsky_crosspost_should_retry') || ap_bsky_crosspost_should_retry($bsky))) {
+            $delay = 60;
+            if (!empty($bsky['rate_limited']) && function_exists('ap_bsky_result_retry_after_sec')) {
+                $delay = ap_bsky_result_retry_after_sec($bsky, 300);
+            } elseif (!empty($bsky['deferred'])) {
+                $delay = 15;
+            }
+            $enq = ap_bsky_crosspost_retry_enqueue(
+                $noteId,
+                (int) $bskyOwnerId,
+                (int) $localId,
+                (string) ($bsky['error'] ?? 'fail'),
+                $delay
+            );
+            if (!empty($enq['queued'])) {
+                $bsky['retry_queued'] = true;
+                ap_log('bsky_crosspost_retry_queued local_id=' . $localId
+                    . ' err=' . ap_short((string) ($bsky['error'] ?? 'fail'))
+                    . ' delay=' . $delay
+                    . (!empty($bsky['rate_limited']) ? ' rate_limited=1' : ''));
+            }
+            if (!empty($bsky['rate_limited']) && function_exists('ap_bsky_crosspost_retry_pause_owner')) {
+                ap_bsky_crosspost_retry_pause_owner(
+                    (int) $bskyOwnerId,
+                    $delay,
+                    'Rate limit exceeded; paused owner queue'
+                );
+            }
+        }
+    } elseif ($bsky === null && function_exists('ap_bsky_crosspost_status')) {
+        // Owner has no mapped user id / session path — make that visible in logs.
+        ap_log('bsky_crosspost_skip local_id=' . $localId . ' err=no_owner_session_mapping');
     }
 
     // Warm link-preview cache for the first URL (best-effort; don't fail the post)

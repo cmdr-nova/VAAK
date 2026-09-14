@@ -2327,6 +2327,13 @@ function ap_masto_api(string $method, string $path): void
             ap_masto_json(['error' => 'Record not found'], 404);
         }
         $res = ap_masto_status_pin((int) $row['local_id']);
+        if (!empty($res['ok']) && function_exists('ap_bsky_sync_pin_to_bluesky')) {
+            require_once __DIR__ . '/ap-bsky.php';
+            $owner = function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0;
+            if ($owner > 0) {
+                ap_bsky_sync_pin_to_bluesky($owner);
+            }
+        }
         if (empty($res['ok'])) {
             ap_masto_json(['error' => $res['error'] ?? 'Could not pin'], 422);
         }
@@ -2341,6 +2348,13 @@ function ap_masto_api(string $method, string $path): void
             ap_masto_json(['error' => 'Record not found'], 404);
         }
         ap_masto_status_unpin((int) $row['local_id']);
+        if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
+            require_once __DIR__ . '/ap-bsky.php';
+            $owner = function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0;
+            if ($owner > 0) {
+                ap_bsky_sync_pin_to_bluesky($owner);
+            }
+        }
         ap_masto_json(ap_masto_status_from_row(ap_masto_status_by_local_id((int) $row['local_id']) ?: $row));
         return;
     }

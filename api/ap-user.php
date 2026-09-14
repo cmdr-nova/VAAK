@@ -798,65 +798,74 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     $noteUriRaw = (string) ($row['id'] ?? '');
     if ($noteUriRaw !== '' && function_exists('ap_note_public_replies')) {
         $replies = ap_note_public_replies($noteUriRaw, 40);
-        if ($replies !== []) {
-            echo '<section class="note-replies" aria-label="Replies">';
-            echo '<h2 class="note-replies-title">Replies <span class="muted">(' . count($replies) . ')</span></h2>';
-            foreach ($replies as $rep) {
-                $rUrl = (string) ($rep['url'] ?? '');
-                $rActor = (string) ($rep['actor_id'] ?? '');
-                $rContent = (string) ($rep['content'] ?? '');
-                $rWhen = (string) ($rep['published'] ?? '');
-                $handle = $rActor;
-                if (preg_match('#/users/([A-Za-z0-9_]+)$#', $rActor, $hm)) {
-                    $handle = '@' . $hm[1]
-                        . (str_contains($rActor, 'mkultra.monster') ? '@mkultra.monster' : '');
-                } elseif (preg_match('#bsky\.app/profile/([^/?#]+)#i', $rActor, $bm)) {
-                    $handle = '@' . rawurldecode($bm[1]);
-                }
-                $snip = $rContent;
-                if (function_exists('mb_strlen') && mb_strlen($snip) > 320) {
-                    $snip = mb_substr($snip, 0, 320) . '…';
-                } elseif (strlen($snip) > 320) {
-                    $snip = substr($snip, 0, 320) . '…';
-                }
-                $rSpoiler = trim((string) ($rep['spoiler_text'] ?? ''));
-                $rSensitive = !empty($rep['sensitive']) || $rSpoiler !== '';
-                $localReply = str_starts_with($rUrl, 'https://mkultra.monster/users/')
-                    && str_contains($rUrl, '/notes/');
-                echo '<article class="note-reply"><div class="note-reply-hd"><span class="who">'
-                    . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-                    . '</span>';
-                if ($rWhen !== '') {
-                    echo ' <span class="muted">· '
-                        . htmlspecialchars($rWhen, ENT_QUOTES, 'UTF-8') . '</span>';
-                }
-                echo '</div>';
-                $bodyHtml = $snip !== ''
-                    ? ('<div class="note-reply-body">'
-                        . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-                        . '</div>')
-                    : '';
-                if ($rSensitive) {
-                    $cwLabel = $rSpoiler !== ''
-                        ? ('CW · ' . htmlspecialchars($rSpoiler, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
-                        : 'CW · Sensitive';
-                    echo '<details class="note-reply-cw-gate"><summary>' . $cwLabel
-                        . ' <span class="muted" style="font-weight:500">· show</span></summary>';
-                    echo $bodyHtml;
-                    echo '</details>';
-                } elseif ($bodyHtml !== '') {
-                    echo $bodyHtml;
-                }
-                if ($rUrl !== '' && str_starts_with($rUrl, 'https://')) {
-                    echo '<div class="muted" style="margin-top:.35rem;font-size:.78rem"><a href="'
-                        . htmlspecialchars($rUrl, ENT_QUOTES, 'UTF-8') . '"'
-                        . ($localReply ? '' : ' target="_blank" rel="noopener noreferrer"')
-                        . '>Open reply</a></div>';
-                }
-                echo '</article>';
-            }
-            echo '</section>';
+        echo '<section class="note-replies" aria-label="Replies">';
+        echo '<h2 class="note-replies-title">Replies'
+            . ($replies !== [] ? (' <span class="muted">(' . count($replies) . ')</span>') : '')
+            . '</h2>';
+        if ($replies === []) {
+            echo '<p class="muted" style="margin:.35rem 0 0">No replies yet.</p>';
         }
+        foreach ($replies as $rep) {
+            $rUrl = (string) ($rep['url'] ?? '');
+            $rActor = (string) ($rep['actor_id'] ?? '');
+            $rContent = (string) ($rep['content'] ?? '');
+            $rWhen = (string) ($rep['published'] ?? '');
+            $rKind = (string) ($rep['kind'] ?? '');
+            $handle = $rActor;
+            if (preg_match('#/users/([A-Za-z0-9_]+)$#', $rActor, $hm)) {
+                $handle = '@' . $hm[1]
+                    . (str_contains($rActor, 'mkultra.monster') ? '@mkultra.monster' : '');
+            } elseif (preg_match('#bsky\.app/profile/([^/?#]+)#i', $rActor, $bm)) {
+                $handle = '@' . rawurldecode($bm[1]);
+            }
+            $snip = $rContent;
+            if (function_exists('mb_strlen') && mb_strlen($snip) > 320) {
+                $snip = mb_substr($snip, 0, 320) . '…';
+            } elseif (strlen($snip) > 320) {
+                $snip = substr($snip, 0, 320) . '…';
+            }
+            $rSpoiler = trim((string) ($rep['spoiler_text'] ?? ''));
+            $rSensitive = !empty($rep['sensitive']) || $rSpoiler !== '';
+            $localReply = str_starts_with($rUrl, 'https://mkultra.monster/users/')
+                && str_contains($rUrl, '/notes/');
+            $isBsky = ($rKind === 'bluesky') || str_contains($rUrl, 'bsky.app/');
+            echo '<article class="note-reply"><div class="note-reply-hd"><span class="who">'
+                . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                . '</span>';
+            if ($isBsky) {
+                echo ' <span class="badge" style="font-size:.7rem">Bluesky</span>';
+            }
+            if ($rWhen !== '') {
+                echo ' <span class="muted">· '
+                    . htmlspecialchars($rWhen, ENT_QUOTES, 'UTF-8') . '</span>';
+            }
+            echo '</div>';
+            $bodyHtml = $snip !== ''
+                ? ('<div class="note-reply-body">'
+                    . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . '</div>')
+                : '';
+            if ($rSensitive) {
+                $cwLabel = $rSpoiler !== ''
+                    ? ('CW · ' . htmlspecialchars($rSpoiler, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+                    : 'CW · Sensitive';
+                echo '<details class="note-reply-cw-gate"><summary>' . $cwLabel
+                    . ' <span class="muted" style="font-weight:500">· show</span></summary>';
+                echo $bodyHtml;
+                echo '</details>';
+            } elseif ($bodyHtml !== '') {
+                echo $bodyHtml;
+            }
+            if ($rUrl !== '' && str_starts_with($rUrl, 'https://')) {
+                $openLabel = $localReply ? 'Open reply' : ($isBsky ? 'Open on Bluesky' : 'Open on remote');
+                echo '<div class="muted" style="margin-top:.35rem;font-size:.78rem"><a href="'
+                    . htmlspecialchars($rUrl, ENT_QUOTES, 'UTF-8') . '"'
+                    . ($localReply ? '' : ' target="_blank" rel="noopener noreferrer"')
+                    . '>' . $openLabel . '</a></div>';
+            }
+            echo '</article>';
+        }
+        echo '</section>';
     }
 
     echo '<p class="back"><a href="/users/' . $safe . '">← profile</a></p>';

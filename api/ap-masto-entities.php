@@ -2092,6 +2092,7 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
     }
 
     $mentions = array_values($byAcct);
+    $placeholders = [];
 
     // Escape then re-inject mention links
     $escaped = htmlspecialchars($plainText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -2156,18 +2157,44 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
             ) ?? $escaped;
         }
 
-        if ($placeholders) {
-            $escaped = str_replace(array_keys($placeholders), array_values($placeholders), $escaped);
-        }
+        // Re-protect mention cards (incl. bare-@ pass) while we linkify URLs/hashtags,
+        // so we never rewrite https:// inside existing href="..." attributes.
+        $escaped = preg_replace_callback(
+            '#<span class="h-card">.*?</span>#su',
+            static function (array $m) use (&$placeholders): string {
+                $key = "\x01M" . count($placeholders) . "\x01";
+                $placeholders[$key] = $m[0];
+                return $key;
+            },
+            $escaped
+        ) ?? $escaped;
     }
 
-    // Protect URLs so #fragments aren't hashtags, then linkify #tags for Ice Cubes
+    // Protect remaining HTML tags (safety) then turn bare URLs into <a href>.
+    $tagHold = [];
+    $escaped = preg_replace_callback(
+        '/<[^>]+>/u',
+        static function (array $m) use (&$tagHold): string {
+            $key = "\x01T" . count($tagHold) . "\x01";
+            $tagHold[$key] = $m[0];
+            return $key;
+        },
+        $escaped
+    ) ?? $escaped;
+
     $urlHold = [];
     $escaped = preg_replace_callback(
         '#https?://[^\s<]+#iu',
         static function (array $m) use (&$urlHold): string {
+            $raw = $m[0];
+            // Trailing punctuation often sits after the URL in prose.
+            $trimmed = rtrim($raw, '.,);]!?\'"');
+            $trail = substr($raw, strlen($trimmed));
+            $url = html_entity_decode($trimmed, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $href = htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
             $key = "\x01U" . count($urlHold) . "\x01";
-            $urlHold[$key] = $m[0];
+            $urlHold[$key] = '<a href="' . $href . '" target="_blank" rel="nofollow noopener noreferrer">'
+                . $trimmed . '</a>' . $trail;
             return $key;
         },
         $escaped
@@ -2175,6 +2202,12 @@ function ap_masto_content_with_mentions(string $plainText, array $extraActorIds 
     [$escaped, $tags] = ap_masto_linkify_hashtags_escaped($escaped);
     if ($urlHold) {
         $escaped = str_replace(array_keys($urlHold), array_values($urlHold), $escaped);
+    }
+    if ($tagHold) {
+        $escaped = str_replace(array_keys($tagHold), array_values($tagHold), $escaped);
+    }
+    if (!empty($placeholders)) {
+        $escaped = str_replace(array_keys($placeholders), array_values($placeholders), $escaped);
     }
 
     // Mastodon-style: blank lines → separate <p>; single newlines → <br>.
@@ -2947,6 +2980,30 @@ function ap_masto_context_descendants_for_object_url(string $objectUrl): array
     if ($objectUrl === '') {
         return $descendants;
     }
+    // Local outbox replies to this Note (e.g. you replied from Notifications).
+    // These never appear in events.in_reply_to for our own Creates, so thread
+    // views were showing "No replies found yet" despite the reply existing.
+    try {
+        $ost = ap_db()->prepare(
+            "SELECT id FROM outbox_notes
+             WHERE (in_reply_to = ? OR in_reply_to = ?)
+             ORDER BY published ASC
+             LIMIT 80"
+        );
+        $ost->execute([$objectUrl, $objectUrl . '/']);
+        foreach ($ost->fetchAll() as $orow) {
+            $nid = rtrim((string) ($orow['id'] ?? ''), '/');
+            if ($nid === '' || !function_exists('ap_masto_status_by_note_id')) {
+                continue;
+            }
+            $local = ap_masto_status_by_note_id($nid);
+            if (is_array($local)) {
+                $descendants[] = ap_masto_status_from_row($local, true, true);
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore — still collect remote/event replies
+    }
     $dst = ap_db()->prepare(
         "SELECT * FROM events
          WHERE type = 'Create'
@@ -2990,6 +3047,28 @@ function ap_masto_context_descendants_for_object_url(string $objectUrl): array
                 $nent = $nent['reblog'];
             }
             $descendants[] = $nent;
+        }
+        // Nested local replies to a remote child URL
+        try {
+            $ost2 = ap_db()->prepare(
+                "SELECT id FROM outbox_notes
+                 WHERE (in_reply_to = ? OR in_reply_to = ?)
+                 ORDER BY published ASC
+                 LIMIT 40"
+            );
+            $ost2->execute([$cuid, $cuid . '/']);
+            foreach ($ost2->fetchAll() as $orow) {
+                $nid = rtrim((string) ($orow['id'] ?? ''), '/');
+                if ($nid === '' || !function_exists('ap_masto_status_by_note_id')) {
+                    continue;
+                }
+                $local = ap_masto_status_by_note_id($nid);
+                if (is_array($local)) {
+                    $descendants[] = ap_masto_status_from_row($local, true, true);
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
         }
     }
     return $descendants;
