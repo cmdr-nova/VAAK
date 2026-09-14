@@ -10383,6 +10383,9 @@ function ap_remote_actor_label(string $actorId, bool $allowFetch = false): array
     $display = $segNorm;
 
     $row = ap_remote_actor_ensure($actorId, $allowFetch);
+    if (!$allowFetch && (!is_array($row) || ap_remote_actor_username_is_placeholder($row['username'] ?? null))) {
+        ap_remote_actor_warm_async($actorId);
+    }
     if (is_array($row)) {
         $rowUser = ap_remote_actor_normalize_username(isset($row['username']) ? (string) $row['username'] : null);
         if ($rowUser !== null && !ap_remote_actor_username_is_placeholder($rowUser)) {
@@ -10432,6 +10435,38 @@ function ap_remote_actor_label(string $actorId, bool $allowFetch = false): array
         'handle' => $handle,
         'acct' => $acct,
     ];
+}
+
+/** Queue best-effort actor/profile enrichment without delaying timeline paint. */
+function ap_remote_actor_warm_async(string $actorId): void
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
+        return;
+    }
+    $script = __DIR__ . '/ap-actor-warm.php';
+    if (!is_file($script)) {
+        return;
+    }
+    $lockPath = sys_get_temp_dir() . '/vaak-actor-' . hash('sha256', $actorId) . '.lock';
+    $lock = @fopen($lockPath, 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($lock)) fclose($lock);
+        return;
+    }
+    $running = trim((string) @shell_exec("pgrep -fc 'ap-actor-warm\\.php' 2>/dev/null"));
+    if ($running !== '' && ctype_digit($running) && (int) $running >= 3) {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        return;
+    }
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    $php = defined('PHP_BINARY') && is_executable(PHP_BINARY) && !str_contains(PHP_BINARY, 'php-fpm')
+        ? PHP_BINARY
+        : '/usr/bin/php';
+    @exec('nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script) . ' '
+        . escapeshellarg($actorId) . ' >/dev/null 2>&1 </dev/null &');
 }
 
 /* ----------------- Remote custom emojis (:shortcode: → image URL) ----------------- */
