@@ -4423,6 +4423,11 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 if (!admin_gallery_event_has_media($erow)) {
                     continue;
                 }
+                if ($view === 'vakktok'
+                    && (!admin_vakktok_item_has_video(['row' => $erow])
+                        || admin_vakktok_item_is_sensitive(['row' => $erow]))) {
+                    continue;
+                }
                 $seenIds[$eid] = true;
                 $added[] = ['k' => 'event', 'id' => $eid];
                 if (count($added) >= $want) {
@@ -10179,11 +10184,6 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             }
         }
         exit;
-    }
-    if ($view === 'vakktok') {
-        // VakkTok has a media-only projection; never serve mixed gallery cache keys.
-        $adminTlFromCache = false;
-        $adminTlRankedCached = null;
     }
     $adminTlPerfT0 = microtime(true);
     $adminTlPerfHydrateMs = 0.0;
