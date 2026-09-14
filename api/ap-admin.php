@@ -14986,7 +14986,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
 
         <?php if ($view === 'profile'): ?>
-        <h2 style="font-size:1rem;margin:2rem 0 .5rem">Muted accounts</h2>
+        <div class="composer" style="margin-top:1.25rem;padding:.75rem">
+          <label for="profile-list-search">Search your mutes, deprioritized accounts, and blocks</label>
+          <input id="profile-list-search" type="search" placeholder="Filter these lists…" autocomplete="off">
+        </div>
+        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted accounts</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide from <b>your</b> Home / Federated / Notifications. Follow stays. Also available on remote profiles.
         </div>
@@ -15031,8 +15035,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
+        </details>
 
-        <h2 style="font-size:1rem;margin:2rem 0 .5rem">Deprioritized on Home</h2>
+        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Soft-rank these accounts lower on <b>Home</b> only (⋯ → Deprioritize). They still appear on Federated, Local, and notifications. Mute/block still fully hide.
         </div>
@@ -15060,6 +15065,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
+        </details>
 
         <h2 style="font-size:1rem;margin:2rem 0 .5rem">Muted words</h2>
         <div class="meta" style="margin-bottom:.75rem">
@@ -15100,7 +15106,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endforeach; ?>
         <?php endif; ?>
 
-        <h2 style="font-size:1rem;margin:2rem 0 .5rem">Your blocks</h2>
+        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:2rem 0 .5rem">Your blocks</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Personal blocks hide that account’s <b>profile and posts</b> from you (timelines, search, profile pages). Mutes only filter timelines/notifications.
           <?php if (!empty($vaakIsAdmin)): ?>
@@ -15152,6 +15158,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
+        </details>
+        <script>
+          (function () {
+            const input = document.getElementById('profile-list-search');
+            if (!input) return;
+            const sections = Array.from(document.querySelectorAll('.profile-list-section'));
+            input.addEventListener('input', function () {
+              const q = input.value.trim().toLowerCase();
+              sections.forEach(function (section) {
+                section.querySelectorAll('.tweet').forEach(function (row) {
+                  row.hidden = q !== '' && !row.textContent.toLowerCase().includes(q);
+                });
+              });
+            });
+          }());
+        </script>
 
         <h2 style="font-size:1rem;margin:2rem 0 .5rem">AI alt-text settings</h2>
         <?php
