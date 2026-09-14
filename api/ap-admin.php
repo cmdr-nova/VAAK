@@ -7641,7 +7641,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               <?php if (!empty($e['target_actor'])): ?><span class="tag">target <?= h(basename(parse_url((string) $e['target_actor'], PHP_URL_PATH) ?: '')) ?></span><?php endif; ?>
             </div>
             <div class="tweet-actions">
-              <?php if ($objectId !== ''): ?>
+              <?php if ($objectId !== '' && $isOwnEvent): ?>
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
               <?php endif; ?>
               <?php if ($canReply): ?>
@@ -7657,7 +7657,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                     <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
                   </form>
                 <?php endif; ?>
-                <a href="<?= h(admin_remote_object_href((string) $e['object_id'])) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -8883,10 +8882,6 @@ function admin_render_remote_boost_card(
               echo admin_cw_gate_html($boostSpoiler, $boostSensitive, $boostInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($objectId !== ''): ?>
-                <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                <a href="<?= h(admin_remote_object_href($objectId)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
-              <?php endif; ?>
               <?php if ($origActor !== '' && !$alreadyFollowing && !vaak_is_own_url($origActor)): ?>
                 <form method="post" action="?view=following" style="display:inline">
                   <input type="hidden" name="action" value="follow_remote">
