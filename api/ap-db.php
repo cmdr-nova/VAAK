@@ -464,6 +464,14 @@ SQL);
             if (!$hasColumn) $db->exec("ALTER TABLE actor_profile ADD COLUMN {$policyColumn} TEXT NOT NULL DEFAULT 'anyone'");
         } catch (Throwable $e) { error_log('[ap-db] interaction policy column not provisioned: ' . $e->getMessage()); }
     }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'forum_signature'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] forum signature column not provisioned: ' . $e->getMessage());
+    }
 
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
