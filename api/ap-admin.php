@@ -102,17 +102,12 @@ if (is_dir('/var/log/mkultra') && (is_writable('/var/log/mkultra') || @touch('/v
 }
 
 // Avoid blank white screens: exceptions + fatals under federation write traffic.
-$adminRenderHiccup = static function (string $msg): void {
+$adminRenderHiccup = static function (string $msg = ''): void {
     if (!headers_sent()) {
         http_response_code(500);
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
     }
-    $msg = trim($msg);
-    if ($msg === '') {
-        $msg = '(no error message — see /var/log/mkultra/ap-admin.log)';
-    }
-    $safe = htmlspecialchars($msg, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         . '<title>Admin hiccup</title></head>'
         . '<body style="margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#eee">'
@@ -122,7 +117,7 @@ $adminRenderHiccup = static function (string $msg): void {
         . '<p>This page failed to render — often a brief database contention or worker error. '
         . '<a href="/vaak/?view=home" style="color:#7ee0ff">Retry Home</a> · '
         . '<a href="javascript:location.reload()" style="color:#7ee0ff">Reload</a></p>'
-        . '<pre style="color:#bbb;font-size:.78rem;white-space:pre-wrap;overflow:auto;background:#0a0a0a;padding:.75rem;border-radius:8px;border:1px solid #2a2a2a">' . $safe . '</pre>'
+        . '<p style="color:#bbb;font-size:.86rem;margin-bottom:0">No private diagnostic details are shown here. If this persists, contact the server operator.</p>'
         . '</div></main></body></html>';
 };
 set_exception_handler(static function (Throwable $e) use ($adminRenderHiccup): void {
@@ -136,10 +131,7 @@ set_exception_handler(static function (Throwable $e) use ($adminRenderHiccup): v
         '[' . gmdate('Y-m-d H:i:s') . " UTC] " . $detail . "\n\n",
         FILE_APPEND | LOCK_EX
     );
-    $adminRenderHiccup(
-        get_class($e) . ': ' . ($e->getMessage() !== '' ? $e->getMessage() : '(empty message)')
-        . "\n" . $e->getFile() . ':' . $e->getLine()
-    );
+    $adminRenderHiccup();
     exit;
 });
 register_shutdown_function(static function () use ($adminRenderHiccup): void {
@@ -168,7 +160,7 @@ register_shutdown_function(static function () use ($adminRenderHiccup): void {
         '[' . gmdate('Y-m-d H:i:s') . " UTC] " . $detail . "\n\n",
         FILE_APPEND | LOCK_EX
     );
-    $adminRenderHiccup($msg . ($file !== '' ? "\n" . $file . ':' . $line : ''));
+    $adminRenderHiccup();
 });
 
 $notice = null;
