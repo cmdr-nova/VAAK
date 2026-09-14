@@ -6409,6 +6409,20 @@ function ap_bsky_unrepost_object(int $ownerUserId, string $objectId): array
     return ['ok' => true, 'skipped' => true];
 }
 
+/** Delete a locally authored Bluesky crosspost mapped from a VAAK note. */
+function ap_bsky_delete_crosspost_for_note(int $ownerUserId, string $noteId): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled() || !function_exists('ap_bsky_crosspost_by_note_id')) {
+        return ['ok' => true, 'skipped' => true];
+    }
+    $map = ap_bsky_crosspost_by_note_id(rtrim($noteId, '/'));
+    $uri = is_array($map) ? (string) ($map['bsky_uri'] ?? '') : '';
+    if (!preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/([^/]+)$~', $uri, $m)) {
+        return ['ok' => true, 'skipped' => true];
+    }
+    return ap_bsky_delete_record_uri($ownerUserId, 'at://' . $m[1] . '/app.bsky.feed.post/' . $m[2]);
+}
+
 // ---------------------------------------------------------------------------
 // Bluesky → VAAK notifications (mentions / replies / quotes / reposts / likes)
 // ---------------------------------------------------------------------------

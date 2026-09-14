@@ -953,6 +953,22 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $localId = 0;
             }
         }
+    } elseif ($action === 'delete_status') {
+        $localId = (int) ($_POST['local_id'] ?? 0);
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'outbox')) ?: 'outbox';
+        if (!defined('AP_INBOX_LIB_ONLY')) {
+            define('AP_INBOX_LIB_ONLY', true);
+        }
+        require_once __DIR__ . '/ap-inbox.php';
+        $result = function_exists('ap_delete_local_status') ? ap_delete_local_status($localId) : ['ok' => false, 'error' => 'Delete unavailable'];
+        if (!empty($result['ok'])) {
+            admin_tl_cache_clear();
+            $notice = 'Post deleted and federated.';
+            $view = $returnView;
+        } else {
+            $error = $result['error'] ?? 'Delete failed.';
+            $view = $returnView;
+        }
         if ($localId <= 0) {
             $error = 'Could not find that local post to edit.';
             $composerForceOpen = true;
@@ -7754,6 +7770,33 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         ? admin_global_actor_control($actorId)
         : null;
     $menu = '';
+    // Owner-only post controls live in the overflow menu. Keep the permission
+    // check tied to the authenticated actor and a local note URL so remote
+    // cards can never gain edit, pin, or delete controls.
+    if ($isSelf && $objectId !== '' && vaak_is_own_url($objectId) && str_contains($objectId, '/notes/')) {
+        $localId = 0;
+        try {
+            $stOwn = ap_db()->prepare('SELECT local_id FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1');
+            $stOwn->execute([$objectId, rtrim($objectId, '/') . '/']);
+            $localId = (int) ($stOwn->fetchColumn() ?: 0);
+        } catch (Throwable $e) {
+            $localId = 0;
+        }
+        if ($localId > 0) {
+            $menu .= admin_edit_post_button($objectId, '', '', false, $returnView);
+            $menu .= admin_pin_post_button($objectId, $returnView, $returnFrom);
+            $menu .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Delete this post permanently?\');">'
+                . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                . '<input type="hidden" name="action" value="delete_status">'
+                . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+                . '<input type="hidden" name="local_id" value="' . $localId . '">'
+                . '<button class="menu-action danger" type="submit">Delete</button></form>';
+        }
+    }
+    if (!$isSelf && $objectId !== '' && str_starts_with($objectId, 'https://')) {
+        $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
+        $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
+    }
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
     if ($actorId !== '' && str_starts_with($actorId, 'https://') && !$isSelf) {
@@ -9611,7 +9654,13 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         <?php if (!$isHome && $fediId !== ''): ?>
           <a class="meta" href="<?= h($fediId) ?>" style="margin-left:.25rem">AP copy</a>
         <?php endif; ?>
-        <a class="meta" href="<?= h($openUrl) ?>" target="_blank" rel="noopener noreferrer" style="margin-left:.35rem">Open on Bluesky</a>
+        <details class="post-action-menu">
+          <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
+          <div class="post-action-menu__body">
+            <a class="menu-action" href="<?= h($openUrl) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
+            <?php if ($fediId !== ''): ?><a class="menu-action" href="<?= h($fediId) ?>" target="_blank" rel="noopener noreferrer">Open AP copy</a><?php endif; ?>
+          </div>
+        </details>
       </div>
     </article>
     <?php

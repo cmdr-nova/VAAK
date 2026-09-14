@@ -5372,6 +5372,19 @@ function ap_delete_local_status(int $localId): array
     if ($noteId === '' || !str_starts_with($noteId, $actor . '/notes/')) {
         return ['ok' => false, 'error' => 'Refusing to delete non-local status'];
     }
+    // Remove a linked Bluesky crosspost before deleting the local mapping.
+    // This is best-effort: ActivityPub Delete remains authoritative for fedi.
+    $bskyDelete = null;
+    try {
+        if (!function_exists('ap_bsky_delete_crosspost_for_note')) {
+            require_once __DIR__ . '/ap-bsky.php';
+        }
+        if (function_exists('ap_bsky_delete_crosspost_for_note')) {
+            $bskyDelete = ap_bsky_delete_crosspost_for_note(ap_db_default_owner_user_id(), $noteId);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-inbox] bsky crosspost delete: ' . $e->getMessage());
+    }
 
     $deleteId = $actor . '/deletes/' . bin2hex(random_bytes(8));
     $published = gmdate('c');
