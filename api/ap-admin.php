@@ -12719,7 +12719,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <?php if ($notice): ?><div class="flash ok"><?= h($notice) ?></div><?php endif; ?>
     <?php if ($error): ?><div class="flash err"><?= h($error) ?></div><?php endif; ?>
 
-    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky'], true) ? ' timeline-feed' : '' ?>">
+    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions'], true) ? ' timeline-feed' : '' ?>">
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <div class="compose-inline-slot" id="compose-inline-slot" aria-label="Loading composer">
           <div class="compose-inline-skeleton" aria-hidden="true"></div>
