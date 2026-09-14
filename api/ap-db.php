@@ -3597,6 +3597,13 @@ function ap_fix_utf8(?string $s): string
     return $s;
 }
 
+/** Convert simple Markdown emphasis after HTML has been sanitized. */
+function ap_profile_markdown_inline(string $html): string
+{
+    $html = preg_replace('/(?<!\*)\*\*([^*\n]+)\*\*(?!\*)/u', '<strong>$1</strong>', $html) ?? $html;
+    return preg_replace('/(?<![\w*])\*([^*\n]+)\*(?!\*)/u', '<em>$1</em>', $html) ?? $html;
+}
+
 /**
  * Convert ActivityPub / Mastodon HTML content to plain text without gluing
  * adjacent blocks (e.g. mention paragraph + body paragraph → "@userHello").

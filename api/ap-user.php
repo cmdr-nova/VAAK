@@ -723,6 +723,7 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
     $content = function_exists('ap_html_sanitize_allowlist')
         ? ap_html_sanitize_allowlist($content, '<p><br><a><strong><em><code><ul><ol><li>')
         : htmlspecialchars(strip_tags($content), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $content = function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline($content) : $content;
     $published = (string) ($note['published'] ?? $row['published'] ?? '');
     $dateLabel = $published;
     try {
@@ -755,6 +756,7 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     $content = function_exists('ap_html_sanitize_allowlist')
         ? ap_html_sanitize_allowlist((string) ($note['content'] ?? $row['content'] ?? ''), '<p><br><a><strong><em><code><ul><ol><li>')
         : htmlspecialchars(strip_tags((string) ($note['content'] ?? $row['content'] ?? '')), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $content = function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline($content) : $content;
     $p = ap_profile_get($actorKey);
     $name = htmlspecialchars((string) $p['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $safe = htmlspecialchars($actorKey, ENT_QUOTES, 'UTF-8');
@@ -842,7 +844,7 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
             echo '</div>';
             $bodyHtml = $snip !== ''
                 ? ('<div class="note-reply-body">'
-                    . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . (function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline(htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) : htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
                     . '</div>')
                 : '';
             if ($rSensitive) {

@@ -1189,6 +1189,7 @@ function ap_cmdr_note_html(array $row, array $create): void
     $content = function_exists('ap_html_sanitize_allowlist')
         ? ap_html_sanitize_allowlist($content, '<p><br><a><strong><em><code><ul><ol><li>')
         : strip_tags($content, '<p><br><a><strong><em><code><ul><ol><li>');
+    $content = function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline($content) : $content;
     // Normalize legacy </p><br><p> spacers; CSS (.note-body p) handles spacing.
     if ($content !== '' && function_exists('ap_normalize_status_html')) {
         $content = ap_normalize_status_html($content);
@@ -1479,7 +1480,7 @@ function ap_cmdr_note_html(array $row, array $create): void
             echo '</div>';
             $bodyHtml = $snip !== ''
                 ? ('<div class="note-reply-body">'
-                    . htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . (function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline(htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) : htmlspecialchars($snip, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
                     . '</div>')
                 : '';
             // Only gate when *this* reply still has a CW (not inherited from parent).
