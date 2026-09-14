@@ -201,30 +201,22 @@ if ($view === 'import_export' && isset($_GET['export'])) {
 }
 
 /**
- * AI credentials for alt-text (OpenAI-compatible Chat Completions vision).
- * - Any user: only their own encrypted Profile key (+ optional ai_api_root / ai_model)
- * - Host /etc/mkultra/xai.env: cmdr_nova only (never other admins / invitees)
- * Not request-static — FPM workers must not leak the host key across users.
+ * Per-user AI credentials for alt-text (OpenAI-compatible Chat Completions vision).
+ * The key is always read from the authenticated user's encrypted profile field;
+ * there is no shared/provider-specific host-key fallback.
  *
  * @return array{api_key:string,model:string,api_root:string,source:string,prefer_chat:bool}
  */
 function admin_xai_config(): array
 {
     $apiKey = '';
-    $source = '';
+    $source = 'user';
     $model = '';
     $apiRoot = '';
     $userRoot = '';
     $userModel = '';
 
     $user = $GLOBALS['vaak_user'] ?? null;
-    // Derive host-key authorization from the authenticated user row itself.
-    // Request globals can be temporarily switched by federation helpers and
-    // must never decide who may read the operator-only environment key.
-    $actorKey = strtolower(trim((string) (is_array($user) ? ($user['actor_key'] ?? '') : '')));
-    // Host xAI key is operator-only — not shared with other is_admin rows
-    $mayUseHostXai = ($actorKey === 'cmdr_nova');
-
     if (is_array($user)) {
         if (function_exists('ap_auth_user_get_xai_key')) {
             $uk = ap_auth_user_get_xai_key($user);
@@ -246,56 +238,14 @@ function admin_xai_config(): array
         $userModel = trim((string) ($fresh['ai_model'] ?? ''));
     }
 
-    // Host env key: cmdr_nova only (never invitees, never other accounts)
-    $envKey = '';
-    $envModel = '';
-    $envRoot = '';
-    if ($mayUseHostXai) {
-        $envKey = getenv('XAI_API_KEY') ?: '';
-        $envModel = getenv('XAI_ALT_MODEL') ?: getenv('XAI_MODEL') ?: '';
-        $envRoot = getenv('XAI_API_ROOT') ?: '';
-        $envFile = '/etc/mkultra/xai.env';
-        if (is_readable($envFile)) {
-            foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
-                $line = trim($line);
-                if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
-                    continue;
-                }
-                [$k, $v] = explode('=', $line, 2);
-                $k = trim($k);
-                $v = trim($v, " \t\"'");
-                if ($k === 'XAI_API_KEY' && $v !== '') {
-                    $envKey = $v;
-                } elseif ($k === 'XAI_ALT_MODEL' && $v !== '') {
-                    $envModel = $v;
-                } elseif ($k === 'XAI_API_ROOT' && $v !== '') {
-                    $envRoot = rtrim($v, '/');
-                }
-            }
-        }
-        if ($apiKey === '' && $envKey !== '') {
-            $apiKey = $envKey;
-            $source = 'env';
-        }
-    }
-
-    if ($source === 'user') {
-        if ($userRoot !== '') {
-            $apiRoot = $userRoot;
-        } else {
-            // Personal key without custom root → OpenAI-compatible default
-            $apiRoot = 'https://api.openai.com/v1';
-        }
-        if ($userModel !== '') {
-            $model = $userModel;
-        } else {
-            $model = 'gpt-4o-mini';
-        }
-    } elseif ($source === 'env') {
-        $apiRoot = $envRoot !== '' ? $envRoot : 'https://api.x.ai/v1';
-        $model = $envModel !== '' ? $envModel : 'grok-4.6';
+    if ($userRoot !== '') {
+        $apiRoot = $userRoot;
     } else {
         $apiRoot = 'https://api.openai.com/v1';
+    }
+    if ($userModel !== '') {
+        $model = $userModel;
+    } else {
         $model = 'gpt-4o-mini';
     }
 
@@ -310,7 +260,7 @@ function admin_xai_config(): array
     $rootHost = strtolower((string) (parse_url($apiRoot, PHP_URL_HOST) ?: ''));
     $preferChat = $rootHost === 'api.openai.com'
         || str_contains($apiRoot, 'openai')
-        || ($source === 'user' && $rootHost !== 'api.x.ai');
+        || $rootHost !== 'api.x.ai';
 
     return [
         'api_key' => $apiKey,
@@ -2568,9 +2518,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Bluesky connect failed.';
             }
         }
-    } elseif ($action === 'save_xai_key') {
+    } elseif ($action === 'save_ai_key' || $action === 'save_xai_key') {
         $view = 'profile';
-        $key = trim((string) ($_POST['xai_api_key'] ?? ''));
+        $key = trim((string) ($_POST['ai_api_key'] ?? $_POST['xai_api_key'] ?? ''));
         $apiRootIn = trim((string) ($_POST['ai_api_root'] ?? ''));
         $modelIn = trim((string) ($_POST['ai_model'] ?? ''));
         $hasKey = $key !== '';
@@ -2610,7 +2560,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     : 'AI endpoint settings saved.';
             }
         }
-    } elseif ($action === 'clear_xai_key') {
+    } elseif ($action === 'clear_ai_key' || $action === 'clear_xai_key') {
         $view = 'profile';
         $res = ap_auth_user_set_xai_key($vaakOwnerId, null);
         if (!empty($res['ok'])) {
@@ -2622,10 +2572,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $vaakUser = $fresh;
                 $GLOBALS['vaak_user'] = $fresh;
             }
-            $notice = 'Cleared your AI alt-text API key.'
-                . ($vaakActorKey === 'cmdr_nova'
-                    ? ' Operator host key still available as fallback for you only.'
-                    : '');
+            $notice = 'Cleared your AI alt-text API key.';
         } else {
             $error = $res['error'] ?? 'Could not clear API key.';
         }
@@ -15005,9 +14952,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endforeach; ?>
         <?php endif; ?>
 
-        <h2 style="font-size:1rem;margin:2rem 0 .5rem">AI alt-text API key</h2>
+        <h2 style="font-size:1rem;margin:2rem 0 .5rem">AI alt-text settings</h2>
         <?php
-          $xaiConfigured = function_exists('ap_auth_user_has_xai_key') && ap_auth_user_has_xai_key($vaakUser);
+          $aiConfigured = function_exists('ap_auth_user_has_xai_key') && ap_auth_user_has_xai_key($vaakUser);
           $aiRootVal = trim((string) ($vaakUser['ai_api_root'] ?? ''));
           $aiModelVal = trim((string) ($vaakUser['ai_model'] ?? ''));
           if (($aiRootVal === '' || $aiModelVal === '') && function_exists('ap_auth_user_by_id')) {
@@ -15023,19 +14970,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }
         ?>
         <div class="meta" style="margin-bottom:.75rem">
-          OpenAI-compatible API key for image descriptions (Chat Completions vision).
+          Your OpenAI-compatible API key for image descriptions (Chat Completions vision).
           Stored encrypted <b>on your account only</b> — never shown again after save, never shared with other users.
-          Status: <b><?= $xaiConfigured ? 'configured' : 'not configured' ?></b>
-          <?php if (!$xaiConfigured && $vaakActorKey === 'cmdr_nova'): ?>
-            · operator host key available as fallback for you only
-          <?php elseif (!$xaiConfigured): ?>
-            · add your own key to use AI describe (no shared server key)
+          Status: <b><?= $aiConfigured ? 'configured' : 'not configured' ?></b>
+          <?php if (!$aiConfigured): ?>
+            · add your own key to use AI describe
           <?php endif; ?>
         </div>
         <form class="composer" method="post" action="?view=profile" style="margin-bottom:.75rem" autocomplete="off">
-          <input type="hidden" name="action" value="save_xai_key">
+          <input type="hidden" name="action" value="save_ai_key">
           <label class="meta" style="display:block;margin-bottom:.35rem">API key</label>
-          <input name="xai_api_key" type="password" maxlength="500" placeholder="sk-… or provider key" autocomplete="new-password" style="margin-bottom:.65rem"<?= $xaiConfigured ? '' : ' required' ?>>
+          <input name="ai_api_key" type="password" maxlength="500" placeholder="sk-… or provider key" autocomplete="new-password" style="margin-bottom:.65rem"<?= $aiConfigured ? '' : ' required' ?>>
           <label class="meta" style="display:block;margin-bottom:.35rem">API base URL <span style="opacity:.7">(optional)</span></label>
           <input name="ai_api_root" type="url" maxlength="300" placeholder="https://api.openai.com/v1" value="<?= h($aiRootVal) ?>" style="margin-bottom:.65rem">
           <label class="meta" style="display:block;margin-bottom:.35rem">Model <span style="opacity:.7">(optional)</span></label>
@@ -15045,9 +14990,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-primary" type="submit">Save</button>
           </div>
         </form>
-        <?php if ($xaiConfigured): ?>
+        <?php if ($aiConfigured): ?>
           <form method="post" action="?view=profile" style="margin-bottom:1.25rem" onsubmit="return confirm('Clear your personal AI API key?');">
-            <input type="hidden" name="action" value="clear_xai_key">
+            <input type="hidden" name="action" value="clear_ai_key">
             <button class="btn btn-ghost" type="submit">Clear API key</button>
           </form>
         <?php endif; ?>
@@ -20272,7 +20217,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     <div class="alt-modal__ft">
       <span class="meta" id="alt-modal-count">0 / 1500</span>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap">
-        <button type="button" class="btn btn-ghost" id="alt-modal-ai" title="Generate a draft description with Grok (review before saving)">✦ Generate with AI</button>
+        <button type="button" class="btn btn-ghost" id="alt-modal-ai" title="Generate a draft description with your configured AI provider (review before saving)">✦ Generate with AI</button>
         <button type="button" class="btn btn-ghost" id="alt-modal-cancel">Cancel</button>
         <button type="button" class="btn btn-primary" id="alt-modal-save">Save</button>
       </div>
@@ -21254,7 +21199,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     }
     altAiBusy = true;
     if (altAiBtn) altAiBtn.disabled = true;
-    setAltAiStatus('Generating with Grok…');
+    setAltAiStatus('Generating with AI…');
     try {
       const fd = new FormData();
       fd.set('action', 'ai_alt_text');
