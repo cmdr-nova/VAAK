@@ -12529,11 +12529,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .profile-form input[type="text"],
     .profile-form input[type="url"],
+    .profile-form input[type="file"],
     .profile-form textarea {
       width: 100%; background: #0c0c0c; color: var(--text);
       border: 1px solid var(--border); border-radius: 10px;
       padding: .65rem .75rem; font: inherit;
     }
+    .profile-form input[type="file"] { padding:.45rem .55rem; color:var(--muted); cursor:pointer; }
+    .profile-form input[type="file"]::file-selector-button {
+      margin-right:.65rem; padding:.4rem .7rem; border:1px solid var(--border);
+      border-radius:7px; background:var(--panel-2); color:var(--text); font:inherit; cursor:pointer;
+    }
+    .profile-form input[type="file"]::file-selector-button:hover { border-color:var(--primary); color:var(--primary); }
     .profile-form textarea { min-height: 140px; resize: vertical; }
     .profile-form .field-row {
       display: grid; grid-template-columns: 1fr 2fr auto; gap: .5rem; margin-top: .5rem; align-items: center;
@@ -15067,7 +15074,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <h2 style="font-size:1rem;margin:2rem 0 .5rem">Muted words</h2>
+        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted words</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide posts on your Home &amp; Federated when text/CW contains a phrase (case-insensitive substring).
         </div>
@@ -15105,6 +15112,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
+        </details>
 
         <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:2rem 0 .5rem">Your blocks</summary>
         <div class="meta" style="margin-bottom:.75rem">
