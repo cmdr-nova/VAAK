@@ -191,9 +191,10 @@ function vaak_bookmark_folder_add_status(
             ap_masto_bookmark_add($statusId, $objectId, $ownerUserId);
         }
         $exists = ap_db()->prepare(
-            'SELECT 1 FROM vaak_bookmark_folder_items WHERE folder_id = ? AND status_id = ?'
+            'SELECT 1 FROM vaak_bookmark_folder_items
+             WHERE folder_id = ? AND owner_user_id = ? AND status_id = ?'
         );
-        $exists->execute([$folderId, $statusId]);
+        $exists->execute([$folderId, $ownerUserId, $statusId]);
         if ($exists->fetchColumn()) {
             return ['ok' => true, 'already' => true];
         }
@@ -272,6 +273,49 @@ function vaak_bookmark_folder_status_ids(int $folderId, int $ownerUserId, int $l
         return $out;
     } catch (Throwable $e) {
         return [];
+    }
+}
+
+/**
+ * Return both stored status IDs and bookmark object URLs for a folder.
+ * Some remote/Bluesky status resolvers normalize the public status ID while
+ * rendering, so the object URL is a stable fallback for folder filtering.
+ *
+ * @return array{status_ids:list<string>,object_ids:list<string>}
+ */
+function vaak_bookmark_folder_match_keys(int $folderId, int $ownerUserId, int $limit = 500): array
+{
+    if ($folderId < 1 || $ownerUserId < 1) {
+        return ['status_ids' => [], 'object_ids' => []];
+    }
+    $limit = max(1, min(500, $limit));
+    vaak_bookmark_folders_ensure_schema();
+    try {
+        $st = ap_db()->prepare(
+            'SELECT i.status_id, b.object_id
+             FROM vaak_bookmark_folder_items i
+             LEFT JOIN masto_bookmarks b
+               ON b.owner_user_id = i.owner_user_id AND b.status_id = i.status_id
+             WHERE i.folder_id = ? AND i.owner_user_id = ?
+             ORDER BY i.added_at DESC
+             LIMIT ' . $limit
+        );
+        $st->execute([$folderId, $ownerUserId]);
+        $statusIds = [];
+        $objectIds = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $sid = trim((string) ($row['status_id'] ?? ''));
+            $oid = rtrim(trim((string) ($row['object_id'] ?? '')), '/');
+            if ($sid !== '') {
+                $statusIds[$sid] = true;
+            }
+            if ($oid !== '') {
+                $objectIds[$oid] = true;
+            }
+        }
+        return ['status_ids' => array_keys($statusIds), 'object_ids' => array_keys($objectIds)];
+    } catch (Throwable $e) {
+        return ['status_ids' => [], 'object_ids' => []];
     }
 }
 

@@ -4814,15 +4814,30 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
              FROM outbox_notes o
              LEFT JOIN masto_statuses m
                ON (m.note_id = o.id OR m.note_id = o.id || '/')
-             WHERE o.in_reply_to = ? OR o.in_reply_to = ?
+             WHERE o.id LIKE 'https://mkultra.monster/users/%/notes/%'
+               AND o.in_reply_to IS NOT NULL
+               AND COALESCE(o.visibility, 'public') = 'public'
              ORDER BY o.published ASC
-             LIMIT 80"
+             LIMIT 500"
         );
-        $st->execute($variants);
-        foreach ($st->fetchAll() as $row) {
+        $st->execute();
+        $children = [];
+        foreach ($st->fetchAll() as $candidate) {
+            if (!is_array($candidate)) continue;
+            $parent = rtrim(trim((string) ($candidate['in_reply_to'] ?? '')), '/');
+            if ($parent !== '') $children[$parent][] = $candidate;
+        }
+        $parents = [$noteId];
+        $seenLocal = [];
+        while ($parents !== [] && count($seenLocal) < 80) {
+            $parentId = array_shift($parents);
+            foreach ($children[$parentId] ?? [] as $row) {
             if (!is_array($row)) {
                 continue;
             }
+            $rowId = rtrim((string) ($row['id'] ?? ''), '/');
+            if ($rowId === '' || isset($seenLocal[$rowId])) continue;
+            $seenLocal[$rowId] = true;
             $vis = (string) ($row['visibility'] ?? 'public');
             if ($vis === 'direct' || $vis === 'private') {
                 continue;
@@ -4858,6 +4873,8 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
                 $spoiler,
                 $sensitive
             );
+            $parents[] = $rowId;
+            }
         }
     } catch (Throwable $e) {
         // ignore

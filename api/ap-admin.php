@@ -13161,13 +13161,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $bmFolderFilter = (int) ($_GET['folder'] ?? 0);
           $bmList = ap_masto_bookmarks_list(80, null);
           if ($bmFolderFilter > 0 && function_exists('vaak_bookmark_folder_status_ids')) {
-              $allowed = array_fill_keys(
-                  vaak_bookmark_folder_status_ids($bmFolderFilter, $vaakOwnerId, 500),
-                  true
-              );
+              $matchKeys = function_exists('vaak_bookmark_folder_match_keys')
+                  ? vaak_bookmark_folder_match_keys($bmFolderFilter, $vaakOwnerId, 500)
+                  : ['status_ids' => vaak_bookmark_folder_status_ids($bmFolderFilter, $vaakOwnerId, 500), 'object_ids' => []];
+              $allowed = array_fill_keys($matchKeys['status_ids'], true);
+              $allowedObjects = array_fill_keys($matchKeys['object_ids'], true);
               $bmList = array_values(array_filter(
                   $bmList,
-                  static fn($st) => isset($allowed[(string) ($st['id'] ?? '')])
+                  static function ($st) use ($allowed, $allowedObjects): bool {
+                      $sid = (string) ($st['id'] ?? '');
+                      $objects = [rtrim((string) ($st['uri'] ?? ''), '/'), rtrim((string) ($st['url'] ?? ''), '/')];
+                      return isset($allowed[$sid]) || (bool) array_intersect($objects, array_keys($allowedObjects));
+                  }
               ));
           }
         ?>
