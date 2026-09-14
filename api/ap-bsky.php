@@ -5132,7 +5132,9 @@ function ap_bsky_sync_profile_from_vaak(int $ownerUserId, ?string $actorKey = nu
     if ($pinRef !== null) {
         $record['pinnedPost'] = $pinRef;
     } else {
-        unset($record['pinnedPost']);
+        // A routine VAAK profile update must not erase a valid Bluesky pin.
+        // Explicit unpin actions use ap_bsky_sync_pin_to_bluesky(), which is
+        // responsible for clearing pinnedPost after the user unpins locally.
     }
 
     $put = ap_bsky_xrpc($pds, 'com.atproto.repo.putRecord', 'POST', null, [

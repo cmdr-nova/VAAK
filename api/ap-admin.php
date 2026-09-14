@@ -11913,6 +11913,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
+    /* Focused status threads use the same flat card treatment as timelines. */
+    #status-thread-ancestors > article.tweet,
+    #status-thread-descendants > article.tweet,
+    article.tweet#status-focus {
+      background: transparent; border: 0; border-bottom: 1px solid var(--border);
+      border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
+    }
+    #status-thread-ancestors > article.tweet:hover,
+    #status-thread-descendants > article.tweet:hover,
+    article.tweet#status-focus:hover { background: transparent; }
     .relay-card .relay-meta { text-align: left; margin-left: 0; padding-left: 0; }
     .forum-post { display:flex; gap:.8rem; align-items:flex-start; }
     .forum-post-avatar { width:42px; height:42px; flex:0 0 42px; border-radius:50%; object-fit:cover; background:var(--panel-2); border:1px solid var(--border); }
