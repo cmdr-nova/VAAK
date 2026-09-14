@@ -11900,7 +11900,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
     }
     .timeline-feed #timeline-items > article.tweet:hover {
-      border-color: var(--border); background: rgba(255,255,255,.025);
+      border-color: var(--border); background: transparent;
     }
     .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
