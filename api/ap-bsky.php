@@ -2134,6 +2134,7 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     if (!empty($record['fediverseId'])) {
         $raw['record']['fediverseId'] = (string) $record['fediverseId'];
     }
+    $cacheSaved = false;
     try {
         $st = ap_db()->prepare(
             'INSERT INTO bsky_posts (
@@ -2187,8 +2188,26 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $now,
             $now,
         ]);
+        $cacheSaved = true;
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());
+    }
+    if ($cacheSaved) {
+        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
+        if (function_exists('ap_search_fts_upsert') && function_exists('ap_search_fts_external_pk')) {
+            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
+                $text,
+                (string) ($author['handle'] ?? ''),
+                (string) ($author['displayName'] ?? ''),
+            ])));
+            ap_search_fts_upsert(
+                'bsky_post',
+                ap_search_fts_external_pk('bsky_post', $uri),
+                $uri,
+                $publishedAt,
+                $searchBody
+            );
+        }
     }
     // Keep link map in sync.
     ap_bsky_index_feed_post_links($post);
@@ -2473,6 +2492,16 @@ function ap_bsky_posts_prune(string $cutoffIso, bool $dryRun = false): array
             $del = ap_db()->prepare('DELETE FROM bsky_posts WHERE seen_at < ?');
             $del->execute([$cutoffIso]);
             $posts = $del->rowCount();
+            if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
+                $orphans = ap_db()->query(
+                    "SELECT d.source_pk FROM ap_search_docs d
+                     WHERE d.source = 'bsky_post'
+                       AND NOT EXISTS (SELECT 1 FROM bsky_posts p WHERE p.bsky_uri = d.object_id)"
+                )->fetchAll(PDO::FETCH_COLUMN) ?: [];
+                foreach ($orphans as $sourcePk) {
+                    ap_search_fts_delete('bsky_post', (int) $sourcePk);
+                }
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] posts_prune: ' . $e->getMessage());
@@ -3848,6 +3877,15 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
         if ($did !== '' && $did !== $actorRef) {
             $st->execute([$did, $did, $json, $now]);
             $vs->execute([$ownerUserId, $did, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+        }
+        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
+        if ($did !== '' && function_exists('ap_search_fts_external_pk')) {
+            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
+                (string) ($profile['handle'] ?? ''),
+                (string) ($profile['displayName'] ?? ''),
+                (string) ($profile['description'] ?? ''),
+            ])));
+            ap_search_fts_upsert('bsky_actor', ap_search_fts_external_pk('bsky_actor', $did), $did, $now, $searchBody);
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor profile cache write failed');

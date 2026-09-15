@@ -1516,6 +1516,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
             }
         }
+        if ($view === 'search' && isset($_POST['return_q'])) {
+            $_GET['q'] = trim((string) $_POST['return_q']);
+        }
     } elseif ($action === 'unfollow_remote') {
         $target = trim((string) ($_POST['actor_id'] ?? ''));
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'following')) ?: 'following';
@@ -2086,13 +2089,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $comment = trim((string) ($_POST['comment'] ?? ''));
         $statusUri = trim((string) ($_POST['object_id'] ?? $_POST['status_uri'] ?? ''));
         $statuses = $statusUri !== '' ? [$statusUri] : [];
+        $sendRemote = (string) ($_POST['report_delivery'] ?? 'remote') !== 'local';
         $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
         $returnFrom = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_from'] ?? '')) ?: '';
-        $res = ap_report_send($target, $comment, $statuses);
+        $res = ap_report_send($target, $comment, $statuses, $sendRemote);
         if (!empty($res['ok'])) {
-            $notice = !empty($res['local_peer'])
+            $notice = !empty($res['local_only'])
+                ? 'Report filed for VAAK moderation only; it was not sent to the remote instance.'
+                : (!empty($res['local_peer'])
                 ? 'Report filed for local moderators.'
-                : 'Report (Flag) sent to remote moderators.';
+                : 'Report (Flag) sent to remote moderators.');
             $wanted = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'report')) ?: 'report';
             if ($wanted === 'moderation' && empty($vaakIsAdmin)) {
                 $wanted = 'report';
@@ -9787,7 +9793,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         $linkCardHtml = ap_bsky_external_link_card_html($external);
     }
     $isHome = ($context === 'home');
-    $linkView = $isHome ? 'home' : 'bluesky';
+    $linkView = $isHome ? 'home' : ($context === 'search' ? 'search' : 'bluesky');
     // Stay on the current surface (Home mix vs Bluesky tab). reply_to / quote_object
     // still carry the bsky.app target so dual-publish / AT reply keep working.
     $composeView = $linkView;
@@ -12958,7 +12964,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'atmosphere', 'import_export', 'security'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
       $navSiteOpen = in_array($view, ['guestbook', 'support', 'analytics'], true);
-      $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
+      $reportsNoticeCount = function_exists('ap_reports_notification_count') ? ap_reports_notification_count() : 0;
     ?>
     <nav class="nav">
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
@@ -13017,12 +13023,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php if (!empty($vaakIsAdmin)): ?>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="admin" <?= $navAdminOpen ? 'open' : '' ?>>
-        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsOpenCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsOpenCount ?> open reports">⚑ <?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span><?php endif; ?></summary>
+        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsNoticeCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsNoticeCount ?> received reports">⚑ <?= $reportsNoticeCount > 99 ? '99+' : (string) (int) $reportsNoticeCount ?></span><?php endif; ?></summary>
         <div class="nav-sub">
           <a class="<?= $view === 'moderation' ? 'active' : '' ?>" href="?view=moderation" id="nav-moderation">
             <span class="ico">⚑</span><span class="label">Moderation</span>
-            <?php if ($reportsOpenCount > 0): ?>
-              <span class="nav-badge"><?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span>
+            <?php if ($reportsNoticeCount > 0): ?>
+              <span class="nav-badge" aria-label="<?= (int) $reportsNoticeCount ?> received reports"><?= $reportsNoticeCount > 99 ? '99+' : (string) (int) $reportsNoticeCount ?></span>
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'blocks' ? 'active' : '' ?>" href="?view=blocks"><span class="ico">⊘</span><span class="label">Server blocks</span></a>
@@ -13908,8 +13914,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <textarea id="report-comment" name="comment" maxlength="5000" placeholder="Optional comment for moderators" style="margin-top:.35rem;min-height:3.5rem"<?= $reportPrefillActive ? ' autofocus' : '' ?>></textarea>
           <label for="report-object" style="margin-top:.65rem;display:block">Post URL (optional)</label>
           <input id="report-object" name="object_id" type="url" placeholder="Optional post URL to attach" style="margin-top:.35rem" value="<?= h($reportObjectPrefill) ?>">
+          <fieldset style="margin:.75rem 0 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:.6rem">
+            <legend class="meta">Report delivery</legend>
+            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="remote" checked> Send to the remote instance's moderators</label>
+            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="local"> Keep it on VAAK only (for testing)</label>
+          </fieldset>
           <div class="composer-actions" style="margin-top:.75rem">
-            <span class="meta">Visible to every VAAK account</span>
+            <span class="meta">VAAK moderators can review it; remote delivery follows your selection.</span>
             <button class="btn btn-primary" type="submit">Send report</button>
           </div>
         </form>
@@ -13998,8 +14009,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </article>
         <?php endif; ?>
         <div class="meta" style="margin-bottom:.75rem">
-          Incoming shows every report received, including reports already ignored or dismissed, plus local user reports awaiting review.
-          Use <b>Dismiss</b> / <b>Ignore</b> to clear an open report from the action-needed count.
+          Incoming shows reports still awaiting moderator action, plus local user reports awaiting review. The Admin notification badge counts all received reports, including ignored or dismissed ones; use <b>About me</b>, <b>Dismissed / ignored</b>, or <b>All</b> to review those.
+          Use <b>Dismiss</b> / <b>Ignore</b> to clear a report from the action-needed list.
           Remote outbound reports (already sent) appear under <b>Sent</b>.
         </div>
         <div class="tweet-actions" style="flex-wrap:wrap;gap:.4rem;margin-bottom:1rem">
@@ -14042,8 +14053,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               · <a href="<?= h($reportObjectPrefill) ?>" target="_blank" rel="noopener noreferrer">Remote</a>
             </div>
           <?php endif; ?>
+          <fieldset style="margin:.75rem 0 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:.6rem">
+            <legend class="meta">Report delivery</legend>
+            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="remote" checked> Send to the remote instance's moderators</label>
+            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="local"> Keep it on VAAK only (for testing)</label>
+          </fieldset>
           <div class="composer-actions">
-            <span class="meta">Delivered to their shared inbox when possible</span>
+            <span class="meta">Choose whether to notify their remote instance or keep this report local.</span>
             <button class="btn btn-primary" type="submit">Send report</button>
           </div>
         </form>
@@ -16454,6 +16470,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $stype = preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '';
           $sresolve = !isset($_GET['q']) || !empty($_GET['resolve']);
           $sresults = ['accounts' => [], 'hashtags' => [], 'statuses' => []];
+          $bskySearch = ['accounts' => [], 'posts' => []];
           // Post-URL open is handled early (before HTML). Skip text search for those queries.
           $sqIsPostUrl = $sq !== '' && str_starts_with($sq, 'https://')
               && function_exists('ap_masto_url_looks_like_status')
@@ -16465,6 +16482,40 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               require_once __DIR__ . '/ap-inbox.php';
               $sresults = ap_masto_search($sq, $stype !== '' ? $stype : null, $sresolve, 25);
               $sOwner = admin_owner_user_id();
+              $bskySources = $stype === 'accounts' ? ['bsky_actor']
+                  : ($stype === 'statuses' ? ['bsky_post']
+                      : ($stype === '' ? ['bsky_post', 'bsky_actor'] : []));
+              if ($bskySources !== [] && function_exists('ap_search_fts_query')
+                  && function_exists('ap_bsky_post_item_by_uri')
+                  && function_exists('ap_bsky_actor_profile_cache_get')) {
+                  $hiddenBsky = function_exists('ap_bsky_hide_did_set') ? ap_bsky_hide_did_set($sOwner) : [];
+                  $seenBskyDids = [];
+                  foreach (ap_search_fts_query($sq, 60, '', $bskySources) as $bskyHit) {
+                      $source = (string) ($bskyHit['source'] ?? '');
+                      $objectId = trim((string) ($bskyHit['object_id'] ?? ''));
+                      if ($objectId === '') continue;
+                      if ($source === 'bsky_post') {
+                          $item = ap_bsky_post_item_by_uri($objectId);
+                          $author = is_array($item['post']['author'] ?? null) ? $item['post']['author'] : [];
+                          $did = trim((string) ($author['did'] ?? ''));
+                          if (!empty($hiddenBsky[$did])) continue;
+                          if ($did !== '' && function_exists('ap_actor_is_content_blocked')
+                              && ap_actor_is_content_blocked($did, null, $sOwner)) continue;
+                          if (is_array($item)) $bskySearch['posts'][] = $item;
+                      } elseif ($source === 'bsky_actor') {
+                          $cached = ap_bsky_actor_profile_cache_get($objectId, $sOwner);
+                          if (!is_array($cached) || !is_array($cached['profile'] ?? null)) continue;
+                          $profile = $cached['profile'];
+                          $did = trim((string) ($cached['did'] ?? $profile['did'] ?? ''));
+                          if ($did === '' || isset($seenBskyDids[$did]) || !empty($hiddenBsky[$did])) continue;
+                          if (function_exists('ap_actor_is_content_blocked')
+                              && ap_actor_is_content_blocked($did, null, $sOwner)) continue;
+                          $seenBskyDids[$did] = true;
+                          $bskySearch['accounts'][] = ['did' => $did, 'profile' => $profile,
+                              'viewer' => is_array($cached['viewer'] ?? null) ? $cached['viewer'] : []];
+                      }
+                  }
+              }
               if (function_exists('ap_actor_is_content_blocked') && $sOwner > 0) {
                   $sresults['accounts'] = array_values(array_filter(
                       is_array($sresults['accounts'] ?? null) ? $sresults['accounts'] : [],
@@ -16499,7 +16550,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                  placeholder="text · #tag · @user@instance · or https://…/post URL" autofocus>
           <div class="meta" style="margin:.45rem 0 .15rem;line-height:1.4">
             Paste a public post link (Mastodon/Akkoma/etc.) to <b>fetch it into VAAK</b> and open the thread —
-            even if it was published before this instance existed.
+            even if it was published before this instance existed. Bluesky results come from posts and profiles already in VAAK’s cache.
           </div>
           <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:.6rem 0">
             <label class="meta"><input type="radio" name="type" value="" <?= $stype === '' ? 'checked' : '' ?>> All</label>
@@ -16518,9 +16569,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php else: ?>
           <div class="meta" style="margin-bottom:.75rem">
             Results for <b><?= h($sq) ?></b> —
-            <?= count($sresults['accounts']) ?> accounts ·
+            <?= count($sresults['accounts']) + count($bskySearch['accounts']) ?> accounts ·
             <?= count($sresults['hashtags']) ?> tags ·
-            <?= count($sresults['statuses']) ?> posts
+            <?= count($sresults['statuses']) + count($bskySearch['posts']) ?> posts
           </div>
           <?php if ($sresults['accounts']): ?>
             <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Accounts</h3>
@@ -16581,6 +16632,34 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </article>
             <?php endforeach; ?>
           <?php endif; ?>
+          <?php if ($bskySearch['accounts']): ?>
+            <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Bluesky accounts in VAAK’s cache</h3>
+            <?php foreach ($bskySearch['accounts'] as $bacc): ?>
+              <?php
+                $bp = is_array($bacc['profile'] ?? null) ? $bacc['profile'] : [];
+                $bdid = (string) ($bacc['did'] ?? '');
+                $bhandle = trim((string) ($bp['handle'] ?? ''));
+                $bdisplay = trim((string) ($bp['displayName'] ?? '')) ?: ($bhandle !== '' ? $bhandle : $bdid);
+                $bprofileUrl = function_exists('ap_bsky_actor_profile_url') ? ap_bsky_actor_profile_url($bdid) : 'https://bsky.app/profile/' . rawurlencode($bdid);
+                $bviewer = is_array($bacc['viewer'] ?? null) ? $bacc['viewer'] : [];
+                $bfollowing = !empty($bviewer['following']);
+                $bconnected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row(admin_owner_user_id()));
+                $bme = $bconnected && (string) (ap_bsky_session_row(admin_owner_user_id())['did'] ?? '') === $bdid;
+              ?>
+              <article class="tweet tweet-bsky">
+                <div class="tweet-hd">
+                  <?php if (!empty($bp['avatar'])): ?><img class="tweet-av" src="<?= h((string) $bp['avatar']) ?>" alt="" width="40" height="40" loading="lazy" referrerpolicy="no-referrer"><?php endif; ?>
+                  <div class="tweet-hd-main"><div class="who"><?= admin_emoji_html($bdisplay) ?> <span class="meta">@<?= h($bhandle !== '' ? $bhandle : $bdid) ?></span> <span class="tag">Bluesky</span></div><div class="meta"><?= h($bdid) ?></div></div>
+                </div>
+                <?php if (trim((string) ($bp['description'] ?? '')) !== ''): ?><div class="tweet-bd"><?= admin_linkify_body_html((string) $bp['description'], 'search') ?></div><?php endif; ?>
+                <div class="tweet-actions">
+                  <a href="?view=remote_profile&amp;actor=<?= rawurlencode($bprofileUrl) ?>&amp;from=search">VAAK profile</a>
+                  <a href="<?= h($bprofileUrl) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
+                  <?php if (!$bme && $bconnected && !$bfollowing): ?><form method="post" action="?view=search" style="display:inline"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="follow_remote"><input type="hidden" name="return_view" value="search"><input type="hidden" name="return_q" value="<?= h($sq) ?>"><input type="hidden" name="actor_id" value="<?= h($bprofileUrl) ?>"><button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow on Bluesky</button></form><?php elseif ($bfollowing): ?><span class="tag">following</span><?php endif; ?>
+                </div>
+              </article>
+            <?php endforeach; ?>
+          <?php endif; ?>
           <?php if ($sresults['hashtags']): ?>
             <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Hashtags</h3>
             <?php foreach ($sresults['hashtags'] as $tag): ?>
@@ -16620,7 +16699,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               ?>
             <?php endforeach; ?>
           <?php endif; ?>
-          <?php if (!$sresults['accounts'] && !$sresults['hashtags'] && !$sresults['statuses']): ?>
+          <?php if ($bskySearch['posts']): ?>
+            <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Bluesky posts in VAAK’s cache</h3>
+            <?php foreach ($bskySearch['posts'] as $bpost): admin_render_bsky_feed_item($bpost, 'following', 'search'); endforeach; ?>
+          <?php endif; ?>
+          <?php if (!$sresults['accounts'] && !$sresults['hashtags'] && !$sresults['statuses'] && !$bskySearch['accounts'] && !$bskySearch['posts']): ?>
             <?php
               $sqHostHint = preg_replace('#^https?://#i', '', ltrim($sq, '@'));
               $sqHostHint = preg_replace('#/.*$#', '', (string) $sqHostHint);
@@ -16638,7 +16721,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 No posts or tags matching <code><?= h($sq) ?></code> in recent federation traffic.
                 <a href="?view=tags">Follow hashtags</a> to catch future posts on Home, or try another tag.
               <?php else: ?>
-                No matches in the local federation cache.
+                No matches in VAAK’s local federation or Bluesky cache.
                 For remote people use the full <code>@user@host</code> with resolve enabled
                 (example: <code>@gargron@mastodon.social</code>).
               <?php endif; ?>

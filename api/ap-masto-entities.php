@@ -8776,7 +8776,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
         require_once __DIR__ . '/ap-search-fts.php';
     }
     if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
-        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName);
+        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName, ['event', 'mention', 'status']);
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
