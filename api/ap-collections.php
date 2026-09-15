@@ -333,6 +333,13 @@ function ap_collection_add_member(int $collectionId, string $actorId): array
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return ['ok' => false, 'error' => 'Invalid actor URL'];
     }
+    // Collections are ActivityPub-only. In particular, do not accept the
+    // bsky.app profile facade as if it were a Fediverse actor URL.
+    $host = strtolower((string) parse_url($actorId, PHP_URL_HOST));
+    if ($host === '' || $host === 'bsky.app' || str_ends_with($host, '.bsky.app')
+        || $host === 'bsky.social' || str_ends_with($host, '.bsky.social')) {
+        return ['ok' => false, 'error' => 'Fediverse Collections can only contain Fediverse accounts. Use a Bluesky Starter Pack for Bluesky accounts.'];
+    }
     $owner = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
     if ($actorId === $owner || ($owner !== '' && str_starts_with($actorId, $owner . '/'))) {
         return ['ok' => false, 'error' => 'Cannot add yourself to a collection'];

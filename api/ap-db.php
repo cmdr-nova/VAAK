@@ -384,7 +384,7 @@ SQL);
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
         'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
-        'remote_media_cache', 'site_syndications',
+        'remote_media_cache', 'site_syndications', 'bsky_starter_pack_cache', 'bsky_starter_pack_sync_state',
     ];
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.

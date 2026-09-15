@@ -3699,7 +3699,7 @@ function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 /** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
 function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
 {
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists'], true)
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists', 'starter_packs'], true)
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
@@ -4010,6 +4010,149 @@ function ap_bsky_get_graph_list(int $ownerUserId, string $listUri, int $limit = 
         if ($pageItems === []) break;
     }
     return ['ok' => true, 'items' => $items, 'complete' => false];
+}
+
+/** SQLite creates locally; PostgreSQL tables are provisioned by the owner migration. */
+function ap_bsky_starter_pack_cache_ready(?PDO $db = null): bool
+{
+    static $ready = [];
+    $db ??= ap_db();
+    $key = spl_object_id($db);
+    if (isset($ready[$key])) return $ready[$key];
+    try {
+        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_starter_pack_cache','bsky_starter_pack_sync_state')");
+            $names = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+            return $ready[$key] = isset($names['bsky_starter_pack_cache'], $names['bsky_starter_pack_sync_state']);
+        }
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_starter_pack_cache (
+ owner_user_id INTEGER NOT NULL, pack_uri TEXT NOT NULL, list_uri TEXT NOT NULL,
+ name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+ members_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
+ PRIMARY KEY(owner_user_id, pack_uri)
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_starter_pack_cache_owner ON bsky_starter_pack_cache(owner_user_id, updated_at DESC)');
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_starter_pack_sync_state (
+ owner_user_id INTEGER PRIMARY KEY, synced_at TEXT, updated_at TEXT NOT NULL
+)
+SQL);
+        return $ready[$key] = true;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] starter pack cache schema unavailable');
+        return $ready[$key] = false;
+    }
+}
+
+/** Refresh owned starter packs and their linked curated-list members in a worker. */
+function ap_bsky_starter_packs_refresh_worker(int $ownerUserId): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_starter_pack_cache_ready()) return ['ok' => false, 'error' => 'Starter pack cache is unavailable'];
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
+    $repo = (string) ($session['did'] ?? '');
+    $cursor = null; $records = []; $complete = false;
+    for ($page = 0; $page < 10; $page++) {
+        $q = ['repo' => $repo, 'collection' => 'app.bsky.graph.starterpack', 'limit' => 100];
+        if ($cursor !== null) $q['cursor'] = $cursor;
+        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $q);
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not fetch starter packs')];
+        foreach ((array) ($res['json']['records'] ?? []) as $row) {
+            $value = is_array($row['value'] ?? null) ? $row['value'] : [];
+            $uri = (string) ($row['uri'] ?? ''); $list = (string) ($value['list'] ?? '');
+            if (str_starts_with($uri, 'at://') && str_starts_with($list, 'at://')) $records[$uri] = ['uri'=>$uri,'list'=>$list,'value'=>$value];
+        }
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
+        if ($cursor === null) { $complete = true; break; }
+    }
+    if (!$complete) return ['ok' => false, 'error' => 'Starter pack listing was incomplete'];
+    $db = ap_db(); $now = gmdate('c');
+    try {
+        $up = $db->prepare('INSERT INTO bsky_starter_pack_cache (owner_user_id,pack_uri,list_uri,name,description,created_at,members_json,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,pack_uri) DO UPDATE SET list_uri=excluded.list_uri,name=excluded.name,description=excluded.description,created_at=excluded.created_at,members_json=excluded.members_json,updated_at=excluded.updated_at');
+        foreach ($records as $uri => $pack) {
+            $members = ap_bsky_get_graph_list($ownerUserId, $pack['list'], 500);
+            if (empty($members['ok']) || empty($members['complete'])) continue;
+            $items = [];
+            foreach ((array) ($members['items'] ?? []) as $entry) {
+                $subject = is_array($entry['subject'] ?? null) ? $entry['subject'] : [];
+                $did = (string) ($subject['did'] ?? '');
+                if (!str_starts_with($did, 'did:')) continue;
+                $items[] = ['did'=>$did,'uri'=>(string)($entry['uri'] ?? ''),'handle'=>(string)($subject['handle'] ?? ''),'displayName'=>(string)($subject['displayName'] ?? ''),'avatar'=>(string)($subject['avatar'] ?? '')];
+            }
+            $v = $pack['value'];
+            $up->execute([$ownerUserId,$uri,$pack['list'],mb_substr((string)($v['name'] ?? 'Starter Pack'),0,64),mb_substr((string)($v['description'] ?? ''),0,300), (string)($v['createdAt'] ?? $now), json_encode($items,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE),$now]);
+        }
+        $del = $db->prepare('DELETE FROM bsky_starter_pack_cache WHERE owner_user_id=? AND pack_uri=?');
+        $st = $db->prepare('SELECT pack_uri FROM bsky_starter_pack_cache WHERE owner_user_id=?'); $st->execute([$ownerUserId]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) if (!isset($records[(string)$uri])) $del->execute([$ownerUserId,(string)$uri]);
+        $db->prepare('INSERT INTO bsky_starter_pack_sync_state(owner_user_id,synced_at,updated_at) VALUES(?,?,?) ON CONFLICT(owner_user_id) DO UPDATE SET synced_at=excluded.synced_at,updated_at=excluded.updated_at')->execute([$ownerUserId,$now,$now]);
+        return ['ok'=>true,'synced'=>count($records)];
+    } catch (Throwable $e) { error_log('[ap-bsky] starter pack cache write failed'); return ['ok'=>false,'error'=>'Could not store starter packs']; }
+}
+
+function ap_bsky_starter_packs_cached(int $ownerUserId): array
+{
+    if (!ap_bsky_starter_pack_cache_ready()) return [];
+    try {
+        $state=ap_db()->prepare('SELECT synced_at FROM bsky_starter_pack_sync_state WHERE owner_user_id=?'); $state->execute([$ownerUserId]);
+        $syncedAt=strtotime((string)($state->fetchColumn() ?: '')) ?: 0;
+        if ($syncedAt < time()-300) ap_bsky_starter_packs_enqueue($ownerUserId);
+        $st=ap_db()->prepare('SELECT pack_uri,list_uri,name,description,created_at,members_json,updated_at FROM bsky_starter_pack_cache WHERE owner_user_id=? ORDER BY LOWER(name)'); $st->execute([$ownerUserId]);
+        return array_map(static function(array $r): array { $r['members']=json_decode((string)$r['members_json'],true) ?: []; unset($r['members_json']); return $r; }, $st->fetchAll() ?: []);
+    } catch (Throwable $e) { return []; }
+}
+
+function ap_bsky_starter_packs_enqueue(int $ownerUserId, bool $force = false): bool
+{
+    return ap_bsky_background_sync_enqueue($ownerUserId, 'starter_packs', $force);
+}
+
+function ap_bsky_starter_pack_create(int $ownerUserId, string $name, string $description = ''): array
+{
+    $name=trim($name); if ($name==='' || mb_strlen($name)>50) return ['ok'=>false,'error'=>'Name must be 1–50 characters'];
+    $list=ap_bsky_create_graph_list($ownerUserId,$name,'curation'); if (empty($list['ok'])) return $list;
+    $session=ap_bsky_session_row($ownerUserId); $did=(string)($session['did']??'');
+    $made=ap_bsky_account_xrpc($ownerUserId,'com.atproto.repo.createRecord','POST',null,['repo'=>$did,'collection'=>'app.bsky.graph.starterpack','record'=>['$type'=>'app.bsky.graph.starterpack','name'=>$name,'description'=>mb_substr(trim($description),0,300),'list'=>(string)$list['uri'],'createdAt'=>gmdate('c')]]);
+    if (empty($made['ok'])) { ap_bsky_delete_record_uri($ownerUserId,(string)$list['uri']); return ['ok'=>false,'error'=>(string)($made['error']??'Could not create Starter Pack')]; }
+    ap_bsky_starter_packs_enqueue($ownerUserId,true); return ['ok'=>true,'uri'=>(string)($made['json']['uri']??''),'list_uri'=>(string)$list['uri']];
+}
+
+function ap_bsky_starter_pack_add_member(int $ownerUserId, string $packUri, string $ref): array
+{
+    $pack=null; foreach(ap_bsky_starter_packs_cached($ownerUserId) as $p) if (($p['pack_uri']??'')===$packUri) {$pack=$p;break;}
+    if (!$pack) return ['ok'=>false,'error'=>'Starter Pack not found in your account'];
+    $ref=trim($ref);
+    $isBskyInput=str_starts_with($ref,'did:') || preg_match('~^https://bsky\.app/profile/[^/?#]+$~i',$ref)
+        || preg_match('/^@?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i',$ref);
+    if (!$isBskyInput) return ['ok'=>false,'error'=>'Starter Packs can only contain Bluesky accounts. Enter a Bluesky handle, DID, or bsky.app profile URL.'];
+    $did=ap_bsky_resolve_target_did($ref,$ownerUserId); if (!is_string($did) || !str_starts_with($did,'did:')) return ['ok'=>false,'error'=>'Could not resolve that Bluesky account'];
+    $made=ap_bsky_add_graph_list_member($ownerUserId,(string)$pack['list_uri'],$did);
+    if (!empty($made['ok'])) ap_bsky_starter_packs_enqueue($ownerUserId,true);
+    return $made;
+}
+
+function ap_bsky_starter_pack_remove_member(int $ownerUserId, string $packUri, string $did): array
+{
+    foreach(ap_bsky_starter_packs_cached($ownerUserId) as $p) if (($p['pack_uri']??'')===$packUri) {
+        foreach((array)$p['members'] as $m) if (($m['did']??'')===$did && str_starts_with((string)($m['uri']??''),'at://')) {
+            $res=ap_bsky_delete_graph_list_member($ownerUserId,(string)$m['uri']); if (!empty($res['ok'])) ap_bsky_starter_packs_enqueue($ownerUserId,true); return $res;
+        }
+    }
+    return ['ok'=>false,'error'=>'Starter Pack member not found'];
+}
+
+function ap_bsky_starter_pack_delete(int $ownerUserId, string $packUri): array
+{
+    foreach(ap_bsky_starter_packs_cached($ownerUserId) as $p) if (($p['pack_uri']??'')===$packUri) {
+        foreach((array)$p['members'] as $m) if (str_starts_with((string)($m['uri']??''),'at://')) ap_bsky_delete_graph_list_member($ownerUserId,(string)$m['uri']);
+        $pack=ap_bsky_delete_record_uri($ownerUserId,$packUri); if (empty($pack['ok'])) return $pack;
+        $list=ap_bsky_delete_record_uri($ownerUserId,(string)$p['list_uri']);
+        try { ap_db()->prepare('DELETE FROM bsky_starter_pack_cache WHERE owner_user_id=? AND pack_uri=?')->execute([$ownerUserId,$packUri]); } catch(Throwable $e) {}
+        return !empty($list['ok']) ? ['ok'=>true] : ['ok'=>true,'warning'=>'Starter Pack removed; its Bluesky list could not be deleted'];
+    }
+    return ['ok'=>false,'error'=>'Starter Pack not found in your account'];
 }
 
 // ---------------------------------------------------------------------------
@@ -4439,7 +4582,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         $db->prepare("UPDATE bsky_actor_refresh_queue SET status = ?, attempts = ?, next_attempt_at = ?, locked_at = NULL, last_error = 'Worker lease expired' WHERE owner_user_id = ? AND actor_ref = ? AND status = 'processing'")
             ->execute([$dead ? 'failed' : 'pending', $attempt, gmdate('c', time() + $delay), $owner, $actorRef]);
     }
-    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref IN ('__vaak_sync__:lists', '__vaak_sync__:bookmarks') THEN 0 ELSE 1 END, queued_at LIMIT ?");
+    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref IN ('__vaak_sync__:lists', '__vaak_sync__:bookmarks', '__vaak_sync__:starter_packs') THEN 0 ELSE 1 END, queued_at LIMIT ?");
     $st->bindValue(1, $now);
     $st->bindValue(2, max(1, min(5, $limit)), PDO::PARAM_INT);
     $st->execute();
@@ -4462,6 +4605,13 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
             if ($actorRef === '__vaak_sync__:bookmarks') {
                 $result = ap_bsky_get_bookmarks($owner, 200, true);
                 if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Bookmark synchronization failed'));
+                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+                $stats['succeeded']++;
+                continue;
+            }
+            if ($actorRef === '__vaak_sync__:starter_packs') {
+                $result = ap_bsky_starter_packs_refresh_worker($owner);
+                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Starter pack synchronization failed'));
                 $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
                 $stats['succeeded']++;
                 continue;
