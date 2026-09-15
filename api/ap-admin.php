@@ -7622,7 +7622,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               <?php else: ?>
                 <?= admin_avatar_img($aid !== '' ? $aid : null) ?>
               <?php endif; ?>
-              <div class="tweet-hd-main">
+              <div class="tweet-hd-main tweet-hd-main--fedi">
                 <div>
                   <?php
                     $whoName = actor_display_name($aid !== '' ? $aid : null);
@@ -7641,12 +7641,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                     <?php endif; ?>
                   <?php endif; ?>
                   <span class="meta"> · <?= h(relative_time($e['created_at'])) ?></span>
-                  <?php
-                    $evVis = admin_visibility_meta($e['visibility'] ?? 'public');
-                    if ($evVis['key'] !== 'public'):
-                  ?>
-                    <span class="tag" style="margin-left:.35rem" title="Audience"><?= h($evVis['label']) ?></span>
-                  <?php endif; ?>
+                  <?php $evVis = admin_visibility_meta($e['visibility'] ?? 'public'); ?>
                   <?php if ($fromFollowedTag || !empty($e['_from_followed_tag'])): ?>
                     <?php
                       $matchedTag = '';
@@ -7668,7 +7663,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <?php endif; ?>
                   <?= admin_anti_ai_tag_html($summaryRaw, $aid !== '' ? $aid : null) ?>
                 </div>
-                <div class="meta"><?= h((string) $e['host']) ?></div>
+                <div class="meta">
+                  <?= h((string) $e['host']) ?>
+                  <?php if ($evVis['key'] !== 'public'): ?><span class="tag" style="margin-left:.35rem" title="Audience"><?= h($evVis['label']) ?></span><?php endif; ?>
+                </div>
               </div>
             </div>
             <?php
@@ -8700,7 +8698,7 @@ function admin_render_masto_status_card(
               <?php else: ?>
                 <?= admin_avatar_img($isLocal ? vaak_actor_id() : ($actorRef !== '' ? $actorRef : null)) ?>
               <?php endif; ?>
-              <div class="tweet-hd-main">
+              <div class="tweet-hd-main tweet-hd-main--fedi">
                 <div>
                   <?php if ($actorRef !== '' && !$isLocal): ?>
                     <a class="who" href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?></a>
@@ -8714,16 +8712,11 @@ function admin_render_masto_status_card(
                   <?php if (!empty($st['edited_at'])): ?>
                     <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                   <?php endif; ?>
-                  <?php
-                    $stVis = admin_visibility_meta($st['visibility'] ?? 'public');
-                    if ($stVis['key'] !== 'public'):
-                  ?>
-                    <span class="tag" style="margin-left:.35rem" title="Audience"><?= h($stVis['label']) ?></span>
-                  <?php endif; ?>
+                  <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                   <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                 </div>
                 <?php if ($stVis['key'] !== 'public'): ?>
-                  <div class="meta"><?= h($stVis['label']) ?></div>
+                  <div class="meta"><span class="tag" title="Audience"><?= h($stVis['label']) ?></span></div>
                 <?php endif; ?>
               </div>
             </div>
@@ -9010,7 +9003,7 @@ function admin_render_remote_boost_card(
               <?php else: ?>
                 <?= admin_avatar_img($origActor !== '' ? $origActor : null) ?>
               <?php endif; ?>
-              <div class="tweet-hd-main">
+              <div class="tweet-hd-main tweet-hd-main--fedi">
                 <div>
                   <?php if ($origProfile !== ''): ?>
                     <a class="who" href="<?= h($origProfile) ?>" style="color:inherit;text-decoration:none"><?= actor_display_name_html($origActor !== '' ? $origActor : null) ?></a>
@@ -9196,7 +9189,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
             <div class="meta" style="margin-bottom:.45rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
             <div class="tweet-hd">
               <?= admin_avatar_img($targetActor !== '' ? $targetActor : null) ?>
-              <div class="tweet-hd-main">
+              <div class="tweet-hd-main tweet-hd-main--fedi">
                 <div>
                   <span class="who"><?= admin_emoji_html($innerHandle, $targetActor !== '' ? $targetActor : null) ?></span>
                   <?php if ($innerAcct !== '' && $innerAcct !== $innerHandle): ?>
@@ -9457,7 +9450,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
           <article class="tweet tweet-own"<?= $noteId !== '' ? ' id="note-' . h(md5($noteId)) . '" data-note-id="' . h($noteId) . '"' : '' ?>>
             <div class="tweet-hd">
               <?= admin_avatar_img($actor) ?>
-              <div class="tweet-hd-main">
+              <div class="tweet-hd-main tweet-hd-main--fedi">
                 <?php
                   $ownProfile = function_exists('ap_profile_get') ? ap_profile_get($actorKey) : [];
                   $ownName = trim((string) ($ownProfile['name'] ?? ''));
@@ -9497,12 +9490,9 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   <?php if ($ownPinned): ?>
                     <span class="tag" style="margin-left:.35rem" title="Pinned on profile">pinned</span>
                   <?php endif; ?>
-                  <?php if ($ownVisMeta['key'] !== 'public'): ?>
-                    <span class="tag" style="margin-left:.35rem" title="Audience"><?= h($ownVisLabel) ?></span>
-                  <?php endif; ?>
                   <?= admin_anti_ai_tag_html($bodyPlain, $actor !== '' ? $actor : null) ?>
                 </div>
-                <div class="meta">mkultra.monster<?= $ownVisMeta['key'] !== 'public' ? ' · ' . h($ownVisLabel) : '' ?></div>
+                <div class="meta">mkultra.monster<?php if ($ownVisMeta['key'] !== 'public'): ?> <span class="tag" title="Audience"><?= h($ownVisLabel) ?></span><?php endif; ?></div>
               </div>
             </div>
             <?php if ($replyTo !== '' && str_starts_with($replyTo, 'https://')): ?>
@@ -12231,6 +12221,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       flex: 1; min-width: 0;
       display: flex; justify-content: space-between; gap: 1rem;
     }
+    /* Fediverse audience belongs below the author row, never beside a long handle. */
+    .tweet-hd-main--fedi { display: block; }
+    .tweet-hd-main--fedi > .meta { margin-top: .15rem; }
     .tweet-av {
       width: 40px; height: 40px; border-radius: 50%;
       object-fit: cover; flex-shrink: 0;
