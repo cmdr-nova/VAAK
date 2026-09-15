@@ -4408,25 +4408,32 @@ function ap_bsky_get_profile(int $ownerUserId, string $actor): array
     if (empty($tok['ok'])) {
         $tok = ap_bsky_access_token($ownerUserId, true);
     }
-    if (empty($tok['ok'])) {
-        return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Not connected')];
-    }
-    $row = ap_bsky_session_row($ownerUserId);
-    $hosts = ap_bsky_feed_hosts(rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'));
-    $lastErr = 'getProfile failed';
-    foreach ($hosts as $host) {
-        $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
-        if (($r['status'] ?? 0) === 401) {
-            $tok = ap_bsky_access_token($ownerUserId, true);
-            if (empty($tok['ok'])) {
-                return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Session expired')];
-            }
+    $lastErr = (string) ($tok['error'] ?? 'getProfile failed');
+    if (!empty($tok['ok'])) {
+        $row = ap_bsky_session_row($ownerUserId);
+        $hosts = ap_bsky_feed_hosts(rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'));
+        foreach ($hosts as $host) {
             $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
+            if (($r['status'] ?? 0) === 401) {
+                $tok = ap_bsky_access_token($ownerUserId, true);
+                if (empty($tok['ok'])) {
+                    $lastErr = (string) ($tok['error'] ?? 'Session expired');
+                    break;
+                }
+                $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
+            }
+            if (!empty($r['ok']) && is_array($r['json'] ?? null)) {
+                return ['ok' => true, 'profile' => $r['json']];
+            }
+            $lastErr = (string) ($r['error'] ?? $lastErr);
         }
-        if (!empty($r['ok']) && is_array($r['json'] ?? null)) {
-            return ['ok' => true, 'profile' => $r['json']];
-        }
-        $lastErr = (string) ($r['error'] ?? $lastErr);
+    }
+    // A custom PDS may not provide AppView methods, and its JWT may not be
+    // accepted by public.api.bsky.app. Profile data is public, so make one
+    // unauthenticated AppView request before declaring the profile unavailable.
+    $public = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, null, 8);
+    if (!empty($public['ok']) && is_array($public['json'] ?? null)) {
+        return ['ok' => true, 'profile' => $public['json']];
     }
     return ['ok' => false, 'error' => $lastErr];
 }
@@ -4492,22 +4499,62 @@ function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0,
     if (!ap_bsky_actor_refresh_migrate($db)) return null;
     $actorRef = trim($actorRef);
     if ($actorRef === '') return null;
+    $lookupRefs = [$actorRef];
+    $identity = $actorRef;
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorRef, $m)) {
+        $identity = rawurldecode($m[1]);
+    } elseif (str_starts_with($actorRef, 'at://did:')
+        && preg_match('~^at://(did:[^/]+)~', $actorRef, $m)) {
+        $identity = $m[1];
+    }
+    if (str_starts_with($identity, 'did:')) {
+        $lookupRefs[] = $identity;
+        $lookupRefs[] = 'https://bsky.app/profile/' . $identity;
+        $lookupRefs[] = 'https://bsky.app/profile/' . rawurlencode($identity);
+    }
+    $lookupRefs = array_values(array_unique($lookupRefs));
     try {
+        $row = null;
+        $matchedRef = '';
         $st = $db->prepare('SELECT * FROM bsky_actor_profiles WHERE actor_ref = ? LIMIT 1');
-        $st->execute([$actorRef]);
-        $row = $st->fetch();
+        foreach ($lookupRefs as $ref) {
+            $st->execute([$ref]);
+            $candidate = $st->fetch();
+            if (is_array($candidate)) {
+                $row = $candidate;
+                $matchedRef = $ref;
+                break;
+            }
+        }
         if (!is_array($row)) return null;
         $profile = json_decode((string) ($row['profile_json'] ?? ''), true);
         if (!is_array($profile)) return null;
+        $profileDid = trim((string) ($row['did'] ?? $profile['did'] ?? ''));
+        if (str_starts_with($profileDid, 'did:')) {
+            $lookupRefs[] = $profileDid;
+            $lookupRefs[] = 'https://bsky.app/profile/' . $profileDid;
+            $lookupRefs[] = 'https://bsky.app/profile/' . rawurlencode($profileDid);
+            $lookupRefs = array_values(array_unique($lookupRefs));
+        }
         $out = ['profile' => $profile, 'did' => (string) ($row['did'] ?? ''), 'updated_at' => (string) ($row['updated_at'] ?? '')];
         if ($ownerUserId > 0) {
-            $vs = $db->prepare('SELECT following_uri, followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
-            $vs->execute([$ownerUserId, $actorRef]);
-            $viewer = $vs->fetch();
+            $viewerRefs = array_values(array_unique(array_merge([$matchedRef], $lookupRefs)));
+            $vs = $db->prepare('SELECT following_uri, followed_by, updated_at FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+            $viewer = null;
+            foreach ($viewerRefs as $ref) {
+                $vs->execute([$ownerUserId, $ref]);
+                $candidate = $vs->fetch();
+                if (is_array($candidate) && (!is_array($viewer)
+                    || (strtotime((string) ($candidate['updated_at'] ?? '')) ?: 0)
+                        > (strtotime((string) ($viewer['updated_at'] ?? '')) ?: 0))) {
+                    $viewer = $candidate;
+                }
+            }
             if (is_array($viewer)) {
                 $out['viewer'] = [
-                    'following' => (string) ($viewer['following_uri'] ?? ''),
+                    'following' => is_string($viewer['following_uri'] ?? null) ? (string) $viewer['following_uri'] : null,
                     'followedBy' => !empty($viewer['followed_by']),
+                    'updated_at' => (string) ($viewer['updated_at'] ?? ''),
                 ];
             }
         }
@@ -4523,20 +4570,30 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
     if (!ap_bsky_actor_refresh_migrate($db)) return;
     $actorRef = trim($actorRef);
     if ($actorRef === '' || $ownerUserId < 1) return;
-    $viewer = is_array($profile['viewer'] ?? null) ? $profile['viewer'] : [];
+    $hasViewer = is_array($profile['viewer'] ?? null);
+    $viewer = $hasViewer ? $profile['viewer'] : [];
     $did = trim((string) ($profile['did'] ?? ''));
     unset($profile['viewer']); // relationship state is scoped to the VAAK owner below.
     $json = json_encode($profile, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($json)) return;
     $now = gmdate('c');
     try {
+        $profileRefs = [$actorRef];
+        if ($did !== '') {
+            $profileRefs[] = $did;
+            $profileRefs[] = 'https://bsky.app/profile/' . $did;
+            $profileRefs[] = 'https://bsky.app/profile/' . rawurlencode($did);
+        }
+        $profileRefs = array_values(array_unique($profileRefs));
         $st = $db->prepare('INSERT INTO bsky_actor_profiles (actor_ref, did, profile_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (actor_ref) DO UPDATE SET did = excluded.did, profile_json = excluded.profile_json, updated_at = excluded.updated_at');
-        $st->execute([$actorRef, $did !== '' ? $did : null, $json, $now]);
         $vs = $db->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET following_uri = excluded.following_uri, followed_by = excluded.followed_by, updated_at = excluded.updated_at');
-        $vs->execute([$ownerUserId, $actorRef, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
-        if ($did !== '' && $did !== $actorRef) {
-            $st->execute([$did, $did, $json, $now]);
-            $vs->execute([$ownerUserId, $did, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+        foreach ($profileRefs as $ref) {
+            $st->execute([$ref, $did !== '' ? $did : null, $json, $now]);
+            // Anonymous public AppView responses contain no viewer state. Keep
+            // any prior owner-specific relationship cache intact in that case.
+            if ($hasViewer) {
+                $vs->execute([$ownerUserId, $ref, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+            }
         }
         if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
         if ($did !== '' && function_exists('ap_search_fts_external_pk')) {
@@ -4559,7 +4616,11 @@ function ap_bsky_actor_viewer_cache_update(int $ownerUserId, string $did, ?strin
     $db = ap_db();
     if (!ap_bsky_actor_refresh_migrate($db)) return;
     $now = gmdate('c');
-    $refs = [$did, 'https://bsky.app/profile/' . rawurlencode($did)];
+    $refs = [
+        $did,
+        'https://bsky.app/profile/' . $did,
+        'https://bsky.app/profile/' . rawurlencode($did),
+    ];
     foreach ($refs as $ref) {
         try {
             $st = $db->prepare('SELECT followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
@@ -4581,14 +4642,97 @@ function ap_bsky_actor_refresh_enqueue(int $ownerUserId, string $actorRef, bool 
     $actorRef = trim($actorRef);
     if ($ownerUserId < 1 || $actorRef === '' || !ap_bsky_is_profile_ref($actorRef)) return;
     $cached = ap_bsky_actor_profile_cache_get($actorRef, $ownerUserId, $db);
-    if (!$force && is_array($cached) && isset($cached['viewer'])
-        && (strtotime($cached['updated_at']) ?: 0) > time() - 6 * 3600) return;
+    if (!$force && is_array($cached)
+        && (strtotime($cached['updated_at'] ?? '') ?: 0) > time() - 6 * 3600
+        && isset($cached['viewer'])
+        && (strtotime((string) ($cached['viewer']['updated_at'] ?? '')) ?: 0) > time() - 300) return;
     $now = gmdate('c');
     try {
         $st = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
         $st->execute([$ownerUserId, $actorRef, $now, $now]);
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor refresh enqueue failed');
+    }
+}
+
+/** Coalesced durable sync of native follows made in Bluesky or VAAK. */
+function ap_bsky_follow_sync_enqueue(int $ownerUserId, ?PDO $db = null): void
+{
+    $db ??= ap_db();
+    if ($ownerUserId < 1 || ap_bsky_session_row($ownerUserId) === null || !ap_bsky_actor_refresh_migrate($db)) return;
+    $actorRef = '__vaak_sync__:follows';
+    $now = gmdate('c');
+    try {
+        $st = $db->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+        $st->execute([$ownerUserId, $actorRef]);
+        $existing = $st->fetch();
+        if (is_array($existing)) {
+            $status = (string) ($existing['status'] ?? '');
+            $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
+            if (in_array($status, ['pending', 'processing'], true)
+                || ($status === 'succeeded' && $queuedAt > time() - 600)) return;
+        }
+        $up = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
+        $up->execute([$ownerUserId, $actorRef, $now, $now]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] follow sync enqueue failed');
+    }
+}
+
+/** Import and reconcile native follow records only after every page succeeds. */
+function ap_bsky_follow_sync_worker(int $ownerUserId): array
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    $repo = trim((string) ($session['did'] ?? ''));
+    if ($repo === '' || !str_starts_with($repo, 'did:')) return ['ok' => false, 'error' => 'Connected Bluesky DID unavailable'];
+
+    $follows = [];
+    $cursor = null;
+    // Protect the worker from an unexpectedly huge repository; never reconcile partial data.
+    for ($page = 0; $page < 25; $page++) {
+        $query = ['repo' => $repo, 'collection' => 'app.bsky.graph.follow', 'limit' => 100];
+        if (is_string($cursor) && $cursor !== '') $query['cursor'] = $cursor;
+        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $query);
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not read Bluesky follows')];
+        }
+        foreach ((array) ($res['json']['records'] ?? []) as $record) {
+            if (!is_array($record)) continue;
+            $value = is_array($record['value'] ?? null) ? $record['value'] : [];
+            $did = trim((string) ($value['subject'] ?? ''));
+            if (!str_starts_with($did, 'did:')) continue;
+            $uri = trim((string) ($record['uri'] ?? ''));
+            $follows[$did] = $uri !== '' ? $uri : null;
+        }
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) && $res['json']['cursor'] !== ''
+            ? $res['json']['cursor'] : null;
+        if ($cursor === null) break;
+    }
+    if ($cursor !== null) return ['ok' => false, 'error' => 'Bluesky follow list exceeds the safe per-run page limit'];
+
+    ap_bsky_graph_sync_migrate();
+    $db = ap_db();
+    try {
+        $db->beginTransaction();
+        $existing = $db->prepare("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follow'");
+        $existing->execute([$ownerUserId]);
+        $existingDids = array_map('strval', $existing->fetchAll(PDO::FETCH_COLUMN) ?: []);
+        foreach ($follows as $did => $uri) ap_bsky_graph_sync_upsert($ownerUserId, 'follow', $did, $uri, 'pull');
+        foreach ($existingDids as $did) {
+            if (!array_key_exists($did, $follows)) ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
+        }
+        $profiles = $db->prepare('SELECT DISTINCT did FROM bsky_actor_profiles WHERE did IS NOT NULL AND did <> ?');
+        $profiles->execute(['']);
+        foreach ($profiles->fetchAll(PDO::FETCH_COLUMN) ?: [] as $did) {
+            if (is_string($did) && str_starts_with($did, 'did:')) {
+                ap_bsky_actor_viewer_cache_update($ownerUserId, $did, $follows[$did] ?? null);
+            }
+        }
+        $db->commit();
+        return ['ok' => true, 'count' => count($follows)];
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        return ['ok' => false, 'error' => 'Could not reconcile Bluesky follow cache'];
     }
 }
 
@@ -4639,7 +4783,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         $db->prepare("UPDATE bsky_actor_refresh_queue SET status = ?, attempts = ?, next_attempt_at = ?, locked_at = NULL, last_error = 'Worker lease expired' WHERE owner_user_id = ? AND actor_ref = ? AND status = 'processing'")
             ->execute([$dead ? 'failed' : 'pending', $attempt, gmdate('c', time() + $delay), $owner, $actorRef]);
     }
-    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref IN ('__vaak_sync__:lists', '__vaak_sync__:bookmarks', '__vaak_sync__:starter_packs') THEN 0 ELSE 1 END, queued_at LIMIT ?");
+    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref IN ('__vaak_sync__:lists', '__vaak_sync__:bookmarks', '__vaak_sync__:starter_packs', '__vaak_sync__:follows') THEN 0 ELSE 1 END, queued_at LIMIT ?");
     $st->bindValue(1, $now);
     $st->bindValue(2, max(1, min(5, $limit)), PDO::PARAM_INT);
     $st->execute();
@@ -4681,6 +4825,13 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                 $stats['succeeded']++;
                 continue;
             }
+            if ($actorRef === '__vaak_sync__:follows') {
+                $result = ap_bsky_follow_sync_worker($owner);
+                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Follow synchronization failed'));
+                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+                $stats['succeeded']++;
+                continue;
+            }
             $result = ap_bsky_get_profile($owner, $actorRef);
             if (empty($result['ok']) || !is_array($result['profile'] ?? null)) {
                 throw new RuntimeException((string) ($result['error'] ?? 'Profile fetch failed'));
@@ -4689,6 +4840,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
             ap_bsky_actor_profile_cache_upsert($actorRef, $owner, $profile);
             $did = trim((string) ($profile['did'] ?? ''));
             if ($did !== '') {
+                $feedIndexed = false;
                 $tok = ap_bsky_access_token($owner, false);
                 if (empty($tok['ok'])) $tok = ap_bsky_access_token($owner, true);
                 if (!empty($tok['ok'])) {
@@ -4697,8 +4849,15 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                         $feed = ap_bsky_xrpc($host, 'app.bsky.feed.getAuthorFeed', 'GET', ['actor' => $did, 'limit' => 40], null, (string) $tok['access'], 12);
                         if (!empty($feed['ok']) && is_array($feed['json']['feed'] ?? null)) {
                             ap_bsky_index_feed_items($feed['json']['feed'], $owner, 40);
+                            $feedIndexed = true;
                             break;
                         }
+                    }
+                }
+                if (!$feedIndexed) {
+                    $feed = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getAuthorFeed', 'GET', ['actor' => $did, 'limit' => 40], null, null, 8);
+                    if (!empty($feed['ok']) && is_array($feed['json']['feed'] ?? null)) {
+                        ap_bsky_index_feed_items($feed['json']['feed'], $owner, 40);
                     }
                 }
             }

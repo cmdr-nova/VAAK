@@ -17373,6 +17373,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       if (str_starts_with($bskyIdentity, 'did:')) {
                           $rpBskyRequestedRef = 'https://bsky.app/profile/' . $bskyIdentity;
                           $rpActor = $rpBskyRequestedRef;
+                          $rpBskyDid = $bskyIdentity;
                       }
                   }
                   $cachedBsky = function_exists('ap_bsky_actor_profile_cache_get')
@@ -17386,6 +17387,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   }
                   if (function_exists('ap_bsky_actor_refresh_enqueue')) {
                       ap_bsky_actor_refresh_enqueue($vaakOwnerId, $rpBskyRequestedRef, $rpForceRefresh);
+                  }
+                  if (function_exists('ap_bsky_follow_sync_enqueue')) {
+                      ap_bsky_follow_sync_enqueue($vaakOwnerId);
                   }
                   $bp = is_array($cachedBsky['profile'] ?? null) ? $cachedBsky['profile'] : [];
                   if ($bp !== []) {
@@ -17411,9 +17415,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           'image_source_url' => $rpHeader,
                       ];
                       $viewer = is_array($cachedBsky['viewer'] ?? null) ? $cachedBsky['viewer'] : [];
-                      $rpBskyFollowing = !empty($viewer['following']);
+                      $viewerStateKnown = is_array($cachedBsky['viewer'] ?? null);
+                      $rpBskyFollowing = $viewerStateKnown
+                          ? (is_string($viewer['following'] ?? null) && $viewer['following'] !== '')
+                          : false;
                       $rpBskyFollowsYou = !empty($viewer['followedBy']);
-                      if (!$rpBskyFollowing && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
+                      if (!$viewerStateKnown && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
                           $rpBskyFollowing = is_array(ap_bsky_graph_sync_get($vaakOwnerId, 'follow', $rpBskyDid));
                       }
                   }
