@@ -9859,7 +9859,10 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         <?php endif; ?>
         <?php
           $bookmarkFolderMenuHtml = '';
-          if ($context === 'bookmarks' && $bookmarked && !empty($bmKeys['status_id'])) {
+          $bookmarkFolderMap = is_array($GLOBALS['vaak_bookmark_folder_status_map'] ?? null)
+              ? $GLOBALS['vaak_bookmark_folder_status_map'] : [];
+          if ($context === 'bookmarks' && $bookmarked && !empty($bmKeys['status_id'])
+              && empty($bookmarkFolderMap[(string) $bmKeys['status_id']])) {
               $bookmarkFolderMenuHtml = '<button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="bsky" data-status-id="'
                   . h((string) $bmKeys['status_id']) . '" data-object-id="' . h((string) ($bmKeys['object_id'] ?? ''))
                   . '">Add to folder</button>';
@@ -12480,7 +12483,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .flash.ok { background: #0a2a18; border: 1px solid #1f5a3a; color: #b6f5d0; }
     .flash.err { background: #2a1010; border: 1px solid #5a2a2a; color: #ffc9c9; }
     .bm-folder-popover {
-      position: fixed; z-index: 80; min-width: 220px; max-width: min(320px, 92vw);
+      position: fixed; z-index: 12010; min-width: 220px; max-width: min(320px, 92vw);
       background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
       box-shadow: 0 12px 40px rgba(0,0,0,.45); padding: .65rem .7rem; color: var(--text);
     }
@@ -13581,6 +13584,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $bmList = array_slice($bmList, 0, $bookmarkLimit);
               $bskyBookmarkItems = array_slice($bskyBookmarkItems, 0, $bookmarkLimit);
           }
+          $bookmarkStatusIds = array_values(array_filter(array_map(
+              static fn($st) => (string) ($st['id'] ?? ''),
+              $bmList
+          )));
+          $bookmarkStatusIds = array_merge($bookmarkStatusIds, array_keys($bskyBookmarkKeys));
+          $GLOBALS['vaak_bookmark_folder_status_map'] = function_exists('vaak_bookmark_folder_member_status_map')
+              ? vaak_bookmark_folder_member_status_map($bookmarkStatusIds, $vaakOwnerId)
+              : [];
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
@@ -13628,6 +13639,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $sid = (string) ($st['id'] ?? '');
               $oid = (string) ($st['uri'] ?? '');
               $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
+              $bmFolderMap = is_array($GLOBALS['vaak_bookmark_folder_status_map'] ?? null)
+                  ? $GLOBALS['vaak_bookmark_folder_status_map'] : [];
+              $bmFolderIds = !empty($bmFolderMap[$sid]) ? [1] : [];
             ?>
             <article class="tweet">
               <div class="tweet-hd">
@@ -13666,12 +13680,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <input type="hidden" name="object_id" value="<?= h($oid) ?>">
                     <button class="icon-btn on" type="submit" title="Bookmark folders" aria-label="Bookmark folders" data-bm-picker="1"><i class="ph-fill ph-bookmark-simple" aria-hidden="true"></i></button>
                   </form>
-                  <details class="post-action-menu">
-                    <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
-                    <div class="post-action-menu__body">
-                      <button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="fedi" data-status-id="<?= h($sid) ?>" data-object-id="<?= h($oid) ?>">Add to folder</button>
-                    </div>
-                  </details>
+                  <?php if ($bmFolderIds === []): ?>
+                    <details class="post-action-menu">
+                      <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
+                      <div class="post-action-menu__body">
+                        <button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="fedi" data-status-id="<?= h($sid) ?>" data-object-id="<?= h($oid) ?>">Add to folder</button>
+                      </div>
+                    </details>
+                  <?php endif; ?>
                 <?php endif; ?>
               </div>
             </article>
@@ -19242,6 +19258,7 @@ window.apAdminToast = function (msg, isErr) {
     const bookmarkPlatform = opts && opts.platform
       ? opts.platform
       : (anchorBtn.closest('.tweet-bsky') ? 'bsky' : 'fedi');
+    const isFolderAction = anchorBtn.matches('[data-bm-folder-open="1"]');
     closeFolderPopover();
     const rect = anchorBtn.getBoundingClientRect();
     const pop = document.createElement('div');
@@ -19269,6 +19286,7 @@ window.apAdminToast = function (msg, isErr) {
     if (!folderPopover) return;
     positionFolderPopover(pop, anchorBtn);
     const selected = new Set((selectedIds || (data && data.selected) || []).map(String));
+    if (isFolderAction) anchorBtn.hidden = selected.size > 0;
     const folders = (data && data.folders) || [];
     let html = '<h4>Save to folder</h4>';
     html += '<div class="meta" style="margin-bottom:.35rem">Stays in All bookmarks either way.</div>';
@@ -19304,6 +19322,10 @@ window.apAdminToast = function (msg, isErr) {
       if (!res || !res.ok) {
         input.checked = !input.checked;
         window.apAdminToast((res && res.error) || 'Folder update failed.', true);
+      } else {
+        if (input.checked) selected.add(String(fid));
+        else selected.delete(String(fid));
+        if (isFolderAction) anchorBtn.hidden = selected.size > 0;
       }
     });
 
@@ -19316,12 +19338,18 @@ window.apAdminToast = function (msg, isErr) {
         if (name) {
           const created = await postFolderAction('bookmark_folder_create', { title: name });
           if (created && created.ok && created.id) {
-            await postFolderAction('bookmark_folder_add', {
+            const added = await postFolderAction('bookmark_folder_add', {
               folder_id: String(created.id),
               status_id: statusId,
               object_id: objectId || '',
               platform: bookmarkPlatform
             });
+            if (!added || !added.ok) {
+              window.apAdminToast((added && added.error) || 'Could not add bookmark to folder.', true);
+              return;
+            }
+            selected.add(String(created.id));
+            if (isFolderAction) anchorBtn.hidden = true;
             window.apAdminToast('Saved to “' + name + '”.');
           } else {
             window.apAdminToast((created && created.error) || 'Could not create folder.', true);

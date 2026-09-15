@@ -1977,6 +1977,25 @@ SQL);
  * @param array<string,mixed>|null $embed
  * @return array<string,mixed>|null
  */
+function ap_bsky_embed_video_view(?array $embed): ?array
+{
+    if ($embed === null) return null;
+    $type = (string) ($embed['$type'] ?? '');
+    if (str_contains($type, 'recordWithMedia')) {
+        $media = is_array($embed['media'] ?? null) ? $embed['media'] : null;
+        if ($media === null) return null;
+        if (is_array($media['video'] ?? null)) return $media['video'];
+        if (str_contains((string) ($media['$type'] ?? ''), 'video')
+            || isset($media['playlist']) || isset($media['thumbnail'])) return $media;
+        return null;
+    }
+    if (!str_contains($type, 'video')) return null;
+    // AppView's video#view shape exposes playlist/thumbnail directly. Some
+    // cached/legacy projections wrap those fields under `video` instead.
+    if (is_array($embed['video'] ?? null)) return $embed['video'];
+    return (isset($embed['playlist']) || isset($embed['thumbnail'])) ? $embed : null;
+}
+
 function ap_bsky_post_embed_compact(?array $embed): ?array
 {
     if ($embed === null) {
@@ -2017,8 +2036,8 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
     // Bluesky video views expose an HLS playlist plus an optional poster. Keep
     // these URLs in the compact cache for post and status video previews
     // without retaining the much larger raw AppView response.
-    if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
-        $video = $embed['video'];
+    $video = ap_bsky_embed_video_view($embed);
+    if ($video !== null) {
         $playlist = (string) ($video['playlist'] ?? $video['url'] ?? '');
         $thumbnail = (string) ($video['thumbnail'] ?? $video['thumb'] ?? '');
         if (str_starts_with($playlist, 'https://') || str_starts_with($thumbnail, 'https://')) {
@@ -5469,13 +5488,7 @@ function ap_bsky_post_video_media(array $post): array
     if ($embed === null) {
         return [];
     }
-    $video = null;
-    $type = (string) ($embed['$type'] ?? '');
-    if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
-        $video = $embed['video'];
-    } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['video'] ?? null)) {
-        $video = $embed['media']['video'];
-    }
+    $video = ap_bsky_embed_video_view($embed);
     if (!is_array($video)) {
         return [];
     }
