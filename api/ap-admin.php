@@ -18748,6 +18748,34 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  function snapshotInteractButton(form) {
+    const btn = form.querySelector('button[type="submit"]');
+    const actionInput = form.querySelector('input[name="action"]');
+    if (!btn || !actionInput) return null;
+    return {
+      btn,
+      actionInput,
+      html: btn.innerHTML,
+      className: btn.className,
+      title: btn.title,
+      ariaLabel: btn.getAttribute('aria-label'),
+      bmPicker: btn.getAttribute('data-bm-picker'),
+      action: actionInput.value,
+    };
+  }
+
+  function restoreInteractButton(snapshot) {
+    if (!snapshot) return;
+    snapshot.btn.innerHTML = snapshot.html;
+    snapshot.btn.className = snapshot.className;
+    snapshot.btn.title = snapshot.title;
+    if (snapshot.ariaLabel === null) snapshot.btn.removeAttribute('aria-label');
+    else snapshot.btn.setAttribute('aria-label', snapshot.ariaLabel);
+    if (snapshot.bmPicker === null) snapshot.btn.removeAttribute('data-bm-picker');
+    else snapshot.btn.setAttribute('data-bm-picker', snapshot.bmPicker);
+    snapshot.actionInput.value = snapshot.action;
+  }
+
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -18765,11 +18793,18 @@ window.apAdminToast = function (msg, isErr) {
     }
     ev.preventDefault();
     if (form.dataset.busy === '1') return;
+    const fd = new FormData(form);
+    fd.set('ajax', '1');
+    const before = snapshotInteractButton(form);
+    const optimisticKind = action.startsWith('favourite') ? 'favourite'
+      : action.startsWith('bookmark') ? 'bookmark' : 'reblog';
+    const optimisticActive = action === 'favourite_status'
+      || action === 'bookmark_status' || action === 'reblog_status';
+    applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive });
     form.dataset.busy = '1';
+    // Keep the visual state immediate, but prevent duplicate requests in flight.
     if (btn) btn.disabled = true;
     try {
-      const fd = new FormData(form);
-      fd.set('ajax', '1');
       const res = await fetch(form.getAttribute('action') || window.location.href, {
         method: 'POST',
         body: fd,
@@ -18781,6 +18816,7 @@ window.apAdminToast = function (msg, isErr) {
       });
       const data = await res.json().catch(() => null);
       if (!data || !data.ok) {
+        restoreInteractButton(before);
         window.apAdminToast((data && (data.error || data.notice)) || 'Action failed.', true);
         return;
       }
@@ -18808,6 +18844,7 @@ window.apAdminToast = function (msg, isErr) {
       }
       // favourite: icon fill only — no toast, no scroll jump
     } catch (err) {
+      restoreInteractButton(before);
       window.apAdminToast('Network error — try again.', true);
     } finally {
       form.dataset.busy = '0';
@@ -19297,6 +19334,32 @@ window.apAdminToast = function (msg, isErr) {
       if (data && data.object_id) btn.dataset.objectId = String(data.object_id);
     }
 
+    function snapshotBskyButton(btn) {
+      return {
+        html: btn.innerHTML,
+        className: btn.className,
+        title: btn.title,
+        ariaLabel: btn.getAttribute('aria-label'),
+        ariaPressed: btn.getAttribute('aria-pressed'),
+        recordUri: btn.dataset.recordUri,
+        bmPicker: btn.getAttribute('data-bm-picker'),
+      };
+    }
+
+    function restoreBskyButton(btn, state) {
+      btn.innerHTML = state.html;
+      btn.className = state.className;
+      btn.title = state.title;
+      if (state.ariaLabel === null) btn.removeAttribute('aria-label');
+      else btn.setAttribute('aria-label', state.ariaLabel);
+      if (state.ariaPressed === null) btn.removeAttribute('aria-pressed');
+      else btn.setAttribute('aria-pressed', state.ariaPressed);
+      if (state.recordUri === undefined) delete btn.dataset.recordUri;
+      else btn.dataset.recordUri = state.recordUri;
+      if (state.bmPicker === null) btn.removeAttribute('data-bm-picker');
+      else btn.setAttribute('data-bm-picker', state.bmPicker);
+    }
+
     document.addEventListener('click', async (ev) => {
       const btn = ev.target && ev.target.closest ? ev.target.closest('button.bsky-action') : null;
       if (!btn) return;
@@ -19318,6 +19381,8 @@ window.apAdminToast = function (msg, isErr) {
         if (sid && typeof window.novaOpenBookmarkFolderPicker === 'function') {
           window.novaOpenBookmarkFolderPicker(btn, sid, oid, null, {
             onRemove: async () => {
+              const before = snapshotBskyButton(btn);
+              applyBskyBookmarkUi(btn, false);
               btn.dataset.busy = '1';
               btn.disabled = true;
               try {
@@ -19325,6 +19390,7 @@ window.apAdminToast = function (msg, isErr) {
                 applyBskyBookmarkUi(btn, false, data);
                 if (window.vaakHaptic) window.vaakHaptic(6);
               } catch (e) {
+                restoreBskyButton(btn, before);
                 if (typeof window.apAdminToast === 'function') {
                   window.apAdminToast((e && e.message) || 'Unbookmark failed', true);
                 }
@@ -19352,6 +19418,15 @@ window.apAdminToast = function (msg, isErr) {
         btn.title = 'Refresh the page to undo this action';
         return;
       }
+      const before = snapshotBskyButton(btn);
+      const optimisticOn = postAction === 'bsky_like' || postAction === 'bsky_repost' || postAction === 'bsky_bookmark';
+      if (action === 'like') setBskyIcon(btn, 'heart', optimisticOn, { on: 'Unlike', off: 'Like on Bluesky' });
+      else if (action === 'repost') {
+        btn.classList.toggle('on', optimisticOn);
+        btn.setAttribute('aria-pressed', optimisticOn ? 'true' : 'false');
+        btn.title = optimisticOn ? 'Undo boost' : 'Boost on Bluesky';
+        btn.setAttribute('aria-label', optimisticOn ? 'Undo boost' : 'Boost');
+      } else if (action === 'bookmark') applyBskyBookmarkUi(btn, optimisticOn);
       btn.dataset.busy = '1';
       btn.disabled = true;
       try {
@@ -19400,6 +19475,7 @@ window.apAdminToast = function (msg, isErr) {
         }
         if (window.vaakHaptic) window.vaakHaptic(6);
       } catch (e) {
+        restoreBskyButton(btn, before);
         const msg = (e && e.message) ? e.message : 'Bluesky action failed — try again';
         btn.title = msg;
         if (typeof window.apAdminToast === 'function') {
