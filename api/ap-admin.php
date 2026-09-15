@@ -793,7 +793,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 (int) ($_POST['folder_id'] ?? 0),
                 (string) ($_POST['status_id'] ?? ''),
                 $vaakOwnerId,
-                trim((string) ($_POST['object_id'] ?? '')) ?: null
+                trim((string) ($_POST['object_id'] ?? '')) ?: null,
+                (string) ($_POST['platform'] ?? '') === 'bsky' ? 'bsky' : 'fedi'
             );
             $payload = $res + [
                 'status_id' => (string) ($_POST['status_id'] ?? ''),
@@ -1725,16 +1726,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $error = 'Unknown collection action.';
         }
     } elseif (str_starts_with($action, 'list_')) {
-        $view = 'lists';
+        $view = (string) ($_POST['return_view'] ?? 'lists');
+        if (!in_array($view, ['lists', 'mod_lists'], true)) $view = 'lists';
         $lid = (int) ($_POST['list_id'] ?? $_GET['id'] ?? 0);
-        if ($action === 'list_create') {
+        if ($action === 'list_mod_action') {
+            $view = 'mod_lists';
+            $res = ap_list_set_moderation_action($lid, (string) ($_POST['moderation_action'] ?? 'none'));
+            if (!empty($res['ok'])) $notice = 'Moderation list action saved.';
+            else $error = $res['error'] ?? 'Could not update moderation list.';
+            if ($lid > 0) $_GET['id'] = (string) $lid;
+        } elseif ($action === 'list_create') {
             $res = ap_list_create(
                 (string) ($_POST['title'] ?? ''),
                 (string) ($_POST['replies_policy'] ?? 'list'),
-                !empty($_POST['exclusive'])
+                !empty($_POST['exclusive']),
+                (string) ($_POST['list_kind'] ?? 'curation'),
+                (string) ($_POST['moderation_action'] ?? 'none')
             );
             if (!empty($res['ok'])) {
                 $notice = 'List created.';
+                $view = (($_POST['list_kind'] ?? 'curation') === 'moderation') ? 'mod_lists' : 'lists';
                 $_GET['id'] = (string) (int) ($res['id'] ?? 0);
             } else {
                 $error = $res['error'] ?? 'Could not create list.';
@@ -1764,7 +1775,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
         } elseif ($action === 'list_add_account') {
             $ref = trim((string) ($_POST['actor'] ?? $_POST['to'] ?? ''));
-            $actorId = ap_list_resolve_actor_ref($ref) ?? '';
+            $actorId = '';
+            if (function_exists('ap_bsky_resolve_target_did')) {
+                $did = ap_bsky_resolve_target_did($ref, $vaakOwnerId);
+                if ($did !== null) $actorId = 'https://bsky.app/profile/' . rawurlencode($did);
+            }
+            if ($actorId === '') $actorId = ap_list_resolve_actor_ref($ref) ?? '';
             $followIfNeeded = !empty($_POST['follow_if_needed']);
             $res = ap_list_add_account($lid, $actorId, $followIfNeeded);
             if (!empty($res['ok'])) {
@@ -1776,6 +1792,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
             }
             if ($lid > 0) {
+                $listForReturn = ap_list_by_id($lid);
+                if (($listForReturn['list_kind'] ?? '') === 'moderation') $view = 'mod_lists';
                 $_GET['id'] = (string) $lid;
             }
         } elseif ($action === 'list_remove_account') {
@@ -1787,6 +1805,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not remove account.';
             }
             if ($lid > 0) {
+                $listForReturn = ap_list_by_id($lid);
+                if (($listForReturn['list_kind'] ?? '') === 'moderation') $view = 'mod_lists';
                 $_GET['id'] = (string) $lid;
             }
         } else {
@@ -2581,7 +2601,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
                 if ($bmKeys['status_id'] !== '' && function_exists('ap_masto_bookmark_remove')) {
                     try {
-                        ap_masto_bookmark_remove($bmKeys['status_id'], $vaakOwnerId);
+                        ap_masto_bookmark_remove($bmKeys['status_id'], $vaakOwnerId, 'bsky');
                     } catch (Throwable $e) {
                         // ignore
                     }
@@ -2643,7 +2663,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 // (local AP twin when mapped, otherwise a stable bsky: status key).
                 if ($bmKeys['status_id'] !== '' && function_exists('ap_masto_bookmark_add')) {
                     try {
-                        ap_masto_bookmark_add($bmKeys['status_id'], $bmKeys['object_id'], $vaakOwnerId);
+                        ap_masto_bookmark_add($bmKeys['status_id'], $bmKeys['object_id'], $vaakOwnerId, 'bsky');
                     } catch (Throwable $e) {
                         // ignore
                     }
@@ -6131,6 +6151,7 @@ function view_title(string $view): string
         'tags' => 'Hashtags',
         'collections' => 'Collections',
         'lists' => 'Lists',
+        'mod_lists' => 'Mod Lists',
         'import_export' => 'Import / Export',
         'report' => 'Report',
         'moderation' => 'Moderation',
@@ -9531,7 +9552,7 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
  * @param array<string,mixed> $item
  * @param string $context 'bluesky' (tab) or 'home' (mixed Home feed — federated card chrome)
  */
-function admin_render_bsky_feed_item(array $item, string $feedKey = 'following', string $context = 'bluesky'): void
+function admin_render_bsky_feed_item(array $item, string $feedKey = 'following', string $context = 'bluesky', int $contextId = 0): void
 {
     $post = is_array($item['post'] ?? null) ? $item['post'] : null;
     if ($post === null) {
@@ -9646,8 +9667,9 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     if (is_array($external) && function_exists('ap_bsky_external_link_card_html')) {
         $linkCardHtml = ap_bsky_external_link_card_html($external);
     }
-    $isHome = ($context === 'home');
-    $linkView = $isHome ? 'home' : ($context === 'search' ? 'search' : 'bluesky');
+    $isHome = in_array($context, ['home', 'list'], true);
+    $linkView = $context === 'list' ? 'lists' : ($isHome ? 'home' : (in_array($context, ['search', 'bookmarks'], true) ? $context : 'bluesky'));
+    $contextQuery = ($context === 'list' && $contextId > 0) ? '&amp;id=' . $contextId . '&amp;timeline=1' : '';
     // Stay on the current surface (Home mix vs Bluesky tab). reply_to / quote_object
     // still carry the bsky.app target so dual-publish / AT reply keep working.
     $composeView = $linkView;
@@ -9750,8 +9772,8 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
               admin_bsky_post_mention_accts($post)
           );
         ?>
-        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?><?= admin_reply_mention_query($bskyMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
-        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+        <a class="icon-btn" href="?view=<?= h($composeView) ?><?= $contextQuery ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?><?= admin_reply_mention_query($bskyMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+        <a class="icon-btn" href="?view=<?= h($composeView) ?><?= $contextQuery ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
         <?php if ($uri !== '' && $cid !== ''): ?>
           <?php
             $bmKeys = admin_bsky_bookmark_keys($uri, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
@@ -12800,7 +12822,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
-      $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'atmosphere', 'import_export', 'security'], true);
+      $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'atmosphere', 'import_export', 'security', 'mod_lists'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
       $navSiteOpen = in_array($view, ['guestbook', 'support', 'analytics'], true);
       $reportsNoticeCount = function_exists('ap_reports_notification_count') ? ap_reports_notification_count() : 0;
@@ -12851,6 +12873,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Profile</span></a>
+          <a class="<?= $view === 'mod_lists' ? 'active' : '' ?>" href="?view=mod_lists"><span class="ico">⛨</span><span class="label">Mod Lists</span></a>
           <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
           <a class="<?= $view === 'atmosphere' ? 'active' : '' ?>" href="?view=atmosphere"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">ATmosphere</span></a>
           <?php endif; ?>
@@ -13402,6 +13425,48 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
               return true;
           }));
+          $bskyBookmarkItems = [];
+          if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
+              && ap_bsky_session_row($vaakOwnerId) !== null) {
+              $bskyResult = ap_bsky_get_bookmarks($vaakOwnerId, 80);
+              if (!empty($bskyResult['ok']) && is_array($bskyResult['bookmarks'] ?? null)) {
+                  $bskyBookmarkItems = $bskyResult['bookmarks'];
+              }
+          }
+          $bskyBookmarkKeys = [];
+          foreach ($bskyBookmarkItems as $bItem) {
+              $post = is_array($bItem['post'] ?? null) ? $bItem['post'] : [];
+              $uri = (string) ($post['uri'] ?? '');
+              if ($uri === '') {
+                  continue;
+              }
+              $keys = admin_bsky_bookmark_keys($uri, $vaakOwnerId);
+              if ($keys['status_id'] !== '') {
+                  $bskyBookmarkKeys[$keys['status_id']] = true;
+              }
+          }
+          if ($bskyBookmarkKeys !== []) {
+              // Bluesky interactions are mirrored into VAAK's bookmark rows for
+              // folders; the actual Bluesky post card below is the canonical copy.
+              $bmList = array_values(array_filter($bmList, static function ($st) use ($bskyBookmarkKeys): bool {
+                  return !isset($bskyBookmarkKeys[(string) ($st['id'] ?? '')]);
+              }));
+          }
+          if ($bmFolderFilter > 0) {
+              $folderKeys = isset($allowed) && is_array($allowed) ? $allowed : [];
+              $folderObjects = isset($allowedObjects) && is_array($allowedObjects) ? $allowedObjects : [];
+              $bskyBookmarkItems = array_values(array_filter($bskyBookmarkItems, static function ($item) use ($folderKeys, $folderObjects, $vaakOwnerId): bool {
+                  $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+                  $uri = (string) ($post['uri'] ?? '');
+                  if ($uri === '') {
+                      return false;
+                  }
+                  $keys = admin_bsky_bookmark_keys($uri, $vaakOwnerId);
+                  return ($keys['status_id'] !== '' && isset($folderKeys[$keys['status_id']]))
+                      || ($keys['object_id'] !== '' && isset($folderObjects[rtrim($keys['object_id'], '/')]))
+                      || isset($folderObjects[rtrim($uri, '/')]);
+              }));
+          }
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
@@ -13432,9 +13497,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
           </form>
         <?php endif; ?>
-        <?php if (!$bmList): ?>
+        <?php if (!$bmList && !$bskyBookmarkItems): ?>
           <div class="empty"><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
-        <?php else: ?>
+        <?php endif; ?>
+        <?php if ($bskyBookmarkItems): ?>
+          <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>
+          <?php foreach ($bskyBookmarkItems as $bskyBookmarkItem): ?>
+            <?php admin_render_bsky_feed_item($bskyBookmarkItem, 'following', 'bookmarks'); ?>
+          <?php endforeach; ?>
+        <?php endif; ?>
+        <?php if ($bmList): ?>
           <?php foreach ($bmList as $st): ?>
             <?php
               $acct = (string) ($st['account']['acct'] ?? '?');
@@ -15879,16 +15951,89 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
         <?php endif; ?>
 
+      <?php elseif ($view === 'mod_lists'): ?>
+        <?php
+          if (function_exists('ap_lists_sync_bsky')) ap_lists_sync_bsky($vaakOwnerId);
+          $modLists = array_values(array_filter(ap_lists_all(), static fn(array $row): bool => ($row['list_kind'] ?? 'curation') === 'moderation'));
+          $modListId = (int) ($_GET['id'] ?? 0);
+          $modList = $modListId > 0 ? ap_list_by_id($modListId) : null;
+          if ($modList && ($modList['list_kind'] ?? '') !== 'moderation') $modList = null;
+        ?>
+        <?php if ($modListId > 0 && !$modList): ?>
+          <div class="empty">Moderation list not found. <a href="?view=mod_lists">Back to Mod Lists</a></div>
+        <?php elseif ($modList): ?>
+          <div class="page-back"><a class="btn btn-ghost" href="?view=mod_lists">← Mod Lists</a></div>
+          <section class="composer" style="margin-top:.75rem">
+            <h2 style="margin:.1rem 0 .5rem"><?= h((string) $modList['title']) ?></h2>
+            <p class="meta">An active mute/block applies to your account only in VAAK. Fediverse members are filtered locally; Bluesky members sync to the linked list. Set the action to “Unsubscribed / inactive” to keep the list and members but stop applying it.</p>
+            <?php if (!empty($modList['bsky_list_uri'])): ?><p class="meta">Bluesky list: <?= h((string) ($modList['bsky_moderation_action'] ?? 'none')) ?> · synced</p><?php endif; ?>
+          </section>
+          <?php $currentModAction = (string) ($modList['bsky_moderation_action'] ?? 'none'); ?>
+          <form class="composer" method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>" style="margin-top:.65rem" onsubmit="const action=event.submitter?.value; if(action==='none' && <?= json_encode(!empty($modList['bsky_list_uri'])) ?>) return confirm('Unsubscribe from this Bluesky moderation list? VAAK will stop muting/blocking its members, but the list itself will remain on Bluesky.'); return true;">
+            <input type="hidden" name="action" value="list_mod_action"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>">
+            <div class="meta" style="margin-bottom:.5rem"><?= $currentModAction === 'none' ? 'Subscribe to this moderation list. Choose what to do with all of its members:' : 'Choose how this moderation list applies to all its members:' ?></div>
+            <div class="composer-actions" style="justify-content:flex-start;flex-wrap:wrap">
+              <button class="btn <?= $currentModAction === 'mute' ? 'btn-primary' : 'btn-ghost' ?>" type="submit" name="moderation_action" value="mute">Mute all users</button>
+              <button class="btn <?= $currentModAction === 'block' ? 'btn-primary' : 'btn-ghost' ?>" type="submit" name="moderation_action" value="block">Block all users</button>
+              <?php if ($currentModAction !== 'none'): ?><button class="btn btn-ghost" type="submit" name="moderation_action" value="none">Unsubscribe / deactivate</button><?php endif; ?>
+            </div>
+            <div class="meta" style="margin-top:.5rem">This affects only your account. For a linked Bluesky list, mute/block subscribes there too; unsubscribe removes that Bluesky subscription and keeps the list.</div>
+          </form>
+          <form method="post" action="?view=mod_lists" style="margin:.65rem 0" onsubmit="return confirm(<?= json_encode(($modList['bsky_list_source'] ?? '') === 'subscription' ? 'Unsubscribe and remove this list from VAAK? The list itself will remain on Bluesky.' : 'Delete moderation list “' . (string) ($modList['title'] ?? '') . '”' . (!empty($modList['bsky_list_uri']) ? ' on VAAK and Bluesky' : '') . '?') ?>)">
+            <input type="hidden" name="action" value="list_delete"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>"><button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete list</button>
+          </form>
+          <?php if (($modList['bsky_list_source'] ?? '') !== 'subscription'): ?><form class="composer" method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>" style="margin-top:.75rem">
+            <input type="hidden" name="action" value="list_add_account"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>">
+            <div class="meta" style="margin-bottom:.5rem">Add a Fediverse handle/URL or Bluesky handle</div>
+            <input name="actor" required placeholder="@user@instance or handle.bsky.social">
+            <div class="composer-actions"><span class="meta">Fediverse accounts are VAAK-local; Bluesky accounts sync to the linked Bluesky list.</span><button class="btn btn-primary" type="submit">Add</button></div>
+          </form><?php else: ?><p class="meta">Members belong to another account’s Bluesky list; manage its membership on Bluesky. You can unsubscribe here to stop applying it.</p><?php endif; ?>
+          <h3 style="margin:1rem 0 .5rem">Members</h3>
+          <?php foreach (ap_list_accounts((int) $modList['id']) as $modMember): $memberActor = (string) ($modMember['actor_id'] ?? ''); ?>
+            <article class="tweet"><div class="tweet-hd"><?= admin_avatar_img($memberActor) ?><div class="tweet-hd-main"><span class="who"><?= actor_display_name_html($memberActor) ?></span> <span class="meta"><?= h(actor_handle($memberActor)) ?></span></div></div>
+              <?php if (($modList['bsky_list_source'] ?? '') !== 'subscription'): ?><div class="tweet-actions"><form method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>"><input type="hidden" name="action" value="list_remove_account"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>"><input type="hidden" name="actor_id" value="<?= h($memberActor) ?>"><button class="btn btn-ghost" type="submit">Remove</button></form></div><?php endif; ?>
+            </article>
+          <?php endforeach; ?>
+        <?php else: ?>
+          <p class="meta">Personal moderation lists. Active members are muted/blocked only for your account in VAAK; linked Bluesky lists apply the matching personal subscription there. Unsubscribing keeps the list and members but stops the action. Bluesky list records/members are public protocol data, so avoid sensitive lists.</p>
+          <form class="composer" method="post" action="?view=mod_lists" style="margin-bottom:1rem">
+            <input type="hidden" name="action" value="list_create"><input type="hidden" name="list_kind" value="moderation"><input type="hidden" name="return_view" value="mod_lists">
+            <div class="meta" style="margin-bottom:.5rem">Create moderation list</div><input name="title" required maxlength="<?= (int) AP_LIST_TITLE_MAX ?>" placeholder="List name">
+            <label class="meta" style="display:block;margin-top:.65rem">Personal action (also subscribes on Bluesky if connected)</label><select name="moderation_action"><option value="mute">Mute these accounts</option><option value="block">Block these accounts</option><option value="none">Unsubscribed / inactive (keep list)</option></select>
+            <div class="composer-actions"><span class="meta"><?= count($modLists) ?> / <?= (int) AP_LIST_MAX ?></span><button class="btn btn-primary" type="submit">Create</button></div>
+          </form>
+          <?php if (!$modLists): ?><div class="empty">No moderation lists yet. Connect Bluesky in ATmosphere to import your existing subscriptions.</div><?php endif; ?>
+          <?php foreach ($modLists as $modRow): ?><article class="tweet"><div class="tweet-hd-main"><span class="who"><?= h((string) $modRow['title']) ?></span> <span class="tag"><?= ($modRow['bsky_moderation_action'] ?? 'none') === 'none' ? 'inactive' : h((string) $modRow['bsky_moderation_action']) ?></span><div class="meta"><?= (int) ($modRow['member_count'] ?? 0) ?> members<?= ($modRow['bsky_list_source'] ?? '') === 'subscription' ? ' · subscribed Bluesky list' : (($modRow['bsky_list_source'] ?? '') === 'bsky' ? ' · owned Bluesky list' : (!empty($modRow['bsky_list_uri']) ? ' · Bluesky synced' : ' · VAAK only')) ?></div></div><div class="tweet-actions"><a class="btn btn-primary" href="?view=mod_lists&amp;id=<?= (int) $modRow['id'] ?>">Open</a></div></article><?php endforeach; ?>
+        <?php endif; ?>
+
       <?php elseif ($view === 'lists'): ?>
         <?php
+          if (function_exists('ap_lists_sync_bsky')) ap_lists_sync_bsky($vaakOwnerId);
           $listId = (int) ($_GET['id'] ?? 0);
           $listDetail = $listId > 0 ? ap_list_by_id($listId) : null;
+          if ($listDetail && ($listDetail['list_kind'] ?? 'curation') !== 'curation') $listDetail = null;
           $listNotFound = ($listId > 0 && !$listDetail);
           $listMembers = ($listDetail ? ap_list_accounts((int) $listDetail['id']) : []);
           $listShowTimeline = !empty($_GET['timeline']) && $listDetail;
-          $listTimelineStatuses = [];
+          $listTimelineItems = [];
           if ($listShowTimeline && function_exists('ap_masto_timeline_list')) {
-              $listTimelineStatuses = ap_masto_timeline_list((int) $listDetail['id'], 40);
+              foreach (ap_masto_timeline_list((int) $listDetail['id'], 60) as $status) {
+                  $listTimelineItems[] = ['kind' => 'fedi', 'row' => $status, 'at' => (string) ($status['created_at'] ?? '')];
+              }
+              if (function_exists('ap_bsky_posts_for_authors')) {
+                  $listDids = [];
+                  foreach ($listMembers as $member) {
+                      $did = (string) ($member['bsky_did'] ?? '');
+                      if ($did !== '') $listDids[] = $did;
+                  }
+                  foreach (ap_bsky_posts_for_authors($listDids, $vaakOwnerId, 60) as $item) {
+                      $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+                      $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+                      $listTimelineItems[] = ['kind' => 'bsky', 'row' => $item, 'at' => (string) ($post['indexedAt'] ?? $record['createdAt'] ?? '')];
+                  }
+              }
+              usort($listTimelineItems, static fn(array $a, array $b): int => (strtotime((string) ($b['at'] ?? '')) ?: 0) <=> (strtotime((string) ($a['at'] ?? '')) ?: 0));
+              $listTimelineItems = array_slice($listTimelineItems, 0, 40);
           }
           $followingIdsForLists = [];
           foreach (ap_following_list($vaakActorId) as $frow) {
@@ -15905,10 +16050,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="page-back"><a class="btn btn-ghost" href="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>">← Members</a></div>
             <span class="meta">Timeline · <?= h((string) $listDetail['title']) ?></span>
           </div>
-          <?php if (!$listTimelineStatuses): ?>
-            <div class="empty">No posts from list members in the firehose yet.</div>
+          <?php if (!$listTimelineItems): ?>
+            <div class="empty">No cached posts from list members yet. Bluesky author feeds are being queued for background refresh; try again shortly.</div>
           <?php else: ?>
-            <?php foreach ($listTimelineStatuses as $st): ?>
+            <?php foreach ($listTimelineItems as $timelineItem): ?>
+              <?php if (($timelineItem['kind'] ?? '') === 'bsky'): ?>
+                <?php admin_render_bsky_feed_item((array) ($timelineItem['row'] ?? []), 'list-' . (int) $listDetail['id'], 'list', (int) $listDetail['id']); ?>
+              <?php else: ?>
+              <?php $st = is_array($timelineItem['row'] ?? null) ? $timelineItem['row'] : []; ?>
               <?php
                 // Prefer rendering via event row when we can recover it
                 $oid = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
@@ -15944,6 +16093,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <?php
                 }
               ?>
+              <?php endif; ?>
             <?php endforeach; ?>
           <?php endif; ?>
 
@@ -15953,6 +16103,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
           <form class="composer" method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="list_update">
+            <input type="hidden" name="return_view" value="lists">
             <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
             <div class="meta" style="margin-bottom:.5rem">Edit list · <?= count($listMembers) ?> members</div>
             <input name="title" type="text" required maxlength="<?= (int) AP_LIST_TITLE_MAX ?>" value="<?= h((string) $listDetail['title']) ?>" placeholder="Title">
@@ -15978,6 +16129,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="tweet-actions" style="margin:0 0 1rem;gap:.5rem">
             <form method="post" action="?view=lists" style="display:inline" onsubmit="return confirm(<?= json_encode('Delete list “' . (string) ($listDetail['title'] ?? '') . '”?') ?>);">
               <input type="hidden" name="action" value="list_delete">
+              <input type="hidden" name="return_view" value="lists">
               <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
               <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete list</button>
             </form>
@@ -15985,15 +16137,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
           <form class="composer" method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="list_add_account">
+            <input type="hidden" name="return_view" value="lists">
             <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
-            <div class="meta" style="margin-bottom:.5rem">Add account (must be someone you follow)</div>
-            <input name="actor" type="text" required placeholder="@user@instance or https://…/users/…">
+            <div class="meta" style="margin-bottom:.5rem">Add a Fediverse account or Bluesky handle</div>
+            <input name="actor" type="text" required placeholder="@user@instance, handle.bsky.social, or profile URL">
             <label class="composer-check" style="margin-top:.65rem">
               <input type="checkbox" name="follow_if_needed" value="1">
               <span>Follow first if not already following (uses 30/hour rate limit)</span>
             </label>
             <div class="composer-actions">
-              <span class="meta">Private list · not a public Collection</span>
+              <span class="meta">Fediverse membership stays in VAAK; Bluesky members sync to the linked list.</span>
               <button class="btn btn-primary" type="submit">Add</button>
             </div>
           </form>
@@ -16021,6 +16174,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <a href="?view=remote_profile&amp;actor=<?= urlencode($maid) ?>">Profile</a>
                   <form method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="display:inline">
                     <input type="hidden" name="action" value="list_remove_account">
+                    <input type="hidden" name="return_view" value="lists">
                     <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
                     <input type="hidden" name="actor_id" value="<?= h($maid) ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Remove</button>
@@ -16031,15 +16185,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
 
         <?php else: ?>
-          <?php $allLists = ap_lists_all(); ?>
+          <?php $allLists = array_values(array_filter(ap_lists_all(), static fn(array $row): bool => ($row['list_kind'] ?? 'curation') === 'curation')); ?>
           <div class="meta" style="margin-bottom:.75rem">
-            Private lists of people you follow — like Mastodon Lists. Separate from
-            <a href="?view=collections">Collections</a> (public starter packs).
+            Custom feeds of accounts you choose, including Fediverse and Bluesky posts. Separate from
+            <a href="?view=collections">Collections</a> (public starter packs). VAAK-only lists are private; a Bluesky-synced list and its Bluesky members are public protocol records.
             Limit: <?= (int) AP_LIST_MAX ?> lists.
           </div>
 
           <form class="composer" method="post" action="?view=lists" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="list_create">
+            <input type="hidden" name="list_kind" value="curation"><input type="hidden" name="return_view" value="lists">
             <div class="meta" style="margin-bottom:.5rem">New list</div>
             <input name="title" type="text" required maxlength="<?= (int) AP_LIST_TITLE_MAX ?>" placeholder="Title (e.g. Close friends)">
             <label class="meta" style="display:block;margin-top:.65rem">Replies in timeline</label>
@@ -16077,10 +16232,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </div>
                 <div class="tweet-actions">
-                  <a class="btn btn-primary" href="?view=lists&amp;id=<?= (int) $L['id'] ?>" style="padding:.35rem .9rem;font-size:.85rem">Open</a>
-                  <a class="btn btn-ghost" href="?view=lists&amp;id=<?= (int) $L['id'] ?>&amp;timeline=1" style="padding:.35rem .9rem;font-size:.85rem">Timeline</a>
+                  <a class="btn btn-primary" href="?view=lists&amp;id=<?= (int) $L['id'] ?>&amp;timeline=1" style="padding:.35rem .9rem;font-size:.85rem">View feed</a>
+                  <a class="btn btn-ghost" href="?view=lists&amp;id=<?= (int) $L['id'] ?>" style="padding:.35rem .9rem;font-size:.85rem">Manage members</a>
                   <form method="post" action="?view=lists" style="display:inline" onsubmit="return confirm(<?= json_encode('Delete list “' . (string) ($L['title'] ?? '') . '”?') ?>);">
                     <input type="hidden" name="action" value="list_delete">
+                    <input type="hidden" name="return_view" value="lists">
                     <input type="hidden" name="list_id" value="<?= (int) $L['id'] ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem;color:var(--danger)">Delete</button>
                   </form>
@@ -18901,6 +19057,7 @@ window.apAdminToast = function (msg, isErr) {
    * @param {{ onRemove?: () => (void|Promise<void>) }|null} opts
    */
   async function openBookmarkFolderPicker(anchorBtn, statusId, objectId, selectedIds, opts) {
+    const bookmarkPlatform = anchorBtn.closest('.tweet-bsky') ? 'bsky' : 'fedi';
     closeFolderPopover();
     const rect = anchorBtn.getBoundingClientRect();
     const pop = document.createElement('div');
@@ -18957,7 +19114,8 @@ window.apAdminToast = function (msg, isErr) {
       const res = await postFolderAction(action, {
         folder_id: fid,
         status_id: statusId,
-        object_id: objectId || ''
+        object_id: objectId || '',
+        platform: bookmarkPlatform
       });
       if (!res || !res.ok) {
         input.checked = !input.checked;
@@ -18977,7 +19135,8 @@ window.apAdminToast = function (msg, isErr) {
             await postFolderAction('bookmark_folder_add', {
               folder_id: String(created.id),
               status_id: statusId,
-              object_id: objectId || ''
+              object_id: objectId || '',
+              platform: bookmarkPlatform
             });
             window.apAdminToast('Saved to “' + name + '”.');
           } else {

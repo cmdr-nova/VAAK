@@ -173,7 +173,8 @@ function vaak_bookmark_folder_add_status(
     int $folderId,
     string $statusId,
     int $ownerUserId,
-    ?string $objectId = null
+    ?string $objectId = null,
+    string $platform = 'fedi'
 ): array {
     if ($folderId < 1 || $ownerUserId < 1 || $statusId === '') {
         return ['ok' => false, 'error' => 'Invalid folder or status.'];
@@ -188,7 +189,7 @@ function vaak_bookmark_folder_add_status(
             return ['ok' => false, 'error' => 'Folder not found.'];
         }
         if (function_exists('ap_masto_bookmark_add')) {
-            ap_masto_bookmark_add($statusId, $objectId, $ownerUserId);
+            ap_masto_bookmark_add($statusId, $objectId, $ownerUserId, $platform);
         }
         $exists = ap_db()->prepare(
             'SELECT 1 FROM vaak_bookmark_folder_items

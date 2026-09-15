@@ -1569,6 +1569,38 @@ function ap_bsky_feed_hosts(string $pdsHost): array
     return array_values(array_unique($hosts));
 }
 
+/** Authenticated XRPC using this account's PDS/AppView proxy hosts. */
+function ap_bsky_account_xrpc(int $ownerUserId, string $nsid, string $method = 'GET', ?array $query = null, ?array $body = null): array
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) {
+        return ['ok' => false, 'error' => 'Bluesky not connected'];
+    }
+    $token = ap_bsky_access_token($ownerUserId, false);
+    if (empty($token['ok'])) {
+        $token = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($token['ok'])) {
+        return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
+    }
+    $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $last = ['ok' => false, 'error' => $nsid . ' failed'];
+    foreach (ap_bsky_feed_hosts($pds) as $host) {
+        $last = ap_bsky_xrpc($host, $nsid, $method, $query, $body, (string) $token['access'], 15);
+        if (($last['status'] ?? 0) === 401) {
+            $token = ap_bsky_access_token($ownerUserId, true);
+            if (empty($token['ok'])) {
+                return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
+            }
+            $last = ap_bsky_xrpc($host, $nsid, $method, $query, $body, (string) $token['access'], 15);
+        }
+        if (!empty($last['ok'])) {
+            return $last;
+        }
+    }
+    return $last;
+}
+
 /**
  * @return array{ok:bool,error?:string,feed?:list<array>,cursor?:?string}
  */
@@ -2433,6 +2465,40 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20): array
             return [];
         }
     }
+}
+
+/** Cached mixed-author posts for a VAAK custom list; refreshes are queued lazily. */
+function ap_bsky_posts_for_authors(array $authorDids, int $ownerUserId, int $limit = 40): array
+{
+    $dids = array_values(array_unique(array_filter(array_map('trim', $authorDids), static fn(string $did): bool => str_starts_with($did, 'did:'))));
+    if ($ownerUserId < 1 || $dids === []) return [];
+    $dids = array_slice($dids, 0, 500);
+    foreach ($dids as $did) ap_bsky_author_feed_refresh_enqueue($ownerUserId, $did, 180);
+    ap_bsky_posts_migrate();
+    $limit = max(1, min(100, $limit));
+    $ph = implode(',', array_fill(0, count($dids), '?'));
+    try {
+        $st = ap_db()->prepare("SELECT raw_json, reason_json FROM bsky_posts WHERE author_did IN ($ph) AND raw_json IS NOT NULL ORDER BY indexed_at DESC NULLS LAST, updated_at DESC LIMIT " . (int) ($limit * 3));
+        $st->execute($dids);
+    } catch (Throwable $e) {
+        try {
+            $st = ap_db()->prepare("SELECT raw_json, reason_json FROM bsky_posts WHERE author_did IN ($ph) AND raw_json IS NOT NULL ORDER BY indexed_at DESC, updated_at DESC LIMIT " . (int) ($limit * 3));
+            $st->execute($dids);
+        } catch (Throwable $e2) {
+            return [];
+        }
+    }
+    $items = [];
+    foreach ($st->fetchAll() ?: [] as $row) {
+        $post = is_string($row['raw_json'] ?? null) ? json_decode((string) $row['raw_json'], true) : null;
+        if (!is_array($post)) continue;
+        $item = ['post' => $post];
+        $reason = is_string($row['reason_json'] ?? null) ? json_decode((string) $row['reason_json'], true) : null;
+        if (is_array($reason)) $item['reason'] = $reason;
+        $items[] = $item;
+    }
+    $items = ap_bsky_filter_hidden_authors($ownerUserId, $items);
+    return array_slice($items, 0, $limit);
 }
 
 /** Coalesce a fresh authenticated pull of an author's feed onto the durable profile-refresh queue. */
@@ -3486,6 +3552,7 @@ function ap_bsky_create_bookmark(int $ownerUserId, array $subject): array
     if (empty($put['ok'])) {
         return ['ok' => false, 'error' => (string) ($put['error'] ?? 'bookmark failed')];
     }
+    ap_bsky_bookmark_cache_clear($ownerUserId);
     return ['ok' => true];
 }
 
@@ -3521,7 +3588,271 @@ function ap_bsky_delete_bookmark(int $ownerUserId, string $uri): array
     if (empty($put['ok'])) {
         return ['ok' => false, 'error' => (string) ($put['error'] ?? 'unbookmark failed')];
     }
+    ap_bsky_bookmark_cache_clear($ownerUserId);
     return ['ok' => true];
+}
+
+function ap_bsky_bookmark_cache_clear(int $ownerUserId): void
+{
+    if ($ownerUserId > 0) {
+        @unlink(sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json');
+    }
+}
+
+/**
+ * Fetch the connected account's Bluesky bookmarks for VAAK's unified Library.
+ * This is intentionally a read-through cache: Bluesky remains authoritative,
+ * so direct changes made in the Bluesky app are reflected on the next refresh.
+ *
+ * @return array{ok:bool,bookmarks?:list<array<string,mixed>>,error?:string}
+ */
+function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh = false): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
+        return ['ok' => false, 'error' => 'Bluesky is not connected'];
+    }
+    $limit = max(1, min(200, $limit));
+    $syncLimit = 200;
+    $cachePath = sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json';
+    if (!$refresh && is_file($cachePath) && (time() - (int) @filemtime($cachePath)) < 45) {
+        $cached = json_decode((string) @file_get_contents($cachePath), true);
+        if (is_array($cached) && is_array($cached['bookmarks'] ?? null)) {
+            return ['ok' => true, 'bookmarks' => array_slice($cached['bookmarks'], 0, $limit), 'cached' => true];
+        }
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) {
+        return ['ok' => false, 'error' => 'Bluesky not connected'];
+    }
+    $token = ap_bsky_access_token($ownerUserId, false);
+    if (empty($token['ok'])) {
+        $token = ap_bsky_access_token($ownerUserId, true);
+    }
+    if (empty($token['ok'])) {
+        return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
+    }
+    $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $hosts = ap_bsky_feed_hosts($pds);
+    $access = (string) $token['access'];
+    $cursor = null;
+    $bookmarks = [];
+    $complete = false;
+    $lastError = 'Could not load Bluesky bookmarks';
+    for ($page = 0; $page < 2 && count($bookmarks) < $syncLimit; $page++) {
+        $query = ['limit' => min(100, $syncLimit - count($bookmarks))];
+        if ($cursor !== null && $cursor !== '') {
+            $query['cursor'] = $cursor;
+        }
+        $result = null;
+        foreach ($hosts as $host) {
+            $result = ap_bsky_xrpc($host, 'app.bsky.bookmark.getBookmarks', 'GET', $query, null, $access, 15);
+            if (($result['status'] ?? 0) === 401) {
+                $token = ap_bsky_access_token($ownerUserId, true);
+                if (empty($token['ok'])) {
+                    return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
+                }
+                $access = (string) $token['access'];
+                $result = ap_bsky_xrpc($host, 'app.bsky.bookmark.getBookmarks', 'GET', $query, null, $access, 15);
+            }
+            if (!empty($result['ok']) && is_array($result['json'] ?? null)) {
+                break;
+            }
+            $lastError = (string) ($result['error'] ?? $lastError);
+        }
+        if (empty($result['ok']) || !is_array($result['json'] ?? null)) {
+            if ($page === 0) {
+                return ['ok' => false, 'error' => $lastError];
+            }
+            break;
+        }
+        $rows = is_array($result['json']['bookmarks'] ?? null) ? $result['json']['bookmarks'] : [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            // BookmarkView contains a strongRef in `subject` and the hydrated
+            // PostView in `item`; render the latter so media/text aren't lost.
+            $post = is_array($row['item'] ?? null) ? $row['item'] : (is_array($row['post'] ?? null) ? $row['post'] : null);
+            if ($post === null || trim((string) ($post['uri'] ?? '')) === '') {
+                continue;
+            }
+            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : [];
+            $post['viewer']['bookmarked'] = true;
+            $bookmarks[] = ['post' => $post, '_vaak_bookmarked_at' => (string) ($row['createdAt'] ?? '')];
+            if (count($bookmarks) >= $syncLimit) {
+                break;
+            }
+        }
+        $cursor = isset($result['json']['cursor']) && is_string($result['json']['cursor'])
+            ? $result['json']['cursor'] : null;
+        if ($cursor === null) {
+            $complete = true;
+            break;
+        }
+        if ($rows === []) {
+            break;
+        }
+    }
+    // Reconcile only when Bluesky returned the complete collection within the
+    // bounded sync window. Never infer removals from a truncated page set.
+    if ($complete && function_exists('admin_bsky_bookmark_keys')) {
+        $present = [];
+        foreach ($bookmarks as $item) {
+            $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+            $uri = (string) ($post['uri'] ?? '');
+            if ($uri !== '') {
+                $keys = admin_bsky_bookmark_keys($uri, $ownerUserId);
+                if (($keys['status_id'] ?? '') !== '') {
+                    $present[(string) $keys['status_id']] = true;
+                }
+            }
+        }
+        try {
+            $st = ap_db()->prepare('SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND (source_mask & 2) <> 0');
+            $st->execute([$ownerUserId]);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $savedId) {
+                $savedId = (string) $savedId;
+                if (!isset($present[$savedId]) && function_exists('ap_masto_bookmark_remove')) {
+                    ap_masto_bookmark_remove($savedId, $ownerUserId, 'bsky');
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] bookmark reconciliation: ' . $e->getMessage());
+        }
+    }
+    @file_put_contents($cachePath, json_encode(['bookmarks' => $bookmarks], JSON_UNESCAPED_SLASHES), LOCK_EX);
+    return ['ok' => true, 'bookmarks' => array_slice($bookmarks, 0, $limit)];
+}
+
+/** Create an owned Bluesky graph list. */
+function ap_bsky_create_graph_list(int $ownerUserId, string $name, string $purpose = 'curation'): array
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
+    $purpose = $purpose === 'moderation' ? 'app.bsky.graph.defs#modlist' : 'app.bsky.graph.defs#curatelist';
+    $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.createRecord', 'POST', null, [
+        'repo' => (string) ($session['did'] ?? ''),
+        'collection' => 'app.bsky.graph.list',
+        'record' => [
+            '$type' => 'app.bsky.graph.list',
+            'name' => mb_substr(trim($name), 0, 64),
+            'purpose' => $purpose,
+            'description' => '',
+            'createdAt' => gmdate('c'),
+        ],
+    ]);
+    if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not create Bluesky list')];
+    return ['ok' => true, 'uri' => (string) ($res['json']['uri'] ?? ''), 'cid' => (string) ($res['json']['cid'] ?? '')];
+}
+
+/** Add a DID to an owned Bluesky list; caller stores the returned record URI. */
+function ap_bsky_add_graph_list_member(int $ownerUserId, string $listUri, string $did): array
+{
+    if (!str_starts_with($listUri, 'at://') || !str_starts_with($did, 'did:')) {
+        return ['ok' => false, 'error' => 'A Bluesky list URI and account DID are required'];
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
+    $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.createRecord', 'POST', null, [
+        'repo' => (string) ($session['did'] ?? ''),
+        'collection' => 'app.bsky.graph.listitem',
+        'record' => [
+            '$type' => 'app.bsky.graph.listitem',
+            'list' => $listUri,
+            'subject' => $did,
+            'createdAt' => gmdate('c'),
+        ],
+    ]);
+    if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not add Bluesky list member')];
+    return ['ok' => true, 'uri' => (string) ($res['json']['uri'] ?? '')];
+}
+
+function ap_bsky_delete_graph_list_member(int $ownerUserId, string $itemUri): array
+{
+    if (!preg_match('~^at://[^/]+/app\.bsky\.graph\.listitem/[^/]+$~', $itemUri)) {
+        return ['ok' => false, 'error' => 'Invalid Bluesky list-item URI'];
+    }
+    return ap_bsky_delete_record_uri($ownerUserId, $itemUri);
+}
+
+/** Apply or remove this account's mute/block subscription to an owned mod list. */
+function ap_bsky_set_graph_list_moderation(int $ownerUserId, string $listUri, string $action): array
+{
+    if (!str_starts_with($listUri, 'at://') || !in_array($action, ['mute', 'block'], true)) {
+        return ['ok' => false, 'error' => 'Invalid moderation list action'];
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
+    $kind = $action === 'block' ? 'app.bsky.graph.listblock' : 'app.bsky.graph.listmute';
+    $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.createRecord', 'POST', null, [
+        'repo' => (string) ($session['did'] ?? ''),
+        'collection' => $kind,
+        'record' => ['$type' => $kind, 'subject' => $listUri, 'createdAt' => gmdate('c')],
+    ]);
+    if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not subscribe to Bluesky moderation list')];
+    ap_bsky_refresh_hide_set($ownerUserId, true);
+    return ['ok' => true, 'uri' => (string) ($res['json']['uri'] ?? '')];
+}
+
+function ap_bsky_remove_graph_list_moderation(int $ownerUserId, string $listUri, string $action, string $recordUri = ''): array
+{
+    if (!str_starts_with($listUri, 'at://') || !in_array($action, ['mute', 'block'], true)) {
+        return ['ok' => false, 'error' => 'Invalid moderation list action'];
+    }
+    if ($recordUri !== '') {
+        $deleted = ap_bsky_delete_record_uri($ownerUserId, $recordUri);
+        if (!empty($deleted['ok'])) {
+            ap_bsky_refresh_hide_set($ownerUserId, true);
+            return $deleted;
+        }
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
+    $collection = $action === 'block' ? 'app.bsky.graph.listblock' : 'app.bsky.graph.listmute';
+    $cursor = null;
+    for ($page = 0; $page < 20; $page++) {
+        $query = ['repo' => (string) ($session['did'] ?? ''), 'collection' => $collection, 'limit' => 100];
+        if ($cursor !== null) $query['cursor'] = $cursor;
+        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $query);
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not inspect Bluesky list subscriptions')];
+        }
+        foreach ((array) ($res['json']['records'] ?? []) as $record) {
+            $value = is_array($record['value'] ?? null) ? $record['value'] : [];
+            if ((string) ($value['subject'] ?? '') === $listUri) {
+                $uri = (string) ($record['uri'] ?? '');
+                $deleted = $uri !== '' ? ap_bsky_delete_record_uri($ownerUserId, $uri) : ['ok' => false];
+                if (!empty($deleted['ok'])) ap_bsky_refresh_hide_set($ownerUserId, true);
+                return $deleted;
+            }
+        }
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
+        if ($cursor === null) break;
+    }
+    return ['ok' => true, 'already_removed' => true];
+}
+
+/** Paginated collection fetch for an owned Bluesky list's hydrated entries. */
+function ap_bsky_get_graph_list(int $ownerUserId, string $listUri, int $limit = 500): array
+{
+    if (!str_starts_with($listUri, 'at://')) return ['ok' => false, 'error' => 'Invalid Bluesky list URI'];
+    $items = [];
+    $cursor = null;
+    $limit = max(1, min(2000, $limit));
+    for ($page = 0; $page < 20 && count($items) < $limit; $page++) {
+        $query = ['list' => $listUri, 'limit' => min(100, $limit - count($items))];
+        if ($cursor !== null) $query['cursor'] = $cursor;
+        $res = ap_bsky_account_xrpc($ownerUserId, 'app.bsky.graph.getList', 'GET', $query);
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky list'), 'items' => $items, 'complete' => false];
+        }
+        $pageItems = is_array($res['json']['items'] ?? null) ? $res['json']['items'] : [];
+        $items = array_merge($items, $pageItems);
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
+        if ($cursor === null) return ['ok' => true, 'items' => $items, 'complete' => true];
+        if ($pageItems === []) break;
+    }
+    return ['ok' => true, 'items' => $items, 'complete' => false];
 }
 
 // ---------------------------------------------------------------------------
@@ -4379,9 +4710,8 @@ function ap_bsky_hide_did_remove(int $ownerUserId, string $did, string $reason, 
 /** @return array<string,true> did => true */
 function ap_bsky_hide_did_set(int $ownerUserId): array
 {
-    static $cache = [];
-    if (isset($cache[$ownerUserId])) {
-        return $cache[$ownerUserId];
+    if (isset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId])) {
+        return $GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId];
     }
     $out = [];
     if ($ownerUserId < 1) {
@@ -4400,13 +4730,14 @@ function ap_bsky_hide_did_set(int $ownerUserId): array
     } catch (Throwable $e) {
         // empty
     }
-    $cache[$ownerUserId] = $out;
+    $GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId] = $out;
     return $out;
 }
 
 function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
 {
-    // static cache is per-request; no-op helper for future APCu
+    if ($ownerUserId === null) unset($GLOBALS['ap_bsky_hide_did_cache']);
+    else unset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId]);
 }
 
 /**

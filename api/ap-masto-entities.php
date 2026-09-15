@@ -8249,6 +8249,10 @@ function ap_masto_suggestions_v2(int $limit = 40): array
             $moderationRefs[] = ap_masto_suggestion_best_actor_id($actorId);
         }
         foreach (array_unique($moderationRefs) as $ref) {
+            if ($ownerUserId > 0 && function_exists('ap_lists_moderation_action_for_actor')
+                && ap_lists_moderation_action_for_actor($ref, $ownerUserId) !== 'none') {
+                return true;
+            }
             if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($ref)) {
                 return true;
             }

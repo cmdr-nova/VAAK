@@ -1449,7 +1449,8 @@ CREATE TABLE IF NOT EXISTS masto_bookmarks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status_id TEXT NOT NULL UNIQUE,
     object_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    source_mask INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_masto_bookmarks_created ON masto_bookmarks(created_at DESC);
 
@@ -1605,17 +1606,29 @@ CREATE TABLE masto_bookmarks (
     status_id TEXT NOT NULL,
     object_id TEXT,
     created_at TEXT NOT NULL,
+    source_mask INTEGER NOT NULL DEFAULT 1,
     UNIQUE(owner_user_id, status_id)
 );
 CREATE INDEX IF NOT EXISTS idx_masto_bookmarks_created ON masto_bookmarks(owner_user_id, created_at DESC);
 SQL);
         $db->prepare(
             'INSERT OR IGNORE INTO masto_bookmarks
-             (owner_user_id, owner_actor_id, status_id, object_id, created_at)
-             SELECT ?, ?, status_id, object_id, created_at FROM masto_bookmarks_legacy_f'
+             (owner_user_id, owner_actor_id, status_id, object_id, created_at, source_mask)
+             SELECT ?, ?, status_id, object_id, created_at, 1 FROM masto_bookmarks_legacy_f'
         )->execute([$cmdrUserId, $cmdrActorId]);
         $db->exec('DROP TABLE masto_bookmarks_legacy_f');
         $db->exec('COMMIT');
+    }
+
+    // A bookmark row can represent either network or both when the same post
+    // has been saved in both services. Existing rows are Fediverse-originated.
+    try {
+        $bmCols = array_column($db->query('PRAGMA table_info(masto_bookmarks)')->fetchAll(), 'name');
+        if ($bmCols && !in_array('source_mask', $bmCols, true)) {
+            $db->exec('ALTER TABLE masto_bookmarks ADD COLUMN source_mask INTEGER NOT NULL DEFAULT 1');
+        }
+    } catch (Throwable $e) {
+        // PostgreSQL production schemas are provisioned out-of-band.
     }
 
     $tagColsF = array_column($db->query('PRAGMA table_info(masto_followed_tags)')->fetchAll(), 'name');
@@ -1741,6 +1754,31 @@ SQL);
         $db->prepare('UPDATE masto_lists SET owner_user_id = ? WHERE owner_user_id = 1')
             ->execute([$cmdrUserId]);
         $db->exec('CREATE INDEX IF NOT EXISTS idx_masto_lists_owner_updated ON masto_lists(owner_user_id, updated_at DESC)');
+    }
+    try {
+        $listCols = array_column($db->query('PRAGMA table_info(masto_lists)')->fetchAll(), 'name');
+        foreach ([
+            'list_kind' => "TEXT NOT NULL DEFAULT 'curation'",
+            'bsky_list_uri' => 'TEXT',
+            'bsky_moderation_action' => "TEXT NOT NULL DEFAULT 'none'",
+            'bsky_mod_action_uri' => 'TEXT',
+            'bsky_list_source' => "TEXT NOT NULL DEFAULT 'vaak'",
+        ] as $col => $ddl) {
+            if ($listCols && !in_array($col, $listCols, true)) {
+                $db->exec('ALTER TABLE masto_lists ADD COLUMN ' . $col . ' ' . $ddl);
+            }
+        }
+        $accountCols = array_column($db->query('PRAGMA table_info(masto_list_accounts)')->fetchAll(), 'name');
+        foreach (['bsky_did' => 'TEXT', 'bsky_item_uri' => 'TEXT'] as $col => $ddl) {
+            if ($accountCols && !in_array($col, $accountCols, true)) {
+                $db->exec('ALTER TABLE masto_list_accounts ADD COLUMN ' . $col . ' ' . $ddl);
+            }
+        }
+        if ($listCols && in_array('bsky_list_uri', $listCols, true)) {
+            $db->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_masto_lists_owner_bsky_uri ON masto_lists(owner_user_id, bsky_list_uri) WHERE bsky_list_uri IS NOT NULL');
+        }
+    } catch (Throwable $e) {
+        // PostgreSQL production schemas are provisioned out-of-band.
     }
 
     $mediaCols = array_column($db->query('PRAGMA table_info(masto_media)')->fetchAll(), 'name');
@@ -1898,16 +1936,22 @@ CREATE TABLE IF NOT EXISTS masto_lists (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_user_id INTEGER NOT NULL,
     title TEXT NOT NULL,
+    list_kind TEXT NOT NULL DEFAULT 'curation',
+    bsky_list_uri TEXT,
+    bsky_moderation_action TEXT NOT NULL DEFAULT 'none',
+    bsky_mod_action_uri TEXT,
+    bsky_list_source TEXT NOT NULL DEFAULT 'vaak',
     replies_policy TEXT NOT NULL DEFAULT 'list',
     exclusive INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_masto_lists_updated ON masto_lists(updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS masto_list_accounts (
     list_id INTEGER NOT NULL,
     actor_id TEXT NOT NULL,
+    bsky_did TEXT,
+    bsky_item_uri TEXT,
     added_at TEXT NOT NULL,
     PRIMARY KEY (list_id, actor_id),
     FOREIGN KEY (list_id) REFERENCES masto_lists(id) ON DELETE CASCADE
@@ -7465,6 +7509,10 @@ function ap_row_is_hidden(?string $actorId, ?string $host = null, ?int $ownerUse
     if ($actorId !== null && $actorId !== '' && ap_is_muted_actor($actorId, $ownerUserId)) {
         return true;
     }
+    if ($actorId !== null && $actorId !== '' && function_exists('ap_lists_moderation_action_for_actor')
+        && ap_lists_moderation_action_for_actor($actorId, $ownerUserId) !== 'none') {
+        return true;
+    }
     return ap_user_is_blocked($actorId, $host, $ownerUserId);
 }
 
@@ -7481,7 +7529,9 @@ function ap_actor_is_content_blocked(?string $actorId, ?string $host = null, ?in
     if ($ownerUserId === null || $ownerUserId < 1) {
         return false;
     }
-    return ap_user_is_blocked($actorId, $host, $ownerUserId);
+    if (ap_user_is_blocked($actorId, $host, $ownerUserId)) return true;
+    return $actorId !== null && function_exists('ap_lists_moderation_action_for_actor')
+        && ap_lists_moderation_action_for_actor($actorId, $ownerUserId) === 'block';
 }
 
 /* ----------------- Muted words / phrases (per-user timeline filter) ----------------- */
@@ -8808,7 +8858,7 @@ function ap_masto_status_flags_prefetch(array $statusIds): void
             foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
                 $memo['fav'][(string) $hit] = true;
             }
-            $st = $db->prepare("SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND status_id IN ($ph)");
+            $st = $db->prepare("SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND (source_mask & 1) <> 0 AND status_id IN ($ph)");
             $st->execute($params);
             foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
                 $memo['bm'][(string) $hit] = true;
@@ -8859,7 +8909,7 @@ function ap_masto_status_is_bookmarked(string $statusId, ?int $ownerUserId = nul
     }
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     try {
-        $st = ap_db()->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?');
+        $st = ap_db()->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ? AND (source_mask & 1) <> 0');
         $st->execute([$ownerUserId, $statusId]);
         $hit = (bool) $st->fetchColumn();
         if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
@@ -8993,7 +9043,7 @@ function ap_masto_favourite_rows(int $limit = 40, ?string $maxId = null, ?int $o
     }
 }
 
-function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerUserId = null): void
+function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerUserId = null, string $platform = 'fedi'): void
 {
     if ($statusId === '') {
         return;
@@ -9008,21 +9058,33 @@ function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerU
         error_log('[ap-db] bookmark_add refused: owner actor unresolved');
         return;
     }
+    $mask = $platform === 'bsky' ? 2 : 1;
     ap_db()->prepare(
-        'INSERT INTO masto_bookmarks (owner_user_id, owner_actor_id, status_id, object_id, created_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(owner_user_id, status_id) DO NOTHING'
-    )->execute([$ownerUserId, $ownerActorId, $statusId, $objectId, gmdate('c')]);
+        'INSERT INTO masto_bookmarks (owner_user_id, owner_actor_id, status_id, object_id, created_at, source_mask)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(owner_user_id, status_id) DO UPDATE SET
+           source_mask = masto_bookmarks.source_mask | excluded.source_mask,
+           object_id = COALESCE(excluded.object_id, masto_bookmarks.object_id)'
+    )->execute([$ownerUserId, $ownerActorId, $statusId, $objectId, gmdate('c'), $mask]);
 }
 
-function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null): void
+function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null, string $platform = 'fedi'): void
 {
     if ($statusId === '') {
         return;
     }
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    ap_db()->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?')
+    $keepMask = $platform === 'bsky' ? 1 : 2;
+    $db = ap_db();
+    $db->prepare('UPDATE masto_bookmarks SET source_mask = source_mask & ? WHERE owner_user_id = ? AND status_id = ?')
+        ->execute([$keepMask, $ownerUserId, $statusId]);
+    $db->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ? AND source_mask = 0')
         ->execute([$ownerUserId, $statusId]);
+    $st = $db->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?');
+    $st->execute([$ownerUserId, $statusId]);
+    if ($st->fetchColumn()) {
+        return;
+    }
     // VAAK folder overlay — keep memberships from orphaning after any client unbookmarks
     if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
         vaak_bookmark_folders_on_unbookmark($statusId, $ownerUserId);
