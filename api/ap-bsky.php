@@ -4573,6 +4573,34 @@ function ap_bsky_actor_refresh_enqueue(int $ownerUserId, string $actorRef, bool 
     }
 }
 
+/** Queue connected-profile public counts without making profile HTML wait on XRPC. */
+function ap_bsky_profile_counts_enqueue(int $ownerUserId, string $handle): bool
+{
+    $handle = ltrim(trim($handle), '@');
+    if ($ownerUserId < 1 || $handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)
+        || str_ends_with(strtolower($handle), '.ap.brid.gy') || str_ends_with(strtolower($handle), '.brid.gy')
+        || !ap_bsky_actor_refresh_migrate()) return false;
+    $actorRef = '__vaak_profile_counts__:' . strtolower($handle);
+    $now = gmdate('c');
+    try {
+        $st = ap_db()->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+        $st->execute([$ownerUserId, $actorRef]);
+        $existing = $st->fetch();
+        if (is_array($existing)) {
+            $status = (string) ($existing['status'] ?? '');
+            $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
+            if (in_array($status, ['pending', 'processing'], true)
+                || ($status === 'succeeded' && $queuedAt > time() - 120)) return true;
+        }
+        $up = ap_db()->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
+        $up->execute([$ownerUserId, $actorRef, $now, $now]);
+        return true;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] profile counts enqueue failed');
+        return false;
+    }
+}
+
 /** @return array{claimed:int,succeeded:int,retried:int,failed:int} */
 function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
 {
@@ -4604,6 +4632,14 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         if ($claim->rowCount() !== 1) continue;
         $stats['claimed']++;
         try {
+            if (str_starts_with($actorRef, '__vaak_profile_counts__:')) {
+                $handle = substr($actorRef, strlen('__vaak_profile_counts__:'));
+                $result = ap_bsky_public_profile_counts($handle, 120, true);
+                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Bluesky profile counts refresh failed'));
+                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+                $stats['succeeded']++;
+                continue;
+            }
             if ($actorRef === '__vaak_sync__:lists') {
                 require_once __DIR__ . '/ap-lists.php';
                 $result = ap_lists_sync_bsky($owner, true);

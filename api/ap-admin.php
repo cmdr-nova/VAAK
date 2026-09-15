@@ -6610,7 +6610,10 @@ function admin_media_row_html(array $items, string $hint = ''): string
         }
         if (admin_media_is_video($url, $mt)) {
             $hasVideo = true;
-            $cells[] = '<video class="media-video" src="' . h($url) . '" controls loop playsinline preload="none"'
+            $isHls = (bool) preg_match('/\.m3u8(?:$|[?#])/i', $url)
+                || in_array(strtolower(trim((string) $mt)), ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true);
+            $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($url) . '"';
+            $cells[] = '<video class="media-video"' . $sourceAttr . ' controls loop playsinline preload="none"'
                 . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
@@ -7896,7 +7899,7 @@ function admin_global_domain_control(string $host): ?array
 }
 
 /** Permission-aware actor actions used by posts, profiles, and DMs. */
-function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = ''): string
+function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = '', string $extraMenuHtml = ''): string
 {
     $html = '';
     $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
@@ -7955,6 +7958,9 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
         $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">'
             . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
+    }
+    if ($extraMenuHtml !== '') {
+        $menu .= $extraMenuHtml;
     }
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
@@ -9847,19 +9853,19 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
           <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
           <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
           <button type="button" class="icon-btn bsky-action<?= $bookmarked ? ' on' : '' ?>" data-bsky-action="bookmark" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>" data-bm-picker="<?= $bookmarked ? '1' : '0' ?>" title="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bookmarked ? 'true' : 'false' ?>"><i class="ph<?= $bookmarked ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
-          <?php if ($context === 'bookmarks' && $bookmarked && $bmKeys['status_id'] !== ''): ?>
-            <details class="post-action-menu">
-              <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
-              <div class="post-action-menu__body">
-                <button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="bsky" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>">Add to folder</button>
-              </div>
-            </details>
-          <?php endif; ?>
         <?php endif; ?>
         <?php if (!$isHome && $fediId !== ''): ?>
           <a class="meta" href="<?= h($fediId) ?>" style="margin-left:.25rem">AP copy</a>
         <?php endif; ?>
-        <?= block_quick_actions($authorProfileUrl !== '' ? $authorProfileUrl : ('https://bsky.app/profile/' . rawurlencode($handle)), 'bsky.app', $composeView, (int) ($GLOBALS['vaak_owner_id'] ?? 0), false, $composeView, $openUrl) ?>
+        <?php
+          $bookmarkFolderMenuHtml = '';
+          if ($context === 'bookmarks' && $bookmarked && !empty($bmKeys['status_id'])) {
+              $bookmarkFolderMenuHtml = '<button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="bsky" data-status-id="'
+                  . h((string) $bmKeys['status_id']) . '" data-object-id="' . h((string) ($bmKeys['object_id'] ?? ''))
+                  . '">Add to folder</button>';
+          }
+        ?>
+        <?= block_quick_actions($authorProfileUrl !== '' ? $authorProfileUrl : ('https://bsky.app/profile/' . rawurlencode($handle)), 'bsky.app', $composeView, (int) ($GLOBALS['vaak_owner_id'] ?? 0), false, $composeView, $openUrl, $bookmarkFolderMenuHtml) ?>
       </div>
     </article>
     <?php
@@ -22986,6 +22992,66 @@ if (VIEW === 'support') loadSupport();
 if (VIEW === 'analytics') loadAnalytics();
 </script>
 <?php endif; ?>
+<script>
+// Load HLS playback only when a Bluesky stream video approaches the viewport.
+(function () {
+  const videos = Array.from(document.querySelectorAll('video[data-hls-src]'));
+  if (!videos.length) return;
+  let loader;
+  function loadHls() {
+    if (!loader) {
+      loader = new Promise((resolve, reject) => {
+        if (window.Hls) return resolve(window.Hls);
+        const script = document.createElement('script');
+        script.src = '/api/assets/hls-1.7.3.min.js';
+        script.async = true;
+        script.onload = () => resolve(window.Hls || null);
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+    }
+    return loader;
+  }
+  async function prepare(video) {
+    const src = video.dataset.hlsSrc;
+    if (!src || video.dataset.hlsReady === '1') return;
+    video.dataset.hlsReady = '1';
+    const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
+    // Prefer native HLS on Safari's ManagedMediaSource path. Some Chromium
+    // builds report weak native support despite being unable to play HLS.
+    if (nativeHls && ('ManagedMediaSource' in window || !('MediaSource' in window))) {
+      video.src = src;
+      return;
+    }
+    try {
+      const Hls = await loadHls();
+      if (Hls && Hls.isSupported()) {
+        const player = new Hls({ enableWorker: true, lowLatencyMode: false });
+        video.__vaakHlsPlayer = player;
+        player.loadSource(src);
+        player.attachMedia(video);
+      } else if (nativeHls) {
+        video.src = src;
+      }
+    } catch (_) {
+      // Leave the cached poster visible; the post's overflow menu still links
+      // to Bluesky for browsers that cannot play this stream.
+    }
+  }
+  if ('IntersectionObserver' in window) {
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (!entry.isIntersecting) return;
+        observer.unobserve(entry.target);
+        prepare(entry.target);
+      });
+    }, { rootMargin: '500px 0px' });
+    videos.forEach((video) => observer.observe(video));
+  } else {
+    videos.forEach(prepare);
+  }
+})();
+</script>
 <script>
 // Small, opt-in keyboard layer for fast timeline navigation (X-style, but
 // limited to familiar actions and disabled while typing in a form control).

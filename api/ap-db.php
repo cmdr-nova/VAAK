@@ -5955,7 +5955,7 @@ function ap_profile_bsky_handle(string $actorKey, array $profile = []): ?string
  *
  * @return array{ok:bool,followers:int,following:int,posts:int,handle?:string,error?:string}
  */
-function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
+function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $allowFetch = true): array
 {
     $handle = ltrim(trim($handle), '@');
     if ($handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)) {
@@ -5975,19 +5975,27 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
     $ttlSec = max(30, min(900, $ttlSec));
     if (is_file($cachePath)) {
         $age = time() - (int) @filemtime($cachePath);
-        if ($age >= 0 && $age < $ttlSec) {
-            $raw = @file_get_contents($cachePath);
-            $cached = is_string($raw) ? json_decode($raw, true) : null;
-            if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
-                return [
-                    'ok' => !empty($cached['ok']),
-                    'followers' => (int) $cached['followers'],
-                    'following' => (int) $cached['following'],
-                    'posts' => (int) ($cached['posts'] ?? 0),
-                    'handle' => (string) ($cached['handle'] ?? $handle),
-                ];
+        $raw = @file_get_contents($cachePath);
+        $cached = is_string($raw) ? json_decode($raw, true) : null;
+        if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
+            $cachedResult = [
+                'ok' => !empty($cached['ok']),
+                'followers' => (int) $cached['followers'],
+                'following' => (int) $cached['following'],
+                'posts' => (int) ($cached['posts'] ?? 0),
+                'handle' => (string) ($cached['handle'] ?? $handle),
+                'fresh' => $age >= 0 && $age < $ttlSec,
+            ];
+            if ($cachedResult['fresh'] || !$allowFetch) {
+                return $cachedResult;
             }
         }
+    } elseif (!$allowFetch) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'handle' => $handle, 'fresh' => false];
+    }
+
+    if (!$allowFetch) {
+        return $cachedResult ?? ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'handle' => $handle, 'fresh' => false];
     }
 
     $url = 'https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' . rawurlencode($handle);
@@ -6023,6 +6031,7 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
         'following' => max(0, (int) ($json['followsCount'] ?? 0)),
         'posts' => max(0, (int) ($json['postsCount'] ?? 0)),
         'handle' => (string) ($json['handle'] ?? $handle),
+        'fresh' => true,
     ];
     @file_put_contents($cachePath, json_encode($out, JSON_UNESCAPED_SLASHES), LOCK_EX);
     return $out;
@@ -6049,10 +6058,19 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
     $bskyFollowers = 0;
     $bskyFollowing = 0;
     if (is_string($handle) && $handle !== '') {
-        $remote = ap_bsky_public_profile_counts($handle);
+        // Never hold public HTML profile rendering on an AppView request. Serve
+        // a stale file-cache value, then let the durable worker refresh it.
+        $remote = ap_bsky_public_profile_counts($handle, 120, false);
         if (!empty($remote['ok'])) {
             $bskyFollowers = (int) $remote['followers'];
             $bskyFollowing = (int) $remote['following'];
+        }
+        if (empty($remote['fresh']) && function_exists('ap_profile_bsky_owner_id')
+            && function_exists('ap_bsky_profile_counts_enqueue')) {
+            $ownerUserId = ap_profile_bsky_owner_id($actorKey);
+            if ($ownerUserId > 0) {
+                ap_bsky_profile_counts_enqueue($ownerUserId, $handle);
+            }
         }
     }
     return [
@@ -6064,6 +6082,24 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
         'bsky_following' => $bskyFollowing,
         'bsky_handle' => $handle,
     ];
+}
+
+/** Site-account owner for its connected Bluesky session, if one exists. */
+function ap_profile_bsky_owner_id(string $actorKey): int
+{
+    $actorKey = strtolower(trim(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? ''));
+    if ($actorKey === '') return 0;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT s.owner_user_id FROM bsky_sessions s
+             INNER JOIN ap_users u ON u.id = s.owner_user_id
+             WHERE lower(u.actor_key) = ? OR lower(u.username) = ? LIMIT 1'
+        );
+        $st->execute([$actorKey, $actorKey]);
+        return max(0, (int) ($st->fetchColumn() ?: 0));
+    } catch (Throwable $e) {
+        return 0;
+    }
 }
 
 /**
