@@ -342,25 +342,3 @@ function vaak_bookmark_folders_for_status(string $statusId, int $ownerUserId): a
         return [];
     }
 }
-
-/** @param list<string> $statusIds @return array<string,true> */
-function vaak_bookmark_folder_member_status_map(array $statusIds, int $ownerUserId): array
-{
-    $statusIds = array_values(array_unique(array_filter(array_map('strval', $statusIds), static fn($id) => $id !== '')));
-    if ($ownerUserId < 1 || $statusIds === []) return [];
-    $statusIds = array_slice($statusIds, 0, 300);
-    vaak_bookmark_folders_ensure_schema();
-    try {
-        $marks = implode(',', array_fill(0, count($statusIds), '?'));
-        $st = ap_db()->prepare('SELECT DISTINCT status_id FROM vaak_bookmark_folder_items WHERE owner_user_id = ? AND status_id IN (' . $marks . ')');
-        $st->execute(array_merge([$ownerUserId], $statusIds));
-        $map = [];
-        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $statusId) {
-            $statusId = (string) $statusId;
-            if ($statusId !== '') $map[$statusId] = true;
-        }
-        return $map;
-    } catch (Throwable $e) {
-        return [];
-    }
-}

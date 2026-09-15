@@ -1769,7 +1769,8 @@ function ap_cmdr_html(): void
             echo '<p class="muted">' . htmlspecialchars($emptyMsg, ENT_QUOTES, 'UTF-8') . '</p>';
         } else {
             foreach ($postsData['rows'] as $n) {
-                echo ap_cmdr_post_preview_html($n);
+                // Public profile rendering must not wait on remote quote/reply fetches.
+                echo ap_cmdr_post_preview_html($n, false);
             }
             $totalPages = max(1, (int) ceil($tabTotal / $perPage));
             if ($totalPages > 1) {
@@ -2318,7 +2319,7 @@ function ap_cmdr_normalize_profile_tab(string $tab): string
 /**
  * Best-effort plain-text snippet for a remote/local object URL (reply/quote parent).
  */
-function ap_cmdr_object_snippet(string $objectUrl, int $maxLen = 140): string
+function ap_cmdr_object_snippet(string $objectUrl, int $maxLen = 140, bool $allowRemoteFetch = true): string
 {
     $objectUrl = rtrim(trim($objectUrl), '/');
     if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
@@ -2378,7 +2379,7 @@ function ap_cmdr_object_snippet(string $objectUrl, int $maxLen = 140): string
     }
 
     // Live fetch remote AS2 once (profile pages only have a handful of quotes)
-    if (!str_starts_with($objectUrl, 'https://mkultra.monster/')) {
+    if ($allowRemoteFetch && !str_starts_with($objectUrl, 'https://mkultra.monster/')) {
         try {
             if (!function_exists('ap_fetch_as2_object')) {
                 if (!defined('AP_INBOX_LIB_ONLY')) {
@@ -2429,7 +2430,7 @@ function ap_cmdr_short_url_label(string $url): string
     return $label !== '' ? $label : $url;
 }
 
-function ap_cmdr_post_preview_html(array $n): string
+function ap_cmdr_post_preview_html(array $n, bool $allowRemoteSnippets = true): string
 {
     $kind = (string) ($n['kind'] ?? 'compose');
     $isSite = ($kind === 'site_blog' || $kind === 'site_note');
@@ -2499,7 +2500,7 @@ function ap_cmdr_post_preview_html(array $n): string
     if ($isBoost) {
         $objectId = rtrim((string) ($n['object_id'] ?? $id), '/');
         $targetActor = rtrim((string) ($n['target_actor'] ?? ''), '/');
-        $snippet = $objectId !== '' ? ap_cmdr_object_snippet($objectId, 180) : '';
+        $snippet = $objectId !== '' ? ap_cmdr_object_snippet($objectId, 180, $allowRemoteSnippets) : '';
         $who = '';
         if ($targetActor !== '' && str_starts_with($targetActor, 'https://')) {
             if (function_exists('ap_cmdr_actor_handle_label')) {
@@ -2565,7 +2566,7 @@ function ap_cmdr_post_preview_html(array $n): string
     }
     $quoteHtml = '';
     if ($quoteUrl !== '') {
-        $qSnippet = ap_cmdr_object_snippet($quoteUrl, 160);
+        $qSnippet = ap_cmdr_object_snippet($quoteUrl, 160, $allowRemoteSnippets);
         // No nested <a> inside the outer .post link — browsers break the card layout
         $quoteHtml = '<div class="quote-block"><span class="qt-label">Quoted</span>';
         if ($qSnippet !== '') {
@@ -2585,7 +2586,7 @@ function ap_cmdr_post_preview_html(array $n): string
     }
     $replyHtml = '';
     if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
-        $rSnippet = ap_cmdr_object_snippet($replyTo, 100);
+        $rSnippet = ap_cmdr_object_snippet($replyTo, 100, $allowRemoteSnippets);
         $label = $rSnippet !== ''
             ? htmlspecialchars($rSnippet, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
             : htmlspecialchars(ap_cmdr_short_url_label($replyTo), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');

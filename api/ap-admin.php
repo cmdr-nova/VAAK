@@ -9650,6 +9650,9 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $liked = $likeRecord !== '';
     $reposted = $repostRecord !== '';
     $bookmarked = !empty($viewer['bookmarked']) || !empty($viewer['bookmark']);
+    // The Bookmarks view itself is authoritative even when an older cached
+    // AppView projection omitted viewer.bookmarked.
+    if ($context === 'bookmarks') $bookmarked = true;
     $reason = is_array($item['reason'] ?? null) ? $item['reason'] : null;
     $reasonLabel = '';
     $isRepost = false;
@@ -9857,18 +9860,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         <?php if (!$isHome && $fediId !== ''): ?>
           <a class="meta" href="<?= h($fediId) ?>" style="margin-left:.25rem">AP copy</a>
         <?php endif; ?>
-        <?php
-          $bookmarkFolderMenuHtml = '';
-          $bookmarkFolderMap = is_array($GLOBALS['vaak_bookmark_folder_status_map'] ?? null)
-              ? $GLOBALS['vaak_bookmark_folder_status_map'] : [];
-          if ($context === 'bookmarks' && $bookmarked && !empty($bmKeys['status_id'])
-              && empty($bookmarkFolderMap[(string) $bmKeys['status_id']])) {
-              $bookmarkFolderMenuHtml = '<button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="bsky" data-status-id="'
-                  . h((string) $bmKeys['status_id']) . '" data-object-id="' . h((string) ($bmKeys['object_id'] ?? ''))
-                  . '">Add to folder</button>';
-          }
-        ?>
-        <?= block_quick_actions($authorProfileUrl !== '' ? $authorProfileUrl : ('https://bsky.app/profile/' . rawurlencode($handle)), 'bsky.app', $composeView, (int) ($GLOBALS['vaak_owner_id'] ?? 0), false, $composeView, $openUrl, $bookmarkFolderMenuHtml) ?>
+        <?= block_quick_actions($authorProfileUrl !== '' ? $authorProfileUrl : ('https://bsky.app/profile/' . rawurlencode($handle)), 'bsky.app', $composeView, (int) ($GLOBALS['vaak_owner_id'] ?? 0), false, $composeView, $openUrl) ?>
       </div>
     </article>
     <?php
@@ -13584,14 +13576,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $bmList = array_slice($bmList, 0, $bookmarkLimit);
               $bskyBookmarkItems = array_slice($bskyBookmarkItems, 0, $bookmarkLimit);
           }
-          $bookmarkStatusIds = array_values(array_filter(array_map(
-              static fn($st) => (string) ($st['id'] ?? ''),
-              $bmList
-          )));
-          $bookmarkStatusIds = array_merge($bookmarkStatusIds, array_keys($bskyBookmarkKeys));
-          $GLOBALS['vaak_bookmark_folder_status_map'] = function_exists('vaak_bookmark_folder_member_status_map')
-              ? vaak_bookmark_folder_member_status_map($bookmarkStatusIds, $vaakOwnerId)
-              : [];
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
@@ -13639,9 +13623,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $sid = (string) ($st['id'] ?? '');
               $oid = (string) ($st['uri'] ?? '');
               $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
-              $bmFolderMap = is_array($GLOBALS['vaak_bookmark_folder_status_map'] ?? null)
-                  ? $GLOBALS['vaak_bookmark_folder_status_map'] : [];
-              $bmFolderIds = !empty($bmFolderMap[$sid]) ? [1] : [];
             ?>
             <article class="tweet">
               <div class="tweet-hd">
@@ -13680,14 +13661,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <input type="hidden" name="object_id" value="<?= h($oid) ?>">
                     <button class="icon-btn on" type="submit" title="Bookmark folders" aria-label="Bookmark folders" data-bm-picker="1"><i class="ph-fill ph-bookmark-simple" aria-hidden="true"></i></button>
                   </form>
-                  <?php if ($bmFolderIds === []): ?>
-                    <details class="post-action-menu">
-                      <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
-                      <div class="post-action-menu__body">
-                        <button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="fedi" data-status-id="<?= h($sid) ?>" data-object-id="<?= h($oid) ?>">Add to folder</button>
-                      </div>
-                    </details>
-                  <?php endif; ?>
                 <?php endif; ?>
               </div>
             </article>
@@ -19258,7 +19231,6 @@ window.apAdminToast = function (msg, isErr) {
     const bookmarkPlatform = opts && opts.platform
       ? opts.platform
       : (anchorBtn.closest('.tweet-bsky') ? 'bsky' : 'fedi');
-    const isFolderAction = anchorBtn.matches('[data-bm-folder-open="1"]');
     closeFolderPopover();
     const rect = anchorBtn.getBoundingClientRect();
     const pop = document.createElement('div');
@@ -19286,7 +19258,6 @@ window.apAdminToast = function (msg, isErr) {
     if (!folderPopover) return;
     positionFolderPopover(pop, anchorBtn);
     const selected = new Set((selectedIds || (data && data.selected) || []).map(String));
-    if (isFolderAction) anchorBtn.hidden = selected.size > 0;
     const folders = (data && data.folders) || [];
     let html = '<h4>Save to folder</h4>';
     html += '<div class="meta" style="margin-bottom:.35rem">Stays in All bookmarks either way.</div>';
@@ -19325,7 +19296,6 @@ window.apAdminToast = function (msg, isErr) {
       } else {
         if (input.checked) selected.add(String(fid));
         else selected.delete(String(fid));
-        if (isFolderAction) anchorBtn.hidden = selected.size > 0;
       }
     });
 
@@ -19349,7 +19319,6 @@ window.apAdminToast = function (msg, isErr) {
               return;
             }
             selected.add(String(created.id));
-            if (isFolderAction) anchorBtn.hidden = true;
             window.apAdminToast('Saved to “' + name + '”.');
           } else {
             window.apAdminToast((created && created.error) || 'Could not create folder.', true);
@@ -19384,24 +19353,6 @@ window.apAdminToast = function (msg, isErr) {
   });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closeFolderPopover();
-  });
-
-  document.addEventListener('click', (ev) => {
-    const btn = ev.target && ev.target.closest
-      ? ev.target.closest('[data-bm-folder-open="1"]')
-      : null;
-    if (!btn) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    const statusId = btn.getAttribute('data-status-id') || '';
-    if (!statusId || typeof window.novaOpenBookmarkFolderPicker !== 'function') return;
-    window.novaOpenBookmarkFolderPicker(
-      btn,
-      statusId,
-      btn.getAttribute('data-object-id') || '',
-      null,
-      { hideRemove: true, platform: btn.getAttribute('data-bm-platform') || 'fedi' }
-    );
   });
 
   function applyInteractButton(form, data) {
@@ -20125,6 +20076,15 @@ window.apAdminToast = function (msg, isErr) {
       if (data && data.object_id) btn.dataset.objectId = String(data.object_id);
     }
 
+    function removeBskyBookmarkCardIfNeeded(btn) {
+      if (!(window.location.search || '').includes('view=bookmarks')) return;
+      const card = btn.closest('article.tweet');
+      if (!card) return;
+      card.style.transition = 'opacity .2s ease';
+      card.style.opacity = '0';
+      setTimeout(() => card.remove(), 220);
+    }
+
     function snapshotBskyButton(btn) {
       return {
         html: btn.innerHTML,
@@ -20182,6 +20142,7 @@ window.apAdminToast = function (msg, isErr) {
               try {
                 const data = await postBskyAction(btn, 'bsky_unbookmark', before);
                 applyBskyBookmarkUi(btn, false, data);
+                removeBskyBookmarkCardIfNeeded(btn);
                 if (window.vaakHaptic) window.vaakHaptic(6);
               } catch (e) {
                 restoreBskyButton(btn, before);
@@ -20252,6 +20213,7 @@ window.apAdminToast = function (msg, isErr) {
                   try {
                     const removed = await postBskyAction(btn, 'bsky_unbookmark');
                     applyBskyBookmarkUi(btn, false, removed);
+                    removeBskyBookmarkCardIfNeeded(btn);
                   } catch (e) {
                     if (typeof window.apAdminToast === 'function') {
                       window.apAdminToast((e && e.message) || 'Unbookmark failed', true);
