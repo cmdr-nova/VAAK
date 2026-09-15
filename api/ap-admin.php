@@ -1012,22 +1012,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $localId = 0;
             }
         }
-    } elseif ($action === 'delete_status') {
-        $localId = (int) ($_POST['local_id'] ?? 0);
-        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'outbox')) ?: 'outbox';
-        if (!defined('AP_INBOX_LIB_ONLY')) {
-            define('AP_INBOX_LIB_ONLY', true);
-        }
-        require_once __DIR__ . '/ap-inbox.php';
-        $result = function_exists('ap_delete_local_status') ? ap_delete_local_status($localId) : ['ok' => false, 'error' => 'Delete unavailable'];
-        if (!empty($result['ok'])) {
-            admin_tl_cache_clear();
-            $notice = 'Post deleted and federated.';
-            $view = $returnView;
-        } else {
-            $error = $result['error'] ?? 'Delete failed.';
-            $view = $returnView;
-        }
         if ($localId <= 0) {
             $error = 'Could not find that local post to edit.';
             $composerForceOpen = true;
@@ -1095,6 +1079,22 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'return_view' => $returnView,
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             exit;
+        }
+    } elseif ($action === 'delete_status') {
+        $localId = (int) ($_POST['local_id'] ?? 0);
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'outbox')) ?: 'outbox';
+        if (!defined('AP_INBOX_LIB_ONLY')) {
+            define('AP_INBOX_LIB_ONLY', true);
+        }
+        require_once __DIR__ . '/ap-inbox.php';
+        $result = function_exists('ap_delete_local_status') ? ap_delete_local_status($localId) : ['ok' => false, 'error' => 'Delete unavailable'];
+        if (!empty($result['ok'])) {
+            admin_tl_cache_clear();
+            $notice = 'Post deleted and federated.';
+            $view = $returnView;
+        } else {
+            $error = $result['error'] ?? 'Delete failed.';
+            $view = $returnView;
         }
     } elseif ($action === 'queue_post') {
         $inReplyTo = trim((string) ($_POST['in_reply_to'] ?? ''));
@@ -12113,6 +12113,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
+    .remote-profile-feed > article.tweet,
+    .remote-profile-feed > .remote-profile-posts > article.tweet {
+      background: transparent; border: 0; border-bottom: 1px solid var(--border);
+      border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
+    }
+    .remote-profile-feed > article.tweet:hover,
+    .remote-profile-feed > .remote-profile-posts > article.tweet:hover { background: transparent; }
+    .remote-profile-tabs { display:flex; gap:.35rem; flex-wrap:wrap; margin:1.2rem 0 .5rem; border-bottom:1px solid var(--border); }
+    .remote-profile-tabs a { color:var(--muted); text-decoration:none; padding:.65rem .8rem; border-bottom:2px solid transparent; }
+    .remote-profile-tabs a.is-active { color:var(--text); border-color:var(--primary); }
+    .remote-profile-tabs .tab-count { opacity:.7; font-size:.8em; margin-left:.3rem; }
     /* Focused status threads use the same flat card treatment as timelines. */
     #status-thread-ancestors > article.tweet,
     #status-thread-descendants > article.tweet,
@@ -13000,7 +13011,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       }());
     </script>
 
-    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions'], true) ? ' timeline-feed' : '' ?>">
+    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions'], true) ? ' timeline-feed' : '' ?><?= $view === 'remote_profile' ? ' remote-profile-feed' : '' ?>">
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <div class="compose-inline-slot" id="compose-inline-slot" aria-label="Loading composer">
           <div class="compose-inline-skeleton" aria-hidden="true"></div>
@@ -17029,9 +17040,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               // Bluesky profile: hydrate via AT Protocol (never AP actor fetch / WebFinger).
               if ($rpIsBsky && !$rpIsLocal && function_exists('ap_bsky_get_profile')
                   && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId))) {
-                  $bskyProf = ap_bsky_get_profile($vaakOwnerId, $rpActor);
-                  if (!empty($bskyProf['ok']) && is_array($bskyProf['profile'] ?? null)) {
-                      $bp = $bskyProf['profile'];
+                  $rpBskyRequestedRef = $rpActor;
+                  $cachedBsky = function_exists('ap_bsky_actor_profile_cache_get')
+                      ? ap_bsky_actor_profile_cache_get($rpBskyRequestedRef, $vaakOwnerId)
+                      : null;
+                  if (function_exists('ap_bsky_actor_refresh_enqueue')) {
+                      ap_bsky_actor_refresh_enqueue($vaakOwnerId, $rpBskyRequestedRef, $rpForceRefresh);
+                  }
+                  $bp = is_array($cachedBsky['profile'] ?? null) ? $cachedBsky['profile'] : [];
+                  if ($bp !== []) {
                       $rpBskyDid = (string) ($bp['did'] ?? '');
                       $rpBskyHandle = (string) ($bp['handle'] ?? '');
                       $rpActor = $rpBskyDid !== ''
@@ -17053,53 +17070,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           'icon_source_url' => $rpAvatar,
                           'image_source_url' => $rpHeader,
                       ];
-                      $viewer = is_array($bp['viewer'] ?? null) ? $bp['viewer'] : [];
+                      $viewer = is_array($cachedBsky['viewer'] ?? null) ? $cachedBsky['viewer'] : [];
                       $rpBskyFollowing = !empty($viewer['following']);
                       $rpBskyFollowsYou = !empty($viewer['followedBy']);
-                      if ($rpBskyFollowing && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_upsert')) {
-                          ap_bsky_graph_sync_upsert(
-                              $vaakOwnerId,
-                              'follow',
-                              $rpBskyDid,
-                              is_string($viewer['following'] ?? null) ? (string) $viewer['following'] : null,
-                              'pull'
-                          );
+                      if (!$rpBskyFollowing && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
+                          $rpBskyFollowing = is_array(ap_bsky_graph_sync_get($vaakOwnerId, 'follow', $rpBskyDid));
                       }
-                      // Prefer durable cache; fill-through via XRPC when thin/stale.
-                      if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
-                          $rpBskyPosts = ap_bsky_posts_for_author($rpBskyDid, 20);
-                      }
-                      $needAuthorFetch = $rpForceRefresh || count($rpBskyPosts) < 5;
-                      if ($needAuthorFetch && $rpBskyDid !== '') {
-                          $tok = ap_bsky_access_token($vaakOwnerId, false);
-                          if (empty($tok['ok'])) {
-                              $tok = ap_bsky_access_token($vaakOwnerId, true);
-                          }
-                          if (!empty($tok['ok'])) {
-                              $sess = ap_bsky_session_row($vaakOwnerId);
-                              $hosts = ap_bsky_feed_hosts(rtrim((string) ($sess['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'));
-                              foreach ($hosts as $host) {
-                                  $af = ap_bsky_xrpc(
-                                      $host,
-                                      'app.bsky.feed.getAuthorFeed',
-                                      'GET',
-                                      ['actor' => $rpBskyDid, 'limit' => 20],
-                                      null,
-                                      (string) $tok['access'],
-                                      12
-                                  );
-                                  if (!empty($af['ok']) && is_array($af['json']['feed'] ?? null)) {
-                                      $rpBskyPosts = $af['json']['feed'];
-                                      if (function_exists('ap_bsky_index_feed_items')) {
-                                          ap_bsky_index_feed_items($rpBskyPosts, $vaakOwnerId, 20);
-                                      }
-                                      break;
-                                  }
-                              }
-                          }
-                      }
-                  } else {
-                      $rpError = 'Could not load Bluesky profile: ' . (string) ($bskyProf['error'] ?? 'unknown error');
+                  }
+                  if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
+                      $rpBskyPosts = ap_bsky_posts_for_author($rpBskyDid, 40);
                   }
               } elseif ($rpIsBsky && !$rpIsLocal) {
                   $rpError = 'Connect a Bluesky account in ATmosphere settings to view and follow Bluesky profiles here.';
@@ -17155,12 +17134,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       $bind = [$rpActor, $rpActor . '/'];
                       $postsSql = "SELECT * FROM events WHERE type IN ('Create','Announce') AND ("
                            . implode(' OR ', $ors) . ")
-                           AND (
+                           AND (type = 'Announce' OR
                              (summary IS NOT NULL AND summary != '')
                              OR (media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]')
                              OR (spoiler_text IS NOT NULL AND spoiler_text != '')
-                             OR (sensitive IS NOT NULL AND sensitive != 0)
-                           )
+                             OR (sensitive IS NOT NULL AND sensitive != 0))
                            ORDER BY created_at DESC, id DESC LIMIT 30";
                       if (function_exists('ap_db_execute_retry')) {
                           $st = ap_db_execute_retry($postsSql, $bind);
@@ -17173,14 +17151,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   }
               } elseif (!$rpIsBsky) {
                   $rpMeta = $rpActor !== '' ? ap_remote_actor_get($rpActor) : null;
-                  // Cache-first: only sync-fetch AS2 on miss, snowflake placeholder, or Refresh.
+                  // Cache-first: regular profile views never wait on the remote
+                  // server. The warmer refreshes missing/stale actor metadata in
+                  // the background; explicit Refresh remains an immediate fetch.
                   $rpUserCached = is_array($rpMeta) ? trim((string) ($rpMeta['username'] ?? '')) : '';
                   $rpUserPlaceholder = $rpUserCached === ''
                       || (function_exists('ap_remote_actor_username_is_placeholder')
                           && ap_remote_actor_username_is_placeholder($rpUserCached));
-                  $rpNeedFetch = $rpActor !== ''
-                      && function_exists('ap_fetch_as2_object')
-                      && ($rpForceRefresh || !is_array($rpMeta) || $rpUserPlaceholder);
+                  $rpMetaUpdated = is_array($rpMeta) ? (strtotime((string) ($rpMeta['updated_at'] ?? '')) ?: 0) : 0;
+                  $rpNeedsWarm = $rpActor !== '' && (!$rpMeta || $rpUserPlaceholder || $rpMetaUpdated < time() - 12 * 3600);
+                  $rpNeedFetch = $rpForceRefresh && $rpNeedsWarm && function_exists('ap_fetch_as2_object');
+                  if ($rpNeedsWarm && !$rpForceRefresh && function_exists('ap_remote_actor_warm_async')) {
+                      ap_remote_actor_warm_async($rpActor);
+                  }
                   if ($rpNeedFetch) {
                       $rpDoc = ap_fetch_as2_object($rpActor);
                       if (is_array($rpDoc)) {
@@ -17304,7 +17287,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       $rpHost = parse_url($rpActor, PHP_URL_HOST);
                       $rpPath = trim((string) (parse_url($rpActor, PHP_URL_PATH) ?? ''), '/');
                       if (is_string($rpHost) && ($rpPath === '' || $rpPath === $rpHost || $rpPath === 'actor')) {
-                          $hostSql = "SELECT * FROM events WHERE type = 'Create' AND actor_id LIKE ? AND summary IS NOT NULL AND summary != ''
+                          $hostSql = "SELECT * FROM events WHERE type IN ('Create','Announce') AND actor_id LIKE ? AND (type = 'Announce' OR summary IS NOT NULL AND summary != '' OR media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]')
                                ORDER BY id DESC LIMIT 30";
                           $like = ['https://' . strtolower($rpHost) . '/%'];
                           if (function_exists('ap_db_execute_retry')) {
@@ -17318,11 +17301,63 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       }
                   }
               }
+              if ($rpIsLocal && $rpOutboxPosts && $rpActor !== '') {
+                  // The local outbox stores authored Notes; boost activities live
+                  // in the event ledger, so include them in the profile Boosts tab.
+                  try {
+                      $boostSt = ap_db()->prepare("SELECT * FROM events WHERE type = 'Announce' AND (actor_id = ? OR actor_id = ?) ORDER BY created_at DESC, id DESC LIMIT 30");
+                      $boostSt->execute([$rpActor, $rpActor . '/']);
+                      $rpPosts = $boostSt->fetchAll() ?: [];
+                  } catch (Throwable $e) {
+                      $rpPosts = [];
+                  }
+              }
               $rpFollowing = $rpActor !== '' && admin_is_following($followingIds, $rpActor);
           } catch (Throwable $e) {
               error_log('[ap-admin] remote_profile: ' . $e->getMessage());
               $rpError = $e->getMessage();
           }
+          $rpTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
+          if (!in_array($rpTab, ['posts', 'replies', 'boosts', 'media'], true)) $rpTab = 'posts';
+          $rpTabItems = ['posts' => [], 'replies' => [], 'boosts' => [], 'media' => []];
+          if ($rpIsBsky) {
+              foreach ($rpBskyPosts as $item) {
+                  if (!is_array($item)) continue;
+                  $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+                  $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+                  $embed = is_array($post['embed'] ?? null) ? $post['embed'] : [];
+                  $reason = is_array($item['reason'] ?? null) ? $item['reason'] : [];
+                  if (!empty($reason['$type']) && str_ends_with((string) $reason['$type'], '.reasonRepost')) {
+                      $rpTabItems['boosts'][] = $item;
+                      continue;
+                  }
+                  if (!empty($record['reply'])) $rpTabItems['replies'][] = $item;
+                  else $rpTabItems['posts'][] = $item; // Quote posts remain Posts, not Boosts.
+                  $embedType = (string) ($embed['$type'] ?? '');
+                  if (str_contains($embedType, 'images') || str_contains($embedType, 'video')
+                      || str_contains($embedType, 'recordWithMedia')) $rpTabItems['media'][] = $item;
+              }
+          } elseif ($rpOutboxPosts) {
+              foreach ($rpOutboxPosts as $item) {
+                  $create = json_decode((string) ($item['raw_create_json'] ?? ''), true);
+                  $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
+                  if (!empty($obj['inReplyTo'])) $rpTabItems['replies'][] = $item;
+                  else $rpTabItems['posts'][] = $item;
+                  if (!empty($obj['attachment']) || !empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
+              }
+              foreach ($rpPosts as $boostItem) {
+                  if (strtolower((string) ($boostItem['type'] ?? '')) === 'announce') $rpTabItems['boosts'][] = $boostItem;
+              }
+          } else {
+              foreach ($rpPosts as $item) {
+                  $type = strtolower((string) ($item['type'] ?? 'create'));
+                  if ($type === 'announce') $rpTabItems['boosts'][] = $item;
+                  elseif (!empty($item['in_reply_to']) || !empty($item['in_reply_to_id'])) $rpTabItems['replies'][] = $item;
+                  else $rpTabItems['posts'][] = $item;
+                  if (!empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
+              }
+          }
+          $rpTabHref = '?view=remote_profile&actor=' . rawurlencode($rpActor) . '&from=' . rawurlencode($rpFrom) . '&tab=';
         ?>
         <?php if ($rpError): ?>
           <div class="empty" style="color:var(--danger)">Couldn’t load this profile (database busy). Retry shortly.</div>
@@ -17340,7 +17375,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php if ($rpIsLocal): ?>
               <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" title="Reload local profile">↻ Refresh</a>
             <?php else: ?>
-              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>&amp;refresh=1" title="Re-fetch profile from remote">↻ Refresh profile</a>
+              <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>&amp;refresh=1" title="Queue a background profile and post refresh">↻ Refresh profile</a>
             <?php endif; ?>
           </div>
           <?php
@@ -17350,6 +17385,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     : ($rpBskyFollowsYou ? 'follows_you' : 'none'))
                 : admin_rel_state($followingIds, $followerIds, $rpActor);
             $rpFollowing = $rpRel === 'mutual' || $rpRel === 'following';
+            $rpFollowsYou = $rpIsBsky
+                ? $rpBskyFollowsYou
+                : ($rpRel === 'mutual' || $rpRel === 'follows_you');
             $rpOwnerId = admin_owner_user_id();
             $rpMuted = !$rpIsBsky && function_exists('ap_is_muted_actor') && ap_is_muted_actor($rpActor, $rpOwnerId);
             $rpBlockedPersonal = !$rpIsBsky && function_exists('ap_user_is_blocked')
@@ -17429,12 +17467,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php elseif ($rpIsLocal): ?>
               <div class="meta" style="margin-top:.75rem">No bio set.</div>
             <?php else: ?>
-              <div class="meta" style="margin-top:.75rem">No bio available from this instance’s cache / remote fetch.</div>
+              <div class="meta" style="margin-top:.75rem">No bio is cached yet; profile details are being refreshed in the background.</div>
             <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
               <?php if ($rpRel !== 'none'): ?>
-                <?= admin_rel_badge($rpRel) ?>
+                <span id="remote-profile-rel-state" data-following="<?= $rpFollowing ? '1' : '0' ?>" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>"><?= admin_rel_badge($rpRel) ?></span>
               <?php else: ?>
                 <span class="meta">not following</span>
               <?php endif; ?>
@@ -17509,25 +17547,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php endif; ?>
             </div>
           </article>
-          <h2 style="font-size:1rem;margin:1.25rem 0 .5rem"><?= $rpIsBsky ? 'Recent Bluesky posts' : ($rpIsLocal ? 'Recent posts' : 'Recent posts we’ve seen on this instance') ?></h2>
+          <nav class="remote-profile-tabs" aria-label="Profile posts">
+            <?php foreach (['posts' => 'Posts', 'replies' => 'Replies', 'boosts' => 'Boosts', 'media' => 'Media'] as $tabKey => $tabLabel): ?>
+              <a href="<?= h($rpTabHref . rawurlencode($tabKey)) ?>" class="<?= $rpTab === $tabKey ? 'is-active' : '' ?>" <?= $rpTab === $tabKey ? 'aria-current="page"' : '' ?>><?= h($tabLabel) ?><span class="tab-count"><?= count($rpTabItems[$tabKey]) ?></span></a>
+            <?php endforeach; ?>
+          </nav>
+          <div class="remote-profile-posts">
           <?php if ($rpIsBsky): ?>
-            <?php if ($rpBskyPosts === []): ?>
-              <div class="empty">No posts loaded from Bluesky yet.</div>
+            <?php if ($rpTabItems[$rpTab] === []): ?>
+              <div class="empty">No <?= h($rpTab) ?> loaded from Bluesky yet.</div>
             <?php else: ?>
-              <?php foreach ($rpBskyPosts as $bItem): ?>
-                <?php if (is_array($bItem)) {
-                    admin_render_bsky_feed_item($bItem, 'following');
-                } ?>
+              <?php foreach ($rpTabItems[$rpTab] as $bItem): ?>
+                <?php if (is_array($bItem)) admin_render_bsky_feed_item($bItem, 'following'); ?>
               <?php endforeach; ?>
             <?php endif; ?>
-          <?php elseif ($rpOutboxPosts): ?>
-            <?php foreach ($rpOutboxPosts as $n): ?>
+          <?php elseif ($rpOutboxPosts && $rpTab !== 'boosts'): ?>
+            <?php if ($rpTabItems[$rpTab] === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
+            <?php foreach ($rpTabItems[$rpTab] as $n): ?>
               <?php admin_render_outbox_card($n, 'remote_profile'); ?>
             <?php endforeach; ?>
-          <?php elseif (!$rpPosts): ?>
-            <div class="empty"><?= $rpIsLocal ? 'No local outbox posts yet.' : 'No Create/Announce activity from this actor in the local firehose yet.' ?></div>
+          <?php elseif ($rpTabItems[$rpTab] === []): ?>
+            <div class="empty">No <?= h($rpTab) ?> available<?= $rpIsLocal ? ' in the local outbox' : ' in the activity seen by this instance' ?>.</div>
           <?php else: ?>
-            <?php foreach ($rpPosts as $p): ?>
+            <?php foreach ($rpTabItems[$rpTab] as $p): ?>
               <?php
                 $pSum = (string) ($p['summary'] ?? '');
                 if (function_exists('ap_plain_unglue_mentions')) {
@@ -17550,6 +17592,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </article>
             <?php endforeach; ?>
           <?php endif; ?>
+          </div>
           <?php endif; /* !rpContentBlocked */ ?>
         <?php endif; ?>
 
@@ -22449,8 +22492,9 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (window.apAdminToast) window.apAdminToast('Upload or network error — try again.', true);
       else alert('Upload or network error — try again.');
     } finally {
-      composeMode = 'reply';
-      if (actionField) actionField.value = 'reply';
+      // Do not reset composeMode here: failures leave the modal open so the
+      // user can retry. Resetting to reply made a failed edit retry publish a
+      // brand-new post. Successful submissions reset via resetComposeChrome().
       form.dataset.busy = '0';
       if (submitBtn) submitBtn.disabled = false;
       if (queueBtn) queueBtn.disabled = false;
@@ -22642,8 +22686,17 @@ if (VIEW === 'analytics') loadAnalytics();
       return;
     }
     const before = { action: actionInput.value, label: button.innerHTML, title: button.title };
-    const want = actionInput.value === 'follow_remote';
-    form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
+      const want = actionInput.value === 'follow_remote';
+      form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
+      const relState = document.getElementById('remote-profile-rel-state');
+      const relBefore = relState ? { html: relState.innerHTML, following: relState.dataset.following } : null;
+      if (relState) {
+        const followedBy = relState.dataset.followedBy === '1';
+        relState.dataset.following = want ? '1' : '0';
+        relState.innerHTML = want
+          ? '<span class="tag" title="You follow them">' + (followedBy ? 'mutual' : 'following') + '</span>'
+          : (followedBy ? '<span class="tag" title="They follow you">follows you</span>' : '');
+      }
     const fd = new FormData(form); fd.set('ajax', '1');
     if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
     try {
@@ -22665,6 +22718,7 @@ if (VIEW === 'analytics') loadAnalytics();
             if (q.status === 'succeeded') { if (Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) { delete form.dataset.queuePending; if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form); } return; }
             if (q.status === 'failed' && Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) {
               if (form.isConnected) { actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title; }
+              if (relState && relBefore) { relState.innerHTML = relBefore.html; relState.dataset.following = relBefore.following; }
               delete form.dataset.queuePending;
               if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form);
               window.apAdminToast(q.last_error || 'Follow action failed after retrying.', true); return;
@@ -22674,6 +22728,7 @@ if (VIEW === 'analytics') loadAnalytics();
       })();
     } catch (e) {
       actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title;
+      if (relState && relBefore) { relState.innerHTML = relBefore.html; relState.dataset.following = relBefore.following; }
       window.apAdminToast((e && e.message) || 'Follow action failed.', true);
     } finally { form.dataset.queueBusy = '0'; button.disabled = false; }
   });

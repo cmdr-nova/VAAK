@@ -3699,6 +3699,226 @@ function ap_bsky_get_profile(int $ownerUserId, string $actor): array
     return ['ok' => false, 'error' => $lastErr];
 }
 
+/** Persistent, owner-independent public profile cache plus owner-specific viewer state. */
+function ap_bsky_actor_refresh_migrate(?PDO $db = null): bool
+{
+    static $readyByConnection = [];
+    $db ??= ap_db();
+    $key = spl_object_id($db);
+    if (isset($readyByConnection[$key])) return $readyByConnection[$key];
+    try {
+        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_actor_profiles', 'bsky_actor_viewers', 'bsky_actor_refresh_queue')");
+            $names = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+            $ready = isset($names['bsky_actor_profiles'], $names['bsky_actor_viewers'], $names['bsky_actor_refresh_queue']);
+            if (!$ready) error_log('[ap-bsky] actor refresh tables require owner provisioning; runtime role did not attempt DDL');
+            return $readyByConnection[$key] = $ready;
+        }
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_actor_profiles (
+    actor_ref TEXT PRIMARY KEY,
+    did TEXT,
+    profile_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_actor_viewers (
+    owner_user_id INTEGER NOT NULL,
+    actor_ref TEXT NOT NULL,
+    following_uri TEXT,
+    followed_by INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, actor_ref)
+)
+SQL);
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_actor_refresh_queue (
+    owner_user_id INTEGER NOT NULL,
+    actor_ref TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    queued_at TEXT NOT NULL,
+    next_attempt_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    locked_at TEXT,
+    last_error TEXT,
+    PRIMARY KEY (owner_user_id, actor_ref)
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_actor_refresh_ready ON bsky_actor_refresh_queue (status, next_attempt_at, queued_at)');
+        return $readyByConnection[$key] = true;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] actor refresh schema: ' . $e->getMessage());
+        return $readyByConnection[$key] = false;
+    }
+}
+
+/** @return array{profile:array<string,mixed>,did:?string,updated_at:string,viewer?:array<string,mixed>}|null */
+function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0, ?PDO $db = null): ?array
+{
+    $db ??= ap_db();
+    if (!ap_bsky_actor_refresh_migrate($db)) return null;
+    $actorRef = trim($actorRef);
+    if ($actorRef === '') return null;
+    try {
+        $st = $db->prepare('SELECT * FROM bsky_actor_profiles WHERE actor_ref = ? LIMIT 1');
+        $st->execute([$actorRef]);
+        $row = $st->fetch();
+        if (!is_array($row)) return null;
+        $profile = json_decode((string) ($row['profile_json'] ?? ''), true);
+        if (!is_array($profile)) return null;
+        $out = ['profile' => $profile, 'did' => (string) ($row['did'] ?? ''), 'updated_at' => (string) ($row['updated_at'] ?? '')];
+        if ($ownerUserId > 0) {
+            $vs = $db->prepare('SELECT following_uri, followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+            $vs->execute([$ownerUserId, $actorRef]);
+            $viewer = $vs->fetch();
+            if (is_array($viewer)) {
+                $out['viewer'] = [
+                    'following' => (string) ($viewer['following_uri'] ?? ''),
+                    'followedBy' => !empty($viewer['followed_by']),
+                ];
+            }
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, array $profile, ?PDO $db = null): void
+{
+    $db ??= ap_db();
+    if (!ap_bsky_actor_refresh_migrate($db)) return;
+    $actorRef = trim($actorRef);
+    if ($actorRef === '' || $ownerUserId < 1) return;
+    $viewer = is_array($profile['viewer'] ?? null) ? $profile['viewer'] : [];
+    $did = trim((string) ($profile['did'] ?? ''));
+    unset($profile['viewer']); // relationship state is scoped to the VAAK owner below.
+    $json = json_encode($profile, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($json)) return;
+    $now = gmdate('c');
+    try {
+        $st = $db->prepare('INSERT INTO bsky_actor_profiles (actor_ref, did, profile_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (actor_ref) DO UPDATE SET did = excluded.did, profile_json = excluded.profile_json, updated_at = excluded.updated_at');
+        $st->execute([$actorRef, $did !== '' ? $did : null, $json, $now]);
+        $vs = $db->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET following_uri = excluded.following_uri, followed_by = excluded.followed_by, updated_at = excluded.updated_at');
+        $vs->execute([$ownerUserId, $actorRef, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+        if ($did !== '' && $did !== $actorRef) {
+            $st->execute([$did, $did, $json, $now]);
+            $vs->execute([$ownerUserId, $did, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] actor profile cache write failed');
+    }
+}
+
+/** Keep cached viewer state aligned with queued Follow/Unfollow completions. */
+function ap_bsky_actor_viewer_cache_update(int $ownerUserId, string $did, ?string $followingUri): void
+{
+    if ($ownerUserId < 1 || !str_starts_with($did, 'did:')) return;
+    $db = ap_db();
+    if (!ap_bsky_actor_refresh_migrate($db)) return;
+    $now = gmdate('c');
+    $refs = [$did, 'https://bsky.app/profile/' . rawurlencode($did)];
+    foreach ($refs as $ref) {
+        try {
+            $st = $db->prepare('SELECT followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+            $st->execute([$ownerUserId, $ref]);
+            $followsYou = $st->fetchColumn();
+            $up = $db->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET following_uri = excluded.following_uri, updated_at = excluded.updated_at');
+            $up->execute([$ownerUserId, $ref, $followingUri, $followsYou === false ? 0 : (int) $followsYou, $now]);
+        } catch (Throwable $e) {
+            // The action queue remains authoritative if this optional cache is unavailable.
+        }
+    }
+}
+
+/** Coalesced durable enqueue; no network I/O occurs on the web request. */
+function ap_bsky_actor_refresh_enqueue(int $ownerUserId, string $actorRef, bool $force = false, ?PDO $db = null): void
+{
+    $db ??= ap_db();
+    if (!ap_bsky_actor_refresh_migrate($db)) return;
+    $actorRef = trim($actorRef);
+    if ($ownerUserId < 1 || $actorRef === '' || !ap_bsky_is_profile_ref($actorRef)) return;
+    $cached = ap_bsky_actor_profile_cache_get($actorRef, $ownerUserId, $db);
+    if (!$force && is_array($cached) && isset($cached['viewer'])
+        && (strtotime($cached['updated_at']) ?: 0) > time() - 6 * 3600) return;
+    $now = gmdate('c');
+    try {
+        $st = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
+        $st->execute([$ownerUserId, $actorRef, $now, $now]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] actor refresh enqueue failed');
+    }
+}
+
+/** @return array{claimed:int,succeeded:int,retried:int,failed:int} */
+function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
+{
+    if (!ap_bsky_actor_refresh_migrate()) return ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
+    $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
+    $db = ap_db();
+    $now = gmdate('c');
+    $stale = gmdate('c', time() - 600);
+    $staleJobs = $db->prepare("SELECT owner_user_id, actor_ref, attempts FROM bsky_actor_refresh_queue WHERE status = 'processing' AND locked_at < ?");
+    $staleJobs->execute([$stale]);
+    foreach ($staleJobs->fetchAll() ?: [] as $staleJob) {
+        $owner = (int) $staleJob['owner_user_id'];
+        $actorRef = (string) $staleJob['actor_ref'];
+        $attempt = (int) $staleJob['attempts'] + 1;
+        $dead = $attempt >= 8;
+        $delay = min(3600, 30 * (2 ** min(7, max(0, $attempt - 1))));
+        $db->prepare("UPDATE bsky_actor_refresh_queue SET status = ?, attempts = ?, next_attempt_at = ?, locked_at = NULL, last_error = 'Worker lease expired' WHERE owner_user_id = ? AND actor_ref = ? AND status = 'processing'")
+            ->execute([$dead ? 'failed' : 'pending', $attempt, gmdate('c', time() + $delay), $owner, $actorRef]);
+    }
+    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY queued_at LIMIT ?");
+    $st->bindValue(1, $now);
+    $st->bindValue(2, max(1, min(5, $limit)), PDO::PARAM_INT);
+    $st->execute();
+    foreach ($st->fetchAll() ?: [] as $job) {
+        $owner = (int) ($job['owner_user_id'] ?? 0);
+        $actorRef = (string) ($job['actor_ref'] ?? '');
+        $claim = $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'processing', locked_at = ? WHERE owner_user_id = ? AND actor_ref = ? AND status = 'pending'");
+        $claim->execute([gmdate('c'), $owner, $actorRef]);
+        if ($claim->rowCount() !== 1) continue;
+        $stats['claimed']++;
+        try {
+            $result = ap_bsky_get_profile($owner, $actorRef);
+            if (empty($result['ok']) || !is_array($result['profile'] ?? null)) {
+                throw new RuntimeException((string) ($result['error'] ?? 'Profile fetch failed'));
+            }
+            $profile = $result['profile'];
+            ap_bsky_actor_profile_cache_upsert($actorRef, $owner, $profile);
+            $did = trim((string) ($profile['did'] ?? ''));
+            if ($did !== '') {
+                $tok = ap_bsky_access_token($owner, false);
+                if (empty($tok['ok'])) $tok = ap_bsky_access_token($owner, true);
+                if (!empty($tok['ok'])) {
+                    $sess = ap_bsky_session_row($owner);
+                    foreach (ap_bsky_feed_hosts(rtrim((string) ($sess['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/')) as $host) {
+                        $feed = ap_bsky_xrpc($host, 'app.bsky.feed.getAuthorFeed', 'GET', ['actor' => $did, 'limit' => 40], null, (string) $tok['access'], 12);
+                        if (!empty($feed['ok']) && is_array($feed['json']['feed'] ?? null)) {
+                            ap_bsky_index_feed_items($feed['json']['feed'], $owner, 40);
+                            break;
+                        }
+                    }
+                }
+            }
+            $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+            $stats['succeeded']++;
+        } catch (Throwable $e) {
+            $cur = $db->prepare('SELECT attempts FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ?');
+            $cur->execute([$owner, $actorRef]);
+            $attempt = (int) $cur->fetchColumn() + 1;
+            $failed = $attempt >= 8;
+            $delay = min(3600, 30 * (2 ** min(7, max(0, $attempt - 1))));
+            $db->prepare('UPDATE bsky_actor_refresh_queue SET status = ?, attempts = ?, next_attempt_at = ?, locked_at = NULL, last_error = ? WHERE owner_user_id = ? AND actor_ref = ?')
+                ->execute([$failed ? 'failed' : 'pending', $attempt, gmdate('c', time() + $delay), substr($e->getMessage(), 0, 300), $owner, $actorRef]);
+            $stats[$failed ? 'failed' : 'retried']++;
+        }
+    }
+    return $stats;
+}
+
 /**
  * Follow a Bluesky DID via app.bsky.graph.follow.
  *
@@ -3715,6 +3935,7 @@ function ap_bsky_follow_actor(int $ownerUserId, string $didOrRef, ?string $recor
     }
     $existing = ap_bsky_graph_sync_get($ownerUserId, 'follow', $did);
     if (is_array($existing) && !empty($existing['bsky_uri'])) {
+        ap_bsky_actor_viewer_cache_update($ownerUserId, $did, (string) $existing['bsky_uri']);
         return ['ok' => true, 'already' => true, 'uri' => (string) $existing['bsky_uri']];
     }
     // Also check live profile viewer state
@@ -3723,6 +3944,7 @@ function ap_bsky_follow_actor(int $ownerUserId, string $didOrRef, ?string $recor
         $followUri = (string) ($prof['profile']['viewer']['following'] ?? '');
         if (str_starts_with($followUri, 'at://')) {
             ap_bsky_graph_sync_upsert($ownerUserId, 'follow', $did, $followUri, 'pull');
+            ap_bsky_actor_viewer_cache_update($ownerUserId, $did, $followUri);
             return ['ok' => true, 'already' => true, 'uri' => $followUri];
         }
     }
@@ -3765,6 +3987,7 @@ function ap_bsky_follow_actor(int $ownerUserId, string $didOrRef, ?string $recor
     }
     $uri = (string) ($put['json']['uri'] ?? '');
     ap_bsky_graph_sync_upsert($ownerUserId, 'follow', $did, $uri !== '' ? $uri : null, 'vaak');
+    ap_bsky_actor_viewer_cache_update($ownerUserId, $did, $uri !== '' ? $uri : null);
     ap_bsky_tl_cache_clear_owner($ownerUserId);
     return ['ok' => true, 'uri' => $uri, 'already' => false];
 }
@@ -3797,6 +4020,7 @@ function ap_bsky_unfollow_actor(int $ownerUserId, string $didOrRef): array
     }
     if ($followUri === '' || !preg_match('~^at://[^/]+/app\.bsky\.graph\.follow/([^/]+)$~', $followUri, $m)) {
         ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
+        ap_bsky_actor_viewer_cache_update($ownerUserId, $did, null);
         return ['ok' => true, 'already' => true, 'skipped' => true];
     }
     $rkey = $m[1];
@@ -3821,6 +4045,7 @@ function ap_bsky_unfollow_actor(int $ownerUserId, string $didOrRef): array
         }
     }
     ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
+    ap_bsky_actor_viewer_cache_update($ownerUserId, $did, null);
     ap_bsky_tl_cache_clear_owner($ownerUserId);
     if (empty($del['ok'])) {
         return ['ok' => false, 'error' => (string) ($del['error'] ?? 'Bluesky unfollow failed')];

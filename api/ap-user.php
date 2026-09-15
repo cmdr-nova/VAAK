@@ -549,8 +549,16 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
 
     $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
-    if (!in_array($tab, ['posts', 'featured'], true)) {
+    if (!in_array($tab, ['posts', 'media', 'featured'], true)) {
         $tab = 'posts';
+    }
+    $mediaNotes = [];
+    foreach ($publicNotes as $mediaNote) {
+        $create = json_decode((string) ($mediaNote['raw_create_json'] ?? ''), true);
+        $noteObj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
+        if ($noteObj && ap_user_note_media_html($noteObj, false) !== '') {
+            $mediaNotes[] = [$mediaNote, $noteObj];
+        }
     }
     $featuredCards = function_exists('ap_featured_cards_for_actor_key')
         ? ap_featured_cards_for_actor_key($actorKey)
@@ -589,6 +597,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     foreach (
         [
             'posts' => ['Posts', count($publicNotes)],
+            'media' => ['Media', count($mediaNotes)],
             'featured' => ['Featured', $featuredCount],
         ] as $tKey => $tInfo
     ) {
@@ -603,7 +612,26 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
     echo '</nav>';
 
-    if ($tab === 'featured') {
+    if ($tab === 'media') {
+        echo '<section class="posts profile-media-gallery" aria-label="Media">';
+        if (!$mediaNotes) {
+            echo '<p class="muted">No public media posts yet.</p>';
+        } else {
+            foreach ($mediaNotes as [$mediaRow, $mediaObj]) {
+                echo '<article class="profile-media-item">' . ap_user_note_media_html($mediaObj, true);
+                $mediaText = trim(strip_tags((string) ($mediaObj['content'] ?? $mediaRow['content'] ?? '')));
+                if ($mediaText !== '') {
+                    echo '<div class="profile-media-caption">' . htmlspecialchars($mediaText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';
+                }
+                $mediaDate = (string) ($mediaObj['published'] ?? $mediaRow['published'] ?? '');
+                if ($mediaDate !== '') {
+                    echo '<time class="profile-media-date" datetime="' . htmlspecialchars($mediaDate, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars($mediaDate, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</time>';
+                }
+                echo '</article>';
+            }
+        }
+        echo '</section>';
+    } elseif ($tab === 'featured') {
         echo '<section class="posts featured-section" aria-label="Featured">';
         echo function_exists('ap_featured_cards_html')
             ? ap_featured_cards_html($featuredCards)
@@ -920,6 +948,11 @@ function ap_user_html_shell_start(string $title): void
       .profile-tabs a:hover{color:#eee;background:#1a1a1a}
       .profile-tabs a.is-active{color:#0b0b0b;background:#00ff9f}
       .profile-tabs a .tab-count{opacity:.7;font-weight:500;margin-left:.25rem;font-size:.8rem}
+      .profile-media-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.8rem;align-items:start}
+      .profile-media-item{min-width:0;padding:.6rem;background:#111;border:1px solid #292929;border-radius:12px;overflow:hidden}
+      .profile-media-item .media-row{margin:0;border-radius:8px;overflow:hidden}
+      .profile-media-caption{margin-top:.55rem;color:#ccc;font-size:.88rem;line-height:1.4;overflow-wrap:anywhere}
+      .profile-media-date{display:block;margin-top:.4rem;color:#858585;font-size:.75rem}
       .featured-accounts{list-style:none;margin:0;padding:0}
       .featured-account{border-bottom:1px solid #2a2a2a}
       .featured-account:last-child{border-bottom:none}
