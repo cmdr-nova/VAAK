@@ -312,6 +312,9 @@ function ap_bsky_crosspost_should_retry(?array $result): bool
         'No Bluesky session',
         'Missing DID',
         'Reply parent is not a Bluesky post',
+        // A genuinely Fediverse-only parent must remain Fediverse-only. Retrying
+        // can otherwise mirror the reply later if an unrelated mapping appears.
+        'Reply parent is Fediverse-only',
         'no_owner_session_mapping',
     ];
     foreach ($permanent as $p) {
