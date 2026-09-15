@@ -18992,7 +18992,7 @@ window.apAdminToast = function (msg, isErr) {
     fd.set('ajax', '1');
     const before = snapshotInteractButton(form);
     const optimisticKind = (action === 'favourite_status' || action === 'unfavourite_status') ? 'favourite'
-      : action.startsWith('bookmark') ? 'bookmark' : 'reblog';
+      : (action === 'bookmark_status' || action === 'unbookmark_status') ? 'bookmark' : 'reblog';
     const optimisticActive = action === 'favourite_status'
       || action === 'bookmark_status' || action === 'reblog_status';
     applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive });
