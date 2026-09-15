@@ -17164,6 +17164,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             if (is_array($stLocalStatus)) {
                 admin_render_masto_status_card($stLocalStatus, $followingIds, $stFrom, true, false);
             } else {
+                // A focused post is an explicit detail view, so a quote target
+                // encoded as RE: <URL> may be hydrated here (never on timelines).
+                if (is_array($stEvent)) {
+                    $stEvent['_allow_quote_fetch'] = true;
+                }
                 $focusStatus = ap_masto_status_from_event($stEvent);
                 if (is_array($focusStatus)) {
                     if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusStatus['id'])) {

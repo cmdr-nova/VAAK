@@ -3567,6 +3567,16 @@ function ap_masto_clean_mention_text(string $text): string
     return trim($text);
 }
 
+/** Pull a quote URL from Mastodon-compatible RE: quote prefixes. */
+function ap_masto_quote_url_from_text(string $text): string
+{
+    if (preg_match('#(?:^|\\s)RE:\\s*(https://[^\\s<>]+)#iu', html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'), $m)) {
+        $url = rtrim((string) $m[1], '.,;:!?)\\]}');
+        return str_starts_with($url, 'https://') ? $url : '';
+    }
+    return '';
+}
+
 /** Cached link card for remote text, with a background warm on cache miss. */
 function ap_masto_remote_link_card(string $text, bool $hasMedia = false): ?array
 {
@@ -5034,6 +5044,11 @@ function ap_masto_status_from_event(array $row): ?array
 
     $account = ap_masto_remote_account($actorId);
     $text = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    // Misskey/Sharkey quote boosts are sometimes serialized as a bare
+    // `RE: <permalink>` body instead of ActivityPub's quote/tag fields. Keep
+    // that target as a real quote card before cleaning the machine prefix out
+    // of the visible commentary.
+    $quoteObjectUrl = ap_masto_quote_url_from_text($text);
     $spoilerText = trim((string) ($row['spoiler_text'] ?? ''));
     $isSensitive = !empty($row['sensitive']) || $spoilerText !== '';
     // Strip RE:<url> prefixes from quote commentary (keep ↪ QT block intact)
@@ -5094,7 +5109,7 @@ function ap_masto_status_from_event(array $row): ?array
     // Allow empty stubs in thread context (CW-only / fetch failures still need a parent card).
     // Announces of our own notes often store null summary — still show the boost wrapper.
     $type = strtolower((string) ($row['type'] ?? 'Create'));
-    $allowEmpty = !empty($row['_allow_empty_for_context']) || $type === 'announce';
+    $allowEmpty = !empty($row['_allow_empty_for_context']) || $type === 'announce' || $quoteObjectUrl !== '';
     $hasCw = trim((string) ($row['spoiler_text'] ?? '')) !== '' || !empty($row['sensitive']);
     if (trim($text) === '' && !$media && !$hasCw) {
         if (!$allowEmpty) {
@@ -5241,7 +5256,9 @@ function ap_masto_status_from_event(array $row): ?array
         'poll' => null,
         // Explicit null prevents clients from carrying a stale native quote
         // card across status updates when this remote post has no quote.
-        'quote' => null,
+        'quote' => $quoteObjectUrl !== ''
+            ? ap_masto_quote_entity($quoteObjectUrl, 0, !empty($row['_allow_quote_fetch']))
+            : null,
         'quote_approval' => [
             'automatic' => ['public'],
             'manual' => [],

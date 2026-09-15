@@ -1551,8 +1551,20 @@ function ap_note_cw_from_doc(?array $doc): array
         $spoiler = function_exists('ap_html_to_plain_text')
             ? trim(ap_html_to_plain_text($doc['summary']))
             : trim(html_entity_decode(strip_tags($doc['summary']), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        $spoiler = mb_substr(ap_fix_utf8($spoiler), 0, 500);
     }
+    // Some Misskey/Sharkey versions expose the warning with their native key
+    // as well as (or instead of) ActivityPub's `summary`.
+    if ($spoiler === '') {
+        foreach (['cw', 'contentWarning', 'content_warning', '_misskey_contentWarning'] as $key) {
+            if (isset($doc[$key]) && is_string($doc[$key]) && trim($doc[$key]) !== '') {
+                $spoiler = function_exists('ap_html_to_plain_text')
+                    ? trim(ap_html_to_plain_text($doc[$key]))
+                    : trim(html_entity_decode(strip_tags($doc[$key]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                break;
+            }
+        }
+    }
+    $spoiler = mb_substr(ap_fix_utf8($spoiler), 0, 500);
     $sensitive = !empty($doc['sensitive']) || $spoiler !== '';
     return ['spoiler_text' => $spoiler, 'sensitive' => $sensitive];
 }
