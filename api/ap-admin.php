@@ -19466,6 +19466,22 @@ window.apAdminToast = function (msg, isErr) {
       closeFolderPopover();
     }
   });
+  // The Bookmarks view button opens the folder picker; its form action is
+  // unbookmark_status, so handle the click directly instead of letting a
+  // browser submit race past the folder-picker interception.
+  document.addEventListener('click', (ev) => {
+    const target = ev.target;
+    const btn = target && target.closest
+      ? target.closest('form.bm-folder-trigger button[data-bm-picker="1"]') : null;
+    if (!btn) return;
+    ev.preventDefault();
+    const form = btn.closest('form');
+    const statusId = form && form.querySelector('input[name="status_id"]');
+    const objectId = form && form.querySelector('input[name="object_id"]');
+    if (statusId && statusId.value) {
+      openBookmarkFolderPicker(btn, statusId.value, objectId ? objectId.value : '', null);
+    }
+  });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closeFolderPopover();
   });

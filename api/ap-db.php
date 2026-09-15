@@ -374,7 +374,7 @@ SQL);
         'account_aliases', 'actor_profile', 'ap_account_move', 'ap_bites', 'ap_blocks', 'ap_collection_items',
         'ap_collection_memberships', 'ap_collections', 'ap_drafts', 'ap_featured_accounts',
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
-        'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_post_subscriptions', 'ap_queue_settings',
+        'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
         'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
@@ -1878,6 +1878,20 @@ CREATE TABLE IF NOT EXISTS ap_action_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_action_queue_due ON ap_action_queue(status, next_attempt_at, id);
 CREATE INDEX IF NOT EXISTS idx_ap_action_queue_owner_target ON ap_action_queue(owner_user_id, platform, action_kind, target_key, id);
+CREATE TABLE IF NOT EXISTS ap_publish_delivery_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    note_id TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_publish_delivery_due ON ap_publish_delivery_queue(status, next_attempt_at, id);
 SQL);
     try {
         $st = $db->query('SELECT id FROM ap_queue_settings WHERE id = 1');

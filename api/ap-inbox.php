@@ -4800,22 +4800,8 @@ function ap_publish_status_text(
     $replyLocalId = null;
     $extraMentionActors = [];
     if ($inReplyTo !== '' && str_starts_with($inReplyTo, 'https://')) {
-        $objDoc = ap_fetch_as2_object($inReplyTo);
-        if (is_array($objDoc)) {
-            $at = ap_as_id($objDoc['attributedTo'] ?? null) ?: ap_as_id($objDoc['actor'] ?? null);
-            if ($at) {
-                $replyActor = $at;
-                $extraMentionActors[] = $at;
-                // Self-replies: do NOT address ourselves in `to` (that loops the Create
-                // back into our own inbox → fake mention notification + thread dupe).
-                if (
-                    rtrim($at, '/') !== rtrim($actor, '/')
-                    && !in_array($at, $to, true)
-                ) {
-                    $to[] = $at;
-                }
-            }
-        }
+        // Resolve remote parent/author in the durable delivery worker so the
+        // local reply is visible without waiting on another server's DNS/HTTP.
         $mapped = function_exists('ap_masto_status_by_note_id') ? ap_masto_status_by_note_id($inReplyTo) : null;
         if ($mapped) {
             $replyLocalId = (int) $mapped['local_id'];
@@ -4931,18 +4917,8 @@ function ap_publish_status_text(
                 $note['quoteAuthorization'] = $auth['id'];
             }
         }
-        // CC the quoted author when known
-        $qDoc = ap_fetch_as2_object($quoteObjectId);
-        if (is_array($qDoc)) {
-            $qActor = ap_as_id($qDoc['attributedTo'] ?? null) ?: ap_as_id($qDoc['actor'] ?? null);
-            if ($qActor && rtrim($qActor, '/') !== rtrim($actor, '/')) {
-                $quoteApprovalPending = true;
-            }
-            if ($qActor && str_starts_with($qActor, 'https://') && !in_array($qActor, $cc, true) && !in_array($qActor, $to, true)) {
-                $cc[] = $qActor;
-                $note['cc'] = $cc;
-            }
-        }
+        // Resolve the quoted author and FEP-044f consent requirement in the
+        // delivery worker. Unknown remote quotes are conservatively held there.
     }
     // Keep Create audience in sync after mention/quote audience mutations
     $note['to'] = $to;
@@ -5024,9 +5000,8 @@ function ap_publish_status_text(
         if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+/notes/#', $quoteObjectId)) {
             $summaryDoc = ap_local_note_as2_doc($quoteObjectId);
         }
-        if ($summaryDoc === null) {
-            $summaryDoc = ap_fetch_as2_object($quoteObjectId);
-        }
+        // Do not fetch remote quote content on the compose request's critical
+        // path. Remote preview enrichment is handled by normal cache warming.
         if (is_array($summaryDoc)) {
             $summaryDoc = ap_unwrap_as2_object($summaryDoc);
         }
@@ -5040,6 +5015,46 @@ function ap_publish_status_text(
         }
     }
     ap_metrics_record('Create', $actor, $noteId, null, strlen($contentHtml), 'compose', $feedSummary, null, null, null, '', false, $visibility);
+
+    // Local content is committed above. Persist outbound delivery separately
+    // so federation and Bluesky latency cannot delay timeline publication.
+    try {
+        require_once __DIR__ . '/ap-publish-delivery.php';
+        $deliveryOwnerId = function_exists('ap_db_owner_user_id_for_actor')
+            ? ap_db_owner_user_id_for_actor($actor) : 0;
+        $deliveryPayload = [
+            'local_id' => $localId,
+            'content' => $content,
+            'visibility' => $visibility,
+            'media_local_ids' => $mediaLocalIds,
+            'spoiler_text' => $spoilerText,
+            'in_reply_to' => $inReplyTo,
+            'quote_object_id' => $quoteObjectId,
+            'quote_approval_pending' => $quoteApprovalPending,
+        ];
+        if (ap_publish_delivery_enqueue($deliveryOwnerId, $noteId, $deliveryPayload)) {
+            ap_publish_delivery_wake_async();
+            if ($content !== '' && !$mediaRows) {
+                try {
+                    require_once __DIR__ . '/ap-link-preview.php';
+                    $warmUrl = ap_link_preview_extract_url($content);
+                    if ($warmUrl !== null) ap_link_preview_warm_async($warmUrl);
+                } catch (Throwable $e) { /* optional preview warming */ }
+            }
+            ap_log("publish_status queued create=$createId local_id=$localId visibility=$visibility");
+            return [
+                'ok' => true, 'note_id' => $noteId, 'create_id' => $createId,
+                'local_id' => $localId, 'published' => $published,
+                'content_html' => $contentHtml, 'visibility' => $visibility,
+                'delivered' => 0, 'queued' => 1, 'delivery_pending' => true,
+                'bsky' => ['ok' => true, 'queued' => true],
+            ];
+        }
+    } catch (Throwable $e) {
+        // Fall through to the legacy synchronous route if durable storage is
+        // unavailable; never report background delivery without a saved job.
+        error_log('[ap-inbox] publish queue unavailable; using synchronous delivery: ' . $e->getMessage());
+    }
 
     $priorityExtra = [];
     // Priority-deliver to reply author + mentioned actors (not DMs — still public/unlisted/private Create).
