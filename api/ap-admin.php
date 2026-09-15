@@ -1971,7 +1971,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $actor = $resolved;
                 }
             }
-            if ($actor !== '' && rtrim($actor, '/') === rtrim(vaak_actor_id(), '/')) {
+            if ($actor !== '' && admin_is_local_admin_actor($actor)) {
+                $error = 'Server-wide mute and block controls cannot be applied to an admin account. Manage admin membership outside Moderation.';
+            } elseif ($actor !== '' && rtrim($actor, '/') === rtrim(vaak_actor_id(), '/')) {
                 $error = 'You can’t block yourself.';
             } else {
                 $result = ap_block_upsert('actor', $actor, $kind, $reason !== '' ? $reason : null);
@@ -1997,7 +1999,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     }
                 }
                 if ($error === null) {
-                    if (rtrim($input, '/') === rtrim(vaak_actor_id(), '/')) {
+                    if (admin_is_local_admin_actor($input)) {
+                        $error = 'Server-wide mute and block controls cannot be applied to an admin account. Manage admin membership outside Moderation.';
+                    } elseif (rtrim($input, '/') === rtrim(vaak_actor_id(), '/')) {
                         $error = 'You can’t block yourself.';
                     } else {
                         $result = ap_block_upsert('actor', $input, $kind, $reason !== '' ? $reason : null);
@@ -7924,6 +7928,46 @@ function admin_global_actor_control(string $actorId): ?array
     return $key !== '' && isset($controls[$key]) && is_array($controls[$key])
         ? $controls[$key]
         : null;
+}
+
+/** Protect every local account currently marked as an admin from server-wide moderation. */
+function admin_is_local_admin_actor(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return false;
+    }
+    if (function_exists('vaak_actor_id') && $actorId === rtrim(vaak_actor_id(), '/')) {
+        return true;
+    }
+    static $admins = null;
+    static $lookupFailed = false;
+    if ($admins === null) {
+        $admins = [];
+        try {
+            $rows = ap_db()->query("SELECT actor_id, actor_key FROM ap_users WHERE is_admin = 1")->fetchAll() ?: [];
+            foreach ($rows as $row) {
+                foreach ([(string) ($row['actor_id'] ?? ''), (string) ($row['actor_key'] ?? '')] as $value) {
+                    $value = rtrim(trim($value), '/');
+                    if ($value !== '') {
+                        $admins[$value] = true;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // Fail closed for same-instance actors if admin membership cannot be checked.
+            $lookupFailed = true;
+            $admins = [];
+        }
+    }
+    if ($lookupFailed) {
+        $actorHost = strtolower((string) parse_url($actorId, PHP_URL_HOST));
+        $localHost = strtolower((string) parse_url(function_exists('vaak_actor_id') ? vaak_actor_id() : '', PHP_URL_HOST));
+        if ($actorHost !== '' && $actorHost === $localHost) {
+            return true;
+        }
+    }
+    return isset($admins[$actorId]);
 }
 
 function admin_global_domain_control(string $host): ?array
@@ -14082,9 +14126,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </form>
                 </section>
                 <div class="tweet-actions" style="flex-wrap:wrap;gap:.55rem;margin-top:.65rem">
-                  <?php foreach ([['Reporter',$reporter],['Reported account',$target]] as [$actorLabel,$actorUri]): if ($actorUri === '' || !str_starts_with($actorUri, 'https://')) continue; $actorControl = admin_global_actor_control($actorUri); ?>
+                  <?php foreach ([['Reporter',$reporter],['Reported account',$target]] as [$actorLabel,$actorUri]): if ($actorUri === '' || !str_starts_with($actorUri, 'https://')) continue; $actorControl = admin_global_actor_control($actorUri); $protectedAdmin = admin_is_local_admin_actor($actorUri); ?>
                     <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($actorUri) ?>&amp;from=moderation">Inspect <?= h($actorLabel) ?></a>
-                    <?php if (!$actorControl): foreach (['mute' => 'Global mute', 'block' => 'Server-wide block'] as $controlKind => $controlLabel): ?>
+                    <?php if ($protectedAdmin): ?><span class="tag">Admin account · server-wide controls unavailable</span>
+                    <?php elseif (!$actorControl): foreach (['mute' => 'Global mute', 'block' => 'Server-wide block'] as $controlKind => $controlLabel): ?>
                       <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>" style="display:inline" onsubmit="return confirm(<?= h(json_encode($controlKind === 'mute' ? 'Apply a server-wide mute to this ' . strtolower($actorLabel) . '?' : 'Block this ' . strtolower($actorLabel) . ' server-wide? This rejects their federation with HTTP 403.')) ?>)">
                         <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="block_actor"><input type="hidden" name="return_view" value="moderation"><input type="hidden" name="report_id" value="<?= $repId ?>"><input type="hidden" name="kind" value="<?= h($controlKind) ?>"><input type="hidden" name="actor_id" value="<?= h($actorUri) ?>">
                         <button class="btn btn-ghost" type="submit"<?= $controlKind === 'block' ? ' style="color:var(--danger)"' : '' ?>><?= h($controlLabel) ?> <?= h($actorLabel) ?></button>
