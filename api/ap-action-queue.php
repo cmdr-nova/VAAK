@@ -166,6 +166,15 @@ function ap_action_queue_bind_owner(int $ownerUserId): bool
     return true;
 }
 
+/** Worker-safe equivalent of the admin UI's own-actor URL test. */
+function ap_action_queue_is_own_object(string $objectId): bool
+{
+    $objectId = rtrim(trim($objectId), '/');
+    $actorId = rtrim(ap_local_actor_id(), '/');
+    return $objectId !== '' && $actorId !== ''
+        && ($objectId === $actorId || str_starts_with($objectId, $actorId . '/'));
+}
+
 /** @return array{ok:bool,error?:string,receipt?:array} */
 function ap_action_queue_execute(array $row, array $payload, array $receipt): array
 {
@@ -240,7 +249,7 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 if (!preg_match('/^\d+$/', $sid)) return ['ok' => false, 'error' => 'Invalid Fediverse status reference.'];
                 if ($want) {
                     $likeId = null;
-                    if ($actor !== '' && $obj !== '' && !vaak_is_own_url($obj)) {
+                    if ($actor !== '' && $obj !== '' && !ap_action_queue_is_own_object($obj)) {
                         $localActor = rtrim(ap_local_actor_id(), '/');
                         $stableLikeId = $localActor . '/likes/queue-' . (int) $row['id'] . '-' . (int) $row['revision'];
                         $sent = ap_cmdr_send_like($obj, $actor, $stableLikeId);

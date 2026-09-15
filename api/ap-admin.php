@@ -18983,11 +18983,10 @@ window.apAdminToast = function (msg, isErr) {
       return;
     }
     ev.preventDefault();
-    if (form.dataset.busy === '1') {
+    if (form.dataset.busy === '1' || form.dataset.queuePending === '1') {
       window.apAdminToast(queueSlowdownToast);
       return;
     }
-    if (form.dataset.queuePending === '1') window.apAdminToast(queueSlowdownToast);
     const fd = new FormData(form);
     fd.set('ajax', '1');
     const before = snapshotInteractButton(form);
@@ -19609,11 +19608,10 @@ window.apAdminToast = function (msg, isErr) {
       if (!btn) return;
       ev.preventDefault();
       ev.stopPropagation();
-      if (btn.dataset.busy === '1') {
+      if (btn.dataset.busy === '1' || btn.dataset.queuePending === '1') {
         if (typeof window.apAdminToast === 'function') window.apAdminToast(bskyQueueSlowdownToast);
         return;
       }
-      if (btn.dataset.queuePending === '1' && typeof window.apAdminToast === 'function') window.apAdminToast(bskyQueueSlowdownToast);
       const action = btn.dataset.bskyAction || '';
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
@@ -22622,8 +22620,7 @@ if (VIEW === 'analytics') loadAnalytics();
     const button = form.querySelector('button[type="submit"]');
     if (!actionInput || !button || !['follow_remote', 'unfollow_remote'].includes(actionInput.value)) return;
     ev.preventDefault();
-    if (form.dataset.queueBusy === '1') { window.apAdminToast(slowdown); return; }
-    if (form.dataset.queuePending === '1') window.apAdminToast(slowdown);
+    if (form.dataset.queueBusy === '1' || form.dataset.queuePending === '1') { window.apAdminToast(slowdown); return; }
     const before = { action: actionInput.value, label: button.innerHTML, title: button.title };
     const want = actionInput.value === 'follow_remote';
     form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
