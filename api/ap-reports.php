@@ -302,11 +302,35 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
             $target,
             json_encode($cleanStatuses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
             $comment !== '' ? $comment : null,
-            $delivered > 0 ? ($isLocalPeer ? 'open' : 'sent') : 'failed',
+            $delivered > 0 ? 'sent' : 'failed',
             $now,
             $now,
         ]);
         $id = ap_db_last_insert_id('ap_reports');
+        if ($id < 1) {
+            $st = ap_db()->prepare('SELECT id FROM ap_reports WHERE activity_id = ?');
+            $st->execute([$activityId]);
+            $id = (int) ($st->fetch()['id'] ?? 0);
+        }
+        if ($id > 0) {
+            // Keep the delivery receipt in Sent, and create a separate local
+            // moderator task so an admin can act on the reported actor/content.
+            $reviewActivityId = $activityId . '/local-review';
+            ap_db()->prepare(
+                'INSERT INTO ap_reports
+                 (activity_id, direction, reporter_actor_id, target_actor_id, status_uris_json, comment, about_us, state, created_at, updated_at)
+                 VALUES (?, \'local\', ?, ?, ?, ?, 0, \'open\', ?, ?)
+                 ON CONFLICT(activity_id) DO NOTHING'
+            )->execute([
+                $reviewActivityId,
+                $reporter,
+                $target,
+                json_encode($cleanStatuses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                $comment !== '' ? $comment : null,
+                $now,
+                $now,
+            ]);
+        }
     } catch (Throwable $e) {
         error_log('[ap-reports] send store: ' . $e->getMessage());
     }
@@ -418,6 +442,8 @@ function ap_reports_list(string $filter = 'open', int $limit = 80): array
             $st = ap_db()->prepare(
                 "SELECT * FROM ap_reports
                  WHERE direction = 'in'
+                    OR (state = 'open' AND direction = 'local'
+                        AND reporter_actor_id LIKE 'https://mkultra.monster/users/%')
                     OR (state = 'open' AND direction = 'out'
                         AND reporter_actor_id LIKE 'https://mkultra.monster/users/%')
                  ORDER BY id DESC LIMIT ?"
@@ -465,6 +491,7 @@ function ap_reports_open_count(): int
             "SELECT COUNT(*) FROM ap_reports
              WHERE state = 'open'
                AND (direction = 'in'
+                    OR (direction = 'local' AND state = 'open')
                     OR (direction = 'out' AND reporter_actor_id LIKE 'https://mkultra.monster/users/%'))"
         )->fetchColumn();
     } catch (Throwable $e) {

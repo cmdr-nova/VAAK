@@ -14083,11 +14083,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
             ?>
             <?php
-              $isLocalFiled = $dir === 'out'
+              $isLocalFiled = in_array($dir, ['out', 'local'], true)
                   && str_starts_with($reporter, 'https://mkultra.monster/users/');
               $repLabel = $dir === 'in'
                   ? 'Inbound Flag'
-                  : ($isLocalFiled ? 'Local user report' : 'Outbound Flag');
+                  : ($dir === 'local' ? 'Local report for review' : ($isLocalFiled ? 'Local user report' : 'Outbound Flag'));
               $canClose = $state === 'open' && ($dir === 'in' || $isLocalFiled);
             ?>
             <article class="tweet" style="<?= $aboutUs ? 'border-color:var(--primary)' : '' ?>">
@@ -14106,6 +14106,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </summary>
                 <div class="meta" style="margin:.65rem 0 .25rem">Report #<?= $repId ?> · reported account: <span class="mono" style="overflow-wrap:anywhere"><?= h($target !== '' ? $target : 'not provided') ?></span></div>
+                <?php if ($reporter !== '' && str_starts_with($reporter, 'https://')): ?><div class="meta" style="margin:.25rem 0 .5rem;overflow-wrap:anywhere">Reporter actor ID: <a href="<?= h($reporter) ?>" target="_blank" rel="noopener noreferrer"><?= h($reporter) ?></a></div><?php endif; ?>
                 <?php if ($comment !== ''): ?><div class="body" style="margin:.5rem 0;white-space:pre-wrap"><?= h($comment) ?></div><?php else: ?><div class="meta" style="margin:.5rem 0">No report explanation was provided.</div><?php endif; ?>
                 <?php if ($statusUris): ?>
                   <div class="meta" style="margin:.5rem 0">Referenced posts:</div>
