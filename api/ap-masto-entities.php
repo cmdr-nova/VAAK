@@ -2524,6 +2524,74 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
 
     $doc = ap_fetch_as2_object($objectUrl);
     if (!is_array($doc)) {
+        // Some Mastodon instances require authorized fetch for ActivityPub
+        // objects, while still exposing public statuses through their REST API.
+        // Keep this fallback bounded to canonical Mastodon status URLs.
+        $statusId = ap_masto_remote_status_id_from_object_url($objectUrl);
+        $host = strtolower((string) (parse_url($objectUrl, PHP_URL_HOST) ?: ''));
+        if ($statusId !== null && $host !== '' && function_exists('ap_host_resolves_public')
+            && ap_host_resolves_public($host)) {
+            if (!function_exists('ap_http_curl_get_ex')) {
+                if (!defined('AP_INBOX_LIB_ONLY')) {
+                    define('AP_INBOX_LIB_ONLY', true);
+                }
+                require_once __DIR__ . '/ap-inbox.php';
+            }
+            if (function_exists('ap_http_curl_get_ex')) {
+                $apiUrl = 'https://' . $host . '/api/v1/statuses/' . rawurlencode($statusId);
+                $response = ap_http_curl_get_ex($apiUrl, ['Accept: application/json'], 5, 524288);
+                if (is_string($response['body'] ?? null) && $response['body'] !== '') {
+                    $status = json_decode($response['body'], true);
+                    $statusUri = is_array($status) ? rtrim((string) ($status['uri'] ?? ''), '/') : '';
+                    $accountUrl = is_array($status) && is_array($status['account'] ?? null)
+                        ? rtrim((string) ($status['account']['url'] ?? ''), '/')
+                        : '';
+                    $visibility = strtolower((string) ($status['visibility'] ?? ''));
+                    if (is_array($status) && $statusUri === $objectUrl && $accountUrl !== ''
+                        && str_starts_with($accountUrl, 'https://')
+                        && in_array($visibility, ['public', 'unlisted'], true)) {
+                        $attachments = [];
+                        $statusAttachments = is_array($status['media_attachments'] ?? null)
+                            ? $status['media_attachments']
+                            : [];
+                        foreach ($statusAttachments as $attachment) {
+                            if (!is_array($attachment)) {
+                                continue;
+                            }
+                            $mediaUrl = (string) ($attachment['url'] ?? $attachment['remote_url'] ?? '');
+                            if ($mediaUrl === '') {
+                                continue;
+                            }
+                            $mediaType = match ((string) ($attachment['type'] ?? '')) {
+                                'image' => 'Image',
+                                'video', 'gifv' => 'Video',
+                                'audio' => 'Audio',
+                                default => 'Document',
+                            };
+                            $attachments[] = [
+                                'type' => $mediaType,
+                                'mediaType' => (string) ($attachment['mime_type'] ?? ''),
+                                'url' => $mediaUrl,
+                                'name' => (string) ($attachment['description'] ?? ''),
+                            ];
+                        }
+                        $doc = [
+                            'type' => 'Note',
+                            'id' => $statusUri,
+                            'attributedTo' => $accountUrl,
+                            'content' => (string) ($status['content'] ?? ''),
+                            'summary' => (string) ($status['spoiler_text'] ?? ''),
+                            'sensitive' => !empty($status['sensitive']),
+                            'published' => (string) ($status['created_at'] ?? ''),
+                            'attachment' => $attachments,
+                        ];
+                        $restVisibility = $visibility;
+                    }
+                }
+            }
+        }
+    }
+    if (!is_array($doc)) {
         // A slow/unavailable remote must not erase an otherwise usable cached
         // focus post. PeerTube transcoding endpoints can be particularly slow.
         return $isNoteRow ? $existing : null;
@@ -2599,6 +2667,9 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
         return function_exists('ap_event_by_object_id') ? ap_event_by_object_id($oid) : $existing;
     }
 
+    $spoilerText = is_string($doc['summary'] ?? null) ? (string) $doc['summary'] : '';
+    $sensitive = !empty($doc['sensitive']);
+    $visibility = isset($restVisibility) && is_string($restVisibility) ? $restVisibility : 'public';
     ap_metrics_record(
         'Create',
         $actorId,
@@ -2609,7 +2680,10 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
         is_string($summary) ? $summary : null,
         is_array($media) ? $media : null,
         $published,
-        $inReplyTo
+        $inReplyTo,
+        $spoilerText,
+        $sensitive,
+        $visibility
     );
 
     return function_exists('ap_event_by_object_id') ? ap_event_by_object_id($oid) : null;
