@@ -531,16 +531,30 @@ function ap_reports_open_count(): int
     }
 }
 
-/** Number of received/local reports to surface in the moderation notification badge. */
+/** Number of distinct received/local reports still awaiting moderator action. */
 function ap_reports_notification_count(): int
 {
     try {
-        return (int) ap_db()->query(
-            "SELECT COUNT(*) FROM ap_reports
-             WHERE direction = 'in'
-                OR (direction = 'local'
-                    AND reporter_actor_id LIKE 'https://mkultra.monster/users/%')"
-        )->fetchColumn();
+        $rows = ap_db()->query(
+            "SELECT activity_id FROM ap_reports
+             WHERE state = 'open'
+               AND (direction = 'in'
+                    OR (direction = 'local'
+                        AND reporter_actor_id LIKE 'https://mkultra.monster/users/%'))"
+        )->fetchAll(PDO::FETCH_COLUMN) ?: [];
+        $reports = [];
+        foreach ($rows as $activityId) {
+            $activityId = (string) $activityId;
+            // An outbound report also gets a separate local-review row. Treat
+            // those as one notification if the original Flag is received too.
+            if (str_ends_with($activityId, '/local-review')) {
+                $activityId = substr($activityId, 0, -strlen('/local-review'));
+            }
+            if ($activityId !== '') {
+                $reports[$activityId] = true;
+            }
+        }
+        return count($reports);
     } catch (Throwable $e) {
         return 0;
     }

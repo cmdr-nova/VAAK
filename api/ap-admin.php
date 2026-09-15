@@ -14009,7 +14009,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </article>
         <?php endif; ?>
         <div class="meta" style="margin-bottom:.75rem">
-          Incoming shows reports still awaiting moderator action, plus local user reports awaiting review. The Admin notification badge counts all received reports, including ignored or dismissed ones; use <b>About me</b>, <b>Dismissed / ignored</b>, or <b>All</b> to review those.
+          Incoming shows reports still awaiting moderator action, plus local user reports awaiting review. The Admin notification badge counts distinct reports still needing action; ignoring or dismissing a report clears it from the badge, while it remains available in <b>About me</b>, <b>Dismissed / ignored</b>, and <b>All</b>.
           Use <b>Dismiss</b> / <b>Ignore</b> to clear a report from the action-needed list.
           Remote outbound reports (already sent) appear under <b>Sent</b>.
         </div>
