@@ -244,6 +244,33 @@ function ap_lists_sync_bsky(int $ownerUserId, bool $force = false): array
             error_log('[ap-lists] reconcile unsubscribed Bluesky moderation lists: ' . $e->getMessage());
         }
     }
+    // An unsubscribe is not a deletion: retain the local copy when getList
+    // still resolves. If the referenced record itself is gone, remove its
+    // VAAK mirror (including members) as well. Only treat explicit not-found
+    // responses as deletion; transient/auth failures must preserve local data.
+    try {
+        $st = ap_db()->prepare("SELECT id, bsky_list_uri, bsky_moderation_action FROM masto_lists WHERE owner_user_id = ? AND bsky_list_source = 'subscription' AND bsky_list_uri IS NOT NULL");
+        $st->execute([$ownerUserId]);
+        foreach ($st->fetchAll() ?: [] as $subscription) {
+            $uri = (string) ($subscription['bsky_list_uri'] ?? '');
+            if ($uri === '' || isset($moderationUris['mute'][$uri]) || isset($moderationUris['block'][$uri])) continue;
+            $exists = ap_bsky_get_graph_list($ownerUserId, $uri, 1);
+            $error = strtolower((string) ($exists['error'] ?? ''));
+            $status = (int) ($exists['status'] ?? 0);
+            if (!empty($exists['ok']) || !in_array($status, [400, 404, 410], true)
+                || !preg_match('/not[ _-]?found|recordnotfound|could not find/', $error)) continue;
+            $id = (int) ($subscription['id'] ?? 0);
+            if ($id < 1) continue;
+            ap_db()->beginTransaction();
+            ap_db()->prepare('DELETE FROM masto_list_accounts WHERE list_id = ?')->execute([$id]);
+            ap_db()->prepare('DELETE FROM masto_lists WHERE id = ? AND owner_user_id = ?')->execute([$id, $ownerUserId]);
+            ap_db()->commit();
+            if (($subscription['bsky_moderation_action'] ?? 'none') !== 'none') ap_bsky_refresh_hide_set($ownerUserId, true);
+        }
+    } catch (Throwable $e) {
+        try { if (ap_db()->inTransaction()) ap_db()->rollBack(); } catch (Throwable $ignored) {}
+        error_log('[ap-lists] reconcile deleted subscribed Bluesky lists failed');
+    }
     ap_lists_moderation_cache_clear($ownerUserId);
     @file_put_contents($cache, json_encode(['at' => time(), 'synced' => $synced]), LOCK_EX);
     return ['ok' => true, 'synced' => $synced];

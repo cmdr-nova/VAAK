@@ -3875,7 +3875,7 @@ function ap_bsky_get_graph_list(int $ownerUserId, string $listUri, int $limit = 
         if ($cursor !== null) $query['cursor'] = $cursor;
         $res = ap_bsky_account_xrpc($ownerUserId, 'app.bsky.graph.getList', 'GET', $query);
         if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
-            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky list'), 'items' => $items, 'complete' => false];
+            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky list'), 'status' => (int) ($res['status'] ?? 0), 'items' => $items, 'complete' => false];
         }
         $pageItems = is_array($res['json']['items'] ?? null) ? $res['json']['items'] : [];
         $items = array_merge($items, $pageItems);
