@@ -1004,6 +1004,11 @@ function ap_route_verified_activity(array $activity, int $bytes): string
 
     // Accept of our outbound Follow (usually not Public — handle before private skip).
     if ($type === 'Accept' && $actorId) {
+        $quoteResult = ap_quote_response_handle($activity, 'Accept');
+        if ($quoteResult !== null) {
+            ap_metrics_record('Accept', $actorId, $objectId, LOCAL_ACTOR, $bytes, $quoteResult, null);
+            return $quoteResult;
+        }
         // Mastodon-style relay: Accept of Follow(as:Public) matching ap_relays.follow_activity_id
         if (!function_exists('ap_relay_handle_accept')) {
             require_once __DIR__ . '/ap-relays.php';
@@ -1035,6 +1040,11 @@ function ap_route_verified_activity(array $activity, int $bytes): string
 
     // Reject of our relay Follow(as:Public)
     if ($type === 'Reject' && $actorId) {
+        $quoteResult = ap_quote_response_handle($activity, 'Reject');
+        if ($quoteResult !== null) {
+            ap_metrics_record('Reject', $actorId, $objectId, LOCAL_ACTOR, $bytes, $quoteResult, null);
+            return $quoteResult;
+        }
         if (!function_exists('ap_relay_handle_reject')) {
             require_once __DIR__ . '/ap-relays.php';
         }
@@ -4125,7 +4135,7 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
  * @param list<string> $priorityExtra reply-author / announce-target inboxes
  * @return array{delivered:int,queued:int,bridgy:bool}
  */
-function ap_deliver_public_activity(array $activity, array $priorityExtra = []): array
+function ap_deliver_public_activity(array $activity, array $priorityExtra = [], bool $skipBridgy = false): array
 {
     $prevActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
     $actorUrl = is_string($activity['actor'] ?? null) ? rtrim((string) $activity['actor'], '/') : '';
@@ -4147,7 +4157,7 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = []):
     $bridgyOk = false;
     // Bridgy FIRST and alone — never sit behind slow followers/shared inboxes.
     // Personal inbox is enough for Bluesky; stop early on first 2xx.
-    foreach ($bridgyInboxes as $inbox) {
+    foreach ($skipBridgy ? [] : $bridgyInboxes as $inbox) {
         if (ap_is_blocked_inbox($inbox)) {
             continue;
         }
@@ -4158,7 +4168,7 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = []):
             break;
         }
     }
-    if (!$bridgyOk) {
+    if (!$bridgyOk && !$skipBridgy) {
         // Don't lose Bluesky if Bridgy timed out — retry in background.
         ap_deliver_fanout_background($activity, $bridgyInboxes, $ident['key_id'], $ident['priv']);
         ap_log('deliver_bridgy_deferred type=' . (string) ($activity['type'] ?? '?'));
@@ -4314,8 +4324,46 @@ function ap_deliver_followers_activity(array $activity, array $priorityExtra = [
     return ['delivered' => $delivered, 'queued' => $queued, 'bridgy' => false];
 }
 
+/** Send a FEP-044f Reject to the requesting actor when local policy denies it. */
+function ap_quote_request_reject(array $activity, string $ownerActor, string $requester): void
+{
+    $instrument = ap_as_id($activity['instrument'] ?? null);
+    $quoted = ap_as_id($activity['object'] ?? null);
+    $requestId = ap_as_id($activity) ?: ($instrument !== null ? $instrument . '/quote' : '');
+    if ($instrument === null || $quoted === null || $requestId === '') {
+        return;
+    }
+    $doc = ap_fetch_actor_doc($requester);
+    $inbox = is_array($doc)
+        ? (ap_resolve_personal_inbox_from_actor_doc($doc) ?: ap_resolve_inbox_from_actor_doc($doc))
+        : null;
+    if (!$inbox || ap_is_blocked_inbox($inbox)) {
+        return;
+    }
+    $prevActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
+    if (function_exists('ap_request_actor_set') && preg_match('#/users/([A-Za-z0-9_]+)$#', $ownerActor, $am)) {
+        ap_request_actor_set($am[1]);
+    }
+    $ident = ap_outbound_identity();
+    $reject = [
+        '@context' => ['https://www.w3.org/ns/activitystreams', ['QuoteRequest' => 'https://w3id.org/fep/044f#QuoteRequest']],
+        'id' => $ownerActor . '/rejects/' . bin2hex(random_bytes(8)),
+        'type' => 'Reject',
+        'actor' => $ownerActor,
+        'to' => [$requester],
+        'object' => [
+            'type' => 'QuoteRequest', 'id' => $requestId, 'actor' => $requester,
+            'object' => $quoted, 'instrument' => $instrument,
+        ],
+    ];
+    ap_deliver_signed_json($inbox, $reject, $ident['key_id'], $ident['priv'], 5.0);
+    if (function_exists('ap_request_actor_set')) {
+        ap_request_actor_set(is_array($prevActor) ? (string) ($prevActor['key'] ?? '') : null);
+    }
+}
+
 /**
- * Auto-approve FEP-044f QuoteRequest for public quotes of our notes.
+ * Auto-approve FEP-044f QuoteRequest for quotable public/unlisted notes.
  * Returns action label, or null if this QuoteRequest is not for us.
  */
 function ap_handle_quote_request(array $activity): ?string
@@ -4331,11 +4379,18 @@ function ap_handle_quote_request(array $activity): ?string
     $ownerKey = (string) $qm[1];
     $ownerActor = 'https://mkultra.monster/users/' . $ownerKey;
     // Confirm note exists
-    $st = ap_db()->prepare('SELECT id FROM outbox_notes WHERE id = ?');
+    $st = ap_db()->prepare('SELECT id, visibility FROM outbox_notes WHERE id = ?');
     $st->execute([$quotedId]);
-    if (!$st->fetch()) {
+    $quotedRow = $st->fetch();
+    if (!is_array($quotedRow)) {
+        ap_quote_request_reject($activity, $ownerActor, $actorId);
         ap_log('quote_request_unknown_note ' . ap_short($quotedId));
         return 'quote_request_unknown';
+    }
+    if (!is_array($quotedRow) || !in_array(ap_normalize_visibility((string) ($quotedRow['visibility'] ?? 'public')), ['public', 'unlisted'], true)) {
+        ap_quote_request_reject($activity, $ownerActor, $actorId);
+        ap_log('quote_request_policy_denied visibility actor=' . ap_short($actorId));
+        return 'quote_request_policy_denied';
     }
     if (ap_is_blocked_actor($actorId)) {
         ap_log('quote_request_blocked ' . ap_short($actorId));
@@ -4347,6 +4402,7 @@ function ap_handle_quote_request(array $activity): ?string
     // this check protects the server when a remote instance sends a request anyway.
     $quotePolicy = (string) (ap_profile_get($ownerKey)['quote_policy'] ?? 'anyone');
     if ($quotePolicy === 'nobody') {
+        ap_quote_request_reject($activity, $ownerActor, $actorId);
         ap_log('quote_request_policy_denied nobody actor=' . ap_short($actorId));
         return 'quote_request_policy_denied';
     }
@@ -4356,6 +4412,7 @@ function ap_handle_quote_request(array $activity): ?string
         );
         $st->execute([$ownerActor, $ownerActor . '/', $actorId, $actorId . '/']);
         if (!$st->fetchColumn()) {
+            ap_quote_request_reject($activity, $ownerActor, $actorId);
             ap_log('quote_request_policy_denied followers actor=' . ap_short($actorId));
             return 'quote_request_policy_denied';
         }
@@ -4421,6 +4478,190 @@ function ap_handle_quote_request(array $activity): ?string
     ap_metrics_record('QuoteRequest', $actorId, $quotedId, $ownerActor, 0, $ok ? 'quote_accepted' : 'quote_accept_deliver_fail', $quotingId);
     ap_log('quote_request ' . ($ok ? 'accepted' : 'accept_fail') . ' by=' . ap_short($actorId) . ' note=' . ap_short($quotedId) . ' stamp=' . ap_short($stampId));
     return $ok ? 'quote_accepted' : 'quote_accept_deliver_fail';
+}
+
+/** Send the FEP-044f consent request for a quote of a remote object. */
+function ap_quote_request_send(string $quotedObjectId, array $quoteNote): bool
+{
+    $quotedObjectId = rtrim(trim($quotedObjectId), '/');
+    $noteId = rtrim((string) ($quoteNote['id'] ?? ''), '/');
+    $actor = rtrim((string) ($quoteNote['attributedTo'] ?? ''), '/');
+    if (!str_starts_with($quotedObjectId, 'https://') || !str_starts_with($noteId, 'https://')
+        || !str_starts_with($actor, 'https://')) {
+        return false;
+    }
+    $target = ap_fetch_as2_object($quotedObjectId);
+    if (!is_array($target)) {
+        ap_log('quote_request_target_fetch_fail note=' . ap_short($noteId));
+        return false;
+    }
+    $targetActor = ap_as_id($target['attributedTo'] ?? null) ?: ap_as_id($target['actor'] ?? null);
+    if (!$targetActor || rtrim($targetActor, '/') === $actor) {
+        return false;
+    }
+    $actorDoc = ap_fetch_actor_doc($targetActor);
+    $inbox = is_array($actorDoc)
+        ? (ap_resolve_personal_inbox_from_actor_doc($actorDoc) ?: ap_resolve_inbox_from_actor_doc($actorDoc))
+        : null;
+    if (!$inbox || ap_is_blocked_inbox($inbox)) {
+        ap_log('quote_request_inbox_missing actor=' . ap_short($targetActor));
+        return false;
+    }
+    $prevActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
+    if (function_exists('ap_request_actor_set') && preg_match('#/users/([A-Za-z0-9_]+)$#', $actor, $am)) {
+        ap_request_actor_set($am[1]);
+    }
+    $ident = ap_outbound_identity();
+    $request = [
+        '@context' => ['https://www.w3.org/ns/activitystreams', ap_quote_ld_context(), ['QuoteRequest' => 'https://w3id.org/fep/044f#QuoteRequest']],
+        'id' => $noteId . '/quote',
+        'type' => 'QuoteRequest',
+        'actor' => $actor,
+        'to' => [$targetActor],
+        'object' => $quotedObjectId,
+        'instrument' => ap_note_ensure_quote_policy($quoteNote),
+    ];
+    $ok = ap_deliver_signed_json($inbox, $request, $ident['key_id'], $ident['priv'], 5.0);
+    $queued = !$ok && ap_deliver_fanout_background($request, [$inbox], $ident['key_id'], $ident['priv']);
+    if (function_exists('ap_request_actor_set')) {
+        ap_request_actor_set(is_array($prevActor) ? (string) ($prevActor['key'] ?? '') : null);
+    }
+    ap_log('quote_request_send ' . ($ok ? 'ok' : ($queued ? 'queued' : 'fail')) . ' target=' . ap_short($quotedObjectId) . ' request=' . ap_short($noteId . '/quote'));
+    return $ok || $queued;
+}
+
+/** Apply a valid FEP-044f Accept/Reject response to one of our outbound quotes. */
+function ap_quote_response_handle(array $activity, string $responseType): ?string
+{
+    $request = $activity['object'] ?? null;
+    if (!is_array($request) || (string) ($request['type'] ?? '') !== 'QuoteRequest') {
+        return null;
+    }
+    $sender = ap_as_id($activity['actor'] ?? null);
+    $requestActor = ap_as_id($request['actor'] ?? null);
+    $quotedId = ap_as_id($request['object'] ?? null);
+    $instrument = ap_as_id($request['instrument'] ?? null);
+    if (!$sender || !$requestActor || !$quotedId || !$instrument
+        || rtrim($sender, '/') !== rtrim($requestActor, '/')
+        || !preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+/notes/#', $instrument)) {
+        return 'quote_response_invalid';
+    }
+    $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+    $st->execute([$instrument, rtrim($instrument, '/') . '/']);
+    $row = $st->fetch();
+    if (!is_array($row)) {
+        return 'quote_response_unknown';
+    }
+    $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+    $note = is_array($raw) && is_array($raw['object'] ?? null) ? $raw['object'] : null;
+    if (!is_array($note) || rtrim((string) ($note['id'] ?? ''), '/') !== rtrim($instrument, '/')
+        || rtrim(ap_as_id($note['quote'] ?? null) ?? '', '/') !== rtrim($quotedId, '/')
+        || rtrim((string) ($request['id'] ?? ''), '/') !== rtrim($instrument, '/') . '/quote') {
+        return 'quote_response_mismatch';
+    }
+    $localActor = function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : rtrim(LOCAL_ACTOR, '/');
+    if ($localActor === '' || rtrim((string) ($note['attributedTo'] ?? ''), '/') !== $localActor) {
+        return 'quote_response_wrong_owner';
+    }
+    $targetDoc = ap_fetch_as2_object($quotedId);
+    $targetActor = is_array($targetDoc)
+        ? (ap_as_id($targetDoc['attributedTo'] ?? null) ?: ap_as_id($targetDoc['actor'] ?? null))
+        : null;
+    if (!$targetActor || rtrim($targetActor, '/') !== rtrim($sender, '/')) {
+        return 'quote_response_wrong_actor';
+    }
+    if ($responseType === 'Accept') {
+        $authId = ap_as_id($activity['result'] ?? null);
+        if (!$authId || !str_starts_with($authId, 'https://')) {
+            return 'quote_response_missing_authorization';
+        }
+        $auth = ap_fetch_as2_object($authId);
+        if (!is_array($auth) || (string) ($auth['type'] ?? '') !== 'QuoteAuthorization'
+            || rtrim((string) ($auth['id'] ?? ''), '/') !== rtrim($authId, '/')
+            || rtrim(ap_as_id($auth['attributedTo'] ?? null) ?? '', '/') !== rtrim($sender, '/')
+            || rtrim(ap_as_id($auth['interactingObject'] ?? null) ?? '', '/') !== rtrim($instrument, '/')
+            || rtrim(ap_as_id($auth['interactionTarget'] ?? null) ?? '', '/') !== rtrim($quotedId, '/')) {
+            return 'quote_response_invalid_authorization';
+        }
+        $note['quoteAuthorization'] = $authId;
+    } else {
+        unset($note['quote'], $note['quoteAuthorization']);
+        $note['tag'] = array_values(array_filter((array) ($note['tag'] ?? []), static fn($tag): bool =>
+            !is_array($tag) || rtrim((string) ($tag['href'] ?? ''), '/') !== rtrim($quotedId, '/')
+        ));
+    }
+    $raw['object'] = $note;
+    $raw = ap_create_finalize($raw);
+    ap_db()->prepare('UPDATE outbox_notes SET raw_create_json = ? WHERE id = ? OR id = ?')->execute([
+        json_encode($raw, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $instrument, rtrim($instrument, '/') . '/',
+    ]);
+    if ($responseType === 'Accept' && empty($note['blueskyUri']) && !empty($note['quote'])) {
+        try {
+            if (!function_exists('ap_bsky_crosspost_status')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            $statusRow = function_exists('ap_masto_status_by_note_id')
+                ? ap_masto_status_by_note_id($instrument)
+                : null;
+            $ownerId = function_exists('ap_db_owner_user_id_for_actor')
+                ? ap_db_owner_user_id_for_actor((string) ($note['attributedTo'] ?? ''))
+                : 0;
+            if ($ownerId > 0 && is_array($statusRow) && function_exists('ap_bsky_session_row')
+                && ap_bsky_session_row($ownerId) !== null) {
+                $mediaSt = ap_db()->prepare('SELECT local_id FROM masto_media WHERE status_local_id = ? ORDER BY local_id ASC');
+                $mediaSt->execute([(int) ($statusRow['local_id'] ?? 0)]);
+                $mediaIds = array_map('intval', $mediaSt->fetchAll(PDO::FETCH_COLUMN));
+                $bsky = ap_bsky_crosspost_status(
+                    $ownerId,
+                    (string) ($statusRow['content_text'] ?? ''),
+                    ap_normalize_visibility((string) ($row['visibility'] ?? 'public')),
+                    $mediaIds,
+                    (string) ($statusRow['spoiler_text'] ?? ''),
+                    !empty($row['in_reply_to']) ? (string) $row['in_reply_to'] : null,
+                    (string) $note['quote'],
+                    $instrument
+                );
+                if (!empty($bsky['ok']) && empty($bsky['skipped']) && !empty($bsky['uri'])
+                    && function_exists('ap_note_attach_bsky_proxy')) {
+                    $note = ap_note_attach_bsky_proxy(
+                        $note,
+                        (string) $bsky['uri'],
+                        isset($bsky['cid']) ? (string) $bsky['cid'] : null
+                    );
+                    $raw['object'] = $note;
+                    $raw = ap_create_finalize($raw);
+                    ap_db()->prepare('UPDATE outbox_notes SET raw_create_json = ? WHERE id = ? OR id = ?')->execute([
+                        json_encode($raw, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $instrument, rtrim($instrument, '/') . '/',
+                    ]);
+                }
+            }
+        } catch (Throwable $e) {
+            ap_log('quote_accept_bsky_mirror_fail ' . ap_short($e->getMessage(), 160));
+        }
+    }
+    $visibility = ap_normalize_visibility((string) ($row['visibility'] ?? 'public'));
+    $update = [
+        '@context' => ['https://www.w3.org/ns/activitystreams', ap_quote_ld_context()],
+        'id' => rtrim((string) ($note['attributedTo'] ?? ''), '/') . '/updates/' . bin2hex(random_bytes(8)),
+        'type' => 'Update', 'actor' => (string) ($note['attributedTo'] ?? ''), 'published' => gmdate('c'),
+        'to' => $note['to'] ?? [], 'cc' => $note['cc'] ?? [], 'object' => $note,
+    ];
+    $prevActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
+    if (function_exists('ap_request_actor_set') && preg_match('#/users/([A-Za-z0-9_]+)$#', (string) ($note['attributedTo'] ?? ''), $am)) {
+        ap_request_actor_set($am[1]);
+    }
+    if (in_array($visibility, ['public', 'unlisted'], true)) {
+        // Pending quotes are mirrored directly to Bluesky only after consent;
+        // this Update is for Fediverse recipients and must not bypass that gate.
+        ap_deliver_public_activity($update, [], true);
+    } else {
+        ap_deliver_followers_activity($update, []);
+    }
+    if (function_exists('ap_request_actor_set')) {
+        ap_request_actor_set(is_array($prevActor) ? (string) ($prevActor['key'] ?? '') : null);
+    }
+    ap_log('quote_response_applied type=' . $responseType . ' quote=' . ap_short($instrument));
+    return $responseType === 'Accept' ? 'quote_accepted' : 'quote_rejected';
 }
 
 /**
@@ -4657,6 +4898,7 @@ function ap_publish_status_text(
         }
         $note['endTime'] = $endTime;
     }
+    $quoteApprovalPending = false;
     if ($quoteObjectId !== '') {
         $quoteObjectId = rtrim($quoteObjectId, '/');
         $note['quote'] = $quoteObjectId;
@@ -4681,6 +4923,9 @@ function ap_publish_status_text(
         $qDoc = ap_fetch_as2_object($quoteObjectId);
         if (is_array($qDoc)) {
             $qActor = ap_as_id($qDoc['attributedTo'] ?? null) ?: ap_as_id($qDoc['actor'] ?? null);
+            if ($qActor && rtrim($qActor, '/') !== rtrim($actor, '/')) {
+                $quoteApprovalPending = true;
+            }
             if ($qActor && str_starts_with($qActor, 'https://') && !in_array($qActor, $cc, true) && !in_array($qActor, $to, true)) {
                 $cc[] = $qActor;
                 $note['cc'] = $cc;
@@ -4829,10 +5074,17 @@ function ap_publish_status_text(
 
     // Public: Bridgy + followers + shared inboxes. Unlisted/private: followers only.
     $fan = ($visibility === 'public')
-        ? ap_deliver_public_activity($create, $priorityExtra)
+        ? ap_deliver_public_activity($create, $priorityExtra, $quoteApprovalPending)
         : ap_deliver_followers_activity($create, $priorityExtra);
     $delivered = $fan['delivered'];
     $queued = $fan['queued'];
+
+    if ($quoteObjectId !== '') {
+        // FEP-044f requests explicit authorization from the quoted author. Until
+        // their signed authorization arrives, Mastodon-compatible clients see
+        // this quote as pending and VAAK suppresses the embedded post preview.
+        ap_quote_request_send($quoteObjectId, $note);
+    }
 
     ap_log("publish_status create=$createId local_id=$localId visibility=$visibility delivered=$delivered queued=$queued bridgy=" . ($fan['bridgy'] ? '1' : '0')
         . ' kind=' . ($pollNorm !== null ? 'poll' : ($attachments ? 'media' : 'text')));
@@ -4866,16 +5118,23 @@ function ap_publish_status_text(
                 $bskyOwnerId = 0;
             }
             if ($bskyOwnerId > 0) {
-                $bsky = ap_bsky_crosspost_status(
-                    $bskyOwnerId,
-                    $content,
-                    $visibility,
-                    $mediaLocalIds,
-                    $spoilerText,
-                    $inReplyTo !== '' ? $inReplyTo : null,
-                    $quoteObjectId !== '' ? $quoteObjectId : null,
-                    $noteId // fediverseId: Bluesky post is a mirror of this AP Note
-                );
+                if ($quoteApprovalPending) {
+                    // Do not leak an unapproved Fediverse quote through its
+                    // Bluesky mirror. The Accept handler retries this mirror.
+                    $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Quote awaits Fediverse authorization'];
+                    ap_log('bsky_crosspost_deferred_quote note=' . $localId);
+                } else {
+                    $bsky = ap_bsky_crosspost_status(
+                        $bskyOwnerId,
+                        $content,
+                        $visibility,
+                        $mediaLocalIds,
+                        $spoilerText,
+                        $inReplyTo !== '' ? $inReplyTo : null,
+                        $quoteObjectId !== '' ? $quoteObjectId : null,
+                        $noteId // fediverseId: Bluesky post is a mirror of this AP Note
+                    );
+                }
                 if (!empty($bsky['ok']) && empty($bsky['skipped'])
                     && !empty($bsky['uri']) && is_string($bsky['uri'])
                     && function_exists('ap_note_attach_bsky_proxy')) {

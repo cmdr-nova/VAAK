@@ -524,6 +524,7 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
     // Prefer live outbox HTML when present
     $noteId = (string) ($row['note_id'] ?? '');
     $quoteObjectUrl = null;
+    $quoteAuthorized = false;
     if ($noteId !== '') {
         $st = ap_db()->prepare('SELECT content, raw_create_json FROM outbox_notes WHERE id = ?');
         $st->execute([$noteId]);
@@ -542,6 +543,13 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
                 $quoteObjectUrl = ap_masto_quote_url_from_create_json(
                     isset($ob['raw_create_json']) ? (string) $ob['raw_create_json'] : null
                 );
+                $rawCreate = json_decode((string) ($ob['raw_create_json'] ?? ''), true);
+                $quoteNote = is_array($rawCreate) && is_array($rawCreate['object'] ?? null)
+                    ? $rawCreate['object'] : [];
+                $quoteActor = rtrim((string) ($quoteNote['attributedTo'] ?? ''), '/');
+                $quoteAuthorized = !empty($quoteNote['quoteAuthorization'])
+                    || ($quoteActor !== '' && $quoteObjectUrl !== null
+                        && str_starts_with(rtrim($quoteObjectUrl, '/') . '/', $quoteActor . '/notes/'));
             }
         }
     }
@@ -693,7 +701,7 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
         if ($allowQuoteFetch && function_exists('ap_feature_enabled')) {
             $allowQuoteFetch = ap_feature_enabled('detail_quote_hydration', true);
         }
-        $quote = ap_masto_quote_entity($quoteObjectUrl, 0, $allowQuoteFetch);
+        $quote = ap_masto_quote_entity($quoteObjectUrl, 0, $allowQuoteFetch, $quoteAuthorized);
         if ($quote !== null) {
             $status['quote'] = $quote;
         }
@@ -807,12 +815,19 @@ function ap_masto_quote_url_from_create_json(?string $rawCreateJson): ?string
  *
  * @return array{state:string,quoted_status:?array<string,mixed>,quoted_status_id:?string}|null
  */
-function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $allowFetch = false): ?array
+function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $allowFetch = false, bool $authorized = true): ?array
 {
     if ($quoteObjectUrl === null || $quoteObjectUrl === '' || !str_starts_with($quoteObjectUrl, 'https://')) {
         return null;
     }
     $quoteObjectUrl = rtrim($quoteObjectUrl, '/');
+    if (!$authorized) {
+        return [
+            'state' => 'pending',
+            'quoted_status' => null,
+            'quoted_status_id' => null,
+        ];
+    }
     // Avoid deep nesting / recursion
     if ($depth > 1) {
         return [

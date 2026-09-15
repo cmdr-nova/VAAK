@@ -86,6 +86,20 @@ if ($method !== 'GET' && $method !== 'HEAD') {
     exit;
 }
 
+// Dereferenceable FEP-044f QuoteAuthorization stamps for invitee accounts.
+if (preg_match('#^quote_auth/([a-f0-9]+)$#', $sub, $qm)) {
+    $stampId = $actorId . '/quote_auth/' . $qm[1];
+    $stamp = function_exists('ap_quote_auth_get') ? ap_quote_auth_get($stampId) : null;
+    if (!is_array($stamp)) {
+        http_response_code(404);
+        header('Content-Type: application/activity+json; charset=utf-8');
+        echo '{"error":"Not found"}';
+        exit;
+    }
+    ap_user_json(ap_quote_auth_document($stamp), $accept);
+    exit;
+}
+
 if ($sub === 'feed.xml' || $sub === 'feed.atom') {
     $feedProfile = function_exists('ap_profile_get') ? ap_profile_get($actorKey) : [];
     ap_feed_render($actorKey, (string) ($feedProfile['name'] ?? ('@' . $actorKey)), $sub === 'feed.atom' ? 'atom' : 'rss');
