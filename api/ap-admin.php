@@ -797,12 +797,19 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not delete folder.';
             }
         } elseif ($action === 'bookmark_folder_add') {
+            $folderStatusId = trim((string) ($_POST['status_id'] ?? ''));
+            $folderObjectId = trim((string) ($_POST['object_id'] ?? ''));
+            $folderPlatform = (string) ($_POST['platform'] ?? '') === 'bsky' ? 'bsky' : 'fedi';
+            if ($folderStatusId === '' && $folderPlatform === 'bsky' && str_starts_with($folderObjectId, 'at://')
+                && function_exists('admin_bsky_bookmark_keys')) {
+                $folderStatusId = (string) (admin_bsky_bookmark_keys($folderObjectId, $vaakOwnerId)['status_id'] ?? '');
+            }
             $res = vaak_bookmark_folder_add_status(
                 (int) ($_POST['folder_id'] ?? 0),
-                (string) ($_POST['status_id'] ?? ''),
+                $folderStatusId,
                 $vaakOwnerId,
-                trim((string) ($_POST['object_id'] ?? '')) ?: null,
-                (string) ($_POST['platform'] ?? '') === 'bsky' ? 'bsky' : 'fedi'
+                $folderObjectId !== '' ? $folderObjectId : null,
+                $folderPlatform
             );
             $payload = $res + [
                 'status_id' => (string) ($_POST['status_id'] ?? ''),
@@ -814,9 +821,15 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not add to folder.';
             }
         } else {
+            $folderStatusId = trim((string) ($_POST['status_id'] ?? ''));
+            $folderObjectId = trim((string) ($_POST['object_id'] ?? ''));
+            if ($folderStatusId === '' && (string) ($_POST['platform'] ?? '') === 'bsky'
+                && str_starts_with($folderObjectId, 'at://') && function_exists('admin_bsky_bookmark_keys')) {
+                $folderStatusId = (string) (admin_bsky_bookmark_keys($folderObjectId, $vaakOwnerId)['status_id'] ?? '');
+            }
             $res = vaak_bookmark_folder_remove_status(
                 (int) ($_POST['folder_id'] ?? 0),
-                (string) ($_POST['status_id'] ?? ''),
+                $folderStatusId,
                 $vaakOwnerId
             );
             $payload = $res + [
@@ -3272,6 +3285,13 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
     $statusId = trim((string) ($_GET['status_id'] ?? ''));
+    $objectId = trim((string) ($_GET['object_id'] ?? ''));
+    $platform = (string) ($_GET['platform'] ?? '') === 'bsky' ? 'bsky' : 'fedi';
+    if ($statusId === '' && $platform === 'bsky' && str_starts_with($objectId, 'at://')
+        && function_exists('admin_bsky_bookmark_keys')) {
+        $keys = admin_bsky_bookmark_keys($objectId, $vaakOwnerId);
+        $statusId = (string) ($keys['status_id'] ?? '');
+    }
     $folders = function_exists('vaak_bookmark_folders_list')
         ? vaak_bookmark_folders_list($vaakOwnerId)
         : [];
@@ -3283,6 +3303,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
         'folders' => $folders,
         'selected' => $selected,
         'status_id' => $statusId,
+        'object_id' => $objectId,
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -19362,7 +19383,9 @@ window.apAdminToast = function (msg, isErr) {
 
     let data = null;
     try {
-      const res = await fetch('?ajax=bookmark_folders&status_id=' + encodeURIComponent(statusId), {
+      const res = await fetch('?ajax=bookmark_folders&status_id=' + encodeURIComponent(statusId)
+        + '&object_id=' + encodeURIComponent(objectId || '')
+        + '&platform=' + encodeURIComponent(bookmarkPlatform), {
         credentials: 'same-origin',
         headers: { 'Accept': 'application/json' }
       });
@@ -19372,6 +19395,8 @@ window.apAdminToast = function (msg, isErr) {
     }
     if (!folderPopover) return;
     positionFolderPopover(pop, anchorBtn);
+    if (data && data.status_id) statusId = String(data.status_id);
+    if (data && data.object_id) objectId = String(data.object_id);
     const selected = new Set((selectedIds || (data && data.selected) || []).map(String));
     const folders = (data && data.folders) || [];
     let html = '<h4>Save to folder</h4>';
@@ -19417,7 +19442,8 @@ window.apAdminToast = function (msg, isErr) {
     pop.addEventListener('click', async (ev) => {
       const t = ev.target;
       if (!(t instanceof HTMLElement)) return;
-      if (t.getAttribute('data-bm-done') === '1') {
+      const doneButton = t.closest('[data-bm-done="1"]');
+      if (doneButton) {
         const nameInput = pop.querySelector('#bm-new-folder-name');
         const name = nameInput instanceof HTMLInputElement ? nameInput.value.trim() : '';
         if (name) {
@@ -19443,7 +19469,8 @@ window.apAdminToast = function (msg, isErr) {
         closeFolderPopover();
         return;
       }
-      if (t.getAttribute('data-bm-unbookmark') === '1') {
+      const removeButton = t.closest('[data-bm-unbookmark="1"]');
+      if (removeButton) {
         closeFolderPopover();
         if (opts && typeof opts.onRemove === 'function') {
           try { await opts.onRemove(); } catch (e) { /* quiet */ }
@@ -19462,7 +19489,10 @@ window.apAdminToast = function (msg, isErr) {
   window.novaOpenBookmarkFolderPicker = openBookmarkFolderPicker;
 
   document.addEventListener('click', (ev) => {
-    if (folderPopover && !folderPopover.contains(ev.target)) {
+    const target = ev.target;
+    const pickerTrigger = target && target.closest
+      ? target.closest('button[data-bm-picker="1"], button.bsky-action[data-bsky-action="bookmark"]') : null;
+    if (folderPopover && !folderPopover.contains(target) && !pickerTrigger) {
       closeFolderPopover();
     }
   });
@@ -19481,7 +19511,7 @@ window.apAdminToast = function (msg, isErr) {
     if (statusId && statusId.value) {
       openBookmarkFolderPicker(btn, statusId.value, objectId ? objectId.value : '', null);
     }
-  });
+  }, true);
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closeFolderPopover();
   });
@@ -19605,15 +19635,19 @@ window.apAdminToast = function (msg, isErr) {
     if (!INTERACT.has(action)) return;
     const btn = form.querySelector('button[type="submit"]');
     ev.preventDefault();
-    if (form.dataset.busy === '1' || form.dataset.queuePending === '1') {
-      window.apQueueRepeatedClick(form);
-      return;
-    }
     // Already bookmarked: open folder picker instead of immediately removing
+    // This takes precedence over the pending-queue guard: the local bookmark
+    // state is already optimistic, so users can organize/remove it immediately
+    // while the durable add is still being delivered in the background.
     if (action === 'unbookmark_status' && btn && btn.getAttribute('data-bm-picker') === '1' && form.dataset.skipBmPicker !== '1') {
       const sid = (form.querySelector('input[name="status_id"]') || {}).value || '';
       const oid = (form.querySelector('input[name="object_id"]') || {}).value || '';
       if (sid) openBookmarkFolderPicker(btn, sid, oid, null);
+      return;
+    }
+    if (form.dataset.busy === '1' || (form.dataset.queuePending === '1'
+        && !(action === 'unbookmark_status' && form.dataset.skipBmPicker === '1'))) {
+      window.apQueueRepeatedClick(form);
       return;
     }
     const fd = new FormData(form);
@@ -20242,15 +20276,14 @@ window.apAdminToast = function (msg, isErr) {
       else btn.setAttribute('data-bm-picker', state.bmPicker);
     }
 
+    // Capture this before card/timeline click handlers can stop propagation.
+    // In particular, a saved bookmark must open its organizer even while its
+    // durable save/remove request is still being reconciled in the background.
     document.addEventListener('click', async (ev) => {
       const btn = ev.target && ev.target.closest ? ev.target.closest('button.bsky-action') : null;
       if (!btn) return;
       ev.preventDefault();
       ev.stopPropagation();
-      if (btn.dataset.busy === '1' || btn.dataset.queuePending === '1') {
-        if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(btn);
-        return;
-      }
       const action = btn.dataset.bskyAction || '';
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
@@ -20260,11 +20293,12 @@ window.apAdminToast = function (msg, isErr) {
       if (!action) return;
 
       // Already bookmarked: open folder picker (same as federated cards).
-      if (action === 'bookmark' && isOn && btn.getAttribute('data-bm-picker') === '1') {
+      if (action === 'bookmark' && isOn) {
         const sid = btn.dataset.statusId || '';
         const oid = btn.dataset.objectId || uri;
-        if (sid && typeof window.novaOpenBookmarkFolderPicker === 'function') {
+        if (typeof window.novaOpenBookmarkFolderPicker === 'function') {
           window.novaOpenBookmarkFolderPicker(btn, sid, oid, null, {
+            platform: 'bsky',
             onRemove: async () => {
               const before = snapshotBskyButton(btn);
               applyBskyBookmarkUi(btn, false);
@@ -20287,6 +20321,11 @@ window.apAdminToast = function (msg, isErr) {
             },
           });
         }
+        return;
+      }
+
+      if (btn.dataset.busy === '1' || btn.dataset.queuePending === '1') {
+        if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(btn);
         return;
       }
 
@@ -20371,7 +20410,7 @@ window.apAdminToast = function (msg, isErr) {
         btn.dataset.busy = '0';
         btn.disabled = false;
       }
-    });
+    }, true);
   })();
 
   const root = document.querySelector('.feed');
