@@ -2548,14 +2548,24 @@ function ap_bsky_posts_prune(string $cutoffIso, bool $dryRun = false): array
 {
     ap_bsky_posts_migrate();
     ap_bsky_post_links_migrate();
+    // A post saved as a Bluesky bookmark is user-owned cache data, not merely
+    // an evictable timeline entry. Fail closed if the bookmark cache schema
+    // cannot be checked, so maintenance never deletes content blindly.
+    if (!ap_bsky_bookmark_cache_migrate()) return ['posts' => 0, 'links' => 0];
     $posts = 0;
     $links = 0;
     try {
-        $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE seen_at < ?');
+        $st = ap_db()->prepare("SELECT COUNT(*) FROM bsky_posts p WHERE p.seen_at < ?
+            AND NOT EXISTS (
+              SELECT 1 FROM bsky_bookmark_cache b WHERE b.bookmark_uri = p.bsky_uri
+            )");
         $st->execute([$cutoffIso]);
         $posts = (int) $st->fetchColumn();
         if ($posts > 0 && !$dryRun) {
-            $del = ap_db()->prepare('DELETE FROM bsky_posts WHERE seen_at < ?');
+            $del = ap_db()->prepare("DELETE FROM bsky_posts WHERE seen_at < ?
+                AND NOT EXISTS (
+                  SELECT 1 FROM bsky_bookmark_cache b WHERE b.bookmark_uri = bsky_posts.bsky_uri
+                )");
             $del->execute([$cutoffIso]);
             $posts = $del->rowCount();
             if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {

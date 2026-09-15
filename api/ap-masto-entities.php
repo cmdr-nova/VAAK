@@ -9289,6 +9289,38 @@ function ap_masto_bookmarks_list(int $limit = 40, ?string $maxId = null): array
 }
 
 /**
+ * Hydrate only bookmarked statuses assigned to a VAAK folder. This avoids
+ * resolving the whole bookmark page just to display a small folder.
+ *
+ * @param list<string> $statusIds
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_bookmarks_for_status_ids(array $statusIds, ?int $ownerUserId = null): array
+{
+    $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    $ids = array_values(array_unique(array_filter(array_map(
+        static fn($id): string => trim((string) $id),
+        array_slice($statusIds, 0, 500)
+    ), static fn(string $id): bool => $id !== '')));
+    if ($ownerUserId < 1 || $ids === []) return [];
+    try {
+        $marks = implode(',', array_fill(0, count($ids), '?'));
+        $st = ap_db()->prepare(
+            'SELECT * FROM masto_bookmarks WHERE owner_user_id = ? AND status_id IN (' . $marks . ') ORDER BY created_at DESC'
+        );
+        $st->execute(array_merge([$ownerUserId], $ids));
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
+            if ($status !== null) $out[] = $status;
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/**
  * Mastodon-shaped boost wrapper status for one of our Announces.
  *
  * @param array<string,mixed> $reblogRow masto_reblogs row

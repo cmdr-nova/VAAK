@@ -6239,11 +6239,11 @@ function admin_report_href(string $targetActor, string $objectId = '', string $f
 function admin_media_is_video(string $url, ?string $mediaType = null): bool
 {
     $mt = strtolower(trim((string) $mediaType));
-    if (str_starts_with($mt, 'video/')) {
+    if (str_starts_with($mt, 'video/') || in_array($mt, ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true)) {
         return true;
     }
     $path = (string) (parse_url($url, PHP_URL_PATH) ?? '');
-    return (bool) preg_match('/\.(mp4|webm|mov|m4v)(\?|$)/i', $path);
+    return (bool) preg_match('/\.(mp4|webm|mov|m4v|m3u8)$/i', $path);
 }
 
 function admin_media_is_audio(string $url, ?string $mediaType = null): bool
@@ -6589,7 +6589,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
             if ($mt === null && strtolower((string) ($item['type'] ?? '')) === 'audio') {
                 $mt = 'audio/*';
             }
-            $preview = (string) ($item['preview_url'] ?? $item['poster'] ?? '');
+            $preview = (string) ($item['preview_url'] ?? $item['poster'] ?? $item['thumbnail'] ?? '');
         }
         if ($url === '' || !str_starts_with($url, 'https://')) {
             continue;
@@ -9579,8 +9579,12 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
     $atUri = trim($atUri);
     $objectId = $atUri;
     $statusId = '';
-    if ($atUri !== '' && function_exists('ap_bsky_local_note_id_for_at_uri')) {
-        $noteId = ap_bsky_local_note_id_for_at_uri($atUri, $ownerUserId);
+    if ($atUri !== '' && function_exists('ap_bsky_crosspost_by_uri')) {
+        // Render-time bookmark key lookup must remain cache/DB-only. The more
+        // general local-note resolver can fall back to an XRPC getRecord call,
+        // which made folder pages issue one network request per cached bookmark.
+        $crosspost = ap_bsky_crosspost_by_uri($atUri);
+        $noteId = is_array($crosspost) ? trim((string) ($crosspost['note_id'] ?? '')) : '';
         if (is_string($noteId) && $noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
             $st = ap_masto_status_by_note_id($noteId);
             if (is_array($st) && !empty($st['local_id'])) {
@@ -9624,6 +9628,11 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $av = (string) ($author['avatar'] ?? '');
     $text = function_exists('ap_bsky_post_text') ? ap_bsky_post_text($post) : '';
     $imgs = function_exists('ap_bsky_post_image_urls') ? ap_bsky_post_image_urls($post) : [];
+    $videos = function_exists('ap_bsky_post_video_media') ? ap_bsky_post_video_media($post) : [];
+    // The cached Bluesky AppView embed contains an HLS playlist and thumbnail.
+    // Feed cards (including bookmarks) share this renderer, so use that data
+    // directly rather than adding a per-card fetch or another cache path.
+    $mediaItems = array_merge($imgs, $videos);
     $external = function_exists('ap_bsky_post_external') ? ap_bsky_post_external($post) : null;
     $openUrl = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : 'https://bsky.app/';
     $created = (string) ($post['indexedAt'] ?? ($post['record']['createdAt'] ?? ''));
@@ -9719,7 +9728,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     }
 
     // Same lightbox triggers as federated cards (not raw <a target=_blank>).
-    $mediaHtml = $imgs !== [] ? admin_media_row_html($imgs) : '';
+    $mediaHtml = $mediaItems !== [] ? admin_media_row_html($mediaItems) : '';
     $linkCardHtml = '';
     if (is_array($external) && function_exists('ap_bsky_external_link_card_html')) {
         $linkCardHtml = ap_bsky_external_link_card_html($external);
@@ -9838,6 +9847,14 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
           <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
           <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
           <button type="button" class="icon-btn bsky-action<?= $bookmarked ? ' on' : '' ?>" data-bsky-action="bookmark" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>" data-bm-picker="<?= $bookmarked ? '1' : '0' ?>" title="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bookmarked ? 'true' : 'false' ?>"><i class="ph<?= $bookmarked ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+          <?php if ($context === 'bookmarks' && $bookmarked && $bmKeys['status_id'] !== ''): ?>
+            <details class="post-action-menu">
+              <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
+              <div class="post-action-menu__body">
+                <button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="bsky" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>">Add to folder</button>
+              </div>
+            </details>
+          <?php endif; ?>
         <?php endif; ?>
         <?php if (!$isHome && $fediId !== ''): ?>
           <a class="meta" href="<?= h($fediId) ?>" style="margin-left:.25rem">AP copy</a>
@@ -13460,13 +13477,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $bookmarkLimit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
           $bookmarkLimit = (int) (ceil($bookmarkLimit / 20) * 20);
           $bookmarkFetchLimit = $bmFolderFilter > 0 ? 80 : $bookmarkLimit;
-          $bmList = ap_masto_bookmarks_list($bookmarkFetchLimit, null);
+          $matchKeys = ['status_ids' => [], 'object_ids' => []];
           if ($bmFolderFilter > 0 && function_exists('vaak_bookmark_folder_status_ids')) {
               $matchKeys = function_exists('vaak_bookmark_folder_match_keys')
                   ? vaak_bookmark_folder_match_keys($bmFolderFilter, $vaakOwnerId, 500)
                   : ['status_ids' => vaak_bookmark_folder_status_ids($bmFolderFilter, $vaakOwnerId, 500), 'object_ids' => []];
-              $allowed = array_fill_keys($matchKeys['status_ids'], true);
-              $allowedObjects = array_fill_keys($matchKeys['object_ids'], true);
+          }
+          $allowed = array_fill_keys($matchKeys['status_ids'], true);
+          $allowedObjects = array_fill_keys($matchKeys['object_ids'], true);
+          $bmList = ($bmFolderFilter > 0 && function_exists('ap_masto_bookmarks_for_status_ids'))
+              ? ap_masto_bookmarks_for_status_ids($matchKeys['status_ids'], $vaakOwnerId)
+              : ap_masto_bookmarks_list($bookmarkFetchLimit, null);
+          if ($bmFolderFilter > 0 && !function_exists('ap_masto_bookmarks_for_status_ids')) {
               $bmList = array_values(array_filter(
                   $bmList,
                   static function ($st) use ($allowed, $allowedObjects): bool {
@@ -13537,8 +13559,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }));
           }
           if ($bmFolderFilter > 0) {
-              $folderKeys = isset($allowed) && is_array($allowed) ? $allowed : [];
-              $folderObjects = isset($allowedObjects) && is_array($allowedObjects) ? $allowedObjects : [];
+              $folderKeys = $allowed;
+              $folderObjects = $allowedObjects;
               $bskyBookmarkItems = array_values(array_filter($bskyBookmarkItems, static function ($item) use ($folderKeys, $folderObjects, $vaakOwnerId): bool {
                   $post = is_array($item['post'] ?? null) ? $item['post'] : [];
                   $uri = (string) ($post['uri'] ?? '');
@@ -13638,6 +13660,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <input type="hidden" name="object_id" value="<?= h($oid) ?>">
                     <button class="icon-btn on" type="submit" title="Bookmark folders" aria-label="Bookmark folders" data-bm-picker="1"><i class="ph-fill ph-bookmark-simple" aria-hidden="true"></i></button>
                   </form>
+                  <details class="post-action-menu">
+                    <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
+                    <div class="post-action-menu__body">
+                      <button type="button" class="menu-action" data-bm-folder-open="1" data-bm-platform="fedi" data-status-id="<?= h($sid) ?>" data-object-id="<?= h($oid) ?>">Add to folder</button>
+                    </div>
+                  </details>
                 <?php endif; ?>
               </div>
             </article>
@@ -17340,10 +17368,27 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               // Bluesky profile: hydrate via AT Protocol (never AP actor fetch / WebFinger).
               if ($rpIsBsky && !$rpIsLocal && function_exists('ap_bsky_get_profile')
                   && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId))) {
+                  // Normalize encoded DID path segments before cache lookup / queueing.
+                  // The browser-facing bsky.app profile URL uses literal colons for DIDs;
+                  // a percent-encoded DID can otherwise become a distinct cache key and
+                  // an invalid Open on Bluesky destination.
                   $rpBskyRequestedRef = $rpActor;
+                  if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $rpActor, $bskyPath)) {
+                      $bskyIdentity = rawurldecode($bskyPath[1]);
+                      if (str_starts_with($bskyIdentity, 'did:')) {
+                          $rpBskyRequestedRef = 'https://bsky.app/profile/' . $bskyIdentity;
+                          $rpActor = $rpBskyRequestedRef;
+                      }
+                  }
                   $cachedBsky = function_exists('ap_bsky_actor_profile_cache_get')
                       ? ap_bsky_actor_profile_cache_get($rpBskyRequestedRef, $vaakOwnerId)
                       : null;
+                  if (!$cachedBsky && preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)$~', $rpBskyRequestedRef, $bskyDid)) {
+                      $cachedBsky = ap_bsky_actor_profile_cache_get(
+                          'https://bsky.app/profile/' . rawurlencode($bskyDid[1]),
+                          $vaakOwnerId
+                      );
+                  }
                   if (function_exists('ap_bsky_actor_refresh_enqueue')) {
                       ap_bsky_actor_refresh_enqueue($vaakOwnerId, $rpBskyRequestedRef, $rpForceRefresh);
                   }
@@ -17352,7 +17397,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       $rpBskyDid = (string) ($bp['did'] ?? '');
                       $rpBskyHandle = (string) ($bp['handle'] ?? '');
                       $rpActor = $rpBskyDid !== ''
-                          ? ('https://bsky.app/profile/' . rawurlencode($rpBskyDid))
+                          ? (function_exists('ap_bsky_actor_profile_url') ? ap_bsky_actor_profile_url($rpBskyDid) : ('https://bsky.app/profile/' . $rpBskyDid))
                           : ($rpBskyHandle !== ''
                               ? ('https://bsky.app/profile/' . rawurlencode($rpBskyHandle))
                               : $rpActor);
@@ -19185,10 +19230,12 @@ window.apAdminToast = function (msg, isErr) {
    * @param {string} statusId
    * @param {string} objectId
    * @param {Array|null} selectedIds
-   * @param {{ onRemove?: () => (void|Promise<void>) }|null} opts
+   * @param {{ onRemove?: () => (void|Promise<void>), hideRemove?: boolean, platform?: string }|null} opts
    */
   async function openBookmarkFolderPicker(anchorBtn, statusId, objectId, selectedIds, opts) {
-    const bookmarkPlatform = anchorBtn.closest('.tweet-bsky') ? 'bsky' : 'fedi';
+    const bookmarkPlatform = opts && opts.platform
+      ? opts.platform
+      : (anchorBtn.closest('.tweet-bsky') ? 'bsky' : 'fedi');
     closeFolderPopover();
     const rect = anchorBtn.getBoundingClientRect();
     const pop = document.createElement('div');
@@ -19232,7 +19279,7 @@ window.apAdminToast = function (msg, isErr) {
     html += '<input type="text" id="bm-new-folder-name" maxlength="80" placeholder="New folder name…">';
     html += '<div class="bm-folder-actions">'
       + '<button type="button" class="btn btn-primary" data-bm-done="1">Done</button>'
-      + '<button type="button" class="btn btn-ghost" data-bm-unbookmark="1">Remove bookmark</button>'
+      + ((opts && opts.hideRemove) ? '' : '<button type="button" class="btn btn-ghost" data-bm-unbookmark="1">Remove bookmark</button>')
       + '</div>';
     pop.innerHTML = html;
 
@@ -19303,6 +19350,24 @@ window.apAdminToast = function (msg, isErr) {
   });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closeFolderPopover();
+  });
+
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target && ev.target.closest
+      ? ev.target.closest('[data-bm-folder-open="1"]')
+      : null;
+    if (!btn) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const statusId = btn.getAttribute('data-status-id') || '';
+    if (!statusId || typeof window.novaOpenBookmarkFolderPicker !== 'function') return;
+    window.novaOpenBookmarkFolderPicker(
+      btn,
+      statusId,
+      btn.getAttribute('data-object-id') || '',
+      null,
+      { hideRemove: true, platform: btn.getAttribute('data-bm-platform') || 'fedi' }
+    );
   });
 
   function applyInteractButton(form, data) {
