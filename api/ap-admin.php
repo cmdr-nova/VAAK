@@ -18930,6 +18930,22 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   const queueSlowdownToast = 'Whoa their pardner, slow down there. Your action is in the queue.';
+  const queuedClickBursts = new WeakMap();
+  window.apQueueRepeatedClick = function (element) {
+    const now = Date.now();
+    const state = queuedClickBursts.get(element) || { times: [], lastToast: 0 };
+    state.times = state.times.filter((time) => now - time <= 2500);
+    state.times.push(now);
+    // Ignore the first couple of duplicate taps; only toast on a genuine burst.
+    if (state.times.length >= 3 && now - state.lastToast >= 2500) {
+      window.apAdminToast(queueSlowdownToast);
+      state.lastToast = now;
+    }
+    queuedClickBursts.set(element, state);
+  };
+  window.apQueueRepeatedClickReset = function (element) {
+    queuedClickBursts.delete(element);
+  };
   async function watchInteractQueue(form, queueId, revision, snapshot) {
     let tries = 0;
     while (tries++ < 90) {
@@ -18951,6 +18967,7 @@ window.apAdminToast = function (msg, isErr) {
           if (Number(q.revision) === Number(form.dataset.queueRevision || revision)) {
             delete form.dataset.queuePending;
             delete form.dataset.queueId;
+            window.apQueueRepeatedClickReset(form);
           }
           return;
         }
@@ -18959,6 +18976,7 @@ window.apAdminToast = function (msg, isErr) {
             if (form.isConnected) restoreInteractButton(snapshot);
             delete form.dataset.queuePending;
             delete form.dataset.queueId;
+            window.apQueueRepeatedClickReset(form);
             window.apAdminToast(q.last_error || 'Action failed after retrying.', true);
           }
           return;
@@ -18974,17 +18992,16 @@ window.apAdminToast = function (msg, isErr) {
     const action = actionInput ? actionInput.value : '';
     if (!INTERACT.has(action)) return;
     const btn = form.querySelector('button[type="submit"]');
+    ev.preventDefault();
+    if (form.dataset.busy === '1' || form.dataset.queuePending === '1') {
+      window.apQueueRepeatedClick(form);
+      return;
+    }
     // Already bookmarked: open folder picker instead of immediately removing
     if (action === 'unbookmark_status' && btn && btn.getAttribute('data-bm-picker') === '1' && form.dataset.skipBmPicker !== '1') {
-      ev.preventDefault();
       const sid = (form.querySelector('input[name="status_id"]') || {}).value || '';
       const oid = (form.querySelector('input[name="object_id"]') || {}).value || '';
       if (sid) openBookmarkFolderPicker(btn, sid, oid, null);
-      return;
-    }
-    ev.preventDefault();
-    if (form.dataset.busy === '1' || form.dataset.queuePending === '1') {
-      window.apAdminToast(queueSlowdownToast);
       return;
     }
     const fd = new FormData(form);
@@ -19490,7 +19507,6 @@ window.apAdminToast = function (msg, isErr) {
       btn.setAttribute('aria-label', on ? tOn : tOff);
     }
 
-    const bskyQueueSlowdownToast = 'Whoa their pardner, slow down there. Your action is in the queue.';
     async function watchBskyQueue(btn, queueId, revision, snapshot) {
       let tries = 0;
       while (tries++ < 90) {
@@ -19511,6 +19527,7 @@ window.apAdminToast = function (msg, isErr) {
             if (Number(q.revision) === Number(btn.dataset.queueRevision || revision)) {
               delete btn.dataset.queuePending;
               delete btn.dataset.queueId;
+              if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(btn);
             }
             return;
           }
@@ -19518,6 +19535,7 @@ window.apAdminToast = function (msg, isErr) {
             if (btn.isConnected) restoreBskyButton(btn, snapshot);
             delete btn.dataset.queuePending;
             delete btn.dataset.queueId;
+            if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(btn);
             if (typeof window.apAdminToast === 'function') window.apAdminToast(q.last_error || 'Action failed after retrying.', true);
             return;
           }
@@ -19609,7 +19627,7 @@ window.apAdminToast = function (msg, isErr) {
       ev.preventDefault();
       ev.stopPropagation();
       if (btn.dataset.busy === '1' || btn.dataset.queuePending === '1') {
-        if (typeof window.apAdminToast === 'function') window.apAdminToast(bskyQueueSlowdownToast);
+        if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(btn);
         return;
       }
       const action = btn.dataset.bskyAction || '';
@@ -22612,7 +22630,6 @@ if (VIEW === 'analytics') loadAnalytics();
 <script>
 // Follow/unfollow forms use the same durable queue as timeline reactions.
 (function () {
-  const slowdown = 'Whoa their pardner, slow down there. Your action is in the queue.';
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -22620,7 +22637,10 @@ if (VIEW === 'analytics') loadAnalytics();
     const button = form.querySelector('button[type="submit"]');
     if (!actionInput || !button || !['follow_remote', 'unfollow_remote'].includes(actionInput.value)) return;
     ev.preventDefault();
-    if (form.dataset.queueBusy === '1' || form.dataset.queuePending === '1') { window.apAdminToast(slowdown); return; }
+    if (form.dataset.queueBusy === '1' || form.dataset.queuePending === '1') {
+      if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(form);
+      return;
+    }
     const before = { action: actionInput.value, label: button.innerHTML, title: button.title };
     const want = actionInput.value === 'follow_remote';
     form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
@@ -22642,10 +22662,11 @@ if (VIEW === 'analytics') loadAnalytics();
             const sr = await fetch(window.location.pathname + (window.location.search || ''), { method: 'POST', body: sf, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
             const sd = await sr.json(); const q = sd && sd.queue;
             if (!q || Number(q.revision) < Number(form.dataset.queueRevision || data.revision)) continue;
-            if (q.status === 'succeeded') { if (Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) delete form.dataset.queuePending; return; }
+            if (q.status === 'succeeded') { if (Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) { delete form.dataset.queuePending; if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form); } return; }
             if (q.status === 'failed' && Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) {
               if (form.isConnected) { actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title; }
               delete form.dataset.queuePending;
+              if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form);
               window.apAdminToast(q.last_error || 'Follow action failed after retrying.', true); return;
             }
           } catch (e) { /* retain queued state on transient polling errors */ }
