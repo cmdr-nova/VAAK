@@ -20045,6 +20045,10 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
+<?php if ($view === 'bookmarks'): ?>
+<script src="/api/assets/bsky-bookmarks.js?v=20260915-1" defer></script>
+<?php endif; ?>
+
 <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'mentions', 'bluesky'], true)): ?>
 <script>
 (function () {
