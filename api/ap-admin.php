@@ -8148,6 +8148,38 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av'): string
         . 'title="' . h($alt) . '">';
 }
 
+/** Cache-only Bluesky member presentation; profile hydration is queued, never fetched inline. */
+function admin_list_member_presentation(array $member, int $ownerUserId, int &$warmBudget): array
+{
+    $did = trim((string) ($member['bsky_did'] ?? ''));
+    if (str_starts_with($did, 'did:')) {
+        $cached = function_exists('ap_bsky_actor_profile_cache_get')
+            ? ap_bsky_actor_profile_cache_get($did, $ownerUserId)
+            : null;
+        $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
+        if ($warmBudget > 0 && function_exists('ap_bsky_actor_refresh_enqueue')) {
+            ap_bsky_actor_refresh_enqueue($ownerUserId, $did);
+            $warmBudget--;
+        }
+        $handle = trim((string) ($profile['handle'] ?? ''));
+        $name = trim((string) ($profile['displayName'] ?? '')) ?: ($handle !== '' ? '@' . $handle : 'Bluesky user');
+        $href = 'https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did);
+        $avatar = function_exists('ap_profile_sanitize_https_url')
+            ? ap_profile_sanitize_https_url((string) ($profile['avatar'] ?? ''))
+            : null;
+        $fallback = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : 'https://mkultra.monster/img/avatar/default.jpg';
+        $img = '<img class="tweet-av" src="' . h($avatar ?? $fallback) . '" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
+        return ['avatar' => $img, 'name' => h($name), 'handle' => h($handle !== '' ? '@' . $handle : 'Bluesky'), 'href' => $href];
+    }
+    $actorId = trim((string) ($member['actor_id'] ?? ''));
+    return [
+        'avatar' => admin_avatar_img($actorId !== '' ? $actorId : null),
+        'name' => actor_display_name_html($actorId !== '' ? $actorId : null),
+        'handle' => h(actor_handle($actorId !== '' ? $actorId : null)),
+        'href' => $actorId !== '' ? '?view=remote_profile&actor=' . rawurlencode($actorId) : '',
+    ];
+}
+
 function actor_handle(?string $actorId, ?string $username = null, bool $allowFetch = false): string
 {
     $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
@@ -13426,9 +13458,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               return true;
           }));
           $bskyBookmarkItems = [];
+          $bookmarkRefreshing = false;
           if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
               && ap_bsky_session_row($vaakOwnerId) !== null) {
               $bskyResult = ap_bsky_get_bookmarks($vaakOwnerId, 80);
+              $bookmarkRefreshing = !empty($bskyResult['refreshing']);
               if (!empty($bskyResult['ok']) && is_array($bskyResult['bookmarks'] ?? null)) {
                   $bskyBookmarkItems = $bskyResult['bookmarks'];
               }
@@ -13498,8 +13532,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </form>
         <?php endif; ?>
         <?php if (!$bmList && !$bskyBookmarkItems): ?>
-          <div class="empty"><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
+          <div class="empty"><?= $bookmarkRefreshing && $bmFolderFilter < 1 ? 'Bluesky bookmarks are refreshing in the background. Reload this page shortly.' : ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') ?></div>
         <?php endif; ?>
+        <?php if ($bookmarkRefreshing && $bskyBookmarkItems): ?><p class="meta">Showing cached Bluesky bookmarks while they refresh in the background.</p><?php endif; ?>
         <?php if ($bskyBookmarkItems): ?>
           <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>
           <?php foreach ($bskyBookmarkItems as $bskyBookmarkItem): ?>
@@ -15989,8 +16024,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="composer-actions"><span class="meta">Fediverse accounts are VAAK-local; Bluesky accounts sync to the linked Bluesky list.</span><button class="btn btn-primary" type="submit">Add</button></div>
           </form><?php else: ?><p class="meta">Members belong to another account’s Bluesky list; manage its membership on Bluesky. You can unsubscribe here to stop applying it.</p><?php endif; ?>
           <h3 style="margin:1rem 0 .5rem">Members</h3>
-          <?php foreach (ap_list_accounts((int) $modList['id']) as $modMember): $memberActor = (string) ($modMember['actor_id'] ?? ''); ?>
-            <article class="tweet"><div class="tweet-hd"><?= admin_avatar_img($memberActor) ?><div class="tweet-hd-main"><span class="who"><?= actor_display_name_html($memberActor) ?></span> <span class="meta"><?= h(actor_handle($memberActor)) ?></span></div></div>
+          <?php $profileWarmBudget = 20; foreach (ap_list_accounts((int) $modList['id']) as $modMember): $memberActor = (string) ($modMember['actor_id'] ?? ''); $memberView = admin_list_member_presentation($modMember, $vaakOwnerId, $profileWarmBudget); ?>
+            <article class="tweet"><div class="tweet-hd"><?= $memberView['avatar'] ?><div class="tweet-hd-main"><span class="who"><?= $memberView['name'] ?></span> <span class="meta"><?= $memberView['handle'] ?></span></div></div>
               <?php if (($modList['bsky_list_source'] ?? '') !== 'subscription'): ?><div class="tweet-actions"><form method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>"><input type="hidden" name="action" value="list_remove_account"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>"><input type="hidden" name="actor_id" value="<?= h($memberActor) ?>"><button class="btn btn-ghost" type="submit">Remove</button></form></div><?php endif; ?>
             </article>
           <?php endforeach; ?>
@@ -16013,6 +16048,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $listDetail = $listId > 0 ? ap_list_by_id($listId) : null;
           if ($listDetail && ($listDetail['list_kind'] ?? 'curation') !== 'curation') $listDetail = null;
           $listNotFound = ($listId > 0 && !$listDetail);
+          $profileWarmBudget = 20;
           $listMembers = ($listDetail ? ap_list_accounts((int) $listDetail['id']) : []);
           $listShowTimeline = !empty($_GET['timeline']) && $listDetail;
           $listTimelineItems = [];
@@ -16156,14 +16192,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="empty">No members yet. Add a followed @user@host above.</div>
           <?php else: ?>
             <?php foreach ($listMembers as $mem): ?>
-              <?php $maid = (string) ($mem['actor_id'] ?? ''); ?>
+              <?php $maid = (string) ($mem['actor_id'] ?? ''); $memberView = admin_list_member_presentation($mem, $vaakOwnerId, $profileWarmBudget); ?>
               <article class="tweet">
                 <div class="tweet-hd">
-                  <?= admin_avatar_img($maid) ?>
+                  <?= $memberView['avatar'] ?>
                   <div class="tweet-hd-main">
                     <div>
-                      <span class="who"><?= actor_display_name_html($maid) ?></span>
-                      <span class="meta"> <?= h(actor_handle($maid)) ?></span>
+                      <span class="who"><?= $memberView['name'] ?></span>
+                      <span class="meta"> <?= $memberView['handle'] ?></span>
                       <?php if (ap_actor_is_followed($maid)): ?>
                         <span class="tag">following</span>
                       <?php endif; ?>
@@ -16171,7 +16207,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </div>
                 <div class="tweet-actions">
-                  <a href="?view=remote_profile&amp;actor=<?= urlencode($maid) ?>">Profile</a>
+                  <a href="<?= h($memberView['href'] !== '' ? $memberView['href'] : '?view=remote_profile&amp;actor=' . urlencode($maid)) ?>" target="<?= str_starts_with($maid, 'https://bsky.app/profile/') ? '_blank' : '_self' ?>" rel="noopener noreferrer">Profile</a>
                   <form method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="display:inline">
                     <input type="hidden" name="action" value="list_remove_account">
                     <input type="hidden" name="return_view" value="lists">

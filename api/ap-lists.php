@@ -32,6 +32,10 @@ function ap_lists_sync_bsky(int $ownerUserId, bool $force = false): array
     if (!$force && is_file($cache) && time() - (int) @filemtime($cache) < 300) {
         return ['ok' => true, 'synced' => 0, 'cached' => true];
     }
+    if (!$force) {
+        if (function_exists('ap_bsky_background_sync_enqueue')) ap_bsky_background_sync_enqueue($ownerUserId, 'lists');
+        return ['ok' => true, 'synced' => 0, 'queued' => true];
+    }
     // Push VAAK-owned lists created before the Bluesky connection, plus any
     // pending Bluesky members, before importing the remote snapshot.
     try {
@@ -72,6 +76,7 @@ function ap_lists_sync_bsky(int $ownerUserId, bool $force = false): array
     $did = (string) ($session['did'] ?? '');
     $cursor = null;
     $remoteLists = [];
+    $remoteListsComplete = false;
     for ($page = 0; $page < 10; $page++) {
         $query = ['actor' => $did, 'limit' => 100];
         if ($cursor !== null) $query['cursor'] = $cursor;
@@ -81,7 +86,10 @@ function ap_lists_sync_bsky(int $ownerUserId, bool $force = false): array
         }
         $remoteLists = array_merge($remoteLists, (array) ($res['json']['lists'] ?? []));
         $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
-        if ($cursor === null) break;
+        if ($cursor === null) {
+            $remoteListsComplete = true;
+            break;
+        }
     }
     $moderationUris = ['mute' => [], 'block' => []];
     $moderationViews = ['mute' => [], 'block' => []];
@@ -151,6 +159,38 @@ function ap_lists_sync_bsky(int $ownerUserId, bool $force = false): array
             continue;
         }
         $synced++;
+    }
+    // A complete owner-list snapshot is authoritative: a record removed
+    // directly on Bluesky must remove its VAAK mirror as well. Never reconcile
+    // deletions from a partial or failed pagination pass.
+    if ($remoteListsComplete) {
+        $remoteUris = [];
+        foreach ($remoteLists as $remote) {
+            if (!is_array($remote)) continue;
+            $listView = is_array($remote['list'] ?? null) ? $remote['list'] : $remote;
+            $uri = trim((string) ($listView['uri'] ?? ''));
+            if (str_starts_with($uri, 'at://')) $remoteUris[$uri] = true;
+        }
+        try {
+            $st = ap_db()->prepare("SELECT id, bsky_list_uri, bsky_moderation_action, bsky_mod_action_uri FROM masto_lists WHERE owner_user_id = ? AND bsky_list_uri IS NOT NULL AND COALESCE(bsky_list_source, 'vaak') IN ('vaak', 'bsky')");
+            $st->execute([$ownerUserId]);
+            foreach ($st->fetchAll() ?: [] as $localMirror) {
+                $uri = (string) ($localMirror['bsky_list_uri'] ?? '');
+                if ($uri === '' || isset($remoteUris[$uri])) continue;
+                $id = (int) ($localMirror['id'] ?? 0);
+                if ($id < 1) continue;
+                ap_db()->beginTransaction();
+                ap_db()->prepare('DELETE FROM masto_list_accounts WHERE list_id = ?')->execute([$id]);
+                ap_db()->prepare('DELETE FROM masto_lists WHERE id = ? AND owner_user_id = ?')->execute([$id, $ownerUserId]);
+                ap_db()->commit();
+                if (($localMirror['bsky_moderation_action'] ?? 'none') !== 'none') {
+                    ap_bsky_refresh_hide_set($ownerUserId, true);
+                }
+            }
+        } catch (Throwable $e) {
+            try { if (ap_db()->inTransaction()) ap_db()->rollBack(); } catch (Throwable $ignored) {}
+            error_log('[ap-lists] reconcile remotely deleted owned Bluesky lists failed');
+        }
     }
     // Also show moderation lists owned by other Bluesky users that this
     // account currently subscribes to. These are locally mirrored as

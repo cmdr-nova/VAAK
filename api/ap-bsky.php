@@ -3599,6 +3599,33 @@ function ap_bsky_bookmark_cache_clear(int $ownerUserId): void
     }
 }
 
+/** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
+function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
+{
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists'], true)
+        || !ap_bsky_actor_refresh_migrate()) return false;
+    $actorRef = '__vaak_sync__:' . $collection;
+    $now = gmdate('c');
+    $cooldown = $collection === 'lists' ? 300 : 45;
+    try {
+        $st = ap_db()->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+        $st->execute([$ownerUserId, $actorRef]);
+        $existing = $st->fetch();
+        if (is_array($existing)) {
+            $status = (string) ($existing['status'] ?? '');
+            $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
+            if (in_array($status, ['pending', 'processing'], true)
+                || (!$force && $status === 'succeeded' && $queuedAt > time() - $cooldown)) return true;
+        }
+        $up = ap_db()->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
+        $up->execute([$ownerUserId, $actorRef, $now, $now]);
+        return true;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] collection refresh enqueue failed');
+        return false;
+    }
+}
+
 /**
  * Fetch the connected account's Bluesky bookmarks for VAAK's unified Library.
  * This is intentionally a read-through cache: Bluesky remains authoritative,
@@ -3611,18 +3638,22 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
     if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
         return ['ok' => false, 'error' => 'Bluesky is not connected'];
     }
-    $limit = max(1, min(200, $limit));
-    $syncLimit = 200;
-    $cachePath = sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json';
-    if (!$refresh && is_file($cachePath) && (time() - (int) @filemtime($cachePath)) < 45) {
-        $cached = json_decode((string) @file_get_contents($cachePath), true);
-        if (is_array($cached) && is_array($cached['bookmarks'] ?? null)) {
-            return ['ok' => true, 'bookmarks' => array_slice($cached['bookmarks'], 0, $limit), 'cached' => true];
-        }
-    }
     $session = ap_bsky_session_row($ownerUserId);
     if ($session === null) {
         return ['ok' => false, 'error' => 'Bluesky not connected'];
+    }
+    $limit = max(1, min(200, $limit));
+    $syncLimit = 200;
+    $cachePath = sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json';
+    $cached = is_file($cachePath) ? json_decode((string) @file_get_contents($cachePath), true) : null;
+    if (!$refresh) {
+        if (is_array($cached) && is_array($cached['bookmarks'] ?? null)) {
+            $fresh = time() - (int) @filemtime($cachePath) < 45;
+            if (!$fresh) ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
+            return ['ok' => true, 'bookmarks' => array_slice($cached['bookmarks'], 0, $limit), 'cached' => true, 'refreshing' => !$fresh];
+        }
+        ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
+        return ['ok' => true, 'bookmarks' => [], 'cached' => true, 'refreshing' => true];
     }
     $token = ap_bsky_access_token($ownerUserId, false);
     if (empty($token['ok'])) {
@@ -4282,7 +4313,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         $db->prepare("UPDATE bsky_actor_refresh_queue SET status = ?, attempts = ?, next_attempt_at = ?, locked_at = NULL, last_error = 'Worker lease expired' WHERE owner_user_id = ? AND actor_ref = ? AND status = 'processing'")
             ->execute([$dead ? 'failed' : 'pending', $attempt, gmdate('c', time() + $delay), $owner, $actorRef]);
     }
-    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY queued_at LIMIT ?");
+    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref IN ('__vaak_sync__:lists', '__vaak_sync__:bookmarks') THEN 0 ELSE 1 END, queued_at LIMIT ?");
     $st->bindValue(1, $now);
     $st->bindValue(2, max(1, min(5, $limit)), PDO::PARAM_INT);
     $st->execute();
@@ -4294,6 +4325,21 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         if ($claim->rowCount() !== 1) continue;
         $stats['claimed']++;
         try {
+            if ($actorRef === '__vaak_sync__:lists') {
+                require_once __DIR__ . '/ap-lists.php';
+                $result = ap_lists_sync_bsky($owner, true);
+                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'List synchronization failed'));
+                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+                $stats['succeeded']++;
+                continue;
+            }
+            if ($actorRef === '__vaak_sync__:bookmarks') {
+                $result = ap_bsky_get_bookmarks($owner, 200, true);
+                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Bookmark synchronization failed'));
+                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+                $stats['succeeded']++;
+                continue;
+            }
             $result = ap_bsky_get_profile($owner, $actorRef);
             if (empty($result['ok']) || !is_array($result['profile'] ?? null)) {
                 throw new RuntimeException((string) ($result['error'] ?? 'Profile fetch failed'));
