@@ -167,6 +167,10 @@ register_shutdown_function(static function () use ($adminRenderHiccup): void {
 $notice = null;
 $error = null;
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
+if ($view === 'vakktok') {
+    header('Location: ?view=gallery', true, 302);
+    exit;
+}
 $composerForceOpen = false;
 // Legacy ?view=compose → Your posts + open floating composer
 if ($view === 'compose') {
@@ -3520,7 +3524,7 @@ $db = ap_db();
 $since24 = gmdate('c', time() - 86400);
 $since7 = gmdate('c', time() - 7 * 86400);
 
-$tlLimit = isset($_GET['limit']) ? (int) $_GET['limit'] : (in_array(($view ?? ''), ['gallery', 'vakktok'], true) ? 16 : 15);
+$tlLimit = isset($_GET['limit']) ? (int) $_GET['limit'] : ($view === 'gallery' ? 16 : 15);
 $tlLimit = max(1, min(40, $tlLimit));
 $tlOffset = isset($_GET['offset']) ? max(0, (int) $_GET['offset']) : 0;
 $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
@@ -3528,7 +3532,7 @@ $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
 $wantNewerPoll = $isPartial
     && isset($_GET['newer'])
     && (string) $_GET['newer'] === '1'
-    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true);
+    && in_array($view, ['home', 'feed', 'local', 'gallery'], true);
 
 // Stats-only event COUNTs (were previously paid on every full-page nav click).
 $total24 = 0;
@@ -3859,7 +3863,7 @@ $adminTlCachedTotal = 0;
 if (
     !$wantNewerPoll
     && !$adminTlForceRefresh
-    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
+    && in_array($view, ['home', 'feed', 'local', 'gallery'], true)
 ) {
     $adminTlCacheKey = admin_tl_cache_key($view, $following);
     $adminTlRankedCached = admin_tl_cache_get($adminTlCacheKey);
@@ -3873,8 +3877,8 @@ $yourBskyPosts = [];
 $GLOBALS['admin_masto_by_note'] = [];
 $needOutboxBuild = !$wantNewerPoll && !$adminTlFromCache && (
     in_array($view, ['outbox', 'queue'], true)
-    || in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
-    || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true))
+    || in_array($view, ['home', 'feed', 'local', 'gallery'], true)
+    || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true))
 );
 if ($needOutboxBuild) {
     $outbox = ap_outbox_list(40, $vaakActorKey);
@@ -4009,14 +4013,12 @@ function admin_tl_cache_key(string $view, array $following): string
         $view = 'local';
     } elseif ($view === 'gallery') {
         $view = 'gallery';
-    } elseif ($view === 'vakktok') {
-        $view = 'vakktok';
     } else {
         $view = 'home';
     }
     $parts = [];
-    // Local, Gallery, and VakkTok are follow-set independent (instance/media firehose).
-    if ($view !== 'local' && $view !== 'gallery' && $view !== 'vakktok') {
+    // Local and Gallery are follow-set independent (instance/media firehose).
+    if ($view !== 'local' && $view !== 'gallery') {
         foreach ($following as $f) {
             $aid = rtrim((string) ($f['actor_id'] ?? ''), '/');
             if ($aid !== '') {
@@ -4605,7 +4607,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         return $added === [] ? null : array_merge($ranked, $added);
     }
 
-    if ($view === 'gallery' || $view === 'vakktok') {
+    if ($view === 'gallery') {
         try {
             $st = $db->prepare(
                 "SELECT * FROM events
@@ -4633,11 +4635,6 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                     continue;
                 }
                 if (!admin_gallery_event_has_media($erow)) {
-                    continue;
-                }
-                if ($view === 'vakktok'
-                    && (!admin_vakktok_item_has_video(['row' => $erow])
-                        || admin_vakktok_item_is_sensitive(['row' => $erow]))) {
                     continue;
                 }
                 $seenIds[$eid] = true;
@@ -5658,8 +5655,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
 
 // Gallery: media-only posts (federated Creates with attachments + local outbox with media).
 $galleryTimeline = [];
-$GLOBALS['admin_vakktok_mode'] = ($view === 'vakktok');
-if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakktok'], true)) {
+if (!$wantNewerPoll && !$adminTlFromCache && $view === 'gallery') {
     $galOwnerId = admin_owner_user_id();
     $galSeen = [];
     try {
@@ -5686,9 +5682,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
                 continue;
             }
             if (!admin_gallery_event_has_media($e)) {
-                continue;
-            }
-            if ($view === 'vakktok' && (!admin_vakktok_item_has_video(['row' => $e]) || admin_vakktok_item_is_sensitive(['row' => $e]))) {
                 continue;
             }
             $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
@@ -5732,9 +5725,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
             if (!admin_gallery_outbox_has_media($n)) {
                 continue;
             }
-            if ($view === 'vakktok' && admin_vakktok_item_is_sensitive(['kind' => 'outbox', 'row' => $n])) {
-                continue;
-            }
             $galSeen[$nid] = true;
             $item = [
                 'kind' => 'outbox',
@@ -5752,12 +5742,11 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
     // Bluesky media posts from this user's durable warmed feed cache. Gallery is
     // per-owner, and dual-published posts keep their ActivityPub card above.
     if (
-        in_array($view, ['gallery', 'vakktok'], true)
+        $view === 'gallery'
         && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
         && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($galOwnerId))
         && function_exists('ap_bsky_posts_for_home')
         && function_exists('ap_bsky_post_image_urls')
-        && function_exists('ap_bsky_post_video_media')
     ) {
         try {
             foreach (ap_bsky_posts_for_home($galOwnerId, 120) as $bItem) {
@@ -5765,18 +5754,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakkto
                     continue;
                 }
                 $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
-                $bPostMedia = array_merge(
-                    array_map(static fn(string $url): array => [
-                        'url' => $url,
-                        'mediaType' => 'image/*',
-                        'is_video' => false,
-                    ], ap_bsky_post_image_urls($bItem['post'])),
-                    ap_bsky_post_video_media($bItem['post'])
-                );
-                if ($bUri === '' || $bPostMedia === []) {
-                    continue;
-                }
-                if ($view === 'vakktok' && ap_bsky_post_video_media($bItem['post']) === []) {
+                $bPostImages = ap_bsky_post_image_urls($bItem['post']);
+                if ($bUri === '' || $bPostImages === []) {
                     continue;
                 }
                 $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
@@ -5812,7 +5791,7 @@ if (
     !$isPartial
     && $adminTlFromCache
     && is_array($adminTlRankedCached)
-    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
+    && in_array($view, ['home', 'feed', 'local', 'gallery'], true)
 ) {
     $adminTlCachedTotal = count($adminTlRankedCached);
     $sliceKeys = array_slice($adminTlRankedCached, 0, $tlLimit);
@@ -5862,7 +5841,7 @@ if (
         );
     } elseif ($view === 'local') {
         $localTimeline = $hydrated;
-    } elseif (in_array($view, ['gallery', 'vakktok'], true)) {
+    } elseif ($view === 'gallery') {
         $galleryTimeline = $hydrated;
     }
 }
@@ -6430,9 +6409,8 @@ function admin_gallery_normalize_media_list(array $items): array
             continue;
         }
         $isVideo = admin_media_is_video($url, $mt);
-        // Gallery stays image-focused; VakkTok opts into the same source rows
-        // but keeps only video cells at render time.
-        if ($isVideo && empty($GLOBALS['admin_vakktok_mode'])) {
+        // Gallery stays image-focused; videos remain available inline on posts.
+        if ($isVideo) {
             continue;
         }
         // Gallery prefers visual media; skip obvious non-image docs
@@ -6464,10 +6442,7 @@ function admin_gallery_item_media(array $item): array
             static fn(string $url): array => ['url' => $url, 'mediaType' => 'image/*', 'is_video' => false],
             ap_bsky_post_image_urls($post)
         );
-        $videos = function_exists('ap_bsky_post_video_media')
-            ? ap_bsky_post_video_media($post)
-            : [];
-        return array_merge($images, $videos);
+        return $images;
     }
     if ($kind === 'outbox') {
         return admin_gallery_media_from_outbox($row);
@@ -6546,64 +6521,6 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
       <?php endif; ?>
     </a>
     <?php
-}
-
-/** Render one full-screen, video-only VakkTok item. */
-function admin_vakktok_item_has_video(array $item): bool
-{
-    foreach (admin_gallery_item_media($item) as $media) {
-        if (!empty($media['is_video'])) return true;
-    }
-    return false;
-}
-
-/** VakkTok intentionally omits sensitive/CW media from its autoplay reel. */
-function admin_vakktok_item_is_sensitive(array $item): bool
-{
-    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
-    if (!empty($row['sensitive']) || trim((string) ($row['spoiler_text'] ?? '')) !== '') {
-        return true;
-    }
-    if (($item['kind'] ?? '') === 'outbox') {
-        $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
-        $obj = is_array($raw['object'] ?? null) ? $raw['object'] : $raw;
-        if (is_array($obj) && (!empty($obj['sensitive']) || trim((string) ($obj['summary'] ?? $obj['contentWarning'] ?? '')) !== '')) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function admin_render_vakktok_cell(array $item): void
-{
-    $media = admin_gallery_item_media($item);
-    $video = null;
-    foreach ($media as $candidate) {
-        if (!empty($candidate['is_video'])) {
-            $video = $candidate;
-            break;
-        }
-    }
-    if (!is_array($video) || empty($video['url'])) {
-        return;
-    }
-    $url = (string) $video['url'];
-    $poster = '';
-    try {
-        $st = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
-        $st->execute([$url]);
-        $poster = (string) ($st->fetchColumn() ?: '');
-    } catch (Throwable $e) {
-        // Remote videos may not have a local poster.
-    }
-    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
-    echo '<article class="vakktok-item" data-vakktok-video="1">';
-    echo '<video class="vakktok-video" controls loop playsinline preload="metadata" src="' . h($url) . '"';
-    if (str_starts_with($poster, 'https://')) {
-        echo ' poster="' . h($poster) . '"';
-    }
-    echo '></video>';
-    echo '</article>';
 }
 
 function admin_media_row_html(array $items, string $hint = ''): string
@@ -10204,7 +10121,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     break;
                 }
             }
-        } elseif ($view === 'gallery' || $view === 'vakktok') {
+        } elseif ($view === 'gallery') {
             $st = $db->prepare(
                 "SELECT * FROM events
                  WHERE type IN ('Create', 'Quote', 'QuotePost')
@@ -10217,9 +10134,6 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             $st->execute([$sinceAt, $limit * 3]);
             foreach ($st->fetchAll() ?: [] as $e) {
                 if (!is_array($e) || !admin_gallery_event_has_media($e)) {
-                    continue;
-                }
-                if ($view === 'vakktok' && (!admin_vakktok_item_has_video(['row' => $e]) || admin_vakktok_item_is_sensitive(['row' => $e]))) {
                     continue;
                 }
                 $pushEvent($e);
@@ -10393,7 +10307,7 @@ if ($isPartial && $view === 'bluesky') {
 }
 
 // AJAX fragment for Home / Local / Federated / Gallery infinite scroll
-if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)) {
+if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
     // Live poll: items newer than the client's current head (no scroll jump on server).
     $wantNewer = isset($_GET['newer']) && (string) $_GET['newer'] === '1';
     $sinceTs = isset($_GET['since']) ? (int) $_GET['since'] : 0;
@@ -10421,8 +10335,6 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             }
             if ($view === 'gallery') {
                 admin_render_gallery_cell($item, $followingIds, 'gallery');
-            } elseif ($view === 'vakktok') {
-                admin_render_vakktok_cell($item);
             } else {
                 admin_render_timeline_item($item, $followingIds, $view);
             }
@@ -10495,10 +10407,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             ? $feedTimeline
             : ($view === 'local'
                 ? $localTimeline
-                : (in_array($view, ['gallery', 'vakktok'], true) ? $galleryTimeline : $homeTimeline));
-        if ($view === 'vakktok') {
-            $timeline = array_values(array_filter($timeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
-        }
+                : ($view === 'gallery' ? $galleryTimeline : $homeTimeline));
         $rankedMiss = admin_tl_rank_from_timeline($timeline);
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.
         while ($tlOffset + $tlLimit > count($rankedMiss) && $rankedMiss !== []) {
@@ -10539,8 +10448,6 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         }
         if ($view === 'gallery') {
             admin_render_gallery_cell($item, $followingIds, 'gallery');
-        } elseif ($view === 'vakktok') {
-            admin_render_vakktok_cell($item);
         } else {
             admin_render_timeline_item($item, $followingIds, $view);
         }
@@ -12247,10 +12154,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: rgba(0,0,0,.25);
       pointer-events: none;
     }
-    .vakktok-feed { height: calc(100vh - 7rem); min-height: 28rem; overflow-y: auto; scrollbar-width: none; -ms-overflow-style: none; scroll-snap-type: y mandatory; overscroll-behavior: contain; background: #050505; border: 1px solid var(--border); border-radius: 12px; }
-    .vakktok-feed::-webkit-scrollbar { display: none; }
-    .vakktok-item { position: relative; height: 100%; min-height: 28rem; scroll-snap-align: start; display: grid; place-items: center; background: #050505; }
-    .vakktok-video { display: block; width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; object-fit: contain; object-position: center; aspect-ratio: auto; background: #000; }
     .tweet-hd {
       display: flex; align-items: flex-start; gap: .75rem;
       margin-bottom: .45rem;
@@ -12907,7 +12810,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span><span class="nav-badge"<?= $noticesUnreadNav > 0 ? '' : ' hidden' ?>><?= $noticesUnreadNav > 99 ? '99+' : (string) (int) $noticesUnreadNav ?></span></a>
       <hr class="nav-sep">
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
-      <a class="<?= $view === 'vakktok' ? 'active' : '' ?>" href="?view=vakktok"><span class="ico">▶</span><span class="label">VakkTok</span></a>
       <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
       <a class="<?= $view === 'bluesky' ? 'active' : '' ?>" href="?view=bluesky"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">Bluesky</span></a>
       <?php endif; ?>
@@ -13366,24 +13268,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endforeach; ?>
         </div>
         <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $feedHasMore ? 'Scroll for more…' : ($feedTimeline ? 'End of timeline' : '') ?></div>
-        <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
-
-      <?php elseif ($view === 'vakktok'): ?>
-        <?php
-          $tokLimit = max($tlLimit, 8);
-          $tokTimeline = array_values(array_filter($galleryTimeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
-          $tokPage = array_slice($tokTimeline, 0, $tokLimit);
-          $tokHasMore = $adminTlFromCache
-              ? $adminTlCachedHasMore
-              : (count($tokTimeline) > $tokLimit);
-        ?>
-        <?php if (!$tokTimeline): ?><div class="empty">No videos are available yet.</div><?php endif; ?>
-        <div id="timeline-items" class="vakktok-feed" data-view="vakktok" data-offset="<?= (int) count($tokPage) ?>" data-limit="<?= (int) $tokLimit ?>" data-has-more="<?= $tokHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($tokPage[0]['sort']) ? $tokPage[0]['sort'] : time()) ?>">
-          <?php foreach ($tokPage as $item): ?>
-            <?php if (!admin_timeline_item_muted_by_words($item)) { admin_render_vakktok_cell($item); } ?>
-          <?php endforeach; ?>
-        </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $tokHasMore ? 'Scroll for more…' : '' ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'gallery'): ?>
@@ -18170,7 +18054,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'bluesky'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
     <?php endif; ?>
@@ -19656,7 +19540,7 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
-<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'mentions', 'bluesky'], true)): ?>
+<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'mentions', 'bluesky'], true)): ?>
 <script>
 (function () {
   /** Replace a timeline card in place without jumping scroll to the top. */
@@ -20015,10 +19899,7 @@ window.apAdminToast = function (msg, isErr) {
   const topBtn = document.getElementById('feed-top-btn');
   const newBtn = document.getElementById('feed-new-btn');
   const feedRoot = document.querySelector('.feed');
-  // Read the timeline identity before constructing the scroll API.  The
-  // VakkTok-specific scroll container check is used during scrollApi(), so
-  // declaring this later would hit JavaScript's temporal dead zone and stop
-  // pagination setup for every timeline.
+  // Read the timeline identity before constructing the scroll API.
   let viewName = items ? (items.dataset.view || 'home') : 'home';
   let hasMore = items ? items.dataset.hasMore === '1' : false;
   if (newBtn && feedRoot) {
@@ -20033,7 +19914,7 @@ window.apAdminToast = function (msg, isErr) {
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
   // .feed is overflow:visible — IntersectionObserver must use the viewport.
   function feedIsScrollContainer() {
-    const scrollRoot = (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) ? items : root;
+    const scrollRoot = root;
     const style = window.getComputedStyle(scrollRoot);
     const oy = style.overflowY;
     if (oy !== 'auto' && oy !== 'scroll') return false;
@@ -20041,7 +19922,7 @@ window.apAdminToast = function (msg, isErr) {
   }
   function scrollApi() {
     if (feedIsScrollContainer()) {
-      const scrollRoot = (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) ? items : root;
+      const scrollRoot = root;
       return {
         mode: 'feed',
         ioRoot: scrollRoot,
@@ -20059,9 +19940,6 @@ window.apAdminToast = function (msg, isErr) {
       setTop: (v, smooth) => window.scrollTo({ top: v, behavior: smooth ? 'smooth' : 'auto' }),
       onScroll: (fn) => window.addEventListener('scroll', fn, { passive: true }),
     };
-  }
-  if (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) {
-    items.appendChild(sentinel);
   }
   let offset = parseInt(items.dataset.offset || '0', 10);
   let limit = parseInt(items.dataset.limit || '15', 10);
@@ -20086,85 +19964,6 @@ window.apAdminToast = function (msg, isErr) {
   const isBskyTimeline = viewName === 'bluesky';
 
   let sc = scrollApi();
-
-  // VakkTok behaves like a focused video reel: the visible video plays muted,
-  // while videos leaving the viewport are paused so background media does not
-  // consume CPU or memory.
-  if (viewName === 'vakktok') {
-    const tokRoot = items.classList.contains('vakktok-feed') ? items : null;
-    let activeTokVideo = null;
-    const syncTokPlayback = () => {
-      if (!tokRoot) return;
-      const rootRect = tokRoot.getBoundingClientRect();
-      let best = null;
-      let bestRatio = 0;
-      items.querySelectorAll('.vakktok-video').forEach((video) => {
-        const rect = video.getBoundingClientRect();
-        const visible = Math.max(0, Math.min(rect.bottom, rootRect.bottom) - Math.max(rect.top, rootRect.top));
-        const ratio = rect.height > 0 ? visible / rect.height : 0;
-        if (ratio > bestRatio) { best = video; bestRatio = ratio; }
-        if (video !== activeTokVideo && ratio < 0.55) {
-          video.pause();
-          try { video.currentTime = 0; } catch (e) {}
-        }
-      });
-      if (best && bestRatio >= 0.7) {
-        if (activeTokVideo && activeTokVideo !== best) {
-          activeTokVideo.pause();
-          try { activeTokVideo.currentTime = 0; } catch (e) {}
-        }
-        activeTokVideo = best;
-        best.muted = false;
-        best.play().catch(() => {});
-      }
-    };
-    const tokObserver = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        const video = entry.target;
-        if (!(video instanceof HTMLVideoElement)) return;
-        if (entry.isIntersecting && entry.intersectionRatio >= 0.7) {
-          items.querySelectorAll('.vakktok-video').forEach((other) => {
-            if (other !== video) {
-              other.pause();
-              try { other.currentTime = 0; } catch (e) {}
-            }
-          });
-          activeTokVideo = video;
-          video.muted = false;
-          video.play().catch(() => {});
-        } else {
-          video.pause();
-          try { video.currentTime = 0; } catch (e) {}
-        }
-      });
-    }, { root: tokRoot, threshold: [0.7] });
-    const observeTokVideos = (scope) => {
-      if (!scope || !scope.querySelectorAll) return;
-      scope.querySelectorAll('.vakktok-video').forEach((video) => {
-        if (video.dataset.tokObserved === '1') return;
-        video.dataset.tokObserved = '1';
-        video.addEventListener('loadedmetadata', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
-        video.addEventListener('canplay', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
-        tokObserver.observe(video);
-      });
-    };
-    observeTokVideos(items);
-    if (tokRoot) {
-      tokRoot.addEventListener('scroll', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
-      tokRoot.addEventListener('keydown', (event) => {
-        if (event.key === 'ArrowDown' || event.key === 'PageDown') {
-          window.requestAnimationFrame(syncTokPlayback);
-        }
-      });
-      window.addEventListener('resize', syncTokPlayback, { passive: true });
-    }
-    const tokMutationObserver = new MutationObserver((mutations) => {
-      mutations.forEach((mutation) => mutation.addedNodes.forEach((node) => observeTokVideos(node)));
-      window.requestAnimationFrame(syncTokPlayback);
-    });
-    tokMutationObserver.observe(items, { childList: true, subtree: true });
-    window.requestAnimationFrame(syncTokPlayback);
-  }
 
   // Pull-to-refresh indicator (mobile / window scroll)
   let ptrEl = root.querySelector('.feed-ptr');
@@ -20415,7 +20214,6 @@ window.apAdminToast = function (msg, isErr) {
       items.dataset.hasMore = hasMore ? '1' : '0';
       if (status) {
         if (hasMore) status.textContent = 'Scroll for more…';
-        else if (viewName === 'vakktok') status.textContent = '';
         else if (isNotifTimeline) status.textContent = 'End of notifications';
         else if (isBskyTimeline) status.textContent = 'End of Bluesky feed';
         else status.textContent = 'End of timeline';

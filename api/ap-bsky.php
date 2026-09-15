@@ -1983,8 +1983,8 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
         ];
     }
     // Bluesky video views expose an HLS playlist plus an optional poster. Keep
-    // these URLs in the durable compact cache so Gallery/VakkTok can hydrate
-    // video posts without retaining the much larger raw AppView response.
+    // these URLs in the compact cache for post and status video previews
+    // without retaining the much larger raw AppView response.
     if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
         $video = $embed['video'];
         $playlist = (string) ($video['playlist'] ?? $video['url'] ?? '');
