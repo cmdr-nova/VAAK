@@ -22307,6 +22307,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         ta.focus();
         try { ta.setSelectionRange(pos, pos); } catch (_) {}
         ta.dispatchEvent(new Event('input', { bubbles: true }));
+        // A selection is complete; close the picker and reset its search so
+        // the next opening starts with the full emoji set.
+        picker.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
+        search.value = '';
+        buttons.forEach((button) => { button.hidden = false; });
       });
       grid.appendChild(b);
       buttons.push(b);
