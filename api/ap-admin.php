@@ -613,6 +613,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
         exit;
     }
+    if ($action === 'profile_hover_data') {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        $actor = trim((string) ($_POST['actor'] ?? ''));
+        $payload = admin_profile_hover_payload($actor, $vaakOwnerId, $vaakActorId);
+        echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        exit;
+    }
     if (in_array($action, ['favourite_status', 'unfavourite_status', 'bookmark_status', 'unbookmark_status', 'reblog_status', 'unreblog_status'], true)) {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $view = $returnView;
@@ -7763,14 +7771,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $evMentionSeed = admin_reply_mention_seed($aid, null, is_array($eventMentions ?? null) ? $eventMentions : []);
                 ?>
                 <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?><?= admin_reply_mention_query($evMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
-                <?php if ($aid !== '' && !$alreadyFollowing): ?>
-                  <form method="post" action="?view=following" style="display:inline">
-                    <input type="hidden" name="action" value="follow_remote">
-                    <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                    <input type="hidden" name="actor_id" value="<?= h($aid) ?>">
-                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                  </form>
-                <?php endif; ?>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -8173,10 +8173,132 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av'): string
         ? AP_REMOTE_AVATAR_FALLBACK
         : 'https://mkultra.monster/img/avatar/default.jpg';
     // onerror → default so a stale/broken R2 URL never shows a cracked icon
+    $hover = is_string($actorId) && str_starts_with(strtolower(trim($actorId)), 'https://')
+        ? ' data-profile-hover-actor="' . h(rtrim(trim($actorId), '/')) . '"'
+        : '';
     return '<img class="' . h($class) . '" src="' . h($url) . '" alt="" width="40" height="40" '
+        . $hover
         . 'loading="lazy" decoding="async" referrerpolicy="no-referrer" '
         . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'" '
         . 'title="' . h($alt) . '">';
+}
+
+/** Cache-only hover data; remote profile warming is always dispatched in the background. */
+function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $ownerActorId): array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
+        return ['ok' => false, 'error' => 'Invalid profile'];
+    }
+    $profileUrl = '?view=remote_profile&actor=' . rawurlencode($actorId) . '&from=home';
+    $own = function_exists('vaak_is_own_url') && vaak_is_own_url($actorId);
+    $platform = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actorId) ? 'bluesky' : 'fediverse';
+    $display = '';
+    $handle = '';
+    $avatar = '';
+    $bio = '';
+    $following = false;
+    $followsYou = false;
+    $loading = false;
+    $canFollow = !$own;
+
+    if ($platform === 'bluesky') {
+        $cached = function_exists('ap_bsky_actor_profile_cache_get')
+            ? ap_bsky_actor_profile_cache_get($actorId, $ownerUserId)
+            : null;
+        if (function_exists('ap_bsky_actor_refresh_enqueue')) {
+            ap_bsky_actor_refresh_enqueue($ownerUserId, $actorId);
+        }
+        if (function_exists('ap_bsky_follow_sync_enqueue')) {
+            ap_bsky_follow_sync_enqueue($ownerUserId);
+        }
+        $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
+        $did = trim((string) ($profile['did'] ?? $cached['did'] ?? ''));
+        $handle = trim((string) ($profile['handle'] ?? ''));
+        $display = trim((string) ($profile['displayName'] ?? '')) ?: ($handle !== '' ? '@' . $handle : 'Bluesky user');
+        $avatar = is_string($profile['avatar'] ?? null) ? (string) $profile['avatar'] : '';
+        $bio = is_string($profile['description'] ?? null) ? $profile['description'] : '';
+        $viewer = is_array($cached['viewer'] ?? null) ? $cached['viewer'] : null;
+        $following = $viewer !== null
+            ? (is_string($viewer['following'] ?? null) && $viewer['following'] !== '')
+            : ($did !== '' && function_exists('ap_bsky_graph_sync_get')
+                && is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', $did)));
+        $followsYou = !empty($viewer['followedBy']);
+        $loading = !is_array($cached) || $profile === [];
+        $connected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($ownerUserId));
+        $canFollow = !$own && $connected;
+        if ($did !== '') {
+            $profileUrl = '?view=remote_profile&actor=' . rawurlencode('https://bsky.app/profile/' . $did) . '&from=home';
+        }
+    } elseif (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#i', $actorId, $m)
+        && function_exists('ap_local_user_by_actor_id')
+        && is_array($localUser = ap_local_user_by_actor_id($actorId))) {
+        $key = (string) ($localUser['actor_key'] ?? rawurldecode($m[1]));
+        $profile = function_exists('ap_profile_get') ? ap_profile_get($key) : [];
+        $display = trim((string) ($profile['name'] ?? '')) ?: $key;
+        $handle = '@' . $key . '@mkultra.monster';
+        $avatar = (string) ($profile['icon_url'] ?? '');
+        $bioRaw = (string) ($profile['summary'] ?? '');
+        $bio = function_exists('ap_html_to_plain_text')
+            ? ap_html_to_plain_text($bioRaw)
+            : trim(html_entity_decode(strip_tags($bioRaw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    } else {
+        $row = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
+        $summary = is_array($row) && is_string($row['summary'] ?? null) ? (string) $row['summary'] : null;
+        if (!is_array($row) || $summary === null) {
+            if (function_exists('ap_remote_actor_warm_async')) ap_remote_actor_warm_async($actorId);
+            $loading = true;
+        } elseif ((strtotime((string) ($row['updated_at'] ?? '')) ?: 0) < time() - 12 * 3600) {
+            if (function_exists('ap_remote_actor_warm_async')) ap_remote_actor_warm_async($actorId);
+            $loading = true;
+        }
+        $display = is_array($row) ? trim((string) ($row['display_name'] ?? '')) : '';
+        $handle = function_exists('actor_handle') ? actor_handle($actorId, is_array($row) ? ($row['username'] ?? null) : null) : '';
+        $avatar = is_array($row) ? (string) ($row['icon_source_url'] ?? '') : '';
+        if ($summary !== null && $summary !== '') {
+            $bio = function_exists('ap_html_to_plain_text')
+                ? ap_html_to_plain_text($summary)
+                : trim(html_entity_decode(strip_tags($summary), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+    }
+
+    if ($platform !== 'bluesky') {
+        $followingRows = function_exists('ap_following_list') ? ap_following_list($ownerActorId) : [];
+        $followerRows = function_exists('ap_followers_list') ? ap_followers_list($ownerActorId) : [];
+        $followingMap = $followerMap = [];
+        foreach ($followingRows as $row) {
+            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($id !== '') { $followingMap[$id] = true; $followingMap[$id . '/'] = true; }
+        }
+        foreach ($followerRows as $row) {
+            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($id !== '') { $followerMap[$id] = true; $followerMap[$id . '/'] = true; }
+        }
+        $following = function_exists('admin_is_following') && admin_is_following($followingMap, $actorId);
+        $followsYou = function_exists('admin_is_following') && admin_is_following($followerMap, $actorId);
+    }
+
+    $bio = preg_replace('/\s+/u', ' ', trim($bio)) ?? trim($bio);
+    $bio = mb_substr($bio, 0, 500);
+    $avatar = function_exists('ap_profile_sanitize_https_url')
+        ? (ap_profile_sanitize_https_url($avatar) ?? '')
+        : (str_starts_with($avatar, 'https://') ? $avatar : '');
+    if ($display === '') $display = $handle !== '' ? $handle : 'Account';
+    return [
+        'ok' => true,
+        'loading' => $loading,
+        'actor' => $actorId,
+        'profile_url' => $profileUrl,
+        'platform' => $platform,
+        'display_name' => $display,
+        'handle' => $handle,
+        'avatar' => $avatar,
+        'bio' => $bio,
+        'following' => $following,
+        'follows_you' => $followsYou,
+        'own' => $own,
+        'can_follow' => $canFollow,
+    ];
 }
 
 /** Cache-only Bluesky member presentation; profile hydration is queued, never fetched inline. */
@@ -8827,14 +8949,6 @@ function admin_render_masto_status_card(
                   <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
-              <?php if ($actorRef !== '' && !$following && !$isLocal): ?>
-                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
-                  <input type="hidden" name="action" value="follow_remote">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="actor_id" value="<?= h($actorRef) ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                </form>
-              <?php endif; ?>
               <?php if ($uri !== ''): ?>
                 <a href="<?= h(admin_remote_object_href($uri, $st['url'] ?? null)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
               <?php endif; ?>
@@ -9074,14 +9188,6 @@ function admin_render_remote_boost_card(
               echo admin_cw_gate_html($boostSpoiler, $boostSensitive, $boostInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($origActor !== '' && !$alreadyFollowing && !vaak_is_own_url($origActor)): ?>
-                <form method="post" action="?view=following" style="display:inline">
-                  <input type="hidden" name="action" value="follow_remote">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="actor_id" value="<?= h($origActor) ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                </form>
-              <?php endif; ?>
               <?php if ($canReply): ?>
                 <?php
                   $boostExtraMentions = [];
@@ -9236,14 +9342,6 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               <?php if ($objectId !== ''): ?>
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
                 <a href="<?= h(admin_remote_object_href($objectId)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
-              <?php endif; ?>
-              <?php if ($targetActor !== '' && !$alreadyFollowing): ?>
-                <form method="post" action="?view=following" style="display:inline">
-                  <input type="hidden" name="action" value="follow_remote">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="actor_id" value="<?= h($targetActor) ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                </form>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -9799,10 +9897,10 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         <?php if ($av !== ''): ?>
           <?php if ($authorProfileHref !== ''): ?>
             <a href="<?= h($authorProfileHref) ?>" style="text-decoration:none">
-              <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer">
+              <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-profile-hover-actor="<?= h($authorProfileUrl) ?>">
             </a>
           <?php else: ?>
-            <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer">
+            <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-profile-hover-actor="<?= h($authorProfileUrl) ?>">
           <?php endif; ?>
         <?php endif; ?>
         <div class="tweet-hd-main">
@@ -12267,6 +12365,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       object-fit: cover; flex-shrink: 0;
       background: #1a1a1a; border: 1px solid var(--border);
     }
+    .profile-hover-card {
+      position: fixed; z-index: 10050; width: min(340px, calc(100vw - 24px));
+      padding: 1rem; border: 1px solid var(--border); border-radius: 14px;
+      background: var(--panel, #171717); color: var(--text, #eee);
+      box-shadow: 0 12px 38px rgba(0,0,0,.48); pointer-events: auto;
+    }
+    .profile-hover-card[hidden] { display: none; }
+    .profile-hover-head { display:flex; align-items:center; gap:.75rem; margin-bottom:.55rem; }
+    .profile-hover-avatar { width:48px; height:48px; flex:0 0 48px; object-fit:cover; border-radius:50%; background:#222; }
+    .profile-hover-name { font-weight:700; overflow-wrap:anywhere; }
+    .profile-hover-bio { margin:.55rem 0; color:var(--muted); font-size:.9rem; line-height:1.4; overflow-wrap:anywhere; }
+    .profile-hover-foot { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
+    .profile-hover-spinner { width:20px; height:20px; border:2px solid var(--border); border-top-color:var(--primary); border-radius:50%; animation:profile-hover-spin .75s linear infinite; }
+    @keyframes profile-hover-spin { to { transform:rotate(360deg); } }
+    @media (hover:none), (pointer:coarse) { .profile-hover-card { display:none !important; } }
     .who { font-weight: 600; }
     .vanity-verified {
       display: inline-flex; align-items: center; justify-content: center;
@@ -17565,6 +17678,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                                   'host' => $rpHost,
                                   'icon_source_url' => $icon,
                                   'image_source_url' => $image,
+                                  'summary' => isset($rpDoc['summary']) && is_string($rpDoc['summary']) ? $rpDoc['summary'] : '',
                               ];
                               ap_remote_actor_upsert($rpActor, $fields);
                               // Mastodon dual IRI: also cache /users/{preferredUsername}
@@ -20315,7 +20429,6 @@ window.apAdminToast = function (msg, isErr) {
   // ↑ button: ignore infinite-scroll fights until the user leaves the top (or pin expires).
   let stickToTop = false;
   let stickToTopTimer = 0;
-  const POLL_MS = 120000;
   const AT_TOP_PX = 120;
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
   const isNotifTimeline = viewName === 'mentions';
@@ -20856,13 +20969,8 @@ window.apAdminToast = function (msg, isErr) {
     ptrCollapse();
   }, { passive: true });
 
-  // Auto-hydrate: poll for newer posts; keep ↻ Refresh for a full reload.
-  setInterval(pollNewer, POLL_MS);
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') pollNewer();
-  });
-  // Prime shortly after paint; subsequent checks use the two-minute cadence.
-  setTimeout(pollNewer, 5000);
+  // Do not auto-refresh the timeline: replacing or navigating feed content can
+  // interrupt a draft in the composer. Manual pull-to-refresh still uses this.
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
 
@@ -23147,6 +23255,91 @@ if (VIEW === 'analytics') loadAnalytics();
       window.apAdminToast((e && e.message) || 'Follow action failed.', true);
     } finally { form.dataset.queueBusy = '0'; button.disabled = false; }
   });
+})();
+</script>
+<script>
+// Desktop-only profile previews are cache-first; cold profiles warm asynchronously.
+(function () {
+  if (!window.matchMedia || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+  const card = document.createElement('aside');
+  card.className = 'profile-hover-card'; card.hidden = true; card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-live', 'polite'); card.innerHTML = '<div class="profile-hover-head"><span class="profile-hover-spinner" aria-hidden="true"></span><span>Loading profile…</span></div>';
+  document.body.appendChild(card);
+  let showTimer = 0, hideTimer = 0, requestSeq = 0, anchor = null;
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function position() {
+    if (!anchor || card.hidden) return;
+    const r = anchor.getBoundingClientRect(), w = card.offsetWidth, h = card.offsetHeight, pad = 12;
+    let left = r.right + 10;
+    if (left + w > innerWidth - pad) left = Math.max(pad, r.left - w - 10);
+    let top = Math.max(pad, Math.min(r.top, innerHeight - h - pad));
+    card.style.left = left + 'px'; card.style.top = top + 'px';
+  }
+  function node(tag, cls, value) {
+    const el = document.createElement(tag); if (cls) el.className = cls;
+    if (value !== undefined) el.textContent = value; return el;
+  }
+  function render(data) {
+    card.replaceChildren();
+    const head = node('div', 'profile-hover-head');
+    if (data.avatar && /^https:\/\//i.test(data.avatar)) { const img = node('img', 'profile-hover-avatar'); img.src = data.avatar; img.alt = ''; img.referrerPolicy = 'no-referrer'; head.appendChild(img); }
+    const names = node('div', ''); names.appendChild(node('div', 'profile-hover-name', data.display_name || data.handle || 'Account'));
+    if (data.handle) names.appendChild(node('div', 'meta', data.handle));
+    head.appendChild(names); card.appendChild(head);
+    const bio = Array.from(String(data.bio || ''));
+    if (bio.length) card.appendChild(node('div', 'profile-hover-bio', bio.slice(0, 100).join('') + (bio.length > 100 ? '…' : '')));
+    const foot = node('div', 'profile-hover-foot');
+    const relation = data.following && data.follows_you ? 'mutual' : data.following ? 'following' : data.follows_you ? 'follows you' : '';
+    foot.appendChild(node('span', 'meta', relation));
+    const actions = node('span', '');
+    if (data.profile_url) { const link = node('a', 'btn btn-ghost', 'View profile'); link.href = data.profile_url; actions.appendChild(link); }
+    if (data.can_follow && !data.own) {
+      const form = document.createElement('form'); form.method = 'post'; form.action = window.location.pathname + (window.location.search || '');
+      form.style.display = 'inline';
+      const add = (name, value) => { const input = document.createElement('input'); input.type = 'hidden'; input.name = name; input.value = value; form.appendChild(input); };
+      add('action', data.following ? 'unfollow_remote' : 'follow_remote'); add('actor_id', data.actor); add('return_view', 'home');
+      if (window.VAAK_CSRF) add('csrf', window.VAAK_CSRF);
+      const button = node('button', 'btn btn-primary', data.following ? 'Unfollow' : (data.follows_you ? 'Follow back' : 'Follow'));
+      button.type = 'submit'; form.appendChild(button); actions.appendChild(form);
+    }
+    foot.appendChild(actions); card.appendChild(foot); position();
+  }
+  async function load(actor, seq) {
+    const send = async () => {
+      const fd = new FormData(); fd.set('action', 'profile_hover_data'); fd.set('actor', actor);
+      if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+      const res = await fetch(window.location.pathname + (window.location.search || ''), { method:'POST', body:fd, credentials:'same-origin', headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'} });
+      if (!res.ok) throw new Error('Profile preview unavailable'); return res.json();
+    };
+    try {
+      let data = await send();
+      for (let i = 0; data && data.ok && data.loading && i < 4 && seq === requestSeq; i++) { await sleep(900); data = await send(); }
+      if (seq !== requestSeq || !card.isConnected) return;
+      if (data && data.ok) render(data);
+      else card.replaceChildren(node('div', 'meta', (data && data.error) || 'Profile preview unavailable'));
+    } catch (_) { if (seq === requestSeq) card.replaceChildren(node('div', 'meta', 'Profile preview unavailable')); }
+  }
+  function show(el) {
+    const actor = el && el.dataset.profileHoverActor;
+    if (!actor || !/^https:\/\//i.test(actor)) return;
+    clearTimeout(hideTimer); clearTimeout(showTimer);
+    showTimer = setTimeout(() => {
+      anchor = el; const seq = ++requestSeq;
+      card.hidden = false; card.style.left = '12px'; card.style.top = '12px';
+      card.innerHTML = '<div class="profile-hover-head"><span class="profile-hover-spinner" aria-hidden="true"></span><span>Loading profile…</span></div>';
+      position(); load(actor, seq);
+    }, 320);
+  }
+  function scheduleHide() { clearTimeout(showTimer); clearTimeout(hideTimer); hideTimer = setTimeout(() => { card.hidden = true; anchor = null; requestSeq++; }, 240); }
+  document.addEventListener('pointerover', ev => { const el = ev.target.closest && ev.target.closest('[data-profile-hover-actor]'); if (el && !el.contains(ev.relatedTarget)) show(el); });
+  document.addEventListener('pointerout', ev => {
+    const el = ev.target.closest && ev.target.closest('[data-profile-hover-actor]');
+    const next = ev.relatedTarget;
+    if (el && !(next && (el.contains(next) || (next.contains && next.contains(el))))) scheduleHide();
+  });
+  card.addEventListener('pointerenter', () => clearTimeout(hideTimer)); card.addEventListener('pointerleave', scheduleHide);
+  window.addEventListener('scroll', () => { if (!card.hidden) position(); }, true);
+  window.addEventListener('resize', () => { if (!card.hidden) position(); });
 })();
 </script>
 </body>

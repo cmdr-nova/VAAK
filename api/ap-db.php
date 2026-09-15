@@ -688,6 +688,11 @@ SQL);
     if (!in_array('forum_signature', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
     }
+    $remoteActorCols = $db->query('PRAGMA table_info(remote_actors)')->fetchAll();
+    $remoteActorNames = array_column($remoteActorCols, 'name');
+    if (!in_array('summary', $remoteActorNames, true)) {
+        $db->exec('ALTER TABLE remote_actors ADD COLUMN summary TEXT');
+    }
 
     $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS masto_suggestion_dismissals (
@@ -1104,6 +1109,7 @@ CREATE TABLE IF NOT EXISTS remote_actors (
     host TEXT,
     icon_source_url TEXT,
     image_source_url TEXT,
+    summary TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -10396,7 +10402,7 @@ function ap_remote_actor_normalize_username(?string $username): ?string
 }
 
 /**
- * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string} $fields
+ * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string,summary?:?string} $fields
  */
 function ap_remote_actor_upsert(string $actorId, array $fields): void
 {
@@ -10430,23 +10436,27 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     $host = $fields['host'] ?? ($existing['host'] ?? null);
     $icon = $fields['icon_source_url'] ?? ($existing['icon_source_url'] ?? null);
     $image = $fields['image_source_url'] ?? ($existing['image_source_url'] ?? null);
+    $summary = array_key_exists('summary', $fields) && is_string($fields['summary'])
+        ? mb_substr($fields['summary'], 0, 10000)
+        : ($existing['summary'] ?? null);
     if (is_string($icon)) {
         $icon = ap_profile_sanitize_https_url($icon);
     }
     if (is_string($image)) {
         $image = ap_profile_sanitize_https_url($image);
     }
-    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, summary, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_id) DO UPDATE SET
            username = COALESCE(excluded.username, remote_actors.username),
            display_name = COALESCE(excluded.display_name, remote_actors.display_name),
            host = COALESCE(excluded.host, remote_actors.host),
            icon_source_url = COALESCE(excluded.icon_source_url, remote_actors.icon_source_url),
            image_source_url = COALESCE(excluded.image_source_url, remote_actors.image_source_url),
+           summary = COALESCE(excluded.summary, remote_actors.summary),
            updated_at = excluded.updated_at';
     // Best-effort cache write: never take down admin HTML mid-render on lock.
-    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, ap_db_now()]) === false) {
+    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, $summary, ap_db_now()]) === false) {
         error_log('[ap-db] remote_actor_upsert skipped (locked): ' . $actorId);
     }
 }
@@ -10514,6 +10524,7 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                     'host' => $hostNorm,
                     'icon_source_url' => $icon,
                     'image_source_url' => $image,
+                    'summary' => isset($doc['summary']) && is_string($doc['summary']) ? $doc['summary'] : '',
                 ];
                 ap_remote_actor_upsert($actorId, $fields);
                 // Mastodon dual IRI: seed /users/{preferredUsername} when we only
