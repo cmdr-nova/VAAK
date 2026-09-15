@@ -9446,6 +9446,14 @@ function admin_render_outbox_card(array $n, string $returnView): void
         $ownSpoiler = trim((string) ($srow['spoiler_text'] ?? $ownSpoiler));
         $ownSensitive = !empty($srow['sensitive']) || $ownSpoiler !== '';
     }
+    $ownQuoteStatusId = '';
+    if (is_array($srow) && !empty($srow['local_id']) && function_exists('ap_masto_snowflake_id')) {
+        $ownQuoteStatusId = (string) ap_masto_snowflake_id(
+            (string) (($srow['published'] ?? '') ?: ($published !== '' ? $published : gmdate('c'))),
+            (int) $srow['local_id'],
+            0
+        );
+    }
     ?>
           <article class="tweet tweet-own"<?= $noteId !== '' ? ' id="note-' . h(md5($noteId)) . '" data-note-id="' . h($noteId) . '"' : '' ?>>
             <div class="tweet-hd">
@@ -9537,6 +9545,9 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   ?>
                   <?= admin_edit_post_button($noteId, $editPlain, $editSpoiler, $editSensitive, $returnView) ?>
                   <?= admin_pin_post_button($noteId, $returnView) ?>
+                  <?php if ($ownVisMeta['key'] !== 'private'): ?>
+                    <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($noteId) ?><?= $ownQuoteStatusId !== '' ? '&amp;quote_status_id=' . urlencode($ownQuoteStatusId) : '' ?>" title="Quote your post" aria-label="Quote your post"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+                  <?php endif; ?>
                 <?php endif; ?>
             <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply / continue thread" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
                 <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL (<?= h($ownVisLabel ?? 'Public') ?>)">Note</a>
@@ -11937,10 +11948,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     @keyframes feed-ptr-spin { to { transform: rotate(360deg); } }
     .compose-modal {
       position: fixed; inset: 0; z-index: 90;
-      display: none; align-items: flex-end; justify-content: center;
+      display: flex; align-items: flex-end; justify-content: center;
       padding: 1rem; background: rgba(0,0,0,.55); backdrop-filter: blur(4px);
+      opacity: 0; visibility: hidden; pointer-events: none;
+      transition: opacity .18s ease, visibility 0s linear .18s;
     }
-    .compose-modal.open { display: flex; }
+    .compose-modal.open {
+      opacity: 1; visibility: visible; pointer-events: auto;
+      transition: opacity .18s ease, visibility 0s;
+    }
     .compose-modal__panel {
       width: min(560px, 100%);
       max-height: min(90dvh, 720px);
@@ -11954,7 +11970,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       padding: 1rem 1.1rem 1.15rem;
       margin-bottom: .5rem;
       box-sizing: border-box;
+      transform: translateY(14px) scale(.985);
+      transition: transform .2s cubic-bezier(.2,.75,.25,1);
     }
+    .compose-modal.open .compose-modal__panel { transform: translateY(0) scale(1); }
     .compose-modal__panel > .composer {
       flex: 1 1 auto;
       min-height: 0;
@@ -12002,6 +12021,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     @media (min-width: 701px) {
       .compose-modal { align-items: center; }
       .compose-modal__panel { border-radius: 16px; margin-bottom: 0; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .compose-modal, .compose-modal__panel { transition: none !important; }
     }
     .compose-modal__hd {
       display: flex; justify-content: space-between; align-items: center;
@@ -21467,6 +21489,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     e.preventDefault();
     e.returnValue = '';
   });
+  let composeModalTransitionToken = 0;
   function openModal(opts) {
     opts = opts || {};
     // Keep timeline scroll locked while the pop-out opens (focus would otherwise
@@ -21481,9 +21504,17 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (supportsInlineComposer && isComposerInline()) {
       placeComposerInModal();
     }
+    const transitionToken = ++composeModalTransitionToken;
     modal.hidden = false;
-    modal.classList.add('open');
+    modal.inert = false;
     modal.setAttribute('aria-hidden', 'false');
+    if (!modal.classList.contains('open')) {
+      requestAnimationFrame(() => {
+        if (transitionToken === composeModalTransitionToken && !modal.hidden) {
+          modal.classList.add('open');
+        }
+      });
+    }
     const restoreScroll = () => {
       try { window.scrollTo(0, savedWindowY); } catch (e) {}
       if (feedEl) feedEl.scrollTop = savedFeedTop;
@@ -21861,19 +21892,35 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       }
     }
     skipDraftOnClose = false;
+    const transitionToken = ++composeModalTransitionToken;
     modal.classList.remove('open');
     modal.setAttribute('aria-hidden', 'true');
-    if (typeof window.__apResetComposeChrome === 'function') {
-      try { window.__apResetComposeChrome(); } catch (e) {}
-    }
-    clearComposeFieldsAfterClose();
-    // After closing a reply/quote pop-out on Home/Local/Federated, put the
-    // shared composer back at the top of the timeline (otherwise it stays
-    // inside the hidden modal until refresh).
-    if (supportsInlineComposer) {
-      placeComposerInline();
+    modal.inert = true;
+    const finishClose = () => {
+      if (transitionToken !== composeModalTransitionToken || modal.classList.contains('open')) return;
+      if (typeof window.__apResetComposeChrome === 'function') {
+        try { window.__apResetComposeChrome(); } catch (e) {}
+      }
+      clearComposeFieldsAfterClose();
+      // Rehome the shared composer after the exit animation finishes.
+      if (supportsInlineComposer) placeComposerInline();
+      else modal.hidden = true;
+    };
+    const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reducedMotion) {
+      finishClose();
     } else {
-      modal.hidden = true;
+      const onFadeOut = (event) => {
+        if (event.target === modal && event.propertyName === 'opacity') {
+          modal.removeEventListener('transitionend', onFadeOut);
+          finishClose();
+        }
+      };
+      modal.addEventListener('transitionend', onFadeOut);
+      window.setTimeout(() => {
+        modal.removeEventListener('transitionend', onFadeOut);
+        finishClose();
+      }, 260);
     }
   }
 
