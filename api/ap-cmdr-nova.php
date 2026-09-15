@@ -869,6 +869,16 @@ function ap_cmdr_shell_start(string $title): void
       .profile-tabs a.is-active{color:#0b0b0b;background:#00ff9f;border-color:#00ff9f}
       .profile-tabs a .tab-count{opacity:.7;font-weight:500;margin-left:.25rem;font-size:.8rem}
       .profile-tabs a.is-active .tab-count{opacity:.85}
+      .profile-media-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.8rem;align-items:start}
+      .profile-media-item{min-width:0;padding:.6rem;background:#111;border:1px solid #292929;border-radius:12px;overflow:hidden}
+      .profile-media-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px;border-radius:8px;overflow:hidden;background:#090909}
+      .profile-media-grid.media-count-1{grid-template-columns:1fr}
+      .profile-media-grid a{display:block;min-width:0;aspect-ratio:1/1;overflow:hidden}
+      .profile-media-grid img,.profile-media-grid video{display:block;width:100%;height:100%;object-fit:cover;background:#090909}
+      .profile-media-grid audio{width:100%;grid-column:1/-1}
+      .profile-media-caption{margin-top:.55rem;color:#ccc;font-size:.88rem;line-height:1.4;overflow-wrap:anywhere}
+      .profile-media-date{display:block;margin-top:.4rem;color:#858585;font-size:.75rem}
+      .profile-media-open{display:inline-block;margin-top:.45rem;color:#7ee0ff;font-size:.78rem;text-decoration:none}
       .featured-accounts{list-style:none;margin:0;padding:0}
       .featured-account{border-bottom:1px solid #2a2a2a}
       .featured-account:last-child{border-bottom:none}
@@ -1677,11 +1687,12 @@ function ap_cmdr_html(): void
         $bskyHandle = (string) $combined['bsky_handle'];
     }
     // HTML profile feed = site blogs + notes + AP compose (no federation side effects).
-    // Featured tab still needs post counts for the other tab badges.
+    // Media and Featured tabs still need the post counts for their tab badges.
     $feedTab = $tab === 'featured' ? 'posts' : $tab;
     $postsData = ap_cmdr_posts_page($page, $perPage, $feedTab);
     $counts = is_array($postsData['counts'] ?? null) ? $postsData['counts'] : ['posts' => 0, 'replies' => 0, 'boosts' => 0];
     $counts['featured'] = $featuredCount;
+    $counts['media'] = (int) ($postsData['counts']['media'] ?? 0);
     $tabTotal = (int) ($postsData['total'] ?? 0);
     $statPosts = (int) ($counts['posts'] ?? 0) + (int) ($counts['replies'] ?? 0); // original posts + replies (not boosts)
 
@@ -1704,6 +1715,7 @@ function ap_cmdr_html(): void
             'posts' => 'Posts',
             'replies' => 'Replies',
             'boosts' => 'Boosts',
+            'media' => 'Media',
             'featured' => 'Featured',
         ] as $tKey => $tLabel
     ) {
@@ -1717,7 +1729,22 @@ function ap_cmdr_html(): void
     }
     echo '</nav>';
 
-    if ($tab === 'featured') {
+    if ($tab === 'media') {
+        echo '<section class="posts profile-media-gallery" aria-label="Media">';
+        echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Media</h2>';
+        if (!$postsData['rows']) {
+            echo '<p class="muted">No public media posts yet.</p>';
+        } else {
+            foreach ($postsData['rows'] as $mediaRow) {
+                echo ap_cmdr_profile_media_item_html($mediaRow);
+            }
+            $totalPages = max(1, (int) ceil($tabTotal / $perPage));
+            if ($totalPages > 1) {
+                echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, ['tab' => 'media']);
+            }
+        }
+        echo '</section>';
+    } elseif ($tab === 'featured') {
         echo '<section class="posts featured-section" aria-label="Featured">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Featured</h2>';
         echo function_exists('ap_featured_cards_html')
@@ -1999,12 +2026,89 @@ function ap_cmdr_outbox_site_url_index(): array
     return $out;
 }
 
+/** Return displayable media attachments from an outbox row. */
+function ap_cmdr_profile_media_items(array $row): array
+{
+    $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+    $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
+    $atts = $obj['attachment'] ?? [];
+    if (!is_array($atts)) {
+        return [];
+    }
+    if (isset($atts['type'])) {
+        $atts = [$atts];
+    }
+    $items = [];
+    foreach ($atts as $att) {
+        if (!is_array($att)) continue;
+        $url = is_string($att['url'] ?? null)
+            ? (string) $att['url']
+            : (is_array($att['url'] ?? null) ? (string) ($att['url']['href'] ?? '') : '');
+        if (!str_starts_with($url, 'https://')) continue;
+        $mime = strtolower((string) ($att['mediaType'] ?? ''));
+        $type = strtolower((string) ($att['type'] ?? ''));
+        $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?? ''));
+        if (str_starts_with($mime, 'image/') || $type === 'image'
+            || preg_match('/\.(jpe?g|png|gif|webp|avif)$/', $path)) {
+            $kind = 'image';
+        } elseif (str_starts_with($mime, 'video/') || $type === 'video'
+            || preg_match('/\.(mp4|webm|mov|m4v)$/', $path)) {
+            $kind = 'video';
+        } elseif (str_starts_with($mime, 'audio/') || $type === 'audio'
+            || preg_match('/\.(mp3|ogg|opus|wav|m4a|aac)$/', $path)) {
+            $kind = 'audio';
+        } else {
+            continue;
+        }
+        $thumb = $att['thumbnail'] ?? ($att['preview'] ?? null);
+        $poster = is_string($thumb) ? $thumb : (is_array($thumb) ? (string) ($thumb['url'] ?? $thumb['href'] ?? '') : '');
+        $items[] = [
+            'url' => $url,
+            'type' => $kind,
+            'mime' => $mime,
+            'poster' => str_starts_with($poster, 'https://') ? $poster : '',
+            'alt' => (string) ($att['name'] ?? $att['summary'] ?? ''),
+        ];
+        if (count($items) >= 4) break;
+    }
+    return $items;
+}
+
+/** Render one public post as a tile in the HTML profile Media gallery. */
+function ap_cmdr_profile_media_item_html(array $row): string
+{
+    $items = is_array($row['_profile_media_items'] ?? null) ? $row['_profile_media_items'] : ap_cmdr_profile_media_items($row);
+    if ($items === []) return '';
+    $cells = [];
+    foreach ($items as $item) {
+        $url = htmlspecialchars((string) ($item['url'] ?? ''), ENT_QUOTES, 'UTF-8');
+        $alt = htmlspecialchars((string) ($item['alt'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $poster = (string) ($item['poster'] ?? '');
+        $safePoster = $poster !== '' ? ' poster="' . htmlspecialchars($poster, ENT_QUOTES, 'UTF-8') . '"' : '';
+        if (($item['type'] ?? '') === 'video') {
+            $cells[] = '<video class="profile-media-video" src="' . $url . '" controls playsinline preload="metadata"' . $safePoster . ' referrerpolicy="no-referrer"></video>';
+        } elseif (($item['type'] ?? '') === 'audio') {
+            $cells[] = '<audio src="' . $url . '" controls preload="none"></audio>';
+        } else {
+            $cells[] = '<a href="' . $url . '" target="_blank" rel="noopener noreferrer"><img src="' . $url . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer"></a>';
+        }
+    }
+    if ($cells === []) return '';
+    $content = trim(html_entity_decode(strip_tags((string) ($row['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $caption = $content !== '' ? '<div class="profile-media-caption">' . htmlspecialchars(mb_substr($content, 0, 220), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>' : '';
+    $published = (string) ($row['published'] ?? '');
+    $date = $published !== '' ? '<time class="profile-media-date" datetime="' . htmlspecialchars($published, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars($published, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</time>' : '';
+    $id = rtrim((string) ($row['id'] ?? ''), '/');
+    $open = str_starts_with($id, 'https://') ? '<a class="profile-media-open" href="' . htmlspecialchars($id, ENT_QUOTES, 'UTF-8') . '">Open post</a>' : '';
+    return '<article class="profile-media-item"><div class="profile-media-grid media-count-' . count($cells) . '">' . implode('', $cells) . '</div>' . $caption . $date . $open . '</article>';
+}
+
 /**
  * Paginated HTML profile feed: site blogs + notes + AP compose/blog/note.
  * Site archive items are display-only (not ActivityPub Creates).
  *
- * @param 'posts'|'replies'|'boosts' $tab
- * @return array{rows:list<array<string,mixed>>,total:int,page:int,per_page:int,tab:string,counts:array{posts:int,replies:int,boosts:int}}
+ * @param 'posts'|'replies'|'boosts'|'media' $tab
+ * @return array{rows:list<array<string,mixed>>,total:int,page:int,per_page:int,tab:string,counts:array{posts:int,replies:int,boosts:int,media:int}}
  */
 function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts'): array
 {
@@ -2015,6 +2119,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     $posts = [];
     $replies = [];
     $boosts = [];
+    $media = [];
 
     // AP outbox: compose, replies, quotes, polls, + syndicated blog/note shares.
     // HTML profile is discovery-facing: only fully public posts (not unlisted/private).
@@ -2032,6 +2137,11 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
                 continue;
             }
             $replyTo = rtrim(trim((string) ($row['in_reply_to'] ?? '')), '/');
+            $mediaItems = ap_cmdr_profile_media_items($row);
+            if ($mediaItems !== []) {
+                $row['_profile_media_items'] = $mediaItems;
+                $media[] = $row;
+            }
             if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
                 $replies[] = $row;
             } else {
@@ -2169,6 +2279,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
         'posts' => count($posts) + count($pinnedRows),
         'replies' => count($replies),
         'boosts' => count($boosts),
+        'media' => count($media),
     ];
     if ($tab === 'all') {
         $items = array_merge($pinnedRows, $posts, $replies, $boosts);
@@ -2180,6 +2291,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
         $items = match ($tab) {
             'replies' => $replies,
             'boosts' => $boosts,
+            'media' => $media,
             default => array_merge($pinnedRows, $posts),
         };
     }
@@ -2200,7 +2312,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
 function ap_cmdr_normalize_profile_tab(string $tab): string
 {
     $tab = strtolower(trim($tab));
-    return in_array($tab, ['posts', 'replies', 'boosts', 'featured', 'all'], true) ? $tab : 'posts';
+    return in_array($tab, ['posts', 'replies', 'boosts', 'media', 'featured', 'all'], true) ? $tab : 'posts';
 }
 
 /**

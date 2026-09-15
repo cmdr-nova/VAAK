@@ -12112,6 +12112,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border-color: var(--border); background: transparent;
     }
     .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
+    /* Your Posts uses the same flat, separated Mastodon-like timeline surface. */
+    .your-posts-feed > article.tweet {
+      background: transparent; border: 0; border-bottom: 1px solid var(--border);
+      border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
+    }
+    .your-posts-feed > article.tweet:hover { border-color: var(--border); background: transparent; }
+    .your-posts-feed > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
     .remote-profile-feed > article.tweet,
     .remote-profile-feed > .remote-profile-posts > article.tweet {
@@ -17583,6 +17590,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <div class="meta"><?= h(relative_time((string) $p['created_at'])) ?></div>
                 </div>
                 <div class="body" style="white-space:pre-wrap"><?= h($pSum) ?></div>
+                <?php
+                  $pMedia = mention_media_urls($p['media_urls'] ?? null);
+                  if ($pMedia) {
+                      echo admin_media_row_html($pMedia);
+                  }
+                ?>
                 <?php if ($pObj !== ''): ?>
                   <div class="tweet-actions">
                     <a href="<?= h(admin_status_href($pObj, 'remote_profile')) ?>">Open</a>
@@ -17821,9 +17834,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'outbox'): ?>
         <?php if (!$outbox): ?><div class="empty">No local posts yet. Use the ＋ button to compose.</div><?php endif; ?>
-        <?php foreach ($outbox as $n): ?>
-          <?php admin_render_outbox_card($n, 'outbox'); ?>
-        <?php endforeach; ?>
+        <div class="your-posts-feed">
+          <?php foreach ($outbox as $n): ?>
+            <?php admin_render_outbox_card($n, 'outbox'); ?>
+          <?php endforeach; ?>
+        </div>
 
       <?php elseif ($view === 'stats'): ?>
         <div class="meta" style="margin-bottom:.85rem">
