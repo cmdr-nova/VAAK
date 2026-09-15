@@ -2979,7 +2979,7 @@ function ap_bsky_filter_feed_items(array $feed, array $prefs): array
  * @param array{uri:string,cid:string} $subject
  * @return array{ok:bool,error?:string,uri?:string,cid?:string}
  */
-function ap_bsky_create_like(int $ownerUserId, array $subject): array
+function ap_bsky_create_like(int $ownerUserId, array $subject, ?string $recordKey = null): array
 {
     $uri = (string) ($subject['uri'] ?? '');
     $cid = (string) ($subject['cid'] ?? '');
@@ -3008,11 +3008,16 @@ function ap_bsky_create_like(int $ownerUserId, array $subject): array
             'createdAt' => gmdate('c'),
         ],
     ];
-    $put = ap_bsky_xrpc($pds, 'com.atproto.repo.createRecord', 'POST', null, $body, (string) $tok['access'], 15);
+    $endpoint = 'com.atproto.repo.createRecord';
+    if ($recordKey !== null && preg_match('/^[A-Za-z0-9._~:-]{1,240}$/', $recordKey)) {
+        $body['rkey'] = $recordKey;
+        $endpoint = 'com.atproto.repo.putRecord';
+    }
+    $put = ap_bsky_xrpc($pds, $endpoint, 'POST', null, $body, (string) $tok['access'], 15);
     if (empty($put['ok']) && (($put['status'] ?? 0) === 401)) {
         $tok = ap_bsky_access_token($ownerUserId, true);
         if (!empty($tok['ok'])) {
-            $put = ap_bsky_xrpc($pds, 'com.atproto.repo.createRecord', 'POST', null, $body, (string) $tok['access'], 15);
+            $put = ap_bsky_xrpc($pds, $endpoint, 'POST', null, $body, (string) $tok['access'], 15);
         }
     }
     if (empty($put['ok'])) {
@@ -3699,7 +3704,7 @@ function ap_bsky_get_profile(int $ownerUserId, string $actor): array
  *
  * @return array{ok:bool,error?:string,skipped?:bool,already?:bool,uri?:string}
  */
-function ap_bsky_follow_actor(int $ownerUserId, string $didOrRef): array
+function ap_bsky_follow_actor(int $ownerUserId, string $didOrRef, ?string $recordKey = null): array
 {
     if (!ap_bsky_tab_enabled() || ap_bsky_session_row($ownerUserId) === null) {
         return ['ok' => false, 'error' => 'Connect Bluesky in Profile settings first'];
@@ -3743,11 +3748,16 @@ function ap_bsky_follow_actor(int $ownerUserId, string $didOrRef): array
             'createdAt' => gmdate('c'),
         ],
     ];
-    $put = ap_bsky_xrpc($pds, 'com.atproto.repo.createRecord', 'POST', null, $body, (string) $tok['access'], 12);
+    if ($recordKey !== null && preg_match('/^[A-Za-z0-9._~:-]{1,240}$/', $recordKey)) {
+        $body['rkey'] = $recordKey;
+    }
+    $endpoint = $recordKey !== null && preg_match('/^[A-Za-z0-9._~:-]{1,240}$/', $recordKey)
+        ? 'com.atproto.repo.putRecord' : 'com.atproto.repo.createRecord';
+    $put = ap_bsky_xrpc($pds, $endpoint, 'POST', null, $body, (string) $tok['access'], 12);
     if (empty($put['ok']) && (($put['status'] ?? 0) === 401)) {
         $tok = ap_bsky_access_token($ownerUserId, true);
         if (!empty($tok['ok'])) {
-            $put = ap_bsky_xrpc($pds, 'com.atproto.repo.createRecord', 'POST', null, $body, (string) $tok['access'], 12);
+            $put = ap_bsky_xrpc($pds, $endpoint, 'POST', null, $body, (string) $tok['access'], 12);
         }
     }
     if (empty($put['ok'])) {
@@ -6296,7 +6306,7 @@ function ap_bsky_crosspost_status_inner(
  * @param array{uri:string,cid:string} $subject
  * @return array{ok:bool,error?:string,uri?:string,cid?:string}
  */
-function ap_bsky_create_repost(int $ownerUserId, array $subject): array
+function ap_bsky_create_repost(int $ownerUserId, array $subject, ?string $recordKey = null): array
 {
     $uri = (string) ($subject['uri'] ?? '');
     $cid = (string) ($subject['cid'] ?? '');
@@ -6316,7 +6326,7 @@ function ap_bsky_create_repost(int $ownerUserId, array $subject): array
     }
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $did = (string) ($row['did'] ?? '');
-    $put = ap_bsky_xrpc($pds, 'com.atproto.repo.createRecord', 'POST', null, [
+    $body = [
         'repo' => $did,
         'collection' => 'app.bsky.feed.repost',
         'record' => [
@@ -6324,19 +6334,17 @@ function ap_bsky_create_repost(int $ownerUserId, array $subject): array
             'subject' => ['uri' => $uri, 'cid' => $cid],
             'createdAt' => gmdate('c'),
         ],
-    ], (string) $tok['access'], 15);
+    ];
+    $endpoint = 'com.atproto.repo.createRecord';
+    if ($recordKey !== null && preg_match('/^[A-Za-z0-9._~:-]{1,240}$/', $recordKey)) {
+        $body['rkey'] = $recordKey;
+        $endpoint = 'com.atproto.repo.putRecord';
+    }
+    $put = ap_bsky_xrpc($pds, $endpoint, 'POST', null, $body, (string) $tok['access'], 15);
     if (empty($put['ok']) && (($put['status'] ?? 0) === 401)) {
         $tok = ap_bsky_access_token($ownerUserId, true);
         if (!empty($tok['ok'])) {
-            $put = ap_bsky_xrpc($pds, 'com.atproto.repo.createRecord', 'POST', null, [
-                'repo' => $did,
-                'collection' => 'app.bsky.feed.repost',
-                'record' => [
-                    '$type' => 'app.bsky.feed.repost',
-                    'subject' => ['uri' => $uri, 'cid' => $cid],
-                    'createdAt' => gmdate('c'),
-                ],
-            ], (string) $tok['access'], 15);
+            $put = ap_bsky_xrpc($pds, $endpoint, 'POST', null, $body, (string) $tok['access'], 15);
         }
     }
     if (empty($put['ok'])) {
@@ -6354,7 +6362,7 @@ function ap_bsky_create_repost(int $ownerUserId, array $subject): array
  *
  * @return array{ok:bool,skipped?:bool,error?:string,uri?:string}
  */
-function ap_bsky_repost_object(int $ownerUserId, string $objectId): array
+function ap_bsky_repost_object(int $ownerUserId, string $objectId, ?string $recordKey = null): array
 {
     if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
         return ['ok' => true, 'skipped' => true];
@@ -6363,7 +6371,7 @@ function ap_bsky_repost_object(int $ownerUserId, string $objectId): array
     if ($ref === null) {
         return ['ok' => true, 'skipped' => true, 'error' => 'No Bluesky subject'];
     }
-    return ap_bsky_create_repost($ownerUserId, $ref);
+    return ap_bsky_create_repost($ownerUserId, $ref, $recordKey);
 }
 
 /** Remove this account's Bluesky repost for a VAAK/AP object, when present. */

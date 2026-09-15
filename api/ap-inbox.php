@@ -3076,7 +3076,7 @@ function ap_outbound_identity(): array
  *
  * @return array{ok:bool,error?:string,already?:bool,follow_id?:string}
  */
-function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true): array
+function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true, ?string $stableFollowId = null): array
 {
     $rawInput = trim($actorId);
     $resolved = ap_resolve_actor_ref($rawInput);
@@ -3134,7 +3134,8 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true):
     $localKeyId = ap_local_key_id();
     $localPriv = ap_local_priv_path();
     $targetId = $want;
-    $backId = $localId . '/follows/' . bin2hex(random_bytes(10));
+    $backId = is_string($stableFollowId) && str_starts_with($stableFollowId, $localId . '/follows/')
+        ? $stableFollowId : $localId . '/follows/' . bin2hex(random_bytes(10));
 
     // Same-instance local actor: update graphs only (no HTTP to ourselves).
     if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $targetId, $lm)) {
@@ -3212,7 +3213,7 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true):
  *
  * @return array{ok:bool,error?:string,already?:bool}
  */
-function ap_unfollow_remote_actor(string $actorId): array
+function ap_unfollow_remote_actor(string $actorId, ?string $followActivityId = null, ?string $stableUndoId = null): array
 {
     $rawInput = trim($actorId);
     $resolved = ap_resolve_actor_ref($rawInput);
@@ -3265,10 +3266,16 @@ function ap_unfollow_remote_actor(string $actorId): array
     $sharedInbox = is_array($doc) ? ap_resolve_inbox_from_actor_doc($doc) : null;
     $inbox = $personalInbox ?: $sharedInbox;
 
-    // Best-effort Undo; always remove locally so admin UI stays truthful
-    if ($inbox && str_starts_with($inbox, 'https://') && !ap_is_blocked_inbox($inbox)) {
-        $undoId = $localId . '/undos/' . bin2hex(random_bytes(10));
-        $followId = $localId . '/follows/undo-' . bin2hex(random_bytes(6));
+    // The durable interaction worker must not mark an unfollow complete until
+    // the remote Undo has been accepted. Keep local graph state for retry.
+    if (!$inbox || !str_starts_with($inbox, 'https://') || ap_is_blocked_inbox($inbox)) {
+        return ['ok' => false, 'error' => 'Remote inbox unavailable for Follow undo'];
+    }
+    {
+        $undoId = is_string($stableUndoId) && str_starts_with($stableUndoId, $localId . '/undos/')
+            ? $stableUndoId : $localId . '/undos/' . bin2hex(random_bytes(10));
+        $followId = is_string($followActivityId) && str_starts_with($followActivityId, $localId . '/follows/')
+            ? $followActivityId : $localId . '/follows/undo-' . bin2hex(random_bytes(6));
         $undo = [
             '@context' => 'https://www.w3.org/ns/activitystreams',
             'id' => $undoId,
@@ -3282,7 +3289,9 @@ function ap_unfollow_remote_actor(string $actorId): array
                 'object' => $targetId,
             ],
         ];
-        ap_deliver_signed_json($inbox, $undo, $ident['key_id'], $ident['priv'], 5.0);
+        if (!ap_deliver_signed_json($inbox, $undo, $ident['key_id'], $ident['priv'], 5.0)) {
+            return ['ok' => false, 'error' => 'Could not deliver Follow undo to remote inbox'];
+        }
     }
 
     ap_following_remove($targetId, $localId);
@@ -5924,7 +5933,7 @@ function ap_actor_delivery_inboxes(string $actorId): array
  *
  * @return array{ok:bool,like_id?:string,delivered?:int,error?:string}
  */
-function ap_cmdr_send_like(string $objectId, string $targetActor): array
+function ap_cmdr_send_like(string $objectId, string $targetActor, ?string $stableLikeId = null): array
 {
     $objectId = trim($objectId);
     $targetActor = rtrim(trim($targetActor), '/');
@@ -5944,7 +5953,8 @@ function ap_cmdr_send_like(string $objectId, string $targetActor): array
         return ['ok' => false, 'error' => 'blocked'];
     }
 
-    $likeId = $actor . '/likes/' . bin2hex(random_bytes(16));
+    $likeId = is_string($stableLikeId) && str_starts_with($stableLikeId, $actor . '/likes/')
+        ? $stableLikeId : $actor . '/likes/' . bin2hex(random_bytes(16));
     $activity = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
         'id' => $likeId,
@@ -5985,7 +5995,7 @@ function ap_cmdr_send_like(string $objectId, string $targetActor): array
  *
  * @return array{ok:bool,delivered?:int,error?:string}
  */
-function ap_cmdr_send_undo_like(string $likeActivityId, string $objectId, string $targetActor): array
+function ap_cmdr_send_undo_like(string $likeActivityId, string $objectId, string $targetActor, ?string $stableUndoId = null): array
 {
     $likeActivityId = trim($likeActivityId);
     $objectId = trim($objectId);
@@ -5998,7 +6008,8 @@ function ap_cmdr_send_undo_like(string $likeActivityId, string $objectId, string
     }
     $ident = ap_outbound_identity();
     $actor = $ident['id'];
-    $undoId = $actor . '/undos/' . bin2hex(random_bytes(12));
+    $undoId = is_string($stableUndoId) && str_starts_with($stableUndoId, $actor . '/undos/')
+        ? $stableUndoId : $actor . '/undos/' . bin2hex(random_bytes(12));
     $activity = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
         'id' => $undoId,
@@ -6029,7 +6040,7 @@ function ap_cmdr_send_undo_like(string $likeActivityId, string $objectId, string
  *
  * @return array{ok:bool,announce_id?:string,delivered?:int,queued?:int,error?:string}
  */
-function ap_cmdr_send_announce(string $objectId, ?string $targetActor = null): array
+function ap_cmdr_send_announce(string $objectId, ?string $targetActor = null, ?string $stableAnnounceId = null): array
 {
     $objectId = trim($objectId);
     if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
@@ -6038,7 +6049,8 @@ function ap_cmdr_send_announce(string $objectId, ?string $targetActor = null): a
     $objectId = preg_replace('/#announce-\d+$/', '', $objectId) ?? $objectId;
     $ident = ap_outbound_identity();
     $actor = $ident['id'];
-    $announceId = $actor . '/announces/' . bin2hex(random_bytes(16));
+    $announceId = is_string($stableAnnounceId) && str_starts_with($stableAnnounceId, $actor . '/announces/')
+        ? $stableAnnounceId : $actor . '/announces/' . bin2hex(random_bytes(16));
     $published = gmdate('c');
     $to = ['https://www.w3.org/ns/activitystreams#Public'];
     $cc = [$actor . '/followers'];
@@ -6081,7 +6093,7 @@ function ap_cmdr_send_announce(string $objectId, ?string $targetActor = null): a
  *
  * @return array{ok:bool,delivered?:int,queued?:int,error?:string}
  */
-function ap_cmdr_send_undo_announce(string $announceActivityId, string $objectId, ?string $targetActor = null): array
+function ap_cmdr_send_undo_announce(string $announceActivityId, string $objectId, ?string $targetActor = null, ?string $stableUndoId = null): array
 {
     $announceActivityId = trim($announceActivityId);
     $objectId = trim($objectId);
@@ -6090,7 +6102,8 @@ function ap_cmdr_send_undo_announce(string $announceActivityId, string $objectId
     }
     $ident = ap_outbound_identity();
     $actor = $ident['id'];
-    $undoId = $actor . '/undos/' . bin2hex(random_bytes(12));
+    $undoId = is_string($stableUndoId) && str_starts_with($stableUndoId, $actor . '/undos/')
+        ? $stableUndoId : $actor . '/undos/' . bin2hex(random_bytes(12));
     $to = ['https://www.w3.org/ns/activitystreams#Public'];
     $cc = [$actor . '/followers'];
     if (is_string($targetActor) && str_starts_with($targetActor, 'https://')) {
@@ -6127,7 +6140,8 @@ function ap_cmdr_send_undo_announce(string $announceActivityId, string $objectId
         }
     }
     ap_metrics_record('Undo', $actor, $announceActivityId, $targetActor, strlen(json_encode($activity) ?: ''), 'unboost_ok', null);
-    return ['ok' => true, 'delivered' => $delivered];
+    return ['ok' => $delivered > 0, 'delivered' => $delivered,
+        'error' => $delivered > 0 ? null : 'No remote inbox accepted the Undo'];
 }
 
 /**

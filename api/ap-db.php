@@ -375,7 +375,7 @@ SQL);
         'ap_anti_ai_hits', 'ap_bites', 'ap_blocks', 'ap_collection_items',
         'ap_collection_memberships', 'ap_collections', 'ap_drafts', 'ap_featured_accounts',
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
-        'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_post_subscriptions', 'ap_queue_settings',
+        'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
         'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
@@ -1823,6 +1823,36 @@ CREATE TABLE IF NOT EXISTS ap_post_queue (
 CREATE INDEX IF NOT EXISTS idx_ap_post_queue_state_sched ON ap_post_queue(state, scheduled_at);
 CREATE INDEX IF NOT EXISTS idx_ap_post_queue_state_pos ON ap_post_queue(state, position);
 CREATE INDEX IF NOT EXISTS idx_ap_post_queue_owner_state_pos ON ap_post_queue(owner_user_id, state, position);
+SQL);
+
+    // Reversible likes / boosts / bookmarks / follows are persisted separately
+    // from post publication jobs. See docs/ap-action-queue-postgres.sql for the
+    // one-time production provisioning DDL (www-data has no CREATE privilege).
+    $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_action_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    desired_state INTEGER NOT NULL,
+    confirmed_state INTEGER,
+    revision INTEGER NOT NULL DEFAULT 1,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 12,
+    next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
+    last_error TEXT,
+    result_json TEXT,
+    receipt_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_user_id, platform, action_kind, target_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_action_queue_due ON ap_action_queue(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_ap_action_queue_owner_target ON ap_action_queue(owner_user_id, platform, action_kind, target_key, id);
 SQL);
     try {
         $st = $db->query('SELECT id FROM ap_queue_settings WHERE id = 1');

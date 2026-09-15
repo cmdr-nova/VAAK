@@ -9320,7 +9320,7 @@ function ap_masto_own_reblogs_as_statuses(int $limit = 40, ?string $maxId = null
  * @param array{status:array<string,mixed>,object_id:string,target_actor:?string,is_ours:bool} $resolved
  * @return array{ok:bool,status?:array<string,mixed>,error?:string}
  */
-function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
+function ap_masto_reblog_perform(array $resolved, bool $undo = false, ?string $stableActivityId = null, ?string $stableUndoId = null, bool $deferBskyMirror = false): array
 {
     $original = $resolved['status'];
     $statusId = (string) ($original['id'] ?? '');
@@ -9355,7 +9355,7 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
     }
 
     if ($undo) {
-        $prev = ap_masto_reblog_remove($statusId);
+        $prev = ap_masto_reblog_row_by_status($statusId);
         if ($prev && !empty($prev['announce_activity_id'])) {
             if (!function_exists('ap_cmdr_send_undo_announce')) {
                 if (!defined('AP_INBOX_LIB_ONLY')) {
@@ -9363,31 +9363,53 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
                 }
                 require_once __DIR__ . '/ap-inbox.php';
             }
-            ap_cmdr_send_undo_announce(
+            $undoResult = ap_cmdr_send_undo_announce(
                 (string) $prev['announce_activity_id'],
                 (string) ($prev['object_id'] ?? $objectId),
-                isset($prev['target_actor']) ? (string) $prev['target_actor'] : $targetActor
+                isset($prev['target_actor']) ? (string) $prev['target_actor'] : $targetActor,
+                $stableUndoId
             );
+            if (empty($undoResult['ok'])) {
+                // Keep local boost state intact so the durable worker can retry
+                // the same Undo activity id on its next pass.
+                return ['ok' => false, 'error' => (string) ($undoResult['error'] ?? 'Could not deliver boost undo')];
+            }
+            ap_masto_reblog_remove($statusId);
+        } else {
+            ap_masto_reblog_remove($statusId);
         }
         // VAAK boosts may also have created a Bluesky repost for a mapped
         // object. Undo both sides when the target has an ATProto twin.
-        try {
-            if (!function_exists('ap_bsky_unrepost_object')) {
-                require_once __DIR__ . '/ap-bsky.php';
+        $bskyMirror = ['ok' => true, 'skipped' => true];
+        if (!$deferBskyMirror) {
+            try {
+                if (!function_exists('ap_bsky_unrepost_object')) require_once __DIR__ . '/ap-bsky.php';
+                if (function_exists('ap_bsky_unrepost_object')) {
+                    $bskyMirror = ap_bsky_unrepost_object(ap_db_default_owner_user_id(), $objectId);
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-masto] bsky_unrepost: ' . $e->getMessage());
             }
-            if (function_exists('ap_bsky_unrepost_object')) {
-                ap_bsky_unrepost_object(ap_db_default_owner_user_id(), $objectId);
-            }
-        } catch (Throwable $e) {
-            error_log('[ap-masto] bsky_unrepost: ' . $e->getMessage());
         }
         $original['reblogged'] = false;
-        return ['ok' => true, 'status' => ap_masto_apply_interaction_flags($original)];
+        return ['ok' => true, 'status' => ap_masto_apply_interaction_flags($original), 'bsky_mirror' => $bskyMirror];
     }
 
     $existing = ap_masto_reblog_row_by_status($statusId);
     if ($existing) {
-        return ['ok' => true, 'status' => ap_masto_status_from_reblog($existing, $original)];
+        $bskyMirror = ['ok' => true, 'skipped' => true];
+        if ($stableActivityId !== null && !$deferBskyMirror) {
+            try {
+                if (!function_exists('ap_bsky_repost_object')) require_once __DIR__ . '/ap-bsky.php';
+                if (function_exists('ap_bsky_repost_object')) {
+                    $bskyOwner = ap_db_default_owner_user_id();
+                    // Let ATProto choose a valid TID here; durable queue writes
+                    // pass their own persisted, valid record key separately.
+                    $bskyMirror = ap_bsky_repost_object($bskyOwner, $objectId);
+                }
+            } catch (Throwable $e) { $bskyMirror = ['ok' => false, 'error' => 'Bluesky mirror failed']; }
+        }
+        return ['ok' => true, 'status' => ap_masto_status_from_reblog($existing, $original), 'bsky_mirror' => $bskyMirror];
     }
 
     if (!function_exists('ap_cmdr_send_announce')) {
@@ -9396,23 +9418,22 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
         }
         require_once __DIR__ . '/ap-inbox.php';
     }
-    $fan = ap_cmdr_send_announce($objectId, is_string($targetActor) ? $targetActor : null);
+    $fan = ap_cmdr_send_announce($objectId, is_string($targetActor) ? $targetActor : null, $stableActivityId);
     if (empty($fan['ok']) || empty($fan['announce_id'])) {
         return ['ok' => false, 'error' => $fan['error'] ?? 'Could not boost'];
     }
     // Best-effort Bluesky repost when the target has an AT twin (or is a bsky URL).
-    try {
-        if (!function_exists('ap_bsky_repost_object')) {
-            require_once __DIR__ . '/ap-bsky.php';
-        }
-        if (function_exists('ap_bsky_repost_object') && function_exists('ap_db_masto_owner_user_id')) {
-            $bskyOwner = ap_db_masto_owner_user_id();
-            if ($bskyOwner > 0) {
-                ap_bsky_repost_object($bskyOwner, $objectId);
+    $bskyMirror = ['ok' => true, 'skipped' => true];
+    if (!$deferBskyMirror) {
+        try {
+            if (!function_exists('ap_bsky_repost_object')) require_once __DIR__ . '/ap-bsky.php';
+            if (function_exists('ap_bsky_repost_object') && function_exists('ap_db_masto_owner_user_id')) {
+                $bskyOwner = ap_db_masto_owner_user_id();
+                if ($bskyOwner > 0) $bskyMirror = ap_bsky_repost_object($bskyOwner, $objectId);
             }
+        } catch (Throwable $e) {
+            error_log('[ap-masto] bsky_repost: ' . $e->getMessage());
         }
-    } catch (Throwable $e) {
-        error_log('[ap-masto] bsky_repost: ' . $e->getMessage());
     }
     $created = gmdate('c');
     // Provisional id until we know DB id — insert then update boost_status_id
@@ -9438,5 +9459,5 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false): array
     } catch (Throwable $e) {
         // keep tmp id
     }
-    return ['ok' => true, 'status' => ap_masto_status_from_reblog($row, $original)];
+        return ['ok' => true, 'status' => ap_masto_status_from_reblog($row, $original), 'bsky_mirror' => $bskyMirror];
 }

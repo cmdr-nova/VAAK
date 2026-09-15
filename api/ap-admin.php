@@ -30,6 +30,7 @@ require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
 require_once __DIR__ . '/ap-bsky.php'; // Phase A Bluesky tab (opt-in, feature-flagged)
+require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline actions
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -595,6 +596,19 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $action = '';
         $view = 'home';
     }
+    if ($action === 'action_queue_status') {
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store');
+        $queueId = (int) ($_POST['queue_id'] ?? 0);
+        $status = ap_action_queue_status($vaakOwnerId, $queueId);
+        if (!$status) {
+            http_response_code(404);
+            echo json_encode(['ok' => false, 'error' => 'Queued action not found.']);
+        } else {
+            echo json_encode(['ok' => true, 'queue' => $status], JSON_UNESCAPED_SLASHES);
+        }
+        exit;
+    }
     if (in_array($action, ['favourite_status', 'unfavourite_status', 'bookmark_status', 'unbookmark_status', 'reblog_status', 'unreblog_status'], true)) {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $view = $returnView;
@@ -622,6 +636,22 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $interactKind = 'reblog';
                 if ($resolved === null) {
                     $error = 'Status not found in local store.';
+                } elseif ($wantJson) {
+                    $queue = ap_action_queue_enqueue(
+                        $vaakOwnerId, 'fedi', 'boost', (string) ($resolved['object_id'] ?? $objectId),
+                        $action === 'reblog_status', ['status_id' => $sid]
+                    );
+                    if (!empty($queue['ok'])) {
+                        header('Content-Type: application/json; charset=utf-8');
+                        header('Cache-Control: no-store');
+                        http_response_code(202);
+                        echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
+                            'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
+                            'kind' => 'reblog', 'active' => $action === 'reblog_status', 'status_id' => $statusId,
+                            'notice' => 'Boost action queued.'], JSON_UNESCAPED_SLASHES);
+                        exit;
+                    }
+                    $error = $queue['error'] ?? 'Could not queue boost.';
                 } else {
                     $res = ap_masto_reblog_perform($resolved, $action === 'unreblog_status');
                     if (empty($res['ok'])) {
@@ -641,6 +671,34 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         $objectId = (string) $statusArr['reblog']['uri'];
                     }
                     $objectId = preg_replace('/#announce-\d+$/', '', $objectId) ?? $objectId;
+                }
+                if ($wantJson) {
+                    $desired = in_array($action, ['favourite_status', 'bookmark_status'], true);
+                    $kind = str_starts_with($action, 'favourite') ? 'favourite' : 'bookmark';
+                    $targetKey = $objectId !== '' ? $objectId : $statusId;
+                    $queue = ap_action_queue_enqueue($vaakOwnerId, 'fedi', $kind === 'favourite' ? 'like' : 'bookmark', $targetKey, $desired, [
+                        'status_id' => $statusId, 'object_id' => $targetKey, 'target_actor' => $targetActor,
+                    ]);
+                    if (!empty($queue['ok'])) {
+                        $folderIds = [];
+                        if ($kind === 'bookmark' && $desired && function_exists('vaak_bookmark_folders_for_status')) {
+                            $folderIds = vaak_bookmark_folders_for_status($statusId, $vaakOwnerId);
+                        }
+                        header('Content-Type: application/json; charset=utf-8');
+                        header('Cache-Control: no-store');
+                        http_response_code(202);
+                        echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
+                            'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
+                            'kind' => $kind, 'active' => $desired, 'status_id' => $statusId,
+                            'object_id' => $targetKey, 'folder_ids' => $folderIds,
+                            'open_folder_picker' => $kind === 'bookmark' && $desired,
+                            'notice' => 'Action queued.'], JSON_UNESCAPED_SLASHES);
+                        exit;
+                    }
+                    header('Content-Type: application/json; charset=utf-8');
+                    http_response_code(503);
+                    echo json_encode(['ok' => false, 'error' => $queue['error'] ?? 'Could not queue action.']);
+                    exit;
                 }
                 if ($action === 'favourite_status') {
                     $interactKind = 'favourite';
@@ -1386,6 +1444,31 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $target = trim((string) ($_POST['actor_id'] ?? ''));
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'followers')) ?: 'followers';
         $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
+        $wantFollowJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        if ($wantFollowJson && $target !== '') {
+            $isBsky = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($target);
+            $connected = $isBsky && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId));
+            if ($isBsky && !$connected) {
+                $error = 'Connect Bluesky in Profile settings first.';
+            } else {
+                $queue = ap_action_queue_enqueue($vaakOwnerId, $connected ? 'bsky' : 'fedi', 'follow', $target, true, ['actor' => $target]);
+                if (!empty($queue['ok'])) {
+                    header('Content-Type: application/json; charset=utf-8');
+                    header('Cache-Control: no-store');
+                    http_response_code(202);
+                    echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'], 'revision' => $queue['revision'],
+                        'coalesced' => $queue['coalesced'] ?? false, 'kind' => 'follow', 'active' => true]);
+                    exit;
+                }
+                $error = $queue['error'] ?? 'Could not queue follow.';
+            }
+            header('Content-Type: application/json; charset=utf-8');
+            http_response_code(503);
+            echo json_encode(['ok' => false, 'error' => $error ?? 'Could not queue follow.']);
+            exit;
+        }
         if ($target === '') {
             $error = 'Enter an actor URL (https://…) or handle (@user@instance).';
         } else {
@@ -1436,6 +1519,31 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $target = trim((string) ($_POST['actor_id'] ?? ''));
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'following')) ?: 'following';
         $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
+        $wantFollowJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        if ($wantFollowJson && $target !== '') {
+            $isBsky = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($target);
+            $connected = $isBsky && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId));
+            if ($isBsky && !$connected) {
+                $error = 'Connect Bluesky in Profile settings first.';
+            } else {
+                $queue = ap_action_queue_enqueue($vaakOwnerId, $connected ? 'bsky' : 'fedi', 'follow', $target, false, ['actor' => $target]);
+                if (!empty($queue['ok'])) {
+                    header('Content-Type: application/json; charset=utf-8');
+                    header('Cache-Control: no-store');
+                    http_response_code(202);
+                    echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'], 'revision' => $queue['revision'],
+                        'coalesced' => $queue['coalesced'] ?? false, 'kind' => 'follow', 'active' => false]);
+                    exit;
+                }
+                $error = $queue['error'] ?? 'Could not queue unfollow.';
+            }
+            header('Content-Type: application/json; charset=utf-8');
+            http_response_code(503);
+            echo json_encode(['ok' => false, 'error' => $error ?? 'Could not queue unfollow.']);
+            exit;
+        }
         if ($target === '') {
             $error = 'Missing actor to unfollow.';
         } else {
@@ -2349,6 +2457,50 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             if (is_array($resolved) && !empty($resolved['cid'])) {
                 $cid = (string) $resolved['cid'];
             }
+        }
+        if ($wantAjax && in_array($action, ['bsky_like', 'bsky_unlike', 'bsky_repost', 'bsky_unrepost', 'bsky_bookmark', 'bsky_unbookmark'], true)) {
+            $queueKind = str_contains($action, 'like') ? 'like' : (str_contains($action, 'repost') ? 'boost' : 'bookmark');
+            $desired = in_array($action, ['bsky_like', 'bsky_repost', 'bsky_bookmark'], true);
+            if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
+                $error = 'Bluesky tab is disabled on this instance.';
+            } elseif (!str_starts_with($subject, 'at://')) {
+                $error = 'Missing Bluesky post reference.';
+            } elseif (in_array($queueKind, ['like', 'boost'], true) && $desired && $cid === '') {
+                $error = 'Missing Bluesky post CID.';
+            } else {
+                $keys = function_exists('admin_bsky_bookmark_keys') ? admin_bsky_bookmark_keys($subject, $vaakOwnerId) : ['status_id' => '', 'object_id' => $subject];
+                $receipt = $recordUri !== '' ? ['record_uri' => $recordUri] : [];
+                $queue = ap_action_queue_enqueue($vaakOwnerId, 'bsky', $queueKind, $subject, $desired, [
+                    'uri' => $subject, 'cid' => $cid, 'record_uri' => $recordUri,
+                    'status_id' => (string) ($_POST['bsky_status_id'] ?? $keys['status_id'] ?? ''),
+                    'object_id' => (string) ($_POST['bsky_object_id'] ?? $keys['object_id'] ?? $subject),
+                ], $receipt);
+                if (!empty($queue['ok'])) {
+                    header('Content-Type: application/json; charset=utf-8');
+                    header('Cache-Control: no-store');
+                    http_response_code(202);
+                    echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
+                        'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
+                        'action' => $action, 'kind' => $queueKind === 'like' ? 'favourite' : ($queueKind === 'boost' ? 'reblog' : 'bookmark'),
+                        'uri' => $subject, 'cid' => $cid, 'active' => $desired,
+                        'liked' => $queueKind === 'like' ? $desired : null,
+                        'reposted' => $queueKind === 'boost' ? $desired : null,
+                        'bookmarked' => $queueKind === 'bookmark' ? $desired : null,
+                        'record_uri' => $desired ? $recordUri : '',
+                        'status_id' => (string) ($keys['status_id'] ?? ''), 'object_id' => (string) ($keys['object_id'] ?? $subject),
+                        'open_folder_picker' => $queueKind === 'bookmark' && $desired,
+                        'folder_ids' => $queueKind === 'bookmark' && $desired && !empty($keys['status_id']) && function_exists('vaak_bookmark_folders_for_status')
+                            ? vaak_bookmark_folders_for_status((string) $keys['status_id'], $vaakOwnerId) : [],
+                    ], JSON_UNESCAPED_SLASHES);
+                    exit;
+                }
+                $error = $queue['error'] ?? 'Could not save action to queue.';
+            }
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            http_response_code(503);
+            echo json_encode(['ok' => false, 'error' => $error ?? 'Could not save action to queue.']);
+            exit;
         }
         $ajaxOut = ['ok' => false, 'action' => $action, 'uri' => $subject];
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
@@ -18776,6 +18928,44 @@ window.apAdminToast = function (msg, isErr) {
     snapshot.actionInput.value = snapshot.action;
   }
 
+  const queueSlowdownToast = 'Whoa their pardner, slow down there. Your action is in the queue.';
+  async function watchInteractQueue(form, queueId, revision, snapshot) {
+    let tries = 0;
+    while (tries++ < 90) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const fd = new FormData();
+      fd.set('action', 'action_queue_status');
+      fd.set('queue_id', String(queueId));
+      fd.set('ajax', '1');
+      if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+      try {
+        const res = await fetch(window.location.pathname + (window.location.search || ''), {
+          method: 'POST', body: fd, credentials: 'same-origin',
+          headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+        });
+        const data = await res.json();
+        const q = data && data.queue;
+        if (!q || Number(q.revision) < Number(form.dataset.queueRevision || revision)) continue;
+        if (q.status === 'succeeded') {
+          if (Number(q.revision) === Number(form.dataset.queueRevision || revision)) {
+            delete form.dataset.queuePending;
+            delete form.dataset.queueId;
+          }
+          return;
+        }
+        if (q.status === 'failed') {
+          if (Number(q.revision) === Number(form.dataset.queueRevision || revision)) {
+            if (form.isConnected) restoreInteractButton(snapshot);
+            delete form.dataset.queuePending;
+            delete form.dataset.queueId;
+            window.apAdminToast(q.last_error || 'Action failed after retrying.', true);
+          }
+          return;
+        }
+      } catch (e) { /* queue remains durable; a later poll or page reload can reconcile */ }
+    }
+  }
+
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -18792,7 +18982,11 @@ window.apAdminToast = function (msg, isErr) {
       return;
     }
     ev.preventDefault();
-    if (form.dataset.busy === '1') return;
+    if (form.dataset.busy === '1') {
+      window.apAdminToast(queueSlowdownToast);
+      return;
+    }
+    if (form.dataset.queuePending === '1') window.apAdminToast(queueSlowdownToast);
     const fd = new FormData(form);
     fd.set('ajax', '1');
     const before = snapshotInteractButton(form);
@@ -18803,7 +18997,7 @@ window.apAdminToast = function (msg, isErr) {
     applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive });
     form.dataset.busy = '1';
     // Keep the visual state immediate, but prevent duplicate requests in flight.
-    if (btn) btn.disabled = true;
+    if (btn) btn.disabled = false;
     try {
       const res = await fetch(form.getAttribute('action') || window.location.href, {
         method: 'POST',
@@ -18821,6 +19015,12 @@ window.apAdminToast = function (msg, isErr) {
         return;
       }
       applyInteractButton(form, data);
+      if (data.queued && data.queue_id) {
+        form.dataset.queuePending = '1';
+        form.dataset.queueId = String(data.queue_id);
+        form.dataset.queueRevision = String(data.revision || '');
+        watchInteractQueue(form, data.queue_id, data.revision, before);
+      }
       // On Favourites / Bookmarks lists, drop the row when toggling off
       if ((data.kind === 'favourite' || data.kind === 'bookmark') && data.active === false) {
         const card = form.closest('article.tweet');
@@ -19290,7 +19490,42 @@ window.apAdminToast = function (msg, isErr) {
       btn.setAttribute('aria-label', on ? tOn : tOff);
     }
 
-    async function postBskyAction(btn, postAction) {
+    const bskyQueueSlowdownToast = 'Whoa their pardner, slow down there. Your action is in the queue.';
+    async function watchBskyQueue(btn, queueId, revision, snapshot) {
+      let tries = 0;
+      while (tries++ < 90) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const body = new URLSearchParams({ action: 'action_queue_status', queue_id: String(queueId), ajax: '1' });
+        if (window.VAAK_CSRF) body.set('csrf', window.VAAK_CSRF);
+        try {
+          const qv = btn.dataset.returnView || 'bluesky';
+          const res = await fetch('?view=' + encodeURIComponent(qv) + '&ajax=1', {
+            method: 'POST', credentials: 'same-origin',
+            headers: { 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', ...(window.VAAK_CSRF ? { 'X-VAAK-CSRF': window.VAAK_CSRF } : {}) },
+            body: body.toString(),
+          });
+          const data = await res.json();
+          const q = data && data.queue;
+          if (!q || Number(q.revision) < Number(btn.dataset.queueRevision || revision)) continue;
+          if (q.status === 'succeeded') {
+            if (Number(q.revision) === Number(btn.dataset.queueRevision || revision)) {
+              delete btn.dataset.queuePending;
+              delete btn.dataset.queueId;
+            }
+            return;
+          }
+          if (q.status === 'failed' && Number(q.revision) === Number(btn.dataset.queueRevision || revision)) {
+            if (btn.isConnected) restoreBskyButton(btn, snapshot);
+            delete btn.dataset.queuePending;
+            delete btn.dataset.queueId;
+            if (typeof window.apAdminToast === 'function') window.apAdminToast(q.last_error || 'Action failed after retrying.', true);
+            return;
+          }
+        } catch (e) { /* the persisted action can be reconciled by a later poll */ }
+      }
+    }
+
+    async function postBskyAction(btn, postAction, before = null) {
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
       const recordUri = btn.dataset.recordUri || '';
@@ -19301,6 +19536,8 @@ window.apAdminToast = function (msg, isErr) {
       if (uri) body.set('bsky_uri', uri);
       if (cid) body.set('bsky_cid', cid);
       if (recordUri) body.set('bsky_record_uri', recordUri);
+      if (btn.dataset.statusId) body.set('bsky_status_id', btn.dataset.statusId);
+      if (btn.dataset.objectId) body.set('bsky_object_id', btn.dataset.objectId);
       if (objectRef) body.set('bsky_object', objectRef);
       if (returnView) body.set('return_view', returnView);
       body.set('ajax', '1');
@@ -19320,6 +19557,12 @@ window.apAdminToast = function (msg, isErr) {
       if (!res.ok || !data || !data.ok) {
         const msg = (data && data.error) ? data.error : ('HTTP ' + res.status);
         throw new Error(msg);
+      }
+      if (data.queued && data.queue_id) {
+        btn.dataset.queuePending = '1';
+        btn.dataset.queueId = String(data.queue_id);
+        btn.dataset.queueRevision = String(data.revision || '');
+        watchBskyQueue(btn, data.queue_id, data.revision, before || snapshotBskyButton(btn));
       }
       return data;
     }
@@ -19365,7 +19608,11 @@ window.apAdminToast = function (msg, isErr) {
       if (!btn) return;
       ev.preventDefault();
       ev.stopPropagation();
-      if (btn.dataset.busy === '1') return;
+      if (btn.dataset.busy === '1') {
+        if (typeof window.apAdminToast === 'function') window.apAdminToast(bskyQueueSlowdownToast);
+        return;
+      }
+      if (btn.dataset.queuePending === '1' && typeof window.apAdminToast === 'function') window.apAdminToast(bskyQueueSlowdownToast);
       const action = btn.dataset.bskyAction || '';
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
@@ -19386,7 +19633,7 @@ window.apAdminToast = function (msg, isErr) {
               btn.dataset.busy = '1';
               btn.disabled = true;
               try {
-                const data = await postBskyAction(btn, 'bsky_unbookmark');
+                const data = await postBskyAction(btn, 'bsky_unbookmark', before);
                 applyBskyBookmarkUi(btn, false, data);
                 if (window.vaakHaptic) window.vaakHaptic(6);
               } catch (e) {
@@ -19414,10 +19661,6 @@ window.apAdminToast = function (msg, isErr) {
       if (postAction === 'bsky_like' && !(uri || objectRef)) return;
       if ((postAction === 'bsky_repost' || postAction === 'bsky_bookmark')
           && !((uri && cid) || objectRef)) return;
-      if ((postAction === 'bsky_unlike' || postAction === 'bsky_unrepost') && !recordUri) {
-        btn.title = 'Refresh the page to undo this action';
-        return;
-      }
       const before = snapshotBskyButton(btn);
       const optimisticOn = postAction === 'bsky_like' || postAction === 'bsky_repost' || postAction === 'bsky_bookmark';
       if (action === 'like') setBskyIcon(btn, 'heart', optimisticOn, { on: 'Unlike', off: 'Like on Bluesky' });
@@ -19428,13 +19671,14 @@ window.apAdminToast = function (msg, isErr) {
         btn.setAttribute('aria-label', optimisticOn ? 'Undo boost' : 'Boost');
       } else if (action === 'bookmark') applyBskyBookmarkUi(btn, optimisticOn);
       btn.dataset.busy = '1';
-      btn.disabled = true;
+      btn.disabled = false;
       try {
-        const data = await postBskyAction(btn, postAction);
+        const data = await postBskyAction(btn, postAction, before);
         if (action === 'like') {
           const on = !!data.liked;
           setBskyIcon(btn, 'heart', on, { on: 'Unlike', off: 'Like on Bluesky' });
-          btn.dataset.recordUri = on ? (data.record_uri || '') : '';
+          if (!on) btn.dataset.recordUri = '';
+          else if (data.record_uri) btn.dataset.recordUri = data.record_uri;
           if (data.uri) btn.dataset.uri = String(data.uri);
           if (data.cid) btn.dataset.cid = String(data.cid);
         } else if (action === 'repost') {
@@ -19444,7 +19688,8 @@ window.apAdminToast = function (msg, isErr) {
           btn.setAttribute('aria-pressed', on ? 'true' : 'false');
           btn.title = on ? 'Undo boost' : 'Boost on Bluesky';
           btn.setAttribute('aria-label', on ? 'Undo boost' : 'Boost');
-          btn.dataset.recordUri = on ? (data.record_uri || '') : '';
+          if (!on) btn.dataset.recordUri = '';
+          else if (data.record_uri) btn.dataset.recordUri = data.record_uri;
         } else if (action === 'bookmark') {
           applyBskyBookmarkUi(btn, !!data.bookmarked, data);
           if (data.bookmarked && data.open_folder_picker && typeof window.novaOpenBookmarkFolderPicker === 'function') {
@@ -22362,6 +22607,56 @@ if (VIEW === 'analytics') loadAnalytics();
     if (!card) return;
     const reply = card.querySelector('a[title="Reply"], a[aria-label="Reply"]');
     if (reply) { ev.preventDefault(); reply.click(); }
+  });
+})();
+</script>
+<script>
+// Follow/unfollow forms use the same durable queue as timeline reactions.
+(function () {
+  const slowdown = 'Whoa their pardner, slow down there. Your action is in the queue.';
+  document.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const actionInput = form.querySelector('input[name="action"]');
+    const button = form.querySelector('button[type="submit"]');
+    if (!actionInput || !button || !['follow_remote', 'unfollow_remote'].includes(actionInput.value)) return;
+    ev.preventDefault();
+    if (form.dataset.queueBusy === '1') { window.apAdminToast(slowdown); return; }
+    if (form.dataset.queuePending === '1') window.apAdminToast(slowdown);
+    const before = { action: actionInput.value, label: button.innerHTML, title: button.title };
+    const want = actionInput.value === 'follow_remote';
+    form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
+    const fd = new FormData(form); fd.set('ajax', '1');
+    if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    try {
+      const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
+      form.dataset.queuePending = '1'; form.dataset.queueId = String(data.queue_id); form.dataset.queueRevision = String(data.revision || '');
+      actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
+      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following (action queued)' : 'Unfollowed (action queued)';
+      (async () => {
+        for (let n = 0; n < 90; n++) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const sf = new FormData(); sf.set('action', 'action_queue_status'); sf.set('queue_id', String(data.queue_id)); sf.set('ajax', '1');
+          if (window.VAAK_CSRF) sf.set('csrf', window.VAAK_CSRF);
+          try {
+            const sr = await fetch(window.location.pathname + (window.location.search || ''), { method: 'POST', body: sf, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
+            const sd = await sr.json(); const q = sd && sd.queue;
+            if (!q || Number(q.revision) < Number(form.dataset.queueRevision || data.revision)) continue;
+            if (q.status === 'succeeded') { if (Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) delete form.dataset.queuePending; return; }
+            if (q.status === 'failed' && Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) {
+              if (form.isConnected) { actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title; }
+              delete form.dataset.queuePending;
+              window.apAdminToast(q.last_error || 'Follow action failed after retrying.', true); return;
+            }
+          } catch (e) { /* retain queued state on transient polling errors */ }
+        }
+      })();
+    } catch (e) {
+      actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title;
+      window.apAdminToast((e && e.message) || 'Follow action failed.', true);
+    } finally { form.dataset.queueBusy = '0'; button.disabled = false; }
   });
 })();
 </script>
