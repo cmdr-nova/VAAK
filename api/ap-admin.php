@@ -3843,6 +3843,7 @@ if (
 
 // Outbox cards: home / federated mix-in + Your posts
 $outbox = [];
+$yourBskyPosts = [];
 /** @var array<string,array<string,mixed>> note_id → masto_statuses row (request cache) */
 $GLOBALS['admin_masto_by_note'] = [];
 $needOutboxBuild = !$wantNewerPoll && !$adminTlFromCache && (
@@ -3885,6 +3886,23 @@ if ($needOutboxBuild) {
         } catch (Throwable $e) {
             // fall back to per-card lookups
         }
+    }
+}
+// The authenticated Bluesky account can be used directly in the Bluesky app.
+// Pull its author feed through the durable refresh queue and show cached posts
+// here as Bluesky-only items (never create ActivityPub outbox rows for them).
+if ($view === 'outbox' && !$wantNewerPoll && function_exists('ap_bsky_session_row')) {
+    try {
+        $bskySession = ap_bsky_session_row((int) ($GLOBALS['vaak_owner_id'] ?? 0));
+        $ownBskyDid = trim((string) ($bskySession['did'] ?? ''));
+        if ($ownBskyDid !== '' && function_exists('ap_bsky_author_feed_refresh_enqueue')) {
+            ap_bsky_author_feed_refresh_enqueue((int) $GLOBALS['vaak_owner_id'], $ownBskyDid);
+        }
+        if ($ownBskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
+            $yourBskyPosts = ap_bsky_posts_for_author($ownBskyDid, 40);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] own Bluesky posts: ' . $e->getMessage());
     }
 }
 
@@ -17136,6 +17154,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       error_log('[ap-admin] remote_profile local outbox: ' . $e->getMessage());
                       $rpOutboxPosts = [];
                   }
+                  // The signed-in user's linked Bluesky posts are part of their
+                  // VAAK profile too, while remaining Bluesky-only publications.
+                  if (strtolower($rpLocalKey) === strtolower((string) $vaakActorKey)
+                      && function_exists('ap_bsky_session_row')) {
+                      $ownBskySession = ap_bsky_session_row((int) $vaakOwnerId);
+                      $ownBskyDid = trim((string) ($ownBskySession['did'] ?? ''));
+                      if ($ownBskyDid !== '') {
+                          if (function_exists('ap_bsky_author_feed_refresh_enqueue')) {
+                              ap_bsky_author_feed_refresh_enqueue((int) $vaakOwnerId, $ownBskyDid);
+                          }
+                          if (function_exists('ap_bsky_posts_for_author')) {
+                              $rpBskyPosts = ap_bsky_posts_for_author($ownBskyDid, 40);
+                          }
+                      }
+                  }
                   if (!$rpOutboxPosts) {
                       $ors = ['actor_id = ? OR actor_id = ?'];
                       $bind = [$rpActor, $rpActor . '/'];
@@ -17344,13 +17377,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if (str_contains($embedType, 'images') || str_contains($embedType, 'video')
                       || str_contains($embedType, 'recordWithMedia')) $rpTabItems['media'][] = $item;
               }
-          } elseif ($rpOutboxPosts) {
+          } elseif ($rpOutboxPosts || ($rpIsLocal && $rpBskyPosts)) {
               foreach ($rpOutboxPosts as $item) {
                   $create = json_decode((string) ($item['raw_create_json'] ?? ''), true);
                   $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
                   if (!empty($obj['inReplyTo'])) $rpTabItems['replies'][] = $item;
                   else $rpTabItems['posts'][] = $item;
                   if (!empty($obj['attachment']) || !empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
+              }
+              foreach ($rpBskyPosts as $item) {
+                  if (!is_array($item)) continue;
+                  $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+                  $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+                  $embed = is_array($post['embed'] ?? null) ? $post['embed'] : [];
+                  $reason = is_array($item['reason'] ?? null) ? $item['reason'] : [];
+                  if (!empty($reason['$type']) && str_ends_with((string) $reason['$type'], '.reasonRepost')) {
+                      $rpTabItems['boosts'][] = $item;
+                      continue;
+                  }
+                  if (!empty($record['reply'])) $rpTabItems['replies'][] = $item;
+                  else $rpTabItems['posts'][] = $item;
+                  $embedType = (string) ($embed['$type'] ?? '');
+                  if (str_contains($embedType, 'images') || str_contains($embedType, 'video')
+                      || str_contains($embedType, 'recordWithMedia')) $rpTabItems['media'][] = $item;
               }
               foreach ($rpPosts as $boostItem) {
                   if (strtolower((string) ($boostItem['type'] ?? '')) === 'announce') $rpTabItems['boosts'][] = $boostItem;
@@ -17568,10 +17617,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php if (is_array($bItem)) admin_render_bsky_feed_item($bItem, 'following'); ?>
               <?php endforeach; ?>
             <?php endif; ?>
-          <?php elseif ($rpOutboxPosts && $rpTab !== 'boosts'): ?>
+          <?php elseif (($rpOutboxPosts || ($rpIsLocal && $rpBskyPosts)) && $rpTab !== 'boosts'): ?>
             <?php if ($rpTabItems[$rpTab] === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
-            <?php foreach ($rpTabItems[$rpTab] as $n): ?>
-              <?php admin_render_outbox_card($n, 'remote_profile'); ?>
+            <?php
+              $localProfileItems = $rpTabItems[$rpTab];
+              usort($localProfileItems, static function ($a, $b): int {
+                  $aPost = is_array($a['post'] ?? null) ? $a['post'] : [];
+                  $bPost = is_array($b['post'] ?? null) ? $b['post'] : [];
+                  $aTime = (string) ($a['published'] ?? $aPost['record']['createdAt'] ?? $aPost['indexedAt'] ?? '');
+                  $bTime = (string) ($b['published'] ?? $bPost['record']['createdAt'] ?? $bPost['indexedAt'] ?? '');
+                  return (strtotime($bTime) ?: 0) <=> (strtotime($aTime) ?: 0);
+              });
+            ?>
+            <?php foreach ($localProfileItems as $n): ?>
+              <?php if (isset($n['post']) && is_array($n['post'])): ?>
+                <?php admin_render_bsky_feed_item($n, 'following', 'remote_profile'); ?>
+              <?php else: ?>
+                <?php admin_render_outbox_card($n, 'remote_profile'); ?>
+              <?php endif; ?>
             <?php endforeach; ?>
           <?php elseif ($rpTabItems[$rpTab] === []): ?>
             <div class="empty">No <?= h($rpTab) ?> available<?= $rpIsLocal ? ' in the local outbox' : ' in the activity seen by this instance' ?>.</div>
@@ -17833,10 +17896,42 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
 
       <?php elseif ($view === 'outbox'): ?>
-        <?php if (!$outbox): ?><div class="empty">No local posts yet. Use the ＋ button to compose.</div><?php endif; ?>
+        <?php
+          $yourPostItems = [];
+          $localNoteIds = [];
+          foreach ($outbox as $n) {
+              $noteId = rtrim((string) ($n['id'] ?? ''), '/');
+              if ($noteId !== '') $localNoteIds[$noteId] = true;
+              $yourPostItems[] = [
+                  'kind' => 'outbox',
+                  'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
+                  'row' => $n,
+              ];
+          }
+          foreach ($yourBskyPosts as $bItem) {
+              $post = is_array($bItem['post'] ?? null) ? $bItem['post'] : [];
+              $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+              if (($author['did'] ?? '') !== ($bskySession['did'] ?? '')) continue;
+              $uri = (string) ($post['uri'] ?? '');
+              $link = $uri !== '' && function_exists('ap_bsky_post_link_by_uri') ? ap_bsky_post_link_by_uri($uri) : null;
+              $fediId = (string) (($link['fediverse_id'] ?? '') ?: ($post['record']['fediverseId'] ?? ''));
+              if ($fediId !== '' && isset($localNoteIds[rtrim($fediId, '/')])) continue;
+              $yourPostItems[] = [
+                  'kind' => 'bsky',
+                  'sort' => strtotime((string) ($post['record']['createdAt'] ?? $post['indexedAt'] ?? '')) ?: 0,
+                  'item' => $bItem,
+              ];
+          }
+          usort($yourPostItems, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+        ?>
+        <?php if (!$yourPostItems): ?><div class="empty">No posts yet. Use the ＋ button to compose.</div><?php endif; ?>
         <div class="your-posts-feed">
-          <?php foreach ($outbox as $n): ?>
-            <?php admin_render_outbox_card($n, 'outbox'); ?>
+          <?php foreach ($yourPostItems as $yourPost): ?>
+            <?php if ($yourPost['kind'] === 'bsky'): ?>
+              <?php admin_render_bsky_feed_item($yourPost['item'], 'following', 'outbox'); ?>
+            <?php else: ?>
+              <?php admin_render_outbox_card($yourPost['row'], 'outbox'); ?>
+            <?php endif; ?>
           <?php endforeach; ?>
         </div>
 

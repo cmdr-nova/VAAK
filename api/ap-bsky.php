@@ -1855,24 +1855,26 @@ function ap_bsky_index_feed_post_links(array $post): void
 /** Max plain text stored for a cached Bluesky post (mirrors events.summary cap). */
 const AP_BSKY_POST_TEXT_MAX = 4000;
 
-function ap_bsky_posts_migrate(): void
+function ap_bsky_posts_migrate(?PDO $db = null): void
 {
-    static $done = false;
-    if ($done) {
+    static $doneByConnection = [];
+    $db ??= ap_db();
+    $connectionKey = spl_object_id($db);
+    if (isset($doneByConnection[$connectionKey])) {
         return;
     }
-    $done = true;
+    $doneByConnection[$connectionKey] = true;
     try {
-        $driver = function_exists('ap_db_driver') ? ap_db_driver() : 'sqlite';
+        $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
         if ($driver === 'pgsql') {
-            $have = (bool) ap_db()->query(
+            $have = (bool) $db->query(
                 "SELECT EXISTS (
                     SELECT 1 FROM information_schema.tables
                     WHERE table_schema = current_schema() AND table_name = 'bsky_posts'
                  )"
             )->fetchColumn();
             if (!$have) {
-                ap_db()->exec(<<<'SQL'
+                $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_posts (
     bsky_uri TEXT PRIMARY KEY,
     bsky_cid TEXT,
@@ -1898,15 +1900,15 @@ CREATE TABLE IF NOT EXISTS bsky_posts (
 )
 SQL);
                 try {
-                    ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_author_idx ON bsky_posts (author_did, indexed_at DESC)');
-                    ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_seen ON bsky_posts (seen_at)');
-                    ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_owner_idx ON bsky_posts (owner_user_id, indexed_at DESC)');
+                    $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_author_idx ON bsky_posts (author_did, indexed_at DESC)');
+                    $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_seen ON bsky_posts (seen_at)');
+                    $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_posts_owner_idx ON bsky_posts (owner_user_id, indexed_at DESC)');
                 } catch (Throwable $e) {
                     // ignore
                 }
             }
         } else {
-            ap_db()->exec(<<<'SQL'
+            $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS bsky_posts (
     bsky_uri TEXT PRIMARY KEY,
     bsky_cid TEXT,
@@ -2411,6 +2413,44 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20): array
         } catch (Throwable $e2) {
             return [];
         }
+    }
+}
+
+/** Coalesce a fresh authenticated pull of an author's feed onto the durable profile-refresh queue. */
+function ap_bsky_author_feed_refresh_enqueue(int $ownerUserId, string $authorDid, int $freshForSec = 180, ?PDO $db = null): void
+{
+    $authorDid = trim($authorDid);
+    if ($ownerUserId < 1 || !str_starts_with($authorDid, 'did:')) {
+        return;
+    }
+    $db ??= ap_db();
+    ap_bsky_posts_migrate($db);
+    $freshForSec = max(30, min(3600, $freshForSec));
+    try {
+        $st = $db->prepare('SELECT MAX(seen_at) FROM bsky_posts WHERE author_did = ?');
+        $st->execute([$authorDid]);
+        $lastPostSeen = strtotime((string) ($st->fetchColumn() ?: '')) ?: 0;
+        if ($lastPostSeen > time() - $freshForSec) {
+            return;
+        }
+        // An empty author feed still needs a short cooldown after a successful pull.
+        if (ap_bsky_actor_refresh_migrate($db)) {
+            $st = $db->prepare("SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1");
+            $st->execute([$ownerUserId, $authorDid]);
+            $job = $st->fetch();
+            if (is_array($job)) {
+                if (in_array((string) ($job['status'] ?? ''), ['pending', 'processing'], true)) {
+                    return;
+                }
+                $lastAttempt = strtotime((string) ($job['queued_at'] ?? '')) ?: 0;
+                if ((string) ($job['status'] ?? '') === 'succeeded' && $lastAttempt > time() - $freshForSec) {
+                    return;
+                }
+            }
+        }
+        ap_bsky_actor_refresh_enqueue($ownerUserId, $authorDid, true, $db);
+    } catch (Throwable $e) {
+        // Keep a background-refresh failure from breaking profile/timeline rendering.
     }
 }
 
