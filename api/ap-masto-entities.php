@@ -3557,14 +3557,33 @@ function ap_masto_clean_mention_text(string $text): string
     ) ?? $text;
     // Bridgy / generic: strip any "RE: https://…" chunk (including glued to prior word)
     $text = preg_replace('#RE:\s*https?://\S+#iu', '', $text) ?? $text;
-    // Any leading absolute URL (typically spaced); \S+ is fine after RE: strip above
-    $text = preg_replace('#^https?://\S+#u', '', $text) ?? $text;
+    // Do not discard a leading URL unless it was explicitly marked as an RE:
+    // URL-only posts are valid (and commonly used for video/link shares).
     // Drop leftover QT machine markers from enriched summaries (keep block for splitters)
     $text = preg_replace('#^↪ QT(?:\s+@\S+:)?\s*#u', '', $text) ?? $text;
     // Collapse whitespace left by mid-string RE: removal
     $text = preg_replace("/[ \t]+/u", ' ', $text) ?? $text;
     $text = preg_replace("/\n{3,}/u", "\n\n", $text) ?? $text;
     return trim($text);
+}
+
+/** Cached link card for remote text, with a background warm on cache miss. */
+function ap_masto_remote_link_card(string $text, bool $hasMedia = false): ?array
+{
+    if ($hasMedia || !function_exists('ap_link_preview_card_for_status_text')) {
+        return null;
+    }
+    $card = ap_link_preview_card_for_status_text($text, false, false);
+    if ($card !== null) {
+        return $card;
+    }
+    if (function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_warm_async')) {
+        $url = ap_link_preview_extract_url($text);
+        if ($url !== null) {
+            ap_link_preview_warm_async($url);
+        }
+    }
+    return null;
 }
 
 /**
@@ -3741,7 +3760,7 @@ function ap_masto_status_from_mention(array $row): array
         'mentions' => $pack['mentions'],
         'tags' => $pack['tags'] ?? [],
         'emojis' => [],
-        'card' => null,
+        'card' => ap_masto_remote_link_card((string) ($row['content'] ?? ''), count($media) > 0),
         'poll' => null,
         // Explicit null prevents clients from carrying a stale native quote
         // card across status updates when this remote post has no quote.
@@ -5218,7 +5237,7 @@ function ap_masto_status_from_event(array $row): ?array
         'mentions' => $pack['mentions'],
         'tags' => $pack['tags'] ?? [],
         'emojis' => [],
-        'card' => null,
+        'card' => ap_masto_remote_link_card((string) ($row['summary'] ?? ''), count($media) > 0),
         'poll' => null,
         // Explicit null prevents clients from carrying a stale native quote
         // card across status updates when this remote post has no quote.
