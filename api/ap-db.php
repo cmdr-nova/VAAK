@@ -472,6 +472,14 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] forum signature column not provisioned: ' . $e->getMessage());
     }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ap_reports' AND column_name = 'admin_notes'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec("ALTER TABLE ap_reports ADD COLUMN admin_notes TEXT NOT NULL DEFAULT ''");
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] moderation report notes column not provisioned: ' . $e->getMessage());
+    }
 
     // pgloader preserves SQLite primary-key columns but may not create the
     // serial/identity default that inserts rely on. Personal blocks omit id
@@ -1978,6 +1986,7 @@ CREATE TABLE IF NOT EXISTS ap_reports (
     comment TEXT,
     about_us INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'open',
+    admin_notes TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -2041,6 +2050,13 @@ CREATE TABLE IF NOT EXISTS ap_featured_accounts (
 CREATE INDEX IF NOT EXISTS idx_ap_featured_owner
     ON ap_featured_accounts(owner_user_id, position ASC, id ASC);
 SQL);
+
+    // Private moderator audit notes attached to reports (additive for existing local DBs).
+    $reportCols = $db->query('PRAGMA table_info(ap_reports)')->fetchAll();
+    $reportColNames = array_column($reportCols, 'name');
+    if (!in_array('admin_notes', $reportColNames, true)) {
+        $db->exec("ALTER TABLE ap_reports ADD COLUMN admin_notes TEXT NOT NULL DEFAULT ''");
+    }
 
     // Local full-text search (SQLite FTS5) — isolated from Mastodon Elasticsearch
     require_once __DIR__ . '/ap-search-fts.php';

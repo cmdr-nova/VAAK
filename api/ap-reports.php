@@ -351,6 +351,41 @@ function ap_report_set_state(int $id, string $state): array
     }
 }
 
+/** Append a private, timestamped admin audit note to a moderation report. */
+function ap_report_append_admin_note(int $id, string $note, string $admin = 'admin'): array
+{
+    $note = trim($note);
+    if ($id <= 0 || $note === '') {
+        return ['ok' => false, 'error' => 'Enter a note first.'];
+    }
+    if (function_exists('mb_substr')) {
+        $note = mb_substr($note, 0, 5000, 'UTF-8');
+    } else {
+        $note = substr($note, 0, 5000);
+    }
+    $admin = trim($admin) !== '' ? trim($admin) : 'admin';
+    try {
+        $st = ap_db()->prepare('SELECT admin_notes FROM ap_reports WHERE id = ?');
+        $st->execute([$id]);
+        $existing = $st->fetchColumn();
+        if ($existing === false) {
+            return ['ok' => false, 'error' => 'Report not found.'];
+        }
+        $entry = '[' . gmdate('Y-m-d H:i:s') . ' UTC · ' . $admin . "]\n" . $note;
+        $combined = trim((string) $existing);
+        $combined = $combined === '' ? $entry : $combined . "\n\n" . $entry;
+        if (strlen($combined) > 50000) {
+            $combined = substr($combined, -50000);
+        }
+        $up = ap_db()->prepare('UPDATE ap_reports SET admin_notes = ?, updated_at = ? WHERE id = ?');
+        $up->execute([$combined, function_exists('ap_db_now') ? ap_db_now() : gmdate('c'), $id]);
+        return ['ok' => true];
+    } catch (Throwable $e) {
+        error_log('[ap-reports] admin note save: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Could not save the private admin note.'];
+    }
+}
+
 /**
  * @return list<array<string,mixed>>
  */
@@ -364,7 +399,7 @@ function ap_reports_list(string $filter = 'open', int $limit = 80): array
             $st->execute([$limit]);
         } elseif ($filter === 'about_us') {
             $st = ap_db()->prepare(
-                "SELECT * FROM ap_reports WHERE about_us = 1 AND state = 'open' ORDER BY id DESC LIMIT ?"
+                "SELECT * FROM ap_reports WHERE about_us = 1 ORDER BY id DESC LIMIT ?"
             );
             $st->execute([$limit]);
         } elseif ($filter === 'outbound') {
@@ -378,12 +413,13 @@ function ap_reports_list(string $filter = 'open', int $limit = 80): array
             );
             $st->execute([$limit]);
         } else {
-            // Open queue: inbound Flags + local users' outbound reports awaiting review
+            // Incoming inbox: show every received Flag regardless of state, plus
+            // locally filed reports still awaiting moderator review.
             $st = ap_db()->prepare(
                 "SELECT * FROM ap_reports
-                 WHERE state = 'open'
-                   AND (direction = 'in'
-                        OR (direction = 'out' AND reporter_actor_id LIKE 'https://mkultra.monster/users/%'))
+                 WHERE direction = 'in'
+                    OR (state = 'open' AND direction = 'out'
+                        AND reporter_actor_id LIKE 'https://mkultra.monster/users/%')
                  ORDER BY id DESC LIMIT ?"
             );
             $st->execute([$limit]);

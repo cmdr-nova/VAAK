@@ -585,7 +585,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         'set_app_password', 'purge_oauth_tokens',
         'block_add', 'block_actor', 'block_domain', 'unblock',
         'relay_add', 'relay_enable', 'relay_disable', 'relay_remove',
-        'report_dismiss', 'report_ignore',
+        'report_dismiss', 'report_ignore', 'report_reopen', 'report_note',
         'invite_create',
         'user_ban', 'user_unban',
         'policies_save_privacy', 'policies_save_conduct', 'policies_save_rules',
@@ -2026,7 +2026,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($kind === 'block' || $kind === 'suspend') {
                     $notice .= ' · inbound federation from them is now rejected (HTTP 403).';
                 }
-                $view = 'blocks';
+                $reportId = (int) ($_POST['report_id'] ?? 0);
+                $adminNote = trim((string) ($_POST['admin_note'] ?? ''));
+                if ($reportId > 0 && $adminNote !== '' && function_exists('ap_report_append_admin_note')) {
+                    $noteResult = ap_report_append_admin_note($reportId, $adminNote, (string) ($vaakHandle ?? 'admin'));
+                    if (empty($noteResult['ok'])) {
+                        $error = $noteResult['error'] ?? 'Control applied, but the report note could not be saved.';
+                    }
+                }
+                $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'blocks')) ?: 'blocks';
+                $view = in_array($returnView, ['moderation', 'remote_profile', 'blocks'], true) ? $returnView : 'blocks';
             } else {
                 $error = $result['error'] ?? 'Block failed.';
             }
@@ -2143,15 +2152,36 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } else {
             $error = $res['error'] ?? 'Remove failed.';
         }
-    } elseif ($action === 'report_dismiss' || $action === 'report_ignore') {
+    } elseif ($action === 'report_note') {
         $view = 'moderation';
         $rid = (int) ($_POST['report_id'] ?? 0);
-        $state = $action === 'report_ignore' ? 'ignored' : 'dismissed';
+        $res = function_exists('ap_report_append_admin_note')
+            ? ap_report_append_admin_note($rid, (string) ($_POST['admin_note'] ?? ''), (string) ($vaakHandle ?? 'admin'))
+            : ['ok' => false, 'error' => 'Private report notes are unavailable.'];
+        if (!empty($res['ok'])) {
+            $notice = 'Private admin note saved.';
+        } else {
+            $error = $res['error'] ?? 'Could not save admin note.';
+        }
+        if (!empty($_POST['filter'])) {
+            $_GET['filter'] = preg_replace('/[^a-z_]/', '', (string) $_POST['filter']) ?: 'open';
+        }
+    } elseif ($action === 'report_dismiss' || $action === 'report_ignore' || $action === 'report_reopen') {
+        $view = 'moderation';
+        $rid = (int) ($_POST['report_id'] ?? 0);
+        $state = $action === 'report_ignore' ? 'ignored' : ($action === 'report_reopen' ? 'open' : 'dismissed');
         $res = ap_report_set_state($rid, $state);
         if (!empty($res['ok'])) {
             $notice = $state === 'ignored'
                 ? 'Report ignored — cleared from open queue.'
-                : 'Report dismissed — cleared from open queue.';
+                : ($state === 'open' ? 'Report returned to the open queue.' : 'Report dismissed — cleared from open queue.');
+            $adminNote = trim((string) ($_POST['admin_note'] ?? ''));
+            if ($adminNote !== '' && function_exists('ap_report_append_admin_note')) {
+                $noteResult = ap_report_append_admin_note($rid, $adminNote, (string) ($vaakHandle ?? 'admin'));
+                if (empty($noteResult['ok'])) {
+                    $error = $noteResult['error'] ?? 'Report state changed, but the private note could not be saved.';
+                }
+            }
         } else {
             $error = $res['error'] ?? 'Could not update report.';
         }
@@ -12943,7 +12973,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php if (!empty($vaakIsAdmin)): ?>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="admin" <?= $navAdminOpen ? 'open' : '' ?>>
-        <summary><span class="ico">⚙</span><span class="label">Admin</span></summary>
+        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsOpenCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsOpenCount ?> open reports">⚑ <?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span><?php endif; ?></summary>
         <div class="nav-sub">
           <a class="<?= $view === 'moderation' ? 'active' : '' ?>" href="?view=moderation" id="nav-moderation">
             <span class="ico">⚑</span><span class="label">Moderation</span>
@@ -13924,13 +13954,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </article>
         <?php endif; ?>
         <div class="meta" style="margin-bottom:.75rem">
-          Open queue includes inbound Flags and reports filed by local users awaiting review.
-          Use <b>Dismiss</b> / <b>Ignore</b> to clear items from the queue (clears the Moderation badge).
+          Incoming shows every report received, including reports already ignored or dismissed, plus local user reports awaiting review.
+          Use <b>Dismiss</b> / <b>Ignore</b> to clear an open report from the action-needed count.
           Remote outbound reports (already sent) appear under <b>Sent</b>.
         </div>
         <div class="tweet-actions" style="flex-wrap:wrap;gap:.4rem;margin-bottom:1rem">
           <?php foreach ([
-              'open' => 'Open inbox',
+              'open' => 'Incoming',
               'about_us' => 'About me',
               'outbound' => 'Sent',
               'closed' => 'Dismissed / ignored',
@@ -14017,57 +14047,59 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $canClose = $state === 'open' && ($dir === 'in' || $isLocalFiled);
             ?>
             <article class="tweet" style="<?= $aboutUs ? 'border-color:var(--primary)' : '' ?>">
-              <div class="tweet-hd">
-                <div class="tweet-hd-main">
-                  <div>
-                    <span class="who"><?= h($repLabel) ?></span>
-                    <span class="tag"><?= h($state) ?></span>
-                    <?php if ($aboutUs): ?><span class="tag">about you</span><?php endif; ?>
-                    <span class="tag" title="Transparent triage score; does not auto-moderate">priority <?= $priority ?></span>
-                    <?php if ($isLocalFiled): ?><span class="tag">needs review</span><?php endif; ?>
-                    <span class="meta"> · <?= h(relative_time((string) ($rep['created_at'] ?? ''))) ?></span>
+              <details class="report-detail">
+                <summary style="cursor:pointer;list-style:none">
+                  <div class="tweet-hd">
+                    <div class="tweet-hd-main">
+                      <div><span class="who"><?= h($repLabel) ?></span> <span class="tag"><?= h($state) ?></span>
+                        <?php if ($aboutUs): ?><span class="tag">about you</span><?php endif; ?>
+                        <span class="tag" title="Triage hint only; never auto-moderates">priority <?= $priority ?></span>
+                        <span class="meta"> · <?= h(relative_time((string) ($rep['created_at'] ?? ''))) ?></span>
+                      </div>
+                      <div class="meta">From <?= h($reporter !== '' ? actor_handle($reporter) : '?') ?> → <?= h($target !== '' ? actor_handle($target) : 'unknown target') ?></div>
+                    </div>
+                    <span class="btn btn-ghost" style="padding:.25rem .6rem">Open report</span>
                   </div>
-                  <div class="meta">
-                    From <?= h($reporter !== '' ? actor_handle($reporter) : '?') ?>
-                    → <?= h($target !== '' ? actor_handle($target) : 'unknown target') ?>
-                  </div>
-                </div>
-              </div>
-              <?php if ($comment !== ''): ?>
-                <div class="body" style="margin:.35rem 0;white-space:pre-wrap"><?= h($comment) ?></div>
-              <?php endif; ?>
-              <?php if ($statusUris): ?>
-                <div class="meta" style="margin:.35rem 0">Attached posts:</div>
-                <ul style="margin:.25rem 0 .5rem 1.1rem;padding:0">
-                  <?php foreach (array_slice($statusUris, 0, 8) as $su): ?>
-                    <li class="mono" style="margin:.2rem 0;word-break:break-all">
-                      <a href="<?= h(admin_status_href($su, 'moderation')) ?>"><?= h($su) ?></a>
-                    </li>
+                </summary>
+                <div class="meta" style="margin:.65rem 0 .25rem">Report #<?= $repId ?> · reported account: <span class="mono" style="overflow-wrap:anywhere"><?= h($target !== '' ? $target : 'not provided') ?></span></div>
+                <?php if ($comment !== ''): ?><div class="body" style="margin:.5rem 0;white-space:pre-wrap"><?= h($comment) ?></div><?php else: ?><div class="meta" style="margin:.5rem 0">No report explanation was provided.</div><?php endif; ?>
+                <?php if ($statusUris): ?>
+                  <div class="meta" style="margin:.5rem 0">Referenced posts:</div>
+                  <ul style="margin:.25rem 0 .75rem 1.1rem;padding:0">
+                    <?php foreach (array_slice($statusUris, 0, 12) as $su): ?>
+                      <li class="mono" style="margin:.25rem 0;word-break:break-all"><a href="<?= h(admin_status_href($su, 'moderation')) ?>"><?= h($su) ?></a> · <a href="<?= h($su) ?>" target="_blank" rel="noopener noreferrer">open original URL</a></li>
+                    <?php endforeach; ?>
+                  </ul>
+                <?php else: ?><div class="meta" style="margin:.5rem 0">No posts were attached to this report.</div><?php endif; ?>
+                <?php $adminNotes = trim((string) ($rep['admin_notes'] ?? '')); ?>
+                <section style="margin:.75rem 0;padding:.7rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+                  <div class="meta" style="font-weight:700;margin-bottom:.35rem">Private admin notes</div>
+                  <?php if ($adminNotes !== ''): ?><div class="mono" style="white-space:pre-wrap;overflow-wrap:anywhere;margin-bottom:.65rem"><?= h($adminNotes) ?></div><?php else: ?><div class="meta" style="margin-bottom:.65rem">No admin notes yet. Use this to record why you took an action.</div><?php endif; ?>
+                  <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="report_note"><input type="hidden" name="report_id" value="<?= $repId ?>"><input type="hidden" name="filter" value="<?= h($modFilter) ?>">
+                    <textarea name="admin_note" maxlength="5000" required placeholder="Why was this report ignored, dismissed, or acted on? (visible only to admins)" style="min-height:4rem;width:100%"></textarea>
+                    <button class="btn btn-ghost" type="submit" style="margin-top:.4rem">Save private note</button>
+                  </form>
+                </section>
+                <div class="tweet-actions" style="flex-wrap:wrap;gap:.55rem;margin-top:.65rem">
+                  <?php foreach ([['Reporter',$reporter],['Reported account',$target]] as [$actorLabel,$actorUri]): if ($actorUri === '' || !str_starts_with($actorUri, 'https://')) continue; $actorControl = admin_global_actor_control($actorUri); ?>
+                    <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($actorUri) ?>&amp;from=moderation">Inspect <?= h($actorLabel) ?></a>
+                    <?php if (!$actorControl): foreach (['mute' => 'Global mute', 'block' => 'Server-wide block'] as $controlKind => $controlLabel): ?>
+                      <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>" style="display:inline" onsubmit="return confirm(<?= h(json_encode($controlKind === 'mute' ? 'Apply a server-wide mute to this ' . strtolower($actorLabel) . '?' : 'Block this ' . strtolower($actorLabel) . ' server-wide? This rejects their federation with HTTP 403.')) ?>)">
+                        <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="block_actor"><input type="hidden" name="return_view" value="moderation"><input type="hidden" name="report_id" value="<?= $repId ?>"><input type="hidden" name="kind" value="<?= h($controlKind) ?>"><input type="hidden" name="actor_id" value="<?= h($actorUri) ?>">
+                        <button class="btn btn-ghost" type="submit"<?= $controlKind === 'block' ? ' style="color:var(--danger)"' : '' ?>><?= h($controlLabel) ?> <?= h($actorLabel) ?></button>
+                      </form>
+                    <?php endforeach; else: ?><span class="tag">Existing server <?= h((string) ($actorControl['kind'] ?? '')) ?> for <?= h($actorLabel) ?></span><?php endif; ?>
                   <?php endforeach; ?>
-                </ul>
-              <?php endif; ?>
-              <div class="tweet-actions" style="flex-wrap:wrap">
-                <?php if ($reporter !== '' && str_starts_with($reporter, 'https://')): ?>
-                  <a href="?view=remote_profile&amp;actor=<?= urlencode($reporter) ?>&amp;from=moderation">Reporter</a>
-                <?php endif; ?>
-                <?php if ($target !== '' && str_starts_with($target, 'https://')): ?>
-                  <a href="?view=remote_profile&amp;actor=<?= urlencode($target) ?>&amp;from=moderation">Target</a>
-                <?php endif; ?>
-                <?php if ($canClose): ?>
-                  <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>" style="display:inline">
-                    <input type="hidden" name="action" value="report_ignore">
-                    <input type="hidden" name="report_id" value="<?= $repId ?>">
-                    <input type="hidden" name="filter" value="<?= h($modFilter) ?>">
-                    <button class="btn btn-primary" type="submit" style="padding:.3rem .8rem;font-size:.85rem" title="Clear from open queue">Ignore</button>
-                  </form>
-                  <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>" style="display:inline">
-                    <input type="hidden" name="action" value="report_dismiss">
-                    <input type="hidden" name="report_id" value="<?= $repId ?>">
-                    <input type="hidden" name="filter" value="<?= h($modFilter) ?>">
-                    <button class="btn btn-ghost" type="submit" style="padding:.3rem .8rem;font-size:.85rem" title="Mark handled / dismiss">Dismiss</button>
-                  </form>
-                <?php endif; ?>
-              </div>
+                  <?php if ($canClose): ?>
+                    <?php foreach (['report_ignore' => 'Ignore', 'report_dismiss' => 'Dismiss'] as $reportAction => $buttonLabel): ?>
+                      <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>" style="display:inline"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="<?= h($reportAction) ?>"><input type="hidden" name="report_id" value="<?= $repId ?>"><input type="hidden" name="filter" value="<?= h($modFilter) ?>"><button class="btn <?= $reportAction === 'report_ignore' ? 'btn-primary' : 'btn-ghost' ?>" type="submit"><?= h($buttonLabel) ?></button></form>
+                    <?php endforeach; ?>
+                  <?php elseif (in_array($state, ['ignored', 'dismissed'], true) && ($dir === 'in' || $isLocalFiled)): ?>
+                    <form method="post" action="?view=moderation&amp;filter=<?= h($modFilter) ?>" style="display:inline"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="report_reopen"><input type="hidden" name="report_id" value="<?= $repId ?>"><input type="hidden" name="filter" value="<?= h($modFilter) ?>"><button class="btn btn-primary" type="submit"><?= $state === 'ignored' ? 'Un-ignore / reopen' : 'Reopen report' ?></button></form>
+                  <?php endif; ?>
+                </div>
+              </details>
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
