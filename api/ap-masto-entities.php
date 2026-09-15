@@ -8186,7 +8186,45 @@ function ap_masto_suggestions_v2(int $limit = 40): array
             }
         }
     }
-    $skip = static function (string $actorId) use ($local, $dismissed, $following, $followingKeys): bool {
+    // The Bluesky hide set includes synced VAAK blocks/mutes plus blocks, mutes,
+    // and subscribed moderation lists pulled from Bluesky. Build handle aliases
+    // from cached posts so handle-form suggestions are matched to hidden DIDs.
+    $bskyHiddenKeys = [];
+    if ($ownerUserId > 0 && function_exists('ap_bsky_hide_did_set')) {
+        $bskyHiddenKeys = ap_bsky_hide_did_set($ownerUserId);
+        $hiddenDids = array_values(array_filter(array_keys($bskyHiddenKeys), static fn($v) => str_starts_with($v, 'did:')));
+        foreach (array_chunk($hiddenDids, 40) as $chunk) {
+            try {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $hst = ap_db()->prepare(
+                    "SELECT DISTINCT lower(author_handle) AS h FROM bsky_posts
+                     WHERE lower(author_did) IN ($ph) AND author_handle IS NOT NULL AND author_handle != ''"
+                );
+                $hst->execute($chunk);
+                foreach ($hst->fetchAll() as $hrow) {
+                    $handle = strtolower(trim((string) ($hrow['h'] ?? '')));
+                    if ($handle !== '') $bskyHiddenKeys[$handle] = true;
+                }
+                try {
+                    $pst = ap_db()->prepare(
+                        "SELECT profile_json FROM bsky_actor_profiles WHERE lower(did) IN ($ph)"
+                    );
+                    $pst->execute($chunk);
+                    foreach ($pst->fetchAll() as $prow) {
+                        $profile = json_decode((string) ($prow['profile_json'] ?? ''), true);
+                        $handle = is_array($profile) ? strtolower(trim((string) ($profile['handle'] ?? ''))) : '';
+                        if ($handle !== '') $bskyHiddenKeys[$handle] = true;
+                    }
+                } catch (Throwable $e) {
+                    // Actor-profile cache is optional; post-cache aliases are sufficient when present.
+                }
+            } catch (Throwable $e) {
+                // DIDs still match direct Bluesky URLs even if the post cache is unavailable.
+            }
+        }
+    }
+
+    $skip = static function (string $actorId) use ($local, $dismissed, $following, $followingKeys, $ownerUserId, $bskyHiddenKeys): bool {
         $actorId = rtrim($actorId, '/');
         if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
             return true;
@@ -8204,8 +8242,33 @@ function ap_masto_suggestions_v2(int $limit = 40): array
                 return true;
             }
         }
-        if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($actorId)) {
-            return true;
+        // Check both the recommendation URL and its best known alias. This
+        // matters for Bridgy/Bluesky actors which can have distinct AP URLs.
+        $moderationRefs = [$actorId];
+        if (function_exists('ap_masto_suggestion_best_actor_id')) {
+            $moderationRefs[] = ap_masto_suggestion_best_actor_id($actorId);
+        }
+        foreach (array_unique($moderationRefs) as $ref) {
+            if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($ref)) {
+                return true;
+            }
+            if ($ownerUserId > 0 && function_exists('ap_user_is_blocked') && ap_user_is_blocked($ref, null, $ownerUserId)) {
+                return true;
+            }
+            if ($ownerUserId > 0 && function_exists('ap_is_muted_actor') && ap_is_muted_actor($ref, $ownerUserId)) {
+                return true;
+            }
+            if (function_exists('ap_is_globally_muted_actor') && ap_is_globally_muted_actor($ref)) {
+                return true;
+            }
+            if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $ref, $bm)) {
+                $key = strtolower(rawurldecode($bm[1]));
+                if (isset($bskyHiddenKeys[$key])) return true;
+            }
+            if (preg_match('~/(?:ap/)?(did:[a-z0-9]+:[a-z0-9]+)(?:[/#?]|$)~i', $ref, $dm)
+                && isset($bskyHiddenKeys[strtolower($dm[1])])) {
+                return true;
+            }
         }
         return false;
     };
@@ -8296,6 +8359,11 @@ function ap_masto_suggestions_v2(int $limit = 40): array
             ? ap_masto_suggestion_account((string) $actorId)
             : null;
         if ($account === null) {
+            continue;
+        }
+        // The Account serializer can resolve additional canonical aliases (notably
+        // Bridgy-backed Bluesky actors); apply moderation to those before returning.
+        if ($skip((string) ($account['uri'] ?? '')) || $skip((string) ($account['url'] ?? ''))) {
             continue;
         }
         $sources = array_keys($meta['sources']);
