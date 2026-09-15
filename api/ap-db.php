@@ -371,8 +371,7 @@ SQL);
       }
     }
     $requiredTables = [
-        'account_aliases', 'actor_profile', 'ap_account_move', 'ap_anti_ai_actors',
-        'ap_anti_ai_hits', 'ap_bites', 'ap_blocks', 'ap_collection_items',
+        'account_aliases', 'actor_profile', 'ap_account_move', 'ap_bites', 'ap_blocks', 'ap_collection_items',
         'ap_collection_memberships', 'ap_collections', 'ap_drafts', 'ap_featured_accounts',
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_post_subscriptions', 'ap_queue_settings',
@@ -674,10 +673,6 @@ SQL);
     if (!in_array('auto_follow_back', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_follow_back INTEGER NOT NULL DEFAULT 0');
     }
-    // Viewer preference: highlight anti-AI posters (slop/clanker heuristic) in timelines
-    if (!in_array('anti_ai_marker', $profileNames, true)) {
-        $db->exec('ALTER TABLE actor_profile ADD COLUMN anti_ai_marker INTEGER NOT NULL DEFAULT 0');
-    }
     if (!in_array('auto_unblur_sensitive', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
     }
@@ -693,28 +688,6 @@ SQL);
     if (!in_array('forum_signature', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
     }
-
-    // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
-    $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS ap_anti_ai_hits (
-    actor_id TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    hit_at TEXT NOT NULL,
-    PRIMARY KEY (actor_id, object_id)
-);
-CREATE INDEX IF NOT EXISTS idx_ap_anti_ai_hits_actor_at ON ap_anti_ai_hits(actor_id, hit_at DESC);
-CREATE INDEX IF NOT EXISTS idx_ap_anti_ai_hits_at ON ap_anti_ai_hits(hit_at);
-CREATE TABLE IF NOT EXISTS ap_anti_ai_actors (
-    actor_id TEXT PRIMARY KEY,
-    hit_count INTEGER NOT NULL DEFAULT 0,
-    marked INTEGER NOT NULL DEFAULT 0,
-    marked_at TEXT,
-    last_hit_at TEXT,
-    cleared_at TEXT,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_ap_anti_ai_actors_marked ON ap_anti_ai_actors(marked);
-SQL);
 
     $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS masto_suggestion_dismissals (
@@ -2109,7 +2082,6 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'collection_consent' => true,
         'vanity_verified' => false,
         'auto_follow_back' => false,
-        'anti_ai_marker' => false,
         'auto_unblur_sensitive' => false,
         'auto_delete_posts_7d' => false,
         'reply_policy' => 'anyone',
@@ -2178,9 +2150,6 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
             : false,
         'auto_follow_back' => array_key_exists('auto_follow_back', $row)
             ? !empty($row['auto_follow_back'])
-            : false,
-        'anti_ai_marker' => array_key_exists('anti_ai_marker', $row)
-            ? !empty($row['anti_ai_marker'])
             : false,
         'auto_unblur_sensitive' => array_key_exists('auto_unblur_sensitive', $row)
             ? !empty($row['auto_unblur_sensitive'])
@@ -2273,7 +2242,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2401,11 +2370,6 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     } else {
         $autoFollowBack = !empty($existingProfile['auto_follow_back']) ? 1 : 0;
     }
-    if (array_key_exists('anti_ai_marker', $fields)) {
-        $antiAiMarker = !empty($fields['anti_ai_marker']) ? 1 : 0;
-    } else {
-        $antiAiMarker = !empty($existingProfile['anti_ai_marker']) ? 1 : 0;
-    }
     $autoUnblurSensitive = array_key_exists('auto_unblur_sensitive', $fields)
         ? (!empty($fields['auto_unblur_sensitive']) ? 1 : 0)
         : (!empty($existingProfile['auto_unblur_sensitive']) ? 1 : 0);
@@ -2418,8 +2382,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2432,7 +2396,6 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            collection_consent = excluded.collection_consent,
            vanity_verified = excluded.vanity_verified,
            auto_follow_back = excluded.auto_follow_back,
-           anti_ai_marker = excluded.anti_ai_marker,
            auto_unblur_sensitive = excluded.auto_unblur_sensitive,
            auto_delete_posts_7d = excluded.auto_delete_posts_7d,
            reply_policy = excluded.reply_policy,
@@ -2453,7 +2416,6 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $collectionConsent,
         $vanityVerified,
         $autoFollowBack,
-        $antiAiMarker,
         $autoUnblurSensitive,
         $autoDeletePosts7d,
         $replyPolicy,

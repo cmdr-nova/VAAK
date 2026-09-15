@@ -1287,7 +1287,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'collection_consent' => !empty($_POST['collection_consent']),
                 'vanity_verified' => !empty($_POST['vanity_verified']),
                 'auto_follow_back' => !empty($_POST['auto_follow_back']),
-                'anti_ai_marker' => !empty($_POST['anti_ai_marker']),
                 'auto_unblur_sensitive' => !empty($_POST['auto_unblur_sensitive']),
                 'auto_delete_posts_7d' => !empty($_POST['auto_delete_posts_7d']),
                 'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
@@ -7371,51 +7370,6 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
     return $out;
 }
 
-/** Viewer preference: highlight anti-AI posters (request-memoized). */
-function admin_viewer_anti_ai_enabled(): bool
-{
-    static $cached = null;
-    if ($cached !== null) {
-        return $cached;
-    }
-    $key = function_exists('vaak_actor_key') ? (string) vaak_actor_key() : 'cmdr_nova';
-    $p = function_exists('ap_profile_get') ? ap_profile_get($key) : [];
-    $cached = !empty($p['anti_ai_marker']);
-    return $cached;
-}
-
-/** Cheap heuristic: current post text contains slop/clanker (etc.). */
-function admin_text_looks_anti_ai(string $text): bool
-{
-    return function_exists('ap_text_looks_anti_ai')
-        ? ap_text_looks_anti_ai($text)
-        : ($text !== '' && (bool) preg_match('/\b(?:slop|clankers?)\b/iu', $text));
-}
-
-/**
- * Small timeline tag when viewer opted in and either:
- * - this actor is marked from cached posts (≥3 slang hits), or
- * - this specific post matches the heuristic (early signal before mark).
- */
-function admin_anti_ai_tag_html(string $text, ?string $actorId = null): string
-{
-    if (!admin_viewer_anti_ai_enabled()) {
-        return '';
-    }
-    $actorId = $actorId !== null ? rtrim(trim($actorId), '/') : '';
-    $marked = $actorId !== ''
-        && function_exists('ap_anti_ai_actor_is_marked')
-        && ap_anti_ai_actor_is_marked($actorId);
-    $thisPost = admin_text_looks_anti_ai($text);
-    if (!$marked && !$thisPost) {
-        return '';
-    }
-    $title = $marked
-        ? 'Marked anti-AI from cached posts (3+ uses of slop/clanker/etc.)'
-        : 'Uses anti-AI slang in this post';
-    return '<span class="tag" style="margin-left:.35rem" title="' . h($title) . '">anti-ai</span>';
-}
-
 /**
  * Wrap post body + media + quotes + link cards so long posts can fold as one unit.
  */
@@ -7687,7 +7641,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <?php if ($isOtherLocal): ?>
                     <span class="tag" title="Posted by another account on this instance">local</span>
                   <?php endif; ?>
-                  <?= admin_anti_ai_tag_html($summaryRaw, $aid !== '' ? $aid : null) ?>
                 </div>
                 <div class="meta">
                   <?= h((string) $e['host']) ?>
@@ -8779,7 +8732,6 @@ function admin_render_masto_status_card(
                     <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                   <?php endif; ?>
                   <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
-                  <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                 </div>
                 <?php if ($stVis['key'] !== 'public'): ?>
                   <div class="meta"><span class="tag" title="Audience"><?= h($stVis['label']) ?></span></div>
@@ -9564,7 +9516,6 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   <?php if ($ownPinned): ?>
                     <span class="tag" style="margin-left:.35rem" title="Pinned on profile">pinned</span>
                   <?php endif; ?>
-                  <?= admin_anti_ai_tag_html($bodyPlain, $actor !== '' ? $actor : null) ?>
                 </div>
                 <div class="meta">mkultra.monster<?php if ($ownVisMeta['key'] !== 'public'): ?> <span class="tag" title="Audience"><?= h($ownVisLabel) ?></span><?php endif; ?></div>
               </div>
@@ -9858,7 +9809,6 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
               <span class="meta"> · <?= h(relative_time($created)) ?></span>
             <?php endif; ?>
             <span class="tag" title="From Bluesky">Bluesky</span>
-            <?= admin_anti_ai_tag_html($text, $authorDid !== '' ? $authorDid : null) ?>
             <?php if ($quote !== null): ?>
               <span class="tag" title="<?= $isQuoteBoost ? 'Quote post' : 'Quote with commentary' ?>">quote</span>
             <?php endif; ?>
@@ -14927,7 +14877,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
-            <label><input type="checkbox" name="anti_ai_marker" value="1" <?= !empty($profile['anti_ai_marker']) ? 'checked' : '' ?>> Highlight anti-AI posters in my timelines</label>
             <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
             <label><input type="checkbox" name="auto_delete_posts_7d" value="1" <?= !empty($profile['auto_delete_posts_7d']) ? 'checked' : '' ?>> Automatically delete my posts older than 7 days</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
@@ -14941,13 +14890,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Private account</b> —
             new followers remain pending until you approve them. Your ActivityPub actor is advertised as locked/private.
-          </div>
-          <div class="meta" style="margin:.35rem 0 .75rem">
-            <b style="color:var(--primary)">Anti-AI highlight</b> —
-            viewer-only: when on, timeline cards show a small <code>anti-ai</code> tag for remote posters
-            who’ve used slang like “slop” / “clanker” in <b>3+ cached posts</b> (fedi Creates + Bluesky cache; job rescans periodically;
-            mark clears if that usage drops off for ~90 days). A single matching post can also tag early.
-            Nothing is appended to federated outbound posts.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Sensitive media</b> —
