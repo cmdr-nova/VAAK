@@ -20573,6 +20573,15 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  // Keep the "New posts" affordance alive without ever swapping feed content
+  // under the user. Pause even the lightweight discovery request while the
+  // composer is open so an in-progress draft gets uninterrupted focus.
+  function pollNewerWhenSafe() {
+    const composer = document.getElementById('compose-modal');
+    if (composer && composer.classList.contains('open')) return;
+    pollNewer();
+  }
+
   function armStickToTop() {
     stickToTop = true;
     if (stickToTopTimer) window.clearTimeout(stickToTopTimer);
@@ -20969,8 +20978,13 @@ window.apAdminToast = function (msg, isErr) {
     ptrCollapse();
   }, { passive: true });
 
-  // Do not auto-refresh the timeline: replacing or navigating feed content can
-  // interrupt a draft in the composer. Manual pull-to-refresh still uses this.
+  // Poll only to announce cached/ingested posts. Insertion is always user-driven
+  // via the New posts button, and polling pauses while the composer is open.
+  setInterval(pollNewerWhenSafe, 120000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') pollNewerWhenSafe();
+  });
+  setTimeout(pollNewerWhenSafe, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
 
