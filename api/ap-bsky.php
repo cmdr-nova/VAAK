@@ -3590,14 +3590,109 @@ function ap_bsky_delete_bookmark(int $ownerUserId, string $uri): array
     if (empty($put['ok'])) {
         return ['ok' => false, 'error' => (string) ($put['error'] ?? 'unbookmark failed')];
     }
-    ap_bsky_bookmark_cache_clear($ownerUserId);
+    ap_bsky_bookmark_cache_clear($ownerUserId, $uri);
     return ['ok' => true];
 }
 
-function ap_bsky_bookmark_cache_clear(int $ownerUserId): void
+function ap_bsky_bookmark_cache_clear(int $ownerUserId, ?string $removeUri = null): void
 {
-    if ($ownerUserId > 0) {
-        @unlink(sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json');
+    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return;
+    try {
+        if (is_string($removeUri) && str_starts_with($removeUri, 'at://')) {
+            ap_db()->prepare('DELETE FROM bsky_bookmark_cache WHERE owner_user_id = ? AND bookmark_uri = ?')->execute([$ownerUserId, $removeUri]);
+        }
+        ap_db()->prepare('INSERT INTO bsky_bookmark_sync_state (owner_user_id, head_checked_at, full_synced_at, updated_at) VALUES (?, ?, NULL, ?) ON CONFLICT (owner_user_id) DO UPDATE SET head_checked_at = excluded.head_checked_at, updated_at = excluded.updated_at')
+            ->execute([$ownerUserId, '1970-01-01T00:00:00+00:00', gmdate('c')]);
+        ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks', true);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] bookmark cache invalidation failed');
+    }
+}
+
+/** PostgreSQL bookmark-cache tables are provisioned by the owner-run migration. */
+function ap_bsky_bookmark_cache_migrate(?PDO $db = null): bool
+{
+    static $readyByConnection = [];
+    $db ??= ap_db();
+    $key = spl_object_id($db);
+    if (isset($readyByConnection[$key])) return $readyByConnection[$key];
+    try {
+        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_bookmark_cache', 'bsky_bookmark_sync_state')");
+            $tables = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
+            return $readyByConnection[$key] = isset($tables['bsky_bookmark_cache'], $tables['bsky_bookmark_sync_state']);
+        }
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_bookmark_cache (
+    owner_user_id INTEGER NOT NULL,
+    bookmark_uri TEXT NOT NULL,
+    bookmarked_at TEXT NOT NULL,
+    post_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, bookmark_uri)
+)
+SQL);
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_bookmark_cache_owner_time ON bsky_bookmark_cache (owner_user_id, bookmarked_at DESC)');
+        $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS bsky_bookmark_sync_state (
+    owner_user_id INTEGER PRIMARY KEY,
+    head_checked_at TEXT,
+    full_synced_at TEXT,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        return $readyByConnection[$key] = true;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] bookmark cache schema unavailable');
+        return $readyByConnection[$key] = false;
+    }
+}
+
+/** @return list<array{post:array<string,mixed>,_vaak_bookmarked_at:string}> */
+function ap_bsky_bookmark_cache_read(int $ownerUserId, int $limit): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return [];
+    try {
+        $st = ap_db()->prepare('SELECT post_json, bookmarked_at FROM bsky_bookmark_cache WHERE owner_user_id = ? ORDER BY bookmarked_at DESC, bookmark_uri DESC LIMIT ?');
+        $st->bindValue(1, $ownerUserId, PDO::PARAM_INT);
+        $st->bindValue(2, max(1, min(500, $limit)), PDO::PARAM_INT);
+        $st->execute();
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $item = json_decode((string) ($row['post_json'] ?? ''), true);
+            if (!is_array($item) || !is_array($item['post'] ?? null)) continue;
+            $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
+            $item['post']['viewer']['bookmarked'] = true;
+            $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
+            $out[] = $item;
+        }
+        return $out;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] bookmark cache read failed');
+        return [];
+    }
+}
+
+/** Import the old volatile cache once, so deployment does not blank the first view. */
+function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
+{
+    $path = sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json';
+    if ($ownerUserId < 1 || !is_file($path) || !ap_bsky_bookmark_cache_migrate()) return;
+    $legacy = json_decode((string) @file_get_contents($path), true);
+    if (!is_array($legacy) || !is_array($legacy['bookmarks'] ?? null)) return;
+    $db = ap_db();
+    try {
+        $st = $db->prepare('INSERT INTO bsky_bookmark_cache (owner_user_id, bookmark_uri, bookmarked_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, bookmark_uri) DO NOTHING');
+        $now = gmdate('c');
+        foreach ($legacy['bookmarks'] as $item) {
+            $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+            $uri = trim((string) ($post['uri'] ?? ''));
+            if (!str_starts_with($uri, 'at://')) continue;
+            $bookmarkedAt = trim((string) ($item['_vaak_bookmarked_at'] ?? '')) ?: $now;
+            $st->execute([$ownerUserId, $uri, $bookmarkedAt, json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $now]);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] legacy bookmark cache import failed');
     }
 }
 
@@ -3608,7 +3703,7 @@ function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, b
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
-    $cooldown = $collection === 'lists' ? 300 : 45;
+    $cooldown = 300;
     try {
         $st = ap_db()->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
         $st->execute([$ownerUserId, $actorRef]);
@@ -3629,15 +3724,14 @@ function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, b
 }
 
 /**
- * Fetch the connected account's Bluesky bookmarks for VAAK's unified Library.
- * This is intentionally a read-through cache: Bluesky remains authoritative,
- * so direct changes made in the Bluesky app are reflected on the next refresh.
+ * Read the durable bookmark cache for page requests; queued workers refresh
+ * the new head and only paginate the full set for an initial/daily baseline.
  *
- * @return array{ok:bool,bookmarks?:list<array<string,mixed>>,error?:string}
+ * @return array{ok:bool,bookmarks?:list<array<string,mixed>>,error?:string,cached?:bool,refreshing?:bool}
  */
 function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh = false): array
 {
-    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
+    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled())) {
         return ['ok' => false, 'error' => 'Bluesky is not connected'];
     }
     $session = ap_bsky_session_row($ownerUserId);
@@ -3645,18 +3739,34 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
         return ['ok' => false, 'error' => 'Bluesky not connected'];
     }
     $limit = max(1, min(200, $limit));
-    $syncLimit = 200;
-    $cachePath = sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json';
-    $cached = is_file($cachePath) ? json_decode((string) @file_get_contents($cachePath), true) : null;
-    if (!$refresh) {
-        if (is_array($cached) && is_array($cached['bookmarks'] ?? null)) {
-            $fresh = time() - (int) @filemtime($cachePath) < 45;
-            if (!$fresh) ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
-            return ['ok' => true, 'bookmarks' => array_slice($cached['bookmarks'], 0, $limit), 'cached' => true, 'refreshing' => !$fresh];
-        }
-        ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
-        return ['ok' => true, 'bookmarks' => [], 'cached' => true, 'refreshing' => true];
+    if (!ap_bsky_bookmark_cache_migrate()) return ['ok' => false, 'error' => 'Bluesky bookmark cache is not provisioned'];
+    if ($refresh) return ap_bsky_bookmarks_refresh_worker($ownerUserId, $limit);
+
+    $cached = ap_bsky_bookmark_cache_read($ownerUserId, $limit);
+    if ($cached === []) {
+        ap_bsky_bookmark_cache_import_legacy($ownerUserId);
+        $cached = ap_bsky_bookmark_cache_read($ownerUserId, $limit);
     }
+    $state = null;
+    try {
+        $st = ap_db()->prepare('SELECT head_checked_at FROM bsky_bookmark_sync_state WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        $state = $st->fetch();
+    } catch (Throwable $e) {
+        $state = null;
+    }
+    $checkedAt = is_array($state) ? (strtotime((string) ($state['head_checked_at'] ?? '')) ?: 0) : 0;
+    $stale = $checkedAt < time() - 300;
+    if ($stale) ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
+    return ['ok' => true, 'bookmarks' => $cached, 'cached' => true, 'refreshing' => $stale];
+}
+
+/** Refresh only the new head, except for the initial/daily bounded baseline. */
+function ap_bsky_bookmarks_refresh_worker(int $ownerUserId, int $limit = 200): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return ['ok' => false, 'error' => 'Bookmark cache unavailable'];
+    $session = ap_bsky_session_row($ownerUserId);
+    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
     $token = ap_bsky_access_token($ownerUserId, false);
     if (empty($token['ok'])) {
         $token = ap_bsky_access_token($ownerUserId, true);
@@ -3667,12 +3777,29 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
     $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $hosts = ap_bsky_feed_hosts($pds);
     $access = (string) $token['access'];
+    $db = ap_db();
+    $known = [];
+    $state = null;
+    try {
+        $st = $db->prepare('SELECT bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) $known[(string) $uri] = true;
+        $st = $db->prepare('SELECT full_synced_at FROM bsky_bookmark_sync_state WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        $state = $st->fetch();
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Could not read bookmark cache state'];
+    }
+    $fullAt = is_array($state) ? (strtotime((string) ($state['full_synced_at'] ?? '')) ?: 0) : 0;
+    $fullSync = $known === [] || $fullAt < time() - 86400;
     $cursor = null;
-    $bookmarks = [];
+    $newItems = [];
+    $seenUris = [];
     $complete = false;
+    $foundKnownBoundary = false;
     $lastError = 'Could not load Bluesky bookmarks';
-    for ($page = 0; $page < 2 && count($bookmarks) < $syncLimit; $page++) {
-        $query = ['limit' => min(100, $syncLimit - count($bookmarks))];
+    for ($page = 0; $page < 10; $page++) {
+        $query = ['limit' => 100];
         if ($cursor !== null && $cursor !== '') {
             $query['cursor'] = $cursor;
         }
@@ -3709,13 +3836,19 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
             if ($post === null || trim((string) ($post['uri'] ?? '')) === '') {
                 continue;
             }
-            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : [];
-            $post['viewer']['bookmarked'] = true;
-            $bookmarks[] = ['post' => $post, '_vaak_bookmarked_at' => (string) ($row['createdAt'] ?? '')];
-            if (count($bookmarks) >= $syncLimit) {
+            $uri = trim((string) $post['uri']);
+            if (!$fullSync && isset($known[$uri])) {
+                $foundKnownBoundary = true;
                 break;
             }
+            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : [];
+            $post['viewer']['bookmarked'] = true;
+            $bookmarkedAt = trim((string) ($row['createdAt'] ?? '')) ?: gmdate('c');
+            $json = json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (is_string($json)) $newItems[] = ['uri' => $uri, 'bookmarked_at' => $bookmarkedAt, 'post_json' => $json];
+            $seenUris[$uri] = true;
         }
+        if ($foundKnownBoundary) break;
         $cursor = isset($result['json']['cursor']) && is_string($result['json']['cursor'])
             ? $result['json']['cursor'] : null;
         if ($cursor === null) {
@@ -3726,35 +3859,26 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
             break;
         }
     }
-    // Reconcile only when Bluesky returned the complete collection within the
-    // bounded sync window. Never infer removals from a truncated page set.
-    if ($complete && function_exists('admin_bsky_bookmark_keys')) {
-        $present = [];
-        foreach ($bookmarks as $item) {
-            $post = is_array($item['post'] ?? null) ? $item['post'] : [];
-            $uri = (string) ($post['uri'] ?? '');
-            if ($uri !== '') {
-                $keys = admin_bsky_bookmark_keys($uri, $ownerUserId);
-                if (($keys['status_id'] ?? '') !== '') {
-                    $present[(string) $keys['status_id']] = true;
-                }
-            }
+    $now = gmdate('c');
+    try {
+        $db->beginTransaction();
+        $up = $db->prepare('INSERT INTO bsky_bookmark_cache (owner_user_id, bookmark_uri, bookmarked_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, bookmark_uri) DO UPDATE SET bookmarked_at = excluded.bookmarked_at, post_json = excluded.post_json, updated_at = excluded.updated_at');
+        foreach ($newItems as $item) $up->execute([$ownerUserId, $item['uri'], $item['bookmarked_at'], $item['post_json'], $now]);
+        $stateUp = $db->prepare('INSERT INTO bsky_bookmark_sync_state (owner_user_id, head_checked_at, full_synced_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (owner_user_id) DO UPDATE SET head_checked_at = excluded.head_checked_at, full_synced_at = COALESCE(excluded.full_synced_at, bsky_bookmark_sync_state.full_synced_at), updated_at = excluded.updated_at');
+        $stateUp->execute([$ownerUserId, $now, $complete ? $now : null, $now]);
+        if ($complete) {
+            $existing = $db->prepare('SELECT bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ?');
+            $existing->execute([$ownerUserId]);
+            $del = $db->prepare('DELETE FROM bsky_bookmark_cache WHERE owner_user_id = ? AND bookmark_uri = ?');
+            foreach ($existing->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) if (!isset($seenUris[(string) $uri])) $del->execute([$ownerUserId, (string) $uri]);
         }
-        try {
-            $st = ap_db()->prepare('SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND (source_mask & 2) <> 0');
-            $st->execute([$ownerUserId]);
-            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $savedId) {
-                $savedId = (string) $savedId;
-                if (!isset($present[$savedId]) && function_exists('ap_masto_bookmark_remove')) {
-                    ap_masto_bookmark_remove($savedId, $ownerUserId, 'bsky');
-                }
-            }
-        } catch (Throwable $e) {
-            error_log('[ap-bsky] bookmark reconciliation: ' . $e->getMessage());
-        }
+        $db->commit();
+    } catch (Throwable $e) {
+        try { if ($db->inTransaction()) $db->rollBack(); } catch (Throwable $ignored) {}
+        error_log('[ap-bsky] bookmark cache write failed');
+        return ['ok' => false, 'error' => 'Could not store Bluesky bookmarks'];
     }
-    @file_put_contents($cachePath, json_encode(['bookmarks' => $bookmarks], JSON_UNESCAPED_SLASHES), LOCK_EX);
-    return ['ok' => true, 'bookmarks' => array_slice($bookmarks, 0, $limit)];
+    return ['ok' => true, 'bookmarks' => ap_bsky_bookmark_cache_read($ownerUserId, $limit), 'added' => count($newItems), 'full_sync' => $complete, 'boundary_found' => $foundKnownBoundary];
 }
 
 /** Create an owned Bluesky graph list. */
