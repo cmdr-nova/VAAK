@@ -306,6 +306,7 @@ function ap_bsky_crosspost_should_retry(?array $result): bool
     // Permanent / intentional skips — do not retry.
     $permanent = [
         'Visibility not cross-posted',
+        'Audio recording posts are not mirrored to Bluesky',
         'Bluesky not connected',
         'Nothing to cross-post',
         'No owner',
@@ -5727,7 +5728,7 @@ function ap_bsky_bio_from_vaak_summary(string $summaryHtml, string $profileUrl):
  *
  * @return array{ok:bool,error?:string,bytes?:string,mime?:string}
  */
-function ap_bsky_fetch_image_bytes(string $url): array
+function ap_bsky_fetch_image_bytes(string $url, bool $forPost = false): array
 {
     $url = trim($url);
     if ($url === '' || !str_starts_with($url, 'https://')) {
@@ -5759,8 +5760,11 @@ function ap_bsky_fetch_image_bytes(string $url): array
     if (!is_string($bytes) || $bytes === '' || $status < 200 || $status >= 300) {
         return ['ok' => false, 'error' => 'Image download failed'];
     }
-    if (strlen($bytes) > 2 * 1024 * 1024) {
-        return ['ok' => false, 'error' => 'Image too large for Bluesky avatar/banner (>2MB)'];
+    $downloadLimit = $forPost ? 15 * 1024 * 1024 : 2 * 1024 * 1024;
+    if (strlen($bytes) > $downloadLimit) {
+        return ['ok' => false, 'error' => $forPost
+            ? 'Image too large for Bluesky post mirror (>15MB)'
+            : 'Image too large for Bluesky avatar/banner (>2MB)'];
     }
     $mime = 'image/jpeg';
     if (preg_match('#^(image/(?:jpeg|png|webp|gif))#i', $ctype, $m)) {
@@ -5774,9 +5778,103 @@ function ap_bsky_fetch_image_bytes(string $url): array
     } elseif (str_starts_with($bytes, 'GIF8')) {
         $mime = 'image/gif';
     }
-    // Bluesky app.bsky.actor.profile only accepts image/jpeg or image/png for
-    // avatar/banner blobs — convert webp/gif (and anything else) to JPEG.
+    if ($forPost) {
+        return ap_bsky_normalize_embed_image($bytes, $mime);
+    }
+    // Profile image uploads keep their existing normalization and size limit.
     return ap_bsky_normalize_profile_image($bytes, $mime);
+}
+
+/**
+ * Normalize a feed image to Bluesky's 1,000,000-byte embed limit.
+ * Prefer a lossless PNG when it fits; otherwise encode JPEG and progressively
+ * reduce quality/size. Keeps transparency for PNGs whenever feasible.
+ *
+ * @return array{ok:bool,error?:string,bytes?:string,mime?:string}
+ */
+function ap_bsky_normalize_embed_image(string $bytes, string $mime): array
+{
+    $maxBytes = 1000000;
+    $mime = strtolower(trim($mime));
+    if ($mime === 'image/jpg') {
+        $mime = 'image/jpeg';
+    }
+    if (strlen($bytes) <= $maxBytes && in_array($mime, ['image/jpeg', 'image/png', 'image/webp'], true)) {
+        return ['ok' => true, 'bytes' => $bytes, 'mime' => $mime];
+    }
+    if (!function_exists('imagecreatefromstring') || !function_exists('imagejpeg') || !function_exists('imagepng')) {
+        return ['ok' => false, 'error' => 'GD is required to fit this image within Bluesky’s 1MB embed limit'];
+    }
+    $im = @imagecreatefromstring($bytes);
+    if ($im === false) {
+        return ['ok' => false, 'error' => 'Could not decode image for Bluesky post'];
+    }
+    $width = imagesx($im);
+    $height = imagesy($im);
+    if ($width < 1 || $height < 1 || ($width * $height) > 40000000) {
+        imagedestroy($im);
+        return ['ok' => false, 'error' => 'Image dimensions are unsafe for Bluesky normalization'];
+    }
+    if (function_exists('imagepalettetotruecolor')) {
+        @imagepalettetotruecolor($im);
+    }
+    $preservePng = ($mime === 'image/png');
+    for ($pass = 0; $pass < 7; $pass++) {
+        if ($preservePng) {
+            ob_start();
+            $pngOk = imagepng($im, null, 9);
+            $png = ob_get_clean();
+            if ($pngOk && is_string($png) && $png !== '' && strlen($png) <= $maxBytes) {
+                imagedestroy($im);
+                return ['ok' => true, 'bytes' => $png, 'mime' => 'image/png'];
+            }
+        }
+        foreach ([88, 82, 76, 70, 64, 58, 52] as $quality) {
+            $jpegSource = $im;
+            $flattened = null;
+            if ($preservePng && function_exists('imagecreatetruecolor')) {
+                $flattened = imagecreatetruecolor(imagesx($im), imagesy($im));
+                if ($flattened !== false) {
+                    $black = imagecolorallocate($flattened, 0, 0, 0);
+                    imagefilledrectangle($flattened, 0, 0, imagesx($im), imagesy($im), $black);
+                    imagecopy($flattened, $im, 0, 0, 0, 0, imagesx($im), imagesy($im));
+                    $jpegSource = $flattened;
+                }
+            }
+            ob_start();
+            $jpegOk = imagejpeg($jpegSource, null, $quality);
+            $jpeg = ob_get_clean();
+            if ($flattened !== null && $flattened !== false) {
+                imagedestroy($flattened);
+            }
+            if ($jpegOk && is_string($jpeg) && $jpeg !== '' && strlen($jpeg) <= $maxBytes) {
+                imagedestroy($im);
+                return ['ok' => true, 'bytes' => $jpeg, 'mime' => 'image/jpeg'];
+            }
+        }
+        $width = imagesx($im);
+        $height = imagesy($im);
+        if ($width <= 320 || $height <= 240 || !function_exists('imagecreatetruecolor')) {
+            break;
+        }
+        $newWidth = max(320, (int) floor($width * 0.85));
+        $newHeight = max(240, (int) floor($height * 0.85));
+        $smaller = imagecreatetruecolor($newWidth, $newHeight);
+        if ($smaller === false) {
+            break;
+        }
+        if ($preservePng) {
+            imagealphablending($smaller, false);
+            imagesavealpha($smaller, true);
+            $transparent = imagecolorallocatealpha($smaller, 0, 0, 0, 127);
+            imagefilledrectangle($smaller, 0, 0, $newWidth, $newHeight, $transparent);
+        }
+        imagecopyresampled($smaller, $im, 0, 0, 0, 0, $newWidth, $newHeight, $width, $height);
+        imagedestroy($im);
+        $im = $smaller;
+    }
+    imagedestroy($im);
+    return ['ok' => false, 'error' => 'Could not fit image within Bluesky’s 1MB embed limit'];
 }
 
 /**
@@ -7232,11 +7330,31 @@ function ap_bsky_crosspost_status_inner(
     // Upload media (first segment only). Bluesky allows 1 video XOR ≤4 images.
     $images = [];
     $videoEmbed = null;
-    if ($mediaLocalIds !== [] && function_exists('ap_media_by_local_ids')) {
+    if ($mediaLocalIds !== []) {
         if (!function_exists('ap_media_by_local_ids')) {
             require_once __DIR__ . '/ap-r2.php';
         }
-        $mediaRows = ap_media_by_local_ids(array_map('intval', $mediaLocalIds));
+        if (!function_exists('ap_media_by_local_ids')) {
+            return ['ok' => false, 'deferred' => true, 'error' => 'Media lookup is unavailable for Bluesky mirror'];
+        }
+        $mediaIds = array_values(array_unique(array_filter(array_map('intval', $mediaLocalIds), static fn($id) => $id > 0)));
+        if ($mediaIds === []) {
+            return ['ok' => false, 'deferred' => true, 'error' => 'Media IDs are invalid for Bluesky mirror'];
+        }
+        $mediaRows = ap_media_by_local_ids($mediaIds);
+        if (count($mediaRows) !== count($mediaIds)) {
+            return ['ok' => false, 'deferred' => true, 'error' => 'Could not load all media for Bluesky mirror'];
+        }
+        foreach ($mediaRows as $mediaRow) {
+            if (!is_array($mediaRow)) {
+                continue;
+            }
+            $mediaMime = strtolower((string) ($mediaRow['mime'] ?? $mediaRow['content_type'] ?? ''));
+            $mediaKind = strtolower((string) ($mediaRow['media_type'] ?? ''));
+            if ($mediaKind === 'audio' || str_starts_with($mediaMime, 'audio/')) {
+                return ['ok' => true, 'skipped' => true, 'error' => 'Audio recording posts are not mirrored to Bluesky'];
+            }
+        }
         // Prefer the first video when present; otherwise upload images.
         $videoRow = null;
         foreach ($mediaRows as $m) {
@@ -7260,68 +7378,66 @@ function ap_bsky_crosspost_status_inner(
         if (is_array($videoRow)) {
             $url = (string) ($videoRow['public_url'] ?? $videoRow['url'] ?? $videoRow['remote_url'] ?? '');
             $mime = strtolower((string) ($videoRow['mime'] ?? $videoRow['content_type'] ?? 'video/mp4'));
-            if ($url !== '' && str_starts_with($url, 'https://')) {
-                $fetched = ap_bsky_fetch_video_bytes($url, $mime);
-                if (!empty($fetched['ok'])) {
-                    $nameHint = basename(parse_url($url, PHP_URL_PATH) ?: 'video.mov');
-                    $mp4 = ap_bsky_video_ensure_mp4(
-                        (string) $fetched['bytes'],
-                        (string) ($fetched['mime'] ?? $mime),
-                        is_string($nameHint) ? $nameHint : 'video.mov'
+            if ($url === '' || !str_starts_with($url, 'https://')) {
+                return ['ok' => false, 'deferred' => true, 'error' => 'Video attachment has no valid HTTPS URL'];
+            }
+            $fetched = ap_bsky_fetch_video_bytes($url, $mime);
+            if (empty($fetched['ok'])) {
+                return ['ok' => false, 'deferred' => true, 'error' => (string) ($fetched['error'] ?? 'Video download failed')];
+            }
+            $nameHint = basename(parse_url($url, PHP_URL_PATH) ?: 'video.mov');
+            $mp4 = ap_bsky_video_ensure_mp4(
+                (string) $fetched['bytes'],
+                (string) ($fetched['mime'] ?? $mime),
+                is_string($nameHint) ? $nameHint : 'video.mov'
+            );
+            if (empty($mp4['ok'])) {
+                return ['ok' => false, 'deferred' => true, 'error' => 'Video conversion failed: ' . (string) ($mp4['error'] ?? 'unknown')];
+            }
+            $upName = pathinfo(is_string($nameHint) ? $nameHint : 'video', PATHINFO_FILENAME) . '.mp4';
+            $up = ap_bsky_upload_video(
+                $pds,
+                $access,
+                $did,
+                (string) $mp4['bytes'],
+                (string) ($mp4['mime'] ?? 'video/mp4'),
+                $upName,
+                180
+            );
+            if (empty($up['ok']) && str_contains((string) ($up['error'] ?? ''), 'Expired')) {
+                $tok = ap_bsky_access_token($ownerUserId, true);
+                if (!empty($tok['ok'])) {
+                    $access = (string) $tok['access'];
+                    $up = ap_bsky_upload_video(
+                        $pds,
+                        $access,
+                        $did,
+                        (string) $mp4['bytes'],
+                        (string) ($mp4['mime'] ?? 'video/mp4'),
+                        $upName,
+                        180
                     );
-                    if (!empty($mp4['ok'])) {
-                        $upName = pathinfo(is_string($nameHint) ? $nameHint : 'video', PATHINFO_FILENAME) . '.mp4';
-                        $up = ap_bsky_upload_video(
-                            $pds,
-                            $access,
-                            $did,
-                            (string) $mp4['bytes'],
-                            (string) ($mp4['mime'] ?? 'video/mp4'),
-                            $upName,
-                            180
-                        );
-                        if (empty($up['ok']) && str_contains((string) ($up['error'] ?? ''), 'Expired')) {
-                            $tok = ap_bsky_access_token($ownerUserId, true);
-                            if (!empty($tok['ok'])) {
-                                $access = (string) $tok['access'];
-                                $up = ap_bsky_upload_video(
-                                    $pds,
-                                    $access,
-                                    $did,
-                                    (string) $mp4['bytes'],
-                                    (string) ($mp4['mime'] ?? 'video/mp4'),
-                                    $upName,
-                                    180
-                                );
-                            }
-                        }
-                        if (ap_bsky_result_is_rate_limited($up)) {
-                            return [
-                                'ok' => false,
-                                'deferred' => true,
-                                'rate_limited' => true,
-                                'retry_after_sec' => ap_bsky_result_retry_after_sec($up),
-                                'error' => 'Rate limit exceeded',
-                            ];
-                        }
-                        if (!empty($up['ok']) && is_array($up['blob'] ?? null)) {
-                            $videoEmbed = [
-                                'blob' => $up['blob'],
-                                'alt' => (string) ($videoRow['description'] ?? $videoRow['alt'] ?? ''),
-                            ];
-                            $ar = ap_bsky_video_aspect_ratio($videoRow);
-                            if ($ar !== null) {
-                                $videoEmbed['aspectRatio'] = $ar;
-                            }
-                        } else {
-                            error_log('[ap-bsky] video upload failed: ' . (string) ($up['error'] ?? 'unknown'));
-                        }
-                    } else {
-                        error_log('[ap-bsky] video remux failed: ' . (string) ($mp4['error'] ?? 'unknown'));
-                    }
-                } else {
-                    error_log('[ap-bsky] video fetch failed: ' . (string) ($fetched['error'] ?? 'unknown'));
                 }
+            }
+            if (ap_bsky_result_is_rate_limited($up)) {
+                return [
+                    'ok' => false,
+                    'deferred' => true,
+                    'rate_limited' => true,
+                    'retry_after_sec' => ap_bsky_result_retry_after_sec($up),
+                    'error' => 'Rate limit exceeded',
+                ];
+            }
+            if (empty($up['ok']) || !is_array($up['blob'] ?? null)) {
+                return ['ok' => false, 'deferred' => true, 'error' => 'Video upload failed: ' . (string) ($up['error'] ?? 'unknown')];
+            }
+            $videoEmbed = [
+                'blob' => $up['blob'],
+                'alt' => (string) ($videoRow['description'] ?? $videoRow['alt'] ?? ''),
+            ];
+            $ar = ap_bsky_video_aspect_ratio($videoRow);
+            if ($ar !== null) {
+                $videoEmbed['aspectRatio'] = $ar;
             }
         } else {
             foreach (array_slice($mediaRows, 0, 4) as $m) {
@@ -7329,16 +7445,17 @@ function ap_bsky_crosspost_status_inner(
                     continue;
                 }
                 $mime = strtolower((string) ($m['mime'] ?? $m['content_type'] ?? ''));
-                if ($mime !== '' && !str_starts_with($mime, 'image/')) {
+                $kind = strtolower((string) ($m['media_type'] ?? ''));
+                if ($mime !== '' && !str_starts_with($mime, 'image/') && $kind !== 'image') {
                     continue; // skip audio / non-image
                 }
                 $url = (string) ($m['public_url'] ?? $m['url'] ?? $m['remote_url'] ?? '');
                 if ($url === '' || !str_starts_with($url, 'https://')) {
-                    continue;
+                    return ['ok' => false, 'deferred' => true, 'error' => 'Image attachment has no valid HTTPS URL'];
                 }
-                $img = ap_bsky_fetch_image_bytes($url);
+                $img = ap_bsky_fetch_image_bytes($url, true);
                 if (empty($img['ok'])) {
-                    continue;
+                    return ['ok' => false, 'deferred' => true, 'error' => 'Image mirror failed: ' . (string) ($img['error'] ?? 'download failed')];
                 }
                 $up = ap_bsky_upload_blob($pds, $access, (string) $img['bytes'], (string) $img['mime']);
                 if (empty($up['ok']) && (($up['status'] ?? 0) === 401)) {
@@ -7362,6 +7479,8 @@ function ap_bsky_crosspost_status_inner(
                         'alt' => (string) ($m['description'] ?? $m['alt'] ?? ''),
                         'blob' => $up['blob'],
                     ];
+                } else {
+                    return ['ok' => false, 'deferred' => true, 'error' => 'Image upload failed: ' . (string) ($up['error'] ?? 'unknown')];
                 }
             }
         }
