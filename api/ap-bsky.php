@@ -315,6 +315,9 @@ function ap_bsky_crosspost_should_retry(?array $result): bool
         // A genuinely Fediverse-only parent must remain Fediverse-only. Retrying
         // can otherwise mirror the reply later if an unrelated mapping appears.
         'Reply parent is Fediverse-only',
+        // Quote posts follow the quoted post's source too; do not retry an
+        // intentional Fediverse-only quote as a plain-text Bluesky post.
+        'Quote target is Fediverse-only',
         'no_owner_session_mapping',
     ];
     foreach ($permanent as $p) {
@@ -6228,6 +6231,17 @@ function ap_bsky_crosspost_status_inner(
     $quoteRef = null;
     if (is_string($quoteObjectId) && $quoteObjectId !== '') {
         $quoteRef = ap_bsky_resolve_strong_ref($quoteObjectId, $ownerUserId);
+        if ($quoteRef === null) {
+            // Do not turn a native Fediverse quote into a Bluesky text post
+            // containing only a link. A quote mirrors only when its target has
+            // a resolvable Bluesky identity (including a known dual-published
+            // Fediverse/Bluesky mapping).
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'error' => 'Quote target is Fediverse-only',
+            ];
+        }
     }
     if (ap_bsky_budget_exceeded()) {
         return ['ok' => false, 'deferred' => true, 'error' => 'Bluesky budget exceeded before auth'];
