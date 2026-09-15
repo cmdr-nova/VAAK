@@ -648,7 +648,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
                             'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
                             'kind' => 'reblog', 'active' => $action === 'reblog_status', 'status_id' => $statusId,
-                            'notice' => 'Boost action queued.'], JSON_UNESCAPED_SLASHES);
+                            'notice' => $action === 'reblog_status' ? 'Boosted!' : 'Boost removed.'], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     $error = $queue['error'] ?? 'Could not queue boost.';
@@ -693,7 +693,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                             'kind' => $kind, 'active' => $desired, 'status_id' => $statusId,
                             'object_id' => $targetKey, 'folder_ids' => $folderIds,
                             'open_folder_picker' => $kind === 'bookmark' && $desired,
-                            'notice' => 'Action queued.'], JSON_UNESCAPED_SLASHES);
+                            'notice' => $kind === 'favourite'
+                                ? ($desired ? 'Liked!' : 'Like removed.')
+                                : ($desired ? 'Bookmarked!' : 'Bookmark removed.')], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     header('Content-Type: application/json; charset=utf-8');
@@ -899,17 +901,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($mediaIds) {
                     $notice .= ' · ' . count($mediaIds) . ' media';
                 }
-                if ($delivered > 0 || $queued > 0) {
-                    $notice .= ' Delivered to ' . $delivered . ' inbox(es)';
-                    if ($queued > 0) {
-                        $notice .= ', ' . $queued . ' more queued in background';
-                    }
-                    $notice .= '.';
-                }
                 $bskyRes = is_array($result['bsky'] ?? null) ? $result['bsky'] : null;
                 if (is_array($bskyRes) && !empty($bskyRes['rate_limited']) && !empty($bskyRes['retry_queued'])) {
-                    $composeToast = 'Rate Limit Exceeded - Post added to queue';
-                    $notice .= ' Bluesky rate-limited — mirror queued.';
+                    $composeToast = 'Posted! Bluesky sync is catching up.';
+                    $notice .= ' Bluesky sync is catching up.';
                 }
                 $successMessages = $isQuote
                     ? ['Quote sent!', 'Sent that quote into orbit!', 'Quote posted!']
@@ -1051,13 +1046,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = 'Post updated.';
                 $delivered = (int) ($result['delivered'] ?? 0);
                 $queued = (int) ($result['queued'] ?? 0);
-                if ($delivered > 0 || $queued > 0) {
-                    $notice .= ' Update delivered to ' . $delivered . ' inbox(es)';
-                    if ($queued > 0) {
-                        $notice .= ', ' . $queued . ' more queued';
-                    }
-                    $notice .= '.';
-                }
                 $view = $returnView;
             } else {
                 $error = $result['error'] ?? 'Edit failed.';
@@ -1333,11 +1321,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($verCount > 0) {
                     $notice .= ' ' . $verCount . ' field' . ($verCount === 1 ? '' : 's') . ' verified (rel=me).';
                 }
-                if (!empty($fan['queued'])) {
-                    $notice .= ' Update queued for background delivery to ' . (int) $fan['queued'] . ' inbox(es).';
-                } elseif (!empty($fan['ok'])) {
+                if (empty($fan['queued']) && !empty($fan['ok'])) {
                     $notice .= ' Update delivered to ' . (int) ($fan['delivered'] ?? 0) . ' inbox(es).';
-                } else {
+                } elseif (empty($fan['queued'])) {
                     $notice .= ' (follower Update skipped: ' . ($fan['error'] ?? 'unknown') . ')';
                 }
                 // Mirror avatar / header / bio to linked Bluesky PDS account (if any).
@@ -23013,10 +22999,10 @@ if (VIEW === 'analytics') loadAnalytics();
     try {
       const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
       const data = await res.json().catch(() => null);
-      if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
+      if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || (want ? 'Could not follow account.' : 'Could not unfollow account.'));
       form.dataset.queuePending = '1'; form.dataset.queueId = String(data.queue_id); form.dataset.queueRevision = String(data.revision || '');
       actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
-      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following (action queued)' : 'Unfollowed (action queued)';
+      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following' : 'Unfollowed';
       (async () => {
         for (let n = 0; n < 90; n++) {
           await new Promise((resolve) => setTimeout(resolve, 2000));
