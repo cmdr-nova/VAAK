@@ -7,6 +7,10 @@ if (PHP_SAPI !== 'cli') {
     exit;
 }
 
+// Cron's environment is intentionally minimal; queued Bluesky interactions
+// must still be able to refresh an already-linked account's data.
+putenv('VAAK_FEATURE_BLUESKY_TAB=1');
+
 $limit = 20;
 foreach ($argv as $arg) {
     if (preg_match('/^--limit=(\d+)$/', $arg, $m)) $limit = max(1, min(50, (int) $m[1]));

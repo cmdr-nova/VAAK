@@ -3225,7 +3225,9 @@ function ap_bsky_delete_record_uri(int $ownerUserId, string $recordUri): array
  */
 function ap_bsky_like_object(int $ownerUserId, string $objectId): array
 {
-    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
+    // CLI collection refreshes are explicitly queued only for linked accounts;
+    // the cron process must not depend on PHP-FPM's feature-flag environment.
+    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled())) {
         return ['ok' => true, 'skipped' => true];
     }
     $ref = ap_bsky_resolve_strong_ref($objectId, $ownerUserId);

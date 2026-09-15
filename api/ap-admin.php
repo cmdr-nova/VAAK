@@ -12988,6 +12988,26 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         </div>
       </div>
     </div>
+    <script>
+      // Start this request as soon as the right rail is parsed so it can run
+      // while PHP/browser continue building a potentially large main view.
+      (function () {
+        const box = document.getElementById('trends-sidebar');
+        if (!box) return;
+        box.dataset.deferred = 'loading';
+        fetch('?ajax=trends&from=' + encodeURIComponent(box.dataset.from || 'home'), {
+          credentials: 'same-origin', headers: { 'Accept': 'text/html' }, cache: 'no-store'
+        }).then((res) => res.ok ? res.text() : '')
+          .then((html) => {
+            if (html && html.trim()) {
+              box.innerHTML = html;
+              box.dataset.deferred = '0';
+            } else {
+              box.dataset.deferred = '1';
+            }
+          }).catch(() => { box.dataset.deferred = '1'; });
+      })();
+    </script>
   </aside>
 
   <section class="main">
@@ -13412,7 +13432,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               ? vaak_bookmark_folders_list($vaakOwnerId)
               : [];
           $bmFolderFilter = (int) ($_GET['folder'] ?? 0);
-          $bmList = ap_masto_bookmarks_list(80, null);
+          $bookmarkLimit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
+          $bookmarkLimit = (int) (ceil($bookmarkLimit / 20) * 20);
+          $bookmarkFetchLimit = $bmFolderFilter > 0 ? 80 : $bookmarkLimit;
+          $bmList = ap_masto_bookmarks_list($bookmarkFetchLimit, null);
           if ($bmFolderFilter > 0 && function_exists('vaak_bookmark_folder_status_ids')) {
               $matchKeys = function_exists('vaak_bookmark_folder_match_keys')
                   ? vaak_bookmark_folder_match_keys($bmFolderFilter, $vaakOwnerId, 500)
@@ -13457,11 +13480,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
               return true;
           }));
+          if ($bmFolderFilter < 1) $bmList = array_slice($bmList, 0, $bookmarkLimit);
           $bskyBookmarkItems = [];
           $bookmarkRefreshing = false;
           if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
               && ap_bsky_session_row($vaakOwnerId) !== null) {
-              $bskyResult = ap_bsky_get_bookmarks($vaakOwnerId, 80);
+              $bskyFetchLimit = $bmFolderFilter > 0 ? 200 : $bookmarkLimit;
+              $bskyResult = ap_bsky_get_bookmarks($vaakOwnerId, $bskyFetchLimit);
               $bookmarkRefreshing = !empty($bskyResult['refreshing']);
               if (!empty($bskyResult['ok']) && is_array($bskyResult['bookmarks'] ?? null)) {
                   $bskyBookmarkItems = $bskyResult['bookmarks'];
@@ -13500,6 +13525,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       || ($keys['object_id'] !== '' && isset($folderObjects[rtrim($keys['object_id'], '/')]))
                       || isset($folderObjects[rtrim($uri, '/')]);
               }));
+              $bmList = array_slice($bmList, 0, $bookmarkLimit);
+              $bskyBookmarkItems = array_slice($bskyBookmarkItems, 0, $bookmarkLimit);
           }
         ?>
         <section class="side-card" style="margin-bottom:1rem">
@@ -13590,6 +13617,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </div>
             </article>
           <?php endforeach; ?>
+        <?php endif; ?>
+        <?php if ($bookmarkLimit < 80 && (count($bmList) >= $bookmarkLimit || count($bskyBookmarkItems) >= $bookmarkLimit)): ?>
+          <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
+            <a class="btn btn-ghost" href="?view=bookmarks<?= $bmFolderFilter > 0 ? '&amp;folder=' . $bmFolderFilter : '' ?>&amp;limit=<?= min(80, $bookmarkLimit + 20) ?>">Show 20 more bookmarks</a>
+          </div>
         <?php endif; ?>
 
       <?php elseif ($view === 'mentions'): ?>
@@ -20862,46 +20894,6 @@ window.apAdminToast = function (msg, isErr) {
 })();
 </script>
 <?php endif; ?>
-
-<script>
-// Deferred trends for every view that shows the right rail (Home, Notices, Discuss, …).
-// Always starts as a shimmer shell; keep it visible briefly even on a warm cache
-// so the sidebar clearly "loads" instead of popping in instantly.
-(function () {
-  const MIN_SKELETON_MS = 420;
-  function loadDeferredTrends() {
-    const box = document.getElementById('trends-sidebar');
-    if (!box || box.dataset.deferred !== '1') return;
-    box.dataset.deferred = 'loading';
-    const from = box.dataset.from || 'home';
-    const started = Date.now();
-    const apply = (html) => {
-      const wait = Math.max(0, MIN_SKELETON_MS - (Date.now() - started));
-      window.setTimeout(() => {
-        if (html && html.trim()) {
-          box.innerHTML = html;
-          box.dataset.deferred = '0';
-        } else {
-          box.dataset.deferred = '1';
-        }
-      }, wait);
-    };
-    fetch('?ajax=trends&from=' + encodeURIComponent(from), {
-      credentials: 'same-origin',
-      headers: { 'Accept': 'text/html' },
-      cache: 'no-store'
-    }).then((res) => res.ok ? res.text() : '')
-      .then((html) => apply(html))
-      .catch(() => apply(''));
-  }
-  window.novaLoadDeferredTrends = loadDeferredTrends;
-  if ('requestIdleCallback' in window) {
-    requestIdleCallback(loadDeferredTrends, { timeout: 1200 });
-  } else {
-    setTimeout(loadDeferredTrends, 120);
-  }
-})();
-</script>
 
 <?php
 $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
