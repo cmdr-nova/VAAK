@@ -674,7 +674,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
                 if ($wantJson) {
                     $desired = in_array($action, ['favourite_status', 'bookmark_status'], true);
-                    $kind = str_starts_with($action, 'favourite') ? 'favourite' : 'bookmark';
+                    $kind = in_array($action, ['favourite_status', 'unfavourite_status'], true)
+                        ? 'favourite' : 'bookmark';
                     $targetKey = $objectId !== '' ? $objectId : $statusId;
                     $queue = ap_action_queue_enqueue($vaakOwnerId, 'fedi', $kind === 'favourite' ? 'like' : 'bookmark', $targetKey, $desired, [
                         'status_id' => $statusId, 'object_id' => $targetKey, 'target_actor' => $targetActor,
@@ -18990,7 +18991,7 @@ window.apAdminToast = function (msg, isErr) {
     const fd = new FormData(form);
     fd.set('ajax', '1');
     const before = snapshotInteractButton(form);
-    const optimisticKind = action.startsWith('favourite') ? 'favourite'
+    const optimisticKind = (action === 'favourite_status' || action === 'unfavourite_status') ? 'favourite'
       : action.startsWith('bookmark') ? 'bookmark' : 'reblog';
     const optimisticActive = action === 'favourite_status'
       || action === 'bookmark_status' || action === 'reblog_status';
