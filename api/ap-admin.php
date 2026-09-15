@@ -8154,7 +8154,7 @@ function admin_actor_avatar_url(?string $actorId): string
     return $remoteFallback;
 }
 
-function admin_avatar_img(?string $actorId, string $class = 'tweet-av'): string
+function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $profileHover = true): string
 {
     try {
         $url = admin_actor_avatar_url($actorId);
@@ -8164,23 +8164,17 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av'): string
             ? AP_REMOTE_AVATAR_FALLBACK
             : 'https://mkultra.monster/img/avatar/default.jpg';
     }
-    try {
-        $alt = actor_handle($actorId);
-    } catch (Throwable $e) {
-        $alt = '';
-    }
     $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
         ? AP_REMOTE_AVATAR_FALLBACK
         : 'https://mkultra.monster/img/avatar/default.jpg';
     // onerror → default so a stale/broken R2 URL never shows a cracked icon
-    $hover = is_string($actorId) && str_starts_with(strtolower(trim($actorId)), 'https://')
+    $hover = $profileHover && is_string($actorId) && str_starts_with(strtolower(trim($actorId)), 'https://')
         ? ' data-profile-hover-actor="' . h(rtrim(trim($actorId), '/')) . '"'
         : '';
     return '<img class="' . h($class) . '" src="' . h($url) . '" alt="" width="40" height="40" '
         . $hover
         . 'loading="lazy" decoding="async" referrerpolicy="no-referrer" '
-        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'" '
-        . 'title="' . h($alt) . '">';
+        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
 }
 
 /** Cache-only hover data; remote profile warming is always dispatched in the background. */
@@ -13001,7 +12995,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   ╚═══╝</pre>
         <strong>VAAK</strong>
       </a>
-      <?= admin_avatar_img($vaakActorId, 'brand-avatar') ?>
+      <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
     </div>
