@@ -773,7 +773,7 @@ function ap_masto_api(string $method, string $path): void
         ap_masto_require_token('read:lists');
         $out = [];
         foreach (ap_lists_all() as $row) {
-            if (($row['list_kind'] ?? 'curation') === 'curation') $out[] = ap_list_to_masto($row);
+            $out[] = ap_list_to_masto($row);
         }
         ap_masto_json($out);
         return;
@@ -802,7 +802,7 @@ function ap_masto_api(string $method, string $path): void
         if ($method === 'GET') {
             ap_masto_require_token('read:lists');
             $row = ap_list_by_id($listId);
-            if (!$row || ($row['list_kind'] ?? 'curation') !== 'curation') {
+            if (!$row) {
                 ap_masto_json(['error' => 'Record not found'], 404);
                 return;
             }
@@ -811,11 +811,6 @@ function ap_masto_api(string $method, string $path): void
         }
         if ($method === 'PUT' || $method === 'PATCH') {
             ap_masto_require_token('write:lists');
-            $existingList = ap_list_by_id($listId);
-            if (!$existingList || ($existingList['list_kind'] ?? 'curation') !== 'curation') {
-                ap_masto_json(['error' => 'Record not found'], 404);
-                return;
-            }
             $in = ap_masto_input();
             $fields = [];
             if (array_key_exists('title', $in) || isset($_POST['title'])) {
@@ -839,11 +834,6 @@ function ap_masto_api(string $method, string $path): void
         }
         if ($method === 'DELETE') {
             ap_masto_require_token('write:lists');
-            $existingList = ap_list_by_id($listId);
-            if (!$existingList || ($existingList['list_kind'] ?? 'curation') !== 'curation') {
-                ap_masto_json(['error' => 'Record not found'], 404);
-                return;
-            }
             $res = ap_list_delete($listId);
             if (empty($res['ok'])) {
                 $code = (($res['error'] ?? '') === 'Record not found') ? 404 : 422;
@@ -860,8 +850,7 @@ function ap_masto_api(string $method, string $path): void
         $listId = (int) $la[1];
         if ($method === 'GET') {
             ap_masto_require_token('read:lists');
-            $existingList = ap_list_by_id($listId);
-            if (!$existingList || ($existingList['list_kind'] ?? 'curation') !== 'curation') {
+            if (!ap_list_by_id($listId)) {
                 ap_masto_json(['error' => 'Record not found'], 404);
                 return;
             }
@@ -879,8 +868,7 @@ function ap_masto_api(string $method, string $path): void
         }
         if ($method === 'POST' || $method === 'DELETE') {
             ap_masto_require_token('write:lists');
-            $existingList = ap_list_by_id($listId);
-            if (!$existingList || ($existingList['list_kind'] ?? 'curation') !== 'curation') {
+            if (!ap_list_by_id($listId)) {
                 ap_masto_json(['error' => 'Record not found'], 404);
                 return;
             }
@@ -932,7 +920,7 @@ function ap_masto_api(string $method, string $path): void
         }
         $out = [];
         foreach (ap_lists_for_actor($actor) as $row) {
-            if (($row['list_kind'] ?? 'curation') === 'curation') $out[] = ap_list_to_masto($row);
+            $out[] = ap_list_to_masto($row);
         }
         ap_masto_json($out);
         return;
@@ -940,8 +928,7 @@ function ap_masto_api(string $method, string $path): void
     if (preg_match('#^/api/v1/timelines/list/(\d+)$#', $path, $tl) && $method === 'GET') {
         ap_masto_require_token('read:lists');
         $listId = (int) $tl[1];
-        $existingList = ap_list_by_id($listId);
-        if (!$existingList || ($existingList['list_kind'] ?? 'curation') !== 'curation') {
+        if (!ap_list_by_id($listId)) {
             ap_masto_json(['error' => 'Record not found'], 404);
             return;
         }

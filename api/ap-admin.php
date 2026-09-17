@@ -167,10 +167,6 @@ register_shutdown_function(static function () use ($adminRenderHiccup): void {
 $notice = null;
 $error = null;
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
-if ($view === 'vakktok') {
-    header('Location: ?view=gallery', true, 302);
-    exit;
-}
 $composerForceOpen = false;
 // Legacy ?view=compose → Your posts + open floating composer
 if ($view === 'compose') {
@@ -613,14 +609,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
         exit;
     }
-    if ($action === 'profile_hover_data') {
-        header('Content-Type: application/json; charset=utf-8');
-        header('Cache-Control: no-store');
-        $actor = trim((string) ($_POST['actor'] ?? ''));
-        $payload = admin_profile_hover_payload($actor, $vaakOwnerId, $vaakActorId);
-        echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        exit;
-    }
     if (in_array($action, ['favourite_status', 'unfavourite_status', 'bookmark_status', 'unbookmark_status', 'reblog_status', 'unreblog_status'], true)) {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $view = $returnView;
@@ -660,7 +648,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
                             'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
                             'kind' => 'reblog', 'active' => $action === 'reblog_status', 'status_id' => $statusId,
-                            'notice' => $action === 'reblog_status' ? 'Boosted!' : 'Boost removed.'], JSON_UNESCAPED_SLASHES);
+                            'notice' => 'Boost action queued.'], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     $error = $queue['error'] ?? 'Could not queue boost.';
@@ -705,9 +693,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                             'kind' => $kind, 'active' => $desired, 'status_id' => $statusId,
                             'object_id' => $targetKey, 'folder_ids' => $folderIds,
                             'open_folder_picker' => $kind === 'bookmark' && $desired,
-                            'notice' => $kind === 'favourite'
-                                ? ($desired ? 'Liked!' : 'Like removed.')
-                                : ($desired ? 'Bookmarked!' : 'Bookmark removed.')], JSON_UNESCAPED_SLASHES);
+                            'notice' => 'Action queued.'], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     header('Content-Type: application/json; charset=utf-8');
@@ -797,19 +783,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not delete folder.';
             }
         } elseif ($action === 'bookmark_folder_add') {
-            $folderStatusId = trim((string) ($_POST['status_id'] ?? ''));
-            $folderObjectId = trim((string) ($_POST['object_id'] ?? ''));
-            $folderPlatform = (string) ($_POST['platform'] ?? '') === 'bsky' ? 'bsky' : 'fedi';
-            if ($folderStatusId === '' && $folderPlatform === 'bsky' && str_starts_with($folderObjectId, 'at://')
-                && function_exists('admin_bsky_bookmark_keys')) {
-                $folderStatusId = (string) (admin_bsky_bookmark_keys($folderObjectId, $vaakOwnerId)['status_id'] ?? '');
-            }
             $res = vaak_bookmark_folder_add_status(
                 (int) ($_POST['folder_id'] ?? 0),
-                $folderStatusId,
+                (string) ($_POST['status_id'] ?? ''),
                 $vaakOwnerId,
-                $folderObjectId !== '' ? $folderObjectId : null,
-                $folderPlatform
+                trim((string) ($_POST['object_id'] ?? '')) ?: null
             );
             $payload = $res + [
                 'status_id' => (string) ($_POST['status_id'] ?? ''),
@@ -821,15 +799,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not add to folder.';
             }
         } else {
-            $folderStatusId = trim((string) ($_POST['status_id'] ?? ''));
-            $folderObjectId = trim((string) ($_POST['object_id'] ?? ''));
-            if ($folderStatusId === '' && (string) ($_POST['platform'] ?? '') === 'bsky'
-                && str_starts_with($folderObjectId, 'at://') && function_exists('admin_bsky_bookmark_keys')) {
-                $folderStatusId = (string) (admin_bsky_bookmark_keys($folderObjectId, $vaakOwnerId)['status_id'] ?? '');
-            }
             $res = vaak_bookmark_folder_remove_status(
                 (int) ($_POST['folder_id'] ?? 0),
-                $folderStatusId,
+                (string) ($_POST['status_id'] ?? ''),
                 $vaakOwnerId
             );
             $payload = $res + [
@@ -927,10 +899,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($mediaIds) {
                     $notice .= ' · ' . count($mediaIds) . ' media';
                 }
+                if (empty($result['delivery_pending']) && ($delivered > 0 || $queued > 0)) {
+                    $notice .= ' Delivered to ' . $delivered . ' inbox(es)';
+                    if ($queued > 0) {
+                        $notice .= ', ' . $queued . ' more queued in background';
+                    }
+                    $notice .= '.';
+                }
                 $bskyRes = is_array($result['bsky'] ?? null) ? $result['bsky'] : null;
                 if (is_array($bskyRes) && !empty($bskyRes['rate_limited']) && !empty($bskyRes['retry_queued'])) {
-                    $composeToast = 'Posted! Bluesky sync is catching up.';
-                    $notice .= ' Bluesky sync is catching up.';
+                    $composeToast = 'Rate Limit Exceeded - Post added to queue';
+                    $notice .= ' Bluesky rate-limited — mirror queued.';
                 }
                 $successMessages = $isQuote
                     ? ['Quote sent!', 'Sent that quote into orbit!', 'Quote posted!']
@@ -1072,6 +1051,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = 'Post updated.';
                 $delivered = (int) ($result['delivered'] ?? 0);
                 $queued = (int) ($result['queued'] ?? 0);
+                if ($delivered > 0 || $queued > 0) {
+                    $notice .= ' Update delivered to ' . $delivered . ' inbox(es)';
+                    if ($queued > 0) {
+                        $notice .= ', ' . $queued . ' more queued';
+                    }
+                    $notice .= '.';
+                }
                 $view = $returnView;
             } else {
                 $error = $result['error'] ?? 'Edit failed.';
@@ -1096,15 +1082,68 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
     } elseif ($action === 'delete_status') {
         $localId = (int) ($_POST['local_id'] ?? 0);
+        $noteIdPost = rtrim(trim((string) ($_POST['note_id'] ?? '')), '/');
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'outbox')) ?: 'outbox';
         if (!defined('AP_INBOX_LIB_ONLY')) {
             define('AP_INBOX_LIB_ONLY', true);
         }
         require_once __DIR__ . '/ap-inbox.php';
+        if ($localId < 1 && $noteIdPost !== '' && str_starts_with($noteIdPost, 'https://')
+            && function_exists('ap_masto_status_by_note_id')) {
+            $nrow = ap_masto_status_by_note_id($noteIdPost);
+            $localId = is_array($nrow) ? (int) ($nrow['local_id'] ?? 0) : 0;
+        }
         $result = function_exists('ap_delete_local_status') ? ap_delete_local_status($localId) : ['ok' => false, 'error' => 'Delete unavailable'];
         if (!empty($result['ok'])) {
             admin_tl_cache_clear();
-            $notice = 'Post deleted and federated.';
+            if (function_exists('ap_bsky_tl_cache_clear_owner')) {
+                ap_bsky_tl_cache_clear_owner((int) ($GLOBALS['vaak_owner_id'] ?? 0));
+            }
+            $notice = 'Post has been deleted';
+            $view = $returnView;
+        } else {
+            $error = $result['error'] ?? 'Delete failed.';
+            $view = $returnView;
+        }
+    } elseif ($action === 'delete_bsky_post') {
+        // Own Bluesky post: delete local twin (federates) when mapped, else Bluesky-only deleteRecord.
+        $bskyUri = trim((string) ($_POST['bsky_uri'] ?? ''));
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'bluesky')) ?: 'bluesky';
+        require_once __DIR__ . '/ap-bsky.php';
+        if (!defined('AP_INBOX_LIB_ONLY')) {
+            define('AP_INBOX_LIB_ONLY', true);
+        }
+        require_once __DIR__ . '/ap-inbox.php';
+        $owner = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        $result = ['ok' => false, 'error' => 'Invalid Bluesky post'];
+        if (str_starts_with($bskyUri, 'at://') && $owner > 0) {
+            $noteId = function_exists('ap_bsky_local_note_id_for_at_uri')
+                ? ap_bsky_local_note_id_for_at_uri($bskyUri, $owner)
+                : null;
+            if (is_string($noteId) && str_starts_with($noteId, 'https://mkultra.monster/')
+                && function_exists('ap_masto_status_by_note_id') && function_exists('ap_delete_local_status')) {
+                $nrow = ap_masto_status_by_note_id($noteId);
+                $localId = is_array($nrow) ? (int) ($nrow['local_id'] ?? 0) : 0;
+                $result = $localId > 0
+                    ? ap_delete_local_status($localId)
+                    : ['ok' => false, 'error' => 'Local status missing'];
+            } else {
+                $result = ap_bsky_delete_record_uri($owner, $bskyUri);
+                if (!empty($result['ok'])) {
+                    try {
+                        ap_db()->prepare('DELETE FROM bsky_posts WHERE bsky_uri = ?')->execute([$bskyUri]);
+                    } catch (Throwable $e) {
+                        // ignore
+                    }
+                }
+            }
+        }
+        if (!empty($result['ok'])) {
+            admin_tl_cache_clear();
+            if (function_exists('ap_bsky_tl_cache_clear_owner')) {
+                ap_bsky_tl_cache_clear_owner($owner);
+            }
+            $notice = 'Post has been deleted';
             $view = $returnView;
         } else {
             $error = $result['error'] ?? 'Delete failed.';
@@ -1313,6 +1352,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'collection_consent' => !empty($_POST['collection_consent']),
                 'vanity_verified' => !empty($_POST['vanity_verified']),
                 'auto_follow_back' => !empty($_POST['auto_follow_back']),
+                'anti_ai_marker' => !empty($_POST['anti_ai_marker']),
                 'auto_unblur_sensitive' => !empty($_POST['auto_unblur_sensitive']),
                 'auto_delete_posts_7d' => !empty($_POST['auto_delete_posts_7d']),
                 'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
@@ -1346,9 +1386,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($verCount > 0) {
                     $notice .= ' ' . $verCount . ' field' . ($verCount === 1 ? '' : 's') . ' verified (rel=me).';
                 }
-                if (empty($fan['queued']) && !empty($fan['ok'])) {
+                if (!empty($fan['queued'])) {
+                    $notice .= ' Update queued for background delivery to ' . (int) $fan['queued'] . ' inbox(es).';
+                } elseif (!empty($fan['ok'])) {
                     $notice .= ' Update delivered to ' . (int) ($fan['delivered'] ?? 0) . ' inbox(es).';
-                } elseif (empty($fan['queued'])) {
+                } else {
                     $notice .= ' (follower Update skipped: ' . ($fan['error'] ?? 'unknown') . ')';
                 }
                 // Mirror avatar / header / bio to linked Bluesky PDS account (if any).
@@ -1527,9 +1569,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
             }
         }
-        if ($view === 'search' && isset($_POST['return_q'])) {
-            $_GET['q'] = trim((string) $_POST['return_q']);
-        }
     } elseif ($action === 'unfollow_remote') {
         $target = trim((string) ($_POST['actor_id'] ?? ''));
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'following')) ?: 'following';
@@ -1631,31 +1670,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             } else {
                 $error = $res['error'] ?? 'Follow failed.';
             }
-        }
-    } elseif (str_starts_with($action, 'starter_pack_')) {
-        $view = 'collections';
-        $packUri = trim((string) ($_POST['pack_uri'] ?? ''));
-        if ($action === 'starter_pack_create') {
-            $res = ap_bsky_starter_pack_create($vaakOwnerId, (string) ($_POST['name'] ?? ''), (string) ($_POST['description'] ?? ''));
-            if (!empty($res['ok'])) $notice = 'Starter Pack created on Bluesky.';
-            else $error = $res['error'] ?? 'Could not create Starter Pack.';
-        } elseif ($action === 'starter_pack_add_member') {
-            $res = ap_bsky_starter_pack_add_member($vaakOwnerId, $packUri, (string) ($_POST['actor'] ?? ''));
-            if (!empty($res['ok'])) $notice = 'Bluesky account added to Starter Pack.';
-            else $error = $res['error'] ?? 'Could not add Starter Pack member.';
-        } elseif ($action === 'starter_pack_remove_member') {
-            $res = ap_bsky_starter_pack_remove_member($vaakOwnerId, $packUri, (string) ($_POST['did'] ?? ''));
-            if (!empty($res['ok'])) $notice = 'Starter Pack member removed.';
-            else $error = $res['error'] ?? 'Could not remove Starter Pack member.';
-        } elseif ($action === 'starter_pack_delete') {
-            $res = ap_bsky_starter_pack_delete($vaakOwnerId, $packUri);
-            if (!empty($res['ok'])) $notice = 'Starter Pack deleted from Bluesky.';
-            else $error = $res['error'] ?? 'Could not delete Starter Pack.';
-        } elseif ($action === 'starter_pack_refresh') {
-            ap_bsky_starter_packs_enqueue($vaakOwnerId, true);
-            $notice = 'Starter Pack refresh queued.';
-        } else {
-            $error = 'Unknown Starter Pack action.';
         }
     } elseif (str_starts_with($action, 'collection_')) {
         $view = 'collections';
@@ -1772,26 +1786,16 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $error = 'Unknown collection action.';
         }
     } elseif (str_starts_with($action, 'list_')) {
-        $view = (string) ($_POST['return_view'] ?? 'lists');
-        if (!in_array($view, ['lists', 'mod_lists'], true)) $view = 'lists';
+        $view = 'lists';
         $lid = (int) ($_POST['list_id'] ?? $_GET['id'] ?? 0);
-        if ($action === 'list_mod_action') {
-            $view = 'mod_lists';
-            $res = ap_list_set_moderation_action($lid, (string) ($_POST['moderation_action'] ?? 'none'));
-            if (!empty($res['ok'])) $notice = 'Moderation list action saved.';
-            else $error = $res['error'] ?? 'Could not update moderation list.';
-            if ($lid > 0) $_GET['id'] = (string) $lid;
-        } elseif ($action === 'list_create') {
+        if ($action === 'list_create') {
             $res = ap_list_create(
                 (string) ($_POST['title'] ?? ''),
                 (string) ($_POST['replies_policy'] ?? 'list'),
-                !empty($_POST['exclusive']),
-                (string) ($_POST['list_kind'] ?? 'curation'),
-                (string) ($_POST['moderation_action'] ?? 'none')
+                !empty($_POST['exclusive'])
             );
             if (!empty($res['ok'])) {
                 $notice = 'List created.';
-                $view = (($_POST['list_kind'] ?? 'curation') === 'moderation') ? 'mod_lists' : 'lists';
                 $_GET['id'] = (string) (int) ($res['id'] ?? 0);
             } else {
                 $error = $res['error'] ?? 'Could not create list.';
@@ -1821,12 +1825,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
         } elseif ($action === 'list_add_account') {
             $ref = trim((string) ($_POST['actor'] ?? $_POST['to'] ?? ''));
-            $actorId = '';
-            if (function_exists('ap_bsky_resolve_target_did')) {
-                $did = ap_bsky_resolve_target_did($ref, $vaakOwnerId);
-                if ($did !== null) $actorId = 'https://bsky.app/profile/' . rawurlencode($did);
-            }
-            if ($actorId === '') $actorId = ap_list_resolve_actor_ref($ref) ?? '';
+            $actorId = ap_list_resolve_actor_ref($ref) ?? '';
             $followIfNeeded = !empty($_POST['follow_if_needed']);
             $res = ap_list_add_account($lid, $actorId, $followIfNeeded);
             if (!empty($res['ok'])) {
@@ -1838,8 +1837,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
             }
             if ($lid > 0) {
-                $listForReturn = ap_list_by_id($lid);
-                if (($listForReturn['list_kind'] ?? '') === 'moderation') $view = 'mod_lists';
                 $_GET['id'] = (string) $lid;
             }
         } elseif ($action === 'list_remove_account') {
@@ -1851,8 +1848,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $res['error'] ?? 'Could not remove account.';
             }
             if ($lid > 0) {
-                $listForReturn = ap_list_by_id($lid);
-                if (($listForReturn['list_kind'] ?? '') === 'moderation') $view = 'mod_lists';
                 $_GET['id'] = (string) $lid;
             }
         } else {
@@ -2144,16 +2139,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $comment = trim((string) ($_POST['comment'] ?? ''));
         $statusUri = trim((string) ($_POST['object_id'] ?? $_POST['status_uri'] ?? ''));
         $statuses = $statusUri !== '' ? [$statusUri] : [];
-        $sendRemote = (string) ($_POST['report_delivery'] ?? 'remote') !== 'local';
         $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
         $returnFrom = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_from'] ?? '')) ?: '';
-        $res = ap_report_send($target, $comment, $statuses, $sendRemote);
+        $res = ap_report_send($target, $comment, $statuses);
         if (!empty($res['ok'])) {
-            $notice = !empty($res['local_only'])
-                ? 'Report filed for VAAK moderation only; it was not sent to the remote instance.'
-                : (!empty($res['local_peer'])
+            $notice = !empty($res['local_peer'])
                 ? 'Report filed for local moderators.'
-                : 'Report (Flag) sent to remote moderators.');
+                : 'Report (Flag) sent to remote moderators.';
             $wanted = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'report')) ?: 'report';
             if ($wanted === 'moderation' && empty($vaakIsAdmin)) {
                 $wanted = 'report';
@@ -2647,7 +2639,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
                 if ($bmKeys['status_id'] !== '' && function_exists('ap_masto_bookmark_remove')) {
                     try {
-                        ap_masto_bookmark_remove($bmKeys['status_id'], $vaakOwnerId, 'bsky');
+                        ap_masto_bookmark_remove($bmKeys['status_id'], $vaakOwnerId);
                     } catch (Throwable $e) {
                         // ignore
                     }
@@ -2709,7 +2701,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 // (local AP twin when mapped, otherwise a stable bsky: status key).
                 if ($bmKeys['status_id'] !== '' && function_exists('ap_masto_bookmark_add')) {
                     try {
-                        ap_masto_bookmark_add($bmKeys['status_id'], $bmKeys['object_id'], $vaakOwnerId, 'bsky');
+                        ap_masto_bookmark_add($bmKeys['status_id'], $bmKeys['object_id'], $vaakOwnerId);
                     } catch (Throwable $e) {
                         // ignore
                     }
@@ -3285,13 +3277,6 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
     $statusId = trim((string) ($_GET['status_id'] ?? ''));
-    $objectId = trim((string) ($_GET['object_id'] ?? ''));
-    $platform = (string) ($_GET['platform'] ?? '') === 'bsky' ? 'bsky' : 'fedi';
-    if ($statusId === '' && $platform === 'bsky' && str_starts_with($objectId, 'at://')
-        && function_exists('admin_bsky_bookmark_keys')) {
-        $keys = admin_bsky_bookmark_keys($objectId, $vaakOwnerId);
-        $statusId = (string) ($keys['status_id'] ?? '');
-    }
     $folders = function_exists('vaak_bookmark_folders_list')
         ? vaak_bookmark_folders_list($vaakOwnerId)
         : [];
@@ -3303,7 +3288,6 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
         'folders' => $folders,
         'selected' => $selected,
         'status_id' => $statusId,
-        'object_id' => $objectId,
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -3464,32 +3448,63 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
     exit;
 }
 
-// Deferred trends sidebar (recompute / OG fetch happens here, not on every nav).
-if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
-    header('Content-Type: text/html; charset=utf-8');
-    header('Cache-Control: no-store');
+/**
+ * Render right-rail trending modules from disk cache (optionally stale).
+ *
+ * @param array{age?:int,stale?:bool,empty?:bool}|null $meta
+ */
+function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null): string
+{
+    $viewForTrends = preg_replace('/[^a-z_]/', '', $viewForTrends) ?: 'home';
     $trendTags = [];
     $trendLinks = [];
     $trendStatuses = [];
-    try {
-        $trendTags = function_exists('ap_masto_trends_tags') ? ap_masto_trends_tags(5) : [];
-        $trendLinks = function_exists('ap_masto_trends_links') ? ap_masto_trends_links(5) : [];
-        $trendStatuses = function_exists('ap_masto_trends_statuses') ? ap_masto_trends_statuses(5) : [];
-    } catch (Throwable $e) {
-        error_log('[ap-admin] ajax trends: ' . $e->getMessage());
+    $maxAge = 0;
+    $anyStale = false;
+    $anyHit = false;
+    foreach (['tags' => 5, 'links' => 5, 'statuses' => 5] as $kind => $limit) {
+        $row = function_exists('ap_masto_trends_cache_read')
+            ? ap_masto_trends_cache_read($kind, 1, $allowStale)
+            : null;
+        if (!is_array($row)) {
+            continue;
+        }
+        $anyHit = true;
+        $maxAge = max($maxAge, (int) ($row['age'] ?? 0));
+        $anyStale = $anyStale || !empty($row['stale']);
+        $items = array_slice($row['items'], 0, $limit);
+        if ($kind === 'tags') {
+            $trendTags = $items;
+        } elseif ($kind === 'links') {
+            $trendLinks = $items;
+        } else {
+            $trendStatuses = $items;
+        }
     }
+    $meta = [
+        'age' => $maxAge,
+        'stale' => $anyStale,
+        'empty' => !$anyHit,
+    ];
+    if (!$anyHit) {
+        return '';
+    }
+
     $admin_strim = static function (string $s, int $width): string {
         if (function_exists('mb_strimwidth')) {
             return mb_strimwidth($s, 0, $width, '…');
         }
         return strlen($s) > $width ? (substr($s, 0, max(0, $width - 1)) . '…') : $s;
     };
-    $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
-    echo '<div class="side-card"><h3>Trending tags</h3>';
-    if (!$trendTags) {
-        echo '<div class="meta">No hashtag signal yet…</div>';
+
+    $html = '<div class="side-card"><h3>Trending tags</h3>';
+    if ($trendTags === []) {
+        $html .= '<div class="meta">No hashtag signal yet…</div>';
     } else {
         foreach ($trendTags as $tg) {
+            if (!is_array($tg)) {
+                continue;
+            }
             $tname = (string) ($tg['name'] ?? '');
             $usesToday = !empty($tg['history'][0]['uses']) ? (int) $tg['history'][0]['uses'] : 0;
             $usesWeek = 0;
@@ -3498,22 +3513,23 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
                     $usesWeek += (int) ($hday['uses'] ?? 0);
                 }
             }
-            echo '<div class="bar-row"><span><a href="?view=search&amp;q='
+            $html .= '<div class="bar-row"><span><a href="?view=search&amp;q='
                 . urlencode('#' . $tname) . '">#' . h($tname) . '</a></span>'
                 . '<span class="meta" title="uses today / 7d">' . $usesToday . '/' . $usesWeek . '</span></div>';
         }
     }
-    echo '</div>';
-    echo '<div class="side-card"><h3>Trending links</h3>';
-    if (!$trendLinks) {
-        echo '<div class="meta">No link signal yet…</div>';
+    $html .= '</div>';
+    $html .= '<div class="side-card"><h3>Trending links</h3>';
+    if ($trendLinks === []) {
+        $html .= '<div class="meta">No link signal yet…</div>';
     } else {
         foreach ($trendLinks as $ln) {
+            if (!is_array($ln)) {
+                continue;
+            }
             $title = trim((string) ($ln['title'] ?? ''));
             $url = trim((string) ($ln['url'] ?? ''));
             $host = $url !== '' ? strtolower((string) (parse_url($url, PHP_URL_HOST) ?: '')) : '';
-            // When OG title is missing we used to dump the raw URL as the label —
-            // unbroken query strings blew out the right rail. Prefer host + short path.
             $titleIsUrl = $title === '' || $title === $url
                 || str_starts_with($title, 'http://') || str_starts_with($title, 'https://');
             if ($titleIsUrl && $url !== '') {
@@ -3525,46 +3541,98 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
             } else {
                 $label = $admin_strim($title !== '' ? $title : ($host !== '' ? $host : 'link'), 72);
             }
-            echo '<div class="trend-link">';
+            $html .= '<div class="trend-link">';
             if ($url !== '') {
-                echo '<a href="' . h($url) . '" rel="noopener noreferrer" target="_blank" title="' . h($url) . '">'
+                $html .= '<a href="' . h($url) . '" rel="noopener noreferrer" target="_blank" title="' . h($url) . '">'
                     . h($label) . '</a>';
                 if (!$titleIsUrl && $host !== '') {
-                    echo '<span class="trend-link-host">' . h($host) . '</span>';
+                    $html .= '<span class="trend-link-host">' . h($host) . '</span>';
                 }
             } else {
-                echo h($label);
+                $html .= h($label);
             }
-            echo '</div>';
+            $html .= '</div>';
         }
     }
-    echo '</div>';
-    echo '<div class="side-card"><h3>Trending posts</h3>';
-    if (!$trendStatuses) {
-        echo '<div class="meta">No post signal yet…</div>';
+    $html .= '</div>';
+    $html .= '<div class="side-card"><h3>Trending posts</h3>';
+    if ($trendStatuses === []) {
+        $html .= '<div class="meta">No post signal yet…</div>';
     } else {
         foreach ($trendStatuses as $ts) {
+            if (!is_array($ts)) {
+                continue;
+            }
             $acct = is_array($ts['account'] ?? null) ? $ts['account'] : [];
             $who = (string) ($acct['acct'] ?? $acct['username'] ?? 'someone');
-            // Decode &#039; / &amp; / curly quotes — bare strip_tags left entities visible.
             $content = function_exists('admin_html_to_plain')
                 ? admin_html_to_plain((string) ($ts['content'] ?? ''))
                 : trim(html_entity_decode(strip_tags((string) ($ts['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
             $excerpt = $admin_strim($content, 96);
             $surl = (string) ($ts['url'] ?? $ts['uri'] ?? '');
-            echo '<div style="margin:0 0 .65rem;line-height:1.35">';
-            echo '<div class="meta" style="margin-bottom:.15rem">' . h($who) . '</div>';
+            $html .= '<div style="margin:0 0 .65rem;line-height:1.35">';
+            $html .= '<div class="meta" style="margin-bottom:.15rem">' . h($who) . '</div>';
             if ($surl !== '') {
-                echo '<a href="' . h(admin_status_href($surl, $viewForTrends))
+                $html .= '<a href="' . h(admin_status_href($surl, $viewForTrends))
                     . '" style="color:var(--text);text-decoration:none">'
                     . h($excerpt !== '' ? $excerpt : '(media)') . '</a>';
             } else {
-                echo '<span>' . h($excerpt !== '' ? $excerpt : '(media)') . '</span>';
+                $html .= '<span>' . h($excerpt !== '' ? $excerpt : '(media)') . '</span>';
             }
-            echo '</div>';
+            $html .= '</div>';
         }
     }
-    echo '</div>';
+    $html .= '</div>';
+    return $html;
+}
+
+// Deferred trends sidebar (cache-first; background refresh when stale).
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
+    header('Content-Type: text/html; charset=utf-8');
+    $forceRefresh = !empty($_GET['refresh']);
+    $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
+    $meta = null;
+    $html = '';
+    try {
+        if ($forceRefresh) {
+            // Recompute now (caller asked), then render from fresh cache.
+            if (function_exists('ap_masto_trends_tags')) {
+                ap_masto_trends_tags(5);
+            }
+            if (function_exists('ap_masto_trends_links')) {
+                ap_masto_trends_links(5);
+            }
+            if (function_exists('ap_masto_trends_statuses')) {
+                ap_masto_trends_statuses(5);
+            }
+            $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
+        } else {
+            $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
+            if ($html === '') {
+                // Cold cache: compute once for this request.
+                if (function_exists('ap_masto_trends_tags')) {
+                    ap_masto_trends_tags(5);
+                }
+                if (function_exists('ap_masto_trends_links')) {
+                    ap_masto_trends_links(5);
+                }
+                if (function_exists('ap_masto_trends_statuses')) {
+                    ap_masto_trends_statuses(5);
+                }
+                $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
+            } elseif (!empty($meta['stale']) && function_exists('ap_masto_trends_schedule_refresh')) {
+                ap_masto_trends_schedule_refresh();
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] ajax trends: ' . $e->getMessage());
+    }
+    $age = (int) ($meta['age'] ?? 0);
+    $stale = !empty($meta['stale']) ? '1' : '0';
+    header('Cache-Control: private, max-age=60');
+    header('X-Vaak-Trends-Age: ' . $age);
+    header('X-Vaak-Trends-Stale: ' . $stale);
+    echo $html;
     exit;
 }
 
@@ -3598,7 +3666,7 @@ $db = ap_db();
 $since24 = gmdate('c', time() - 86400);
 $since7 = gmdate('c', time() - 7 * 86400);
 
-$tlLimit = isset($_GET['limit']) ? (int) $_GET['limit'] : ($view === 'gallery' ? 16 : 15);
+$tlLimit = isset($_GET['limit']) ? (int) $_GET['limit'] : (in_array(($view ?? ''), ['gallery', 'vakktok'], true) ? 16 : 15);
 $tlLimit = max(1, min(40, $tlLimit));
 $tlOffset = isset($_GET['offset']) ? max(0, (int) $_GET['offset']) : 0;
 $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
@@ -3606,7 +3674,7 @@ $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
 $wantNewerPoll = $isPartial
     && isset($_GET['newer'])
     && (string) $_GET['newer'] === '1'
-    && in_array($view, ['home', 'feed', 'local', 'gallery'], true);
+    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true);
 
 // Stats-only event COUNTs (were previously paid on every full-page nav click).
 $total24 = 0;
@@ -3937,7 +4005,7 @@ $adminTlCachedTotal = 0;
 if (
     !$wantNewerPoll
     && !$adminTlForceRefresh
-    && in_array($view, ['home', 'feed', 'local', 'gallery'], true)
+    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
 ) {
     $adminTlCacheKey = admin_tl_cache_key($view, $following);
     $adminTlRankedCached = admin_tl_cache_get($adminTlCacheKey);
@@ -3951,8 +4019,8 @@ $yourBskyPosts = [];
 $GLOBALS['admin_masto_by_note'] = [];
 $needOutboxBuild = !$wantNewerPoll && !$adminTlFromCache && (
     in_array($view, ['outbox', 'queue'], true)
-    || in_array($view, ['home', 'feed', 'local', 'gallery'], true)
-    || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true))
+    || in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
+    || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true))
 );
 if ($needOutboxBuild) {
     $outbox = ap_outbox_list(40, $vaakActorKey);
@@ -4087,12 +4155,14 @@ function admin_tl_cache_key(string $view, array $following): string
         $view = 'local';
     } elseif ($view === 'gallery') {
         $view = 'gallery';
+    } elseif ($view === 'vakktok') {
+        $view = 'vakktok';
     } else {
         $view = 'home';
     }
     $parts = [];
-    // Local and Gallery are follow-set independent (instance/media firehose).
-    if ($view !== 'local' && $view !== 'gallery') {
+    // Local, Gallery, and VakkTok are follow-set independent (instance/media firehose).
+    if ($view !== 'local' && $view !== 'gallery' && $view !== 'vakktok') {
         foreach ($following as $f) {
             $aid = rtrim((string) ($f['actor_id'] ?? ''), '/');
             if ($aid !== '') {
@@ -4681,7 +4751,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         return $added === [] ? null : array_merge($ranked, $added);
     }
 
-    if ($view === 'gallery') {
+    if ($view === 'gallery' || $view === 'vakktok') {
         try {
             $st = $db->prepare(
                 "SELECT * FROM events
@@ -4709,6 +4779,11 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                     continue;
                 }
                 if (!admin_gallery_event_has_media($erow)) {
+                    continue;
+                }
+                if ($view === 'vakktok'
+                    && (!admin_vakktok_item_has_video(['row' => $erow])
+                        || admin_vakktok_item_is_sensitive(['row' => $erow]))) {
                     continue;
                 }
                 $seenIds[$eid] = true;
@@ -5729,7 +5804,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
 
 // Gallery: media-only posts (federated Creates with attachments + local outbox with media).
 $galleryTimeline = [];
-if (!$wantNewerPoll && !$adminTlFromCache && $view === 'gallery') {
+$GLOBALS['admin_vakktok_mode'] = ($view === 'vakktok');
+if (!$wantNewerPoll && !$adminTlFromCache && in_array($view, ['gallery', 'vakktok'], true)) {
     $galOwnerId = admin_owner_user_id();
     $galSeen = [];
     try {
@@ -5756,6 +5832,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && $view === 'gallery') {
                 continue;
             }
             if (!admin_gallery_event_has_media($e)) {
+                continue;
+            }
+            if ($view === 'vakktok' && (!admin_vakktok_item_has_video(['row' => $e]) || admin_vakktok_item_is_sensitive(['row' => $e]))) {
                 continue;
             }
             $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
@@ -5799,6 +5878,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && $view === 'gallery') {
             if (!admin_gallery_outbox_has_media($n)) {
                 continue;
             }
+            if ($view === 'vakktok' && admin_vakktok_item_is_sensitive(['kind' => 'outbox', 'row' => $n])) {
+                continue;
+            }
             $galSeen[$nid] = true;
             $item = [
                 'kind' => 'outbox',
@@ -5816,11 +5898,12 @@ if (!$wantNewerPoll && !$adminTlFromCache && $view === 'gallery') {
     // Bluesky media posts from this user's durable warmed feed cache. Gallery is
     // per-owner, and dual-published posts keep their ActivityPub card above.
     if (
-        $view === 'gallery'
+        in_array($view, ['gallery', 'vakktok'], true)
         && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
         && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($galOwnerId))
         && function_exists('ap_bsky_posts_for_home')
         && function_exists('ap_bsky_post_image_urls')
+        && function_exists('ap_bsky_post_video_media')
     ) {
         try {
             foreach (ap_bsky_posts_for_home($galOwnerId, 120) as $bItem) {
@@ -5828,8 +5911,18 @@ if (!$wantNewerPoll && !$adminTlFromCache && $view === 'gallery') {
                     continue;
                 }
                 $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
-                $bPostImages = ap_bsky_post_image_urls($bItem['post']);
-                if ($bUri === '' || $bPostImages === []) {
+                $bPostMedia = array_merge(
+                    array_map(static fn(string $url): array => [
+                        'url' => $url,
+                        'mediaType' => 'image/*',
+                        'is_video' => false,
+                    ], ap_bsky_post_image_urls($bItem['post'])),
+                    ap_bsky_post_video_media($bItem['post'])
+                );
+                if ($bUri === '' || $bPostMedia === []) {
+                    continue;
+                }
+                if ($view === 'vakktok' && ap_bsky_post_video_media($bItem['post']) === []) {
                     continue;
                 }
                 $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
@@ -5865,7 +5958,7 @@ if (
     !$isPartial
     && $adminTlFromCache
     && is_array($adminTlRankedCached)
-    && in_array($view, ['home', 'feed', 'local', 'gallery'], true)
+    && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
 ) {
     $adminTlCachedTotal = count($adminTlRankedCached);
     $sliceKeys = array_slice($adminTlRankedCached, 0, $tlLimit);
@@ -5915,7 +6008,7 @@ if (
         );
     } elseif ($view === 'local') {
         $localTimeline = $hydrated;
-    } elseif ($view === 'gallery') {
+    } elseif (in_array($view, ['gallery', 'vakktok'], true)) {
         $galleryTimeline = $hydrated;
     }
 }
@@ -6205,7 +6298,6 @@ function view_title(string $view): string
         'tags' => 'Hashtags',
         'collections' => 'Collections',
         'lists' => 'Lists',
-        'mod_lists' => 'Mod Lists',
         'import_export' => 'Import / Export',
         'report' => 'Report',
         'moderation' => 'Moderation',
@@ -6268,11 +6360,11 @@ function admin_report_href(string $targetActor, string $objectId = '', string $f
 function admin_media_is_video(string $url, ?string $mediaType = null): bool
 {
     $mt = strtolower(trim((string) $mediaType));
-    if (str_starts_with($mt, 'video/') || in_array($mt, ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true)) {
+    if (str_starts_with($mt, 'video/')) {
         return true;
     }
     $path = (string) (parse_url($url, PHP_URL_PATH) ?? '');
-    return (bool) preg_match('/\.(mp4|webm|mov|m4v|m3u8)$/i', $path);
+    return (bool) preg_match('/\.(mp4|webm|mov|m4v)(\?|$)/i', $path);
 }
 
 function admin_media_is_audio(string $url, ?string $mediaType = null): bool
@@ -6328,6 +6420,47 @@ function admin_edit_post_button(
             . '&from=home&compose=1&edit_note=' . rawurlencode($noteId);
     }
     return '<a class="btn btn-ghost" href="' . h($href) . '" style="padding:.25rem .7rem;font-size:.8rem">Edit</a>';
+}
+
+/**
+ * Trash control for own posts — federates ActivityPub Delete + removes Bluesky mirror(s).
+ */
+function admin_delete_post_button(string $noteId, string $returnView = 'home', string $from = ''): string
+{
+    if ($noteId === '' || !vaak_is_own_url($noteId) || !str_contains($noteId, '/notes/')) {
+        return '';
+    }
+    $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
+    $from = preg_replace('/[^a-z_]/', '', $from) ?: '';
+    $localId = 0;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT local_id FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1'
+        );
+        $st->execute([$noteId, rtrim($noteId, '/') . '/']);
+        $localId = (int) ($st->fetchColumn() ?: 0);
+    } catch (Throwable $e) {
+        return '';
+    }
+    if ($localId <= 0) {
+        return '';
+    }
+    $actionUrl = '?view=' . rawurlencode($returnView);
+    if ($returnView === 'status') {
+        $actionUrl .= '&object=' . rawurlencode($noteId);
+        if ($from !== '') {
+            $actionUrl .= '&from=' . rawurlencode($from);
+        }
+    }
+    return '<form method="post" action="' . h($actionUrl) . '" style="display:inline" '
+        . 'onsubmit="return confirm(\'Delete this post permanently? Remotes and Bluesky mirrors are removed too.\');">'
+        . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+        . '<input type="hidden" name="action" value="delete_status">'
+        . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+        . '<input type="hidden" name="local_id" value="' . $localId . '">'
+        . '<input type="hidden" name="note_id" value="' . h($noteId) . '">'
+        . '<button class="icon-btn" type="submit" title="Delete post" aria-label="Delete post" style="color:var(--danger)">'
+        . '<i class="ph ph-trash" aria-hidden="true"></i></button></form>';
 }
 
 /** Pin / unpin local public posts (Ice Cubes + HTML profile). Max 5. */
@@ -6484,8 +6617,9 @@ function admin_gallery_normalize_media_list(array $items): array
             continue;
         }
         $isVideo = admin_media_is_video($url, $mt);
-        // Gallery stays image-focused; videos remain available inline on posts.
-        if ($isVideo) {
+        // Gallery stays image-focused; VakkTok opts into the same source rows
+        // but keeps only video cells at render time.
+        if ($isVideo && empty($GLOBALS['admin_vakktok_mode'])) {
             continue;
         }
         // Gallery prefers visual media; skip obvious non-image docs
@@ -6517,7 +6651,10 @@ function admin_gallery_item_media(array $item): array
             static fn(string $url): array => ['url' => $url, 'mediaType' => 'image/*', 'is_video' => false],
             ap_bsky_post_image_urls($post)
         );
-        return $images;
+        $videos = function_exists('ap_bsky_post_video_media')
+            ? ap_bsky_post_video_media($post)
+            : [];
+        return array_merge($images, $videos);
     }
     if ($kind === 'outbox') {
         return admin_gallery_media_from_outbox($row);
@@ -6548,6 +6685,22 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
         $objectId = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : '';
         $author = is_array($post['author'] ?? null) ? $post['author'] : [];
         $handle = trim((string) ($author['handle'] ?? ''));
+        // Dual-published posts: open the local VAAK note so Status/thread works.
+        $atUri = trim((string) ($post['uri'] ?? ''));
+        if ($atUri !== '' && function_exists('ap_bsky_local_note_id_for_at_uri')) {
+            $twin = ap_bsky_local_note_id_for_at_uri(
+                $atUri,
+                (int) ($GLOBALS['vaak_owner_id'] ?? 0)
+            );
+            if (is_string($twin) && str_starts_with($twin, 'https://')) {
+                $objectId = rtrim($twin, '/');
+            }
+        }
+        // Bluesky adult/graphic labels → same Gallery blur as fedi sensitive.
+        // Leave spoiler empty so auto_unblur_sensitive can unblur (spoiler always gates).
+        if (function_exists('ap_bsky_post_is_sensitive') && ap_bsky_post_is_sensitive($post)) {
+            $sensitive = true;
+        }
     } elseif ($kind === 'outbox') {
         $objectId = rtrim((string) ($row['id'] ?? ''), '/');
         if ($objectId !== '' && preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/#', $objectId, $m)) {
@@ -6598,6 +6751,146 @@ function admin_render_gallery_cell(array $item, array $followingIds, string $ret
     <?php
 }
 
+/** Render one full-screen, video-only VakkTok item. */
+function admin_vakktok_item_has_video(array $item): bool
+{
+    foreach (admin_gallery_item_media($item) as $media) {
+        if (!empty($media['is_video'])) return true;
+    }
+    return false;
+}
+
+/** VakkTok intentionally omits sensitive/CW media from its autoplay reel. */
+function admin_vakktok_item_is_sensitive(array $item): bool
+{
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if (!empty($row['sensitive']) || trim((string) ($row['spoiler_text'] ?? '')) !== '') {
+        return true;
+    }
+    if (($item['kind'] ?? '') === 'bsky') {
+        $post = is_array($row['post'] ?? null) ? $row['post'] : [];
+        if ($post !== [] && function_exists('ap_bsky_post_is_sensitive') && ap_bsky_post_is_sensitive($post)) {
+            return true;
+        }
+    }
+    if (($item['kind'] ?? '') === 'outbox') {
+        $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+        $obj = is_array($raw['object'] ?? null) ? $raw['object'] : $raw;
+        if (is_array($obj) && (!empty($obj['sensitive']) || trim((string) ($obj['summary'] ?? $obj['contentWarning'] ?? '')) !== '')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function admin_render_vakktok_cell(array $item): void
+{
+    $media = admin_gallery_item_media($item);
+    $video = null;
+    foreach ($media as $candidate) {
+        if (!empty($candidate['is_video'])) {
+            $video = $candidate;
+            break;
+        }
+    }
+    if (!is_array($video) || empty($video['url'])) {
+        return;
+    }
+    $url = (string) $video['url'];
+    $poster = '';
+    try {
+        $st = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
+        $st->execute([$url]);
+        $poster = (string) ($st->fetchColumn() ?: '');
+    } catch (Throwable $e) {
+        // Remote videos may not have a local poster.
+    }
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    echo '<article class="vakktok-item" data-vakktok-video="1">';
+    echo '<video class="vakktok-video" controls loop playsinline preload="metadata" src="' . h($url) . '"';
+    if (str_starts_with($poster, 'https://')) {
+        echo ' poster="' . h($poster) . '"';
+    }
+    echo '></video>';
+    echo '</article>';
+}
+
+/** Media strip inside a quote-block (quoted post attachments). */
+function admin_quote_media_html(array $items): string
+{
+    if ($items === [] || !function_exists('admin_media_row_html')) {
+        return '';
+    }
+    $row = admin_media_row_html($items);
+    if ($row === '') {
+        return '';
+    }
+    return '<div class="quote-media" style="margin-top:.45rem">' . $row . '</div>';
+}
+
+/**
+ * Normalize Mastodon media_attachments / AS2 attachments into admin_media_row_html items.
+ *
+ * @param mixed $attachments
+ * @return list<array{url:string,mediaType:?string,preview_url?:string}>
+ */
+function admin_quote_media_items_from_status_like(mixed $attachments): array
+{
+    if (!is_array($attachments)) {
+        return [];
+    }
+    if (isset($attachments['type']) || isset($attachments['url']) || isset($attachments['preview_url'])) {
+        $attachments = [$attachments];
+    }
+    $items = [];
+    foreach ($attachments as $att) {
+        if (!is_array($att)) {
+            continue;
+        }
+        $url = '';
+        if (is_string($att['url'] ?? null)) {
+            $url = (string) $att['url'];
+        } elseif (is_array($att['url'] ?? null)) {
+            $url = (string) ($att['url']['href'] ?? $att['url']['url'] ?? '');
+        } elseif (is_string($att['preview_url'] ?? null)) {
+            $url = (string) $att['preview_url'];
+        }
+        if (!str_starts_with($url, 'https://')) {
+            continue;
+        }
+        $mt = null;
+        if (isset($att['mediaType']) && is_string($att['mediaType'])) {
+            $mt = (string) $att['mediaType'];
+        } elseif (isset($att['type']) && is_string($att['type'])) {
+            $t = strtolower((string) $att['type']);
+            if (in_array($t, ['video', 'gifv'], true)) {
+                $mt = 'video/mp4';
+            } elseif ($t === 'audio') {
+                $mt = 'audio/*';
+            } elseif ($t === 'image') {
+                $mt = 'image/jpeg';
+            }
+        }
+        $preview = '';
+        if (is_string($att['preview_url'] ?? null) && str_starts_with((string) $att['preview_url'], 'https://')) {
+            $preview = (string) $att['preview_url'];
+        } elseif (is_string($att['preview'] ?? null) && str_starts_with((string) $att['preview'], 'https://')) {
+            $preview = (string) $att['preview'];
+        } elseif (is_string($att['thumbnail'] ?? null) && str_starts_with((string) $att['thumbnail'], 'https://')) {
+            $preview = (string) $att['thumbnail'];
+        }
+        $items[] = [
+            'url' => $url,
+            'mediaType' => $mt,
+            'preview_url' => $preview,
+        ];
+        if (count($items) >= 4) {
+            break;
+        }
+    }
+    return $items;
+}
+
 function admin_media_row_html(array $items, string $hint = ''): string
 {
     if (!$items) {
@@ -6618,7 +6911,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
             if ($mt === null && strtolower((string) ($item['type'] ?? '')) === 'audio') {
                 $mt = 'audio/*';
             }
-            $preview = (string) ($item['preview_url'] ?? $item['poster'] ?? $item['thumbnail'] ?? '');
+            $preview = (string) ($item['preview_url'] ?? $item['poster'] ?? '');
         }
         if ($url === '' || !str_starts_with($url, 'https://')) {
             continue;
@@ -6639,10 +6932,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
         }
         if (admin_media_is_video($url, $mt)) {
             $hasVideo = true;
-            $isHls = (bool) preg_match('/\.m3u8(?:$|[?#])/i', $url)
-                || in_array(strtolower(trim((string) $mt)), ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true);
-            $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($url) . '"';
-            $cells[] = '<video class="media-video"' . $sourceAttr . ' controls loop playsinline preload="none"'
+            $cells[] = '<video class="media-video" src="' . h($url) . '" controls loop playsinline preload="none"'
                 . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
@@ -7365,6 +7655,51 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
     return $out;
 }
 
+/** Viewer preference: highlight anti-AI posters (request-memoized). */
+function admin_viewer_anti_ai_enabled(): bool
+{
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    $key = function_exists('vaak_actor_key') ? (string) vaak_actor_key() : 'cmdr_nova';
+    $p = function_exists('ap_profile_get') ? ap_profile_get($key) : [];
+    $cached = !empty($p['anti_ai_marker']);
+    return $cached;
+}
+
+/** Cheap heuristic: current post text contains slop/clanker (etc.). */
+function admin_text_looks_anti_ai(string $text): bool
+{
+    return function_exists('ap_text_looks_anti_ai')
+        ? ap_text_looks_anti_ai($text)
+        : ($text !== '' && (bool) preg_match('/\b(?:slop|clankers?)\b/iu', $text));
+}
+
+/**
+ * Small timeline tag when viewer opted in and either:
+ * - this actor is marked from cached posts (≥3 slang hits), or
+ * - this specific post matches the heuristic (early signal before mark).
+ */
+function admin_anti_ai_tag_html(string $text, ?string $actorId = null): string
+{
+    if (!admin_viewer_anti_ai_enabled()) {
+        return '';
+    }
+    $actorId = $actorId !== null ? rtrim(trim($actorId), '/') : '';
+    $marked = $actorId !== ''
+        && function_exists('ap_anti_ai_actor_is_marked')
+        && ap_anti_ai_actor_is_marked($actorId);
+    $thisPost = admin_text_looks_anti_ai($text);
+    if (!$marked && !$thisPost) {
+        return '';
+    }
+    $title = $marked
+        ? 'Marked anti-AI from cached posts (3+ uses of slop/clanker/etc.)'
+        : 'Uses anti-AI slang in this post';
+    return '<span class="tag" style="margin-left:.35rem" title="' . h($title) . '">anti-ai</span>';
+}
+
 /**
  * Wrap post body + media + quotes + link cards so long posts can fold as one unit.
  */
@@ -7636,6 +7971,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <?php if ($isOtherLocal): ?>
                     <span class="tag" title="Posted by another account on this instance">local</span>
                   <?php endif; ?>
+                  <?= admin_anti_ai_tag_html($summaryRaw, $aid !== '' ? $aid : null) ?>
                 </div>
                 <div class="meta">
                   <?= h((string) $e['host']) ?>
@@ -7733,11 +8069,18 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                               . admin_linkify_body_html(mb_substr((string) $quotedBsky['text'], 0, 400), $returnView, [])
                               . '</div>';
                       }
+                      $qMediaEv = admin_quote_media_items_from_status_like($quotedStatus['media_attachments'] ?? []);
+                      if ($qMediaEv === [] && is_array($quotedBsky) && !empty($quotedBsky['media']) && is_array($quotedBsky['media'])) {
+                          $qMediaEv = $quotedBsky['media'];
+                      }
+                      if ($qMediaEv !== []) {
+                          $bodyChunk .= admin_quote_media_html($qMediaEv);
+                      }
                       if ($quotedStatusUrl !== '') {
                           $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
                               . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted</a></div>';
                       }
-                  } elseif (is_array($quotedBsky) && (trim((string) ($quotedBsky['text'] ?? '')) !== '' || ($quotedBsky['handle'] ?? '') !== '')) {
+                  } elseif (is_array($quotedBsky) && (trim((string) ($quotedBsky['text'] ?? '')) !== '' || ($quotedBsky['handle'] ?? '') !== '' || !empty($quotedBsky['media']))) {
                       $qAcct = ($quotedBsky['handle'] ?? '') !== '' ? (string) $quotedBsky['handle'] : '';
                       if ($qAcct !== '') {
                           $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qAcct) . '</div>';
@@ -7747,6 +8090,9 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                           $bodyChunk .= '<div style="margin-top:.25rem">'
                               . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView, [])
                               . '</div>';
+                      }
+                      if (!empty($quotedBsky['media']) && is_array($quotedBsky['media'])) {
+                          $bodyChunk .= admin_quote_media_html($quotedBsky['media']);
                       }
                       $qOpen = (string) ($quotedBsky['url'] ?? $quotedStatusUrl);
                       if ($qOpen !== '' && $qOpen !== 'https://bsky.app/') {
@@ -7792,6 +8138,14 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $evMentionSeed = admin_reply_mention_seed($aid, null, is_array($eventMentions ?? null) ? $eventMentions : []);
                 ?>
                 <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?><?= admin_reply_mention_query($evMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <?php if ($aid !== '' && !$alreadyFollowing): ?>
+                  <form method="post" action="?view=following" style="display:inline">
+                    <input type="hidden" name="action" value="follow_remote">
+                    <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                    <input type="hidden" name="actor_id" value="<?= h($aid) ?>">
+                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
+                  </form>
+                <?php endif; ?>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -7920,7 +8274,7 @@ function admin_global_domain_control(string $host): ?array
 }
 
 /** Permission-aware actor actions used by posts, profiles, and DMs. */
-function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = '', string $extraMenuHtml = ''): string
+function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = ''): string
 {
     $html = '';
     $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
@@ -7966,7 +8320,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         if ($localId > 0) {
             $menu .= admin_edit_post_button($objectId, '', '', false, $returnView);
             $menu .= admin_pin_post_button($objectId, $returnView, $returnFrom);
-            $menu .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Delete this post permanently?\');">'
+            $menu .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Delete this post permanently? Remotes and Bluesky mirrors are removed too.\');">'
                 . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
                 . '<input type="hidden" name="action" value="delete_status">'
                 . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
@@ -7979,9 +8333,6 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
         $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">'
             . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
-    }
-    if ($extraMenuHtml !== '') {
-        $menu .= $extraMenuHtml;
     }
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
@@ -8175,7 +8526,7 @@ function admin_actor_avatar_url(?string $actorId): string
     return $remoteFallback;
 }
 
-function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $profileHover = true): string
+function admin_avatar_img(?string $actorId, string $class = 'tweet-av'): string
 {
     try {
         $url = admin_actor_avatar_url($actorId);
@@ -8185,167 +8536,19 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $pr
             ? AP_REMOTE_AVATAR_FALLBACK
             : 'https://mkultra.monster/img/avatar/default.jpg';
     }
+    try {
+        $alt = actor_handle($actorId);
+    } catch (Throwable $e) {
+        $alt = '';
+    }
     $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
         ? AP_REMOTE_AVATAR_FALLBACK
         : 'https://mkultra.monster/img/avatar/default.jpg';
     // onerror → default so a stale/broken R2 URL never shows a cracked icon
-    $hover = $profileHover && is_string($actorId) && str_starts_with(strtolower(trim($actorId)), 'https://')
-        ? ' data-profile-hover-actor="' . h(rtrim(trim($actorId), '/')) . '"'
-        : '';
     return '<img class="' . h($class) . '" src="' . h($url) . '" alt="" width="40" height="40" '
-        . $hover
         . 'loading="lazy" decoding="async" referrerpolicy="no-referrer" '
-        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
-}
-
-/** Cache-only hover data; remote profile warming is always dispatched in the background. */
-function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $ownerActorId): array
-{
-    $actorId = rtrim(trim($actorId), '/');
-    if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
-        return ['ok' => false, 'error' => 'Invalid profile'];
-    }
-    $profileUrl = '?view=remote_profile&actor=' . rawurlencode($actorId) . '&from=home';
-    $own = function_exists('vaak_is_own_url') && vaak_is_own_url($actorId);
-    $platform = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actorId) ? 'bluesky' : 'fediverse';
-    $display = '';
-    $handle = '';
-    $avatar = '';
-    $bio = '';
-    $following = false;
-    $followsYou = false;
-    $loading = false;
-    $canFollow = !$own;
-
-    if ($platform === 'bluesky') {
-        $cached = function_exists('ap_bsky_actor_profile_cache_get')
-            ? ap_bsky_actor_profile_cache_get($actorId, $ownerUserId)
-            : null;
-        if (function_exists('ap_bsky_actor_refresh_enqueue')) {
-            ap_bsky_actor_refresh_enqueue($ownerUserId, $actorId);
-        }
-        if (function_exists('ap_bsky_follow_sync_enqueue')) {
-            ap_bsky_follow_sync_enqueue($ownerUserId);
-        }
-        $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
-        $did = trim((string) ($profile['did'] ?? $cached['did'] ?? ''));
-        $handle = trim((string) ($profile['handle'] ?? ''));
-        $display = trim((string) ($profile['displayName'] ?? '')) ?: ($handle !== '' ? '@' . $handle : 'Bluesky user');
-        $avatar = is_string($profile['avatar'] ?? null) ? (string) $profile['avatar'] : '';
-        $bio = is_string($profile['description'] ?? null) ? $profile['description'] : '';
-        $viewer = is_array($cached['viewer'] ?? null) ? $cached['viewer'] : null;
-        $following = $viewer !== null
-            ? (is_string($viewer['following'] ?? null) && $viewer['following'] !== '')
-            : ($did !== '' && function_exists('ap_bsky_graph_sync_get')
-                && is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', $did)));
-        $followsYou = !empty($viewer['followedBy']);
-        $loading = !is_array($cached) || $profile === [];
-        $connected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($ownerUserId));
-        $canFollow = !$own && $connected;
-        if ($did !== '') {
-            $profileUrl = '?view=remote_profile&actor=' . rawurlencode('https://bsky.app/profile/' . $did) . '&from=home';
-        }
-    } elseif (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#i', $actorId, $m)
-        && function_exists('ap_local_user_by_actor_id')
-        && is_array($localUser = ap_local_user_by_actor_id($actorId))) {
-        $key = (string) ($localUser['actor_key'] ?? rawurldecode($m[1]));
-        $profile = function_exists('ap_profile_get') ? ap_profile_get($key) : [];
-        $display = trim((string) ($profile['name'] ?? '')) ?: $key;
-        $handle = '@' . $key . '@mkultra.monster';
-        $avatar = (string) ($profile['icon_url'] ?? '');
-        $bioRaw = (string) ($profile['summary'] ?? '');
-        $bio = function_exists('ap_html_to_plain_text')
-            ? ap_html_to_plain_text($bioRaw)
-            : trim(html_entity_decode(strip_tags($bioRaw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    } else {
-        $row = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
-        $summary = is_array($row) && is_string($row['summary'] ?? null) ? (string) $row['summary'] : null;
-        if (!is_array($row) || $summary === null) {
-            if (function_exists('ap_remote_actor_warm_async')) ap_remote_actor_warm_async($actorId);
-            $loading = true;
-        } elseif ((strtotime((string) ($row['updated_at'] ?? '')) ?: 0) < time() - 12 * 3600) {
-            if (function_exists('ap_remote_actor_warm_async')) ap_remote_actor_warm_async($actorId);
-            $loading = true;
-        }
-        $display = is_array($row) ? trim((string) ($row['display_name'] ?? '')) : '';
-        $handle = function_exists('actor_handle') ? actor_handle($actorId, is_array($row) ? ($row['username'] ?? null) : null) : '';
-        $avatar = is_array($row) ? (string) ($row['icon_source_url'] ?? '') : '';
-        if ($summary !== null && $summary !== '') {
-            $bio = function_exists('ap_html_to_plain_text')
-                ? ap_html_to_plain_text($summary)
-                : trim(html_entity_decode(strip_tags($summary), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        }
-    }
-
-    if ($platform !== 'bluesky') {
-        $followingRows = function_exists('ap_following_list') ? ap_following_list($ownerActorId) : [];
-        $followerRows = function_exists('ap_followers_list') ? ap_followers_list($ownerActorId) : [];
-        $followingMap = $followerMap = [];
-        foreach ($followingRows as $row) {
-            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($id !== '') { $followingMap[$id] = true; $followingMap[$id . '/'] = true; }
-        }
-        foreach ($followerRows as $row) {
-            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($id !== '') { $followerMap[$id] = true; $followerMap[$id . '/'] = true; }
-        }
-        $following = function_exists('admin_is_following') && admin_is_following($followingMap, $actorId);
-        $followsYou = function_exists('admin_is_following') && admin_is_following($followerMap, $actorId);
-    }
-
-    $bio = preg_replace('/\s+/u', ' ', trim($bio)) ?? trim($bio);
-    $bio = mb_substr($bio, 0, 500);
-    $avatar = function_exists('ap_profile_sanitize_https_url')
-        ? (ap_profile_sanitize_https_url($avatar) ?? '')
-        : (str_starts_with($avatar, 'https://') ? $avatar : '');
-    if ($display === '') $display = $handle !== '' ? $handle : 'Account';
-    return [
-        'ok' => true,
-        'loading' => $loading,
-        'actor' => $actorId,
-        'profile_url' => $profileUrl,
-        'platform' => $platform,
-        'display_name' => $display,
-        'handle' => $handle,
-        'avatar' => $avatar,
-        'bio' => $bio,
-        'following' => $following,
-        'follows_you' => $followsYou,
-        'own' => $own,
-        'can_follow' => $canFollow,
-    ];
-}
-
-/** Cache-only Bluesky member presentation; profile hydration is queued, never fetched inline. */
-function admin_list_member_presentation(array $member, int $ownerUserId, int &$warmBudget): array
-{
-    $did = trim((string) ($member['bsky_did'] ?? ''));
-    if (str_starts_with($did, 'did:')) {
-        $cached = function_exists('ap_bsky_actor_profile_cache_get')
-            ? ap_bsky_actor_profile_cache_get($did, $ownerUserId)
-            : null;
-        $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
-        if ($warmBudget > 0 && function_exists('ap_bsky_actor_refresh_enqueue')) {
-            ap_bsky_actor_refresh_enqueue($ownerUserId, $did);
-            $warmBudget--;
-        }
-        $handle = trim((string) ($profile['handle'] ?? ''));
-        $name = trim((string) ($profile['displayName'] ?? '')) ?: ($handle !== '' ? '@' . $handle : 'Bluesky user');
-        $href = 'https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did);
-        $avatar = function_exists('ap_profile_sanitize_https_url')
-            ? ap_profile_sanitize_https_url((string) ($profile['avatar'] ?? ''))
-            : null;
-        $fallback = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : 'https://mkultra.monster/img/avatar/default.jpg';
-        $img = '<img class="tweet-av" src="' . h($avatar ?? $fallback) . '" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
-        return ['avatar' => $img, 'name' => h($name), 'handle' => h($handle !== '' ? '@' . $handle : 'Bluesky'), 'href' => $href];
-    }
-    $actorId = trim((string) ($member['actor_id'] ?? ''));
-    return [
-        'avatar' => admin_avatar_img($actorId !== '' ? $actorId : null),
-        'name' => actor_display_name_html($actorId !== '' ? $actorId : null),
-        'handle' => h(actor_handle($actorId !== '' ? $actorId : null)),
-        'href' => $actorId !== '' ? '?view=remote_profile&actor=' . rawurlencode($actorId) : '',
-    ];
+        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'" '
+        . 'title="' . h($alt) . '">';
 }
 
 function actor_handle(?string $actorId, ?string $username = null, bool $allowFetch = false): string
@@ -8811,12 +9014,52 @@ function admin_render_masto_status_card(
             $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
                 . admin_linkify_body_html(mb_substr($qplain, 0, 400), $returnView, $qMentions) . '</div>';
         }
+        $qMediaItems = admin_quote_media_items_from_status_like($qst['media_attachments'] ?? []);
+        if ($qMediaItems !== []) {
+            $bodyInner .= admin_quote_media_html($qMediaItems);
+        }
         if ($quri !== '') {
             $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="' . h(admin_status_href($quri, $returnView)) . '">Open quoted</a></div>';
         }
         $bodyInner .= '</div>';
     } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
-        $bodyInner .= '<div class="quote-block meta">Quoted post (not cached yet)</div>';
+        // Last-chance Bluesky hydrate for Status cards when masto entity stayed pending.
+        $pendingUrl = '';
+        if (!empty($st['quote_url']) && is_string($st['quote_url'])) {
+            $pendingUrl = (string) $st['quote_url'];
+        }
+        $bskyPending = null;
+        if ($pendingUrl !== '' && function_exists('ap_quote_target_is_bluesky')
+            && ap_quote_target_is_bluesky($pendingUrl) && function_exists('ap_bsky_post_preview_from_url')) {
+            $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+            $bskyPending = ap_bsky_post_preview_from_url($pendingUrl, $ownerForBsky, true);
+        }
+        if (is_array($bskyPending) && (trim((string) ($bskyPending['text'] ?? '')) !== ''
+            || trim((string) ($bskyPending['handle'] ?? '')) !== '')) {
+            $qAcct = trim((string) (($bskyPending['handle'] ?? '') !== ''
+                ? ('@' . $bskyPending['handle'])
+                : ($bskyPending['display'] ?? 'Quoted')));
+            $qText = trim((string) ($bskyPending['text'] ?? ''));
+            $qOpen = (string) ($bskyPending['url'] ?? $pendingUrl);
+            if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($qOpen, 'https://bsky.app/')) {
+                $qOpen = ap_bsky_normalize_web_url($qOpen);
+            }
+            $bodyInner .= '<div class="quote-block"><span class="qt-label">' . h($qAcct) . '</span>';
+            if ($qText !== '') {
+                $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
+                    . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView) . '</div>';
+            }
+            if (!empty($bskyPending['media']) && is_array($bskyPending['media'])) {
+                $bodyInner .= admin_quote_media_html($bskyPending['media']);
+            }
+            if ($qOpen !== '' && $qOpen !== 'https://bsky.app/') {
+                $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="'
+                    . h($qOpen) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
+            }
+            $bodyInner .= '</div>';
+        } else {
+            $bodyInner .= '<div class="quote-block meta">Quoted post (not cached yet)</div>';
+        }
     }
     if ($media) {
         $bodyInner .= admin_media_row_html($media);
@@ -8870,6 +9113,7 @@ function admin_render_masto_status_card(
                     <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                   <?php endif; ?>
                   <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
+                  <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                 </div>
                 <?php if ($stVis['key'] !== 'public'): ?>
                   <div class="meta"><span class="tag" title="Audience"><?= h($stVis['label']) ?></span></div>
@@ -8920,6 +9164,11 @@ function admin_render_masto_status_card(
                     $focused ? 'status' : ($returnView === 'status' ? 'home' : $returnView),
                     $focused ? $returnView : ''
                 ) ?>
+                <?= admin_delete_post_button(
+                    $uri,
+                    $focused ? 'status' : ($returnView === 'status' ? 'home' : $returnView),
+                    $focused ? $returnView : ''
+                ) ?>
               <?php endif; ?>
               <?php if ($uri !== ''): ?>
                 <?php
@@ -8962,6 +9211,14 @@ function admin_render_masto_status_card(
                   <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                   <input type="hidden" name="object_id" value="<?= h($uri) ?>">
                   <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                </form>
+              <?php endif; ?>
+              <?php if ($actorRef !== '' && !$following && !$isLocal): ?>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="action" value="follow_remote">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="actor_id" value="<?= h($actorRef) ?>">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
                 </form>
               <?php endif; ?>
               <?php if ($uri !== ''): ?>
@@ -9203,6 +9460,14 @@ function admin_render_remote_boost_card(
               echo admin_cw_gate_html($boostSpoiler, $boostSensitive, $boostInner);
             ?>
             <div class="tweet-actions">
+              <?php if ($origActor !== '' && !$alreadyFollowing && !vaak_is_own_url($origActor)): ?>
+                <form method="post" action="?view=following" style="display:inline">
+                  <input type="hidden" name="action" value="follow_remote">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="actor_id" value="<?= h($origActor) ?>">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
+                </form>
+              <?php endif; ?>
               <?php if ($canReply): ?>
                 <?php
                   $boostExtraMentions = [];
@@ -9358,6 +9623,14 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
                 <a href="<?= h(admin_remote_object_href($objectId)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
               <?php endif; ?>
+              <?php if ($targetActor !== '' && !$alreadyFollowing): ?>
+                <form method="post" action="?view=following" style="display:inline">
+                  <input type="hidden" name="action" value="follow_remote">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="actor_id" value="<?= h($targetActor) ?>">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
+                </form>
+              <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
@@ -9488,6 +9761,26 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 }
             }
 
+            $bskyQuotePrev = null;
+            // Always hydrate Bluesky quote targets via AppView (don't require empty $plain first).
+            // Also rewrites encoded-DID open URLs (did%3Aplc%3A…) to handle form when possible.
+            if (!$tomb && is_string($qUrl) && $qUrl !== ''
+                && (str_starts_with($qUrl, 'https://bsky.app/') || str_starts_with($qUrl, 'at://') || str_contains($qUrl, 'bsky.brid.gy'))
+                && function_exists('ap_bsky_post_preview_from_url')) {
+                $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+                $bskyQuotePrev = ap_bsky_post_preview_from_url($qUrl, $ownerForBsky, true);
+                if (is_array($bskyQuotePrev)) {
+                    if (trim((string) ($bskyQuotePrev['text'] ?? '')) !== '') {
+                        $plain = trim((string) $bskyQuotePrev['text']);
+                    }
+                    if (!empty($bskyQuotePrev['url'])) {
+                        $qUrl = (string) $bskyQuotePrev['url'];
+                    }
+                }
+            } elseif (is_string($qUrl) && $qUrl !== '' && function_exists('ap_bsky_normalize_web_url')
+                && str_starts_with($qUrl, 'https://bsky.app/')) {
+                $qUrl = ap_bsky_normalize_web_url($qUrl);
+            }
             if ($plain === '' && !$tomb && is_string($qUrl) && $qUrl !== '') {
                 if (vaak_is_own_url($qUrl) && str_contains($qUrl, '/notes/')
                     && function_exists('ap_local_note_as2_doc')) {
@@ -9519,12 +9812,13 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 // Never sync-fetch quoted remotes on timeline paint — that stalls
                 // Federated tab swaps for seconds. Local/event cache above is enough;
                 // remaining quotes render as a link stub (same idea as boost hydrate).
-                if ($plain === '' && $qDoc === null) {
+                if ($plain === '' && $qDoc === null && empty($bskyQuotePrev)) {
                     $quoteFetchBudget = &$GLOBALS['admin_quote_fetch_budget'];
                     if (!isset($quoteFetchBudget) || !is_int($quoteFetchBudget)) {
                         $quoteFetchBudget = 0;
                     }
-                    if ($quoteFetchBudget > 0 && function_exists('ap_fetch_as2_object')) {
+                    if ($quoteFetchBudget > 0 && function_exists('ap_fetch_as2_object')
+                        && !(is_string($qUrl) && (str_starts_with($qUrl, 'https://bsky.app/') || str_starts_with($qUrl, 'at://')))) {
                         $quoteFetchBudget--;
                         $qDoc = ap_fetch_as2_object($qUrl);
                     }
@@ -9540,20 +9834,47 @@ function admin_render_outbox_card(array $n, string $returnView): void
             if ($plain !== '' && function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
                 $plain = '';
             }
-            if ($qUrl || $tomb || $plain !== '') {
+            if ($qUrl || $tomb || $plain !== '' || !empty($bskyQuotePrev)) {
                 $quoteHtml = '<div class="quote-block"><span class="qt-label">Quoted</span><br>';
-                if ($tomb || ($plain === '' && !$qUrl)) {
+                if (is_array($bskyQuotePrev ?? null)) {
+                    $qAcct = trim((string) (($bskyQuotePrev['display'] ?? '') !== '' ? $bskyQuotePrev['display'] : ($bskyQuotePrev['handle'] ?? '')));
+                    if ($qAcct !== '') {
+                        $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
+                    }
+                    if ($plain !== '') {
+                        if (mb_strlen($plain) > 280) {
+                            $plain = mb_substr($plain, 0, 277) . '…';
+                        }
+                        $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">' . h($plain) . '</div>';
+                    }
+                    if (!empty($bskyQuotePrev['media']) && is_array($bskyQuotePrev['media'])) {
+                        $quoteHtml .= admin_quote_media_html($bskyQuotePrev['media']);
+                    }
+                } elseif ($tomb || ($plain === '' && !$qUrl)) {
                     $quoteHtml .= '(quoted post unavailable)';
                 } elseif ($plain !== '') {
                     if (mb_strlen($plain) > 280) {
                         $plain = mb_substr($plain, 0, 277) . '…';
                     }
                     $quoteHtml .= h($plain);
+                    if (is_array($qDoc ?? null)) {
+                        $qAttMedia = admin_quote_media_items_from_status_like($qDoc['attachment'] ?? []);
+                        if ($qAttMedia !== []) {
+                            $quoteHtml .= admin_quote_media_html($qAttMedia);
+                        }
+                    }
                 } else {
                     $quoteHtml .= '<span class="mono">' . h((string) $qUrl) . '</span>';
                 }
-                if (is_string($qUrl) && $qUrl !== '') {
-                    $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($qUrl) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
+                $openUrl = is_array($bskyQuotePrev ?? null) && !empty($bskyQuotePrev['url'])
+                    ? (string) $bskyQuotePrev['url']
+                    : (is_string($qUrl) ? $qUrl : '');
+                if ($openUrl !== '' && function_exists('ap_bsky_normalize_web_url')
+                    && str_starts_with($openUrl, 'https://bsky.app/')) {
+                    $openUrl = ap_bsky_normalize_web_url($openUrl);
+                }
+                if ($openUrl !== '') {
+                    $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($openUrl) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
                 }
                 $quoteHtml .= '</div>';
             }
@@ -9630,6 +9951,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   <?php if ($ownPinned): ?>
                     <span class="tag" style="margin-left:.35rem" title="Pinned on profile">pinned</span>
                   <?php endif; ?>
+                  <?= admin_anti_ai_tag_html($bodyPlain, $actor !== '' ? $actor : null) ?>
                 </div>
                 <div class="meta">mkultra.monster<?php if ($ownVisMeta['key'] !== 'public'): ?> <span class="tag" title="Audience"><?= h($ownVisLabel) ?></span><?php endif; ?></div>
               </div>
@@ -9676,6 +9998,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                   ?>
                   <?= admin_edit_post_button($noteId, $editPlain, $editSpoiler, $editSensitive, $returnView) ?>
                   <?= admin_pin_post_button($noteId, $returnView) ?>
+                  <?= admin_delete_post_button($noteId, $returnView) ?>
                   <?php if ($ownVisMeta['key'] !== 'private'): ?>
                     <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($noteId) ?><?= $ownQuoteStatusId !== '' ? '&amp;quote_status_id=' . urlencode($ownQuoteStatusId) : '' ?>" title="Quote your post" aria-label="Quote your post"><i class="ph ph-quotes" aria-hidden="true"></i></a>
                   <?php endif; ?>
@@ -9689,6 +10012,65 @@ function admin_render_outbox_card(array $n, string $returnView): void
 }
 
 /**
+ * True when a Status Open URL is Bluesky / ATProto (not ActivityPub).
+ */
+function admin_object_url_is_bluesky(string $url): bool
+{
+    $url = trim($url);
+    if ($url === '') {
+        return false;
+    }
+    if (str_starts_with($url, 'at://') || str_starts_with($url, 'https://bsky.app/')) {
+        return true;
+    }
+    if (str_contains($url, 'bsky.brid.gy')) {
+        return true;
+    }
+    return function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($url);
+}
+
+/**
+ * Resolve a Bluesky web/AT URL into a feed item for Status Open.
+ *
+ * @return array{post:array<string,mixed>,reason?:array}|null
+ */
+function admin_load_bsky_status_item(string $objectUrl, int $ownerUserId = 0): ?array
+{
+    $objectUrl = trim($objectUrl);
+    if ($objectUrl === '' || !function_exists('ap_bsky_at_uri_from_any_url')) {
+        return null;
+    }
+    $at = ap_bsky_at_uri_from_any_url($objectUrl);
+    if ($at === null && str_starts_with($objectUrl, 'at://')) {
+        $at = $objectUrl;
+    }
+    if ($at === null || !str_starts_with($at, 'at://')) {
+        return null;
+    }
+    if (function_exists('ap_bsky_post_item_by_uri')) {
+        $item = ap_bsky_post_item_by_uri($at);
+        if (is_array($item) && is_array($item['post'] ?? null)) {
+            return $item;
+        }
+    }
+    // Warm cache via public AppView, then re-read.
+    if (function_exists('ap_bsky_post_preview_from_url')) {
+        try {
+            ap_bsky_post_preview_from_url($objectUrl, $ownerUserId, true);
+        } catch (Throwable $e) {
+            // ignore
+        }
+        if (function_exists('ap_bsky_post_item_by_uri')) {
+            $item = ap_bsky_post_item_by_uri($at);
+            if (is_array($item) && is_array($item['post'] ?? null)) {
+                return $item;
+            }
+        }
+    }
+    return null;
+}
+
+/**
  * Stable VAAK bookmark key for a Bluesky AT-URI (local twin snowflake when mapped).
  *
  * @return array{status_id:string,object_id:string}
@@ -9698,12 +10080,8 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
     $atUri = trim($atUri);
     $objectId = $atUri;
     $statusId = '';
-    if ($atUri !== '' && function_exists('ap_bsky_crosspost_by_uri')) {
-        // Render-time bookmark key lookup must remain cache/DB-only. The more
-        // general local-note resolver can fall back to an XRPC getRecord call,
-        // which made folder pages issue one network request per cached bookmark.
-        $crosspost = ap_bsky_crosspost_by_uri($atUri);
-        $noteId = is_array($crosspost) ? trim((string) ($crosspost['note_id'] ?? '')) : '';
+    if ($atUri !== '' && function_exists('ap_bsky_local_note_id_for_at_uri')) {
+        $noteId = ap_bsky_local_note_id_for_at_uri($atUri, $ownerUserId);
         if (is_string($noteId) && $noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
             $st = ap_masto_status_by_note_id($noteId);
             if (is_array($st) && !empty($st['local_id'])) {
@@ -9732,7 +10110,7 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
  * @param array<string,mixed> $item
  * @param string $context 'bluesky' (tab) or 'home' (mixed Home feed — federated card chrome)
  */
-function admin_render_bsky_feed_item(array $item, string $feedKey = 'following', string $context = 'bluesky', int $contextId = 0): void
+function admin_render_bsky_feed_item(array $item, string $feedKey = 'following', string $context = 'bluesky'): void
 {
     $post = is_array($item['post'] ?? null) ? $item['post'] : null;
     if ($post === null) {
@@ -9747,11 +10125,6 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $av = (string) ($author['avatar'] ?? '');
     $text = function_exists('ap_bsky_post_text') ? ap_bsky_post_text($post) : '';
     $imgs = function_exists('ap_bsky_post_image_urls') ? ap_bsky_post_image_urls($post) : [];
-    $videos = function_exists('ap_bsky_post_video_media') ? ap_bsky_post_video_media($post) : [];
-    // The cached Bluesky AppView embed contains an HLS playlist and thumbnail.
-    // Feed cards (including bookmarks) share this renderer, so use that data
-    // directly rather than adding a per-card fetch or another cache path.
-    $mediaItems = array_merge($imgs, $videos);
     $external = function_exists('ap_bsky_post_external') ? ap_bsky_post_external($post) : null;
     $openUrl = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : 'https://bsky.app/';
     $created = (string) ($post['indexedAt'] ?? ($post['record']['createdAt'] ?? ''));
@@ -9763,9 +10136,6 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $liked = $likeRecord !== '';
     $reposted = $repostRecord !== '';
     $bookmarked = !empty($viewer['bookmarked']) || !empty($viewer['bookmark']);
-    // The Bookmarks view itself is authoritative even when an older cached
-    // AppView projection omitted viewer.bookmarked.
-    if ($context === 'bookmarks') $bookmarked = true;
     $reason = is_array($item['reason'] ?? null) ? $item['reason'] : null;
     $reasonLabel = '';
     $isRepost = false;
@@ -9794,13 +10164,17 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $quote = function_exists('ap_bsky_quote_preview') ? ap_bsky_quote_preview($post) : null;
     $isQuoteBoost = $quote !== null && $text === '' && !$isRepost;
     // Prefer DID-form bsky.app URLs so compose → crosspost can resolve at:// without
-    // a handle lookup (handle-form https://bsky.app/profile/{handle}/post/… often failed).
+    // a handle lookup. Keep did:plc:… colons literal — did%3Aplc%3A… 404s on bsky.app.
     $replyTarget = $openUrl !== '' ? $openUrl : $uri;
+    if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($replyTarget, 'https://bsky.app/')) {
+        $replyTarget = ap_bsky_normalize_web_url($replyTarget);
+    }
     $authorDid = (string) ($author['did'] ?? '');
     if ($uri !== '' && preg_match('#/app\.bsky\.feed\.post/([^/\s]+)$#', $uri, $rm)
         && str_starts_with($authorDid, 'did:')) {
-        $replyTarget = 'https://bsky.app/profile/' . rawurlencode($authorDid)
-            . '/post/' . rawurlencode($rm[1]);
+        $replyTarget = function_exists('ap_bsky_https_url_from_at_uri')
+            ? ap_bsky_https_url_from_at_uri($uri, null)
+            : ('https://bsky.app/profile/' . $authorDid . '/post/' . $rm[1]);
     }
 
     // Build nested blocks as compact strings (same as fedi cards). Template
@@ -9841,6 +10215,9 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
                 . admin_linkify_body_html(mb_substr($qTextLink, 0, 400), 'bluesky')
                 . '</div>';
         }
+        if (!empty($quote['media']) && is_array($quote['media'])) {
+            $quoteHtml .= admin_quote_media_html($quote['media']);
+        }
         $qUrl = (string) ($quote['url'] ?? '');
         if ($qUrl !== '' && $qUrl !== 'https://bsky.app/') {
             $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="'
@@ -9850,21 +10227,31 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     }
 
     // Same lightbox triggers as federated cards (not raw <a target=_blank>).
-    $mediaHtml = $mediaItems !== [] ? admin_media_row_html($mediaItems) : '';
+    $mediaHtml = $imgs !== [] ? admin_media_row_html($imgs) : '';
+    // Adult/graphic Bluesky labels → same CW gate + auto_unblur_sensitive as fedi.
+    if ($mediaHtml !== '' && function_exists('ap_bsky_post_is_sensitive') && ap_bsky_post_is_sensitive($post)
+        && function_exists('admin_cw_gate_html')) {
+        $mediaHtml = admin_cw_gate_html('', true, $mediaHtml);
+    }
     $linkCardHtml = '';
     if (is_array($external) && function_exists('ap_bsky_external_link_card_html')) {
         $linkCardHtml = ap_bsky_external_link_card_html($external);
     }
-    $isHome = in_array($context, ['home', 'list'], true);
-    $linkView = $context === 'list' ? 'lists' : ($isHome ? 'home' : (in_array($context, ['search', 'bookmarks'], true) ? $context : 'bluesky'));
-    $contextQuery = ($context === 'list' && $contextId > 0) ? '&amp;id=' . $contextId . '&amp;timeline=1' : '';
+    $isHome = ($context === 'home');
+    $linkView = $isHome ? 'home' : 'bluesky';
     // Stay on the current surface (Home mix vs Bluesky tab). reply_to / quote_object
     // still carry the bsky.app target so dual-publish / AT reply keep working.
     $composeView = $linkView;
     $authorDid = (string) ($author['did'] ?? '');
     $authorProfileUrl = $authorDid !== ''
-        ? ('https://bsky.app/profile/' . rawurlencode($authorDid))
-        : ($handle !== '' ? ('https://bsky.app/profile/' . rawurlencode($handle)) : '');
+        ? (function_exists('ap_bsky_actor_profile_url')
+            ? ap_bsky_actor_profile_url($authorDid)
+            : ('https://bsky.app/profile/' . $authorDid))
+        : ($handle !== ''
+            ? (function_exists('ap_bsky_actor_profile_url')
+                ? ap_bsky_actor_profile_url($handle)
+                : ('https://bsky.app/profile/' . rawurlencode($handle)))
+            : '');
     $authorProfileHref = $authorProfileUrl !== ''
         ? ('?view=remote_profile&actor=' . rawurlencode($authorProfileUrl) . '&from=' . rawurlencode($linkView))
         : '';
@@ -9889,9 +10276,15 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
             if ($qAcct !== '') {
                 $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
             }
-            $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
-                . admin_linkify_body_html(mb_substr((string) $quote['text'], 0, 400), $linkView)
-                . '</div>';
+            $qTextHome = trim((string) ($quote['text'] ?? ''));
+            if ($qTextHome !== '') {
+                $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
+                    . admin_linkify_body_html(mb_substr($qTextHome, 0, 400), $linkView)
+                    . '</div>';
+            }
+            if (!empty($quote['media']) && is_array($quote['media'])) {
+                $quoteHtml .= admin_quote_media_html($quote['media']);
+            }
             $qUrl = (string) ($quote['url'] ?? '');
             if ($qUrl !== '' && $qUrl !== 'https://bsky.app/') {
                 $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="'
@@ -9912,10 +10305,10 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         <?php if ($av !== ''): ?>
           <?php if ($authorProfileHref !== ''): ?>
             <a href="<?= h($authorProfileHref) ?>" style="text-decoration:none">
-              <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-profile-hover-actor="<?= h($authorProfileUrl) ?>">
+              <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer">
             </a>
           <?php else: ?>
-            <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-profile-hover-actor="<?= h($authorProfileUrl) ?>">
+            <img class="tweet-av" src="<?= h($av) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer">
           <?php endif; ?>
         <?php endif; ?>
         <div class="tweet-hd-main">
@@ -9936,6 +10329,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
               <span class="meta"> · <?= h(relative_time($created)) ?></span>
             <?php endif; ?>
             <span class="tag" title="From Bluesky">Bluesky</span>
+            <?= admin_anti_ai_tag_html($text, $authorDid !== '' ? $authorDid : null) ?>
             <?php if ($quote !== null): ?>
               <span class="tag" title="<?= $isQuoteBoost ? 'Quote post' : 'Quote with commentary' ?>">quote</span>
             <?php endif; ?>
@@ -9960,8 +10354,8 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
               admin_bsky_post_mention_accts($post)
           );
         ?>
-        <a class="icon-btn" href="?view=<?= h($composeView) ?><?= $contextQuery ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?><?= admin_reply_mention_query($bskyMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
-        <a class="icon-btn" href="?view=<?= h($composeView) ?><?= $contextQuery ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?><?= admin_reply_mention_query($bskyMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
         <?php if ($uri !== '' && $cid !== ''): ?>
           <?php
             $bmKeys = admin_bsky_bookmark_keys($uri, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
@@ -9969,6 +10363,32 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
           <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
           <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
           <button type="button" class="icon-btn bsky-action<?= $bookmarked ? ' on' : '' ?>" data-bsky-action="bookmark" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>" data-bm-picker="<?= $bookmarked ? '1' : '0' ?>" title="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bookmarked ? 'true' : 'false' ?>"><i class="ph<?= $bookmarked ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+        <?php endif; ?>
+        <?php
+          $myBskyDid = '';
+          $sessRow = function_exists('ap_bsky_session_row')
+              ? ap_bsky_session_row((int) ($GLOBALS['vaak_owner_id'] ?? 0))
+              : null;
+          if (is_array($sessRow)) {
+              $myBskyDid = trim((string) ($sessRow['did'] ?? ''));
+          }
+          $isOwnBsky = $myBskyDid !== '' && $authorDid !== '' && $authorDid === $myBskyDid && $uri !== '';
+        ?>
+        <?php if ($isOwnBsky): ?>
+          <?php if ($fediId !== '' && function_exists('admin_delete_post_button') && str_contains($fediId, '/notes/')): ?>
+            <?= admin_delete_post_button($fediId, $composeView) ?>
+          <?php else: ?>
+            <form method="post" action="?view=<?= h($composeView) ?>" style="display:inline"
+              onsubmit="return confirm('Delete this Bluesky post<?= $fediId !== '' ? ' (and federate Delete for the VAAK twin if mapped)' : '' ?>?');">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <input type="hidden" name="action" value="delete_bsky_post">
+              <input type="hidden" name="return_view" value="<?= h($composeView) ?>">
+              <input type="hidden" name="bsky_uri" value="<?= h($uri) ?>">
+              <button class="icon-btn" type="submit" title="Delete post" aria-label="Delete post" style="color:var(--danger)">
+                <i class="ph ph-trash" aria-hidden="true"></i>
+              </button>
+            </form>
+          <?php endif; ?>
         <?php endif; ?>
         <?php if (!$isHome && $fediId !== ''): ?>
           <a class="meta" href="<?= h($fediId) ?>" style="margin-left:.25rem">AP copy</a>
@@ -10331,7 +10751,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     break;
                 }
             }
-        } elseif ($view === 'gallery') {
+        } elseif ($view === 'gallery' || $view === 'vakktok') {
             $st = $db->prepare(
                 "SELECT * FROM events
                  WHERE type IN ('Create', 'Quote', 'QuotePost')
@@ -10344,6 +10764,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             $st->execute([$sinceAt, $limit * 3]);
             foreach ($st->fetchAll() ?: [] as $e) {
                 if (!is_array($e) || !admin_gallery_event_has_media($e)) {
+                    continue;
+                }
+                if ($view === 'vakktok' && (!admin_vakktok_item_has_video(['row' => $e]) || admin_vakktok_item_is_sensitive(['row' => $e]))) {
                     continue;
                 }
                 $pushEvent($e);
@@ -10517,7 +10940,7 @@ if ($isPartial && $view === 'bluesky') {
 }
 
 // AJAX fragment for Home / Local / Federated / Gallery infinite scroll
-if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
+if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)) {
     // Live poll: items newer than the client's current head (no scroll jump on server).
     $wantNewer = isset($_GET['newer']) && (string) $_GET['newer'] === '1';
     $sinceTs = isset($_GET['since']) ? (int) $_GET['since'] : 0;
@@ -10545,6 +10968,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
             }
             if ($view === 'gallery') {
                 admin_render_gallery_cell($item, $followingIds, 'gallery');
+            } elseif ($view === 'vakktok') {
+                admin_render_vakktok_cell($item);
             } else {
                 admin_render_timeline_item($item, $followingIds, $view);
             }
@@ -10617,7 +11042,10 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
             ? $feedTimeline
             : ($view === 'local'
                 ? $localTimeline
-                : ($view === 'gallery' ? $galleryTimeline : $homeTimeline));
+                : (in_array($view, ['gallery', 'vakktok'], true) ? $galleryTimeline : $homeTimeline));
+        if ($view === 'vakktok') {
+            $timeline = array_values(array_filter($timeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
+        }
         $rankedMiss = admin_tl_rank_from_timeline($timeline);
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.
         while ($tlOffset + $tlLimit > count($rankedMiss) && $rankedMiss !== []) {
@@ -10658,6 +11086,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery'], true)) {
         }
         if ($view === 'gallery') {
             admin_render_gallery_cell($item, $followingIds, 'gallery');
+        } elseif ($view === 'vakktok') {
+            admin_render_vakktok_cell($item);
         } else {
             admin_render_timeline_item($item, $followingIds, $view);
         }
@@ -12364,6 +12794,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: rgba(0,0,0,.25);
       pointer-events: none;
     }
+    .vakktok-feed { height: calc(100vh - 7rem); min-height: 28rem; overflow-y: auto; scrollbar-width: none; -ms-overflow-style: none; scroll-snap-type: y mandatory; overscroll-behavior: contain; background: #050505; border: 1px solid var(--border); border-radius: 12px; }
+    .vakktok-feed::-webkit-scrollbar { display: none; }
+    .vakktok-item { position: relative; height: 100%; min-height: 28rem; scroll-snap-align: start; display: grid; place-items: center; background: #050505; }
+    .vakktok-video { display: block; width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; object-fit: contain; object-position: center; aspect-ratio: auto; background: #000; }
     .tweet-hd {
       display: flex; align-items: flex-start; gap: .75rem;
       margin-bottom: .45rem;
@@ -12380,21 +12814,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       object-fit: cover; flex-shrink: 0;
       background: #1a1a1a; border: 1px solid var(--border);
     }
-    .profile-hover-card {
-      position: fixed; z-index: 10050; width: min(340px, calc(100vw - 24px));
-      padding: 1rem; border: 1px solid var(--border); border-radius: 14px;
-      background: var(--panel, #171717); color: var(--text, #eee);
-      box-shadow: 0 12px 38px rgba(0,0,0,.48); pointer-events: auto;
-    }
-    .profile-hover-card[hidden] { display: none; }
-    .profile-hover-head { display:flex; align-items:center; gap:.75rem; margin-bottom:.55rem; }
-    .profile-hover-avatar { width:48px; height:48px; flex:0 0 48px; object-fit:cover; border-radius:50%; background:#222; }
-    .profile-hover-name { font-weight:700; overflow-wrap:anywhere; }
-    .profile-hover-bio { margin:.55rem 0; color:var(--muted); font-size:.9rem; line-height:1.4; overflow-wrap:anywhere; }
-    .profile-hover-foot { display:flex; align-items:center; justify-content:space-between; gap:.5rem; }
-    .profile-hover-spinner { width:20px; height:20px; border:2px solid var(--border); border-top-color:var(--primary); border-radius:50%; animation:profile-hover-spin .75s linear infinite; }
-    @keyframes profile-hover-spin { to { transform:rotate(360deg); } }
-    @media (hover:none), (pointer:coarse) { .profile-hover-card { display:none !important; } }
     .who { font-weight: 600; }
     .vanity-verified {
       display: inline-flex; align-items: center; justify-content: center;
@@ -12603,7 +13022,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .flash.ok { background: #0a2a18; border: 1px solid #1f5a3a; color: #b6f5d0; }
     .flash.err { background: #2a1010; border: 1px solid #5a2a2a; color: #ffc9c9; }
     .bm-folder-popover {
-      position: fixed; z-index: 12010; min-width: 220px; max-width: min(320px, 92vw);
+      position: fixed; z-index: 80; min-width: 220px; max-width: min(320px, 92vw);
       background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
       box-shadow: 0 12px 40px rgba(0,0,0,.45); padding: .65rem .7rem; color: var(--text);
     }
@@ -13016,7 +13435,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   ╚═══╝</pre>
         <strong>VAAK</strong>
       </a>
-      <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
+      <?= admin_avatar_img($vaakActorId, 'brand-avatar') ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
     </div>
@@ -13025,16 +13444,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = in_array($view, ['favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists'], true);
-      $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'atmosphere', 'import_export', 'security', 'mod_lists'], true);
+      $navYouOpen = in_array($view, ['outbox', 'queue', 'drafts', 'profile', 'atmosphere', 'import_export', 'security'], true);
       $navAdminOpen = in_array($view, ['blocks', 'stats', 'moderation', 'relays', 'invites', 'users', 'policies'], true);
       $navSiteOpen = in_array($view, ['guestbook', 'support', 'analytics'], true);
-      $reportsNoticeCount = function_exists('ap_reports_notification_count') ? ap_reports_notification_count() : 0;
+      $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
     ?>
     <nav class="nav">
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
       <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span><span class="nav-badge"<?= $noticesUnreadNav > 0 ? '' : ' hidden' ?>><?= $noticesUnreadNav > 99 ? '99+' : (string) (int) $noticesUnreadNav ?></span></a>
       <hr class="nav-sep">
       <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
+      <a class="<?= $view === 'vakktok' ? 'active' : '' ?>" href="?view=vakktok"><span class="ico">▶</span><span class="label">VakkTok</span></a>
       <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
       <a class="<?= $view === 'bluesky' ? 'active' : '' ?>" href="?view=bluesky"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">Bluesky</span></a>
       <?php endif; ?>
@@ -13076,7 +13496,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Profile</span></a>
-          <a class="<?= $view === 'mod_lists' ? 'active' : '' ?>" href="?view=mod_lists"><span class="ico">⛨</span><span class="label">Mod Lists</span></a>
           <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
           <a class="<?= $view === 'atmosphere' ? 'active' : '' ?>" href="?view=atmosphere"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">ATmosphere</span></a>
           <?php endif; ?>
@@ -13087,12 +13506,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php if (!empty($vaakIsAdmin)): ?>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="admin" <?= $navAdminOpen ? 'open' : '' ?>>
-        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsNoticeCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsNoticeCount ?> received reports">⚑ <?= $reportsNoticeCount > 99 ? '99+' : (string) (int) $reportsNoticeCount ?></span><?php endif; ?></summary>
+        <summary><span class="ico">⚙</span><span class="label">Admin</span><?php if ($reportsOpenCount > 0): ?><span class="nav-badge" style="position:static" aria-label="<?= (int) $reportsOpenCount ?> open reports">⚑ <?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span><?php endif; ?></summary>
         <div class="nav-sub">
           <a class="<?= $view === 'moderation' ? 'active' : '' ?>" href="?view=moderation" id="nav-moderation">
             <span class="ico">⚑</span><span class="label">Moderation</span>
-            <?php if ($reportsNoticeCount > 0): ?>
-              <span class="nav-badge" aria-label="<?= (int) $reportsNoticeCount ?> received reports"><?= $reportsNoticeCount > 99 ? '99+' : (string) (int) $reportsNoticeCount ?></span>
+            <?php if ($reportsOpenCount > 0): ?>
+              <span class="nav-badge"><?= $reportsOpenCount > 99 ? '99+' : (string) (int) $reportsOpenCount ?></span>
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'blocks' ? 'active' : '' ?>" href="?view=blocks"><span class="ico">⊘</span><span class="label">Server blocks</span></a>
@@ -13131,54 +13550,50 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </form>
     </div>
     <?php
-      // Always paint a shimmer shell first; JS fills via ?ajax=trends after paint
-      // (even on a warm cache) so every page shows a brief loading state.
+      // Paint warm/stale disk cache immediately; JS may quietly refresh after 15m.
+      $trendsMeta = null;
+      $trendsHtml = function_exists('admin_trends_sidebar_html')
+          ? admin_trends_sidebar_html((string) $view, true, $trendsMeta)
+          : '';
+      $trendsAge = (int) ($trendsMeta['age'] ?? 0);
+      $trendsStale = !empty($trendsMeta['stale']);
+      if ($trendsHtml !== '' && $trendsStale && function_exists('ap_masto_trends_schedule_refresh')) {
+          ap_masto_trends_schedule_refresh();
+      }
     ?>
-    <div id="trends-sidebar" data-deferred="1" data-from="<?= h($view) ?>">
-      <div class="side-card" aria-busy="true" aria-label="Loading trending tags">
-        <h3>Trending tags</h3>
-        <div class="trends-skeleton" aria-hidden="true">
-          <div class="trends-skeleton-row"></div>
-          <div class="trends-skeleton-row"></div>
-          <div class="trends-skeleton-row" style="width:72%"></div>
+    <div id="trends-sidebar"
+         data-deferred="<?= $trendsHtml !== '' ? '0' : '1' ?>"
+         data-from="<?= h($view) ?>"
+         data-cached-age="<?= (int) $trendsAge ?>"
+         data-stale="<?= $trendsStale ? '1' : '0' ?>">
+      <?php if ($trendsHtml !== ''): ?>
+        <?= $trendsHtml ?>
+      <?php else: ?>
+        <div class="side-card" aria-busy="true" aria-label="Loading trending tags">
+          <h3>Trending tags</h3>
+          <div class="trends-skeleton" aria-hidden="true">
+            <div class="trends-skeleton-row"></div>
+            <div class="trends-skeleton-row"></div>
+            <div class="trends-skeleton-row" style="width:72%"></div>
+          </div>
         </div>
-      </div>
-      <div class="side-card" aria-busy="true" aria-label="Loading trending links">
-        <h3>Trending links</h3>
-        <div class="trends-skeleton" aria-hidden="true">
-          <div class="trends-skeleton-row wide"></div>
-          <div class="trends-skeleton-row wide" style="width:88%"></div>
+        <div class="side-card" aria-busy="true" aria-label="Loading trending links">
+          <h3>Trending links</h3>
+          <div class="trends-skeleton" aria-hidden="true">
+            <div class="trends-skeleton-row wide"></div>
+            <div class="trends-skeleton-row wide" style="width:88%"></div>
+          </div>
         </div>
-      </div>
-      <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
-        <h3>Trending posts</h3>
-        <div class="trends-skeleton" aria-hidden="true">
-          <div class="trends-skeleton-row wide"></div>
-          <div class="trends-skeleton-row wide" style="width:80%"></div>
-          <div class="trends-skeleton-row" style="width:60%"></div>
+        <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
+          <h3>Trending posts</h3>
+          <div class="trends-skeleton" aria-hidden="true">
+            <div class="trends-skeleton-row wide"></div>
+            <div class="trends-skeleton-row wide" style="width:80%"></div>
+            <div class="trends-skeleton-row" style="width:60%"></div>
+          </div>
         </div>
-      </div>
+      <?php endif; ?>
     </div>
-    <script>
-      // Start this request as soon as the right rail is parsed so it can run
-      // while PHP/browser continue building a potentially large main view.
-      (function () {
-        const box = document.getElementById('trends-sidebar');
-        if (!box) return;
-        box.dataset.deferred = 'loading';
-        fetch('?ajax=trends&from=' + encodeURIComponent(box.dataset.from || 'home'), {
-          credentials: 'same-origin', headers: { 'Accept': 'text/html' }, cache: 'no-store'
-        }).then((res) => res.ok ? res.text() : '')
-          .then((html) => {
-            if (html && html.trim()) {
-              box.innerHTML = html;
-              box.dataset.deferred = '0';
-            } else {
-              box.dataset.deferred = '1';
-            }
-          }).catch(() => { box.dataset.deferred = '1'; });
-      })();
-    </script>
   </aside>
 
   <section class="main">
@@ -13516,6 +13931,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $feedHasMore ? 'Scroll for more…' : ($feedTimeline ? 'End of timeline' : '') ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
+      <?php elseif ($view === 'vakktok'): ?>
+        <?php
+          $tokLimit = max($tlLimit, 8);
+          $tokTimeline = array_values(array_filter($galleryTimeline, static fn($item): bool => is_array($item) && admin_vakktok_item_has_video($item) && !admin_vakktok_item_is_sensitive($item)));
+          $tokPage = array_slice($tokTimeline, 0, $tokLimit);
+          $tokHasMore = $adminTlFromCache
+              ? $adminTlCachedHasMore
+              : (count($tokTimeline) > $tokLimit);
+        ?>
+        <?php if (!$tokTimeline): ?><div class="empty">No videos are available yet.</div><?php endif; ?>
+        <div id="timeline-items" class="vakktok-feed" data-view="vakktok" data-offset="<?= (int) count($tokPage) ?>" data-limit="<?= (int) $tokLimit ?>" data-has-more="<?= $tokHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($tokPage[0]['sort']) ? $tokPage[0]['sort'] : time()) ?>">
+          <?php foreach ($tokPage as $item): ?>
+            <?php if (!admin_timeline_item_muted_by_words($item)) { admin_render_vakktok_cell($item); } ?>
+          <?php endforeach; ?>
+        </div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $tokHasMore ? 'Scroll for more…' : '' ?></div>
+        <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
+
       <?php elseif ($view === 'gallery'): ?>
         <?php
           $galLimit = max($tlLimit, 16);
@@ -13603,21 +14036,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               ? vaak_bookmark_folders_list($vaakOwnerId)
               : [];
           $bmFolderFilter = (int) ($_GET['folder'] ?? 0);
-          $bookmarkLimit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
-          $bookmarkLimit = (int) (ceil($bookmarkLimit / 20) * 20);
-          $bookmarkFetchLimit = $bmFolderFilter > 0 ? 80 : $bookmarkLimit;
-          $matchKeys = ['status_ids' => [], 'object_ids' => []];
+          $bmList = ap_masto_bookmarks_list(80, null);
           if ($bmFolderFilter > 0 && function_exists('vaak_bookmark_folder_status_ids')) {
               $matchKeys = function_exists('vaak_bookmark_folder_match_keys')
                   ? vaak_bookmark_folder_match_keys($bmFolderFilter, $vaakOwnerId, 500)
                   : ['status_ids' => vaak_bookmark_folder_status_ids($bmFolderFilter, $vaakOwnerId, 500), 'object_ids' => []];
-          }
-          $allowed = array_fill_keys($matchKeys['status_ids'], true);
-          $allowedObjects = array_fill_keys($matchKeys['object_ids'], true);
-          $bmList = ($bmFolderFilter > 0 && function_exists('ap_masto_bookmarks_for_status_ids'))
-              ? ap_masto_bookmarks_for_status_ids($matchKeys['status_ids'], $vaakOwnerId)
-              : ap_masto_bookmarks_list($bookmarkFetchLimit, null);
-          if ($bmFolderFilter > 0 && !function_exists('ap_masto_bookmarks_for_status_ids')) {
+              $allowed = array_fill_keys($matchKeys['status_ids'], true);
+              $allowedObjects = array_fill_keys($matchKeys['object_ids'], true);
               $bmList = array_values(array_filter(
                   $bmList,
                   static function ($st) use ($allowed, $allowedObjects): bool {
@@ -13656,54 +14081,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
               return true;
           }));
-          if ($bmFolderFilter < 1) $bmList = array_slice($bmList, 0, $bookmarkLimit);
-          $bskyBookmarkItems = [];
-          $bookmarkRefreshing = false;
-          if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
-              && ap_bsky_session_row($vaakOwnerId) !== null) {
-              $bskyFetchLimit = $bmFolderFilter > 0 ? 200 : $bookmarkLimit;
-              $bskyResult = ap_bsky_get_bookmarks($vaakOwnerId, $bskyFetchLimit);
-              $bookmarkRefreshing = !empty($bskyResult['refreshing']);
-              if (!empty($bskyResult['ok']) && is_array($bskyResult['bookmarks'] ?? null)) {
-                  $bskyBookmarkItems = $bskyResult['bookmarks'];
-              }
-          }
-          $bskyBookmarkKeys = [];
-          foreach ($bskyBookmarkItems as $bItem) {
-              $post = is_array($bItem['post'] ?? null) ? $bItem['post'] : [];
-              $uri = (string) ($post['uri'] ?? '');
-              if ($uri === '') {
-                  continue;
-              }
-              $keys = admin_bsky_bookmark_keys($uri, $vaakOwnerId);
-              if ($keys['status_id'] !== '') {
-                  $bskyBookmarkKeys[$keys['status_id']] = true;
-              }
-          }
-          if ($bskyBookmarkKeys !== []) {
-              // Bluesky interactions are mirrored into VAAK's bookmark rows for
-              // folders; the actual Bluesky post card below is the canonical copy.
-              $bmList = array_values(array_filter($bmList, static function ($st) use ($bskyBookmarkKeys): bool {
-                  return !isset($bskyBookmarkKeys[(string) ($st['id'] ?? '')]);
-              }));
-          }
-          if ($bmFolderFilter > 0) {
-              $folderKeys = $allowed;
-              $folderObjects = $allowedObjects;
-              $bskyBookmarkItems = array_values(array_filter($bskyBookmarkItems, static function ($item) use ($folderKeys, $folderObjects, $vaakOwnerId): bool {
-                  $post = is_array($item['post'] ?? null) ? $item['post'] : [];
-                  $uri = (string) ($post['uri'] ?? '');
-                  if ($uri === '') {
-                      return false;
-                  }
-                  $keys = admin_bsky_bookmark_keys($uri, $vaakOwnerId);
-                  return ($keys['status_id'] !== '' && isset($folderKeys[$keys['status_id']]))
-                      || ($keys['object_id'] !== '' && isset($folderObjects[rtrim($keys['object_id'], '/')]))
-                      || isset($folderObjects[rtrim($uri, '/')]);
-              }));
-              $bmList = array_slice($bmList, 0, $bookmarkLimit);
-              $bskyBookmarkItems = array_slice($bskyBookmarkItems, 0, $bookmarkLimit);
-          }
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
@@ -13734,17 +14111,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
           </form>
         <?php endif; ?>
-        <?php if (!$bmList && !$bskyBookmarkItems): ?>
-          <div class="empty"><?= $bookmarkRefreshing && $bmFolderFilter < 1 ? 'Bluesky bookmarks are refreshing in the background. Reload this page shortly.' : ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') ?></div>
-        <?php endif; ?>
-        <?php if ($bookmarkRefreshing && $bskyBookmarkItems): ?><p class="meta">Showing cached Bluesky bookmarks while they refresh in the background.</p><?php endif; ?>
-        <?php if ($bskyBookmarkItems): ?>
-          <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>
-          <?php foreach ($bskyBookmarkItems as $bskyBookmarkItem): ?>
-            <?php admin_render_bsky_feed_item($bskyBookmarkItem, 'following', 'bookmarks'); ?>
-          <?php endforeach; ?>
-        <?php endif; ?>
-        <?php if ($bmList): ?>
+        <?php if (!$bmList): ?>
+          <div class="empty"><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
+        <?php else: ?>
           <?php foreach ($bmList as $st): ?>
             <?php
               $acct = (string) ($st['account']['acct'] ?? '?');
@@ -13793,11 +14162,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </div>
             </article>
           <?php endforeach; ?>
-        <?php endif; ?>
-        <?php if ($bookmarkLimit < 80 && (count($bmList) >= $bookmarkLimit || count($bskyBookmarkItems) >= $bookmarkLimit)): ?>
-          <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
-            <a class="btn btn-ghost" href="?view=bookmarks<?= $bmFolderFilter > 0 ? '&amp;folder=' . $bmFolderFilter : '' ?>&amp;limit=<?= min(80, $bookmarkLimit + 20) ?>">Show 20 more bookmarks</a>
-          </div>
         <?php endif; ?>
 
       <?php elseif ($view === 'mentions'): ?>
@@ -14049,13 +14413,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <textarea id="report-comment" name="comment" maxlength="5000" placeholder="Optional comment for moderators" style="margin-top:.35rem;min-height:3.5rem"<?= $reportPrefillActive ? ' autofocus' : '' ?>></textarea>
           <label for="report-object" style="margin-top:.65rem;display:block">Post URL (optional)</label>
           <input id="report-object" name="object_id" type="url" placeholder="Optional post URL to attach" style="margin-top:.35rem" value="<?= h($reportObjectPrefill) ?>">
-          <fieldset style="margin:.75rem 0 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:.6rem">
-            <legend class="meta">Report delivery</legend>
-            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="remote" checked> Send to the remote instance's moderators</label>
-            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="local"> Keep it on VAAK only (for testing)</label>
-          </fieldset>
           <div class="composer-actions" style="margin-top:.75rem">
-            <span class="meta">VAAK moderators can review it; remote delivery follows your selection.</span>
+            <span class="meta">Visible to every VAAK account</span>
             <button class="btn btn-primary" type="submit">Send report</button>
           </div>
         </form>
@@ -14144,8 +14503,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </article>
         <?php endif; ?>
         <div class="meta" style="margin-bottom:.75rem">
-          Incoming shows reports still awaiting moderator action, plus local user reports awaiting review. The Admin notification badge counts distinct reports still needing action; ignoring or dismissing a report clears it from the badge, while it remains available in <b>About me</b>, <b>Dismissed / ignored</b>, and <b>All</b>.
-          Use <b>Dismiss</b> / <b>Ignore</b> to clear a report from the action-needed list.
+          Incoming shows every report received, including reports already ignored or dismissed, plus local user reports awaiting review.
+          Use <b>Dismiss</b> / <b>Ignore</b> to clear an open report from the action-needed count.
           Remote outbound reports (already sent) appear under <b>Sent</b>.
         </div>
         <div class="tweet-actions" style="flex-wrap:wrap;gap:.4rem;margin-bottom:1rem">
@@ -14188,13 +14547,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               · <a href="<?= h($reportObjectPrefill) ?>" target="_blank" rel="noopener noreferrer">Remote</a>
             </div>
           <?php endif; ?>
-          <fieldset style="margin:.75rem 0 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:.6rem">
-            <legend class="meta">Report delivery</legend>
-            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="remote" checked> Send to the remote instance's moderators</label>
-            <label style="display:flex;gap:.45rem;align-items:center;margin:.2rem 0"><input type="radio" name="report_delivery" value="local"> Keep it on VAAK only (for testing)</label>
-          </fieldset>
           <div class="composer-actions">
-            <span class="meta">Choose whether to notify their remote instance or keep this report local.</span>
+            <span class="meta">Delivered to their shared inbox when possible</span>
             <button class="btn btn-primary" type="submit">Send report</button>
           </div>
         </form>
@@ -15076,6 +15430,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
+            <label><input type="checkbox" name="anti_ai_marker" value="1" <?= !empty($profile['anti_ai_marker']) ? 'checked' : '' ?>> Highlight anti-AI posters in my timelines</label>
             <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
             <label><input type="checkbox" name="auto_delete_posts_7d" value="1" <?= !empty($profile['auto_delete_posts_7d']) ? 'checked' : '' ?>> Automatically delete my posts older than 7 days</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
@@ -15089,6 +15444,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Private account</b> —
             new followers remain pending until you approve them. Your ActivityPub actor is advertised as locked/private.
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Anti-AI highlight</b> —
+            viewer-only: when on, timeline cards show a small <code>anti-ai</code> tag for remote posters
+            who’ve used slang like “slop” / “clanker” in <b>3+ cached posts</b> (fedi Creates + Bluesky cache; job rescans periodically;
+            mark clears if that usage drops off for ~90 days). A single matching post can also tag early.
+            Nothing is appended to federated outbound posts.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Sensitive media</b> —
@@ -16086,44 +16448,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php
             $localColls = ap_collections_list_local();
             $memberships = ap_collection_memberships_list(false);
-            $bskyConnected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId));
-            $starterPacks = $bskyConnected ? ap_bsky_starter_packs_cached($vaakOwnerId) : [];
           ?>
           <div class="meta" style="margin-bottom:.75rem">
-            Fediverse Collections and Bluesky Starter Packs share this page but stay native to their own network. Fediverse accounts can only be added to Collections; Bluesky accounts can only be added to Starter Packs.
+            Curated bundles of accounts (like Bluesky starter packs / Mastodon Collections). Follow everyone in a pack at once.
             Local limit: <?= (int) AP_COLLECTION_MAX_LOCAL ?> collections · <?= (int) AP_COLLECTION_MAX_MEMBERS ?> members each.
           </div>
-
-          <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky Starter Packs</h3>
-          <?php if (!$bskyConnected): ?>
-            <div class="empty" style="margin-bottom:1rem">Connect Bluesky in ATmosphere to manage Starter Packs.</div>
-          <?php else: ?>
-            <form class="composer" method="post" action="?view=collections" style="margin-bottom:1rem">
-              <input type="hidden" name="action" value="starter_pack_create">
-              <div class="meta" style="margin-bottom:.5rem">Create a Starter Pack on Bluesky</div>
-              <input name="name" type="text" required maxlength="50" placeholder="Name (max 50 characters)">
-              <textarea name="description" maxlength="300" placeholder="Description (optional)" style="margin-top:.5rem;min-height:3.5rem"></textarea>
-              <div class="composer-actions"><span class="meta">Bluesky accounts only · cached and refreshed in the background</span><button class="btn btn-primary" type="submit">Create Starter Pack</button></div>
-            </form>
-            <form method="post" action="?view=collections" style="margin:-.35rem 0 .75rem"><input type="hidden" name="action" value="starter_pack_refresh"><button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Refresh Starter Pack cache</button><span class="meta"> Refresh runs in the background.</span></form>
-            <?php if (!$starterPacks): ?><div class="empty" style="margin-bottom:1rem">No cached Starter Packs yet. A background sync will populate this section shortly.</div>
-            <?php else: foreach ($starterPacks as $pack): preg_match('~^at://([^/]+)/app\\.bsky\\.graph\\.starterpack/([^/]+)$~', (string)$pack['pack_uri'], $packId); $packLink = !empty($packId[1]) && !empty($packId[2]) ? 'https://bsky.app/starter-pack/' . rawurlencode($packId[1]) . '/' . rawurlencode($packId[2]) : 'https://bsky.app/'; ?>
-              <article class="tweet">
-                <div class="tweet-hd"><div class="tweet-hd-main"><div><span class="who"><?= h((string)$pack['name']) ?></span><span class="tag">Bluesky</span></div>
-                  <?php if (trim((string)$pack['description']) !== ''): ?><div class="meta"><?= h((string)$pack['description']) ?></div><?php endif; ?>
-                  <div class="meta"><?= count((array)$pack['members']) ?> members · synced <?= h(relative_time((string)$pack['updated_at'])) ?></div>
-                </div></div>
-                <form class="composer" method="post" action="?view=collections" style="margin:.6rem 0"><input type="hidden" name="action" value="starter_pack_add_member"><input type="hidden" name="pack_uri" value="<?= h((string)$pack['pack_uri']) ?>"><div class="composer-actions"><input name="actor" required placeholder="Bluesky handle, DID, or bsky.app profile URL"><button class="btn btn-primary" type="submit">Add Bluesky account</button></div></form>
-                <?php if (empty($pack['members'])): ?><div class="empty">No members in this Starter Pack yet.</div><?php endif; ?>
-                <?php foreach ((array)$pack['members'] as $pm): $pdid=(string)($pm['did']??''); $phandle=(string)($pm['handle']??''); $purl='https://bsky.app/profile/'.rawurlencode($phandle!==''?$phandle:$pdid); ?>
-                  <div class="tweet-actions" style="justify-content:space-between;border-top:1px solid var(--line);padding:.45rem 0"><a href="<?= h($purl) ?>" target="_blank" rel="noopener noreferrer"><?= h((string)(($pm['displayName']??'') ?: ($phandle ?: $pdid))) ?> <span class="meta"><?= h($phandle) ?></span></a><form method="post" action="?view=collections"><input type="hidden" name="action" value="starter_pack_remove_member"><input type="hidden" name="pack_uri" value="<?= h((string)$pack['pack_uri']) ?>"><input type="hidden" name="did" value="<?= h($pdid) ?>"><button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Remove</button></form></div>
-                <?php endforeach; ?>
-                <div class="tweet-actions" style="margin-top:.5rem"><a href="<?= h($packLink) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a><form method="post" action="?view=collections" onsubmit="return confirm('Delete this Starter Pack and its linked Bluesky list?')"><input type="hidden" name="action" value="starter_pack_delete"><input type="hidden" name="pack_uri" value="<?= h((string)$pack['pack_uri']) ?>"><button class="btn btn-ghost" type="submit" style="color:var(--danger);padding:.25rem .7rem;font-size:.8rem">Delete</button></form></div>
-              </article>
-            <?php endforeach; endif; ?>
-          <?php endif; ?>
-
-          <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Fediverse Collections</h3>
 
           <form class="composer" method="post" action="?view=collections" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="collection_create">
@@ -16227,90 +16556,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
         <?php endif; ?>
 
-      <?php elseif ($view === 'mod_lists'): ?>
-        <?php
-          if (function_exists('ap_lists_sync_bsky')) ap_lists_sync_bsky($vaakOwnerId);
-          $modLists = array_values(array_filter(ap_lists_all(), static fn(array $row): bool => ($row['list_kind'] ?? 'curation') === 'moderation'));
-          $modListId = (int) ($_GET['id'] ?? 0);
-          $modList = $modListId > 0 ? ap_list_by_id($modListId) : null;
-          if ($modList && ($modList['list_kind'] ?? '') !== 'moderation') $modList = null;
-        ?>
-        <?php if ($modListId > 0 && !$modList): ?>
-          <div class="empty">Moderation list not found. <a href="?view=mod_lists">Back to Mod Lists</a></div>
-        <?php elseif ($modList): ?>
-          <div class="page-back"><a class="btn btn-ghost" href="?view=mod_lists">← Mod Lists</a></div>
-          <section class="composer" style="margin-top:.75rem">
-            <h2 style="margin:.1rem 0 .5rem"><?= h((string) $modList['title']) ?></h2>
-            <p class="meta">An active mute/block applies to your account only in VAAK. Fediverse members are filtered locally; Bluesky members sync to the linked list. Set the action to “Unsubscribed / inactive” to keep the list and members but stop applying it.</p>
-            <?php if (!empty($modList['bsky_list_uri'])): ?><p class="meta">Bluesky list: <?= h((string) ($modList['bsky_moderation_action'] ?? 'none')) ?> · synced</p><?php endif; ?>
-          </section>
-          <?php $currentModAction = (string) ($modList['bsky_moderation_action'] ?? 'none'); ?>
-          <form class="composer" method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>" style="margin-top:.65rem" onsubmit="const action=event.submitter?.value; if(action==='none' && <?= json_encode(!empty($modList['bsky_list_uri'])) ?>) return confirm('Unsubscribe from this Bluesky moderation list? VAAK will stop muting/blocking its members, but the list itself will remain on Bluesky.'); return true;">
-            <input type="hidden" name="action" value="list_mod_action"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>">
-            <div class="meta" style="margin-bottom:.5rem"><?= $currentModAction === 'none' ? 'Subscribe to this moderation list. Choose what to do with all of its members:' : 'Choose how this moderation list applies to all its members:' ?></div>
-            <div class="composer-actions" style="justify-content:flex-start;flex-wrap:wrap">
-              <button class="btn <?= $currentModAction === 'mute' ? 'btn-primary' : 'btn-ghost' ?>" type="submit" name="moderation_action" value="mute">Mute all users</button>
-              <button class="btn <?= $currentModAction === 'block' ? 'btn-primary' : 'btn-ghost' ?>" type="submit" name="moderation_action" value="block">Block all users</button>
-              <?php if ($currentModAction !== 'none'): ?><button class="btn btn-ghost" type="submit" name="moderation_action" value="none">Unsubscribe / deactivate</button><?php endif; ?>
-            </div>
-            <div class="meta" style="margin-top:.5rem">This affects only your account. For a linked Bluesky list, mute/block subscribes there too; unsubscribe removes that Bluesky subscription and keeps the list.</div>
-          </form>
-          <form method="post" action="?view=mod_lists" style="margin:.65rem 0" onsubmit="return confirm(<?= json_encode(($modList['bsky_list_source'] ?? '') === 'subscription' ? 'Unsubscribe and remove this list from VAAK? The list itself will remain on Bluesky.' : 'Delete moderation list “' . (string) ($modList['title'] ?? '') . '”' . (!empty($modList['bsky_list_uri']) ? ' on VAAK and Bluesky' : '') . '?') ?>)">
-            <input type="hidden" name="action" value="list_delete"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>"><button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete list</button>
-          </form>
-          <?php if (($modList['bsky_list_source'] ?? '') !== 'subscription'): ?><form class="composer" method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>" style="margin-top:.75rem">
-            <input type="hidden" name="action" value="list_add_account"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>">
-            <div class="meta" style="margin-bottom:.5rem">Add a Fediverse handle/URL or Bluesky handle</div>
-            <input name="actor" required placeholder="@user@instance or handle.bsky.social">
-            <div class="composer-actions"><span class="meta">Fediverse accounts are VAAK-local; Bluesky accounts sync to the linked Bluesky list.</span><button class="btn btn-primary" type="submit">Add</button></div>
-          </form><?php else: ?><p class="meta">Members belong to another account’s Bluesky list; manage its membership on Bluesky. You can unsubscribe here to stop applying it.</p><?php endif; ?>
-          <h3 style="margin:1rem 0 .5rem">Members</h3>
-          <?php $profileWarmBudget = 20; foreach (ap_list_accounts((int) $modList['id']) as $modMember): $memberActor = (string) ($modMember['actor_id'] ?? ''); $memberView = admin_list_member_presentation($modMember, $vaakOwnerId, $profileWarmBudget); ?>
-            <article class="tweet"><div class="tweet-hd"><?= $memberView['avatar'] ?><div class="tweet-hd-main"><span class="who"><?= $memberView['name'] ?></span> <span class="meta"><?= $memberView['handle'] ?></span></div></div>
-              <?php if (($modList['bsky_list_source'] ?? '') !== 'subscription'): ?><div class="tweet-actions"><form method="post" action="?view=mod_lists&amp;id=<?= (int) $modList['id'] ?>"><input type="hidden" name="action" value="list_remove_account"><input type="hidden" name="return_view" value="mod_lists"><input type="hidden" name="list_id" value="<?= (int) $modList['id'] ?>"><input type="hidden" name="actor_id" value="<?= h($memberActor) ?>"><button class="btn btn-ghost" type="submit">Remove</button></form></div><?php endif; ?>
-            </article>
-          <?php endforeach; ?>
-        <?php else: ?>
-          <p class="meta">Personal moderation lists. Active members are muted/blocked only for your account in VAAK; linked Bluesky lists apply the matching personal subscription there. Unsubscribing keeps the list and members but stops the action. Bluesky list records/members are public protocol data, so avoid sensitive lists.</p>
-          <form class="composer" method="post" action="?view=mod_lists" style="margin-bottom:1rem">
-            <input type="hidden" name="action" value="list_create"><input type="hidden" name="list_kind" value="moderation"><input type="hidden" name="return_view" value="mod_lists">
-            <div class="meta" style="margin-bottom:.5rem">Create moderation list</div><input name="title" required maxlength="<?= (int) AP_LIST_TITLE_MAX ?>" placeholder="List name">
-            <label class="meta" style="display:block;margin-top:.65rem">Personal action (also subscribes on Bluesky if connected)</label><select name="moderation_action"><option value="mute">Mute these accounts</option><option value="block">Block these accounts</option><option value="none">Unsubscribed / inactive (keep list)</option></select>
-            <div class="composer-actions"><span class="meta"><?= count($modLists) ?> / <?= (int) AP_LIST_MAX ?></span><button class="btn btn-primary" type="submit">Create</button></div>
-          </form>
-          <?php if (!$modLists): ?><div class="empty">No moderation lists yet. Connect Bluesky in ATmosphere to import your existing subscriptions.</div><?php endif; ?>
-          <?php foreach ($modLists as $modRow): ?><article class="tweet"><div class="tweet-hd-main"><span class="who"><?= h((string) $modRow['title']) ?></span> <span class="tag"><?= ($modRow['bsky_moderation_action'] ?? 'none') === 'none' ? 'inactive' : h((string) $modRow['bsky_moderation_action']) ?></span><div class="meta"><?= (int) ($modRow['member_count'] ?? 0) ?> members<?= ($modRow['bsky_list_source'] ?? '') === 'subscription' ? ' · subscribed Bluesky list' : (($modRow['bsky_list_source'] ?? '') === 'bsky' ? ' · owned Bluesky list' : (!empty($modRow['bsky_list_uri']) ? ' · Bluesky synced' : ' · VAAK only')) ?></div></div><div class="tweet-actions"><a class="btn btn-primary" href="?view=mod_lists&amp;id=<?= (int) $modRow['id'] ?>">Open</a></div></article><?php endforeach; ?>
-        <?php endif; ?>
-
       <?php elseif ($view === 'lists'): ?>
         <?php
-          if (function_exists('ap_lists_sync_bsky')) ap_lists_sync_bsky($vaakOwnerId);
           $listId = (int) ($_GET['id'] ?? 0);
           $listDetail = $listId > 0 ? ap_list_by_id($listId) : null;
-          if ($listDetail && ($listDetail['list_kind'] ?? 'curation') !== 'curation') $listDetail = null;
           $listNotFound = ($listId > 0 && !$listDetail);
-          $profileWarmBudget = 20;
           $listMembers = ($listDetail ? ap_list_accounts((int) $listDetail['id']) : []);
           $listShowTimeline = !empty($_GET['timeline']) && $listDetail;
-          $listTimelineItems = [];
+          $listTimelineStatuses = [];
           if ($listShowTimeline && function_exists('ap_masto_timeline_list')) {
-              foreach (ap_masto_timeline_list((int) $listDetail['id'], 60) as $status) {
-                  $listTimelineItems[] = ['kind' => 'fedi', 'row' => $status, 'at' => (string) ($status['created_at'] ?? '')];
-              }
-              if (function_exists('ap_bsky_posts_for_authors')) {
-                  $listDids = [];
-                  foreach ($listMembers as $member) {
-                      $did = (string) ($member['bsky_did'] ?? '');
-                      if ($did !== '') $listDids[] = $did;
-                  }
-                  foreach (ap_bsky_posts_for_authors($listDids, $vaakOwnerId, 60) as $item) {
-                      $post = is_array($item['post'] ?? null) ? $item['post'] : [];
-                      $record = is_array($post['record'] ?? null) ? $post['record'] : [];
-                      $listTimelineItems[] = ['kind' => 'bsky', 'row' => $item, 'at' => (string) ($post['indexedAt'] ?? $record['createdAt'] ?? '')];
-                  }
-              }
-              usort($listTimelineItems, static fn(array $a, array $b): int => (strtotime((string) ($b['at'] ?? '')) ?: 0) <=> (strtotime((string) ($a['at'] ?? '')) ?: 0));
-              $listTimelineItems = array_slice($listTimelineItems, 0, 40);
+              $listTimelineStatuses = ap_masto_timeline_list((int) $listDetail['id'], 40);
           }
           $followingIdsForLists = [];
           foreach (ap_following_list($vaakActorId) as $frow) {
@@ -16327,14 +16582,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="page-back"><a class="btn btn-ghost" href="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>">← Members</a></div>
             <span class="meta">Timeline · <?= h((string) $listDetail['title']) ?></span>
           </div>
-          <?php if (!$listTimelineItems): ?>
-            <div class="empty">No cached posts from list members yet. Bluesky author feeds are being queued for background refresh; try again shortly.</div>
+          <?php if (!$listTimelineStatuses): ?>
+            <div class="empty">No posts from list members in the firehose yet.</div>
           <?php else: ?>
-            <?php foreach ($listTimelineItems as $timelineItem): ?>
-              <?php if (($timelineItem['kind'] ?? '') === 'bsky'): ?>
-                <?php admin_render_bsky_feed_item((array) ($timelineItem['row'] ?? []), 'list-' . (int) $listDetail['id'], 'list', (int) $listDetail['id']); ?>
-              <?php else: ?>
-              <?php $st = is_array($timelineItem['row'] ?? null) ? $timelineItem['row'] : []; ?>
+            <?php foreach ($listTimelineStatuses as $st): ?>
               <?php
                 // Prefer rendering via event row when we can recover it
                 $oid = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
@@ -16370,7 +16621,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <?php
                 }
               ?>
-              <?php endif; ?>
             <?php endforeach; ?>
           <?php endif; ?>
 
@@ -16380,7 +16630,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
           <form class="composer" method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="list_update">
-            <input type="hidden" name="return_view" value="lists">
             <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
             <div class="meta" style="margin-bottom:.5rem">Edit list · <?= count($listMembers) ?> members</div>
             <input name="title" type="text" required maxlength="<?= (int) AP_LIST_TITLE_MAX ?>" value="<?= h((string) $listDetail['title']) ?>" placeholder="Title">
@@ -16406,7 +16655,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="tweet-actions" style="margin:0 0 1rem;gap:.5rem">
             <form method="post" action="?view=lists" style="display:inline" onsubmit="return confirm(<?= json_encode('Delete list “' . (string) ($listDetail['title'] ?? '') . '”?') ?>);">
               <input type="hidden" name="action" value="list_delete">
-              <input type="hidden" name="return_view" value="lists">
               <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
               <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete list</button>
             </form>
@@ -16414,16 +16662,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
           <form class="composer" method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="list_add_account">
-            <input type="hidden" name="return_view" value="lists">
             <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
-            <div class="meta" style="margin-bottom:.5rem">Add a Fediverse account or Bluesky handle</div>
-            <input name="actor" type="text" required placeholder="@user@instance, handle.bsky.social, or profile URL">
+            <div class="meta" style="margin-bottom:.5rem">Add account (must be someone you follow)</div>
+            <input name="actor" type="text" required placeholder="@user@instance or https://…/users/…">
             <label class="composer-check" style="margin-top:.65rem">
               <input type="checkbox" name="follow_if_needed" value="1">
               <span>Follow first if not already following (uses 30/hour rate limit)</span>
             </label>
             <div class="composer-actions">
-              <span class="meta">Fediverse membership stays in VAAK; Bluesky members sync to the linked list.</span>
+              <span class="meta">Private list · not a public Collection</span>
               <button class="btn btn-primary" type="submit">Add</button>
             </div>
           </form>
@@ -16433,14 +16680,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="empty">No members yet. Add a followed @user@host above.</div>
           <?php else: ?>
             <?php foreach ($listMembers as $mem): ?>
-              <?php $maid = (string) ($mem['actor_id'] ?? ''); $memberView = admin_list_member_presentation($mem, $vaakOwnerId, $profileWarmBudget); ?>
+              <?php $maid = (string) ($mem['actor_id'] ?? ''); ?>
               <article class="tweet">
                 <div class="tweet-hd">
-                  <?= $memberView['avatar'] ?>
+                  <?= admin_avatar_img($maid) ?>
                   <div class="tweet-hd-main">
                     <div>
-                      <span class="who"><?= $memberView['name'] ?></span>
-                      <span class="meta"> <?= $memberView['handle'] ?></span>
+                      <span class="who"><?= actor_display_name_html($maid) ?></span>
+                      <span class="meta"> <?= h(actor_handle($maid)) ?></span>
                       <?php if (ap_actor_is_followed($maid)): ?>
                         <span class="tag">following</span>
                       <?php endif; ?>
@@ -16448,10 +16695,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </div>
                 <div class="tweet-actions">
-                  <a href="<?= h($memberView['href'] !== '' ? $memberView['href'] : '?view=remote_profile&amp;actor=' . urlencode($maid)) ?>" target="<?= str_starts_with($maid, 'https://bsky.app/profile/') ? '_blank' : '_self' ?>" rel="noopener noreferrer">Profile</a>
+                  <a href="?view=remote_profile&amp;actor=<?= urlencode($maid) ?>">Profile</a>
                   <form method="post" action="?view=lists&amp;id=<?= (int) $listDetail['id'] ?>" style="display:inline">
                     <input type="hidden" name="action" value="list_remove_account">
-                    <input type="hidden" name="return_view" value="lists">
                     <input type="hidden" name="list_id" value="<?= (int) $listDetail['id'] ?>">
                     <input type="hidden" name="actor_id" value="<?= h($maid) ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Remove</button>
@@ -16462,16 +16708,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
 
         <?php else: ?>
-          <?php $allLists = array_values(array_filter(ap_lists_all(), static fn(array $row): bool => ($row['list_kind'] ?? 'curation') === 'curation')); ?>
+          <?php $allLists = ap_lists_all(); ?>
           <div class="meta" style="margin-bottom:.75rem">
-            Custom feeds of accounts you choose, including Fediverse and Bluesky posts. Separate from
-            <a href="?view=collections">Collections</a> (public starter packs). VAAK-only lists are private; a Bluesky-synced list and its Bluesky members are public protocol records.
+            Private lists of people you follow — like Mastodon Lists. Separate from
+            <a href="?view=collections">Collections</a> (public starter packs).
             Limit: <?= (int) AP_LIST_MAX ?> lists.
           </div>
 
           <form class="composer" method="post" action="?view=lists" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="list_create">
-            <input type="hidden" name="list_kind" value="curation"><input type="hidden" name="return_view" value="lists">
             <div class="meta" style="margin-bottom:.5rem">New list</div>
             <input name="title" type="text" required maxlength="<?= (int) AP_LIST_TITLE_MAX ?>" placeholder="Title (e.g. Close friends)">
             <label class="meta" style="display:block;margin-top:.65rem">Replies in timeline</label>
@@ -16509,11 +16754,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </div>
                 <div class="tweet-actions">
-                  <a class="btn btn-primary" href="?view=lists&amp;id=<?= (int) $L['id'] ?>&amp;timeline=1" style="padding:.35rem .9rem;font-size:.85rem">View feed</a>
-                  <a class="btn btn-ghost" href="?view=lists&amp;id=<?= (int) $L['id'] ?>" style="padding:.35rem .9rem;font-size:.85rem">Manage members</a>
+                  <a class="btn btn-primary" href="?view=lists&amp;id=<?= (int) $L['id'] ?>" style="padding:.35rem .9rem;font-size:.85rem">Open</a>
+                  <a class="btn btn-ghost" href="?view=lists&amp;id=<?= (int) $L['id'] ?>&amp;timeline=1" style="padding:.35rem .9rem;font-size:.85rem">Timeline</a>
                   <form method="post" action="?view=lists" style="display:inline" onsubmit="return confirm(<?= json_encode('Delete list “' . (string) ($L['title'] ?? '') . '”?') ?>);">
                     <input type="hidden" name="action" value="list_delete">
-                    <input type="hidden" name="return_view" value="lists">
                     <input type="hidden" name="list_id" value="<?= (int) $L['id'] ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem;color:var(--danger)">Delete</button>
                   </form>
@@ -16715,7 +16959,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $stype = preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '';
           $sresolve = !isset($_GET['q']) || !empty($_GET['resolve']);
           $sresults = ['accounts' => [], 'hashtags' => [], 'statuses' => []];
-          $bskySearch = ['accounts' => [], 'posts' => []];
           // Post-URL open is handled early (before HTML). Skip text search for those queries.
           $sqIsPostUrl = $sq !== '' && str_starts_with($sq, 'https://')
               && function_exists('ap_masto_url_looks_like_status')
@@ -16727,40 +16970,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               require_once __DIR__ . '/ap-inbox.php';
               $sresults = ap_masto_search($sq, $stype !== '' ? $stype : null, $sresolve, 25);
               $sOwner = admin_owner_user_id();
-              $bskySources = $stype === 'accounts' ? ['bsky_actor']
-                  : ($stype === 'statuses' ? ['bsky_post']
-                      : ($stype === '' ? ['bsky_post', 'bsky_actor'] : []));
-              if ($bskySources !== [] && function_exists('ap_search_fts_query')
-                  && function_exists('ap_bsky_post_item_by_uri')
-                  && function_exists('ap_bsky_actor_profile_cache_get')) {
-                  $hiddenBsky = function_exists('ap_bsky_hide_did_set') ? ap_bsky_hide_did_set($sOwner) : [];
-                  $seenBskyDids = [];
-                  foreach (ap_search_fts_query($sq, 60, '', $bskySources) as $bskyHit) {
-                      $source = (string) ($bskyHit['source'] ?? '');
-                      $objectId = trim((string) ($bskyHit['object_id'] ?? ''));
-                      if ($objectId === '') continue;
-                      if ($source === 'bsky_post') {
-                          $item = ap_bsky_post_item_by_uri($objectId);
-                          $author = is_array($item['post']['author'] ?? null) ? $item['post']['author'] : [];
-                          $did = trim((string) ($author['did'] ?? ''));
-                          if (!empty($hiddenBsky[$did])) continue;
-                          if ($did !== '' && function_exists('ap_actor_is_content_blocked')
-                              && ap_actor_is_content_blocked($did, null, $sOwner)) continue;
-                          if (is_array($item)) $bskySearch['posts'][] = $item;
-                      } elseif ($source === 'bsky_actor') {
-                          $cached = ap_bsky_actor_profile_cache_get($objectId, $sOwner);
-                          if (!is_array($cached) || !is_array($cached['profile'] ?? null)) continue;
-                          $profile = $cached['profile'];
-                          $did = trim((string) ($cached['did'] ?? $profile['did'] ?? ''));
-                          if ($did === '' || isset($seenBskyDids[$did]) || !empty($hiddenBsky[$did])) continue;
-                          if (function_exists('ap_actor_is_content_blocked')
-                              && ap_actor_is_content_blocked($did, null, $sOwner)) continue;
-                          $seenBskyDids[$did] = true;
-                          $bskySearch['accounts'][] = ['did' => $did, 'profile' => $profile,
-                              'viewer' => is_array($cached['viewer'] ?? null) ? $cached['viewer'] : []];
-                      }
-                  }
-              }
               if (function_exists('ap_actor_is_content_blocked') && $sOwner > 0) {
                   $sresults['accounts'] = array_values(array_filter(
                       is_array($sresults['accounts'] ?? null) ? $sresults['accounts'] : [],
@@ -16795,7 +17004,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                  placeholder="text · #tag · @user@instance · or https://…/post URL" autofocus>
           <div class="meta" style="margin:.45rem 0 .15rem;line-height:1.4">
             Paste a public post link (Mastodon/Akkoma/etc.) to <b>fetch it into VAAK</b> and open the thread —
-            even if it was published before this instance existed. Bluesky results come from posts and profiles already in VAAK’s cache.
+            even if it was published before this instance existed.
           </div>
           <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:.6rem 0">
             <label class="meta"><input type="radio" name="type" value="" <?= $stype === '' ? 'checked' : '' ?>> All</label>
@@ -16814,9 +17023,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php else: ?>
           <div class="meta" style="margin-bottom:.75rem">
             Results for <b><?= h($sq) ?></b> —
-            <?= count($sresults['accounts']) + count($bskySearch['accounts']) ?> accounts ·
+            <?= count($sresults['accounts']) ?> accounts ·
             <?= count($sresults['hashtags']) ?> tags ·
-            <?= count($sresults['statuses']) + count($bskySearch['posts']) ?> posts
+            <?= count($sresults['statuses']) ?> posts
           </div>
           <?php if ($sresults['accounts']): ?>
             <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Accounts</h3>
@@ -16877,34 +17086,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </article>
             <?php endforeach; ?>
           <?php endif; ?>
-          <?php if ($bskySearch['accounts']): ?>
-            <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Bluesky accounts in VAAK’s cache</h3>
-            <?php foreach ($bskySearch['accounts'] as $bacc): ?>
-              <?php
-                $bp = is_array($bacc['profile'] ?? null) ? $bacc['profile'] : [];
-                $bdid = (string) ($bacc['did'] ?? '');
-                $bhandle = trim((string) ($bp['handle'] ?? ''));
-                $bdisplay = trim((string) ($bp['displayName'] ?? '')) ?: ($bhandle !== '' ? $bhandle : $bdid);
-                $bprofileUrl = function_exists('ap_bsky_actor_profile_url') ? ap_bsky_actor_profile_url($bdid) : 'https://bsky.app/profile/' . rawurlencode($bdid);
-                $bviewer = is_array($bacc['viewer'] ?? null) ? $bacc['viewer'] : [];
-                $bfollowing = !empty($bviewer['following']);
-                $bconnected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row(admin_owner_user_id()));
-                $bme = $bconnected && (string) (ap_bsky_session_row(admin_owner_user_id())['did'] ?? '') === $bdid;
-              ?>
-              <article class="tweet tweet-bsky">
-                <div class="tweet-hd">
-                  <?php if (!empty($bp['avatar'])): ?><img class="tweet-av" src="<?= h((string) $bp['avatar']) ?>" alt="" width="40" height="40" loading="lazy" referrerpolicy="no-referrer"><?php endif; ?>
-                  <div class="tweet-hd-main"><div class="who"><?= admin_emoji_html($bdisplay) ?> <span class="meta">@<?= h($bhandle !== '' ? $bhandle : $bdid) ?></span> <span class="tag">Bluesky</span></div><div class="meta"><?= h($bdid) ?></div></div>
-                </div>
-                <?php if (trim((string) ($bp['description'] ?? '')) !== ''): ?><div class="tweet-bd"><?= admin_linkify_body_html((string) $bp['description'], 'search') ?></div><?php endif; ?>
-                <div class="tweet-actions">
-                  <a href="?view=remote_profile&amp;actor=<?= rawurlencode($bprofileUrl) ?>&amp;from=search">VAAK profile</a>
-                  <a href="<?= h($bprofileUrl) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
-                  <?php if (!$bme && $bconnected && !$bfollowing): ?><form method="post" action="?view=search" style="display:inline"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="follow_remote"><input type="hidden" name="return_view" value="search"><input type="hidden" name="return_q" value="<?= h($sq) ?>"><input type="hidden" name="actor_id" value="<?= h($bprofileUrl) ?>"><button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow on Bluesky</button></form><?php elseif ($bfollowing): ?><span class="tag">following</span><?php endif; ?>
-                </div>
-              </article>
-            <?php endforeach; ?>
-          <?php endif; ?>
           <?php if ($sresults['hashtags']): ?>
             <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Hashtags</h3>
             <?php foreach ($sresults['hashtags'] as $tag): ?>
@@ -16944,11 +17125,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               ?>
             <?php endforeach; ?>
           <?php endif; ?>
-          <?php if ($bskySearch['posts']): ?>
-            <h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Bluesky posts in VAAK’s cache</h3>
-            <?php foreach ($bskySearch['posts'] as $bpost): admin_render_bsky_feed_item($bpost, 'following', 'search'); endforeach; ?>
-          <?php endif; ?>
-          <?php if (!$sresults['accounts'] && !$sresults['hashtags'] && !$sresults['statuses'] && !$bskySearch['accounts'] && !$bskySearch['posts']): ?>
+          <?php if (!$sresults['accounts'] && !$sresults['hashtags'] && !$sresults['statuses']): ?>
             <?php
               $sqHostHint = preg_replace('#^https?://#i', '', ltrim($sq, '@'));
               $sqHostHint = preg_replace('#/.*$#', '', (string) $sqHostHint);
@@ -16966,7 +17143,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 No posts or tags matching <code><?= h($sq) ?></code> in recent federation traffic.
                 <a href="?view=tags">Follow hashtags</a> to catch future posts on Home, or try another tag.
               <?php else: ?>
-                No matches in VAAK’s local federation or Bluesky cache.
+                No matches in the local federation cache.
                 For remote people use the full <code>@user@host</code> with resolve enabled
                 (example: <code>@gargron@mastodon.social</code>).
               <?php endif; ?>
@@ -17373,11 +17550,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             if (is_array($stLocalStatus)) {
                 admin_render_masto_status_card($stLocalStatus, $followingIds, $stFrom, true, false);
             } else {
-                // A focused post is an explicit detail view, so a quote target
-                // encoded as RE: <URL> may be hydrated here (never on timelines).
-                if (is_array($stEvent)) {
-                    $stEvent['_allow_quote_fetch'] = true;
-                }
                 $focusStatus = ap_masto_status_from_event($stEvent);
                 if (is_array($focusStatus)) {
                     if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusStatus['id'])) {
@@ -17491,40 +17663,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               // Bluesky profile: hydrate via AT Protocol (never AP actor fetch / WebFinger).
               if ($rpIsBsky && !$rpIsLocal && function_exists('ap_bsky_get_profile')
                   && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($vaakOwnerId))) {
-                  // Normalize encoded DID path segments before cache lookup / queueing.
-                  // The browser-facing bsky.app profile URL uses literal colons for DIDs;
-                  // a percent-encoded DID can otherwise become a distinct cache key and
-                  // an invalid Open on Bluesky destination.
                   $rpBskyRequestedRef = $rpActor;
-                  if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $rpActor, $bskyPath)) {
-                      $bskyIdentity = rawurldecode($bskyPath[1]);
-                      if (str_starts_with($bskyIdentity, 'did:')) {
-                          $rpBskyRequestedRef = 'https://bsky.app/profile/' . $bskyIdentity;
-                          $rpActor = $rpBskyRequestedRef;
-                          $rpBskyDid = $bskyIdentity;
-                      }
-                  }
                   $cachedBsky = function_exists('ap_bsky_actor_profile_cache_get')
                       ? ap_bsky_actor_profile_cache_get($rpBskyRequestedRef, $vaakOwnerId)
                       : null;
-                  if (!$cachedBsky && preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)$~', $rpBskyRequestedRef, $bskyDid)) {
-                      $cachedBsky = ap_bsky_actor_profile_cache_get(
-                          'https://bsky.app/profile/' . rawurlencode($bskyDid[1]),
-                          $vaakOwnerId
-                      );
-                  }
                   if (function_exists('ap_bsky_actor_refresh_enqueue')) {
                       ap_bsky_actor_refresh_enqueue($vaakOwnerId, $rpBskyRequestedRef, $rpForceRefresh);
-                  }
-                  if (function_exists('ap_bsky_follow_sync_enqueue')) {
-                      ap_bsky_follow_sync_enqueue($vaakOwnerId);
                   }
                   $bp = is_array($cachedBsky['profile'] ?? null) ? $cachedBsky['profile'] : [];
                   if ($bp !== []) {
                       $rpBskyDid = (string) ($bp['did'] ?? '');
                       $rpBskyHandle = (string) ($bp['handle'] ?? '');
                       $rpActor = $rpBskyDid !== ''
-                          ? (function_exists('ap_bsky_actor_profile_url') ? ap_bsky_actor_profile_url($rpBskyDid) : ('https://bsky.app/profile/' . $rpBskyDid))
+                          ? ('https://bsky.app/profile/' . rawurlencode($rpBskyDid))
                           : ($rpBskyHandle !== ''
                               ? ('https://bsky.app/profile/' . rawurlencode($rpBskyHandle))
                               : $rpActor);
@@ -17543,12 +17694,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           'image_source_url' => $rpHeader,
                       ];
                       $viewer = is_array($cachedBsky['viewer'] ?? null) ? $cachedBsky['viewer'] : [];
-                      $viewerStateKnown = is_array($cachedBsky['viewer'] ?? null);
-                      $rpBskyFollowing = $viewerStateKnown
-                          ? (is_string($viewer['following'] ?? null) && $viewer['following'] !== '')
-                          : false;
+                      $rpBskyFollowing = !empty($viewer['following']);
                       $rpBskyFollowsYou = !empty($viewer['followedBy']);
-                      if (!$viewerStateKnown && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
+                      if (!$rpBskyFollowing && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
                           $rpBskyFollowing = is_array(ap_bsky_graph_sync_get($vaakOwnerId, 'follow', $rpBskyDid));
                       }
                   }
@@ -17693,7 +17841,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                                   'host' => $rpHost,
                                   'icon_source_url' => $icon,
                                   'image_source_url' => $image,
-                                  'summary' => isset($rpDoc['summary']) && is_string($rpDoc['summary']) ? $rpDoc['summary'] : '',
                               ];
                               ap_remote_actor_upsert($rpActor, $fields);
                               // Mastodon dual IRI: also cache /users/{preferredUsername}
@@ -18517,7 +18664,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'bluesky'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
     <?php endif; ?>
@@ -19361,12 +19508,9 @@ window.apAdminToast = function (msg, isErr) {
    * @param {string} statusId
    * @param {string} objectId
    * @param {Array|null} selectedIds
-   * @param {{ onRemove?: () => (void|Promise<void>), hideRemove?: boolean, platform?: string }|null} opts
+   * @param {{ onRemove?: () => (void|Promise<void>) }|null} opts
    */
   async function openBookmarkFolderPicker(anchorBtn, statusId, objectId, selectedIds, opts) {
-    const bookmarkPlatform = opts && opts.platform
-      ? opts.platform
-      : (anchorBtn.closest('.tweet-bsky') ? 'bsky' : 'fedi');
     closeFolderPopover();
     const rect = anchorBtn.getBoundingClientRect();
     const pop = document.createElement('div');
@@ -19383,9 +19527,7 @@ window.apAdminToast = function (msg, isErr) {
 
     let data = null;
     try {
-      const res = await fetch('?ajax=bookmark_folders&status_id=' + encodeURIComponent(statusId)
-        + '&object_id=' + encodeURIComponent(objectId || '')
-        + '&platform=' + encodeURIComponent(bookmarkPlatform), {
+      const res = await fetch('?ajax=bookmark_folders&status_id=' + encodeURIComponent(statusId), {
         credentials: 'same-origin',
         headers: { 'Accept': 'application/json' }
       });
@@ -19395,8 +19537,6 @@ window.apAdminToast = function (msg, isErr) {
     }
     if (!folderPopover) return;
     positionFolderPopover(pop, anchorBtn);
-    if (data && data.status_id) statusId = String(data.status_id);
-    if (data && data.object_id) objectId = String(data.object_id);
     const selected = new Set((selectedIds || (data && data.selected) || []).map(String));
     const folders = (data && data.folders) || [];
     let html = '<h4>Save to folder</h4>';
@@ -19414,7 +19554,7 @@ window.apAdminToast = function (msg, isErr) {
     html += '<input type="text" id="bm-new-folder-name" maxlength="80" placeholder="New folder name…">';
     html += '<div class="bm-folder-actions">'
       + '<button type="button" class="btn btn-primary" data-bm-done="1">Done</button>'
-      + ((opts && opts.hideRemove) ? '' : '<button type="button" class="btn btn-ghost" data-bm-unbookmark="1">Remove bookmark</button>')
+      + '<button type="button" class="btn btn-ghost" data-bm-unbookmark="1">Remove bookmark</button>'
       + '</div>';
     pop.innerHTML = html;
 
@@ -19427,39 +19567,28 @@ window.apAdminToast = function (msg, isErr) {
       const res = await postFolderAction(action, {
         folder_id: fid,
         status_id: statusId,
-        object_id: objectId || '',
-        platform: bookmarkPlatform
+        object_id: objectId || ''
       });
       if (!res || !res.ok) {
         input.checked = !input.checked;
         window.apAdminToast((res && res.error) || 'Folder update failed.', true);
-      } else {
-        if (input.checked) selected.add(String(fid));
-        else selected.delete(String(fid));
       }
     });
 
     pop.addEventListener('click', async (ev) => {
       const t = ev.target;
       if (!(t instanceof HTMLElement)) return;
-      const doneButton = t.closest('[data-bm-done="1"]');
-      if (doneButton) {
+      if (t.getAttribute('data-bm-done') === '1') {
         const nameInput = pop.querySelector('#bm-new-folder-name');
         const name = nameInput instanceof HTMLInputElement ? nameInput.value.trim() : '';
         if (name) {
           const created = await postFolderAction('bookmark_folder_create', { title: name });
           if (created && created.ok && created.id) {
-            const added = await postFolderAction('bookmark_folder_add', {
+            await postFolderAction('bookmark_folder_add', {
               folder_id: String(created.id),
               status_id: statusId,
-              object_id: objectId || '',
-              platform: bookmarkPlatform
+              object_id: objectId || ''
             });
-            if (!added || !added.ok) {
-              window.apAdminToast((added && added.error) || 'Could not add bookmark to folder.', true);
-              return;
-            }
-            selected.add(String(created.id));
             window.apAdminToast('Saved to “' + name + '”.');
           } else {
             window.apAdminToast((created && created.error) || 'Could not create folder.', true);
@@ -19469,8 +19598,7 @@ window.apAdminToast = function (msg, isErr) {
         closeFolderPopover();
         return;
       }
-      const removeButton = t.closest('[data-bm-unbookmark="1"]');
-      if (removeButton) {
+      if (t.getAttribute('data-bm-unbookmark') === '1') {
         closeFolderPopover();
         if (opts && typeof opts.onRemove === 'function') {
           try { await opts.onRemove(); } catch (e) { /* quiet */ }
@@ -19489,16 +19617,14 @@ window.apAdminToast = function (msg, isErr) {
   window.novaOpenBookmarkFolderPicker = openBookmarkFolderPicker;
 
   document.addEventListener('click', (ev) => {
-    const target = ev.target;
-    const pickerTrigger = target && target.closest
-      ? target.closest('button[data-bm-picker="1"], button.bsky-action[data-bsky-action="bookmark"]') : null;
-    if (folderPopover && !folderPopover.contains(target) && !pickerTrigger) {
+    if (folderPopover && !folderPopover.contains(ev.target)) {
       closeFolderPopover();
     }
   });
-  // The Bookmarks view button opens the folder picker; its form action is
-  // unbookmark_status, so handle the click directly instead of letting a
-  // browser submit race past the folder-picker interception.
+  // The Bookmarks view's saved-state button is a folder-menu trigger, not an
+  // unbookmark submit. Handle its click directly so browser/form submit
+  // behavior cannot bypass the picker; timeline forms still use the submit
+  // handler below for their bookmark/unbookmark toggle.
   document.addEventListener('click', (ev) => {
     const target = ev.target;
     const btn = target && target.closest
@@ -19511,7 +19637,7 @@ window.apAdminToast = function (msg, isErr) {
     if (statusId && statusId.value) {
       openBookmarkFolderPicker(btn, statusId.value, objectId ? objectId.value : '', null);
     }
-  }, true);
+  });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closeFolderPopover();
   });
@@ -19635,19 +19761,15 @@ window.apAdminToast = function (msg, isErr) {
     if (!INTERACT.has(action)) return;
     const btn = form.querySelector('button[type="submit"]');
     ev.preventDefault();
+    if (form.dataset.busy === '1' || form.dataset.queuePending === '1') {
+      window.apQueueRepeatedClick(form);
+      return;
+    }
     // Already bookmarked: open folder picker instead of immediately removing
-    // This takes precedence over the pending-queue guard: the local bookmark
-    // state is already optimistic, so users can organize/remove it immediately
-    // while the durable add is still being delivered in the background.
     if (action === 'unbookmark_status' && btn && btn.getAttribute('data-bm-picker') === '1' && form.dataset.skipBmPicker !== '1') {
       const sid = (form.querySelector('input[name="status_id"]') || {}).value || '';
       const oid = (form.querySelector('input[name="object_id"]') || {}).value || '';
       if (sid) openBookmarkFolderPicker(btn, sid, oid, null);
-      return;
-    }
-    if (form.dataset.busy === '1' || (form.dataset.queuePending === '1'
-        && !(action === 'unbookmark_status' && form.dataset.skipBmPicker === '1'))) {
-      window.apQueueRepeatedClick(form);
       return;
     }
     const fd = new FormData(form);
@@ -20045,11 +20167,7 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
-<?php if ($view === 'bookmarks'): ?>
-<script src="/api/assets/bsky-bookmarks.js?v=20260915-1" defer></script>
-<?php endif; ?>
-
-<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'mentions', 'bluesky'], true)): ?>
+<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'mentions', 'bluesky'], true)): ?>
 <script>
 (function () {
   /** Replace a timeline card in place without jumping scroll to the top. */
@@ -20245,15 +20363,6 @@ window.apAdminToast = function (msg, isErr) {
       if (data && data.object_id) btn.dataset.objectId = String(data.object_id);
     }
 
-    function removeBskyBookmarkCardIfNeeded(btn) {
-      if (!(window.location.search || '').includes('view=bookmarks')) return;
-      const card = btn.closest('article.tweet');
-      if (!card) return;
-      card.style.transition = 'opacity .2s ease';
-      card.style.opacity = '0';
-      setTimeout(() => card.remove(), 220);
-    }
-
     function snapshotBskyButton(btn) {
       return {
         html: btn.innerHTML,
@@ -20280,14 +20389,15 @@ window.apAdminToast = function (msg, isErr) {
       else btn.setAttribute('data-bm-picker', state.bmPicker);
     }
 
-    // Capture this before card/timeline click handlers can stop propagation.
-    // In particular, a saved bookmark must open its organizer even while its
-    // durable save/remove request is still being reconciled in the background.
     document.addEventListener('click', async (ev) => {
       const btn = ev.target && ev.target.closest ? ev.target.closest('button.bsky-action') : null;
       if (!btn) return;
       ev.preventDefault();
       ev.stopPropagation();
+      if (btn.dataset.busy === '1' || btn.dataset.queuePending === '1') {
+        if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(btn);
+        return;
+      }
       const action = btn.dataset.bskyAction || '';
       const uri = btn.dataset.uri || '';
       const cid = btn.dataset.cid || '';
@@ -20297,12 +20407,11 @@ window.apAdminToast = function (msg, isErr) {
       if (!action) return;
 
       // Already bookmarked: open folder picker (same as federated cards).
-      if (action === 'bookmark' && isOn) {
+      if (action === 'bookmark' && isOn && btn.getAttribute('data-bm-picker') === '1') {
         const sid = btn.dataset.statusId || '';
         const oid = btn.dataset.objectId || uri;
-        if (typeof window.novaOpenBookmarkFolderPicker === 'function') {
+        if (sid && typeof window.novaOpenBookmarkFolderPicker === 'function') {
           window.novaOpenBookmarkFolderPicker(btn, sid, oid, null, {
-            platform: 'bsky',
             onRemove: async () => {
               const before = snapshotBskyButton(btn);
               applyBskyBookmarkUi(btn, false);
@@ -20311,7 +20420,6 @@ window.apAdminToast = function (msg, isErr) {
               try {
                 const data = await postBskyAction(btn, 'bsky_unbookmark', before);
                 applyBskyBookmarkUi(btn, false, data);
-                removeBskyBookmarkCardIfNeeded(btn);
                 if (window.vaakHaptic) window.vaakHaptic(6);
               } catch (e) {
                 restoreBskyButton(btn, before);
@@ -20325,11 +20433,6 @@ window.apAdminToast = function (msg, isErr) {
             },
           });
         }
-        return;
-      }
-
-      if (btn.dataset.busy === '1' || btn.dataset.queuePending === '1') {
-        if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(btn);
         return;
       }
 
@@ -20387,7 +20490,6 @@ window.apAdminToast = function (msg, isErr) {
                   try {
                     const removed = await postBskyAction(btn, 'bsky_unbookmark');
                     applyBskyBookmarkUi(btn, false, removed);
-                    removeBskyBookmarkCardIfNeeded(btn);
                   } catch (e) {
                     if (typeof window.apAdminToast === 'function') {
                       window.apAdminToast((e && e.message) || 'Unbookmark failed', true);
@@ -20414,7 +20516,7 @@ window.apAdminToast = function (msg, isErr) {
         btn.dataset.busy = '0';
         btn.disabled = false;
       }
-    }, true);
+    });
   })();
 
   const root = document.querySelector('.feed');
@@ -20424,7 +20526,10 @@ window.apAdminToast = function (msg, isErr) {
   const topBtn = document.getElementById('feed-top-btn');
   const newBtn = document.getElementById('feed-new-btn');
   const feedRoot = document.querySelector('.feed');
-  // Read the timeline identity before constructing the scroll API.
+  // Read the timeline identity before constructing the scroll API.  The
+  // VakkTok-specific scroll container check is used during scrollApi(), so
+  // declaring this later would hit JavaScript's temporal dead zone and stop
+  // pagination setup for every timeline.
   let viewName = items ? (items.dataset.view || 'home') : 'home';
   let hasMore = items ? items.dataset.hasMore === '1' : false;
   if (newBtn && feedRoot) {
@@ -20439,7 +20544,7 @@ window.apAdminToast = function (msg, isErr) {
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
   // .feed is overflow:visible — IntersectionObserver must use the viewport.
   function feedIsScrollContainer() {
-    const scrollRoot = root;
+    const scrollRoot = (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) ? items : root;
     const style = window.getComputedStyle(scrollRoot);
     const oy = style.overflowY;
     if (oy !== 'auto' && oy !== 'scroll') return false;
@@ -20447,7 +20552,7 @@ window.apAdminToast = function (msg, isErr) {
   }
   function scrollApi() {
     if (feedIsScrollContainer()) {
-      const scrollRoot = root;
+      const scrollRoot = (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) ? items : root;
       return {
         mode: 'feed',
         ioRoot: scrollRoot,
@@ -20466,6 +20571,9 @@ window.apAdminToast = function (msg, isErr) {
       onScroll: (fn) => window.addEventListener('scroll', fn, { passive: true }),
     };
   }
+  if (viewName === 'vakktok' && items.classList.contains('vakktok-feed')) {
+    items.appendChild(sentinel);
+  }
   let offset = parseInt(items.dataset.offset || '0', 10);
   let limit = parseInt(items.dataset.limit || '15', 10);
   let notifMaxId = items.dataset.maxId || '';
@@ -20482,12 +20590,92 @@ window.apAdminToast = function (msg, isErr) {
   // ↑ button: ignore infinite-scroll fights until the user leaves the top (or pin expires).
   let stickToTop = false;
   let stickToTopTimer = 0;
+  const POLL_MS = 120000;
   const AT_TOP_PX = 120;
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
   const isNotifTimeline = viewName === 'mentions';
   const isBskyTimeline = viewName === 'bluesky';
 
   let sc = scrollApi();
+
+  // VakkTok behaves like a focused video reel: the visible video plays muted,
+  // while videos leaving the viewport are paused so background media does not
+  // consume CPU or memory.
+  if (viewName === 'vakktok') {
+    const tokRoot = items.classList.contains('vakktok-feed') ? items : null;
+    let activeTokVideo = null;
+    const syncTokPlayback = () => {
+      if (!tokRoot) return;
+      const rootRect = tokRoot.getBoundingClientRect();
+      let best = null;
+      let bestRatio = 0;
+      items.querySelectorAll('.vakktok-video').forEach((video) => {
+        const rect = video.getBoundingClientRect();
+        const visible = Math.max(0, Math.min(rect.bottom, rootRect.bottom) - Math.max(rect.top, rootRect.top));
+        const ratio = rect.height > 0 ? visible / rect.height : 0;
+        if (ratio > bestRatio) { best = video; bestRatio = ratio; }
+        if (video !== activeTokVideo && ratio < 0.55) {
+          video.pause();
+          try { video.currentTime = 0; } catch (e) {}
+        }
+      });
+      if (best && bestRatio >= 0.7) {
+        if (activeTokVideo && activeTokVideo !== best) {
+          activeTokVideo.pause();
+          try { activeTokVideo.currentTime = 0; } catch (e) {}
+        }
+        activeTokVideo = best;
+        best.muted = false;
+        best.play().catch(() => {});
+      }
+    };
+    const tokObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        const video = entry.target;
+        if (!(video instanceof HTMLVideoElement)) return;
+        if (entry.isIntersecting && entry.intersectionRatio >= 0.7) {
+          items.querySelectorAll('.vakktok-video').forEach((other) => {
+            if (other !== video) {
+              other.pause();
+              try { other.currentTime = 0; } catch (e) {}
+            }
+          });
+          activeTokVideo = video;
+          video.muted = false;
+          video.play().catch(() => {});
+        } else {
+          video.pause();
+          try { video.currentTime = 0; } catch (e) {}
+        }
+      });
+    }, { root: tokRoot, threshold: [0.7] });
+    const observeTokVideos = (scope) => {
+      if (!scope || !scope.querySelectorAll) return;
+      scope.querySelectorAll('.vakktok-video').forEach((video) => {
+        if (video.dataset.tokObserved === '1') return;
+        video.dataset.tokObserved = '1';
+        video.addEventListener('loadedmetadata', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
+        video.addEventListener('canplay', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
+        tokObserver.observe(video);
+      });
+    };
+    observeTokVideos(items);
+    if (tokRoot) {
+      tokRoot.addEventListener('scroll', () => window.requestAnimationFrame(syncTokPlayback), { passive: true });
+      tokRoot.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowDown' || event.key === 'PageDown') {
+          window.requestAnimationFrame(syncTokPlayback);
+        }
+      });
+      window.addEventListener('resize', syncTokPlayback, { passive: true });
+    }
+    const tokMutationObserver = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => mutation.addedNodes.forEach((node) => observeTokVideos(node)));
+      window.requestAnimationFrame(syncTokPlayback);
+    });
+    tokMutationObserver.observe(items, { childList: true, subtree: true });
+    window.requestAnimationFrame(syncTokPlayback);
+  }
 
   // Pull-to-refresh indicator (mobile / window scroll)
   let ptrEl = root.querySelector('.feed-ptr');
@@ -20626,15 +20814,6 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
-  // Keep the "New posts" affordance alive without ever swapping feed content
-  // under the user. Pause even the lightweight discovery request while the
-  // composer is open so an in-progress draft gets uninterrupted focus.
-  function pollNewerWhenSafe() {
-    const composer = document.getElementById('compose-modal');
-    if (composer && composer.classList.contains('open')) return;
-    pollNewer();
-  }
-
   function armStickToTop() {
     stickToTop = true;
     if (stickToTopTimer) window.clearTimeout(stickToTopTimer);
@@ -20747,6 +20926,7 @@ window.apAdminToast = function (msg, isErr) {
       items.dataset.hasMore = hasMore ? '1' : '0';
       if (status) {
         if (hasMore) status.textContent = 'Scroll for more…';
+        else if (viewName === 'vakktok') status.textContent = '';
         else if (isNotifTimeline) status.textContent = 'End of notifications';
         else if (isBskyTimeline) status.textContent = 'End of Bluesky feed';
         else status.textContent = 'End of timeline';
@@ -21031,13 +21211,13 @@ window.apAdminToast = function (msg, isErr) {
     ptrCollapse();
   }, { passive: true });
 
-  // Poll only to announce cached/ingested posts. Insertion is always user-driven
-  // via the New posts button, and polling pauses while the composer is open.
-  setInterval(pollNewerWhenSafe, 120000);
+  // Auto-hydrate: poll for newer posts; keep ↻ Refresh for a full reload.
+  setInterval(pollNewer, POLL_MS);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') pollNewerWhenSafe();
+    if (document.visibilityState === 'visible') pollNewer();
   });
-  setTimeout(pollNewerWhenSafe, 5000);
+  // Prime shortly after paint; subsequent checks use the two-minute cadence.
+  setTimeout(pollNewer, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
 
@@ -21200,6 +21380,127 @@ window.apAdminToast = function (msg, isErr) {
 })();
 </script>
 <?php endif; ?>
+
+<script>
+// Trends sidebar: show cached HTML immediately (SSR and/or sessionStorage),
+// and only quietly refresh in the background about every 15 minutes.
+(function () {
+  const STORE_KEY = 'vaak.trends.html.v1';
+  const CLIENT_TTL_MS = 15 * 60 * 1000;
+
+  function readStore() {
+    try {
+      const raw = sessionStorage.getItem(STORE_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || typeof data.html !== 'string' || !data.html.trim()) return null;
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function writeStore(html, ageSec) {
+    try {
+      sessionStorage.setItem(STORE_KEY, JSON.stringify({
+        html: html,
+        at: Date.now(),
+        age: typeof ageSec === 'number' ? ageSec : 0
+      }));
+    } catch (e) {}
+  }
+
+  function applyHtml(box, html, ageSec, stale) {
+    if (!box || !html || !String(html).trim()) return false;
+    box.innerHTML = html;
+    box.dataset.deferred = '0';
+    if (typeof ageSec === 'number') box.dataset.cachedAge = String(ageSec);
+    box.dataset.stale = stale ? '1' : '0';
+    return true;
+  }
+
+  function fetchTrends(box, opts) {
+    opts = opts || {};
+    const from = box.dataset.from || 'home';
+    const refresh = !!opts.refresh;
+    const url = '?ajax=trends&from=' + encodeURIComponent(from)
+      + (refresh ? '&refresh=1' : '');
+    box.dataset.deferred = box.dataset.deferred === '0' ? '0' : 'loading';
+    return fetch(url, {
+      credentials: 'same-origin',
+      headers: { 'Accept': 'text/html' },
+      cache: refresh ? 'no-store' : 'default'
+    }).then((res) => {
+      if (!res.ok) return { html: '', age: 0, stale: true };
+      const age = parseInt(res.headers.get('X-Vaak-Trends-Age') || '0', 10) || 0;
+      const stale = (res.headers.get('X-Vaak-Trends-Stale') || '0') === '1';
+      return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
+    }).then((payload) => {
+      if (payload.html && payload.html.trim()) {
+        applyHtml(box, payload.html, payload.age, payload.stale);
+        writeStore(payload.html, payload.age);
+      } else if (box.dataset.deferred !== '0') {
+        box.dataset.deferred = '1';
+      }
+      return payload;
+    }).catch(() => {
+      if (box.dataset.deferred !== '0') box.dataset.deferred = '1';
+      return null;
+    });
+  }
+
+  function loadDeferredTrends(force) {
+    const box = document.getElementById('trends-sidebar');
+    if (!box) return;
+
+    const stored = readStore();
+    const storedAgeMs = stored ? (Date.now() - (stored.at || 0)) : Infinity;
+    const storedFresh = stored && storedAgeMs < CLIENT_TTL_MS;
+
+    // Prefer session cache for instant paint across page navigations.
+    if (storedFresh && box.dataset.deferred !== '0') {
+      applyHtml(box, stored.html, stored.age || 0, false);
+    } else if (stored && box.dataset.deferred !== '0') {
+      // Stale session cache still beats a skeleton while we refresh.
+      applyHtml(box, stored.html, stored.age || 0, true);
+    }
+
+    const hasPaint = box.dataset.deferred === '0' && box.innerHTML.trim() !== '';
+    const serverAgeSec = parseInt(box.dataset.cachedAge || '0', 10) || 0;
+    const serverStale = box.dataset.stale === '1';
+    const serverFresh = hasPaint && !serverStale && serverAgeSec < (15 * 60);
+    if (serverFresh && !storedFresh) {
+      // Seed session cache from SSR so the next page nav is instant.
+      writeStore(box.innerHTML, serverAgeSec);
+    }
+    const needRefresh = !!force
+      || !hasPaint
+      || serverStale
+      || (!serverFresh && !storedFresh);
+
+    if (!needRefresh) return;
+
+    const run = () => { fetchTrends(box, { refresh: !!force && !hasPaint }); };
+    if (hasPaint) {
+      // Quiet background refresh — don't block interaction.
+      if ('requestIdleCallback' in window) {
+        requestIdleCallback(run, { timeout: 4000 });
+      } else {
+        setTimeout(run, 600);
+      }
+    } else {
+      run();
+    }
+  }
+
+  window.novaLoadDeferredTrends = loadDeferredTrends;
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(() => loadDeferredTrends(false), { timeout: 1200 });
+  } else {
+    setTimeout(() => loadDeferredTrends(false), 50);
+  }
+})();
+</script>
 
 <?php
 $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
@@ -22360,12 +22661,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         ta.focus();
         try { ta.setSelectionRange(pos, pos); } catch (_) {}
         ta.dispatchEvent(new Event('input', { bubbles: true }));
-        // A selection is complete; close the picker and reset its search so
-        // the next opening starts with the full emoji set.
-        picker.hidden = true;
-        toggle.setAttribute('aria-expanded', 'false');
-        search.value = '';
-        buttons.forEach((button) => { button.hidden = false; });
       });
       grid.appendChild(b);
       buttons.push(b);
@@ -22374,15 +22669,24 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       const q = search.value.trim().toLowerCase();
       buttons.forEach((b) => { b.hidden = !!q && !b.dataset.search.includes(q); });
     });
-    toggle.addEventListener('click', () => {
+    toggle.addEventListener('click', (event) => {
+      // Stop the same click from bubbling to the document "click outside"
+      // closer — especially when the hit target is the inner <i> icon.
+      event.stopPropagation();
       const open = picker.hidden;
       picker.hidden = !open;
       toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-      if (open) search.focus();
+      if (open) {
+        // Defer focus so this click cannot be treated as an outside dismiss.
+        setTimeout(() => { try { search.focus(); } catch (_) {} }, 0);
+      }
     });
     document.addEventListener('click', (event) => {
       if (picker.hidden) return;
-      if (event.target === picker || picker.contains(event.target) || event.target === toggle) return;
+      const t = event.target;
+      if (!(t instanceof Node)) return;
+      // toggle.contains covers clicks on the Phosphor <i> inside the button.
+      if (picker.contains(t) || toggle.contains(t)) return;
       picker.hidden = true;
       toggle.setAttribute('aria-expanded', 'false');
     });
@@ -23171,66 +23475,6 @@ if (VIEW === 'analytics') loadAnalytics();
 </script>
 <?php endif; ?>
 <script>
-// Load HLS playback only when a Bluesky stream video approaches the viewport.
-(function () {
-  const videos = Array.from(document.querySelectorAll('video[data-hls-src]'));
-  if (!videos.length) return;
-  let loader;
-  function loadHls() {
-    if (!loader) {
-      loader = new Promise((resolve, reject) => {
-        if (window.Hls) return resolve(window.Hls);
-        const script = document.createElement('script');
-        script.src = '/api/assets/hls-1.7.3.min.js';
-        script.async = true;
-        script.onload = () => resolve(window.Hls || null);
-        script.onerror = reject;
-        document.head.appendChild(script);
-      });
-    }
-    return loader;
-  }
-  async function prepare(video) {
-    const src = video.dataset.hlsSrc;
-    if (!src || video.dataset.hlsReady === '1') return;
-    video.dataset.hlsReady = '1';
-    const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
-    // Prefer native HLS on Safari's ManagedMediaSource path. Some Chromium
-    // builds report weak native support despite being unable to play HLS.
-    if (nativeHls && ('ManagedMediaSource' in window || !('MediaSource' in window))) {
-      video.src = src;
-      return;
-    }
-    try {
-      const Hls = await loadHls();
-      if (Hls && Hls.isSupported()) {
-        const player = new Hls({ enableWorker: true, lowLatencyMode: false });
-        video.__vaakHlsPlayer = player;
-        player.loadSource(src);
-        player.attachMedia(video);
-      } else if (nativeHls) {
-        video.src = src;
-      }
-    } catch (_) {
-      // Leave the cached poster visible; the post's overflow menu still links
-      // to Bluesky for browsers that cannot play this stream.
-    }
-  }
-  if ('IntersectionObserver' in window) {
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        observer.unobserve(entry.target);
-        prepare(entry.target);
-      });
-    }, { rootMargin: '500px 0px' });
-    videos.forEach((video) => observer.observe(video));
-  } else {
-    videos.forEach(prepare);
-  }
-})();
-</script>
-<script>
 // Small, opt-in keyboard layer for fast timeline navigation (X-style, but
 // limited to familiar actions and disabled while typing in a form control).
 (function () {
@@ -23298,10 +23542,10 @@ if (VIEW === 'analytics') loadAnalytics();
     try {
       const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
       const data = await res.json().catch(() => null);
-      if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || (want ? 'Could not follow account.' : 'Could not unfollow account.'));
+      if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
       form.dataset.queuePending = '1'; form.dataset.queueId = String(data.queue_id); form.dataset.queueRevision = String(data.revision || '');
       actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
-      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following' : 'Unfollowed';
+      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following (action queued)' : 'Unfollowed (action queued)';
       (async () => {
         for (let n = 0; n < 90; n++) {
           await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -23328,91 +23572,6 @@ if (VIEW === 'analytics') loadAnalytics();
       window.apAdminToast((e && e.message) || 'Follow action failed.', true);
     } finally { form.dataset.queueBusy = '0'; button.disabled = false; }
   });
-})();
-</script>
-<script>
-// Desktop-only profile previews are cache-first; cold profiles warm asynchronously.
-(function () {
-  if (!window.matchMedia || !window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
-  const card = document.createElement('aside');
-  card.className = 'profile-hover-card'; card.hidden = true; card.setAttribute('role', 'dialog');
-  card.setAttribute('aria-live', 'polite'); card.innerHTML = '<div class="profile-hover-head"><span class="profile-hover-spinner" aria-hidden="true"></span><span>Loading profile…</span></div>';
-  document.body.appendChild(card);
-  let showTimer = 0, hideTimer = 0, requestSeq = 0, anchor = null;
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  function position() {
-    if (!anchor || card.hidden) return;
-    const r = anchor.getBoundingClientRect(), w = card.offsetWidth, h = card.offsetHeight, pad = 12;
-    let left = r.right + 10;
-    if (left + w > innerWidth - pad) left = Math.max(pad, r.left - w - 10);
-    let top = Math.max(pad, Math.min(r.top, innerHeight - h - pad));
-    card.style.left = left + 'px'; card.style.top = top + 'px';
-  }
-  function node(tag, cls, value) {
-    const el = document.createElement(tag); if (cls) el.className = cls;
-    if (value !== undefined) el.textContent = value; return el;
-  }
-  function render(data) {
-    card.replaceChildren();
-    const head = node('div', 'profile-hover-head');
-    if (data.avatar && /^https:\/\//i.test(data.avatar)) { const img = node('img', 'profile-hover-avatar'); img.src = data.avatar; img.alt = ''; img.referrerPolicy = 'no-referrer'; head.appendChild(img); }
-    const names = node('div', ''); names.appendChild(node('div', 'profile-hover-name', data.display_name || data.handle || 'Account'));
-    if (data.handle) names.appendChild(node('div', 'meta', data.handle));
-    head.appendChild(names); card.appendChild(head);
-    const bio = Array.from(String(data.bio || ''));
-    if (bio.length) card.appendChild(node('div', 'profile-hover-bio', bio.slice(0, 100).join('') + (bio.length > 100 ? '…' : '')));
-    const foot = node('div', 'profile-hover-foot');
-    const relation = data.following && data.follows_you ? 'mutual' : data.following ? 'following' : data.follows_you ? 'follows you' : '';
-    foot.appendChild(node('span', 'meta', relation));
-    const actions = node('span', '');
-    if (data.profile_url) { const link = node('a', 'btn btn-ghost', 'View profile'); link.href = data.profile_url; actions.appendChild(link); }
-    if (data.can_follow && !data.own) {
-      const form = document.createElement('form'); form.method = 'post'; form.action = window.location.pathname + (window.location.search || '');
-      form.style.display = 'inline';
-      const add = (name, value) => { const input = document.createElement('input'); input.type = 'hidden'; input.name = name; input.value = value; form.appendChild(input); };
-      add('action', data.following ? 'unfollow_remote' : 'follow_remote'); add('actor_id', data.actor); add('return_view', 'home');
-      if (window.VAAK_CSRF) add('csrf', window.VAAK_CSRF);
-      const button = node('button', 'btn btn-primary', data.following ? 'Unfollow' : (data.follows_you ? 'Follow back' : 'Follow'));
-      button.type = 'submit'; form.appendChild(button); actions.appendChild(form);
-    }
-    foot.appendChild(actions); card.appendChild(foot); position();
-  }
-  async function load(actor, seq) {
-    const send = async () => {
-      const fd = new FormData(); fd.set('action', 'profile_hover_data'); fd.set('actor', actor);
-      if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
-      const res = await fetch(window.location.pathname + (window.location.search || ''), { method:'POST', body:fd, credentials:'same-origin', headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'} });
-      if (!res.ok) throw new Error('Profile preview unavailable'); return res.json();
-    };
-    try {
-      let data = await send();
-      for (let i = 0; data && data.ok && data.loading && i < 4 && seq === requestSeq; i++) { await sleep(900); data = await send(); }
-      if (seq !== requestSeq || !card.isConnected) return;
-      if (data && data.ok) render(data);
-      else card.replaceChildren(node('div', 'meta', (data && data.error) || 'Profile preview unavailable'));
-    } catch (_) { if (seq === requestSeq) card.replaceChildren(node('div', 'meta', 'Profile preview unavailable')); }
-  }
-  function show(el) {
-    const actor = el && el.dataset.profileHoverActor;
-    if (!actor || !/^https:\/\//i.test(actor)) return;
-    clearTimeout(hideTimer); clearTimeout(showTimer);
-    showTimer = setTimeout(() => {
-      anchor = el; const seq = ++requestSeq;
-      card.hidden = false; card.style.left = '12px'; card.style.top = '12px';
-      card.innerHTML = '<div class="profile-hover-head"><span class="profile-hover-spinner" aria-hidden="true"></span><span>Loading profile…</span></div>';
-      position(); load(actor, seq);
-    }, 320);
-  }
-  function scheduleHide() { clearTimeout(showTimer); clearTimeout(hideTimer); hideTimer = setTimeout(() => { card.hidden = true; anchor = null; requestSeq++; }, 240); }
-  document.addEventListener('pointerover', ev => { const el = ev.target.closest && ev.target.closest('[data-profile-hover-actor]'); if (el && !el.contains(ev.relatedTarget)) show(el); });
-  document.addEventListener('pointerout', ev => {
-    const el = ev.target.closest && ev.target.closest('[data-profile-hover-actor]');
-    const next = ev.relatedTarget;
-    if (el && !(next && (el.contains(next) || (next.contains && next.contains(el))))) scheduleHide();
-  });
-  card.addEventListener('pointerenter', () => clearTimeout(hideTimer)); card.addEventListener('pointerleave', scheduleHide);
-  window.addEventListener('scroll', () => { if (!card.hidden) position(); }, true);
-  window.addEventListener('resize', () => { if (!card.hidden) position(); });
 })();
 </script>
 </body>

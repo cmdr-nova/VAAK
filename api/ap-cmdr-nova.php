@@ -873,8 +873,8 @@ function ap_cmdr_shell_start(string $title): void
       .profile-media-item{min-width:0;padding:.6rem;background:#111;border:1px solid #292929;border-radius:12px;overflow:hidden}
       .profile-media-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px;border-radius:8px;overflow:hidden;background:#090909}
       .profile-media-grid.media-count-1{grid-template-columns:1fr}
-      .profile-media-grid a{display:block;min-width:0;aspect-ratio:1/1;overflow:hidden}
-      .profile-media-grid img,.profile-media-grid video{display:block;width:100%;height:100%;object-fit:cover;background:#090909}
+      .profile-media-grid a,.profile-media-grid .note-media-trigger{display:block;min-width:0;aspect-ratio:1/1;overflow:hidden;width:100%;height:auto;padding:0;margin:0;border:0;background:#090909;cursor:zoom-in}
+      .profile-media-grid img,.profile-media-grid video{display:block;width:100%;height:100%;object-fit:cover;background:#090909;border:0;border-radius:0;max-height:none}
       .profile-media-grid audio{width:100%;grid-column:1/-1}
       .profile-media-caption{margin-top:.55rem;color:#ccc;font-size:.88rem;line-height:1.4;overflow-wrap:anywhere}
       .profile-media-date{display:block;margin-top:.4rem;color:#858585;font-size:.75rem}
@@ -1769,8 +1769,7 @@ function ap_cmdr_html(): void
             echo '<p class="muted">' . htmlspecialchars($emptyMsg, ENT_QUOTES, 'UTF-8') . '</p>';
         } else {
             foreach ($postsData['rows'] as $n) {
-                // Public profile rendering must not wait on remote quote/reply fetches.
-                echo ap_cmdr_post_preview_html($n, false);
+                echo ap_cmdr_post_preview_html($n);
             }
             $totalPages = max(1, (int) ceil($tabTotal / $perPage));
             if ($totalPages > 1) {
@@ -2091,7 +2090,10 @@ function ap_cmdr_profile_media_item_html(array $row): string
         } elseif (($item['type'] ?? '') === 'audio') {
             $cells[] = '<audio src="' . $url . '" controls preload="none"></audio>';
         } else {
-            $cells[] = '<a href="' . $url . '" target="_blank" rel="noopener noreferrer"><img src="' . $url . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer"></a>';
+            // Same lightbox as post images (.note-media-trigger / #ap-img-lightbox).
+            $cells[] = '<button type="button" class="note-media-trigger" data-full="' . $url . '" aria-label="View full image">'
+                . '<img src="' . $url . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer">'
+                . '</button>';
         }
     }
     if ($cells === []) return '';
@@ -2319,7 +2321,7 @@ function ap_cmdr_normalize_profile_tab(string $tab): string
 /**
  * Best-effort plain-text snippet for a remote/local object URL (reply/quote parent).
  */
-function ap_cmdr_object_snippet(string $objectUrl, int $maxLen = 140, bool $allowRemoteFetch = true): string
+function ap_cmdr_object_snippet(string $objectUrl, int $maxLen = 140): string
 {
     $objectUrl = rtrim(trim($objectUrl), '/');
     if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
@@ -2379,7 +2381,7 @@ function ap_cmdr_object_snippet(string $objectUrl, int $maxLen = 140, bool $allo
     }
 
     // Live fetch remote AS2 once (profile pages only have a handful of quotes)
-    if ($allowRemoteFetch && !str_starts_with($objectUrl, 'https://mkultra.monster/')) {
+    if (!str_starts_with($objectUrl, 'https://mkultra.monster/')) {
         try {
             if (!function_exists('ap_fetch_as2_object')) {
                 if (!defined('AP_INBOX_LIB_ONLY')) {
@@ -2430,7 +2432,7 @@ function ap_cmdr_short_url_label(string $url): string
     return $label !== '' ? $label : $url;
 }
 
-function ap_cmdr_post_preview_html(array $n, bool $allowRemoteSnippets = true): string
+function ap_cmdr_post_preview_html(array $n): string
 {
     $kind = (string) ($n['kind'] ?? 'compose');
     $isSite = ($kind === 'site_blog' || $kind === 'site_note');
@@ -2500,7 +2502,7 @@ function ap_cmdr_post_preview_html(array $n, bool $allowRemoteSnippets = true): 
     if ($isBoost) {
         $objectId = rtrim((string) ($n['object_id'] ?? $id), '/');
         $targetActor = rtrim((string) ($n['target_actor'] ?? ''), '/');
-        $snippet = $objectId !== '' ? ap_cmdr_object_snippet($objectId, 180, $allowRemoteSnippets) : '';
+        $snippet = $objectId !== '' ? ap_cmdr_object_snippet($objectId, 180) : '';
         $who = '';
         if ($targetActor !== '' && str_starts_with($targetActor, 'https://')) {
             if (function_exists('ap_cmdr_actor_handle_label')) {
@@ -2566,7 +2568,7 @@ function ap_cmdr_post_preview_html(array $n, bool $allowRemoteSnippets = true): 
     }
     $quoteHtml = '';
     if ($quoteUrl !== '') {
-        $qSnippet = ap_cmdr_object_snippet($quoteUrl, 160, $allowRemoteSnippets);
+        $qSnippet = ap_cmdr_object_snippet($quoteUrl, 160);
         // No nested <a> inside the outer .post link — browsers break the card layout
         $quoteHtml = '<div class="quote-block"><span class="qt-label">Quoted</span>';
         if ($qSnippet !== '') {
@@ -2586,7 +2588,7 @@ function ap_cmdr_post_preview_html(array $n, bool $allowRemoteSnippets = true): 
     }
     $replyHtml = '';
     if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
-        $rSnippet = ap_cmdr_object_snippet($replyTo, 100, $allowRemoteSnippets);
+        $rSnippet = ap_cmdr_object_snippet($replyTo, 100);
         $label = $rSnippet !== ''
             ? htmlspecialchars($rSnippet, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
             : htmlspecialchars(ap_cmdr_short_url_label($replyTo), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');

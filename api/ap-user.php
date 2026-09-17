@@ -725,9 +725,10 @@ function ap_user_note_media_html(array $note, bool $interactive = true): string
             || (bool) preg_match('/\.(mp4|webm|mov|m4v)(\?|$)/i', (string) (parse_url($url, PHP_URL_PATH) ?? ''));
         if (str_starts_with($mt, 'image/') || $atype === 'Image') {
             if ($interactive) {
-                $cells[] = '<a class="media-cell" href="' . $safe . '" target="_blank" rel="noopener noreferrer">'
+                // Same lightbox as cmdr_nova HTML profile posts (.note-media-trigger).
+                $cells[] = '<button type="button" class="note-media-trigger media-cell" data-full="' . $safe . '" aria-label="View full image">'
                     . '<img src="' . $safe . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer">'
-                    . '</a>';
+                    . '</button>';
             } else {
                 $cells[] = '<img src="' . $safe . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer">';
             }
@@ -999,7 +1000,13 @@ function ap_user_html_shell_start(string $title): void
       .media-row.media-count-3{grid-template-columns:1fr 1fr;grid-template-rows:minmax(120px,1fr) minmax(120px,1fr)}
       .media-row.media-count-3>:first-child{grid-row:1 / span 2}
       .media-row.media-count-4{grid-template-columns:1fr 1fr;grid-template-rows:minmax(120px,1fr) minmax(120px,1fr)}
-      .media-row .media-cell{display:block;width:100%;height:100%;min-height:0;background:#0c0c0c}
+      .media-row .media-cell,.media-row .note-media-trigger{display:block;width:100%;height:100%;min-height:0;padding:0;margin:0;border:0;background:#0c0c0c;cursor:zoom-in}
+      .note-media-trigger img{display:block;width:100%;height:100%;object-fit:cover}
+      .ap-img-lightbox{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;padding:1rem;background:rgba(0,0,0,.88);backdrop-filter:blur(3px)}
+      .ap-img-lightbox.open{display:flex}
+      .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.55)}
+      .ap-img-lightbox__close{position:absolute;top:max(.75rem,env(safe-area-inset-top));right:max(.75rem,env(safe-area-inset-right));appearance:none;border:0;border-radius:999px;width:2.4rem;height:2.4rem;background:rgba(255,255,255,.14);color:#fff;font-size:1.4rem;line-height:1;cursor:pointer}
+      .ap-img-lightbox__close:hover{background:rgba(255,255,255,.24)}
       .media-row img,.media-row video{display:block;width:100%;height:100%;max-height:min(58vh,520px);object-fit:cover;background:#0c0c0c;border:0}
       .media-row.media-count-1 .media-cell{height:auto}
       .media-row.media-count-1 img{height:auto;object-fit:contain;max-height:min(62vh,560px);min-height:0;background:transparent}
@@ -1044,5 +1051,15 @@ function ap_user_html_shell_end(): void
     echo '<a href="https://mkultra.monster/">mkultra.monster</a>';
     echo '</nav>';
     echo '<p class="muted" style="margin:.45rem 0 0">Invite-only ActivityPub · powered by VAAK</p>';
-    echo '</footer></div></main></body></html>';
+    echo '</footer></div></main>';
+    if (function_exists('ap_cmdr_lightbox_markup_and_script')) {
+        echo ap_cmdr_lightbox_markup_and_script();
+    } else {
+        echo '<div class="ap-img-lightbox" id="ap-img-lightbox" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Image preview">'
+            . '<button type="button" class="ap-img-lightbox__close" id="ap-img-lightbox-close" aria-label="Close">×</button>'
+            . '<img id="ap-img-lightbox-img" src="" alt="">'
+            . '</div>';
+        echo '<script>(function(){var box=document.getElementById("ap-img-lightbox");var img=document.getElementById("ap-img-lightbox-img");var closeBtn=document.getElementById("ap-img-lightbox-close");if(!box||!img)return;function openLb(src,alt){if(!src)return;img.src=src;img.alt=alt||"";box.classList.add("open");box.setAttribute("aria-hidden","false");document.body.style.overflow="hidden";}function closeLb(){box.classList.remove("open");box.setAttribute("aria-hidden","true");img.removeAttribute("src");img.alt="";document.body.style.overflow="";}document.addEventListener("click",function(e){var t=e.target instanceof Element?e.target.closest(".note-media-trigger,[data-ap-lightbox]"):null;if(!t)return;e.preventDefault();var full=t.getAttribute("data-full")||(t.querySelector&&t.querySelector("img")&&t.querySelector("img").src)||"";var alt=(t.querySelector&&t.querySelector("img")&&t.querySelector("img").alt)||"";openLb(full,alt);});closeBtn&&closeBtn.addEventListener("click",closeLb);box.addEventListener("click",function(e){if(e.target===box)closeLb();});document.addEventListener("keydown",function(e){if(e.key==="Escape"&&box.classList.contains("open"))closeLb();});})();</script>';
+    }
+    echo '</body></html>';
 }

@@ -550,6 +550,23 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
                 $quoteAuthorized = !empty($quoteNote['quoteAuthorization'])
                     || ($quoteActor !== '' && $quoteObjectUrl !== null
                         && str_starts_with(rtrim($quoteObjectUrl, '/') . '/', $quoteActor . '/notes/'));
+                // Bluesky quotes never use FEP-044f stamps.
+                if (!$quoteAuthorized && $quoteObjectUrl !== null && function_exists('ap_quote_target_is_bluesky')
+                    && ap_quote_target_is_bluesky($quoteObjectUrl)) {
+                    $quoteAuthorized = true;
+                }
+                // Remotes with canQuote automaticApproval:Public — show as accepted
+                // even if Accept stamp was missed (common when QuoteRequest was dropped).
+                if (!$quoteAuthorized && $quoteObjectUrl !== null && function_exists('ap_quote_target_allows_automatic')
+                    && ap_quote_target_allows_automatic($quoteObjectUrl)) {
+                    $quoteAuthorized = true;
+                }
+                // Authorized-fetch walls can block QuoteRequest entirely; if we already
+                // have the quoted post locally, don't leave the UI stuck on "pending".
+                if (!$quoteAuthorized && $quoteObjectUrl !== null && function_exists('ap_quote_target_locally_known')
+                    && ap_quote_target_locally_known($quoteObjectUrl)) {
+                    $quoteAuthorized = true;
+                }
             }
         }
     }
@@ -837,7 +854,53 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
         ];
     }
 
-    $quoted = ap_masto_lookup_status_by_object_url($quoteObjectUrl, $depth + 1, $allowFetch);
+    // allowHiddenActor: quote embeds of people you've blocked/hidden should still
+    // resolve when *you* quoted them (otherwise VAAK shows endless "pending").
+    $quoted = ap_masto_lookup_status_by_object_url($quoteObjectUrl, $depth + 1, $allowFetch, true);
+    if ($quoted === null
+        && function_exists('ap_quote_target_is_bluesky')
+        && ap_quote_target_is_bluesky($quoteObjectUrl)
+        && function_exists('ap_bsky_post_preview_from_url')) {
+        // Bluesky quotes are not AS2 — synthesize a minimal status from AppView/cache
+        // so Status/Home masto cards aren't stuck on "pending".
+        $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+        $prev = ap_bsky_post_preview_from_url($quoteObjectUrl, $ownerForBsky, true);
+        if (is_array($prev) && (trim((string) ($prev['text'] ?? '')) !== '' || trim((string) ($prev['handle'] ?? '')) !== '')) {
+            $handle = ltrim((string) ($prev['handle'] ?? ''), '@');
+            $display = trim((string) ($prev['display'] ?? ''));
+            if ($display === '') {
+                $display = $handle !== '' ? $handle : 'Bluesky';
+            }
+            $webUrl = (string) ($prev['url'] ?? $quoteObjectUrl);
+            if (function_exists('ap_bsky_normalize_web_url')) {
+                $webUrl = ap_bsky_normalize_web_url($webUrl);
+            }
+            $text = trim((string) ($prev['text'] ?? ''));
+            $html = $text !== ''
+                ? (function_exists('ap_plain_text_to_html')
+                    ? ap_plain_text_to_html($text)
+                    : ('<p>' . htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>'))
+                : '';
+            $acct = $handle !== '' ? $handle : 'bsky.app';
+            $quoted = [
+                'id' => 'bsky:' . md5((string) ($prev['uri'] ?? $webUrl)),
+                'uri' => $webUrl,
+                'url' => $webUrl,
+                'content' => $html,
+                'account' => [
+                    'id' => 'bsky:' . md5($acct),
+                    'acct' => $acct,
+                    'username' => $acct,
+                    'display_name' => $display,
+                    'url' => $handle !== ''
+                        ? (function_exists('ap_bsky_actor_profile_url')
+                            ? ap_bsky_actor_profile_url($handle)
+                            : ('https://bsky.app/profile/' . rawurlencode($handle)))
+                        : 'https://bsky.app/',
+                ],
+            ];
+        }
+    }
     if ($quoted === null) {
         // Still advertise the quote so clients know one exists (pending until cached)
         return [
@@ -884,7 +947,7 @@ function ap_masto_object_url_lookup_candidates(string $objectUrl): array
  *
  * @return array<string,mixed>|null
  */
-function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth = 1, bool $allowFetch = false): ?array
+function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth = 1, bool $allowFetch = false, bool $allowHiddenActor = false): ?array
 {
     $objectUrl = rtrim(trim($objectUrl), '/');
     if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
@@ -911,6 +974,11 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
         $st->execute([$cand, $cand . '/']);
         $erow = $st->fetch();
         if (is_array($erow)) {
+            // Outbound quotes of blocked/hidden actors should still resolve —
+            // you intentionally quoted them; hide lists must not blank the card.
+            if ($allowHiddenActor) {
+                $erow['_allow_hidden_actor'] = true;
+            }
             $status = ap_masto_status_from_event($erow);
             if (is_array($status)) {
                 // Prefer the inner reblog payload when the event was an Announce
@@ -2526,7 +2594,9 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
     if (!is_array($doc)) {
         // Some Mastodon instances require authorized fetch for ActivityPub
         // objects, while still exposing public statuses through their REST API.
-        // Keep this fallback bounded to canonical Mastodon status URLs.
+        // This is a bounded fallback for canonical Mastodon status URLs only;
+        // it keeps an inaccessible peer from stalling the timeline and stores
+        // the same public fields we need for the boost card.
         $statusId = ap_masto_remote_status_id_from_object_url($objectUrl);
         $host = strtolower((string) (parse_url($objectUrl, PHP_URL_HOST) ?: ''));
         if ($statusId !== null && $host !== '' && function_exists('ap_host_resolves_public')
@@ -2539,15 +2609,24 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
             }
             if (function_exists('ap_http_curl_get_ex')) {
                 $apiUrl = 'https://' . $host . '/api/v1/statuses/' . rawurlencode($statusId);
-                $response = ap_http_curl_get_ex($apiUrl, ['Accept: application/json'], 5, 524288);
+                $response = ap_http_curl_get_ex(
+                    $apiUrl,
+                    ['Accept: application/json'],
+                    5,
+                    524288
+                );
                 if (is_string($response['body'] ?? null) && $response['body'] !== '') {
                     $status = json_decode($response['body'], true);
                     $statusUri = is_array($status) ? rtrim((string) ($status['uri'] ?? ''), '/') : '';
                     $accountUrl = is_array($status) && is_array($status['account'] ?? null)
                         ? rtrim((string) ($status['account']['url'] ?? ''), '/')
                         : '';
+                    // Do not cache a response for a different ID/account, or
+                    // content from a private endpoint that escaped the boost.
                     $visibility = strtolower((string) ($status['visibility'] ?? ''));
-                    if (is_array($status) && $statusUri === $objectUrl && $accountUrl !== ''
+                    if (is_array($status)
+                        && $statusUri === $objectUrl
+                        && $accountUrl !== ''
                         && str_starts_with($accountUrl, 'https://')
                         && in_array($visibility, ['public', 'unlisted'], true)) {
                         $attachments = [];
@@ -2562,7 +2641,8 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
                             if ($mediaUrl === '') {
                                 continue;
                             }
-                            $mediaType = match ((string) ($attachment['type'] ?? '')) {
+                            $mime = (string) ($attachment['type'] ?? '');
+                            $mediaType = match ($mime) {
                                 'image' => 'Image',
                                 'video', 'gifv' => 'Video',
                                 'audio' => 'Audio',
@@ -2669,7 +2749,9 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
 
     $spoilerText = is_string($doc['summary'] ?? null) ? (string) $doc['summary'] : '';
     $sensitive = !empty($doc['sensitive']);
-    $visibility = isset($restVisibility) && is_string($restVisibility) ? $restVisibility : 'public';
+    $visibility = isset($restVisibility) && is_string($restVisibility)
+        ? $restVisibility
+        : 'public';
     ap_metrics_record(
         'Create',
         $actorId,
@@ -3641,16 +3723,6 @@ function ap_masto_clean_mention_text(string $text): string
     return trim($text);
 }
 
-/** Pull a quote URL from Mastodon-compatible RE: quote prefixes. */
-function ap_masto_quote_url_from_text(string $text): string
-{
-    if (preg_match('#(?:^|\\s)RE:\\s*(https://[^\\s<>]+)#iu', html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'), $m)) {
-        $url = rtrim((string) $m[1], '.,;:!?)\\]}');
-        return str_starts_with($url, 'https://') ? $url : '';
-    }
-    return '';
-}
-
 /** Cached link card for remote text, with a background warm on cache miss. */
 function ap_masto_remote_link_card(string $text, bool $hasMedia = false): ?array
 {
@@ -4358,9 +4430,46 @@ function ap_masto_notification_entity(array $item): ?array
                 $status['url'] = $subjectUrl;
                 $status['uri'] = $subjectUrl;
             }
-            // Placeholder only when we truly have no local body.
-            if (trim(strip_tags((string) ($status['content'] ?? ''))) === ''
-                || str_contains((string) ($row['content'] ?? ''), 'your Bluesky post')) {
+            // Hydrate empty / placeholder body from Bluesky cache (common for likes on replies).
+            $bodyPlain = trim(strip_tags((string) ($status['content'] ?? '')));
+            $rowContent = (string) ($row['content'] ?? '');
+            $needsPreview = $bodyPlain === ''
+                || str_contains($rowContent, 'your Bluesky post')
+                || $bodyPlain === 'Bluesky post'
+                || str_contains((string) ($status['content'] ?? ''), 'Bluesky post');
+            if ($needsPreview) {
+                if (!function_exists('ap_bsky_subject_post_preview_text')) {
+                    $bskyLib = __DIR__ . '/ap-bsky.php';
+                    if (is_file($bskyLib)) {
+                        require_once $bskyLib;
+                    }
+                }
+                if (function_exists('ap_bsky_subject_post_preview_text')) {
+                    $preview = ap_bsky_subject_post_preview_text(
+                        $subjectUrl,
+                        (int) ($row['owner_user_id'] ?? 0)
+                    );
+                    if ($preview !== '') {
+                        $status['content'] = function_exists('ap_plain_text_to_html')
+                            ? ap_plain_text_to_html($preview)
+                            : ('<p>' . htmlspecialchars($preview, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>');
+                        // Prefer local twin URL when available.
+                        if (function_exists('ap_bsky_local_note_id_for_at_uri')) {
+                            $twin = ap_bsky_local_note_id_for_at_uri(
+                                $subjectUrl,
+                                (int) ($row['owner_user_id'] ?? 0)
+                            );
+                            if (is_string($twin) && str_starts_with($twin, 'https://mkultra.monster/')) {
+                                $status['url'] = rtrim($twin, '/');
+                                $status['uri'] = rtrim($twin, '/');
+                            }
+                        }
+                        $needsPreview = false;
+                    }
+                }
+            }
+            // Placeholder only when we truly have no body.
+            if ($needsPreview) {
                 $status['content'] = '<p>Bluesky post</p>';
             }
         }
@@ -5104,9 +5213,10 @@ function ap_masto_status_from_event(array $row): ?array
     }
     $actorId = (string) ($row['actor_id'] ?? '');
     $evHost = isset($row['host']) ? (string) $row['host'] : null;
-    if ($actorId === '' || (function_exists('ap_row_is_hidden')
+    $allowHidden = !empty($row['_allow_hidden_actor']);
+    if ($actorId === '' || (!$allowHidden && (function_exists('ap_row_is_hidden')
         ? ap_row_is_hidden($actorId, $evHost, ap_db_masto_owner_user_id())
-        : ap_row_is_blocked($actorId, $evHost))) {
+        : ap_row_is_blocked($actorId, $evHost)))) {
         return null;
     }
     // Skip session actor's own outbound copies (shown via local statuses / outbox cards).
@@ -5118,11 +5228,6 @@ function ap_masto_status_from_event(array $row): ?array
 
     $account = ap_masto_remote_account($actorId);
     $text = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-    // Misskey/Sharkey quote boosts are sometimes serialized as a bare
-    // `RE: <permalink>` body instead of ActivityPub's quote/tag fields. Keep
-    // that target as a real quote card before cleaning the machine prefix out
-    // of the visible commentary.
-    $quoteObjectUrl = ap_masto_quote_url_from_text($text);
     $spoilerText = trim((string) ($row['spoiler_text'] ?? ''));
     $isSensitive = !empty($row['sensitive']) || $spoilerText !== '';
     // Strip RE:<url> prefixes from quote commentary (keep ↪ QT block intact)
@@ -5183,7 +5288,7 @@ function ap_masto_status_from_event(array $row): ?array
     // Allow empty stubs in thread context (CW-only / fetch failures still need a parent card).
     // Announces of our own notes often store null summary — still show the boost wrapper.
     $type = strtolower((string) ($row['type'] ?? 'Create'));
-    $allowEmpty = !empty($row['_allow_empty_for_context']) || $type === 'announce' || $quoteObjectUrl !== '';
+    $allowEmpty = !empty($row['_allow_empty_for_context']) || $type === 'announce';
     $hasCw = trim((string) ($row['spoiler_text'] ?? '')) !== '' || !empty($row['sensitive']);
     if (trim($text) === '' && !$media && !$hasCw) {
         if (!$allowEmpty) {
@@ -5330,9 +5435,7 @@ function ap_masto_status_from_event(array $row): ?array
         'poll' => null,
         // Explicit null prevents clients from carrying a stale native quote
         // card across status updates when this remote post has no quote.
-        'quote' => $quoteObjectUrl !== ''
-            ? ap_masto_quote_entity($quoteObjectUrl, 0, !empty($row['_allow_quote_fetch']))
-            : null,
+        'quote' => null,
         'quote_approval' => [
             'automatic' => ['public'],
             'manual' => [],
@@ -7309,17 +7412,26 @@ function ap_masto_trends_cache_info(string $kind): array
 }
 
 /**
- * @return list<array<string,mixed>>|null
+ * Read trends cache. When $allowStale is true, expired files are still returned
+ * so the sidebar can paint immediately (stale-while-revalidate).
+ *
+ * @return array{items:list<array<string,mixed>>,age:int,stale:bool}|null
  */
-function ap_masto_trends_cache_get(string $kind, int $minItems = 1): ?array
+function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allowStale = false): ?array
 {
     $info = ap_masto_trends_cache_info($kind);
     $path = $info['path'];
     if (!is_file($path)) {
         return null;
     }
-    $age = time() - (int) filemtime($path);
-    if ($age < 0 || $age >= (int) $info['ttl']) {
+    $mtime = (int) filemtime($path);
+    $age = time() - $mtime;
+    if ($age < 0) {
+        $age = 0;
+    }
+    $ttl = (int) $info['ttl'];
+    $stale = $age >= $ttl;
+    if ($stale && !$allowStale) {
         return null;
     }
     $raw = @file_get_contents($path);
@@ -7333,7 +7445,55 @@ function ap_masto_trends_cache_get(string $kind, int $minItems = 1): ?array
     if (count($decoded['items']) < $minItems) {
         return null;
     }
-    return $decoded['items'];
+    return [
+        'items' => $decoded['items'],
+        'age' => $age,
+        'stale' => $stale,
+    ];
+}
+
+/**
+ * @return list<array<string,mixed>>|null
+ */
+function ap_masto_trends_cache_get(string $kind, int $minItems = 1): ?array
+{
+    $row = ap_masto_trends_cache_read($kind, $minItems, false);
+    return is_array($row) ? $row['items'] : null;
+}
+
+/**
+ * After the HTTP response is sent, recompute expired trend caches.
+ * Safe to call multiple times per request (runs once).
+ */
+function ap_masto_trends_schedule_refresh(): void
+{
+    static $scheduled = false;
+    if ($scheduled) {
+        return;
+    }
+    $scheduled = true;
+    register_shutdown_function(static function (): void {
+        try {
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            // Force recompute: cache_get returns null when expired.
+            if (function_exists('ap_masto_trends_tags')) {
+                ap_masto_trends_tags(10);
+            }
+            if (function_exists('ap_masto_trends_links')) {
+                ap_masto_trends_links(10);
+            }
+            if (function_exists('ap_masto_trends_statuses')) {
+                ap_masto_trends_statuses(10);
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-masto] trends refresh: ' . $e->getMessage());
+        }
+    });
 }
 
 /**
@@ -8340,10 +8500,6 @@ function ap_masto_suggestions_v2(int $limit = 40): array
             $moderationRefs[] = ap_masto_suggestion_best_actor_id($actorId);
         }
         foreach (array_unique($moderationRefs) as $ref) {
-            if ($ownerUserId > 0 && function_exists('ap_lists_moderation_action_for_actor')
-                && ap_lists_moderation_action_for_actor($ref, $ownerUserId) !== 'none') {
-                return true;
-            }
             if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($ref)) {
                 return true;
             }
@@ -8871,7 +9027,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
         require_once __DIR__ . '/ap-search-fts.php';
     }
     if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
-        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName, ['event', 'mention', 'status']);
+        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName);
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
@@ -9360,38 +9516,6 @@ function ap_masto_bookmarks_list(int $limit = 40, ?string $maxId = null): array
         }
     }
     return $out;
-}
-
-/**
- * Hydrate only bookmarked statuses assigned to a VAAK folder. This avoids
- * resolving the whole bookmark page just to display a small folder.
- *
- * @param list<string> $statusIds
- * @return list<array<string,mixed>>
- */
-function ap_masto_bookmarks_for_status_ids(array $statusIds, ?int $ownerUserId = null): array
-{
-    $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    $ids = array_values(array_unique(array_filter(array_map(
-        static fn($id): string => trim((string) $id),
-        array_slice($statusIds, 0, 500)
-    ), static fn(string $id): bool => $id !== '')));
-    if ($ownerUserId < 1 || $ids === []) return [];
-    try {
-        $marks = implode(',', array_fill(0, count($ids), '?'));
-        $st = ap_db()->prepare(
-            'SELECT * FROM masto_bookmarks WHERE owner_user_id = ? AND status_id IN (' . $marks . ') ORDER BY created_at DESC'
-        );
-        $st->execute(array_merge([$ownerUserId], $ids));
-        $out = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
-            if ($status !== null) $out[] = $status;
-        }
-        return $out;
-    } catch (Throwable $e) {
-        return [];
-    }
 }
 
 /**

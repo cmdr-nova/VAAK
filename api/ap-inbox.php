@@ -1551,20 +1551,8 @@ function ap_note_cw_from_doc(?array $doc): array
         $spoiler = function_exists('ap_html_to_plain_text')
             ? trim(ap_html_to_plain_text($doc['summary']))
             : trim(html_entity_decode(strip_tags($doc['summary']), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $spoiler = mb_substr(ap_fix_utf8($spoiler), 0, 500);
     }
-    // Some Misskey/Sharkey versions expose the warning with their native key
-    // as well as (or instead of) ActivityPub's `summary`.
-    if ($spoiler === '') {
-        foreach (['cw', 'contentWarning', 'content_warning', '_misskey_contentWarning'] as $key) {
-            if (isset($doc[$key]) && is_string($doc[$key]) && trim($doc[$key]) !== '') {
-                $spoiler = function_exists('ap_html_to_plain_text')
-                    ? trim(ap_html_to_plain_text($doc[$key]))
-                    : trim(html_entity_decode(strip_tags($doc[$key]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                break;
-            }
-        }
-    }
-    $spoiler = mb_substr(ap_fix_utf8($spoiler), 0, 500);
     $sensitive = !empty($doc['sensitive']) || $spoiler !== '';
     return ['spoiler_text' => $spoiler, 'sensitive' => $sensitive];
 }
@@ -1946,7 +1934,186 @@ function ap_fetch_as2_object(string $url): ?array
             return $local;
         }
     }
-    return ap_fetch_remote_as2($url);
+    $doc = ap_fetch_remote_as2($url);
+    if (is_array($doc)) {
+        return $doc;
+    }
+    // Misskey/Sharkey often require authorized fetch for AS2 while still
+    // exposing public notes via /api/notes/show — use that for boost cards.
+    return ap_misskey_note_as2_from_url($url);
+}
+
+/**
+ * Misskey/Sharkey note id from https://host/notes/{id} (and /note/{id}).
+ */
+function ap_misskey_note_id_from_url(string $url): ?string
+{
+    $url = rtrim(trim($url), '/');
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        return null;
+    }
+    if (preg_match('#/notes?/([a-zA-Z0-9_-]+)(?:/|$|\?)#', $url, $m)) {
+        return $m[1];
+    }
+    return null;
+}
+
+/**
+ * Best-effort AS2 Note synthesized from Misskey/Sharkey /api/notes/show.
+ * Used when authorized-fetch blocks unsigned AS2 GETs (common on eepy.moe etc.).
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_misskey_note_as2_from_url(string $url): ?array
+{
+    $url = rtrim(trim($url), '/');
+    $noteId = ap_misskey_note_id_from_url($url);
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    if ($noteId === null || $host === '' || $host === 'mkultra.monster') {
+        return null;
+    }
+    if (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($host)) {
+        return null;
+    }
+    $apiUrl = 'https://' . $host . '/api/notes/show';
+    $payload = json_encode(['noteId' => $noteId], JSON_UNESCAPED_SLASHES);
+    if (!is_string($payload)) {
+        return null;
+    }
+    $ch = curl_init($apiUrl);
+    if ($ch === false) {
+        return null;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'User-Agent: VAAK/1.0 (+https://mkultra.monster/vaak)',
+        ],
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => 6,
+    ]);
+    $raw = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    $body = is_string($raw) ? $raw : null;
+    if ($status < 200 || $status >= 300 || !is_string($body) || $body === '') {
+        return null;
+    }
+    $note = json_decode($body, true);
+    if (!is_array($note) || (string) ($note['id'] ?? '') !== $noteId) {
+        return null;
+    }
+    $visibility = strtolower((string) ($note['visibility'] ?? 'public'));
+    // Only hydrate public-ish notes into the firehose / boost cards.
+    if (!in_array($visibility, ['public', 'home'], true)) {
+        return null;
+    }
+    $user = is_array($note['user'] ?? null) ? $note['user'] : [];
+    $username = trim((string) ($user['username'] ?? ''));
+    if ($username === '') {
+        return null;
+    }
+    $userHost = trim((string) ($user['host'] ?? ''));
+    $actorHost = $userHost !== '' ? strtolower($userHost) : $host;
+    // Prefer an explicit AP uri when Misskey gives one for remote users.
+    $actorId = '';
+    foreach (['uri', 'url'] as $k) {
+        $cand = rtrim((string) ($user[$k] ?? ''), '/');
+        if (str_starts_with($cand, 'https://')) {
+            $actorId = $cand;
+            break;
+        }
+    }
+    if ($actorId === '') {
+        $actorId = 'https://' . $actorHost . '/users/' . rawurlencode($username);
+    }
+    $text = (string) ($note['text'] ?? '');
+    $cw = trim((string) ($note['cw'] ?? ''));
+    $attachments = [];
+    $files = is_array($note['files'] ?? null) ? $note['files'] : [];
+    foreach ($files as $file) {
+        if (!is_array($file)) {
+            continue;
+        }
+        $mediaUrl = (string) ($file['url'] ?? $file['webpublicUrl'] ?? '');
+        if ($mediaUrl === '' || !str_starts_with($mediaUrl, 'https://')) {
+            continue;
+        }
+        $mime = strtolower((string) ($file['type'] ?? ''));
+        $mediaType = str_starts_with($mime, 'image/') ? 'Image'
+            : (str_starts_with($mime, 'video/') ? 'Video'
+            : (str_starts_with($mime, 'audio/') ? 'Audio' : 'Document'));
+        $attachments[] = [
+            'type' => $mediaType,
+            'mediaType' => $mime,
+            'url' => $mediaUrl,
+            'name' => (string) ($file['comment'] ?? $file['name'] ?? ''),
+        ];
+    }
+    // Plain text → light HTML so existing strip/convert paths stay happy.
+    $content = $text !== ''
+        ? '<p>' . nl2br(htmlspecialchars($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'), false) . '</p>'
+        : '';
+    if ($content === '' && $attachments !== []) {
+        $content = '<p>(attachment)</p>';
+    }
+    $published = (string) ($note['createdAt'] ?? '');
+    if ($published !== '' && !str_contains($published, 'T')) {
+        // already ISO usually
+    }
+    $inReplyTo = null;
+    $reply = $note['reply'] ?? null;
+    if (is_array($reply) && !empty($reply['id'])) {
+        $replyHost = $host;
+        $replyUser = is_array($reply['user'] ?? null) ? $reply['user'] : [];
+        $rh = trim((string) ($replyUser['host'] ?? ''));
+        if ($rh !== '') {
+            $replyHost = strtolower($rh);
+        }
+        $inReplyTo = 'https://' . $replyHost . '/notes/' . rawurlencode((string) $reply['id']);
+    } elseif (!empty($note['replyId']) && is_string($note['replyId'])) {
+        $inReplyTo = 'https://' . $host . '/notes/' . rawurlencode((string) $note['replyId']);
+    }
+    // Quote / renote target (Misskey quote-boost / renote-with-comment).
+    $quoteUrl = null;
+    $renote = $note['renote'] ?? null;
+    if (is_array($renote) && !empty($renote['id'])) {
+        $rHost = $host;
+        $rUser = is_array($renote['user'] ?? null) ? $renote['user'] : [];
+        $rh = trim((string) ($rUser['host'] ?? ''));
+        if ($rh !== '') {
+            $rHost = strtolower($rh);
+        }
+        $quoteUrl = 'https://' . $rHost . '/notes/' . rawurlencode((string) $renote['id']);
+    } elseif (!empty($note['renoteId']) && is_string($note['renoteId'])) {
+        $quoteUrl = 'https://' . $host . '/notes/' . rawurlencode((string) $note['renoteId']);
+    }
+
+    $doc = [
+        'type' => 'Note',
+        'id' => 'https://' . $host . '/notes/' . rawurlencode($noteId),
+        'attributedTo' => $actorId,
+        'content' => $content,
+        'summary' => $cw,
+        'sensitive' => $cw !== '',
+        'published' => $published !== '' ? $published : gmdate('c'),
+        'attachment' => $attachments,
+        'to' => $visibility === 'public'
+            ? ['https://www.w3.org/ns/activitystreams#Public']
+            : [],
+    ];
+    if ($inReplyTo !== null) {
+        $doc['inReplyTo'] = $inReplyTo;
+    }
+    if ($quoteUrl !== null) {
+        $doc['quoteUrl'] = $quoteUrl;
+        $doc['_misskey_quote'] = $quoteUrl;
+    }
+    return $doc;
 }
 
 function ap_object_targets_actor($object, string $actorId): bool
@@ -2531,6 +2698,15 @@ function ap_quote_is_tombstone(mixed $quote): bool
 function ap_quote_target_pack(array $object): array
 {
     $out = ['url' => null, 'embedded' => null, 'tombstone' => false];
+    $normalizeQuoteUrl = static function (?string $url): ?string {
+        if ($url === null || $url === '' || !str_starts_with($url, 'https://')) {
+            return $url;
+        }
+        if (str_starts_with($url, 'https://bsky.app/') && function_exists('ap_bsky_normalize_web_url')) {
+            return ap_bsky_normalize_web_url($url);
+        }
+        return $url;
+    };
     foreach (['quote', 'quoteUri', 'quoteUrl', '_misskey_quote'] as $key) {
         if (!isset($object[$key])) {
             continue;
@@ -2541,7 +2717,7 @@ function ap_quote_target_pack(array $object): array
             // Keep any id on the tombstone for linking if present
             $tid = ap_as_id($val);
             if ($tid !== null && str_starts_with($tid, 'https://')) {
-                $out['url'] = $tid;
+                $out['url'] = $normalizeQuoteUrl($tid);
             }
             return $out;
         }
@@ -2549,20 +2725,20 @@ function ap_quote_target_pack(array $object): array
             $out['embedded'] = $val;
             $id = ap_as_id($val);
             if ($id !== null && str_starts_with($id, 'https://')) {
-                $out['url'] = $id;
+                $out['url'] = $normalizeQuoteUrl($id);
             }
             // Prefer inner Note id when quote embeds a Create
             $inner = ap_unwrap_as2_object($val);
             $innerId = ap_as_id($inner);
             if ($innerId !== null && str_starts_with($innerId, 'https://')
                 && !str_ends_with(rtrim($innerId, '/'), '/activity')) {
-                $out['url'] = $innerId;
+                $out['url'] = $normalizeQuoteUrl($innerId);
             }
             return $out;
         }
         $id = ap_as_id($val);
         if ($id !== null && str_starts_with($id, 'https://')) {
-            $out['url'] = $id;
+            $out['url'] = $normalizeQuoteUrl($id);
             return $out;
         }
     }
@@ -2598,7 +2774,7 @@ function ap_quote_target_pack(array $object): array
             if ($isQuote) {
                 $href = $tag['href'] ?? null;
                 if (is_string($href) && str_starts_with($href, 'https://')) {
-                    $out['url'] = $href;
+                    $out['url'] = $normalizeQuoteUrl($href);
                     return $out;
                 }
             }
@@ -4542,10 +4718,111 @@ function ap_quote_request_send(string $quotedObjectId, array $quoteNote): bool
     return $ok || $queued;
 }
 
+/** True for Bluesky / Bridgy AT quote targets (not FEP-044f ActivityPub subjects). */
+function ap_quote_target_is_bluesky(string $quoteObjectId): bool
+{
+    $quoteObjectId = trim($quoteObjectId);
+    return str_starts_with($quoteObjectId, 'https://bsky.app/')
+        || str_starts_with($quoteObjectId, 'at://')
+        || str_contains($quoteObjectId, 'bsky.brid.gy');
+}
+
+/** True when we already have the quoted object cached locally (events / outbox). */
+function ap_quote_target_locally_known(string $quoteObjectId): bool
+{
+    $quoteObjectId = rtrim(trim($quoteObjectId), '/');
+    if ($quoteObjectId === '' || !str_starts_with($quoteObjectId, 'https://')) {
+        return false;
+    }
+    $cands = function_exists('ap_object_url_lookup_candidates')
+        ? ap_object_url_lookup_candidates($quoteObjectId)
+        : [$quoteObjectId, $quoteObjectId . '/'];
+    foreach ($cands as $cand) {
+        if (!is_string($cand) || $cand === '') {
+            continue;
+        }
+        try {
+            $st = ap_db()->prepare('SELECT 1 FROM events WHERE object_id = ? OR object_id = ? LIMIT 1');
+            $st->execute([$cand, rtrim($cand, '/') . '/']);
+            if ($st->fetchColumn()) {
+                return true;
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+        try {
+            $st = ap_db()->prepare('SELECT 1 FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+            $st->execute([$cand, rtrim($cand, '/') . '/']);
+            if ($st->fetchColumn()) {
+                return true;
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+    }
+    return false;
+}
+
+/**
+ * Remote note allows automatic public quoting (FEP-044f / GTS interactionPolicy).
+ * Used so VAAK can display quotes as accepted when remotes auto-approve but the
+ * Accept stamp was missed, and to skip endless "pending" for open policies.
+ */
+function ap_quote_target_allows_automatic(string $quoteObjectId): bool
+{
+    $quoteObjectId = rtrim(trim($quoteObjectId), '/');
+    if ($quoteObjectId === '' || !str_starts_with($quoteObjectId, 'https://') || ap_quote_target_is_bluesky($quoteObjectId)) {
+        return false;
+    }
+    $doc = ap_fetch_as2_object($quoteObjectId);
+    if (!is_array($doc)) {
+        return false;
+    }
+    $doc = function_exists('ap_unwrap_as2_object') ? ap_unwrap_as2_object($doc) : $doc;
+    $policy = is_array($doc['interactionPolicy'] ?? null) ? $doc['interactionPolicy'] : [];
+    $canQuote = is_array($policy['canQuote'] ?? null) ? $policy['canQuote'] : [];
+    $auto = $canQuote['automaticApproval'] ?? [];
+    if (!is_array($auto)) {
+        $auto = $auto !== null && $auto !== '' ? [$auto] : [];
+    }
+    foreach ($auto as $entry) {
+        $id = is_string($entry) ? $entry : (is_array($entry) ? (string) ($entry['id'] ?? '') : '');
+        if ($id === 'https://www.w3.org/ns/activitystreams#Public'
+            || $id === 'as:Public'
+            || $id === 'Public') {
+            return true;
+        }
+    }
+    return false;
+}
+
 /** Apply a valid FEP-044f Accept/Reject response to one of our outbound quotes. */
 function ap_quote_response_handle(array $activity, string $responseType): ?string
 {
     $request = $activity['object'] ?? null;
+    // Accept.object may be an embedded QuoteRequest or a URI to one we sent.
+    if (is_string($request) && str_starts_with($request, 'https://mkultra.monster/users/')
+        && str_ends_with(rtrim($request, '/'), '/quote')) {
+        $reqDoc = ap_fetch_as2_object($request);
+        // Our QuoteRequests are not always HTTP-dereferenceable; reconstruct from id.
+        if (!is_array($reqDoc)) {
+            $instrument = preg_replace('#/quote/?$#', '', rtrim($request, '/'));
+            $st = ap_db()->prepare('SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+            $st->execute([$instrument, $instrument . '/']);
+            $rawTmp = json_decode((string) ($st->fetchColumn() ?: ''), true);
+            $noteTmp = is_array($rawTmp['object'] ?? null) ? $rawTmp['object'] : null;
+            if (is_array($noteTmp)) {
+                $reqDoc = [
+                    'type' => 'QuoteRequest',
+                    'id' => rtrim($instrument, '/') . '/quote',
+                    'actor' => (string) ($noteTmp['attributedTo'] ?? ''),
+                    'object' => (string) ($noteTmp['quote'] ?? ''),
+                    'instrument' => $instrument,
+                ];
+            }
+        }
+        $request = $reqDoc;
+    }
     if (!is_array($request) || (string) ($request['type'] ?? '') !== 'QuoteRequest') {
         return null;
     }
@@ -4553,8 +4830,9 @@ function ap_quote_response_handle(array $activity, string $responseType): ?strin
     $requestActor = ap_as_id($request['actor'] ?? null);
     $quotedId = ap_as_id($request['object'] ?? null);
     $instrument = ap_as_id($request['instrument'] ?? null);
+    // FEP-044f: Accept.actor = quoted author; QuoteRequest.actor = quoter (us).
+    // They must NOT be required to match — that bug left every outbound quote pending.
     if (!$sender || !$requestActor || !$quotedId || !$instrument
-        || rtrim($sender, '/') !== rtrim($requestActor, '/')
         || !preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+/notes/#', $instrument)) {
         return 'quote_response_invalid';
     }
@@ -4566,21 +4844,31 @@ function ap_quote_response_handle(array $activity, string $responseType): ?strin
     }
     $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
     $note = is_array($raw) && is_array($raw['object'] ?? null) ? $raw['object'] : null;
+    $reqId = rtrim((string) ($request['id'] ?? ''), '/');
+    $expectReqId = rtrim($instrument, '/') . '/quote';
     if (!is_array($note) || rtrim((string) ($note['id'] ?? ''), '/') !== rtrim($instrument, '/')
         || rtrim(ap_as_id($note['quote'] ?? null) ?? '', '/') !== rtrim($quotedId, '/')
-        || rtrim((string) ($request['id'] ?? ''), '/') !== rtrim($instrument, '/') . '/quote') {
+        || ($reqId !== '' && $reqId !== $expectReqId)) {
         return 'quote_response_mismatch';
     }
     $localActor = function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : rtrim(LOCAL_ACTOR, '/');
     if ($localActor === '' || rtrim((string) ($note['attributedTo'] ?? ''), '/') !== $localActor) {
         return 'quote_response_wrong_owner';
     }
+    // QuoteRequest.actor must be us (the quoter).
+    if (rtrim($requestActor, '/') !== $localActor) {
+        return 'quote_response_wrong_requester';
+    }
     $targetDoc = ap_fetch_as2_object($quotedId);
     $targetActor = is_array($targetDoc)
         ? (ap_as_id($targetDoc['attributedTo'] ?? null) ?: ap_as_id($targetDoc['actor'] ?? null))
         : null;
-    if (!$targetActor || rtrim($targetActor, '/') !== rtrim($sender, '/')) {
+    // Prefer attributedTo from the quoted object; fall back to Accept.actor.
+    if ($targetActor && rtrim($targetActor, '/') !== rtrim($sender, '/')) {
         return 'quote_response_wrong_actor';
+    }
+    if (!$targetActor) {
+        $targetActor = $sender;
     }
     if ($responseType === 'Accept') {
         $authId = ap_as_id($activity['result'] ?? null);
@@ -5016,8 +5304,9 @@ function ap_publish_status_text(
     }
     ap_metrics_record('Create', $actor, $noteId, null, strlen($contentHtml), 'compose', $feedSummary, null, null, null, '', false, $visibility);
 
-    // Local content is committed above. Persist outbound delivery separately
-    // so federation and Bluesky latency cannot delay timeline publication.
+    // The canonical post and its timeline row are committed above. Persist
+    // federation/mirroring work before returning so remote slowness cannot
+    // hold the compose request open, and a restart cannot discard delivery.
     try {
         require_once __DIR__ . '/ap-publish-delivery.php';
         $deliveryOwnerId = function_exists('ap_db_owner_user_id_for_actor')
@@ -5033,13 +5322,15 @@ function ap_publish_status_text(
             'quote_approval_pending' => $quoteApprovalPending,
         ];
         if (ap_publish_delivery_enqueue($deliveryOwnerId, $noteId, $deliveryPayload)) {
+            // Best effort immediate wake; the scheduled worker is the durable
+            // recovery path if process spawning is unavailable or interrupted.
             ap_publish_delivery_wake_async();
             if ($content !== '' && !$mediaRows) {
                 try {
                     require_once __DIR__ . '/ap-link-preview.php';
                     $warmUrl = ap_link_preview_extract_url($content);
                     if ($warmUrl !== null) ap_link_preview_warm_async($warmUrl);
-                } catch (Throwable $e) { /* optional preview warming */ }
+                } catch (Throwable $e) { /* preview warming is optional */ }
             }
             ap_log("publish_status queued create=$createId local_id=$localId visibility=$visibility");
             return [
@@ -5051,8 +5342,8 @@ function ap_publish_status_text(
             ];
         }
     } catch (Throwable $e) {
-        // Fall through to the legacy synchronous route if durable storage is
-        // unavailable; never report background delivery without a saved job.
+        // Preserve the established synchronous path if the durable queue is
+        // unavailable; never silently claim success without recording work.
         error_log('[ap-inbox] publish queue unavailable; using synchronous delivery: ' . $e->getMessage());
     }
 
@@ -5107,10 +5398,19 @@ function ap_publish_status_text(
     $queued = $fan['queued'];
 
     if ($quoteObjectId !== '') {
-        // FEP-044f requests explicit authorization from the quoted author. Until
-        // their signed authorization arrives, Mastodon-compatible clients see
-        // this quote as pending and VAAK suppresses the embedded post preview.
-        ap_quote_request_send($quoteObjectId, $note);
+        // FEP-044f only applies to ActivityPub quote targets. Bluesky/Bridgy
+        // URLs cannot Accept QuoteRequest — skip the useless fetch loop.
+        $quoteIsBsky = function_exists('ap_quote_target_is_bluesky')
+            ? ap_quote_target_is_bluesky($quoteObjectId)
+            : (str_starts_with($quoteObjectId, 'https://bsky.app/')
+                || str_starts_with($quoteObjectId, 'at://')
+                || str_contains($quoteObjectId, 'bsky.brid.gy'));
+        if (!$quoteIsBsky) {
+            // FEP-044f requests explicit authorization from the quoted author. Until
+            // their signed authorization arrives, Mastodon-compatible clients see
+            // this quote as pending and VAAK suppresses the embedded post preview.
+            ap_quote_request_send($quoteObjectId, $note);
+        }
     }
 
     ap_log("publish_status create=$createId local_id=$localId visibility=$visibility delivered=$delivered queued=$queued bridgy=" . ($fan['bridgy'] ? '1' : '0')
@@ -5667,15 +5967,28 @@ function ap_delete_local_status(int $localId): array
     if ($noteId === '' || !str_starts_with($noteId, $actor . '/notes/')) {
         return ['ok' => false, 'error' => 'Refusing to delete non-local status'];
     }
-    // Remove a linked Bluesky crosspost before deleting the local mapping.
-    // This is best-effort: ActivityPub Delete remains authoritative for fedi.
+    // Remove linked Bluesky crosspost(s) before deleting the local mapping.
+    // Best-effort: ActivityPub Delete remains authoritative for fedi.
     $bskyDelete = null;
     try {
         if (!function_exists('ap_bsky_delete_crosspost_for_note')) {
             require_once __DIR__ . '/ap-bsky.php';
         }
         if (function_exists('ap_bsky_delete_crosspost_for_note')) {
-            $bskyDelete = ap_bsky_delete_crosspost_for_note(ap_db_default_owner_user_id(), $noteId);
+            $bskyOwner = 0;
+            if (function_exists('ap_db_owner_user_id_for_actor')) {
+                $actorHint = $noteId;
+                if (preg_match('#^(https://mkultra\.monster/users/[A-Za-z0-9_]+)/notes/#', $noteId, $am)) {
+                    $actorHint = $am[1];
+                }
+                $bskyOwner = (int) ap_db_owner_user_id_for_actor($actorHint);
+            }
+            if ($bskyOwner < 1 && function_exists('ap_db_default_owner_user_id')) {
+                $bskyOwner = (int) ap_db_default_owner_user_id();
+            }
+            if ($bskyOwner > 0) {
+                $bskyDelete = ap_bsky_delete_crosspost_for_note($bskyOwner, $noteId);
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-inbox] bsky crosspost delete: ' . $e->getMessage());

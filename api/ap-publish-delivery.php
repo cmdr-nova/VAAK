@@ -64,7 +64,13 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     $quoteId = (string) ($payload['quote_object_id'] ?? '');
     if ($quoteId !== '') {
         $sameActorQuote = str_starts_with(rtrim($quoteId, '/') . '/', rtrim($actor, '/') . '/notes/');
-        if (!$sameActorQuote) {
+        // Bluesky / Bridgy AT targets are not ActivityPub QuoteAuthorization
+        // subjects — never hold them as FEP-044f "pending" (that skipped the
+        // Bluesky mirror entirely while still marking bsky_done).
+        $isBskyQuote = str_starts_with($quoteId, 'https://bsky.app/')
+            || str_starts_with($quoteId, 'at://')
+            || str_contains($quoteId, 'bsky.brid.gy');
+        if (!$sameActorQuote && !$isBskyQuote) {
             $pendingQuote = true;
             $qDoc = ap_fetch_as2_object($quoteId);
             if (is_array($qDoc)) {

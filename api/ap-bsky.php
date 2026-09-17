@@ -306,7 +306,6 @@ function ap_bsky_crosspost_should_retry(?array $result): bool
     // Permanent / intentional skips — do not retry.
     $permanent = [
         'Visibility not cross-posted',
-        'Audio recording posts are not mirrored to Bluesky',
         'Bluesky not connected',
         'Nothing to cross-post',
         'No owner',
@@ -694,6 +693,32 @@ function ap_bsky_crosspost_save(string $noteId, string $bskyUri, ?string $bskyCi
     }
     ap_bsky_crossposts_migrate();
     $cid = is_string($bskyCid) && $bskyCid !== '' ? $bskyCid : null;
+    // Note.blueskyUri stores the *root* segment; bsky_crossposts should keep the *tip*
+    // so later self-replies nest under the last chunk. Never clobber a tip with its root.
+    $existing = ap_bsky_crosspost_by_note_id($noteId);
+    if (is_array($existing)) {
+        $prevUri = trim((string) ($existing['bsky_uri'] ?? ''));
+        if ($prevUri !== '' && $prevUri !== $bskyUri && ap_bsky_uri_is_thread_root_of($bskyUri, $prevUri)) {
+            if (($existing['bsky_cid'] === null || $existing['bsky_cid'] === '') && $cid !== null) {
+                try {
+                    $ust = ap_db()->prepare(
+                        'UPDATE bsky_crossposts SET bsky_cid = COALESCE(bsky_cid, ?) WHERE note_id = ? OR note_id = ?'
+                    );
+                    $ust->execute([$cid, $noteId, $noteId . '/']);
+                } catch (Throwable $e) {
+                    // ignore
+                }
+            }
+            return [
+                'note_id' => $noteId,
+                'bsky_uri' => $prevUri,
+                'bsky_cid' => isset($existing['bsky_cid']) && $existing['bsky_cid'] !== ''
+                    ? (string) $existing['bsky_cid']
+                    : $cid,
+                'owner_user_id' => $ownerUserId ?? (isset($existing['owner_user_id']) ? (int) $existing['owner_user_id'] : null),
+            ];
+        }
+    }
     $now = gmdate('c');
     try {
         $st = ap_db()->prepare(
@@ -714,6 +739,36 @@ function ap_bsky_crosspost_save(string $noteId, string $bskyUri, ?string $bskyCi
     } catch (Throwable $e) {
         error_log('[ap-bsky] crosspost_save: ' . $e->getMessage());
         return null;
+    }
+}
+
+/**
+ * True when $maybeRoot is the thread root (or ancestor) of $tipUri.
+ */
+function ap_bsky_uri_is_thread_root_of(string $maybeRoot, string $tipUri): bool
+{
+    $maybeRoot = trim($maybeRoot);
+    $tipUri = trim($tipUri);
+    if ($maybeRoot === '' || $tipUri === '' || $maybeRoot === $tipUri) {
+        return false;
+    }
+    if (!str_starts_with($maybeRoot, 'at://') || !str_starts_with($tipUri, 'at://')) {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT reply_parent, reply_root FROM bsky_posts WHERE bsky_uri = ? LIMIT 1'
+        );
+        $st->execute([$tipUri]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            return false;
+        }
+        $parent = trim((string) ($row['reply_parent'] ?? ''));
+        $root = trim((string) ($row['reply_root'] ?? ''));
+        return $root === $maybeRoot || $parent === $maybeRoot;
+    } catch (Throwable $e) {
+        return false;
     }
 }
 
@@ -1007,6 +1062,81 @@ function ap_bsky_resolve_strong_ref(string $ref, int $ownerUserId = 0): ?array
         return null;
     }
     return ['uri' => $uri, 'cid' => $cid];
+}
+
+/**
+ * When replying to our own dual-published / split thread, parent at the tip
+ * (latest self-segment under the same root) so Bluesky nests the continuation
+ * instead of forking a sibling off the root. Leaves other people's posts alone.
+ *
+ * @param array{uri:string,cid:string} $parent
+ * @return array{uri:string,cid:string}
+ */
+function ap_bsky_self_thread_tip_ref(array $parent, int $ownerUserId): array
+{
+    $parentUri = trim((string) ($parent['uri'] ?? ''));
+    $parentCid = trim((string) ($parent['cid'] ?? ''));
+    if ($ownerUserId < 1 || !preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/([^/\s]+)$~', $parentUri, $m)) {
+        return $parent;
+    }
+    $parentDid = $m[1];
+    $row = ap_bsky_session_row($ownerUserId);
+    $myDid = is_array($row) ? trim((string) ($row['did'] ?? '')) : '';
+    if ($myDid === '' || $parentDid !== $myDid) {
+        return $parent;
+    }
+
+    // Resolve the thread root for this parent (itself if it's the root).
+    $rootUri = $parentUri;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT reply_root FROM bsky_posts WHERE bsky_uri = ? LIMIT 1'
+        );
+        $st->execute([$parentUri]);
+        $rr = trim((string) ($st->fetchColumn() ?: ''));
+        if ($rr !== '' && str_starts_with($rr, 'at://')) {
+            $rootUri = $rr;
+        }
+    } catch (Throwable $e) {
+        // keep parentUri as root guess
+    }
+
+    // Newest own post under this root (includes the root itself).
+    $tipUri = $parentUri;
+    $tipCid = $parentCid;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT bsky_uri, bsky_cid, published_at, indexed_at
+             FROM bsky_posts
+             WHERE author_did = ?
+               AND (bsky_uri = ? OR reply_root = ?)
+             ORDER BY COALESCE(published_at, indexed_at) DESC NULLS LAST, updated_at DESC
+             LIMIT 1'
+        );
+        $st->execute([$myDid, $rootUri, $rootUri]);
+        $tip = $st->fetch(PDO::FETCH_ASSOC);
+        if (is_array($tip) && !empty($tip['bsky_uri'])) {
+            $tipUri = (string) $tip['bsky_uri'];
+            if (!empty($tip['bsky_cid'])) {
+                $tipCid = (string) $tip['bsky_cid'];
+            }
+        }
+    } catch (Throwable $e) {
+        // fall through
+    }
+
+    if ($tipUri === $parentUri) {
+        return $parent;
+    }
+    if ($tipCid === '') {
+        $resolved = ap_bsky_resolve_strong_ref($tipUri, $ownerUserId);
+        if (is_array($resolved) && !empty($resolved['cid'])) {
+            return $resolved;
+        }
+        // Keep parent if we can't get a cid for the tip.
+        return $parent;
+    }
+    return ['uri' => $tipUri, 'cid' => $tipCid];
 }
 
 /**
@@ -1570,38 +1700,6 @@ function ap_bsky_feed_hosts(string $pdsHost): array
     return array_values(array_unique($hosts));
 }
 
-/** Authenticated XRPC using this account's PDS/AppView proxy hosts. */
-function ap_bsky_account_xrpc(int $ownerUserId, string $nsid, string $method = 'GET', ?array $query = null, ?array $body = null): array
-{
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) {
-        return ['ok' => false, 'error' => 'Bluesky not connected'];
-    }
-    $token = ap_bsky_access_token($ownerUserId, false);
-    if (empty($token['ok'])) {
-        $token = ap_bsky_access_token($ownerUserId, true);
-    }
-    if (empty($token['ok'])) {
-        return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
-    }
-    $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    $last = ['ok' => false, 'error' => $nsid . ' failed'];
-    foreach (ap_bsky_feed_hosts($pds) as $host) {
-        $last = ap_bsky_xrpc($host, $nsid, $method, $query, $body, (string) $token['access'], 15);
-        if (($last['status'] ?? 0) === 401) {
-            $token = ap_bsky_access_token($ownerUserId, true);
-            if (empty($token['ok'])) {
-                return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
-            }
-            $last = ap_bsky_xrpc($host, $nsid, $method, $query, $body, (string) $token['access'], 15);
-        }
-        if (!empty($last['ok'])) {
-            return $last;
-        }
-    }
-    return $last;
-}
-
 /**
  * @return array{ok:bool,error?:string,feed?:list<array>,cursor?:?string}
  */
@@ -1683,7 +1781,13 @@ function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cur
     if ($actor === '') {
         return ['ok' => false, 'error' => 'Missing Bluesky actor'];
     }
-    $query = ['actor' => $actor, 'limit' => max(1, min(50, $limit))];
+    // posts_and_author_threads: roots + replies on the author's own threads
+    // (catches Bluesky self-thread continuations that posts_no_replies would drop).
+    $query = [
+        'actor' => $actor,
+        'limit' => max(1, min(50, $limit)),
+        'filter' => 'posts_and_author_threads',
+    ];
     if (is_string($cursor) && $cursor !== '') {
         $query['cursor'] = $cursor;
     }
@@ -1715,7 +1819,8 @@ function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cur
         }
         if (!empty($af['ok']) && is_array($af['json'] ?? null)) {
             $feed = is_array($af['json']['feed'] ?? null) ? $af['json']['feed'] : [];
-            ap_bsky_index_feed_items($feed, $ownerUserId, 15);
+            ap_bsky_index_feed_items($feed, $ownerUserId, count($feed));
+            ap_bsky_import_own_feed_as_local($ownerUserId, $feed);
             return [
                 'ok' => true,
                 'feed' => $feed,
@@ -1973,30 +2078,106 @@ SQL);
 }
 
 /**
+ * Bluesky label values that should blur media like Fediverse "sensitive".
+ *
+ * @return list<string>
+ */
+function ap_bsky_sensitive_label_vals(): array
+{
+    return [
+        'porn',
+        'sexual',
+        'nudity',
+        'graphic-media',
+        'sexual-cartoon',
+        'sexual-figurative',
+        'nsfw',
+        'self-harm',
+        'sensitive',
+    ];
+}
+
+/**
+ * Compact label list from PostView labels or record selfLabels.
+ *
+ * @param mixed $labels
+ * @return list<array{val:string,src?:string}>
+ */
+function ap_bsky_compact_label_list(mixed $labels): array
+{
+    if (!is_array($labels)) {
+        return [];
+    }
+    // selfLabels: { $type, values: [ {val}, ... ] }
+    if (isset($labels['values']) && is_array($labels['values'])) {
+        $labels = $labels['values'];
+    }
+    $out = [];
+    $seen = [];
+    foreach ($labels as $lab) {
+        $val = '';
+        $src = '';
+        if (is_array($lab)) {
+            $val = strtolower(trim((string) ($lab['val'] ?? '')));
+            $src = trim((string) ($lab['src'] ?? ''));
+        } elseif (is_string($lab)) {
+            $val = strtolower(trim($lab));
+        }
+        if ($val === '' || isset($seen[$val])) {
+            continue;
+        }
+        $seen[$val] = true;
+        $row = ['val' => $val];
+        if ($src !== '') {
+            $row['src'] = $src;
+        }
+        $out[] = $row;
+    }
+    return $out;
+}
+
+/**
+ * All label vals on a PostView-shaped post (top-level + record self-labels).
+ *
+ * @param array<string,mixed> $post
+ * @return list<string>
+ */
+function ap_bsky_post_label_vals(array $post): array
+{
+    $vals = [];
+    foreach (ap_bsky_compact_label_list($post['labels'] ?? null) as $lab) {
+        $vals[] = (string) ($lab['val'] ?? '');
+    }
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    foreach (ap_bsky_compact_label_list($record['labels'] ?? ($record['selfLabels'] ?? null)) as $lab) {
+        $vals[] = (string) ($lab['val'] ?? '');
+    }
+    $vals = array_values(array_filter(array_unique($vals), static fn(string $v): bool => $v !== ''));
+    return $vals;
+}
+
+/**
+ * True when a Bluesky post carries adult/graphic moderation labels.
+ *
+ * @param array<string,mixed> $post
+ */
+function ap_bsky_post_is_sensitive(array $post): bool
+{
+    $sens = array_fill_keys(ap_bsky_sensitive_label_vals(), true);
+    foreach (ap_bsky_post_label_vals($post) as $val) {
+        if (isset($sens[$val])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Compact embed projection for cache (images / external / quote stub).
  *
  * @param array<string,mixed>|null $embed
  * @return array<string,mixed>|null
  */
-function ap_bsky_embed_video_view(?array $embed): ?array
-{
-    if ($embed === null) return null;
-    $type = (string) ($embed['$type'] ?? '');
-    if (str_contains($type, 'recordWithMedia')) {
-        $media = is_array($embed['media'] ?? null) ? $embed['media'] : null;
-        if ($media === null) return null;
-        if (is_array($media['video'] ?? null)) return $media['video'];
-        if (str_contains((string) ($media['$type'] ?? ''), 'video')
-            || isset($media['playlist']) || isset($media['thumbnail'])) return $media;
-        return null;
-    }
-    if (!str_contains($type, 'video')) return null;
-    // AppView's video#view shape exposes playlist/thumbnail directly. Some
-    // cached/legacy projections wrap those fields under `video` instead.
-    if (is_array($embed['video'] ?? null)) return $embed['video'];
-    return (isset($embed['playlist']) || isset($embed['thumbnail'])) ? $embed : null;
-}
-
 function ap_bsky_post_embed_compact(?array $embed): ?array
 {
     if ($embed === null) {
@@ -2035,10 +2216,10 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
         ];
     }
     // Bluesky video views expose an HLS playlist plus an optional poster. Keep
-    // these URLs in the compact cache for post and status video previews
-    // without retaining the much larger raw AppView response.
-    $video = ap_bsky_embed_video_view($embed);
-    if ($video !== null) {
+    // these URLs in the durable compact cache so Gallery/VakkTok can hydrate
+    // video posts without retaining the much larger raw AppView response.
+    if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
+        $video = $embed['video'];
         $playlist = (string) ($video['playlist'] ?? $video['url'] ?? '');
         $thumbnail = (string) ($video['thumbnail'] ?? $video['thumb'] ?? '');
         if (str_starts_with($playlist, 'https://') || str_starts_with($thumbnail, 'https://')) {
@@ -2073,7 +2254,7 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
         if (mb_strlen($text) > 400) {
             $text = mb_substr($text, 0, 397) . '…';
         }
-        return [
+        $outRec = [
             '$type' => 'app.bsky.embed.record#viewRecord',
             'uri' => (string) ($rec['uri'] ?? ''),
             'cid' => (string) ($rec['cid'] ?? ''),
@@ -2089,6 +2270,28 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
                 'createdAt' => (string) ($value['createdAt'] ?? $rec['indexedAt'] ?? ''),
             ],
         ];
+        // Keep quoted media so timeline quote blocks can show images/videos.
+        $embedsOut = [];
+        $srcEmbeds = is_array($rec['embeds'] ?? null) ? $rec['embeds'] : [];
+        foreach ($srcEmbeds as $em) {
+            if (!is_array($em)) {
+                continue;
+            }
+            $c = ap_bsky_post_embed_compact($em);
+            if (is_array($c)) {
+                $embedsOut[] = $c;
+            }
+        }
+        if ($embedsOut === [] && is_array($value['embed'] ?? null)) {
+            $c = ap_bsky_post_embed_compact($value['embed']);
+            if (is_array($c)) {
+                $embedsOut[] = $c;
+            }
+        }
+        if ($embedsOut !== []) {
+            $outRec['embeds'] = $embedsOut;
+        }
+        return $outRec;
     };
     if (str_contains($type, 'recordWithMedia') && is_array($embed['media'] ?? null)) {
         $mediaCompact = ap_bsky_post_embed_compact($embed['media']);
@@ -2179,6 +2382,8 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
         'replyCount' => (int) ($post['replyCount'] ?? 0),
         'quoteCount' => (int) ($post['quoteCount'] ?? 0),
         'viewer' => is_array($post['viewer'] ?? null) ? $post['viewer'] : null,
+        // Keep moderation labels so Gallery / CW can blur adult media.
+        'labels' => ap_bsky_compact_label_list($post['labels'] ?? null),
     ];
     if (isset($record['reply']) && is_array($record['reply'])) {
         $raw['record']['reply'] = $record['reply'];
@@ -2186,7 +2391,28 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     if (!empty($record['fediverseId'])) {
         $raw['record']['fediverseId'] = (string) $record['fediverseId'];
     }
-    $cacheSaved = false;
+    // Self-labels live on the record (composer shield); also fold into top-level labels.
+    $selfLabels = ap_bsky_compact_label_list($record['labels'] ?? ($record['selfLabels'] ?? null));
+    if ($selfLabels !== []) {
+        $raw['record']['labels'] = [
+            '$type' => 'com.atproto.label.defs#selfLabels',
+            'values' => $selfLabels,
+        ];
+        $seenVals = [];
+        foreach ($raw['labels'] as $lab) {
+            if (is_array($lab) && isset($lab['val'])) {
+                $seenVals[strtolower((string) $lab['val'])] = true;
+            }
+        }
+        foreach ($selfLabels as $lab) {
+            $val = strtolower((string) ($lab['val'] ?? ''));
+            if ($val === '' || isset($seenVals[$val])) {
+                continue;
+            }
+            $raw['labels'][] = $lab;
+            $seenVals[$val] = true;
+        }
+    }
     try {
         $st = ap_db()->prepare(
             'INSERT INTO bsky_posts (
@@ -2240,26 +2466,8 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $now,
             $now,
         ]);
-        $cacheSaved = true;
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());
-    }
-    if ($cacheSaved) {
-        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
-        if (function_exists('ap_search_fts_upsert') && function_exists('ap_search_fts_external_pk')) {
-            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
-                $text,
-                (string) ($author['handle'] ?? ''),
-                (string) ($author['displayName'] ?? ''),
-            ])));
-            ap_search_fts_upsert(
-                'bsky_post',
-                ap_search_fts_external_pk('bsky_post', $uri),
-                $uri,
-                $publishedAt,
-                $searchBody
-            );
-        }
     }
     // Keep link map in sync.
     ap_bsky_index_feed_post_links($post);
@@ -2300,11 +2508,436 @@ function ap_bsky_index_feed_items(array $feed, ?int $ownerUserId = null, int $sy
                         ap_bsky_index_feed_item($item, $ownerUserId);
                     }
                 }
+                if ($ownerUserId !== null && $ownerUserId > 0) {
+                    ap_bsky_import_own_feed_as_local($ownerUserId, $rest);
+                }
             } catch (Throwable $e) {
                 // ignore
             }
         });
     }
+}
+
+/**
+ * Stable local note id for a Bluesky AT-URI (idempotent re-imports).
+ */
+function ap_bsky_local_note_id_for_import(string $actorId, string $atUri): string
+{
+    $actorId = rtrim($actorId, '/');
+    return $actorId . '/notes/' . substr(hash('sha256', $atUri), 0, 16);
+}
+
+/**
+ * Resolve a Bluesky quote embed to a URL VAAK can hydrate (local twin preferred).
+ *
+ * @param array<string,mixed> $post
+ */
+function ap_bsky_quote_target_url_for_import(array $post, int $ownerUserId = 0): ?string
+{
+    if (!function_exists('ap_bsky_quote_preview')) {
+        return null;
+    }
+    $q = ap_bsky_quote_preview($post);
+    if (!is_array($q)) {
+        return null;
+    }
+    $at = trim((string) ($q['uri'] ?? ''));
+    $web = trim((string) ($q['url'] ?? ''));
+    if ($at !== '' && str_starts_with($at, 'at://') && $ownerUserId > 0) {
+        $local = ap_bsky_local_note_id_for_at_uri($at, $ownerUserId);
+        if (is_string($local) && str_starts_with($local, 'https://')) {
+            return rtrim($local, '/');
+        }
+    }
+    if ($web !== '' && $web !== 'https://bsky.app/' && str_starts_with($web, 'https://')) {
+        if (function_exists('ap_bsky_normalize_web_url')) {
+            $web = ap_bsky_normalize_web_url($web);
+        }
+        return $web;
+    }
+    if ($at !== '' && str_starts_with($at, 'at://') && function_exists('ap_bsky_https_url_from_at_uri')) {
+        $handle = trim((string) ($q['handle'] ?? ''));
+        return ap_bsky_https_url_from_at_uri($at, $handle !== '' ? $handle : null);
+    }
+    return null;
+}
+
+/**
+ * Patch an already-imported Bluesky-origin note that is missing quote context.
+ *
+ * @param array<string,mixed> $post
+ * @return array{ok:bool,updated?:bool,error?:string}
+ */
+function ap_bsky_repair_imported_note_quote(string $noteId, array $post, int $ownerUserId = 0): array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    $quoteUrl = ap_bsky_quote_target_url_for_import($post, $ownerUserId);
+    if ($noteId === '' || $quoteUrl === null || $quoteUrl === '') {
+        return ['ok' => true, 'updated' => false];
+    }
+    try {
+        $st = ap_db()->prepare('SELECT raw_create_json, kind FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            return ['ok' => false, 'error' => 'Note missing'];
+        }
+        $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+        if (!is_array($create) || !is_array($create['object'] ?? null)) {
+            return ['ok' => false, 'error' => 'Bad create JSON'];
+        }
+        $obj = &$create['object'];
+        $hasQuote = false;
+        foreach (['quote', 'quoteUri', 'quoteUrl', '_misskey_quote'] as $k) {
+            if (!empty($obj[$k]) && is_string($obj[$k]) && str_starts_with($obj[$k], 'https://')) {
+                $hasQuote = true;
+                break;
+            }
+        }
+        if ($hasQuote) {
+            return ['ok' => true, 'updated' => false];
+        }
+        $obj['quote'] = $quoteUrl;
+        $obj['quoteUri'] = $quoteUrl;
+        $obj['_misskey_quote'] = $quoteUrl;
+        $tag = [
+            'type' => 'Link',
+            'mediaType' => 'application/ld+json; profile="https://www.w3.org/ns/activitystreams"',
+            'rel' => 'https://misskey-hub.net/ns#_misskey_quote',
+            'href' => $quoteUrl,
+        ];
+        if (!isset($obj['tag']) || !is_array($obj['tag'])) {
+            $obj['tag'] = [$tag];
+        } else {
+            $tags = isset($obj['tag']['type']) || isset($obj['tag']['href']) ? [$obj['tag']] : $obj['tag'];
+            $tags[] = $tag;
+            $obj['tag'] = $tags;
+        }
+        $raw = json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $up = ap_db()->prepare(
+            "UPDATE outbox_notes SET raw_create_json = ?, kind = 'quote' WHERE id = ? OR id = ?"
+        );
+        $up->execute([$raw, $noteId, $noteId . '/']);
+        // Refresh compose summary so Home cards can show QT text without AppView.
+        $qPrev = function_exists('ap_bsky_quote_preview') ? ap_bsky_quote_preview($post) : null;
+        if (is_array($qPrev) && function_exists('ap_metrics_record')) {
+            $handle = trim((string) ($qPrev['handle'] ?? ''));
+            $qText = trim((string) ($qPrev['text'] ?? ''));
+            $commentary = trim((string) (($post['record']['text'] ?? '') ?: ''));
+            $summary = $commentary;
+            if ($qText !== '' || $handle !== '') {
+                $summary = ($commentary !== '' ? $commentary . "\n\n" : '')
+                    . '↪ QT' . ($handle !== '' ? ' @' . $handle : '') . ': '
+                    . ($qText !== '' ? $qText : $quoteUrl);
+            }
+            // Best-effort: update latest compose event summary for this object.
+            try {
+                $est = ap_db()->prepare(
+                    "UPDATE events SET summary = ? WHERE id = (
+                        SELECT id FROM events
+                        WHERE object_id = ? AND action_taken = 'compose'
+                        ORDER BY id DESC LIMIT 1
+                     )"
+                );
+                $est->execute([$summary, $noteId]);
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+        return ['ok' => true, 'updated' => true];
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => $e->getMessage()];
+    }
+}
+
+/**
+ * Import a Bluesky-native post (authored by the connected account) as a local
+ * VAAK outbox note for Your Posts + HTML profile. Does NOT federate Create.
+ *
+ * @param array<string,mixed> $post PostView
+ * @return array{ok:bool,skipped?:bool,error?:string,note_id?:string,created?:bool}
+ */
+function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $depth = 0): array
+{
+    if ($ownerUserId < 1 || $depth > 4) {
+        return ['ok' => false, 'error' => 'Invalid import'];
+    }
+    $sess = ap_bsky_session_row($ownerUserId);
+    if ($sess === null) {
+        return ['ok' => true, 'skipped' => true, 'error' => 'No Bluesky session'];
+    }
+    $myDid = trim((string) ($sess['did'] ?? ''));
+    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+    $authorDid = trim((string) ($author['did'] ?? ''));
+    if ($myDid === '' || $authorDid === '' || $authorDid !== $myDid) {
+        return ['ok' => true, 'skipped' => true, 'error' => 'Not own post'];
+    }
+    $uri = trim((string) ($post['uri'] ?? ''));
+    $cid = trim((string) ($post['cid'] ?? ''));
+    if (!preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/([^/\s]+)$~', $uri)) {
+        return ['ok' => true, 'skipped' => true, 'error' => 'Not a feed post'];
+    }
+    // Already dual-published / previously imported.
+    $existing = ap_bsky_local_note_id_for_at_uri($uri, $ownerUserId);
+    if (is_string($existing) && str_starts_with($existing, 'https://')) {
+        $existing = rtrim($existing, '/');
+        $repaired = ap_bsky_repair_imported_note_quote($existing, $post, $ownerUserId);
+        return [
+            'ok' => true,
+            'skipped' => true,
+            'note_id' => $existing,
+            'created' => false,
+            'repaired_quote' => !empty($repaired['ok']) && !empty($repaired['updated']),
+        ];
+    }
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    if (!empty($record['fediverseId']) && is_string($record['fediverseId'])
+        && str_starts_with($record['fediverseId'], 'https://mkultra.monster/')) {
+        // VAAK→Bluesky mirror — never create a second local twin.
+        ap_bsky_crosspost_save(rtrim($record['fediverseId'], '/'), $uri, $cid !== '' ? $cid : null, $ownerUserId);
+        return ['ok' => true, 'skipped' => true, 'note_id' => rtrim($record['fediverseId'], '/'), 'created' => false];
+    }
+
+    $actorId = ap_db_owner_actor_id_for_user_id($ownerUserId);
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return ['ok' => false, 'error' => 'Missing local actor'];
+    }
+    $noteId = ap_bsky_local_note_id_for_import($actorId, $uri);
+    try {
+        $st = ap_db()->prepare('SELECT id, raw_create_json, kind FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $existingRow = $st->fetch(PDO::FETCH_ASSOC);
+        if (is_array($existingRow) && !empty($existingRow['id'])) {
+            ap_bsky_crosspost_save($noteId, $uri, $cid !== '' ? $cid : null, $ownerUserId);
+            // Repair quote context on earlier imports that dropped the embed.
+            $repaired = ap_bsky_repair_imported_note_quote($noteId, $post, $ownerUserId);
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'note_id' => $noteId,
+                'created' => false,
+                'repaired_quote' => !empty($repaired['ok']) && !empty($repaired['updated']),
+            ];
+        }
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => $e->getMessage()];
+    }
+
+    // Ensure parent self-thread notes exist first (HTML profile reply threading).
+    $inReplyTo = null;
+    $reply = is_array($record['reply'] ?? null) ? $record['reply'] : null;
+    $parentUri = is_array($reply['parent'] ?? null) ? trim((string) ($reply['parent']['uri'] ?? '')) : '';
+    if (str_starts_with($parentUri, 'at://')) {
+        $parentNote = ap_bsky_local_note_id_for_at_uri($parentUri, $ownerUserId);
+        if (!is_string($parentNote) || !str_starts_with($parentNote, 'https://')) {
+            $parentItem = ap_bsky_post_item_by_uri($parentUri);
+            $parentPost = is_array($parentItem['post'] ?? null) ? $parentItem['post'] : null;
+            if (is_array($parentPost)) {
+                $parentImp = ap_bsky_import_own_post_as_local($ownerUserId, $parentPost, $depth + 1);
+                if (!empty($parentImp['note_id']) && is_string($parentImp['note_id'])) {
+                    $parentNote = $parentImp['note_id'];
+                }
+            }
+        }
+        if (is_string($parentNote) && str_starts_with($parentNote, 'https://')) {
+            $inReplyTo = rtrim($parentNote, '/');
+        }
+    }
+
+    $text = trim((string) ($record['text'] ?? ''));
+    $published = trim((string) ($record['createdAt'] ?? ($post['indexedAt'] ?? '')));
+    if ($published === '') {
+        $published = gmdate('c');
+    }
+    $contentHtml = function_exists('ap_plain_text_to_html')
+        ? ap_plain_text_to_html($text !== '' ? $text : '')
+        : ('<p>' . htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>');
+    if ($text === '' && $contentHtml === '<p></p>') {
+        $contentHtml = '<p></p>';
+    }
+
+    $attachments = [];
+    if (function_exists('ap_bsky_post_image_urls')) {
+        foreach (ap_bsky_post_image_urls($post) as $imgUrl) {
+            if (!is_string($imgUrl) || !str_starts_with($imgUrl, 'https://')) {
+                continue;
+            }
+            $attachments[] = [
+                'type' => 'Document',
+                'mediaType' => 'image/jpeg',
+                'url' => $imgUrl,
+                'name' => '',
+            ];
+        }
+    }
+    if ($attachments === [] && function_exists('ap_bsky_post_video_media')) {
+        $vids = ap_bsky_post_video_media($post);
+        if (is_array($vids)) {
+            foreach ($vids as $vid) {
+                if (!is_array($vid)) {
+                    continue;
+                }
+                $vurl = (string) ($vid['url'] ?? '');
+                if (!str_starts_with($vurl, 'https://')) {
+                    continue;
+                }
+                $attachments[] = [
+                    'type' => 'Document',
+                    'mediaType' => (string) ($vid['mediaType'] ?? 'video/mp4'),
+                    'url' => $vurl,
+                    'name' => '',
+                    'thumbnail' => str_starts_with((string) ($vid['thumbnail'] ?? ''), 'https://')
+                        ? (string) $vid['thumbnail']
+                        : null,
+                ];
+            }
+        }
+    }
+
+    $createId = $actorId . '/creates/' . substr(hash('sha256', 'bsky-import:' . $uri), 0, 16);
+    $to = ['https://www.w3.org/ns/activitystreams#Public'];
+    $cc = [$actorId . '/followers'];
+    $note = [
+        'id' => $noteId,
+        'type' => 'Note',
+        'attributedTo' => $actorId,
+        'content' => $contentHtml,
+        'published' => $published,
+        'to' => $to,
+        'cc' => $cc,
+        'url' => $noteId,
+        'vaakOrigin' => 'bluesky',
+    ];
+    if ($inReplyTo !== null) {
+        $note['inReplyTo'] = $inReplyTo;
+    }
+    if ($attachments !== []) {
+        $note['attachment'] = $attachments;
+    }
+    $kind = 'compose';
+    $quoteUrl = ap_bsky_quote_target_url_for_import($post, $ownerUserId);
+    if (is_string($quoteUrl) && $quoteUrl !== '') {
+        $note['quote'] = $quoteUrl;
+        $note['quoteUri'] = $quoteUrl;
+        $note['_misskey_quote'] = $quoteUrl;
+        $tag = [
+            'type' => 'Link',
+            'mediaType' => 'application/ld+json; profile="https://www.w3.org/ns/activitystreams"',
+            'rel' => 'https://misskey-hub.net/ns#_misskey_quote',
+            'href' => $quoteUrl,
+        ];
+        $note['tag'] = [$tag];
+        $kind = 'quote';
+    }
+    if (function_exists('ap_note_attach_bsky_proxy')) {
+        $note = ap_note_attach_bsky_proxy($note, $uri, $cid !== '' ? $cid : null);
+    } else {
+        $note['blueskyUri'] = $uri;
+        if ($cid !== '') {
+            $note['blueskyCid'] = $cid;
+        }
+    }
+
+    $create = [
+        'id' => $createId,
+        'type' => 'Create',
+        'actor' => $actorId,
+        'published' => $published,
+        'to' => $to,
+        'cc' => $cc,
+        'object' => $note,
+    ];
+    if (function_exists('ap_create_finalize')) {
+        $create = ap_create_finalize($create);
+    }
+
+    try {
+        ap_outbox_store([
+            'id' => $noteId,
+            'create_id' => $createId,
+            'published' => $published,
+            'content' => $contentHtml !== '' ? $contentHtml : '<p></p>',
+            'in_reply_to' => $inReplyTo,
+            'to' => $to,
+            'cc' => $cc,
+            'raw_create_json' => json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            'kind' => $kind,
+            'visibility' => 'public',
+        ]);
+        $replyLocalId = null;
+        if ($inReplyTo !== null && function_exists('ap_masto_status_by_note_id')) {
+            $prow = ap_masto_status_by_note_id($inReplyTo);
+            if (is_array($prow)) {
+                $replyLocalId = (int) ($prow['local_id'] ?? 0) ?: null;
+            }
+        }
+        if (function_exists('ap_masto_status_register')) {
+            ap_masto_status_register(
+                $noteId,
+                $createId,
+                $published,
+                $text,
+                $replyLocalId,
+                '',
+                false,
+                'public'
+            );
+        }
+        ap_bsky_crosspost_save($noteId, $uri, $cid !== '' ? $cid : null, $ownerUserId);
+        ap_bsky_post_link_upsert($uri, $cid !== '' ? $cid : null, $noteId, $noteId);
+        if (function_exists('ap_metrics_record')) {
+            ap_metrics_record('Create', $actorId, $noteId, null, strlen($contentHtml), 'bsky_import', $text);
+        }
+        // Intentionally no ActivityPub fanout — origin is Bluesky.
+        return ['ok' => true, 'note_id' => $noteId, 'created' => true];
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] import_own_post: ' . $e->getMessage());
+        return ['ok' => false, 'error' => $e->getMessage()];
+    }
+}
+
+/**
+ * Import Bluesky-native posts from a feed page for the connected account.
+ *
+ * @param list<array<string,mixed>> $feed
+ * @return array{imported:int,skipped:int,errors:int}
+ */
+function ap_bsky_import_own_feed_as_local(int $ownerUserId, array $feed): array
+{
+    $stats = ['imported' => 0, 'skipped' => 0, 'errors' => 0];
+    if ($ownerUserId < 1 || $feed === []) {
+        return $stats;
+    }
+    // Oldest first so parents exist before replies when possible.
+    $posts = [];
+    foreach ($feed as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $post = is_array($item['post'] ?? null) ? $item['post'] : (isset($item['uri']) ? $item : null);
+        if (!is_array($post)) {
+            continue;
+        }
+        $posts[] = $post;
+    }
+    usort($posts, static function (array $a, array $b): int {
+        $ta = strtotime((string) (($a['record']['createdAt'] ?? null) ?: ($a['indexedAt'] ?? ''))) ?: 0;
+        $tb = strtotime((string) (($b['record']['createdAt'] ?? null) ?: ($b['indexedAt'] ?? ''))) ?: 0;
+        return $ta <=> $tb;
+    });
+    foreach ($posts as $post) {
+        $res = ap_bsky_import_own_post_as_local($ownerUserId, $post);
+        if (!empty($res['created'])) {
+            $stats['imported']++;
+        } elseif (!empty($res['skipped'])) {
+            $stats['skipped']++;
+        } elseif (empty($res['ok'])) {
+            $stats['errors']++;
+        } else {
+            $stats['skipped']++;
+        }
+    }
+    return $stats;
 }
 
 /**
@@ -2487,40 +3120,6 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20): array
     }
 }
 
-/** Cached mixed-author posts for a VAAK custom list; refreshes are queued lazily. */
-function ap_bsky_posts_for_authors(array $authorDids, int $ownerUserId, int $limit = 40): array
-{
-    $dids = array_values(array_unique(array_filter(array_map('trim', $authorDids), static fn(string $did): bool => str_starts_with($did, 'did:'))));
-    if ($ownerUserId < 1 || $dids === []) return [];
-    $dids = array_slice($dids, 0, 500);
-    foreach ($dids as $did) ap_bsky_author_feed_refresh_enqueue($ownerUserId, $did, 180);
-    ap_bsky_posts_migrate();
-    $limit = max(1, min(100, $limit));
-    $ph = implode(',', array_fill(0, count($dids), '?'));
-    try {
-        $st = ap_db()->prepare("SELECT raw_json, reason_json FROM bsky_posts WHERE author_did IN ($ph) AND raw_json IS NOT NULL ORDER BY indexed_at DESC NULLS LAST, updated_at DESC LIMIT " . (int) ($limit * 3));
-        $st->execute($dids);
-    } catch (Throwable $e) {
-        try {
-            $st = ap_db()->prepare("SELECT raw_json, reason_json FROM bsky_posts WHERE author_did IN ($ph) AND raw_json IS NOT NULL ORDER BY indexed_at DESC, updated_at DESC LIMIT " . (int) ($limit * 3));
-            $st->execute($dids);
-        } catch (Throwable $e2) {
-            return [];
-        }
-    }
-    $items = [];
-    foreach ($st->fetchAll() ?: [] as $row) {
-        $post = is_string($row['raw_json'] ?? null) ? json_decode((string) $row['raw_json'], true) : null;
-        if (!is_array($post)) continue;
-        $item = ['post' => $post];
-        $reason = is_string($row['reason_json'] ?? null) ? json_decode((string) $row['reason_json'], true) : null;
-        if (is_array($reason)) $item['reason'] = $reason;
-        $items[] = $item;
-    }
-    $items = ap_bsky_filter_hidden_authors($ownerUserId, $items);
-    return array_slice($items, 0, $limit);
-}
-
 /** Coalesce a fresh authenticated pull of an author's feed onto the durable profile-refresh queue. */
 function ap_bsky_author_feed_refresh_enqueue(int $ownerUserId, string $authorDid, int $freshForSec = 180, ?PDO $db = null): void
 {
@@ -2568,36 +3167,16 @@ function ap_bsky_posts_prune(string $cutoffIso, bool $dryRun = false): array
 {
     ap_bsky_posts_migrate();
     ap_bsky_post_links_migrate();
-    // A post saved as a Bluesky bookmark is user-owned cache data, not merely
-    // an evictable timeline entry. Fail closed if the bookmark cache schema
-    // cannot be checked, so maintenance never deletes content blindly.
-    if (!ap_bsky_bookmark_cache_migrate()) return ['posts' => 0, 'links' => 0];
     $posts = 0;
     $links = 0;
     try {
-        $st = ap_db()->prepare("SELECT COUNT(*) FROM bsky_posts p WHERE p.seen_at < ?
-            AND NOT EXISTS (
-              SELECT 1 FROM bsky_bookmark_cache b WHERE b.bookmark_uri = p.bsky_uri
-            )");
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE seen_at < ?');
         $st->execute([$cutoffIso]);
         $posts = (int) $st->fetchColumn();
         if ($posts > 0 && !$dryRun) {
-            $del = ap_db()->prepare("DELETE FROM bsky_posts WHERE seen_at < ?
-                AND NOT EXISTS (
-                  SELECT 1 FROM bsky_bookmark_cache b WHERE b.bookmark_uri = bsky_posts.bsky_uri
-                )");
+            $del = ap_db()->prepare('DELETE FROM bsky_posts WHERE seen_at < ?');
             $del->execute([$cutoffIso]);
             $posts = $del->rowCount();
-            if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
-                $orphans = ap_db()->query(
-                    "SELECT d.source_pk FROM ap_search_docs d
-                     WHERE d.source = 'bsky_post'
-                       AND NOT EXISTS (SELECT 1 FROM bsky_posts p WHERE p.bsky_uri = d.object_id)"
-                )->fetchAll(PDO::FETCH_COLUMN) ?: [];
-                foreach ($orphans as $sourcePk) {
-                    ap_search_fts_delete('bsky_post', (int) $sourcePk);
-                }
-            }
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] posts_prune: ' . $e->getMessage());
@@ -3054,6 +3633,14 @@ function ap_bsky_following_feed(
     // Never block paint on hide-set crawl — filter with last-known set; refresh async.
     ap_bsky_schedule_hide_refresh($ownerUserId);
     $feed = ap_bsky_filter_hidden_authors($ownerUserId, $feed);
+    // Bluesky → VAAK: if a dual-published post was deleted on Bluesky, federate Delete.
+    if ($isHead && function_exists('ap_bsky_reconcile_deleted_crossposts')) {
+        try {
+            ap_bsky_reconcile_deleted_crossposts($ownerUserId, 12);
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] delete reconcile: ' . $e->getMessage());
+        }
+    }
 
     $mergePending = !$includeMerge && !empty($prefs['mergeFeedEnabled']) && $isHead && ($prefs['savedFeedUris'] ?? []) !== [];
 
@@ -3255,9 +3842,7 @@ function ap_bsky_delete_record_uri(int $ownerUserId, string $recordUri): array
  */
 function ap_bsky_like_object(int $ownerUserId, string $objectId): array
 {
-    // CLI collection refreshes are explicitly queued only for linked accounts;
-    // the cron process must not depend on PHP-FPM's feature-flag environment.
-    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled())) {
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
         return ['ok' => true, 'skipped' => true];
     }
     $ref = ap_bsky_resolve_strong_ref($objectId, $ownerUserId);
@@ -3278,6 +3863,64 @@ function ap_bsky_post_text(array $post): string
  * Extract quoted post preview from a hydrated PostView embed.
  *
  * @return array{uri:?string,handle:string,display:string,text:string,url:string}|null
+ */
+/**
+ * Media items (admin_media_row_html shape) from Bluesky embed view/compact trees.
+ *
+ * @param mixed $embeds Single embed map or list of embeds
+ * @return list<array{url:string,mediaType:?string,preview_url?:string}>
+ */
+function ap_bsky_media_items_from_embeds(mixed $embeds): array
+{
+    if (!is_array($embeds)) {
+        return [];
+    }
+    $list = isset($embeds['$type']) || isset($embeds['images']) || isset($embeds['video']) || isset($embeds['playlist'])
+        ? [$embeds]
+        : $embeds;
+    $items = [];
+    foreach ($list as $em) {
+        if (!is_array($em)) {
+            continue;
+        }
+        // Compact or view images
+        $images = is_array($em['images'] ?? null) ? $em['images'] : [];
+        foreach ($images as $img) {
+            if (!is_array($img)) {
+                continue;
+            }
+            $url = (string) ($img['fullsize'] ?? $img['thumb'] ?? $img['url'] ?? '');
+            if (!str_starts_with($url, 'https://')) {
+                continue;
+            }
+            $thumb = (string) ($img['thumb'] ?? $img['preview_url'] ?? '');
+            $items[] = [
+                'url' => $url,
+                'mediaType' => 'image/jpeg',
+                'preview_url' => str_starts_with($thumb, 'https://') ? $thumb : '',
+            ];
+        }
+        // Compact video {playlist,thumbnail} or view video
+        $video = is_array($em['video'] ?? null) ? $em['video'] : $em;
+        $playlist = (string) ($video['playlist'] ?? $em['playlist'] ?? '');
+        $thumbnail = (string) ($video['thumbnail'] ?? $em['thumbnail'] ?? '');
+        $vType = (string) ($em['$type'] ?? '');
+        if ($playlist === '' && (str_contains($vType, 'video') || isset($em['playlist']))) {
+            $playlist = (string) ($em['playlist'] ?? '');
+        }
+        if (str_starts_with($playlist, 'https://')) {
+            $items[] = [
+                'url' => $playlist,
+                'mediaType' => 'application/x-mpegURL',
+                'preview_url' => str_starts_with($thumbnail, 'https://') ? $thumbnail : '',
+            ];
+        }
+    }
+    return $items;
+}
+
+/**
+ * @return array{uri:?string,handle:string,display:string,text:string,url:string,media?:list<array{url:string,mediaType:?string,preview_url?:string}>}|null
  */
 function ap_bsky_quote_preview(array $post): ?array
 {
@@ -3309,6 +3952,7 @@ function ap_bsky_quote_preview(array $post): ?array
             'display' => 'Unavailable',
             'text' => str_contains($vType, 'Blocked') ? 'Quoted post is blocked' : 'Quoted post unavailable',
             'url' => 'https://bsky.app/',
+            'media' => [],
         ];
     }
     // Custom feeds often embed feed generators / lists / starter packs as record#view.
@@ -3336,9 +3980,28 @@ function ap_bsky_quote_preview(array $post): ?array
     }
     // Live XRPC uses value.text; our durable compact cache may put text on the record root.
     $text = trim((string) ($value['text'] ?? $viewRecord['text'] ?? ''));
+    $media = [];
+    $embeds = is_array($viewRecord['embeds'] ?? null) ? $viewRecord['embeds'] : [];
+    if ($embeds !== []) {
+        $media = ap_bsky_media_items_from_embeds($embeds);
+    } elseif (is_array($value['embed'] ?? null)) {
+        $media = ap_bsky_media_items_from_embeds($value['embed']);
+    }
+    // Older compact caches stripped quote embeds — fall back to the quoted post body cache.
+    $uriEarly = (string) ($viewRecord['uri'] ?? '');
+    if ($media === [] && str_starts_with($uriEarly, 'at://') && function_exists('ap_bsky_post_item_by_uri')) {
+        $quotedItem = ap_bsky_post_item_by_uri($uriEarly);
+        if (is_array($quotedItem) && is_array($quotedItem['post'] ?? null)) {
+            $qp = $quotedItem['post'];
+            if (is_array($qp['embed'] ?? null)) {
+                $media = ap_bsky_media_items_from_embeds($qp['embed']);
+            } elseif (is_array($qp['record']['embed'] ?? null)) {
+                $media = ap_bsky_media_items_from_embeds($qp['record']['embed']);
+            }
+        }
+    }
     // Image/video-only quotes: surface a short placeholder so the block isn't just "Open quoted".
     if ($text === '') {
-        $embeds = is_array($viewRecord['embeds'] ?? null) ? $viewRecord['embeds'] : [];
         foreach ($embeds as $em) {
             if (!is_array($em)) {
                 continue;
@@ -3348,7 +4011,7 @@ function ap_bsky_quote_preview(array $post): ?array
                 $text = '📷 Image';
                 break;
             }
-            if (str_contains($et, 'video') || isset($em['playlist']) || isset($em['thumbnail'])) {
+            if (str_contains($et, 'video') || isset($em['playlist']) || isset($em['thumbnail']) || isset($em['video'])) {
                 $text = '🎬 Video';
                 break;
             }
@@ -3359,17 +4022,20 @@ function ap_bsky_quote_preview(array $post): ?array
                 break;
             }
         }
+        if ($text === '' && $media !== []) {
+            $text = '📷 Image';
+        }
     }
     $uri = (string) ($viewRecord['uri'] ?? '');
     $url = $uri !== ''
         ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null)
         : 'https://bsky.app/';
     // No usable quote payload (common with broken compact cache) — don't render an empty shell.
-    if ($text === '' && $handle === '' && ($uri === '' || $url === 'https://bsky.app/')) {
+    if ($text === '' && $handle === '' && $media === [] && ($uri === '' || $url === 'https://bsky.app/')) {
         return null;
     }
     // Generator-style records sometimes lack author; skip empty shells.
-    if ($text === '' && $handle === '') {
+    if ($text === '' && $handle === '' && $media === []) {
         return null;
     }
     return [
@@ -3378,6 +4044,7 @@ function ap_bsky_quote_preview(array $post): ?array
         'display' => $display,
         'text' => $text,
         'url' => $url,
+        'media' => $media,
     ];
 }
 
@@ -3438,7 +4105,16 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
     }
     $record = is_array($post['record'] ?? null) ? $post['record'] : [];
     $text = trim((string) ($record['text'] ?? ''));
-    if ($text === '' && $handle === '' && $uri === '') {
+    $media = [];
+    if (is_array($post['embed'] ?? null)) {
+        $media = ap_bsky_media_items_from_embeds($post['embed']);
+    } elseif (is_array($record['embed'] ?? null)) {
+        $media = ap_bsky_media_items_from_embeds($record['embed']);
+    }
+    if ($text === '' && $media !== []) {
+        $text = '📷 Image';
+    }
+    if ($text === '' && $handle === '' && $uri === '' && $media === []) {
         return null;
     }
     $url = $uri !== ''
@@ -3450,6 +4126,7 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
         'display' => $display,
         'text' => $text,
         'url' => $url,
+        'media' => $media,
     ];
 }
 
@@ -3469,7 +4146,7 @@ function ap_bsky_post_preview_from_url(string $url, int $ownerUserId = 0, bool $
     $cached = ap_bsky_post_item_by_uri($atUri);
     if (is_array($cached) && is_array($cached['post'] ?? null)) {
         $prev = ap_bsky_post_as_quote_preview($cached['post']);
-        if ($prev !== null && ($prev['text'] !== '' || $prev['handle'] !== '')) {
+        if ($prev !== null && ($prev['text'] !== '' || $prev['handle'] !== '' || !empty($prev['media']))) {
             return $prev;
         }
     }
@@ -3584,7 +4261,6 @@ function ap_bsky_create_bookmark(int $ownerUserId, array $subject): array
     if (empty($put['ok'])) {
         return ['ok' => false, 'error' => (string) ($put['error'] ?? 'bookmark failed')];
     }
-    ap_bsky_bookmark_cache_clear($ownerUserId);
     return ['ok' => true];
 }
 
@@ -3620,569 +4296,7 @@ function ap_bsky_delete_bookmark(int $ownerUserId, string $uri): array
     if (empty($put['ok'])) {
         return ['ok' => false, 'error' => (string) ($put['error'] ?? 'unbookmark failed')];
     }
-    ap_bsky_bookmark_cache_clear($ownerUserId, $uri);
     return ['ok' => true];
-}
-
-function ap_bsky_bookmark_cache_clear(int $ownerUserId, ?string $removeUri = null): void
-{
-    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return;
-    try {
-        if (is_string($removeUri) && str_starts_with($removeUri, 'at://')) {
-            ap_db()->prepare('DELETE FROM bsky_bookmark_cache WHERE owner_user_id = ? AND bookmark_uri = ?')->execute([$ownerUserId, $removeUri]);
-        }
-        ap_db()->prepare('INSERT INTO bsky_bookmark_sync_state (owner_user_id, head_checked_at, full_synced_at, updated_at) VALUES (?, ?, NULL, ?) ON CONFLICT (owner_user_id) DO UPDATE SET head_checked_at = excluded.head_checked_at, updated_at = excluded.updated_at')
-            ->execute([$ownerUserId, '1970-01-01T00:00:00+00:00', gmdate('c')]);
-        ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks', true);
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] bookmark cache invalidation failed');
-    }
-}
-
-/** PostgreSQL bookmark-cache tables are provisioned by the owner-run migration. */
-function ap_bsky_bookmark_cache_migrate(?PDO $db = null): bool
-{
-    static $readyByConnection = [];
-    $db ??= ap_db();
-    $key = spl_object_id($db);
-    if (isset($readyByConnection[$key])) return $readyByConnection[$key];
-    try {
-        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
-            $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_bookmark_cache', 'bsky_bookmark_sync_state')");
-            $tables = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
-            return $readyByConnection[$key] = isset($tables['bsky_bookmark_cache'], $tables['bsky_bookmark_sync_state']);
-        }
-        $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS bsky_bookmark_cache (
-    owner_user_id INTEGER NOT NULL,
-    bookmark_uri TEXT NOT NULL,
-    bookmarked_at TEXT NOT NULL,
-    post_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (owner_user_id, bookmark_uri)
-)
-SQL);
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_bookmark_cache_owner_time ON bsky_bookmark_cache (owner_user_id, bookmarked_at DESC)');
-        $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS bsky_bookmark_sync_state (
-    owner_user_id INTEGER PRIMARY KEY,
-    head_checked_at TEXT,
-    full_synced_at TEXT,
-    updated_at TEXT NOT NULL
-)
-SQL);
-        return $readyByConnection[$key] = true;
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] bookmark cache schema unavailable');
-        return $readyByConnection[$key] = false;
-    }
-}
-
-/** @return list<array{post:array<string,mixed>,_vaak_bookmarked_at:string}> */
-function ap_bsky_bookmark_cache_read(int $ownerUserId, int $limit): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return [];
-    try {
-        $st = ap_db()->prepare('SELECT post_json, bookmarked_at FROM bsky_bookmark_cache WHERE owner_user_id = ? ORDER BY bookmarked_at DESC, bookmark_uri DESC LIMIT ?');
-        $st->bindValue(1, $ownerUserId, PDO::PARAM_INT);
-        $st->bindValue(2, max(1, min(500, $limit)), PDO::PARAM_INT);
-        $st->execute();
-        $out = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $item = json_decode((string) ($row['post_json'] ?? ''), true);
-            if (!is_array($item) || !is_array($item['post'] ?? null)) continue;
-            $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
-            $item['post']['viewer']['bookmarked'] = true;
-            $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
-            $out[] = $item;
-        }
-        return $out;
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] bookmark cache read failed');
-        return [];
-    }
-}
-
-/** Import the old volatile cache once, so deployment does not blank the first view. */
-function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
-{
-    $path = sys_get_temp_dir() . '/vaak-bsky-bookmarks-' . $ownerUserId . '.json';
-    if ($ownerUserId < 1 || !is_file($path) || !ap_bsky_bookmark_cache_migrate()) return;
-    $legacy = json_decode((string) @file_get_contents($path), true);
-    if (!is_array($legacy) || !is_array($legacy['bookmarks'] ?? null)) return;
-    $db = ap_db();
-    try {
-        $st = $db->prepare('INSERT INTO bsky_bookmark_cache (owner_user_id, bookmark_uri, bookmarked_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, bookmark_uri) DO NOTHING');
-        $now = gmdate('c');
-        foreach ($legacy['bookmarks'] as $item) {
-            $post = is_array($item['post'] ?? null) ? $item['post'] : [];
-            $uri = trim((string) ($post['uri'] ?? ''));
-            if (!str_starts_with($uri, 'at://')) continue;
-            $bookmarkedAt = trim((string) ($item['_vaak_bookmarked_at'] ?? '')) ?: $now;
-            $st->execute([$ownerUserId, $uri, $bookmarkedAt, json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $now]);
-        }
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] legacy bookmark cache import failed');
-    }
-}
-
-/** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
-function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
-{
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists', 'starter_packs'], true)
-        || !ap_bsky_actor_refresh_migrate()) return false;
-    $actorRef = '__vaak_sync__:' . $collection;
-    $now = gmdate('c');
-    $cooldown = 300;
-    try {
-        $st = ap_db()->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
-        $st->execute([$ownerUserId, $actorRef]);
-        $existing = $st->fetch();
-        if (is_array($existing)) {
-            $status = (string) ($existing['status'] ?? '');
-            $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
-            if (in_array($status, ['pending', 'processing'], true)
-                || (!$force && $status === 'succeeded' && $queuedAt > time() - $cooldown)) return true;
-        }
-        $up = ap_db()->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
-        $up->execute([$ownerUserId, $actorRef, $now, $now]);
-        return true;
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] collection refresh enqueue failed');
-        return false;
-    }
-}
-
-/**
- * Read the durable bookmark cache for page requests; queued workers refresh
- * the new head and only paginate the full set for an initial/daily baseline.
- *
- * @return array{ok:bool,bookmarks?:list<array<string,mixed>>,error?:string,cached?:bool,refreshing?:bool}
- */
-function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh = false): array
-{
-    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled())) {
-        return ['ok' => false, 'error' => 'Bluesky is not connected'];
-    }
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) {
-        return ['ok' => false, 'error' => 'Bluesky not connected'];
-    }
-    $limit = max(1, min(200, $limit));
-    if (!ap_bsky_bookmark_cache_migrate()) return ['ok' => false, 'error' => 'Bluesky bookmark cache is not provisioned'];
-    if ($refresh) return ap_bsky_bookmarks_refresh_worker($ownerUserId, $limit);
-
-    $cached = ap_bsky_bookmark_cache_read($ownerUserId, $limit);
-    if ($cached === []) {
-        ap_bsky_bookmark_cache_import_legacy($ownerUserId);
-        $cached = ap_bsky_bookmark_cache_read($ownerUserId, $limit);
-    }
-    $state = null;
-    try {
-        $st = ap_db()->prepare('SELECT head_checked_at FROM bsky_bookmark_sync_state WHERE owner_user_id = ? LIMIT 1');
-        $st->execute([$ownerUserId]);
-        $state = $st->fetch();
-    } catch (Throwable $e) {
-        $state = null;
-    }
-    $checkedAt = is_array($state) ? (strtotime((string) ($state['head_checked_at'] ?? '')) ?: 0) : 0;
-    $stale = $checkedAt < time() - 300;
-    if ($stale) ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
-    return ['ok' => true, 'bookmarks' => $cached, 'cached' => true, 'refreshing' => $stale];
-}
-
-/** Refresh only the new head, except for the initial/daily bounded baseline. */
-function ap_bsky_bookmarks_refresh_worker(int $ownerUserId, int $limit = 200): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return ['ok' => false, 'error' => 'Bookmark cache unavailable'];
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    $token = ap_bsky_access_token($ownerUserId, false);
-    if (empty($token['ok'])) {
-        $token = ap_bsky_access_token($ownerUserId, true);
-    }
-    if (empty($token['ok'])) {
-        return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
-    }
-    $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    $hosts = ap_bsky_feed_hosts($pds);
-    $access = (string) $token['access'];
-    $db = ap_db();
-    $known = [];
-    $state = null;
-    try {
-        $st = $db->prepare('SELECT bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ?');
-        $st->execute([$ownerUserId]);
-        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) $known[(string) $uri] = true;
-        $st = $db->prepare('SELECT full_synced_at FROM bsky_bookmark_sync_state WHERE owner_user_id = ? LIMIT 1');
-        $st->execute([$ownerUserId]);
-        $state = $st->fetch();
-    } catch (Throwable $e) {
-        return ['ok' => false, 'error' => 'Could not read bookmark cache state'];
-    }
-    $fullAt = is_array($state) ? (strtotime((string) ($state['full_synced_at'] ?? '')) ?: 0) : 0;
-    $fullSync = $known === [] || $fullAt < time() - 86400;
-    $cursor = null;
-    $newItems = [];
-    $seenUris = [];
-    $complete = false;
-    $foundKnownBoundary = false;
-    $lastError = 'Could not load Bluesky bookmarks';
-    for ($page = 0; $page < 10; $page++) {
-        $query = ['limit' => 100];
-        if ($cursor !== null && $cursor !== '') {
-            $query['cursor'] = $cursor;
-        }
-        $result = null;
-        foreach ($hosts as $host) {
-            $result = ap_bsky_xrpc($host, 'app.bsky.bookmark.getBookmarks', 'GET', $query, null, $access, 15);
-            if (($result['status'] ?? 0) === 401) {
-                $token = ap_bsky_access_token($ownerUserId, true);
-                if (empty($token['ok'])) {
-                    return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
-                }
-                $access = (string) $token['access'];
-                $result = ap_bsky_xrpc($host, 'app.bsky.bookmark.getBookmarks', 'GET', $query, null, $access, 15);
-            }
-            if (!empty($result['ok']) && is_array($result['json'] ?? null)) {
-                break;
-            }
-            $lastError = (string) ($result['error'] ?? $lastError);
-        }
-        if (empty($result['ok']) || !is_array($result['json'] ?? null)) {
-            if ($page === 0) {
-                return ['ok' => false, 'error' => $lastError];
-            }
-            break;
-        }
-        $rows = is_array($result['json']['bookmarks'] ?? null) ? $result['json']['bookmarks'] : [];
-        foreach ($rows as $row) {
-            if (!is_array($row)) {
-                continue;
-            }
-            // BookmarkView contains a strongRef in `subject` and the hydrated
-            // PostView in `item`; render the latter so media/text aren't lost.
-            $post = is_array($row['item'] ?? null) ? $row['item'] : (is_array($row['post'] ?? null) ? $row['post'] : null);
-            if ($post === null || trim((string) ($post['uri'] ?? '')) === '') {
-                continue;
-            }
-            $uri = trim((string) $post['uri']);
-            if (!$fullSync && isset($known[$uri])) {
-                $foundKnownBoundary = true;
-                break;
-            }
-            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : [];
-            $post['viewer']['bookmarked'] = true;
-            $bookmarkedAt = trim((string) ($row['createdAt'] ?? '')) ?: gmdate('c');
-            $json = json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            if (is_string($json)) $newItems[] = ['uri' => $uri, 'bookmarked_at' => $bookmarkedAt, 'post_json' => $json];
-            $seenUris[$uri] = true;
-        }
-        if ($foundKnownBoundary) break;
-        $cursor = isset($result['json']['cursor']) && is_string($result['json']['cursor'])
-            ? $result['json']['cursor'] : null;
-        if ($cursor === null) {
-            $complete = true;
-            break;
-        }
-        if ($rows === []) {
-            break;
-        }
-    }
-    $now = gmdate('c');
-    try {
-        $db->beginTransaction();
-        $up = $db->prepare('INSERT INTO bsky_bookmark_cache (owner_user_id, bookmark_uri, bookmarked_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, bookmark_uri) DO UPDATE SET bookmarked_at = excluded.bookmarked_at, post_json = excluded.post_json, updated_at = excluded.updated_at');
-        foreach ($newItems as $item) $up->execute([$ownerUserId, $item['uri'], $item['bookmarked_at'], $item['post_json'], $now]);
-        $stateUp = $db->prepare('INSERT INTO bsky_bookmark_sync_state (owner_user_id, head_checked_at, full_synced_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (owner_user_id) DO UPDATE SET head_checked_at = excluded.head_checked_at, full_synced_at = COALESCE(excluded.full_synced_at, bsky_bookmark_sync_state.full_synced_at), updated_at = excluded.updated_at');
-        $stateUp->execute([$ownerUserId, $now, $complete ? $now : null, $now]);
-        if ($complete) {
-            $existing = $db->prepare('SELECT bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ?');
-            $existing->execute([$ownerUserId]);
-            $del = $db->prepare('DELETE FROM bsky_bookmark_cache WHERE owner_user_id = ? AND bookmark_uri = ?');
-            foreach ($existing->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) if (!isset($seenUris[(string) $uri])) $del->execute([$ownerUserId, (string) $uri]);
-        }
-        $db->commit();
-    } catch (Throwable $e) {
-        try { if ($db->inTransaction()) $db->rollBack(); } catch (Throwable $ignored) {}
-        error_log('[ap-bsky] bookmark cache write failed');
-        return ['ok' => false, 'error' => 'Could not store Bluesky bookmarks'];
-    }
-    return ['ok' => true, 'bookmarks' => ap_bsky_bookmark_cache_read($ownerUserId, $limit), 'added' => count($newItems), 'full_sync' => $complete, 'boundary_found' => $foundKnownBoundary];
-}
-
-/** Create an owned Bluesky graph list. */
-function ap_bsky_create_graph_list(int $ownerUserId, string $name, string $purpose = 'curation'): array
-{
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    $purpose = $purpose === 'moderation' ? 'app.bsky.graph.defs#modlist' : 'app.bsky.graph.defs#curatelist';
-    $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.createRecord', 'POST', null, [
-        'repo' => (string) ($session['did'] ?? ''),
-        'collection' => 'app.bsky.graph.list',
-        'record' => [
-            '$type' => 'app.bsky.graph.list',
-            'name' => mb_substr(trim($name), 0, 64),
-            'purpose' => $purpose,
-            'description' => '',
-            'createdAt' => gmdate('c'),
-        ],
-    ]);
-    if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not create Bluesky list')];
-    return ['ok' => true, 'uri' => (string) ($res['json']['uri'] ?? ''), 'cid' => (string) ($res['json']['cid'] ?? '')];
-}
-
-/** Add a DID to an owned Bluesky list; caller stores the returned record URI. */
-function ap_bsky_add_graph_list_member(int $ownerUserId, string $listUri, string $did): array
-{
-    if (!str_starts_with($listUri, 'at://') || !str_starts_with($did, 'did:')) {
-        return ['ok' => false, 'error' => 'A Bluesky list URI and account DID are required'];
-    }
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.createRecord', 'POST', null, [
-        'repo' => (string) ($session['did'] ?? ''),
-        'collection' => 'app.bsky.graph.listitem',
-        'record' => [
-            '$type' => 'app.bsky.graph.listitem',
-            'list' => $listUri,
-            'subject' => $did,
-            'createdAt' => gmdate('c'),
-        ],
-    ]);
-    if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not add Bluesky list member')];
-    return ['ok' => true, 'uri' => (string) ($res['json']['uri'] ?? '')];
-}
-
-function ap_bsky_delete_graph_list_member(int $ownerUserId, string $itemUri): array
-{
-    if (!preg_match('~^at://[^/]+/app\.bsky\.graph\.listitem/[^/]+$~', $itemUri)) {
-        return ['ok' => false, 'error' => 'Invalid Bluesky list-item URI'];
-    }
-    return ap_bsky_delete_record_uri($ownerUserId, $itemUri);
-}
-
-/** Apply or remove this account's mute/block subscription to an owned mod list. */
-function ap_bsky_set_graph_list_moderation(int $ownerUserId, string $listUri, string $action): array
-{
-    if (!str_starts_with($listUri, 'at://') || !in_array($action, ['mute', 'block'], true)) {
-        return ['ok' => false, 'error' => 'Invalid moderation list action'];
-    }
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    $kind = $action === 'block' ? 'app.bsky.graph.listblock' : 'app.bsky.graph.listmute';
-    $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.createRecord', 'POST', null, [
-        'repo' => (string) ($session['did'] ?? ''),
-        'collection' => $kind,
-        'record' => ['$type' => $kind, 'subject' => $listUri, 'createdAt' => gmdate('c')],
-    ]);
-    if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not subscribe to Bluesky moderation list')];
-    ap_bsky_refresh_hide_set($ownerUserId, true);
-    return ['ok' => true, 'uri' => (string) ($res['json']['uri'] ?? '')];
-}
-
-function ap_bsky_remove_graph_list_moderation(int $ownerUserId, string $listUri, string $action, string $recordUri = ''): array
-{
-    if (!str_starts_with($listUri, 'at://') || !in_array($action, ['mute', 'block'], true)) {
-        return ['ok' => false, 'error' => 'Invalid moderation list action'];
-    }
-    if ($recordUri !== '') {
-        $deleted = ap_bsky_delete_record_uri($ownerUserId, $recordUri);
-        if (!empty($deleted['ok'])) {
-            ap_bsky_refresh_hide_set($ownerUserId, true);
-            return $deleted;
-        }
-    }
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    $collection = $action === 'block' ? 'app.bsky.graph.listblock' : 'app.bsky.graph.listmute';
-    $cursor = null;
-    for ($page = 0; $page < 20; $page++) {
-        $query = ['repo' => (string) ($session['did'] ?? ''), 'collection' => $collection, 'limit' => 100];
-        if ($cursor !== null) $query['cursor'] = $cursor;
-        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $query);
-        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
-            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not inspect Bluesky list subscriptions')];
-        }
-        foreach ((array) ($res['json']['records'] ?? []) as $record) {
-            $value = is_array($record['value'] ?? null) ? $record['value'] : [];
-            if ((string) ($value['subject'] ?? '') === $listUri) {
-                $uri = (string) ($record['uri'] ?? '');
-                $deleted = $uri !== '' ? ap_bsky_delete_record_uri($ownerUserId, $uri) : ['ok' => false];
-                if (!empty($deleted['ok'])) ap_bsky_refresh_hide_set($ownerUserId, true);
-                return $deleted;
-            }
-        }
-        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
-        if ($cursor === null) break;
-    }
-    return ['ok' => true, 'already_removed' => true];
-}
-
-/** Paginated collection fetch for an owned Bluesky list's hydrated entries. */
-function ap_bsky_get_graph_list(int $ownerUserId, string $listUri, int $limit = 500): array
-{
-    if (!str_starts_with($listUri, 'at://')) return ['ok' => false, 'error' => 'Invalid Bluesky list URI'];
-    $items = [];
-    $cursor = null;
-    $limit = max(1, min(2000, $limit));
-    for ($page = 0; $page < 20 && count($items) < $limit; $page++) {
-        $query = ['list' => $listUri, 'limit' => min(100, $limit - count($items))];
-        if ($cursor !== null) $query['cursor'] = $cursor;
-        $res = ap_bsky_account_xrpc($ownerUserId, 'app.bsky.graph.getList', 'GET', $query);
-        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
-            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky list'), 'status' => (int) ($res['status'] ?? 0), 'items' => $items, 'complete' => false];
-        }
-        $pageItems = is_array($res['json']['items'] ?? null) ? $res['json']['items'] : [];
-        $items = array_merge($items, $pageItems);
-        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
-        if ($cursor === null) return ['ok' => true, 'items' => $items, 'complete' => true];
-        if ($pageItems === []) break;
-    }
-    return ['ok' => true, 'items' => $items, 'complete' => false];
-}
-
-/** SQLite creates locally; PostgreSQL tables are provisioned by the owner migration. */
-function ap_bsky_starter_pack_cache_ready(?PDO $db = null): bool
-{
-    static $ready = [];
-    $db ??= ap_db();
-    $key = spl_object_id($db);
-    if (isset($ready[$key])) return $ready[$key];
-    try {
-        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
-            $st = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_starter_pack_cache','bsky_starter_pack_sync_state')");
-            $names = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)), true);
-            return $ready[$key] = isset($names['bsky_starter_pack_cache'], $names['bsky_starter_pack_sync_state']);
-        }
-        $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS bsky_starter_pack_cache (
- owner_user_id INTEGER NOT NULL, pack_uri TEXT NOT NULL, list_uri TEXT NOT NULL,
- name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
- members_json TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL,
- PRIMARY KEY(owner_user_id, pack_uri)
-)
-SQL);
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_starter_pack_cache_owner ON bsky_starter_pack_cache(owner_user_id, updated_at DESC)');
-        $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS bsky_starter_pack_sync_state (
- owner_user_id INTEGER PRIMARY KEY, synced_at TEXT, updated_at TEXT NOT NULL
-)
-SQL);
-        return $ready[$key] = true;
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] starter pack cache schema unavailable');
-        return $ready[$key] = false;
-    }
-}
-
-/** Refresh owned starter packs and their linked curated-list members in a worker. */
-function ap_bsky_starter_packs_refresh_worker(int $ownerUserId): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_starter_pack_cache_ready()) return ['ok' => false, 'error' => 'Starter pack cache is unavailable'];
-    $session = ap_bsky_session_row($ownerUserId);
-    if ($session === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    $repo = (string) ($session['did'] ?? '');
-    $cursor = null; $records = []; $complete = false;
-    for ($page = 0; $page < 10; $page++) {
-        $q = ['repo' => $repo, 'collection' => 'app.bsky.graph.starterpack', 'limit' => 100];
-        if ($cursor !== null) $q['cursor'] = $cursor;
-        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $q);
-        if (empty($res['ok']) || !is_array($res['json'] ?? null)) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not fetch starter packs')];
-        foreach ((array) ($res['json']['records'] ?? []) as $row) {
-            $value = is_array($row['value'] ?? null) ? $row['value'] : [];
-            $uri = (string) ($row['uri'] ?? ''); $list = (string) ($value['list'] ?? '');
-            if (str_starts_with($uri, 'at://') && str_starts_with($list, 'at://')) $records[$uri] = ['uri'=>$uri,'list'=>$list,'value'=>$value];
-        }
-        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
-        if ($cursor === null) { $complete = true; break; }
-    }
-    if (!$complete) return ['ok' => false, 'error' => 'Starter pack listing was incomplete'];
-    $db = ap_db(); $now = gmdate('c');
-    try {
-        $up = $db->prepare('INSERT INTO bsky_starter_pack_cache (owner_user_id,pack_uri,list_uri,name,description,created_at,members_json,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,pack_uri) DO UPDATE SET list_uri=excluded.list_uri,name=excluded.name,description=excluded.description,created_at=excluded.created_at,members_json=excluded.members_json,updated_at=excluded.updated_at');
-        foreach ($records as $uri => $pack) {
-            $members = ap_bsky_get_graph_list($ownerUserId, $pack['list'], 500);
-            if (empty($members['ok']) || empty($members['complete'])) continue;
-            $items = [];
-            foreach ((array) ($members['items'] ?? []) as $entry) {
-                $subject = is_array($entry['subject'] ?? null) ? $entry['subject'] : [];
-                $did = (string) ($subject['did'] ?? '');
-                if (!str_starts_with($did, 'did:')) continue;
-                $items[] = ['did'=>$did,'uri'=>(string)($entry['uri'] ?? ''),'handle'=>(string)($subject['handle'] ?? ''),'displayName'=>(string)($subject['displayName'] ?? ''),'avatar'=>(string)($subject['avatar'] ?? '')];
-            }
-            $v = $pack['value'];
-            $up->execute([$ownerUserId,$uri,$pack['list'],mb_substr((string)($v['name'] ?? 'Starter Pack'),0,64),mb_substr((string)($v['description'] ?? ''),0,300), (string)($v['createdAt'] ?? $now), json_encode($items,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE),$now]);
-        }
-        $del = $db->prepare('DELETE FROM bsky_starter_pack_cache WHERE owner_user_id=? AND pack_uri=?');
-        $st = $db->prepare('SELECT pack_uri FROM bsky_starter_pack_cache WHERE owner_user_id=?'); $st->execute([$ownerUserId]);
-        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) if (!isset($records[(string)$uri])) $del->execute([$ownerUserId,(string)$uri]);
-        $db->prepare('INSERT INTO bsky_starter_pack_sync_state(owner_user_id,synced_at,updated_at) VALUES(?,?,?) ON CONFLICT(owner_user_id) DO UPDATE SET synced_at=excluded.synced_at,updated_at=excluded.updated_at')->execute([$ownerUserId,$now,$now]);
-        return ['ok'=>true,'synced'=>count($records)];
-    } catch (Throwable $e) { error_log('[ap-bsky] starter pack cache write failed'); return ['ok'=>false,'error'=>'Could not store starter packs']; }
-}
-
-function ap_bsky_starter_packs_cached(int $ownerUserId): array
-{
-    if (!ap_bsky_starter_pack_cache_ready()) return [];
-    try {
-        $state=ap_db()->prepare('SELECT synced_at FROM bsky_starter_pack_sync_state WHERE owner_user_id=?'); $state->execute([$ownerUserId]);
-        $syncedAt=strtotime((string)($state->fetchColumn() ?: '')) ?: 0;
-        if ($syncedAt < time()-300) ap_bsky_starter_packs_enqueue($ownerUserId);
-        $st=ap_db()->prepare('SELECT pack_uri,list_uri,name,description,created_at,members_json,updated_at FROM bsky_starter_pack_cache WHERE owner_user_id=? ORDER BY LOWER(name)'); $st->execute([$ownerUserId]);
-        return array_map(static function(array $r): array { $r['members']=json_decode((string)$r['members_json'],true) ?: []; unset($r['members_json']); return $r; }, $st->fetchAll() ?: []);
-    } catch (Throwable $e) { return []; }
-}
-
-function ap_bsky_starter_packs_enqueue(int $ownerUserId, bool $force = false): bool
-{
-    return ap_bsky_background_sync_enqueue($ownerUserId, 'starter_packs', $force);
-}
-
-function ap_bsky_starter_pack_create(int $ownerUserId, string $name, string $description = ''): array
-{
-    $name=trim($name); if ($name==='' || mb_strlen($name)>50) return ['ok'=>false,'error'=>'Name must be 1–50 characters'];
-    $list=ap_bsky_create_graph_list($ownerUserId,$name,'curation'); if (empty($list['ok'])) return $list;
-    $session=ap_bsky_session_row($ownerUserId); $did=(string)($session['did']??'');
-    $made=ap_bsky_account_xrpc($ownerUserId,'com.atproto.repo.createRecord','POST',null,['repo'=>$did,'collection'=>'app.bsky.graph.starterpack','record'=>['$type'=>'app.bsky.graph.starterpack','name'=>$name,'description'=>mb_substr(trim($description),0,300),'list'=>(string)$list['uri'],'createdAt'=>gmdate('c')]]);
-    if (empty($made['ok'])) { ap_bsky_delete_record_uri($ownerUserId,(string)$list['uri']); return ['ok'=>false,'error'=>(string)($made['error']??'Could not create Starter Pack')]; }
-    ap_bsky_starter_packs_enqueue($ownerUserId,true); return ['ok'=>true,'uri'=>(string)($made['json']['uri']??''),'list_uri'=>(string)$list['uri']];
-}
-
-function ap_bsky_starter_pack_add_member(int $ownerUserId, string $packUri, string $ref): array
-{
-    $pack=null; foreach(ap_bsky_starter_packs_cached($ownerUserId) as $p) if (($p['pack_uri']??'')===$packUri) {$pack=$p;break;}
-    if (!$pack) return ['ok'=>false,'error'=>'Starter Pack not found in your account'];
-    $ref=trim($ref);
-    $isBskyInput=str_starts_with($ref,'did:') || preg_match('~^https://bsky\.app/profile/[^/?#]+$~i',$ref)
-        || preg_match('/^@?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i',$ref);
-    if (!$isBskyInput) return ['ok'=>false,'error'=>'Starter Packs can only contain Bluesky accounts. Enter a Bluesky handle, DID, or bsky.app profile URL.'];
-    $did=ap_bsky_resolve_target_did($ref,$ownerUserId); if (!is_string($did) || !str_starts_with($did,'did:')) return ['ok'=>false,'error'=>'Could not resolve that Bluesky account'];
-    $made=ap_bsky_add_graph_list_member($ownerUserId,(string)$pack['list_uri'],$did);
-    if (!empty($made['ok'])) ap_bsky_starter_packs_enqueue($ownerUserId,true);
-    return $made;
-}
-
-function ap_bsky_starter_pack_remove_member(int $ownerUserId, string $packUri, string $did): array
-{
-    foreach(ap_bsky_starter_packs_cached($ownerUserId) as $p) if (($p['pack_uri']??'')===$packUri) {
-        foreach((array)$p['members'] as $m) if (($m['did']??'')===$did && str_starts_with((string)($m['uri']??''),'at://')) {
-            $res=ap_bsky_delete_graph_list_member($ownerUserId,(string)$m['uri']); if (!empty($res['ok'])) ap_bsky_starter_packs_enqueue($ownerUserId,true); return $res;
-        }
-    }
-    return ['ok'=>false,'error'=>'Starter Pack member not found'];
-}
-
-function ap_bsky_starter_pack_delete(int $ownerUserId, string $packUri): array
-{
-    foreach(ap_bsky_starter_packs_cached($ownerUserId) as $p) if (($p['pack_uri']??'')===$packUri) {
-        foreach((array)$p['members'] as $m) if (str_starts_with((string)($m['uri']??''),'at://')) ap_bsky_delete_graph_list_member($ownerUserId,(string)$m['uri']);
-        $pack=ap_bsky_delete_record_uri($ownerUserId,$packUri); if (empty($pack['ok'])) return $pack;
-        $list=ap_bsky_delete_record_uri($ownerUserId,(string)$p['list_uri']);
-        try { ap_db()->prepare('DELETE FROM bsky_starter_pack_cache WHERE owner_user_id=? AND pack_uri=?')->execute([$ownerUserId,$packUri]); } catch(Throwable $e) {}
-        return !empty($list['ok']) ? ['ok'=>true] : ['ok'=>true,'warning'=>'Starter Pack removed; its Bluesky list could not be deleted'];
-    }
-    return ['ok'=>false,'error'=>'Starter Pack not found in your account'];
 }
 
 // ---------------------------------------------------------------------------
@@ -4409,32 +4523,25 @@ function ap_bsky_get_profile(int $ownerUserId, string $actor): array
     if (empty($tok['ok'])) {
         $tok = ap_bsky_access_token($ownerUserId, true);
     }
-    $lastErr = (string) ($tok['error'] ?? 'getProfile failed');
-    if (!empty($tok['ok'])) {
-        $row = ap_bsky_session_row($ownerUserId);
-        $hosts = ap_bsky_feed_hosts(rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'));
-        foreach ($hosts as $host) {
-            $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
-            if (($r['status'] ?? 0) === 401) {
-                $tok = ap_bsky_access_token($ownerUserId, true);
-                if (empty($tok['ok'])) {
-                    $lastErr = (string) ($tok['error'] ?? 'Session expired');
-                    break;
-                }
-                $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
-            }
-            if (!empty($r['ok']) && is_array($r['json'] ?? null)) {
-                return ['ok' => true, 'profile' => $r['json']];
-            }
-            $lastErr = (string) ($r['error'] ?? $lastErr);
-        }
+    if (empty($tok['ok'])) {
+        return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Not connected')];
     }
-    // A custom PDS may not provide AppView methods, and its JWT may not be
-    // accepted by public.api.bsky.app. Profile data is public, so make one
-    // unauthenticated AppView request before declaring the profile unavailable.
-    $public = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, null, 8);
-    if (!empty($public['ok']) && is_array($public['json'] ?? null)) {
-        return ['ok' => true, 'profile' => $public['json']];
+    $row = ap_bsky_session_row($ownerUserId);
+    $hosts = ap_bsky_feed_hosts(rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'));
+    $lastErr = 'getProfile failed';
+    foreach ($hosts as $host) {
+        $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
+        if (($r['status'] ?? 0) === 401) {
+            $tok = ap_bsky_access_token($ownerUserId, true);
+            if (empty($tok['ok'])) {
+                return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'Session expired')];
+            }
+            $r = ap_bsky_xrpc($host, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actor], null, (string) $tok['access'], 12);
+        }
+        if (!empty($r['ok']) && is_array($r['json'] ?? null)) {
+            return ['ok' => true, 'profile' => $r['json']];
+        }
+        $lastErr = (string) ($r['error'] ?? $lastErr);
     }
     return ['ok' => false, 'error' => $lastErr];
 }
@@ -4500,62 +4607,22 @@ function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0,
     if (!ap_bsky_actor_refresh_migrate($db)) return null;
     $actorRef = trim($actorRef);
     if ($actorRef === '') return null;
-    $lookupRefs = [$actorRef];
-    $identity = $actorRef;
-    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorRef, $m)) {
-        $identity = rawurldecode($m[1]);
-    } elseif (str_starts_with($actorRef, 'at://did:')
-        && preg_match('~^at://(did:[^/]+)~', $actorRef, $m)) {
-        $identity = $m[1];
-    }
-    if (str_starts_with($identity, 'did:')) {
-        $lookupRefs[] = $identity;
-        $lookupRefs[] = 'https://bsky.app/profile/' . $identity;
-        $lookupRefs[] = 'https://bsky.app/profile/' . rawurlencode($identity);
-    }
-    $lookupRefs = array_values(array_unique($lookupRefs));
     try {
-        $row = null;
-        $matchedRef = '';
         $st = $db->prepare('SELECT * FROM bsky_actor_profiles WHERE actor_ref = ? LIMIT 1');
-        foreach ($lookupRefs as $ref) {
-            $st->execute([$ref]);
-            $candidate = $st->fetch();
-            if (is_array($candidate)) {
-                $row = $candidate;
-                $matchedRef = $ref;
-                break;
-            }
-        }
+        $st->execute([$actorRef]);
+        $row = $st->fetch();
         if (!is_array($row)) return null;
         $profile = json_decode((string) ($row['profile_json'] ?? ''), true);
         if (!is_array($profile)) return null;
-        $profileDid = trim((string) ($row['did'] ?? $profile['did'] ?? ''));
-        if (str_starts_with($profileDid, 'did:')) {
-            $lookupRefs[] = $profileDid;
-            $lookupRefs[] = 'https://bsky.app/profile/' . $profileDid;
-            $lookupRefs[] = 'https://bsky.app/profile/' . rawurlencode($profileDid);
-            $lookupRefs = array_values(array_unique($lookupRefs));
-        }
         $out = ['profile' => $profile, 'did' => (string) ($row['did'] ?? ''), 'updated_at' => (string) ($row['updated_at'] ?? '')];
         if ($ownerUserId > 0) {
-            $viewerRefs = array_values(array_unique(array_merge([$matchedRef], $lookupRefs)));
-            $vs = $db->prepare('SELECT following_uri, followed_by, updated_at FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
-            $viewer = null;
-            foreach ($viewerRefs as $ref) {
-                $vs->execute([$ownerUserId, $ref]);
-                $candidate = $vs->fetch();
-                if (is_array($candidate) && (!is_array($viewer)
-                    || (strtotime((string) ($candidate['updated_at'] ?? '')) ?: 0)
-                        > (strtotime((string) ($viewer['updated_at'] ?? '')) ?: 0))) {
-                    $viewer = $candidate;
-                }
-            }
+            $vs = $db->prepare('SELECT following_uri, followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
+            $vs->execute([$ownerUserId, $actorRef]);
+            $viewer = $vs->fetch();
             if (is_array($viewer)) {
                 $out['viewer'] = [
-                    'following' => is_string($viewer['following_uri'] ?? null) ? (string) $viewer['following_uri'] : null,
+                    'following' => (string) ($viewer['following_uri'] ?? ''),
                     'followedBy' => !empty($viewer['followed_by']),
-                    'updated_at' => (string) ($viewer['updated_at'] ?? ''),
                 ];
             }
         }
@@ -4571,39 +4638,20 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
     if (!ap_bsky_actor_refresh_migrate($db)) return;
     $actorRef = trim($actorRef);
     if ($actorRef === '' || $ownerUserId < 1) return;
-    $hasViewer = is_array($profile['viewer'] ?? null);
-    $viewer = $hasViewer ? $profile['viewer'] : [];
+    $viewer = is_array($profile['viewer'] ?? null) ? $profile['viewer'] : [];
     $did = trim((string) ($profile['did'] ?? ''));
     unset($profile['viewer']); // relationship state is scoped to the VAAK owner below.
     $json = json_encode($profile, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($json)) return;
     $now = gmdate('c');
     try {
-        $profileRefs = [$actorRef];
-        if ($did !== '') {
-            $profileRefs[] = $did;
-            $profileRefs[] = 'https://bsky.app/profile/' . $did;
-            $profileRefs[] = 'https://bsky.app/profile/' . rawurlencode($did);
-        }
-        $profileRefs = array_values(array_unique($profileRefs));
         $st = $db->prepare('INSERT INTO bsky_actor_profiles (actor_ref, did, profile_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (actor_ref) DO UPDATE SET did = excluded.did, profile_json = excluded.profile_json, updated_at = excluded.updated_at');
+        $st->execute([$actorRef, $did !== '' ? $did : null, $json, $now]);
         $vs = $db->prepare('INSERT INTO bsky_actor_viewers (owner_user_id, actor_ref, following_uri, followed_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET following_uri = excluded.following_uri, followed_by = excluded.followed_by, updated_at = excluded.updated_at');
-        foreach ($profileRefs as $ref) {
-            $st->execute([$ref, $did !== '' ? $did : null, $json, $now]);
-            // Anonymous public AppView responses contain no viewer state. Keep
-            // any prior owner-specific relationship cache intact in that case.
-            if ($hasViewer) {
-                $vs->execute([$ownerUserId, $ref, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
-            }
-        }
-        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
-        if ($did !== '' && function_exists('ap_search_fts_external_pk')) {
-            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
-                (string) ($profile['handle'] ?? ''),
-                (string) ($profile['displayName'] ?? ''),
-                (string) ($profile['description'] ?? ''),
-            ])));
-            ap_search_fts_upsert('bsky_actor', ap_search_fts_external_pk('bsky_actor', $did), $did, $now, $searchBody);
+        $vs->execute([$ownerUserId, $actorRef, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+        if ($did !== '' && $did !== $actorRef) {
+            $st->execute([$did, $did, $json, $now]);
+            $vs->execute([$ownerUserId, $did, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor profile cache write failed');
@@ -4617,11 +4665,7 @@ function ap_bsky_actor_viewer_cache_update(int $ownerUserId, string $did, ?strin
     $db = ap_db();
     if (!ap_bsky_actor_refresh_migrate($db)) return;
     $now = gmdate('c');
-    $refs = [
-        $did,
-        'https://bsky.app/profile/' . $did,
-        'https://bsky.app/profile/' . rawurlencode($did),
-    ];
+    $refs = [$did, 'https://bsky.app/profile/' . rawurlencode($did)];
     foreach ($refs as $ref) {
         try {
             $st = $db->prepare('SELECT followed_by FROM bsky_actor_viewers WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
@@ -4643,125 +4687,14 @@ function ap_bsky_actor_refresh_enqueue(int $ownerUserId, string $actorRef, bool 
     $actorRef = trim($actorRef);
     if ($ownerUserId < 1 || $actorRef === '' || !ap_bsky_is_profile_ref($actorRef)) return;
     $cached = ap_bsky_actor_profile_cache_get($actorRef, $ownerUserId, $db);
-    if (!$force && is_array($cached)
-        && (strtotime($cached['updated_at'] ?? '') ?: 0) > time() - 6 * 3600
-        && isset($cached['viewer'])
-        && (strtotime((string) ($cached['viewer']['updated_at'] ?? '')) ?: 0) > time() - 300) return;
+    if (!$force && is_array($cached) && isset($cached['viewer'])
+        && (strtotime($cached['updated_at']) ?: 0) > time() - 6 * 3600) return;
     $now = gmdate('c');
     try {
         $st = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
         $st->execute([$ownerUserId, $actorRef, $now, $now]);
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor refresh enqueue failed');
-    }
-}
-
-/** Coalesced durable sync of native follows made in Bluesky or VAAK. */
-function ap_bsky_follow_sync_enqueue(int $ownerUserId, ?PDO $db = null): void
-{
-    $db ??= ap_db();
-    if ($ownerUserId < 1 || ap_bsky_session_row($ownerUserId) === null || !ap_bsky_actor_refresh_migrate($db)) return;
-    $actorRef = '__vaak_sync__:follows';
-    $now = gmdate('c');
-    try {
-        $st = $db->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
-        $st->execute([$ownerUserId, $actorRef]);
-        $existing = $st->fetch();
-        if (is_array($existing)) {
-            $status = (string) ($existing['status'] ?? '');
-            $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
-            if (in_array($status, ['pending', 'processing'], true)
-                || ($status === 'succeeded' && $queuedAt > time() - 600)) return;
-        }
-        $up = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
-        $up->execute([$ownerUserId, $actorRef, $now, $now]);
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] follow sync enqueue failed');
-    }
-}
-
-/** Import and reconcile native follow records only after every page succeeds. */
-function ap_bsky_follow_sync_worker(int $ownerUserId): array
-{
-    $session = ap_bsky_session_row($ownerUserId);
-    $repo = trim((string) ($session['did'] ?? ''));
-    if ($repo === '' || !str_starts_with($repo, 'did:')) return ['ok' => false, 'error' => 'Connected Bluesky DID unavailable'];
-
-    $follows = [];
-    $cursor = null;
-    // Protect the worker from an unexpectedly huge repository; never reconcile partial data.
-    for ($page = 0; $page < 25; $page++) {
-        $query = ['repo' => $repo, 'collection' => 'app.bsky.graph.follow', 'limit' => 100];
-        if (is_string($cursor) && $cursor !== '') $query['cursor'] = $cursor;
-        $res = ap_bsky_account_xrpc($ownerUserId, 'com.atproto.repo.listRecords', 'GET', $query);
-        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
-            return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not read Bluesky follows')];
-        }
-        foreach ((array) ($res['json']['records'] ?? []) as $record) {
-            if (!is_array($record)) continue;
-            $value = is_array($record['value'] ?? null) ? $record['value'] : [];
-            $did = trim((string) ($value['subject'] ?? ''));
-            if (!str_starts_with($did, 'did:')) continue;
-            $uri = trim((string) ($record['uri'] ?? ''));
-            $follows[$did] = $uri !== '' ? $uri : null;
-        }
-        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) && $res['json']['cursor'] !== ''
-            ? $res['json']['cursor'] : null;
-        if ($cursor === null) break;
-    }
-    if ($cursor !== null) return ['ok' => false, 'error' => 'Bluesky follow list exceeds the safe per-run page limit'];
-
-    ap_bsky_graph_sync_migrate();
-    $db = ap_db();
-    try {
-        $db->beginTransaction();
-        $existing = $db->prepare("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follow'");
-        $existing->execute([$ownerUserId]);
-        $existingDids = array_map('strval', $existing->fetchAll(PDO::FETCH_COLUMN) ?: []);
-        foreach ($follows as $did => $uri) ap_bsky_graph_sync_upsert($ownerUserId, 'follow', $did, $uri, 'pull');
-        foreach ($existingDids as $did) {
-            if (!array_key_exists($did, $follows)) ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
-        }
-        $profiles = $db->prepare('SELECT DISTINCT did FROM bsky_actor_profiles WHERE did IS NOT NULL AND did <> ?');
-        $profiles->execute(['']);
-        foreach ($profiles->fetchAll(PDO::FETCH_COLUMN) ?: [] as $did) {
-            if (is_string($did) && str_starts_with($did, 'did:')) {
-                ap_bsky_actor_viewer_cache_update($ownerUserId, $did, $follows[$did] ?? null);
-            }
-        }
-        $db->commit();
-        return ['ok' => true, 'count' => count($follows)];
-    } catch (Throwable $e) {
-        if ($db->inTransaction()) $db->rollBack();
-        return ['ok' => false, 'error' => 'Could not reconcile Bluesky follow cache'];
-    }
-}
-
-/** Queue connected-profile public counts without making profile HTML wait on XRPC. */
-function ap_bsky_profile_counts_enqueue(int $ownerUserId, string $handle): bool
-{
-    $handle = ltrim(trim($handle), '@');
-    if ($ownerUserId < 1 || $handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)
-        || str_ends_with(strtolower($handle), '.ap.brid.gy') || str_ends_with(strtolower($handle), '.brid.gy')
-        || !ap_bsky_actor_refresh_migrate()) return false;
-    $actorRef = '__vaak_profile_counts__:' . strtolower($handle);
-    $now = gmdate('c');
-    try {
-        $st = ap_db()->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
-        $st->execute([$ownerUserId, $actorRef]);
-        $existing = $st->fetch();
-        if (is_array($existing)) {
-            $status = (string) ($existing['status'] ?? '');
-            $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
-            if (in_array($status, ['pending', 'processing'], true)
-                || ($status === 'succeeded' && $queuedAt > time() - 120)) return true;
-        }
-        $up = ap_db()->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
-        $up->execute([$ownerUserId, $actorRef, $now, $now]);
-        return true;
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] profile counts enqueue failed');
-        return false;
     }
 }
 
@@ -4784,7 +4717,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         $db->prepare("UPDATE bsky_actor_refresh_queue SET status = ?, attempts = ?, next_attempt_at = ?, locked_at = NULL, last_error = 'Worker lease expired' WHERE owner_user_id = ? AND actor_ref = ? AND status = 'processing'")
             ->execute([$dead ? 'failed' : 'pending', $attempt, gmdate('c', time() + $delay), $owner, $actorRef]);
     }
-    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref IN ('__vaak_sync__:lists', '__vaak_sync__:bookmarks', '__vaak_sync__:starter_packs', '__vaak_sync__:follows') THEN 0 ELSE 1 END, queued_at LIMIT ?");
+    $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY queued_at LIMIT ?");
     $st->bindValue(1, $now);
     $st->bindValue(2, max(1, min(5, $limit)), PDO::PARAM_INT);
     $st->execute();
@@ -4796,43 +4729,6 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
         if ($claim->rowCount() !== 1) continue;
         $stats['claimed']++;
         try {
-            if (str_starts_with($actorRef, '__vaak_profile_counts__:')) {
-                $handle = substr($actorRef, strlen('__vaak_profile_counts__:'));
-                $result = ap_bsky_public_profile_counts($handle, 120, true);
-                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Bluesky profile counts refresh failed'));
-                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
-                $stats['succeeded']++;
-                continue;
-            }
-            if ($actorRef === '__vaak_sync__:lists') {
-                require_once __DIR__ . '/ap-lists.php';
-                $result = ap_lists_sync_bsky($owner, true);
-                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'List synchronization failed'));
-                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
-                $stats['succeeded']++;
-                continue;
-            }
-            if ($actorRef === '__vaak_sync__:bookmarks') {
-                $result = ap_bsky_get_bookmarks($owner, 200, true);
-                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Bookmark synchronization failed'));
-                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
-                $stats['succeeded']++;
-                continue;
-            }
-            if ($actorRef === '__vaak_sync__:starter_packs') {
-                $result = ap_bsky_starter_packs_refresh_worker($owner);
-                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Starter pack synchronization failed'));
-                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
-                $stats['succeeded']++;
-                continue;
-            }
-            if ($actorRef === '__vaak_sync__:follows') {
-                $result = ap_bsky_follow_sync_worker($owner);
-                if (empty($result['ok'])) throw new RuntimeException((string) ($result['error'] ?? 'Follow synchronization failed'));
-                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
-                $stats['succeeded']++;
-                continue;
-            }
             $result = ap_bsky_get_profile($owner, $actorRef);
             if (empty($result['ok']) || !is_array($result['profile'] ?? null)) {
                 throw new RuntimeException((string) ($result['error'] ?? 'Profile fetch failed'));
@@ -4841,24 +4737,29 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
             ap_bsky_actor_profile_cache_upsert($actorRef, $owner, $profile);
             $did = trim((string) ($profile['did'] ?? ''));
             if ($did !== '') {
-                $feedIndexed = false;
                 $tok = ap_bsky_access_token($owner, false);
                 if (empty($tok['ok'])) $tok = ap_bsky_access_token($owner, true);
                 if (!empty($tok['ok'])) {
                     $sess = ap_bsky_session_row($owner);
                     foreach (ap_bsky_feed_hosts(rtrim((string) ($sess['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/')) as $host) {
-                        $feed = ap_bsky_xrpc($host, 'app.bsky.feed.getAuthorFeed', 'GET', ['actor' => $did, 'limit' => 40], null, (string) $tok['access'], 12);
+                        $feed = ap_bsky_xrpc(
+                            $host,
+                            'app.bsky.feed.getAuthorFeed',
+                            'GET',
+                            ['actor' => $did, 'limit' => 40, 'filter' => 'posts_and_author_threads'],
+                            null,
+                            (string) $tok['access'],
+                            12
+                        );
                         if (!empty($feed['ok']) && is_array($feed['json']['feed'] ?? null)) {
                             ap_bsky_index_feed_items($feed['json']['feed'], $owner, 40);
-                            $feedIndexed = true;
+                            // Own DID only — import Bluesky-native posts as local (unfederated) notes.
+                            $sessDid = trim((string) (($sess['did'] ?? '') ?: ''));
+                            if ($sessDid !== '' && $did === $sessDid) {
+                                ap_bsky_import_own_feed_as_local($owner, $feed['json']['feed']);
+                            }
                             break;
                         }
-                    }
-                }
-                if (!$feedIndexed) {
-                    $feed = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getAuthorFeed', 'GET', ['actor' => $did, 'limit' => 40], null, null, 8);
-                    if (!empty($feed['ok']) && is_array($feed['json']['feed'] ?? null)) {
-                        ap_bsky_index_feed_items($feed['json']['feed'], $owner, 40);
                     }
                 }
             }
@@ -5257,8 +5158,9 @@ function ap_bsky_hide_did_remove(int $ownerUserId, string $did, string $reason, 
 /** @return array<string,true> did => true */
 function ap_bsky_hide_did_set(int $ownerUserId): array
 {
-    if (isset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId])) {
-        return $GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId];
+    static $cache = [];
+    if (isset($cache[$ownerUserId])) {
+        return $cache[$ownerUserId];
     }
     $out = [];
     if ($ownerUserId < 1) {
@@ -5277,14 +5179,13 @@ function ap_bsky_hide_did_set(int $ownerUserId): array
     } catch (Throwable $e) {
         // empty
     }
-    $GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId] = $out;
+    $cache[$ownerUserId] = $out;
     return $out;
 }
 
 function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
 {
-    if ($ownerUserId === null) unset($GLOBALS['ap_bsky_hide_did_cache']);
-    else unset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId]);
+    // static cache is per-request; no-op helper for future APCu
 }
 
 /**
@@ -5648,7 +5549,13 @@ function ap_bsky_post_video_media(array $post): array
     if ($embed === null) {
         return [];
     }
-    $video = ap_bsky_embed_video_view($embed);
+    $video = null;
+    $type = (string) ($embed['$type'] ?? '');
+    if (str_contains($type, 'video') && is_array($embed['video'] ?? null)) {
+        $video = $embed['video'];
+    } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['video'] ?? null)) {
+        $video = $embed['media']['video'];
+    }
     if (!is_array($video)) {
         return [];
     }
@@ -5728,7 +5635,7 @@ function ap_bsky_bio_from_vaak_summary(string $summaryHtml, string $profileUrl):
  *
  * @return array{ok:bool,error?:string,bytes?:string,mime?:string}
  */
-function ap_bsky_fetch_image_bytes(string $url, bool $forPost = false): array
+function ap_bsky_fetch_image_bytes(string $url): array
 {
     $url = trim($url);
     if ($url === '' || !str_starts_with($url, 'https://')) {
@@ -5760,11 +5667,8 @@ function ap_bsky_fetch_image_bytes(string $url, bool $forPost = false): array
     if (!is_string($bytes) || $bytes === '' || $status < 200 || $status >= 300) {
         return ['ok' => false, 'error' => 'Image download failed'];
     }
-    $downloadLimit = $forPost ? 15 * 1024 * 1024 : 2 * 1024 * 1024;
-    if (strlen($bytes) > $downloadLimit) {
-        return ['ok' => false, 'error' => $forPost
-            ? 'Image too large for Bluesky post mirror (>15MB)'
-            : 'Image too large for Bluesky avatar/banner (>2MB)'];
+    if (strlen($bytes) > 2 * 1024 * 1024) {
+        return ['ok' => false, 'error' => 'Image too large for Bluesky avatar/banner (>2MB)'];
     }
     $mime = 'image/jpeg';
     if (preg_match('#^(image/(?:jpeg|png|webp|gif))#i', $ctype, $m)) {
@@ -5778,103 +5682,9 @@ function ap_bsky_fetch_image_bytes(string $url, bool $forPost = false): array
     } elseif (str_starts_with($bytes, 'GIF8')) {
         $mime = 'image/gif';
     }
-    if ($forPost) {
-        return ap_bsky_normalize_embed_image($bytes, $mime);
-    }
-    // Profile image uploads keep their existing normalization and size limit.
+    // Bluesky app.bsky.actor.profile only accepts image/jpeg or image/png for
+    // avatar/banner blobs — convert webp/gif (and anything else) to JPEG.
     return ap_bsky_normalize_profile_image($bytes, $mime);
-}
-
-/**
- * Normalize a feed image to Bluesky's 1,000,000-byte embed limit.
- * Prefer a lossless PNG when it fits; otherwise encode JPEG and progressively
- * reduce quality/size. Keeps transparency for PNGs whenever feasible.
- *
- * @return array{ok:bool,error?:string,bytes?:string,mime?:string}
- */
-function ap_bsky_normalize_embed_image(string $bytes, string $mime): array
-{
-    $maxBytes = 1000000;
-    $mime = strtolower(trim($mime));
-    if ($mime === 'image/jpg') {
-        $mime = 'image/jpeg';
-    }
-    if (strlen($bytes) <= $maxBytes && in_array($mime, ['image/jpeg', 'image/png', 'image/webp'], true)) {
-        return ['ok' => true, 'bytes' => $bytes, 'mime' => $mime];
-    }
-    if (!function_exists('imagecreatefromstring') || !function_exists('imagejpeg') || !function_exists('imagepng')) {
-        return ['ok' => false, 'error' => 'GD is required to fit this image within Bluesky’s 1MB embed limit'];
-    }
-    $im = @imagecreatefromstring($bytes);
-    if ($im === false) {
-        return ['ok' => false, 'error' => 'Could not decode image for Bluesky post'];
-    }
-    $width = imagesx($im);
-    $height = imagesy($im);
-    if ($width < 1 || $height < 1 || ($width * $height) > 40000000) {
-        imagedestroy($im);
-        return ['ok' => false, 'error' => 'Image dimensions are unsafe for Bluesky normalization'];
-    }
-    if (function_exists('imagepalettetotruecolor')) {
-        @imagepalettetotruecolor($im);
-    }
-    $preservePng = ($mime === 'image/png');
-    for ($pass = 0; $pass < 7; $pass++) {
-        if ($preservePng) {
-            ob_start();
-            $pngOk = imagepng($im, null, 9);
-            $png = ob_get_clean();
-            if ($pngOk && is_string($png) && $png !== '' && strlen($png) <= $maxBytes) {
-                imagedestroy($im);
-                return ['ok' => true, 'bytes' => $png, 'mime' => 'image/png'];
-            }
-        }
-        foreach ([88, 82, 76, 70, 64, 58, 52] as $quality) {
-            $jpegSource = $im;
-            $flattened = null;
-            if ($preservePng && function_exists('imagecreatetruecolor')) {
-                $flattened = imagecreatetruecolor(imagesx($im), imagesy($im));
-                if ($flattened !== false) {
-                    $black = imagecolorallocate($flattened, 0, 0, 0);
-                    imagefilledrectangle($flattened, 0, 0, imagesx($im), imagesy($im), $black);
-                    imagecopy($flattened, $im, 0, 0, 0, 0, imagesx($im), imagesy($im));
-                    $jpegSource = $flattened;
-                }
-            }
-            ob_start();
-            $jpegOk = imagejpeg($jpegSource, null, $quality);
-            $jpeg = ob_get_clean();
-            if ($flattened !== null && $flattened !== false) {
-                imagedestroy($flattened);
-            }
-            if ($jpegOk && is_string($jpeg) && $jpeg !== '' && strlen($jpeg) <= $maxBytes) {
-                imagedestroy($im);
-                return ['ok' => true, 'bytes' => $jpeg, 'mime' => 'image/jpeg'];
-            }
-        }
-        $width = imagesx($im);
-        $height = imagesy($im);
-        if ($width <= 320 || $height <= 240 || !function_exists('imagecreatetruecolor')) {
-            break;
-        }
-        $newWidth = max(320, (int) floor($width * 0.85));
-        $newHeight = max(240, (int) floor($height * 0.85));
-        $smaller = imagecreatetruecolor($newWidth, $newHeight);
-        if ($smaller === false) {
-            break;
-        }
-        if ($preservePng) {
-            imagealphablending($smaller, false);
-            imagesavealpha($smaller, true);
-            $transparent = imagecolorallocatealpha($smaller, 0, 0, 0, 127);
-            imagefilledrectangle($smaller, 0, 0, $newWidth, $newHeight, $transparent);
-        }
-        imagecopyresampled($smaller, $im, 0, 0, 0, 0, $newWidth, $newHeight, $width, $height);
-        imagedestroy($im);
-        $im = $smaller;
-    }
-    imagedestroy($im);
-    return ['ok' => false, 'error' => 'Could not fit image within Bluesky’s 1MB embed limit'];
 }
 
 /**
@@ -7273,6 +7083,8 @@ function ap_bsky_crosspost_status_inner(
                 'error' => 'Reply parent is Fediverse-only',
             ];
         }
+        // Self-reply to our own split OP: nest under the tip segment, not a root sibling.
+        $parent = ap_bsky_self_thread_tip_ref($parent, $ownerUserId);
         $replyRef = ap_bsky_reply_ref_for_parent($parent, $ownerUserId);
     }
     $quoteRef = null;
@@ -7330,31 +7142,11 @@ function ap_bsky_crosspost_status_inner(
     // Upload media (first segment only). Bluesky allows 1 video XOR ≤4 images.
     $images = [];
     $videoEmbed = null;
-    if ($mediaLocalIds !== []) {
+    if ($mediaLocalIds !== [] && function_exists('ap_media_by_local_ids')) {
         if (!function_exists('ap_media_by_local_ids')) {
             require_once __DIR__ . '/ap-r2.php';
         }
-        if (!function_exists('ap_media_by_local_ids')) {
-            return ['ok' => false, 'deferred' => true, 'error' => 'Media lookup is unavailable for Bluesky mirror'];
-        }
-        $mediaIds = array_values(array_unique(array_filter(array_map('intval', $mediaLocalIds), static fn($id) => $id > 0)));
-        if ($mediaIds === []) {
-            return ['ok' => false, 'deferred' => true, 'error' => 'Media IDs are invalid for Bluesky mirror'];
-        }
-        $mediaRows = ap_media_by_local_ids($mediaIds);
-        if (count($mediaRows) !== count($mediaIds)) {
-            return ['ok' => false, 'deferred' => true, 'error' => 'Could not load all media for Bluesky mirror'];
-        }
-        foreach ($mediaRows as $mediaRow) {
-            if (!is_array($mediaRow)) {
-                continue;
-            }
-            $mediaMime = strtolower((string) ($mediaRow['mime'] ?? $mediaRow['content_type'] ?? ''));
-            $mediaKind = strtolower((string) ($mediaRow['media_type'] ?? ''));
-            if ($mediaKind === 'audio' || str_starts_with($mediaMime, 'audio/')) {
-                return ['ok' => true, 'skipped' => true, 'error' => 'Audio recording posts are not mirrored to Bluesky'];
-            }
-        }
+        $mediaRows = ap_media_by_local_ids(array_map('intval', $mediaLocalIds));
         // Prefer the first video when present; otherwise upload images.
         $videoRow = null;
         foreach ($mediaRows as $m) {
@@ -7378,66 +7170,68 @@ function ap_bsky_crosspost_status_inner(
         if (is_array($videoRow)) {
             $url = (string) ($videoRow['public_url'] ?? $videoRow['url'] ?? $videoRow['remote_url'] ?? '');
             $mime = strtolower((string) ($videoRow['mime'] ?? $videoRow['content_type'] ?? 'video/mp4'));
-            if ($url === '' || !str_starts_with($url, 'https://')) {
-                return ['ok' => false, 'deferred' => true, 'error' => 'Video attachment has no valid HTTPS URL'];
-            }
-            $fetched = ap_bsky_fetch_video_bytes($url, $mime);
-            if (empty($fetched['ok'])) {
-                return ['ok' => false, 'deferred' => true, 'error' => (string) ($fetched['error'] ?? 'Video download failed')];
-            }
-            $nameHint = basename(parse_url($url, PHP_URL_PATH) ?: 'video.mov');
-            $mp4 = ap_bsky_video_ensure_mp4(
-                (string) $fetched['bytes'],
-                (string) ($fetched['mime'] ?? $mime),
-                is_string($nameHint) ? $nameHint : 'video.mov'
-            );
-            if (empty($mp4['ok'])) {
-                return ['ok' => false, 'deferred' => true, 'error' => 'Video conversion failed: ' . (string) ($mp4['error'] ?? 'unknown')];
-            }
-            $upName = pathinfo(is_string($nameHint) ? $nameHint : 'video', PATHINFO_FILENAME) . '.mp4';
-            $up = ap_bsky_upload_video(
-                $pds,
-                $access,
-                $did,
-                (string) $mp4['bytes'],
-                (string) ($mp4['mime'] ?? 'video/mp4'),
-                $upName,
-                180
-            );
-            if (empty($up['ok']) && str_contains((string) ($up['error'] ?? ''), 'Expired')) {
-                $tok = ap_bsky_access_token($ownerUserId, true);
-                if (!empty($tok['ok'])) {
-                    $access = (string) $tok['access'];
-                    $up = ap_bsky_upload_video(
-                        $pds,
-                        $access,
-                        $did,
-                        (string) $mp4['bytes'],
-                        (string) ($mp4['mime'] ?? 'video/mp4'),
-                        $upName,
-                        180
+            if ($url !== '' && str_starts_with($url, 'https://')) {
+                $fetched = ap_bsky_fetch_video_bytes($url, $mime);
+                if (!empty($fetched['ok'])) {
+                    $nameHint = basename(parse_url($url, PHP_URL_PATH) ?: 'video.mov');
+                    $mp4 = ap_bsky_video_ensure_mp4(
+                        (string) $fetched['bytes'],
+                        (string) ($fetched['mime'] ?? $mime),
+                        is_string($nameHint) ? $nameHint : 'video.mov'
                     );
+                    if (!empty($mp4['ok'])) {
+                        $upName = pathinfo(is_string($nameHint) ? $nameHint : 'video', PATHINFO_FILENAME) . '.mp4';
+                        $up = ap_bsky_upload_video(
+                            $pds,
+                            $access,
+                            $did,
+                            (string) $mp4['bytes'],
+                            (string) ($mp4['mime'] ?? 'video/mp4'),
+                            $upName,
+                            180
+                        );
+                        if (empty($up['ok']) && str_contains((string) ($up['error'] ?? ''), 'Expired')) {
+                            $tok = ap_bsky_access_token($ownerUserId, true);
+                            if (!empty($tok['ok'])) {
+                                $access = (string) $tok['access'];
+                                $up = ap_bsky_upload_video(
+                                    $pds,
+                                    $access,
+                                    $did,
+                                    (string) $mp4['bytes'],
+                                    (string) ($mp4['mime'] ?? 'video/mp4'),
+                                    $upName,
+                                    180
+                                );
+                            }
+                        }
+                        if (ap_bsky_result_is_rate_limited($up)) {
+                            return [
+                                'ok' => false,
+                                'deferred' => true,
+                                'rate_limited' => true,
+                                'retry_after_sec' => ap_bsky_result_retry_after_sec($up),
+                                'error' => 'Rate limit exceeded',
+                            ];
+                        }
+                        if (!empty($up['ok']) && is_array($up['blob'] ?? null)) {
+                            $videoEmbed = [
+                                'blob' => $up['blob'],
+                                'alt' => (string) ($videoRow['description'] ?? $videoRow['alt'] ?? ''),
+                            ];
+                            $ar = ap_bsky_video_aspect_ratio($videoRow);
+                            if ($ar !== null) {
+                                $videoEmbed['aspectRatio'] = $ar;
+                            }
+                        } else {
+                            error_log('[ap-bsky] video upload failed: ' . (string) ($up['error'] ?? 'unknown'));
+                        }
+                    } else {
+                        error_log('[ap-bsky] video remux failed: ' . (string) ($mp4['error'] ?? 'unknown'));
+                    }
+                } else {
+                    error_log('[ap-bsky] video fetch failed: ' . (string) ($fetched['error'] ?? 'unknown'));
                 }
-            }
-            if (ap_bsky_result_is_rate_limited($up)) {
-                return [
-                    'ok' => false,
-                    'deferred' => true,
-                    'rate_limited' => true,
-                    'retry_after_sec' => ap_bsky_result_retry_after_sec($up),
-                    'error' => 'Rate limit exceeded',
-                ];
-            }
-            if (empty($up['ok']) || !is_array($up['blob'] ?? null)) {
-                return ['ok' => false, 'deferred' => true, 'error' => 'Video upload failed: ' . (string) ($up['error'] ?? 'unknown')];
-            }
-            $videoEmbed = [
-                'blob' => $up['blob'],
-                'alt' => (string) ($videoRow['description'] ?? $videoRow['alt'] ?? ''),
-            ];
-            $ar = ap_bsky_video_aspect_ratio($videoRow);
-            if ($ar !== null) {
-                $videoEmbed['aspectRatio'] = $ar;
             }
         } else {
             foreach (array_slice($mediaRows, 0, 4) as $m) {
@@ -7445,17 +7239,16 @@ function ap_bsky_crosspost_status_inner(
                     continue;
                 }
                 $mime = strtolower((string) ($m['mime'] ?? $m['content_type'] ?? ''));
-                $kind = strtolower((string) ($m['media_type'] ?? ''));
-                if ($mime !== '' && !str_starts_with($mime, 'image/') && $kind !== 'image') {
+                if ($mime !== '' && !str_starts_with($mime, 'image/')) {
                     continue; // skip audio / non-image
                 }
                 $url = (string) ($m['public_url'] ?? $m['url'] ?? $m['remote_url'] ?? '');
                 if ($url === '' || !str_starts_with($url, 'https://')) {
-                    return ['ok' => false, 'deferred' => true, 'error' => 'Image attachment has no valid HTTPS URL'];
+                    continue;
                 }
-                $img = ap_bsky_fetch_image_bytes($url, true);
+                $img = ap_bsky_fetch_image_bytes($url);
                 if (empty($img['ok'])) {
-                    return ['ok' => false, 'deferred' => true, 'error' => 'Image mirror failed: ' . (string) ($img['error'] ?? 'download failed')];
+                    continue;
                 }
                 $up = ap_bsky_upload_blob($pds, $access, (string) $img['bytes'], (string) $img['mime']);
                 if (empty($up['ok']) && (($up['status'] ?? 0) === 401)) {
@@ -7479,8 +7272,6 @@ function ap_bsky_crosspost_status_inner(
                         'alt' => (string) ($m['description'] ?? $m['alt'] ?? ''),
                         'blob' => $up['blob'],
                     ];
-                } else {
-                    return ['ok' => false, 'deferred' => true, 'error' => 'Image upload failed: ' . (string) ($up['error'] ?? 'unknown')];
                 }
             }
         }
@@ -7727,18 +7518,214 @@ function ap_bsky_unrepost_object(int $ownerUserId, string $objectId): array
     return ['ok' => true, 'skipped' => true];
 }
 
-/** Delete a locally authored Bluesky crosspost mapped from a VAAK note. */
+/**
+ * Collect every Bluesky post URI mapped to a VAAK note (root + split tip + links).
+ *
+ * @return list<string>
+ */
+function ap_bsky_uris_for_note(string $noteId): array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
+        return [];
+    }
+    $uris = [];
+    if (function_exists('ap_bsky_crosspost_by_note_id')) {
+        $map = ap_bsky_crosspost_by_note_id($noteId);
+        if (is_array($map) && !empty($map['bsky_uri'])) {
+            $uris[] = trim((string) $map['bsky_uri']);
+        }
+    }
+    try {
+        ap_bsky_post_links_migrate();
+        $st = ap_db()->prepare(
+            'SELECT bsky_uri FROM bsky_post_links
+             WHERE fediverse_id = ? OR fediverse_id = ? OR ap_object_id = ? OR ap_object_id = ?'
+        );
+        $st->execute([$noteId, $noteId . '/', $noteId, $noteId . '/']);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $u = trim((string) ($row['bsky_uri'] ?? ''));
+            if ($u !== '') {
+                $uris[] = $u;
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+    try {
+        $st = ap_db()->prepare('SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $raw = (string) ($st->fetchColumn() ?: '');
+        $j = json_decode($raw, true);
+        $obj = is_array($j) ? ($j['object'] ?? $j) : null;
+        if (is_array($obj) && !empty($obj['blueskyUri']) && is_string($obj['blueskyUri'])) {
+            $uris[] = trim((string) $obj['blueskyUri']);
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+    $out = [];
+    $seen = [];
+    foreach ($uris as $u) {
+        if (!str_starts_with($u, 'at://') || isset($seen[$u])) {
+            continue;
+        }
+        $seen[$u] = true;
+        $out[] = $u;
+    }
+    return $out;
+}
+
+/**
+ * Delete all Bluesky post records mapped from a VAAK note (split threads included).
+ *
+ * @return array{ok:bool,skipped?:bool,error?:string,deleted?:int,uris?:list<string>}
+ */
 function ap_bsky_delete_crosspost_for_note(int $ownerUserId, string $noteId): array
 {
-    if ($ownerUserId < 1 || !ap_bsky_tab_enabled() || !function_exists('ap_bsky_crosspost_by_note_id')) {
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
         return ['ok' => true, 'skipped' => true];
     }
-    $map = ap_bsky_crosspost_by_note_id(rtrim($noteId, '/'));
-    $uri = is_array($map) ? (string) ($map['bsky_uri'] ?? '') : '';
-    if (!preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/([^/]+)$~', $uri, $m)) {
+    $noteId = rtrim(trim($noteId), '/');
+    $uris = ap_bsky_uris_for_note($noteId);
+    if ($uris === []) {
         return ['ok' => true, 'skipped' => true];
     }
-    return ap_bsky_delete_record_uri($ownerUserId, 'at://' . $m[1] . '/app.bsky.feed.post/' . $m[2]);
+    $deleted = 0;
+    $errors = [];
+    foreach ($uris as $uri) {
+        $res = ap_bsky_delete_record_uri($ownerUserId, $uri);
+        $err = strtolower((string) ($res['error'] ?? ''));
+        // NotFound / already-gone still counts as cleaned up.
+        if (!empty($res['ok']) || str_contains($err, 'not found') || str_contains($err, 'notfound')) {
+            $deleted++;
+            try {
+                ap_db()->prepare('DELETE FROM bsky_posts WHERE bsky_uri = ?')->execute([$uri]);
+            } catch (Throwable $e) {
+                // ignore
+            }
+            try {
+                ap_db()->prepare('DELETE FROM bsky_post_links WHERE bsky_uri = ?')->execute([$uri]);
+            } catch (Throwable $e) {
+                // ignore
+            }
+        } elseif (!empty($res['error'])) {
+            $errors[] = (string) $res['error'];
+        }
+    }
+    try {
+        ap_db()->prepare('DELETE FROM bsky_crossposts WHERE note_id = ? OR note_id = ?')
+            ->execute([$noteId, $noteId . '/']);
+    } catch (Throwable $e) {
+        // ignore
+    }
+    try {
+        ap_db()->prepare(
+            'DELETE FROM bsky_post_links WHERE fediverse_id = ? OR fediverse_id = ? OR ap_object_id = ? OR ap_object_id = ?'
+        )->execute([$noteId, $noteId . '/', $noteId, $noteId . '/']);
+    } catch (Throwable $e) {
+        // ignore
+    }
+    if ($deleted < 1 && $errors !== []) {
+        return ['ok' => false, 'error' => $errors[0], 'deleted' => 0, 'uris' => $uris];
+    }
+    return ['ok' => true, 'deleted' => $deleted, 'uris' => $uris];
+}
+
+/**
+ * Bluesky → VAAK: if our dual-published Bluesky posts disappeared from the repo,
+ * delete the local Note and federate ActivityPub Delete.
+ *
+ * @return array{checked:int,deleted:int}
+ */
+function ap_bsky_reconcile_deleted_crossposts(int $ownerUserId, int $limit = 15): array
+{
+    $out = ['checked' => 0, 'deleted' => 0];
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
+        return $out;
+    }
+    $throttle = sys_get_temp_dir() . '/vaak-bsky-del-reconcile-' . $ownerUserId;
+    if (is_file($throttle) && (time() - (int) @filemtime($throttle)) < 300) {
+        return $out;
+    }
+    @touch($throttle);
+
+    try {
+        ap_bsky_crossposts_migrate();
+        $st = ap_db()->prepare(
+            'SELECT note_id, bsky_uri FROM bsky_crossposts
+             WHERE owner_user_id = ?
+             ORDER BY created_at DESC
+             LIMIT ?'
+        );
+        $st->execute([$ownerUserId, max(1, min(40, $limit))]);
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    } catch (Throwable $e) {
+        return $out;
+    }
+
+    foreach ($rows as $row) {
+        $uri = trim((string) ($row['bsky_uri'] ?? ''));
+        $noteId = rtrim(trim((string) ($row['note_id'] ?? '')), '/');
+        if (!str_starts_with($uri, 'at://') || !str_starts_with($noteId, 'https://')) {
+            continue;
+        }
+        $out['checked']++;
+        $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
+            'uris' => $uri,
+        ], null, null, 6);
+        $posts = is_array($got['json']['posts'] ?? null) ? $got['json']['posts'] : [];
+        $stillThere = false;
+        foreach ($posts as $p) {
+            if (is_array($p) && trim((string) ($p['uri'] ?? '')) === $uri) {
+                $stillThere = true;
+                break;
+            }
+        }
+        // Also treat explicit NotFound from getRecord as gone.
+        if ($stillThere) {
+            continue;
+        }
+        // Confirm via PDS getRecord when possible (public AppView can lag).
+        if (preg_match('~^at://([^/]+)/(app\.bsky\.feed\.post)/([^/]+)$~', $uri, $m)) {
+            $tok = ap_bsky_access_token($ownerUserId, false);
+            if (!empty($tok['ok'])) {
+                $sess = ap_bsky_session_row($ownerUserId);
+                $pds = rtrim((string) ($sess['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+                $rec = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
+                    'repo' => $m[1],
+                    'collection' => $m[2],
+                    'rkey' => $m[3],
+                ], null, (string) $tok['access'], 6);
+                if (!empty($rec['ok'])) {
+                    continue; // still on PDS
+                }
+            }
+        }
+        try {
+            $lst = ap_db()->prepare(
+                'SELECT local_id FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1'
+            );
+            $lst->execute([$noteId, $noteId . '/']);
+            $localId = (int) ($lst->fetchColumn() ?: 0);
+            if ($localId < 1) {
+                // Orphan map — just clear Bluesky cache/maps.
+                ap_bsky_delete_crosspost_for_note($ownerUserId, $noteId);
+                continue;
+            }
+            if (!function_exists('ap_delete_local_status')) {
+                require_once __DIR__ . '/ap-inbox.php';
+            }
+            // Deletes any remaining Bluesky segments, then federates ActivityPub Delete.
+            $del = ap_delete_local_status($localId);
+            if (!empty($del['ok'])) {
+                $out['deleted']++;
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] reconcile delete: ' . $e->getMessage());
+        }
+    }
+    return $out;
 }
 
 // ---------------------------------------------------------------------------
@@ -7752,8 +7739,35 @@ function ap_bsky_actor_profile_url(string $handleOrDid): string
         return 'https://bsky.app/';
     }
     // did:plc:… paths keep colons; handles are percent-encoded.
+    // Never emit did%3Aplc%3A… — the bsky.app SPA 404s ("Post not found").
+    if (str_starts_with($h, 'did%3A') || str_starts_with($h, 'did%3a')) {
+        $h = rawurldecode($h);
+    }
     $path = str_starts_with($h, 'did:') ? $h : rawurlencode($h);
     return 'https://bsky.app/profile/' . $path;
+}
+
+/**
+ * Normalize a bsky.app web URL so DID profile paths keep literal colons.
+ * Encoded did%3Aplc%3A… links 404 in the Bluesky web app.
+ */
+function ap_bsky_normalize_web_url(string $url): string
+{
+    $url = trim($url);
+    if ($url === '' || !str_starts_with($url, 'https://bsky.app/')) {
+        return $url;
+    }
+    if (preg_match('~^(https://bsky\.app/profile/)([^/]+)(/post/[^/?#]+)?(.*)$~i', $url, $m)) {
+        $actor = rawurldecode($m[2]);
+        // DIDs must stay unencoded; handles may be re-encoded safely.
+        $actorPath = str_starts_with($actor, 'did:') ? $actor : rawurlencode($actor);
+        $post = $m[3] ?? '';
+        if ($post !== '' && preg_match('~^/post/([^/?#]+)~', $post, $pm)) {
+            $post = '/post/' . rawurlencode(rawurldecode($pm[1]));
+        }
+        return $m[1] . $actorPath . $post . ($m[4] ?? '');
+    }
+    return $url;
 }
 
 /**
@@ -7766,11 +7780,14 @@ function ap_bsky_https_url_from_at_uri(string $uri, ?string $authorHandle = null
         return 'https://bsky.app/';
     }
     if (str_starts_with($uri, 'https://')) {
-        return $uri;
+        return ap_bsky_normalize_web_url($uri);
     }
     // at://did:…/app.bsky.feed.post/RKEY  (use ~ delimiter — # appears in URLs)
     if (preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/([^/\s?]+)~', $uri, $m)) {
         $actor = ($authorHandle !== null && $authorHandle !== '') ? $authorHandle : $m[1];
+        if (str_starts_with($actor, 'did%3A') || str_starts_with($actor, 'did%3a')) {
+            $actor = rawurldecode($actor);
+        }
         // bsky.app keeps did:plc:… colons unencoded in profile paths.
         $actorPath = str_starts_with($actor, 'did:') ? $actor : rawurlencode($actor);
         return 'https://bsky.app/profile/' . $actorPath . '/post/' . rawurlencode($m[2]);
@@ -8002,6 +8019,67 @@ function ap_bsky_update_seen(int $ownerUserId, ?string $seenAt = null): array
 }
 
 /**
+ * Preview text for a liked/boosted Bluesky subject (our post).
+ * Prefers local VAAK twin, then durable bsky_posts cache, then AppView getPosts.
+ */
+function ap_bsky_subject_post_preview_text(string $subjectAtOrUrl, int $ownerUserId = 0): string
+{
+    $subjectAtOrUrl = trim($subjectAtOrUrl);
+    if ($subjectAtOrUrl === '') {
+        return '';
+    }
+    $at = $subjectAtOrUrl;
+    if (!str_starts_with($at, 'at://')) {
+        $resolved = function_exists('ap_bsky_at_uri_from_any_url')
+            ? ap_bsky_at_uri_from_any_url($subjectAtOrUrl)
+            : (function_exists('ap_bsky_at_uri_from_https') ? ap_bsky_at_uri_from_https($subjectAtOrUrl, $ownerUserId) : null);
+        if (is_string($resolved) && str_starts_with($resolved, 'at://')) {
+            $at = $resolved;
+        }
+    }
+    // Local twin (dual-publish or Bluesky→VAAK import).
+    if ($ownerUserId > 0 && str_starts_with($at, 'at://')) {
+        $noteId = ap_bsky_local_note_id_for_at_uri($at, $ownerUserId);
+        if (is_string($noteId) && str_starts_with($noteId, 'https://')
+            && function_exists('ap_masto_status_by_note_id')) {
+            $local = ap_masto_status_by_note_id($noteId);
+            $txt = trim((string) ($local['content_text'] ?? ''));
+            if ($txt !== '') {
+                return $txt;
+            }
+        }
+    }
+    // Durable cache.
+    if (str_starts_with($at, 'at://')) {
+        $item = ap_bsky_post_item_by_uri($at);
+        if (is_array($item)) {
+            $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+            $txt = trim((string) (($post['record']['text'] ?? null) ?: ($post['text'] ?? '')));
+            if ($txt !== '') {
+                return $txt;
+            }
+        }
+        // Cold cache: one public AppView fetch.
+        if (function_exists('ap_bsky_post_preview_from_url')) {
+            $prev = ap_bsky_post_preview_from_url(
+                function_exists('ap_bsky_https_url_from_at_uri')
+                    ? ap_bsky_https_url_from_at_uri($at, null)
+                    : $subjectAtOrUrl,
+                $ownerUserId,
+                true
+            );
+            if (is_array($prev)) {
+                $txt = trim((string) ($prev['text'] ?? ''));
+                if ($txt !== '') {
+                    return $txt;
+                }
+            }
+        }
+    }
+    return '';
+}
+
+/**
  * Map one Bluesky notification into a VAAK mentions row (no DB write).
  *
  * @return array<string,mixed>|null
@@ -8048,12 +8126,25 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
     $activityType = 'Create';
     $objType = 'Note';
     $kind = null;
+    $subjectHandle = null;
+    if ($reasonSubject !== '' && str_starts_with($reasonSubject, 'at://')) {
+        $subjItem = ap_bsky_post_item_by_uri($reasonSubject);
+        if (is_array($subjItem)) {
+            $subjPost = is_array($subjItem['post'] ?? null) ? $subjItem['post'] : [];
+            $subjAuthor = is_array($subjPost['author'] ?? null) ? $subjPost['author'] : [];
+            $h = trim((string) ($subjAuthor['handle'] ?? ''));
+            if ($h !== '') {
+                $subjectHandle = $h;
+            }
+        }
+    }
     $subjectHttps = $reasonSubject !== ''
-        ? ap_bsky_https_url_from_at_uri($reasonSubject, null)
+        ? ap_bsky_https_url_from_at_uri($reasonSubject, $subjectHandle)
         : '';
     $postHttps = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
 
-    // Prefer local VAAK note id when the liked/boosted Bluesky post was cross-posted.
+    // Prefer local VAAK note id when the liked/boosted Bluesky post was cross-posted
+    // or imported from Bluesky (including self-thread replies).
     $localNoteId = null;
     if ($reasonSubject !== '') {
         $localNoteId = ap_bsky_local_note_id_for_at_uri($reasonSubject, $ownerUserId);
@@ -8064,10 +8155,11 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
             $activityType = 'Like';
             $objType = 'Like';
             $kind = 'like';
-            if ($localNoteId !== null && function_exists('ap_masto_status_by_note_id')) {
-                $local = ap_masto_status_by_note_id($localNoteId);
-                if (is_array($local) && trim((string) ($local['content_text'] ?? '')) !== '') {
-                    $text = (string) $local['content_text'];
+            // Like records have no text — preview the liked subject (works for replies too).
+            if ($reasonSubject !== '') {
+                $preview = ap_bsky_subject_post_preview_text($reasonSubject, $ownerUserId);
+                if ($preview !== '') {
+                    $text = $preview;
                 }
             }
             if ($text === '') {
@@ -8078,10 +8170,10 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
             $activityType = 'Announce';
             $objType = 'Announce';
             $kind = 'reblog';
-            if ($localNoteId !== null && function_exists('ap_masto_status_by_note_id')) {
-                $local = ap_masto_status_by_note_id($localNoteId);
-                if (is_array($local) && trim((string) ($local['content_text'] ?? '')) !== '') {
-                    $text = (string) $local['content_text'];
+            if ($reasonSubject !== '') {
+                $preview = ap_bsky_subject_post_preview_text($reasonSubject, $ownerUserId);
+                if ($preview !== '') {
+                    $text = $preview;
                 }
             }
             if ($text === '') {

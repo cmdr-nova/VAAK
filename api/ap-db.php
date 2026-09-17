@@ -371,7 +371,8 @@ SQL);
       }
     }
     $requiredTables = [
-        'account_aliases', 'actor_profile', 'ap_account_move', 'ap_bites', 'ap_blocks', 'ap_collection_items',
+        'account_aliases', 'actor_profile', 'ap_account_move', 'ap_anti_ai_actors',
+        'ap_anti_ai_hits', 'ap_bites', 'ap_blocks', 'ap_collection_items',
         'ap_collection_memberships', 'ap_collections', 'ap_drafts', 'ap_featured_accounts',
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
@@ -384,7 +385,7 @@ SQL);
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
         'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
-        'remote_media_cache', 'site_syndications', 'bsky_starter_pack_cache', 'bsky_starter_pack_sync_state',
+        'remote_media_cache', 'site_syndications',
     ];
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
@@ -673,6 +674,10 @@ SQL);
     if (!in_array('auto_follow_back', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_follow_back INTEGER NOT NULL DEFAULT 0');
     }
+    // Viewer preference: highlight anti-AI posters (slop/clanker heuristic) in timelines
+    if (!in_array('anti_ai_marker', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN anti_ai_marker INTEGER NOT NULL DEFAULT 0');
+    }
     if (!in_array('auto_unblur_sensitive', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0');
     }
@@ -688,11 +693,28 @@ SQL);
     if (!in_array('forum_signature', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
     }
-    $remoteActorCols = $db->query('PRAGMA table_info(remote_actors)')->fetchAll();
-    $remoteActorNames = array_column($remoteActorCols, 'name');
-    if (!in_array('summary', $remoteActorNames, true)) {
-        $db->exec('ALTER TABLE remote_actors ADD COLUMN summary TEXT');
-    }
+
+    // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
+    $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_anti_ai_hits (
+    actor_id TEXT NOT NULL,
+    object_id TEXT NOT NULL,
+    hit_at TEXT NOT NULL,
+    PRIMARY KEY (actor_id, object_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_anti_ai_hits_actor_at ON ap_anti_ai_hits(actor_id, hit_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ap_anti_ai_hits_at ON ap_anti_ai_hits(hit_at);
+CREATE TABLE IF NOT EXISTS ap_anti_ai_actors (
+    actor_id TEXT PRIMARY KEY,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    marked INTEGER NOT NULL DEFAULT 0,
+    marked_at TEXT,
+    last_hit_at TEXT,
+    cleared_at TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_anti_ai_actors_marked ON ap_anti_ai_actors(marked);
+SQL);
 
     $db->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS masto_suggestion_dismissals (
@@ -1109,7 +1131,6 @@ CREATE TABLE IF NOT EXISTS remote_actors (
     host TEXT,
     icon_source_url TEXT,
     image_source_url TEXT,
-    summary TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -1455,8 +1476,7 @@ CREATE TABLE IF NOT EXISTS masto_bookmarks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status_id TEXT NOT NULL UNIQUE,
     object_id TEXT,
-    created_at TEXT NOT NULL,
-    source_mask INTEGER NOT NULL DEFAULT 1
+    created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_masto_bookmarks_created ON masto_bookmarks(created_at DESC);
 
@@ -1612,29 +1632,17 @@ CREATE TABLE masto_bookmarks (
     status_id TEXT NOT NULL,
     object_id TEXT,
     created_at TEXT NOT NULL,
-    source_mask INTEGER NOT NULL DEFAULT 1,
     UNIQUE(owner_user_id, status_id)
 );
 CREATE INDEX IF NOT EXISTS idx_masto_bookmarks_created ON masto_bookmarks(owner_user_id, created_at DESC);
 SQL);
         $db->prepare(
             'INSERT OR IGNORE INTO masto_bookmarks
-             (owner_user_id, owner_actor_id, status_id, object_id, created_at, source_mask)
-             SELECT ?, ?, status_id, object_id, created_at, 1 FROM masto_bookmarks_legacy_f'
+             (owner_user_id, owner_actor_id, status_id, object_id, created_at)
+             SELECT ?, ?, status_id, object_id, created_at FROM masto_bookmarks_legacy_f'
         )->execute([$cmdrUserId, $cmdrActorId]);
         $db->exec('DROP TABLE masto_bookmarks_legacy_f');
         $db->exec('COMMIT');
-    }
-
-    // A bookmark row can represent either network or both when the same post
-    // has been saved in both services. Existing rows are Fediverse-originated.
-    try {
-        $bmCols = array_column($db->query('PRAGMA table_info(masto_bookmarks)')->fetchAll(), 'name');
-        if ($bmCols && !in_array('source_mask', $bmCols, true)) {
-            $db->exec('ALTER TABLE masto_bookmarks ADD COLUMN source_mask INTEGER NOT NULL DEFAULT 1');
-        }
-    } catch (Throwable $e) {
-        // PostgreSQL production schemas are provisioned out-of-band.
     }
 
     $tagColsF = array_column($db->query('PRAGMA table_info(masto_followed_tags)')->fetchAll(), 'name');
@@ -1760,31 +1768,6 @@ SQL);
         $db->prepare('UPDATE masto_lists SET owner_user_id = ? WHERE owner_user_id = 1')
             ->execute([$cmdrUserId]);
         $db->exec('CREATE INDEX IF NOT EXISTS idx_masto_lists_owner_updated ON masto_lists(owner_user_id, updated_at DESC)');
-    }
-    try {
-        $listCols = array_column($db->query('PRAGMA table_info(masto_lists)')->fetchAll(), 'name');
-        foreach ([
-            'list_kind' => "TEXT NOT NULL DEFAULT 'curation'",
-            'bsky_list_uri' => 'TEXT',
-            'bsky_moderation_action' => "TEXT NOT NULL DEFAULT 'none'",
-            'bsky_mod_action_uri' => 'TEXT',
-            'bsky_list_source' => "TEXT NOT NULL DEFAULT 'vaak'",
-        ] as $col => $ddl) {
-            if ($listCols && !in_array($col, $listCols, true)) {
-                $db->exec('ALTER TABLE masto_lists ADD COLUMN ' . $col . ' ' . $ddl);
-            }
-        }
-        $accountCols = array_column($db->query('PRAGMA table_info(masto_list_accounts)')->fetchAll(), 'name');
-        foreach (['bsky_did' => 'TEXT', 'bsky_item_uri' => 'TEXT'] as $col => $ddl) {
-            if ($accountCols && !in_array($col, $accountCols, true)) {
-                $db->exec('ALTER TABLE masto_list_accounts ADD COLUMN ' . $col . ' ' . $ddl);
-            }
-        }
-        if ($listCols && in_array('bsky_list_uri', $listCols, true)) {
-            $db->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_masto_lists_owner_bsky_uri ON masto_lists(owner_user_id, bsky_list_uri) WHERE bsky_list_uri IS NOT NULL');
-        }
-    } catch (Throwable $e) {
-        // PostgreSQL production schemas are provisioned out-of-band.
     }
 
     $mediaCols = array_column($db->query('PRAGMA table_info(masto_media)')->fetchAll(), 'name');
@@ -1956,22 +1939,16 @@ CREATE TABLE IF NOT EXISTS masto_lists (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     owner_user_id INTEGER NOT NULL,
     title TEXT NOT NULL,
-    list_kind TEXT NOT NULL DEFAULT 'curation',
-    bsky_list_uri TEXT,
-    bsky_moderation_action TEXT NOT NULL DEFAULT 'none',
-    bsky_mod_action_uri TEXT,
-    bsky_list_source TEXT NOT NULL DEFAULT 'vaak',
     replies_policy TEXT NOT NULL DEFAULT 'list',
     exclusive INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_masto_lists_updated ON masto_lists(updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS masto_list_accounts (
     list_id INTEGER NOT NULL,
     actor_id TEXT NOT NULL,
-    bsky_did TEXT,
-    bsky_item_uri TEXT,
     added_at TEXT NOT NULL,
     PRIMARY KEY (list_id, actor_id),
     FOREIGN KEY (list_id) REFERENCES masto_lists(id) ON DELETE CASCADE
@@ -2146,6 +2123,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'collection_consent' => true,
         'vanity_verified' => false,
         'auto_follow_back' => false,
+        'anti_ai_marker' => false,
         'auto_unblur_sensitive' => false,
         'auto_delete_posts_7d' => false,
         'reply_policy' => 'anyone',
@@ -2214,6 +2192,9 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
             : false,
         'auto_follow_back' => array_key_exists('auto_follow_back', $row)
             ? !empty($row['auto_follow_back'])
+            : false,
+        'anti_ai_marker' => array_key_exists('anti_ai_marker', $row)
+            ? !empty($row['anti_ai_marker'])
             : false,
         'auto_unblur_sensitive' => array_key_exists('auto_unblur_sensitive', $row)
             ? !empty($row['auto_unblur_sensitive'])
@@ -2306,7 +2287,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2434,6 +2415,11 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     } else {
         $autoFollowBack = !empty($existingProfile['auto_follow_back']) ? 1 : 0;
     }
+    if (array_key_exists('anti_ai_marker', $fields)) {
+        $antiAiMarker = !empty($fields['anti_ai_marker']) ? 1 : 0;
+    } else {
+        $antiAiMarker = !empty($existingProfile['anti_ai_marker']) ? 1 : 0;
+    }
     $autoUnblurSensitive = array_key_exists('auto_unblur_sensitive', $fields)
         ? (!empty($fields['auto_unblur_sensitive']) ? 1 : 0)
         : (!empty($existingProfile['auto_unblur_sensitive']) ? 1 : 0);
@@ -2446,8 +2432,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2460,6 +2446,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            collection_consent = excluded.collection_consent,
            vanity_verified = excluded.vanity_verified,
            auto_follow_back = excluded.auto_follow_back,
+           anti_ai_marker = excluded.anti_ai_marker,
            auto_unblur_sensitive = excluded.auto_unblur_sensitive,
            auto_delete_posts_7d = excluded.auto_delete_posts_7d,
            reply_policy = excluded.reply_policy,
@@ -2480,6 +2467,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $collectionConsent,
         $vanityVerified,
         $autoFollowBack,
+        $antiAiMarker,
         $autoUnblurSensitive,
         $autoDeletePosts7d,
         $replyPolicy,
@@ -5975,7 +5963,7 @@ function ap_profile_bsky_handle(string $actorKey, array $profile = []): ?string
  *
  * @return array{ok:bool,followers:int,following:int,posts:int,handle?:string,error?:string}
  */
-function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $allowFetch = true): array
+function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
 {
     $handle = ltrim(trim($handle), '@');
     if ($handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)) {
@@ -5995,27 +5983,19 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $
     $ttlSec = max(30, min(900, $ttlSec));
     if (is_file($cachePath)) {
         $age = time() - (int) @filemtime($cachePath);
-        $raw = @file_get_contents($cachePath);
-        $cached = is_string($raw) ? json_decode($raw, true) : null;
-        if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
-            $cachedResult = [
-                'ok' => !empty($cached['ok']),
-                'followers' => (int) $cached['followers'],
-                'following' => (int) $cached['following'],
-                'posts' => (int) ($cached['posts'] ?? 0),
-                'handle' => (string) ($cached['handle'] ?? $handle),
-                'fresh' => $age >= 0 && $age < $ttlSec,
-            ];
-            if ($cachedResult['fresh'] || !$allowFetch) {
-                return $cachedResult;
+        if ($age >= 0 && $age < $ttlSec) {
+            $raw = @file_get_contents($cachePath);
+            $cached = is_string($raw) ? json_decode($raw, true) : null;
+            if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
+                return [
+                    'ok' => !empty($cached['ok']),
+                    'followers' => (int) $cached['followers'],
+                    'following' => (int) $cached['following'],
+                    'posts' => (int) ($cached['posts'] ?? 0),
+                    'handle' => (string) ($cached['handle'] ?? $handle),
+                ];
             }
         }
-    } elseif (!$allowFetch) {
-        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'handle' => $handle, 'fresh' => false];
-    }
-
-    if (!$allowFetch) {
-        return $cachedResult ?? ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'handle' => $handle, 'fresh' => false];
     }
 
     $url = 'https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' . rawurlencode($handle);
@@ -6051,7 +6031,6 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $
         'following' => max(0, (int) ($json['followsCount'] ?? 0)),
         'posts' => max(0, (int) ($json['postsCount'] ?? 0)),
         'handle' => (string) ($json['handle'] ?? $handle),
-        'fresh' => true,
     ];
     @file_put_contents($cachePath, json_encode($out, JSON_UNESCAPED_SLASHES), LOCK_EX);
     return $out;
@@ -6078,19 +6057,10 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
     $bskyFollowers = 0;
     $bskyFollowing = 0;
     if (is_string($handle) && $handle !== '') {
-        // Never hold public HTML profile rendering on an AppView request. Serve
-        // a stale file-cache value, then let the durable worker refresh it.
-        $remote = ap_bsky_public_profile_counts($handle, 120, false);
+        $remote = ap_bsky_public_profile_counts($handle);
         if (!empty($remote['ok'])) {
             $bskyFollowers = (int) $remote['followers'];
             $bskyFollowing = (int) $remote['following'];
-        }
-        if (empty($remote['fresh']) && function_exists('ap_profile_bsky_owner_id')
-            && function_exists('ap_bsky_profile_counts_enqueue')) {
-            $ownerUserId = ap_profile_bsky_owner_id($actorKey);
-            if ($ownerUserId > 0) {
-                ap_bsky_profile_counts_enqueue($ownerUserId, $handle);
-            }
         }
     }
     return [
@@ -6102,24 +6072,6 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
         'bsky_following' => $bskyFollowing,
         'bsky_handle' => $handle,
     ];
-}
-
-/** Site-account owner for its connected Bluesky session, if one exists. */
-function ap_profile_bsky_owner_id(string $actorKey): int
-{
-    $actorKey = strtolower(trim(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? ''));
-    if ($actorKey === '') return 0;
-    try {
-        $st = ap_db()->prepare(
-            'SELECT s.owner_user_id FROM bsky_sessions s
-             INNER JOIN ap_users u ON u.id = s.owner_user_id
-             WHERE lower(u.actor_key) = ? OR lower(u.username) = ? LIMIT 1'
-        );
-        $st->execute([$actorKey, $actorKey]);
-        return max(0, (int) ($st->fetchColumn() ?: 0));
-    } catch (Throwable $e) {
-        return 0;
-    }
 }
 
 /**
@@ -7565,10 +7517,6 @@ function ap_row_is_hidden(?string $actorId, ?string $host = null, ?int $ownerUse
     if ($actorId !== null && $actorId !== '' && ap_is_muted_actor($actorId, $ownerUserId)) {
         return true;
     }
-    if ($actorId !== null && $actorId !== '' && function_exists('ap_lists_moderation_action_for_actor')
-        && ap_lists_moderation_action_for_actor($actorId, $ownerUserId) !== 'none') {
-        return true;
-    }
     return ap_user_is_blocked($actorId, $host, $ownerUserId);
 }
 
@@ -7585,9 +7533,7 @@ function ap_actor_is_content_blocked(?string $actorId, ?string $host = null, ?in
     if ($ownerUserId === null || $ownerUserId < 1) {
         return false;
     }
-    if (ap_user_is_blocked($actorId, $host, $ownerUserId)) return true;
-    return $actorId !== null && function_exists('ap_lists_moderation_action_for_actor')
-        && ap_lists_moderation_action_for_actor($actorId, $ownerUserId) === 'block';
+    return ap_user_is_blocked($actorId, $host, $ownerUserId);
 }
 
 /* ----------------- Muted words / phrases (per-user timeline filter) ----------------- */
@@ -8914,7 +8860,7 @@ function ap_masto_status_flags_prefetch(array $statusIds): void
             foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
                 $memo['fav'][(string) $hit] = true;
             }
-            $st = $db->prepare("SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND (source_mask & 1) <> 0 AND status_id IN ($ph)");
+            $st = $db->prepare("SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND status_id IN ($ph)");
             $st->execute($params);
             foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
                 $memo['bm'][(string) $hit] = true;
@@ -8965,7 +8911,7 @@ function ap_masto_status_is_bookmarked(string $statusId, ?int $ownerUserId = nul
     }
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     try {
-        $st = ap_db()->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ? AND (source_mask & 1) <> 0');
+        $st = ap_db()->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?');
         $st->execute([$ownerUserId, $statusId]);
         $hit = (bool) $st->fetchColumn();
         if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
@@ -9099,7 +9045,7 @@ function ap_masto_favourite_rows(int $limit = 40, ?string $maxId = null, ?int $o
     }
 }
 
-function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerUserId = null, string $platform = 'fedi'): void
+function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerUserId = null): void
 {
     if ($statusId === '') {
         return;
@@ -9114,33 +9060,21 @@ function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerU
         error_log('[ap-db] bookmark_add refused: owner actor unresolved');
         return;
     }
-    $mask = $platform === 'bsky' ? 2 : 1;
     ap_db()->prepare(
-        'INSERT INTO masto_bookmarks (owner_user_id, owner_actor_id, status_id, object_id, created_at, source_mask)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(owner_user_id, status_id) DO UPDATE SET
-           source_mask = masto_bookmarks.source_mask | excluded.source_mask,
-           object_id = COALESCE(excluded.object_id, masto_bookmarks.object_id)'
-    )->execute([$ownerUserId, $ownerActorId, $statusId, $objectId, gmdate('c'), $mask]);
+        'INSERT INTO masto_bookmarks (owner_user_id, owner_actor_id, status_id, object_id, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(owner_user_id, status_id) DO NOTHING'
+    )->execute([$ownerUserId, $ownerActorId, $statusId, $objectId, gmdate('c')]);
 }
 
-function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null, string $platform = 'fedi'): void
+function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null): void
 {
     if ($statusId === '') {
         return;
     }
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    $keepMask = $platform === 'bsky' ? 1 : 2;
-    $db = ap_db();
-    $db->prepare('UPDATE masto_bookmarks SET source_mask = source_mask & ? WHERE owner_user_id = ? AND status_id = ?')
-        ->execute([$keepMask, $ownerUserId, $statusId]);
-    $db->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ? AND source_mask = 0')
+    ap_db()->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?')
         ->execute([$ownerUserId, $statusId]);
-    $st = $db->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?');
-    $st->execute([$ownerUserId, $statusId]);
-    if ($st->fetchColumn()) {
-        return;
-    }
     // VAAK folder overlay — keep memberships from orphaning after any client unbookmarks
     if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
         vaak_bookmark_folders_on_unbookmark($statusId, $ownerUserId);
@@ -10416,7 +10350,7 @@ function ap_remote_actor_normalize_username(?string $username): ?string
 }
 
 /**
- * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string,summary?:?string} $fields
+ * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string} $fields
  */
 function ap_remote_actor_upsert(string $actorId, array $fields): void
 {
@@ -10450,27 +10384,23 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     $host = $fields['host'] ?? ($existing['host'] ?? null);
     $icon = $fields['icon_source_url'] ?? ($existing['icon_source_url'] ?? null);
     $image = $fields['image_source_url'] ?? ($existing['image_source_url'] ?? null);
-    $summary = array_key_exists('summary', $fields) && is_string($fields['summary'])
-        ? mb_substr($fields['summary'], 0, 10000)
-        : ($existing['summary'] ?? null);
     if (is_string($icon)) {
         $icon = ap_profile_sanitize_https_url($icon);
     }
     if (is_string($image)) {
         $image = ap_profile_sanitize_https_url($image);
     }
-    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, summary, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_id) DO UPDATE SET
            username = COALESCE(excluded.username, remote_actors.username),
            display_name = COALESCE(excluded.display_name, remote_actors.display_name),
            host = COALESCE(excluded.host, remote_actors.host),
            icon_source_url = COALESCE(excluded.icon_source_url, remote_actors.icon_source_url),
            image_source_url = COALESCE(excluded.image_source_url, remote_actors.image_source_url),
-           summary = COALESCE(excluded.summary, remote_actors.summary),
            updated_at = excluded.updated_at';
     // Best-effort cache write: never take down admin HTML mid-render on lock.
-    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, $summary, ap_db_now()]) === false) {
+    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, ap_db_now()]) === false) {
         error_log('[ap-db] remote_actor_upsert skipped (locked): ' . $actorId);
     }
 }
@@ -10538,7 +10468,6 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                     'host' => $hostNorm,
                     'icon_source_url' => $icon,
                     'image_source_url' => $image,
-                    'summary' => isset($doc['summary']) && is_string($doc['summary']) ? $doc['summary'] : '',
                 ];
                 ap_remote_actor_upsert($actorId, $fields);
                 // Mastodon dual IRI: seed /users/{preferredUsername} when we only
