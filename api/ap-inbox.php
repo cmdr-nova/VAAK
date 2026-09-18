@@ -6169,6 +6169,11 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
     if (ap_is_blocked_actor($peer)) {
         return ['ok' => false, 'error' => 'Recipient is blocked'];
     }
+    $dmOwnerId = ap_db_default_owner_user_id();
+    if (function_exists('ap_actor_is_content_blocked')
+        && ap_actor_is_content_blocked($peer, null, $dmOwnerId)) {
+        return ['ok' => false, 'error' => 'Recipient is blocked for this account'];
+    }
     $actor = ap_local_actor_id();
     if (rtrim($peer, '/') === rtrim($actor, '/')) {
         return ['ok' => false, 'error' => 'Cannot DM yourself'];
@@ -6179,7 +6184,6 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
     }
 
     // Light rate limit: max 30 outbound DMs / hour (per owner)
-    $dmOwnerId = ap_db_default_owner_user_id();
     $since = gmdate('c', time() - 3600);
     $st = ap_db()->prepare(
         "SELECT COUNT(*) AS c FROM direct_messages

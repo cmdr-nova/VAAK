@@ -9934,6 +9934,10 @@ function ap_dm_store(array $row): array
             ? ap_db_owner_user_id_for_actor($ownerHint)
             : ap_db_default_owner_user_id();
     }
+    if (function_exists('ap_actor_is_content_blocked')
+        && ap_actor_is_content_blocked($peer, null, $ownerUserId)) {
+        return ['ok' => false, 'error' => 'Peer is blocked for this account'];
+    }
     $ownerActorId = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
     if ($ownerActorId === '') {
         $ownerActorId = ap_db_owner_actor_id_for_user_id($ownerUserId);
@@ -10082,6 +10086,9 @@ function ap_dm_by_id(int $id, ?int $ownerUserId = null): ?array
     );
     $st->execute([$id, $ownerUserId]);
     $row = $st->fetch();
+    if (is_array($row) && ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
+        return null;
+    }
     return is_array($row) ? $row : null;
 }
 
@@ -10093,7 +10100,21 @@ function ap_dm_by_object_id(string $objectId, ?int $ownerUserId = null): ?array
     );
     $st->execute([$ownerUserId, $objectId]);
     $row = $st->fetch();
+    if (is_array($row) && ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
+        return null;
+    }
     return is_array($row) ? $row : null;
+}
+
+/** True when a DM peer is hidden by a server-wide or owner-specific actor block. */
+function ap_dm_peer_is_blocked_for_owner(string $peerActorId, int $ownerUserId): bool
+{
+    $peerActorId = ap_dm_peer_key($peerActorId);
+    if ($peerActorId === '' || ap_is_blocked_actor($peerActorId)) {
+        return true;
+    }
+    return function_exists('ap_actor_is_content_blocked')
+        && ap_actor_is_content_blocked($peerActorId, null, $ownerUserId);
 }
 
 /** @return list<array<string,mixed>> */
@@ -10104,13 +10125,16 @@ function ap_dm_list_recent(int $limit = 80, ?int $ownerUserId = null): array
     $st = ap_db()->prepare(
         'SELECT * FROM direct_messages WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ?'
     );
-    $st->execute([$ownerUserId, $limit]);
+    $st->execute([$ownerUserId, min(600, $limit * 3)]);
     $out = [];
     foreach ($st->fetchAll() as $row) {
-        if (ap_is_blocked_actor((string) ($row['peer_actor_id'] ?? ''))) {
+        if (ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
             continue;
         }
         $out[] = $row;
+        if (count($out) >= $limit) {
+            break;
+        }
     }
     return $out;
 }
@@ -10121,6 +10145,9 @@ function ap_dm_thread(string $peerActorId, int $limit = 100, ?int $ownerUserId =
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     $peer = ap_dm_peer_key($peerActorId);
     $limit = max(1, min(200, $limit));
+    if (ap_dm_peer_is_blocked_for_owner($peer, $ownerUserId)) {
+        return [];
+    }
     $st = ap_db()->prepare(
         'SELECT * FROM direct_messages
          WHERE owner_user_id = ? AND deleted_at IS NULL AND peer_actor_id = ?
@@ -10150,7 +10177,7 @@ function ap_dm_conversations(int $limit = 40, ?int $ownerUserId = null): array
     $out = [];
     foreach ($st->fetchAll() as $row) {
         $peer = (string) $row['peer_actor_id'];
-        if (ap_is_blocked_actor($peer)) {
+        if (ap_dm_peer_is_blocked_for_owner($peer, $ownerUserId)) {
             continue;
         }
         $last = ap_dm_by_id((int) $row['last_id'], $ownerUserId);
@@ -10214,12 +10241,18 @@ function ap_dm_unread_count(?int $ownerUserId = null): int
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     $st = ap_db()->prepare(
-        "SELECT COUNT(*) AS c FROM direct_messages
-         WHERE owner_user_id = ? AND deleted_at IS NULL AND direction = 'in' AND read_at IS NULL"
+        "SELECT peer_actor_id, COUNT(*) AS c FROM direct_messages
+         WHERE owner_user_id = ? AND deleted_at IS NULL AND direction = 'in' AND read_at IS NULL
+         GROUP BY peer_actor_id"
     );
     $st->execute([$ownerUserId]);
-    $row = $st->fetch();
-    return (int) ($row['c'] ?? 0);
+    $count = 0;
+    foreach ($st->fetchAll() as $row) {
+        if (!ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
+            $count += (int) ($row['c'] ?? 0);
+        }
+    }
+    return $count;
 }
 
 function ap_dm_conversation_id(string $peerActorId): string

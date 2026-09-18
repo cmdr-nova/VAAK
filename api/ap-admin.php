@@ -3406,13 +3406,12 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     $latestDmId = '';
     try {
         $ownerForDm = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
-        $dmLatest = ap_db()->prepare(
-            "SELECT id FROM direct_messages
-             WHERE owner_user_id = ? AND direction = 'in' AND read_at IS NULL AND deleted_at IS NULL
-             ORDER BY id DESC LIMIT 1"
-        );
-        $dmLatest->execute([$ownerForDm]);
-        $latestDmId = (string) ($dmLatest->fetchColumn() ?: '');
+        foreach (ap_dm_list_recent(200, $ownerForDm) as $dmRow) {
+            if (($dmRow['direction'] ?? '') === 'in' && empty($dmRow['read_at'])) {
+                $latestDmId = (string) ($dmRow['id'] ?? '');
+                break;
+            }
+        }
     } catch (Throwable $e) {
         // Keep the badge endpoint usable if DM metadata is temporarily busy.
     }
@@ -11862,13 +11861,12 @@ $dmLatestIdNav = '';
 try {
     $ownerForDmSeed = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
     if ($ownerForDmSeed > 0) {
-        $dmSeedSt = ap_db()->prepare(
-            "SELECT id FROM direct_messages
-             WHERE owner_user_id = ? AND direction = 'in' AND read_at IS NULL AND deleted_at IS NULL
-             ORDER BY id DESC LIMIT 1"
-        );
-        $dmSeedSt->execute([$ownerForDmSeed]);
-        $dmLatestIdNav = (string) ($dmSeedSt->fetchColumn() ?: '');
+        foreach (ap_dm_list_recent(200, $ownerForDmSeed) as $dmSeedRow) {
+            if (($dmSeedRow['direction'] ?? '') === 'in' && empty($dmSeedRow['read_at'])) {
+                $dmLatestIdNav = (string) ($dmSeedRow['id'] ?? '');
+                break;
+            }
+        }
     }
 } catch (Throwable $e) {
     $dmLatestIdNav = '';
