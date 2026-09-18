@@ -10019,6 +10019,9 @@ function admin_render_remote_boost_card(
                       $boostInner .= '<div class="quote-card-open"><a href="'
                           . h(admin_status_href($qUrl, $returnView)) . '">Open quoted</a></div>';
                   }
+                  if ($mediaUrls !== []) {
+                      $boostInner .= admin_media_row_html($mediaUrls);
+                  }
                   $boostInner .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $boostMentions = [];
@@ -10038,7 +10041,9 @@ function admin_render_remote_boost_card(
               } else {
                   $boostInner .= '<div class="meta">(boost)</div>';
               }
-              $boostMedia = $mediaUrls;
+              // Quote media belongs inside the compact quote card, not as a
+              // second attachment row beneath it.
+              $boostMedia = is_array($boostQuoteParts) ? [] : $mediaUrls;
               if ($boostMedia) {
                   $boostInner .= admin_media_row_html($boostMedia);
               }
