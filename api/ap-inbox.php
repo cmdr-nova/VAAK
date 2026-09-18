@@ -4317,6 +4317,31 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
 }
 
 /**
+ * Directly connected Bluesky accounts do not need Bridgy Fed fan-out. Bridgy
+ * seeing the AP copy before VAAK's native mirror can create duplicate bridge
+ * objects, follow prompts, and onboarding DMs. ActivityPub followers still
+ * receive the activity normally; only Bridgy's special priority destinations
+ * are suppressed for this actor.
+ */
+function ap_should_skip_bridgy_for_direct_bsky(array $activity): bool
+{
+    $type = strtolower((string) ($activity['type'] ?? ''));
+    if (!in_array($type, ['create', 'update', 'delete', 'announce', 'quote', 'quotepost'], true)) {
+        return false;
+    }
+    $actor = rtrim(trim((string) ($activity['actor'] ?? '')), '/');
+    if ($actor === '' || !function_exists('ap_db_owner_user_id_for_actor')) {
+        return false;
+    }
+    $owner = (int) ap_db_owner_user_id_for_actor($actor);
+    if ($owner < 1) {
+        return false;
+    }
+    require_once __DIR__ . '/ap-bsky.php';
+    return function_exists('ap_bsky_session_row') && ap_bsky_session_row($owner) !== null;
+}
+
+/**
  * Public Create/Announce/Delete fan-out that cannot traffic-jam on media/polls:
  * Bridgy Fed first (Bluesky), then a small sync follower budget, everything else background.
  *
@@ -4325,6 +4350,7 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
  */
 function ap_deliver_public_activity(array $activity, array $priorityExtra = [], bool $skipBridgy = false): array
 {
+    $skipBridgy = $skipBridgy || ap_should_skip_bridgy_for_direct_bsky($activity);
     $prevActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
     $actorUrl = is_string($activity['actor'] ?? null) ? rtrim((string) $activity['actor'], '/') : '';
     $owner = '';
