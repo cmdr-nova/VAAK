@@ -3,7 +3,8 @@
  * Local full-text search via SQLite FTS5 or PostgreSQL tsvector.
  * Intentionally separate from Mastodon/cmplxdecay Elasticsearch on this host.
  *
- * Corpus: federated events (Create/Announce/Update), mentions, local masto_statuses.
+ * Corpus: federated events (Create/Announce/Update), mentions, local Mastodon statuses,
+ * plus Bluesky posts and account profiles already present in VAAK's cache.
  * Designed for 10^5–few×10^5 docs with incremental upserts (not a full reindex per query).
  */
 declare(strict_types=1);
@@ -205,14 +206,14 @@ function ap_search_fts_normalize_body(string $plain, string $spoiler = ''): stri
 /**
  * Upsert one searchable document. No-op on empty body.
  *
- * @param 'event'|'mention'|'status' $source
+ * @param 'event'|'mention'|'status'|'bsky_post'|'bsky_actor' $source
  */
 function ap_search_fts_upsert(string $source, int $sourcePk, ?string $objectId, string $createdAt, string $body): void
 {
     if (!ap_search_fts_available() || $sourcePk <= 0) {
         return;
     }
-    if (!in_array($source, ['event', 'mention', 'status'], true)) {
+    if (!in_array($source, ['event', 'mention', 'status', 'bsky_post', 'bsky_actor'], true)) {
         return;
     }
     $body = trim($body);
@@ -236,10 +237,20 @@ function ap_search_fts_upsert(string $source, int $sourcePk, ?string $objectId, 
     }
 }
 
-/** @param 'event'|'mention'|'status' $source */
+/** Stable compact numeric key for external cache records in source_pk. */
+function ap_search_fts_external_pk(string $source, string $key): int
+{
+    // Keep the existing integer source_pk schema while avoiding collisions with
+    // local row ids by deriving a stable 56-bit key from the external identity.
+    $pk = (int) hexdec(substr(hash('sha256', $source . "\0" . $key), 0, 14));
+    return max(1, $pk);
+}
+
+/** @param 'event'|'mention'|'status'|'bsky_post'|'bsky_actor' $source */
 function ap_search_fts_delete(string $source, int $sourcePk): void
 {
-    if (!ap_search_fts_available() || $sourcePk <= 0) {
+    if (!ap_search_fts_available() || $sourcePk <= 0
+        || !in_array($source, ['event', 'mention', 'status', 'bsky_post', 'bsky_actor'], true)) {
         return;
     }
     try {
@@ -391,41 +402,56 @@ function ap_search_fts_match_query(string $q, string $tagName = ''): ?string
  *
  * @return list<array{source:string,source_pk:int,object_id:?string,created_at:string,rank:float}>
  */
-function ap_search_fts_query(string $q, int $limit = 40, string $tagName = ''): array
+function ap_search_fts_query(string $q, int $limit = 40, string $tagName = '', ?array $sources = null): array
 {
     if (!ap_search_fts_available()) {
         return [];
     }
     ap_search_fts_maybe_backfill_slice();
+    ap_search_fts_bsky_backfill_slice();
     $match = ap_search_fts_match_query($q, $tagName);
     if ($match === null) {
         return [];
     }
     $limit = max(1, min(80, $limit));
+    if ($sources !== null) {
+        $allowed = ['event', 'mention', 'status', 'bsky_post', 'bsky_actor'];
+        $sources = array_values(array_intersect($sources, $allowed));
+        if ($sources === []) return [];
+        $sourceSql = implode(',', array_fill(0, count($sources), '?'));
+    }
     try {
         if (ap_search_fts_driver() === 'pgsql') {
             $tsquery = ap_search_fts_postgres_query($match);
+            $sourceClause = $sources !== null ? " AND source IN ($sourceSql)" : '';
             $st = ap_db()->prepare(
                 "SELECT source, source_pk, object_id, created_at,
                         ts_rank_cd(body_tsv, to_tsquery('simple', ?)) AS rank
                  FROM ap_search_docs
-                 WHERE body_tsv @@ to_tsquery('simple', ?)
+                 WHERE body_tsv @@ to_tsquery('simple', ?) $sourceClause
                  ORDER BY rank DESC, created_at DESC
                  LIMIT ?"
             );
-            $st->execute([$tsquery, $tsquery, $limit]);
+            $params = [$tsquery, $tsquery];
+            if ($sources !== null) $params = array_merge($params, $sources);
+            $params[] = $limit;
+            $st->execute($params);
         } else {
         // bm25: lower is better; order by rank then recency
+            $sourceClause = $sources !== null ? " AND d.source IN ($sourceSql)" : '';
             $st = ap_db()->prepare(
                 "SELECT d.source, d.source_pk, d.object_id, d.created_at,
                         bm25(ap_search_fts) AS rank
                  FROM ap_search_fts
                  JOIN ap_search_docs d ON d.id = ap_search_fts.rowid
-                 WHERE ap_search_fts MATCH ?
+                 WHERE ap_search_fts MATCH ? $sourceClause
                  ORDER BY rank ASC, d.created_at DESC
                  LIMIT ?"
             );
-            $st->execute([$match, $limit]);
+            $params = [$match];
+            if ($sources !== null) $params = array_merge($params, $sources);
+            $params[] = $limit;
+            $st->execute($params);
         }
         $out = [];
         foreach ($st->fetchAll() ?: [] as $row) {
@@ -441,6 +467,71 @@ function ap_search_fts_query(string $q, int $limit = 40, string $tagName = ''): 
     } catch (Throwable $e) {
         error_log('[ap-search-fts] query: ' . $e->getMessage());
         return [];
+    }
+}
+
+/** Incrementally index cached Bluesky posts and profiles without remote calls. */
+function ap_search_fts_bsky_backfill_slice(int $batch = 500): void
+{
+    if (!ap_search_fts_available()) return;
+    $batch = max(50, min(2000, $batch));
+    try {
+        if ((ap_search_fts_meta_get('bsky_post_backfill_done') ?? '') !== '1') {
+            if (function_exists('ap_bsky_posts_migrate')) ap_bsky_posts_migrate();
+            $cursor = ap_search_fts_meta_get('bsky_post_cursor') ?? '';
+            $st = ap_db()->prepare(
+                'SELECT bsky_uri, text, author_handle, author_display, published_at
+                 FROM bsky_posts WHERE bsky_uri > ? ORDER BY bsky_uri ASC LIMIT ?'
+            );
+            $st->execute([$cursor, $batch]);
+            $rows = $st->fetchAll() ?: [];
+            foreach ($rows as $row) {
+                $uri = (string) ($row['bsky_uri'] ?? '');
+                if ($uri === '') continue;
+                $body = ap_search_fts_normalize_body(implode(' ', array_filter([
+                    (string) ($row['text'] ?? ''),
+                    (string) ($row['author_handle'] ?? ''),
+                    (string) ($row['author_display'] ?? ''),
+                ])));
+                ap_search_fts_upsert('bsky_post', ap_search_fts_external_pk('bsky_post', $uri), $uri,
+                    (string) ($row['published_at'] ?? ''), $body);
+                $cursor = $uri;
+            }
+            ap_search_fts_meta_set('bsky_post_cursor', $cursor);
+            if (count($rows) < $batch) ap_search_fts_meta_set('bsky_post_backfill_done', '1');
+        }
+    } catch (Throwable $e) {
+        // Instances without Bluesky enabled may not have the cache table yet.
+    }
+    try {
+        if ((ap_search_fts_meta_get('bsky_actor_backfill_done') ?? '') !== '1') {
+            if (function_exists('ap_bsky_actor_refresh_migrate')) ap_bsky_actor_refresh_migrate();
+            $cursor = ap_search_fts_meta_get('bsky_actor_cursor') ?? '';
+            $st = ap_db()->prepare(
+                'SELECT actor_ref, did, profile_json, updated_at
+                 FROM bsky_actor_profiles WHERE actor_ref > ? ORDER BY actor_ref ASC LIMIT ?'
+            );
+            $st->execute([$cursor, $batch]);
+            $rows = $st->fetchAll() ?: [];
+            foreach ($rows as $row) {
+                $profile = json_decode((string) ($row['profile_json'] ?? ''), true);
+                $did = trim((string) ($row['did'] ?? ''));
+                $ref = $did !== '' ? $did : trim((string) ($row['actor_ref'] ?? ''));
+                if (!is_array($profile) || $ref === '') continue;
+                $body = ap_search_fts_normalize_body(implode(' ', array_filter([
+                    (string) ($profile['handle'] ?? ''),
+                    (string) ($profile['displayName'] ?? ''),
+                    (string) ($profile['description'] ?? ''),
+                ])));
+                ap_search_fts_upsert('bsky_actor', ap_search_fts_external_pk('bsky_actor', $ref), $ref,
+                    (string) ($row['updated_at'] ?? ''), $body);
+                $cursor = (string) ($row['actor_ref'] ?? '');
+            }
+            ap_search_fts_meta_set('bsky_actor_cursor', $cursor);
+            if (count($rows) < $batch) ap_search_fts_meta_set('bsky_actor_backfill_done', '1');
+        }
+    } catch (Throwable $e) {
+        // Profile cache may not exist yet.
     }
 }
 
@@ -613,6 +704,10 @@ function ap_search_fts_rebuild(): array
     ap_search_fts_meta_set('backfill_event_id', '0');
     ap_search_fts_meta_set('backfill_mention_id', '0');
     ap_search_fts_meta_set('backfill_status_id', '0');
+    ap_search_fts_meta_set('bsky_post_cursor', '');
+    ap_search_fts_meta_set('bsky_actor_cursor', '');
+    ap_search_fts_meta_set('bsky_post_backfill_done', '0');
+    ap_search_fts_meta_set('bsky_actor_backfill_done', '0');
     $total = 0;
     for ($i = 0; $i < 200; $i++) {
         $s = ap_search_fts_backfill(3000);

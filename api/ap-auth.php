@@ -56,8 +56,14 @@ function ap_auth_env(): array
         }
     }
     if ($secret === '') {
-        // Stable fallback from host identity — rotate by setting VAAK_SECRET
-        $secret = hash('sha256', 'vaak|' . (string) gethostname() . '|' . AP_DB_PATH);
+        // Never derive an encryption key from host/database identity in
+        // production: a copied database plus predictable host metadata would
+        // make every user's encrypted integration secret recoverable.
+        if (getenv('AP_ALLOW_INSECURE_SECRET') !== '1') {
+            throw new RuntimeException('VAAK_SECRET is not configured');
+        }
+        // Explicit opt-in is limited to local development/test environments.
+        $secret = hash('sha256', 'vaak-dev|' . (string) gethostname() . '|' . AP_DB_PATH);
     }
     $cfg = ['secret' => $secret];
     return $cfg;
@@ -1074,10 +1080,15 @@ function ap_auth_secret_encrypt(string $plaintext): string
     if ($plaintext === '') {
         return '';
     }
-    $key = hash('sha256', ap_auth_env()['secret'], true);
-    $iv = random_bytes(12);
-    $tag = '';
-    $cipher = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, '', 16);
+    try {
+        $key = hash('sha256', ap_auth_env()['secret'], true);
+        $iv = random_bytes(12);
+        $tag = '';
+        $cipher = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, '', 16);
+    } catch (Throwable $e) {
+        error_log('[ap-auth] secret encryption unavailable');
+        return '';
+    }
     if (!is_string($cipher) || $cipher === '' || strlen($tag) !== 16) {
         return '';
     }
@@ -1100,8 +1111,13 @@ function ap_auth_secret_decrypt(string $blob): ?string
     $iv = substr($raw, 0, 12);
     $tag = substr($raw, 12, 16);
     $cipher = substr($raw, 28);
-    $key = hash('sha256', ap_auth_env()['secret'], true);
-    $plain = openssl_decrypt($cipher, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+    try {
+        $key = hash('sha256', ap_auth_env()['secret'], true);
+        $plain = openssl_decrypt($cipher, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+    } catch (Throwable $e) {
+        error_log('[ap-auth] secret decryption unavailable');
+        return null;
+    }
     if (!is_string($plain) || $plain === '') {
         return null;
     }

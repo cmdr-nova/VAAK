@@ -2513,6 +2513,7 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $seenVals[$val] = true;
         }
     }
+    $cacheSaved = false;
     try {
         $st = ap_db()->prepare(
             'INSERT INTO bsky_posts (
@@ -2566,8 +2567,26 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $now,
             $now,
         ]);
+        $cacheSaved = true;
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());
+    }
+    if ($cacheSaved) {
+        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
+        if (function_exists('ap_search_fts_upsert') && function_exists('ap_search_fts_external_pk')) {
+            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
+                $text,
+                (string) ($author['handle'] ?? ''),
+                (string) ($author['displayName'] ?? ''),
+            ])));
+            ap_search_fts_upsert(
+                'bsky_post',
+                ap_search_fts_external_pk('bsky_post', $uri),
+                $uri,
+                $publishedAt,
+                $searchBody
+            );
+        }
     }
     // Keep link map in sync.
     ap_bsky_index_feed_post_links($post);
@@ -4786,6 +4805,96 @@ function ap_bsky_bookmark_cache_read(int $ownerUserId, int $limit): array
     }
 }
 
+/** Read only the cached Bluesky posts whose AT-URIs belong to a folder. */
+function ap_bsky_bookmark_cache_read_uris(int $ownerUserId, array $uris, int $limit = 80): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) {
+        return [];
+    }
+    // Folder membership stores the public bsky.app URL for non-twin posts,
+    // while the durable cache stores AT-URIs. Resolve those from the cache by
+    // rkey first so opening a folder does not perform one handle lookup per
+    // item (network resolution is only the fallback for an uncached item).
+    $knownByRkey = [];
+    $rkeys = [];
+    foreach ($uris as $rawUri) {
+        if (preg_match('~^https://bsky\.app/profile/[^/]+/post/([^/?#]+)~i', trim((string) $rawUri), $m)) {
+            $rkeys[rawurldecode($m[1])] = true;
+        }
+    }
+    if ($rkeys !== []) {
+        try {
+            $clauses = [];
+            $bind = [$ownerUserId];
+            foreach (array_keys($rkeys) as $rkey) {
+                $clauses[] = 'bookmark_uri LIKE ?';
+                $bind[] = '%/app.bsky.feed.post/' . $rkey;
+            }
+            $st = ap_db()->prepare(
+                'SELECT bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ? AND ('
+                . implode(' OR ', $clauses) . ')'
+            );
+            $st->execute($bind);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $knownUri) {
+                if (preg_match('~/app\.bsky\.feed\.post/([^/]+)$~', (string) $knownUri, $m)) {
+                    $knownByRkey[$m[1]] = (string) $knownUri;
+                }
+            }
+        } catch (Throwable $e) {
+            // The normal resolver remains a safe fallback below.
+        }
+    }
+    $normalized = [];
+    foreach ($uris as $rawUri) {
+        $uri = trim((string) $rawUri);
+        $rkey = '';
+        if (preg_match('~^https://bsky\.app/profile/[^/]+/post/([^/?#]+)~i', $uri, $m)) {
+            $rkey = rawurldecode($m[1]);
+        }
+        if ($rkey !== '' && isset($knownByRkey[$rkey])) {
+            $uri = $knownByRkey[$rkey];
+        }
+        if ($uri !== '' && !str_starts_with($uri, 'at://') && function_exists('ap_bsky_at_uri_from_any_url')) {
+            $resolved = ap_bsky_at_uri_from_any_url($uri);
+            if (is_string($resolved) && str_starts_with($resolved, 'at://')) {
+                $uri = $resolved;
+            }
+        }
+        if (str_starts_with($uri, 'at://')) {
+            $normalized[$uri] = true;
+        }
+    }
+    $uris = array_keys($normalized);
+    if ($uris === []) {
+        return [];
+    }
+    $limit = max(1, min(200, $limit));
+    try {
+        $marks = implode(',', array_fill(0, count($uris), '?'));
+        $st = ap_db()->prepare(
+            'SELECT post_json, bookmarked_at FROM bsky_bookmark_cache
+             WHERE owner_user_id = ? AND bookmark_uri IN (' . $marks . ')
+             ORDER BY bookmarked_at DESC, bookmark_uri DESC LIMIT ' . $limit
+        );
+        $st->execute(array_merge([$ownerUserId], $uris));
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $item = json_decode((string) ($row['post_json'] ?? ''), true);
+            if (!is_array($item) || !is_array($item['post'] ?? null)) {
+                continue;
+            }
+            $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
+            $item['post']['viewer']['bookmarked'] = true;
+            $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
+            $out[] = $item;
+        }
+        return $out;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] bookmark folder cache read failed');
+        return [];
+    }
+}
+
 /** Import the old volatile cache once, so deployment does not blank the first view. */
 function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 {
@@ -4872,6 +4981,36 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
     $stale = $checkedAt < time() - 300;
     if ($stale) ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
     return ['ok' => true, 'bookmarks' => $cached, 'cached' => true, 'refreshing' => $stale];
+}
+
+/**
+ * Read a folder's Bluesky bookmarks without loading the entire collection.
+ * A stale head refresh is still coalesced into the normal background queue;
+ * this request never calls the Bluesky API.
+ */
+function ap_bsky_get_bookmarks_for_uris(int $ownerUserId, array $uris, int $limit = 80): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
+        return ['ok' => false, 'error' => 'Bluesky is not connected'];
+    }
+    if (ap_bsky_session_row($ownerUserId) === null || !ap_bsky_bookmark_cache_migrate()) {
+        return ['ok' => false, 'error' => 'Bluesky is not connected'];
+    }
+    $items = ap_bsky_bookmark_cache_read_uris($ownerUserId, $uris, $limit);
+    $checkedAt = 0;
+    try {
+        $st = ap_db()->prepare('SELECT head_checked_at FROM bsky_bookmark_sync_state WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$ownerUserId]);
+        $row = $st->fetch();
+        $checkedAt = is_array($row) ? (strtotime((string) ($row['head_checked_at'] ?? '')) ?: 0) : 0;
+    } catch (Throwable $e) {
+        // The folder can still render from its durable cache if state is unavailable.
+    }
+    $stale = $checkedAt < time() - 300;
+    if ($stale) {
+        ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
+    }
+    return ['ok' => true, 'bookmarks' => $items, 'cached' => true, 'refreshing' => $stale];
 }
 
 /** Refresh only the new head, except for the initial/daily bounded baseline. */
@@ -5661,6 +5800,15 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
         if ($did !== '' && $did !== $actorRef) {
             $st->execute([$did, $did, $json, $now]);
             $vs->execute([$ownerUserId, $did, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
+        }
+        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
+        if ($did !== '' && function_exists('ap_search_fts_upsert') && function_exists('ap_search_fts_external_pk')) {
+            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
+                (string) ($profile['handle'] ?? ''),
+                (string) ($profile['displayName'] ?? ''),
+                (string) ($profile['description'] ?? ''),
+            ])));
+            ap_search_fts_upsert('bsky_actor', ap_search_fts_external_pk('bsky_actor', $did), $did, $now, $searchBody);
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor profile cache write failed');
@@ -9166,10 +9314,50 @@ function ap_bsky_subject_post_preview_text(string $subjectAtOrUrl, int $ownerUse
                 return $txt;
             }
         }
-        // Intentionally no sync AppView fetch here — notification list paint
-        // must stay local/cache-only (Ice Cubes polls this path often).
+        // Notification list paint stays cache-only. A single coalesced CLI
+        // warmer fills the durable cache for the next poll instead of making
+        // Ice Cubes wait on AppView network I/O.
+        ap_bsky_post_preview_warm_async($at, $ownerUserId);
     }
     return '';
+}
+
+/** Queue one bounded AppView fetch for an uncached notification subject. */
+function ap_bsky_post_preview_warm_async(string $atUri, int $ownerUserId = 0): void
+{
+    $atUri = trim($atUri);
+    if (!str_starts_with($atUri, 'at://') || !function_exists('exec') || !function_exists('shell_exec')) {
+        return;
+    }
+    $script = __DIR__ . '/ap-bsky-post-warm.php';
+    if (!is_file($script)) {
+        return;
+    }
+    $lockPath = sys_get_temp_dir() . '/vaak-bsky-post-warm-' . sha1($atUri) . '.lock';
+    $lock = @fopen($lockPath, 'x');
+    if ($lock === false) {
+        if (!is_file($lockPath) || (filemtime($lockPath) ?: time()) > time() - 900) {
+            return;
+        }
+        @unlink($lockPath);
+        $lock = @fopen($lockPath, 'x');
+        if ($lock === false) return;
+    }
+    fclose($lock);
+    $running = trim((string) @shell_exec("pgrep -fc 'ap-bsky-post-warm\\.php' 2>/dev/null"));
+    if ((int) $running >= 2) {
+        @unlink($lockPath);
+        return;
+    }
+    $php = function_exists('ap_php_cli_binary')
+        ? ap_php_cli_binary()
+        : ((string) getenv('VAAK_PHP_CLI') !== '' ? (string) getenv('VAAK_PHP_CLI') : '/usr/bin/php');
+    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script)
+        . ' --uri=' . escapeshellarg($atUri)
+        . ' --owner=' . (int) max(0, $ownerUserId)
+        . ' --lock=' . escapeshellarg($lockPath)
+        . ' >/dev/null 2>&1 </dev/null &';
+    @exec($cmd);
 }
 
 /**

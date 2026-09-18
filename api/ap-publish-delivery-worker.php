@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 $limit = 10;
+$healthOnly = false;
 foreach ($argv as $arg) if (preg_match('/^--limit=(\d+)$/', $arg, $m)) $limit = max(1, min(50, (int) $m[1]));
+foreach ($argv as $arg) if ($arg === '--health') $healthOnly = true;
 
 try {
     if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
@@ -15,6 +17,10 @@ try {
     require_once __DIR__ . '/ap-action-queue.php';
     require_once __DIR__ . '/ap-inbox.php';
     require_once __DIR__ . '/ap-publish-delivery.php';
+    if ($healthOnly) {
+        fwrite(STDOUT, json_encode(ap_publish_delivery_queue_health(), JSON_UNESCAPED_SLASHES) . "\n");
+        exit(0);
+    }
     $stats = ap_publish_delivery_worker_run($limit);
     fwrite(STDOUT, sprintf("[%s] publish_delivery claimed=%d succeeded=%d retried=%d failed=%d%s\n",
         gmdate('c'), $stats['claimed'], $stats['succeeded'], $stats['retried'], $stats['failed'],

@@ -47,6 +47,27 @@ keys, bearer tokens, database URLs, or user/runtime data.
 Deployment routing and service configuration remain environment-specific and are
 not included here.
 
+### Required background workers
+
+Local posts and quote boosts are committed before federation delivery. The
+delivery queue is retried by `api/ap-publish-delivery-worker.php`; production
+deployments must run it as the `www-data` service account. The web request also
+attempts a short-lived async wake-up, but that is best-effort and must not be
+the only scheduler (PHP-FPM may have `exec` disabled).
+
+For a simple deployment, add a cron entry that loads the same environment file
+used by PHP-FPM:
+
+```cron
+* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-publish-delivery-worker.php --limit=25 >>/var/log/vaak-publish-delivery.log 2>&1
+```
+
+Use a systemd timer instead when the host already manages application workers.
+The worker is idempotent and uses a lease, so overlapping timer invocations are
+safe; keep only one active timer on a host to avoid unnecessary database work.
+Deploy checks can query queue state without claiming work with
+`api/ap-publish-delivery-worker.php --health`.
+
 ## Public Feeds
 
 Local actor profiles expose public outbox feeds at `/users/{username}/feed.xml`

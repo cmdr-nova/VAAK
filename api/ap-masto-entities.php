@@ -4610,11 +4610,26 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
 
+    // Notification snowflakes use seconds * 1e9.  Use that timestamp as a
+    // source-level keyset boundary so older pages are not lost behind a fixed
+    // per-table LIMIT.  Rows in the same second are retained and filtered by
+    // the complete generated id below.
+    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
+    $maxCursorAt = null;
+    if ($maxIdInt >= 1000000000000000000) {
+        $maxCursorAt = gmdate('c', intdiv($maxIdInt, 1000000000));
+    }
+
     if (array_intersect($want, $mentionTypes)) {
-        $st = ap_db()->prepare(
-            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 80'
-        );
-        $st->execute([$ownerUserId]);
+        $sql = 'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL';
+        $bind = [$ownerUserId];
+        if ($maxCursorAt !== null) {
+            $sql .= ' AND created_at <= ?';
+            $bind[] = $maxCursorAt;
+        }
+        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT 200';
+        $st = ap_db()->prepare($sql);
+        $st->execute($bind);
         $seenActivityIds = [];
         foreach ($st->fetchAll() as $row) {
             $activityId = trim((string) ($row['activity_id'] ?? ''));
@@ -4630,7 +4645,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             }
             $nid = (int) $row['id'];
             $items[] = [
-                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
+                'sort' => (int) ap_masto_notification_id_for_mention($nid, (string) ($row['created_at'] ?? '')),
                 'kind' => 'mention',
                 'row' => $row,
             ];
@@ -4641,14 +4656,18 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         // Follow events must target THIS session actor only (never NULL/empty — that leaked).
         // Include Bluesky follows (action_taken=bsky_follow) — those are not in AP followers[].
         $bskyFollowAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
-        $st = ap_db()->prepare(
-            "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
+        $sql = "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
              WHERE type = 'Follow'
                AND action_taken IN ('local_accept_followback', ?)
-               AND (target_actor = ? OR target_actor = ?)
-             ORDER BY id DESC LIMIT 40"
-        );
-        $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
+               AND (target_actor = ? OR target_actor = ?)";
+        $bind = [$bskyFollowAction, $ownerActorId, $ownerActorId . '/'];
+        if ($maxCursorAt !== null) {
+            $sql .= ' AND created_at <= ?';
+            $bind[] = $maxCursorAt;
+        }
+        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT 200';
+        $st = ap_db()->prepare($sql);
+        $st->execute($bind);
         // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
         $followerSet = [];
         try {
@@ -4670,7 +4689,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             }
             $nid = 1000000 + (int) $row['id'];
             $items[] = [
-                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
+                'sort' => (int) ap_masto_notification_id_for_follow_event((int) $row['id'], (string) ($row['created_at'] ?? '')),
                 'kind' => 'follow',
                 'row' => $row,
             ];
@@ -4681,10 +4700,15 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     if (in_array('poll', $want, true)) {
         try {
             $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('c');
-            $st = ap_db()->prepare(
-                'SELECT * FROM masto_polls WHERE expires_at <= ? ORDER BY expires_at DESC LIMIT 40'
-            );
-            $st->execute([$now]);
+            $pollSql = 'SELECT * FROM masto_polls WHERE expires_at <= ?';
+            $pollBind = [$now];
+            if ($maxCursorAt !== null) {
+                $pollSql .= ' AND expires_at <= ?';
+                $pollBind[] = $maxCursorAt;
+            }
+            $pollSql .= ' ORDER BY expires_at DESC, local_id DESC LIMIT 200';
+            $st = ap_db()->prepare($pollSql);
+            $st->execute($pollBind);
             $me = rtrim($ownerActorId !== '' ? $ownerActorId : ap_masto_session_actor_id(), '/');
             foreach ($st->fetchAll() as $row) {
                 if (!is_array($row)) {
@@ -4707,7 +4731,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 }
                 $nid = 2000000 + (int) $row['local_id'];
                 $items[] = [
-                    'sort' => strtotime((string) ($row['expires_at'] ?? '')) ?: $nid,
+                    'sort' => (int) ap_masto_notification_id_for_poll((int) $row['local_id'], (string) ($row['expires_at'] ?? '')),
                     'kind' => 'poll',
                     'row' => $row,
                 ];
@@ -4722,11 +4746,10 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     });
 
     $out = [];
-    // Items are newest-first (sort desc). Ice Cubes polls with since_id near the tip;
-    // once we hit the watermark, older rows cannot be "newer" — stop instead of
-    // hydrating the whole backlog (was ~4–11s for /api/v2/notifications).
+    // Items are newest-first (sort desc). Ice Cubes polls with since_id near the
+    // tip; filter the watermark without stopping because source namespaces can
+    // interleave at the same timestamp.
     $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
-    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
     foreach ($items as $item) {
         $ent = ap_masto_notification_entity($item);
         if ($ent === null) {
@@ -4737,9 +4760,11 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         if ($maxIdInt > 0 && $entId >= $maxIdInt) {
             continue;
         }
-        // since_id: only newer than watermark; then stop (newest-first)
+        // since_id: only newer than watermark. Do not break: notification
+        // namespaces/types can have different generated IDs at the same
+        // timestamp, so an older-looking item must not hide a later source.
         if ($sinceIdInt > 0 && $entId <= $sinceIdInt) {
-            break;
+            continue;
         }
         $out[] = $ent;
         if (count($out) >= $limit) {
@@ -9042,7 +9067,9 @@ function ap_masto_search_statuses(string $q, int $limit): array
         require_once __DIR__ . '/ap-search-fts.php';
     }
     if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
-        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName);
+        // Bluesky cache hits are rendered separately by the HTML search view;
+        // keep the Mastodon API status response limited to AP-backed records.
+        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName, ['event', 'mention', 'status']);
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
