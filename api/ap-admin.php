@@ -10422,17 +10422,23 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 $plain = '';
             }
             if ($qUrl || $tomb || $plain !== '' || !empty($bskyQuotePrev)) {
-                $quoteHtml = '<div class="quote-block"><span class="qt-label">Quoted</span><br>';
+                $quoteHtml = '<div class="quote-card"><div class="quote-card-source">QUOTED POST</div>';
                 if (is_array($bskyQuotePrev ?? null)) {
-                    $qAcct = trim((string) (($bskyQuotePrev['display'] ?? '') !== '' ? $bskyQuotePrev['display'] : ($bskyQuotePrev['handle'] ?? '')));
-                    if ($qAcct !== '') {
-                        $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
+                    $qDisplay = trim((string) ($bskyQuotePrev['display'] ?? ''));
+                    $qHandle = trim((string) ($bskyQuotePrev['handle'] ?? ''));
+                    $qAvatar = trim((string) ($bskyQuotePrev['avatar'] ?? ''));
+                    $quoteHtml .= '<div class="quote-card-author">';
+                    if ($qAvatar !== '') {
+                        $quoteHtml .= '<img class="quote-card-avatar" src="' . h($qAvatar) . '" alt="" width="32" height="32" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
                     }
+                    $quoteHtml .= '<div><div class="quote-card-name">' . h($qDisplay !== '' ? $qDisplay : ($qHandle !== '' ? $qHandle : 'Quoted post')) . '</div>'
+                        . ($qHandle !== '' ? '<div class="quote-card-handle">@' . h($qHandle) . '</div>' : '')
+                        . '</div></div>';
                     if ($plain !== '') {
                         if (mb_strlen($plain) > 280) {
                             $plain = mb_substr($plain, 0, 277) . '…';
                         }
-                        $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">' . h($plain) . '</div>';
+                        $quoteHtml .= '<div class="quote-card-body">' . h($plain) . '</div>';
                     }
                     if (!empty($bskyQuotePrev['media']) && is_array($bskyQuotePrev['media'])) {
                         $quoteHtml .= admin_quote_media_html($bskyQuotePrev['media']);
@@ -10461,7 +10467,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                     $openUrl = ap_bsky_normalize_web_url($openUrl);
                 }
                 if ($openUrl !== '') {
-                    $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($openUrl) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
+                    $quoteHtml .= '<div class="quote-card-open"><a href="' . h($openUrl) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
                 }
                 $quoteHtml .= '</div>';
             }
