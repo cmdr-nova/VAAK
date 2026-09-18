@@ -128,8 +128,8 @@ try {
                 }
             }
             $savedUris = array_values(array_unique($savedUris));
-            $samplePerFeed = max(5, min(15, (int) floor($limit / 2)));
-            foreach (array_slice($savedUris, 0, 4) as $feedUri) {
+            $samplePerFeed = max(8, min(20, (int) floor($limit / 2) + 4));
+            foreach (array_slice($savedUris, 0, 8) as $feedUri) {
                 $cf = ap_bsky_get_custom_feed($uid, $feedUri, $samplePerFeed, null);
                 if (empty($cf['ok']) || empty($cf['feed']) || !is_array($cf['feed'])) {
                     continue;
@@ -162,18 +162,9 @@ try {
                     $source
                 );
                 ap_bsky_schedule_hide_refresh($uid);
-                // Invalidate Home ranked cache so the next paint picks up fresh Bluesky mix.
-                foreach ([
-                    '/var/lib/mkultra/ap/admin-tl-cache',
-                    sys_get_temp_dir() . '/vaak-admin-tl-cache',
-                ] as $tlDir) {
-                    if (!is_dir($tlDir)) {
-                        continue;
-                    }
-                    foreach (glob($tlDir . '/tl_home_*.json') ?: [] as $f) {
-                        @unlink($f);
-                    }
-                }
+                // Do not wipe Home ranked cache here — that forced a slow full
+                // rebuild on the next paint. Fresh Bluesky rows land via scroll
+                // extend / cache TTL (bsky_posts is already updated above).
             } else {
                 $n = count($feed);
             }

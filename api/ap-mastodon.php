@@ -2256,7 +2256,17 @@ function ap_masto_api(string $method, string $path): void
 
         if ($action === 'favourite') {
             $likeId = null;
-            if (empty($resolved['is_ours']) && $objectId !== '' && is_string($targetActor) && $targetActor !== '') {
+            $isBskyObject = function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($objectId);
+            if ($isBskyObject) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            if ($isBskyObject && function_exists('ap_bsky_like_object')) {
+                $ownerId = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+                $bskyLike = ap_bsky_like_object($ownerId, $objectId);
+                if (!empty($bskyLike['ok']) && empty($bskyLike['skipped']) && !empty($bskyLike['uri'])) {
+                    $likeId = (string) $bskyLike['uri'];
+                }
+            } elseif (empty($resolved['is_ours']) && $objectId !== '' && is_string($targetActor) && $targetActor !== '') {
                 if (!defined('AP_INBOX_LIB_ONLY')) {
                     define('AP_INBOX_LIB_ONLY', true);
                 }
@@ -2272,7 +2282,13 @@ function ap_masto_api(string $method, string $path): void
         }
         if ($action === 'unfavourite') {
             $prev = ap_masto_favourite_remove($statusId);
-            if ($prev && !empty($prev['like_activity_id']) && !empty($prev['object_id']) && !empty($prev['target_actor'])) {
+            if ($prev && !empty($prev['like_activity_id']) && str_starts_with((string) $prev['like_activity_id'], 'at://')) {
+                require_once __DIR__ . '/ap-bsky.php';
+                $ownerId = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+                if (function_exists('ap_bsky_delete_record_uri')) {
+                    ap_bsky_delete_record_uri($ownerId, (string) $prev['like_activity_id']);
+                }
+            } elseif ($prev && !empty($prev['like_activity_id']) && !empty($prev['object_id']) && !empty($prev['target_actor'])) {
                 if (!defined('AP_INBOX_LIB_ONLY')) {
                     define('AP_INBOX_LIB_ONLY', true);
                 }

@@ -5963,7 +5963,7 @@ function ap_profile_bsky_handle(string $actorKey, array $profile = []): ?string
  *
  * @return array{ok:bool,followers:int,following:int,posts:int,handle?:string,error?:string}
  */
-function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
+function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $forceRefresh = false): array
 {
     $handle = ltrim(trim($handle), '@');
     if ($handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)) {
@@ -5981,7 +5981,7 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
     }
     $cachePath = $cacheDir . '/' . hash('sha256', strtolower($handle)) . '.json';
     $ttlSec = max(30, min(900, $ttlSec));
-    if (is_file($cachePath)) {
+    if (!$forceRefresh && is_file($cachePath)) {
         $age = time() - (int) @filemtime($cachePath);
         if ($age >= 0 && $age < $ttlSec) {
             $raw = @file_get_contents($cachePath);
@@ -6049,6 +6049,25 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120): array
  *   bsky_handle:?string
  * }
  */
+function ap_profile_bsky_owner_id(string $actorKey): int
+{
+    $actorKey = strtolower(trim(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? ''));
+    if ($actorKey === '') {
+        return 0;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT s.owner_user_id FROM bsky_sessions s
+             INNER JOIN ap_users u ON u.id = s.owner_user_id
+             WHERE lower(u.actor_key) = ? OR lower(u.username) = ? LIMIT 1'
+        );
+        $st->execute([$actorKey, $actorKey]);
+        return max(0, (int) ($st->fetchColumn() ?: 0));
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, int $apFollowing): array
 {
     $apFollowers = max(0, $apFollowers);
@@ -6057,10 +6076,19 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
     $bskyFollowers = 0;
     $bskyFollowing = 0;
     if (is_string($handle) && $handle !== '') {
-        $remote = ap_bsky_public_profile_counts($handle);
+        $remote = ap_bsky_public_profile_counts($handle, 120, false);
         if (!empty($remote['ok'])) {
             $bskyFollowers = (int) $remote['followers'];
             $bskyFollowing = (int) $remote['following'];
+        }
+        if (function_exists('ap_bsky_profile_counts_enqueue')) {
+            $uid = ap_profile_bsky_owner_id($actorKey);
+            if ($uid < 1 && function_exists('ap_db_default_owner_user_id')) {
+                $uid = ap_db_default_owner_user_id();
+            }
+            if ($uid > 0) {
+                ap_bsky_profile_counts_enqueue($uid, $handle);
+            }
         }
     }
     return [

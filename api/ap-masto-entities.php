@@ -3796,6 +3796,13 @@ function ap_masto_status_from_mention(array $row): array
             $inReplyTo = $mm[0];
         }
     }
+    if ($inReplyTo !== '' && (str_starts_with($inReplyTo, 'https://bsky.app/') || str_starts_with($inReplyTo, 'at://'))
+        && function_exists('ap_bsky_local_note_id_for_at_uri')) {
+        $twinParent = ap_bsky_local_note_id_for_at_uri($inReplyTo, (int) ($row['owner_user_id'] ?? 0), false);
+        if (is_string($twinParent) && str_starts_with($twinParent, 'https://')) {
+            $inReplyTo = rtrim($twinParent, '/');
+        }
+    }
     $replyPublicId = null;
     $replyAccountId = null;
     $replyParentActor = null;
@@ -3893,6 +3900,7 @@ function ap_masto_status_from_mention(array $row): array
         'created_at' => ap_masto_format_time(isset($row['created_at']) ? (string) $row['created_at'] : null),
         'in_reply_to_id' => $replyPublicId,
         'in_reply_to_account_id' => $replyAccountId,
+        'in_reply_to' => $inReplyTo !== '' ? $inReplyTo : null,
         'sensitive' => $isSensitive,
         'spoiler_text' => $spoilerText,
         'visibility' => 'public',
@@ -4604,7 +4612,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
 
     if (array_intersect($want, $mentionTypes)) {
         $st = ap_db()->prepare(
-            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 250'
+            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 80'
         );
         $st->execute([$ownerUserId]);
         $seenActivityIds = [];
@@ -4638,7 +4646,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
              WHERE type = 'Follow'
                AND action_taken IN ('local_accept_followback', ?)
                AND (target_actor = ? OR target_actor = ?)
-             ORDER BY id DESC LIMIT 100"
+             ORDER BY id DESC LIMIT 40"
         );
         $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
         // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
@@ -9516,6 +9524,35 @@ function ap_masto_bookmarks_list(int $limit = 40, ?string $maxId = null): array
         }
     }
     return $out;
+}
+
+function ap_masto_bookmarks_for_status_ids(array $statusIds, ?int $ownerUserId = null): array
+{
+    $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    $ids = array_values(array_unique(array_filter(array_map(
+        static fn($id): string => trim((string) $id),
+        array_slice($statusIds, 0, 500)
+    ), static fn(string $id): bool => $id !== '')));
+    if ($ownerUserId < 1 || $ids === []) {
+        return [];
+    }
+    try {
+        $marks = implode(',', array_fill(0, count($ids), '?'));
+        $st = ap_db()->prepare(
+            'SELECT * FROM masto_bookmarks WHERE owner_user_id = ? AND status_id IN (' . $marks . ') ORDER BY created_at DESC'
+        );
+        $st->execute(array_merge([$ownerUserId], $ids));
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
+            if ($status !== null) {
+                $out[] = $status;
+            }
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
 }
 
 /**

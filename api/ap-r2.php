@@ -185,7 +185,7 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     if ($uploadErr !== UPLOAD_ERR_OK) {
         $errMsg = match ($uploadErr) {
             UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE
-                => 'File too large for the server (video max 50MB, images 10MB, audio 20MB).',
+                => 'File too large for the server (video max 50MB, images 25MB, audio 20MB).',
             UPLOAD_ERR_PARTIAL => 'Upload was interrupted — try again on Wi‑Fi.',
             UPLOAD_ERR_NO_TMP_DIR, UPLOAD_ERR_CANT_WRITE
                 => 'Server could not store the upload. Try again in a moment.',
@@ -220,7 +220,7 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     $max = 0;
     if (str_starts_with($mime, 'image/') || in_array($mime, ['image/heic', 'image/heif', 'image/heic-sequence'], true)) {
         $kind = 'image';
-        $max = 10 * 1024 * 1024;
+        $max = 25 * 1024 * 1024;
         $allowedImg = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif', 'image/heic-sequence'];
         // Some iPhones send HEIC as application/octet-stream; sniff by extension
         $origName = strtolower((string) ($file['name'] ?? ''));
@@ -240,6 +240,17 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
             $bodyOverride = $converted['body'];
             $mime = 'image/jpeg';
             $size = strlen($bodyOverride);
+        }
+        // Still images → WebP so they fit VAAK/Bluesky size caps. Keep animated GIFs.
+        if ($mime !== 'image/gif' || !ap_media_gif_is_animated($tmp)) {
+            $webp = ap_media_convert_to_webp($tmp);
+            $wlen = is_array($webp) ? strlen($webp['body']) : 0;
+            if ($wlen > 0 && ($wlen < $size || $size > 980 * 1024)) {
+                $tmp = $webp['path'];
+                $bodyOverride = $webp['body'];
+                $mime = 'image/webp';
+                $size = $wlen;
+            }
         }
     } elseif (str_starts_with($mime, 'video/')) {
         $kind = 'video';
@@ -479,6 +490,123 @@ function ap_media_convert_to_jpeg(string $path): ?array
         return null;
     }
     return ['path' => $out, 'body' => $jpeg];
+}
+
+function ap_media_gif_is_animated(string $path): bool
+{
+    $fh = @fopen($path, 'rb');
+    if ($fh === false) {
+        return false;
+    }
+    $chunk = (string) fread($fh, 1024 * 256);
+    fclose($fh);
+    // Netscape application extension, or more than one graphic-control block.
+    if (str_contains($chunk, 'NETSCAPE2.0')) {
+        return true;
+    }
+    return substr_count($chunk, "\x21\xF9\x04") > 1;
+}
+
+/**
+ * Convert a still image to WebP (max edge 2048, aim ≤980KB for Bluesky blobs).
+ *
+ * @return array{path:string,body:string}|null
+ */
+function ap_media_convert_to_webp(string $path): ?array
+{
+    $maxBytes = 980 * 1024;
+    $maxEdge = 2048;
+    $out = tempnam(sys_get_temp_dir(), 'apwebp');
+    if ($out === false) {
+        return null;
+    }
+    @unlink($out);
+    $out .= '.webp';
+    $magick = trim((string) shell_exec('command -v magick'));
+    $convert = $magick !== '' ? 'magick' : trim((string) shell_exec('command -v convert'));
+    $best = null;
+    if ($convert !== '') {
+        foreach ([80, 72, 62, 52] as $q) {
+            $cmd = $convert . ' ' . escapeshellarg($path) . '[0] -auto-orient -resize '
+                . escapeshellarg($maxEdge . 'x' . $maxEdge . '>')
+                . ' -quality ' . (int) $q . ' ' . escapeshellarg($out) . ' 2>/dev/null';
+            exec($cmd, $unused, $code);
+            if ($code !== 0 || !is_file($out)) {
+                continue;
+            }
+            $body = @file_get_contents($out);
+            if (!is_string($body) || $body === '') {
+                @unlink($out);
+                continue;
+            }
+            $best = $body;
+            if (strlen($body) <= $maxBytes) {
+                break;
+            }
+        }
+        if (is_string($best) && $best !== '') {
+            file_put_contents($out, $best);
+            return ['path' => $out, 'body' => $best];
+        }
+        @unlink($out);
+    }
+    if (!function_exists('imagecreatefromstring') || !function_exists('imagewebp')) {
+        return null;
+    }
+    $data = @file_get_contents($path);
+    if (!is_string($data) || $data === '') {
+        return null;
+    }
+    $img = @imagecreatefromstring($data);
+    if ($img === false) {
+        return null;
+    }
+    if (function_exists('imagepalettetotruecolor')) {
+        @imagepalettetotruecolor($img);
+    }
+    if (function_exists('imagealphablending') && function_exists('imagesavealpha')) {
+        @imagealphablending($img, true);
+        @imagesavealpha($img, true);
+    }
+    $w = imagesx($img);
+    $h = imagesy($img);
+    if ($w > $maxEdge || $h > $maxEdge) {
+        $scale = min($maxEdge / max(1, $w), $maxEdge / max(1, $h));
+        $nw = max(1, (int) round($w * $scale));
+        $nh = max(1, (int) round($h * $scale));
+        $resized = imagecreatetruecolor($nw, $nh);
+        if ($resized !== false) {
+            imagealphablending($resized, false);
+            imagesavealpha($resized, true);
+            $transparent = imagecolorallocatealpha($resized, 0, 0, 0, 127);
+            imagefilledrectangle($resized, 0, 0, $nw, $nh, $transparent);
+            imagecopyresampled($resized, $img, 0, 0, 0, 0, $nw, $nh, $w, $h);
+            imagedestroy($img);
+            $img = $resized;
+        }
+    }
+    foreach ([80, 72, 62, 52] as $q) {
+        ob_start();
+        $ok = imagewebp($img, null, $q);
+        $encoded = ob_get_clean();
+        if (!$ok || !is_string($encoded) || $encoded === '') {
+            continue;
+        }
+        $best = $encoded;
+        if (strlen($encoded) <= $maxBytes) {
+            break;
+        }
+    }
+    imagedestroy($img);
+    if (!is_string($best) || $best === '') {
+        return null;
+    }
+    $tmp = tempnam(sys_get_temp_dir(), 'apwebp');
+    if ($tmp === false) {
+        return null;
+    }
+    file_put_contents($tmp, $best);
+    return ['path' => $tmp, 'body' => $best];
 }
 
 function ap_media_by_local_id(int $id): ?array
