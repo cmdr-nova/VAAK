@@ -10491,6 +10491,15 @@ function admin_render_outbox_card(array $n, string $returnView): void
             }
         }
     }
+    // A local quote can carry its attachment list separately from the quote
+    // preview. Keep those attachments inside the quoted card on every surface.
+    if ($quoteHtml !== '' && $mediaHtml !== '') {
+        $quoteClose = strrpos($quoteHtml, '</div>');
+        if ($quoteClose !== false) {
+            $quoteHtml = substr_replace($quoteHtml, $mediaHtml, $quoteClose, 0);
+            $mediaHtml = '';
+        }
+    }
     $bodyPlain = admin_html_to_plain($content);
     $ownSpoiler = '';
     $ownSensitive = false;
