@@ -5289,7 +5289,6 @@ function ap_masto_status_from_event(array $row): ?array
     if ($text !== '' && str_contains($text, '↪ QT')) {
         $qtPos = mb_strpos($text, '↪ QT');
         $commentary = trim(mb_substr($text, 0, $qtPos));
-        $commentary = preg_replace('/(?:^|\n)\s*(?:⬇️|⬇|↓|↘)\s*$/u', '', $commentary) ?? $commentary;
         $quoted = trim(mb_substr($text, $qtPos));
         $qAcct = '';
         $qText = '';

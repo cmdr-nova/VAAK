@@ -8129,8 +8129,6 @@ function admin_quote_summary_parts(string $summary): ?array
         return null;
     }
     $commentary = trim(mb_substr($summary, 0, $marker));
-    // Bridges commonly insert a down-arrow or similar separator before QT.
-    $commentary = preg_replace('/(?:^|\n)\s*(?:⬇️|⬇|↓|↘)\s*$/u', '', $commentary) ?? $commentary;
     return [
         'commentary' => trim($commentary),
         'quoted' => trim(mb_substr($summary, $marker)),
