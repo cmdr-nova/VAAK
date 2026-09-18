@@ -8386,7 +8386,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   if ($quoteParts['quoted'] !== '' && function_exists('ap_masto_content_with_mentions')) {
                       $qMentions = ap_masto_content_with_mentions($quoteParts['quoted'], [])['mentions'] ?? [];
                   }
-                  $bodyChunk .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+                  $bodyChunk .= '<div class="quote-card"><div class="quote-card-source">QUOTED POST</div>';
                   // Fallback text/acct from the already-enriched "↪ QT @acct: text" line
                   // when the remote object is not in local cache (common; no sync HTTP on paint).
                   $qFallbackAcct = '';
@@ -8477,12 +8477,18 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   } else {
                       $bodyChunk .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
                   }
+                  // Quote attachments belong to the quoted card, including
+                  // media carried by the bridge event rather than its nested
+                  // quoted object payload.
+                  if ($eMedia !== []) {
+                      $bodyChunk .= admin_media_row_html($eMedia);
+                  }
                   $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
                       . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
               }
-              $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
+              $mediaChunk = ($quoteParts === null && $eMedia) ? admin_media_row_html($eMedia) : '';
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
             ?>
             <div class="tags">
