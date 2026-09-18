@@ -4409,6 +4409,7 @@ function ap_bsky_quote_preview(array $post): ?array
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
         'display' => $display,
+        'avatar' => (string) ($author['avatar'] ?? ''),
         'text' => $text,
         'url' => $url,
         'media' => $media,

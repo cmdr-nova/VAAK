@@ -9525,7 +9525,9 @@ function admin_render_masto_status_card(
             . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef !== '' ? $actorRef : null) . '</div>';
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
-    if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
+    // Prefer the compact link-preview card when available; rendering both the
+    // structured quote and its preview duplicates the quoted post.
+    if (!is_array($st['card'] ?? null) && is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
         $qst = $quote['quoted_status'];
         $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
         $qacct = (string) ($qst['account']['acct'] ?? '');
@@ -9552,7 +9554,7 @@ function admin_render_masto_status_card(
             $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="' . h(admin_status_href($quri, $returnView)) . '">Open quoted</a></div>';
         }
         $bodyInner .= '</div>';
-    } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
+    } elseif (!is_array($st['card'] ?? null) && is_array($quote) && ($quote['state'] ?? '') === 'pending') {
         // Last-chance Bluesky hydrate for Status cards when masto entity stayed pending.
         $pendingUrl = '';
         if (!empty($st['quote_url']) && is_string($st['quote_url'])) {
@@ -10802,16 +10804,22 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
 
     $quoteHtml = '';
     if (is_array($quote)) {
-        $qlabel = $isQuoteBoost ? 'Quote' : 'Quoted';
         $qAcct = $quote['handle'] !== '' ? '@' . $quote['handle'] : (string) ($quote['display'] ?? '');
-        $quoteHtml = '<div class="quote-block"><span class="qt-label">' . h($qlabel) . '</span>';
-        if ($qAcct !== '') {
-            $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
+        $qDisplay = trim((string) ($quote['display'] ?? ''));
+        $qAvatar = trim((string) ($quote['avatar'] ?? ''));
+        $quoteHtml = '<div class="quote-card quote-card-bsky">'
+            . '<div class="quote-card-source">BLUESKY</div>'
+            . '<div class="quote-card-author">';
+        if ($qAvatar !== '') {
+            $quoteHtml .= '<img class="quote-card-avatar" src="' . h($qAvatar) . '" alt="" width="32" height="32" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
         }
+        $quoteHtml .= '<div><div class="quote-card-name">' . h($qDisplay !== '' ? $qDisplay : ($qAcct !== '' ? ltrim($qAcct, '@') : 'Bluesky user')) . '</div>'
+            . ($qAcct !== '' ? '<div class="quote-card-handle">' . h($qAcct) . '</div>' : '')
+            . '</div></div>';
         $qText = trim((string) ($quote['text'] ?? ''));
         if ($qText !== '') {
             $qTextLink = preg_replace('#(?<![\w./:@])(www\.[^\s<]+)#iu', 'https://$1', $qText) ?? $qText;
-            $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
+            $quoteHtml .= '<div class="quote-card-body">'
                 . admin_linkify_body_html(mb_substr($qTextLink, 0, 400), 'bluesky')
                 . '</div>';
         }
@@ -10820,7 +10828,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         }
         $qUrl = (string) ($quote['url'] ?? '');
         if ($qUrl !== '' && $qUrl !== 'https://bsky.app/') {
-            $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="'
+            $quoteHtml .= '<div class="quote-card-open"><a href="'
                 . h($qUrl) . '" target="_blank" rel="noopener noreferrer">Open quoted</a></div>';
         }
         $quoteHtml .= '</div>';
@@ -10867,32 +10875,6 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     }
     // Home: linkify as home so mentions/hashtags stay in-app like federated cards.
     $bodyHtml = $textForLink !== '' ? admin_linkify_body_html($textForLink, $linkView) : '';
-    if ($quote !== null && is_array($quote) && $quoteHtml !== '') {
-        // Re-linkify quote body with home context when mixed into Home.
-        if ($isHome && ($quote['text'] ?? '') !== '') {
-            $qlabel = $isQuoteBoost ? 'Quote' : 'Quoted';
-            $qAcct = $quote['handle'] !== '' ? '@' . $quote['handle'] : (string) ($quote['display'] ?? '');
-            $quoteHtml = '<div class="quote-block"><span class="qt-label">' . h($qlabel) . '</span>';
-            if ($qAcct !== '') {
-                $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
-            }
-            $qTextHome = trim((string) ($quote['text'] ?? ''));
-            if ($qTextHome !== '') {
-                $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
-                    . admin_linkify_body_html(mb_substr($qTextHome, 0, 400), $linkView)
-                    . '</div>';
-            }
-            if (!empty($quote['media']) && is_array($quote['media'])) {
-                $quoteHtml .= admin_quote_media_html($quote['media']);
-            }
-            $qUrl = (string) ($quote['url'] ?? '');
-            if ($qUrl !== '' && $qUrl !== 'https://bsky.app/') {
-                $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="'
-                    . h($qUrl) . '" target="_blank" rel="noopener noreferrer">Open quoted</a></div>';
-            }
-            $quoteHtml .= '</div>';
-        }
-    }
     ?>
     <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>">
       <?php if ($reasonLabel !== ''): ?>
@@ -14185,6 +14167,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet-bsky .quote-block { white-space: normal; }
     .tweet-bsky-home .quote-block { margin-top: .45rem; }
     .quote-block .qt-label { color: var(--primary); font-size: .75rem; letter-spacing: .04em; }
+    .quote-card {
+      margin: .55rem 0 0; padding: .65rem .75rem; border: 1px solid var(--border);
+      border-radius: 12px; background: var(--panel-2); color: var(--text);
+      overflow-wrap: anywhere; word-break: break-word;
+    }
+    .quote-card-source { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
+    .quote-card-author { display: flex; align-items: center; gap: .55rem; margin-top: .35rem; }
+    .quote-card-avatar { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; flex: 0 0 auto; }
+    .quote-card-name { font-weight: 700; line-height: 1.15; }
+    .quote-card-handle { color: var(--muted); font-size: .88em; line-height: 1.2; }
+    .quote-card-body { margin-top: .55rem; color: var(--muted); white-space: pre-wrap; }
+    .quote-card-body a { color: var(--primary); }
+    .quote-card-open { margin-top: .45rem; font-size: .82em; }
+    .quote-card-open a { color: var(--muted); }
     .notification-post {
       margin-top: .55rem;
       color: var(--text);
