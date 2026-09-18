@@ -9531,8 +9531,9 @@ function admin_render_masto_status_card(
         $qst = $quote['quoted_status'];
         $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
         $qacct = (string) ($qst['account']['acct'] ?? '');
+        $qdisplay = trim((string) ($qst['account']['display_name'] ?? ''));
+        $qavatar = trim((string) ($qst['account']['avatar'] ?? $qst['account']['avatar_static'] ?? ''));
         $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
-        $qlabel = $qacct !== '' ? '@' . $qacct : 'Quoted';
         $qMentions = [];
         if (!empty($qst['mentions']) && is_array($qst['mentions'])) {
             foreach ($qst['mentions'] as $qm) {
@@ -9541,9 +9542,15 @@ function admin_render_masto_status_card(
                 }
             }
         }
-        $bodyInner .= '<div class="quote-block"><span class="qt-label">' . h($qlabel) . '</span>';
+        $bodyInner .= '<div class="quote-card"><div class="quote-card-source">QUOTED POST</div><div class="quote-card-author">';
+        if ($qavatar !== '') {
+            $bodyInner .= '<img class="quote-card-avatar" src="' . h($qavatar) . '" alt="" width="32" height="32" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+        }
+        $bodyInner .= '<div><div class="quote-card-name">' . h($qdisplay !== '' ? $qdisplay : ($qacct !== '' ? $qacct : 'Quoted post')) . '</div>'
+            . ($qacct !== '' ? '<div class="quote-card-handle">@' . h($qacct) . '</div>' : '')
+            . '</div></div>';
         if ($qplain !== '') {
-            $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
+            $bodyInner .= '<div class="quote-card-body">'
                 . admin_linkify_body_html(mb_substr($qplain, 0, 400), $returnView, $qMentions) . '</div>';
         }
         $qMediaItems = admin_quote_media_items_from_status_like($qst['media_attachments'] ?? []);
@@ -9551,7 +9558,7 @@ function admin_render_masto_status_card(
             $bodyInner .= admin_quote_media_html($qMediaItems);
         }
         if ($quri !== '') {
-            $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="' . h(admin_status_href($quri, $returnView)) . '">Open quoted</a></div>';
+            $bodyInner .= '<div class="quote-card-open"><a href="' . h(admin_status_href($quri, $returnView)) . '">Open quoted</a></div>';
         }
         $bodyInner .= '</div>';
     } elseif (!is_array($st['card'] ?? null) && is_array($quote) && ($quote['state'] ?? '') === 'pending') {
