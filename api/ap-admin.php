@@ -9606,6 +9606,17 @@ function admin_render_masto_status_card(
             $bodyInner .= '<div class="quote-block meta">Quoted post (not cached yet)</div>';
         }
     }
+    // Bridged quote events often store the quoted attachment on the outer
+    // status while the nested quote object only contains text. Keep that
+    // attachment inside the quote card on focused/status surfaces too.
+    if ($media !== [] && $quote !== null && str_contains($bodyInner, 'quote-card')) {
+        $quoteMediaHtml = admin_media_row_html($media);
+        $quoteClose = strrpos($bodyInner, '</div>');
+        if ($quoteClose !== false) {
+            $bodyInner = substr_replace($bodyInner, $quoteMediaHtml, $quoteClose, 0);
+            $media = [];
+        }
+    }
     if ($media) {
         $bodyInner .= admin_media_row_html($media);
     }
