@@ -5282,6 +5282,52 @@ function ap_masto_status_from_event(array $row): ?array
             $text = ap_masto_clean_mention_text($text);
         }
     }
+    // Bridged quote summaries are sometimes cached as plain text on an event.
+    // Promote the QT portion into the Mastodon quote object so renderers do not
+    // show the quoted text once as body content and again as a quote card.
+    $eventQuote = null;
+    if ($text !== '' && str_contains($text, '↪ QT')) {
+        $qtPos = mb_strpos($text, '↪ QT');
+        $commentary = trim(mb_substr($text, 0, $qtPos));
+        $commentary = preg_replace('/(?:^|\n)\s*(?:⬇️|⬇|↓|↘)\s*$/u', '', $commentary) ?? $commentary;
+        $quoted = trim(mb_substr($text, $qtPos));
+        $qAcct = '';
+        $qText = '';
+        if (preg_match('/^↪ QT(?:\s+@([^:]+))?\s*:\s*(.*)$/us', $quoted, $qm)) {
+            $qAcct = trim((string) ($qm[1] ?? ''));
+            $qText = trim((string) ($qm[2] ?? ''));
+        }
+        $qUrl = '';
+        if (preg_match('#https://[^\s<>]+#u', $commentary, $um)) {
+            $qUrl = rtrim((string) $um[0], '.,);]');
+        } elseif (preg_match('#https://[^\s<>]+#u', $quoted, $um)) {
+            $qUrl = rtrim((string) $um[0], '.,);]');
+        }
+        $qAcctLabel = $qAcct !== '' ? $qAcct : 'Quoted post';
+        $qAccount = [
+            'id' => 'quote-' . substr(hash('sha256', $qAcctLabel . '|' . $qUrl), 0, 16),
+            'username' => ltrim($qAcctLabel, '@'),
+            'acct' => ltrim($qAcctLabel, '@'),
+            'display_name' => ltrim($qAcctLabel, '@'),
+            'url' => $qUrl !== '' ? $qUrl : null,
+            'uri' => $qUrl !== '' ? $qUrl : null,
+        ];
+        $eventQuote = [
+            'state' => 'accepted',
+            'quoted_url' => $qUrl,
+            'quoted_status' => [
+                'id' => 'quote-' . substr(hash('sha256', $qUrl !== '' ? $qUrl : $quoted), 0, 16),
+                'uri' => $qUrl !== '' ? $qUrl : null,
+                'url' => $qUrl !== '' ? $qUrl : null,
+                'account' => $qAccount,
+                'content' => $qText !== '' && $qText !== '(quoted post unavailable)'
+                    ? (function_exists('ap_plain_text_to_html') ? ap_plain_text_to_html($qText) : '<p>' . htmlspecialchars($qText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>')
+                    : '',
+                'media_attachments' => [],
+            ],
+        ];
+        $text = $commentary;
+    }
     $objectId = (string) ($row['object_id'] ?? '');
     $url = $objectId !== '' ? $objectId : $actorId;
     // Human "Open remote" / status.url — Bridgy convert/ap URLs are AP JSON, not a webpage
@@ -5473,9 +5519,8 @@ function ap_masto_status_from_event(array $row): ?array
         'emojis' => [],
         'card' => ap_masto_remote_link_card((string) ($row['summary'] ?? ''), count($media) > 0),
         'poll' => null,
-        // Explicit null prevents clients from carrying a stale native quote
-        // card across status updates when this remote post has no quote.
-        'quote' => null,
+        'quote' => $eventQuote,
+        'quote_url' => is_array($eventQuote) ? (string) ($eventQuote['quoted_url'] ?? '') : '',
         'quote_approval' => [
             'automatic' => ['public'],
             'manual' => [],
