@@ -10007,16 +10007,16 @@ function admin_render_remote_boost_card(
                   } elseif (preg_match('#https://[^\s<>]+#u', $boostQuoted, $qUrlMatch)) {
                       $qUrl = rtrim((string) $qUrlMatch[0], '.,);]');
                   }
-                  $boostInner .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+                  $boostInner .= '<div class="quote-card"><div class="quote-card-source">QUOTED POST</div>';
                   if ($qAcct !== '') {
-                      $boostInner .= '<div class="meta" style="margin-top:.3rem">@' . h($qAcct) . '</div>';
+                      $boostInner .= '<div class="quote-card-author"><div><div class="quote-card-name">' . h(ltrim($qAcct, '@')) . '</div><div class="quote-card-handle">@' . h(ltrim($qAcct, '@')) . '</div></div></div>';
                   }
                   if ($qText !== '' && $qText !== '(quoted post unavailable)') {
-                      $boostInner .= '<div style="margin-top:.25rem">'
+                      $boostInner .= '<div class="quote-card-body">'
                           . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView) . '</div>';
                   }
                   if ($qUrl !== '') {
-                      $boostInner .= '<div class="meta" style="margin-top:.3rem"><a href="'
+                      $boostInner .= '<div class="quote-card-open"><a href="'
                           . h(admin_status_href($qUrl, $returnView)) . '">Open quoted</a></div>';
                   }
                   $boostInner .= '</div>';
