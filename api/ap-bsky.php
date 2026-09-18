@@ -9166,22 +9166,8 @@ function ap_bsky_subject_post_preview_text(string $subjectAtOrUrl, int $ownerUse
                 return $txt;
             }
         }
-        // Cold cache: one public AppView fetch.
-        if (function_exists('ap_bsky_post_preview_from_url')) {
-            $prev = ap_bsky_post_preview_from_url(
-                function_exists('ap_bsky_https_url_from_at_uri')
-                    ? ap_bsky_https_url_from_at_uri($at, null)
-                    : $subjectAtOrUrl,
-                $ownerUserId,
-                true
-            );
-            if (is_array($prev)) {
-                $txt = trim((string) ($prev['text'] ?? ''));
-                if ($txt !== '') {
-                    return $txt;
-                }
-            }
-        }
+        // Intentionally no sync AppView fetch here — notification list paint
+        // must stay local/cache-only (Ice Cubes polls this path often).
     }
     return '';
 }

@@ -4722,17 +4722,24 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     });
 
     $out = [];
+    // Items are newest-first (sort desc). Ice Cubes polls with since_id near the tip;
+    // once we hit the watermark, older rows cannot be "newer" — stop instead of
+    // hydrating the whole backlog (was ~4–11s for /api/v2/notifications).
+    $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
+    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
     foreach ($items as $item) {
         $ent = ap_masto_notification_entity($item);
         if ($ent === null) {
             continue;
         }
-        // Generic max_id / since_id on notification id string
-        if ($maxId !== null && $maxId !== '' && (int) $ent['id'] >= (int) $maxId) {
+        $entId = (int) ($ent['id'] ?? 0);
+        // max_id: skip newer-or-equal, keep scanning older
+        if ($maxIdInt > 0 && $entId >= $maxIdInt) {
             continue;
         }
-        if ($sinceId !== null && $sinceId !== '' && (int) $ent['id'] <= (int) $sinceId) {
-            continue;
+        // since_id: only newer than watermark; then stop (newest-first)
+        if ($sinceIdInt > 0 && $entId <= $sinceIdInt) {
+            break;
         }
         $out[] = $ent;
         if (count($out) >= $limit) {
