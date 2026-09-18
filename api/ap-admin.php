@@ -8120,6 +8120,23 @@ function admin_event_is_empty_private_stub(array $e): bool
     return true;
 }
 
+/** Split federated quote summaries even when a bridge inserts a marker line. */
+function admin_quote_summary_parts(string $summary): ?array
+{
+    $summary = trim($summary);
+    $marker = mb_strpos($summary, '↪ QT');
+    if ($marker === false) {
+        return null;
+    }
+    $commentary = trim(mb_substr($summary, 0, $marker));
+    // Bridges commonly insert a down-arrow or similar separator before QT.
+    $commentary = preg_replace('/(?:^|\n)\s*(?:⬇️|⬇|↓|↘)\s*$/u', '', $commentary) ?? $commentary;
+    return [
+        'commentary' => trim($commentary),
+        'quoted' => trim(mb_substr($summary, $marker)),
+    ];
+}
+
 function admin_render_event_tweet(array $e, array $followingIds, string $returnView, bool $fromFollowedTag = false): void
 {
     // Hide empty followers-only firehose stubs (no body to show).
@@ -8179,14 +8196,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     $quotedStatusUrl = '';
     $quotedBsky = null;
     if ($summaryRaw !== '' && str_contains($summaryRaw, '↪ QT')) {
-        $chunks = preg_split('/\n\n↪ QT/u', $summaryRaw, 2);
-        if (!is_array($chunks) || count($chunks) !== 2) {
-            // Tolerate single newline between commentary and QT marker
-            $chunks = preg_split('/\n↪ QT/u', $summaryRaw, 2);
-        }
-        if (is_array($chunks) && count($chunks) === 2) {
-            $commentary = trim($chunks[0]);
-            $quoted = trim('↪ QT' . $chunks[1]);
+        $parts = admin_quote_summary_parts($summaryRaw);
+        if (is_array($parts)) {
+            $commentary = (string) ($parts['commentary'] ?? '');
+            $quoted = (string) ($parts['quoted'] ?? '');
             if ($summaryIsAs2Dump($quoted) || preg_match('/^↪ QT(Create|Announce|Update|Note|QuotePost)\b/u', $quoted)) {
                 $quoted = '↪ QT: (quoted post unavailable)';
             }
@@ -9904,6 +9917,7 @@ function admin_render_remote_boost_card(
     if ($summaryRaw !== '' && function_exists('ap_masto_clean_mention_text')) {
         $summaryRaw = ap_masto_clean_mention_text($summaryRaw);
     }
+    $boostQuoteParts = admin_quote_summary_parts($summaryRaw);
     $mediaRow = is_array($innerEvent) ? ($innerEvent['media_urls'] ?? null) : ($e['media_urls'] ?? null);
     $mediaUrls = mention_media_urls($mediaRow);
     $summaryRaw = admin_media_placeholder_summary($summaryRaw, $mediaUrls);
@@ -9966,8 +9980,40 @@ function admin_render_remote_boost_card(
               </div>
             </div>
             <?php
-              $boostInner = '';
-              if ($summaryRaw !== '') {
+            $boostInner = '';
+              if (is_array($boostQuoteParts)) {
+                  $boostCommentary = trim((string) ($boostQuoteParts['commentary'] ?? ''));
+                  $boostQuoted = trim((string) ($boostQuoteParts['quoted'] ?? ''));
+                  if ($boostCommentary !== '') {
+                      $boostInner .= '<div class="body feed-body">'
+                          . admin_linkify_body_html($boostCommentary, $returnView) . '</div>';
+                  }
+                  $qAcct = '';
+                  $qText = '';
+                  if (preg_match('/^↪ QT(?:\s+@([^:]+))?\s*:\s*(.*)$/us', $boostQuoted, $qMatch)) {
+                      $qAcct = trim((string) ($qMatch[1] ?? ''));
+                      $qText = trim((string) ($qMatch[2] ?? ''));
+                  }
+                  $qUrl = '';
+                  if (preg_match('#https://[^\s<>]+#u', $boostCommentary, $qUrlMatch)) {
+                      $qUrl = rtrim((string) $qUrlMatch[0], '.,);]');
+                  } elseif (preg_match('#https://[^\s<>]+#u', $boostQuoted, $qUrlMatch)) {
+                      $qUrl = rtrim((string) $qUrlMatch[0], '.,);]');
+                  }
+                  $boostInner .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+                  if ($qAcct !== '') {
+                      $boostInner .= '<div class="meta" style="margin-top:.3rem">@' . h($qAcct) . '</div>';
+                  }
+                  if ($qText !== '' && $qText !== '(quoted post unavailable)') {
+                      $boostInner .= '<div style="margin-top:.25rem">'
+                          . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView) . '</div>';
+                  }
+                  if ($qUrl !== '') {
+                      $boostInner .= '<div class="meta" style="margin-top:.3rem"><a href="'
+                          . h(admin_status_href($qUrl, $returnView)) . '">Open quoted</a></div>';
+                  }
+                  $boostInner .= '</div>';
+              } elseif ($summaryRaw !== '') {
                   $boostMentions = [];
                   if (function_exists('ap_masto_content_with_mentions')) {
                       $boostMentions = ap_masto_content_with_mentions(
