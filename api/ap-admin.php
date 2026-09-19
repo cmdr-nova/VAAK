@@ -22827,7 +22827,11 @@ window.apAdminToast = function (msg, isErr) {
       sentinel.textContent = current.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Bluesky favourites';
       if (current.dataset.hasMore === '1' && !sentinel.dataset.observed) {
         sentinel.dataset.observed = '1';
-        new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) load(false); }, { rootMargin: '180px' }).observe(sentinel);
+        const feed = document.querySelector('.feed');
+        const feedStyle = feed ? window.getComputedStyle(feed) : null;
+        const observerRoot = feed && feedStyle && ['auto', 'scroll'].includes(feedStyle.overflowY)
+          ? feed : null;
+        new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) load(false); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
       }
     } catch (e) {
       if (replace) current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
