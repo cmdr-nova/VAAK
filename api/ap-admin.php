@@ -10846,8 +10846,10 @@ function admin_render_favourite_status_card(array $st): void
     echo '<div class="tweet-hd-main"><div><span class="who">' . h($acct) . '</span><span class="meta"> · ' . h((string) ($st['created_at'] ?? '')) . '</span></div></div></div>';
     $favPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
     $favMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
-    echo admin_cw_gate_html((string) ($st['spoiler_text'] ?? ''), !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '', $favPlain !== ''
-        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>' : '');
+    $favMedia = is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [];
+    $favBody = $favPlain !== '' ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>' : '';
+    $favMediaHtml = $favMedia !== [] ? admin_media_row_html($favMedia) : '';
+    echo admin_cw_gate_html((string) ($st['spoiler_text'] ?? ''), !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '', $favBody . $favMediaHtml);
     echo '<div class="tweet-actions">';
     if ($oid !== '') {
         echo '<a class="btn btn-ghost" href="' . h(admin_status_href($oid, 'favourites')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a>';
