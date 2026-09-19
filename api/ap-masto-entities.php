@@ -9456,6 +9456,16 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
         $st->execute([$eventId]);
         $erow = $st->fetch();
         if (is_array($erow)) {
+            // Favourite rows can point at the interaction event itself. That
+            // event is intentionally body-less; resolve its object back to
+            // the cached Create/Update publication before rendering.
+            $eventType = (string) ($erow['type'] ?? '');
+            if (!in_array($eventType, ['Create', 'Update'], true) && !empty($erow['object_id'])) {
+                $preferred = ap_event_by_object_id((string) $erow['object_id']);
+                if (is_array($preferred) && in_array((string) ($preferred['type'] ?? ''), ['Create', 'Update'], true)) {
+                    $erow = $preferred;
+                }
+            }
             $status = ap_masto_status_from_event($erow);
             if ($status) {
                 $objectId = (string) ($erow['object_id'] ?? '');
