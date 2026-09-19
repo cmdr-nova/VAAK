@@ -14398,6 +14398,32 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .profile-preview .ph {
       width: 64px; height: 64px; border-radius: 50%; background: #222; border: 2px solid var(--border);
     }
+    .vaak-spinner {
+      display: inline-block; width: 1rem; height: 1rem; flex: 0 0 auto;
+      border: 2px solid currentColor; border-right-color: transparent;
+      border-radius: 50%; animation: vaak-spinner-spin .72s linear infinite;
+      vertical-align: -.15em;
+    }
+    @keyframes vaak-spinner-spin { to { transform: rotate(360deg); } }
+    .vaak-loading-indicator {
+      position: fixed; top: .75rem; left: 50%; z-index: 10080;
+      display: inline-flex; align-items: center; gap: .5rem;
+      padding: .45rem .75rem; border: 1px solid var(--border);
+      border-radius: 999px; background: color-mix(in srgb, var(--panel) 92%, transparent);
+      color: var(--primary); box-shadow: 0 8px 24px rgba(0,0,0,.28);
+      opacity: 0; visibility: hidden; pointer-events: none;
+      transform: translate(-50%, -.4rem); transition: opacity .16s ease, transform .16s ease, visibility 0s linear .16s;
+      font-size: .82rem; font-weight: 600;
+    }
+    .vaak-loading-indicator.is-visible {
+      opacity: 1; visibility: visible; transform: translate(-50%, 0);
+      transition: opacity .16s ease, transform .16s ease, visibility 0s;
+    }
+    .timeline-status-loading { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
+    @media (prefers-reduced-motion: reduce) {
+      .vaak-spinner { animation-duration: 1.4s; }
+      .vaak-loading-indicator { transition: none; }
+    }
     .brand-profile-link {
       display: inline-block;
       margin-top: .45rem;
@@ -14408,6 +14434,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   </style>
 </head>
 <body>
+<div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
+  <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
+</div>
 <div class="mobile-nav-backdrop" id="mobile-nav-backdrop" hidden></div>
 <header class="mobile-topbar" id="mobile-topbar">
   <button type="button" class="mobile-topbar__menu" id="mobile-menu-btn" aria-label="Open menu" aria-controls="admin-rail-left" aria-expanded="false">☰</button>
@@ -21885,6 +21914,12 @@ window.apAdminToast = function (msg, isErr) {
   let items = document.getElementById('timeline-items');
   let sentinel = document.getElementById('timeline-sentinel');
   let status = document.getElementById('timeline-status');
+  function setTimelineLoading(active, announce) {
+    if (items) items.setAttribute('aria-busy', active ? 'true' : 'false');
+    if (status && active) {
+      status.innerHTML = '<span class="timeline-status-loading"><span class="vaak-spinner" aria-hidden="true"></span><span>' + (announce || 'Loading…') + '</span></span>';
+    }
+  }
   const topBtn = document.getElementById('feed-top-btn');
   const newBtn = document.getElementById('feed-new-btn');
   const feedRoot = document.querySelector('.feed');
@@ -22205,7 +22240,7 @@ window.apAdminToast = function (msg, isErr) {
     skeleton.setAttribute('aria-hidden', 'true');
     skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
     if (status && status.parentNode) status.parentNode.insertBefore(skeleton, status);
-    if (status) status.textContent = 'Loading…';
+    setTimelineLoading(true, 'Loading…');
     try {
       // A page may render no HTML when every row was filtered or deduplicated.
       // Keep the pagination cursor independent from rendered card count (as
@@ -22306,6 +22341,7 @@ window.apAdminToast = function (msg, isErr) {
       hasMore = false;
     } finally {
       if (skeleton && skeleton.parentNode) skeleton.remove();
+      setTimelineLoading(false);
       loading = false;
       if (stickToTop) {
         sc.setTop(0, false);
@@ -22655,7 +22691,8 @@ window.apAdminToast = function (msg, isErr) {
     }
     if (nextView === viewName && !push) return;
     tabSwapBusy = true;
-    if (status) status.textContent = 'Loading…';
+    setTimelineLoading(true, 'Loading timeline…');
+    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading timeline…');
     items.classList.add('timeline-swapping');
     try {
       let tabData = timelineTabPrefetch.get(nextView);
@@ -22750,6 +22787,8 @@ window.apAdminToast = function (msg, isErr) {
       return;
     } finally {
       items.classList.remove('timeline-swapping');
+      setTimelineLoading(false);
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       tabSwapBusy = false;
       loading = false;
     }
@@ -25206,6 +25245,45 @@ if (VIEW === 'analytics') loadAnalytics();
   });
   window.addEventListener('scroll', () => { if (!card.hidden) position(); }, true);
   window.addEventListener('resize', () => { if (!card.hidden) position(); });
+})();
+</script>
+<script>
+// Shared navigation feedback for full-page loads and form submissions.
+(function () {
+  const indicator = document.getElementById('vaak-loading-indicator');
+  if (!indicator) return;
+  const label = indicator.querySelector('[data-vaak-loading-label]');
+  let hideTimer = 0;
+  window.vaakShowLoading = function (text) {
+    if (hideTimer) window.clearTimeout(hideTimer);
+    if (label) label.textContent = text || 'Loading…';
+    indicator.classList.add('is-visible');
+    indicator.setAttribute('aria-hidden', 'false');
+  };
+  window.vaakHideLoading = function () {
+    indicator.classList.remove('is-visible');
+    indicator.setAttribute('aria-hidden', 'true');
+  };
+  document.addEventListener('click', function (ev) {
+    if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    const link = ev.target.closest && ev.target.closest('a[href]');
+    if (!link || link.target === '_blank' || link.hasAttribute('download')) return;
+    const href = link.getAttribute('href') || '';
+    if (!href || href[0] === '#' || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
+    let destination;
+    try { destination = new URL(href, window.location.href); } catch (e) { return; }
+    if (destination.origin !== window.location.origin) return;
+    window.setTimeout(() => {
+      if (!ev.defaultPrevented) window.vaakShowLoading('Loading…');
+    }, 0);
+  }, true);
+  document.addEventListener('submit', function (ev) {
+    if (ev.defaultPrevented) return;
+    window.setTimeout(() => {
+      if (!ev.defaultPrevented) window.vaakShowLoading('Saving…');
+    }, 0);
+  }, true);
+  window.addEventListener('pageshow', window.vaakHideLoading);
 })();
 </script>
 </body>
