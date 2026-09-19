@@ -11786,6 +11786,12 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     }
     $adminTlPerfT0 = microtime(true);
     $adminTlPerfHydrateMs = 0.0;
+    // Infinite-scroll pages must never wait on remote quote previews. The
+    // first page may use a tiny preview budget, but older pages render from
+    // VAAK's cache and let the background warmers fill missing Bluesky data.
+    if ($tlOffset > 0) {
+        $GLOBALS['admin_bsky_quote_fetch_budget'] = 0;
+    }
     if ($adminTlFromCache && is_array($adminTlRankedCached)) {
         $totalRanked = count($adminTlRankedCached);
         // Past the cached head → re-query older remotes by created_at cursor and append.
