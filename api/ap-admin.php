@@ -9589,21 +9589,26 @@ function admin_render_masto_status_card(
             if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($qOpen, 'https://bsky.app/')) {
                 $qOpen = ap_bsky_normalize_web_url($qOpen);
             }
-            $bodyInner .= '<div class="quote-block"><span class="qt-label">' . h($qAcct) . '</span>';
+            $qDomain = $qOpen !== '' ? (string) (parse_url($qOpen, PHP_URL_HOST) ?: '') : '';
+            $bodyInner .= '<div class="quote-card"><div class="quote-card-source">'
+                . h($qDomain !== '' ? $qDomain : 'QUOTED POST') . '</div>';
+            $bodyInner .= '<div class="quote-card-author"><div><div class="quote-card-name">'
+                . h(ltrim($qAcct, '@')) . '</div><div class="quote-card-handle">'
+                . h($qAcct) . '</div></div></div>';
             if ($qText !== '') {
-                $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
+                $bodyInner .= '<div class="quote-card-body">'
                     . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView) . '</div>';
             }
             if (!empty($bskyPending['media']) && is_array($bskyPending['media'])) {
                 $bodyInner .= admin_quote_media_html($bskyPending['media']);
             }
             if ($qOpen !== '' && $qOpen !== 'https://bsky.app/') {
-                $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="'
+                $bodyInner .= '<div class="quote-card-open"><a href="'
                     . h($qOpen) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
             }
             $bodyInner .= '</div>';
         } else {
-            $bodyInner .= '<div class="quote-block meta">Quoted post (not cached yet)</div>';
+            $bodyInner .= '<div class="quote-card"><div class="quote-card-source">QUOTED POST</div><div class="quote-card-body">Quoted post (not cached yet)</div></div>';
         }
     }
     // Bridged quote events often store the quoted attachment on the outer
