@@ -4923,7 +4923,7 @@ function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 /** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
 function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
 {
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists', 'starter_packs'], true)
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs'], true)
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
@@ -4945,6 +4945,81 @@ function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, b
         error_log('[ap-bsky] collection refresh enqueue failed');
         return false;
     }
+}
+
+/** Durable cache for the account's Bluesky likes (the Bluesky equivalent of Favourites). */
+function ap_bsky_favourite_cache_migrate(?PDO $db = null): bool
+{
+    static $ready = [];
+    $db ??= ap_db(); $key = spl_object_id($db);
+    if (isset($ready[$key])) return $ready[$key];
+    try {
+        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
+            $q = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_favourite_cache','bsky_favourite_sync_state')");
+            $tables = array_fill_keys(array_map('strval', $q->fetchAll(PDO::FETCH_COLUMN)), true);
+            return $ready[$key] = isset($tables['bsky_favourite_cache'], $tables['bsky_favourite_sync_state']);
+        }
+        $db->exec('CREATE TABLE IF NOT EXISTS bsky_favourite_cache (owner_user_id INTEGER NOT NULL, favourite_uri TEXT NOT NULL, favourited_at TEXT NOT NULL, post_json TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (owner_user_id, favourite_uri))');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_favourite_cache_owner_time ON bsky_favourite_cache (owner_user_id, favourited_at DESC)');
+        $db->exec('CREATE TABLE IF NOT EXISTS bsky_favourite_sync_state (owner_user_id INTEGER PRIMARY KEY, checked_at TEXT, updated_at TEXT NOT NULL)');
+        return $ready[$key] = true;
+    } catch (Throwable $e) { error_log('[ap-bsky] favourite cache schema unavailable'); return $ready[$key] = false; }
+}
+
+function ap_bsky_favourite_cache_read(int $ownerUserId, int $limit = 80): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return [];
+    try {
+        $st = ap_db()->prepare('SELECT post_json, favourited_at FROM bsky_favourite_cache WHERE owner_user_id = ? ORDER BY favourited_at DESC, favourite_uri DESC LIMIT ?');
+        $st->execute([$ownerUserId, max(1, min(200, $limit))]); $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) { $item = json_decode((string) ($row['post_json'] ?? ''), true); if (is_array($item) && is_array($item['post'] ?? null)) { $item['_vaak_favourited_at'] = (string) ($row['favourited_at'] ?? ''); $out[] = $item; } }
+        return $out;
+    } catch (Throwable $e) { return []; }
+}
+
+function ap_bsky_favourite_cache_clear(int $ownerUserId, ?string $removeUri = null): void
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return;
+    try {
+        if (is_string($removeUri) && str_starts_with($removeUri, 'at://')) ap_db()->prepare('DELETE FROM bsky_favourite_cache WHERE owner_user_id = ? AND favourite_uri = ?')->execute([$ownerUserId, $removeUri]);
+        ap_db()->prepare('INSERT INTO bsky_favourite_sync_state (owner_user_id, checked_at, updated_at) VALUES (?, ?, ?) ON CONFLICT (owner_user_id) DO UPDATE SET checked_at = excluded.checked_at, updated_at = excluded.updated_at')->execute([$ownerUserId, '1970-01-01T00:00:00+00:00', gmdate('c')]);
+        ap_bsky_background_sync_enqueue($ownerUserId, 'favourites', true);
+    } catch (Throwable $e) { error_log('[ap-bsky] favourite cache invalidation failed'); }
+}
+
+function ap_bsky_get_favourites(int $ownerUserId, int $limit = 80, bool $refresh = false): array
+{
+    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled()) || ap_bsky_session_row($ownerUserId) === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
+    if (!ap_bsky_favourite_cache_migrate()) return ['ok' => false, 'error' => 'Bluesky favourite cache is not provisioned'];
+    if ($refresh) return ap_bsky_favourites_refresh_worker($ownerUserId, $limit);
+    $cached = ap_bsky_favourite_cache_read($ownerUserId, $limit); $checked = 0;
+    try { $st = ap_db()->prepare('SELECT checked_at FROM bsky_favourite_sync_state WHERE owner_user_id = ?'); $st->execute([$ownerUserId]); $checked = strtotime((string) ($st->fetchColumn() ?: '')) ?: 0; } catch (Throwable $e) {}
+    $stale = $checked < time() - 300; if ($stale) ap_bsky_background_sync_enqueue($ownerUserId, 'favourites');
+    return ['ok' => true, 'favourites' => $cached, 'cached' => true, 'refreshing' => $stale];
+}
+
+function ap_bsky_favourites_refresh_worker(int $ownerUserId, int $limit = 200): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return ['ok' => false, 'error' => 'Favourite cache unavailable'];
+    $session = ap_bsky_session_row($ownerUserId); $token = ap_bsky_access_token($ownerUserId, false); if (empty($token['ok'])) $token = ap_bsky_access_token($ownerUserId, true);
+    if ($session === null || empty($token['ok'])) return ['ok' => false, 'error' => 'Bluesky session unavailable'];
+    $did = (string) ($session['did'] ?? ''); $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'); $access = (string) $token['access'];
+    $res = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', ['repo' => $did, 'collection' => 'app.bsky.feed.like', 'limit' => max(1, min(100, $limit)), 'reverse' => 'true'], null, $access, 15);
+    if (empty($res['ok']) || !is_array($res['json'] ?? null)) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky likes')];
+    $rows = is_array($res['json']['records'] ?? null) ? $res['json']['records'] : []; $items = [];
+    foreach ($rows as $row) {
+        $v = is_array($row['value'] ?? null) ? $row['value'] : []; $subject = is_array($v['subject'] ?? null) ? $v['subject'] : []; $uri = trim((string) ($subject['uri'] ?? '')); if (!str_starts_with($uri, 'at://')) continue;
+        $postRes = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', ['uris' => $uri], null, null, 8); $post = is_array($postRes['json']['posts'][0] ?? null) ? $postRes['json']['posts'][0] : null; if ($post === null) continue;
+        $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : []; $post['viewer']['like'] = (string) ($row['uri'] ?? '');
+        $items[] = [$uri, trim((string) ($v['createdAt'] ?? $row['value']['createdAt'] ?? gmdate('c'))) ?: gmdate('c'), json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)];
+    }
+    try {
+        $db = ap_db(); $db->beginTransaction(); $up = $db->prepare('INSERT INTO bsky_favourite_cache (owner_user_id, favourite_uri, favourited_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, favourite_uri) DO UPDATE SET favourited_at = excluded.favourited_at, post_json = excluded.post_json, updated_at = excluded.updated_at');
+        foreach ($items as $item) if (is_string($item[2])) $up->execute([$ownerUserId, $item[0], $item[1], $item[2], gmdate('c')]);
+        $db->prepare('DELETE FROM bsky_favourite_cache WHERE owner_user_id = ? AND favourite_uri NOT IN (SELECT favourite_uri FROM bsky_favourite_cache WHERE owner_user_id = ? ORDER BY favourited_at DESC LIMIT ?)')->execute([$ownerUserId, $ownerUserId, max(1, min(200, $limit))]);
+        $db->prepare('INSERT INTO bsky_favourite_sync_state (owner_user_id, checked_at, updated_at) VALUES (?, ?, ?) ON CONFLICT (owner_user_id) DO UPDATE SET checked_at = excluded.checked_at, updated_at = excluded.updated_at')->execute([$ownerUserId, gmdate('c'), gmdate('c')]); $db->commit();
+    } catch (Throwable $e) { try { if ($db->inTransaction()) $db->rollBack(); } catch (Throwable $ignored) {} return ['ok' => false, 'error' => 'Could not store Bluesky favourites']; }
+    return ['ok' => true, 'favourites' => ap_bsky_favourite_cache_read($ownerUserId, $limit), 'added' => count($items)];
 }
 
 /**
@@ -6012,6 +6087,8 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                     $result = ap_bsky_get_bookmarks($owner, 200, true);
                 } elseif ($kind === 'bookmarks') {
                     $result = ['ok' => true, 'skipped' => true];
+                } elseif ($kind === 'favourites' && function_exists('ap_bsky_get_favourites')) {
+                    $result = ap_bsky_get_favourites($owner, 200, true);
                 } elseif ($kind === 'follows') {
                     $result = function_exists('ap_bsky_follow_sync_worker')
                         ? ap_bsky_follow_sync_worker($owner)

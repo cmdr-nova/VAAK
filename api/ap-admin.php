@@ -2752,6 +2752,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             if (!empty($res['ok']) && function_exists('ap_bsky_tl_cache_clear_owner')) {
                 ap_bsky_tl_cache_clear_owner($vaakOwnerId);
             }
+            if (!empty($res['ok']) && function_exists('ap_bsky_favourite_cache_clear')) {
+                ap_bsky_favourite_cache_clear($vaakOwnerId, $subject);
+            }
         } elseif ($action === 'bsky_repost') {
             $res = ap_bsky_create_repost($vaakOwnerId, ['uri' => $subject, 'cid' => $cid]);
             $ajaxOut['ok'] = !empty($res['ok']);
@@ -3412,6 +3415,20 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     foreach ($items as $item) {
         admin_render_bsky_feed_item($item, 'following', 'bookmarks');
     }
+    exit;
+}
+
+// Cache-first Bluesky favourites; the page shell never waits on AppView/PDS.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
+    header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store');
+    $items = [];
+    if (function_exists('ap_bsky_get_favourites') && function_exists('ap_bsky_session_row') && ap_bsky_session_row($vaakOwnerId) !== null) {
+        $result = ap_bsky_get_favourites($vaakOwnerId, 60);
+        if (!empty($result['ok']) && is_array($result['favourites'] ?? null)) $items = $result['favourites'];
+    }
+    if ($items === []) { echo '<div class="empty" data-bsky-favourite-empty>No cached Bluesky favourites yet. They will appear after the background sync completes.</div>'; exit; }
+    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
+    foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'favourites');
     exit;
 }
 
@@ -14902,7 +14919,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
         <?php
           $favList = ap_masto_favourites_list(60, null);
-          if (!$favList):
+          $deferBskyFavourites = true;
+          if (!$favList && !$deferBskyFavourites):
         ?>
           <div class="empty">No favourites yet.</div>
         <?php else: ?>
@@ -14953,6 +14971,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
+        <div data-bsky-favourites-fragment>
+          <div class="empty">Loading cached Bluesky favourites…</div>
+        </div>
 
       <?php elseif ($view === 'bookmarks'): ?>
 
@@ -22744,6 +22765,18 @@ window.apAdminToast = function (msg, isErr) {
     .catch(() => {
       fragment.innerHTML = '<div class="empty">Bluesky bookmarks are still refreshing in the background.</div>';
     });
+})();
+</script>
+
+<script>
+// Favourites: load Bluesky likes from the durable cache after the Fediverse shell.
+(function () {
+  const fragment = document.querySelector('[data-bsky-favourites-fragment]');
+  if (!fragment) return;
+  fetch('?ajax=favourites_bsky', { credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store' })
+    .then((res) => { if (!res.ok) throw new Error('favourite fragment ' + res.status); return res.text(); })
+    .then((html) => { if (html && html.trim()) fragment.outerHTML = html; })
+    .catch(() => { fragment.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>'; });
 })();
 </script>
 
