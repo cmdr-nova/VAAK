@@ -968,8 +968,13 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
         }
 
         // Inbound event (federated Create/etc.)
+        // Interaction rows (Like/Announce) often arrive after the original
+        // Create and contain no post body. Prefer the publication event so
+        // favourites/bookmarks render the saved context instead of a bare URL.
         $st = ap_db()->prepare(
-            'SELECT * FROM events WHERE object_id = ? OR object_id = ? ORDER BY id DESC LIMIT 1'
+            "SELECT * FROM events WHERE (object_id = ? OR object_id = ?)
+             AND COALESCE(action_taken, '') != 'deleted'
+             ORDER BY CASE type WHEN 'Create' THEN 0 WHEN 'Update' THEN 1 WHEN 'Announce' THEN 2 ELSE 3 END, id DESC LIMIT 1"
         );
         $st->execute([$cand, $cand . '/']);
         $erow = $st->fetch();

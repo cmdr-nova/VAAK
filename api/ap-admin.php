@@ -3421,14 +3421,22 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
 // Cache-first Bluesky favourites; the page shell never waits on AppView/PDS.
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store');
-    $items = [];
+    $offset = max(0, (int) ($_GET['offset'] ?? 0));
+    $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $items = []; $hasMore = false;
     if (function_exists('ap_bsky_get_favourites') && function_exists('ap_bsky_session_row') && ap_bsky_session_row($vaakOwnerId) !== null) {
-        $result = ap_bsky_get_favourites($vaakOwnerId, 60);
+        $result = function_exists('ap_bsky_get_favourites_page')
+            ? ap_bsky_get_favourites_page($vaakOwnerId, $offset, $limit)
+            : ap_bsky_get_favourites($vaakOwnerId, $limit);
         if (!empty($result['ok']) && is_array($result['favourites'] ?? null)) $items = $result['favourites'];
+        $hasMore = !empty($result['has_more']);
     }
-    if ($items === []) { echo '<div class="empty" data-bsky-favourite-empty>No cached Bluesky favourites yet. They will appear after the background sync completes.</div>'; exit; }
-    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    echo '<div data-bsky-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-loaded="1">';
+    if ($items === [] && $offset === 0) { echo '<div class="empty" data-bsky-favourite-empty>No cached Bluesky favourites yet. They will appear after the background sync completes.</div></div>'; exit; }
+    if ($offset === 0) echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
     foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'favourites');
+    echo '</div>';
     exit;
 }
 
@@ -14971,7 +14979,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
-        <div data-bsky-favourites-fragment>
+        <div data-bsky-favourites-fragment data-offset="0" data-limit="20">
           <div class="empty">Loading cached Bluesky favourites…</div>
         </div>
 
@@ -22773,10 +22781,62 @@ window.apAdminToast = function (msg, isErr) {
 (function () {
   const fragment = document.querySelector('[data-bsky-favourites-fragment]');
   if (!fragment) return;
-  fetch('?ajax=favourites_bsky', { credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store' })
-    .then((res) => { if (!res.ok) throw new Error('favourite fragment ' + res.status); return res.text(); })
-    .then((html) => { if (html && html.trim()) fragment.outerHTML = html; })
-    .catch(() => { fragment.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>'; });
+  let current = fragment;
+  let loading = false;
+  const load = async (replace) => {
+    if (loading || (!replace && current.dataset.hasMore !== '1')) return;
+    loading = true;
+    let skeleton = null;
+    if (!replace) {
+      skeleton = document.createElement('div');
+      skeleton.className = 'timeline-skeleton';
+      skeleton.setAttribute('aria-hidden', 'true');
+      skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
+      current.appendChild(skeleton);
+    }
+    try {
+      const offset = replace ? 0 : (parseInt(current.dataset.offset || '0', 10) || 0);
+      const limit = current.dataset.limit || '20';
+      const res = await fetch('?ajax=favourites_bsky&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
+        credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('favourite fragment ' + res.status);
+      const html = await res.text();
+      const holder = document.createElement('div');
+      holder.innerHTML = html;
+      const next = holder.firstElementChild;
+      if (!next) return;
+      if (replace) {
+        current.replaceWith(next);
+        current = next;
+      } else {
+        while (next.firstChild) current.appendChild(next.firstChild);
+        current.dataset.offset = next.dataset.offset || String(offset);
+        current.dataset.hasMore = next.dataset.hasMore || '0';
+      }
+      if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(current);
+      if (typeof window.novaEnqueueBoostHydrates === 'function') window.novaEnqueueBoostHydrates(current);
+      let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
+      if (!sentinel) {
+        sentinel = document.createElement('div');
+        sentinel.setAttribute('data-bsky-favourites-sentinel', '1');
+        sentinel.className = 'meta';
+        sentinel.style.cssText = 'padding:1rem 0 2rem;text-align:center';
+        current.appendChild(sentinel);
+      }
+      sentinel.textContent = current.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Bluesky favourites';
+      if (current.dataset.hasMore === '1' && !sentinel.dataset.observed) {
+        sentinel.dataset.observed = '1';
+        new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) load(false); }, { rootMargin: '180px' }).observe(sentinel);
+      }
+    } catch (e) {
+      if (replace) current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
+    } finally {
+      if (skeleton && skeleton.parentNode) skeleton.remove();
+      loading = false;
+    }
+  };
+  load(true);
 })();
 </script>
 

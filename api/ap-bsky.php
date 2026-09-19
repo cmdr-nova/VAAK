@@ -4974,15 +4974,30 @@ function ap_bsky_favourite_cache_migrate(?PDO $db = null): bool
     } catch (Throwable $e) { error_log('[ap-bsky] favourite cache schema unavailable'); return $ready[$key] = false; }
 }
 
-function ap_bsky_favourite_cache_read(int $ownerUserId, int $limit = 80): array
+function ap_bsky_favourite_cache_read(int $ownerUserId, int $limit = 80, int $offset = 0): array
 {
     if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return [];
     try {
-        $st = ap_db()->prepare('SELECT post_json, favourited_at FROM bsky_favourite_cache WHERE owner_user_id = ? ORDER BY favourited_at DESC, favourite_uri DESC LIMIT ?');
-        $st->execute([$ownerUserId, max(1, min(200, $limit))]); $out = [];
+        $st = ap_db()->prepare('SELECT post_json, favourited_at FROM bsky_favourite_cache WHERE owner_user_id = ? ORDER BY favourited_at DESC, favourite_uri DESC LIMIT ? OFFSET ?');
+        $st->execute([$ownerUserId, max(1, min(200, $limit)), max(0, $offset)]); $out = [];
         foreach ($st->fetchAll() ?: [] as $row) { $item = json_decode((string) ($row['post_json'] ?? ''), true); if (is_array($item) && is_array($item['post'] ?? null)) { $item['_vaak_favourited_at'] = (string) ($row['favourited_at'] ?? ''); $out[] = $item; } }
         return $out;
     } catch (Throwable $e) { return []; }
+}
+
+function ap_bsky_favourite_cache_count(int $ownerUserId): int
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return 0;
+    try { $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_favourite_cache WHERE owner_user_id = ?'); $st->execute([$ownerUserId]); return (int) $st->fetchColumn(); } catch (Throwable $e) { return 0; }
+}
+
+/** Read one cached page without making the Favourites page wait for Bluesky. */
+function ap_bsky_get_favourites_page(int $ownerUserId, int $offset = 0, int $limit = 20): array
+{
+    $base = ap_bsky_get_favourites($ownerUserId, 1, false);
+    if (empty($base['ok'])) return $base;
+    return ['ok' => true, 'favourites' => ap_bsky_favourite_cache_read($ownerUserId, $limit, $offset), 'cached' => true,
+        'refreshing' => !empty($base['refreshing']), 'has_more' => ($offset + $limit) < ap_bsky_favourite_cache_count($ownerUserId)];
 }
 
 function ap_bsky_favourite_cache_clear(int $ownerUserId, ?string $removeUri = null): void
