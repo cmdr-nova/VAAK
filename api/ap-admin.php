@@ -3380,6 +3380,41 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
     exit;
 }
 
+// Cache-first bookmark cards.  The page shell should never wait for the
+// Bluesky collection or its card renderer; this fragment is loaded after the
+// first paint and is backed by the durable cache/worker path.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    $folderId = (int) ($_GET['folder'] ?? 0);
+    $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
+    $limit = (int) (ceil($limit / 20) * 20);
+    $items = [];
+    if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
+        && ap_bsky_session_row($vaakOwnerId) !== null) {
+        if ($folderId > 0 && function_exists('vaak_bookmark_folder_match_keys')) {
+            $keys = vaak_bookmark_folder_match_keys($folderId, $vaakOwnerId, 500);
+            $result = function_exists('ap_bsky_get_bookmarks_for_uris')
+                ? ap_bsky_get_bookmarks_for_uris($vaakOwnerId, array_keys($keys['object_ids'] ?? []), $limit)
+                : ['ok' => true, 'bookmarks' => []];
+        } else {
+            $result = ap_bsky_get_bookmarks($vaakOwnerId, $limit);
+        }
+        if (!empty($result['ok']) && is_array($result['bookmarks'] ?? null)) {
+            $items = $result['bookmarks'];
+        }
+    }
+    if ($items === []) {
+        echo '<div class="empty" data-bsky-bookmark-empty>No cached Bluesky bookmarks yet. They will appear after the background sync completes.</div>';
+        exit;
+    }
+    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>';
+    foreach ($items as $item) {
+        admin_render_bsky_feed_item($item, 'following', 'bookmarks');
+    }
+    exit;
+}
+
 // Lightweight JSON for nav badge / tab title polling (before heavy feed queries)
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     header('Content-Type: application/json; charset=utf-8');
@@ -14981,9 +15016,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if ($bmFolderFilter < 1) {
               $bmList = array_slice($bmList, 0, $bookmarkLimit);
           }
+          // Bluesky cards are fetched from the durable cache after the shell
+          // paints. This keeps the initial document independent of collection
+          // refreshes and expensive card hydration.
+          $deferBskyBookmarks = true;
           $bskyBookmarkItems = [];
           $bookmarkRefreshing = false;
-          if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
+          if (!$deferBskyBookmarks && function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
               && ap_bsky_session_row($vaakOwnerId) !== null) {
               $bskyResult = ($bmFolderFilter > 0 && function_exists('ap_bsky_get_bookmarks_for_uris'))
                   ? ap_bsky_get_bookmarks_for_uris($vaakOwnerId, array_keys($allowedObjects), $bookmarkLimit)
@@ -15057,7 +15096,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
           </form>
         <?php endif; ?>
-        <?php if (!$bmList && !$bskyBookmarkItems): ?>
+        <?php if ($deferBskyBookmarks): ?>
+          <div data-bsky-bookmarks-fragment data-folder="<?= (int) $bmFolderFilter ?>" data-limit="<?= (int) $bookmarkLimit ?>">
+            <div class="empty">Loading cached Bluesky bookmarks…</div>
+          </div>
+        <?php endif; ?>
+        <?php if (!$bmList && !$bskyBookmarkItems && !$deferBskyBookmarks): ?>
           <div class="empty"><?= $bookmarkRefreshing && $bmFolderFilter < 1 ? 'Bluesky bookmarks are refreshing in the background. Reload this page shortly.' : ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') ?></div>
         <?php endif; ?>
         <?php if ($bskyBookmarkItems): ?>
@@ -22678,6 +22722,30 @@ window.apAdminToast = function (msg, isErr) {
 })();
 </script>
 <?php endif; ?>
+
+<script>
+// Bookmarks: paint the Fediverse/cache shell first, then load Bluesky cards
+// from the durable cache without holding up the document response.
+(function () {
+  const fragment = document.querySelector('[data-bsky-bookmarks-fragment]');
+  if (!fragment) return;
+  const folder = fragment.dataset.folder || '0';
+  const limit = fragment.dataset.limit || '20';
+  const url = '?ajax=bookmarks_bsky&folder=' + encodeURIComponent(folder)
+    + '&limit=' + encodeURIComponent(limit);
+  fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store' })
+    .then((res) => {
+      if (!res.ok) throw new Error('bookmark fragment ' + res.status);
+      return res.text();
+    })
+    .then((html) => {
+      if (html && html.trim()) fragment.outerHTML = html;
+    })
+    .catch(() => {
+      fragment.innerHTML = '<div class="empty">Bluesky bookmarks are still refreshing in the background.</div>';
+    });
+})();
+</script>
 
 <script>
 // Trends sidebar: show cached HTML immediately (SSR and/or sessionStorage),
