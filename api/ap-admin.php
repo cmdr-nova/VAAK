@@ -8965,11 +8965,9 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $pr
             ? AP_REMOTE_AVATAR_FALLBACK
             : 'https://mkultra.monster/img/avatar/default.jpg';
     }
-    try {
-        $alt = actor_handle($actorId);
-    } catch (Throwable $e) {
-        $alt = '';
-    }
+    // Avatar images are decorative; the adjacent account text carries the
+    // accessible name. Do not add a title tooltip here, since it obscures
+    // the timeline while hovering over avatars.
     $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
         ? AP_REMOTE_AVATAR_FALLBACK
         : 'https://mkultra.monster/img/avatar/default.jpg';
@@ -8977,8 +8975,7 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $pr
     return '<img class="' . h($class) . '" src="' . h($url) . '" alt="" width="40" height="40" '
         . ($profileHover ? admin_profile_hover_attr($actorId) : '')
         . 'loading="lazy" decoding="async" referrerpolicy="no-referrer" '
-        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'" '
-        . 'title="' . h($alt) . '">';
+        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
 }
 
 function admin_profile_hover_attr(?string $actorId): string
@@ -22614,6 +22611,41 @@ window.apAdminToast = function (msg, isErr) {
       .catch(() => { try { slot.remove(); } catch (e) {} });
   }
 
+  const timelineTabPrefetch = new Map();
+  const timelineTabPrefetching = new Set();
+  const timelineTabCacheTtl = 90000;
+  async function fetchTimelineTab(view, limitValue) {
+    const url = '?view=' + encodeURIComponent(view) + '&partial=1&offset=0&limit=' + encodeURIComponent(String(limitValue || 15));
+    const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' }, cache: 'no-store' });
+    if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+      const authError = new Error('Authentication required');
+      authError.authRequired = true;
+      throw authError;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const html = await res.text();
+    return {
+      html,
+      hasMore: res.headers.get('X-Has-More') === '1',
+      nextOffset: parseInt(res.headers.get('X-Next-Offset') || String(limitValue || 15), 10),
+      at: Date.now()
+    };
+  }
+  function scheduleTimelineTabPrefetch() {
+    const run = () => {
+      ['home', 'local', 'feed'].filter((v) => v !== viewName).reduce((chain, v) => chain.then(async () => {
+        if (document.hidden || timelineTabPrefetch.has(v) || timelineTabPrefetching.has(v)) return;
+        timelineTabPrefetching.add(v);
+        try { timelineTabPrefetch.set(v, await fetchTimelineTab(v, limit)); }
+        catch (e) {}
+        finally { timelineTabPrefetching.delete(v); }
+      }), Promise.resolve());
+    };
+    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(run, { timeout: 3500 });
+    else window.setTimeout(run, 1200);
+  }
+  scheduleTimelineTabPrefetch();
+
   async function swapTimelineView(nextView, push) {
     if (tabSwapBusy) return;
     nextView = String(nextView || '');
@@ -22626,25 +22658,18 @@ window.apAdminToast = function (msg, isErr) {
     if (status) status.textContent = 'Loading…';
     items.classList.add('timeline-swapping');
     try {
-      const url = '?view=' + encodeURIComponent(nextView)
-        + '&partial=1&offset=0&limit=' + encodeURIComponent(String(limit || 15));
-      const res = await fetch(url, {
-        credentials: 'same-origin',
-        headers: { 'Accept': 'text/html' },
-        cache: 'no-store'
-      });
-      if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
-        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('tabSwap');
-        return;
+      let tabData = timelineTabPrefetch.get(nextView);
+      if (!tabData || (Date.now() - tabData.at) > timelineTabCacheTtl) {
+        tabData = await fetchTimelineTab(nextView, limit);
       }
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const html = await res.text();
+      timelineTabPrefetch.delete(nextView);
+      const html = tabData.html;
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
         window.vaakRedirectToLogin('tabSwap-html');
         return;
       }
-      hasMore = res.headers.get('X-Has-More') === '1';
-      const nextOff = parseInt(res.headers.get('X-Next-Offset') || String(limit), 10);
+      hasMore = !!tabData.hasMore;
+      const nextOff = parseInt(tabData.nextOffset || String(limit), 10);
       offset = nextOff > 0 ? nextOff : limit;
       viewName = nextView;
       pendingHtml = '';
@@ -22715,7 +22740,12 @@ window.apAdminToast = function (msg, isErr) {
         history.pushState({ vaakTl: nextView }, '', u.pathname + u.search);
       }
       document.title = (TL_TITLES[nextView] || nextView) + ' · VAAK';
+      scheduleTimelineTabPrefetch();
     } catch (e) {
+      if (e && e.authRequired && typeof window.vaakRedirectToLogin === 'function') {
+        window.vaakRedirectToLogin('tabSwap');
+        return;
+      }
       window.location.href = '?view=' + encodeURIComponent(nextView);
       return;
     } finally {
