@@ -198,9 +198,9 @@ function ap_report_ingest(array $activity): array
  * Send an outbound Flag to a remote account's instance.
  *
  * @param list<string> $statusUris optional post URIs to attach
- * @return array{ok:bool,error?:string,id?:int,activity_id?:string,delivered?:int}
+ * @return array{ok:bool,error?:string,id?:int,activity_id?:string,delivered?:int,local_only?:bool}
  */
-function ap_report_send(string $targetActorRef, string $comment = '', array $statusUris = []): array
+function ap_report_send(string $targetActorRef, string $comment = '', array $statusUris = [], bool $sendRemote = true): array
 {
     $target = rtrim(trim($targetActorRef), '/');
     if ($target === '' || !str_starts_with($target, 'https://')) {
@@ -226,7 +226,8 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
     if ($target === $reporter || str_starts_with($target, $reporter . '/')) {
         return ['ok' => false, 'error' => "Can't report yourself"];
     }
-    if ($repKeyId === '' || $repPriv === '') {
+    $isLocalPeer = (bool) preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $target);
+    if ($sendRemote && !$isLocalPeer && ($repKeyId === '' || $repPriv === '')) {
         if (!defined('LOCAL_KEY_ID') || !defined('LOCAL_PRIV')) {
             return ['ok' => false, 'error' => 'Actor keys unavailable'];
         }
@@ -249,7 +250,6 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
     $cleanStatuses = array_values(array_unique($cleanStatuses));
     $object = array_values(array_unique(array_merge([$target], $cleanStatuses)));
 
-    $isLocalPeer = (bool) preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $target);
     $activityId = $reporter . '/reports/' . bin2hex(random_bytes(10));
     $flag = [
         '@context' => 'https://www.w3.org/ns/activitystreams',
@@ -262,7 +262,11 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
     ];
 
     $delivered = 0;
-    if ($isLocalPeer) {
+    if (!$sendRemote) {
+        // Test/local-only reports go to VAAK moderation but never resolve or
+        // contact the remote actor's inbox.
+        $delivered = 1;
+    } elseif ($isLocalPeer) {
         // Same-instance: file for local moderators (no self-federation)
         $delivered = 1;
     } else {
@@ -291,28 +295,45 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
 
     $now = function_exists('ap_db_now') ? ap_db_now() : gmdate('c');
     $id = 0;
+    $storedActivityId = $sendRemote ? $activityId : $activityId . '/local-only';
     try {
-        ap_db()->prepare(
-            'INSERT INTO ap_reports
-             (activity_id, direction, reporter_actor_id, target_actor_id, status_uris_json, comment, about_us, state, created_at, updated_at)
-             VALUES (?, \'out\', ?, ?, ?, ?, 0, ?, ?, ?)'
-        )->execute([
-            $activityId,
-            $reporter,
-            $target,
-            json_encode($cleanStatuses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-            $comment !== '' ? $comment : null,
-            $delivered > 0 ? 'sent' : 'failed',
-            $now,
-            $now,
-        ]);
+        if (!$sendRemote) {
+            ap_db()->prepare(
+                'INSERT INTO ap_reports
+                 (activity_id, direction, reporter_actor_id, target_actor_id, status_uris_json, comment, about_us, state, created_at, updated_at)
+                 VALUES (?, \'local\', ?, ?, ?, ?, 0, \'open\', ?, ?)'
+            )->execute([
+                $storedActivityId,
+                $reporter,
+                $target,
+                json_encode($cleanStatuses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                $comment !== '' ? $comment : null,
+                $now,
+                $now,
+            ]);
+        } else {
+            ap_db()->prepare(
+                'INSERT INTO ap_reports
+                 (activity_id, direction, reporter_actor_id, target_actor_id, status_uris_json, comment, about_us, state, created_at, updated_at)
+                 VALUES (?, \'out\', ?, ?, ?, ?, 0, ?, ?, ?)'
+            )->execute([
+                $activityId,
+                $reporter,
+                $target,
+                json_encode($cleanStatuses, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                $comment !== '' ? $comment : null,
+                $delivered > 0 ? 'sent' : 'failed',
+                $now,
+                $now,
+            ]);
+        }
         $id = ap_db_last_insert_id('ap_reports');
         if ($id < 1) {
             $st = ap_db()->prepare('SELECT id FROM ap_reports WHERE activity_id = ?');
-            $st->execute([$activityId]);
+            $st->execute([$storedActivityId]);
             $id = (int) ($st->fetch()['id'] ?? 0);
         }
-        if ($id > 0) {
+        if ($sendRemote && $id > 0) {
             // Keep the delivery receipt in Sent, and create a separate local
             // moderator task so an admin can act on the reported actor/content.
             $reviewActivityId = $activityId . '/local-review';
@@ -336,10 +357,20 @@ function ap_report_send(string $targetActorRef, string $comment = '', array $sta
     }
 
     if (function_exists('ap_metrics_record')) {
-        ap_metrics_record('Flag', $reporter, $activityId, $target, strlen(json_encode($flag) ?: ''), $delivered > 0 ? 'local_report_out' : 'local_report_fail', $comment !== '' ? $comment : null);
+        ap_metrics_record('Flag', $reporter, $activityId, $target, strlen(json_encode($flag) ?: ''), !$sendRemote ? 'local_report_only' : ($delivered > 0 ? 'local_report_out' : 'local_report_fail'), $comment !== '' ? $comment : null);
     }
     if (function_exists('ap_log')) {
-        ap_log("report_out target=$target delivered=$delivered local_peer=" . ($isLocalPeer ? '1' : '0'));
+        ap_log("report_out target=$target delivered=" . ($sendRemote ? (string) $delivered : '0') . ' local_only=' . ($sendRemote ? '0' : '1') . ' local_peer=' . ($isLocalPeer ? '1' : '0'));
+    }
+
+    if (!$sendRemote) {
+        return [
+            'ok' => true,
+            'id' => $id,
+            'activity_id' => $activityId,
+            'delivered' => 0,
+            'local_only' => true,
+        ];
     }
 
     if ($delivered < 1) {
@@ -437,11 +468,12 @@ function ap_reports_list(string $filter = 'open', int $limit = 80): array
             );
             $st->execute([$limit]);
         } else {
-            // Incoming inbox: show every received Flag regardless of state, plus
-            // locally filed reports still awaiting moderator review.
+            // The default moderation queue contains only reports that still
+            // need moderator action. Closed reports remain available through
+            // the About me / Dismissed / All filters.
             $st = ap_db()->prepare(
                 "SELECT * FROM ap_reports
-                 WHERE direction = 'in'
+                 WHERE (direction = 'in' AND state = 'open')
                     OR (state = 'open' AND direction = 'local'
                         AND reporter_actor_id LIKE 'https://mkultra.monster/users/%')
                     OR (state = 'open' AND direction = 'out'
@@ -491,9 +523,38 @@ function ap_reports_open_count(): int
             "SELECT COUNT(*) FROM ap_reports
              WHERE state = 'open'
                AND (direction = 'in'
-                    OR (direction = 'local' AND state = 'open')
+                    OR direction = 'local'
                     OR (direction = 'out' AND reporter_actor_id LIKE 'https://mkultra.monster/users/%'))"
         )->fetchColumn();
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
+/** Number of distinct received/local reports still awaiting moderator action. */
+function ap_reports_notification_count(): int
+{
+    try {
+        $rows = ap_db()->query(
+            "SELECT activity_id FROM ap_reports
+             WHERE state = 'open'
+               AND (direction = 'in'
+                    OR (direction = 'local'
+                        AND reporter_actor_id LIKE 'https://mkultra.monster/users/%'))"
+        )->fetchAll(PDO::FETCH_COLUMN) ?: [];
+        $reports = [];
+        foreach ($rows as $activityId) {
+            $activityId = (string) $activityId;
+            // An outbound report also gets a separate local-review row. Treat
+            // those as one notification if the original Flag is received too.
+            if (str_ends_with($activityId, '/local-review')) {
+                $activityId = substr($activityId, 0, -strlen('/local-review'));
+            }
+            if ($activityId !== '') {
+                $reports[$activityId] = true;
+            }
+        }
+        return count($reports);
     } catch (Throwable $e) {
         return 0;
     }

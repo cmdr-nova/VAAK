@@ -190,14 +190,24 @@ try {
 
         // --- Firehose / Home events retention ---
         $eventsCutoff = $nowUtc->modify('-' . $eventsDays . ' days')->format('c');
-        $st = $db->prepare('SELECT COUNT(*) FROM events WHERE created_at < ?');
+        // Keep remote objects users have bookmarked even after the general
+        // timeline retention window; their saved bookmark must remain renderable.
+        $st = $db->prepare("SELECT COUNT(*) FROM events WHERE created_at < ?
+            AND NOT EXISTS (
+              SELECT 1 FROM masto_bookmarks b
+              WHERE rtrim(b.object_id, '/') = rtrim(events.object_id, '/')
+            )");
         $st->execute([$eventsCutoff]);
         $n = (int) $st->fetchColumn();
         if ($n > 0) {
             if ($dryRun) {
                 $log("would_delete events older_than=$eventsCutoff count=$n");
             } else {
-                $del = $db->prepare('DELETE FROM events WHERE created_at < ?');
+                $del = $db->prepare("DELETE FROM events WHERE created_at < ?
+                    AND NOT EXISTS (
+                      SELECT 1 FROM masto_bookmarks b
+                      WHERE rtrim(b.object_id, '/') = rtrim(events.object_id, '/')
+                    )");
                 $del->execute([$eventsCutoff]);
                 $stats['events_deleted'] = $del->rowCount();
                 $log("deleted events older_than=$eventsCutoff count={$stats['events_deleted']}");

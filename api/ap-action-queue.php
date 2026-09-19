@@ -229,8 +229,8 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 if (function_exists('ap_bsky_tl_cache_clear_owner')) ap_bsky_tl_cache_clear_owner($owner);
                 $statusId = (string) ($payload['status_id'] ?? '');
                 if ($statusId !== '') {
-                    if ($want) ap_masto_bookmark_add($statusId, (string) ($payload['object_id'] ?? $target), $owner);
-                    else ap_masto_bookmark_remove($statusId, $owner);
+                    if ($want) ap_masto_bookmark_add($statusId, (string) ($payload['object_id'] ?? $target), $owner, 'bsky');
+                    else ap_masto_bookmark_remove($statusId, $owner, 'bsky');
                 }
                 return ['ok' => true, 'receipt' => []];
             }

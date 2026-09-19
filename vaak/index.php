@@ -347,11 +347,11 @@ ASCII;
   <title>VAAK</title>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
   <link rel="manifest" href="/vaak/manifest.webmanifest?v=20260909">
-  <link rel="icon" href="/vaak/favicon.svg?v=20260907" type="image/svg+xml">
-  <link rel="icon" href="/vaak/favicon.ico?v=20260907" sizes="any">
-  <link rel="icon" href="/vaak/favicon-32x32.png?v=20260907" type="image/png" sizes="32x32">
-  <link rel="icon" href="/vaak/favicon-16x16.png?v=20260907" type="image/png" sizes="16x16">
-  <link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260907">
+  <link rel="icon" href="/vaak/favicon.svg?v=20260916a" type="image/svg+xml">
+  <link rel="icon" href="/vaak/favicon.ico?v=20260916a" sizes="any">
+  <link rel="icon" href="/vaak/favicon-32x32.png?v=20260916a" type="image/png" sizes="32x32">
+  <link rel="icon" href="/vaak/favicon-16x16.png?v=20260916a" type="image/png" sizes="16x16">
+  <link rel="apple-touch-icon" href="/vaak/apple-touch-icon.png?v=20260916a">
   <style>
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
