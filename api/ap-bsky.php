@@ -1324,7 +1324,15 @@ function ap_bsky_xrpc(
     }
     $url = $base . '/xrpc/' . $nsid;
     if ($method === 'GET' && is_array($query) && $query !== []) {
-        $url .= '?' . http_build_query($query);
+        // ATProto array parameters (notably `uris`) are repeated keys, not
+        // PHP's `uris[0]` bracket notation.
+        $parts = [];
+        foreach ($query as $name => $value) {
+            foreach (is_array($value) ? $value : [$value] as $part) {
+                $parts[] = rawurlencode((string) $name) . '=' . rawurlencode((string) $part);
+            }
+        }
+        $url .= '?' . implode('&', $parts);
     }
     $headers = [
         'Accept: application/json',
@@ -5007,11 +5015,18 @@ function ap_bsky_favourites_refresh_worker(int $ownerUserId, int $limit = 200): 
     $res = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', ['repo' => $did, 'collection' => 'app.bsky.feed.like', 'limit' => max(1, min(100, $limit)), 'reverse' => 'true'], null, $access, 15);
     if (empty($res['ok']) || !is_array($res['json'] ?? null)) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky likes')];
     $rows = is_array($res['json']['records'] ?? null) ? $res['json']['records'] : []; $items = [];
+    $byUri = [];
     foreach ($rows as $row) {
         $v = is_array($row['value'] ?? null) ? $row['value'] : []; $subject = is_array($v['subject'] ?? null) ? $v['subject'] : []; $uri = trim((string) ($subject['uri'] ?? '')); if (!str_starts_with($uri, 'at://')) continue;
-        $postRes = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', ['uris' => $uri], null, null, 8); $post = is_array($postRes['json']['posts'][0] ?? null) ? $postRes['json']['posts'][0] : null; if ($post === null) continue;
-        $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : []; $post['viewer']['like'] = (string) ($row['uri'] ?? '');
-        $items[] = [$uri, trim((string) ($v['createdAt'] ?? $row['value']['createdAt'] ?? gmdate('c'))) ?: gmdate('c'), json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)];
+        $byUri[$uri] = ['row' => $row, 'created' => trim((string) ($v['createdAt'] ?? gmdate('c'))) ?: gmdate('c')];
+    }
+    foreach (array_chunk(array_keys($byUri), 25) as $uriBatch) {
+        $postRes = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', ['uris' => $uriBatch], null, null, 10);
+        foreach (is_array($postRes['json']['posts'] ?? null) ? $postRes['json']['posts'] : [] as $post) {
+            if (!is_array($post)) continue; $uri = trim((string) ($post['uri'] ?? '')); if ($uri === '' || !isset($byUri[$uri])) continue;
+            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : []; $post['viewer']['like'] = (string) ($byUri[$uri]['row']['uri'] ?? '');
+            $items[] = [$uri, $byUri[$uri]['created'], json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)];
+        }
     }
     try {
         $db = ap_db(); $db->beginTransaction(); $up = $db->prepare('INSERT INTO bsky_favourite_cache (owner_user_id, favourite_uri, favourited_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, favourite_uri) DO UPDATE SET favourited_at = excluded.favourited_at, post_json = excluded.post_json, updated_at = excluded.updated_at');
