@@ -960,6 +960,15 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
     }
 
     foreach ($candidates as $cand) {
+        // A remote Delete is authoritative: do not resurrect a favourited
+        // object from an older cached Create event.
+        try {
+            $deleted = ap_db()->prepare("SELECT 1 FROM events WHERE (object_id = ? OR object_id = ?) AND (type = 'Delete' OR action_taken = 'deleted') LIMIT 1");
+            $deleted->execute([$cand, $cand . '/']);
+            if ($deleted->fetchColumn()) continue;
+        } catch (Throwable $e) {
+            // Keep the normal cache resolver available if this check fails.
+        }
         // Local note
         $local = ap_masto_status_by_note_id($cand);
         if (is_array($local)) {
@@ -9456,6 +9465,11 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
         $st->execute([$eventId]);
         $erow = $st->fetch();
         if (is_array($erow)) {
+            try {
+                $deleted = ap_db()->prepare("SELECT 1 FROM events WHERE (object_id = ? OR object_id = ?) AND (type = 'Delete' OR action_taken = 'deleted') LIMIT 1");
+                $deleted->execute([(string) ($erow['object_id'] ?? ''), rtrim((string) ($erow['object_id'] ?? ''), '/') . '/']);
+                if ($deleted->fetchColumn()) return null;
+            } catch (Throwable $e) {}
             // Favourite rows can point at the interaction event itself. That
             // event is intentionally body-less; resolve its object back to
             // the cached Create/Update publication before rendering.

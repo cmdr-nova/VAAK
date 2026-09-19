@@ -3383,6 +3383,21 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
     exit;
 }
 
+// Paginated Fediverse favourite cards. Deleted remote objects are omitted by
+// ap_masto_favourites_list(), and older rows are loaded only as the user scrolls.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
+    header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store');
+    $offset = max(0, (int) ($_GET['offset'] ?? 0));
+    $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $rows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list($offset + $limit + 1, null) : [];
+    $items = array_slice($rows, $offset, $limit);
+    $hasMore = count($rows) > ($offset + $limit);
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
+    foreach ($items as $item) admin_render_favourite_status_card($item);
+    echo '</div>'; exit;
+}
+
 // Cache-first bookmark cards.  The page shell should never wait for the
 // Bluesky collection or its card renderer; this fragment is loaded after the
 // first paint and is backed by the durable cache/worker path.
@@ -10819,6 +10834,31 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
     return ['status_id' => $statusId, 'object_id' => $objectId];
 }
 
+/** Render one cached Fediverse favourite for the Favourites stream/partials. */
+function admin_render_favourite_status_card(array $st): void
+{
+    $acct = (string) ($st['account']['acct'] ?? '?');
+    $sid = (string) ($st['id'] ?? '');
+    $oid = (string) ($st['uri'] ?? '');
+    $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
+    echo '<article class="tweet relay-card"><div class="tweet-hd">';
+    echo admin_avatar_img($actorUrl !== '' ? $actorUrl : null);
+    echo '<div class="tweet-hd-main"><div><span class="who">' . h($acct) . '</span><span class="meta"> · ' . h((string) ($st['created_at'] ?? '')) . '</span></div></div></div>';
+    $favPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
+    $favMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
+    echo admin_cw_gate_html((string) ($st['spoiler_text'] ?? ''), !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '', $favPlain !== ''
+        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>' : '');
+    echo '<div class="tweet-actions">';
+    if ($oid !== '') {
+        echo '<a class="btn btn-ghost" href="' . h(admin_status_href($oid, 'favourites')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a>';
+        echo '<a href="' . h(admin_remote_object_href($oid)) . '" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>';
+    }
+    if ($sid !== '') {
+        echo '<form method="post" action="?view=favourites" style="display:inline"><input type="hidden" name="action" value="unfavourite_status"><input type="hidden" name="return_view" value="favourites"><input type="hidden" name="status_id" value="' . h($sid) . '"><input type="hidden" name="object_id" value="' . h($oid) . '"><input type="hidden" name="target_actor" value="' . h($actorUrl) . '"><button class="icon-btn on" type="submit" title="Unlike" aria-label="Unlike"><i class="ph-fill ph-heart" aria-hidden="true"></i></button></form>';
+    }
+    echo '</div></article>';
+}
+
 /**
  * Render one Bluesky feed item (Bluesky tab or Home mix).
  *
@@ -14926,58 +14966,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'favourites'): ?>
 
         <?php
-          $favList = ap_masto_favourites_list(60, null);
+          $favRows = ap_masto_favourites_list(21, null);
+          $favHasMore = count($favRows) > 20;
+          $favList = array_slice($favRows, 0, 20);
           $deferBskyFavourites = true;
           if (!$favList && !$deferBskyFavourites):
         ?>
           <div class="empty">No favourites yet.</div>
         <?php else: ?>
-          <?php foreach ($favList as $st): ?>
-            <?php
-              $acct = (string) ($st['account']['acct'] ?? '?');
-              $sid = (string) ($st['id'] ?? '');
-              $oid = (string) ($st['uri'] ?? '');
-              $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
-            ?>
-            <article class="tweet relay-card">
-              <div class="tweet-hd">
-                <?= admin_avatar_img($actorUrl !== '' ? $actorUrl : null) ?>
-                <div class="tweet-hd-main">
-                  <div>
-                    <span class="who"><?= h($acct) ?></span>
-                    <span class="meta"> · <?= h((string) ($st['created_at'] ?? '')) ?></span>
-                  </div>
-                </div>
-              </div>
-              <?php
-                $favPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
-                $favMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
-                echo admin_cw_gate_html(
-                    (string) ($st['spoiler_text'] ?? ''),
-                    !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
-                    $favPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
-                        : ''
-                );
-              ?>
-              <div class="tweet-actions">
-                <?php if ($oid !== ''): ?>
-                  <a class="btn btn-ghost" href="<?= h(admin_status_href($oid, 'favourites')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                  <a href="<?= h(admin_remote_object_href($oid)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
-                <?php endif; ?>
-                <?php if ($sid !== ''): ?>
-                  <form method="post" action="?view=favourites" style="display:inline">
-                    <input type="hidden" name="action" value="unfavourite_status">
-                    <input type="hidden" name="return_view" value="favourites">
-                    <input type="hidden" name="status_id" value="<?= h($sid) ?>">
-                    <input type="hidden" name="object_id" value="<?= h($oid) ?>">
-                    <input type="hidden" name="target_actor" value="<?= h($actorUrl) ?>">
-                    <button class="icon-btn on" type="submit" title="Unlike" aria-label="Unlike"><i class="ph-fill ph-heart" aria-hidden="true"></i></button>
-                  </form>
-                <?php endif; ?>
-              </div>
-            </article>
-          <?php endforeach; ?>
+          <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
+            <?php foreach ($favList as $st): admin_render_favourite_status_card($st); endforeach; ?>
+            <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
+          </div>
         <?php endif; ?>
         <div data-bsky-favourites-fragment data-offset="0" data-limit="20">
           <div class="empty">Loading cached Bluesky favourites…</div>
@@ -22841,6 +22841,54 @@ window.apAdminToast = function (msg, isErr) {
     }
   };
   load(true);
+})();
+</script>
+
+<script>
+// Fediverse favourites use the same append-only infinite scroll as timelines.
+(function () {
+  const root = document.querySelector('[data-fedi-favourites-fragment]');
+  if (!root) return;
+  let busy = false;
+  const arm = () => {
+    const sentinel = root.querySelector('[data-fedi-favourites-sentinel]');
+    if (!sentinel || root.dataset.hasMore !== '1' || sentinel.dataset.observed === '1') return;
+    sentinel.dataset.observed = '1';
+    const feed = document.querySelector('.feed');
+    const style = feed ? window.getComputedStyle(feed) : null;
+    const observerRoot = feed && style && ['auto', 'scroll'].includes(style.overflowY) ? feed : null;
+    new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) load(); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
+  };
+  const load = async () => {
+    if (busy || root.dataset.hasMore !== '1') return;
+    busy = true;
+    const skeleton = document.createElement('div');
+    skeleton.className = 'timeline-skeleton';
+    skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
+    root.appendChild(skeleton);
+    try {
+      const offset = parseInt(root.dataset.offset || '0', 10) || 0;
+      const limit = root.dataset.limit || '20';
+      const res = await fetch('?ajax=favourites_fedi&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), { credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store' });
+      if (!res.ok) throw new Error('favourite page ' + res.status);
+      const holder = document.createElement('div'); holder.innerHTML = await res.text();
+      const next = holder.firstElementChild;
+      if (!next) return;
+      const nextSentinel = next.querySelector('[data-fedi-favourites-sentinel]');
+      if (nextSentinel) nextSentinel.remove();
+      while (next.firstChild) root.insertBefore(next.firstChild, skeleton);
+      root.dataset.offset = next.dataset.offset || String(offset);
+      root.dataset.hasMore = next.dataset.hasMore || '0';
+      const sentinel = root.querySelector('[data-fedi-favourites-sentinel]');
+      if (sentinel) { sentinel.textContent = root.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Fediverse favourites'; sentinel.dataset.observed = ''; }
+      if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(root);
+      arm();
+    } catch (e) {
+      const sentinel = root.querySelector('[data-fedi-favourites-sentinel]');
+      if (sentinel) sentinel.textContent = 'Could not load more — try Refresh';
+    } finally { skeleton.remove(); busy = false; }
+  };
+  arm();
 })();
 </script>
 
