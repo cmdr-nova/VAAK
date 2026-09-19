@@ -14399,21 +14399,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       width: 64px; height: 64px; border-radius: 50%; background: #222; border: 2px solid var(--border);
     }
     .vaak-spinner {
-      display: inline-block; width: 1rem; height: 1rem; flex: 0 0 auto;
+      display: inline-block; width: 1.2rem; height: 1.2rem; flex: 0 0 auto;
       border: 2px solid currentColor; border-right-color: transparent;
       border-radius: 50%; animation: vaak-spinner-spin .72s linear infinite;
       vertical-align: -.15em;
     }
     @keyframes vaak-spinner-spin { to { transform: rotate(360deg); } }
     .vaak-loading-indicator {
-      position: fixed; top: .75rem; left: 50%; z-index: 10080;
+      position: fixed; bottom: 1rem; left: 50%; z-index: 10080;
       display: inline-flex; align-items: center; gap: .5rem;
-      padding: .45rem .75rem; border: 1px solid var(--border);
+      padding: .6rem .95rem; border: 1px solid var(--border);
       border-radius: 999px; background: color-mix(in srgb, var(--panel) 92%, transparent);
       color: var(--primary); box-shadow: 0 8px 24px rgba(0,0,0,.28);
       opacity: 0; visibility: hidden; pointer-events: none;
-      transform: translate(-50%, -.4rem); transition: opacity .16s ease, transform .16s ease, visibility 0s linear .16s;
-      font-size: .82rem; font-weight: 600;
+      transform: translate(-50%, .5rem); transition: opacity .16s ease, transform .16s ease, visibility 0s linear .16s;
+      font-size: .88rem; font-weight: 600;
     }
     .vaak-loading-indicator.is-visible {
       opacity: 1; visibility: visible; transform: translate(-50%, 0);
