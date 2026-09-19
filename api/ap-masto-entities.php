@@ -4601,6 +4601,12 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
 function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
 {
     $limit = max(1, min(80, $limit));
+    // Keep notification polling bounded. Ice Cubes usually asks for 40
+    // items, but scanning 200 rows from every source made deleted/remote
+    // status resolution take 10+ seconds even when the response was empty.
+    // Pagination continues with max_id, so a smaller source window does not
+    // discard the notification history.
+    $sourceLimit = max(40, min(100, $limit * 2));
     // favourites, mentions, boosts, quote-boosts, bites, poll ended, favourited-status edits, follows, subscribed posts
     $want = ['mention', 'follow', 'favourite', 'reblog', 'quote', 'poll', 'update', 'bite', 'status'];
     if ($types) {
@@ -4641,7 +4647,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             $sql .= ' AND created_at <= ?';
             $bind[] = $maxCursorAt;
         }
-        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT 200';
+        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT ' . $sourceLimit;
         $st = ap_db()->prepare($sql);
         $st->execute($bind);
         $seenActivityIds = [];
@@ -4679,7 +4685,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             $sql .= ' AND created_at <= ?';
             $bind[] = $maxCursorAt;
         }
-        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT 200';
+        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT ' . $sourceLimit;
         $st = ap_db()->prepare($sql);
         $st->execute($bind);
         // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
@@ -4720,7 +4726,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 $pollSql .= ' AND expires_at <= ?';
                 $pollBind[] = $maxCursorAt;
             }
-            $pollSql .= ' ORDER BY expires_at DESC, local_id DESC LIMIT 200';
+            $pollSql .= ' ORDER BY expires_at DESC, local_id DESC LIMIT ' . $sourceLimit;
             $st = ap_db()->prepare($pollSql);
             $st->execute($pollBind);
             $me = rtrim($ownerActorId !== '' ? $ownerActorId : ap_masto_session_actor_id(), '/');
