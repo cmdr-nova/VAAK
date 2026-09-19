@@ -13571,14 +13571,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     #status-thread-ancestors > article.tweet,
     #status-thread-descendants > article.tweet,
     article.tweet#status-focus,
-    #status-focus > article.tweet {
+    #status-focus > article.tweet,
+    .status-thread-parent > article.tweet {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
       border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
     }
     #status-thread-ancestors > article.tweet:hover,
     #status-thread-descendants > article.tweet:hover,
     article.tweet#status-focus:hover,
-    #status-focus > article.tweet:hover { background: transparent; }
+    #status-focus > article.tweet:hover,
+    .status-thread-parent > article.tweet:hover { background: transparent; }
     .relay-card .relay-meta { text-align: left; margin-left: 0; padding-left: 0; }
     .forum-post { display:flex; gap:.8rem; align-items:flex-start; }
     .forum-post-avatar { width:42px; height:42px; flex:0 0 42px; border-radius:50%; object-fit:cover; background:var(--panel-2); border:1px solid var(--border); }
@@ -18723,11 +18725,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             }
           ?>
           <?php if (is_array($stBskyParentLocal)): ?>
-            <div class="meta" style="margin:0 0 .5rem">Your post</div>
-            <?php admin_render_masto_status_card($stBskyParentLocal, $followingIds, $stFrom, false, true); ?>
+            <div class="status-thread-parent">
+              <div class="meta" style="margin:0 0 .5rem">Your post</div>
+              <?php admin_render_masto_status_card($stBskyParentLocal, $followingIds, $stFrom, false, true); ?>
+            </div>
           <?php elseif (is_array($stBskyParentItem)): ?>
-            <div class="meta" style="margin:0 0 .5rem">Parent post</div>
-            <?php admin_render_bsky_feed_item($stBskyParentItem, 'following', $stBskyCtx); ?>
+            <div class="status-thread-parent">
+              <div class="meta" style="margin:0 0 .5rem">Parent post</div>
+              <?php admin_render_bsky_feed_item($stBskyParentItem, 'following', $stBskyCtx); ?>
+            </div>
           <?php endif; ?>
           <div id="status-focus">
             <?php admin_render_bsky_feed_item($stBskyItem, 'following', $stBskyCtx); ?>
