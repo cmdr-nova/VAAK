@@ -9967,7 +9967,7 @@ function admin_render_remote_boost_card(
     }
     ?>
           <article class="tweet tweet-boost"<?= $hydrateAttrs ?>>
-            <div class="meta" style="margin-bottom:.45rem;color:var(--primary)">
+            <?php if (!is_array($boostQuoteParts)): ?><div class="meta" style="margin-bottom:.45rem;color:var(--primary)">
               <i class="ph ph-repeat" aria-hidden="true"></i>
               <?php if ($boosterProfile !== ''): ?>
                 <a href="<?= h($boosterProfile) ?>" style="color:inherit;text-decoration:none"><?= h($boosterName) ?></a>
@@ -9980,7 +9980,7 @@ function admin_render_remote_boost_card(
               <?php endif; ?>
               · <?= h(relative_time($created)) ?>
               <?php if ($fromFollowedTag): ?><span class="tag" style="margin-left:.35rem">followed tag</span><?php endif; ?>
-            </div>
+            </div><?php endif; ?>
             <div class="tweet-hd">
               <?php if ($origProfile !== ''): ?>
                 <a href="<?= h($origProfile) ?>" style="text-decoration:none"><?= admin_avatar_img($origActor !== '' ? $origActor : null) ?></a>
@@ -10024,9 +10024,22 @@ function admin_render_remote_boost_card(
                   } elseif (preg_match('#https://[^\s<>]+#u', $boostQuoted, $qUrlMatch)) {
                       $qUrl = rtrim((string) $qUrlMatch[0], '.,);]');
                   }
-                  $boostInner .= '<div class="quote-card"><div class="quote-card-source">QUOTED POST</div>';
+                  $qStatus = null;
+                  if ($qUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
+                      $qStatus = ap_masto_lookup_status_by_object_url($qUrl, 0, false);
+                  }
+                  $qStatusAccount = is_array($qStatus['account'] ?? null) ? $qStatus['account'] : [];
+                  $qStatusDisplay = trim((string) ($qStatusAccount['display_name'] ?? ''));
+                  $qStatusAvatar = trim((string) ($qStatusAccount['avatar'] ?? $qStatusAccount['avatar_static'] ?? ''));
+                  $qDomain = $qUrl !== '' ? (string) (parse_url($qUrl, PHP_URL_HOST) ?: '') : '';
+                  $boostInner .= '<div class="quote-card"><div class="quote-card-source">'
+                      . h($qDomain !== '' ? $qDomain : 'QUOTED POST') . '</div>';
                   if ($qAcct !== '') {
-                      $boostInner .= '<div class="quote-card-author"><div><div class="quote-card-name">' . h(ltrim($qAcct, '@')) . '</div><div class="quote-card-handle">@' . h(ltrim($qAcct, '@')) . '</div></div></div>';
+                      $boostInner .= '<div class="quote-card-author">';
+                      if ($qStatusAvatar !== '') {
+                          $boostInner .= '<img class="quote-card-avatar" src="' . h($qStatusAvatar) . '" alt="" width="32" height="32" loading="lazy" decoding="async" referrerpolicy="no-referrer">';
+                      }
+                      $boostInner .= '<div><div class="quote-card-name">' . h($qStatusDisplay !== '' ? $qStatusDisplay : ltrim($qAcct, '@')) . '</div><div class="quote-card-handle">@' . h(ltrim($qAcct, '@')) . '</div></div></div>';
                   }
                   if ($qText !== '' && $qText !== '(quoted post unavailable)') {
                       $boostInner .= '<div class="quote-card-body">'
