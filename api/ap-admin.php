@@ -13213,8 +13213,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       display: block; min-height: 0;
     }
     .compose-inline-panel #compose-content {
-      height: 96px; min-height: 96px; max-height: 500px;
-      field-sizing: fixed; flex: none;
+      height: 96px; min-height: 96px; max-height: 192px;
+      flex: none;
       overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
     }
     .compose-inline-panel .compose-inline-options {
@@ -13507,7 +13507,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       max-height: 100%;
       resize: vertical;
       overflow-y: auto; /* long text scrolls inside the box, not the modal */
-      field-sizing: fixed;
       box-sizing: border-box;
     }
     /* Inline feed composer: these must beat .compose-modal__panel > .composer
@@ -13533,11 +13532,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       height: auto !important;
     }
     .compose-modal__panel.compose-inline-panel #compose-content {
-      height: 96px !important;
-      min-height: 96px !important;
-      max-height: 500px !important;
+      height: 96px;
+      min-height: 96px;
+      max-height: 192px;
       flex: none !important;
-      field-sizing: fixed !important;
     }
     /* Hide bulky controls until JS moves them into the icon toolbar. */
     .compose-inline-panel.compose-tools-ready > .composer > .compose-emoji-wrap,
@@ -23608,18 +23606,19 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const ta = document.getElementById('compose-content');
     if (!ta) return;
     const inline = !!ta.closest('.compose-inline-panel');
+    const baseHeight = 96;
+    const maxHeight = baseHeight * 2;
     const empty = !(ta.value || '').trim();
     if (inline && empty) {
-      ta.style.height = '96px';
+      ta.style.height = baseHeight + 'px';
       ta.style.overflowY = 'hidden';
       return;
     }
     ta.style.height = '0px';
-    const max = 500;
     const contentHeight = ta.scrollHeight;
-    const next = Math.min(Math.max(contentHeight, 96), max);
+    const next = Math.min(Math.max(contentHeight, baseHeight), maxHeight);
     ta.style.height = next + 'px';
-    ta.style.overflowY = contentHeight > max ? 'auto' : 'hidden';
+    ta.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
   }
   function saveComposeLocalBackup() {
     if (composeMode === 'edit_status') return;
@@ -24640,7 +24639,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
 
   function fillEditFields(content, spoilerText, sensitive) {
     const ta = document.getElementById('compose-content');
-    if (ta) ta.value = content || '';
+    if (ta) {
+      ta.value = content || '';
+      // Edits are populated asynchronously; measure the authoritative content
+      // immediately so the composer does not collapse back to its base height.
+      autoGrowComposeTextarea();
+    }
     const spoiler = form.querySelector('input[name="spoiler_text"]');
     if (spoiler) spoiler.value = spoilerText || '';
     const sens = form.querySelector('input[name="sensitive"]');
