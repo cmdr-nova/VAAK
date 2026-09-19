@@ -661,7 +661,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
                             'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
                             'kind' => 'reblog', 'active' => $action === 'reblog_status', 'status_id' => $statusId,
-                            'notice' => 'Boost action queued.'], JSON_UNESCAPED_SLASHES);
+                            'notice' => 'Boosted!'], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     $error = $queue['error'] ?? 'Could not queue boost.';
