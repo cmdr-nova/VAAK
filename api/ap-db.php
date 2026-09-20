@@ -10106,6 +10106,26 @@ function ap_dm_by_object_id(string $objectId, ?int $ownerUserId = null): ?array
     return is_array($row) ? $row : null;
 }
 
+/** True when an object URL belongs to any stored private DM. */
+function ap_dm_object_is_private(string $objectId): bool
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '') {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT 1 FROM direct_messages
+             WHERE object_id = ? OR object_id = ?
+             LIMIT 1'
+        );
+        $st->execute([$objectId, $objectId . '/']);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 /** True when a DM peer is hidden by a server-wide or owner-specific actor block. */
 function ap_dm_peer_is_blocked_for_owner(string $peerActorId, int $ownerUserId): bool
 {

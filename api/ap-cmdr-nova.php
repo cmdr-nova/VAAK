@@ -379,7 +379,11 @@ if (preg_match('#^/users/cmdr_nova/(notes|creates)/([a-f0-9]+)$#', $path, $nm)) 
     $hex = $nm[2];
     $objectId = CMDR_ACTOR_ID . '/' . $kind . '/' . $hex;
     $row = null;
-    if ($kind === 'notes') {
+    // DM object URLs are never dereferenceable public notes, even if a future
+    // migration accidentally creates a colliding outbox row.
+    if (function_exists('ap_dm_object_is_private') && ap_dm_object_is_private($objectId)) {
+        $row = null;
+    } elseif ($kind === 'notes') {
         $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ?');
         $st->execute([$objectId]);
         $row = $st->fetch();
