@@ -710,6 +710,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                             'cid' => (string) ($bskyRef['cid'] ?? ''),
                             'status_id' => $statusId,
                             'object_id' => $targetKey,
+                            'target_actor' => $targetActor,
                         ]);
                     } else {
                     $queue = ap_action_queue_enqueue($vaakOwnerId, 'fedi', $kind === 'favourite' ? 'like' : 'bookmark', $targetKey, $desired, [
@@ -4576,6 +4577,15 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
     foreach ($timeline as &$item) {
         $actor = admin_home_item_preference_actor($item);
         $count = $actor !== '' ? (int) ($weights[$actor] ?? 0) : 0;
+        // Native Bluesky favourites may record a bsky.app profile URL while
+        // cached posts identify the author by DID. Check both cheap aliases.
+        if ($count < 1 && (($item['kind'] ?? '') === 'bsky')) {
+            $author = is_array($item['row']['post']['author'] ?? null) ? $item['row']['post']['author'] : [];
+            foreach ([(string) ($author['handle'] ?? ''), (string) ($author['did'] ?? '')] as $ref) {
+                if ($ref === '') continue;
+                $count = max($count, (int) ($weights['https://bsky.app/profile/' . $ref] ?? 0));
+            }
+        }
         $created = (int) ($item['sort'] ?? 0);
         // Only recent items receive a nudge; malformed/old timestamps stay put.
         if ($count < 1 || $created < ($now - 172800) || $created > ($now + 300)) {
