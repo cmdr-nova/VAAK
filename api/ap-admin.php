@@ -16909,6 +16909,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <fieldset style="border:1px solid var(--border);border-radius:10px;padding:.75rem;margin:0 0 1rem">
             <legend style="padding:0 .35rem;color:var(--text)">Profile badges <span class="meta">(up to 6)</span></legend>
             <div class="meta" style="margin:0 0 .65rem">Optional flair shown on your HTML profile only. These badges are not federated.</div>
+            <div class="meta" style="margin:0 0 .65rem">These badges are part of a test and more will be coming soon.</div>
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.45rem .75rem">
               <?php foreach ($profileBadgeCatalog as $badgeKey => $badge): ?>
                 <label style="display:flex;align-items:center;gap:.4rem;margin:0;cursor:pointer">
