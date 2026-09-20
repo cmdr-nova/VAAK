@@ -6600,6 +6600,63 @@ function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
     // static cache is per-request; no-op helper for future APCu
 }
 
+/** Return the synced moderation reasons for one Bluesky DID. */
+function ap_bsky_hide_did_reasons(int $ownerUserId, string $did): array
+{
+    if ($ownerUserId < 1 || !str_starts_with($did, 'did:')) {
+        return [];
+    }
+    ap_bsky_graph_sync_migrate();
+    try {
+        $st = ap_db()->prepare(
+            'SELECT DISTINCT reason FROM bsky_hide_dids WHERE owner_user_id = ? AND did = ?'
+        );
+        $st->execute([$ownerUserId, $did]);
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $reason = trim((string) ($row['reason'] ?? ''));
+            if ($reason !== '') {
+                $out[$reason] = true;
+            }
+        }
+        // Direct VAAK/PDS actions are also mirrored in graph_sync. This keeps
+        // filtering correct even before the next full hide-list refresh.
+        foreach (['block', 'mute'] as $kind) {
+            if (is_array(ap_bsky_graph_sync_get($ownerUserId, $kind, $did))) {
+                $out[$kind] = true;
+            }
+        }
+        return array_keys($out);
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/** Resolve an actor reference and return its synced Bluesky moderation reasons. */
+function ap_bsky_actor_hide_reasons(string $actorRef, int $ownerUserId): array
+{
+    static $cache = [];
+    $actorRef = rtrim(trim($actorRef), '/');
+    $key = $ownerUserId . '|' . $actorRef;
+    if (array_key_exists($key, $cache)) {
+        return $cache[$key];
+    }
+    if ($ownerUserId < 1 || !ap_bsky_is_profile_ref($actorRef)) {
+        return $cache[$key] = [];
+    }
+    $did = null;
+    $profile = function_exists('ap_bsky_actor_profile_cache_get')
+        ? ap_bsky_actor_profile_cache_get($actorRef, $ownerUserId)
+        : null;
+    if (is_array($profile) && is_string($profile['did'] ?? null) && str_starts_with($profile['did'], 'did:')) {
+        $did = $profile['did'];
+    }
+    if ($did === null) {
+        $did = ap_bsky_resolve_target_did($actorRef, $ownerUserId);
+    }
+    return $cache[$key] = is_string($did) ? ap_bsky_hide_did_reasons($ownerUserId, $did) : [];
+}
+
 /**
  * Pull Bluesky blocks, mutes, and subscribed block/mute modlist members into hide set.
  *

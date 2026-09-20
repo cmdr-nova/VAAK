@@ -4600,6 +4600,9 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
  */
 function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
 {
+    if (!function_exists('ap_bsky_actor_hide_reasons') && is_file(__DIR__ . '/ap-bsky.php')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
     $limit = max(1, min(80, $limit));
     // Keep notification polling bounded. Ice Cubes usually asks for 40
     // items, but scanning 200 rows from every source made deleted/remote
@@ -4652,6 +4655,15 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         $st->execute($bind);
         $seenActivityIds = [];
         foreach ($st->fetchAll() as $row) {
+            // Bluesky moderation lists are synced into the same hide set used
+            // by Bluesky feeds. Do not expose their mentions/likes/boosts in
+            // the generic Mastodon-compatible notifications surface.
+            if (function_exists('ap_bsky_actor_hide_reasons')) {
+                $actorRef = (string) ($row['actor_id'] ?? '');
+                if ($actorRef !== '' && ap_bsky_actor_hide_reasons($actorRef, $ownerUserId) !== []) {
+                    continue;
+                }
+            }
             $activityId = trim((string) ($row['activity_id'] ?? ''));
             if ($activityId !== '') {
                 if (isset($seenActivityIds[$activityId])) {
@@ -4801,6 +4813,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
  */
 function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache = false): array
 {
+    if (!function_exists('ap_bsky_actor_hide_reasons') && is_file(__DIR__ . '/ap-bsky.php')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
     $scan = max(1, min(80, $scan));
     $markers = ap_masto_markers_get();
     $lastRead = '0';
@@ -4864,6 +4879,12 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         foreach ($st->fetchAll() ?: [] as $row) {
             if (!is_array($row)) {
                 continue;
+            }
+            if (function_exists('ap_bsky_actor_hide_reasons')) {
+                $actorRef = (string) ($row['actor_id'] ?? '');
+                if ($actorRef !== '' && ap_bsky_actor_hide_reasons($actorRef, $ownerUserId) !== []) {
+                    continue;
+                }
             }
             $activityId = trim((string) ($row['activity_id'] ?? ''));
             if ($activityId !== '') {

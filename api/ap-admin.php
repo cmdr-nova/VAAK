@@ -19485,10 +19485,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 && is_array(ap_bsky_graph_sync_get($rpOwnerId, 'mute', $rpBskyDidForModeration));
             $rpBskyBlocked = $rpBskyDidForModeration !== '' && function_exists('ap_bsky_graph_sync_get')
                 && is_array(ap_bsky_graph_sync_get($rpOwnerId, 'block', $rpBskyDidForModeration));
+            $rpBskyHideReasons = $rpIsBsky && function_exists('ap_bsky_hide_did_reasons')
+                ? ap_bsky_hide_did_reasons($rpOwnerId, $rpBskyDidForModeration)
+                : [];
+            $rpBskyListBlocked = in_array('listblock', $rpBskyHideReasons, true);
+            $rpBskyListMuted = in_array('listmute', $rpBskyHideReasons, true);
             $rpMuted = function_exists('ap_is_muted_actor') && ap_is_muted_actor($rpActor, $rpOwnerId);
-            $rpMuted = $rpMuted || $rpBskyMuted;
+            $rpMuted = $rpMuted || $rpBskyMuted || $rpBskyListMuted;
             $rpBlockedPersonal = $rpIsBsky
-                ? ($rpBskyBlocked || (function_exists('ap_user_is_blocked')
+                ? ($rpBskyBlocked || $rpBskyListBlocked || (function_exists('ap_user_is_blocked')
                     && ap_user_is_blocked($rpActor, short_host($rpActor), $rpOwnerId)))
                 : (function_exists('ap_user_is_blocked') && ap_user_is_blocked($rpActor, short_host($rpActor), $rpOwnerId));
             $rpBlockedServer = function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($rpActor);
