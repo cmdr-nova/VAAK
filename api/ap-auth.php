@@ -332,6 +332,34 @@ function ap_auth_user_set_disabled(int $id, bool $disabled): array
     return ['ok' => true, 'disabled' => $disabled];
 }
 
+/** Deactivate a user's login immediately; content cleanup runs separately. */
+function ap_auth_delete_account(int $id, string $password, string $confirmation): array
+{
+    if ($id < 1 || $confirmation !== 'DELETE') {
+        return ['ok' => false, 'error' => 'Type DELETE exactly to confirm account deletion.'];
+    }
+    $st = ap_db()->prepare('SELECT * FROM ap_users WHERE id = ? LIMIT 1');
+    $st->execute([$id]);
+    $user = $st->fetch();
+    if (!is_array($user)) return ['ok' => false, 'error' => 'Account not found.'];
+    if ((string) ($user['actor_key'] ?? '') === 'cmdr_nova' || !empty($user['is_admin'])) {
+        return ['ok' => false, 'error' => 'The operator account cannot be deleted from this interface.'];
+    }
+    if (ap_auth_verify_credentials((string) ($user['username'] ?? ''), $password) === null) {
+        return ['ok' => false, 'error' => 'Password verification failed.'];
+    }
+    $now = ap_db_now();
+    ap_db()->prepare('UPDATE ap_users SET disabled_at = ?, updated_at = ? WHERE id = ?')
+        ->execute([$now, $now, $id]);
+    try {
+        ap_db()->prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL')
+            ->execute([$now, $id]);
+    } catch (Throwable $e) {
+        error_log('[ap-auth] account delete token revoke: ' . $e->getMessage());
+    }
+    return ['ok' => true, 'user' => $user];
+}
+
 /**
  * Update account email (login alias). Empty clears it.
  *
