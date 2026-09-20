@@ -12195,9 +12195,11 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
 
     if (in_array($view, ['home', 'feed', 'local'], true)) {
         foreach (admin_pending_timeline_items($ownerId) as $pendingItem) {
-            if ((int) ($pendingItem['sort'] ?? 0) > $sinceTs) {
-                $out[] = $pendingItem;
-            }
+            // Queue timestamps can share the same second as the timeline head.
+            // Include all active pending items here; the browser's seen-key
+            // filter prevents duplicates while allowing a just-queued post to
+            // surface immediately after the composer polls.
+            $out[] = $pendingItem;
         }
     }
     usort($out, static fn($a, $b) => $b['sort'] <=> $a['sort']);
