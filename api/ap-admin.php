@@ -13556,11 +13556,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .topbar-timeline .topbar-actions > .timeline-tabs { margin-inline: auto; }
     .topbar-timeline .topbar-actions > .btn { position: absolute; right: 0; width: 2.4rem; height: 2.25rem; min-height: 0; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 0; line-height: 1; }
     .topbar-timeline .topbar-actions > .btn::before { content: '↻'; display: block; font-size: 1.2rem; line-height: 1; }
-    .topbar-refresh.is-refreshing::before { animation: topbar-refresh-spin .72s linear infinite; }
-    @keyframes topbar-refresh-spin { to { transform: rotate(360deg); } }
-    @media (prefers-reduced-motion: reduce) {
-      .topbar-refresh.is-refreshing::before { animation-duration: 1.4s; }
-    }
     .pill {
       display: inline-flex; gap: .5rem; align-items: center;
       padding: .35rem .7rem; border-radius: 999px;
@@ -15147,9 +15142,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed">Federated</a>
           </nav>
         <?php endif; ?>
-        <?php if (in_array($view, ['home', 'local', 'feed', 'gallery', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile', 'users'], true)): ?>
-          <a class="btn btn-ghost topbar-refresh" data-refresh-link href="?view=<?= h($view) ?><?= $view === 'dms' && !empty($_GET['peer']) ? '&amp;peer=' . urlencode((string) $_GET['peer']) : '' ?>&amp;_r=<?= time() ?>" title="Reload this view">↻ Refresh</a>
-        <?php endif; ?>
       </div>
     </div>
 
@@ -15157,12 +15149,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <?php if ($error): ?><div class="flash err" role="alert" data-flash-timeout="10000"><span><?= h($error) ?></span><button class="flash-dismiss" type="button" aria-label="Dismiss error">×</button></div><?php endif; ?>
     <script>
       (function () {
-        document.querySelectorAll('a[data-refresh-link]').forEach(function (refresh) {
-          refresh.addEventListener('click', function () {
-            refresh.classList.add('is-refreshing');
-            refresh.setAttribute('aria-busy', 'true');
-          }, { passive: true });
-        });
         document.querySelectorAll('.flash[data-flash-timeout]').forEach(function (flash) {
           var dismiss = function () {
             if (flash.classList.contains('is-leaving')) return;
@@ -23402,10 +23388,6 @@ window.apAdminToast = function (msg, isErr) {
       });
       const h1 = document.querySelector('.main > .topbar h1');
       if (h1) h1.textContent = TL_TITLES[nextView] || nextView;
-      const refresh = document.querySelector('.topbar-actions a.btn[title="Reload this view"]');
-      if (refresh) {
-        refresh.setAttribute('href', '?view=' + encodeURIComponent(nextView) + '&_r=' + Date.now());
-      }
       if (typeof window.novaEnhanceTweetFolds === 'function') {
         window.novaEnhanceTweetFolds(items);
       }
