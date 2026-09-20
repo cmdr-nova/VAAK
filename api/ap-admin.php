@@ -14198,6 +14198,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       flex: 1; min-width: 0;
       display: flex; justify-content: space-between; gap: 1rem;
     }
+    .collection-disclosure > summary { list-style: none; }
+    .collection-disclosure > summary::-webkit-details-marker { display: none; }
+    .collection-disclosure > summary::after {
+      content: '+'; color: var(--muted); font-size: 1.25rem; line-height: 1;
+      margin-left: auto; padding-left: .5rem;
+    }
+    .collection-disclosure[open] > summary::after { content: '−'; }
+    .collection-disclosure[open] > summary { margin-bottom: .75rem; }
     /* Fediverse audience belongs below the author row, never beside a long handle. */
     .tweet-hd-main--fedi { display: block; }
     .tweet-hd-main--fedi > .meta { margin-top: .15rem; }
@@ -18036,18 +18044,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <form method="post" action="?view=collections" style="margin:-.35rem 0 .75rem"><input type="hidden" name="action" value="starter_pack_refresh"><button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Refresh Starter Pack cache</button><span class="meta"> Refresh runs in the background.</span></form>
             <?php if (!$starterPacks): ?><div class="empty" style="margin-bottom:1rem">No cached Starter Packs yet. A background sync will populate this section shortly.</div>
             <?php else: foreach ($starterPacks as $pack): preg_match('~^at://([^/]+)/app\\.bsky\\.graph\\.starterpack/([^/]+)$~', (string)$pack['pack_uri'], $packId); $packLink = !empty($packId[1]) && !empty($packId[2]) ? 'https://bsky.app/starter-pack/' . rawurlencode($packId[1]) . '/' . rawurlencode($packId[2]) : 'https://bsky.app/'; ?>
-              <article class="tweet">
-                <div class="tweet-hd"><div class="tweet-hd-main"><div><span class="who"><?= h((string)$pack['name']) ?></span><span class="tag">Bluesky</span></div>
+              <details class="tweet collection-disclosure">
+                <summary class="tweet-hd" style="cursor:pointer;list-style:none"><div class="tweet-hd-main"><div><span class="who"><?= h((string)$pack['name']) ?></span><span class="tag">Bluesky</span></div>
                   <?php if (trim((string)$pack['description']) !== ''): ?><div class="meta"><?= h((string)$pack['description']) ?></div><?php endif; ?>
                   <div class="meta"><?= count((array)$pack['members']) ?> members · synced <?= h(relative_time((string)$pack['updated_at'])) ?></div>
-                </div></div>
+                </div></summary>
                 <form class="composer" method="post" action="?view=collections" style="margin:.6rem 0"><input type="hidden" name="action" value="starter_pack_add_member"><input type="hidden" name="pack_uri" value="<?= h((string)$pack['pack_uri']) ?>"><div class="composer-actions"><input name="actor" required placeholder="Bluesky handle, DID, or bsky.app profile URL"><button class="btn btn-primary" type="submit">Add Bluesky account</button></div></form>
                 <?php if (empty($pack['members'])): ?><div class="empty">No members in this Starter Pack yet.</div><?php endif; ?>
                 <?php foreach ((array)$pack['members'] as $pm): $pdid=(string)($pm['did']??''); $phandle=(string)($pm['handle']??''); $purl='https://bsky.app/profile/'.rawurlencode($phandle!==''?$phandle:$pdid); ?>
                   <div class="tweet-actions" style="justify-content:space-between;border-top:1px solid var(--line);padding:.45rem 0"><a href="<?= h($purl) ?>" target="_blank" rel="noopener noreferrer"><?= h((string)(($pm['displayName']??'') ?: ($phandle ?: $pdid))) ?> <span class="meta"><?= h($phandle) ?></span></a><form method="post" action="?view=collections"><input type="hidden" name="action" value="starter_pack_remove_member"><input type="hidden" name="pack_uri" value="<?= h((string)$pack['pack_uri']) ?>"><input type="hidden" name="did" value="<?= h($pdid) ?>"><button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Remove</button></form></div>
                 <?php endforeach; ?>
                 <div class="tweet-actions" style="margin-top:.5rem"><a href="<?= h($packLink) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a><form method="post" action="?view=collections" onsubmit="return confirm('Delete this Starter Pack and its linked Bluesky list?')"><input type="hidden" name="action" value="starter_pack_delete"><input type="hidden" name="pack_uri" value="<?= h((string)$pack['pack_uri']) ?>"><button class="btn btn-ghost" type="submit" style="color:var(--danger);padding:.25rem .7rem;font-size:.8rem">Delete</button></form></div>
-              </article>
+              </details>
             <?php endforeach; endif; ?>
           <?php endif; ?>
 
@@ -18075,8 +18083,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="empty">No collections yet. Create one above.</div>
           <?php else: ?>
             <?php foreach ($localColls as $c): ?>
-              <article class="tweet">
-                <div class="tweet-hd">
+              <details class="tweet collection-disclosure">
+                <summary class="tweet-hd" style="cursor:pointer;list-style:none">
                   <div class="tweet-hd-main">
                     <div>
                       <span class="who"><?= h((string) ($c['name'] ?? '')) ?></span>
@@ -18091,7 +18099,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     </div>
                     <div class="meta"><?= (int) ($c['member_count'] ?? 0) ?> members · <?= h(relative_time((string) ($c['updated_at'] ?? ''))) ?></div>
                   </div>
-                </div>
+                </summary>
                 <?php if (trim((string) ($c['description'] ?? '')) !== ''): ?>
                   <div class="body" style="margin:.35rem 0"><?= h((string) $c['description']) ?></div>
                 <?php endif; ?>
@@ -18108,7 +18116,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem;color:var(--danger)">Delete</button>
                   </form>
                 </div>
-              </article>
+              </details>
             <?php endforeach; ?>
           <?php endif; ?>
 
