@@ -12196,6 +12196,63 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
         error_log('[ap-admin] newer poll: ' . $e->getMessage());
     }
 
+    // Federated also includes the Bluesky side of VAAK's bridge. These rows
+    // are populated by the existing Bluesky warm/index job; keep Local free of
+    // them and deduplicate any ActivityPub twin already returned above.
+    if (
+        $view === 'feed'
+        && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+        && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($ownerId))
+        && function_exists('ap_bsky_posts_for_home')
+    ) {
+        $ownDid = (string) (ap_bsky_session_row($ownerId)['did'] ?? '');
+        $newerBsky = ap_bsky_posts_for_home(
+            $ownerId,
+            $limit,
+            $ownDid !== '' ? $ownDid : null,
+            null,
+            $sinceAt
+        );
+        foreach ($newerBsky as $bItem) {
+            if (!is_array($bItem) || empty($bItem['post']) || !is_array($bItem['post'])) {
+                continue;
+            }
+            $bUri = (string) ($bItem['bsky_uri'] ?? ($bItem['post']['uri'] ?? ''));
+            if ($bUri === '' || isset($seen['bsky:' . $bUri])) {
+                continue;
+            }
+            $indexed = (string) ($bItem['indexed_at'] ?? ($bItem['post']['indexedAt'] ?? ''));
+            $sortTs = strtotime($indexed) ?: 0;
+            if ($sortTs <= $querySinceTs) {
+                continue;
+            }
+            $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
+            if ($fediTwin !== '' && (isset($seen['o:' . $fediTwin]) || isset($seen['o:' . $fediTwin . '/']))) {
+                continue;
+            }
+            $authorDid = (string) ($bItem['post']['author']['did'] ?? '');
+            if ($authorDid !== '' && function_exists('ap_bsky_filter_hidden_authors')) {
+                $filtered = ap_bsky_filter_hidden_authors($ownerId, [['post' => $bItem['post']]]);
+                if ($filtered === []) {
+                    continue;
+                }
+            }
+            $item = [
+                'kind' => 'bsky',
+                'sort' => $sortTs,
+                'row' => $bItem,
+            ];
+            if (admin_timeline_item_muted_by_words($item)) {
+                continue;
+            }
+            $seen['bsky:' . $bUri] = true;
+            if ($fediTwin !== '') {
+                $seen['o:' . $fediTwin] = true;
+            }
+            $out[] = $item;
+        }
+    }
+
     if (in_array($view, ['home', 'feed', 'local'], true)) {
         foreach (admin_pending_timeline_items($ownerId) as $pendingItem) {
             // Queue timestamps can share the same second as the timeline head.
