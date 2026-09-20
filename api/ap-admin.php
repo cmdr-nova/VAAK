@@ -5388,6 +5388,8 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             $st = $db->prepare(
                 'SELECT * FROM masto_reblogs
                  WHERE owner_user_id = ? AND created_at < ?
+                   AND (target_actor IS NULL OR target_actor = \'\'
+                        OR target_actor LIKE \'https://mkultra.monster/users/%\')
                  ORDER BY created_at DESC LIMIT ?'
             );
             $st->execute([$ownerId, $beforeAt, $want * 2]);
@@ -6339,13 +6341,14 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
         }
         $localTimeline[] = $outItem;
     }
-    // Local users' boosts (including boosts of remote posts). The booster is
-    // local; the target can be anywhere, while the Local view remains
-    // instance-scoped by who performed the action.
+    // Local-to-local boosts may appear here; boosts of remote posts remain in
+    // Home/Federated so Local stays strictly instance-scoped.
     try {
         $stRb = $db->prepare(
             "SELECT * FROM masto_reblogs
              WHERE owner_user_id = ?
+               AND (target_actor IS NULL OR target_actor = ''
+                    OR target_actor LIKE 'https://mkultra.monster/users/%')
              ORDER BY created_at DESC LIMIT 120"
         );
         $stRb->execute([$localOwnerId]);
@@ -6366,7 +6369,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
     } catch (Throwable $e) {
         // optional
     }
-    $localTimeline = array_merge($localTimeline, admin_pending_timeline_items($localOwnerId));
+    $localTimeline = array_merge($localTimeline, admin_pending_timeline_items($localOwnerId, false));
     usort($localTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     if ($localTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('local', $following);
@@ -11635,7 +11638,7 @@ function admin_render_pending_timeline_item(array $item, string $returnView): vo
 }
 
 /** @return list<array{kind:string,sort:int,row:array<string,mixed>}> */
-function admin_pending_timeline_items(int $ownerUserId): array
+function admin_pending_timeline_items(int $ownerUserId, bool $includeBoosts = true): array
 {
     if ($ownerUserId < 1) {
         return [];
@@ -11649,6 +11652,10 @@ function admin_pending_timeline_items(int $ownerUserId): array
                     $items[] = ['kind' => 'pending_post', 'sort' => $created, 'row' => $row];
                 }
             }
+        }
+        if (!$includeBoosts) {
+            usort($items, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
+            return $items;
         }
         $st = ap_db()->prepare(
             "SELECT id, action_kind, target_key, updated_at
@@ -11692,6 +11699,9 @@ function admin_timeline_status_ids(array $items): array
             continue;
         }
         if ($kind === 'outbox') {
+            continue;
+        }
+        if ($kind === 'pending_post' || $kind === 'pending_action') {
             continue;
         }
         $eventId = (int) ($row['id'] ?? 0);
