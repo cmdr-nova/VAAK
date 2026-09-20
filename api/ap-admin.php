@@ -4498,6 +4498,97 @@ function admin_tl_rank_from_timeline(array $timeline): array
 }
 
 /**
+ * Return the small, local preference signal used by Home ranking.
+ *
+ * This is intentionally computed only while rebuilding the short-lived ranked
+ * timeline cache. Cache hits never call this function, and it never performs
+ * remote work or decodes post bodies.
+ *
+ * @return array<string,int> canonical actor URL => favourite count
+ */
+function admin_home_favourite_actor_weights(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT target_actor AS actor_id, COUNT(*) AS favourite_count
+             FROM masto_favourites
+             WHERE owner_user_id = ?
+               AND target_actor IS NOT NULL
+               AND target_actor != ''
+             GROUP BY target_actor
+             ORDER BY favourite_count DESC
+             LIMIT 64"
+        );
+        $st->execute([$ownerUserId]);
+        $weights = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+            $count = (int) ($row['favourite_count'] ?? 0);
+            if ($actor !== '' && $count > 0) {
+                $weights[$actor] = min(64, $count);
+            }
+        }
+        return $weights;
+    } catch (Throwable $e) {
+        // Preference ranking is optional; a schema/cache issue must not affect Home.
+        return [];
+    }
+}
+
+/** @param array{kind?:string,row?:array<string,mixed>} $item */
+function admin_home_item_preference_actor(array $item): string
+{
+    $kind = (string) ($item['kind'] ?? '');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if ($kind === 'bsky') {
+        return rtrim((string) ($row['post']['author']['did'] ?? $row['author_did'] ?? ''), '/');
+    }
+    // For boosts/Announce events, rank the original author rather than the
+    // account that performed the boost.
+    if ($kind === 'boost' || strtolower((string) ($row['type'] ?? '')) === 'announce') {
+        $target = rtrim((string) ($row['target_actor'] ?? ''), '/');
+        if ($target !== '') {
+            return $target;
+        }
+    }
+    return rtrim((string) ($row['actor_id'] ?? $row['attributedTo'] ?? ''), '/');
+}
+
+/**
+ * Nudge recent posts from authors the user repeatedly favourites.
+ *
+ * The maximum adjustment is 30 minutes, so this cannot turn the feed into a
+ * separate recommendation stream or pull old posts into a fresh Home page.
+ *
+ * @param list<array{kind?:string,row?:array<string,mixed>,sort?:int}> $timeline
+ * @return list<array{kind?:string,row?:array<string,mixed>,sort?:int}>
+ */
+function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): array
+{
+    $weights = admin_home_favourite_actor_weights($ownerUserId);
+    if ($weights === []) {
+        return $timeline;
+    }
+    $now = time();
+    foreach ($timeline as &$item) {
+        $actor = admin_home_item_preference_actor($item);
+        $count = $actor !== '' ? (int) ($weights[$actor] ?? 0) : 0;
+        $created = (int) ($item['sort'] ?? 0);
+        // Only recent items receive a nudge; malformed/old timestamps stay put.
+        if ($count < 1 || $created < ($now - 172800) || $created > ($now + 300)) {
+            continue;
+        }
+        $item['sort'] = $created + min(1800, (int) round(600 * log(1 + $count, 2)));
+    }
+    unset($item);
+    usort($timeline, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
+    return $timeline;
+}
+
+/**
  * Keep the first Home page fedi-only (fast paint). Queue Bluesky ids into later
  * pages at ~30% with ≥2 fedi cards between, skipping dual-published twins.
  *
@@ -5845,7 +5936,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     // Bluesky mix is queued into the ranked cache *after* the first page so
     // first paint stays fedi-only (no 80-post JSON decode / dual-publish walk).
-    usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    // Personalization is deliberately applied only during ranked-cache builds.
+    // A cache hit (the common Home path) does not run this query or resort work.
+    $homeTimeline = admin_home_apply_favourite_rank($homeTimeline, $homeOwnerId);
     // Soft cap Bluesky share (~30%) so Home stays fedi-first when AT cache is busy.
     // Defer surplus Bluesky (don't drop) so later pages / deeper scroll still get them.
     if ($homeTimeline) {
