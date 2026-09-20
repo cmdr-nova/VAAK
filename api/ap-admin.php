@@ -25461,6 +25461,85 @@ if (VIEW === 'analytics') loadAnalytics();
 <script>
 // Follow/unfollow forms use the same durable queue as timeline reactions.
 (function () {
+  const STORAGE_PREFIX = 'vaak-follow-queue:u<?= (int) $vaakOwnerId ?>:';
+  const MAX_AGE_MS = 10 * 60 * 1000;
+  const POLL_LIMIT = 90;
+  function followKey(form) {
+    const actor = form.querySelector('input[name="actor_id"]');
+    return actor && actor.value ? STORAGE_PREFIX + encodeURIComponent(actor.value) : '';
+  }
+  function readPending(form) {
+    const key = followKey(form);
+    if (!key) return null;
+    try {
+      const value = JSON.parse(window.localStorage.getItem(key) || 'null');
+      if (!value || !value.queueId || !value.revision || !value.ts || Date.now() - Number(value.ts) > MAX_AGE_MS) {
+        window.localStorage.removeItem(key);
+        return null;
+      }
+      return value;
+    } catch (_) { return null; }
+  }
+  function writePending(form, state) {
+    const key = followKey(form);
+    if (!key) return;
+    try { window.localStorage.setItem(key, JSON.stringify({ ...state, ts: Date.now() })); } catch (_) {}
+  }
+  function clearPending(form) {
+    const key = followKey(form);
+    if (!key) return;
+    try { window.localStorage.removeItem(key); } catch (_) {}
+  }
+  function setQueued(form, state) {
+    const button = form.querySelector('button[type="submit"]');
+    if (!button) return;
+    form.dataset.queuePending = '1';
+    form.dataset.queueId = String(state.queueId);
+    form.dataset.queueRevision = String(state.revision);
+    button.disabled = true;
+    button.textContent = state.desired ? 'Following…' : 'Unfollowing…';
+    button.title = state.desired ? 'Follow action queued — processing' : 'Unfollow action queued — processing';
+  }
+  async function pollPending(form, state) {
+    for (let n = 0; n < POLL_LIMIT; n++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      if (!form.isConnected) return;
+      const sf = new FormData(); sf.set('action', 'action_queue_status'); sf.set('queue_id', String(state.queueId)); sf.set('ajax', '1');
+      if (window.VAAK_CSRF) sf.set('csrf', window.VAAK_CSRF);
+      try {
+        const sr = await fetch(window.location.pathname + (window.location.search || ''), { method: 'POST', body: sf, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
+        const sd = await sr.json(); const q = sd && sd.queue;
+        if (!q || Number(q.revision) < Number(state.revision)) continue;
+        const actionInput = form.querySelector('input[name="action"]');
+        const button = form.querySelector('button[type="submit"]');
+        if (q.status === 'succeeded' && Number(q.revision) === Number(state.revision)) {
+          clearPending(form); delete form.dataset.queuePending;
+          if (actionInput) actionInput.value = state.desired ? 'unfollow_remote' : 'follow_remote';
+          if (button) { button.disabled = false; button.textContent = state.desired ? 'Unfollow' : 'Follow'; button.title = state.desired ? 'Following' : 'Follow'; }
+          if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form);
+          return;
+        }
+        if (q.status === 'failed' && Number(q.revision) === Number(state.revision)) {
+          clearPending(form); delete form.dataset.queuePending;
+          if (actionInput) actionInput.value = state.desired ? 'follow_remote' : 'unfollow_remote';
+          if (button) { button.disabled = false; button.textContent = state.desired ? 'Follow' : 'Unfollow'; button.title = state.desired ? 'Follow' : 'Unfollow'; }
+          if (state.relBefore) {
+            const relState = document.getElementById('remote-profile-rel-state');
+            if (relState) { relState.innerHTML = state.relBefore.html || ''; relState.dataset.following = state.relBefore.following || '0'; }
+          }
+          if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form);
+          if (window.apAdminToast) window.apAdminToast(q.last_error || 'Follow action failed after retrying.', true);
+          return;
+        }
+      } catch (_) { /* retain queued state on transient polling errors */ }
+    }
+  }
+  document.querySelectorAll('form').forEach((form) => {
+    const actionInput = form.querySelector('input[name="action"]');
+    if (!actionInput || !['follow_remote', 'unfollow_remote'].includes(actionInput.value)) return;
+    const pending = readPending(form);
+    if (pending) { setQueued(form, pending); pollPending(form, pending); }
+  });
   document.addEventListener('submit', async (ev) => {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -25474,7 +25553,7 @@ if (VIEW === 'analytics') loadAnalytics();
     }
     const before = { action: actionInput.value, label: button.innerHTML, title: button.title };
       const want = actionInput.value === 'follow_remote';
-      form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
+      form.dataset.queueBusy = '1'; button.disabled = true; button.textContent = want ? 'Following…' : 'Unfollowing…';
       const relState = document.getElementById('remote-profile-rel-state');
       const relBefore = relState ? { html: relState.innerHTML, following: relState.dataset.following } : null;
       if (relState) {
@@ -25490,34 +25569,15 @@ if (VIEW === 'analytics') loadAnalytics();
       const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
       const data = await res.json().catch(() => null);
       if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
-      form.dataset.queuePending = '1'; form.dataset.queueId = String(data.queue_id); form.dataset.queueRevision = String(data.revision || '');
+      const pendingState = { queueId: data.queue_id, revision: data.revision || '', desired: want, relBefore };
+      writePending(form, pendingState); setQueued(form, pendingState);
       actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
-      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following (action queued)' : 'Unfollowed (action queued)';
-      (async () => {
-        for (let n = 0; n < 90; n++) {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          const sf = new FormData(); sf.set('action', 'action_queue_status'); sf.set('queue_id', String(data.queue_id)); sf.set('ajax', '1');
-          if (window.VAAK_CSRF) sf.set('csrf', window.VAAK_CSRF);
-          try {
-            const sr = await fetch(window.location.pathname + (window.location.search || ''), { method: 'POST', body: sf, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
-            const sd = await sr.json(); const q = sd && sd.queue;
-            if (!q || Number(q.revision) < Number(form.dataset.queueRevision || data.revision)) continue;
-            if (q.status === 'succeeded') { if (Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) { delete form.dataset.queuePending; if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form); } return; }
-            if (q.status === 'failed' && Number(q.revision) === Number(form.dataset.queueRevision || data.revision)) {
-              if (form.isConnected) { actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title; }
-              if (relState && relBefore) { relState.innerHTML = relBefore.html; relState.dataset.following = relBefore.following; }
-              delete form.dataset.queuePending;
-              if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(form);
-              window.apAdminToast(q.last_error || 'Follow action failed after retrying.', true); return;
-            }
-          } catch (e) { /* retain queued state on transient polling errors */ }
-        }
-      })();
+      pollPending(form, pendingState);
     } catch (e) {
       actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title;
       if (relState && relBefore) { relState.innerHTML = relBefore.html; relState.dataset.following = relBefore.following; }
       window.apAdminToast((e && e.message) || 'Follow action failed.', true);
-    } finally { form.dataset.queueBusy = '0'; button.disabled = false; }
+    } finally { form.dataset.queueBusy = '0'; if (form.dataset.queuePending !== '1') button.disabled = false; }
   });
 })();
 </script>
