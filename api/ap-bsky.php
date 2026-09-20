@@ -6434,6 +6434,45 @@ function ap_bsky_unblock_actor(int $ownerUserId, string $did): array
     $row = ap_bsky_session_row($ownerUserId);
     $existing = ap_bsky_graph_sync_get($ownerUserId, 'block', $did);
     $blockUri = is_array($existing) ? trim((string) ($existing['bsky_uri'] ?? '')) : '';
+    // Pull-synced blocks contain the subject DID but not the record URI. Find
+    // the matching repo record so an unblock initiated in VAAK removes it on
+    // the PDS as well.
+    if ($blockUri === '' && is_array($row) && !empty($row['did'])) {
+        $tok = ap_bsky_access_token($ownerUserId, false);
+        if (empty($tok['ok'])) {
+            $tok = ap_bsky_access_token($ownerUserId, true);
+        }
+        if (!empty($tok['ok'])) {
+            $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+            $cursor = null;
+            for ($page = 0; $page < 20 && $blockUri === ''; $page++) {
+                $query = [
+                    'repo' => (string) $row['did'],
+                    'collection' => 'app.bsky.graph.block',
+                    'limit' => 100,
+                ];
+                if ($cursor !== null && $cursor !== '') {
+                    $query['cursor'] = $cursor;
+                }
+                $list = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', $query, null, (string) $tok['access'], 12);
+                if (empty($list['ok'])) {
+                    break;
+                }
+                foreach ((array) ($list['json']['records'] ?? []) as $record) {
+                    $subject = (string) ($record['value']['subject'] ?? '');
+                    if ($subject === $did) {
+                        $blockUri = (string) ($record['uri'] ?? '');
+                        break;
+                    }
+                }
+                $cursor = isset($list['json']['cursor']) && is_string($list['json']['cursor'])
+                    ? $list['json']['cursor'] : null;
+                if ($cursor === null) {
+                    break;
+                }
+            }
+        }
+    }
     if ($blockUri === '' || !preg_match('~^at://[^/]+/app\.bsky\.graph\.block/([^/]+)$~', $blockUri, $m)) {
         // No stored rkey — still clear local hide + sync row.
         ap_bsky_graph_sync_delete($ownerUserId, 'block', $did);
@@ -6619,6 +6658,9 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         ap_db()->prepare(
             "DELETE FROM bsky_hide_dids WHERE owner_user_id = ? AND reason IN ('block','mute','listblock','listmute')"
         )->execute([$ownerUserId]);
+        ap_db()->prepare(
+            "DELETE FROM bsky_graph_sync WHERE owner_user_id = ? AND source = 'bsky' AND kind IN ('block', 'mute')"
+        )->execute([$ownerUserId]);
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => $e->getMessage()];
     }
@@ -6640,6 +6682,7 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                 continue;
             }
             ap_bsky_hide_did_add($ownerUserId, $did, 'block');
+            ap_bsky_graph_sync_upsert($ownerUserId, 'block', $did, null, 'bsky');
             $blockCount++;
         }
         $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
@@ -6665,6 +6708,7 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                 continue;
             }
             ap_bsky_hide_did_add($ownerUserId, $did, 'mute');
+            ap_bsky_graph_sync_upsert($ownerUserId, 'mute', $did, null, 'bsky');
             $muteCount++;
         }
         $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;

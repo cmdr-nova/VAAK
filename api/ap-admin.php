@@ -2320,6 +2320,44 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         if (!empty($_POST['filter'])) {
             $_GET['filter'] = preg_replace('/[^a-z_]/', '', (string) $_POST['filter']) ?: 'open';
         }
+    } elseif (in_array($action, ['bsky_mute_actor', 'bsky_unmute_actor', 'bsky_block_actor', 'bsky_unblock_actor'], true)) {
+        $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'remote_profile')) ?: 'remote_profile';
+        $returnActor = trim((string) ($_POST['return_actor'] ?? ''));
+        $target = trim((string) ($_POST['actor_id'] ?? ''));
+        if ($target === '' || !function_exists('ap_bsky_resolve_target_did')) {
+            $error = 'Missing Bluesky actor.';
+        } else {
+            if (!function_exists('ap_bsky_mute_actor')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            $did = ap_bsky_resolve_target_did($target, $vaakOwnerId);
+            if (!is_string($did) || !str_starts_with($did, 'did:')) {
+                $error = 'Could not resolve the Bluesky account.';
+            } else {
+                $fn = match ($action) {
+                    'bsky_mute_actor' => 'ap_bsky_mute_actor',
+                    'bsky_unmute_actor' => 'ap_bsky_unmute_actor',
+                    'bsky_block_actor' => 'ap_bsky_block_actor',
+                    'bsky_unblock_actor' => 'ap_bsky_unblock_actor',
+                };
+                $result = $fn($vaakOwnerId, $did);
+                if (!empty($result['ok'])) {
+                    admin_tl_cache_clear();
+                    $notice = match ($action) {
+                        'bsky_mute_actor' => 'Muted on Bluesky.',
+                        'bsky_unmute_actor' => 'Unmuted on Bluesky.',
+                        'bsky_block_actor' => 'Blocked on Bluesky.',
+                        default => 'Unblocked on Bluesky.',
+                    };
+                } else {
+                    $error = $result['error'] ?? 'Bluesky moderation action failed.';
+                }
+            }
+        }
+        if ($view === 'remote_profile' && $returnActor !== '' && str_starts_with($returnActor, 'https://')) {
+            $_GET['actor'] = $returnActor;
+            $_GET['from'] = (string) ($_POST['return_from'] ?? ($_GET['from'] ?? ''));
+        }
     } elseif ($action === 'mute_remote' || $action === 'unmute_remote') {
         $target = trim((string) ($_POST['actor_id'] ?? ''));
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'remote_profile')) ?: 'remote_profile';
@@ -8736,6 +8774,12 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isLocal = $actorId !== '' && function_exists('vaak_is_local_url') && vaak_is_local_url($actorId);
     $isSelf = $actorId !== '' && function_exists('vaak_actor_id')
         && rtrim(vaak_actor_id(), '/') === $actorId;
+    $isBsky = !$isSelf && function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actorId);
+    $bskyDid = '';
+    if ($isBsky && function_exists('ap_bsky_resolve_target_did')) {
+        $resolvedDid = ap_bsky_resolve_target_did($actorId, $ownerUserId);
+        $bskyDid = is_string($resolvedDid) && str_starts_with($resolvedDid, 'did:') ? $resolvedDid : '';
+    }
     if (!$isSelf && str_contains($host, 'bsky.app') && function_exists('ap_bsky_session_row')) {
         $bs = ap_bsky_session_row($ownerUserId);
         $pathHandle = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
@@ -8749,6 +8793,11 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isMuted = $actorId !== '' && function_exists('ap_is_muted_actor')
         ? ap_is_muted_actor($actorId, $ownerUserId)
         : false;
+    $bskyMuted = $bskyDid !== '' && function_exists('ap_bsky_graph_sync_get')
+        && is_array(ap_bsky_graph_sync_get($ownerUserId, 'mute', $bskyDid));
+    $bskyBlocked = $bskyDid !== '' && function_exists('ap_bsky_graph_sync_get')
+        && is_array(ap_bsky_graph_sync_get($ownerUserId, 'block', $bskyDid));
+    $isMuted = $isMuted || $bskyMuted;
     $isDeprioritized = $actorId !== '' && function_exists('ap_is_deprioritized_actor')
         ? ap_is_deprioritized_actor($actorId, $ownerUserId)
         : false;
@@ -8766,22 +8815,26 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     // Personal mute/block first — available to every signed-in user, including admins.
     // Don't offer personal actions for the signed-in actor itself.
     if ($actorId !== '' && str_starts_with($actorId, 'https://') && !$isSelf) {
-        $isBlocked = is_array($personalBlock);
+        $isBlocked = is_array($personalBlock) || $bskyBlocked;
+        $blockUsesPdsOnly = $bskyBlocked && !is_array($personalBlock);
         $menu .= '<form method="post" action="?view=' . h($returnView) . '">'
             . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
-            . '<input type="hidden" name="action" value="' . ($isBlocked ? 'user_block_remove' : 'user_block_add') . '">'
+            . '<input type="hidden" name="action" value="' . ($blockUsesPdsOnly ? 'bsky_unblock_actor' : ($isBlocked ? 'user_block_remove' : 'user_block_add')) . '">'
             . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
             . '<input type="hidden" name="return_from" value="' . h($returnFrom) . '">'
             . '<input type="hidden" name="return_actor" value="' . h($actorId) . '">'
-            . ($isBlocked
+            . ($blockUsesPdsOnly
+                ? '<input type="hidden" name="actor_id" value="' . h($actorId) . '">'
+                : ($isBlocked
                 ? '<input type="hidden" name="id" value="' . (int) ($personalBlock['id'] ?? 0) . '">'
-                : '<input type="hidden" name="target" value="' . h($actorId) . '">')
+                : '<input type="hidden" name="target" value="' . h($actorId) . '">'))
             . '<button class="menu-action" type="submit" title="Hide from your timelines only">'
             . ($isBlocked ? 'Unblock for me' : 'Block for me') . '</button>'
             . '</form>';
+        $muteUsesPdsOnly = $bskyMuted && !ap_is_muted_actor($actorId, $ownerUserId);
         $menu .= '<form method="post" action="?view=' . h($returnView) . '">'
             . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
-            . '<input type="hidden" name="action" value="' . ($isMuted ? 'unmute_remote' : 'mute_remote') . '">'
+            . '<input type="hidden" name="action" value="' . ($muteUsesPdsOnly ? 'bsky_unmute_actor' : ($isMuted ? 'unmute_remote' : 'mute_remote')) . '">'
             . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
             . '<input type="hidden" name="return_from" value="' . h($returnFrom) . '">'
             . '<input type="hidden" name="return_actor" value="' . h($actorId) . '">'
@@ -19427,12 +19480,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 ? $rpBskyFollowsYou
                 : ($rpRel === 'mutual' || $rpRel === 'follows_you');
             $rpOwnerId = admin_owner_user_id();
-            $rpMuted = !$rpIsBsky && function_exists('ap_is_muted_actor') && ap_is_muted_actor($rpActor, $rpOwnerId);
-            $rpBlockedPersonal = !$rpIsBsky && function_exists('ap_user_is_blocked')
-                && ap_user_is_blocked($rpActor, short_host($rpActor), $rpOwnerId);
-            $rpBlockedServer = !$rpIsBsky && function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($rpActor);
-            $rpContentBlocked = !$rpIsBsky && function_exists('ap_actor_is_content_blocked')
-                && ap_actor_is_content_blocked($rpActor, short_host($rpActor), $rpOwnerId);
+            $rpBskyDidForModeration = $rpIsBsky ? trim($rpBskyDid) : '';
+            $rpBskyMuted = $rpBskyDidForModeration !== '' && function_exists('ap_bsky_graph_sync_get')
+                && is_array(ap_bsky_graph_sync_get($rpOwnerId, 'mute', $rpBskyDidForModeration));
+            $rpBskyBlocked = $rpBskyDidForModeration !== '' && function_exists('ap_bsky_graph_sync_get')
+                && is_array(ap_bsky_graph_sync_get($rpOwnerId, 'block', $rpBskyDidForModeration));
+            $rpMuted = function_exists('ap_is_muted_actor') && ap_is_muted_actor($rpActor, $rpOwnerId);
+            $rpMuted = $rpMuted || $rpBskyMuted;
+            $rpBlockedPersonal = $rpIsBsky
+                ? ($rpBskyBlocked || (function_exists('ap_user_is_blocked')
+                    && ap_user_is_blocked($rpActor, short_host($rpActor), $rpOwnerId)))
+                : (function_exists('ap_user_is_blocked') && ap_user_is_blocked($rpActor, short_host($rpActor), $rpOwnerId));
+            $rpBlockedServer = function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($rpActor);
+            $rpContentBlocked = $rpBlockedPersonal || $rpBlockedServer
+                || (!$rpIsBsky && function_exists('ap_actor_is_content_blocked')
+                    && ap_actor_is_content_blocked($rpActor, short_host($rpActor), $rpOwnerId));
             $rpIsOwn = $rpIsBsky
                 ? (function_exists('ap_bsky_session_row') && is_array($sess = ap_bsky_session_row($vaakOwnerId))
                     && (($sess['did'] ?? '') === $rpBskyDid || ($sess['handle'] ?? '') === $rpBskyHandle))
@@ -19571,8 +19633,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <input type="hidden" name="target" value="<?= h($rpActor) ?>">
                   <button class="btn btn-ghost" type="submit" title="Wafrn-compatible bite"><i class="ph ph-tooth" aria-hidden="true"></i> Bite</button>
                 </form>
-                <?= block_quick_actions($rpActor, short_host($rpActor), 'remote_profile', $vaakOwnerId, !empty($vaakIsAdmin), $rpFrom) ?>
               <?php endif; ?>
+              <?= block_quick_actions($rpActor, short_host($rpActor), 'remote_profile', $vaakOwnerId, !empty($vaakIsAdmin), $rpFrom) ?>
               <a href="<?= h($rpIsBsky ? $rpActor : admin_remote_actor_href($rpActor)) ?>" target="_blank" rel="noopener noreferrer"><?= $rpIsBsky ? 'Open on Bluesky' : h(admin_open_profile_label($rpActor)) ?></a>
               <?php if (!$rpIsBsky && !$rpIsLocal && !$rpIsOwn): ?>
                 <?php

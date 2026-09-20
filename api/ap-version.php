@@ -5,9 +5,9 @@ declare(strict_types=1);
  * Public VAAK release channel / version label.
  * Bump these together when shipping a batch to the public mirror.
  */
-const VAAK_VERSION = '0.2.9';
+const VAAK_VERSION = '0.2.10';
 const VAAK_CHANNEL = 'alpha';
-const VAAK_VERSION_DATE = '2026-09-19';
+const VAAK_VERSION_DATE = '2026-09-20';
 
 /** e.g. "VAAK alpha 0.1.0 · 2026-09-10" */
 function vaak_version_label(): string
