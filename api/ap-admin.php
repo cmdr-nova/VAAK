@@ -166,6 +166,8 @@ register_shutdown_function(static function () use ($adminRenderHiccup): void {
 
 $notice = null;
 $error = null;
+$twoFaSetup = null;
+$twoFaRecoveryCodes = [];
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
 $composerForceOpen = false;
 // Legacy ?view=compose → Your posts + open floating composer
@@ -3368,6 +3370,31 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             } else {
                 $error = $res['error'] ?? 'Could not update password.';
             }
+        }
+    } elseif ($action === '2fa_begin_setup') {
+        $view = 'security';
+        $res = ap_auth_2fa_begin_setup($vaakOwnerId, $vaakUsername);
+        if (!empty($res['ok'])) {
+            $twoFaSetup = $res;
+        } else {
+            $error = $res['error'] ?? 'Could not start two-factor setup.';
+        }
+    } elseif ($action === '2fa_confirm_setup') {
+        $view = 'security';
+        $res = ap_auth_2fa_confirm_setup($vaakOwnerId, (string) ($_POST['code'] ?? ''));
+        if (!empty($res['ok'])) {
+            $twoFaRecoveryCodes = is_array($res['recovery_codes'] ?? null) ? $res['recovery_codes'] : [];
+            $notice = 'Two-factor authentication enabled. Save the recovery codes below; they are shown only once.';
+        } else {
+            $error = $res['error'] ?? 'Could not enable two-factor authentication.';
+        }
+    } elseif ($action === '2fa_disable') {
+        $view = 'security';
+        $res = ap_auth_2fa_disable($vaakOwnerId, (string) ($_POST['password'] ?? ''), (string) ($_POST['code'] ?? ''));
+        if (!empty($res['ok'])) {
+            $notice = 'Two-factor authentication disabled.';
+        } else {
+            $error = $res['error'] ?? 'Could not disable two-factor authentication.';
         }
     } elseif ($action === 'revoke_oauth_token') {
         $view = 'security';
@@ -16279,6 +16306,47 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-primary" type="submit">Update password</button>
           </div>
         </form>
+
+        <?php $twoFaEnabled = ap_auth_2fa_enabled($vaakOwnerId); ?>
+        <?php if ($twoFaRecoveryCodes): ?>
+        <div class="tweet" style="margin-bottom:1.25rem;border-color:#00ff9f">
+          <div class="who">Save your recovery codes</div>
+          <div class="body meta" style="margin-top:.5rem">Each code works once if you lose access to your authenticator. VAAK cannot show these again.</div>
+          <code style="display:block;white-space:pre-wrap;margin-top:.75rem;line-height:1.8;color:#9dffd0"><?= h(implode("\n", $twoFaRecoveryCodes)) ?></code>
+        </div>
+        <?php elseif (!$twoFaEnabled && is_array($twoFaSetup)): ?>
+        <form class="composer" method="post" action="?view=security" style="margin-bottom:1.25rem" autocomplete="off">
+          <input type="hidden" name="action" value="2fa_confirm_setup">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <div class="meta"><strong>Finish two-factor setup</strong></div>
+          <div class="body meta" style="margin-top:.5rem">Add this account to an authenticator app using the manual key or the otpauth URI.</div>
+          <code style="display:block;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem;color:#9dffd0">Manual key: <?= h((string) ($twoFaSetup['secret'] ?? '')) ?>\n<?= h((string) ($twoFaSetup['otpauth'] ?? '')) ?></code>
+          <input name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit authenticator code" style="margin-top:.75rem">
+          <div class="composer-actions"><span class="meta">No remote QR service is contacted.</span><button class="btn btn-primary" type="submit">Enable 2FA</button></div>
+        </form>
+        <?php elseif (!$twoFaEnabled): ?>
+        <div class="tweet" style="margin-bottom:1.25rem">
+          <div class="who">Two-factor authentication</div>
+          <div class="body meta" style="margin-top:.5rem">Protect web logins with a TOTP authenticator app. API and Ice Cubes tokens remain independent.</div>
+          <form method="post" action="?view=security" style="margin-top:.75rem">
+            <input type="hidden" name="action" value="2fa_begin_setup">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <button class="btn btn-primary" type="submit">Set up 2FA</button>
+          </form>
+        </div>
+        <?php else: ?>
+        <div class="tweet" style="margin-bottom:1.25rem">
+          <div class="who">Two-factor authentication <span class="tag">enabled</span></div>
+          <div class="body meta" style="margin-top:.5rem">Web logins require an authenticator code or a one-time recovery code.</div>
+          <form method="post" action="?view=security" style="margin-top:.75rem" autocomplete="off">
+            <input type="hidden" name="action" value="2fa_disable">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <input type="password" name="password" required autocomplete="current-password" placeholder="Current password">
+            <input name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="Authenticator or recovery code" style="margin-top:.5rem">
+            <button class="btn btn-ghost" type="submit" style="margin-top:.65rem">Disable 2FA</button>
+          </form>
+        </div>
+        <?php endif; ?>
 
         <div class="tweet" style="margin-bottom:1.25rem" id="vaak-push-card">
           <div class="who">Browser notifications</div>

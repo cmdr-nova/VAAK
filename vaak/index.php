@@ -170,7 +170,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET' && ($_GET['mode'] ?? '') ===
 $notice = null;
 $error = null;
 $mode = preg_replace('/[^a-z]/', '', (string) ($_GET['mode'] ?? '')) ?: '';
-if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset') {
+if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset' && $mode !== '2fa') {
     $mode = '';
 }
 // Flash messages from PRG redirects (forgot / reset password).
@@ -193,7 +193,8 @@ if (isset($_GET['logout'])) {
 // Only handle auth forms here — compose/favourite/etc. POSTs must reach ap-admin.php
 $postAction = (string) ($_POST['action'] ?? '');
 $isAuthPost = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
-    && ($postAction === 'login' || $postAction === 'register' || $mode === 'login' || $mode === 'register');
+    && ($postAction === 'login' || $postAction === 'register' || $postAction === 'verify_2fa'
+        || $mode === 'login' || $mode === 'register' || $mode === '2fa');
 
 if ($isAuthPost) {
     $csrf = (string) ($_POST['csrf'] ?? '');
@@ -224,8 +225,14 @@ if ($isAuthPost) {
             header('Location: /vaak/?view=' . rawurlencode($next), true, 302);
             exit;
         }
-        $error = $res['error'] ?? 'Login failed.';
-        $mode = 'login';
+        if (!empty($res['requires_2fa'])) {
+            ap_auth_start_session();
+            $_SESSION['vaak_2fa_pending_next'] = preg_replace('/[^a-z_]/', '', (string) ($_GET['next'] ?? $_POST['next'] ?? '')) ?: 'home';
+            $mode = '2fa';
+        } else {
+            $error = $res['error'] ?? 'Login failed.';
+            $mode = 'login';
+        }
     } elseif ($postAction === 'register' || $mode === 'register') {
         $res = ap_auth_register(
             (string) ($_POST['invite'] ?? ''),
@@ -239,6 +246,16 @@ if ($isAuthPost) {
         }
         $error = $res['error'] ?? 'Registration failed.';
         $mode = 'register';
+    } elseif ($postAction === 'verify_2fa' || $mode === '2fa') {
+        ap_auth_start_session();
+        $next = preg_replace('/[^a-z_]/', '', (string) ($_SESSION['vaak_2fa_pending_next'] ?? $_POST['next'] ?? '')) ?: 'home';
+        $res = ap_auth_complete_2fa_login((string) ($_POST['code'] ?? ''));
+        if (!empty($res['ok'])) {
+            header('Location: /vaak/?view=' . rawurlencode($next), true, 302);
+            exit;
+        }
+        $error = $res['error'] ?? 'Two-factor verification failed.';
+        $mode = '2fa';
     }
 }
 
@@ -498,6 +515,15 @@ ASCII;
         <label for="password">New password</label>
         <input id="password" name="password" type="password" required minlength="10" autocomplete="new-password" placeholder="at least 10 characters">
         <button type="submit">Set new password</button>
+      </form>
+      <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
+    <?php elseif ($mode === '2fa'): ?>
+      <form method="post" action="/vaak/?mode=2fa" autocomplete="off">
+        <input type="hidden" name="csrf" value="<?= $csrf ?>">
+        <input type="hidden" name="action" value="verify_2fa">
+        <label for="code">Authenticator code or recovery code</label>
+        <input id="code" name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or XXXX-XXXX-XXXX" autofocus>
+        <button type="submit">Verify and log in</button>
       </form>
       <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
     <?php elseif ($mode === 'register'): ?>
