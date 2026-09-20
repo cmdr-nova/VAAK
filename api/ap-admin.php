@@ -8497,6 +8497,41 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
     return $out;
 }
 
+/** Compact X-style conversation list used by the VAAK DM workspace. */
+function admin_dm_conversation_list_html(array $conversations, string $activePeer = ''): string
+{
+    if ($conversations === []) {
+        return '<div class="empty">No direct messages yet.</div>';
+    }
+    $html = '';
+    foreach ($conversations as $conversation) {
+        if (!is_array($conversation)) {
+            continue;
+        }
+        $peer = rtrim((string) ($conversation['peer_actor_id'] ?? ''), '/');
+        if ($peer === '') {
+            continue;
+        }
+        $last = is_array($conversation['last'] ?? null) ? $conversation['last'] : [];
+        $unread = (int) ($conversation['unread'] ?? 0);
+        $preview = admin_html_to_plain((string) ($last['content'] ?? ''));
+        $preview = trim(preg_replace('/\s+/u', ' ', $preview) ?? $preview);
+        if ($preview === '') {
+            $preview = 'Media or link';
+        }
+        $preview = mb_strimwidth($preview, 0, 96, '…', 'UTF-8');
+        $html .= '<a class="dm-conversation-row' . ($peer === $activePeer ? ' is-active' : '') . ($unread > 0 ? ' is-unread' : '') . '" href="?view=dms&amp;peer=' . rawurlencode($peer) . '">';
+        $html .= '<span class="dm-conversation-avatar">' . admin_avatar_img($peer) . '</span>';
+        $html .= '<span class="dm-conversation-copy"><span class="dm-conversation-name">' . actor_display_name_html($peer) . '</span>';
+        $html .= '<span class="dm-conversation-preview">' . h($preview) . '</span></span>';
+        if ($unread > 0) {
+            $html .= '<span class="nav-badge dm-conversation-badge">' . ($unread > 99 ? '99+' : (string) $unread) . '</span>';
+        }
+        $html .= '</a>';
+    }
+    return $html !== '' ? $html : '<div class="empty">No direct messages yet.</div>';
+}
+
 /** Viewer preference: highlight anti-AI posters. Removed from the UI. */
 function admin_viewer_anti_ai_enabled(): bool
 {
@@ -13572,6 +13607,52 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-bubble li { margin: .25rem 0; }
     .dm-thread { display: flex; flex-direction: column; gap: .35rem; }
     .dm-thread .tweet { margin-bottom: 0; padding: .7rem .8rem; }
+    .dm-workspace {
+      display: grid;
+      grid-template-columns: minmax(13rem, 18rem) minmax(0, 1fr);
+      gap: .75rem;
+      align-items: start;
+    }
+    .dm-sidebar, .dm-pane {
+      min-width: 0;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--panel);
+    }
+    .dm-sidebar { overflow: hidden; }
+    .dm-sidebar-title {
+      padding: .75rem .85rem;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+      font-weight: 700;
+    }
+    .dm-conversation-row {
+      display: flex;
+      align-items: center;
+      gap: .55rem;
+      min-width: 0;
+      padding: .65rem .7rem;
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    }
+    .dm-conversation-row:last-child { border-bottom: 0; }
+    .dm-conversation-row:hover, .dm-conversation-row.is-active { background: var(--primary-dim); }
+    .dm-conversation-avatar { flex: 0 0 2.35rem; width: 2.35rem; height: 2.35rem; }
+    .dm-conversation-avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+    .dm-conversation-copy { display: flex; flex-direction: column; gap: .15rem; min-width: 0; flex: 1 1 auto; }
+    .dm-conversation-name, .dm-conversation-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dm-conversation-name { font-weight: 700; }
+    .dm-conversation-preview { color: var(--muted); font-size: .82rem; }
+    .dm-conversation-row.is-unread .dm-conversation-preview { color: var(--text); font-weight: 600; }
+    .dm-conversation-badge { position: static; flex: 0 0 auto; }
+    .dm-pane { padding: .8rem; }
+    .dm-pane > .composer { margin-bottom: 0; }
+    @media (max-width: 760px) {
+      .dm-workspace { grid-template-columns: 1fr; }
+      .dm-sidebar { max-height: 18rem; overflow-y: auto; }
+      .dm-pane { padding: .65rem; }
+    }
     .link-card {
       display: flex; gap: .75rem; margin: .65rem 0 0; padding: 0;
       border-radius: 12px; border: 1px solid var(--border); background: var(--panel-2);
@@ -15862,53 +15943,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $dmUnread = ap_dm_unread_count();
         ?>
         <?php if ($dmPeer === ''): ?>
-          <?php if ($dmUnread > 0): ?>
-            <div class="meta" style="margin-bottom:.75rem;display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
-              <span class="nav-badge" style="position:static"><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span>
-              <span>unread <?= $dmUnread === 1 ? 'message' : 'messages' ?> — open a thread to clear its badge</span>
-            </div>
-          <?php endif; ?>
-          <form class="composer" method="post" action="?view=dms" style="margin-bottom:1rem">
-            <input type="hidden" name="action" value="dm_send">
-            <div class="meta" style="margin-bottom:.5rem">New direct message</div>
-            <input name="to" type="text" required placeholder="@user@instance or https://…/users/…">
-            <textarea name="content" maxlength="2000" required placeholder="Private message…" style="margin-top:.5rem"></textarea>
-            <div class="composer-actions">
-              <span class="meta"></span>
-              <button class="btn btn-primary" type="submit">Send DM</button>
-            </div>
-          </form>
-          <?php if (!$dmConversations): ?>
-            <div class="empty">No direct messages yet.</div>
-          <?php endif; ?>
-          <?php foreach ($dmConversations as $c): ?>
-            <?php
-              $last = $c['last'];
-              $previewHtml = admin_dm_html($last['content'] ?? null, is_array($last) ? $last : null);
-              $peerId = (string) $c['peer_actor_id'];
-              $peerUnread = (int) ($c['unread'] ?? 0);
-            ?>
-            <article class="tweet<?= $peerUnread > 0 ? ' tweet-dm-unread' : '' ?>">
-              <div class="tweet-hd">
-                <?= admin_avatar_img($peerId) ?>
-                <div class="tweet-hd-main">
-                  <div style="display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
-                    <span class="who"><?= actor_display_name_html($peerId) ?></span>
-                    <span class="meta"> <?= h(actor_handle($peerId)) ?></span>
-                    <?php if ($peerUnread > 0): ?>
-                      <span class="nav-badge" style="position:static" title="<?= (int) $peerUnread ?> unread"><?= $peerUnread > 99 ? '99+' : (string) $peerUnread ?></span>
-                    <?php endif; ?>
-                  </div>
-                  <div class="meta"><?= ($last['direction'] ?? '') === 'out' ? 'You' : 'Them' ?> · <?= h(relative_time((string) ($last['created_at'] ?? ''))) ?></div>
+          <div class="dm-workspace">
+            <aside class="dm-sidebar" aria-label="Direct message conversations">
+              <div class="dm-sidebar-title">Messages<?php if ($dmUnread > 0): ?> <span class="nav-badge dm-conversation-badge"><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span><?php endif; ?></div>
+              <?= admin_dm_conversation_list_html($dmConversations) ?>
+            </aside>
+            <section class="dm-pane">
+              <form class="composer" method="post" action="?view=dms">
+                <input type="hidden" name="action" value="dm_send">
+                <div class="meta" style="margin-bottom:.5rem">New direct message</div>
+                <input name="to" type="text" required placeholder="@user@instance or https://…/users/…">
+                <textarea name="content" maxlength="2000" required placeholder="Private message…" style="margin-top:.5rem"></textarea>
+                <div class="composer-actions">
+                  <span class="meta">Private and federated as a direct message</span>
+                  <button class="btn btn-primary" type="submit">Send DM</button>
                 </div>
-              </div>
-              <div class="dm-bubble<?= ($last['direction'] ?? '') === 'out' ? ' dm-out' : ' dm-in' ?>"><?= $previewHtml !== '' ? $previewHtml : '<span class="meta">(no text)</span>' ?></div>
-              <div class="tweet-actions">
-                <a class="btn btn-primary" href="?view=dms&amp;peer=<?= urlencode($peerId) ?>" style="padding:.35rem .9rem;font-size:.85rem"><?= $peerUnread > 0 ? 'Open unread' : 'Open thread' ?></a>
-                <?= block_quick_actions($peerId, short_host($peerId), 'dms', $vaakOwnerId, !empty($vaakIsAdmin), 'dms') ?>
-              </div>
-            </article>
-          <?php endforeach; ?>
+              </form>
+            </section>
+          </div>
         <?php else: ?>
           <?php
             $thread = ap_dm_thread($dmPeer, 200);
@@ -15919,6 +15971,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 error_log('[ap-admin] dm mark read: ' . $e->getMessage());
             }
           ?>
+          <div class="dm-workspace">
+            <aside class="dm-sidebar" aria-label="Direct message conversations">
+              <div class="dm-sidebar-title">Messages</div>
+              <?= admin_dm_conversation_list_html($dmConversations, $dmPeer) ?>
+            </aside>
+            <section class="dm-pane">
           <div style="margin-bottom:.75rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
             <div class="page-back"><a class="btn btn-ghost" href="?view=dms">← All conversations</a></div>
             <?= admin_avatar_img($dmPeer) ?>
@@ -16003,6 +16061,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             window.addEventListener('load', focusLatestDm, { once: true });
           })();
           </script>
+            </section>
+          </div>
         <?php endif; ?>
 
       <?php elseif ($view === 'report'): ?>
