@@ -1229,6 +1229,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $visibility
             );
             if (!empty($result['ok'])) {
+                // A newly queued post should be visible immediately on the
+                // active timeline; invalidate the short-lived ranked index.
+                admin_tl_cache_clear();
                 if ($fromDraftId > 0) {
                     ap_draft_delete($fromDraftId);
                 }
@@ -1258,7 +1261,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'action' => 'queue_post',
                 'queue_id' => $queueId,
                 'scheduled_at' => $queueScheduledLocal,
-                'return_view' => 'queue',
+                'return_view' => $fallbackView,
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             exit;
         }
@@ -4476,6 +4479,10 @@ function admin_tl_rank_entry(array $item): ?array
         $id = (string) ($row['bsky_uri'] ?? ($row['post']['uri'] ?? ''));
         return $id !== '' ? ['k' => 'bsky', 'id' => $id] : null;
     }
+    if ($kind === 'pending_post' || $kind === 'pending_action') {
+        $id = (string) ($row['id'] ?? '');
+        return $id !== '' ? ['k' => $kind, 'id' => $id] : null;
+    }
     return null;
 }
 
@@ -5128,6 +5135,8 @@ function admin_tl_hydrate(array $slice): array
     $outboxIds = [];
     $boostIds = [];
     $bskyUris = [];
+    $pendingPostIds = [];
+    $pendingActionIds = [];
     foreach ($slice as $entry) {
         $k = (string) ($entry['k'] ?? '');
         $id = (string) ($entry['id'] ?? '');
@@ -5139,6 +5148,10 @@ function admin_tl_hydrate(array $slice): array
             $boostIds[] = $id;
         } elseif ($k === 'bsky' && $id !== '') {
             $bskyUris[] = $id;
+        } elseif ($k === 'pending_post' && $id !== '') {
+            $pendingPostIds[] = (int) $id;
+        } elseif ($k === 'pending_action' && $id !== '') {
+            $pendingActionIds[] = (int) $id;
         }
     }
     $eventsById = [];
@@ -5208,6 +5221,31 @@ function admin_tl_hydrate(array $slice): array
             }
         }
     }
+    $pendingByKey = [];
+    try {
+        $ownerId = admin_owner_user_id();
+        foreach (array_unique(array_merge($pendingPostIds, $pendingActionIds)) as $pendingId) {
+            if ($pendingId < 1) continue;
+            $st = ap_db()->prepare(
+                'SELECT * FROM ap_post_queue WHERE id = ? AND owner_user_id = ?
+                 AND state IN (\'pending\', \'publishing\', \'failed\')'
+            );
+            $st->execute([$pendingId, $ownerId]);
+            $row = $st->fetch();
+            if (is_array($row)) $pendingByKey['pending_post:' . $pendingId] = $row;
+            $st = ap_db()->prepare(
+                "SELECT id, action_kind, target_key, updated_at
+                 FROM ap_action_queue WHERE id = ? AND owner_user_id = ?
+                 AND action_kind = 'boost' AND desired_state = 1
+                 AND status IN ('pending','processing')"
+            );
+            $st->execute([$pendingId, $ownerId]);
+            $row = $st->fetch();
+            if (is_array($row)) $pendingByKey['pending_action:' . $pendingId] = $row;
+        }
+    } catch (Throwable $e) {
+        // Pending cards are optional.
+    }
     foreach ($slice as $entry) {
         $k = (string) ($entry['k'] ?? '');
         $id = (string) ($entry['id'] ?? '');
@@ -5266,6 +5304,15 @@ function admin_tl_hydrate(array $slice): array
                 'sort' => strtotime($indexed) ?: 0,
                 'row' => $bItem,
             ];
+        } elseif ($k === 'pending_post' || $k === 'pending_action') {
+            $pending = $pendingByKey[$k . ':' . (int) $id] ?? null;
+            if (is_array($pending)) {
+                $items[] = [
+                    'kind' => $k,
+                    'sort' => strtotime((string) ($pending['created_at'] ?? $pending['updated_at'] ?? '')) ?: time(),
+                    'row' => $pending,
+                ];
+            }
         }
     }
     return $items;
@@ -5333,6 +5380,20 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 if (count($added) >= $want) {
                     break;
                 }
+            }
+            $ownerId = admin_owner_user_id();
+            $st = $db->prepare(
+                'SELECT * FROM masto_reblogs
+                 WHERE owner_user_id = ? AND created_at < ?
+                 ORDER BY created_at DESC LIMIT ?'
+            );
+            $st->execute([$ownerId, $beforeAt, $want * 2]);
+            foreach ($st->fetchAll() ?: [] as $rb) {
+                $sid = (string) ($rb['status_id'] ?? '');
+                if ($sid === '' || isset($seenIds[$sid])) continue;
+                $seenIds[$sid] = true;
+                $added[] = ['k' => 'boost', 'id' => $sid];
+                if (count($added) >= $want) break;
             }
         } catch (Throwable $e) {
             error_log('[ap-admin] local extend: ' . $e->getMessage());
@@ -5776,7 +5837,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
         }
         $feedDeduped[] = $item;
     }
-    $feedTimeline = $feedDeduped;
+    $feedTimeline = array_merge($feedDeduped, admin_pending_timeline_items(admin_owner_user_id()));
+    usort($feedTimeline, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
     $feedEvents = array_map(static fn($i) => $i['row'], array_filter($feedTimeline, static fn($i) => $i['kind'] === 'event'));
     // Seed ranked cache for subsequent infinite-scroll pages
     if ($feedTimeline !== []) {
@@ -6084,6 +6146,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     // first paint stays fedi-only (no 80-post JSON decode / dual-publish walk).
     // Personalization is deliberately applied only during ranked-cache builds.
     // A cache hit (the common Home path) does not run this query or resort work.
+    $homeTimeline = array_merge($homeTimeline, admin_pending_timeline_items($homeOwnerId));
     $homeTimeline = admin_home_apply_favourite_rank($homeTimeline, $homeOwnerId);
     // Soft cap Bluesky share (~30%) so Home stays fedi-first when AT cache is busy.
     // Defer surplus Bluesky (don't drop) so later pages / deeper scroll still get them.
@@ -6279,10 +6342,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
     try {
         $stRb = $db->prepare(
             "SELECT * FROM masto_reblogs
-             WHERE owner_actor_id LIKE 'https://mkultra.monster/users/%'
+             WHERE owner_user_id = ?
              ORDER BY created_at DESC LIMIT 120"
         );
-        $stRb->execute();
+        $stRb->execute([$localOwnerId]);
         foreach ($stRb->fetchAll() ?: [] as $rb) {
             if (!is_array($rb)) {
                 continue;
@@ -6300,6 +6363,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
     } catch (Throwable $e) {
         // optional
     }
+    $localTimeline = array_merge($localTimeline, admin_pending_timeline_items($localOwnerId));
     usort($localTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     if ($localTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('local', $following);
@@ -11504,6 +11568,10 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
 function admin_render_timeline_item(array $item, array $followingIds, string $returnView): void
 {
     $kind = (string) ($item['kind'] ?? '');
+    if ($kind === 'pending_post' || $kind === 'pending_action') {
+        admin_render_pending_timeline_item($item, $returnView);
+        return;
+    }
     if ($kind === 'outbox') {
         admin_render_outbox_card($item['row'], $returnView);
         return;
@@ -11521,6 +11589,81 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     }
     $fromTag = !empty($item['from_tag']) || !empty($item['row']['_from_followed_tag']);
     admin_render_event_tweet($item['row'], $followingIds, $returnView, $fromTag);
+}
+
+/** Render a local action that is queued but not published/committed yet. */
+function admin_render_pending_timeline_item(array $item, string $returnView): void
+{
+    $kind = (string) ($item['kind'] ?? 'pending_post');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    $queueId = (int) ($row['id'] ?? 0);
+    $actor = vaak_actor_id();
+    $handle = '@' . vaak_actor_key() . '@mkultra.monster';
+    $content = trim((string) ($row['content'] ?? ''));
+    $label = $kind === 'pending_action' ? 'Boost queued' : 'Post queued';
+    $replyTo = trim((string) ($row['in_reply_to'] ?? ''));
+    $quoteObject = trim((string) ($row['quote_object'] ?? ''));
+    $target = trim((string) ($row['target_key'] ?? ''));
+    $mediaIds = json_decode((string) ($row['media_ids_json'] ?? '[]'), true);
+    $mediaCount = is_array($mediaIds) ? count($mediaIds) : 0;
+    ?>
+    <article class="tweet tweet-own tweet-pending" data-pending-queue-id="<?= (int) $queueId ?>">
+      <div class="tweet-hd">
+        <?= admin_avatar_img($actor) ?>
+        <div class="tweet-hd-main tweet-hd-main--fedi">
+          <div><span class="who"><?= admin_emoji_html(actor_display_name($actor), $actor) ?></span>
+            <span class="meta"> <?= h($handle) ?> · <?= h($label) ?> · just now</span>
+            <span class="tag" style="margin-left:.35rem" title="This action is waiting in the background queue">processing</span>
+          </div>
+          <div class="meta">mkultra.monster</div>
+        </div>
+      </div>
+      <?php if ($kind === 'pending_action'): ?>
+        <div class="body feed-body">You boosted this post. It will appear fully once the background action completes.</div>
+        <?php if ($target !== ''): ?><div class="meta"><a href="<?= h(admin_status_href($target, $returnView)) ?>">Open boosted post</a></div><?php endif; ?>
+      <?php else: ?>
+        <?php if ($replyTo !== ''): ?><div class="meta" style="margin:.25rem 0 .35rem">↩ reply queued to <a href="<?= h(admin_status_href($replyTo, $returnView)) ?>">parent post</a></div><?php endif; ?>
+        <?php if ($content !== ''): ?><div class="body feed-body" style="white-space:pre-wrap"><?= admin_linkify_body_html($content, $returnView, [], $actor) ?></div><?php endif; ?>
+        <?php if ($quoteObject !== ''): ?><div class="quote-card"><div class="quote-card-source">QUOTE QUEUED</div><a href="<?= h(admin_status_href($quoteObject, $returnView)) ?>">Open quoted post</a></div><?php endif; ?>
+        <?php if ($mediaCount > 0): ?><div class="meta" style="margin-top:.35rem"><?= $mediaCount === 1 ? '1 media attachment' : (int) $mediaCount . ' media attachments' ?> queued</div><?php endif; ?>
+      <?php endif; ?>
+    </article>
+    <?php
+}
+
+/** @return list<array{kind:string,sort:int,row:array<string,mixed>}> */
+function admin_pending_timeline_items(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    $items = [];
+    try {
+        if (function_exists('ap_queue_list_pending')) {
+            foreach (ap_queue_list_pending(24, $ownerUserId) as $row) {
+                $created = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
+                if ($created > 0 && $created >= time() - 7 * 86400) {
+                    $items[] = ['kind' => 'pending_post', 'sort' => $created, 'row' => $row];
+                }
+            }
+        }
+        $st = ap_db()->prepare(
+            "SELECT id, action_kind, target_key, updated_at
+             FROM ap_action_queue
+             WHERE owner_user_id = ? AND action_kind = 'boost'
+               AND desired_state = 1 AND status IN ('pending','processing')
+             ORDER BY updated_at DESC LIMIT 16"
+        );
+        $st->execute([$ownerUserId]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $sort = strtotime((string) ($row['updated_at'] ?? '')) ?: 0;
+            $items[] = ['kind' => 'pending_action', 'sort' => $sort, 'row' => $row];
+        }
+    } catch (Throwable $e) {
+        // Pending indicators are optional and must not block timelines.
+    }
+    usort($items, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
+    return $items;
 }
 
 /**
@@ -12037,6 +12180,11 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
         error_log('[ap-admin] newer poll: ' . $e->getMessage());
     }
 
+    foreach (admin_pending_timeline_items($ownerId) as $pendingItem) {
+        if ((int) ($pendingItem['sort'] ?? 0) > $sinceTs) {
+            $out[] = $pendingItem;
+        }
+    }
     usort($out, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     return array_slice($out, 0, $limit);
 }
@@ -22534,6 +22682,8 @@ window.apAdminToast = function (msg, isErr) {
       if (uri) keys['bsky:' + uri] = true;
     });
     items.querySelectorAll('article.tweet').forEach((el, i) => {
+      const pendingId = el.getAttribute('data-pending-queue-id') || '';
+      if (pendingId) keys['pending:' + pendingId] = true;
       keys['node:' + (el.id || i) + ':' + (el.textContent || '').slice(0, 40)] = true;
     });
     return keys;
@@ -22555,6 +22705,8 @@ window.apAdminToast = function (msg, isErr) {
         if (m) key = decodeURIComponent(m[1]);
       }
       if (!key && el.getAttribute) {
+        const pendingId = el.getAttribute('data-pending-queue-id') || '';
+        if (pendingId) key = 'pending:' + pendingId;
         const bskyUri = el.getAttribute('data-bsky-uri') || '';
         if (bskyUri) key = 'bsky:' + bskyUri;
       }
@@ -22804,7 +22956,7 @@ window.apAdminToast = function (msg, isErr) {
       if (entries.some((en) => en.isIntersecting)) loadMore();
     }, { root: sc.ioRoot, rootMargin: '180px', threshold: 0 });
     io.observe(sentinel);
-    sc.onScroll(updateTopBtn);
+    sc.onScroll(() => { updateTopBtn(); maybeLoadMore(); });
     updateTopBtn();
   }, { passive: true, capture: true });
 
@@ -22823,7 +22975,12 @@ window.apAdminToast = function (msg, isErr) {
     }
     updateNewBtn();
   }
-  sc.onScroll(updateTopBtn);
+  function maybeLoadMore() {
+    if (!hasMore || loading || stickToTop) return;
+    const remaining = sc.height() - (sc.top() + (sc.mode === 'feed' ? (sc.ioRoot ? sc.ioRoot.clientHeight : innerHeight) : innerHeight));
+    if (remaining < 520) loadMore();
+  }
+  sc.onScroll(() => { updateTopBtn(); maybeLoadMore(); });
   updateTopBtn();
   if (topBtn) {
     topBtn.addEventListener('click', () => {
@@ -25250,6 +25407,14 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         window.history.replaceState({}, '', u.pathname + u.search + u.hash);
       } catch (e) {}
       if (mode === 'queue_post') {
+        const queuedTimeline = ['home', 'local', 'feed'].includes(String(data && data.return_view || ''));
+        if (queuedTimeline && typeof window.novaPollTimeline === 'function') {
+          await window.novaPollTimeline();
+          if (typeof window.novaInsertPendingTimeline === 'function') {
+            window.novaInsertPendingTimeline({ scrollToTop: true });
+          }
+          return;
+        }
         window.location.href = '?view=queue';
         return;
       }
