@@ -17067,7 +17067,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <label for="profile-list-search">Search your mutes, deprioritized accounts, and blocks</label>
           <input id="profile-list-search" type="search" placeholder="Filter these lists…" autocomplete="off">
         </div>
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted accounts</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted accounts</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide from <b>your</b> Home / Federated / Notifications. Follow stays. Also available on remote profiles.
         </div>
@@ -17114,7 +17114,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Soft-rank these accounts lower on <b>Home</b> only (⋯ → Deprioritize). They still appear on Federated, Local, and notifications. Mute/block still fully hide.
         </div>
@@ -17144,7 +17144,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted words</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted words</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide posts on your Home &amp; Federated when text/CW contains a phrase (case-insensitive substring).
         </div>
@@ -17184,7 +17184,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:2rem 0 .5rem">Your blocks</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:2rem 0 .5rem">Your blocks</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Personal blocks hide that account’s <b>profile and posts</b> from you (timelines, search, profile pages). Mutes only filter timelines/notifications.
           <?php if (!empty($vaakIsAdmin)): ?>
