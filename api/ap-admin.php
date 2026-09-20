@@ -17444,9 +17444,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </form>
           </section>
           <?php if ($bskyHandle !== ''): ?>
-            <div class="meta" style="margin:.5rem 0">Connected as <b>@<?= h($bskyHandle) ?></b>
-              · <a href="?view=bluesky">Open Bluesky tab</a>
-            </div>
+            <div class="meta" style="margin:.5rem 0">Connected as <b>@<?= h($bskyHandle) ?></b></div>
             <?php if ($bskySessionStale): ?>
               <div class="notice" style="margin:.5rem 0;padding:.65rem .8rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
                 Bluesky login looks expired (common after a password reset). Enter your
