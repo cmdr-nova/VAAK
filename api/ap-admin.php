@@ -13648,8 +13648,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-conversation-badge { position: static; flex: 0 0 auto; }
     .dm-pane { padding: .8rem; }
     .dm-pane > .composer { margin-bottom: 0; }
+    body.dm-fullscreen .shell {
+      max-width: none;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: "main";
+    }
+    body.dm-fullscreen .rail-left,
+    body.dm-fullscreen .rail-right { display: none; }
+    body.dm-fullscreen .main { width: 100%; max-width: none; }
+    body.dm-fullscreen .main > .topbar { padding-inline: clamp(1rem, 4vw, 3rem); }
+    body.dm-fullscreen .feed {
+      width: 100%; max-width: 1400px; margin-inline: auto;
+      padding-inline: clamp(1rem, 4vw, 3rem);
+    }
+    body.dm-fullscreen .dm-workspace {
+      grid-template-columns: minmax(18rem, 26rem) minmax(0, 1fr);
+      min-height: calc(100vh - 5rem);
+    }
+    .dm-back-top { margin-right: auto; }
     @media (max-width: 760px) {
+      body.dm-fullscreen .feed { padding-inline: .65rem; }
       .dm-workspace { grid-template-columns: 1fr; }
+      body.dm-fullscreen .dm-workspace { min-height: 0; }
       .dm-sidebar { max-height: 18rem; overflow-y: auto; }
       .dm-pane { padding: .65rem; }
     }
@@ -15094,7 +15114,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .brand-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); display: block; margin: .4rem auto .45rem; }
   </style>
 </head>
-<body>
+<body class="<?= $view === 'dms' ? 'dm-fullscreen' : '' ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
   <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
 </div>
@@ -15278,6 +15298,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
       <h1><?= h(view_title($view)) ?></h1>
       <div class="topbar-actions">
+        <?php if ($view === 'dms'): ?>
+          <a class="btn btn-ghost dm-back-top" href="?view=home">← Back to Home</a>
+        <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed'], true)): ?>
           <nav class="timeline-tabs" aria-label="Timeline views">
             <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home">Home</a>
