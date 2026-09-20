@@ -2216,6 +2216,32 @@ function ap_profile_normalize_badges(mixed $badges): array
     return $out;
 }
 
+/** Migration-safe check so a permission-limited schema upgrade cannot white-screen profile saves. */
+function ap_profile_badges_column_available(): bool
+{
+    static $available = null;
+    if ($available !== null) {
+        return $available;
+    }
+    try {
+        $db = ap_db();
+        if ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql') {
+            $st = $db->prepare(
+                "SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'profile_badges'"
+            );
+            $st->execute();
+            $available = (bool) $st->fetchColumn();
+        } else {
+            $rows = $db->query('PRAGMA table_info(actor_profile)')->fetchAll();
+            $available = in_array('profile_badges', array_column($rows, 'name'), true);
+        }
+    } catch (Throwable $e) {
+        $available = false;
+    }
+    return $available;
+}
+
 function ap_profile_ensure_default(PDO $db): void
 {
     $stmt = $db->prepare('SELECT actor_key FROM actor_profile WHERE actor_key = ?');
@@ -2375,6 +2401,9 @@ function ap_profile_plain_bio_to_html(string $plain): string
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
+    if (!ap_profile_badges_column_available()) {
+        return ['ok' => false, 'error' => 'Profile badges are still being prepared on this server. Please try again shortly.'];
+    }
     $name = trim(ap_fix_utf8((string) ($fields['name'] ?? '')));
     if ($name === '' || mb_strlen($name) > 100) {
         return ['ok' => false, 'error' => 'Display name required (max 100 chars).'];
