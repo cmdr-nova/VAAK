@@ -741,11 +741,16 @@ function ap_auth_recovery_code(): string
 function ap_auth_2fa_row(int $userId): ?array
 {
     if ($userId < 1) return null;
-    ap_auth_bootstrap();
-    $st = ap_db()->prepare('SELECT * FROM ap_user_2fa WHERE user_id = ? LIMIT 1');
-    $st->execute([$userId]);
-    $row = $st->fetch();
-    return is_array($row) ? $row : null;
+    try {
+        ap_auth_bootstrap();
+        $st = ap_db()->prepare('SELECT * FROM ap_user_2fa WHERE user_id = ? LIMIT 1');
+        $st->execute([$userId]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        error_log('[ap-auth] 2FA state unavailable: ' . $e->getMessage());
+        return null;
+    }
 }
 
 function ap_auth_2fa_enabled(int $userId): bool
@@ -763,10 +768,15 @@ function ap_auth_2fa_begin_setup(int $userId, string $username): array
     $enc = ap_auth_secret_encrypt($secret);
     if ($enc === '') return ['ok' => false, 'error' => 'Could not prepare two-factor setup.'];
     $now = ap_db_now();
-    ap_db()->prepare(
-        'INSERT INTO ap_user_2fa (user_id, pending_secret_enc, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(user_id) DO UPDATE SET pending_secret_enc = excluded.pending_secret_enc, updated_at = excluded.updated_at'
-    )->execute([$userId, $enc, $now]);
+    try {
+        ap_db()->prepare(
+            'INSERT INTO ap_user_2fa (user_id, pending_secret_enc, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET pending_secret_enc = excluded.pending_secret_enc, updated_at = excluded.updated_at'
+        )->execute([$userId, $enc, $now]);
+    } catch (Throwable $e) {
+        error_log('[ap-auth] 2FA setup storage unavailable: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'Two-factor storage is not available yet.'];
+    }
     $label = rawurlencode('VAAK:' . $username);
     $issuer = rawurlencode('VAAK');
     return [
