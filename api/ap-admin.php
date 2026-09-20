@@ -21671,6 +21671,22 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   const queueSlowdownToast = 'Whoa their pardner, slow down there. Your action is in the queue.';
+  // Reconcile a queued boost with the visible timeline without navigating away.
+  // Local intentionally stays instance-scoped; the server-side pending filter
+  // decides whether a queued action belongs in the current view.
+  window.apRefreshTimelinePending = function () {
+    const params = new URLSearchParams(window.location.search || '');
+    const view = params.get('view') || 'home';
+    if (!['home', 'feed', 'local', 'federated'].includes(view)) return;
+    if (typeof window.novaPollTimeline !== 'function') return;
+    Promise.resolve(window.novaPollTimeline())
+      .then(() => {
+        if (typeof window.novaInsertPendingTimeline === 'function') {
+          window.novaInsertPendingTimeline({ scrollToTop: false });
+        }
+      })
+      .catch(() => {});
+  };
   const queuedClickBursts = new WeakMap();
   window.apQueueRepeatedClick = function (element) {
     const now = Date.now();
@@ -21778,6 +21794,9 @@ window.apAdminToast = function (msg, isErr) {
         form.dataset.queueId = String(data.queue_id);
         form.dataset.queueRevision = String(data.revision || '');
         watchInteractQueue(form, data.queue_id, data.revision, before);
+        if (data.kind === 'reblog' && data.active && typeof window.apRefreshTimelinePending === 'function') {
+          window.apRefreshTimelinePending();
+        }
       }
       // On Favourites / Bookmarks lists, drop the row when toggling off
       if ((data.kind === 'favourite' || data.kind === 'bookmark') && data.active === false) {
@@ -21903,6 +21922,9 @@ window.apAdminToast = function (msg, isErr) {
       btn.dataset.queueId = String(data.queue_id);
       btn.dataset.queueRevision = String(data.revision || '');
       watchBskyQueue(btn, data.queue_id, data.revision, before || snapshotBskyButton(btn));
+      if (postAction === 'bsky_repost' && typeof window.apRefreshTimelinePending === 'function') {
+        window.apRefreshTimelinePending();
+      }
     }
     return data;
   }
