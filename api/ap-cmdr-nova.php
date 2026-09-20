@@ -1611,6 +1611,25 @@ function ap_cmdr_html(): void
     }
     echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@cmdr_nova@mkultra.monster</p>';
+    $profileBadges = function_exists('ap_profile_normalize_badges')
+        ? ap_profile_normalize_badges($p['profile_badges'] ?? [])
+        : [];
+    $badgeCatalog = function_exists('ap_profile_badge_catalog') ? ap_profile_badge_catalog() : [];
+    if ($profileBadges !== [] && $badgeCatalog !== []) {
+        echo '<div class="profile-badges" aria-label="Profile badges" style="display:flex;flex-wrap:wrap;gap:.35rem;margin:.6rem 0 0">';
+        foreach ($profileBadges as $badgeKey) {
+            $badge = $badgeCatalog[$badgeKey] ?? null;
+            if (!is_array($badge)) {
+                continue;
+            }
+            $label = (string) ($badge['label'] ?? $badgeKey);
+            $emoji = (string) ($badge['emoji'] ?? '');
+            echo '<span title="' . htmlspecialchars($label, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '" style="display:inline-flex;align-items:center;gap:.25rem;padding:.2rem .5rem;border:1px solid #30343a;border-radius:999px;background:#191a1d;font-size:.9rem">'
+                . htmlspecialchars($emoji, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' '
+                . htmlspecialchars($label, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</span>';
+        }
+        echo '</div>';
+    }
     if (!function_exists('ap_sl_link_for_actor_key')) {
         require_once __DIR__ . '/ap-sl-link.php';
     }

@@ -493,6 +493,14 @@ SQL);
         error_log('[ap-db] forum signature column not provisioned: ' . $e->getMessage());
     }
     try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'profile_badges'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec("ALTER TABLE actor_profile ADD COLUMN profile_badges TEXT NOT NULL DEFAULT '[]'");
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] profile badges column not provisioned: ' . $e->getMessage());
+    }
+    try {
         $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ap_reports' AND column_name = 'admin_notes'")->fetchColumn();
         if (!$hasColumn) {
             $db->exec("ALTER TABLE ap_reports ADD COLUMN admin_notes TEXT NOT NULL DEFAULT ''");
@@ -662,6 +670,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     reply_policy TEXT NOT NULL DEFAULT 'anyone',
     quote_policy TEXT NOT NULL DEFAULT 'anyone',
     forum_signature TEXT NOT NULL DEFAULT '',
+    profile_badges TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
 );
 SQL);
@@ -712,6 +721,9 @@ SQL);
     }
     if (!in_array('forum_signature', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
+    }
+    if (!in_array('profile_badges', $profileNames, true)) {
+        $db->exec("ALTER TABLE actor_profile ADD COLUMN profile_badges TEXT NOT NULL DEFAULT '[]'");
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -2158,8 +2170,50 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'reply_policy' => 'anyone',
         'quote_policy' => 'anyone',
         'forum_signature' => '',
+        'profile_badges' => [],
         'updated_at' => null,
     ];
+}
+
+/** Local-only profile flair. Keys are stored so labels can be revised safely. */
+function ap_profile_badge_catalog(): array
+{
+    return [
+        'rainbow' => ['label' => 'Rainbow pride', 'emoji' => '🏳️‍🌈'],
+        'trans' => ['label' => 'Trans pride', 'emoji' => '🏳️‍⚧️'],
+        'bi' => ['label' => 'Bisexual pride', 'emoji' => '🩷💜💙'],
+        'nonbinary' => ['label' => 'Non-binary pride', 'emoji' => '💛🤍💜🖤'],
+        'usa' => ['label' => 'United States', 'emoji' => '🇺🇸'],
+        'uk' => ['label' => 'United Kingdom', 'emoji' => '🇬🇧'],
+        'canada' => ['label' => 'Canada', 'emoji' => '🇨🇦'],
+        'pirate' => ['label' => 'Pirate', 'emoji' => '🏴‍☠️'],
+        'space' => ['label' => 'Space nerd', 'emoji' => '🚀'],
+        'cat' => ['label' => 'Cat person', 'emoji' => '🐈‍⬛'],
+    ];
+}
+
+/** @return list<string> */
+function ap_profile_normalize_badges(mixed $badges): array
+{
+    $allowed = ap_profile_badge_catalog();
+    if (is_string($badges)) {
+        $decoded = json_decode($badges, true);
+        $badges = is_array($decoded) ? $decoded : [];
+    }
+    if (!is_array($badges)) {
+        return [];
+    }
+    $out = [];
+    foreach ($badges as $badge) {
+        $key = is_string($badge) ? trim($badge) : '';
+        if ($key !== '' && isset($allowed[$key]) && !in_array($key, $out, true)) {
+            $out[] = $key;
+        }
+        if (count($out) >= 6) {
+            break;
+        }
+    }
+    return $out;
 }
 
 function ap_profile_ensure_default(PDO $db): void
@@ -2234,6 +2288,7 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'reply_policy' => in_array((string) ($row['reply_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['reply_policy'] : 'anyone',
         'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
         'forum_signature' => trim((string) ($row['forum_signature'] ?? '')),
+        'profile_badges' => ap_profile_normalize_badges($row['profile_badges'] ?? []),
         'updated_at' => $row['updated_at'] ?? null,
     ];
 }
@@ -2316,7 +2371,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2459,10 +2514,13 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         ? (string) $fields['reply_policy'] : (string) ($existingProfile['reply_policy'] ?? 'anyone');
     $quotePolicy = in_array((string) ($fields['quote_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
+    $profileBadges = array_key_exists('profile_badges', $fields)
+        ? ap_profile_normalize_badges($fields['profile_badges'])
+        : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, profile_badges, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2481,6 +2539,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            reply_policy = excluded.reply_policy,
            quote_policy = excluded.quote_policy,
            forum_signature = excluded.forum_signature,
+           profile_badges = excluded.profile_badges,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2502,6 +2561,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $replyPolicy,
         $quotePolicy,
         $forumSignature,
+        json_encode($profileBadges, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         ap_db_now(),
     ]);
 

@@ -1391,6 +1391,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
                 'quote_policy' => (string) ($_POST['quote_policy'] ?? 'anyone'),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
+                'profile_badges' => is_array($_POST['profile_badges'] ?? null) ? $_POST['profile_badges'] : [],
             ], $vaakActorKey);
             if (empty($saved['ok'])) {
                 $error = $saved['error'] ?? 'Profile save failed.';
@@ -16574,6 +16575,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <label for="pf-forum-signature">Forum signature <span class="meta">(optional, max 500 characters)</span></label>
           <textarea id="pf-forum-signature" name="forum_signature" maxlength="500" rows="3" placeholder="Shown below your Discuss posts…"><?= h((string) ($profile['forum_signature'] ?? '')) ?></textarea>
           <div class="meta" style="margin:.25rem 0 .75rem">Plain text only. HTML, scripts, and control characters are rejected.</div>
+
+          <?php $profileBadgeCatalog = ap_profile_badge_catalog(); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? []); ?>
+          <fieldset style="border:1px solid var(--border);border-radius:10px;padding:.75rem;margin:0 0 1rem">
+            <legend style="padding:0 .35rem;color:var(--text)">Profile badges <span class="meta">(up to 6)</span></legend>
+            <div class="meta" style="margin:0 0 .65rem">Optional flair shown on your HTML profile only. These badges are not federated.</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.45rem .75rem">
+              <?php foreach ($profileBadgeCatalog as $badgeKey => $badge): ?>
+                <label style="display:flex;align-items:center;gap:.4rem;margin:0;cursor:pointer">
+                  <input type="checkbox" name="profile_badges[]" value="<?= h($badgeKey) ?>" <?= in_array($badgeKey, $selectedProfileBadges, true) ? 'checked' : '' ?>>
+                  <span aria-hidden="true"><?= h((string) ($badge['emoji'] ?? '')) ?></span>
+                  <span><?= h((string) ($badge['label'] ?? $badgeKey)) ?></span>
+                </label>
+              <?php endforeach; ?>
+            </div>
+          </fieldset>
 
           <label for="pf-icon-file">Upload avatar (JPEG / PNG / WebP / GIF · max 2&nbsp;MB)</label>
           <input id="pf-icon-file" type="file" name="icon_file" accept="image/jpeg,image/png,image/webp,image/gif">
