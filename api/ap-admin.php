@@ -11938,7 +11938,10 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
         return [];
     }
     $limit = max(1, min(40, $limit));
-    $sinceAt = gmdate('c', $sinceTs);
+    // Timeline heads are second-resolution; overlap the query slightly so a
+    // post published in the same second as the last poll is not skipped.
+    $querySinceTs = max(0, $sinceTs - 2);
+    $sinceAt = gmdate('c', $querySinceTs);
     $db = ap_db();
     $ownerId = admin_owner_user_id();
     $out = [];
@@ -11996,7 +11999,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
                     'row' => $n,
                 ];
-                if ($item['sort'] <= $sinceTs || admin_timeline_item_muted_by_words($item)) {
+                if ($item['sort'] <= $querySinceTs || admin_timeline_item_muted_by_words($item)) {
                     continue;
                 }
                 $seen['o:' . $nid] = true;
@@ -12128,7 +12131,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                         'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
                         'row' => $n,
                     ];
-                    if ($item['sort'] <= $sinceTs || admin_timeline_item_muted_by_words($item)) {
+                    if ($item['sort'] <= $querySinceTs || admin_timeline_item_muted_by_words($item)) {
                         continue;
                     }
                     $seen['o:' . $nid] = true;
@@ -12159,7 +12162,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     }
                     $indexed = (string) ($bItem['indexed_at'] ?? ($bItem['post']['indexedAt'] ?? ''));
                     $sortTs = strtotime($indexed) ?: 0;
-                    if ($sortTs <= $sinceTs) {
+                    if ($sortTs <= $querySinceTs) {
                         continue;
                     }
                     $fediTwin = rtrim((string) ($bItem['fediverse_id'] ?? ''), '/');
