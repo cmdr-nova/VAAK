@@ -17296,7 +17296,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta" style="line-height:1.45">Your login is disabled immediately. Local posts and relationships are then cleaned up in the background, while ActivityPub deletion delivery is queued so this page does not wait on remote servers. This cannot be undone.</div>
           <input type="password" name="password" required autocomplete="current-password" placeholder="Current password" style="margin-top:.75rem">
           <input type="text" name="confirmation" required autocomplete="off" placeholder="Type DELETE to confirm" style="margin-top:.5rem;text-transform:uppercase">
-          <div class="composer-actions"><span class="meta">Operator accounts are protected.</span><button class="btn btn-ghost" type="submit" style="color:var(--danger);border-color:rgba(255,90,90,.5)">Delete account</button></div>
+          <div class="composer-actions"><span class="meta">This action cannot be undone.</span><button class="btn btn-ghost" type="submit" style="color:var(--danger);border-color:rgba(255,90,90,.5)">Delete account</button></div>
         </form>
         <?php endif; ?>
 
