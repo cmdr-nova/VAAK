@@ -6655,6 +6655,13 @@ function ap_bsky_actor_hide_reasons(string $actorRef, int $ownerUserId): array
     // used by the notifications hot path; a missing local profile cache must
     // never turn one page load into a serial set of XRPC requests. New
     // notifications carry their DID and are filtered during ingestion below.
+    if (!is_string($did) && function_exists('ap_bsky_actor_refresh_enqueue')) {
+        // The actor worker will resolve and cache the DID/profile outside the
+        // request. Subsequent notifications/profile views can then apply the
+        // synced moderation-list decision without blocking page load.
+        ap_bsky_actor_refresh_enqueue($ownerUserId, $actorRef);
+        return $cache[$key] = [];
+    }
     return $cache[$key] = is_string($did) ? ap_bsky_hide_did_reasons($ownerUserId, $did) : [];
 }
 
