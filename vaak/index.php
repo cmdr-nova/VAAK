@@ -565,6 +565,15 @@ ASCII;
         <button type="submit">Set new password</button>
       </form>
       <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
+    <?php elseif ($mode === '2fa'): ?>
+      <form method="post" action="/vaak/?mode=2fa" autocomplete="off">
+        <input type="hidden" name="csrf" value="<?= $csrf ?>">
+        <input type="hidden" name="action" value="verify_2fa">
+        <label for="code">Authenticator code or recovery code</label>
+        <input id="code" name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or XXXX-XXXX-XXXX" autofocus>
+        <button type="submit">Verify and log in</button>
+      </form>
+      <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
     <?php elseif ($mode === 'register'): ?>
       <form method="post" action="/vaak/?mode=register" autocomplete="on">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">

@@ -334,6 +334,26 @@ SQL);
         error_log('[ap-db] bsky_sessions not provisioned: ' . $e->getMessage());
     }
 
+    // Per-user TOTP state. Secrets are encrypted by ap-auth; recovery codes
+    // are stored only as password hashes. This table is local-only and never
+    // participates in federation or remote requests.
+    try {
+        if (!isset($present['ap_user_2fa'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_user_2fa (
+    user_id BIGINT PRIMARY KEY,
+    secret_enc TEXT NOT NULL DEFAULT '',
+    pending_secret_enc TEXT NOT NULL DEFAULT '',
+    recovery_codes_json TEXT NOT NULL DEFAULT '[]',
+    enabled_at TEXT,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] ap_user_2fa not provisioned: ' . $e->getMessage());
+    }
+
     $discussTablesReady = false;
     try {
         $discussTablesReady = isset(
@@ -408,7 +428,7 @@ SQL);
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
         'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
-        'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
+        'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors', 'ap_user_2fa',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
@@ -420,7 +440,7 @@ SQL);
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
     if (!$noticeTablesReady || !$discussTablesReady || !isset($present['vaak_blog_posts'])
-        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'])) {
+        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'], $present['ap_user_2fa'])) {
         $present = $loadPresentTables();
     }
     $missing = array_values(array_filter($requiredTables, static fn(string $table): bool => !isset($present[$table])));
@@ -1073,6 +1093,15 @@ CREATE TABLE IF NOT EXISTS ap_users (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_users_email ON ap_users(email);
 CREATE INDEX IF NOT EXISTS idx_ap_users_actor_key ON ap_users(actor_key);
+
+CREATE TABLE IF NOT EXISTS ap_user_2fa (
+    user_id INTEGER PRIMARY KEY,
+    secret_enc TEXT NOT NULL DEFAULT '',
+    pending_secret_enc TEXT NOT NULL DEFAULT '',
+    recovery_codes_json TEXT NOT NULL DEFAULT '[]',
+    enabled_at TEXT,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS ap_password_resets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
