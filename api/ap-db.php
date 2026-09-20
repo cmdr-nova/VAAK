@@ -428,7 +428,7 @@ SQL);
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
         'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
-        'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors', 'ap_user_2fa',
+        'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
