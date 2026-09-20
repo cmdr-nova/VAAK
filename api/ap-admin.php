@@ -104,6 +104,9 @@ if (is_dir('/var/log/mkultra') && (is_writable('/var/log/mkultra') || @touch('/v
 
 // Avoid blank white screens: exceptions + fatals under federation write traffic.
 $adminRenderHiccup = static function (string $msg = ''): void {
+    if (function_exists('vaak_render_failure')) {
+        vaak_render_failure();
+    }
     if (!headers_sent()) {
         http_response_code(500);
         header('Content-Type: text/html; charset=utf-8');
