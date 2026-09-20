@@ -17304,18 +17304,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
         </form>
 
-        <?php if (empty($vaakIsAdmin)): ?>
-        <form class="composer" method="post" action="?view=profile" style="margin-top:1rem;border-color:rgba(255,90,90,.45)" autocomplete="off" onsubmit="return confirm('Delete this VAAK account? The action cannot be undone.');">
-          <input type="hidden" name="action" value="delete_account">
-          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <div class="meta" style="margin-bottom:.55rem"><b style="color:var(--danger)">Delete this account</b></div>
-          <div class="meta" style="line-height:1.45">Your login is disabled immediately. Local posts and relationships are then cleaned up in the background, while ActivityPub deletion delivery is queued so this page does not wait on remote servers. This cannot be undone.</div>
-          <input type="password" name="password" required autocomplete="current-password" placeholder="Current password" style="margin-top:.75rem">
-          <input type="text" name="confirmation" required autocomplete="off" placeholder="Type DELETE to confirm" style="margin-top:.5rem;text-transform:uppercase">
-          <div class="composer-actions"><span class="meta">Operator accounts are protected.</span><button class="btn btn-ghost" type="submit" style="color:var(--danger);border-color:rgba(255,90,90,.5)">Delete account</button></div>
-        </form>
-        <?php endif; ?>
-
         <form class="composer" method="post" action="?view=profile" style="margin-top:1rem">
           <input type="hidden" name="action" value="reverify_profile_fields">
           <div class="meta" style="margin-bottom:.75rem">
@@ -17756,6 +17744,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
             <button class="btn btn-ghost" type="submit">Clear API key</button>
           </form>
+        <?php endif; ?>
+
+        <?php if (empty($vaakIsAdmin)): ?>
+        <form class="composer" method="post" action="?view=profile" style="margin-top:2rem;border-color:rgba(255,90,90,.45)" autocomplete="off" onsubmit="return confirm('Delete this VAAK account? The action cannot be undone.');">
+          <input type="hidden" name="action" value="delete_account">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <div class="meta" style="margin-bottom:.55rem"><b style="color:var(--danger)">Delete this account</b></div>
+          <div class="meta" style="line-height:1.45">Your login is disabled immediately. Local posts and relationships are then cleaned up in the background, while ActivityPub deletion delivery is queued so this page does not wait on remote servers. This cannot be undone.</div>
+          <input type="password" name="password" required autocomplete="current-password" placeholder="Current password" style="margin-top:.75rem">
+          <input type="text" name="confirmation" required autocomplete="off" placeholder="Type DELETE to confirm" style="margin-top:.5rem;text-transform:uppercase">
+          <div class="composer-actions"><span class="meta">Operator accounts are protected.</span><button class="btn btn-ghost" type="submit" style="color:var(--danger);border-color:rgba(255,90,90,.5)">Delete account</button></div>
+        </form>
         <?php endif; ?>
 
         <?php endif; ?>
