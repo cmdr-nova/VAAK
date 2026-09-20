@@ -6651,9 +6651,10 @@ function ap_bsky_actor_hide_reasons(string $actorRef, int $ownerUserId): array
     if (is_array($profile) && is_string($profile['did'] ?? null) && str_starts_with($profile['did'], 'did:')) {
         $did = $profile['did'];
     }
-    if ($did === null) {
-        $did = ap_bsky_resolve_target_did($actorRef, $ownerUserId);
-    }
+    // Do not resolve uncached handles over the network here. This helper is
+    // used by the notifications hot path; a missing local profile cache must
+    // never turn one page load into a serial set of XRPC requests. New
+    // notifications carry their DID and are filtered during ingestion below.
     return $cache[$key] = is_string($did) ? ap_bsky_hide_did_reasons($ownerUserId, $did) : [];
 }
 
@@ -9891,6 +9892,12 @@ function ap_bsky_ingest_notifications(int $ownerUserId, array $notifs, bool $pus
                 } else {
                     $skipped++;
                 }
+                continue;
+            }
+            $notifAuthor = is_array($notif['author'] ?? null) ? $notif['author'] : [];
+            $notifDid = trim((string) ($notifAuthor['did'] ?? ''));
+            if ($notifDid !== '' && ap_bsky_hide_did_reasons($ownerUserId, $notifDid) !== []) {
+                $skipped++;
                 continue;
             }
             $row = ap_bsky_notification_to_mention_row($ownerUserId, $ownerActorId, $notif);
