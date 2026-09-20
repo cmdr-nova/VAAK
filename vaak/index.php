@@ -6,6 +6,79 @@
  */
 declare(strict_types=1);
 
+/**
+ * Keep startup failures human-readable even when the app cannot bootstrap its
+ * database or session layer. This intentionally has no VAAK dependencies.
+ */
+function vaak_render_failure(?Throwable $error = null): void
+{
+    if ($error !== null) {
+        error_log('[vaak-front] ' . get_class($error) . ': ' . $error->getMessage());
+    }
+    while (ob_get_level() > 0) {
+        @ob_end_clean();
+    }
+    http_response_code(503);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    header('Retry-After: 60');
+    echo <<<'HTML'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="theme-color" content="#050505">
+  <title>VAAK · Temporarily unavailable</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh; margin: 0; padding: 2rem;
+      display: grid; place-items: center;
+      background: #050505; color: #e8e8e8;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(42rem, 100%); text-align: center; }
+    .mark {
+      margin: 0 auto 2rem; color: #00ff9f;
+      font: 700 clamp(3.5rem, 17vw, 8rem)/.88 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-shadow: 0 0 32px rgba(0,255,159,.28);
+      white-space: pre; overflow: hidden;
+    }
+    h1 { margin: 0; font-size: clamp(1.35rem, 4vw, 2rem); font-weight: 650; }
+    p { margin: 1rem auto 0; max-width: 34rem; color: #999; font-size: 1rem; line-height: 1.55; }
+    a { color: #00ff9f; text-underline-offset: .18em; }
+  </style>
+</head>
+<body>
+  <main>
+    <pre class="mark" aria-label="VAAK">██╗   ██╗
+██║   ██║
+██║   ██║
+╚██╗ ██╔╝
+ ╚████╔╝
+  ╚═══╝</pre>
+    <h1>Something's gone wrong, we're working on it.</h1>
+    <p>Questions, contact <a href="mailto:cmdr_nova@mkultra.monster">cmdr_nova@mkultra.monster</a></p>
+  </main>
+</body>
+</html>
+HTML;
+    exit;
+}
+
+set_exception_handler(static function (Throwable $error): void {
+    vaak_render_failure($error);
+});
+register_shutdown_function(static function (): void {
+    $last = error_get_last();
+    if (is_array($last) && in_array((int) ($last['type'] ?? 0), [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        vaak_render_failure();
+    }
+});
+
 require_once dirname(__DIR__) . '/api/ap-auth.php';
 require_once dirname(__DIR__) . '/api/ap-version.php';
 
