@@ -660,6 +660,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         $action === 'reblog_status', ['status_id' => $sid]
                     );
                     if (!empty($queue['ok'])) {
+                        // Make pending boosts visible immediately; the worker
+                        // will clear caches again after the remote action lands.
+                        admin_tl_cache_clear();
                         header('Content-Type: application/json; charset=utf-8');
                         header('Cache-Control: no-store');
                         http_response_code(202);
@@ -12180,9 +12183,11 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
         error_log('[ap-admin] newer poll: ' . $e->getMessage());
     }
 
-    foreach (admin_pending_timeline_items($ownerId) as $pendingItem) {
-        if ((int) ($pendingItem['sort'] ?? 0) > $sinceTs) {
-            $out[] = $pendingItem;
+    if (in_array($view, ['home', 'feed', 'local'], true)) {
+        foreach (admin_pending_timeline_items($ownerId) as $pendingItem) {
+            if ((int) ($pendingItem['sort'] ?? 0) > $sinceTs) {
+                $out[] = $pendingItem;
+            }
         }
     }
     usort($out, static fn($a, $b) => $b['sort'] <=> $a['sort']);
