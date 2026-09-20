@@ -1305,6 +1305,22 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             if ($type === 'Delete' && $objectId) {
                 ap_dm_soft_delete_by_object($objectId);
             }
+            // A DM's URL can be addressed from outside the instance, but its
+            // interactions must remain participant-only. Do not let an
+            // arbitrary actor manufacture a favourite/boost notification for
+            // a private conversation (or make the DM discoverable indirectly).
+            if (in_array($type, ['Like', 'Announce', 'EmojiReact', 'Quote', 'QuotePost'], true)) {
+                $dmInteraction = ap_private_dm_interaction_allowed(
+                    is_string($objectId) ? $objectId : '',
+                    is_string($actorId) ? $actorId : '',
+                    (int) ($recipient['owner_user_id'] ?? 0)
+                );
+                if ($dmInteraction === false) {
+                    ap_metrics_record($type, $actorId, $objectId, LOCAL_ACTOR, $bytes, 'private_dm_interaction_rejected', null);
+                    ap_log('private_dm_interaction_rejected type=' . ap_short((string) $type) . ' actor=' . ap_short((string) $actorId) . ' object=' . ap_short((string) $objectId));
+                    return 'private_dm_interaction_rejected';
+                }
+            }
             // Likes / boosts / quote activities of our posts are usually not
             // addressed to as:Public — still notifiable.
             if (in_array($type, ['Like', 'Announce', 'EmojiReact', 'Quote', 'QuotePost'], true)) {
@@ -4067,6 +4083,39 @@ function ap_local_observe(array $activity): void
     }
     if ($type === 'Delete' && $objectId) {
         ap_mention_soft_delete($objectId);
+    }
+}
+
+/**
+ * Direct-message objects are addressable URLs, but they are not public posts.
+ * Only the two participants may send an interaction for a local DM. Returning
+ * null means the object is not one of this owner's stored DMs.
+ */
+function ap_private_dm_interaction_allowed(string $objectId, string $actorId, int $ownerUserId): ?bool
+{
+    $objectId = rtrim(trim($objectId), '/');
+    $actorId = rtrim(trim($actorId), '/');
+    if ($objectId === '' || $actorId === '' || $ownerUserId < 1) {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT peer_actor_id, owner_actor_id FROM direct_messages
+             WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)
+             LIMIT 1'
+        );
+        $st->execute([$ownerUserId, $objectId, $objectId . '/']);
+        $row = $st->fetch();
+        if (!is_array($row)) {
+            return null;
+        }
+        $peer = rtrim((string) ($row['peer_actor_id'] ?? ''), '/');
+        $owner = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+        return $actorId === $peer || $actorId === $owner;
+    } catch (Throwable $e) {
+        // Fail closed for a matching object only; callers treat a lookup error
+        // as an ordinary non-DM and retain the existing inbox path.
+        return null;
     }
 }
 
