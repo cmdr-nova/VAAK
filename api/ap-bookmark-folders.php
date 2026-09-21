@@ -71,7 +71,6 @@ function vaak_bookmark_folders_ensure_schema(): void
     try {
         ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_vaak_bm_folders_owner ON vaak_bookmark_folders(owner_user_id, position, id)');
         ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_vaak_bm_folder_items_owner_status ON vaak_bookmark_folder_items(owner_user_id, status_id)');
-        ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_vaak_bm_folder_items_folder_owner ON vaak_bookmark_folder_items(folder_id, owner_user_id, added_at DESC)');
     } catch (Throwable $e) {
         // ignore
     }

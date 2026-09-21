@@ -1324,15 +1324,7 @@ function ap_bsky_xrpc(
     }
     $url = $base . '/xrpc/' . $nsid;
     if ($method === 'GET' && is_array($query) && $query !== []) {
-        // ATProto array parameters (notably `uris`) are repeated keys, not
-        // PHP's `uris[0]` bracket notation.
-        $parts = [];
-        foreach ($query as $name => $value) {
-            foreach (is_array($value) ? $value : [$value] as $part) {
-                $parts[] = rawurlencode((string) $name) . '=' . rawurlencode((string) $part);
-            }
-        }
-        $url .= '?' . implode('&', $parts);
+        $url .= '?' . http_build_query($query);
     }
     $headers = [
         'Accept: application/json',
@@ -2521,7 +2513,6 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $seenVals[$val] = true;
         }
     }
-    $cacheSaved = false;
     try {
         $st = ap_db()->prepare(
             'INSERT INTO bsky_posts (
@@ -2575,26 +2566,8 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $now,
             $now,
         ]);
-        $cacheSaved = true;
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());
-    }
-    if ($cacheSaved) {
-        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
-        if (function_exists('ap_search_fts_upsert') && function_exists('ap_search_fts_external_pk')) {
-            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
-                $text,
-                (string) ($author['handle'] ?? ''),
-                (string) ($author['displayName'] ?? ''),
-            ])));
-            ap_search_fts_upsert(
-                'bsky_post',
-                ap_search_fts_external_pk('bsky_post', $uri),
-                $uri,
-                $publishedAt,
-                $searchBody
-            );
-        }
     }
     // Keep link map in sync.
     ap_bsky_index_feed_post_links($post);
@@ -4417,7 +4390,6 @@ function ap_bsky_quote_preview(array $post): ?array
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
         'display' => $display,
-        'avatar' => (string) ($author['avatar'] ?? ''),
         'text' => $text,
         'url' => $url,
         'media' => $media,
@@ -4500,7 +4472,6 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
         'display' => $display,
-        'avatar' => (string) ($author['avatar'] ?? ''),
         'text' => $text,
         'url' => $url,
         'media' => $media,
@@ -4815,96 +4786,6 @@ function ap_bsky_bookmark_cache_read(int $ownerUserId, int $limit): array
     }
 }
 
-/** Read only the cached Bluesky posts whose AT-URIs belong to a folder. */
-function ap_bsky_bookmark_cache_read_uris(int $ownerUserId, array $uris, int $limit = 80): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) {
-        return [];
-    }
-    // Folder membership stores the public bsky.app URL for non-twin posts,
-    // while the durable cache stores AT-URIs. Resolve those from the cache by
-    // rkey first so opening a folder does not perform one handle lookup per
-    // item (network resolution is only the fallback for an uncached item).
-    $knownByRkey = [];
-    $rkeys = [];
-    foreach ($uris as $rawUri) {
-        if (preg_match('~^https://bsky\.app/profile/[^/]+/post/([^/?#]+)~i', trim((string) $rawUri), $m)) {
-            $rkeys[rawurldecode($m[1])] = true;
-        }
-    }
-    if ($rkeys !== []) {
-        try {
-            $clauses = [];
-            $bind = [$ownerUserId];
-            foreach (array_keys($rkeys) as $rkey) {
-                $clauses[] = 'bookmark_uri LIKE ?';
-                $bind[] = '%/app.bsky.feed.post/' . $rkey;
-            }
-            $st = ap_db()->prepare(
-                'SELECT bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ? AND ('
-                . implode(' OR ', $clauses) . ')'
-            );
-            $st->execute($bind);
-            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $knownUri) {
-                if (preg_match('~/app\.bsky\.feed\.post/([^/]+)$~', (string) $knownUri, $m)) {
-                    $knownByRkey[$m[1]] = (string) $knownUri;
-                }
-            }
-        } catch (Throwable $e) {
-            // The normal resolver remains a safe fallback below.
-        }
-    }
-    $normalized = [];
-    foreach ($uris as $rawUri) {
-        $uri = trim((string) $rawUri);
-        $rkey = '';
-        if (preg_match('~^https://bsky\.app/profile/[^/]+/post/([^/?#]+)~i', $uri, $m)) {
-            $rkey = rawurldecode($m[1]);
-        }
-        if ($rkey !== '' && isset($knownByRkey[$rkey])) {
-            $uri = $knownByRkey[$rkey];
-        }
-        if ($uri !== '' && !str_starts_with($uri, 'at://') && function_exists('ap_bsky_at_uri_from_any_url')) {
-            $resolved = ap_bsky_at_uri_from_any_url($uri);
-            if (is_string($resolved) && str_starts_with($resolved, 'at://')) {
-                $uri = $resolved;
-            }
-        }
-        if (str_starts_with($uri, 'at://')) {
-            $normalized[$uri] = true;
-        }
-    }
-    $uris = array_keys($normalized);
-    if ($uris === []) {
-        return [];
-    }
-    $limit = max(1, min(200, $limit));
-    try {
-        $marks = implode(',', array_fill(0, count($uris), '?'));
-        $st = ap_db()->prepare(
-            'SELECT post_json, bookmarked_at FROM bsky_bookmark_cache
-             WHERE owner_user_id = ? AND bookmark_uri IN (' . $marks . ')
-             ORDER BY bookmarked_at DESC, bookmark_uri DESC LIMIT ' . $limit
-        );
-        $st->execute(array_merge([$ownerUserId], $uris));
-        $out = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $item = json_decode((string) ($row['post_json'] ?? ''), true);
-            if (!is_array($item) || !is_array($item['post'] ?? null)) {
-                continue;
-            }
-            $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
-            $item['post']['viewer']['bookmarked'] = true;
-            $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
-            $out[] = $item;
-        }
-        return $out;
-    } catch (Throwable $e) {
-        error_log('[ap-bsky] bookmark folder cache read failed');
-        return [];
-    }
-}
-
 /** Import the old volatile cache once, so deployment does not blank the first view. */
 function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 {
@@ -4931,7 +4812,7 @@ function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 /** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
 function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
 {
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs'], true)
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists', 'starter_packs'], true)
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
@@ -4953,103 +4834,6 @@ function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, b
         error_log('[ap-bsky] collection refresh enqueue failed');
         return false;
     }
-}
-
-/** Durable cache for the account's Bluesky likes (the Bluesky equivalent of Favourites). */
-function ap_bsky_favourite_cache_migrate(?PDO $db = null): bool
-{
-    static $ready = [];
-    $db ??= ap_db(); $key = spl_object_id($db);
-    if (isset($ready[$key])) return $ready[$key];
-    try {
-        if (function_exists('ap_db_driver') && ap_db_driver($db) === 'pgsql') {
-            $q = $db->query("SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name IN ('bsky_favourite_cache','bsky_favourite_sync_state')");
-            $tables = array_fill_keys(array_map('strval', $q->fetchAll(PDO::FETCH_COLUMN)), true);
-            return $ready[$key] = isset($tables['bsky_favourite_cache'], $tables['bsky_favourite_sync_state']);
-        }
-        $db->exec('CREATE TABLE IF NOT EXISTS bsky_favourite_cache (owner_user_id INTEGER NOT NULL, favourite_uri TEXT NOT NULL, favourited_at TEXT NOT NULL, post_json TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (owner_user_id, favourite_uri))');
-        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_favourite_cache_owner_time ON bsky_favourite_cache (owner_user_id, favourited_at DESC)');
-        $db->exec('CREATE TABLE IF NOT EXISTS bsky_favourite_sync_state (owner_user_id INTEGER PRIMARY KEY, checked_at TEXT, updated_at TEXT NOT NULL)');
-        return $ready[$key] = true;
-    } catch (Throwable $e) { error_log('[ap-bsky] favourite cache schema unavailable'); return $ready[$key] = false; }
-}
-
-function ap_bsky_favourite_cache_read(int $ownerUserId, int $limit = 80, int $offset = 0): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return [];
-    try {
-        $st = ap_db()->prepare('SELECT post_json, favourited_at FROM bsky_favourite_cache WHERE owner_user_id = ? ORDER BY favourited_at DESC, favourite_uri DESC LIMIT ? OFFSET ?');
-        $st->execute([$ownerUserId, max(1, min(200, $limit)), max(0, $offset)]); $out = [];
-        foreach ($st->fetchAll() ?: [] as $row) { $item = json_decode((string) ($row['post_json'] ?? ''), true); if (is_array($item) && is_array($item['post'] ?? null)) { $item['_vaak_favourited_at'] = (string) ($row['favourited_at'] ?? ''); $out[] = $item; } }
-        return $out;
-    } catch (Throwable $e) { return []; }
-}
-
-function ap_bsky_favourite_cache_count(int $ownerUserId): int
-{
-    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return 0;
-    try { $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_favourite_cache WHERE owner_user_id = ?'); $st->execute([$ownerUserId]); return (int) $st->fetchColumn(); } catch (Throwable $e) { return 0; }
-}
-
-/** Read one cached page without making the Favourites page wait for Bluesky. */
-function ap_bsky_get_favourites_page(int $ownerUserId, int $offset = 0, int $limit = 20): array
-{
-    $base = ap_bsky_get_favourites($ownerUserId, 1, false);
-    if (empty($base['ok'])) return $base;
-    return ['ok' => true, 'favourites' => ap_bsky_favourite_cache_read($ownerUserId, $limit, $offset), 'cached' => true,
-        'refreshing' => !empty($base['refreshing']), 'has_more' => ($offset + $limit) < ap_bsky_favourite_cache_count($ownerUserId)];
-}
-
-function ap_bsky_favourite_cache_clear(int $ownerUserId, ?string $removeUri = null): void
-{
-    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return;
-    try {
-        if (is_string($removeUri) && str_starts_with($removeUri, 'at://')) ap_db()->prepare('DELETE FROM bsky_favourite_cache WHERE owner_user_id = ? AND favourite_uri = ?')->execute([$ownerUserId, $removeUri]);
-        ap_db()->prepare('INSERT INTO bsky_favourite_sync_state (owner_user_id, checked_at, updated_at) VALUES (?, ?, ?) ON CONFLICT (owner_user_id) DO UPDATE SET checked_at = excluded.checked_at, updated_at = excluded.updated_at')->execute([$ownerUserId, '1970-01-01T00:00:00+00:00', gmdate('c')]);
-        ap_bsky_background_sync_enqueue($ownerUserId, 'favourites', true);
-    } catch (Throwable $e) { error_log('[ap-bsky] favourite cache invalidation failed'); }
-}
-
-function ap_bsky_get_favourites(int $ownerUserId, int $limit = 80, bool $refresh = false): array
-{
-    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled()) || ap_bsky_session_row($ownerUserId) === null) return ['ok' => false, 'error' => 'Bluesky not connected'];
-    if (!ap_bsky_favourite_cache_migrate()) return ['ok' => false, 'error' => 'Bluesky favourite cache is not provisioned'];
-    if ($refresh) return ap_bsky_favourites_refresh_worker($ownerUserId, $limit);
-    $cached = ap_bsky_favourite_cache_read($ownerUserId, $limit); $checked = 0;
-    try { $st = ap_db()->prepare('SELECT checked_at FROM bsky_favourite_sync_state WHERE owner_user_id = ?'); $st->execute([$ownerUserId]); $checked = strtotime((string) ($st->fetchColumn() ?: '')) ?: 0; } catch (Throwable $e) {}
-    $stale = $checked < time() - 300; if ($stale) ap_bsky_background_sync_enqueue($ownerUserId, 'favourites');
-    return ['ok' => true, 'favourites' => $cached, 'cached' => true, 'refreshing' => $stale];
-}
-
-function ap_bsky_favourites_refresh_worker(int $ownerUserId, int $limit = 200): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) return ['ok' => false, 'error' => 'Favourite cache unavailable'];
-    $session = ap_bsky_session_row($ownerUserId); $token = ap_bsky_access_token($ownerUserId, false); if (empty($token['ok'])) $token = ap_bsky_access_token($ownerUserId, true);
-    if ($session === null || empty($token['ok'])) return ['ok' => false, 'error' => 'Bluesky session unavailable'];
-    $did = (string) ($session['did'] ?? ''); $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/'); $access = (string) $token['access'];
-    $res = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', ['repo' => $did, 'collection' => 'app.bsky.feed.like', 'limit' => max(1, min(100, $limit)), 'reverse' => 'true'], null, $access, 15);
-    if (empty($res['ok']) || !is_array($res['json'] ?? null)) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky likes')];
-    $rows = is_array($res['json']['records'] ?? null) ? $res['json']['records'] : []; $items = [];
-    $byUri = [];
-    foreach ($rows as $row) {
-        $v = is_array($row['value'] ?? null) ? $row['value'] : []; $subject = is_array($v['subject'] ?? null) ? $v['subject'] : []; $uri = trim((string) ($subject['uri'] ?? '')); if (!str_starts_with($uri, 'at://')) continue;
-        $byUri[$uri] = ['row' => $row, 'created' => trim((string) ($v['createdAt'] ?? gmdate('c'))) ?: gmdate('c')];
-    }
-    foreach (array_chunk(array_keys($byUri), 25) as $uriBatch) {
-        $postRes = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', ['uris' => $uriBatch], null, null, 10);
-        foreach (is_array($postRes['json']['posts'] ?? null) ? $postRes['json']['posts'] : [] as $post) {
-            if (!is_array($post)) continue; $uri = trim((string) ($post['uri'] ?? '')); if ($uri === '' || !isset($byUri[$uri])) continue;
-            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : []; $post['viewer']['like'] = (string) ($byUri[$uri]['row']['uri'] ?? '');
-            $items[] = [$uri, $byUri[$uri]['created'], json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)];
-        }
-    }
-    try {
-        $db = ap_db(); $db->beginTransaction(); $up = $db->prepare('INSERT INTO bsky_favourite_cache (owner_user_id, favourite_uri, favourited_at, post_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (owner_user_id, favourite_uri) DO UPDATE SET favourited_at = excluded.favourited_at, post_json = excluded.post_json, updated_at = excluded.updated_at');
-        foreach ($items as $item) if (is_string($item[2])) $up->execute([$ownerUserId, $item[0], $item[1], $item[2], gmdate('c')]);
-        $db->prepare('DELETE FROM bsky_favourite_cache WHERE owner_user_id = ? AND favourite_uri NOT IN (SELECT favourite_uri FROM bsky_favourite_cache WHERE owner_user_id = ? ORDER BY favourited_at DESC LIMIT ?)')->execute([$ownerUserId, $ownerUserId, max(1, min(200, $limit))]);
-        $db->prepare('INSERT INTO bsky_favourite_sync_state (owner_user_id, checked_at, updated_at) VALUES (?, ?, ?) ON CONFLICT (owner_user_id) DO UPDATE SET checked_at = excluded.checked_at, updated_at = excluded.updated_at')->execute([$ownerUserId, gmdate('c'), gmdate('c')]); $db->commit();
-    } catch (Throwable $e) { try { if ($db->inTransaction()) $db->rollBack(); } catch (Throwable $ignored) {} return ['ok' => false, 'error' => 'Could not store Bluesky favourites']; }
-    return ['ok' => true, 'favourites' => ap_bsky_favourite_cache_read($ownerUserId, $limit), 'added' => count($items)];
 }
 
 /**
@@ -5088,36 +4872,6 @@ function ap_bsky_get_bookmarks(int $ownerUserId, int $limit = 80, bool $refresh 
     $stale = $checkedAt < time() - 300;
     if ($stale) ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
     return ['ok' => true, 'bookmarks' => $cached, 'cached' => true, 'refreshing' => $stale];
-}
-
-/**
- * Read a folder's Bluesky bookmarks without loading the entire collection.
- * A stale head refresh is still coalesced into the normal background queue;
- * this request never calls the Bluesky API.
- */
-function ap_bsky_get_bookmarks_for_uris(int $ownerUserId, array $uris, int $limit = 80): array
-{
-    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
-        return ['ok' => false, 'error' => 'Bluesky is not connected'];
-    }
-    if (ap_bsky_session_row($ownerUserId) === null || !ap_bsky_bookmark_cache_migrate()) {
-        return ['ok' => false, 'error' => 'Bluesky is not connected'];
-    }
-    $items = ap_bsky_bookmark_cache_read_uris($ownerUserId, $uris, $limit);
-    $checkedAt = 0;
-    try {
-        $st = ap_db()->prepare('SELECT head_checked_at FROM bsky_bookmark_sync_state WHERE owner_user_id = ? LIMIT 1');
-        $st->execute([$ownerUserId]);
-        $row = $st->fetch();
-        $checkedAt = is_array($row) ? (strtotime((string) ($row['head_checked_at'] ?? '')) ?: 0) : 0;
-    } catch (Throwable $e) {
-        // The folder can still render from its durable cache if state is unavailable.
-    }
-    $stale = $checkedAt < time() - 300;
-    if ($stale) {
-        ap_bsky_background_sync_enqueue($ownerUserId, 'bookmarks');
-    }
-    return ['ok' => true, 'bookmarks' => $items, 'cached' => true, 'refreshing' => $stale];
 }
 
 /** Refresh only the new head, except for the initial/daily bounded baseline. */
@@ -5908,15 +5662,6 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
             $st->execute([$did, $did, $json, $now]);
             $vs->execute([$ownerUserId, $did, is_string($viewer['following'] ?? null) ? $viewer['following'] : null, !empty($viewer['followedBy']) ? 1 : 0, $now]);
         }
-        if (!function_exists('ap_search_fts_upsert')) require_once __DIR__ . '/ap-search-fts.php';
-        if ($did !== '' && function_exists('ap_search_fts_upsert') && function_exists('ap_search_fts_external_pk')) {
-            $searchBody = ap_search_fts_normalize_body(implode(' ', array_filter([
-                (string) ($profile['handle'] ?? ''),
-                (string) ($profile['displayName'] ?? ''),
-                (string) ($profile['description'] ?? ''),
-            ])));
-            ap_search_fts_upsert('bsky_actor', ap_search_fts_external_pk('bsky_actor', $did), $did, $now, $searchBody);
-        }
     } catch (Throwable $e) {
         error_log('[ap-bsky] actor profile cache write failed');
     }
@@ -6117,8 +5862,6 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                     $result = ap_bsky_get_bookmarks($owner, 200, true);
                 } elseif ($kind === 'bookmarks') {
                     $result = ['ok' => true, 'skipped' => true];
-                } elseif ($kind === 'favourites' && function_exists('ap_bsky_get_favourites')) {
-                    $result = ap_bsky_get_favourites($owner, 200, true);
                 } elseif ($kind === 'follows') {
                     $result = function_exists('ap_bsky_follow_sync_worker')
                         ? ap_bsky_follow_sync_worker($owner)
@@ -6434,45 +6177,6 @@ function ap_bsky_unblock_actor(int $ownerUserId, string $did): array
     $row = ap_bsky_session_row($ownerUserId);
     $existing = ap_bsky_graph_sync_get($ownerUserId, 'block', $did);
     $blockUri = is_array($existing) ? trim((string) ($existing['bsky_uri'] ?? '')) : '';
-    // Pull-synced blocks contain the subject DID but not the record URI. Find
-    // the matching repo record so an unblock initiated in VAAK removes it on
-    // the PDS as well.
-    if ($blockUri === '' && is_array($row) && !empty($row['did'])) {
-        $tok = ap_bsky_access_token($ownerUserId, false);
-        if (empty($tok['ok'])) {
-            $tok = ap_bsky_access_token($ownerUserId, true);
-        }
-        if (!empty($tok['ok'])) {
-            $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-            $cursor = null;
-            for ($page = 0; $page < 20 && $blockUri === ''; $page++) {
-                $query = [
-                    'repo' => (string) $row['did'],
-                    'collection' => 'app.bsky.graph.block',
-                    'limit' => 100,
-                ];
-                if ($cursor !== null && $cursor !== '') {
-                    $query['cursor'] = $cursor;
-                }
-                $list = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', $query, null, (string) $tok['access'], 12);
-                if (empty($list['ok'])) {
-                    break;
-                }
-                foreach ((array) ($list['json']['records'] ?? []) as $record) {
-                    $subject = (string) ($record['value']['subject'] ?? '');
-                    if ($subject === $did) {
-                        $blockUri = (string) ($record['uri'] ?? '');
-                        break;
-                    }
-                }
-                $cursor = isset($list['json']['cursor']) && is_string($list['json']['cursor'])
-                    ? $list['json']['cursor'] : null;
-                if ($cursor === null) {
-                    break;
-                }
-            }
-        }
-    }
     if ($blockUri === '' || !preg_match('~^at://[^/]+/app\.bsky\.graph\.block/([^/]+)$~', $blockUri, $m)) {
         // No stored rkey — still clear local hide + sync row.
         ap_bsky_graph_sync_delete($ownerUserId, 'block', $did);
@@ -6600,71 +6304,6 @@ function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
     // static cache is per-request; no-op helper for future APCu
 }
 
-/** Return the synced moderation reasons for one Bluesky DID. */
-function ap_bsky_hide_did_reasons(int $ownerUserId, string $did): array
-{
-    if ($ownerUserId < 1 || !str_starts_with($did, 'did:')) {
-        return [];
-    }
-    ap_bsky_graph_sync_migrate();
-    try {
-        $st = ap_db()->prepare(
-            'SELECT DISTINCT reason FROM bsky_hide_dids WHERE owner_user_id = ? AND did = ?'
-        );
-        $st->execute([$ownerUserId, $did]);
-        $out = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $reason = trim((string) ($row['reason'] ?? ''));
-            if ($reason !== '') {
-                $out[$reason] = true;
-            }
-        }
-        // Direct VAAK/PDS actions are also mirrored in graph_sync. This keeps
-        // filtering correct even before the next full hide-list refresh.
-        foreach (['block', 'mute'] as $kind) {
-            if (is_array(ap_bsky_graph_sync_get($ownerUserId, $kind, $did))) {
-                $out[$kind] = true;
-            }
-        }
-        return array_keys($out);
-    } catch (Throwable $e) {
-        return [];
-    }
-}
-
-/** Resolve an actor reference and return its synced Bluesky moderation reasons. */
-function ap_bsky_actor_hide_reasons(string $actorRef, int $ownerUserId): array
-{
-    static $cache = [];
-    $actorRef = rtrim(trim($actorRef), '/');
-    $key = $ownerUserId . '|' . $actorRef;
-    if (array_key_exists($key, $cache)) {
-        return $cache[$key];
-    }
-    if ($ownerUserId < 1 || !ap_bsky_is_profile_ref($actorRef)) {
-        return $cache[$key] = [];
-    }
-    $did = null;
-    $profile = function_exists('ap_bsky_actor_profile_cache_get')
-        ? ap_bsky_actor_profile_cache_get($actorRef, $ownerUserId)
-        : null;
-    if (is_array($profile) && is_string($profile['did'] ?? null) && str_starts_with($profile['did'], 'did:')) {
-        $did = $profile['did'];
-    }
-    // Do not resolve uncached handles over the network here. This helper is
-    // used by the notifications hot path; a missing local profile cache must
-    // never turn one page load into a serial set of XRPC requests. New
-    // notifications carry their DID and are filtered during ingestion below.
-    if (!is_string($did) && function_exists('ap_bsky_actor_refresh_enqueue')) {
-        // The actor worker will resolve and cache the DID/profile outside the
-        // request. Subsequent notifications/profile views can then apply the
-        // synced moderation-list decision without blocking page load.
-        ap_bsky_actor_refresh_enqueue($ownerUserId, $actorRef);
-        return $cache[$key] = [];
-    }
-    return $cache[$key] = is_string($did) ? ap_bsky_hide_did_reasons($ownerUserId, $did) : [];
-}
-
 /**
  * Pull Bluesky blocks, mutes, and subscribed block/mute modlist members into hide set.
  *
@@ -6723,9 +6362,6 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
         ap_db()->prepare(
             "DELETE FROM bsky_hide_dids WHERE owner_user_id = ? AND reason IN ('block','mute','listblock','listmute')"
         )->execute([$ownerUserId]);
-        ap_db()->prepare(
-            "DELETE FROM bsky_graph_sync WHERE owner_user_id = ? AND source = 'bsky' AND kind IN ('block', 'mute')"
-        )->execute([$ownerUserId]);
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => $e->getMessage()];
     }
@@ -6747,7 +6383,6 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                 continue;
             }
             ap_bsky_hide_did_add($ownerUserId, $did, 'block');
-            ap_bsky_graph_sync_upsert($ownerUserId, 'block', $did, null, 'bsky');
             $blockCount++;
         }
         $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
@@ -6773,7 +6408,6 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
                 continue;
             }
             ap_bsky_hide_did_add($ownerUserId, $did, 'mute');
-            ap_bsky_graph_sync_upsert($ownerUserId, 'mute', $did, null, 'bsky');
             $muteCount++;
         }
         $cursor = isset($j['cursor']) && is_string($j['cursor']) ? $j['cursor'] : null;
@@ -9532,50 +9166,10 @@ function ap_bsky_subject_post_preview_text(string $subjectAtOrUrl, int $ownerUse
                 return $txt;
             }
         }
-        // Notification list paint stays cache-only. A single coalesced CLI
-        // warmer fills the durable cache for the next poll instead of making
-        // Ice Cubes wait on AppView network I/O.
-        ap_bsky_post_preview_warm_async($at, $ownerUserId);
+        // Intentionally no sync AppView fetch here — notification list paint
+        // must stay local/cache-only (Ice Cubes polls this path often).
     }
     return '';
-}
-
-/** Queue one bounded AppView fetch for an uncached notification subject. */
-function ap_bsky_post_preview_warm_async(string $atUri, int $ownerUserId = 0): void
-{
-    $atUri = trim($atUri);
-    if (!str_starts_with($atUri, 'at://') || !function_exists('exec') || !function_exists('shell_exec')) {
-        return;
-    }
-    $script = __DIR__ . '/ap-bsky-post-warm.php';
-    if (!is_file($script)) {
-        return;
-    }
-    $lockPath = sys_get_temp_dir() . '/vaak-bsky-post-warm-' . sha1($atUri) . '.lock';
-    $lock = @fopen($lockPath, 'x');
-    if ($lock === false) {
-        if (!is_file($lockPath) || (filemtime($lockPath) ?: time()) > time() - 900) {
-            return;
-        }
-        @unlink($lockPath);
-        $lock = @fopen($lockPath, 'x');
-        if ($lock === false) return;
-    }
-    fclose($lock);
-    $running = trim((string) @shell_exec("pgrep -fc 'ap-bsky-post-warm\\.php' 2>/dev/null"));
-    if ((int) $running >= 2) {
-        @unlink($lockPath);
-        return;
-    }
-    $php = function_exists('ap_php_cli_binary')
-        ? ap_php_cli_binary()
-        : ((string) getenv('VAAK_PHP_CLI') !== '' ? (string) getenv('VAAK_PHP_CLI') : '/usr/bin/php');
-    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script)
-        . ' --uri=' . escapeshellarg($atUri)
-        . ' --owner=' . (int) max(0, $ownerUserId)
-        . ' --lock=' . escapeshellarg($lockPath)
-        . ' >/dev/null 2>&1 </dev/null &';
-    @exec($cmd);
 }
 
 /**
@@ -9583,6 +9177,137 @@ function ap_bsky_post_preview_warm_async(string $atUri, int $ownerUserId = 0): v
  *
  * @return array<string,mixed>|null
  */
+/**
+ * True when a URL is likely a displayable image/GIF/video (not a bare webpage).
+ */
+function ap_bsky_url_looks_like_media(string $url): bool
+{
+    $url = trim($url);
+    if ($url === '' || !preg_match('#^https?://#i', $url)) {
+        return false;
+    }
+    if (preg_match('/\.(gif|png|jpe?g|webp|mp4|webm)(\?|#|$)/i', $url)) {
+        return true;
+    }
+    // Common Bluesky GIF / CDN hosts (Tenor, Giphy, Klipy, bsky CDN).
+    return (bool) preg_match(
+        '#https?://(?:(?:media|static)\.)?(?:tenor\.com|giphy\.com|klipy\.com|cdn\.bsky\.app)/#i',
+        $url
+    );
+}
+
+/**
+ * HTTPS media URLs for a Bluesky notification (images + GIF external thumbs/uris).
+ * Prefer hydrated PostView / durable cache; fall back to raw record external.uri;
+ * optionally one AppView getPosts at ingest time (not list-paint).
+ *
+ * @return list<string>
+ */
+function ap_bsky_notification_media_urls(array $notif, int $ownerUserId = 0, bool $allowFetch = true): array
+{
+    $urls = [];
+    $push = static function (string $u) use (&$urls): void {
+        $u = trim($u);
+        if ($u !== '' && str_starts_with($u, 'https://') && !in_array($u, $urls, true)) {
+            $urls[] = $u;
+        }
+    };
+    $fromPost = static function (array $post) use ($push): void {
+        if (function_exists('ap_bsky_post_image_urls')) {
+            foreach (ap_bsky_post_image_urls($post) as $u) {
+                $push((string) $u);
+            }
+        }
+        if (function_exists('ap_bsky_post_external')) {
+            $ext = ap_bsky_post_external($post);
+            if (is_array($ext)) {
+                $thumb = trim((string) ($ext['thumb'] ?? ''));
+                $uri = trim((string) ($ext['uri'] ?? ''));
+                // Prefer the external media URI (often the animated GIF) first;
+                // CDN thumb is a useful fallback / preview.
+                if ($uri !== '' && ap_bsky_url_looks_like_media($uri)) {
+                    $push($uri);
+                }
+                if ($thumb !== '') {
+                    $push($thumb);
+                }
+            }
+        }
+        if (function_exists('ap_bsky_post_video_media')) {
+            foreach (ap_bsky_post_video_media($post) as $vid) {
+                if (!is_array($vid)) {
+                    continue;
+                }
+                $thumb = trim((string) ($vid['thumbnail'] ?? ''));
+                if ($thumb !== '') {
+                    $push($thumb);
+                }
+            }
+        }
+    };
+
+    // Rare: notification already carries a view embed.
+    if (is_array($notif['embed'] ?? null)) {
+        $fromPost([
+            'uri' => (string) ($notif['uri'] ?? ''),
+            'author' => is_array($notif['author'] ?? null) ? $notif['author'] : [],
+            'embed' => $notif['embed'],
+        ]);
+    }
+    if (is_array($notif['post'] ?? null)) {
+        $fromPost($notif['post']);
+    }
+
+    $uri = trim((string) ($notif['uri'] ?? ''));
+    // Durable cache (timeline warm / prior getPosts).
+    if ($urls === [] && str_starts_with($uri, 'at://') && function_exists('ap_bsky_post_item_by_uri')) {
+        $item = ap_bsky_post_item_by_uri($uri);
+        if (is_array($item) && is_array($item['post'] ?? null)) {
+            $fromPost($item['post']);
+        }
+    }
+
+    // Raw record: external GIF pages often put the .gif on external.uri (thumb is a blob).
+    $record = is_array($notif['record'] ?? null) ? $notif['record'] : [];
+    $emb = is_array($record['embed'] ?? null) ? $record['embed'] : null;
+    if (is_array($emb)) {
+        $type = (string) ($emb['$type'] ?? '');
+        $ext = null;
+        if ((str_contains($type, 'external') || isset($emb['external'])) && is_array($emb['external'] ?? null)) {
+            $ext = $emb['external'];
+        } elseif (str_contains($type, 'recordWithMedia') && is_array($emb['media']['external'] ?? null)) {
+            $ext = $emb['media']['external'];
+        }
+        if (is_array($ext)) {
+            $eu = trim((string) ($ext['uri'] ?? ''));
+            if ($eu !== '' && ap_bsky_url_looks_like_media($eu)) {
+                $push($eu);
+            }
+            // thumb may already be https on some AppViews
+            if (is_string($ext['thumb'] ?? null)) {
+                $push((string) $ext['thumb']);
+            }
+        }
+    }
+
+    // Ingest-time hydrate: one public getPosts so GIF/image CDN URLs land in media_urls.
+    if ($urls === [] && $allowFetch && str_starts_with($uri, 'at://') && function_exists('ap_bsky_post_preview_from_url')) {
+        $https = function_exists('ap_bsky_https_url_from_at_uri')
+            ? ap_bsky_https_url_from_at_uri($uri, null)
+            : '';
+        if ($https !== '' && $https !== 'https://bsky.app/') {
+            // Side effect: upserts bsky_posts when fetch succeeds.
+            ap_bsky_post_preview_from_url($https, $ownerUserId, true);
+            $item = function_exists('ap_bsky_post_item_by_uri') ? ap_bsky_post_item_by_uri($uri) : null;
+            if (is_array($item) && is_array($item['post'] ?? null)) {
+                $fromPost($item['post']);
+            }
+        }
+    }
+
+    return array_slice($urls, 0, 4);
+}
+
 function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActorId, array $notif): ?array
 {
     $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
@@ -9733,43 +9458,6 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
         }
     }
 
-    // Preserve attachment previews for notification mentions. The notification
-    // record often carries only the post record, so prefer its embed and then
-    // fall back to the already-warmed bsky_posts cache. No AppView fetch occurs
-    // on this path.
-    $mediaUrls = [];
-    $mediaPost = ['embed' => is_array($record['embed'] ?? null) ? $record['embed'] : null];
-    if (function_exists('ap_bsky_post_image_urls')) {
-        $mediaUrls = ap_bsky_post_image_urls($mediaPost);
-    }
-    if (function_exists('ap_bsky_post_video_media')) {
-        foreach (ap_bsky_post_video_media($mediaPost) as $video) {
-            $thumb = (string) ($video['thumbnail'] ?? '');
-            if (str_starts_with($thumb, 'https://')) {
-                $mediaUrls[] = $thumb;
-            }
-        }
-    }
-    if ($mediaUrls === [] && function_exists('ap_bsky_post_item_by_uri')) {
-        $cachedItem = ap_bsky_post_item_by_uri($uri);
-        $cachedPost = is_array($cachedItem['post'] ?? null) ? $cachedItem['post'] : [];
-        if ($cachedPost !== []) {
-            if (function_exists('ap_bsky_post_image_urls')) {
-                $mediaUrls = ap_bsky_post_image_urls($cachedPost);
-            }
-            if (function_exists('ap_bsky_post_video_media')) {
-                foreach (ap_bsky_post_video_media($cachedPost) as $video) {
-                    $thumb = (string) ($video['thumbnail'] ?? '');
-                    if (str_starts_with($thumb, 'https://')) {
-                        $mediaUrls[] = $thumb;
-                    }
-                }
-            }
-        }
-    }
-    $mediaUrls = array_values(array_unique(array_filter($mediaUrls, static fn($url): bool => is_string($url) && str_starts_with($url, 'https://'))));
-    $mediaUrls = array_slice($mediaUrls, 0, 4);
-
     // Upsert remote actor cache so Ice Cubes shows handle + avatar.
     if (function_exists('ap_remote_actor_upsert')) {
         ap_remote_actor_upsert($actorId, [
@@ -9785,6 +9473,17 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
         ]);
     }
 
+    // Images / GIFs (external embeds) → mentions.media_urls for Ice Cubes + VAAK.
+    $mediaUrls = [];
+    if (in_array($reason, ['mention', 'reply', 'quote'], true)) {
+        $mediaUrls = ap_bsky_notification_media_urls($notif, $ownerUserId, true);
+    }
+    if ($text === '' && $mediaUrls !== []) {
+        // Keep empty body; clients render media_attachments. Avoid "(media)" sentinel
+        // which hides that this was a Bluesky GIF/image share.
+        $text = '';
+    }
+
     return [
         'owner_user_id' => $ownerUserId,
         'owner_actor_id' => $ownerActorId,
@@ -9795,10 +9494,10 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
         'activity_type' => $activityType,
         'content' => $text,
         'in_reply_to' => $inReplyTo,
-        'media_urls' => $mediaUrls,
         'created_at' => $indexedAt,
         'spoiler_text' => '',
         'sensitive' => 0,
+        'media_urls' => $mediaUrls !== [] ? $mediaUrls : null,
     ];
 }
 
@@ -9937,12 +9636,6 @@ function ap_bsky_ingest_notifications(int $ownerUserId, array $notifs, bool $pus
                 } else {
                     $skipped++;
                 }
-                continue;
-            }
-            $notifAuthor = is_array($notif['author'] ?? null) ? $notif['author'] : [];
-            $notifDid = trim((string) ($notifAuthor['did'] ?? ''));
-            if ($notifDid !== '' && ap_bsky_hide_did_reasons($ownerUserId, $notifDid) !== []) {
-                $skipped++;
                 continue;
             }
             $row = ap_bsky_notification_to_mention_row($ownerUserId, $ownerActorId, $notif);

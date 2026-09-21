@@ -1305,22 +1305,6 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             if ($type === 'Delete' && $objectId) {
                 ap_dm_soft_delete_by_object($objectId);
             }
-            // A DM's URL can be addressed from outside the instance, but its
-            // interactions must remain participant-only. Do not let an
-            // arbitrary actor manufacture a favourite/boost notification for
-            // a private conversation (or make the DM discoverable indirectly).
-            if (in_array($type, ['Like', 'Announce', 'EmojiReact', 'Quote', 'QuotePost'], true)) {
-                $dmInteraction = ap_private_dm_interaction_allowed(
-                    is_string($objectId) ? $objectId : '',
-                    is_string($actorId) ? $actorId : '',
-                    (int) ($recipient['owner_user_id'] ?? 0)
-                );
-                if ($dmInteraction === false) {
-                    ap_metrics_record($type, $actorId, $objectId, LOCAL_ACTOR, $bytes, 'private_dm_interaction_rejected', null);
-                    ap_log('private_dm_interaction_rejected type=' . ap_short((string) $type) . ' actor=' . ap_short((string) $actorId) . ' object=' . ap_short((string) $objectId));
-                    return 'private_dm_interaction_rejected';
-                }
-            }
             // Likes / boosts / quote activities of our posts are usually not
             // addressed to as:Public — still notifiable.
             if (in_array($type, ['Like', 'Announce', 'EmojiReact', 'Quote', 'QuotePost'], true)) {
@@ -4086,39 +4070,6 @@ function ap_local_observe(array $activity): void
     }
 }
 
-/**
- * Direct-message objects are addressable URLs, but they are not public posts.
- * Only the two participants may send an interaction for a local DM. Returning
- * null means the object is not one of this owner's stored DMs.
- */
-function ap_private_dm_interaction_allowed(string $objectId, string $actorId, int $ownerUserId): ?bool
-{
-    $objectId = rtrim(trim($objectId), '/');
-    $actorId = rtrim(trim($actorId), '/');
-    if ($objectId === '' || $actorId === '' || $ownerUserId < 1) {
-        return null;
-    }
-    try {
-        $st = ap_db()->prepare(
-            'SELECT peer_actor_id, owner_actor_id FROM direct_messages
-             WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)
-             LIMIT 1'
-        );
-        $st->execute([$ownerUserId, $objectId, $objectId . '/']);
-        $row = $st->fetch();
-        if (!is_array($row)) {
-            return null;
-        }
-        $peer = rtrim((string) ($row['peer_actor_id'] ?? ''), '/');
-        $owner = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
-        return $actorId === $peer || $actorId === $owner;
-    } catch (Throwable $e) {
-        // Fail closed for a matching object only; callers treat a lookup error
-        // as an ordinary non-DM and retain the existing inbox path.
-        return null;
-    }
-}
-
 /** Unsigned HTTPS GET for public AS2/JRD docs (Bridgy Fed often 400s signed GETs). */
 function ap_unsigned_get(string $url, int $timeoutSec = 8): ?string
 {
@@ -4366,31 +4317,6 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
 }
 
 /**
- * Directly connected Bluesky accounts do not need Bridgy Fed fan-out. Bridgy
- * seeing the AP copy before VAAK's native mirror can create duplicate bridge
- * objects, follow prompts, and onboarding DMs. ActivityPub followers still
- * receive the activity normally; only Bridgy's special priority destinations
- * are suppressed for this actor.
- */
-function ap_should_skip_bridgy_for_direct_bsky(array $activity): bool
-{
-    $type = strtolower((string) ($activity['type'] ?? ''));
-    if (!in_array($type, ['create', 'update', 'delete', 'announce', 'quote', 'quotepost'], true)) {
-        return false;
-    }
-    $actor = rtrim(trim((string) ($activity['actor'] ?? '')), '/');
-    if ($actor === '' || !function_exists('ap_db_owner_user_id_for_actor')) {
-        return false;
-    }
-    $owner = (int) ap_db_owner_user_id_for_actor($actor);
-    if ($owner < 1) {
-        return false;
-    }
-    require_once __DIR__ . '/ap-bsky.php';
-    return function_exists('ap_bsky_session_row') && ap_bsky_session_row($owner) !== null;
-}
-
-/**
  * Public Create/Announce/Delete fan-out that cannot traffic-jam on media/polls:
  * Bridgy Fed first (Bluesky), then a small sync follower budget, everything else background.
  *
@@ -4399,7 +4325,6 @@ function ap_should_skip_bridgy_for_direct_bsky(array $activity): bool
  */
 function ap_deliver_public_activity(array $activity, array $priorityExtra = [], bool $skipBridgy = false): array
 {
-    $skipBridgy = $skipBridgy || ap_should_skip_bridgy_for_direct_bsky($activity);
     $prevActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
     $actorUrl = is_string($activity['actor'] ?? null) ? rtrim((string) $activity['actor'], '/') : '';
     $owner = '';
@@ -6218,11 +6143,6 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
     if (ap_is_blocked_actor($peer)) {
         return ['ok' => false, 'error' => 'Recipient is blocked'];
     }
-    $dmOwnerId = ap_db_default_owner_user_id();
-    if (function_exists('ap_actor_is_content_blocked')
-        && ap_actor_is_content_blocked($peer, null, $dmOwnerId)) {
-        return ['ok' => false, 'error' => 'Recipient is blocked for this account'];
-    }
     $actor = ap_local_actor_id();
     if (rtrim($peer, '/') === rtrim($actor, '/')) {
         return ['ok' => false, 'error' => 'Cannot DM yourself'];
@@ -6233,6 +6153,7 @@ function ap_dm_send(string $content, string $toActorOrHandle, ?string $inReplyTo
     }
 
     // Light rate limit: max 30 outbound DMs / hour (per owner)
+    $dmOwnerId = ap_db_default_owner_user_id();
     $since = gmdate('c', time() - 3600);
     $st = ap_db()->prepare(
         "SELECT COUNT(*) AS c FROM direct_messages

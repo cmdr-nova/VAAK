@@ -14,24 +14,6 @@ function ap_publish_delivery_enqueue(int $owner, string $noteId, array $payload)
     return true;
 }
 
-/** Lightweight queue health for deploy checks and scheduled-worker monitors. */
-function ap_publish_delivery_queue_health(): array
-{
-    try {
-        $rows = ap_db()->query("SELECT status, COUNT(*) AS n, MIN(created_at) AS oldest
-            FROM ap_publish_delivery_queue WHERE status IN ('pending','processing') GROUP BY status")->fetchAll() ?: [];
-        $out = ['pending' => 0, 'processing' => 0, 'oldest_pending' => null];
-        foreach ($rows as $row) {
-            $status = (string) ($row['status'] ?? '');
-            if (array_key_exists($status, $out)) $out[$status] = (int) ($row['n'] ?? 0);
-            if ($status === 'pending') $out['oldest_pending'] = $row['oldest'] ?? null;
-        }
-        return ['ok' => true] + $out;
-    } catch (Throwable $e) {
-        return ['ok' => false, 'error' => 'Queue health unavailable'];
-    }
-}
-
 function ap_publish_delivery_wake_async(): void
 {
     if (!function_exists('exec') || !function_exists('shell_exec')) return;

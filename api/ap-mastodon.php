@@ -527,16 +527,9 @@ function ap_masto_oauth_authorize(string $method): void
 
     // Client/redirect/PKCE must be valid to show the login form (not auth failures).
     $configOk = ($error === null);
-    // Bind the browser-rendered authorization form to the session that
-    // requested it.  OAuth clients still use the normal GET -> POST flow;
-    // this only prevents another site from silently submitting credentials
-    // to the authorization endpoint.
-    $csrfToken = $configOk ? ap_auth_csrf_token() : '';
 
     if ($method === 'POST' && $configOk) {
-        if (!ap_auth_csrf_ok((string) ($_POST['csrf'] ?? ''))) {
-            $error = 'Authorization session expired. Please try again.';
-        } elseif (!ap_masto_oauth_rate_ok()) {
+        if (!ap_masto_oauth_rate_ok()) {
             $error = 'Too many attempts. Try again in a few minutes.';
         } else {
             $username = (string) ($_POST['username'] ?? '');
@@ -641,7 +634,6 @@ function ap_masto_oauth_authorize(string $method): void
             . '<input type="hidden" name="scope" value="' . htmlspecialchars($scope, ENT_QUOTES, 'UTF-8') . '">'
             . '<input type="hidden" name="state" value="' . htmlspecialchars($state, ENT_QUOTES, 'UTF-8') . '">'
             . '<input type="hidden" name="response_type" value="code">'
-            . '<input type="hidden" name="csrf" value="' . htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') . '">'
             . ($challenge !== '' ? '<input type="hidden" name="code_challenge" value="' . htmlspecialchars($challenge, ENT_QUOTES, 'UTF-8') . '">' : '')
             . ($challengeMethod !== '' ? '<input type="hidden" name="code_challenge_method" value="' . htmlspecialchars($challengeMethod, ENT_QUOTES, 'UTF-8') . '">' : '')
             . '<label>Username<br><input type="text" name="username" required autocomplete="username" placeholder="username or email" value="' . $postedUser . '"></label>'

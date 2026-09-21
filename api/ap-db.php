@@ -255,36 +255,6 @@ SQL);
         error_log('[ap-db] notice tables not provisioned by runtime role: ' . $e->getMessage());
         }
     }
-    // Long-form VAAK blog posts. Keep the full Markdown body local; the
-    // federated outbox note is only a title/CW plus short excerpt and link.
-    try {
-        if (!isset($present['vaak_blog_posts'])) {
-            $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS vaak_blog_posts (
-    id BIGSERIAL PRIMARY KEY,
-    owner_user_id BIGINT NOT NULL,
-    actor_key TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT '',
-    tags_json TEXT NOT NULL DEFAULT '[]',
-    body_markdown TEXT NOT NULL DEFAULT '',
-    excerpt TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'published',
-    note_id TEXT,
-    canonical_url TEXT NOT NULL DEFAULT '',
-    published_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(owner_user_id, slug)
-)
-SQL);
-            $db->exec('CREATE INDEX IF NOT EXISTS idx_vaak_blog_actor_published ON vaak_blog_posts(actor_key, status, published_at DESC, id DESC)');
-        }
-        $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS canonical_url TEXT NOT NULL DEFAULT ''");
-    } catch (Throwable $e) {
-        error_log('[ap-db] blog table not provisioned: ' . $e->getMessage());
-    }
     // Additive notice-read cursor (may exist on older installs that already have ap_notices).
     try {
         if (!isset($present['ap_notice_reads'])) {
@@ -332,26 +302,6 @@ SQL);
         }
     } catch (Throwable $e) {
         error_log('[ap-db] bsky_sessions not provisioned: ' . $e->getMessage());
-    }
-
-    // Per-user TOTP state. Secrets are encrypted by ap-auth; recovery codes
-    // are stored only as password hashes. This table is local-only and never
-    // participates in federation or remote requests.
-    try {
-        if (!isset($present['ap_user_2fa'])) {
-            $db->exec(<<<'SQL'
-CREATE TABLE IF NOT EXISTS ap_user_2fa (
-    user_id BIGINT PRIMARY KEY,
-    secret_enc TEXT NOT NULL DEFAULT '',
-    pending_secret_enc TEXT NOT NULL DEFAULT '',
-    recovery_codes_json TEXT NOT NULL DEFAULT '[]',
-    enabled_at TEXT,
-    updated_at TEXT NOT NULL
-)
-SQL);
-        }
-    } catch (Throwable $e) {
-        error_log('[ap-db] ap_user_2fa not provisioned: ' . $e->getMessage());
     }
 
     $discussTablesReady = false;
@@ -523,14 +473,6 @@ SQL);
         error_log('[ap-db] forum signature column not provisioned: ' . $e->getMessage());
     }
     try {
-        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'profile_badges'")->fetchColumn();
-        if (!$hasColumn) {
-            $db->exec("ALTER TABLE actor_profile ADD COLUMN profile_badges TEXT NOT NULL DEFAULT '[]'");
-        }
-    } catch (Throwable $e) {
-        error_log('[ap-db] profile badges column not provisioned: ' . $e->getMessage());
-    }
-    try {
         $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ap_reports' AND column_name = 'admin_notes'")->fetchColumn();
         if (!$hasColumn) {
             $db->exec("ALTER TABLE ap_reports ADD COLUMN admin_notes TEXT NOT NULL DEFAULT ''");
@@ -687,28 +629,6 @@ CREATE TABLE IF NOT EXISTS outbox_notes (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_published ON outbox_notes(published);
 
--- Long-form VAAK blog posts. The ActivityPub outbox stores only the short
--- teaser; the complete Markdown body remains here for the HTML profile.
-CREATE TABLE IF NOT EXISTS vaak_blog_posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_user_id INTEGER NOT NULL,
-    actor_key TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT '',
-    tags_json TEXT NOT NULL DEFAULT '[]',
-    body_markdown TEXT NOT NULL DEFAULT '',
-    excerpt TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'published',
-    note_id TEXT,
-    canonical_url TEXT NOT NULL DEFAULT '',
-    published_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(owner_user_id, slug)
-);
-CREATE INDEX IF NOT EXISTS idx_vaak_blog_actor_published ON vaak_blog_posts(actor_key, status, published_at DESC, id DESC);
-
 CREATE TABLE IF NOT EXISTS actor_profile (
     actor_key TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -722,7 +642,6 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     reply_policy TEXT NOT NULL DEFAULT 'anyone',
     quote_policy TEXT NOT NULL DEFAULT 'anyone',
     forum_signature TEXT NOT NULL DEFAULT '',
-    profile_badges TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
 );
 SQL);
@@ -773,9 +692,6 @@ SQL);
     }
     if (!in_array('forum_signature', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN forum_signature TEXT NOT NULL DEFAULT ''");
-    }
-    if (!in_array('profile_badges', $profileNames, true)) {
-        $db->exec("ALTER TABLE actor_profile ADD COLUMN profile_badges TEXT NOT NULL DEFAULT '[]'");
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -882,14 +798,6 @@ SQL);
     }
     if (!in_array('visibility', $outboxNames, true)) {
         $db->exec("ALTER TABLE outbox_notes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'");
-    }
-    try {
-        $blogCols = $db->query('PRAGMA table_info(vaak_blog_posts)')->fetchAll();
-        if ($blogCols && !in_array('canonical_url', array_column($blogCols, 'name'), true)) {
-            $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN canonical_url TEXT NOT NULL DEFAULT ''");
-        }
-    } catch (Throwable $e) {
-        // The table is created above on fresh SQLite databases.
     }
 
     // Inbound firehose visibility (public / unlisted / private) for Ice Cubes labels
@@ -1093,15 +1001,6 @@ CREATE TABLE IF NOT EXISTS ap_users (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_users_email ON ap_users(email);
 CREATE INDEX IF NOT EXISTS idx_ap_users_actor_key ON ap_users(actor_key);
-
-CREATE TABLE IF NOT EXISTS ap_user_2fa (
-    user_id INTEGER PRIMARY KEY,
-    secret_enc TEXT NOT NULL DEFAULT '',
-    pending_secret_enc TEXT NOT NULL DEFAULT '',
-    recovery_codes_json TEXT NOT NULL DEFAULT '[]',
-    enabled_at TEXT,
-    updated_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS ap_password_resets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2230,76 +2129,8 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'reply_policy' => 'anyone',
         'quote_policy' => 'anyone',
         'forum_signature' => '',
-        'profile_badges' => [],
         'updated_at' => null,
     ];
-}
-
-/** Local-only profile flair. Keys are stored so labels can be revised safely. */
-function ap_profile_badge_catalog(): array
-{
-    return [
-        'rainbow' => ['label' => 'Rainbow pride', 'emoji' => '🏳️‍🌈'],
-        'trans' => ['label' => 'Trans pride', 'emoji' => '🏳️‍⚧️'],
-        'bi' => ['label' => 'Bisexual pride', 'emoji' => '🩷💜💙'],
-        'nonbinary' => ['label' => 'Non-binary pride', 'emoji' => '💛🤍💜🖤'],
-        'usa' => ['label' => 'United States', 'emoji' => '🇺🇸'],
-        'uk' => ['label' => 'United Kingdom', 'emoji' => '🇬🇧'],
-        'canada' => ['label' => 'Canada', 'emoji' => '🇨🇦'],
-        'pirate' => ['label' => 'Pirate', 'emoji' => '🏴‍☠️'],
-        'space' => ['label' => 'Space nerd', 'emoji' => '🚀'],
-        'cat' => ['label' => 'Cat person', 'emoji' => '🐈‍⬛'],
-    ];
-}
-
-/** @return list<string> */
-function ap_profile_normalize_badges(mixed $badges): array
-{
-    $allowed = ap_profile_badge_catalog();
-    if (is_string($badges)) {
-        $decoded = json_decode($badges, true);
-        $badges = is_array($decoded) ? $decoded : [];
-    }
-    if (!is_array($badges)) {
-        return [];
-    }
-    $out = [];
-    foreach ($badges as $badge) {
-        $key = is_string($badge) ? trim($badge) : '';
-        if ($key !== '' && isset($allowed[$key]) && !in_array($key, $out, true)) {
-            $out[] = $key;
-        }
-        if (count($out) >= 6) {
-            break;
-        }
-    }
-    return $out;
-}
-
-/** Migration-safe check so a permission-limited schema upgrade cannot white-screen profile saves. */
-function ap_profile_badges_column_available(): bool
-{
-    static $available = null;
-    if ($available !== null) {
-        return $available;
-    }
-    try {
-        $db = ap_db();
-        if ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql') {
-            $st = $db->prepare(
-                "SELECT 1 FROM information_schema.columns
-                 WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'profile_badges'"
-            );
-            $st->execute();
-            $available = (bool) $st->fetchColumn();
-        } else {
-            $rows = $db->query('PRAGMA table_info(actor_profile)')->fetchAll();
-            $available = in_array('profile_badges', array_column($rows, 'name'), true);
-        }
-    } catch (Throwable $e) {
-        $available = false;
-    }
-    return $available;
 }
 
 function ap_profile_ensure_default(PDO $db): void
@@ -2374,7 +2205,6 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'reply_policy' => in_array((string) ($row['reply_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['reply_policy'] : 'anyone',
         'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
         'forum_signature' => trim((string) ($row['forum_signature'] ?? '')),
-        'profile_badges' => ap_profile_normalize_badges($row['profile_badges'] ?? []),
         'updated_at' => $row['updated_at'] ?? null,
     ];
 }
@@ -2457,13 +2287,10 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
-    if (!ap_profile_badges_column_available()) {
-        return ['ok' => false, 'error' => 'Profile badges are still being prepared on this server. Please try again shortly.'];
-    }
     $name = trim(ap_fix_utf8((string) ($fields['name'] ?? '')));
     if ($name === '' || mb_strlen($name) > 100) {
         return ['ok' => false, 'error' => 'Display name required (max 100 chars).'];
@@ -2603,13 +2430,10 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         ? (string) $fields['reply_policy'] : (string) ($existingProfile['reply_policy'] ?? 'anyone');
     $quotePolicy = in_array((string) ($fields['quote_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
-    $profileBadges = array_key_exists('profile_badges', $fields)
-        ? ap_profile_normalize_badges($fields['profile_badges'])
-        : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, profile_badges, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2628,7 +2452,6 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            reply_policy = excluded.reply_policy,
            quote_policy = excluded.quote_policy,
            forum_signature = excluded.forum_signature,
-           profile_badges = excluded.profile_badges,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2650,7 +2473,6 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $replyPolicy,
         $quotePolicy,
         $forumSignature,
-        json_encode($profileBadges, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         ap_db_now(),
     ]);
 
@@ -5007,177 +4829,6 @@ function ap_outbox_store(array $note): void
         $kind,
         $visibility,
     ]);
-}
-
-function ap_blog_slug(string $title, string $suffix = ''): string
-{
-    $slug = strtolower(trim($title));
-    $slug = function_exists('iconv') ? (string) (@iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $slug) ?: $slug) : $slug;
-    $slug = preg_replace('/[^a-z0-9]+/', '-', $slug) ?? '';
-    $slug = trim($slug, '-');
-    if ($slug === '') {
-        $slug = 'post';
-    }
-    if ($suffix !== '') {
-        $slug .= '-' . trim((string) preg_replace('/[^a-z0-9]+/', '-', strtolower($suffix)), '-');
-    }
-    return mb_substr($slug, 0, 120);
-}
-
-/** @return list<string> */
-function ap_blog_tags_decode(mixed $raw): array
-{
-    $vals = is_array($raw) ? $raw : json_decode((string) $raw, true);
-    if (!is_array($vals)) {
-        return [];
-    }
-    $out = [];
-    foreach ($vals as $tag) {
-        $tag = ltrim(trim((string) $tag), '#');
-        $tag = preg_replace('/[^\p{L}\p{N}_-]+/u', '', $tag) ?? '';
-        if ($tag !== '') {
-            $out[strtolower($tag)] = true;
-        }
-    }
-    return array_keys($out);
-}
-
-/** @return list<array<string,mixed>> */
-function ap_blog_posts_list(string $actorKey, bool $publishedOnly = true, int $limit = 50, int $offset = 0): array
-{
-    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
-    if ($actorKey === '') {
-        return [];
-    }
-    $limit = max(1, min(200, $limit));
-    $offset = max(0, $offset);
-    try {
-        $sql = 'SELECT * FROM vaak_blog_posts WHERE actor_key = ?';
-        $params = [$actorKey];
-        if ($publishedOnly) {
-            $sql .= " AND status = 'published'";
-        }
-        $sql .= ' ORDER BY COALESCE(published_at, updated_at) DESC, id DESC LIMIT ' . $limit . ' OFFSET ' . $offset;
-        $st = ap_db()->prepare($sql);
-        $st->execute($params);
-        $rows = $st->fetchAll() ?: [];
-        foreach ($rows as &$row) {
-            $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
-        }
-        unset($row);
-        return $rows;
-    } catch (Throwable $e) {
-        error_log('[ap-db] blog list: ' . $e->getMessage());
-        return [];
-    }
-}
-
-function ap_blog_post_get(string $actorKey, string $slug, bool $publishedOnly = true): ?array
-{
-    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
-    $slug = trim($slug);
-    if ($actorKey === '' || $slug === '') {
-        return null;
-    }
-    try {
-        $sql = 'SELECT * FROM vaak_blog_posts WHERE actor_key = ? AND slug = ?';
-        if ($publishedOnly) {
-            $sql .= " AND status = 'published'";
-        }
-        $sql .= ' LIMIT 1';
-        $st = ap_db()->prepare($sql);
-        $st->execute([$actorKey, $slug]);
-        $row = $st->fetch();
-        if (!is_array($row)) {
-            return null;
-        }
-        $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
-        return $row;
-    } catch (Throwable $e) {
-        return null;
-    }
-}
-
-/** @param list<string> $tags */
-function ap_blog_create(
-    int $ownerUserId,
-    string $actorKey,
-    string $slug,
-    string $title,
-    string $category,
-    array $tags,
-    string $body,
-    string $excerpt,
-    string $status = 'draft',
-    string $canonicalUrl = '',
-    ?string $publishedAt = null
-): ?array {
-    if ($ownerUserId < 1 || $actorKey === '' || $slug === '' || trim($title) === '' || trim($body) === '') {
-        return null;
-    }
-    $status = $status === 'published' ? 'published' : 'draft';
-    $now = ap_db_now();
-    try {
-        $st = ap_db()->prepare(
-            'INSERT INTO vaak_blog_posts
-            (owner_user_id, actor_key, slug, title, category, tags_json, body_markdown, excerpt, status, canonical_url, published_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-        );
-        $publishedAt = $status === 'published' ? ($publishedAt ?: $now) : null;
-        $st->execute([$ownerUserId, $actorKey, $slug, trim($title), trim($category), json_encode(array_values($tags), JSON_UNESCAPED_UNICODE), $body, trim($excerpt), $status, trim($canonicalUrl), $publishedAt, $now, $now]);
-        return ap_blog_post_get($actorKey, $slug, false);
-    } catch (Throwable $e) {
-        error_log('[ap-db] blog create: ' . $e->getMessage());
-        return null;
-    }
-}
-
-/** @param list<string> $tags */
-function ap_blog_update_draft(int $ownerUserId, string $actorKey, string $slug, string $title, string $category, array $tags, string $body, string $excerpt): ?array
-{
-    if ($ownerUserId < 1 || $actorKey === '' || $slug === '' || trim($title) === '' || trim($body) === '') {
-        return null;
-    }
-    try {
-        $st = ap_db()->prepare(
-            "UPDATE vaak_blog_posts
-             SET title = ?, category = ?, tags_json = ?, body_markdown = ?, excerpt = ?, updated_at = ?
-             WHERE owner_user_id = ? AND actor_key = ? AND slug = ? AND status = 'draft'"
-        );
-        $st->execute([$title, $category, json_encode(array_values($tags), JSON_UNESCAPED_UNICODE), $body, $excerpt, ap_db_now(), $ownerUserId, $actorKey, $slug]);
-        return ap_blog_post_get($actorKey, $slug, false);
-    } catch (Throwable $e) {
-        error_log('[ap-db] blog draft update: ' . $e->getMessage());
-        return null;
-    }
-}
-
-function ap_blog_set_note(string $actorKey, string $slug, string $noteId): bool
-{
-    try {
-        $db = ap_db();
-        $st = $db->prepare('UPDATE vaak_blog_posts SET note_id = ?, updated_at = ? WHERE actor_key = ? AND slug = ?');
-        $st->execute([$noteId, ap_db_now(), $actorKey, $slug]);
-        if ($noteId !== '') {
-            $noteSt = $db->prepare("UPDATE outbox_notes SET kind = 'blog' WHERE id = ? OR create_id = ?");
-            $noteSt->execute([$noteId, $noteId]);
-        }
-        return $st->rowCount() > 0;
-    } catch (Throwable $e) {
-        return false;
-    }
-}
-
-function ap_blog_mark_published(string $actorKey, string $slug): bool
-{
-    try {
-        $now = ap_db_now();
-        $st = ap_db()->prepare("UPDATE vaak_blog_posts SET status = 'published', published_at = COALESCE(published_at, ?), updated_at = ? WHERE actor_key = ? AND slug = ?");
-        $st->execute([$now, $now, $actorKey, $slug]);
-        return $st->rowCount() > 0;
-    } catch (Throwable $e) {
-        return false;
-    }
 }
 
 /**
@@ -10283,10 +9934,6 @@ function ap_dm_store(array $row): array
             ? ap_db_owner_user_id_for_actor($ownerHint)
             : ap_db_default_owner_user_id();
     }
-    if (function_exists('ap_actor_is_content_blocked')
-        && ap_actor_is_content_blocked($peer, null, $ownerUserId)) {
-        return ['ok' => false, 'error' => 'Peer is blocked for this account'];
-    }
     $ownerActorId = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
     if ($ownerActorId === '') {
         $ownerActorId = ap_db_owner_actor_id_for_user_id($ownerUserId);
@@ -10435,9 +10082,6 @@ function ap_dm_by_id(int $id, ?int $ownerUserId = null): ?array
     );
     $st->execute([$id, $ownerUserId]);
     $row = $st->fetch();
-    if (is_array($row) && ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
-        return null;
-    }
     return is_array($row) ? $row : null;
 }
 
@@ -10449,41 +10093,7 @@ function ap_dm_by_object_id(string $objectId, ?int $ownerUserId = null): ?array
     );
     $st->execute([$ownerUserId, $objectId]);
     $row = $st->fetch();
-    if (is_array($row) && ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
-        return null;
-    }
     return is_array($row) ? $row : null;
-}
-
-/** True when an object URL belongs to any stored private DM. */
-function ap_dm_object_is_private(string $objectId): bool
-{
-    $objectId = rtrim(trim($objectId), '/');
-    if ($objectId === '') {
-        return false;
-    }
-    try {
-        $st = ap_db()->prepare(
-            'SELECT 1 FROM direct_messages
-             WHERE object_id = ? OR object_id = ?
-             LIMIT 1'
-        );
-        $st->execute([$objectId, $objectId . '/']);
-        return (bool) $st->fetchColumn();
-    } catch (Throwable $e) {
-        return false;
-    }
-}
-
-/** True when a DM peer is hidden by a server-wide or owner-specific actor block. */
-function ap_dm_peer_is_blocked_for_owner(string $peerActorId, int $ownerUserId): bool
-{
-    $peerActorId = ap_dm_peer_key($peerActorId);
-    if ($peerActorId === '' || ap_is_blocked_actor($peerActorId)) {
-        return true;
-    }
-    return function_exists('ap_actor_is_content_blocked')
-        && ap_actor_is_content_blocked($peerActorId, null, $ownerUserId);
 }
 
 /** @return list<array<string,mixed>> */
@@ -10494,16 +10104,13 @@ function ap_dm_list_recent(int $limit = 80, ?int $ownerUserId = null): array
     $st = ap_db()->prepare(
         'SELECT * FROM direct_messages WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ?'
     );
-    $st->execute([$ownerUserId, min(600, $limit * 3)]);
+    $st->execute([$ownerUserId, $limit]);
     $out = [];
     foreach ($st->fetchAll() as $row) {
-        if (ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
+        if (ap_is_blocked_actor((string) ($row['peer_actor_id'] ?? ''))) {
             continue;
         }
         $out[] = $row;
-        if (count($out) >= $limit) {
-            break;
-        }
     }
     return $out;
 }
@@ -10514,9 +10121,6 @@ function ap_dm_thread(string $peerActorId, int $limit = 100, ?int $ownerUserId =
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     $peer = ap_dm_peer_key($peerActorId);
     $limit = max(1, min(200, $limit));
-    if (ap_dm_peer_is_blocked_for_owner($peer, $ownerUserId)) {
-        return [];
-    }
     $st = ap_db()->prepare(
         'SELECT * FROM direct_messages
          WHERE owner_user_id = ? AND deleted_at IS NULL AND peer_actor_id = ?
@@ -10546,7 +10150,7 @@ function ap_dm_conversations(int $limit = 40, ?int $ownerUserId = null): array
     $out = [];
     foreach ($st->fetchAll() as $row) {
         $peer = (string) $row['peer_actor_id'];
-        if (ap_dm_peer_is_blocked_for_owner($peer, $ownerUserId)) {
+        if (ap_is_blocked_actor($peer)) {
             continue;
         }
         $last = ap_dm_by_id((int) $row['last_id'], $ownerUserId);
@@ -10610,18 +10214,12 @@ function ap_dm_unread_count(?int $ownerUserId = null): int
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     $st = ap_db()->prepare(
-        "SELECT peer_actor_id, COUNT(*) AS c FROM direct_messages
-         WHERE owner_user_id = ? AND deleted_at IS NULL AND direction = 'in' AND read_at IS NULL
-         GROUP BY peer_actor_id"
+        "SELECT COUNT(*) AS c FROM direct_messages
+         WHERE owner_user_id = ? AND deleted_at IS NULL AND direction = 'in' AND read_at IS NULL"
     );
     $st->execute([$ownerUserId]);
-    $count = 0;
-    foreach ($st->fetchAll() as $row) {
-        if (!ap_dm_peer_is_blocked_for_owner((string) ($row['peer_actor_id'] ?? ''), $ownerUserId)) {
-            $count += (int) ($row['c'] ?? 0);
-        }
-    }
-    return $count;
+    $row = $st->fetch();
+    return (int) ($row['c'] ?? 0);
 }
 
 function ap_dm_conversation_id(string $peerActorId): string

@@ -56,14 +56,8 @@ function ap_auth_env(): array
         }
     }
     if ($secret === '') {
-        // Never derive an encryption key from host/database identity in
-        // production: a copied database plus predictable host metadata would
-        // make every user's encrypted integration secret recoverable.
-        if (getenv('AP_ALLOW_INSECURE_SECRET') !== '1') {
-            throw new RuntimeException('VAAK_SECRET is not configured');
-        }
-        // Explicit opt-in is limited to local development/test environments.
-        $secret = hash('sha256', 'vaak-dev|' . (string) gethostname() . '|' . AP_DB_PATH);
+        // Stable fallback from host identity — rotate by setting VAAK_SECRET
+        $secret = hash('sha256', 'vaak|' . (string) gethostname() . '|' . AP_DB_PATH);
     }
     $cfg = ['secret' => $secret];
     return $cfg;
@@ -330,34 +324,6 @@ function ap_auth_user_set_disabled(int $id, bool $disabled): array
             ->execute([$now, $id]);
     }
     return ['ok' => true, 'disabled' => $disabled];
-}
-
-/** Deactivate a user's login immediately; content cleanup runs separately. */
-function ap_auth_delete_account(int $id, string $password, string $confirmation): array
-{
-    if ($id < 1 || $confirmation !== 'DELETE') {
-        return ['ok' => false, 'error' => 'Type DELETE exactly to confirm account deletion.'];
-    }
-    $st = ap_db()->prepare('SELECT * FROM ap_users WHERE id = ? LIMIT 1');
-    $st->execute([$id]);
-    $user = $st->fetch();
-    if (!is_array($user)) return ['ok' => false, 'error' => 'Account not found.'];
-    if ((string) ($user['actor_key'] ?? '') === 'cmdr_nova' || !empty($user['is_admin'])) {
-        return ['ok' => false, 'error' => 'The operator account cannot be deleted from this interface.'];
-    }
-    if (ap_auth_verify_credentials((string) ($user['username'] ?? ''), $password) === null) {
-        return ['ok' => false, 'error' => 'Password verification failed.'];
-    }
-    $now = ap_db_now();
-    ap_db()->prepare('UPDATE ap_users SET disabled_at = ?, updated_at = ? WHERE id = ?')
-        ->execute([$now, $now, $id]);
-    try {
-        ap_db()->prepare('UPDATE oauth_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL')
-            ->execute([$now, $id]);
-    } catch (Throwable $e) {
-        error_log('[ap-auth] account delete token revoke: ' . $e->getMessage());
-    }
-    return ['ok' => true, 'user' => $user];
 }
 
 /**
@@ -693,213 +659,6 @@ function ap_auth_login_rate_fail(): void
     @chmod($path, 0600);
 }
 
-/* ----------------- TOTP two-factor authentication ----------------- */
-
-function ap_auth_totp_base32_encode(string $bytes): string
-{
-    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    $buffer = 0;
-    $bits = 0;
-    $out = '';
-    for ($i = 0, $n = strlen($bytes); $i < $n; $i++) {
-        $buffer = ($buffer << 8) | ord($bytes[$i]);
-        $bits += 8;
-        while ($bits >= 5) {
-            $bits -= 5;
-            $out .= $alphabet[($buffer >> $bits) & 31];
-        }
-    }
-    if ($bits > 0) {
-        $out .= $alphabet[($buffer << (5 - $bits)) & 31];
-    }
-    return $out;
-}
-
-function ap_auth_totp_base32_decode(string $value): ?string
-{
-    $value = strtoupper(preg_replace('/[^A-Z2-7]/', '', $value) ?? '');
-    if ($value === '') return null;
-    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-    $buffer = 0;
-    $bits = 0;
-    $out = '';
-    for ($i = 0, $n = strlen($value); $i < $n; $i++) {
-        $pos = strpos($alphabet, $value[$i]);
-        if ($pos === false) return null;
-        $buffer = ($buffer << 5) | $pos;
-        $bits += 5;
-        if ($bits >= 8) {
-            $bits -= 8;
-            $out .= chr(($buffer >> $bits) & 255);
-        }
-    }
-    return $out !== '' ? $out : null;
-}
-
-function ap_auth_totp_verify(string $secret, string $code, int $window = 1): bool
-{
-    $code = preg_replace('/\D/', '', $code) ?? '';
-    if (strlen($code) !== 6) return false;
-    $key = ap_auth_totp_base32_decode($secret);
-    if ($key === null) return false;
-    $counter = (int) floor(time() / 30);
-    for ($offset = -$window; $offset <= $window; $offset++) {
-        $value = $counter + $offset;
-        if ($value < 0) continue;
-        $bin = pack('N2', 0, $value);
-        $hash = hash_hmac('sha1', $bin, $key, true);
-        $index = ord($hash[19]) & 0x0f;
-        $number = ((ord($hash[$index]) & 0x7f) << 24)
-            | ((ord($hash[$index + 1]) & 0xff) << 16)
-            | ((ord($hash[$index + 2]) & 0xff) << 8)
-            | (ord($hash[$index + 3]) & 0xff);
-        if (hash_equals(str_pad((string) ($number % 1000000), 6, '0', STR_PAD_LEFT), $code)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-function ap_auth_recovery_code(): string
-{
-    $raw = strtoupper(bin2hex(random_bytes(6)));
-    return substr($raw, 0, 4) . '-' . substr($raw, 4, 4) . '-' . substr($raw, 8, 4);
-}
-
-function ap_auth_2fa_row(int $userId): ?array
-{
-    if ($userId < 1) return null;
-    try {
-        ap_auth_bootstrap();
-        $st = ap_db()->prepare('SELECT * FROM ap_user_2fa WHERE user_id = ? LIMIT 1');
-        $st->execute([$userId]);
-        $row = $st->fetch();
-        return is_array($row) ? $row : null;
-    } catch (Throwable $e) {
-        error_log('[ap-auth] 2FA state unavailable: ' . $e->getMessage());
-        return null;
-    }
-}
-
-function ap_auth_2fa_enabled(int $userId): bool
-{
-    $row = ap_auth_2fa_row($userId);
-    return is_array($row) && trim((string) ($row['secret_enc'] ?? '')) !== ''
-        && trim((string) ($row['enabled_at'] ?? '')) !== '';
-}
-
-/** @return array{ok:bool,error?:string,secret?:string,otpauth?:string} */
-function ap_auth_2fa_begin_setup(int $userId, string $username): array
-{
-    if ($userId < 1) return ['ok' => false, 'error' => 'Invalid user.'];
-    $secret = ap_auth_totp_base32_encode(random_bytes(20));
-    $enc = ap_auth_secret_encrypt($secret);
-    if ($enc === '') return ['ok' => false, 'error' => 'Could not prepare two-factor setup.'];
-    $now = ap_db_now();
-    try {
-        ap_db()->prepare(
-            'INSERT INTO ap_user_2fa (user_id, pending_secret_enc, updated_at) VALUES (?, ?, ?)
-             ON CONFLICT(user_id) DO UPDATE SET pending_secret_enc = excluded.pending_secret_enc, updated_at = excluded.updated_at'
-        )->execute([$userId, $enc, $now]);
-    } catch (Throwable $e) {
-        error_log('[ap-auth] 2FA setup storage unavailable: ' . $e->getMessage());
-        return ['ok' => false, 'error' => 'Two-factor storage is not available yet.'];
-    }
-    $label = rawurlencode('VAAK:' . $username);
-    $issuer = rawurlencode('VAAK');
-    return [
-        'ok' => true,
-        'secret' => $secret,
-        'otpauth' => 'otpauth://totp/' . $label . '?secret=' . $secret . '&issuer=' . $issuer,
-    ];
-}
-
-/** @return array{ok:bool,error?:string,recovery_codes?:array<int,string>} */
-function ap_auth_2fa_confirm_setup(int $userId, string $code): array
-{
-    $row = ap_auth_2fa_row($userId);
-    $pending = is_array($row) ? ap_auth_secret_decrypt((string) ($row['pending_secret_enc'] ?? '')) : null;
-    if (!$pending || !ap_auth_totp_verify($pending, $code)) {
-        return ['ok' => false, 'error' => 'That code is not valid. Check your authenticator clock and try again.'];
-    }
-    $codes = [];
-    $hashes = [];
-    for ($i = 0; $i < 8; $i++) {
-        $plain = ap_auth_recovery_code();
-        $codes[] = $plain;
-        $hashes[] = password_hash($plain, PASSWORD_DEFAULT);
-    }
-    $now = ap_db_now();
-    ap_db()->prepare(
-        'UPDATE ap_user_2fa SET secret_enc = ?, pending_secret_enc = \'\', recovery_codes_json = ?, enabled_at = ?, updated_at = ? WHERE user_id = ?'
-    )->execute([ap_auth_secret_encrypt($pending), json_encode($hashes, JSON_UNESCAPED_SLASHES), $now, $now, $userId]);
-    return ['ok' => true, 'recovery_codes' => $codes];
-}
-
-function ap_auth_2fa_verify_recovery(int $userId, string $code): bool
-{
-    $row = ap_auth_2fa_row($userId);
-    $codes = is_array($row) ? json_decode((string) ($row['recovery_codes_json'] ?? '[]'), true) : [];
-    if (!is_array($codes)) return false;
-    $normalized = strtoupper(trim($code));
-    foreach ($codes as $i => $hash) {
-        if (is_string($hash) && password_verify($normalized, $hash)) {
-            unset($codes[$i]);
-            ap_db()->prepare('UPDATE ap_user_2fa SET recovery_codes_json = ?, updated_at = ? WHERE user_id = ?')
-                ->execute([json_encode(array_values($codes), JSON_UNESCAPED_SLASHES), ap_db_now(), $userId]);
-            return true;
-        }
-    }
-    return false;
-}
-
-function ap_auth_2fa_verify_code(int $userId, string $code): bool
-{
-    $row = ap_auth_2fa_row($userId);
-    $secret = is_array($row) ? ap_auth_secret_decrypt((string) ($row['secret_enc'] ?? '')) : null;
-    return ($secret !== null && ap_auth_totp_verify($secret, $code)) || ap_auth_2fa_verify_recovery($userId, $code);
-}
-
-/** @return array{ok:bool,error?:string} */
-function ap_auth_2fa_disable(int $userId, string $password, string $code): array
-{
-    $user = ap_auth_user_by_id($userId);
-    if (!$user || ap_auth_verify_credentials((string) ($user['username'] ?? ''), $password) === null) {
-        return ['ok' => false, 'error' => 'Password verification failed.'];
-    }
-    if (!ap_auth_2fa_verify_code($userId, $code)) {
-        return ['ok' => false, 'error' => 'Two-factor code verification failed.'];
-    }
-    ap_db()->prepare('DELETE FROM ap_user_2fa WHERE user_id = ?')->execute([$userId]);
-    return ['ok' => true];
-}
-
-function ap_auth_2fa_pending_clear(): void
-{
-    ap_auth_start_session();
-    unset($_SESSION['vaak_2fa_pending_user_id'], $_SESSION['vaak_2fa_pending_at'], $_SESSION['vaak_2fa_pending_next']);
-}
-
-/** @return array{ok:bool,error?:string,user?:array} */
-function ap_auth_complete_2fa_login(string $code): array
-{
-    ap_auth_start_session();
-    $userId = (int) ($_SESSION['vaak_2fa_pending_user_id'] ?? 0);
-    $started = (int) ($_SESSION['vaak_2fa_pending_at'] ?? 0);
-    if ($userId < 1 || $started < 1 || time() - $started > 600) {
-        ap_auth_2fa_pending_clear();
-        return ['ok' => false, 'error' => 'Two-factor sign-in expired. Please log in again.'];
-    }
-    if (!ap_auth_2fa_verify_code($userId, $code)) {
-        return ['ok' => false, 'error' => 'Invalid two-factor code.'];
-    }
-    $user = ap_auth_user_by_id($userId);
-    ap_auth_2fa_pending_clear();
-    if (!$user) return ['ok' => false, 'error' => 'Account is no longer available.'];
-    ap_auth_login_user($user);
-    return ['ok' => true, 'user' => $user];
-}
-
 /**
  * @return array{ok:bool,error?:string,user?:array}
  */
@@ -914,13 +673,6 @@ function ap_auth_attempt_login(string $login, string $password): array
         return ['ok' => false, 'error' => 'Invalid username/email or password.'];
     }
     ap_auth_login_rate_ok(true);
-    if (ap_auth_2fa_enabled((int) $user['id'])) {
-        ap_auth_start_session();
-        $_SESSION['vaak_2fa_pending_user_id'] = (int) $user['id'];
-        $_SESSION['vaak_2fa_pending_at'] = time();
-        $_SESSION['vaak_2fa_pending_next'] = 'home';
-        return ['ok' => false, 'requires_2fa' => true, 'user' => $user];
-    }
     ap_auth_login_user($user);
     return ['ok' => true, 'user' => $user];
 }
@@ -1322,15 +1074,10 @@ function ap_auth_secret_encrypt(string $plaintext): string
     if ($plaintext === '') {
         return '';
     }
-    try {
-        $key = hash('sha256', ap_auth_env()['secret'], true);
-        $iv = random_bytes(12);
-        $tag = '';
-        $cipher = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, '', 16);
-    } catch (Throwable $e) {
-        error_log('[ap-auth] secret encryption unavailable');
-        return '';
-    }
+    $key = hash('sha256', ap_auth_env()['secret'], true);
+    $iv = random_bytes(12);
+    $tag = '';
+    $cipher = openssl_encrypt($plaintext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag, '', 16);
     if (!is_string($cipher) || $cipher === '' || strlen($tag) !== 16) {
         return '';
     }
@@ -1353,13 +1100,8 @@ function ap_auth_secret_decrypt(string $blob): ?string
     $iv = substr($raw, 0, 12);
     $tag = substr($raw, 12, 16);
     $cipher = substr($raw, 28);
-    try {
-        $key = hash('sha256', ap_auth_env()['secret'], true);
-        $plain = openssl_decrypt($cipher, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
-    } catch (Throwable $e) {
-        error_log('[ap-auth] secret decryption unavailable');
-        return null;
-    }
+    $key = hash('sha256', ap_auth_env()['secret'], true);
+    $plain = openssl_decrypt($cipher, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
     if (!is_string($plain) || $plain === '') {
         return null;
     }

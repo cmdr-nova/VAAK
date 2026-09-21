@@ -960,15 +960,6 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
     }
 
     foreach ($candidates as $cand) {
-        // A remote Delete is authoritative: do not resurrect a favourited
-        // object from an older cached Create event.
-        try {
-            $deleted = ap_db()->prepare("SELECT 1 FROM events WHERE (object_id = ? OR object_id = ?) AND (type = 'Delete' OR action_taken = 'deleted') LIMIT 1");
-            $deleted->execute([$cand, $cand . '/']);
-            if ($deleted->fetchColumn()) continue;
-        } catch (Throwable $e) {
-            // Keep the normal cache resolver available if this check fails.
-        }
         // Local note
         $local = ap_masto_status_by_note_id($cand);
         if (is_array($local)) {
@@ -977,13 +968,8 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
         }
 
         // Inbound event (federated Create/etc.)
-        // Interaction rows (Like/Announce) often arrive after the original
-        // Create and contain no post body. Prefer the publication event so
-        // favourites/bookmarks render the saved context instead of a bare URL.
         $st = ap_db()->prepare(
-            "SELECT * FROM events WHERE (object_id = ? OR object_id = ?)
-             AND COALESCE(action_taken, '') != 'deleted'
-             ORDER BY CASE type WHEN 'Create' THEN 0 WHEN 'Update' THEN 1 WHEN 'Announce' THEN 2 ELSE 3 END, id DESC LIMIT 1"
+            'SELECT * FROM events WHERE object_id = ? OR object_id = ? ORDER BY id DESC LIMIT 1'
         );
         $st->execute([$cand, $cand . '/']);
         $erow = $st->fetch();
@@ -3775,136 +3761,91 @@ function ap_masto_status_from_mention(array $row): array
     }
     $url = $urlBase !== '' ? $urlBase : $actorId;
     $media = [];
+    $mediaUrlList = [];
     if (!empty($row['media_urls'])) {
         $decoded = json_decode((string) $row['media_urls'], true);
         if (is_array($decoded)) {
-            $i = 0;
             foreach ($decoded as $u) {
-                if (is_array($u)) {
-                    $u = $u['url'] ?? $u['href'] ?? $u['preview_url'] ?? $u['thumbnail'] ?? '';
-                    if (is_array($u)) {
-                        $u = $u['href'] ?? $u['url'] ?? '';
-                    }
-                }
                 $clean = is_string($u) ? ap_profile_sanitize_https_url($u) : null;
-                if ($clean === null) {
-                    continue;
-                }
-                $i++;
-                $media[] = [
-                    'id' => (string) (2000000 + $mentionId) . $i,
-                    'type' => 'image',
-                    'url' => $clean,
-                    'preview_url' => $clean,
-                    'remote_url' => $clean,
-                    'preview_remote_url' => null,
-                    'text_url' => null,
-                    'meta' => null,
-                    'description' => null,
-                    'blurhash' => null,
-                ];
-                if ($i >= 4) {
-                    break;
+                if ($clean !== null) {
+                    $mediaUrlList[] = $clean;
                 }
             }
         }
     }
-    // Bluesky notification rows may predate attachment projection. Recover
-    // media from the already-warmed local post cache without fetching AppView
-    // during notification rendering.
-    if ($media === [] && str_starts_with((string) ($row['activity_id'] ?? ''), 'at://')
-        && !function_exists('ap_bsky_post_item_by_uri') && is_file(__DIR__ . '/ap-bsky.php')) {
-        require_once __DIR__ . '/ap-bsky.php';
-    }
-    if ($media === [] && str_starts_with((string) ($row['activity_id'] ?? ''), 'at://')
-        && function_exists('ap_bsky_post_item_by_uri')) {
-        $cached = ap_bsky_post_item_by_uri((string) $row['activity_id']);
-        $cachedPost = is_array($cached['post'] ?? null) ? $cached['post'] : [];
-        if ($cachedPost !== []) {
-            if (function_exists('ap_bsky_post_image_urls')) {
-                foreach (ap_bsky_post_image_urls($cachedPost) as $mediaUrl) {
-                    $media[] = [
-                        'id' => (string) (2000000 + $mentionId) . (count($media) + 1),
-                        'type' => 'image',
-                        'url' => $mediaUrl,
-                        'preview_url' => $mediaUrl,
-                        'remote_url' => $mediaUrl,
-                        'preview_remote_url' => null,
-                        'text_url' => null,
-                        'meta' => null,
-                        'description' => null,
-                        'blurhash' => null,
-                    ];
-                    if (count($media) >= 4) {
-                        break;
-                    }
+    // Older Bluesky mention/reply/quote rows often stored empty media_urls (GIF
+    // embeds lived only on the AT record). Hydrate from durable cache / AppView.
+    if ($mediaUrlList === [] && function_exists('ap_masto_mention_is_bluesky') && ap_masto_mention_is_bluesky($row)) {
+        $bskyLib = __DIR__ . '/ap-bsky.php';
+        if (!function_exists('ap_bsky_notification_media_urls') && is_file($bskyLib)) {
+            require_once $bskyLib;
+        }
+        $activityId = trim((string) ($row['activity_id'] ?? ''));
+        $objectIdForMedia = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
+        $atUri = '';
+        if (str_starts_with($activityId, 'at://')) {
+            $atUri = $activityId;
+        } elseif (function_exists('ap_bsky_at_uri_from_any_url')) {
+            $resolved = ap_bsky_at_uri_from_any_url($objectIdForMedia !== '' ? $objectIdForMedia : $activityId);
+            if (is_string($resolved) && str_starts_with($resolved, 'at://')) {
+                $atUri = $resolved;
+            }
+        }
+        if ($atUri !== '' && function_exists('ap_bsky_notification_media_urls')) {
+            // Prefer cache; allow a few AppView fetches per request so older
+            // GIF/image mentions (empty media_urls) can self-heal without
+            // stalling Ice Cubes polls.
+            static $bskyNotifMediaFetchBudget = 3;
+            $allowFetch = $bskyNotifMediaFetchBudget > 0;
+            if ($allowFetch) {
+                $bskyNotifMediaFetchBudget--;
+            }
+            $hydrated = ap_bsky_notification_media_urls(
+                ['uri' => $atUri, 'record' => []],
+                (int) ($row['owner_user_id'] ?? 0),
+                $allowFetch
+            );
+            foreach ($hydrated as $u) {
+                $clean = is_string($u) ? ap_profile_sanitize_https_url($u) : null;
+                if ($clean !== null) {
+                    $mediaUrlList[] = $clean;
                 }
             }
-            if (count($media) < 4 && function_exists('ap_bsky_post_video_media')) {
-                foreach (ap_bsky_post_video_media($cachedPost) as $video) {
-                    $mediaUrl = (string) ($video['thumbnail'] ?? $video['url'] ?? '');
-                    if (!str_starts_with($mediaUrl, 'https://')) {
-                        continue;
-                    }
-                    $media[] = [
-                        'id' => (string) (2000000 + $mentionId) . (count($media) + 1),
-                        'type' => 'video',
-                        'url' => $mediaUrl,
-                        'preview_url' => $mediaUrl,
-                        'remote_url' => (string) ($video['url'] ?? $mediaUrl),
-                        'preview_remote_url' => null,
-                        'text_url' => null,
-                        'meta' => null,
-                        'description' => null,
-                        'blurhash' => null,
-                    ];
-                    if (count($media) >= 4) {
-                        break;
-                    }
+            // Persist so the next poll/Ice Cubes open is instant.
+            if ($mediaUrlList !== [] && !empty($row['id'])) {
+                try {
+                    $upd = ap_db()->prepare(
+                        'UPDATE mentions SET media_urls = ? WHERE id = ? AND (media_urls IS NULL OR media_urls = \'\' OR media_urls = \'[]\')'
+                    );
+                    $upd->execute([
+                        json_encode(array_slice($mediaUrlList, 0, 4), JSON_UNESCAPED_SLASHES),
+                        (int) $row['id'],
+                    ]);
+                } catch (Throwable $e) {
+                    // best-effort
                 }
             }
         }
     }
-    // A few remote servers (notably older GIF integrations) omit AS2
-    // attachments and leave only the media URL in the Note body. Recover
-    // obvious image/GIF links so Notifications can render the preview instead
-    // of showing a bare static link. This remains bounded and HTTPS-only.
-    if ($media === []) {
-        $body = (string) ($row['content'] ?? '');
-        if ($body !== '' && preg_match_all("#https://[^\\s<>\"']+#i", $body, $urlMatches)) {
-            foreach (($urlMatches[0] ?? []) as $candidate) {
-                $candidate = rtrim((string) $candidate, '.,!?)]}');
-                $path = (string) (parse_url($candidate, PHP_URL_PATH) ?? '');
-                $host = strtolower((string) (parse_url($candidate, PHP_URL_HOST) ?? ''));
-                $looksLikeMedia = (bool) preg_match('/\.(?:gif|png|jpe?g|webp)(?:$|[?#])/i', $candidate)
-                    || str_contains($host, 'giphy.')
-                    || str_contains($host, 'tenor.')
-                    || str_contains($path, '/media_attachments/')
-                    || str_contains($path, '/media/');
-                if (!$looksLikeMedia) {
-                    continue;
-                }
-                $clean = ap_profile_sanitize_https_url($candidate);
-                if ($clean === null) {
-                    continue;
-                }
-                $media[] = [
-                    'id' => (string) (2000000 + $mentionId) . (count($media) + 1),
-                    'type' => 'image',
-                    'url' => $clean,
-                    'preview_url' => $clean,
-                    'remote_url' => $clean,
-                    'preview_remote_url' => null,
-                    'text_url' => null,
-                    'meta' => null,
-                    'description' => null,
-                    'blurhash' => null,
-                ];
-                if (count($media) >= 4) {
-                    break;
-                }
-            }
-        }
+    $i = 0;
+    foreach (array_slice($mediaUrlList, 0, 4) as $clean) {
+        $i++;
+        $isGif = (bool) preg_match('/\.gif(\?|#|$)/i', $clean)
+            || str_contains(strtolower($clean), 'tenor.com')
+            || str_contains(strtolower($clean), 'giphy.com')
+            || str_contains(strtolower($clean), 'klipy.com');
+        $media[] = [
+            'id' => (string) (2000000 + $mentionId) . $i,
+            'type' => 'image',
+            'url' => $clean,
+            'preview_url' => $clean,
+            'remote_url' => $clean,
+            'preview_remote_url' => null,
+            'text_url' => null,
+            'meta' => null,
+            'description' => $isGif ? 'GIF' : null,
+            'blurhash' => null,
+        ];
     }
     $inReplyTo = (string) ($row['in_reply_to'] ?? '');
     if ($inReplyTo === '' && is_string($row['content'] ?? null)) {
@@ -4347,16 +4288,10 @@ function ap_masto_mention_notif_type(array $row): ?string
     if (in_array($objType, ['person', 'application', 'service', 'group'], true)) {
         return null;
     }
-    $hasMedia = !empty($row['media_urls']) && $row['media_urls'] !== '[]';
     // Create Note / Article / reply / bare content
     if (in_array($objType, ['note', 'article', 'page', 'question', ''], true) || ($row['content'] ?? '') !== '') {
         $inReplyTo = rtrim((string) ($row['in_reply_to'] ?? ''), '/');
         if ($inReplyTo !== '' && str_starts_with($inReplyTo, $ourPrefix . '/notes/')) {
-            return 'mention';
-        }
-        // A reply can contain only an attachment. Keep it in Notifications when
-        // it targets one of our notes instead of treating the empty body as noise.
-        if ($hasMedia && $inReplyTo !== '' && str_starts_with($inReplyTo, $ourPrefix . '/statuses/')) {
             return 'mention';
         }
         $content = (string) ($row['content'] ?? '');
@@ -4709,16 +4644,7 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
  */
 function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
 {
-    if (!function_exists('ap_bsky_actor_hide_reasons') && is_file(__DIR__ . '/ap-bsky.php')) {
-        require_once __DIR__ . '/ap-bsky.php';
-    }
     $limit = max(1, min(80, $limit));
-    // Keep notification polling bounded. Ice Cubes usually asks for 40
-    // items, but scanning 200 rows from every source made deleted/remote
-    // status resolution take 10+ seconds even when the response was empty.
-    // Pagination continues with max_id, so a smaller source window does not
-    // discard the notification history.
-    $sourceLimit = max(40, min(100, $limit * 2));
     // favourites, mentions, boosts, quote-boosts, bites, poll ended, favourited-status edits, follows, subscribed posts
     $want = ['mention', 'follow', 'favourite', 'reblog', 'quote', 'poll', 'update', 'bite', 'status'];
     if ($types) {
@@ -4742,37 +4668,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
 
-    // Notification snowflakes use seconds * 1e9.  Use that timestamp as a
-    // source-level keyset boundary so older pages are not lost behind a fixed
-    // per-table LIMIT.  Rows in the same second are retained and filtered by
-    // the complete generated id below.
-    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
-    $maxCursorAt = null;
-    if ($maxIdInt >= 1000000000000000000) {
-        $maxCursorAt = gmdate('c', intdiv($maxIdInt, 1000000000));
-    }
-
     if (array_intersect($want, $mentionTypes)) {
-        $sql = 'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL';
-        $bind = [$ownerUserId];
-        if ($maxCursorAt !== null) {
-            $sql .= ' AND created_at <= ?';
-            $bind[] = $maxCursorAt;
-        }
-        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT ' . $sourceLimit;
-        $st = ap_db()->prepare($sql);
-        $st->execute($bind);
+        $st = ap_db()->prepare(
+            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 80'
+        );
+        $st->execute([$ownerUserId]);
         $seenActivityIds = [];
         foreach ($st->fetchAll() as $row) {
-            // Bluesky moderation lists are synced into the same hide set used
-            // by Bluesky feeds. Do not expose their mentions/likes/boosts in
-            // the generic Mastodon-compatible notifications surface.
-            if (function_exists('ap_bsky_actor_hide_reasons')) {
-                $actorRef = (string) ($row['actor_id'] ?? '');
-                if ($actorRef !== '' && ap_bsky_actor_hide_reasons($actorRef, $ownerUserId) !== []) {
-                    continue;
-                }
-            }
             $activityId = trim((string) ($row['activity_id'] ?? ''));
             if ($activityId !== '') {
                 if (isset($seenActivityIds[$activityId])) {
@@ -4786,7 +4688,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             }
             $nid = (int) $row['id'];
             $items[] = [
-                'sort' => (int) ap_masto_notification_id_for_mention($nid, (string) ($row['created_at'] ?? '')),
+                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
                 'kind' => 'mention',
                 'row' => $row,
             ];
@@ -4797,18 +4699,14 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         // Follow events must target THIS session actor only (never NULL/empty — that leaked).
         // Include Bluesky follows (action_taken=bsky_follow) — those are not in AP followers[].
         $bskyFollowAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
-        $sql = "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
+        $st = ap_db()->prepare(
+            "SELECT id, created_at, actor_id, target_actor, action_taken FROM events
              WHERE type = 'Follow'
                AND action_taken IN ('local_accept_followback', ?)
-               AND (target_actor = ? OR target_actor = ?)";
-        $bind = [$bskyFollowAction, $ownerActorId, $ownerActorId . '/'];
-        if ($maxCursorAt !== null) {
-            $sql .= ' AND created_at <= ?';
-            $bind[] = $maxCursorAt;
-        }
-        $sql .= ' ORDER BY created_at DESC, id DESC LIMIT ' . $sourceLimit;
-        $st = ap_db()->prepare($sql);
-        $st->execute($bind);
+               AND (target_actor = ? OR target_actor = ?)
+             ORDER BY id DESC LIMIT 40"
+        );
+        $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
         // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
         $followerSet = [];
         try {
@@ -4830,7 +4728,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             }
             $nid = 1000000 + (int) $row['id'];
             $items[] = [
-                'sort' => (int) ap_masto_notification_id_for_follow_event((int) $row['id'], (string) ($row['created_at'] ?? '')),
+                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: $nid,
                 'kind' => 'follow',
                 'row' => $row,
             ];
@@ -4841,15 +4739,10 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     if (in_array('poll', $want, true)) {
         try {
             $now = (new DateTimeImmutable('now', new DateTimeZone('UTC')))->format('c');
-            $pollSql = 'SELECT * FROM masto_polls WHERE expires_at <= ?';
-            $pollBind = [$now];
-            if ($maxCursorAt !== null) {
-                $pollSql .= ' AND expires_at <= ?';
-                $pollBind[] = $maxCursorAt;
-            }
-            $pollSql .= ' ORDER BY expires_at DESC, local_id DESC LIMIT ' . $sourceLimit;
-            $st = ap_db()->prepare($pollSql);
-            $st->execute($pollBind);
+            $st = ap_db()->prepare(
+                'SELECT * FROM masto_polls WHERE expires_at <= ? ORDER BY expires_at DESC LIMIT 40'
+            );
+            $st->execute([$now]);
             $me = rtrim($ownerActorId !== '' ? $ownerActorId : ap_masto_session_actor_id(), '/');
             foreach ($st->fetchAll() as $row) {
                 if (!is_array($row)) {
@@ -4872,7 +4765,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 }
                 $nid = 2000000 + (int) $row['local_id'];
                 $items[] = [
-                    'sort' => (int) ap_masto_notification_id_for_poll((int) $row['local_id'], (string) ($row['expires_at'] ?? '')),
+                    'sort' => strtotime((string) ($row['expires_at'] ?? '')) ?: $nid,
                     'kind' => 'poll',
                     'row' => $row,
                 ];
@@ -4887,10 +4780,11 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     });
 
     $out = [];
-    // Items are newest-first (sort desc). Ice Cubes polls with since_id near the
-    // tip; filter the watermark without stopping because source namespaces can
-    // interleave at the same timestamp.
+    // Items are newest-first (sort desc). Ice Cubes polls with since_id near the tip;
+    // once we hit the watermark, older rows cannot be "newer" — stop instead of
+    // hydrating the whole backlog (was ~4–11s for /api/v2/notifications).
     $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
+    $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
     foreach ($items as $item) {
         $ent = ap_masto_notification_entity($item);
         if ($ent === null) {
@@ -4901,11 +4795,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         if ($maxIdInt > 0 && $entId >= $maxIdInt) {
             continue;
         }
-        // since_id: only newer than watermark. Do not break: notification
-        // namespaces/types can have different generated IDs at the same
-        // timestamp, so an older-looking item must not hide a later source.
+        // since_id: only newer than watermark; then stop (newest-first)
         if ($sinceIdInt > 0 && $entId <= $sinceIdInt) {
-            continue;
+            break;
         }
         $out[] = $ent;
         if (count($out) >= $limit) {
@@ -4922,9 +4814,6 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
  */
 function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache = false): array
 {
-    if (!function_exists('ap_bsky_actor_hide_reasons') && is_file(__DIR__ . '/ap-bsky.php')) {
-        require_once __DIR__ . '/ap-bsky.php';
-    }
     $scan = max(1, min(80, $scan));
     $markers = ap_masto_markers_get();
     $lastRead = '0';
@@ -4988,12 +4877,6 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         foreach ($st->fetchAll() ?: [] as $row) {
             if (!is_array($row)) {
                 continue;
-            }
-            if (function_exists('ap_bsky_actor_hide_reasons')) {
-                $actorRef = (string) ($row['actor_id'] ?? '');
-                if ($actorRef !== '' && ap_bsky_actor_hide_reasons($actorRef, $ownerUserId) !== []) {
-                    continue;
-                }
             }
             $activityId = trim((string) ($row['activity_id'] ?? ''));
             if ($activityId !== '') {
@@ -5432,51 +5315,6 @@ function ap_masto_status_from_event(array $row): ?array
             $text = ap_masto_clean_mention_text($text);
         }
     }
-    // Bridged quote summaries are sometimes cached as plain text on an event.
-    // Promote the QT portion into the Mastodon quote object so renderers do not
-    // show the quoted text once as body content and again as a quote card.
-    $eventQuote = null;
-    if ($text !== '' && str_contains($text, '↪ QT')) {
-        $qtPos = mb_strpos($text, '↪ QT');
-        $commentary = trim(mb_substr($text, 0, $qtPos));
-        $quoted = trim(mb_substr($text, $qtPos));
-        $qAcct = '';
-        $qText = '';
-        if (preg_match('/^↪ QT(?:\s+@([^:]+))?\s*:\s*(.*)$/us', $quoted, $qm)) {
-            $qAcct = trim((string) ($qm[1] ?? ''));
-            $qText = trim((string) ($qm[2] ?? ''));
-        }
-        $qUrl = '';
-        if (preg_match('#https://[^\s<>]+#u', $commentary, $um)) {
-            $qUrl = rtrim((string) $um[0], '.,);]');
-        } elseif (preg_match('#https://[^\s<>]+#u', $quoted, $um)) {
-            $qUrl = rtrim((string) $um[0], '.,);]');
-        }
-        $qAcctLabel = $qAcct !== '' ? $qAcct : 'Quoted post';
-        $qAccount = [
-            'id' => 'quote-' . substr(hash('sha256', $qAcctLabel . '|' . $qUrl), 0, 16),
-            'username' => ltrim($qAcctLabel, '@'),
-            'acct' => ltrim($qAcctLabel, '@'),
-            'display_name' => ltrim($qAcctLabel, '@'),
-            'url' => $qUrl !== '' ? $qUrl : null,
-            'uri' => $qUrl !== '' ? $qUrl : null,
-        ];
-        $eventQuote = [
-            'state' => 'accepted',
-            'quoted_url' => $qUrl,
-            'quoted_status' => [
-                'id' => 'quote-' . substr(hash('sha256', $qUrl !== '' ? $qUrl : $quoted), 0, 16),
-                'uri' => $qUrl !== '' ? $qUrl : null,
-                'url' => $qUrl !== '' ? $qUrl : null,
-                'account' => $qAccount,
-                'content' => $qText !== '' && $qText !== '(quoted post unavailable)'
-                    ? (function_exists('ap_plain_text_to_html') ? ap_plain_text_to_html($qText) : '<p>' . htmlspecialchars($qText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>')
-                    : '',
-                'media_attachments' => [],
-            ],
-        ];
-        $text = $commentary;
-    }
     $objectId = (string) ($row['object_id'] ?? '');
     $url = $objectId !== '' ? $objectId : $actorId;
     // Human "Open remote" / status.url — Bridgy convert/ap URLs are AP JSON, not a webpage
@@ -5668,8 +5506,9 @@ function ap_masto_status_from_event(array $row): ?array
         'emojis' => [],
         'card' => ap_masto_remote_link_card((string) ($row['summary'] ?? ''), count($media) > 0),
         'poll' => null,
-        'quote' => $eventQuote,
-        'quote_url' => is_array($eventQuote) ? (string) ($eventQuote['quoted_url'] ?? '') : '',
+        // Explicit null prevents clients from carrying a stale native quote
+        // card across status updates when this remote post has no quote.
+        'quote' => null,
         'quote_approval' => [
             'automatic' => ['public'],
             'manual' => [],
@@ -7640,9 +7479,7 @@ function ap_masto_trends_cache_info(string $kind): array
         $dir = sys_get_temp_dir();
     }
     return [
-        // v2 invalidates pre-Bluesky trend files after the schema/input mix
-        // changes, while preserving stale-while-revalidate behavior.
-        'path' => rtrim($dir, '/') . '/mkultra-ap-trends-v2-' . $kind . '.json',
+        'path' => rtrim($dir, '/') . '/mkultra-ap-trends-' . $kind . '.json',
         'ttl' => AP_MASTO_TRENDS_CACHE_TTL,
     ];
 }
@@ -7759,91 +7596,6 @@ function ap_masto_trends_cache_mtime(string $kind): int
     return is_file($path) ? (int) filemtime($path) : 0;
 }
 
-/** Return true when a trend contributor is hidden for this viewer. Cache data
- * is shared, so this check intentionally runs only while rendering a user's
- * sidebar and never triggers a remote fetch. */
-function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId): bool
-{
-    if ($ownerUserId < 1 || $actor === '') {
-        return false;
-    }
-    $actor = rtrim(trim($actor), '/');
-    if (str_starts_with($actor, 'did:')) {
-        static $bskyHidden = [];
-        $cacheKey = $ownerUserId . ':' . $actor;
-        if (!array_key_exists($cacheKey, $bskyHidden)) {
-            $bskyHidden[$cacheKey] = function_exists('ap_bsky_hide_did_reasons')
-                && ap_bsky_hide_did_reasons($ownerUserId, $actor) !== [];
-        }
-        if ($bskyHidden[$cacheKey]) {
-            return true;
-        }
-        return false;
-    }
-    $host = parse_url($actor, PHP_URL_HOST);
-    $host = is_string($host) ? strtolower($host) : null;
-    if (function_exists('ap_user_is_blocked') && ap_user_is_blocked($actor, $host, $ownerUserId)) {
-        return true;
-    }
-    if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, $ownerUserId)) {
-        return true;
-    }
-    if (function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($actor, $ownerUserId)) {
-        return true;
-    }
-    return function_exists('ap_row_is_hidden') && ap_row_is_hidden($actor, $host, $ownerUserId);
-}
-
-/** @return list<string> */
-function ap_masto_trend_item_actors(array $item): array
-{
-    $actors = [];
-    foreach ((array) ($item['trend_actors'] ?? []) as $actor) {
-        if (is_string($actor) && trim($actor) !== '') {
-            $actors[] = rtrim(trim($actor), '/');
-        }
-    }
-    if (is_array($item['account'] ?? null)) {
-        foreach (['id', 'url'] as $key) {
-            $v = trim((string) ($item['account'][$key] ?? ''));
-            if ($v !== '') {
-                $actors[] = rtrim($v, '/');
-            }
-        }
-    }
-    if (isset($item['author_did']) && is_string($item['author_did'])) {
-        $actors[] = trim($item['author_did']);
-    }
-    return array_values(array_unique(array_filter($actors)));
-}
-
-/** @param list<string> $actors */
-function ap_masto_trend_item_hidden(array $item, int $ownerUserId, array $actors = []): bool
-{
-    $actors = $actors !== [] ? $actors : ap_masto_trend_item_actors($item);
-    foreach ($actors as $actor) {
-        if (ap_masto_trend_actor_hidden((string) $actor, $ownerUserId)) {
-            return true;
-        }
-    }
-    if (function_exists('ap_muted_words_match')) {
-        $texts = [];
-        foreach (['name', 'title', 'url', 'content', 'description'] as $key) {
-            if (isset($item[$key]) && is_string($item[$key])) {
-                $texts[] = $item[$key];
-            }
-        }
-        if (is_array($item['account'] ?? null)) {
-            $texts[] = (string) ($item['account']['display_name'] ?? '');
-            $texts[] = (string) ($item['account']['acct'] ?? '');
-        }
-        if ($texts !== [] && ap_muted_words_match($ownerUserId, ...$texts) !== null) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /**
  * Trending hashtags mined from recent local + federated text (7-day window).
  * Powers /api/v1/trends/tags and the admin sidebar.
@@ -7915,25 +7667,6 @@ function ap_masto_trends_tags(int $limit = 10): array
     } catch (Throwable $e) {
         // ignore
     }
-    // Bluesky posts are already indexed by the feed workers. Read only that
-    // local cache here; never make AppView requests while rebuilding trends.
-    try {
-        if (function_exists('ap_bsky_posts_migrate')) {
-            ap_bsky_posts_migrate();
-        }
-        $st = ap_db()->prepare(
-            'SELECT text, published_at, author_did FROM bsky_posts
-             WHERE published_at >= ? AND text IS NOT NULL AND text <> \'\'
-             ORDER BY indexed_at DESC LIMIT 3000'
-        );
-        $st->execute([gmdate('c', $dayStart - (6 * 86400))]);
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $ts = strtotime((string) ($row['published_at'] ?? '')) ?: 0;
-            $ingest((string) ($row['text'] ?? ''), $ts, (string) ($row['author_did'] ?? ''));
-        }
-    } catch (Throwable $e) {
-        // Bluesky indexing is optional and must never break Fediverse trends.
-    }
     try {
         $since = gmdate('c', $dayStart - (6 * 86400));
         $st = ap_db()->prepare(
@@ -7998,15 +7731,7 @@ function ap_masto_trends_tags(int $limit = 10): array
                 'accounts' => (string) count($s['accounts'][$i]),
             ];
         }
-        $tagEntity = ap_masto_tag_entity((string) $name, $history);
-        $contributors = [];
-        foreach ($s['accounts'] as $dayAccounts) {
-            foreach (array_keys($dayAccounts) as $actor) {
-                $contributors[] = $actor;
-            }
-        }
-        $tagEntity['trend_actors'] = array_values(array_unique($contributors));
-        $out[] = $tagEntity;
+        $out[] = ap_masto_tag_entity((string) $name, $history);
         if (count($out) >= 30) {
             break;
         }
@@ -8194,23 +7919,6 @@ function ap_masto_trends_links(int $limit = 10): array
     } catch (Throwable $e) {
         // ignore
     }
-    try {
-        if (function_exists('ap_bsky_posts_migrate')) {
-            ap_bsky_posts_migrate();
-        }
-        $st = ap_db()->prepare(
-            'SELECT text, published_at, author_did FROM bsky_posts
-             WHERE published_at >= ? AND text IS NOT NULL AND text <> \'\'
-             ORDER BY indexed_at DESC LIMIT 3000'
-        );
-        $st->execute([gmdate('c', $dayStart - (6 * 86400))]);
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $ts = strtotime((string) ($row['published_at'] ?? '')) ?: 0;
-            $ingest((string) ($row['text'] ?? ''), $ts, (string) ($row['author_did'] ?? ''));
-        }
-    } catch (Throwable $e) {
-        // Bluesky indexing is optional.
-    }
 
     $scored = [];
     foreach ($stats as $url => $s) {
@@ -8254,15 +7962,7 @@ function ap_masto_trends_links(int $limit = 10): array
         if ($allowFetch) {
             $fetchBudget--;
         }
-        $linkEntity = ap_masto_trends_link_entity((string) $url, $history, $allowFetch);
-        $contributors = [];
-        foreach ($s['accounts'] as $dayAccounts) {
-            foreach (array_keys($dayAccounts) as $actor) {
-                $contributors[] = $actor;
-            }
-        }
-        $linkEntity['trend_actors'] = array_values(array_unique($contributors));
-        $out[] = $linkEntity;
+        $out[] = ap_masto_trends_link_entity((string) $url, $history, $allowFetch);
         if (count($out) >= 20) {
             break;
         }
@@ -8300,46 +8000,6 @@ function ap_masto_trends_is_status_object_url(string $objectId): bool
         return false;
     }
     return false;
-}
-
-/** Convert an indexed Bluesky post into the small Mastodon Status shape used
- * by Explore. The raw post is already cached, so this is deliberately local. */
-function ap_masto_bsky_trend_status(array $post): ?array
-{
-    $uri = trim((string) ($post['uri'] ?? ''));
-    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
-    $did = trim((string) ($author['did'] ?? ''));
-    if ($uri === '' || $did === '' || !function_exists('ap_bsky_https_url_from_at_uri')) {
-        return null;
-    }
-    $handle = trim((string) ($author['handle'] ?? ''));
-    $url = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
-    $text = trim((string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? '')));
-    return [
-        'id' => $uri,
-        'url' => $url,
-        'uri' => $uri,
-        'content' => nl2br(htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false),
-        'created_at' => (string) (($post['record']['createdAt'] ?? '') ?: ($post['indexedAt'] ?? gmdate('c'))),
-        'visibility' => 'public',
-        'language' => 'en',
-        'account' => [
-            'id' => $did,
-            'url' => function_exists('ap_bsky_actor_profile_url')
-                ? ap_bsky_actor_profile_url($handle !== '' ? $handle : $did)
-                : 'https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did),
-            'username' => $handle !== '' ? $handle : $did,
-            'acct' => $handle !== '' ? $handle : $did,
-            'display_name' => (string) ($author['displayName'] ?? $handle ?: $did),
-            'avatar' => (string) ($author['avatar'] ?? ''),
-        ],
-        'reblogs_count' => (int) ($post['repostCount'] ?? 0),
-        'favourites_count' => (int) ($post['likeCount'] ?? 0),
-        'replies_count' => (int) ($post['replyCount'] ?? 0),
-        'source' => 'bluesky',
-        'author_did' => $did,
-        'trend_actors' => [$did],
-    ];
 }
 
 /**
@@ -8538,37 +8198,6 @@ function ap_masto_trends_statuses(int $limit = 10): array
         } catch (Throwable $e) {
             // ignore
         }
-    }
-
-    // Add cached Bluesky posts to Explore. This reads only bsky_posts; the
-    // feed/AppView workers are responsible for warming that table separately.
-    try {
-        if (function_exists('ap_bsky_posts_migrate')) {
-            ap_bsky_posts_migrate();
-        }
-        $st = ap_db()->prepare(
-            'SELECT raw_json FROM bsky_posts
-             WHERE published_at >= ? AND raw_json IS NOT NULL AND raw_json <> \'\'
-             ORDER BY (COALESCE(like_count, 0) + COALESCE(repost_count, 0) * 2 + COALESCE(reply_count, 0) * 2 + COALESCE(quote_count, 0) * 2) DESC,
-                      indexed_at DESC LIMIT 120'
-        );
-        $st->execute([$since]);
-        foreach ($st->fetchAll() ?: [] as $row) {
-            if (count($out) >= 20) {
-                break;
-            }
-            $raw = json_decode((string) ($row['raw_json'] ?? ''), true);
-            if (!is_array($raw)) {
-                continue;
-            }
-            $status = ap_masto_bsky_trend_status($raw);
-            if ($status === null) {
-                continue;
-            }
-            $takeStatus($status);
-        }
-    } catch (Throwable $e) {
-        // Optional Bluesky cache must never affect Fediverse trends.
     }
 
     ap_masto_trends_cache_set('statuses', $out);
@@ -9471,9 +9100,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
         require_once __DIR__ . '/ap-search-fts.php';
     }
     if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
-        // Bluesky cache hits are rendered separately by the HTML search view;
-        // keep the Mastodon API status response limited to AP-backed records.
-        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName, ['event', 'mention', 'status']);
+        $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName);
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
@@ -9811,21 +9438,6 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
         $st->execute([$eventId]);
         $erow = $st->fetch();
         if (is_array($erow)) {
-            try {
-                $deleted = ap_db()->prepare("SELECT 1 FROM events WHERE (object_id = ? OR object_id = ?) AND (type = 'Delete' OR action_taken = 'deleted') LIMIT 1");
-                $deleted->execute([(string) ($erow['object_id'] ?? ''), rtrim((string) ($erow['object_id'] ?? ''), '/') . '/']);
-                if ($deleted->fetchColumn()) return null;
-            } catch (Throwable $e) {}
-            // Favourite rows can point at the interaction event itself. That
-            // event is intentionally body-less; resolve its object back to
-            // the cached Create/Update publication before rendering.
-            $eventType = (string) ($erow['type'] ?? '');
-            if (!in_array($eventType, ['Create', 'Update'], true) && !empty($erow['object_id'])) {
-                $preferred = ap_event_by_object_id((string) $erow['object_id']);
-                if (is_array($preferred) && in_array((string) ($preferred['type'] ?? ''), ['Create', 'Update'], true)) {
-                    $erow = $preferred;
-                }
-            }
             $status = ap_masto_status_from_event($erow);
             if ($status) {
                 $objectId = (string) ($erow['object_id'] ?? '');

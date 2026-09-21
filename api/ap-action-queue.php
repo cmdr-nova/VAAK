@@ -204,22 +204,6 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                         ? ap_bsky_create_like($owner, ['uri' => (string) ($payload['uri'] ?? $target), 'cid' => (string) ($payload['cid'] ?? '')], $rkey)
                         : ap_bsky_create_repost($owner, ['uri' => (string) ($payload['uri'] ?? $target), 'cid' => (string) ($payload['cid'] ?? '')], $rkey);
                     if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Bluesky action failed.'), 'receipt' => $receipt];
-                    if ($kind === 'like') {
-                        if (function_exists('ap_bsky_favourite_cache_clear')) {
-                            ap_bsky_favourite_cache_clear($owner, (string) ($payload['uri'] ?? $target));
-                        }
-                        $statusId = (string) ($payload['status_id'] ?? '');
-                        if ($statusId !== '' && preg_match('/^\d+$/', $statusId)
-                            && function_exists('ap_masto_favourite_add')) {
-                            ap_masto_favourite_add(
-                                $statusId,
-                                (string) ($payload['object_id'] ?? ($payload['uri'] ?? $target)),
-                                (string) ($payload['target_actor'] ?? '') ?: null,
-                                (string) ($res['uri'] ?? $receipt['record_uri'] ?? '') ?: null,
-                                $owner
-                            );
-                        }
-                    }
                     return ['ok' => true, 'receipt' => ['record_uri' => (string) ($res['uri'] ?? $receipt['record_uri'] ?? ''), 'collection' => $collection]];
                 }
                 if ($recordUri === '' && $kind === 'boost') {
@@ -230,18 +214,8 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 if ($recordUri === '') return ['ok' => true, 'receipt' => []];
                 $res = ap_bsky_delete_record_uri($owner, $recordUri);
                 $err = (string) ($res['error'] ?? 'Bluesky undo failed.');
-                $ok = !empty($res['ok']) || ap_action_queue_remote_state_already_applied($err, false);
-                if ($ok && $kind === 'like') {
-                    if (function_exists('ap_bsky_favourite_cache_clear')) {
-                        ap_bsky_favourite_cache_clear($owner, (string) ($payload['uri'] ?? $target));
-                    }
-                    $statusId = (string) ($payload['status_id'] ?? '');
-                    if ($statusId !== '' && preg_match('/^\d+$/', $statusId)
-                        && function_exists('ap_masto_favourite_remove')) {
-                        ap_masto_favourite_remove($statusId, $owner);
-                    }
-                }
-                return $ok ? ['ok' => true, 'receipt' => []] : ['ok' => false, 'error' => $err];
+                return !empty($res['ok']) || ap_action_queue_remote_state_already_applied($err, false)
+                    ? ['ok' => true, 'receipt' => []] : ['ok' => false, 'error' => $err];
             }
             if ($kind === 'bookmark') {
                 $res = $want
@@ -255,8 +229,8 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 if (function_exists('ap_bsky_tl_cache_clear_owner')) ap_bsky_tl_cache_clear_owner($owner);
                 $statusId = (string) ($payload['status_id'] ?? '');
                 if ($statusId !== '') {
-                    if ($want) ap_masto_bookmark_add($statusId, (string) ($payload['object_id'] ?? $target), $owner, 'bsky');
-                    else ap_masto_bookmark_remove($statusId, $owner, 'bsky');
+                    if ($want) ap_masto_bookmark_add($statusId, (string) ($payload['object_id'] ?? $target), $owner);
+                    else ap_masto_bookmark_remove($statusId, $owner);
                 }
                 return ['ok' => true, 'receipt' => []];
             }

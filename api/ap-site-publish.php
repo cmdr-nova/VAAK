@@ -43,7 +43,7 @@ if ((!defined('AP_SITE_PUBLISH_LIB_ONLY') || !AP_SITE_PUBLISH_LIB_ONLY)
 }
 
 /**
- * @return array{title:string,url:string,summary:string,kind:string,content:string,tags:list<string>,category:string,slug:string,published_at:string}
+ * @return array{title:string,url:string,summary:string,kind:string,content:string,tags:list<string>}
  */
 function ap_publish_parse_input(bool $isCli): array
 {
@@ -72,9 +72,6 @@ function ap_publish_parse_input(bool $isCli): array
             'summary' => trim((string) ($json['summary'] ?? '')),
             'content' => trim((string) ($json['content'] ?? '')),
             'kind' => trim((string) ($json['kind'] ?? 'post')),
-            'category' => trim((string) ($json['category'] ?? '')),
-            'slug' => trim((string) ($json['slug'] ?? '')),
-            'published_at' => trim((string) ($json['published_at'] ?? $json['date'] ?? '')),
             'tags' => $tagsOut,
         ];
     };
@@ -184,10 +181,7 @@ function ap_site_publish_note(
     string $summary = '',
     string $kind = 'post',
     array $tags = [],
-    string $content = '',
-    string $category = '',
-    string $slug = '',
-    string $publishedAt = ''
+    string $content = ''
 ): array {
     $title = trim(ap_fix_utf8($title));
     $url = trim($url);
@@ -260,33 +254,6 @@ function ap_site_publish_note(
     }
     require_once __DIR__ . '/ap-inbox.php';
 
-    // Keep the complete Jekyll Markdown body in VAAK's local Blog store. The
-    // ActivityPub Note below remains a compact compatibility/thread anchor;
-    // profile readers can open the full article without expanding timelines.
-    $blogSlug = $slug !== '' ? ap_blog_slug($slug) : ap_blog_slug($title, substr(hash('sha256', $url), 0, 8));
-    $blogRow = null;
-    if ($outboxKind === 'blog' && function_exists('ap_blog_create') && function_exists('ap_db_cmdr_nova_user_id')) {
-        $blogBody = $content !== '' ? $content : ($summary !== '' ? $summary : $title);
-        $blogRow = ap_blog_create(
-            ap_db_cmdr_nova_user_id(),
-            'cmdr_nova',
-            $blogSlug,
-            $title,
-            $category,
-            array_map(static fn(string $tag): string => ltrim($tag, '#'), $tags),
-            $blogBody,
-            $summary,
-            'draft',
-            $url,
-            $publishedAt !== '' ? $publishedAt : null
-        );
-        if (!is_array($blogRow)) {
-            // A partially provisioned older install can still syndicate the
-            // AP share; the next deploy/migration can backfill the article.
-            error_log('[ap-site-publish] blog store unavailable; publishing AP compatibility share only');
-        }
-    }
-
     $safeUrl = htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
     if ($outboxKind === 'blog') {
@@ -342,10 +309,6 @@ function ap_site_publish_note(
         'cc' => $cc,
         'interactionPolicy' => ap_note_interaction_policy_public(),
     ];
-    if ($outboxKind === 'blog') {
-        $note['summary'] = $title;
-        $note['sensitive'] = true;
-    }
     if ($asTags) {
         $note['tag'] = $asTags;
     }
@@ -370,10 +333,6 @@ function ap_site_publish_note(
         'raw_create_json' => json_encode($create, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         'kind' => $outboxKind,
     ]);
-    if (is_array($blogRow) && function_exists('ap_blog_set_note')) {
-        ap_blog_set_note('cmdr_nova', $blogSlug, $noteId);
-        ap_blog_mark_published('cmdr_nova', $blogSlug);
-    }
 
     // Ice Cubes / Mastodon API timelines read masto_statuses, not outbox alone.
     // Keep paragraph returns (title / summary / link) — do not collapse to one line.
@@ -427,10 +386,7 @@ $result = ap_site_publish_note(
     $input['summary'],
     $input['kind'],
     $input['tags'],
-    $input['content'],
-    $input['category'],
-    $input['slug'],
-    $input['published_at']
+    $input['content']
 );
 
 if ($isCli) {
