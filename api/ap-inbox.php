@@ -3286,6 +3286,19 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true, 
     }
     $actorId = $resolved;
 
+    // Suggestions and older cached account rows may use VAAK's HTML alias
+    // (/@user) or Mastodon-compatible /ap/users/user form. Normalize local
+    // aliases before attempting a network fetch so local follows never depend
+    // on the public HTML content-negotiation path.
+    $resolvedHost = strtolower((string) (parse_url($actorId, PHP_URL_HOST) ?: ''));
+    if ($resolvedHost === 'mkultra.monster') {
+        $resolvedPath = (string) (parse_url($actorId, PHP_URL_PATH) ?: '');
+        if (preg_match('#^/@([A-Za-z][A-Za-z0-9_]{1,29})/?$#', $resolvedPath, $lm)
+            || preg_match('#^/ap/users/([A-Za-z][A-Za-z0-9_]{1,29})/?$#', $resolvedPath, $lm)) {
+            $actorId = 'https://mkultra.monster/users/' . rawurlencode($lm[1]);
+        }
+    }
+
     // Hint for the common Wafrn central-app URL
     if (str_starts_with($actorId, 'https://app.wafrn.net/')) {
         $docTry = ap_fetch_actor_doc($actorId);

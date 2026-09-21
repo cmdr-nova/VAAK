@@ -1772,12 +1772,27 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             ap_masto_suggestion_dismiss($actor);
             $notice = 'Suggestion dismissed.';
         } else {
-            $res = ap_follow_remote_actor($actor, true);
-            if (!empty($res['ok'])) {
-                $notice = 'Follow requested / sent.';
-                ap_masto_suggestion_dismiss($actor); // drop from For You once followed
+            $isBskySuggestion = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor);
+            $hasBskySession = $isBskySuggestion
+                && function_exists('ap_bsky_session_row')
+                && is_array(ap_bsky_session_row($vaakOwnerId));
+            if ($isBskySuggestion && !$hasBskySession) {
+                $error = 'Connect Bluesky in Profile settings before following Bluesky suggestions.';
             } else {
-                $error = $res['error'] ?? 'Follow failed.';
+                $queue = ap_action_queue_enqueue(
+                    $vaakOwnerId,
+                    $isBskySuggestion ? 'bsky' : 'fedi',
+                    'follow',
+                    $actor,
+                    true,
+                    ['actor' => $actor]
+                );
+                if (!empty($queue['ok'])) {
+                    $notice = 'Follow queued — it will finish in the background.';
+                    ap_masto_suggestion_dismiss($actor); // drop from For You once queued
+                } else {
+                    $error = $queue['error'] ?? 'Could not queue follow.';
+                }
             }
         }
     } elseif (str_starts_with($action, 'starter_pack_')) {
