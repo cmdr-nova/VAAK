@@ -25519,6 +25519,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         // Keep text + already-uploaded media_ids for retry.
         return;
       }
+      // The server has accepted the post (or handed it to the durable
+      // publication queue). Do not make the user wait for timeline hydration
+      // or federation delivery before dismissing the page-level save marker.
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       if (window.apAdminToast) {
         const okMsg = mode === 'queue_post'
           ? 'Added to queue.'
@@ -25611,6 +25615,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (queueBtn) queueBtn.disabled = false;
       if (draftBtn) draftBtn.disabled = false;
       setSubmitProgress('hidden', 0);
+      // Composer submits are handled in-place (including publication queue
+      // handoff), so no full-page `pageshow` event is guaranteed to clear the
+      // shared capture-phase Saving… indicator.
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     }
   });
 })();
