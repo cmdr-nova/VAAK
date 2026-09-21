@@ -14150,6 +14150,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       opacity: 1; pointer-events: auto; transform: translateY(0);
     }
     .feed-top-btn:hover { border-color: var(--primary); }
+    /* Search uses the same card rhythm as timelines, but has its own result
+       wrapper so headings and account/tag cards do not inherit composer spacing. */
+    .search-results-feed { display: flex; flex-direction: column; gap: .7rem; }
+    .search-results-feed > h3 { margin: 1.1rem 0 .15rem !important; color: var(--muted); font-size: .9rem; letter-spacing: .04em; text-transform: uppercase; }
+    .search-results-feed > .tweet { margin: 0; }
+    .search-results-feed .search-results-meta { margin: 0 0 .2rem; }
     /* Phones (incl. landscape): short height catches ~844×390 class viewports that
    otherwise fall into the 72px tablet icon-rail and look “squished right”. */
 @media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
@@ -19077,7 +19083,33 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   define('AP_INBOX_LIB_ONLY', true);
               }
               require_once __DIR__ . '/ap-inbox.php';
-              $sresults = ap_masto_search($sq, $stype !== '' ? $stype : null, $sresolve, 25);
+              // Trending-tag navigation is a common repeated request (and
+              // several clients may open it at once). Reuse a very short
+              // public-result cache so a cold FTS/fallback query cannot pile
+              // up PHP-FPM workers. Viewer-specific block filtering remains
+              // below, after the shared result is read.
+              $searchCacheKey = (str_starts_with($sq, '#') ? hash('sha256', mb_strtolower($sq) . '|' . $stype . '|' . ($sresolve ? '1' : '0')) : '');
+              $searchCacheDir = '/var/lib/mkultra/ap/search-cache';
+              if (!is_dir($searchCacheDir) || !is_writable($searchCacheDir)) $searchCacheDir = sys_get_temp_dir() . '/vaak-search-cache';
+              if ($searchCacheKey !== '') {
+                  @mkdir($searchCacheDir, 0770, true);
+              }
+              $searchCachePath = $searchCacheKey !== '' ? rtrim($searchCacheDir, '/') . '/s_' . $searchCacheKey . '.json' : '';
+              $searchCacheHit = false;
+              if ($searchCachePath !== '' && is_file($searchCachePath) && (time() - (int) @filemtime($searchCachePath)) < 20) {
+                  $cachedSearch = json_decode((string) @file_get_contents($searchCachePath), true);
+                  if (is_array($cachedSearch) && isset($cachedSearch['accounts'], $cachedSearch['hashtags'], $cachedSearch['statuses'])) {
+                      $sresults = $cachedSearch;
+                      $searchCacheHit = true;
+                  }
+              }
+              if (!$searchCacheHit) {
+                  $sresults = ap_masto_search($sq, $stype !== '' ? $stype : null, $sresolve, 25);
+                  if ($searchCachePath !== '' && is_array($sresults)) {
+                      $tmpSearchPath = $searchCachePath . '.' . getmypid() . '.tmp';
+                      if (@file_put_contents($tmpSearchPath, json_encode($sresults, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX) !== false) @rename($tmpSearchPath, $searchCachePath);
+                  }
+              }
               $sOwner = admin_owner_user_id();
               if (function_exists('ap_actor_is_content_blocked') && $sOwner > 0) {
                   $sresults['accounts'] = array_values(array_filter(
@@ -19130,7 +19162,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php if ($sq === ''): ?>
           <div class="empty">Search posts, tags, or accounts — or paste a remote post URL above.</div>
         <?php else: ?>
-          <div class="meta" style="margin-bottom:.75rem">
+          <div class="search-results-feed">
+          <div class="meta search-results-meta" style="margin-bottom:.75rem">
             Results for <b><?= h($sq) ?></b> —
             <?= count($sresults['accounts']) ?> accounts ·
             <?= count($sresults['hashtags']) ?> tags ·
@@ -19258,6 +19291,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php endif; ?>
             </div>
           <?php endif; ?>
+          </div>
         <?php endif; ?>
 
       <?php elseif ($view === 'followers'): ?>
@@ -20970,7 +21004,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky', 'outbox'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky', 'outbox', 'search'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
     <?php endif; ?>
@@ -22866,7 +22900,30 @@ window.apAdminToast = function (msg, isErr) {
     if (composeSlot) feedRoot.insertBefore(newBtn, composeSlot.nextSibling);
     else feedRoot.insertBefore(newBtn, feedRoot.firstChild);
   }
-  if (!root || !items || !sentinel) return;
+  if (!root || !items || !sentinel) {
+    // Search pages are intentionally not timeline-paginated, but they still
+    // use the feed scroll container. Keep the same unobtrusive back-to-top
+    // affordance without initializing the timeline observer.
+    if (viewName === 'search' && root && topBtn) {
+      const searchScrollTop = () => {
+        const style = window.getComputedStyle(root);
+        return (style.overflowY === 'auto' || style.overflowY === 'scroll')
+          ? root.scrollTop
+          : (window.scrollY || document.documentElement.scrollTop || 0);
+      };
+      const searchScrollToTop = () => {
+        const style = window.getComputedStyle(root);
+        if (style.overflowY === 'auto' || style.overflowY === 'scroll') root.scrollTo({ top: 0, behavior: 'smooth' });
+        else window.scrollTo({ top: 0, behavior: 'smooth' });
+      };
+      const syncSearchTop = () => { topBtn.classList.toggle('show', searchScrollTop() > 280); };
+      root.addEventListener('scroll', syncSearchTop, { passive: true });
+      window.addEventListener('scroll', syncSearchTop, { passive: true });
+      topBtn.addEventListener('click', searchScrollToTop);
+      syncSearchTop();
+    }
+    return;
+  }
 
   // Desktop: .feed is the scroll container. Mobile: body/window scrolls and
   // .feed is overflow:visible — IntersectionObserver must use the viewport.
