@@ -1676,6 +1676,44 @@ function ap_bsky_create_account(
     ];
 }
 
+/** Issue a single-use invite from the VAAK PDS admin API. */
+function ap_bsky_create_pds_invite(): array
+{
+    $path = '/etc/mkultra/vaak-pds.env';
+    $cfg = [];
+    if (is_readable($path)) {
+        foreach (preg_split("/\r\n|\n|\r/", (string) @file_get_contents($path)) ?: [] as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) continue;
+            [$key, $value] = array_map('trim', explode('=', $line, 2));
+            $cfg[$key] = trim($value, " \t\"'");
+        }
+    }
+    $password = (string) ($cfg['PDS_ADMIN_PASSWORD'] ?? '');
+    if ($password === '') return ['ok' => false, 'error' => 'PDS invite generation is not configured yet.'];
+    $ch = curl_init(AP_BSKY_VAAK_PDS . '/xrpc/com.atproto.server.createInviteCode');
+    if ($ch === false) return ['ok' => false, 'error' => 'Could not initialize the PDS connection.'];
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode(['useCount' => 1], JSON_UNESCAPED_SLASHES),
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+        CURLOPT_USERPWD => 'admin:' . $password,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 2,
+        CURLOPT_TIMEOUT => 8,
+    ]);
+    $raw = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    $json = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($json) || empty($json['code'])) {
+        $detail = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
+        return ['ok' => false, 'error' => $detail !== '' ? $detail : ('PDS invite generation failed' . ($status > 0 ? ' (HTTP ' . $status . ')' : ($err !== '' ? ': ' . $err : '.')))];
+    }
+    return ['ok' => true, 'code' => (string) $json['code']];
+}
+
 /**
  * @return array{ok:bool,error?:string,access?:string}
  */
