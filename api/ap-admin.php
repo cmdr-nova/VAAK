@@ -24065,9 +24065,18 @@ window.apAdminToast = function (msg, isErr) {
 (function () {
   const btn = document.getElementById('feed-top-btn');
   if (!btn || document.getElementById('timeline-items')) return;
-  const update = () => btn.classList.toggle('show', (window.scrollY || document.documentElement.scrollTop || 0) > 280);
-  window.addEventListener('scroll', update, { passive: true });
-  btn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  const feed = document.querySelector('.feed');
+  const feedStyle = feed ? window.getComputedStyle(feed) : null;
+  const feedScrolls = !!feed && feedStyle && ['auto', 'scroll'].includes(feedStyle.overflowY);
+  const root = feedScrolls ? feed : window;
+  const position = () => feedScrolls ? feed.scrollTop : (window.scrollY || document.documentElement.scrollTop || 0);
+  const update = () => btn.classList.toggle('show', position() > 280);
+  root.addEventListener('scroll', update, { passive: true });
+  btn.addEventListener('click', () => {
+    if (feedScrolls) feed.scrollTo({ top: 0, behavior: 'smooth' });
+    else window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+  window.addEventListener('resize', update, { passive: true });
   update();
 })();
 </script>
