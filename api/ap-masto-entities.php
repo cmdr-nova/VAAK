@@ -7306,7 +7306,6 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         // ignore
     }
 
-    return array_slice($out, 0, $limit);
 }
 
 /** @return list<array<string,mixed>> */
@@ -9449,6 +9448,41 @@ function ap_masto_search_statuses(string $q, int $limit): array
                 break;
             }
         }
+        // Merge the local Bluesky cache before treating an FTS hit as final.
+        // This is intentionally cache-only: no AppView/PDS request belongs on
+        // the interactive search path.
+        try {
+            if (function_exists('ap_bsky_posts_migrate')) {
+                ap_bsky_posts_migrate();
+            }
+            $needle = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $qLower) . '%';
+            $bskySt = ap_db()->prepare(
+                'SELECT raw_json FROM bsky_posts
+                 WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE \'\\\'
+                 ORDER BY published_at DESC LIMIT ?'
+            );
+            $bskySt->execute([gmdate('c', time() - (30 * 86400)), $needle, max(80, $limit * 5)]);
+            foreach ($bskySt->fetchAll() ?: [] as $bskyRow) {
+                $raw = json_decode((string) ($bskyRow['raw_json'] ?? ''), true);
+                $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
+                if (!is_array($post)) {
+                    continue;
+                }
+                $text = (string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? ''));
+                if ($tagName !== '' && !preg_match('/#' . preg_quote($tagName, '/') . '\\b/ui', $text)) {
+                    continue;
+                }
+                $status = ap_masto_bsky_trend_status($post);
+                if (is_array($status)) {
+                    $push($status);
+                }
+                if (count($out) >= $limit) {
+                    break;
+                }
+            }
+        } catch (Throwable $e) {
+            // Optional Bluesky cache must never break local search.
+        }
         if ($out) {
             return array_slice($out, 0, $limit);
         }
@@ -9525,6 +9559,41 @@ function ap_masto_search_statuses(string $q, int $limit): array
         }
     } catch (Throwable $e) {
         // ignore
+    }
+
+    // Search the local Bluesky cache as a fallback. This never performs a
+    // network request; feed workers are responsible for warming bsky_posts.
+    try {
+        if (function_exists('ap_bsky_posts_migrate')) {
+            ap_bsky_posts_migrate();
+        }
+        $needle = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $qLower) . '%';
+        $bskySt = ap_db()->prepare(
+            'SELECT raw_json FROM bsky_posts
+             WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE \'\\\'
+             ORDER BY published_at DESC LIMIT ?'
+        );
+        $bskySt->execute([gmdate('c', time() - (30 * 86400)), $needle, max(80, $limit * 5)]);
+        foreach ($bskySt->fetchAll() ?: [] as $bskyRow) {
+            $raw = json_decode((string) ($bskyRow['raw_json'] ?? ''), true);
+            $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
+            if (!is_array($post)) {
+                continue;
+            }
+            $text = (string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? ''));
+            if ($tagName !== '' && !preg_match('/#' . preg_quote($tagName, '/') . '\\b/ui', $text)) {
+                continue;
+            }
+            $status = ap_masto_bsky_trend_status($post);
+            if (is_array($status)) {
+                $push($status);
+            }
+            if (count($out) >= $limit) {
+                break;
+            }
+        }
+    } catch (Throwable $e) {
+        // Optional Bluesky cache must never break local search.
     }
 
     return array_slice($out, 0, $limit);
