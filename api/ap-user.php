@@ -490,8 +490,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     if (function_exists('ap_profile_normalize_summary_html')) {
         $summary = ap_profile_normalize_summary_html($summary);
     }
+    $bskyHandle = function_exists('ap_profile_bsky_handle')
+        ? ap_profile_bsky_handle($actorKey, $p)
+        : null;
 
     ap_user_html_shell_start('@' . $actorKey . '@mkultra.monster');
+    echo '<span id="profile-top" aria-hidden="true"></span>';
     if (!empty($p['image_url'])) {
         $banner = htmlspecialchars((string) $p['image_url'], ENT_QUOTES, 'UTF-8');
         echo '<div class="banner" style="background-image:url(\'' . $banner . '\')"></div>';
@@ -532,6 +536,15 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<input id="ap-follow-handle" name="handle" type="text" inputmode="email" autocomplete="username" spellcheck="false" placeholder="@you@your.instance" required>';
     echo '<button type="submit">Go</button></div>';
     echo '<p class="follow-hint">Opens your instance’s follow dialog.</p></form></div></div>';
+    if ($bskyHandle !== null && trim($bskyHandle) !== '') {
+        $bskyHandleSafe = htmlspecialchars(trim($bskyHandle), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<form id="ap-bsky-follow-form" class="follow-panel" action="https://bsky.app/profile/'
+            . rawurlencode(trim($bskyHandle)) . '" method="get" target="_blank" rel="noopener noreferrer">'
+            . '<label for="ap-bsky-follow-handle">Follow on Bluesky</label>'
+            . '<div class="follow-row"><input id="ap-bsky-follow-handle" name="handle" type="text" value="@' . $bskyHandleSafe . '" readonly>'
+            . '<button type="submit">Open</button></div>'
+            . '<p class="follow-hint">Opens this profile in Bluesky so you can follow it there.</p></form>';
+    }
 
     if (!empty($p['attachment']) && is_array($p['attachment'])) {
         echo '<div class="fields">';
@@ -552,7 +565,16 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         echo '</div>';
     }
 
-    $notes = ap_outbox_list(40, $actorKey);
+    // Backfilled Bluesky history can be large; paginate the profile instead of
+    // rendering the entire archive in one response.
+    $profilePerPage = 40;
+    $profilePage = max(1, (int) ($_GET['page'] ?? 1));
+    $profileTotal = function_exists('ap_outbox_count_for_actor')
+        ? ap_outbox_count_for_actor($actorKey)
+        : 0;
+    $notes = function_exists('ap_outbox_list_page')
+        ? ap_outbox_list_page($profilePerPage, ($profilePage - 1) * $profilePerPage, $actorKey)
+        : ap_outbox_list($profilePerPage, $actorKey);
     $publicNotes = [];
     foreach ($notes as $n) {
         $vis = (string) ($n['visibility'] ?? 'public');
@@ -560,6 +582,17 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             continue;
         }
         $publicNotes[] = $n;
+    }
+    $profileBoosts = [];
+    try {
+        if (function_exists('ap_masto_reblog_rows') && function_exists('ap_db_owner_user_id_for_actor')) {
+            $ownerId = ap_db_owner_user_id_for_actor($actorId);
+            if ($ownerId > 0) {
+                $profileBoosts = ap_masto_reblog_rows(200, null, $ownerId);
+            }
+        }
+    } catch (Throwable $e) {
+        $profileBoosts = [];
     }
 
     $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
@@ -578,9 +611,6 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_featured_cards_for_actor_key($actorKey)
         : [];
     $featuredCount = count($featuredCards);
-    $bskyHandle = function_exists('ap_profile_bsky_handle')
-        ? ap_profile_bsky_handle($actorKey, $p)
-        : null;
     $apFollowing = count($following);
     $apFollowers = count($followers);
     $combined = function_exists('ap_profile_combined_follow_counts')
@@ -595,7 +625,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
 
     echo '<div class="stats">';
-    echo '<div><span class="n">' . count($publicNotes) . '</span><span class="l">Posts</span></div>';
+    echo '<div><span class="n">' . ($profileTotal + count($profileBoosts)) . '</span><span class="l">Posts</span></div>';
     $bskyAttr = $bskyHandle !== null ? ' data-bsky-handle="' . htmlspecialchars($bskyHandle, ENT_QUOTES, 'UTF-8') . '"' : '';
     $bskyTitle = $bskyHandle !== null ? ' title="Includes ActivityPub and connected Bluesky counts"' : '';
     echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $combined['following'] . '</span><span class="l">Following</span></a>';
@@ -610,7 +640,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
         [
-            'posts' => ['Posts', count($publicNotes)],
+            'posts' => ['Posts', $profileTotal + count($profileBoosts)],
             'media' => ['Media', count($mediaNotes)],
             'featured' => ['Featured', $featuredCount],
         ] as $tKey => $tInfo
@@ -644,6 +674,18 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                 echo '</article>';
             }
         }
+        $pageCount = max(1, (int) ceil(max(1, $profileTotal) / $profilePerPage));
+        if ($pageCount > 1) {
+            echo '<nav class="profile-pager" aria-label="Profile pages">';
+            if ($profilePage > 1) {
+                echo '<a href="/users/' . $safe . ($profilePage - 1 > 1 ? '?page=' . ($profilePage - 1) : '') . '">← Newer</a>';
+            }
+            echo '<span>Page ' . $profilePage . ' of ' . $pageCount . '</span>';
+            if ($profilePage < $pageCount) {
+                echo '<a href="/users/' . $safe . '?page=' . ($profilePage + 1) . '">Older →</a>';
+            }
+            echo '</nav><p class="back"><a href="#profile-top">↑ Back to top</a></p>';
+        }
         echo '</section>';
     } elseif ($tab === 'featured') {
         echo '<section class="posts featured-section" aria-label="Featured">';
@@ -653,11 +695,23 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         echo '</section>';
     } else {
         echo '<section class="posts" aria-label="Posts">';
-        if (!$publicNotes) {
+        if (!$publicNotes && !$profileBoosts) {
             echo '<p class="muted">No public posts yet.</p>';
         } else {
             foreach ($publicNotes as $n) {
                 echo ap_user_post_preview_html($actorKey, $n);
+            }
+            foreach ($profileBoosts as $boost) {
+                $object = rtrim((string) ($boost['object_id'] ?? ''), '/');
+                if ($object === '') {
+                    continue;
+                }
+                $safeObject = htmlspecialchars($object, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                $date = (string) ($boost['created_at'] ?? '');
+                echo '<article class="post profile-boost"><div class="muted">↻ boosted</div>'
+                    . '<a href="' . $safeObject . '" rel="noopener noreferrer">' . $safeObject . '</a>'
+                    . ($date !== '' ? '<time class="muted" datetime="' . htmlspecialchars($date, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars($date, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</time>' : '')
+                    . '</article>';
             }
         }
         echo '</section>';
@@ -978,6 +1032,7 @@ function ap_user_html_shell_start(string $title): void
       .featured-name{font-weight:650;color:#e8e8e8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .featured-acct{font-size:.85rem;color:#999;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .posts{margin-top:1.25rem;border-top:1px solid #2a2a2a;padding-top:.5rem}
+      .profile-pager{display:flex;justify-content:center;align-items:center;gap:.8rem;margin:1rem 0;color:#999;font-size:.85rem}.profile-pager a{color:#7ee0ff;text-decoration:none}
       .post{padding:.9rem 0;border-bottom:1px solid #222}
       .note-body p{margin:.4rem 0}.cw{color:#f0c674;font-size:.9rem}
       .reply-line{font-size:.8rem;color:#8ab;margin:0 0 .45rem}

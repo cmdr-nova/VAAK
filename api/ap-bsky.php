@@ -1597,6 +1597,10 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
     }
     // Best-effort: mirror VAAK avatar / header / bio onto the Bluesky profile.
     $sync = ap_bsky_sync_profile_from_vaak($ownerUserId);
+    // Existing accounts (including accounts migrated onto the VAAK PDS) may
+    // have years of posts. Import them through the durable worker so account
+    // connection never waits on history or creates a burst of federation.
+    ap_bsky_own_posts_backfill_enqueue($ownerUserId, $did);
     return [
         'ok' => true,
         'handle' => $handle,
@@ -1604,6 +1608,25 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
         'profile_synced' => !empty($sync['ok']),
         'profile_sync_error' => empty($sync['ok']) ? (string) ($sync['error'] ?? '') : '',
     ];
+}
+
+/** Queue a paginated import of a connected account's existing Bluesky posts. */
+function ap_bsky_own_posts_backfill_enqueue(int $ownerUserId, string $did, ?string $cursor = null): void
+{
+    $did = trim($did);
+    if ($ownerUserId < 1 || !str_starts_with($did, 'did:') || !ap_bsky_actor_refresh_migrate()) {
+        return;
+    }
+    $cursor = trim((string) $cursor);
+    $actorRef = '__vaak_own_posts__:' . $did . ($cursor !== '' ? ':' . rtrim(strtr(base64_encode($cursor), '+/', '-_'), '=') : '');
+    $now = gmdate('c');
+    try {
+        $db = ap_db();
+        $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN 'pending' ELSE bsky_actor_refresh_queue.status END, queued_at = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN excluded.queued_at ELSE bsky_actor_refresh_queue.queued_at END, next_attempt_at = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN excluded.next_attempt_at ELSE bsky_actor_refresh_queue.next_attempt_at END, attempts = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN 0 ELSE bsky_actor_refresh_queue.attempts END, locked_at = NULL, last_error = NULL")
+            ->execute([$ownerUserId, $actorRef, $now, $now]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] own post backfill enqueue failed: ' . $e->getMessage());
+    }
 }
 
 /**
@@ -3088,6 +3111,27 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
             }
         }
     }
+    // Bluesky GIFs are commonly represented as external embeds rather than
+    // image blobs. Preserve the direct media URL for HTML profiles and posts.
+    if ($attachments === [] && function_exists('ap_bsky_url_looks_like_media')) {
+        $embed = is_array($post['embed'] ?? null)
+            ? $post['embed']
+            : (is_array($record['embed'] ?? null) ? $record['embed'] : null);
+        $external = is_array($embed['external'] ?? null) ? $embed['external'] : null;
+        if ($external === null && is_array($embed['media']['external'] ?? null)) {
+            $external = $embed['media']['external'];
+        }
+        $externalUrl = is_array($external) ? trim((string) ($external['uri'] ?? '')) : '';
+        if ($externalUrl !== '' && ap_bsky_url_looks_like_media($externalUrl)) {
+            $path = strtolower((string) (parse_url($externalUrl, PHP_URL_PATH) ?? ''));
+            $attachments[] = [
+                'type' => 'Document',
+                'mediaType' => str_ends_with($path, '.gif') ? 'image/gif' : 'image/jpeg',
+                'url' => $externalUrl,
+                'name' => '',
+            ];
+        }
+    }
 
     $createId = $actorId . '/creates/' . substr(hash('sha256', 'bsky-import:' . $uri), 0, 16);
     $to = ['https://www.w3.org/ns/activitystreams#Public'];
@@ -3230,6 +3274,44 @@ function ap_bsky_import_own_feed_as_local(int $ownerUserId, array $feed): array
             $stats['errors']++;
         } else {
             $stats['skipped']++;
+        }
+    }
+    // Reposts are represented by FeedViewPost.reason rather than a post record.
+    // Preserve them for the owner's VAAK/HTML profile without publishing a new
+    // ActivityPub Announce to the network.
+    $session = ap_bsky_session_row($ownerUserId);
+    $selfDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    foreach ($feed as $item) {
+        if (!is_array($item) || $selfDid === '') {
+            continue;
+        }
+        $reason = is_array($item['reason'] ?? null) ? $item['reason'] : [];
+        $reasonType = strtolower((string) ($reason['$type'] ?? ''));
+        $reasonBy = is_array($reason['by'] ?? null) ? trim((string) ($reason['by']['did'] ?? '')) : '';
+        $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+        $uri = trim((string) ($post['uri'] ?? ''));
+        if (!str_contains($reasonType, 'reasonrepost') || $reasonBy !== $selfDid || !str_starts_with($uri, 'at://')) {
+            continue;
+        }
+        try {
+            if (!function_exists('ap_masto_reblog_add')) {
+                require_once __DIR__ . '/ap-masto-entities.php';
+            }
+            if (!function_exists('ap_masto_reblog_add')) {
+                continue;
+            }
+            $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+            $handle = trim((string) ($author['handle'] ?? ''));
+            $targetActor = $handle !== '' && function_exists('ap_bsky_actor_profile_url')
+                ? ap_bsky_actor_profile_url($handle)
+                : null;
+            $stable = 'bsky-repost-' . substr(hash('sha256', $selfDid . '|' . $uri), 0, 32);
+            $targetUrl = function_exists('ap_bsky_https_url_from_at_uri')
+                ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null)
+                : $uri;
+            ap_masto_reblog_add($stable, $stable, $targetUrl, $targetActor, $stable, $ownerUserId);
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] repost profile import: ' . $e->getMessage());
         }
     }
     return $stats;
@@ -6366,6 +6448,43 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                     throw new RuntimeException((string) ($result['error'] ?? 'Bluesky profile counts refresh failed'));
                 }
                 $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
+                $stats['succeeded']++;
+                continue;
+            }
+            if (str_starts_with($actorRef, '__vaak_own_posts__:')) {
+                $payload = substr($actorRef, strlen('__vaak_own_posts__:'));
+                $did = '';
+                $cursorToken = '';
+                if (preg_match('/^(did:[^:]+)(?::([A-Za-z0-9_-]+))?$/', $payload, $m)) {
+                    $did = trim((string) ($m[1] ?? ''));
+                    $cursorToken = (string) ($m[2] ?? '');
+                }
+                $cursor = null;
+                if ($cursorToken !== '') {
+                    $b64 = strtr($cursorToken, '-_', '+/');
+                    $b64 .= str_repeat('=', (4 - (strlen($b64) % 4)) % 4);
+                    $decoded = base64_decode($b64, true);
+                    if (is_string($decoded) && $decoded !== '') {
+                        $cursor = $decoded;
+                    }
+                }
+                if (!str_starts_with($did, 'did:')) {
+                    throw new RuntimeException('Invalid Bluesky author for post backfill');
+                }
+                $result = ap_bsky_get_author_feed($owner, 50, $cursor);
+                if (empty($result['ok'])) {
+                    throw new RuntimeException((string) ($result['error'] ?? 'Bluesky author feed backfill failed'));
+                }
+                $feed = is_array($result['feed'] ?? null) ? $result['feed'] : [];
+                // getAuthorFeed indexes the durable cache; this import creates
+                // local Your Posts entries only for posts owned by this user.
+                ap_bsky_import_own_feed_as_local($owner, $feed);
+                $nextCursor = trim((string) ($result['cursor'] ?? ''));
+                if ($nextCursor !== '') {
+                    ap_bsky_own_posts_backfill_enqueue($owner, $did, $nextCursor);
+                }
+                $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")
+                    ->execute([$owner, $actorRef]);
                 $stats['succeeded']++;
                 continue;
             }

@@ -5565,6 +5565,34 @@ function ap_outbox_list(int $limit = 50, ?string $actorKey = null): array
     return $stmt->fetchAll() ?: [];
 }
 
+/** Paginated public-profile outbox rows for imported Bluesky history. */
+function ap_outbox_list_page(int $limit = 40, int $offset = 0, ?string $actorKey = null): array
+{
+    $limit = max(1, min(200, $limit));
+    $offset = max(0, $offset);
+    if ($actorKey !== null && $actorKey !== '') {
+        $prefix = 'https://mkultra.monster/users/' . rawurlencode(strtolower(trim($actorKey))) . '/';
+        $stmt = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT ? OFFSET ?');
+        $stmt->execute([$prefix . '%', $limit, $offset]);
+        return $stmt->fetchAll() ?: [];
+    }
+    $stmt = ap_db()->prepare('SELECT * FROM outbox_notes ORDER BY published DESC LIMIT ? OFFSET ?');
+    $stmt->execute([$limit, $offset]);
+    return $stmt->fetchAll() ?: [];
+}
+
+function ap_outbox_count_for_actor(string $actorKey): int
+{
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode(strtolower(trim($actorKey))) . '/';
+    try {
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ?');
+        $st->execute([$prefix . '%']);
+        return (int) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 function ap_follow_lists_cache_gen(bool $bump = false): int
 {
     static $gen = 0;
