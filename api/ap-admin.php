@@ -3381,6 +3381,76 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
 }
 
 // Lightweight JSON for nav badge / tab title polling (before heavy feed queries)
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
+    header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store');
+    $offset = max(0, (int) ($_GET['offset'] ?? 0));
+    $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $rows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list($offset + $limit + 1, null) : [];
+    $items = array_slice($rows, $offset, $limit);
+    $hasMore = count($rows) > ($offset + $limit);
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
+    foreach ($items as $item) admin_render_favourite_status_card($item);
+    echo '</div>'; exit;
+}
+
+// Cache-first bookmark cards.  The page shell should never wait for the
+// Bluesky collection or its card renderer; this fragment is loaded after the
+// first paint and is backed by the durable cache/worker path.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    $folderId = (int) ($_GET['folder'] ?? 0);
+    $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
+    $limit = (int) (ceil($limit / 20) * 20);
+    $items = [];
+    if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
+        && ap_bsky_session_row($vaakOwnerId) !== null) {
+        if ($folderId > 0 && function_exists('vaak_bookmark_folder_match_keys')) {
+            $keys = vaak_bookmark_folder_match_keys($folderId, $vaakOwnerId, 500);
+            $result = function_exists('ap_bsky_get_bookmarks_for_uris')
+                ? ap_bsky_get_bookmarks_for_uris($vaakOwnerId, array_keys($keys['object_ids'] ?? []), $limit)
+                : ['ok' => true, 'bookmarks' => []];
+        } else {
+            $result = ap_bsky_get_bookmarks($vaakOwnerId, $limit);
+        }
+        if (!empty($result['ok']) && is_array($result['bookmarks'] ?? null)) {
+            $items = $result['bookmarks'];
+        }
+    }
+    if ($items === []) {
+        echo '<div class="empty" data-bsky-bookmark-empty>No cached Bluesky bookmarks yet. They will appear after the background sync completes.</div>';
+        exit;
+    }
+    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>';
+    foreach ($items as $item) {
+        admin_render_bsky_feed_item($item, 'following', 'bookmarks');
+    }
+    exit;
+}
+
+// Cache-first Bluesky favourites; the page shell never waits on AppView/PDS.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
+    header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store');
+    $offset = max(0, (int) ($_GET['offset'] ?? 0));
+    $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $items = []; $hasMore = false;
+    if (function_exists('ap_bsky_get_favourites') && function_exists('ap_bsky_session_row') && ap_bsky_session_row($vaakOwnerId) !== null) {
+        $result = function_exists('ap_bsky_get_favourites_page')
+            ? ap_bsky_get_favourites_page($vaakOwnerId, $offset, $limit)
+            : ap_bsky_get_favourites($vaakOwnerId, $limit);
+        if (!empty($result['ok']) && is_array($result['favourites'] ?? null)) $items = $result['favourites'];
+        $hasMore = !empty($result['has_more']);
+    }
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    echo '<div data-bsky-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-loaded="1">';
+    if ($items === [] && $offset === 0) { echo '<div class="empty" data-bsky-favourite-empty>No cached Bluesky favourites yet. They will appear after the background sync completes.</div></div>'; exit; }
+    if ($offset === 0) echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
+    foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'favourites');
+    echo '</div>';
+    exit;
+}
+
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
@@ -12154,6 +12224,39 @@ header('Content-Type: text/html; charset=utf-8');
  * @param array<string,bool> $followingIds
  * @param array<string,bool> $followerIds
  */
+function admin_render_favourite_status_card(array $st): void
+{
+    $acct = (string) ($st['account']['acct'] ?? '?');
+    $sid = (string) ($st['id'] ?? '');
+    $oid = (string) ($st['uri'] ?? '');
+    $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
+    echo '<article class="tweet relay-card"><div class="tweet-hd">';
+    echo admin_avatar_img($actorUrl !== '' ? $actorUrl : null);
+    echo '<div class="tweet-hd-main"><div><span class="who">' . h($acct) . '</span><span class="meta"> · ' . h((string) ($st['created_at'] ?? '')) . '</span></div></div></div>';
+    $favPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
+    $favMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
+    $favMedia = is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [];
+    $favBody = $favPlain !== '' ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>' : '';
+    $favMediaHtml = $favMedia !== [] ? admin_media_row_html($favMedia) : '';
+    echo admin_cw_gate_html((string) ($st['spoiler_text'] ?? ''), !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '', $favBody . $favMediaHtml);
+    echo '<div class="tweet-actions">';
+    if ($oid !== '') {
+        echo '<a class="btn btn-ghost" href="' . h(admin_status_href($oid, 'favourites')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a>';
+        echo '<a href="' . h(admin_remote_object_href($oid)) . '" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>';
+    }
+    if ($sid !== '') {
+        echo '<form method="post" action="?view=favourites" style="display:inline"><input type="hidden" name="action" value="unfavourite_status"><input type="hidden" name="return_view" value="favourites"><input type="hidden" name="status_id" value="' . h($sid) . '"><input type="hidden" name="object_id" value="' . h($oid) . '"><input type="hidden" name="target_actor" value="' . h($actorUrl) . '"><button class="icon-btn on" type="submit" title="Unlike" aria-label="Unlike"><i class="ph-fill ph-heart" aria-hidden="true"></i></button></form>';
+    }
+    echo '</div></article>';
+}
+
+/**
+ * Render one Bluesky feed item (Bluesky tab or Home mix).
+ *
+ * @param array<string,mixed> $item
+ * @param string $context 'bluesky' (tab) or 'home' (mixed Home feed — federated card chrome)
+ */
+
 function admin_render_notification_card(array $n, array $followingIds, array $followerIds): void
 {
     try {
@@ -15029,58 +15132,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'favourites'): ?>
 
         <?php
-          $favList = ap_masto_favourites_list(60, null);
-          if (!$favList):
+          $favRows = ap_masto_favourites_list(21, null);
+          $favHasMore = count($favRows) > 20;
+          $favList = array_slice($favRows, 0, 20);
+          $deferBskyFavourites = true;
+          if (!$favList && !$deferBskyFavourites):
         ?>
           <div class="empty">No favourites yet.</div>
         <?php else: ?>
-          <?php foreach ($favList as $st): ?>
-            <?php
-              $acct = (string) ($st['account']['acct'] ?? '?');
-              $sid = (string) ($st['id'] ?? '');
-              $oid = (string) ($st['uri'] ?? '');
-              $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
-            ?>
-            <article class="tweet relay-card">
-              <div class="tweet-hd">
-                <?= admin_avatar_img($actorUrl !== '' ? $actorUrl : null) ?>
-                <div class="tweet-hd-main">
-                  <div>
-                    <span class="who"><?= h($acct) ?></span>
-                    <span class="meta"> · <?= h((string) ($st['created_at'] ?? '')) ?></span>
-                  </div>
-                </div>
-              </div>
-              <?php
-                $favPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
-                $favMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
-                echo admin_cw_gate_html(
-                    (string) ($st['spoiler_text'] ?? ''),
-                    !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
-                    $favPlain !== ''
-                        ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
-                        : ''
-                );
-              ?>
-              <div class="tweet-actions">
-                <?php if ($oid !== ''): ?>
-                  <a class="btn btn-ghost" href="<?= h(admin_status_href($oid, 'favourites')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                  <a href="<?= h(admin_remote_object_href($oid)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
-                <?php endif; ?>
-                <?php if ($sid !== ''): ?>
-                  <form method="post" action="?view=favourites" style="display:inline">
-                    <input type="hidden" name="action" value="unfavourite_status">
-                    <input type="hidden" name="return_view" value="favourites">
-                    <input type="hidden" name="status_id" value="<?= h($sid) ?>">
-                    <input type="hidden" name="object_id" value="<?= h($oid) ?>">
-                    <input type="hidden" name="target_actor" value="<?= h($actorUrl) ?>">
-                    <button class="icon-btn on" type="submit" title="Unlike" aria-label="Unlike"><i class="ph-fill ph-heart" aria-hidden="true"></i></button>
-                  </form>
-                <?php endif; ?>
-              </div>
-            </article>
-          <?php endforeach; ?>
+          <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
+            <?php foreach ($favList as $st): admin_render_favourite_status_card($st); endforeach; ?>
+            <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
+          </div>
         <?php endif; ?>
+        <div data-bsky-favourites-fragment data-offset="0" data-limit="20">
+          <div class="empty">Loading cached Bluesky favourites…</div>
+        </div>
 
       <?php elseif ($view === 'bookmarks'): ?>
 
@@ -25055,6 +25122,180 @@ if (VIEW === 'analytics') loadAnalytics();
   window.addEventListener('resize', () => { if (!card.hidden) position(); });
 })();
 </script>
+
+<script>
+// Favourites: load Bluesky likes from the durable cache after the Fediverse shell.
+(function () {
+  const fragment = document.querySelector('[data-bsky-favourites-fragment]');
+  if (!fragment) return;
+  let current = fragment;
+  let loading = false;
+  const load = async (replace) => {
+    if (loading || (!replace && current.dataset.hasMore !== '1')) return;
+    loading = true;
+    let skeleton = null;
+    if (!replace) {
+      skeleton = document.createElement('div');
+      skeleton.className = 'timeline-skeleton';
+      skeleton.setAttribute('aria-hidden', 'true');
+      skeleton.innerHTML = '<div class="timeline-skeleton-row"></div><div class="timeline-skeleton-row"></div>';
+      current.appendChild(skeleton);
+    }
+    try {
+      const offset = replace ? 0 : (parseInt(current.dataset.offset || '0', 10) || 0);
+      const limit = current.dataset.limit || '20';
+      const res = await fetch('?ajax=favourites_bsky&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
+        credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('favourite fragment ' + res.status);
+      const html = await res.text();
+      const holder = document.createElement('div');
+      holder.innerHTML = html;
+      const next = holder.firstElementChild;
+      if (!next) return;
+      if (replace) {
+        current.replaceWith(next);
+        current = next;
+      } else {
+        while (next.firstChild) current.appendChild(next.firstChild);
+        current.dataset.offset = next.dataset.offset || String(offset);
+        current.dataset.hasMore = next.dataset.hasMore || '0';
+      }
+      if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(current);
+      if (typeof window.novaEnqueueBoostHydrates === 'function') window.novaEnqueueBoostHydrates(current);
+      let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
+      if (!sentinel) {
+        sentinel = document.createElement('div');
+        sentinel.setAttribute('data-bsky-favourites-sentinel', '1');
+        sentinel.className = 'meta';
+        sentinel.style.cssText = 'padding:1rem 0 2rem;text-align:center';
+        current.appendChild(sentinel);
+      }
+      sentinel.textContent = current.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Bluesky favourites';
+      if (current.dataset.hasMore === '1' && !sentinel.dataset.observed) {
+        sentinel.dataset.observed = '1';
+        const feed = document.querySelector('.feed');
+        const feedStyle = feed ? window.getComputedStyle(feed) : null;
+        const observerRoot = feed && feedStyle && ['auto', 'scroll'].includes(feedStyle.overflowY)
+          ? feed : null;
+        new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) load(false); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
+      }
+    } catch (e) {
+      if (replace) current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
+    } finally {
+      if (skeleton && skeleton.parentNode) skeleton.remove();
+      loading = false;
+    }
+  };
+  load(true);
+})();
+</script>
+
+<script>
+// Fediverse favourites infinite scroll
+(function () {
+  const root = document.querySelector('[data-fedi-favourites-fragment]');
+  if (!root) return;
+  let busy = false;
+  const arm = () => {
+    const sentinel = root.querySelector('[data-fedi-favourites-sentinel]');
+    if (!sentinel || root.dataset.hasMore !== '1' || sentinel.dataset.observed === '1') return;
+    sentinel.dataset.observed = '1';
+    const feed = document.querySelector('.feed');
+    const style = feed ? window.getComputedStyle(feed) : null;
+    const observerRoot = feed && style && ['auto', 'scroll'].includes(style.overflowY) ? feed : null;
+    new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) load(); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
+  };
+  const load = async () => {
+    if (busy || root.dataset.hasMore !== '1') return;
+    busy = true;
+    try {
+      const offset = parseInt(root.dataset.offset || '0', 10) || 0;
+      const limit = root.dataset.limit || '20';
+      const res = await fetch('?ajax=favourites_fedi&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), { credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store' });
+      if (!res.ok) throw new Error('fedi fav ' + res.status);
+      const html = await res.text();
+      const holder = document.createElement('div');
+      holder.innerHTML = html;
+      const next = holder.firstElementChild;
+      if (!next) return;
+      const cards = next.querySelectorAll('article.tweet');
+      cards.forEach((card) => root.insertBefore(card, root.querySelector('[data-fedi-favourites-sentinel]')));
+      root.dataset.offset = next.dataset.offset || String(offset + cards.length);
+      root.dataset.hasMore = next.dataset.hasMore || '0';
+      const oldSent = root.querySelector('[data-fedi-favourites-sentinel]');
+      if (oldSent) oldSent.dataset.observed = '0';
+      if (root.dataset.hasMore !== '1' && oldSent) oldSent.textContent = 'End of Fediverse favourites';
+      arm();
+    } catch (e) {
+      console.warn(e);
+    } finally {
+      busy = false;
+    }
+  };
+  arm();
+})();
+</script>
+<script>
+// Favourites: load Bluesky likes from the durable cache after the Fediverse shell.
+(function () {
+  const fragment = document.querySelector('[data-bsky-favourites-fragment]');
+  if (!fragment) return;
+  let current = fragment;
+  let loading = false;
+  const load = async (replace) => {
+    if (loading || (!replace && current.dataset.hasMore !== '1' && current.dataset.loaded === '1')) return;
+    loading = true;
+    try {
+      const offset = replace ? 0 : (parseInt(current.dataset.offset || '0', 10) || 0);
+      const limit = current.dataset.limit || '20';
+      const res = await fetch('?ajax=favourites_bsky&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
+        credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
+      });
+      if (!res.ok) throw new Error('favourite fragment ' + res.status);
+      const html = await res.text();
+      const holder = document.createElement('div');
+      holder.innerHTML = html;
+      const next = holder.firstElementChild;
+      if (!next) return;
+      if (replace || !current.dataset.loaded) {
+        current.replaceWith(next);
+        current = next;
+      } else {
+        Array.from(next.querySelectorAll('article.tweet')).forEach((card) => current.appendChild(card));
+        current.dataset.offset = next.dataset.offset || current.dataset.offset;
+        current.dataset.hasMore = next.dataset.hasMore || '0';
+      }
+      current.dataset.loaded = '1';
+      let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
+      if (!sentinel && current.dataset.hasMore === '1') {
+        sentinel = document.createElement('div');
+        sentinel.setAttribute('data-bsky-favourites-sentinel', '1');
+        sentinel.className = 'meta';
+        sentinel.style.cssText = 'padding:1rem 0 2rem;text-align:center';
+        sentinel.textContent = 'Scroll for more…';
+        current.appendChild(sentinel);
+      }
+      if (sentinel && current.dataset.hasMore === '1' && sentinel.dataset.observed !== '1') {
+        sentinel.dataset.observed = '1';
+        const feed = document.querySelector('.feed');
+        const style = feed ? window.getComputedStyle(feed) : null;
+        const observerRoot = feed && style && ['auto', 'scroll'].includes(style.overflowY) ? feed : null;
+        new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) load(false); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
+      }
+    } catch (e) {
+      if (!current.dataset.loaded) {
+        current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
+      }
+      console.warn(e);
+    } finally {
+      loading = false;
+    }
+  };
+  load(true);
+})();
+</script>
+
 </body>
 </html>
 <?php

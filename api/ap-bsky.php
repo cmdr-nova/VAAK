@@ -4812,7 +4812,7 @@ function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 /** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
 function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
 {
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'lists', 'starter_packs'], true)
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs'], true)
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
@@ -4835,6 +4835,332 @@ function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, b
         return false;
     }
 }
+
+
+function ap_bsky_favourite_cache_migrate(?PDO $db = null): bool
+{
+    static $ready = [];
+    $db = $db ?? ap_db();
+    $key = spl_object_id($db);
+    if (isset($ready[$key])) {
+        return $ready[$key];
+    }
+    try {
+        try {
+            $db->query('SELECT 1 FROM bsky_favourite_cache LIMIT 1');
+            $db->query('SELECT 1 FROM bsky_favourite_sync_state LIMIT 1');
+            return $ready[$key] = true;
+        } catch (Throwable $probeEx) {
+            // Fall through and attempt CREATE TABLE (SQLite / fresh PG).
+        }
+        $db->exec('CREATE TABLE IF NOT EXISTS bsky_favourite_cache (
+            owner_user_id INTEGER NOT NULL,
+            favourite_uri TEXT NOT NULL,
+            favourited_at TEXT NOT NULL,
+            post_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (owner_user_id, favourite_uri)
+        )');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_favourite_cache_owner_time ON bsky_favourite_cache (owner_user_id, favourited_at DESC)');
+        $db->exec('CREATE TABLE IF NOT EXISTS bsky_favourite_sync_state (
+            owner_user_id INTEGER PRIMARY KEY,
+            checked_at TEXT,
+            updated_at TEXT NOT NULL
+        )');
+        return $ready[$key] = true;
+    } catch (Throwable $e) {
+        return $ready[$key] = false;
+    }
+}
+
+/** @return list<array<string,mixed>> */
+function ap_bsky_favourite_cache_read(int $ownerUserId, int $limit = 80, int $offset = 0): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) {
+        return [];
+    }
+    $limit = max(1, min(200, $limit));
+    $offset = max(0, $offset);
+    try {
+        $st = ap_db()->prepare(
+            'SELECT post_json, favourited_at FROM bsky_favourite_cache
+             WHERE owner_user_id = ?
+             ORDER BY favourited_at DESC, favourite_uri DESC
+             LIMIT ? OFFSET ?'
+        );
+        $st->execute([$ownerUserId, $limit, $offset]);
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $item = json_decode((string) ($row['post_json'] ?? ''), true);
+            if (is_array($item) && is_array($item['post'] ?? null)) {
+                $out[] = $item;
+            }
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+function ap_bsky_favourite_cache_count(int $ownerUserId): int
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) {
+        return 0;
+    }
+    try {
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_favourite_cache WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        return (int) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
+/**
+ * @return array{ok:bool,favourites?:list<array<string,mixed>>,cached?:bool,refreshing?:bool,has_more?:bool,error?:string}
+ */
+function ap_bsky_get_favourites_page(int $ownerUserId, int $offset = 0, int $limit = 20): array
+{
+    $base = ap_bsky_get_favourites($ownerUserId, 1, false);
+    if (empty($base['ok'])) {
+        return $base;
+    }
+    $limit = max(1, min(50, $limit));
+    $offset = max(0, $offset);
+    return [
+        'ok' => true,
+        'favourites' => ap_bsky_favourite_cache_read($ownerUserId, $limit, $offset),
+        'cached' => true,
+        'refreshing' => !empty($base['refreshing']),
+        'has_more' => ($offset + $limit) < ap_bsky_favourite_cache_count($ownerUserId),
+    ];
+}
+
+function ap_bsky_favourite_cache_clear(int $ownerUserId, ?string $removeUri = null): void
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) {
+        return;
+    }
+    try {
+        if (is_string($removeUri) && str_starts_with($removeUri, 'at://')) {
+            ap_db()->prepare('DELETE FROM bsky_favourite_cache WHERE owner_user_id = ? AND favourite_uri = ?')
+                ->execute([$ownerUserId, $removeUri]);
+        }
+        // Force next page view to re-enqueue a sync.
+        ap_db()->prepare(
+            'INSERT INTO bsky_favourite_sync_state (owner_user_id, checked_at, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (owner_user_id) DO UPDATE SET checked_at = excluded.checked_at, updated_at = excluded.updated_at'
+        )->execute([$ownerUserId, '1970-01-01T00:00:00+00:00', gmdate('c')]);
+    } catch (Throwable $e) {
+        // ignore
+    }
+}
+
+/**
+ * Cache-first Bluesky likes. Stale cache enqueues a background refresh.
+ *
+ * @return array{ok:bool,favourites?:list<array<string,mixed>>,cached?:bool,refreshing?:bool,error?:string,added?:int}
+ */
+function ap_bsky_get_favourites(int $ownerUserId, int $limit = 80, bool $refresh = false): array
+{
+    if ($ownerUserId < 1 || (!$refresh && !ap_bsky_tab_enabled()) || ap_bsky_session_row($ownerUserId) === null) {
+        return ['ok' => false, 'error' => 'Bluesky not connected'];
+    }
+    if (!ap_bsky_favourite_cache_migrate()) {
+        return ['ok' => false, 'error' => 'Bluesky favourite cache is not provisioned'];
+    }
+    if ($refresh) {
+        return ap_bsky_favourites_refresh_worker($ownerUserId, $limit);
+    }
+    $cached = ap_bsky_favourite_cache_read($ownerUserId, $limit);
+    $checked = 0;
+    try {
+        $st = ap_db()->prepare('SELECT checked_at FROM bsky_favourite_sync_state WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        $checked = strtotime((string) ($st->fetchColumn() ?: '')) ?: 0;
+    } catch (Throwable $e) {
+        // ignore
+    }
+    $stale = $checked < time() - 300;
+    if ($stale) {
+        ap_bsky_background_sync_enqueue($ownerUserId, 'favourites');
+    }
+    return ['ok' => true, 'favourites' => $cached, 'cached' => true, 'refreshing' => $stale];
+}
+
+/**
+ * Pull newest app.bsky.feed.like records from the user's PDS and hydrate posts.
+ *
+ * @return array{ok:bool,favourites?:list<array<string,mixed>>,error?:string,added?:int}
+ */
+function ap_bsky_favourites_refresh_worker(int $ownerUserId, int $limit = 200): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_favourite_cache_migrate()) {
+        return ['ok' => false, 'error' => 'Favourite cache unavailable'];
+    }
+    $session = ap_bsky_session_row($ownerUserId);
+    $token = ap_bsky_access_token($ownerUserId, false);
+    if (empty($token['ok'])) {
+        $token = ap_bsky_access_token($ownerUserId, true);
+    }
+    if ($session === null || empty($token['ok'])) {
+        return ['ok' => false, 'error' => 'Bluesky session unavailable'];
+    }
+    $did = (string) ($session['did'] ?? '');
+    $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $access = (string) $token['access'];
+    if ($did === '') {
+        return ['ok' => false, 'error' => 'Missing DID'];
+    }
+
+    $limit = max(20, min(200, $limit));
+    $byUri = [];
+    $cursor = null;
+    $pages = 0;
+    while ($pages < 3 && count($byUri) < $limit) {
+        $pages++;
+        $query = [
+            'repo' => $did,
+            'collection' => 'app.bsky.feed.like',
+            'limit' => 100,
+            // Default listRecords order is newest-first for TID rkeys.
+        ];
+        if (is_string($cursor) && $cursor !== '') {
+            $query['cursor'] = $cursor;
+        }
+        $res = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', $query, null, $access, 15);
+        if (($res['status'] ?? 0) === 401) {
+            $token = ap_bsky_access_token($ownerUserId, true);
+            if (empty($token['ok'])) {
+                return ['ok' => false, 'error' => (string) ($token['error'] ?? 'Bluesky session expired')];
+            }
+            $access = (string) $token['access'];
+            $res = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', $query, null, $access, 15);
+        }
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+            if ($pages === 1) {
+                return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not load Bluesky likes')];
+            }
+            break;
+        }
+        $rows = is_array($res['json']['records'] ?? null) ? $res['json']['records'] : [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $v = is_array($row['value'] ?? null) ? $row['value'] : [];
+            $subject = is_array($v['subject'] ?? null) ? $v['subject'] : [];
+            $uri = trim((string) ($subject['uri'] ?? ''));
+            if (!str_starts_with($uri, 'at://') || isset($byUri[$uri])) {
+                continue;
+            }
+            $byUri[$uri] = [
+                'like_uri' => (string) ($row['uri'] ?? ''),
+                'created' => trim((string) ($v['createdAt'] ?? gmdate('c'))) ?: gmdate('c'),
+            ];
+            if (count($byUri) >= $limit) {
+                break;
+            }
+        }
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) ? $res['json']['cursor'] : null;
+        if ($cursor === null || $rows === []) {
+            break;
+        }
+    }
+
+    $items = [];
+    $uris = array_keys($byUri);
+    foreach (array_chunk($uris, 25) as $uriBatch) {
+        // Bluesky expects repeated uris= params, not uris[0]=.
+        $qs = implode('&', array_map(static fn($u) => 'uris=' . rawurlencode($u), $uriBatch));
+        $url = rtrim(AP_BSKY_PUBLIC_API, '/') . '/xrpc/app.bsky.feed.getPosts?' . $qs;
+        $ch = curl_init($url);
+        if ($ch === false) {
+            continue;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 12,
+            CURLOPT_CONNECTTIMEOUT => 4,
+            CURLOPT_HTTPHEADER => [
+                'Accept: application/json',
+                'User-Agent: VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
+            ],
+        ]);
+        $body = curl_exec($ch);
+        curl_close($ch);
+        $json = is_string($body) ? json_decode($body, true) : null;
+        foreach (is_array($json['posts'] ?? null) ? $json['posts'] : [] as $post) {
+            if (!is_array($post)) {
+                continue;
+            }
+            $uri = trim((string) ($post['uri'] ?? ''));
+            if ($uri === '' || !isset($byUri[$uri])) {
+                continue;
+            }
+            $post['viewer'] = is_array($post['viewer'] ?? null) ? $post['viewer'] : [];
+            $post['viewer']['like'] = (string) ($byUri[$uri]['like_uri'] ?? '');
+            $encoded = json_encode(['post' => $post], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (!is_string($encoded)) {
+                continue;
+            }
+            $items[] = [$uri, $byUri[$uri]['created'], $encoded];
+        }
+    }
+
+    if ($uris !== [] && $items === []) {
+        return ['ok' => false, 'error' => 'Could not hydrate Bluesky liked posts'];
+    }
+
+    try {
+        $db = ap_db();
+        $db->beginTransaction();
+        $up = $db->prepare(
+            'INSERT INTO bsky_favourite_cache (owner_user_id, favourite_uri, favourited_at, post_json, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (owner_user_id, favourite_uri) DO UPDATE SET
+               favourited_at = excluded.favourited_at,
+               post_json = excluded.post_json,
+               updated_at = excluded.updated_at'
+        );
+        foreach ($items as $item) {
+            $up->execute([$ownerUserId, $item[0], $item[1], $item[2], gmdate('c')]);
+        }
+        // Keep a bounded newest window.
+        $keep = max(50, min(200, $limit));
+        $db->prepare(
+            'DELETE FROM bsky_favourite_cache
+             WHERE owner_user_id = ?
+               AND favourite_uri NOT IN (
+                 SELECT favourite_uri FROM bsky_favourite_cache
+                 WHERE owner_user_id = ?
+                 ORDER BY favourited_at DESC
+                 LIMIT ?
+               )'
+        )->execute([$ownerUserId, $ownerUserId, $keep]);
+        $db->prepare(
+            'INSERT INTO bsky_favourite_sync_state (owner_user_id, checked_at, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT (owner_user_id) DO UPDATE SET checked_at = excluded.checked_at, updated_at = excluded.updated_at'
+        )->execute([$ownerUserId, gmdate('c'), gmdate('c')]);
+        $db->commit();
+    } catch (Throwable $e) {
+        try {
+            if (isset($db) && $db->inTransaction()) {
+                $db->rollBack();
+            }
+        } catch (Throwable $ignored) {
+        }
+        return ['ok' => false, 'error' => 'Could not store Bluesky favourites'];
+    }
+    return [
+        'ok' => true,
+        'favourites' => ap_bsky_favourite_cache_read($ownerUserId, $limit),
+        'added' => count($items),
+    ];
+}
+
 
 /**
  * Read the durable bookmark cache for page requests; queued workers refresh
@@ -5858,6 +6184,10 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                         : ['ok' => false, 'error' => 'List sync unavailable'];
                 } elseif ($kind === 'starter_packs') {
                     $result = ap_bsky_starter_packs_refresh_worker($owner);
+                } elseif ($kind === 'favourites' && function_exists('ap_bsky_get_favourites')) {
+                    $result = ap_bsky_get_favourites($owner, 200, true);
+                } elseif ($kind === 'favourites') {
+                    $result = ['ok' => false, 'error' => 'Favourites sync unavailable'];
                 } elseif ($kind === 'bookmarks' && function_exists('ap_bsky_get_bookmarks')) {
                     $result = ap_bsky_get_bookmarks($owner, 200, true);
                 } elseif ($kind === 'bookmarks') {
