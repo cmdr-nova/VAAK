@@ -500,6 +500,25 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] timeline indexes not provisioned: ' . $e->getMessage());
     }
+    // Personal interaction pages always constrain by owner before paging by
+    // recency.  The pgloader-created tables often retain only the old global
+    // created_at index, which forces a scan/sort and makes Favourites,
+    // Bookmarks, and Boosts feel disproportionately slow for larger accounts.
+    try {
+        $interactionIndexes = [
+            'idx_masto_favourites_owner_created' =>
+                'CREATE INDEX IF NOT EXISTS idx_masto_favourites_owner_created ON masto_favourites(owner_user_id, created_at DESC)',
+            'idx_masto_bookmarks_owner_created' =>
+                'CREATE INDEX IF NOT EXISTS idx_masto_bookmarks_owner_created ON masto_bookmarks(owner_user_id, created_at DESC)',
+            'idx_masto_reblogs_owner_created' =>
+                'CREATE INDEX IF NOT EXISTS idx_masto_reblogs_owner_created ON masto_reblogs(owner_user_id, created_at DESC)',
+        ];
+        foreach ($interactionIndexes as $sql) {
+            $db->exec($sql);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] interaction indexes not provisioned: ' . $e->getMessage());
+    }
     // Notification feeds filter by account and soft-delete state, then page by id.
     try {
         $hasNotifIndex = (bool) $db->query(
