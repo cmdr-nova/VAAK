@@ -513,7 +513,10 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_local_avatar_url($p['icon_url'] ?? null)
         : ((string) ($p['icon_url'] ?? '') ?: '/img/avatar/local-default.webp');
     echo '<img class="av" src="' . htmlspecialchars($avUrl, ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
-    echo '<div><h1>' . $name . '</h1>';
+    $automatedBadge = !empty($p['automated'])
+        ? ' <span class="automated-flare" title="Automated account">Automated</span>'
+        : '';
+    echo '<div><h1>' . $name . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@' . $safe . '@mkultra.monster</p>';
     $slLink = function_exists('ap_sl_link_for_actor_key') ? ap_sl_link_for_actor_key($actorKey) : null;
     if (is_array($slLink) && !empty($slLink['sl_username'])) {
@@ -1049,6 +1052,7 @@ function ap_user_html_shell_start(string $title): void
       .posts{margin-top:1.25rem;border-top:1px solid #2a2a2a;padding-top:.5rem}
       .profile-pager{display:flex;justify-content:center;align-items:center;gap:.8rem;margin:1rem 0;color:#999;font-size:.85rem}.profile-pager a{color:#7ee0ff;text-decoration:none}
       .profile-top-btn{position:fixed;right:1.25rem;bottom:1.25rem;z-index:20;border:1px solid #333;border-radius:999px;background:#161616;color:#8bf;width:2.8rem;height:2.8rem;font-size:1.2rem;cursor:pointer;box-shadow:0 5px 18px #0008}.profile-top-btn:hover{border-color:#8bf}
+      .automated-flare{display:inline-block;margin-left:.45rem;padding:.15rem .5rem;border:1px solid var(--primary,#53e68b);border-radius:999px;color:var(--primary,#53e68b);font-size:.58em;font-weight:600;vertical-align:middle}
       .post{padding:.9rem 0;border-bottom:1px solid #222}
       .note-body p{margin:.4rem 0}.cw{color:#f0c674;font-size:.9rem}
       .reply-line{font-size:.8rem;color:#8ab;margin:0 0 .45rem}

@@ -1462,6 +1462,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'anti_ai_marker' => false,
                 'auto_unblur_sensitive' => !empty($_POST['auto_unblur_sensitive']),
                 'auto_delete_posts_7d' => !empty($_POST['auto_delete_posts_7d']),
+                'automated' => !empty($_POST['automated']),
                 'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
                 'quote_policy' => (string) ($_POST['quote_policy'] ?? 'anyone'),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
@@ -17197,6 +17198,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <label><input type="checkbox" name="auto_follow_back" value="1" <?= !empty($profile['auto_follow_back']) ? 'checked' : '' ?>> Automatically follow back new followers</label>
             <label><input type="checkbox" name="auto_unblur_sensitive" value="1" <?= !empty($profile['auto_unblur_sensitive']) ? 'checked' : '' ?>> Automatically show sensitive media</label>
             <label><input type="checkbox" name="auto_delete_posts_7d" value="1" <?= !empty($profile['auto_delete_posts_7d']) ? 'checked' : '' ?>> Automatically delete my posts older than 7 days</label>
+            <label><input type="checkbox" name="automated" value="1" <?= !empty($profile['automated']) ? 'checked' : '' ?>> Mark this account as automated</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
             <label><input type="checkbox" name="vanity_verified" value="1" <?= !empty($profile['vanity_verified']) ? 'checked' : '' ?>> Vanity verified checkmark <span class="vanity-verified" aria-hidden="true">✓</span></label>
           </div>
@@ -17216,6 +17218,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Post retention</b> —
             when enabled, VAAK permanently deletes this account’s local posts after 7 days and sends ActivityPub <code>Delete</code> activities. Off by default; remote posts and other users are never affected.
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Automated account</b> —
+            show an automated-account indicator on your public profile and to compatible remote clients.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Vanity verified</b> —

@@ -967,6 +967,7 @@ function ap_cmdr_shell_start(string $title): void
       .pager .pager-btn.is-current{background:#8bf;border-color:#8bf;color:#061018;font-weight:700}
       .pager .pager-status{width:100%;text-align:center;font-size:.78rem;color:#888;margin-bottom:.15rem;letter-spacing:.02em}
       .profile-top-btn{position:fixed;right:1.25rem;bottom:1.25rem;z-index:20;border:1px solid #333;border-radius:999px;background:#161616;color:#8bf;width:2.8rem;height:2.8rem;font-size:1.2rem;cursor:pointer;box-shadow:0 5px 18px #0008}.profile-top-btn:hover{border-color:#8bf}
+      .automated-flare{display:inline-block;margin-left:.45rem;padding:.15rem .5rem;border:1px solid var(--primary,#53e68b);border-radius:999px;color:var(--primary,#53e68b);font-size:.58em;font-weight:600;vertical-align:middle}
       .follow-wrap{margin-top:1.1rem}
       .btn-follow,.btn-reply{appearance:none;border:0;border-radius:999px;padding:.55rem 1.15rem;font:inherit;font-weight:600;cursor:pointer}
       .btn-follow{background:#8bf;color:#061018}
@@ -1349,7 +1350,10 @@ function ap_cmdr_note_html(array $row, array $create): void
     ap_cmdr_shell_start('Post · @cmdr_nova@mkultra.monster');
     echo '<div class="row" style="margin-bottom:1rem">';
     echo '<img class="av" src="' . $avatar . '" alt="" width="72" height="72" referrerpolicy="no-referrer">';
-    echo '<div><h1 style="font-size:1.1rem">' . $name . $vanityBadge . '</h1>';
+    $automatedBadge = !empty($p['automated'])
+        ? ' <span class="automated-flare" title="Automated account">Automated</span>'
+        : '';
+    echo '<div><h1 style="font-size:1.1rem">' . $name . $vanityBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0"><a href="/users/cmdr_nova">@cmdr_nova@mkultra.monster</a></p></div></div>';
     if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
         $rSnippet = ap_cmdr_object_snippet($replyTo, 140);
@@ -1647,7 +1651,10 @@ function ap_cmdr_html(): void
     if (!empty($p['icon_url'])) {
         echo '<img class="av" src="' . htmlspecialchars($p['icon_url'], ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
     }
-    echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . '</h1>';
+    $automatedBadge = !empty($p['automated'])
+        ? ' <span class="automated-flare" title="Automated account">Automated</span>'
+        : '';
+    echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@cmdr_nova@mkultra.monster</p>';
     $profileBadges = function_exists('ap_profile_normalize_badges')
         ? ap_profile_normalize_badges($p['profile_badges'] ?? [])

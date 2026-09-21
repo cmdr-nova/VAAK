@@ -527,6 +527,14 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] retention profile column not provisioned: ' . $e->getMessage());
     }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'automated'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN automated INTEGER NOT NULL DEFAULT 0');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] automated profile column not provisioned: ' . $e->getMessage());
+    }
     foreach (['reply_policy', 'quote_policy'] as $policyColumn) {
         try {
             $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = '{$policyColumn}'")->fetchColumn();
@@ -738,6 +746,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     manually_approves INTEGER NOT NULL DEFAULT 0,
     discoverable INTEGER NOT NULL DEFAULT 1,
     auto_unblur_sensitive INTEGER NOT NULL DEFAULT 0,
+    automated INTEGER NOT NULL DEFAULT 0,
     reply_policy TEXT NOT NULL DEFAULT 'anyone',
     quote_policy TEXT NOT NULL DEFAULT 'anyone',
     forum_signature TEXT NOT NULL DEFAULT '',
@@ -783,6 +792,9 @@ SQL);
     }
     if (!in_array('auto_delete_posts_7d', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN auto_delete_posts_7d INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('automated', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN automated INTEGER NOT NULL DEFAULT 0');
     }
     if (!in_array('reply_policy', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN reply_policy TEXT NOT NULL DEFAULT 'anyone'");
@@ -2246,6 +2258,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'anti_ai_marker' => false,
         'auto_unblur_sensitive' => false,
         'auto_delete_posts_7d' => false,
+        'automated' => false,
         'reply_policy' => 'anyone',
         'quote_policy' => 'anyone',
         'forum_signature' => '',
@@ -2364,6 +2377,9 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'auto_delete_posts_7d' => array_key_exists('auto_delete_posts_7d', $row)
             ? !empty($row['auto_delete_posts_7d'])
             : false,
+        'automated' => array_key_exists('automated', $row)
+            ? !empty($row['automated'])
+            : false,
         'reply_policy' => in_array((string) ($row['reply_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['reply_policy'] : 'anyone',
         'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
         'forum_signature' => trim((string) ($row['forum_signature'] ?? '')),
@@ -2450,7 +2466,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2589,6 +2605,9 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $autoDeletePosts7d = array_key_exists('auto_delete_posts_7d', $fields)
         ? (!empty($fields['auto_delete_posts_7d']) ? 1 : 0)
         : (!empty($existingProfile['auto_delete_posts_7d']) ? 1 : 0);
+    $automated = array_key_exists('automated', $fields)
+        ? (!empty($fields['automated']) ? 1 : 0)
+        : (!empty($existingProfile['automated']) ? 1 : 0);
     $replyPolicy = in_array((string) ($fields['reply_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
         ? (string) $fields['reply_policy'] : (string) ($existingProfile['reply_policy'] ?? 'anyone');
     $quotePolicy = in_array((string) ($fields['quote_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
@@ -2598,8 +2617,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, reply_policy, quote_policy, forum_signature, profile_badges, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2615,6 +2634,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            anti_ai_marker = excluded.anti_ai_marker,
            auto_unblur_sensitive = excluded.auto_unblur_sensitive,
            auto_delete_posts_7d = excluded.auto_delete_posts_7d,
+           automated = excluded.automated,
            reply_policy = excluded.reply_policy,
            quote_policy = excluded.quote_policy,
            forum_signature = excluded.forum_signature,
@@ -2637,6 +2657,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $antiAiMarker,
         $autoUnblurSensitive,
         $autoDeletePosts7d,
+        $automated,
         $replyPolicy,
         $quotePolicy,
         $forumSignature,
@@ -3375,6 +3396,7 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     }
     $ctxExtra = [
         'discoverable' => 'https://joinmastodon.org/ns#discoverable',
+        'bot' => 'https://joinmastodon.org/ns#bot',
         'featured' => [
             '@id' => 'http://joinmastodon.org/ns#featured',
             '@type' => '@id',
@@ -3432,6 +3454,10 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
         'manuallyApprovesFollowers' => (bool) $p['manually_approves'],
         'discoverable' => (bool) $p['discoverable'],
         'indexable' => !empty($p['indexable']),
+        // Mastodon-compatible machine-readable marker for automated accounts.
+        'bot' => !empty($p['automated']),
+        // Keep an explicit VAAK property for clients that expose richer profile metadata.
+        'automated' => !empty($p['automated']),
         'interactionPolicy' => [
             'canFeature' => !empty($p['collection_consent'])
                 ? [
