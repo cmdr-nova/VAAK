@@ -3456,8 +3456,6 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
         'indexable' => !empty($p['indexable']),
         // Mastodon-compatible machine-readable marker for automated accounts.
         'bot' => !empty($p['automated']),
-        // Keep an explicit VAAK property for clients that expose richer profile metadata.
-        'automated' => !empty($p['automated']),
         'interactionPolicy' => [
             'canFeature' => !empty($p['collection_consent'])
                 ? [
