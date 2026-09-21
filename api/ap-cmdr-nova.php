@@ -1812,7 +1812,10 @@ function ap_cmdr_html(): void
     echo '</nav>';
 
     if ($tab === 'blog') {
-        echo '<section class="posts profile-blog" aria-label="Blog">';
+        $blogInfiniteAttrs = !$blogPost
+            ? ' id="profile-posts" class="posts profile-blog profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) max(1, (int) ceil($counts['blog'] / $perPage)) . '" data-profile-tab="blog"'
+            : ' class="posts profile-blog"';
+        echo '<section' . $blogInfiniteAttrs . ' aria-label="Blog">';
         if ($blogPost) {
             echo '<article class="profile-blog-post">';
             echo '<div class="muted">' . htmlspecialchars((string) ($blogPost['category'] ?? 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
@@ -1839,15 +1842,14 @@ function ap_cmdr_html(): void
                 echo '<p class="muted">' . htmlspecialchars((string) ($bp['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . ' · <a href="/users/cmdr_nova?tab=blog&amp;post=' . htmlspecialchars($slugSafe, ENT_QUOTES, 'UTF-8') . '">Read article</a></p>';
                 echo '</article>';
             }
-            $blogTotal = (int) $counts['blog'];
-            $totalPages = max(1, (int) ceil($blogTotal / $perPage));
-            if ($totalPages > 1) {
-                echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, ['tab' => 'blog']);
+            if ((int) $counts['blog'] > $page * $perPage) {
+                echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
             }
         }
         echo '</section>';
     } elseif ($tab === 'media') {
-        echo '<section class="posts profile-media-gallery" aria-label="Media">';
+        $mediaTotalPages = max(1, (int) ceil($tabTotal / $perPage));
+        echo '<section id="profile-posts" class="posts profile-media-gallery profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $mediaTotalPages . '" data-profile-tab="media" aria-label="Media">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Media</h2>';
         if (!$postsData['rows']) {
             echo '<p class="muted">No public media posts yet.</p>';
@@ -1855,9 +1857,8 @@ function ap_cmdr_html(): void
             foreach ($postsData['rows'] as $mediaRow) {
                 echo ap_cmdr_profile_media_item_html($mediaRow);
             }
-            $totalPages = max(1, (int) ceil($tabTotal / $perPage));
-            if ($totalPages > 1) {
-                echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, ['tab' => 'media']);
+            if ($mediaTotalPages > $page) {
+                echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
             }
         }
         echo '</section>';
@@ -1880,9 +1881,7 @@ function ap_cmdr_html(): void
             default => 'No public posts yet.',
         };
         $profileTotalPages = max(1, (int) ceil($tabTotal / $perPage));
-        $profileInfiniteAttrs = in_array($tab, ['posts', 'replies', 'boosts'], true)
-            ? ' id="profile-posts" class="posts profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $profileTotalPages . '" data-profile-tab="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '"'
-            : ' class="posts"';
+        $profileInfiniteAttrs = ' id="profile-posts" class="posts profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $profileTotalPages . '" data-profile-tab="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '"';
         echo '<section' . $profileInfiniteAttrs . ' aria-label="' . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">'
             . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '</h2>';
@@ -1892,13 +1891,8 @@ function ap_cmdr_html(): void
             foreach ($postsData['rows'] as $n) {
                 echo ap_cmdr_post_preview_html($n);
             }
-            $totalPages = $profileTotalPages;
-            if ($totalPages > 1 && !in_array($tab, ['posts', 'replies', 'boosts'], true)) {
-                $extra = $tab === 'posts' ? [] : ['tab' => $tab];
-                echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, $extra);
-            }
         }
-        if ($profileTotalPages > $page && in_array($tab, ['posts', 'replies', 'boosts'], true)) {
+        if ($profileTotalPages > $page) {
             echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
         }
         echo '</section>';
@@ -1906,7 +1900,7 @@ function ap_cmdr_html(): void
 
     echo '<p class="back"><a href="https://mkultra.monster/">← mkultra.monster</a> · <a href="/users/cmdr_nova/outbox">outbox</a></p>';
     echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
-    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;const s=n.querySelector(".profile-infinite-sentinel");Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages&&s){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);const sync=()=>{if(top)top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});if(top)top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();}());</script>';
+    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode(CMDR_ACTOR_ID) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';

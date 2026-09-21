@@ -670,7 +670,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '</nav>';
 
     if ($tab === 'media') {
-        echo '<section class="posts profile-media-gallery" aria-label="Media">';
+        echo '<section id="profile-posts" class="posts profile-media-gallery profile-infinite" aria-label="Media" data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '" data-profile-tab="media">';
         if (!$mediaNotes) {
             echo '<p class="muted">No public media posts yet.</p>';
         } else {
@@ -687,17 +687,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                 echo '</article>';
             }
         }
-        $pageCount = max(1, (int) ceil(max(1, $profileTotal) / $profilePerPage));
-        if ($pageCount > 1) {
-            echo '<nav class="profile-pager" aria-label="Profile pages">';
-            if ($profilePage > 1) {
-                echo '<a href="/users/' . $safe . ($profilePage - 1 > 1 ? '?page=' . ($profilePage - 1) : '') . '">← Newer</a>';
-            }
-            echo '<span>Page ' . $profilePage . ' of ' . $pageCount . '</span>';
-            if ($profilePage < $pageCount) {
-                echo '<a href="/users/' . $safe . '?page=' . ($profilePage + 1) . '">Older →</a>';
-            }
-            echo '</nav><p class="back"><a href="#profile-top">↑ Back to top</a></p>';
+        if ($profilePageCount > $profilePage) {
+            echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
         }
         echo '</section>';
     } elseif ($tab === 'featured') {
@@ -734,7 +725,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
 
     echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
-    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("profile-pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);const sync=()=>{if(top)top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});if(top)top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();}());</script>';
+    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("profile-pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode($actorId, JSON_UNESCAPED_SLASHES) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';
