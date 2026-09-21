@@ -5287,26 +5287,61 @@ function admin_tl_hydrate(array $slice): array
     }
     $boostById = [];
     if ($boostIds !== []) {
-        foreach (array_unique($boostIds) as $sid) {
-            $rb = function_exists('ap_masto_reblog_row_by_status')
-                ? ap_masto_reblog_row_by_status((string) $sid)
-                : null;
-            // Local timeline may include other locals' boosts — fall back to any owner.
-            if (!is_array($rb)) {
-                try {
-                    $st = ap_db()->prepare(
-                        'SELECT * FROM masto_reblogs WHERE status_id = ? OR boost_status_id = ? ORDER BY id DESC LIMIT 1'
-                    );
-                    $st->execute([(string) $sid, (string) $sid]);
-                    $found = $st->fetch();
-                    $rb = is_array($found) ? $found : null;
-                } catch (Throwable $e) {
-                    $rb = null;
+        // Hydrate all boost rows in at most two queries instead of one query
+        // per card. Prefer the logged-in owner's row, then fall back to local
+        // peers' boosts for the Local timeline.
+        $uniqueBoostIds = array_values(array_unique(array_map('strval', $boostIds)));
+        try {
+            $ph = implode(',', array_fill(0, count($uniqueBoostIds), '?'));
+            $ownerId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : ap_db_default_owner_user_id();
+            $bind = array_merge([$ownerId], $uniqueBoostIds, $uniqueBoostIds);
+            $st = ap_db()->prepare("SELECT * FROM masto_reblogs WHERE owner_user_id = ? AND (status_id IN ($ph) OR boost_status_id IN ($ph)) ORDER BY id DESC");
+            $st->execute($bind);
+            foreach ($st->fetchAll() ?: [] as $rb) {
+                if (!is_array($rb)) continue;
+                foreach ([(string) ($rb['status_id'] ?? ''), (string) ($rb['boost_status_id'] ?? '')] as $key) {
+                    if ($key !== '' && in_array($key, $uniqueBoostIds, true) && !isset($boostById[$key])) $boostById[$key] = $rb;
                 }
             }
-            if (is_array($rb)) {
-                $boostById[(string) $sid] = $rb;
+            $missing = array_values(array_filter($uniqueBoostIds, static fn(string $id): bool => !isset($boostById[$id])));
+            if ($missing !== []) {
+                $mph = implode(',', array_fill(0, count($missing), '?'));
+                $bind = array_merge($missing, $missing);
+                $st = ap_db()->prepare("SELECT * FROM masto_reblogs WHERE status_id IN ($mph) OR boost_status_id IN ($mph) ORDER BY id DESC");
+                $st->execute($bind);
+                foreach ($st->fetchAll() ?: [] as $rb) {
+                    if (!is_array($rb)) continue;
+                    foreach ([(string) ($rb['status_id'] ?? ''), (string) ($rb['boost_status_id'] ?? '')] as $key) {
+                        if ($key !== '' && in_array($key, $missing, true) && !isset($boostById[$key])) $boostById[$key] = $rb;
+                    }
+                }
             }
+        } catch (Throwable $e) {
+            // Leave boost rows empty; the card renderer can still show the post.
+        }
+    }
+    // Prime the request-local remote actor memo once for the whole window so
+    // avatar/handle/hover rendering does not issue one SELECT per card.
+    if (function_exists('ap_remote_actors_prefetch')) {
+        $actorIds = [];
+        foreach ($eventsById as $row) {
+            $actor = trim((string) ($row['actor_id'] ?? ''));
+            if ($actor !== '') $actorIds[] = $actor;
+        }
+        foreach ($outboxById as $row) {
+            $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+            $actor = is_array($raw) ? trim((string) ($raw['actor'] ?? '')) : '';
+            if ($actor !== '') $actorIds[] = $actor;
+        }
+        foreach ($boostById as $row) {
+            foreach (['owner_actor_id', 'target_actor'] as $field) {
+                $actor = trim((string) ($row[$field] ?? ''));
+                if ($actor !== '') $actorIds[] = $actor;
+            }
+        }
+        ap_remote_actors_prefetch($actorIds);
+        if (function_exists('ap_remote_media_prefetch')) {
+            ap_remote_media_prefetch($actorIds, 'avatar');
         }
     }
     foreach ($slice as $entry) {
@@ -6368,6 +6403,11 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
     }
     foreach ($localNotes as $n) {
         if (!is_array($n)) {
+            continue;
+        }
+        if (admin_outbox_is_bsky_import($n)) {
+            // Historical Bluesky imports belong in Your Posts/profile views,
+            // but must not be reintroduced into the instance Local timeline.
             continue;
         }
         $outItem = [
@@ -8620,6 +8660,15 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
         $html .= '</a>';
     }
     return $html !== '' ? $html : '<div class="empty">No direct messages yet.</div>';
+}
+
+/** Bluesky-native history imported for Your Posts, but not a local-federation post. */
+function admin_outbox_is_bsky_import(array $row): bool
+{
+    $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+    return is_array($raw)
+        && is_array($raw['object'] ?? null)
+        && (($raw['object']['vaakOrigin'] ?? '') === 'bluesky');
 }
 
 /** Viewer preference: highlight anti-AI posters. Removed from the UI. */
@@ -16129,18 +16178,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <button class="btn btn-primary" type="submit">Reply</button>
             </div>
           </form>
-          <script>
+            <script>
           (function () {
             function focusLatestDm() {
-              const feed = document.querySelector('.feed');
               const thread = document.getElementById('dm-thread');
-              if (!feed || !thread) return;
+              if (!thread) return;
+              // The DM thread, not the page feed, owns the overflow scroll.
+              // Scrolling .feed left fullscreen conversations at the oldest
+              // message because .feed is not the active scroll container here.
               const last = document.getElementById('dm-message-last');
-              const feedRect = feed.getBoundingClientRect();
-              const targetRect = (last || thread).getBoundingClientRect();
-              const target = feed.scrollTop + targetRect.bottom - feedRect.bottom + 24;
-              const maxTop = Math.max(0, feed.scrollHeight - feed.clientHeight);
-              feed.scrollTop = Math.min(maxTop, Math.max(0, target));
+              thread.scrollTop = last
+                ? Math.max(0, last.offsetTop - Math.max(0, thread.clientHeight - last.offsetHeight - 24))
+                : thread.scrollHeight;
             }
             requestAnimationFrame(function () {
               requestAnimationFrame(focusLatestDm);
@@ -26093,15 +26142,13 @@ if (VIEW === 'analytics') loadAnalytics();
     let destination;
     try { destination = new URL(href, window.location.href); } catch (e) { return; }
     if (destination.origin !== window.location.origin) return;
-    window.setTimeout(() => {
-      if (!ev.defaultPrevented) window.vaakShowLoading('Loading…');
-    }, 0);
+    // Show synchronously so the spinner is visible even when navigation starts
+    // before the browser gets a chance to run a zero-delay timer.
+    if (!ev.defaultPrevented) window.vaakShowLoading('Loading…');
   }, true);
   document.addEventListener('submit', function (ev) {
     if (ev.defaultPrevented) return;
-    window.setTimeout(() => {
-      if (!ev.defaultPrevented) window.vaakShowLoading('Saving…');
-    }, 0);
+    if (!ev.defaultPrevented) window.vaakShowLoading('Saving…');
   }, true);
   window.addEventListener('pageshow', window.vaakHideLoading);
   document.addEventListener('click', function (event) {

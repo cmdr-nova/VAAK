@@ -10529,6 +10529,12 @@ function ap_dm_thread(string $peerActorId, int $limit = 100, ?int $ownerUserId =
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     $peer = ap_dm_peer_key($peerActorId);
     $limit = max(1, min(200, $limit));
+    // A personal block applies to the entire DM surface, not only the
+    // conversation list. Do this before loading thread rows so a direct URL
+    // cannot reveal messages from a blocked peer.
+    if ($peer !== '' && ap_is_blocked_actor($peer)) {
+        return [];
+    }
     $st = ap_db()->prepare(
         'SELECT * FROM direct_messages
          WHERE owner_user_id = ? AND deleted_at IS NULL AND peer_actor_id = ?
@@ -11390,10 +11396,53 @@ function ap_remote_media_get(string $actorId, string $kind): ?array
 {
     $actorId = rtrim(trim($actorId), '/');
     $kind = $kind === 'header' ? 'header' : 'avatar';
+    if (!isset($GLOBALS['ap_remote_media_memo']) || !is_array($GLOBALS['ap_remote_media_memo'])) {
+        $GLOBALS['ap_remote_media_memo'] = [];
+    }
+    $memoKey = $actorId . '|' . $kind;
+    if (array_key_exists($memoKey, $GLOBALS['ap_remote_media_memo'])) {
+        return $GLOBALS['ap_remote_media_memo'][$memoKey];
+    }
     $st = ap_db()->prepare('SELECT * FROM remote_media_cache WHERE actor_id = ? AND kind = ?');
     $st->execute([$actorId, $kind]);
     $row = $st->fetch();
-    return is_array($row) ? $row : null;
+    $GLOBALS['ap_remote_media_memo'][$memoKey] = is_array($row) ? $row : null;
+    return $GLOBALS['ap_remote_media_memo'][$memoKey];
+}
+
+/** Batch-load cached remote media for a timeline window. */
+function ap_remote_media_prefetch(array $actorIds, string $kind = 'avatar'): void
+{
+    $kind = $kind === 'header' ? 'header' : 'avatar';
+    $ids = [];
+    foreach ($actorIds as $actorId) {
+        $actorId = rtrim(trim((string) $actorId), '/');
+        if ($actorId !== '' && str_starts_with($actorId, 'https://')) $ids[$actorId] = true;
+    }
+    if ($ids === []) return;
+    if (!isset($GLOBALS['ap_remote_media_memo']) || !is_array($GLOBALS['ap_remote_media_memo'])) {
+        $GLOBALS['ap_remote_media_memo'] = [];
+    }
+    $missing = array_values(array_filter(array_keys($ids), static fn(string $id): bool => !array_key_exists($id . '|' . $kind, $GLOBALS['ap_remote_media_memo'])));
+    if ($missing === []) return;
+    try {
+        foreach (array_chunk($missing, 400) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $st = ap_db()->prepare("SELECT * FROM remote_media_cache WHERE kind = ? AND actor_id IN ($ph)");
+            $st->execute(array_merge([$kind], $chunk));
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) continue;
+                $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($id !== '') $GLOBALS['ap_remote_media_memo'][$id . '|' . $kind] = $row;
+            }
+        }
+        foreach ($missing as $id) {
+            $key = $id . '|' . $kind;
+            if (!array_key_exists($key, $GLOBALS['ap_remote_media_memo'])) $GLOBALS['ap_remote_media_memo'][$key] = null;
+        }
+    } catch (Throwable $e) {
+        // Keep per-actor fallback available if a legacy schema is mid-migrate.
+    }
 }
 
 function ap_remote_media_touch(string $actorId, string $kind): void
