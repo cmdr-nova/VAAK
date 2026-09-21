@@ -23160,6 +23160,7 @@ window.apAdminToast = function (msg, isErr) {
       key = key.replace(/#(?:like|reblog|quote|update|bite)-[A-Za-z0-9_-]+$/, '').replace(/\/$/, '');
       return key;
     };
+    const nodeKey = (el) => 'node:' + ((el && el.textContent) || '').slice(0, 64);
     items.querySelectorAll('a[href*="object="], a.gallery-cell').forEach((a) => {
       const href = a.getAttribute('href') || '';
       const m = href.match(/[?&]object=([^&]+)/);
@@ -23172,7 +23173,11 @@ window.apAdminToast = function (msg, isErr) {
     items.querySelectorAll('article.tweet').forEach((el, i) => {
       const pendingId = el.getAttribute('data-pending-queue-id') || '';
       if (pendingId) keys['pending:' + pendingId] = true;
-      keys['node:' + (el.id || i) + ':' + (el.textContent || '').slice(0, 40)] = true;
+      // Poll fragments do not preserve DOM ids, so an id/index-based key
+      // makes an already-rendered head post look new after polling. Keep the
+      // fallback identical to filterNewHtml's key for cards without object
+      // links (notably local/own posts).
+      keys[nodeKey(el)] = true;
     });
     return keys;
   }
@@ -23201,9 +23206,7 @@ window.apAdminToast = function (msg, isErr) {
         const bskyUri = el.getAttribute('data-bsky-uri') || '';
         if (bskyUri) key = 'bsky:' + bskyUri;
       }
-      if (!key) {
-        key = 'node:' + (el.textContent || '').slice(0, 64);
-      }
+      if (!key) key = nodeKey(el);
       if (known[key]) return;
       known[key] = true;
       keep.push(el);
