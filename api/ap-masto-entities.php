@@ -7531,7 +7531,9 @@ function ap_masto_trends_cache_info(string $kind): array
         $dir = sys_get_temp_dir();
     }
     return [
-        'path' => rtrim($dir, '/') . '/mkultra-ap-trends-' . $kind . '.json',
+        // v2 invalidates pre-Bluesky trend files after the schema/input mix
+        // changes, while preserving stale-while-revalidate behavior.
+        'path' => rtrim($dir, '/') . '/mkultra-ap-trends-v2-' . $kind . '.json',
         'ttl' => AP_MASTO_TRENDS_CACHE_TTL,
     ];
 }
@@ -7648,6 +7650,91 @@ function ap_masto_trends_cache_mtime(string $kind): int
     return is_file($path) ? (int) filemtime($path) : 0;
 }
 
+/** Return true when a trend contributor is hidden for this viewer. Cache data
+ * is shared, so this check intentionally runs only while rendering a user's
+ * sidebar and never triggers a remote fetch. */
+function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId): bool
+{
+    if ($ownerUserId < 1 || $actor === '') {
+        return false;
+    }
+    $actor = rtrim(trim($actor), '/');
+    if (str_starts_with($actor, 'did:')) {
+        static $bskyHidden = [];
+        $cacheKey = $ownerUserId . ':' . $actor;
+        if (!array_key_exists($cacheKey, $bskyHidden)) {
+            $bskyHidden[$cacheKey] = function_exists('ap_bsky_hide_did_reasons')
+                && ap_bsky_hide_did_reasons($ownerUserId, $actor) !== [];
+        }
+        if ($bskyHidden[$cacheKey]) {
+            return true;
+        }
+        return false;
+    }
+    $host = parse_url($actor, PHP_URL_HOST);
+    $host = is_string($host) ? strtolower($host) : null;
+    if (function_exists('ap_user_is_blocked') && ap_user_is_blocked($actor, $host, $ownerUserId)) {
+        return true;
+    }
+    if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, $ownerUserId)) {
+        return true;
+    }
+    if (function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($actor, $ownerUserId)) {
+        return true;
+    }
+    return function_exists('ap_row_is_hidden') && ap_row_is_hidden($actor, $host, $ownerUserId);
+}
+
+/** @return list<string> */
+function ap_masto_trend_item_actors(array $item): array
+{
+    $actors = [];
+    foreach ((array) ($item['trend_actors'] ?? []) as $actor) {
+        if (is_string($actor) && trim($actor) !== '') {
+            $actors[] = rtrim(trim($actor), '/');
+        }
+    }
+    if (is_array($item['account'] ?? null)) {
+        foreach (['id', 'url'] as $key) {
+            $v = trim((string) ($item['account'][$key] ?? ''));
+            if ($v !== '') {
+                $actors[] = rtrim($v, '/');
+            }
+        }
+    }
+    if (isset($item['author_did']) && is_string($item['author_did'])) {
+        $actors[] = trim($item['author_did']);
+    }
+    return array_values(array_unique(array_filter($actors)));
+}
+
+/** @param list<string> $actors */
+function ap_masto_trend_item_hidden(array $item, int $ownerUserId, array $actors = []): bool
+{
+    $actors = $actors !== [] ? $actors : ap_masto_trend_item_actors($item);
+    foreach ($actors as $actor) {
+        if (ap_masto_trend_actor_hidden((string) $actor, $ownerUserId)) {
+            return true;
+        }
+    }
+    if (function_exists('ap_muted_words_match')) {
+        $texts = [];
+        foreach (['name', 'title', 'url', 'content', 'description'] as $key) {
+            if (isset($item[$key]) && is_string($item[$key])) {
+                $texts[] = $item[$key];
+            }
+        }
+        if (is_array($item['account'] ?? null)) {
+            $texts[] = (string) ($item['account']['display_name'] ?? '');
+            $texts[] = (string) ($item['account']['acct'] ?? '');
+        }
+        if ($texts !== [] && ap_muted_words_match($ownerUserId, ...$texts) !== null) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * Trending hashtags mined from recent local + federated text (7-day window).
  * Powers /api/v1/trends/tags and the admin sidebar.
@@ -7719,6 +7806,25 @@ function ap_masto_trends_tags(int $limit = 10): array
     } catch (Throwable $e) {
         // ignore
     }
+    // Bluesky posts are already indexed by the feed workers. Read only that
+    // local cache here; never make AppView requests while rebuilding trends.
+    try {
+        if (function_exists('ap_bsky_posts_migrate')) {
+            ap_bsky_posts_migrate();
+        }
+        $st = ap_db()->prepare(
+            'SELECT text, published_at, author_did FROM bsky_posts
+             WHERE published_at >= ? AND text IS NOT NULL AND text <> \'\'
+             ORDER BY indexed_at DESC LIMIT 3000'
+        );
+        $st->execute([gmdate('c', $dayStart - (6 * 86400))]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $ts = strtotime((string) ($row['published_at'] ?? '')) ?: 0;
+            $ingest((string) ($row['text'] ?? ''), $ts, (string) ($row['author_did'] ?? ''));
+        }
+    } catch (Throwable $e) {
+        // Bluesky indexing is optional and must never break Fediverse trends.
+    }
     try {
         $since = gmdate('c', $dayStart - (6 * 86400));
         $st = ap_db()->prepare(
@@ -7783,7 +7889,15 @@ function ap_masto_trends_tags(int $limit = 10): array
                 'accounts' => (string) count($s['accounts'][$i]),
             ];
         }
-        $out[] = ap_masto_tag_entity((string) $name, $history);
+        $tagEntity = ap_masto_tag_entity((string) $name, $history);
+        $contributors = [];
+        foreach ($s['accounts'] as $dayAccounts) {
+            foreach (array_keys($dayAccounts) as $actor) {
+                $contributors[] = $actor;
+            }
+        }
+        $tagEntity['trend_actors'] = array_values(array_unique($contributors));
+        $out[] = $tagEntity;
         if (count($out) >= 30) {
             break;
         }
@@ -7971,6 +8085,23 @@ function ap_masto_trends_links(int $limit = 10): array
     } catch (Throwable $e) {
         // ignore
     }
+    try {
+        if (function_exists('ap_bsky_posts_migrate')) {
+            ap_bsky_posts_migrate();
+        }
+        $st = ap_db()->prepare(
+            'SELECT text, published_at, author_did FROM bsky_posts
+             WHERE published_at >= ? AND text IS NOT NULL AND text <> \'\'
+             ORDER BY indexed_at DESC LIMIT 3000'
+        );
+        $st->execute([gmdate('c', $dayStart - (6 * 86400))]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $ts = strtotime((string) ($row['published_at'] ?? '')) ?: 0;
+            $ingest((string) ($row['text'] ?? ''), $ts, (string) ($row['author_did'] ?? ''));
+        }
+    } catch (Throwable $e) {
+        // Bluesky indexing is optional.
+    }
 
     $scored = [];
     foreach ($stats as $url => $s) {
@@ -8014,7 +8145,15 @@ function ap_masto_trends_links(int $limit = 10): array
         if ($allowFetch) {
             $fetchBudget--;
         }
-        $out[] = ap_masto_trends_link_entity((string) $url, $history, $allowFetch);
+        $linkEntity = ap_masto_trends_link_entity((string) $url, $history, $allowFetch);
+        $contributors = [];
+        foreach ($s['accounts'] as $dayAccounts) {
+            foreach (array_keys($dayAccounts) as $actor) {
+                $contributors[] = $actor;
+            }
+        }
+        $linkEntity['trend_actors'] = array_values(array_unique($contributors));
+        $out[] = $linkEntity;
         if (count($out) >= 20) {
             break;
         }
@@ -8052,6 +8191,46 @@ function ap_masto_trends_is_status_object_url(string $objectId): bool
         return false;
     }
     return false;
+}
+
+/** Convert an indexed Bluesky post into the small Mastodon Status shape used
+ * by Explore. The raw post is already cached, so this is deliberately local. */
+function ap_masto_bsky_trend_status(array $post): ?array
+{
+    $uri = trim((string) ($post['uri'] ?? ''));
+    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+    $did = trim((string) ($author['did'] ?? ''));
+    if ($uri === '' || $did === '' || !function_exists('ap_bsky_https_url_from_at_uri')) {
+        return null;
+    }
+    $handle = trim((string) ($author['handle'] ?? ''));
+    $url = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
+    $text = trim((string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? '')));
+    return [
+        'id' => $uri,
+        'url' => $url,
+        'uri' => $uri,
+        'content' => nl2br(htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false),
+        'created_at' => (string) (($post['record']['createdAt'] ?? '') ?: ($post['indexedAt'] ?? gmdate('c'))),
+        'visibility' => 'public',
+        'language' => 'en',
+        'account' => [
+            'id' => $did,
+            'url' => function_exists('ap_bsky_actor_profile_url')
+                ? ap_bsky_actor_profile_url($handle !== '' ? $handle : $did)
+                : 'https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did),
+            'username' => $handle !== '' ? $handle : $did,
+            'acct' => $handle !== '' ? $handle : $did,
+            'display_name' => (string) ($author['displayName'] ?? $handle ?: $did),
+            'avatar' => (string) ($author['avatar'] ?? ''),
+        ],
+        'reblogs_count' => (int) ($post['repostCount'] ?? 0),
+        'favourites_count' => (int) ($post['likeCount'] ?? 0),
+        'replies_count' => (int) ($post['replyCount'] ?? 0),
+        'source' => 'bluesky',
+        'author_did' => $did,
+        'trend_actors' => [$did],
+    ];
 }
 
 /**
@@ -8250,6 +8429,37 @@ function ap_masto_trends_statuses(int $limit = 10): array
         } catch (Throwable $e) {
             // ignore
         }
+    }
+
+    // Add cached Bluesky posts to Explore. This reads only bsky_posts; the
+    // feed/AppView workers are responsible for warming that table separately.
+    try {
+        if (function_exists('ap_bsky_posts_migrate')) {
+            ap_bsky_posts_migrate();
+        }
+        $st = ap_db()->prepare(
+            'SELECT raw_json FROM bsky_posts
+             WHERE published_at >= ? AND raw_json IS NOT NULL AND raw_json <> \'\'
+             ORDER BY (COALESCE(like_count, 0) + COALESCE(repost_count, 0) * 2 + COALESCE(reply_count, 0) * 2 + COALESCE(quote_count, 0) * 2) DESC,
+                      indexed_at DESC LIMIT 120'
+        );
+        $st->execute([$since]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            if (count($out) >= 20) {
+                break;
+            }
+            $raw = json_decode((string) ($row['raw_json'] ?? ''), true);
+            if (!is_array($raw)) {
+                continue;
+            }
+            $status = ap_masto_bsky_trend_status($raw);
+            if ($status === null) {
+                continue;
+            }
+            $takeStatus($status);
+        }
+    } catch (Throwable $e) {
+        // Optional Bluesky cache must never affect Fediverse trends.
     }
 
     ap_masto_trends_cache_set('statuses', $out);
