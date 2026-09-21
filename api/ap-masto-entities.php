@@ -9495,6 +9495,39 @@ function ap_masto_search_statuses(string $q, int $limit): array
     }
     if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
         $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName);
+        // Hydrate FTS hits in three bounded set-based queries.  The previous
+        // loop performed one database round-trip per hit, so a trending tag
+        // could briefly exhaust the PHP-FPM pool while rendering search.
+        $hitIds = ['status' => [], 'mention' => [], 'event' => []];
+        foreach ($hits as $hit) {
+            $source = (string) ($hit['source'] ?? '');
+            $pk = (int) ($hit['source_pk'] ?? 0);
+            if ($pk > 0 && isset($hitIds[$source])) $hitIds[$source][$pk] = true;
+        }
+        $hydrated = ['status' => [], 'mention' => [], 'event' => []];
+        try {
+            foreach ($hitIds as $source => $idsMap) {
+                $ids = array_keys($idsMap);
+                if ($ids === []) continue;
+                foreach (array_chunk($ids, 120) as $chunk) {
+                    $ph = implode(',', array_fill(0, count($chunk), '?'));
+                    $sql = $source === 'status'
+                        ? "SELECT * FROM masto_statuses WHERE local_id IN ($ph)"
+                        : ($source === 'mention'
+                            ? "SELECT * FROM mentions WHERE id IN ($ph) AND deleted_at IS NULL"
+                            : "SELECT * FROM events WHERE id IN ($ph)");
+                    $st = ap_db()->prepare($sql);
+                    $st->execute($chunk);
+                    $key = $source === 'status' ? 'local_id' : 'id';
+                    foreach ($st->fetchAll() ?: [] as $row) {
+                        if (is_array($row)) $hydrated[$source][(int) ($row[$key] ?? 0)] = $row;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // Fall through with whatever source maps were hydrated; search is
+            // best-effort and the LIKE fallback remains available below.
+        }
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
@@ -9503,21 +9536,17 @@ function ap_masto_search_statuses(string $q, int $limit): array
             }
             try {
                 if ($source === 'status') {
-                    $row = ap_masto_status_by_local_id($pk);
+                    $row = $hydrated['status'][$pk] ?? null;
                     if (is_array($row)) {
                         $push(ap_masto_status_from_row($row));
                     }
                 } elseif ($source === 'mention') {
-                    $st = ap_db()->prepare('SELECT * FROM mentions WHERE id = ? AND deleted_at IS NULL');
-                    $st->execute([$pk]);
-                    $row = $st->fetch();
+                    $row = $hydrated['mention'][$pk] ?? null;
                     if (is_array($row)) {
                         $push(ap_masto_status_from_mention($row));
                     }
                 } elseif ($source === 'event') {
-                    $st = ap_db()->prepare('SELECT * FROM events WHERE id = ?');
-                    $st->execute([$pk]);
-                    $row = $st->fetch();
+                    $row = $hydrated['event'][$pk] ?? null;
                     if (is_array($row)) {
                         if ($tagName !== '') {
                             $sum = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
