@@ -255,6 +255,36 @@ SQL);
         error_log('[ap-db] notice tables not provisioned by runtime role: ' . $e->getMessage());
         }
     }
+    // Long-form VAAK blog posts. Keep the full Markdown body local; the
+    // federated outbox note is only a title/CW plus short excerpt and link.
+    try {
+        if (!isset($present['vaak_blog_posts'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS vaak_blog_posts (
+    id BIGSERIAL PRIMARY KEY,
+    owner_user_id BIGINT NOT NULL,
+    actor_key TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    body_markdown TEXT NOT NULL DEFAULT '',
+    excerpt TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'published',
+    note_id TEXT,
+    canonical_url TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_user_id, slug)
+)
+SQL);
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_vaak_blog_actor_published ON vaak_blog_posts(actor_key, status, published_at DESC, id DESC)');
+        }
+        $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS canonical_url TEXT NOT NULL DEFAULT ''");
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog table not provisioned: ' . $e->getMessage());
+    }
     // Additive notice-read cursor (may exist on older installs that already have ap_notices).
     try {
         if (!isset($present['ap_notice_reads'])) {
@@ -383,13 +413,13 @@ SQL);
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
-        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
+        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads', 'vaak_blog_posts',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
         'remote_media_cache', 'site_syndications',
     ];
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
-    if (!$noticeTablesReady || !$discussTablesReady
+    if (!$noticeTablesReady || !$discussTablesReady || !isset($present['vaak_blog_posts'])
         || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'])) {
         $present = $loadPresentTables();
     }
@@ -629,6 +659,28 @@ CREATE TABLE IF NOT EXISTS outbox_notes (
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_published ON outbox_notes(published);
 
+-- Long-form VAAK blog posts. The ActivityPub outbox stores only the short
+-- teaser; the complete Markdown body remains here for the HTML profile.
+CREATE TABLE IF NOT EXISTS vaak_blog_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    actor_key TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT '',
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    body_markdown TEXT NOT NULL DEFAULT '',
+    excerpt TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'published',
+    note_id TEXT,
+    canonical_url TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(owner_user_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_vaak_blog_actor_published ON vaak_blog_posts(actor_key, status, published_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS actor_profile (
     actor_key TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -798,6 +850,14 @@ SQL);
     }
     if (!in_array('visibility', $outboxNames, true)) {
         $db->exec("ALTER TABLE outbox_notes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'");
+    }
+    try {
+        $blogCols = $db->query('PRAGMA table_info(vaak_blog_posts)')->fetchAll();
+        if ($blogCols && !in_array('canonical_url', array_column($blogCols, 'name'), true)) {
+            $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN canonical_url TEXT NOT NULL DEFAULT ''");
+        }
+    } catch (Throwable $e) {
+        // The table is created above on fresh SQLite databases.
     }
 
     // Inbound firehose visibility (public / unlisted / private) for Ice Cubes labels
@@ -4829,6 +4889,177 @@ function ap_outbox_store(array $note): void
         $kind,
         $visibility,
     ]);
+}
+
+function ap_blog_slug(string $title, string $suffix = ''): string
+{
+    $slug = strtolower(trim($title));
+    $slug = function_exists('iconv') ? (string) (@iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $slug) ?: $slug) : $slug;
+    $slug = preg_replace('/[^a-z0-9]+/', '-', $slug) ?? '';
+    $slug = trim($slug, '-');
+    if ($slug === '') {
+        $slug = 'post';
+    }
+    if ($suffix !== '') {
+        $slug .= '-' . trim((string) preg_replace('/[^a-z0-9]+/', '-', strtolower($suffix)), '-');
+    }
+    return mb_substr($slug, 0, 120);
+}
+
+/** @return list<string> */
+function ap_blog_tags_decode(mixed $raw): array
+{
+    $vals = is_array($raw) ? $raw : json_decode((string) $raw, true);
+    if (!is_array($vals)) {
+        return [];
+    }
+    $out = [];
+    foreach ($vals as $tag) {
+        $tag = ltrim(trim((string) $tag), '#');
+        $tag = preg_replace('/[^\p{L}\p{N}_-]+/u', '', $tag) ?? '';
+        if ($tag !== '') {
+            $out[strtolower($tag)] = true;
+        }
+    }
+    return array_keys($out);
+}
+
+/** @return list<array<string,mixed>> */
+function ap_blog_posts_list(string $actorKey, bool $publishedOnly = true, int $limit = 50, int $offset = 0): array
+{
+    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
+    if ($actorKey === '') {
+        return [];
+    }
+    $limit = max(1, min(200, $limit));
+    $offset = max(0, $offset);
+    try {
+        $sql = 'SELECT * FROM vaak_blog_posts WHERE actor_key = ?';
+        $params = [$actorKey];
+        if ($publishedOnly) {
+            $sql .= " AND status = 'published'";
+        }
+        $sql .= ' ORDER BY COALESCE(published_at, updated_at) DESC, id DESC LIMIT ' . $limit . ' OFFSET ' . $offset;
+        $st = ap_db()->prepare($sql);
+        $st->execute($params);
+        $rows = $st->fetchAll() ?: [];
+        foreach ($rows as &$row) {
+            $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
+        }
+        unset($row);
+        return $rows;
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog list: ' . $e->getMessage());
+        return [];
+    }
+}
+
+function ap_blog_post_get(string $actorKey, string $slug, bool $publishedOnly = true): ?array
+{
+    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
+    $slug = trim($slug);
+    if ($actorKey === '' || $slug === '') {
+        return null;
+    }
+    try {
+        $sql = 'SELECT * FROM vaak_blog_posts WHERE actor_key = ? AND slug = ?';
+        if ($publishedOnly) {
+            $sql .= " AND status = 'published'";
+        }
+        $sql .= ' LIMIT 1';
+        $st = ap_db()->prepare($sql);
+        $st->execute([$actorKey, $slug]);
+        $row = $st->fetch();
+        if (!is_array($row)) {
+            return null;
+        }
+        $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
+        return $row;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/** @param list<string> $tags */
+function ap_blog_create(
+    int $ownerUserId,
+    string $actorKey,
+    string $slug,
+    string $title,
+    string $category,
+    array $tags,
+    string $body,
+    string $excerpt,
+    string $status = 'draft',
+    string $canonicalUrl = '',
+    ?string $publishedAt = null
+): ?array {
+    if ($ownerUserId < 1 || $actorKey === '' || $slug === '' || trim($title) === '' || trim($body) === '') {
+        return null;
+    }
+    $status = $status === 'published' ? 'published' : 'draft';
+    $now = ap_db_now();
+    try {
+        $st = ap_db()->prepare(
+            'INSERT INTO vaak_blog_posts
+            (owner_user_id, actor_key, slug, title, category, tags_json, body_markdown, excerpt, status, canonical_url, published_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        $publishedAt = $status === 'published' ? ($publishedAt ?: $now) : null;
+        $st->execute([$ownerUserId, $actorKey, $slug, trim($title), trim($category), json_encode(array_values($tags), JSON_UNESCAPED_UNICODE), $body, trim($excerpt), $status, trim($canonicalUrl), $publishedAt, $now, $now]);
+        return ap_blog_post_get($actorKey, $slug, false);
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog create: ' . $e->getMessage());
+        return null;
+    }
+}
+
+/** @param list<string> $tags */
+function ap_blog_update_draft(int $ownerUserId, string $actorKey, string $slug, string $title, string $category, array $tags, string $body, string $excerpt): ?array
+{
+    if ($ownerUserId < 1 || $actorKey === '' || $slug === '' || trim($title) === '' || trim($body) === '') {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "UPDATE vaak_blog_posts
+             SET title = ?, category = ?, tags_json = ?, body_markdown = ?, excerpt = ?, updated_at = ?
+             WHERE owner_user_id = ? AND actor_key = ? AND slug = ? AND status = 'draft'"
+        );
+        $st->execute([$title, $category, json_encode(array_values($tags), JSON_UNESCAPED_UNICODE), $body, $excerpt, ap_db_now(), $ownerUserId, $actorKey, $slug]);
+        return ap_blog_post_get($actorKey, $slug, false);
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog draft update: ' . $e->getMessage());
+        return null;
+    }
+}
+
+function ap_blog_set_note(string $actorKey, string $slug, string $noteId): bool
+{
+    try {
+        $db = ap_db();
+        $st = $db->prepare('UPDATE vaak_blog_posts SET note_id = ?, updated_at = ? WHERE actor_key = ? AND slug = ?');
+        $st->execute([$noteId, ap_db_now(), $actorKey, $slug]);
+        if ($noteId !== '') {
+            $noteSt = $db->prepare("UPDATE outbox_notes SET kind = 'blog' WHERE id = ? OR create_id = ?");
+            $noteSt->execute([$noteId, $noteId]);
+        }
+        return $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function ap_blog_mark_published(string $actorKey, string $slug): bool
+{
+    try {
+        $now = ap_db_now();
+        $st = ap_db()->prepare("UPDATE vaak_blog_posts SET status = 'published', published_at = COALESCE(published_at, ?), updated_at = ? WHERE actor_key = ? AND slug = ?");
+        $st->execute([$now, $now, $actorKey, $slug]);
+        return $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        return false;
+    }
 }
 
 /**
