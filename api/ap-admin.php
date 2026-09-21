@@ -189,7 +189,7 @@ if ($view === 'vakktok') {
 }
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
-    'moderation', 'blocks', 'relays', 'stats', 'invites', 'users', 'policies',
+    'moderation', 'blocks', 'relays', 'stats', 'queue_health', 'invites', 'users', 'policies',
     'guestbook', 'support', 'analytics',
 ];
 // Security is under You for every account (own OAuth tokens / password).
@@ -4002,6 +4002,43 @@ $statsFollowersAll = 0;
 $statsFollowingAll = 0;
 $statsMentionsOpen = 0;
 $statsUserRows = [];
+$queueHealthRows = [];
+if ($view === 'queue_health') {
+    // Read-only measurements; this view never claims jobs or changes worker concurrency.
+    $queueDefs = [
+        ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
+        ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
+        ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
+        ['name' => 'Scheduled posts', 'table' => 'ap_post_queue', 'state' => 'state', 'queued' => ['pending'], 'active' => ['publishing'], 'failed' => ['failed'], 'time' => 'scheduled_at', 'created' => 'created_at'],
+        ['name' => 'Actor/profile refresh', 'table' => 'bsky_actor_refresh_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'queued_at'],
+    ];
+    foreach ($queueDefs as $qd) {
+        try {
+            $states = static fn(array $values): string => implode(',', array_map(static fn(string $v): string => "'" . str_replace("'", "''", $v) . "'", $values));
+            $queuedStates = $states($qd['queued']);
+            $activeStates = $states($qd['active']);
+            $failedStates = $states($qd['failed']);
+            $sql = 'SELECT '
+                . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$queuedStates})) AS queued, "
+                . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$activeStates})) AS active, "
+                . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$failedStates})) AS failed, "
+                . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}, {$activeStates}, {$failedStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS oldest, "
+                . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}) THEN {$qd['time']} END) AS next_due "
+                . "FROM {$qd['table']}";
+            $row = $db->query($sql)->fetch() ?: [];
+            $oldest = trim((string) ($row['oldest'] ?? ''));
+            $nextDue = trim((string) ($row['next_due'] ?? ''));
+            $queueHealthRows[] = [
+                'name' => $qd['name'], 'queued' => (int) ($row['queued'] ?? 0),
+                'active' => (int) ($row['active'] ?? 0), 'failed' => (int) ($row['failed'] ?? 0),
+                'oldest' => $oldest, 'next_due' => $nextDue, 'ok' => true,
+            ];
+        } catch (Throwable $e) {
+            error_log('[ap-admin] queue health ' . $qd['table'] . ': ' . $e->getMessage());
+            $queueHealthRows[] = ['name' => $qd['name'], 'queued' => 0, 'active' => 0, 'failed' => 0, 'oldest' => '', 'next_due' => '', 'ok' => false];
+        }
+    }
+}
 if ($view === 'stats') {
     try {
         $st = ap_db_execute_retry('SELECT COUNT(*) AS c FROM events WHERE created_at >= ?', [$since7]);
@@ -15175,6 +15212,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>
           <a class="<?= $view === 'relays' ? 'active' : '' ?>" href="?view=relays"><span class="ico">⇄</span><span class="label">Relays</span></a>
           <a class="<?= $view === 'stats' ? 'active' : '' ?>" href="?view=stats"><span class="ico">▤</span><span class="label">AP stats</span></a>
+          <a class="<?= $view === 'queue_health' ? 'active' : '' ?>" href="?view=queue_health"><span class="ico">◌</span><span class="label">Queue health</span></a>
         </div>
       </details>
       <?php endif; ?>
@@ -20664,6 +20702,43 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         </div>
         <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $outboxHasMore ? 'Scroll for more…' : ($yourPostItems ? 'End of Your Posts' : '') ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
+
+      <?php elseif ($view === 'queue_health'): ?>
+        <div class="meta" style="margin-bottom:.85rem">
+          Read-only worker health for durable VAAK queues. This view does not claim jobs or change concurrency.
+        </div>
+        <div class="stat-grid">
+          <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'queued')) ?></div><div class="l">Queued</div></div>
+          <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'active')) ?></div><div class="l">Active</div></div>
+          <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'failed')) ?></div><div class="l">Failed</div></div>
+        </div>
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Queue classes</h3>
+          <div style="overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;font-size:.88rem">
+              <thead><tr class="meta" style="text-align:left">
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Queue</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Queued</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Active</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Failed</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Oldest pending</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Next retry</th>
+              </tr></thead>
+              <tbody>
+              <?php foreach ($queueHealthRows as $qh): ?>
+                <tr>
+                  <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= h((string) $qh['name']) ?></td>
+                  <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qh['queued'] ?></td>
+                  <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qh['active'] ?></td>
+                  <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)<?= (int) $qh['failed'] > 0 ? ';color:var(--danger)' : '' ?>"><?= (int) $qh['failed'] ?></td>
+                  <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok']): ?>unavailable<?php elseif ($qh['oldest'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['oldest'])) ?><?php endif; ?></td>
+                  <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['next_due'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['next_due'])) ?><?php endif; ?></td>
+                </tr>
+              <?php endforeach; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
 
       <?php elseif ($view === 'stats'): ?>
         <div class="meta" style="margin-bottom:.85rem">

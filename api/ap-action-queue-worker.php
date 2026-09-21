@@ -20,11 +20,9 @@ try {
     require_once __DIR__ . '/ap-bsky.php';
     require_once __DIR__ . '/ap-action-queue.php';
     $stats = ap_action_queue_worker_run($limit);
-    $profileStats = ap_bsky_actor_refresh_worker_run(min(12, $limit));
-    fwrite(STDOUT, sprintf("[%s] action_queue claimed=%d succeeded=%d retried=%d failed=%d%s; bsky_profile_queue claimed=%d succeeded=%d retried=%d failed=%d\n",
+    fwrite(STDOUT, sprintf("[%s] action_queue claimed=%d succeeded=%d retried=%d failed=%d%s\n",
         gmdate('c'), $stats['claimed'], $stats['succeeded'], $stats['retried'], $stats['failed'],
-        !empty($stats['busy']) ? ' busy=1' : '',
-        $profileStats['claimed'], $profileStats['succeeded'], $profileStats['retried'], $profileStats['failed']));
+        !empty($stats['busy']) ? ' busy=1' : ''));
 } catch (Throwable $e) {
     error_log('[ap-action-queue-worker] ' . $e->getMessage());
     fwrite(STDERR, sprintf("[%s] action_queue worker failed\n", gmdate('c')));

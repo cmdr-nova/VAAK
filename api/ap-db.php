@@ -2007,6 +2007,23 @@ CREATE TABLE IF NOT EXISTS ap_publish_delivery_queue (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ap_publish_delivery_due ON ap_publish_delivery_queue(status, next_attempt_at, id);
+CREATE TABLE IF NOT EXISTS ap_fanout_delivery_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    activity_key TEXT NOT NULL,
+    inbox_url TEXT NOT NULL,
+    activity_json TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    priv_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(activity_key, inbox_url)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_fanout_delivery_due ON ap_fanout_delivery_queue(status, next_attempt_at, id);
 SQL);
     try {
         $st = $db->query('SELECT id FROM ap_queue_settings WHERE id = 1');
@@ -10837,6 +10854,7 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
         return null;
     }
     static $memo = [];
+    static $negativeUntil = [];
     if (isset($memo[$actorId])) {
         return $memo[$actorId];
     }
@@ -10851,6 +10869,14 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
         || (str_contains($actorId, 'bsky.brid.gy/ap/did:') && ap_remote_actor_username_is_placeholder($row['username'] ?? null))
         || $updatedAt < (time() - 12 * 3600)
     );
+    // A short negative cache prevents a broken or unavailable remote host from
+    // being hammered repeatedly by profile cards during the same worker burst.
+    // It is deliberately short and request-local so a transient outage never
+    // becomes authoritative actor state.
+    if ($needsFetch && $allowFetch && (($negativeUntil[$actorId] ?? 0) > time())) {
+        $memo[$actorId] = $row;
+        return $row;
+    }
     if ($needsFetch && function_exists('ap_fetch_as2_object')) {
         try {
             $doc = ap_fetch_as2_object($actorId);
@@ -10902,8 +10928,11 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                     ap_remote_emoji_ingest_actor_doc($actorId, $doc);
                 }
                 $row = ap_remote_actor_get($actorId);
+            } else {
+                $negativeUntil[$actorId] = time() + 300;
             }
         } catch (Throwable $e) {
+            $negativeUntil[$actorId] = time() + 300;
             error_log('[ap-db] remote_actor_ensure: ' . $e->getMessage());
         }
     }

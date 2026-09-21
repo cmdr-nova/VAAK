@@ -1533,6 +1533,7 @@ function ap_masto_remote_account_acct_key(string $actorId): ?string
         }
     } catch (Throwable $e) {
         // ignore
+        $GLOBALS['ap_followed_tags_cache'][$ownerUserId] = [];
     }
     if ($uname === '' && preg_match('#/(?:users|@)([^/]+)/?$#i', $actorId, $m)) {
         $pathUname = rawurldecode((string) $m[1]);
@@ -7397,15 +7398,34 @@ function ap_masto_tag_is_following(string $name, ?int $ownerUserId = null): bool
         return false;
     }
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    $cached = $GLOBALS['ap_followed_tags_cache'][$ownerUserId] ?? null;
+    if (is_array($cached) && !isset($cached['__loading'])) {
+        foreach ($cached as $tag) {
+            if ((string) ($tag['name'] ?? '') === $name) {
+                return true;
+            }
+        }
+        return false;
+    }
     try {
-        $st = ap_db()->prepare(
-            'SELECT 1 FROM masto_followed_tags WHERE owner_user_id = ? AND name = ?'
-        );
+        $st = ap_db()->prepare('SELECT 1 FROM masto_followed_tags WHERE owner_user_id = ? AND name = ?');
         $st->execute([$ownerUserId, $name]);
         return (bool) $st->fetchColumn();
     } catch (Throwable $e) {
         return false;
     }
+}
+
+function ap_masto_followed_tags_cache_clear(?int $ownerUserId = null): void
+{
+    if (!isset($GLOBALS['ap_followed_tags_cache']) || !is_array($GLOBALS['ap_followed_tags_cache'])) {
+        return;
+    }
+    if ($ownerUserId === null || $ownerUserId < 1) {
+        $GLOBALS['ap_followed_tags_cache'] = [];
+        return;
+    }
+    unset($GLOBALS['ap_followed_tags_cache'][$ownerUserId]);
 }
 
 function ap_masto_tag_follow(string $name, ?int $ownerUserId = null): array
@@ -7419,6 +7439,7 @@ function ap_masto_tag_follow(string $name, ?int $ownerUserId = null): array
         'INSERT INTO masto_followed_tags (owner_user_id, name, followed_at) VALUES (?, ?, ?)
          ON CONFLICT(owner_user_id, name) DO NOTHING'
     )->execute([$ownerUserId, $name, gmdate('c')]);
+    ap_masto_followed_tags_cache_clear($ownerUserId);
     return ['ok' => true, 'tag' => ap_masto_tag_entity($name)];
 }
 
@@ -7431,6 +7452,7 @@ function ap_masto_tag_unfollow(string $name, ?int $ownerUserId = null): array
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     ap_db()->prepare('DELETE FROM masto_followed_tags WHERE owner_user_id = ? AND name = ?')
         ->execute([$ownerUserId, $name]);
+    ap_masto_followed_tags_cache_clear($ownerUserId);
     return ['ok' => true, 'tag' => ap_masto_tag_entity($name)];
 }
 
@@ -7441,27 +7463,28 @@ function ap_masto_tag_unfollow(string $name, ?int $ownerUserId = null): array
 function ap_masto_followed_tags(int $limit = 0, ?int $ownerUserId = null): array
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    if (!isset($GLOBALS['ap_followed_tags_cache']) || !is_array($GLOBALS['ap_followed_tags_cache'])) {
+        $GLOBALS['ap_followed_tags_cache'] = [];
+    }
+    if (isset($GLOBALS['ap_followed_tags_cache'][$ownerUserId])) {
+        $cached = $GLOBALS['ap_followed_tags_cache'][$ownerUserId];
+        if (!isset($cached['__loading'])) {
+            return $limit > 0 ? array_slice($cached, 0, $limit) : $cached;
+        }
+    }
+    $GLOBALS['ap_followed_tags_cache'][$ownerUserId] = ['__loading' => true];
     $out = [];
     try {
-        if ($limit > 0) {
-            $limit = max(1, min(5000, $limit));
-            $st = ap_db()->prepare(
-                'SELECT name FROM masto_followed_tags WHERE owner_user_id = ? ORDER BY followed_at DESC LIMIT ?'
-            );
-            $st->execute([$ownerUserId, $limit]);
-        } else {
-            $st = ap_db()->prepare(
-                'SELECT name FROM masto_followed_tags WHERE owner_user_id = ? ORDER BY followed_at DESC'
-            );
-            $st->execute([$ownerUserId]);
-        }
+        $st = ap_db()->prepare('SELECT name FROM masto_followed_tags WHERE owner_user_id = ? ORDER BY followed_at DESC');
+        $st->execute([$ownerUserId]);
         foreach ($st->fetchAll() as $row) {
-            $out[] = ap_masto_tag_entity((string) ($row['name'] ?? ''));
+            $out[] = ap_masto_tag_entity((string) ($row['name'] ?? ''), null, $ownerUserId);
         }
+        $GLOBALS['ap_followed_tags_cache'][$ownerUserId] = $out;
     } catch (Throwable $e) {
         // ignore
     }
-    return $out;
+    return $limit > 0 ? array_slice($out, 0, max(1, min(5000, $limit))) : $out;
 }
 
 /**
@@ -7472,7 +7495,7 @@ function ap_masto_followed_tags(int $limit = 0, ?int $ownerUserId = null): array
 /**
  * @param list<array{day:string,uses:string,accounts:string}>|null $history
  */
-function ap_masto_tag_entity(string $name, ?array $history = null): array
+function ap_masto_tag_entity(string $name, ?array $history = null, ?int $ownerUserId = null): array
 {
     $name = ap_masto_normalize_tag_name($name);
     $id = (string) (100000 + (abs(crc32($name)) % 800000000));
@@ -7493,7 +7516,7 @@ function ap_masto_tag_entity(string $name, ?array $history = null): array
         'name' => $name,
         'url' => 'https://mkultra.monster/tags/' . rawurlencode($name),
         'history' => $history,
-        'following' => ap_masto_tag_is_following($name),
+        'following' => ap_masto_tag_is_following($name, $ownerUserId),
         'featuring' => false,
     ];
 }

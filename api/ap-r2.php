@@ -1032,17 +1032,34 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
         return (string) $cached['public_url'];
     }
 
-    $dl = ap_remote_media_download($source, 4.0);
-    if (empty($dl['ok'])) {
-        if ($cached) {
-            ap_remote_media_touch($actorId, $kind);
-            return (string) $cached['public_url'];
-        }
-        // Last resort: return the remote source URL (better than placeholder for some clients)
-        return $source;
+    // Avoid retry storms when a remote host repeatedly serves broken media,
+    // and serialize fetches for the same actor/source across PHP workers.
+    $negativePath = sys_get_temp_dir() . '/vaak-media-negative-' . hash('sha256', $actorId . '|' . $kind . '|' . $source);
+    if (!$force && is_file($negativePath) && ((int) @file_get_contents($negativePath)) > time()) {
+        return $cached ? (string) $cached['public_url'] : $source;
     }
+    $lockPath = sys_get_temp_dir() . '/vaak-media-fetch-' . hash('sha256', $actorId . '|' . $kind . '|' . $source) . '.lock';
+    $lock = @fopen($lockPath, 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($lock)) fclose($lock);
+        return $cached ? (string) $cached['public_url'] : $source;
+    }
+    try {
+        if (!$force && is_file($negativePath) && ((int) @file_get_contents($negativePath)) > time()) {
+            return $cached ? (string) $cached['public_url'] : $source;
+        }
 
-    $ext = match ($dl['content_type']) {
+        $dl = ap_remote_media_download($source, 4.0);
+        if (empty($dl['ok'])) {
+            @file_put_contents($negativePath, (string) (time() + 300), LOCK_EX);
+            if ($cached) {
+                ap_remote_media_touch($actorId, $kind);
+                return (string) $cached['public_url'];
+            }
+            return $source;
+        }
+
+        $ext = match ($dl['content_type']) {
         'image/png' => 'png',
         'image/gif' => 'gif',
         'image/webp' => 'webp',
@@ -1050,10 +1067,11 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
     };
     $hash = substr(hash('sha256', $actorId . '|' . $kind . '|' . $source), 0, 24);
     $key = 'cache/' . $kind . '/' . $hash . '.' . $ext;
-    $put = ap_r2_put_object($key, (string) $dl['body'], (string) $dl['content_type']);
-    if (empty($put['ok'])) {
-        return $source; // remote URL fallback
-    }
+        $put = ap_r2_put_object($key, (string) $dl['body'], (string) $dl['content_type']);
+        if (empty($put['ok'])) {
+            @file_put_contents($negativePath, (string) (time() + 300), LOCK_EX);
+            return $source; // remote URL fallback
+        }
 
     // Replace old object if key changed
     if ($cached && !empty($cached['s3_key']) && $cached['s3_key'] !== ($put['key'] ?? '')) {
@@ -1084,7 +1102,12 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
         $now,
     ]);
 
-    return (string) $put['public_url'];
+        @unlink($negativePath);
+        return (string) $put['public_url'];
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
 }
 
 /**

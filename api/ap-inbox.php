@@ -4295,6 +4295,39 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
     if (!$inboxUrls) {
         return false;
     }
+    // Prefer one durable child job per inbox. This survives PHP-FPM restarts
+    // and makes retries independent for each remote server.
+    try {
+        $activityKey = (string) ($activity['id'] ?? '');
+        if ($activityKey === '') {
+            $activityKey = 'sha256:' . hash('sha256', json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        }
+        $json = json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if (!is_string($json) || $json === '') throw new RuntimeException('activity encode failed');
+        $db = ap_db();
+        $st = $db->prepare('INSERT INTO ap_fanout_delivery_queue
+            (activity_key,inbox_url,activity_json,key_id,priv_path,status,attempts,next_attempt_at,created_at,updated_at)
+            VALUES (?,?,?,?,?,\'pending\',0,?,?,?) ON CONFLICT(activity_key,inbox_url) DO NOTHING');
+        $now = gmdate('c');
+        $queued = 0;
+        foreach ($inboxUrls as $inbox) {
+            $st->execute([$activityKey, $inbox, $json, $keyId, $privPath, $now, $now, $now]);
+            $queued += $st->rowCount();
+        }
+        $worker = __DIR__ . '/ap-fanout-delivery-worker.php';
+        if (is_file($worker)) {
+            $php = ap_php_cli_binary();
+            $running = trim((string) @shell_exec("pgrep -fc 'ap-fanout-delivery-worker.php' 2>/dev/null"));
+            if ((int) $running === 0) {
+                @exec('nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($worker) . ' --limit=40 >/dev/null 2>&1 </dev/null &');
+            }
+        }
+        ap_log('deliver_durable_queued activity=' . ap_short($activityKey) . ' targets=' . count($inboxUrls) . ' new=' . $queued);
+        return true;
+    } catch (Throwable $e) {
+        // During rollout, older schemas use the legacy ephemeral fallback.
+        ap_log('deliver_durable_unavailable ' . $e->getMessage());
+    }
     $dir = '/tmp/ap-deliver-jobs';
     if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
         ap_log('deliver_bg_mkdir_fail');
