@@ -6457,7 +6457,10 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                 $payload = substr($actorRef, strlen('__vaak_own_posts__:'));
                 $did = '';
                 $cursorToken = '';
-                if (preg_match('/^(did:[^:]+)(?::([A-Za-z0-9_-]+))?$/', $payload, $m)) {
+                // DIDs themselves contain colons (did:plc:<id>, did:web:<host>),
+                // so split only after the DID's identifier rather than at the
+                // first colon. The optional trailing token is the page cursor.
+                if (preg_match('/^(did:(?:plc|web):[^:]+)(?::([A-Za-z0-9_-]+))?$/', $payload, $m)) {
                     $did = trim((string) ($m[1] ?? ''));
                     $cursorToken = (string) ($m[2] ?? '');
                 }
