@@ -10878,9 +10878,21 @@ function admin_render_outbox_card(array $n, string $returnView): void
     $quoteHtml = '';
     $raw = (string) ($n['raw_create_json'] ?? '');
     $obj = null;
+    $isBskyImport = false;
+    $bskyUri = '';
     if ($raw !== '') {
         $decoded = json_decode($raw, true);
         $obj = is_array($decoded) ? ($decoded['object'] ?? $decoded) : null;
+        if (is_array($obj)) {
+            $isBskyImport = (($obj['vaakOrigin'] ?? '') === 'bluesky');
+            $bskyUri = trim((string) ($obj['blueskyUri'] ?? ''));
+        }
+        // Imported Bluesky history is represented with a local twin URL for
+        // profile/history display, but it is not an ActivityPub status owned
+        // by the current VAAK actor. Never expose fediverse actions for it.
+        if ($isBskyImport) {
+            $isOwnNote = false;
+        }
         $atts = is_array($obj) ? ($obj['attachment'] ?? null) : null;
         if (is_array($atts)) {
             if (isset($atts['type'])) {
@@ -11176,7 +11188,16 @@ function admin_render_outbox_card(array $n, string $returnView): void
               echo admin_cw_gate_html($ownSpoiler, $ownSensitive, $ownInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($noteId !== '' && $isOwnNote): ?>
+              <?php if ($isBskyImport): ?>
+                <?php if ($bskyUri !== ''): ?>
+                  <?php
+                    $bskyOpen = function_exists('ap_bsky_https_url_from_at_uri')
+                        ? (string) ap_bsky_https_url_from_at_uri($bskyUri, null)
+                        : $bskyUri;
+                  ?>
+                  <a class="btn btn-ghost" href="<?= h($bskyOpen !== '' ? $bskyOpen : $bskyUri) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
+                <?php endif; ?>
+              <?php elseif ($noteId !== '' && $isOwnNote): ?>
                 <?php
                   $editPlain = $bodyPlain !== '(quote)' ? $bodyPlain : '';
                   $editSpoiler = $ownSpoiler;
