@@ -3865,6 +3865,47 @@ function ap_masto_status_from_mention(array $row): array
             }
         }
     }
+    // A few remote servers (notably older GIF integrations) omit AS2
+    // attachments and leave only the media URL in the Note body. Recover
+    // obvious image/GIF links so Notifications can render the preview instead
+    // of showing a bare static link. This remains bounded and HTTPS-only.
+    if ($media === []) {
+        $body = (string) ($row['content'] ?? '');
+        if ($body !== '' && preg_match_all("#https://[^\\s<>\"']+#i", $body, $urlMatches)) {
+            foreach (($urlMatches[0] ?? []) as $candidate) {
+                $candidate = rtrim((string) $candidate, '.,!?)]}');
+                $path = (string) (parse_url($candidate, PHP_URL_PATH) ?? '');
+                $host = strtolower((string) (parse_url($candidate, PHP_URL_HOST) ?? ''));
+                $looksLikeMedia = (bool) preg_match('/\.(?:gif|png|jpe?g|webp)(?:$|[?#])/i', $candidate)
+                    || str_contains($host, 'giphy.')
+                    || str_contains($host, 'tenor.')
+                    || str_contains($path, '/media_attachments/')
+                    || str_contains($path, '/media/');
+                if (!$looksLikeMedia) {
+                    continue;
+                }
+                $clean = ap_profile_sanitize_https_url($candidate);
+                if ($clean === null) {
+                    continue;
+                }
+                $media[] = [
+                    'id' => (string) (2000000 + $mentionId) . (count($media) + 1),
+                    'type' => 'image',
+                    'url' => $clean,
+                    'preview_url' => $clean,
+                    'remote_url' => $clean,
+                    'preview_remote_url' => null,
+                    'text_url' => null,
+                    'meta' => null,
+                    'description' => null,
+                    'blurhash' => null,
+                ];
+                if (count($media) >= 4) {
+                    break;
+                }
+            }
+        }
+    }
     $inReplyTo = (string) ($row['in_reply_to'] ?? '');
     if ($inReplyTo === '' && is_string($row['content'] ?? null)) {
         // Some remotes omit inReplyTo but prefix body with RE: <local-note-url>
