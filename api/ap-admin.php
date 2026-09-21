@@ -4543,7 +4543,7 @@ function admin_tl_cache_key(string $view, array $following): string
     $owner = admin_owner_user_id();
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v2_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v3_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -6437,6 +6437,12 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
         $stRb->execute();
         foreach ($stRb->fetchAll() ?: [] as $rb) {
             if (!is_array($rb)) {
+                continue;
+            }
+            // Bluesky-native reposts are maintained in masto_reblogs for
+            // the account's Bluesky surface, but are not Fediverse boosts
+            // and must never enter the instance Local timeline.
+            if (admin_reblog_is_bsky($rb)) {
                 continue;
             }
             $boostItem = [
@@ -8674,6 +8680,16 @@ function admin_outbox_is_bsky_import(array $row): bool
     return is_array($raw)
         && is_array($raw['object'] ?? null)
         && (($raw['object']['vaakOrigin'] ?? '') === 'bluesky');
+}
+
+/** True for a Bluesky-native repost stored alongside local reblogs. */
+function admin_reblog_is_bsky(array $row): bool
+{
+    $statusId = strtolower(trim((string) ($row['status_id'] ?? '')));
+    $objectId = strtolower(trim((string) ($row['object_id'] ?? '')));
+    return str_starts_with($statusId, 'bsky-repost-')
+        || str_starts_with($objectId, 'https://bsky.app/')
+        || str_contains($objectId, 'bsky.mkultra.monster/');
 }
 
 /** Viewer preference: highlight anti-AI posters. Removed from the UI. */
@@ -16098,6 +16114,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if ($dmPeer !== '' && str_starts_with($dmPeer, 'https://')) {
               $dmPeer = rtrim($dmPeer, '/');
           }
+          $dmPeerBlocked = $dmPeer !== '' && function_exists('ap_is_blocked_actor')
+              && ap_is_blocked_actor($dmPeer);
           $dmConversations = ap_dm_conversations(60);
           $dmUnread = ap_dm_unread_count();
         ?>
@@ -16131,12 +16149,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </aside>
             <section class="dm-pane">
           <?php
-            $thread = ap_dm_thread($dmPeer, 200);
+            $thread = $dmPeerBlocked ? [] : ap_dm_thread($dmPeer, 200);
             // Mark read after load so a lock/failure can't blank the thread
-            try {
-                ap_dm_mark_peer_read($dmPeer);
-            } catch (Throwable $e) {
-                error_log('[ap-admin] dm mark read: ' . $e->getMessage());
+            if (!$dmPeerBlocked) {
+                try {
+                    ap_dm_mark_peer_read($dmPeer);
+                } catch (Throwable $e) {
+                    error_log('[ap-admin] dm mark read: ' . $e->getMessage());
+                }
             }
           ?>
           <div style="margin-bottom:.75rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
@@ -16147,6 +16167,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="meta"><?= h(actor_handle($dmPeer)) ?></div>
             </div>
           </div>
+          <?php if ($dmPeerBlocked): ?>
+            <div class="empty" style="margin-top:1rem">This conversation is unavailable because this account is blocked. Unblock the account before exchanging messages.</div>
+          <?php endif; ?>
           <div id="dm-thread" class="dm-thread">
           <?php if (!$thread): ?>
             <div class="empty">Empty thread — no stored messages for this peer.</div>
@@ -16182,7 +16205,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
           </div>
-          <form class="composer" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" style="margin-top:1rem">
+          <?php if (!$dmPeerBlocked): ?><form class="composer" method="post" action="?view=dms&amp;peer=<?= urlencode($dmPeer) ?>" style="margin-top:1rem">
             <input type="hidden" name="action" value="dm_reply">
             <input type="hidden" name="to" value="<?= h($dmPeer) ?>">
             <input type="hidden" name="peer" value="<?= h($dmPeer) ?>">
@@ -16204,21 +16227,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <button class="btn btn-primary" type="submit">Reply</button>
             </div>
           </form>
+          <?php endif; ?>
             <script>
           (function () {
             function focusLatestDm() {
               const thread = document.getElementById('dm-thread');
               if (!thread) return;
-              // The DM thread, not the page feed, owns the overflow scroll.
-              // Scrolling .feed left fullscreen conversations at the oldest
-              // message because .feed is not the active scroll container here.
-              const last = document.getElementById('dm-message-last');
-              thread.scrollTop = last
-                ? Math.max(0, last.offsetTop - Math.max(0, thread.clientHeight - last.offsetHeight - 24))
-                : thread.scrollHeight;
+              // The thread is the overflow container. Run after layout and
+              // again after avatars/media settle so flex sizing cannot leave
+              // the view parked at the oldest message.
+              thread.scrollTop = thread.scrollHeight;
             }
-            requestAnimationFrame(function () {
-              requestAnimationFrame(focusLatestDm);
+            [0, 50, 250].forEach(function (delay) {
+              window.setTimeout(function () {
+                requestAnimationFrame(focusLatestDm);
+              }, delay);
             });
             window.addEventListener('load', focusLatestDm, { once: true });
           })();
@@ -22992,8 +23015,14 @@ window.apAdminToast = function (msg, isErr) {
       const uri = el.getAttribute('data-bsky-uri') || '';
       if (uri) keys['bsky:' + uri] = true;
     });
+    items.querySelectorAll('[data-note-id]').forEach((el) => {
+      const noteId = el.getAttribute('data-note-id') || '';
+      if (noteId) keys['note:' + noteId.replace(/\/$/, '')] = true;
+    });
     items.querySelectorAll('article.tweet').forEach((el, i) => {
-      keys['node:' + (el.id || i) + ':' + (el.textContent || '').slice(0, 40)] = true;
+      // Keep this fallback identical to filterNewHtml(); the element id is
+      // not stable between the optimistic card and the polling response.
+      keys['node:' + (el.textContent || '').slice(0, 64)] = true;
     });
     return keys;
   }
@@ -23016,6 +23045,10 @@ window.apAdminToast = function (msg, isErr) {
       if (!key && el.getAttribute) {
         const bskyUri = el.getAttribute('data-bsky-uri') || '';
         if (bskyUri) key = 'bsky:' + bskyUri;
+      }
+      if (!key && el.getAttribute) {
+        const noteId = el.getAttribute('data-note-id') || '';
+        if (noteId) key = 'note:' + noteId.replace(/\/$/, '');
       }
       if (!key) {
         key = 'node:' + (el.textContent || '').slice(0, 64);
