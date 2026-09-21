@@ -433,13 +433,13 @@ SQL);
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
-        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads', 'vaak_blog_posts',
+        'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
         'remote_media_cache', 'site_syndications',
     ];
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
-    if (!$noticeTablesReady || !$discussTablesReady || !isset($present['vaak_blog_posts'])
+    if (!$noticeTablesReady || !$discussTablesReady
         || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'])) {
         $present = $loadPresentTables();
     }
