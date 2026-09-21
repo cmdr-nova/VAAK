@@ -9733,6 +9733,43 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
         }
     }
 
+    // Preserve attachment previews for notification mentions. The notification
+    // record often carries only the post record, so prefer its embed and then
+    // fall back to the already-warmed bsky_posts cache. No AppView fetch occurs
+    // on this path.
+    $mediaUrls = [];
+    $mediaPost = ['embed' => is_array($record['embed'] ?? null) ? $record['embed'] : null];
+    if (function_exists('ap_bsky_post_image_urls')) {
+        $mediaUrls = ap_bsky_post_image_urls($mediaPost);
+    }
+    if (function_exists('ap_bsky_post_video_media')) {
+        foreach (ap_bsky_post_video_media($mediaPost) as $video) {
+            $thumb = (string) ($video['thumbnail'] ?? '');
+            if (str_starts_with($thumb, 'https://')) {
+                $mediaUrls[] = $thumb;
+            }
+        }
+    }
+    if ($mediaUrls === [] && function_exists('ap_bsky_post_item_by_uri')) {
+        $cachedItem = ap_bsky_post_item_by_uri($uri);
+        $cachedPost = is_array($cachedItem['post'] ?? null) ? $cachedItem['post'] : [];
+        if ($cachedPost !== []) {
+            if (function_exists('ap_bsky_post_image_urls')) {
+                $mediaUrls = ap_bsky_post_image_urls($cachedPost);
+            }
+            if (function_exists('ap_bsky_post_video_media')) {
+                foreach (ap_bsky_post_video_media($cachedPost) as $video) {
+                    $thumb = (string) ($video['thumbnail'] ?? '');
+                    if (str_starts_with($thumb, 'https://')) {
+                        $mediaUrls[] = $thumb;
+                    }
+                }
+            }
+        }
+    }
+    $mediaUrls = array_values(array_unique(array_filter($mediaUrls, static fn($url): bool => is_string($url) && str_starts_with($url, 'https://'))));
+    $mediaUrls = array_slice($mediaUrls, 0, 4);
+
     // Upsert remote actor cache so Ice Cubes shows handle + avatar.
     if (function_exists('ap_remote_actor_upsert')) {
         ap_remote_actor_upsert($actorId, [
@@ -9758,6 +9795,7 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
         'activity_type' => $activityType,
         'content' => $text,
         'in_reply_to' => $inReplyTo,
+        'media_urls' => $mediaUrls,
         'created_at' => $indexedAt,
         'spoiler_text' => '',
         'sensitive' => 0,

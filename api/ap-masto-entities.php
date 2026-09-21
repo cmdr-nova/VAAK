@@ -3803,6 +3803,62 @@ function ap_masto_status_from_mention(array $row): array
             }
         }
     }
+    // Bluesky notification rows may predate attachment projection. Recover
+    // media from the already-warmed local post cache without fetching AppView
+    // during notification rendering.
+    if ($media === [] && str_starts_with((string) ($row['activity_id'] ?? ''), 'at://')
+        && !function_exists('ap_bsky_post_item_by_uri') && is_file(__DIR__ . '/ap-bsky.php')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
+    if ($media === [] && str_starts_with((string) ($row['activity_id'] ?? ''), 'at://')
+        && function_exists('ap_bsky_post_item_by_uri')) {
+        $cached = ap_bsky_post_item_by_uri((string) $row['activity_id']);
+        $cachedPost = is_array($cached['post'] ?? null) ? $cached['post'] : [];
+        if ($cachedPost !== []) {
+            if (function_exists('ap_bsky_post_image_urls')) {
+                foreach (ap_bsky_post_image_urls($cachedPost) as $mediaUrl) {
+                    $media[] = [
+                        'id' => (string) (2000000 + $mentionId) . (count($media) + 1),
+                        'type' => 'image',
+                        'url' => $mediaUrl,
+                        'preview_url' => $mediaUrl,
+                        'remote_url' => $mediaUrl,
+                        'preview_remote_url' => null,
+                        'text_url' => null,
+                        'meta' => null,
+                        'description' => null,
+                        'blurhash' => null,
+                    ];
+                    if (count($media) >= 4) {
+                        break;
+                    }
+                }
+            }
+            if (count($media) < 4 && function_exists('ap_bsky_post_video_media')) {
+                foreach (ap_bsky_post_video_media($cachedPost) as $video) {
+                    $mediaUrl = (string) ($video['thumbnail'] ?? $video['url'] ?? '');
+                    if (!str_starts_with($mediaUrl, 'https://')) {
+                        continue;
+                    }
+                    $media[] = [
+                        'id' => (string) (2000000 + $mentionId) . (count($media) + 1),
+                        'type' => 'video',
+                        'url' => $mediaUrl,
+                        'preview_url' => $mediaUrl,
+                        'remote_url' => (string) ($video['url'] ?? $mediaUrl),
+                        'preview_remote_url' => null,
+                        'text_url' => null,
+                        'meta' => null,
+                        'description' => null,
+                        'blurhash' => null,
+                    ];
+                    if (count($media) >= 4) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
     $inReplyTo = (string) ($row['in_reply_to'] ?? '');
     if ($inReplyTo === '' && is_string($row['content'] ?? null)) {
         // Some remotes omit inReplyTo but prefix body with RE: <local-note-url>
@@ -4244,10 +4300,16 @@ function ap_masto_mention_notif_type(array $row): ?string
     if (in_array($objType, ['person', 'application', 'service', 'group'], true)) {
         return null;
     }
+    $hasMedia = !empty($row['media_urls']) && $row['media_urls'] !== '[]';
     // Create Note / Article / reply / bare content
     if (in_array($objType, ['note', 'article', 'page', 'question', ''], true) || ($row['content'] ?? '') !== '') {
         $inReplyTo = rtrim((string) ($row['in_reply_to'] ?? ''), '/');
         if ($inReplyTo !== '' && str_starts_with($inReplyTo, $ourPrefix . '/notes/')) {
+            return 'mention';
+        }
+        // A reply can contain only an attachment. Keep it in Notifications when
+        // it targets one of our notes instead of treating the empty body as noise.
+        if ($hasMedia && $inReplyTo !== '' && str_starts_with($inReplyTo, $ourPrefix . '/statuses/')) {
             return 'mention';
         }
         $content = (string) ($row['content'] ?? '');

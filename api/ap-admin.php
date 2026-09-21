@@ -12130,7 +12130,8 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             return;
         }
         $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
-        $key = $oid !== '' ? ('o:' . $oid) : ('e:' . (int) ($e['id'] ?? 0));
+        $canonicalOid = $oid !== '' ? admin_prefer_fedi_object_id($oid) : '';
+        $key = $canonicalOid !== '' ? ('o:' . $canonicalOid) : ('e:' . (int) ($e['id'] ?? 0));
         if (isset($seen[$key])) {
             return;
         }
@@ -12143,6 +12144,20 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             return;
         }
         $seen[$key] = true;
+        if ($oid !== '') {
+            $seen['o:' . $oid] = true;
+            $seen['o:' . $oid . '/'] = true;
+            if (function_exists('ap_bsky_post_link_by_fedi')) {
+                try {
+                    $link = ap_bsky_post_link_by_fedi($oid);
+                    if (is_array($link) && !empty($link['bsky_uri'])) {
+                        $seen['bsky:' . (string) $link['bsky_uri']] = true;
+                    }
+                } catch (Throwable $e) {
+                    // Dedupe remains best-effort for cached Bluesky twins.
+                }
+            }
+        }
         $out[] = $item;
     };
 
@@ -23104,10 +23119,22 @@ window.apAdminToast = function (msg, isErr) {
 
   function seenKeys() {
     const keys = {};
+    const canonical = (value) => {
+      let key = String(value || '').trim();
+      for (let i = 0; i < 2; i++) {
+        try {
+          const decoded = decodeURIComponent(key);
+          if (decoded === key) break;
+          key = decoded;
+        } catch (e) { break; }
+      }
+      key = key.replace(/#(?:like|reblog|quote|update|bite)-[A-Za-z0-9_-]+$/, '').replace(/\/$/, '');
+      return key;
+    };
     items.querySelectorAll('a[href*="object="], a.gallery-cell').forEach((a) => {
       const href = a.getAttribute('href') || '';
       const m = href.match(/[?&]object=([^&]+)/);
-      if (m) keys[decodeURIComponent(m[1])] = true;
+      if (m) keys[canonical(m[1])] = true;
     });
     items.querySelectorAll('article[data-bsky-uri]').forEach((el) => {
       const uri = el.getAttribute('data-bsky-uri') || '';
@@ -23134,7 +23161,10 @@ window.apAdminToast = function (msg, isErr) {
       if (link) {
         const href = link.getAttribute('href') || '';
         const m = href.match(/[?&]object=([^&]+)/);
-        if (m) key = decodeURIComponent(m[1]);
+        if (m) {
+          try { key = decodeURIComponent(m[1]); } catch (e) { key = m[1]; }
+          key = key.trim().replace(/#(?:like|reblog|quote|update|bite)-[A-Za-z0-9_-]+$/, '').replace(/\/$/, '');
+        }
       }
       if (!key && el.getAttribute) {
         const pendingId = el.getAttribute('data-pending-queue-id') || '';
