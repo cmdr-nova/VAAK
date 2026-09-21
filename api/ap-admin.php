@@ -13826,6 +13826,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     body.blog-fullscreen .main > .topbar { padding-inline: clamp(1rem, 4vw, 3rem); }
     body.blog-fullscreen .feed { width: 100%; max-width: 1100px; margin-inline: auto; padding-inline: clamp(1rem, 4vw, 3rem); }
     .blog-editor { max-width: 100%; }
+    .blog-editor input,
+    .blog-editor textarea { display: block; width: 100%; max-width: 100%; }
     .blog-editor textarea { min-height: min(62vh, 44rem); resize: vertical; line-height: 1.6; }
     .blog-editor .blog-fields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(10rem, 1fr); gap: .75rem; }
     .blog-post-card { padding: clamp(1rem, 3vw, 2rem); }
@@ -15548,8 +15550,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <input name="blog_title" maxlength="240" required placeholder="Title" value="<?= h((string) ($editingDraft['title'] ?? '')) ?>">
                 <input name="blog_category" maxlength="120" placeholder="Category" value="<?= h((string) ($editingDraft['category'] ?? '')) ?>">
               </div>
-              <input name="blog_tags" maxlength="500" placeholder="Hashtags, separated by spaces or commas" value="<?= h(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) ($editingDraft['tags'] ?? [])))) ?>" style="margin-top:.75rem">
               <textarea name="blog_body" maxlength="200000" required placeholder="Write your post…" style="margin-top:.75rem"><?= h((string) ($editingDraft['body_markdown'] ?? '')) ?></textarea>
+              <input name="blog_tags" maxlength="500" placeholder="Hashtags, separated by spaces or commas" value="<?= h(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) ($editingDraft['tags'] ?? [])))) ?>" style="margin-top:.75rem">
               <div class="composer-actions">
                 <span class="meta">Published posts appear under Blog on your HTML profile. The timeline receives a title content warning and a short excerpt.</span>
                 <button class="btn btn-ghost" name="blog_publish" value="0" type="submit"><?= $editingDraft ? 'Update draft' : 'Save draft' ?></button>
