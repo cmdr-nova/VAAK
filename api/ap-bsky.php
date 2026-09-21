@@ -1611,7 +1611,7 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
 }
 
 /** Queue a paginated import of a connected account's existing Bluesky posts. */
-function ap_bsky_own_posts_backfill_enqueue(int $ownerUserId, string $did, ?string $cursor = null): void
+function ap_bsky_own_posts_backfill_enqueue(int $ownerUserId, string $did, ?string $cursor = null, int $delaySeconds = 0): void
 {
     $did = trim($did);
     if ($ownerUserId < 1 || !str_starts_with($did, 'did:') || !ap_bsky_actor_refresh_migrate()) {
@@ -1620,10 +1620,11 @@ function ap_bsky_own_posts_backfill_enqueue(int $ownerUserId, string $did, ?stri
     $cursor = trim((string) $cursor);
     $actorRef = '__vaak_own_posts__:' . $did . ($cursor !== '' ? ':' . rtrim(strtr(base64_encode($cursor), '+/', '-_'), '=') : '');
     $now = gmdate('c');
+    $nextAttempt = gmdate('c', time() + max(0, min(300, $delaySeconds)));
     try {
         $db = ap_db();
         $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN 'pending' ELSE bsky_actor_refresh_queue.status END, queued_at = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN excluded.queued_at ELSE bsky_actor_refresh_queue.queued_at END, next_attempt_at = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN excluded.next_attempt_at ELSE bsky_actor_refresh_queue.next_attempt_at END, attempts = CASE WHEN bsky_actor_refresh_queue.status IN ('succeeded','failed') THEN 0 ELSE bsky_actor_refresh_queue.attempts END, locked_at = NULL, last_error = NULL")
-            ->execute([$ownerUserId, $actorRef, $now, $now]);
+            ->execute([$ownerUserId, $actorRef, $now, $nextAttempt]);
     } catch (Throwable $e) {
         error_log('[ap-bsky] own post backfill enqueue failed: ' . $e->getMessage());
     }
@@ -3489,7 +3490,7 @@ function ap_bsky_post_item_by_uri(string $bskyUri): ?array
  *
  * @return list<array{post:array,reason?:array}>
  */
-function ap_bsky_posts_for_author(string $authorDid, int $limit = 20): array
+function ap_bsky_posts_for_author(string $authorDid, int $limit = 20, int $offset = 0): array
 {
     $authorDid = trim($authorDid);
     if ($authorDid === '' || !str_starts_with($authorDid, 'did:')) {
@@ -3497,14 +3498,15 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20): array
     }
     ap_bsky_posts_migrate();
     $limit = max(1, min(50, $limit));
+    $offset = max(0, $offset);
     try {
         $st = ap_db()->prepare(
             'SELECT raw_json, reason_json FROM bsky_posts
              WHERE author_did = ?
              ORDER BY indexed_at DESC NULLS LAST, updated_at DESC
-             LIMIT ?'
+             LIMIT ? OFFSET ?'
         );
-        $st->execute([$authorDid, $limit]);
+        $st->execute([$authorDid, $limit, $offset]);
         $out = [];
         foreach ($st->fetchAll() ?: [] as $row) {
             $raw = is_string($row['raw_json'] ?? null) ? json_decode((string) $row['raw_json'], true) : null;
@@ -3528,9 +3530,9 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20): array
                 'SELECT raw_json, reason_json FROM bsky_posts
                  WHERE author_did = ?
                  ORDER BY indexed_at DESC, updated_at DESC
-                 LIMIT ?'
+                LIMIT ? OFFSET ?'
             );
-            $st->execute([$authorDid, $limit]);
+            $st->execute([$authorDid, $limit, $offset]);
             $out = [];
             foreach ($st->fetchAll() ?: [] as $row) {
                 $raw = is_string($row['raw_json'] ?? null) ? json_decode((string) $row['raw_json'], true) : null;
@@ -6471,7 +6473,9 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                 if (!str_starts_with($did, 'did:')) {
                     throw new RuntimeException('Invalid Bluesky author for post backfill');
                 }
-                $result = ap_bsky_get_author_feed($owner, 50, $cursor);
+                // Keep migration work deliberately incremental: one small page
+                // per queue lease, with a short pause before the continuation.
+                $result = ap_bsky_get_author_feed($owner, 25, $cursor);
                 if (empty($result['ok'])) {
                     throw new RuntimeException((string) ($result['error'] ?? 'Bluesky author feed backfill failed'));
                 }
@@ -6481,7 +6485,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                 ap_bsky_import_own_feed_as_local($owner, $feed);
                 $nextCursor = trim((string) ($result['cursor'] ?? ''));
                 if ($nextCursor !== '') {
-                    ap_bsky_own_posts_backfill_enqueue($owner, $did, $nextCursor);
+                    ap_bsky_own_posts_backfill_enqueue($owner, $did, $nextCursor, 10);
                 }
                 $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")
                     ->execute([$owner, $actorRef]);

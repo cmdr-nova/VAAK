@@ -4326,12 +4326,14 @@ $yourBskyPosts = [];
 /** @var array<string,array<string,mixed>> note_id → masto_statuses row (request cache) */
 $GLOBALS['admin_masto_by_note'] = [];
 $needOutboxBuild = !$wantNewerPoll && !$adminTlFromCache && (
-    in_array($view, ['outbox', 'queue'], true)
+    (!$isPartial && in_array($view, ['outbox', 'queue'], true))
     || in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)
     || ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true))
 );
 if ($needOutboxBuild) {
-    $outbox = ap_outbox_list(40, $vaakActorKey);
+    $outbox = $view === 'outbox'
+        ? ap_outbox_list_page(40, $tlOffset, $vaakActorKey)
+        : ap_outbox_list(40, $vaakActorKey);
     // One IN-query for body/CW/visibility/edit instead of 2–3 prepares per card
     $noteIds = [];
     foreach ($outbox as $n) {
@@ -4370,7 +4372,7 @@ if ($needOutboxBuild) {
 // The authenticated Bluesky account can be used directly in the Bluesky app.
 // Pull its author feed through the durable refresh queue and show cached posts
 // here as Bluesky-only items (never create ActivityPub outbox rows for them).
-if ($view === 'outbox' && !$wantNewerPoll && function_exists('ap_bsky_session_row')) {
+if ($view === 'outbox' && !$wantNewerPoll && !$isPartial && function_exists('ap_bsky_session_row')) {
     try {
         $bskySession = ap_bsky_session_row((int) ($GLOBALS['vaak_owner_id'] ?? 0));
         $ownBskyDid = trim((string) ($bskySession['did'] ?? ''));
@@ -4378,7 +4380,7 @@ if ($view === 'outbox' && !$wantNewerPoll && function_exists('ap_bsky_session_ro
             ap_bsky_author_feed_refresh_enqueue((int) $GLOBALS['vaak_owner_id'], $ownBskyDid);
         }
         if ($ownBskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
-            $yourBskyPosts = ap_bsky_posts_for_author($ownBskyDid, 40);
+            $yourBskyPosts = ap_bsky_posts_for_author($ownBskyDid, 40, $view === 'outbox' ? $tlOffset : 0);
         }
     } catch (Throwable $e) {
         error_log('[ap-admin] own Bluesky posts: ' . $e->getMessage());
@@ -12010,6 +12012,110 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
 
     usort($out, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     return array_slice($out, 0, $limit);
+}
+
+/**
+ * Build one bounded page for the authenticated Your Posts view.  Fediverse
+ * outbox rows and cached Bluesky rows are paged independently, then merged by
+ * publication time.  This keeps each request small even for accounts with a
+ * very large Bluesky history.
+ *
+ * @return array{items:list<array<string,mixed>>,has_more:bool,next_offset:int}
+ */
+function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $limit): array
+{
+    $offset = max(0, $offset);
+    $limit = max(1, min(40, $limit));
+    $outbox = ap_outbox_list_page($limit, $offset, $actorKey);
+    $bsky = [];
+    $bskyDid = '';
+    try {
+        if (function_exists('ap_bsky_session_row')) {
+            $session = ap_bsky_session_row($ownerId);
+            $bskyDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+            if ($bskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
+                $bsky = ap_bsky_posts_for_author($bskyDid, $limit, $offset);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] outbox page Bluesky cache: ' . $e->getMessage());
+    }
+
+    $localIds = [];
+    $items = [];
+    foreach ($outbox as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $id = rtrim((string) ($row['id'] ?? ''), '/');
+        if ($id !== '') {
+            $localIds[$id] = true;
+        }
+        $items[] = [
+            'kind' => 'outbox',
+            'sort' => strtotime((string) ($row['published'] ?? '')) ?: 0,
+            'row' => $row,
+        ];
+    }
+    foreach ($bsky as $bItem) {
+        $post = is_array($bItem['post'] ?? null) ? $bItem['post'] : [];
+        $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+        if ($bskyDid === '' || (string) ($author['did'] ?? '') !== $bskyDid) {
+            continue;
+        }
+        $uri = (string) ($post['uri'] ?? '');
+        $link = ($uri !== '' && function_exists('ap_bsky_post_link_by_uri'))
+            ? ap_bsky_post_link_by_uri($uri) : null;
+        $fediId = (string) (($link['fediverse_id'] ?? '') ?: ($post['record']['fediverseId'] ?? ''));
+        if ($fediId !== '' && isset($localIds[rtrim($fediId, '/')])) {
+            continue;
+        }
+        $items[] = [
+            'kind' => 'bsky',
+            'sort' => strtotime((string) ($post['record']['createdAt'] ?? $post['indexedAt'] ?? '')) ?: 0,
+            'item' => $bItem,
+        ];
+    }
+    usort($items, static fn(array $a, array $b): int => (int) ($b['sort'] ?? 0) <=> (int) ($a['sort'] ?? 0));
+
+    $fediCount = function_exists('ap_outbox_count_for_actor') ? ap_outbox_count_for_actor($actorKey) : count($outbox);
+    $bskyCount = 0;
+    if ($bskyDid !== '') {
+        try {
+            $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE author_did = ?');
+            $st->execute([$bskyDid]);
+            $bskyCount = (int) $st->fetchColumn();
+        } catch (Throwable $e) {
+            $bskyCount = count($bsky);
+        }
+    }
+    return [
+        'items' => $items,
+        'has_more' => ($offset + $limit) < max($fediCount, $bskyCount),
+        'next_offset' => $offset + $limit,
+    ];
+}
+
+// AJAX fragment for Your Posts infinite scroll. Keep this before the broader
+// timeline fragment so outbox requests never trigger a timeline rebuild.
+if ($isPartial && $view === 'outbox') {
+    $outboxOffset = max(0, (int) ($_GET['offset'] ?? 0));
+    $outboxLimit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $page = admin_outbox_page((int) $vaakOwnerId, (string) $vaakActorKey, $outboxOffset, $outboxLimit);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-Has-More: ' . (!empty($page['has_more']) ? '1' : '0'));
+    header('X-Next-Offset: ' . (int) ($page['next_offset'] ?? ($outboxOffset + $outboxLimit)));
+    ob_start();
+    foreach (($page['items'] ?? []) as $item) {
+        if (($item['kind'] ?? '') === 'bsky') {
+            admin_render_bsky_feed_item($item['item'], 'following', 'outbox');
+        } elseif (is_array($item['row'] ?? null)) {
+            admin_render_outbox_card($item['row'], 'outbox');
+        }
+    }
+    echo ob_get_clean();
+    exit;
 }
 
 // AJAX fragment for Bluesky tab infinite scroll (cursor-based) + deferred merge samples
@@ -20484,9 +20590,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               ];
           }
           usort($yourPostItems, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+          $outboxBskyDid = is_array($bskySession ?? null) ? trim((string) ($bskySession['did'] ?? '')) : '';
+          $outboxBskyCount = 0;
+          if ($outboxBskyDid !== '') {
+              try {
+                  $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE author_did = ?');
+                  $st->execute([$outboxBskyDid]);
+                  $outboxBskyCount = (int) $st->fetchColumn();
+              } catch (Throwable $e) { $outboxBskyCount = count($yourBskyPosts); }
+          }
+          $outboxFediCount = function_exists('ap_outbox_count_for_actor')
+              ? ap_outbox_count_for_actor((string) $vaakActorKey) : count($outbox);
+          $outboxHasMore = ($tlOffset + 40) < max($outboxFediCount, $outboxBskyCount);
         ?>
         <?php if (!$yourPostItems): ?><div class="empty">No posts yet. Use the ＋ button to compose.</div><?php endif; ?>
-        <div class="your-posts-feed">
+        <div id="timeline-items" class="your-posts-feed" data-view="outbox" data-offset="<?= (int) ($tlOffset + 40) ?>" data-limit="40" data-has-more="<?= $outboxHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($yourPostItems[0]['sort']) ? $yourPostItems[0]['sort'] : time()) ?>">
           <?php foreach ($yourPostItems as $yourPost): ?>
             <?php if ($yourPost['kind'] === 'bsky'): ?>
               <?php admin_render_bsky_feed_item($yourPost['item'], 'following', 'outbox'); ?>
@@ -20495,6 +20613,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           <?php endforeach; ?>
         </div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $outboxHasMore ? 'Scroll for more…' : ($yourPostItems ? 'End of Your Posts' : '') ?></div>
+        <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'stats'): ?>
         <div class="meta" style="margin-bottom:.85rem">
@@ -20627,7 +20747,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky', 'outbox'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
     <?php endif; ?>
@@ -22400,7 +22520,7 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
-<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'mentions', 'bluesky'], true)): ?>
+<?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'mentions', 'bluesky', 'outbox'], true)): ?>
 <script>
 (function () {
   /** Replace a timeline card in place without jumping scroll to the top. */
@@ -22569,6 +22689,7 @@ window.apAdminToast = function (msg, isErr) {
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
   const isNotifTimeline = viewName === 'mentions';
   const isBskyTimeline = viewName === 'bluesky';
+  const isOutboxTimeline = viewName === 'outbox';
 
   let sc = scrollApi();
 
@@ -22757,7 +22878,7 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function pollNewer() {
-    if (isNotifTimeline) return; // Notifications use max_id pages, not newer polls.
+    if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
     if (pollBusy || document.hidden) return;
     pollBusy = true;
@@ -22911,6 +23032,7 @@ window.apAdminToast = function (msg, isErr) {
         else if (viewName === 'vakktok') status.textContent = '';
         else if (isNotifTimeline) status.textContent = 'End of notifications';
         else if (isBskyTimeline) status.textContent = 'End of Bluesky feed';
+        else if (isOutboxTimeline) status.textContent = 'End of Your Posts';
         else status.textContent = 'End of timeline';
       }
     } catch (e) {
