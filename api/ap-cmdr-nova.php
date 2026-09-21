@@ -937,7 +937,8 @@ function ap_cmdr_shell_start(string $title): void
       }
       .post-pin--action:hover{filter:none;transform:scale(1.08)}
       .post-unpin-hint{position:static;font-size:.68rem;color:#8ab;opacity:.85;white-space:nowrap;pointer-events:none}
-      .post .body{color:#e8e8e8}
+      .post .body{color:#e8e8e8;overflow-wrap:anywhere;word-break:break-word}
+      .post .body a{overflow-wrap:anywhere;word-break:break-word}
       .post .body p,.note-body p{margin:0 0 .45em}
       .post .body p:last-child,.note-body p:last-child{margin-bottom:0}
       .post .meta{font-size:.8rem;color:#888;margin-top:.45rem}
