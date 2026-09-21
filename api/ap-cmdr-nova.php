@@ -1593,6 +1593,9 @@ function ap_cmdr_html(): void
     }
     $followerCount = count($followers);
     $followingCount = count($following);
+    $bskyHandle = function_exists('ap_profile_bsky_handle')
+        ? ap_profile_bsky_handle('cmdr_nova', $p)
+        : null;
 
     $name = htmlspecialchars($p['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $vanityBadge = !empty($p['vanity_verified'])
@@ -1617,6 +1620,7 @@ function ap_cmdr_html(): void
     ) ?? $summary;
 
     ap_cmdr_shell_start('@cmdr_nova@mkultra.monster');
+    echo '<span id="profile-top" aria-hidden="true"></span>';
     if ($isOwner) {
         echo '<div class="owner-bar" style="margin:0 0 .85rem;padding:.55rem .75rem;border:1px solid #2a4a3a;border-radius:10px;background:rgba(80,160,120,.1);font-size:.86rem;color:#bfe;text-align:center">'
             . 'Signed in as <b>@cmdr_nova</b> — '
@@ -1687,6 +1691,15 @@ function ap_cmdr_html(): void
     echo '</div>';
     echo '<p class="follow-hint" id="ap-follow-hint">Opens your instance’s follow dialog (Mastodon, Akkoma, GoToSocial, etc.).</p>';
     echo '</form></div></div>';
+    if ($bskyHandle !== null && trim($bskyHandle) !== '') {
+        $bskySafe = htmlspecialchars(trim($bskyHandle), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<form class="follow-panel" id="ap-bsky-follow-form" action="https://bsky.app/profile/'
+            . rawurlencode(trim($bskyHandle)) . '" method="get" target="_blank" rel="noopener noreferrer">'
+            . '<label for="ap-bsky-follow-handle">Follow on Bluesky</label>'
+            . '<div class="follow-row"><input id="ap-bsky-follow-handle" type="text" value="@' . $bskySafe . '" readonly>'
+            . '<button type="submit">Open</button></div>'
+            . '<p class="follow-hint">Opens this profile in Bluesky so you can follow it there.</p></form>';
+    }
 
     if (!empty($p['attachment'])) {
         echo '<div class="fields">';
@@ -1721,9 +1734,6 @@ function ap_cmdr_html(): void
         ? ap_featured_cards_for_actor_key('cmdr_nova')
         : [];
     $featuredCount = count($featuredCards);
-    $bskyHandle = function_exists('ap_profile_bsky_handle')
-        ? ap_profile_bsky_handle('cmdr_nova', $p)
-        : null;
     $combined = function_exists('ap_profile_combined_follow_counts')
         ? ap_profile_combined_follow_counts('cmdr_nova', (int) $followerCount, (int) $followingCount)
         : [
@@ -2065,6 +2075,7 @@ function ap_cmdr_pager_html(string $basePath, int $page, int $totalPages, array 
     }
 
     $html .= $btn('Older →', $page < $totalPages ? $page + 1 : null, false, $page >= $totalPages);
+    $html .= '<a class="pager-btn" href="#profile-top">↑ Back to top</a>';
     $html .= '</nav>';
     return $html;
 }
