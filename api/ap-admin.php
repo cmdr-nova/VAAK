@@ -12935,6 +12935,20 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                 }
             }
         }
+        // Keep notification media visible even when an older status entity was
+        // cached without attachments; the mentions row is still authoritative.
+        if ($nMedia === [] && is_array($nStatus) && !empty($row['media_urls'])) {
+            foreach (mention_media_urls((string) $row['media_urls']) as $mediaUrl) {
+                $nMedia[] = [
+                    'url' => $mediaUrl,
+                    'mediaType' => null,
+                    'preview_url' => '',
+                ];
+                if (count($nMedia) >= 4) {
+                    break;
+                }
+            }
+        }
         $typeLabel = match ($nType) {
             'follow' => '👤 followed you',
             'favourite' => '★ liked your post',
