@@ -12090,7 +12090,7 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
         }
     }
     return [
-        'items' => $items,
+        'items' => array_slice($items, 0, $limit),
         'has_more' => ($offset + $limit) < max($fediCount, $bskyCount),
         'next_offset' => $offset + $limit,
     ];
@@ -20602,10 +20602,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $outboxFediCount = function_exists('ap_outbox_count_for_actor')
               ? ap_outbox_count_for_actor((string) $vaakActorKey) : count($outbox);
           $outboxHasMore = ($tlOffset + 40) < max($outboxFediCount, $outboxBskyCount);
+          // Each source is fetched in a bounded window; render only one
+          // combined page so the next offset cannot repeat the second half of
+          // the initial Fediverse/Bluesky windows.
+          $yourPostPage = array_slice($yourPostItems, 0, 40);
         ?>
-        <?php if (!$yourPostItems): ?><div class="empty">No posts yet. Use the ＋ button to compose.</div><?php endif; ?>
-        <div id="timeline-items" class="your-posts-feed" data-view="outbox" data-offset="<?= (int) ($tlOffset + 40) ?>" data-limit="40" data-has-more="<?= $outboxHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($yourPostItems[0]['sort']) ? $yourPostItems[0]['sort'] : time()) ?>">
-          <?php foreach ($yourPostItems as $yourPost): ?>
+        <?php if (!$yourPostPage): ?><div class="empty">No posts yet. Use the ＋ button to compose.</div><?php endif; ?>
+        <div id="timeline-items" class="your-posts-feed" data-view="outbox" data-offset="<?= (int) ($tlOffset + 40) ?>" data-limit="40" data-has-more="<?= $outboxHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($yourPostPage[0]['sort']) ? $yourPostPage[0]['sort'] : time()) ?>">
+          <?php foreach ($yourPostPage as $yourPost): ?>
             <?php if ($yourPost['kind'] === 'bsky'): ?>
               <?php admin_render_bsky_feed_item($yourPost['item'], 'following', 'outbox'); ?>
             <?php else: ?>
