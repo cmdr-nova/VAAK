@@ -22060,6 +22060,11 @@ window.apAdminToast = function (msg, isErr) {
     ev.preventDefault();
     if (form.dataset.busy === '1' || form.dataset.queuePending === '1') {
       window.apQueueRepeatedClick(form);
+      // The shared navigation handler runs during capture and may have shown
+      // the page-level Saving… indicator before this AJAX submit was handled.
+      // Interaction requests are optimistic/background work, so never leave
+      // that indicator hanging while a durable queue drains.
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       return;
     }
     // Already bookmarked: open folder picker instead of immediately removing
@@ -22067,6 +22072,7 @@ window.apAdminToast = function (msg, isErr) {
       const sid = (form.querySelector('input[name="status_id"]') || {}).value || '';
       const oid = (form.querySelector('input[name="object_id"]') || {}).value || '';
       if (sid) openBookmarkFolderPicker(btn, sid, oid, null);
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       return;
     }
     const fd = new FormData(form);
@@ -22132,6 +22138,10 @@ window.apAdminToast = function (msg, isErr) {
       form.dataset.busy = '0';
       delete form.dataset.skipBmPicker;
       if (btn) btn.disabled = false;
+      // This is an AJAX/queued interaction, not a full-page form navigation.
+      // Always clear the shared loading pill when the request is handed off
+      // (or fails), including early error paths above.
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     }
   });
 })();
