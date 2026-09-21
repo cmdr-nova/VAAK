@@ -4334,6 +4334,238 @@ function admin_tl_rank_from_timeline(array $timeline): array
     return $out;
 }
 
+function admin_home_favourite_actor_weights(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT target_actor AS actor_id, COUNT(*) AS favourite_count
+             FROM masto_favourites
+             WHERE owner_user_id = ?
+               AND target_actor IS NOT NULL
+               AND target_actor != ''
+             GROUP BY target_actor
+             ORDER BY favourite_count DESC
+             LIMIT 64"
+        );
+        $st->execute([$ownerUserId]);
+        $weights = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+            $count = (int) ($row['favourite_count'] ?? 0);
+            if ($actor !== '' && $count > 0) {
+                $weights[$actor] = min(64, $count);
+            }
+        }
+        return $weights;
+    } catch (Throwable $e) {
+        // Preference ranking is optional; a schema/cache issue must not affect Home.
+        return [];
+    }
+}
+
+/**
+ * Extract normalized hashtags without doing any remote resolution.
+ * @return list<string>
+ */
+function admin_home_extract_hashtags(string $text): array
+{
+    $text = html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($text === '' || !preg_match_all('/(?<![\p{L}\p{N}_])#([\p{L}\p{N}_]{2,64})/u', $text, $matches)) {
+        return [];
+    }
+    $tags = [];
+    foreach ($matches[1] as $tag) {
+        $tag = function_exists('ap_masto_normalize_tag_name')
+            ? ap_masto_normalize_tag_name((string) $tag)
+            : strtolower((string) $tag);
+        if ($tag !== '') {
+            $tags[$tag] = true;
+        }
+    }
+    return array_keys($tags);
+}
+
+/**
+ * Count tags in a bounded set of locally cached favourites. This runs only
+ * while rebuilding the short-lived ranked Home cache; it never fetches posts.
+ * @return array<string,int>
+ */
+function admin_home_favourite_tag_weights(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    try {
+        $db = ap_db();
+        $fav = $db->prepare(
+            'SELECT status_id, object_id FROM masto_favourites
+             WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 200'
+        );
+        $fav->execute([$ownerUserId]);
+        $favRows = $fav->fetchAll() ?: [];
+        $objectIds = [];
+        $statusIds = [];
+        foreach ($favRows as $row) {
+            $oid = rtrim(trim((string) ($row['object_id'] ?? '')), '/');
+            if ($oid !== '') {
+                $objectIds[$oid] = true;
+            }
+            $sid = (int) ($row['status_id'] ?? 0);
+            if ($sid > 0 && $sid < 2000000) {
+                $statusIds[$sid] = true;
+            }
+        }
+        $texts = [];
+        $ids = array_keys($objectIds);
+        foreach (array_chunk($ids, 80) as $chunk) {
+            if ($chunk === []) {
+                continue;
+            }
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $st = $db->prepare("SELECT object_id, summary FROM events WHERE object_id IN ($ph)");
+            $st->execute($chunk);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                $texts[(string) ($row['object_id'] ?? '')] = (string) ($row['summary'] ?? '');
+            }
+            $st = $db->prepare("SELECT id, content FROM outbox_notes WHERE id IN ($ph)");
+            $st->execute($chunk);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                $texts[(string) ($row['id'] ?? '')] = (string) ($row['content'] ?? '');
+            }
+        }
+        if ($statusIds !== []) {
+            $vals = array_keys($statusIds);
+            $ph = implode(',', array_fill(0, count($vals), '?'));
+            $st = $db->prepare("SELECT local_id, content_text FROM masto_statuses WHERE local_id IN ($ph)");
+            $st->execute($vals);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                $texts['status:' . (string) ($row['local_id'] ?? '')] = (string) ($row['content_text'] ?? '');
+            }
+        }
+        // Bluesky likes are already cached locally; reading them here does not
+        // trigger a refresh or network request.
+        if (function_exists('ap_bsky_favourite_cache_read')) {
+            foreach (ap_bsky_favourite_cache_read($ownerUserId, 120) as $item) {
+                $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+                $text = (string) ($post['record']['text'] ?? $post['text'] ?? '');
+                if ($text !== '') {
+                    $texts[] = $text;
+                }
+            }
+        }
+        $weights = [];
+        foreach ($texts as $text) {
+            foreach (admin_home_extract_hashtags((string) $text) as $tag) {
+                $weights[$tag] = min(32, ((int) ($weights[$tag] ?? 0)) + 1);
+            }
+        }
+        arsort($weights);
+        return array_slice($weights, 0, 32, true);
+    } catch (Throwable $e) {
+        // Optional personalization must never affect Home availability.
+        return [];
+    }
+}
+
+/** @param array{kind?:string,row?:array<string,mixed>} $item @return list<string> */
+function admin_home_item_hashtags(array $item): array
+{
+    $kind = (string) ($item['kind'] ?? '');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    $texts = [];
+    if ($kind === 'bsky') {
+        $post = is_array($row['post'] ?? null) ? $row['post'] : [];
+        $texts[] = (string) ($post['record']['text'] ?? $post['text'] ?? '');
+    } else {
+        foreach (['summary', 'content', 'content_text', 'spoiler_text'] as $key) {
+            if (isset($row[$key])) {
+                $texts[] = (string) $row[$key];
+            }
+        }
+    }
+    $tags = [];
+    foreach ($texts as $text) {
+        foreach (admin_home_extract_hashtags($text) as $tag) {
+            $tags[$tag] = true;
+        }
+    }
+    return array_keys($tags);
+}
+
+/** @param array{kind?:string,row?:array<string,mixed>} $item */
+function admin_home_item_preference_actor(array $item): string
+{
+    $kind = (string) ($item['kind'] ?? '');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if ($kind === 'bsky') {
+        return rtrim((string) ($row['post']['author']['did'] ?? $row['author_did'] ?? ''), '/');
+    }
+    // For boosts/Announce events, rank the original author rather than the
+    // account that performed the boost.
+    if ($kind === 'boost' || strtolower((string) ($row['type'] ?? '')) === 'announce') {
+        $target = rtrim((string) ($row['target_actor'] ?? ''), '/');
+        if ($target !== '') {
+            return $target;
+        }
+    }
+    return rtrim((string) ($row['actor_id'] ?? $row['attributedTo'] ?? ''), '/');
+}
+
+/**
+ * Nudge recent posts from authors the user repeatedly favourites.
+ *
+ * The maximum adjustment is 30 minutes, so this cannot turn the feed into a
+ * separate recommendation stream or pull old posts into a fresh Home page.
+ *
+ * @param list<array{kind?:string,row?:array<string,mixed>,sort?:int}> $timeline
+ * @return list<array{kind?:string,row?:array<string,mixed>,sort?:int}>
+ */
+function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): array
+{
+    $weights = admin_home_favourite_actor_weights($ownerUserId);
+    $tagWeights = admin_home_favourite_tag_weights($ownerUserId);
+    if ($weights === [] && $tagWeights === []) {
+        return $timeline;
+    }
+    $now = time();
+    foreach ($timeline as &$item) {
+        $actor = admin_home_item_preference_actor($item);
+        $count = $actor !== '' ? (int) ($weights[$actor] ?? 0) : 0;
+        // Native Bluesky favourites may record a bsky.app profile URL while
+        // cached posts identify the author by DID. Check both cheap aliases.
+        if ($count < 1 && (($item['kind'] ?? '') === 'bsky')) {
+            $author = is_array($item['row']['post']['author'] ?? null) ? $item['row']['post']['author'] : [];
+            foreach ([(string) ($author['handle'] ?? ''), (string) ($author['did'] ?? '')] as $ref) {
+                if ($ref === '') continue;
+                $count = max($count, (int) ($weights['https://bsky.app/profile/' . $ref] ?? 0));
+            }
+        }
+        $tagCount = 0;
+        foreach (admin_home_item_hashtags($item) as $tag) {
+            $tagCount = max($tagCount, (int) ($tagWeights[$tag] ?? 0));
+        }
+        $created = (int) ($item['sort'] ?? 0);
+        // Only recent items receive a nudge; malformed/old timestamps stay put.
+        if (($count < 1 && $tagCount < 1) || $created < ($now - 172800) || $created > ($now + 300)) {
+            continue;
+        }
+        $authorBonus = $count > 0 ? (int) round(600 * log(1 + $count, 2)) : 0;
+        $tagBonus = $tagCount > 0 ? (int) round(300 * log(1 + $tagCount, 2)) : 0;
+        $bonus = min(1800, $authorBonus + $tagBonus);
+        if ($bonus > 0) {
+            $item['sort'] = $created + $bonus;
+            $item['pref_nudge'] = true; // UI hint only; not persisted
+        }
+    }
+    unset($item);
+    usort($timeline, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
+    return $timeline;
+}
+
+
 /**
  * Keep the first Home page fedi-only (fast paint). Queue Bluesky ids into later
  * pages at ~30% with ≥2 fedi cards between, skipping dual-published twins.
@@ -5682,7 +5914,15 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     // Bluesky mix is queued into the ranked cache *after* the first page so
     // first paint stays fedi-only (no 80-post JSON decode / dual-publish walk).
-    usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    // Personalization only on ranked-cache rebuild (not on cache hits).
+    if (function_exists('admin_pending_timeline_items')) {
+        $homeTimeline = array_merge($homeTimeline, admin_pending_timeline_items($homeOwnerId));
+    }
+    if (function_exists('admin_home_apply_favourite_rank')) {
+        $homeTimeline = admin_home_apply_favourite_rank($homeTimeline, $homeOwnerId);
+    } else {
+        usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    }
     // Soft cap Bluesky share (~30%) so Home stays fedi-first when AT cache is busy.
     // Defer surplus Bluesky (don't drop) so later pages / deeper scroll still get them.
     if ($homeTimeline) {
