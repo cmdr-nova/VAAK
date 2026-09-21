@@ -4009,6 +4009,7 @@ if ($view === 'queue_health') {
         ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
         ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
         ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
+        ['name' => 'Remote media warming', 'table' => 'ap_media_warm_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
         ['name' => 'Scheduled posts', 'table' => 'ap_post_queue', 'state' => 'state', 'queued' => ['pending'], 'active' => ['publishing'], 'failed' => ['failed'], 'time' => 'scheduled_at', 'created' => 'created_at'],
         ['name' => 'Actor/profile refresh', 'table' => 'bsky_actor_refresh_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'queued_at'],
     ];

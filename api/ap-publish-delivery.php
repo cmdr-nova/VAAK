@@ -6,11 +6,14 @@ function ap_publish_delivery_enqueue(int $owner, string $noteId, array $payload)
 {
     if ($owner < 1 || $noteId === '') return false;
     $now = gmdate('c');
+    // Lower values run first: replies/mentions should reach their target
+    // before bulk publication and backfill work.
+    $priority = !empty($payload['in_reply_to']) ? 10 : (!empty($payload['quote_object_id']) ? 20 : 50);
     $db = ap_db();
     $st = $db->prepare("INSERT INTO ap_publish_delivery_queue
-        (owner_user_id,note_id,payload_json,status,attempts,next_attempt_at,created_at,updated_at)
-        VALUES (?,?,?,'pending',0,?,?,?) ON CONFLICT(note_id) DO NOTHING");
-    $st->execute([$owner, $noteId, json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $now, $now, $now]);
+        (owner_user_id,note_id,payload_json,status,priority,attempts,next_attempt_at,created_at,updated_at)
+        VALUES (?,?,?,'pending',?,0,?,?,?) ON CONFLICT(note_id) DO NOTHING");
+    $st->execute([$owner, $noteId, json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $priority, $now, $now, $now]);
     return true;
 }
 
@@ -189,7 +192,7 @@ function ap_publish_delivery_worker_run(int $limit = 10): array
             ->execute([$now, $staleAt]);
         $db->prepare("UPDATE ap_publish_delivery_queue SET status='pending',attempts=attempts+1,claimed_at=NULL,last_error='Worker lease expired; retrying',updated_at=? WHERE status='processing' AND claimed_at < ?")
             ->execute([$now, $staleAt]);
-        $st = $db->prepare("SELECT * FROM ap_publish_delivery_queue WHERE status='pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?");
+        $st = $db->prepare("SELECT * FROM ap_publish_delivery_queue WHERE status='pending' AND next_attempt_at <= ? ORDER BY priority, next_attempt_at, id LIMIT ?");
         $st->bindValue(1, $now); $st->bindValue(2, max(1, min(50, $limit)), PDO::PARAM_INT); $st->execute();
         foreach ($st->fetchAll() as $row) {
             $claim = $db->prepare("UPDATE ap_publish_delivery_queue SET status='processing',claimed_at=?,updated_at=? WHERE id=? AND status='pending'");

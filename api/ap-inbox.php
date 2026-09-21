@@ -1904,6 +1904,9 @@ function ap_fetch_remote_as2(string $url): ?array
         return null;
     }
     $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    if ($host !== '' && ap_remote_fetch_circuit_open($host) > time()) {
+        return null;
+    }
     $preferUnsigned = $host !== '' && (str_ends_with($host, 'brid.gy') || $host === 'brid.gy');
 
     $bodies = $preferUnsigned
@@ -1913,9 +1916,11 @@ function ap_fetch_remote_as2(string $url): ?array
     foreach ($bodies as $body) {
         $doc = ap_decode_as2_body(is_string($body) ? $body : null);
         if ($doc !== null) {
+            ap_remote_fetch_circuit_success($host);
             return $doc;
         }
     }
+    ap_remote_fetch_circuit_failure($host);
     return null;
 }
 
@@ -4104,6 +4109,33 @@ function ap_unsigned_get(string $url, int $timeoutSec = 8): ?string
     return is_string($body) && $body !== '' ? $body : null;
 }
 
+/** Short host circuit for repeated remote AS2 fetch failures. */
+function ap_remote_fetch_circuit_path(string $host): string
+{
+    return sys_get_temp_dir() . '/vaak-remote-fetch-circuit-' . hash('sha256', strtolower($host)) . '.json';
+}
+
+function ap_remote_fetch_circuit_open(string $host): int
+{
+    $path = ap_remote_fetch_circuit_path($host);
+    $state = is_file($path) ? json_decode((string) @file_get_contents($path), true) : null;
+    return is_array($state) ? max(0, (int) ($state['open_until'] ?? 0)) : 0;
+}
+
+function ap_remote_fetch_circuit_failure(string $host): void
+{
+    if ($host === '') return;
+    $path = ap_remote_fetch_circuit_path($host);
+    $state = is_file($path) ? json_decode((string) @file_get_contents($path), true) : [];
+    $failures = is_array($state) ? (int) ($state['failures'] ?? 0) + 1 : 1;
+    @file_put_contents($path, json_encode(['failures' => $failures, 'open_until' => $failures >= 3 ? time() + 60 : 0]), LOCK_EX);
+}
+
+function ap_remote_fetch_circuit_success(string $host): void
+{
+    if ($host !== '') @unlink(ap_remote_fetch_circuit_path($host));
+}
+
 /**
  * After HTTP signature verifies, require keyId host to match activity actor host
  * (and prefer matching the fetched key's owner). Blocks DM/Follow impersonation
@@ -4304,14 +4336,24 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
         }
         $json = json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if (!is_string($json) || $json === '') throw new RuntimeException('activity encode failed');
+        $activityObject = is_array($activity['object'] ?? null) ? $activity['object'] : [];
+        $hasMention = false;
+        foreach (($activityObject['tag'] ?? []) as $tag) {
+            if (is_array($tag) && strtolower((string) ($tag['type'] ?? '')) === 'mention') {
+                $hasMention = true;
+                break;
+            }
+        }
+        // Replies and direct mentions should not sit behind bulk fan-out.
+        $priority = !empty($activityObject['inReplyTo']) ? 10 : ($hasMention ? 20 : 50);
         $db = ap_db();
         $st = $db->prepare('INSERT INTO ap_fanout_delivery_queue
-            (activity_key,inbox_url,activity_json,key_id,priv_path,status,attempts,next_attempt_at,created_at,updated_at)
-            VALUES (?,?,?,?,?,\'pending\',0,?,?,?) ON CONFLICT(activity_key,inbox_url) DO NOTHING');
+            (activity_key,inbox_url,activity_json,key_id,priv_path,status,priority,attempts,next_attempt_at,created_at,updated_at)
+            VALUES (?,?,?,?,?,\'pending\',?,0,?,?,?) ON CONFLICT(activity_key,inbox_url) DO NOTHING');
         $now = gmdate('c');
         $queued = 0;
         foreach ($inboxUrls as $inbox) {
-            $st->execute([$activityKey, $inbox, $json, $keyId, $privPath, $now, $now, $now]);
+            $st->execute([$activityKey, $inbox, $json, $keyId, $privPath, $priority, $now, $now, $now]);
             $queued += $st->rowCount();
         }
         $worker = __DIR__ . '/ap-fanout-delivery-worker.php';

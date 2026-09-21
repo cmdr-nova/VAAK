@@ -70,6 +70,12 @@ Keep the action/publication lines enabled at the normal one-minute cadence;
 media and actor-refresh workers are independently bounded and cannot consume
 their worker slots.
 
+Maintenance also prunes terminal delivery/fan-out/media/profile-refresh rows
+after the queue retention window (seven days by default). User action history is
+kept separately. Durable publication and fan-out jobs use lower numeric
+priorities for replies and mentions so those deliveries are not held behind
+bulk work.
+
 Use a systemd timer instead when the host already manages application workers.
 The worker is idempotent and uses a lease, so overlapping timer invocations are
 safe; keep only one active timer on a host to avoid unnecessary database work.

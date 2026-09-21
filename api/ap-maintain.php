@@ -36,6 +36,7 @@ $oauthGoneDays = 7; // revoked / fully-expired OAuth tokens
 $tmpMaxAgeHours = 48;
 $emojiDays = 30;
 $actorDays = 60;
+$queueDays = 7;
 
 foreach ($argv as $arg) {
     if ($arg === '--dry-run') {
@@ -63,6 +64,9 @@ foreach ($argv as $arg) {
     if (preg_match('/^--actor-days=(\d+)$/', $arg, $m)) {
         $actorDays = max(14, min(365, (int) $m[1]));
     }
+    if (preg_match('/^--queue-days=(\d+)$/', $arg, $m)) {
+        $queueDays = max(1, min(90, (int) $m[1]));
+    }
 }
 
 $lockPath = '/tmp/ap-maintain.lock';
@@ -85,6 +89,7 @@ $stats = [
     'link_previews_deleted' => 0,
     'bsky_posts_deleted' => 0,
     'bsky_post_links_deleted' => 0,
+    'queue_rows_deleted' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
     'errors' => 0,
@@ -100,6 +105,40 @@ try {
     $isPostgres = ap_db_driver() === 'pgsql';
 
     if (!$vacuumOnly) {
+        // --- Durable worker queue retention ---
+        // Delivery and cache-warming rows are operational history, not user
+        // content. Keep a short terminal history so the tables stay small and
+        // due-job scans remain fast. User action rows are retained longer for
+        // troubleshooting and are deliberately handled separately below.
+        $queueCutoff = $nowUtc->modify('-' . $queueDays . ' days')->format('c');
+        $queuePrunes = [
+            ['table' => 'ap_publish_delivery_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
+            ['table' => 'ap_fanout_delivery_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
+            ['table' => 'ap_media_warm_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
+            ['table' => 'bsky_actor_refresh_queue', 'time' => 'queued_at', 'states' => ['succeeded', 'failed']],
+        ];
+        foreach ($queuePrunes as $queuePrune) {
+            try {
+                $stateSql = implode(',', array_fill(0, count($queuePrune['states']), '?'));
+                $sql = "DELETE FROM {$queuePrune['table']} WHERE status IN ({$stateSql}) AND {$queuePrune['time']} < ?";
+                $params = array_merge($queuePrune['states'], [$queueCutoff]);
+                if ($dryRun) {
+                    $countSt = $db->prepare("SELECT COUNT(*) AS c FROM {$queuePrune['table']} WHERE status IN ({$stateSql}) AND {$queuePrune['time']} < ?");
+                    $countSt->execute($params);
+                    $n = (int) (($countSt->fetch()['c'] ?? 0));
+                    $stats['queue_rows_deleted'] += $n;
+                    $log("would_delete queue_rows table={$queuePrune['table']} count={$n} older_than={$queueCutoff}");
+                    continue;
+                }
+                $st = $db->prepare($sql);
+                $st->execute($params);
+                $stats['queue_rows_deleted'] += $st->rowCount();
+            } catch (Throwable $e) {
+                // Older installations may not have every optional queue yet.
+                $log('queue retention skipped table=' . $queuePrune['table'] . ': ' . $e->getMessage());
+            }
+        }
+
         // --- Optional per-account local post retention ---
         // This is deliberately opt-in. Only notes under the enabled local
         // actor's own /users/{key}/notes/ namespace are eligible.

@@ -43,7 +43,7 @@ try {
     $now = gmdate('c');
     $stale = gmdate('c', time() - 600);
     $db->prepare("UPDATE ap_fanout_delivery_queue SET status='pending', claimed_at=NULL, attempts=attempts+1, last_error='Worker lease expired', updated_at=? WHERE status='processing' AND claimed_at < ?")->execute([$now, $stale]);
-    $st = $db->prepare("SELECT * FROM ap_fanout_delivery_queue WHERE status='pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?");
+    $st = $db->prepare("SELECT * FROM ap_fanout_delivery_queue WHERE status='pending' AND next_attempt_at <= ? ORDER BY priority, next_attempt_at, id LIMIT ?");
     $st->bindValue(1, $now); $st->bindValue(2, $limit, PDO::PARAM_INT); $st->execute();
     $stats = ['claimed'=>0,'succeeded'=>0,'retried'=>0,'failed'=>0];
     foreach ($st->fetchAll() as $row) {

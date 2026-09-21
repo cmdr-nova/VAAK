@@ -2037,6 +2037,7 @@ CREATE TABLE IF NOT EXISTS ap_publish_delivery_queue (
     note_id TEXT NOT NULL UNIQUE,
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 50,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
     claimed_at TEXT,
@@ -2045,6 +2046,7 @@ CREATE TABLE IF NOT EXISTS ap_publish_delivery_queue (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ap_publish_delivery_due ON ap_publish_delivery_queue(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_ap_publish_delivery_priority ON ap_publish_delivery_queue(status, next_attempt_at, priority, id);
 CREATE TABLE IF NOT EXISTS ap_fanout_delivery_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     activity_key TEXT NOT NULL,
@@ -2053,6 +2055,7 @@ CREATE TABLE IF NOT EXISTS ap_fanout_delivery_queue (
     key_id TEXT NOT NULL,
     priv_path TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 50,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
     claimed_at TEXT,
@@ -2062,7 +2065,23 @@ CREATE TABLE IF NOT EXISTS ap_fanout_delivery_queue (
     UNIQUE(activity_key, inbox_url)
 );
 CREATE INDEX IF NOT EXISTS idx_ap_fanout_delivery_due ON ap_fanout_delivery_queue(status, next_attempt_at, id);
+CREATE INDEX IF NOT EXISTS idx_ap_fanout_delivery_priority ON ap_fanout_delivery_queue(status, next_attempt_at, priority, id);
 SQL);
+    // Additive queue-priority columns for existing SQLite development trees.
+    foreach (['ap_publish_delivery_queue', 'ap_fanout_delivery_queue'] as $priorityTable) {
+        try {
+            $priorityCols = array_column($db->query("PRAGMA table_info({$priorityTable})")->fetchAll(), 'name');
+            if (!in_array('priority', $priorityCols, true)) {
+                $db->exec("ALTER TABLE {$priorityTable} ADD COLUMN priority INTEGER NOT NULL DEFAULT 50");
+            }
+            $indexName = $priorityTable === 'ap_publish_delivery_queue'
+                ? 'idx_ap_publish_delivery_priority'
+                : 'idx_ap_fanout_delivery_priority';
+            $db->exec("CREATE INDEX IF NOT EXISTS {$indexName} ON {$priorityTable}(status, next_attempt_at, priority, id)");
+        } catch (Throwable $e) {
+            error_log('[ap-db] queue priority not provisioned for ' . $priorityTable . ': ' . $e->getMessage());
+        }
+    }
     try {
         $st = $db->query('SELECT id FROM ap_queue_settings WHERE id = 1');
         if (!$st->fetch()) {
