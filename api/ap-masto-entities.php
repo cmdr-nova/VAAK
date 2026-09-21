@@ -8478,7 +8478,31 @@ function ap_masto_trends_statuses(int $limit = 10): array
         // Optional Bluesky cache must never affect Fediverse trends.
     }
 
-    ap_masto_trends_cache_set('statuses', $out);
+    // Interleave Bluesky into the returned window (they were appended after
+    // fedi and used to get sliced off when limit < count($out)).
+    $fediOnly = [];
+    $bskyOnly = [];
+    foreach ($out as $st) {
+        if (($st['source'] ?? '') === 'bluesky') {
+            $bskyOnly[] = $st;
+        } else {
+            $fediOnly[] = $st;
+        }
+    }
+    $mixed = [];
+    $bi = 0;
+    foreach ($fediOnly as $i => $st) {
+        $mixed[] = $st;
+        if ($bi < count($bskyOnly) && ($i % 3 === 2)) {
+            $mixed[] = $bskyOnly[$bi++];
+        }
+    }
+    while ($bi < count($bskyOnly)) {
+        $mixed[] = $bskyOnly[$bi++];
+    }
+    $out = $mixed;
+
+    ap_masto_trends_cache_set('statuses', array_slice($out, 0, 20));
     return array_slice($out, 0, $limit);
 }
 
