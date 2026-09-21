@@ -3620,6 +3620,8 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $maxAge = 0;
     $anyStale = false;
     $anyHit = false;
+    $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    $viewerId = is_array($viewer) ? (int) ($viewer['id'] ?? 0) : 0;
     foreach (['tags' => 5, 'links' => 5, 'statuses' => 5] as $kind => $limit) {
         $row = function_exists('ap_masto_trends_cache_read')
             ? ap_masto_trends_cache_read($kind, 1, $allowStale)
@@ -3630,7 +3632,20 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         $anyHit = true;
         $maxAge = max($maxAge, (int) ($row['age'] ?? 0));
         $anyStale = $anyStale || !empty($row['stale']);
-        $items = array_slice($row['items'], 0, $limit);
+        $items = [];
+        foreach ($row['items'] as $candidate) {
+            if (!is_array($candidate)) {
+                continue;
+            }
+            if ($viewerId > 0 && function_exists('ap_masto_trend_item_hidden')
+                && ap_masto_trend_item_hidden($candidate, $viewerId)) {
+                continue;
+            }
+            $items[] = $candidate;
+            if (count($items) >= $limit) {
+                break;
+            }
+        }
         if ($kind === 'tags') {
             $trendTags = $items;
         } elseif ($kind === 'links') {
@@ -4249,6 +4264,8 @@ if ($view === 'outbox' && !$wantNewerPoll && function_exists('ap_bsky_session_ro
 /**
  * @return array<string,mixed>|null
  */
+
+
 function admin_masto_row_for_note(string $noteId): ?array
 {
     if ($noteId === '') {
