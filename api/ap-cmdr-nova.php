@@ -74,6 +74,26 @@ if ($path === '/users/cmdr_nova/feed.xml' || $path === '/users/cmdr_nova/feed.at
     exit;
 }
 
+if (!$wantsAp && strtolower((string) ($_GET['format'] ?? '')) === 'jekyll') {
+    $slug = trim((string) ($_GET['post'] ?? ''));
+    $post = $slug !== '' ? ap_blog_post_get('cmdr_nova', $slug, true) : null;
+    if (!is_array($post)) {
+        http_response_code(404);
+        exit('Blog post not found');
+    }
+    $yaml = static function (string $value): string {
+        return '"' . str_replace(['\\', '"', "\r", "\n"], ['\\\\', '\\"', '', '\\n'], $value) . '"';
+    };
+    header('Content-Type: text/markdown; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-z0-9_-]+/i', '-', $slug) . '.md"');
+    echo "---\nlayout: post\ntitle: " . $yaml((string) ($post['title'] ?? ''))
+        . "\ncategory: " . $yaml((string) ($post['category'] ?? ''))
+        . "\ntags: [" . implode(', ', array_map($yaml, (array) ($post['tags'] ?? []))) . "]\ndate: "
+        . $yaml((string) ($post['published_at'] ?? $post['created_at'] ?? '')) . "\n---\n\n"
+        . (string) ($post['body_markdown'] ?? '');
+    exit;
+}
+
 if (preg_match('#^/users/cmdr_nova/(outbox|followers|following)$#', $path, $m)) {
     $col = $m[1];
 
@@ -873,6 +893,12 @@ function ap_cmdr_shell_start(string $title): void
       .profile-tabs a.is-active{color:#0b0b0b;background:#00ff9f;border-color:#00ff9f}
       .profile-tabs a .tab-count{opacity:.7;font-weight:500;margin-left:.25rem;font-size:.8rem}
       .profile-tabs a.is-active .tab-count{opacity:.85}
+      .profile-blog-post{border:1px solid #2a2a2a;border-radius:12px;background:#141414;padding:1.2rem 1.35rem;margin:1rem 0;overflow-wrap:anywhere}
+      .profile-blog-post h2{margin:.2rem 0 .45rem;line-height:1.25}
+      .profile-blog-post .note-body{font-size:1.03rem;line-height:1.75}
+      .profile-blog-post .note-body p{margin:.8rem 0}
+      .profile-blog-post .note-body h2,.profile-blog-post .note-body h3,.profile-blog-post .note-body h4{line-height:1.25;margin:1.35rem 0 .45rem}
+      .profile-blog-post .note-body a{color:#7ee0ff}
       .profile-media-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.8rem;align-items:start}
       .profile-media-item{min-width:0;padding:.6rem;background:#111;border:1px solid #292929;border-radius:12px;overflow:hidden}
       .profile-media-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px;border-radius:8px;overflow:hidden;background:#090909}
@@ -1692,6 +1718,9 @@ function ap_cmdr_html(): void
     $perPage = 20;
     $page = max(1, (int) ($_GET['page'] ?? 1));
     $tab = ap_cmdr_normalize_profile_tab((string) ($_GET['tab'] ?? 'posts'));
+    $blogSlug = trim((string) ($_GET['post'] ?? ''));
+    $blogPost = $blogSlug !== '' ? ap_blog_post_get('cmdr_nova', $blogSlug, true) : null;
+    $blogRows = ap_blog_posts_list('cmdr_nova', true, 20, max(0, ($page - 1) * $perPage));
     $featuredCards = function_exists('ap_featured_cards_for_actor_key')
         ? ap_featured_cards_for_actor_key('cmdr_nova')
         : [];
@@ -1711,11 +1740,12 @@ function ap_cmdr_html(): void
     }
     // HTML profile feed = site blogs + notes + AP compose (no federation side effects).
     // Media and Featured tabs still need the post counts for their tab badges.
-    $feedTab = $tab === 'featured' ? 'posts' : $tab;
+    $feedTab = in_array($tab, ['featured', 'blog'], true) ? 'posts' : $tab;
     $postsData = ap_cmdr_posts_page($page, $perPage, $feedTab);
     $counts = is_array($postsData['counts'] ?? null) ? $postsData['counts'] : ['posts' => 0, 'replies' => 0, 'boosts' => 0];
     $counts['featured'] = $featuredCount;
     $counts['media'] = (int) ($postsData['counts']['media'] ?? 0);
+    $counts['blog'] = count(ap_blog_posts_list('cmdr_nova', true, 200, 0));
     $tabTotal = (int) ($postsData['total'] ?? 0);
     $statPosts = (int) ($counts['posts'] ?? 0) + (int) ($counts['replies'] ?? 0); // original posts + replies (not boosts)
 
@@ -1740,6 +1770,7 @@ function ap_cmdr_html(): void
             'boosts' => 'Boosts',
             'media' => 'Media',
             'featured' => 'Featured',
+            'blog' => 'Blog',
         ] as $tKey => $tLabel
     ) {
         $href = $tKey === 'posts' ? '/users/cmdr_nova' : ('/users/cmdr_nova?tab=' . rawurlencode($tKey));
@@ -1752,7 +1783,42 @@ function ap_cmdr_html(): void
     }
     echo '</nav>';
 
-    if ($tab === 'media') {
+    if ($tab === 'blog') {
+        echo '<section class="posts profile-blog" aria-label="Blog">';
+        if ($blogPost) {
+            echo '<article class="profile-blog-post">';
+            echo '<div class="muted">' . htmlspecialchars((string) ($blogPost['category'] ?? 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
+            echo '<h2>' . htmlspecialchars((string) ($blogPost['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</h2>';
+            echo '<div class="muted">' . htmlspecialchars((string) ($blogPost['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . '</div>';
+            if (str_starts_with((string) ($blogPost['canonical_url'] ?? ''), 'https://')) {
+                echo '<p class="muted"><a href="' . htmlspecialchars((string) $blogPost['canonical_url'], ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">Open original site post</a></p>';
+            }
+            if (!empty($blogPost['tags'])) {
+                echo '<p class="muted">' . htmlspecialchars(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) $blogPost['tags'])), ENT_QUOTES, 'UTF-8') . '</p>';
+            }
+            echo '<div class="note-body">' . ap_cmdr_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) . '</div>';
+            echo '<p><a href="/users/cmdr_nova?tab=blog">← All blog posts</a> · <a href="/users/cmdr_nova?tab=blog&amp;post=' . htmlspecialchars(rawurlencode((string) $blogPost['slug']), ENT_QUOTES, 'UTF-8') . '&amp;format=jekyll">Download Jekyll Markdown</a></p>';
+            echo '</article>';
+        } elseif (!$blogRows) {
+            echo '<p class="muted">No public blog posts yet.</p>';
+        } else {
+            foreach ($blogRows as $bp) {
+                $slugSafe = rawurlencode((string) ($bp['slug'] ?? ''));
+                echo '<article class="profile-blog-post">';
+                echo '<div class="muted">' . htmlspecialchars((string) (($bp['category'] ?? '') !== '' ? $bp['category'] : 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
+                echo '<h2><a href="/users/cmdr_nova?tab=blog&amp;post=' . htmlspecialchars($slugSafe, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars((string) ($bp['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></h2>';
+                echo '<p>' . htmlspecialchars((string) ($bp['excerpt'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+                echo '<p class="muted">' . htmlspecialchars((string) ($bp['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . ' · <a href="/users/cmdr_nova?tab=blog&amp;post=' . htmlspecialchars($slugSafe, ENT_QUOTES, 'UTF-8') . '">Read article</a></p>';
+                echo '</article>';
+            }
+            $blogTotal = (int) $counts['blog'];
+            $totalPages = max(1, (int) ceil($blogTotal / $perPage));
+            if ($totalPages > 1) {
+                echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, ['tab' => 'blog']);
+            }
+        }
+        echo '</section>';
+    } elseif ($tab === 'media') {
         echo '<section class="posts profile-media-gallery" aria-label="Media">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Media</h2>';
         if (!$postsData['rows']) {
@@ -2335,10 +2401,48 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     ];
 }
 
+function ap_cmdr_blog_markdown_html(string $markdown): string
+{
+    $lines = preg_split('/\R/u', trim($markdown)) ?: [];
+    $html = [];
+    $inList = false;
+    $inline = static function (string $value): string {
+        $safe = htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safe = preg_replace_callback('/\[([^\]]+)\]\((https:\/\/[^\s\)]+)\)/', static fn($m) => '<a href="' . htmlspecialchars($m[2], ENT_QUOTES, 'UTF-8') . '" rel="nofollow noopener noreferrer" target="_blank">' . htmlspecialchars($m[1], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>', $safe) ?? $safe;
+        $safe = preg_replace('/\*\*([^*]+)\*\*/', '<strong>$1</strong>', $safe) ?? $safe;
+        return preg_replace('/(?<!\*)\*([^*]+)\*(?!\*)/', '<em>$1</em>', $safe) ?? $safe;
+    };
+    foreach ($lines as $line) {
+        $line = rtrim((string) $line);
+        if ($line === '') {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            continue;
+        }
+        if (preg_match('/^###\s+(.+)$/', $line, $m)) {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<h4>' . $inline($m[1]) . '</h4>';
+        } elseif (preg_match('/^##\s+(.+)$/', $line, $m)) {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<h3>' . $inline($m[1]) . '</h3>';
+        } elseif (preg_match('/^#\s+(.+)$/', $line, $m)) {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<h2>' . $inline($m[1]) . '</h2>';
+        } elseif (preg_match('/^[-*]\s+(.+)$/', $line, $m)) {
+            if (!$inList) { $html[] = '<ul>'; $inList = true; }
+            $html[] = '<li>' . $inline($m[1]) . '</li>';
+        } else {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<p>' . $inline($line) . '</p>';
+        }
+    }
+    if ($inList) { $html[] = '</ul>'; }
+    return implode("\n", $html);
+}
+
 function ap_cmdr_normalize_profile_tab(string $tab): string
 {
     $tab = strtolower(trim($tab));
-    return in_array($tab, ['posts', 'replies', 'boosts', 'media', 'featured', 'all'], true) ? $tab : 'posts';
+    return in_array($tab, ['posts', 'replies', 'boosts', 'media', 'featured', 'blog', 'all'], true) ? $tab : 'posts';
 }
 
 /**

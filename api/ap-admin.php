@@ -203,6 +203,29 @@ if ($view === 'import_export' && isset($_GET['export'])) {
     ap_ie_handle_export(preg_replace('/[^a-z_]/', '', (string) $_GET['export']) ?: '');
 }
 
+// Download a VAAK blog post as Jekyll-compatible Markdown with front matter.
+if ($view === 'blog' && strtolower((string) ($_GET['format'] ?? '')) === 'jekyll') {
+    $slug = trim((string) ($_GET['post'] ?? ''));
+    $post = $slug !== '' ? ap_blog_post_get($vaakActorKey, $slug, false) : null;
+    if (!is_array($post)) {
+        http_response_code(404);
+        exit('Blog post not found');
+    }
+    $yaml = static function (string $value): string {
+        return '"' . str_replace(['\\', '"', "\r", "\n"], ['\\\\', '\\"', '', '\\n'], $value) . '"';
+    };
+    $front = "---\n"
+        . 'layout: post' . "\n"
+        . 'title: ' . $yaml((string) ($post['title'] ?? '')) . "\n"
+        . 'category: ' . $yaml((string) ($post['category'] ?? '')) . "\n"
+        . 'tags: [' . implode(', ', array_map($yaml, (array) ($post['tags'] ?? []))) . "]\n"
+        . 'date: ' . $yaml((string) ($post['published_at'] ?? $post['created_at'] ?? '')) . "\n---\n\n";
+    header('Content-Type: text/markdown; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^a-z0-9_-]+/i', '-', $slug) . '.md"');
+    echo $front . (string) ($post['body_markdown'] ?? '');
+    exit;
+}
+
 /**
  * Per-user AI credentials for alt-text (OpenAI-compatible Chat Completions vision).
  * The key is always read from the authenticated user's encrypted profile field;
@@ -626,6 +649,54 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $payload = admin_profile_hover_payload($actor, $vaakOwnerId, $vaakActorId);
         echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         exit;
+    }
+    if ($action === 'blog_save') {
+        $title = trim((string) ($_POST['blog_title'] ?? ''));
+        $category = trim((string) ($_POST['blog_category'] ?? ''));
+        $body = trim((string) ($_POST['blog_body'] ?? ''));
+        $tagsRaw = trim((string) ($_POST['blog_tags'] ?? ''));
+        $existingSlug = trim((string) ($_POST['blog_slug'] ?? ''));
+        $publish = !empty($_POST['blog_publish']);
+        $tags = [];
+        foreach (preg_split('/[,\s]+/', $tagsRaw) ?: [] as $tag) {
+            $tag = ltrim(trim((string) $tag), '#');
+            $tag = preg_replace('/[^\p{L}\p{N}_-]+/u', '', $tag) ?? '';
+            if ($tag !== '') { $tags[strtolower($tag)] = true; }
+        }
+        $tags = array_keys($tags);
+        $view = 'blog';
+        if ($title === '' || mb_strlen($title) > 240) {
+            $error = 'A blog title is required (maximum 240 characters).';
+        } elseif ($body === '' || mb_strlen($body) > 200000) {
+            $error = 'Blog content is required and must be under 200,000 characters.';
+        } elseif (mb_strlen($category) > 120) {
+            $error = 'Category must be under 120 characters.';
+        } else {
+            $excerpt = admin_blog_excerpt($body, 420);
+            $slug = $existingSlug !== '' ? $existingSlug : ap_blog_slug($title, substr(bin2hex(random_bytes(4)), 0, 8));
+            $blog = $existingSlug !== ''
+                ? ap_blog_update_draft($vaakOwnerId, $vaakActorKey, $slug, $title, $category, $tags, $body, $excerpt)
+                : ap_blog_create($vaakOwnerId, $vaakActorKey, $slug, $title, $category, $tags, $body, $excerpt, 'draft');
+            if (!is_array($blog)) {
+                $error = 'Could not save the blog post.';
+            } elseif (!$publish) {
+                $notice = 'Blog draft saved.';
+            } else {
+                if (!defined('AP_INBOX_LIB_ONLY')) { define('AP_INBOX_LIB_ONLY', true); }
+                require_once __DIR__ . '/ap-inbox.php';
+                $profileUrl = 'https://mkultra.monster/users/' . rawurlencode($vaakActorKey) . '?tab=blog&post=' . rawurlencode($slug);
+                $tagLine = $tags !== [] ? "\n\n" . implode(' ', array_map(static fn(string $tag): string => '#' . $tag, $tags)) : '';
+                $teaser = ($excerpt !== '' ? $excerpt : '') . $tagLine . "\n\nRead the full post: " . $profileUrl;
+                $published = ap_local_post_reply($teaser, '', null, $title, true, null, [], 'public');
+                if (empty($published['ok'])) {
+                    $error = 'Draft saved, but publishing failed: ' . (string) ($published['error'] ?? 'unknown error');
+                } else {
+                    ap_blog_set_note($vaakActorKey, $slug, (string) ($published['note_id'] ?? ''));
+                    ap_blog_mark_published($vaakActorKey, $slug);
+                    $notice = 'Blog post published.';
+                }
+            }
+        }
     }
     if (in_array($action, ['favourite_status', 'unfavourite_status', 'bookmark_status', 'unbookmark_status', 'reblog_status', 'unreblog_status'], true)) {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
@@ -6770,6 +6841,9 @@ $autoOpenComposer = $composerForceOpen
     || $prefillDraftId > 0;
 $composerReturnView = $view;
 $draftsCountNav = function_exists('ap_drafts_count') ? ap_drafts_count() : 0;
+if (function_exists('ap_blog_posts_list')) {
+    $draftsCountNav += count(array_filter(ap_blog_posts_list($vaakActorKey, false, 200), static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft'));
+}
 $profile = ap_profile_get($vaakActorKey);
 
 /** HTML-escape anything displayable (never pass bool/null through to htmlspecialchars). */
@@ -6786,6 +6860,51 @@ function h(mixed $s): string
     }
     $str = function_exists('ap_fix_utf8') ? ap_fix_utf8((string) $s) : (string) $s;
     return htmlspecialchars($str, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function admin_blog_excerpt(string $markdown, int $limit = 420): string
+{
+    $plain = trim(html_entity_decode(strip_tags($markdown), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $plain = preg_replace('/^\s{0,3}#+\s*/m', '', $plain) ?? $plain;
+    $plain = preg_replace('/\[([^\]]+)\]\([^\)]+\)/', '$1', $plain) ?? $plain;
+    $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
+    return function_exists('mb_strimwidth') ? mb_strimwidth($plain, 0, $limit, '…') : substr($plain, 0, $limit);
+}
+
+function admin_blog_markdown_html(string $markdown): string
+{
+    $lines = preg_split('/\R/u', trim($markdown)) ?: [];
+    $html = [];
+    $inList = false;
+    foreach ($lines as $line) {
+        $line = rtrim((string) $line);
+        if ($line === '') {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            continue;
+        }
+        $safe = h($line);
+        $safe = preg_replace_callback('/\[([^\]]+)\]\((https:\/\/[^\s\)]+)\)/', static fn($m) => '<a href="' . h($m[2]) . '" rel="nofollow noopener noreferrer" target="_blank">' . h($m[1]) . '</a>', $safe) ?? $safe;
+        $safe = preg_replace('/\*\*([^*]+)\*\*/', '<strong>$1</strong>', $safe) ?? $safe;
+        $safe = preg_replace('/(?<!\*)\*([^*]+)\*(?!\*)/', '<em>$1</em>', $safe) ?? $safe;
+        if (preg_match('/^###\s+(.+)$/', $line, $m)) {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<h4>' . h($m[1]) . '</h4>';
+        } elseif (preg_match('/^##\s+(.+)$/', $line, $m)) {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<h3>' . h($m[1]) . '</h3>';
+        } elseif (preg_match('/^#\s+(.+)$/', $line, $m)) {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<h2>' . h($m[1]) . '</h2>';
+        } elseif (preg_match('/^[-*]\s+(.+)$/', $line, $m)) {
+            if (!$inList) { $html[] = '<ul>'; $inList = true; }
+            $html[] = '<li>' . preg_replace_callback('/\[([^\]]+)\]\((https:\/\/[^\s\)]+)\)/', static fn($x) => '<a href="' . h($x[2]) . '" rel="nofollow noopener noreferrer" target="_blank">' . h($x[1]) . '</a>', h($m[1])) . '</li>';
+        } else {
+            if ($inList) { $html[] = '</ul>'; $inList = false; }
+            $html[] = '<p>' . $safe . '</p>';
+        }
+    }
+    if ($inList) { $html[] = '</ul>'; }
+    return implode("\n", $html);
 }
 
 
@@ -7010,6 +7129,7 @@ function view_title(string $view): string
         'gallery' => 'Gallery',
         'mentions' => 'Notifications',
         'dms' => 'Direct messages',
+        'blog' => 'Blog',
         'favourites' => 'Favourites',
         'bookmarks' => 'Bookmarks',
         'followers' => 'Followers',
@@ -13695,6 +13815,30 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       min-height: 0;
     }
     body.dm-fullscreen .dm-pane { height: 100%; }
+    body.blog-fullscreen .shell {
+      max-width: none;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: "main";
+    }
+    body.blog-fullscreen .rail-left,
+    body.blog-fullscreen .rail-right { display: none; }
+    body.blog-fullscreen .main { width: 100%; max-width: none; }
+    body.blog-fullscreen .main > .topbar { padding-inline: clamp(1rem, 4vw, 3rem); }
+    body.blog-fullscreen .feed { width: 100%; max-width: 1100px; margin-inline: auto; padding-inline: clamp(1rem, 4vw, 3rem); }
+    .blog-editor { max-width: 100%; }
+    .blog-editor textarea { min-height: min(62vh, 44rem); resize: vertical; line-height: 1.6; }
+    .blog-editor .blog-fields { display: grid; grid-template-columns: minmax(0, 2fr) minmax(10rem, 1fr); gap: .75rem; }
+    .blog-post-card { padding: clamp(1rem, 3vw, 2rem); }
+    .blog-post-card h2 { margin: .15rem 0 .35rem; }
+    .blog-post-body { font-size: 1.05rem; line-height: 1.75; overflow-wrap: anywhere; }
+    .blog-post-body h2, .blog-post-body h3, .blog-post-body h4 { line-height: 1.25; margin: 1.5rem 0 .5rem; }
+    .blog-post-body p { margin: .85rem 0; }
+    .blog-post-body li { margin: .35rem 0; }
+    .blog-post-body a { color: var(--primary); }
+    @media (max-width: 760px) {
+      body.blog-fullscreen .feed { padding-inline: .65rem; }
+      .blog-editor .blog-fields { grid-template-columns: 1fr; }
+    }
     .dm-back-top { margin-right: auto; }
     @media (max-width: 760px) {
       body.dm-fullscreen .feed { padding-inline: .65rem; }
@@ -15145,7 +15289,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .brand-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); display: block; margin: .4rem auto .45rem; }
   </style>
 </head>
-<body class="<?= $view === 'dms' ? 'dm-fullscreen' : '' ?>">
+<body class="<?= $view === 'dms' ? 'dm-fullscreen' : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
   <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
 </div>
@@ -15214,6 +15358,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <summary><span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span></summary>
         <div class="nav-sub">
           <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
+          <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'queue' ? 'active' : '' ?>" href="?view=queue"><span class="ico">⏱</span><span class="label">Queue</span></a>
           <a class="<?= $view === 'drafts' ? 'active' : '' ?>" href="?view=drafts" id="nav-drafts">
             <span class="ico">📄</span><span class="label">Drafts</span>
@@ -15329,7 +15474,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
       <h1><?= h(view_title($view)) ?></h1>
       <div class="topbar-actions">
-        <?php if ($view === 'dms'): ?>
+        <?php if ($view === 'dms' || $view === 'blog'): ?>
           <a class="btn btn-ghost dm-back-top" href="?view=home">← Back to Home</a>
         <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed'], true)): ?>
@@ -15366,7 +15511,79 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php admin_render_compose_panel(true); ?>
         </div>
       <?php endif; ?>
-      <?php if ($view === 'discuss'): ?>
+      <?php if ($view === 'blog'): ?>
+        <?php
+          $blogSlug = trim((string) ($_GET['post'] ?? ''));
+          $blogPost = $blogSlug !== '' ? ap_blog_post_get($vaakActorKey, $blogSlug, false) : null;
+          $editingSlug = trim((string) ($_GET['draft'] ?? ''));
+          $editingDraft = $editingSlug !== '' ? ap_blog_post_get($vaakActorKey, $editingSlug, false) : null;
+          if (!is_array($editingDraft) || (string) ($editingDraft['status'] ?? '') !== 'draft') {
+              $editingDraft = null;
+          }
+          $publishedBlogs = ap_blog_posts_list($vaakActorKey, true, 100);
+          $draftBlogs = array_values(array_filter(
+              ap_blog_posts_list($vaakActorKey, false, 100),
+              static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft'
+          ));
+          if ($blogPost):
+        ?>
+          <article class="side-card blog-post-card">
+            <div class="meta">Blog<?= ($blogPost['category'] ?? '') !== '' ? ' · ' . h((string) $blogPost['category']) : '' ?></div>
+            <h2><?= h((string) ($blogPost['title'] ?? 'Untitled')) ?></h2>
+            <div class="meta"><?= h((string) ($blogPost['published_at'] ?? $blogPost['created_at'] ?? '')) ?></div>
+            <?php if (!empty($blogPost['tags'])): ?><p class="meta">#<?= h(implode(' #', (array) $blogPost['tags'])) ?></p><?php endif; ?>
+            <?php if (str_starts_with((string) ($blogPost['canonical_url'] ?? ''), 'https://')): ?><p class="meta"><a href="<?= h((string) $blogPost['canonical_url']) ?>" target="_blank" rel="noopener noreferrer">Open original site post</a></p><?php endif; ?>
+            <div class="blog-post-body"><?= admin_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) ?></div>
+            <p class="composer-actions"><a class="btn btn-ghost" href="?view=blog">← All blog posts</a> <a class="btn btn-ghost" href="?view=blog&amp;post=<?= h(rawurlencode((string) $blogPost['slug'])) ?>&amp;format=jekyll">Download Jekyll Markdown</a></p>
+          </article>
+        <?php else: ?>
+          <section class="side-card blog-editor">
+            <div class="meta">Long-form publishing · Markdown-compatible (**bold**, *italics*, headings, lists, and links)</div>
+            <h2>Write a blog post</h2>
+            <form method="post" action="?view=blog">
+              <input type="hidden" name="action" value="blog_save">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <?php if ($editingDraft): ?><input type="hidden" name="blog_slug" value="<?= h((string) $editingDraft['slug']) ?>"><?php endif; ?>
+              <div class="blog-fields">
+                <input name="blog_title" maxlength="240" required placeholder="Title" value="<?= h((string) ($editingDraft['title'] ?? '')) ?>">
+                <input name="blog_category" maxlength="120" placeholder="Category" value="<?= h((string) ($editingDraft['category'] ?? '')) ?>">
+              </div>
+              <input name="blog_tags" maxlength="500" placeholder="Hashtags, separated by spaces or commas" value="<?= h(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) ($editingDraft['tags'] ?? [])))) ?>" style="margin-top:.75rem">
+              <textarea name="blog_body" maxlength="200000" required placeholder="Write your post…" style="margin-top:.75rem"><?= h((string) ($editingDraft['body_markdown'] ?? '')) ?></textarea>
+              <div class="composer-actions">
+                <span class="meta">Published posts appear under Blog on your HTML profile. The timeline receives a title content warning and a short excerpt.</span>
+                <button class="btn btn-ghost" name="blog_publish" value="0" type="submit"><?= $editingDraft ? 'Update draft' : 'Save draft' ?></button>
+                <button class="btn btn-primary" name="blog_publish" value="1" type="submit">Publish</button>
+              </div>
+            </form>
+          </section>
+          <?php if ($publishedBlogs !== []): ?>
+            <section class="side-card">
+              <h2>Published</h2>
+              <?php foreach ($publishedBlogs as $bp): ?>
+                <article class="blog-post-card" style="padding:1rem 0;border-top:1px solid var(--border)">
+                  <h3 style="margin:0"><a href="?view=blog&amp;post=<?= h(rawurlencode((string) $bp['slug'])) ?>"><?= h((string) $bp['title']) ?></a></h3>
+                  <div class="meta"><?= h((string) ($bp['category'] ?? '')) ?><?= !empty($bp['category']) ? ' · ' : '' ?><?= h((string) ($bp['published_at'] ?? '')) ?></div>
+                  <p><?= h((string) ($bp['excerpt'] ?? '')) ?></p>
+                </article>
+              <?php endforeach; ?>
+            </section>
+          <?php endif; ?>
+          <?php if ($draftBlogs !== []): ?>
+            <section class="side-card">
+              <h2>Drafts</h2>
+              <?php foreach ($draftBlogs as $bp): ?>
+                <article class="blog-post-card" style="padding:1rem 0;border-top:1px solid var(--border)">
+                  <h3 style="margin:0"><a href="?view=blog&amp;draft=<?= h(rawurlencode((string) $bp['slug'])) ?>"><?= h((string) $bp['title']) ?></a></h3>
+                  <div class="meta">Draft · <?= h((string) ($bp['updated_at'] ?? '')) ?></div>
+                  <p><?= h((string) ($bp['excerpt'] ?? '')) ?></p>
+                </article>
+              <?php endforeach; ?>
+            </section>
+          <?php endif; ?>
+        <?php endif; ?>
+
+      <?php elseif ($view === 'discuss'): ?>
         <?php
           $discussTopicId = (int) ($_GET['topic'] ?? 0);
           $discussTopic = $discussTopicId > 0 ? ap_discuss_topic($discussTopicId) : null;
@@ -20580,10 +20797,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'drafts'): ?>
         <?php $draftRows = function_exists('ap_drafts_list') ? ap_drafts_list(100) : []; ?>
+        <?php $blogDraftRows = function_exists('ap_blog_posts_list') ? array_values(array_filter(ap_blog_posts_list($vaakActorKey, false, 100), static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft')) : []; ?>
         <div class="meta" style="margin-bottom:1rem">
           Closing the composer (or tapping <b>Save draft</b>) keeps unfinished posts here. Resume to edit, or publish / queue from the composer.
         </div>
-        <?php if (!$draftRows): ?>
+        <?php if (!$draftRows && !$blogDraftRows): ?>
           <div class="empty">No drafts yet. Type something in Compose and close it — it’ll land here.</div>
         <?php else: ?>
           <?php foreach ($draftRows as $dr): ?>
@@ -20637,6 +20855,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </div>
             </article>
           <?php endforeach; ?>
+          <?php if ($blogDraftRows): ?>
+            <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Blog drafts</h3>
+            <?php foreach ($blogDraftRows as $bd): ?>
+              <article class="tweet">
+                <div class="tweet-hd"><div><span class="who"><?= h((string) ($bd['title'] ?? 'Untitled')) ?></span><span class="meta"> · <?= h(relative_time((string) ($bd['updated_at'] ?? ''))) ?> · blog draft</span></div></div>
+                <div class="body feed-body" style="white-space:pre-wrap"><?= h((string) ($bd['excerpt'] ?? '')) ?></div>
+                <div class="tweet-actions"><a class="btn btn-primary" href="?view=blog&amp;draft=<?= h(rawurlencode((string) ($bd['slug'] ?? ''))) ?>" style="padding:.25rem .7rem;font-size:.8rem">Resume blog</a></div>
+              </article>
+            <?php endforeach; ?>
+          <?php endif; ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'outbox'): ?>
