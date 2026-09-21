@@ -12191,7 +12191,8 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     continue;
                 }
                 $nid = rtrim((string) ($n['id'] ?? ''), '/');
-                if ($nid === '' || isset($seen['o:' . $nid])) {
+                $canonicalNid = $nid !== '' ? admin_prefer_fedi_object_id($nid) : '';
+                if ($nid === '' || isset($seen['o:' . $nid]) || ($canonicalNid !== '' && isset($seen['o:' . $canonicalNid]))) {
                     continue;
                 }
                 $item = [
@@ -12203,6 +12204,10 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     continue;
                 }
                 $seen['o:' . $nid] = true;
+                if ($canonicalNid !== '') {
+                    $seen['o:' . $canonicalNid] = true;
+                    $seen['o:' . $canonicalNid . '/'] = true;
+                }
                 $out[] = $item;
                 if (count($out) >= $limit) {
                     break;
@@ -12323,7 +12328,8 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                         continue;
                     }
                     $nid = rtrim((string) ($n['id'] ?? ''), '/');
-                    if ($nid === '' || isset($seen['o:' . $nid])) {
+                    $canonicalNid = $nid !== '' ? admin_prefer_fedi_object_id($nid) : '';
+                    if ($nid === '' || isset($seen['o:' . $nid]) || ($canonicalNid !== '' && isset($seen['o:' . $canonicalNid]))) {
                         continue;
                     }
                     $item = [
@@ -12335,6 +12341,10 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                         continue;
                     }
                     $seen['o:' . $nid] = true;
+                    if ($canonicalNid !== '') {
+                        $seen['o:' . $canonicalNid] = true;
+                        $seen['o:' . $canonicalNid . '/'] = true;
+                    }
                     $out[] = $item;
                 }
             }
