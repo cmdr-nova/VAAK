@@ -63,6 +63,7 @@ used by PHP-FPM:
 * * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-fanout-delivery-worker.php --limit=40 >>/var/log/vaak-fanout-delivery.log 2>&1
 * * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-action-queue-worker.php --limit=20 >>/var/log/vaak-action-queue.log 2>&1
 * * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-actor-refresh-worker.php --limit=12 >>/var/log/vaak-actor-refresh.log 2>&1
+* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-media-warm-worker.php --limit=3 >>/var/log/vaak-media-warm.log 2>&1
 ```
 
 Use a systemd timer instead when the host already manages application workers.

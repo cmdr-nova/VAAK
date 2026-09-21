@@ -1110,56 +1110,140 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
     }
 }
 
+/** Enqueue a durable remote actor-media warm, coalescing duplicate requests. */
+function ap_media_warm_enqueue_actor(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return false;
+    }
+    try {
+        $now = gmdate('c');
+        $db = ap_db();
+        $st = $db->prepare(
+            "INSERT INTO ap_media_warm_queue
+             (job_type, target_key, media_kind, status, attempts, max_attempts, next_attempt_at, created_at, updated_at)
+             VALUES ('actor_media', ?, 'avatar_header', 'pending', 0, 8, ?, ?, ?)
+             ON CONFLICT(job_type, target_key, media_kind) DO NOTHING"
+        );
+        $st->execute([$actorId, $now, $now, $now]);
+        // A completed/failed row becomes eligible again when a caller asks
+        // for a fresh warm; an in-flight row remains untouched and coalesced.
+        $up = $db->prepare(
+            "UPDATE ap_media_warm_queue
+             SET status = 'pending', attempts = 0, next_attempt_at = ?,
+                 claimed_at = NULL, last_error = NULL, updated_at = ?
+             WHERE job_type = 'actor_media' AND target_key = ? AND media_kind = 'avatar_header'
+               AND status IN ('succeeded', 'failed')"
+        );
+        $up->execute([$now, $now, $actorId]);
+        return true;
+    } catch (Throwable $e) {
+        error_log('[ap-media-warm] enqueue: ' . $e->getMessage());
+        return false;
+    }
+}
+
 /**
- * Queue a background warm of avatar/header for an actor (best-effort).
- * Concurrency-capped so a busy Home timeline cannot fork-bomb PHP/DNS.
+ * Queue a background warm of avatar/header for an actor.
+ * The database row survives PHP/VPS restarts; a worker is nudged immediately
+ * but cron also drains pending/retry rows when no request is active.
  */
 function ap_remote_media_warm_async(string $actorId): void
 {
     if (function_exists('ap_feature_enabled') && !ap_feature_enabled('remote_media_warm', true)) {
         return;
     }
-    $actorId = rtrim(trim($actorId), '/');
-    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+    if (!ap_media_warm_enqueue_actor($actorId)) {
         return;
     }
-    $script = __DIR__ . '/ap-media-warm.php';
+    $script = __DIR__ . '/ap-media-warm-worker.php';
     if (!is_file($script)) {
         return;
     }
-
-    // Per-actor debounce: skip if a warmer for this actor already holds a lock.
-    $actorLock = sys_get_temp_dir() . '/vaak-mw-' . hash('sha256', $actorId) . '.lock';
-    $actorFh = @fopen($actorLock, 'c+');
-    if ($actorFh === false || !flock($actorFh, LOCK_EX | LOCK_NB)) {
-        if (is_resource($actorFh)) {
-            fclose($actorFh);
-        }
+    $lockPath = sys_get_temp_dir() . '/vaak-media-warm-worker.lock';
+    $lock = @fopen($lockPath, 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($lock)) fclose($lock);
         return;
     }
-    // Stale lock cleanup happens when the child exits; parent keeps the lock
-    // file handle open only long enough to spawn, then closes (child re-locks).
-
-    // Global cap across all actors.
-    $maxConcurrent = 3;
-    $running = 0;
-    $pgrep = trim((string) @shell_exec("pgrep -fc 'ap-media-warm\\.php' 2>/dev/null"));
-    if ($pgrep !== '' && ctype_digit($pgrep)) {
-        $running = (int) $pgrep;
-    }
-    if ($running >= $maxConcurrent) {
-        flock($actorFh, LOCK_UN);
-        fclose($actorFh);
-        return;
-    }
-
-    // Child re-acquires the per-actor lock for the duration of the warm.
-    flock($actorFh, LOCK_UN);
-    fclose($actorFh);
-    $cmd = 'php ' . escapeshellarg($script)
-        . ' ' . escapeshellarg($actorId)
-        . ' > /dev/null 2>&1 &';
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script)
+        . ' --limit=3 >/dev/null 2>&1 </dev/null &';
     @exec($cmd);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+}
+
+/** Run a bounded batch of durable remote actor-media jobs. */
+function ap_media_warm_worker_run(int $limit = 3): array
+{
+    $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
+    $limit = max(1, min(10, $limit));
+    $lock = @fopen(sys_get_temp_dir() . '/vaak-media-warm-worker.lock', 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        return $stats + ['busy' => 1];
+    }
+    try {
+        $db = ap_db();
+        $now = gmdate('c');
+        $stale = gmdate('c', time() - 900);
+        $db->prepare("UPDATE ap_media_warm_queue SET status = 'pending', claimed_at = NULL, updated_at = ?
+                      WHERE status = 'processing' AND claimed_at < ?")->execute([$now, $stale]);
+        $st = $db->prepare("SELECT * FROM ap_media_warm_queue
+                            WHERE status = 'pending' AND next_attempt_at <= ?
+                            ORDER BY next_attempt_at, id LIMIT ?");
+        $st->bindValue(1, $now);
+        $st->bindValue(2, $limit, PDO::PARAM_INT);
+        $st->execute();
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $id = (int) ($row['id'] ?? 0);
+            if ($id < 1) continue;
+            $claimedAt = gmdate('c');
+            $claim = $db->prepare("UPDATE ap_media_warm_queue SET status = 'processing', claimed_at = ?, updated_at = ?
+                                   WHERE id = ? AND status = 'pending'");
+            $claim->execute([$claimedAt, $claimedAt, $id]);
+            if ($claim->rowCount() !== 1) continue;
+            $stats['claimed']++;
+            $ok = false;
+            $error = '';
+            try {
+                $actor = rtrim(trim((string) ($row['target_key'] ?? '')), '/');
+                if ($actor === '' || !str_starts_with($actor, 'https://')) {
+                    throw new RuntimeException('Invalid actor media target.');
+                }
+                if (function_exists('ap_remote_actor_ensure')) ap_remote_actor_ensure($actor, true);
+                $avatar = ap_remote_media_ensure($actor, 'avatar', false);
+                $header = ap_remote_media_ensure($actor, 'header', false);
+                // An actor may legitimately publish neither image. Treat a
+                // completed lookup as success so it is not retried forever.
+                $ok = true;
+                if (!$avatar && !$header) $error = 'Actor has no cached avatar/header.';
+            } catch (Throwable $e) {
+                $error = substr($e->getMessage(), 0, 400);
+            }
+            $attempt = (int) ($row['attempts'] ?? 0) + 1;
+            $max = max(1, (int) ($row['max_attempts'] ?? 8));
+            if ($ok) {
+                $u = $db->prepare("UPDATE ap_media_warm_queue SET status = 'succeeded', attempts = 0,
+                                   claimed_at = NULL, last_error = ?, updated_at = ? WHERE id = ?");
+                $u->execute([$error !== '' ? $error : null, gmdate('c'), $id]);
+                $stats['succeeded']++;
+            } else {
+                $dead = $attempt >= $max;
+                $status = $dead ? 'failed' : 'pending';
+                $delay = min(3600, 30 * (2 ** max(0, min(7, $attempt - 1))));
+                $u = $db->prepare("UPDATE ap_media_warm_queue SET status = ?, attempts = ?,
+                                   next_attempt_at = ?, claimed_at = NULL, last_error = ?, updated_at = ? WHERE id = ?");
+                $u->execute([$status, $attempt, gmdate('c', time() + ($dead ? 0 : $delay)), $error !== '' ? $error : 'Media warm failed.', gmdate('c'), $id]);
+                $stats[$dead ? 'failed' : 'retried']++;
+            }
+        }
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+    return $stats;
 }
 
 /**

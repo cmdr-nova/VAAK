@@ -454,7 +454,7 @@ SQL);
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
         'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads', 'vaak_blog_posts',
         'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions', 'ap_pds_invites',
-        'remote_media_cache', 'site_syndications',
+        'remote_media_cache', 'ap_media_warm_queue', 'site_syndications',
     ];
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
@@ -1324,6 +1324,23 @@ CREATE TABLE IF NOT EXISTS remote_media_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_remote_media_used ON remote_media_cache(last_used_at);
 CREATE INDEX IF NOT EXISTS idx_remote_media_actor ON remote_media_cache(actor_id);
+
+CREATE TABLE IF NOT EXISTS ap_media_warm_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_type TEXT NOT NULL DEFAULT 'actor_media',
+    target_key TEXT NOT NULL,
+    media_kind TEXT NOT NULL DEFAULT 'avatar_header',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 8,
+    next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_type, target_key, media_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_media_warm_due ON ap_media_warm_queue(status, next_attempt_at, id);
 
 CREATE TABLE IF NOT EXISTS oauth_apps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
