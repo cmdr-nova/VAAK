@@ -1647,6 +1647,7 @@ function ap_bsky_create_account(
     if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
         return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not create the VAAK Bluesky account.')];
     }
+    ap_bsky_mark_pds_invite_used($inviteCode);
     $j = $res['json'];
     $access = (string) ($j['accessJwt'] ?? '');
     $refresh = (string) ($j['refreshJwt'] ?? '');
@@ -1676,8 +1677,8 @@ function ap_bsky_create_account(
     ];
 }
 
-/** Issue a single-use invite from the VAAK PDS admin API. */
-function ap_bsky_create_pds_invite(): array
+/** Read the local PDS admin credentials without exposing them to callers. */
+function ap_bsky_pds_admin_config(): array
 {
     $path = '/etc/mkultra/vaak-pds.env';
     $cfg = [];
@@ -1689,6 +1690,13 @@ function ap_bsky_create_pds_invite(): array
             $cfg[$key] = trim($value, " \t\"'");
         }
     }
+    return $cfg;
+}
+
+/** Issue a single-use invite from the VAAK PDS admin API. */
+function ap_bsky_create_pds_invite(?int $ownerUserId = null): array
+{
+    $cfg = ap_bsky_pds_admin_config();
     $password = (string) ($cfg['PDS_ADMIN_PASSWORD'] ?? '');
     if ($password === '') return ['ok' => false, 'error' => 'PDS invite generation is not configured yet.'];
     $ch = curl_init(AP_BSKY_VAAK_PDS . '/xrpc/com.atproto.server.createInviteCode');
@@ -1711,7 +1719,85 @@ function ap_bsky_create_pds_invite(): array
         $detail = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
         return ['ok' => false, 'error' => $detail !== '' ? $detail : ('PDS invite generation failed' . ($status > 0 ? ' (HTTP ' . $status . ')' : ($err !== '' ? ': ' . $err : '.')))];
     }
-    return ['ok' => true, 'code' => (string) $json['code']];
+    $code = (string) $json['code'];
+    if ($ownerUserId !== null && $ownerUserId > 0) {
+        try {
+            ap_db()->prepare('INSERT INTO ap_pds_invites (owner_user_id, code, created_at) VALUES (?, ?, ?) ON CONFLICT (code) DO NOTHING')
+                ->execute([$ownerUserId, $code, ap_db_now()]);
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] invite ledger save: ' . $e->getMessage());
+        }
+    }
+    return ['ok' => true, 'code' => $code];
+}
+
+/**
+ * Return a user's issued PDS invites and reconcile one-time use with the PDS.
+ * The short admin request is limited to this page and never runs in feeds.
+ */
+function ap_bsky_pds_invites_for_user(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) return [];
+    try {
+        $st = ap_db()->prepare('SELECT id, code, created_at, used_at FROM ap_pds_invites WHERE owner_user_id = ? ORDER BY created_at DESC, id DESC LIMIT 50');
+        $st->execute([$ownerUserId]);
+        $rows = $st->fetchAll();
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] invite ledger read: ' . $e->getMessage());
+        return [];
+    }
+    if (!$rows) return [];
+    $cfg = ap_bsky_pds_admin_config();
+    $password = (string) ($cfg['PDS_ADMIN_PASSWORD'] ?? '');
+    if ($password === '') return $rows;
+    $ch = curl_init(AP_BSKY_VAAK_PDS . '/xrpc/com.atproto.server.getInviteCodes?limit=500');
+    if ($ch === false) return $rows;
+    curl_setopt_array($ch, [
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        CURLOPT_USERPWD => 'admin:' . $password,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 1,
+        CURLOPT_TIMEOUT => 3,
+    ]);
+    $raw = curl_exec($ch);
+    curl_close($ch);
+    $json = is_string($raw) ? json_decode($raw, true) : null;
+    $remote = [];
+    foreach ((is_array($json) ? ($json['codes'] ?? []) : []) as $item) {
+        if (!is_array($item) || empty($item['code'])) continue;
+        $remote[(string) $item['code']] = $item;
+    }
+    if (!$remote) return $rows;
+    foreach ($rows as &$row) {
+        if (!empty($row['used_at'])) continue;
+        $item = $remote[(string) ($row['code'] ?? '')] ?? null;
+        $uses = is_array($item) ? ($item['uses'] ?? []) : [];
+        $usedAt = is_array($uses) && !empty($uses[0]['usedAt']) ? (string) $uses[0]['usedAt'] : '';
+        if ($usedAt === '' && is_array($item) && array_key_exists('available', $item) && !$item['available']) {
+            $usedAt = ap_db_now();
+        }
+        if ($usedAt !== '') {
+            try {
+                ap_db()->prepare('UPDATE ap_pds_invites SET used_at = ? WHERE id = ? AND used_at IS NULL')->execute([$usedAt, (int) $row['id']]);
+                $row['used_at'] = $usedAt;
+            } catch (Throwable $e) {
+                error_log('[ap-bsky] invite ledger status save: ' . $e->getMessage());
+            }
+        }
+    }
+    unset($row);
+    return $rows;
+}
+
+function ap_bsky_mark_pds_invite_used(string $code): void
+{
+    $code = trim($code);
+    if ($code === '') return;
+    try {
+        ap_db()->prepare('UPDATE ap_pds_invites SET used_at = COALESCE(used_at, ?) WHERE code = ?')->execute([ap_db_now(), $code]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] invite ledger use save: ' . $e->getMessage());
+    }
 }
 
 /**

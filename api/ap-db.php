@@ -354,6 +354,25 @@ SQL);
         error_log('[ap-db] ap_user_2fa not provisioned: ' . $e->getMessage());
     }
 
+    // Single-use invite codes issued from the VAAK PDS, scoped to the user
+    // who requested them so they remain available after the toast disappears.
+    try {
+        if (!isset($present['ap_pds_invites'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_pds_invites (
+    id BIGSERIAL PRIMARY KEY,
+    owner_user_id BIGINT NOT NULL,
+    code TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    used_at TEXT
+)
+SQL);
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_pds_invites_owner ON ap_pds_invites(owner_user_id, created_at DESC, id DESC)');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] ap_pds_invites not provisioned: ' . $e->getMessage());
+    }
+
     $discussTablesReady = false;
     try {
         $discussTablesReady = isset(
@@ -434,13 +453,13 @@ SQL);
         'masto_reblogs', 'masto_statuses', 'masto_suggestion_dismissals', 'mentions',
         'oauth_apps', 'oauth_codes', 'oauth_tokens', 'outbox_notes', 'push_subscriptions', 'ap_notices', 'ap_notice_replies', 'ap_notice_reads',
         'ap_discuss_categories', 'ap_discuss_topics', 'ap_discuss_posts', 'ap_discuss_reads', 'vaak_blog_posts',
-        'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions',
+        'quote_authorizations', 'remote_actors', 'remote_custom_emojis', 'remote_emoji_host_meta', 'webmentions', 'ap_pds_invites',
         'remote_media_cache', 'site_syndications',
     ];
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
     if (!$noticeTablesReady || !$discussTablesReady || !isset($present['vaak_blog_posts'])
-        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'], $present['ap_user_2fa'])) {
+        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'], $present['ap_user_2fa'], $present['ap_pds_invites'])) {
         $present = $loadPresentTables();
     }
     $missing = array_values(array_filter($requiredTables, static fn(string $table): bool => !isset($present[$table])));

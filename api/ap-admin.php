@@ -3113,9 +3113,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
     } elseif ($action === 'pds_migration_invite_request') {
         $view = 'atmosphere';
-        $res = function_exists('ap_bsky_create_pds_invite') ? ap_bsky_create_pds_invite() : ['ok' => false, 'error' => 'PDS invite generation is unavailable.'];
+        $res = function_exists('ap_bsky_create_pds_invite')
+            ? ap_bsky_create_pds_invite((int) ($vaakUser['id'] ?? 0))
+            : ['ok' => false, 'error' => 'PDS invite generation is unavailable.'];
         if (!empty($res['ok'])) {
-            $notice = 'VAAK PDS invite code: ' . (string) ($res['code'] ?? '') . ' — copy it now; it is single-use for account creation or migration.';
+            $notice = 'PDS invite code created. It is available below and is single-use for account creation or migration.';
         } else {
             $error = $res['error'] ?? 'Could not create a PDS invite code.';
         }
@@ -17348,6 +17350,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if ($bskyPds === '') {
               $bskyPds = defined('AP_BSKY_DEFAULT_PDS') ? (string) AP_BSKY_DEFAULT_PDS : 'https://bsky.mkultra.monster';
           }
+          $pdsInvites = function_exists('ap_bsky_pds_invites_for_user')
+              ? ap_bsky_pds_invites_for_user((int) ($vaakUser['id'] ?? 0))
+              : [];
           // Detect a dead/expired stored login without a network round-trip when possible.
           $bskySessionStale = false;
           if ($bskyHandle !== '' && function_exists('ap_bsky_access_token')) {
@@ -17385,6 +17390,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <input type="hidden" name="return_view" value="atmosphere">
               <button class="btn btn-ghost" type="submit">Create one-time PDS invite code</button>
             </form>
+            <div style="margin-top:1rem">
+              <div class="meta" style="margin-bottom:.45rem"><b>Your PDS invite codes</b> <span class="meta">(single-use)</span></div>
+              <?php if (!$pdsInvites): ?>
+                <div class="meta">No invite codes issued yet.</div>
+              <?php else: ?>
+                <div style="display:grid;gap:.45rem">
+                  <?php foreach ($pdsInvites as $pdsInvite): ?>
+                    <?php $inviteUsed = !empty($pdsInvite['used_at']); ?>
+                    <div style="display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;padding:.45rem .6rem;border:1px solid var(--border);border-radius:8px;background:var(--panel-2)">
+                      <input readonly value="<?= h((string) ($pdsInvite['code'] ?? '')) ?>" aria-label="PDS invite code" onclick="this.select()" style="flex:1 1 18rem;min-width:0;font-family:ui-monospace,monospace">
+                      <button type="button" class="btn btn-ghost" data-copy-value="<?= h((string) ($pdsInvite['code'] ?? '')) ?>" style="padding:.3rem .7rem;font-size:.82rem">Copy</button>
+                      <span class="tag" style="color:<?= $inviteUsed ? 'var(--muted)' : 'var(--primary)' ?>"><?= $inviteUsed ? 'used' : 'unused' ?></span>
+                    </div>
+                  <?php endforeach; ?>
+                </div>
+              <?php endif; ?>
+            </div>
           </section>
           <?php if ($bskyHandle !== ''): ?>
             <div class="meta" style="margin:.5rem 0">Connected as <b>@<?= h($bskyHandle) ?></b>
@@ -25838,6 +25860,22 @@ if (VIEW === 'analytics') loadAnalytics();
     }, 0);
   }, true);
   window.addEventListener('pageshow', window.vaakHideLoading);
+  document.addEventListener('click', function (event) {
+    const button = event.target.closest('[data-copy-value]');
+    if (!button) return;
+    const value = button.getAttribute('data-copy-value') || '';
+    const done = function () {
+      const original = button.textContent;
+      button.textContent = 'Copied';
+      setTimeout(function () { button.textContent = original; }, 1400);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(done).catch(function () {});
+    } else {
+      const input = button.parentElement && button.parentElement.querySelector('input[readonly]');
+      if (input) { input.select(); document.execCommand('copy'); done(); }
+    }
+  });
 })();
 </script>
 </body>
