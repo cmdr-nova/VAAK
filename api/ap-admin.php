@@ -7099,6 +7099,15 @@ function mention_media_urls(?string $json): array
     }
     $out = [];
     foreach ($decoded as $u) {
+        // Older inbox rows stored plain URLs; newer AS2/GIF rows can retain
+        // attachment metadata. Accept both shapes so notification previews do
+        // not disappear for media-only mentions.
+        if (is_array($u)) {
+            $u = $u['url'] ?? $u['href'] ?? $u['preview_url'] ?? $u['thumbnail'] ?? '';
+            if (is_array($u)) {
+                $u = $u['href'] ?? $u['url'] ?? '';
+            }
+        }
         if (is_string($u) && str_starts_with($u, 'https://')) {
             $out[] = $u;
         }

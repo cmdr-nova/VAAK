@@ -3780,6 +3780,12 @@ function ap_masto_status_from_mention(array $row): array
         if (is_array($decoded)) {
             $i = 0;
             foreach ($decoded as $u) {
+                if (is_array($u)) {
+                    $u = $u['url'] ?? $u['href'] ?? $u['preview_url'] ?? $u['thumbnail'] ?? '';
+                    if (is_array($u)) {
+                        $u = $u['href'] ?? $u['url'] ?? '';
+                    }
+                }
                 $clean = is_string($u) ? ap_profile_sanitize_https_url($u) : null;
                 if ($clean === null) {
                     continue;

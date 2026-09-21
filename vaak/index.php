@@ -61,7 +61,7 @@ function vaak_render_failure(?Throwable $error = null): void
  ╚████╔╝
   ╚═══╝</pre>
     <h1>Something's gone wrong, we're working on it.</h1>
-    <p>Questions, contact <a href="mailto:cmdr_nova@mkultra.monster">cmdr_nova@mkultra.monster</a></p>
+    <p>Questions, contact <span class="error-contact">@cmdr_nova@mkultra.monster</span></p>
   </main>
 </body>
 </html>
