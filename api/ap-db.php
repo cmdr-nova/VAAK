@@ -2021,6 +2021,8 @@ CREATE TABLE IF NOT EXISTS ap_action_queue (
     next_attempt_at TEXT NOT NULL,
     claimed_at TEXT,
     last_error TEXT,
+    last_error_host TEXT,
+    last_error_code INTEGER,
     result_json TEXT,
     receipt_json TEXT,
     created_at TEXT NOT NULL,

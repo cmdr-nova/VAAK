@@ -66,6 +66,10 @@ used by PHP-FPM:
 * * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-media-warm-worker.php --limit=3 >>/var/log/vaak-media-warm.log 2>&1
 ```
 
+Keep the action/publication lines enabled at the normal one-minute cadence;
+media and actor-refresh workers are independently bounded and cannot consume
+their worker slots.
+
 Use a systemd timer instead when the host already manages application workers.
 The worker is idempotent and uses a lease, so overlapping timer invocations are
 safe; keep only one active timer on a host to avoid unnecessary database work.

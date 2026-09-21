@@ -65,7 +65,8 @@ function ap_action_queue_enqueue(
             $newReceipt = $receiptJson !== null ? $receiptJson : ($old['receipt_json'] ?? null);
             $u = $db->prepare("UPDATE ap_action_queue SET desired_state = ?, revision = revision + 1,
                 payload_json = ?, receipt_json = ?, status = 'pending', attempts = 0,
-                next_attempt_at = ?, claimed_at = NULL, last_error = NULL, result_json = NULL, updated_at = ? WHERE id = ?");
+                next_attempt_at = ?, claimed_at = NULL, last_error = NULL, last_error_host = NULL,
+                last_error_code = NULL, result_json = NULL, updated_at = ? WHERE id = ?");
             $u->execute([(int) $desired, $payloadJson, $newReceipt, $now, $now, (int) $old['id']]);
             $id = (int) $old['id'];
             $revision = (int) $old['revision'] + 1;
@@ -74,8 +75,8 @@ function ap_action_queue_enqueue(
             $ins = $db->prepare("INSERT INTO ap_action_queue
                 (owner_user_id, platform, action_kind, target_key, desired_state, confirmed_state, revision,
                  payload_json, status, attempts, max_attempts, next_attempt_at, claimed_at, last_error,
-                 result_json, receipt_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, NULL, 1, ?, 'pending', 0, 12, ?, NULL, NULL, NULL, ?, ?, ?)");
+                 last_error_host, last_error_code, result_json, receipt_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, NULL, 1, ?, 'pending', 0, 12, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)");
             $ins->execute([$ownerUserId, $platform, $kind, $targetKey, (int) $desired, $payloadJson, $now, $receiptJson, $now, $now]);
             $id = ap_db_last_insert_id('ap_action_queue', 'id', $db);
             if ($platform === 'bsky' && in_array($kind, ['like', 'boost', 'follow'], true)) {
@@ -99,11 +100,29 @@ function ap_action_queue_enqueue(
     }
 }
 
+/** @return array{host:?string,code:?int} */
+function ap_action_queue_error_context(array $row, array $payload, string $error): array
+{
+    $host = null;
+    foreach ([(string) ($payload['uri'] ?? ''), (string) ($payload['object_id'] ?? ''), (string) ($row['target_key'] ?? '')] as $candidate) {
+        $parsed = parse_url($candidate, PHP_URL_HOST);
+        if (is_string($parsed) && $parsed !== '') {
+            $host = strtolower($parsed);
+            break;
+        }
+    }
+    $code = null;
+    if (preg_match('/\b(?:http|status|code)[ _:=/-]*([45]\d{2})\b/i', $error, $m)) {
+        $code = (int) $m[1];
+    }
+    return ['host' => $host, 'code' => $code];
+}
+
 function ap_action_queue_status(int $ownerUserId, int $id): ?array
 {
     if ($ownerUserId < 1 || $id < 1) return null;
     try {
-        $st = ap_db()->prepare('SELECT id, platform, action_kind, target_key, desired_state, confirmed_state, revision, status, last_error, updated_at FROM ap_action_queue WHERE id = ? AND owner_user_id = ?');
+        $st = ap_db()->prepare('SELECT id, platform, action_kind, target_key, desired_state, confirmed_state, revision, status, last_error, last_error_host, last_error_code, updated_at FROM ap_action_queue WHERE id = ? AND owner_user_id = ?');
         $st->execute([$id, $ownerUserId]);
         $row = $st->fetch();
         if (!is_array($row)) return null;
@@ -356,12 +375,12 @@ function ap_action_queue_worker_run(int $limit = 20): array
                 : ($row['receipt_json'] ?? null);
             if (!empty($result['ok'])) {
                 $status = $changed ? 'pending' : 'succeeded';
-                $update = $db->prepare("UPDATE ap_action_queue SET status = ?, confirmed_state = ?, attempts = 0, next_attempt_at = ?, claimed_at = NULL, last_error = NULL, result_json = ?, receipt_json = ?, updated_at = ? WHERE id = ? AND revision = ?");
+                $update = $db->prepare("UPDATE ap_action_queue SET status = ?, confirmed_state = ?, attempts = 0, next_attempt_at = ?, claimed_at = NULL, last_error = NULL, last_error_host = NULL, last_error_code = NULL, result_json = ?, receipt_json = ?, updated_at = ? WHERE id = ? AND revision = ?");
                 $update->execute([$status, (int) $row['desired_state'], gmdate('c'), json_encode(['ok' => true]), $newReceipt, gmdate('c'), (int) $row['id'], $rev]);
                 if ($update->rowCount() !== 1) {
                     // A new intent arrived after our revision check. Preserve it
                     // and let the next pass reconcile against this result.
-                    $again = $db->prepare("UPDATE ap_action_queue SET status = 'pending', confirmed_state = ?, attempts = 0, next_attempt_at = ?, claimed_at = NULL, last_error = NULL, result_json = ?, receipt_json = ?, updated_at = ? WHERE id = ?");
+                    $again = $db->prepare("UPDATE ap_action_queue SET status = 'pending', confirmed_state = ?, attempts = 0, next_attempt_at = ?, claimed_at = NULL, last_error = NULL, last_error_host = NULL, last_error_code = NULL, result_json = ?, receipt_json = ?, updated_at = ? WHERE id = ?");
                     $again->execute([(int) $row['desired_state'], gmdate('c'), json_encode(['ok' => true]), $newReceipt, gmdate('c'), (int) $row['id']]);
                 }
                 $stats['succeeded']++;
@@ -370,10 +389,12 @@ function ap_action_queue_worker_run(int $limit = 20): array
                 $dead = !$changed && $attempt >= $max;
                 $status = ($changed || !$dead) ? 'pending' : 'failed';
                 $delay = $changed ? 0 : ap_action_queue_backoff($attempt);
-                $update = $db->prepare('UPDATE ap_action_queue SET status = ?, attempts = ?, next_attempt_at = ?, claimed_at = NULL, last_error = ?, receipt_json = ?, updated_at = ? WHERE id = ? AND revision = ?');
-                $update->execute([$status, $attempt, gmdate('c', time() + $delay), substr((string) ($result['error'] ?? 'Action failed.'), 0, 400), $newReceipt, gmdate('c'), (int) $row['id'], $rev]);
+                $errorText = substr((string) ($result['error'] ?? 'Action failed.'), 0, 400);
+                $errorContext = ap_action_queue_error_context($row, $payload, $errorText);
+                $update = $db->prepare('UPDATE ap_action_queue SET status = ?, attempts = ?, next_attempt_at = ?, claimed_at = NULL, last_error = ?, last_error_host = ?, last_error_code = ?, receipt_json = ?, updated_at = ? WHERE id = ? AND revision = ?');
+                $update->execute([$status, $attempt, gmdate('c', time() + $delay), $errorText, $errorContext['host'], $errorContext['code'], $newReceipt, gmdate('c'), (int) $row['id'], $rev]);
                 if ($update->rowCount() !== 1) {
-                    $again = $db->prepare("UPDATE ap_action_queue SET status = 'pending', attempts = 0, next_attempt_at = ?, claimed_at = NULL, last_error = NULL, receipt_json = ?, updated_at = ? WHERE id = ?");
+                    $again = $db->prepare("UPDATE ap_action_queue SET status = 'pending', attempts = 0, next_attempt_at = ?, claimed_at = NULL, last_error = NULL, last_error_host = NULL, last_error_code = NULL, receipt_json = ?, updated_at = ? WHERE id = ?");
                     $again->execute([gmdate('c'), $newReceipt, gmdate('c'), (int) $row['id']]);
                 }
                 $stats[$status === 'failed' ? 'failed' : 'retried']++;
