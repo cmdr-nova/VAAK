@@ -1766,7 +1766,9 @@ function ap_cmdr_html(): void
     $counts['media'] = (int) ($postsData['counts']['media'] ?? 0);
     $counts['blog'] = count(ap_blog_posts_list('cmdr_nova', true, 200, 0));
     $tabTotal = (int) ($postsData['total'] ?? 0);
-    $statPosts = (int) ($counts['posts'] ?? 0) + (int) ($counts['replies'] ?? 0); // original posts + replies (not boosts)
+    // Keep the headline Posts metric aligned with the Posts tab. Replies have
+    // their own tab and should not make the primary count appear inconsistent.
+    $statPosts = (int) ($counts['posts'] ?? 0);
 
     echo '<div class="stats">';
     echo '<div><span class="n">' . $statPosts . '</span><span class="l">Posts</span></div>';
