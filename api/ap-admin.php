@@ -23695,6 +23695,10 @@ window.apAdminToast = function (msg, isErr) {
       items.classList.remove('timeline-swapping');
       tabSwapBusy = false;
       loading = false;
+      // Timeline tabs are swapped in-place, so the shared capture-phase
+      // navigation handler has no full-page `pageshow` event to clear its
+      // indicator.  Hide it when the partial swap (or its error path) ends.
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     }
   }
 
