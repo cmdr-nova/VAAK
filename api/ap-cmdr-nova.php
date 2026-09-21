@@ -1884,7 +1884,7 @@ function ap_cmdr_html(): void
                 echo ap_cmdr_post_preview_html($n);
             }
             $totalPages = $profileTotalPages;
-            if ($totalPages > 1) {
+            if ($totalPages > 1 && !in_array($tab, ['posts', 'replies', 'boosts'], true)) {
                 $extra = $tab === 'posts' ? [] : ['tab' => $tab];
                 echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, $extra);
             }
