@@ -493,6 +493,14 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle($actorKey, $p)
         : null;
+    if (function_exists('ap_db_owner_user_id_for_actor') && function_exists('ap_bsky_session_row') && function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
+        $profileOwnerId = ap_db_owner_user_id_for_actor($actorId);
+        $profileSession = $profileOwnerId > 0 ? ap_bsky_session_row($profileOwnerId) : null;
+        $profileDid = is_array($profileSession) ? trim((string) ($profileSession['did'] ?? '')) : '';
+        if ($profileDid !== '') {
+            ap_bsky_own_posts_backfill_maybe_enqueue($profileOwnerId, $profileDid);
+        }
+    }
 
     ap_user_html_shell_start('@' . $actorKey . '@mkultra.monster');
     echo '<span id="profile-top" aria-hidden="true"></span>';
@@ -535,7 +543,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<div class="follow-row">';
     echo '<input id="ap-follow-handle" name="handle" type="text" inputmode="email" autocomplete="username" spellcheck="false" placeholder="@you@your.instance" required>';
     echo '<button type="submit">Go</button></div>';
-    echo '<p class="follow-hint">Opens your instance’s follow dialog.</p></form></div></div>';
+    echo '<p class="follow-hint">Opens your instance’s follow dialog.</p></form>';
     if ($bskyHandle !== null && trim($bskyHandle) !== '') {
         $bskyHandleSafe = htmlspecialchars(trim($bskyHandle), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         echo '<form id="ap-bsky-follow-form" class="follow-panel" action="https://bsky.app/profile/'
@@ -545,6 +553,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             . '<button type="submit">Open</button></div>'
             . '<p class="follow-hint">Opens this profile in Bluesky so you can follow it there.</p></form>';
     }
+    echo '</div></div>';
 
     if (!empty($p['attachment']) && is_array($p['attachment'])) {
         echo '<div class="fields">';
@@ -611,6 +620,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_featured_cards_for_actor_key($actorKey)
         : [];
     $featuredCount = count($featuredCards);
+    $profilePageCount = max(1, (int) ceil(max(1, $profileTotal) / $profilePerPage));
     $apFollowing = count($following);
     $apFollowers = count($followers);
     $combined = function_exists('ap_profile_combined_follow_counts')
@@ -694,7 +704,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             : '<p class="muted">No featured accounts yet.</p>';
         echo '</section>';
     } else {
-        echo '<section class="posts" aria-label="Posts">';
+        echo '<section id="profile-posts" class="posts profile-infinite" aria-label="Posts" data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '">';
         if (!$publicNotes && !$profileBoosts) {
             echo '<p class="muted">No public posts yet.</p>';
         } else {
@@ -714,9 +724,14 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                     . '</article>';
             }
         }
+        if ($profilePageCount > $profilePage) {
+            echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
+        }
         echo '</section>';
     }
 
+    echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
+    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("profile-pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);const sync=()=>{if(top)top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});if(top)top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();}());</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode($actorId, JSON_UNESCAPED_SLASHES) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';
@@ -1033,6 +1048,7 @@ function ap_user_html_shell_start(string $title): void
       .featured-acct{font-size:.85rem;color:#999;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .posts{margin-top:1.25rem;border-top:1px solid #2a2a2a;padding-top:.5rem}
       .profile-pager{display:flex;justify-content:center;align-items:center;gap:.8rem;margin:1rem 0;color:#999;font-size:.85rem}.profile-pager a{color:#7ee0ff;text-decoration:none}
+      .profile-top-btn{position:fixed;right:1.25rem;bottom:1.25rem;z-index:20;border:1px solid #333;border-radius:999px;background:#161616;color:#8bf;width:2.8rem;height:2.8rem;font-size:1.2rem;cursor:pointer;box-shadow:0 5px 18px #0008}.profile-top-btn:hover{border-color:#8bf}
       .post{padding:.9rem 0;border-bottom:1px solid #222}
       .note-body p{margin:.4rem 0}.cw{color:#f0c674;font-size:.9rem}
       .reply-line{font-size:.8rem;color:#8ab;margin:0 0 .45rem}

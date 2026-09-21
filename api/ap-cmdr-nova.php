@@ -966,6 +966,7 @@ function ap_cmdr_shell_start(string $title): void
       .pager .pager-btn.is-disabled{opacity:.35;pointer-events:none;color:#777}
       .pager .pager-btn.is-current{background:#8bf;border-color:#8bf;color:#061018;font-weight:700}
       .pager .pager-status{width:100%;text-align:center;font-size:.78rem;color:#888;margin-bottom:.15rem;letter-spacing:.02em}
+      .profile-top-btn{position:fixed;right:1.25rem;bottom:1.25rem;z-index:20;border:1px solid #333;border-radius:999px;background:#161616;color:#8bf;width:2.8rem;height:2.8rem;font-size:1.2rem;cursor:pointer;box-shadow:0 5px 18px #0008}.profile-top-btn:hover{border-color:#8bf}
       .follow-wrap{margin-top:1.1rem}
       .btn-follow,.btn-reply{appearance:none;border:0;border-radius:999px;padding:.55rem 1.15rem;font:inherit;font-weight:600;cursor:pointer}
       .btn-follow{background:#8bf;color:#061018}
@@ -1596,6 +1597,17 @@ function ap_cmdr_html(): void
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle('cmdr_nova', $p)
         : null;
+    if (!function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
+    if (function_exists('ap_bsky_session_row') && function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
+        $cmdrUid = function_exists('ap_db_cmdr_nova_user_id') ? ap_db_cmdr_nova_user_id() : 0;
+        $cmdrSession = $cmdrUid > 0 ? ap_bsky_session_row($cmdrUid) : null;
+        $cmdrDid = is_array($cmdrSession) ? trim((string) ($cmdrSession['did'] ?? '')) : '';
+        if ($cmdrDid !== '') {
+            ap_bsky_own_posts_backfill_maybe_enqueue($cmdrUid, $cmdrDid);
+        }
+    }
 
     $name = htmlspecialchars($p['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $vanityBadge = !empty($p['vanity_verified'])
@@ -1690,7 +1702,7 @@ function ap_cmdr_html(): void
     echo '<button type="submit">Go</button>';
     echo '</div>';
     echo '<p class="follow-hint" id="ap-follow-hint">Opens your instance’s follow dialog (Mastodon, Akkoma, GoToSocial, etc.).</p>';
-    echo '</form></div></div>';
+    echo '</form>';
     if ($bskyHandle !== null && trim($bskyHandle) !== '') {
         $bskySafe = htmlspecialchars(trim($bskyHandle), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         echo '<form class="follow-panel" id="ap-bsky-follow-form" action="https://bsky.app/profile/'
@@ -1700,6 +1712,7 @@ function ap_cmdr_html(): void
             . '<button type="submit">Open</button></div>'
             . '<p class="follow-hint">Opens this profile in Bluesky so you can follow it there.</p></form>';
     }
+    echo '</div></div>';
 
     if (!empty($p['attachment'])) {
         echo '<div class="fields">';
@@ -1857,7 +1870,11 @@ function ap_cmdr_html(): void
             'boosts' => 'No public boosts yet.',
             default => 'No public posts yet.',
         };
-        echo '<section class="posts" aria-label="' . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '">';
+        $profileTotalPages = max(1, (int) ceil($tabTotal / $perPage));
+        $profileInfiniteAttrs = in_array($tab, ['posts', 'replies', 'boosts'], true)
+            ? ' id="profile-posts" class="posts profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $profileTotalPages . '" data-profile-tab="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '"'
+            : ' class="posts"';
+        echo '<section' . $profileInfiniteAttrs . ' aria-label="' . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">'
             . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '</h2>';
         if (!$postsData['rows']) {
@@ -1866,16 +1883,21 @@ function ap_cmdr_html(): void
             foreach ($postsData['rows'] as $n) {
                 echo ap_cmdr_post_preview_html($n);
             }
-            $totalPages = max(1, (int) ceil($tabTotal / $perPage));
+            $totalPages = $profileTotalPages;
             if ($totalPages > 1) {
                 $extra = $tab === 'posts' ? [] : ['tab' => $tab];
                 echo ap_cmdr_pager_html('/users/cmdr_nova', $page, $totalPages, $extra);
             }
         }
+        if ($profileTotalPages > $page && in_array($tab, ['posts', 'replies', 'boosts'], true)) {
+            echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
+        }
         echo '</section>';
     }
 
     echo '<p class="back"><a href="https://mkultra.monster/">← mkultra.monster</a> · <a href="/users/cmdr_nova/outbox">outbox</a></p>';
+    echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
+    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;const s=n.querySelector(".profile-infinite-sentinel");Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages&&s){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);const sync=()=>{if(top)top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});if(top)top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();}());</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode(CMDR_ACTOR_ID) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';

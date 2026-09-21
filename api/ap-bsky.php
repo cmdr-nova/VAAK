@@ -1630,6 +1630,27 @@ function ap_bsky_own_posts_backfill_enqueue(int $ownerUserId, string $did, ?stri
     }
 }
 
+/** Resume history import for older linked accounts that predate the queue. */
+function ap_bsky_own_posts_backfill_maybe_enqueue(int $ownerUserId, string $did): void
+{
+    $did = trim($did);
+    if ($ownerUserId < 1 || !str_starts_with($did, 'did:')) {
+        return;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM bsky_actor_refresh_queue
+             WHERE owner_user_id = ? AND actor_ref LIKE ? LIMIT 1"
+        );
+        $st->execute([$ownerUserId, '__vaak_own_posts__:' . $did . '%']);
+        if ($st->fetchColumn() === false) {
+            ap_bsky_own_posts_backfill_enqueue($ownerUserId, $did);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] backfill resume check failed: ' . $e->getMessage());
+    }
+}
+
 /**
  * Create and link a native account on the VAAK PDS.
  * The PDS currently requires an invite code; it is deliberately supplied by
