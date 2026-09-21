@@ -4006,12 +4006,12 @@ $queueHealthRows = [];
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
     $queueDefs = [
-        ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
-        ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
-        ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
-        ['name' => 'Remote media warming', 'table' => 'ap_media_warm_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'created_at'],
-        ['name' => 'Scheduled posts', 'table' => 'ap_post_queue', 'state' => 'state', 'queued' => ['pending'], 'active' => ['publishing'], 'failed' => ['failed'], 'time' => 'scheduled_at', 'created' => 'created_at'],
-        ['name' => 'Actor/profile refresh', 'table' => 'bsky_actor_refresh_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'created' => 'queued_at'],
+        ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Remote media warming', 'table' => 'ap_media_warm_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Scheduled posts', 'table' => 'ap_post_queue', 'state' => 'state', 'queued' => ['pending'], 'active' => ['publishing'], 'failed' => ['failed'], 'time' => 'scheduled_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Actor/profile refresh', 'table' => 'bsky_actor_refresh_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'locked_at', 'created' => 'queued_at'],
     ];
     foreach ($queueDefs as $qd) {
         try {
@@ -4023,20 +4023,24 @@ if ($view === 'queue_health') {
                 . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$queuedStates})) AS queued, "
                 . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$activeStates})) AS active, "
                 . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$failedStates})) AS failed, "
+                . "COALESCE(SUM(attempts), 0) AS retries, "
+                . "MIN(CASE WHEN {$qd['state']} IN ({$activeStates}) THEN {$qd['active_time']} END) AS active_since, "
                 . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}, {$activeStates}, {$failedStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS oldest, "
                 . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}) THEN {$qd['time']} END) AS next_due "
                 . "FROM {$qd['table']}";
             $row = $db->query($sql)->fetch() ?: [];
             $oldest = trim((string) ($row['oldest'] ?? ''));
             $nextDue = trim((string) ($row['next_due'] ?? ''));
+            $activeSince = trim((string) ($row['active_since'] ?? ''));
             $queueHealthRows[] = [
                 'name' => $qd['name'], 'queued' => (int) ($row['queued'] ?? 0),
                 'active' => (int) ($row['active'] ?? 0), 'failed' => (int) ($row['failed'] ?? 0),
-                'oldest' => $oldest, 'next_due' => $nextDue, 'ok' => true,
+                'retries' => (int) ($row['retries'] ?? 0),
+                'oldest' => $oldest, 'active_since' => $activeSince, 'next_due' => $nextDue, 'ok' => true,
             ];
         } catch (Throwable $e) {
             error_log('[ap-admin] queue health ' . $qd['table'] . ': ' . $e->getMessage());
-            $queueHealthRows[] = ['name' => $qd['name'], 'queued' => 0, 'active' => 0, 'failed' => 0, 'oldest' => '', 'next_due' => '', 'ok' => false];
+            $queueHealthRows[] = ['name' => $qd['name'], 'queued' => 0, 'active' => 0, 'failed' => 0, 'retries' => 0, 'oldest' => '', 'active_since' => '', 'next_due' => '', 'ok' => false];
         }
     }
 }
@@ -7912,7 +7916,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
             $isHls = (bool) preg_match('/\.m3u8(?:$|[?#])/i', $url)
                 || in_array(strtolower(trim((string) $mt)), ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true);
             $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($url) . '"';
-            $cells[] = '<video class="media-video"' . $sourceAttr . ' controls loop playsinline preload="none"'
+            $cells[] = '<video class="media-video" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '"' . $sourceAttr . ' controls loop playsinline preload="none"'
                 . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
@@ -7923,7 +7927,7 @@ function admin_media_row_html(array $items, string $hint = ''): string
         } else {
             $hasImage = true;
             $cells[] = '<button type="button" class="media-lightbox-trigger" data-full="' . h($url) . '" title="View image">'
-                . '<img src="' . h($url) . '" alt="" loading="lazy" referrerpolicy="no-referrer" decoding="async">'
+                . '<img src="' . h($url) . '" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '" alt="" loading="lazy" referrerpolicy="no-referrer" decoding="async">'
                 . '</button>';
         }
         if (count($cells) >= 4) {
@@ -20844,6 +20848,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'queued')) ?></div><div class="l">Queued</div></div>
           <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'active')) ?></div><div class="l">Active</div></div>
           <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'failed')) ?></div><div class="l">Failed</div></div>
+          <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'retries')) ?></div><div class="l">Attempts</div></div>
         </div>
         <div class="side-card" style="margin-top:1rem">
           <h3>Queue classes</h3>
@@ -20854,6 +20859,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Queued</th>
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Active</th>
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Failed</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Attempts</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Active since</th>
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Oldest pending</th>
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Next retry</th>
               </tr></thead>
@@ -20864,6 +20871,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qh['queued'] ?></td>
                   <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qh['active'] ?></td>
                   <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)<?= (int) $qh['failed'] > 0 ? ';color:var(--danger)' : '' ?>"><?= (int) $qh['failed'] ?></td>
+                  <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qh['retries'] ?></td>
+                  <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['active_since'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['active_since'])) ?><?php endif; ?></td>
                   <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok']): ?>unavailable<?php elseif ($qh['oldest'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['oldest'])) ?><?php endif; ?></td>
                   <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['next_due'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['next_due'])) ?><?php endif; ?></td>
                 </tr>
@@ -23906,6 +23915,22 @@ window.apAdminToast = function (msg, isErr) {
     requestIdleCallback(() => loadDeferredTrends(false), { timeout: 1200 });
   } else {
     setTimeout(() => loadDeferredTrends(false), 50);
+  }
+
+  // Bookmarks are an intentionally selective hot set: warm only a few
+  // already-visible preview variants during idle time. Ordinary timelines
+  // remain browser-lazy, and Save-Data users are never pulled into a
+  // background media request.
+  if (viewName === 'bookmarks' && !navigator.connection?.saveData) {
+    const warmBookmarkedMedia = () => {
+      const urls = [...document.querySelectorAll('[data-media-warm-url]')]
+        .map((node) => node.getAttribute('data-media-warm-url') || '')
+        .filter((url, index, all) => /^https:\/\//i.test(url) && all.indexOf(url) === index)
+        .slice(0, 3);
+      urls.forEach((url) => { const image = new Image(); image.decoding = 'async'; image.src = url; });
+    };
+    if ('requestIdleCallback' in window) requestIdleCallback(warmBookmarkedMedia, { timeout: 2500 });
+    else setTimeout(warmBookmarkedMedia, 1200);
   }
 })();
 </script>
