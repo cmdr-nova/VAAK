@@ -23936,6 +23936,7 @@ window.apAdminToast = function (msg, isErr) {
   if (!fragment) return;
   let current = fragment;
   let loading = false;
+  let refreshAttempts = 0;
   const load = async (replace) => {
     if (loading || (!replace && current.dataset.hasMore !== '1')) return;
     loading = true;
@@ -23994,6 +23995,19 @@ window.apAdminToast = function (msg, isErr) {
     }
   };
   load(true);
+  // The first response is intentionally cache-first. Give the queue worker a
+  // moment to reconcile a newly-created Bluesky like, then refresh the first
+  // page in place so users do not need to navigate away and back.
+  const refreshAfterQueue = () => {
+    if (refreshAttempts >= 2) return;
+    refreshAttempts++;
+    window.setTimeout(() => {
+      load(true).then(() => {
+        if (refreshAttempts < 2) refreshAfterQueue();
+      });
+    }, refreshAttempts === 1 ? 2500 : 7000);
+  };
+  refreshAfterQueue();
 })();
 </script>
 
