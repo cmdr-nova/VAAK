@@ -8194,6 +8194,71 @@ function ap_masto_trends_is_status_object_url(string $objectId): bool
 }
 
 /**
+ * Convert cached Bluesky embeds into Mastodon-style media attachments.
+ * Search and trends use the lightweight PostView cache, so this must remain
+ * cache-only and tolerate both AppView and compact record shapes.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_bsky_media_attachments(array $post, string $statusId): array
+{
+    $embed = is_array($post['embed'] ?? null)
+        ? $post['embed']
+        : (is_array($post['record']['embed'] ?? null) ? $post['record']['embed'] : null);
+    if (!is_array($embed)) {
+        return [];
+    }
+    $type = strtolower((string) ($embed['$type'] ?? ''));
+    $sources = [$embed];
+    if (str_contains($type, 'recordwithmedia') && is_array($embed['media'] ?? null)) {
+        $sources[] = $embed['media'];
+    }
+    $out = [];
+    $n = 0;
+    foreach ($sources as $source) {
+        foreach ((is_array($source['images'] ?? null) ? $source['images'] : []) as $image) {
+            if (!is_array($image)) {
+                continue;
+            }
+            $url = trim((string) ($image['fullsize'] ?? $image['url'] ?? $image['thumb'] ?? ''));
+            if (!str_starts_with($url, 'https://')) {
+                continue;
+            }
+            $preview = trim((string) ($image['thumb'] ?? $url));
+            $out[] = [
+                'id' => $statusId . '#media-' . (++$n),
+                'type' => 'image',
+                'url' => $url,
+                'preview_url' => str_starts_with($preview, 'https://') ? $preview : $url,
+                'remote_url' => $url,
+                'text_url' => $url,
+                'description' => (string) ($image['alt'] ?? ''),
+                'meta' => [],
+                'blurhash' => null,
+            ];
+        }
+        $video = is_array($source['video'] ?? null) ? $source['video'] : $source;
+        $playlist = trim((string) ($video['playlist'] ?? $video['url'] ?? ''));
+        if ($playlist !== '' && str_starts_with($playlist, 'https://')
+            && (str_contains($type, 'video') || isset($source['playlist']) || isset($source['video']))) {
+            $preview = trim((string) ($video['thumbnail'] ?? $video['thumb'] ?? ''));
+            $out[] = [
+                'id' => $statusId . '#media-' . (++$n),
+                'type' => 'video',
+                'url' => $playlist,
+                'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
+                'remote_url' => $playlist,
+                'text_url' => $playlist,
+                'description' => '',
+                'meta' => [],
+                'blurhash' => null,
+            ];
+        }
+    }
+    return $out;
+}
+
+/**
  * Trending statuses ranked by boosts / likes / replies we observed (7-day window).
  * Powers /api/v1/trends/statuses and the admin sidebar.
  *
@@ -8210,6 +8275,7 @@ function ap_masto_bsky_trend_status(array $post): ?array
     $handle = trim((string) ($author['handle'] ?? ''));
     $url = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
     $text = trim((string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? '')));
+    $media = ap_masto_bsky_media_attachments($post, $uri);
     return [
         'id' => $uri,
         'url' => $url,
@@ -8231,6 +8297,7 @@ function ap_masto_bsky_trend_status(array $post): ?array
         'reblogs_count' => (int) ($post['repostCount'] ?? 0),
         'favourites_count' => (int) ($post['likeCount'] ?? 0),
         'replies_count' => (int) ($post['replyCount'] ?? 0),
+        'media_attachments' => $media,
         'source' => 'bluesky',
         'author_did' => $did,
         'trend_actors' => [$did],
