@@ -3607,6 +3607,12 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
     $items = []; $hasMore = false;
     if (function_exists('ap_bsky_get_favourites') && function_exists('ap_bsky_session_row') && ap_bsky_session_row($vaakOwnerId) !== null) {
+        // Ask the background worker to reconcile newly-created PDS likes on
+        // the first page request. The response remains cache-first and never
+        // waits on AppView/PDS I/O; the queue is coalesced by collection.
+        if ($offset === 0 && function_exists('ap_bsky_background_sync_enqueue')) {
+            ap_bsky_background_sync_enqueue($vaakOwnerId, 'favourites', true);
+        }
         $result = function_exists('ap_bsky_get_favourites_page')
             ? ap_bsky_get_favourites_page($vaakOwnerId, $offset, $limit)
             : ap_bsky_get_favourites($vaakOwnerId, $limit);
@@ -21078,7 +21084,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky', 'favourites'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
     <?php endif; ?>
@@ -24036,6 +24042,19 @@ window.apAdminToast = function (msg, isErr) {
     } finally { skeleton.remove(); busy = false; }
   };
   arm();
+})();
+</script>
+
+<script>
+// Favourites does not use the timeline paginator, so provide the same
+// back-to-top affordance without depending on #timeline-items.
+(function () {
+  const btn = document.getElementById('feed-top-btn');
+  if (!btn || document.getElementById('timeline-items')) return;
+  const update = () => btn.classList.toggle('show', (window.scrollY || document.documentElement.scrollTop || 0) > 280);
+  window.addEventListener('scroll', update, { passive: true });
+  btn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+  update();
 })();
 </script>
 
