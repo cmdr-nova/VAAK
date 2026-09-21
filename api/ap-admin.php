@@ -2877,10 +2877,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             echo json_encode($ajaxOut, JSON_UNESCAPED_SLASHES);
             exit;
         }
-    } elseif ($action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile') {
+    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'profile')) ?: 'profile';
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
             $error = 'Bluesky tab is disabled on this instance.';
+        } elseif ($action === 'bsky_create_account') {
+            $res = ap_bsky_create_account(
+                $vaakOwnerId,
+                (string) ($_POST['bsky_handle_local'] ?? ''),
+                (string) ($_POST['bsky_account_email'] ?? ''),
+                (string) ($_POST['bsky_account_password'] ?? ''),
+                (string) ($_POST['bsky_invite_code'] ?? '')
+            );
+            if (!empty($res['ok'])) {
+                $notice = 'VAAK Bluesky account created and connected as @' . (string) ($res['handle'] ?? '') . '.';
+                if (!empty($res['profile_synced'])) {
+                    $notice .= ' Your VAAK avatar, header, and bio were synced.';
+                }
+            } else {
+                $error = $res['error'] ?? 'Could not create the VAAK Bluesky account.';
+            }
         } elseif ($action === 'bsky_disconnect') {
             ap_bsky_disconnect($vaakOwnerId);
             $notice = 'Bluesky disconnected.';
@@ -17345,6 +17361,40 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 Previous Bluesky session was cleared after it expired. Connect again below.
               </div>
             <?php endif; ?>
+            <section class="side-card" style="margin-top:.75rem">
+              <h2 style="margin:.1rem 0 .45rem;font-size:1rem">Create a VAAK Bluesky account</h2>
+              <div class="meta" style="line-height:1.55;margin-bottom:.75rem">
+                Create a native account on the VAAK PDS and link it to this VAAK account. Your handle will end in
+                <code>.bsky.mkultra.monster</code>. The current PDS requires a one-time invite code; it is used only by the PDS and is not stored by VAAK.
+              </div>
+              <form class="composer" method="post" action="?view=atmosphere">
+                <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                <input type="hidden" name="action" value="bsky_create_account">
+                <input type="hidden" name="return_view" value="atmosphere">
+                <div style="display:block;max-width:22rem;margin:0 0 .85rem">
+                  <label for="bsky-handle-local" style="display:block;margin:0 0 .3rem">Handle</label>
+                  <div style="display:flex;align-items:center;gap:.4rem">
+                    <input id="bsky-handle-local" name="bsky_handle_local" type="text" required pattern="[A-Za-z][A-Za-z0-9-]{2,23}" maxlength="24" autocomplete="username" placeholder="your-handle" style="max-width:14rem;margin-top:0">
+                    <span class="meta">.bsky.mkultra.monster</span>
+                  </div>
+                </div>
+                <div style="display:block;max-width:22rem;margin:0 0 .85rem">
+                  <label for="bsky-account-email" style="display:block;margin:0 0 .3rem">Recovery email</label>
+                  <input id="bsky-account-email" name="bsky_account_email" type="email" required autocomplete="email" placeholder="you@example.com" style="max-width:22rem;margin-top:0">
+                </div>
+                <div style="display:block;max-width:22rem;margin:0 0 .85rem">
+                  <label for="bsky-account-password" style="display:block;margin:0 0 .3rem">Password</label>
+                  <input id="bsky-account-password" name="bsky_account_password" type="password" required minlength="8" maxlength="256" autocomplete="new-password" placeholder="At least 8 characters" style="max-width:22rem;margin-top:0">
+                </div>
+                <div style="display:block;max-width:22rem;margin:0 0 .5rem">
+                  <label for="bsky-invite-code" style="display:block;margin:0 0 .3rem">PDS invite code</label>
+                  <input id="bsky-invite-code" name="bsky_invite_code" type="text" required autocomplete="off" placeholder="Invite code" style="max-width:22rem;margin-top:0">
+                </div>
+                <div class="composer-actions" style="margin-top:.75rem">
+                  <button class="btn btn-primary" type="submit">Create and connect account</button>
+                </div>
+              </form>
+            </section>
             <form class="composer" method="post" action="?view=atmosphere" style="margin-top:.75rem">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="bsky_connect">

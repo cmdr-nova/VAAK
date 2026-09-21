@@ -9,6 +9,7 @@
 declare(strict_types=1);
 
 const AP_BSKY_DEFAULT_PDS = 'https://bsky.social';
+const AP_BSKY_VAAK_PDS = 'https://bsky.mkultra.monster';
 const AP_BSKY_PUBLIC_API = 'https://public.api.bsky.app';
 /** DNS/TCP connect cap — keep UI from stalling on dead resolvers. */
 const AP_BSKY_CONNECT_TIMEOUT = 2;
@@ -1599,6 +1600,76 @@ function ap_bsky_connect(int $ownerUserId, string $identifier, string $appPasswo
     return [
         'ok' => true,
         'handle' => $handle,
+        'did' => $did,
+        'profile_synced' => !empty($sync['ok']),
+        'profile_sync_error' => empty($sync['ok']) ? (string) ($sync['error'] ?? '') : '',
+    ];
+}
+
+/**
+ * Create and link a native account on the VAAK PDS.
+ * The PDS currently requires an invite code; it is deliberately supplied by
+ * the user rather than stored in VAAK or exposed to other accounts.
+ *
+ * @return array{ok:bool,error?:string,handle?:string,did?:string,profile_synced?:bool,profile_sync_error?:string}
+ */
+function ap_bsky_create_account(
+    int $ownerUserId,
+    string $handleLocal,
+    string $email,
+    string $password,
+    string $inviteCode
+): array {
+    if ($ownerUserId < 1) return ['ok' => false, 'error' => 'Not signed in'];
+    if (!function_exists('ap_auth_secret_encrypt')) require_once __DIR__ . '/ap-auth.php';
+    if (ap_bsky_session_row($ownerUserId) !== null) {
+        return ['ok' => false, 'error' => 'A Bluesky account is already connected. Disconnect it before creating another.'];
+    }
+    $handleLocal = strtolower(trim(ltrim($handleLocal, '@')));
+    $email = trim($email);
+    $password = trim($password);
+    $inviteCode = trim($inviteCode);
+    if (!preg_match('/^[a-z][a-z0-9-]{2,23}$/', $handleLocal)) {
+        return ['ok' => false, 'error' => 'Handle must be 3–24 characters, start with a letter, and use only letters, numbers, or hyphens.'];
+    }
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return ['ok' => false, 'error' => 'Enter a valid recovery email address.'];
+    if (strlen($password) < 8 || strlen($password) > 256) return ['ok' => false, 'error' => 'Password must be between 8 and 256 characters.'];
+    if ($inviteCode === '' || strlen($inviteCode) > 256) return ['ok' => false, 'error' => 'A VAAK PDS invite code is required.'];
+
+    ap_bsky_migrate();
+    $handle = $handleLocal . '.bsky.mkultra.monster';
+    $res = ap_bsky_xrpc(AP_BSKY_VAAK_PDS, 'com.atproto.server.createAccount', 'POST', null, [
+        'email' => $email,
+        'handle' => $handle,
+        'password' => $password,
+        'inviteCode' => $inviteCode,
+    ], null, 15);
+    if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+        return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not create the VAAK Bluesky account.')];
+    }
+    $j = $res['json'];
+    $access = (string) ($j['accessJwt'] ?? '');
+    $refresh = (string) ($j['refreshJwt'] ?? '');
+    $did = (string) ($j['did'] ?? '');
+    $actualHandle = (string) ($j['handle'] ?? $handle);
+    if ($access === '' || $refresh === '' || $did === '') return ['ok' => false, 'error' => 'PDS account response was missing session tokens.'];
+    $accessEnc = ap_auth_secret_encrypt($access);
+    $refreshEnc = ap_auth_secret_encrypt($refresh);
+    if ($accessEnc === '' || $refreshEnc === '') return ['ok' => false, 'error' => 'Could not encrypt the new Bluesky session.'];
+    try {
+        $st = ap_db()->prepare(
+            'INSERT INTO bsky_sessions (owner_user_id, handle, did, pds_host, access_jwt_enc, refresh_jwt_enc, connected_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        $st->execute([$ownerUserId, $actualHandle, $did, AP_BSKY_VAAK_PDS, $accessEnc, $refreshEnc, gmdate('c'), gmdate('c')]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] create account session save: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'The PDS account was created, but VAAK could not save its connection. Contact the operator before retrying.'];
+    }
+    $sync = ap_bsky_sync_profile_from_vaak($ownerUserId);
+    return [
+        'ok' => true,
+        'handle' => $actualHandle,
         'did' => $did,
         'profile_synced' => !empty($sync['ok']),
         'profile_sync_error' => empty($sync['ok']) ? (string) ($sync['error'] ?? '') : '',
