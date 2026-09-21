@@ -8199,6 +8199,51 @@ function ap_masto_trends_is_status_object_url(string $objectId): bool
  *
  * @return list<array<string,mixed>> Mastodon Status entities
  */
+function ap_masto_bsky_trend_status(array $post): ?array
+{
+    $uri = trim((string) ($post['uri'] ?? ''));
+    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+    $did = trim((string) ($author['did'] ?? ''));
+    if ($uri === '' || $did === '' || !function_exists('ap_bsky_https_url_from_at_uri')) {
+        return null;
+    }
+    $handle = trim((string) ($author['handle'] ?? ''));
+    $url = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
+    $text = trim((string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? '')));
+    return [
+        'id' => $uri,
+        'url' => $url,
+        'uri' => $uri,
+        'content' => nl2br(htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false),
+        'created_at' => (string) (($post['record']['createdAt'] ?? '') ?: ($post['indexedAt'] ?? gmdate('c'))),
+        'visibility' => 'public',
+        'language' => 'en',
+        'account' => [
+            'id' => $did,
+            'url' => function_exists('ap_bsky_actor_profile_url')
+                ? ap_bsky_actor_profile_url($handle !== '' ? $handle : $did)
+                : 'https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did),
+            'username' => $handle !== '' ? $handle : $did,
+            'acct' => $handle !== '' ? $handle : $did,
+            'display_name' => (string) ($author['displayName'] ?? $handle ?: $did),
+            'avatar' => (string) ($author['avatar'] ?? ''),
+        ],
+        'reblogs_count' => (int) ($post['repostCount'] ?? 0),
+        'favourites_count' => (int) ($post['likeCount'] ?? 0),
+        'replies_count' => (int) ($post['replyCount'] ?? 0),
+        'source' => 'bluesky',
+        'author_did' => $did,
+        'trend_actors' => [$did],
+    ];
+}
+
+/**
+ * Trending statuses ranked by boosts / likes / replies we observed (7-day window).
+ * Powers /api/v1/trends/statuses and the admin sidebar.
+ *
+ * @return list<array<string,mixed>> Mastodon Status entities
+ */
+
 function ap_masto_trends_statuses(int $limit = 10): array
 {
     $limit = max(1, min(20, $limit));
@@ -8305,8 +8350,10 @@ function ap_masto_trends_statuses(int $limit = 10): array
         return true;
     };
 
+    // Leave room so cached Bluesky posts can appear in Explore (~30%).
+    $fediCap = 14;
     foreach ($scored as $oid => $_score) {
-        if (count($out) >= 20) {
+        if (count($out) >= $fediCap) {
             break;
         }
         $row = null;
@@ -8404,19 +8451,28 @@ function ap_masto_trends_statuses(int $limit = 10): array
                       indexed_at DESC LIMIT 120'
         );
         $st->execute([$since]);
+        $bskyAdded = 0;
+        $bskyCap = 6;
         foreach ($st->fetchAll() ?: [] as $row) {
-            if (count($out) >= 20) {
+            if ($bskyAdded >= $bskyCap || count($out) >= 20) {
                 break;
             }
             $raw = json_decode((string) ($row['raw_json'] ?? ''), true);
             if (!is_array($raw)) {
                 continue;
             }
-            $status = ap_masto_bsky_trend_status($raw);
+            // raw_json may be PostView or FeedViewPost({post: ...}).
+            $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
+            if (!function_exists('ap_masto_bsky_trend_status')) {
+                continue;
+            }
+            $status = ap_masto_bsky_trend_status($post);
             if ($status === null) {
                 continue;
             }
-            $takeStatus($status);
+            if ($takeStatus($status)) {
+                $bskyAdded++;
+            }
         }
     } catch (Throwable $e) {
         // Optional Bluesky cache must never affect Fediverse trends.
