@@ -4541,7 +4541,9 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Fingerprint follow-set + owner (per-user mutes/words/blocks)
     $owner = admin_owner_user_id();
-    return $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    // Bump when the ranked-entry eligibility rules change so old cache files
+    // cannot reintroduce cards that a fresh timeline build would exclude.
+    return 'v2_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -5452,7 +5454,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
     if ($view === 'local') {
         try {
             $st = $db->prepare(
-                "SELECT id FROM outbox_notes
+                "SELECT id, raw_create_json FROM outbox_notes
                  WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
                    AND published < ?
                  ORDER BY published DESC
@@ -5460,6 +5462,9 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             );
             $st->execute([$beforeAt, $want * 2]);
             foreach ($st->fetchAll() ?: [] as $nrow) {
+                if (!is_array($nrow) || admin_outbox_is_bsky_import($nrow)) {
+                    continue;
+                }
                 $oid = rtrim((string) ($nrow['id'] ?? ''), '/');
                 if ($oid === '' || isset($seenOutbox[$oid])) {
                     continue;
