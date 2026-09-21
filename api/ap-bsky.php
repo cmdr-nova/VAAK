@@ -9223,12 +9223,11 @@ function ap_bsky_notification_media_urls(array $notif, int $ownerUserId = 0, boo
             if (is_array($ext)) {
                 $thumb = trim((string) ($ext['thumb'] ?? ''));
                 $uri = trim((string) ($ext['uri'] ?? ''));
-                // Prefer the external media URI (often the animated GIF) first;
-                // CDN thumb is a useful fallback / preview.
+                // One attachment only: animated/media URI when available, else CDN thumb.
+                // Pushing both made notifications show GIF + still of the same clip.
                 if ($uri !== '' && ap_bsky_url_looks_like_media($uri)) {
                     $push($uri);
-                }
-                if ($thumb !== '') {
+                } elseif ($thumb !== '') {
                     $push($thumb);
                 }
             }

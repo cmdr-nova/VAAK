@@ -12018,6 +12018,12 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         } elseif (is_string($nSnippet) && strlen($nSnippet) > 280) {
             $snipShow = substr($nSnippet, 0, 280) . '…';
         }
+        // Strip API reply-context prefix when we render a separate "In reply to" block.
+        if (is_string($snipShow) && preg_match('/^↩\s+.+/u', $snipShow)) {
+            $snipShow = preg_replace('/^↩\s+.+(?:\n\n|$)/u', '', $snipShow, 1) ?? $snipShow;
+            $snipShow = trim($snipShow);
+            $nSnippet = $snipShow;
+        }
         // Clickable @handles in mention/quote bodies (full @user@host when present).
         $nSnippetHtml = $snipShow !== ''
             ? admin_linkify_body_html($snipShow, 'mentions', $nStatusMentions ?? [], $nActorRef !== '' ? $nActorRef : null)
@@ -12048,37 +12054,56 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
     </div>
     <?php if ($nType === 'bite' && !$biteHasPost): ?>
       <div class="meta" style="margin-top:.55rem;color:var(--muted)">No associated post</div>
-    <?php elseif ($nSnippetHtml !== '' && $nType === 'mention'): ?>
+    <?php else: ?>
       <?php
-        $nParentUrl = is_array($nStatus) ? rtrim((string) ($nStatus['in_reply_to'] ?? ''), '/') : '';
+        // Parent context for replies/mentions — including GIF-only Bluesky replies
+        // that have no text body (nSnippetHtml empty) but still have in_reply_to.
+        $nParentUrl = '';
         $nParentSnippet = '';
         $nParentHref = '';
-        if ($nParentUrl !== '') {
-            if (function_exists('vaak_is_own_url') && vaak_is_own_url($nParentUrl) && str_contains($nParentUrl, '/notes/')
-                && function_exists('ap_masto_status_by_note_id')) {
-                $nParentRow = ap_masto_status_by_note_id($nParentUrl);
-                if (is_array($nParentRow)) {
-                    $nParentSnippet = trim((string) ($nParentRow['content_text'] ?? ''));
-                    if ($nParentSnippet === '') {
-                        $nParentSnippet = trim(strip_tags((string) ($nParentRow['content_html'] ?? $nParentRow['content'] ?? '')));
-                    }
+        if (in_array($nType, ['mention', 'quote'], true) && is_array($nStatus)) {
+            $nParentUrl = rtrim((string) ($nStatus['in_reply_to'] ?? ''), '/');
+            if ($nParentUrl === '' && $nType === 'quote') {
+                // Quote target may only live in content as "↪ QT https://…"
+                if (preg_match('#↪\s*QT\s+(https://\S+)#u', (string) ($nSnippet ?? ''), $qm)) {
+                    $nParentUrl = rtrim($qm[1], '/');
                 }
-                $nParentHref = '?view=status&object=' . rawurlencode($nParentUrl) . '&from=mentions';
-            } elseif (function_exists('ap_bsky_subject_post_preview_text')) {
-                $nParentSnippet = ap_bsky_subject_post_preview_text($nParentUrl, (int) ($GLOBALS['vaak_owner_id'] ?? 0));
-                $nParentHref = admin_status_href($nParentUrl, 'mentions');
             }
-            if ($nParentSnippet === '') {
-                $nParentSnippet = 'your post';
-            }
-            if (function_exists('mb_strlen') && mb_strlen($nParentSnippet) > 160) {
-                $nParentSnippet = mb_substr($nParentSnippet, 0, 160) . '…';
+            if ($nParentUrl !== '') {
+                if (function_exists('vaak_is_own_url') && vaak_is_own_url($nParentUrl) && str_contains($nParentUrl, '/notes/')
+                    && function_exists('ap_masto_status_by_note_id')) {
+                    $nParentRow = ap_masto_status_by_note_id($nParentUrl);
+                    if (is_array($nParentRow)) {
+                        $nParentSnippet = trim((string) ($nParentRow['content_text'] ?? ''));
+                        if ($nParentSnippet === '') {
+                            $nParentSnippet = trim(strip_tags((string) ($nParentRow['content_html'] ?? $nParentRow['content'] ?? '')));
+                        }
+                        // Media-only local notes use "(media)" sentinel.
+                        if ($nParentSnippet === '' || in_array($nParentSnippet, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+                            $nParentHasMedia = !empty($nParentRow['media_urls']) && $nParentRow['media_urls'] !== '[]';
+                            $nParentSnippet = $nParentHasMedia ? '📷 your post' : 'your post';
+                        }
+                    }
+                    $nParentHref = '?view=status&object=' . rawurlencode($nParentUrl) . '&from=mentions';
+                } elseif (function_exists('ap_bsky_subject_post_preview_text')) {
+                    $nParentSnippet = ap_bsky_subject_post_preview_text(
+                        $nParentUrl,
+                        (int) ($GLOBALS['vaak_owner_id'] ?? (function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0))
+                    );
+                    $nParentHref = admin_status_href($nParentUrl, 'mentions');
+                }
+                if ($nParentSnippet === '' || in_array($nParentSnippet, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+                    $nParentSnippet = 'your post';
+                }
+                if (function_exists('mb_strlen') && mb_strlen($nParentSnippet) > 160) {
+                    $nParentSnippet = mb_substr($nParentSnippet, 0, 160) . '…';
+                }
             }
         }
       ?>
-      <?php if ($nParentUrl !== ''): ?>
+      <?php if ($nParentUrl !== '' && $nParentSnippet !== ''): ?>
         <div class="quote-block" style="margin-top:.55rem">
-          <span class="qt-label">In reply to</span><br>
+          <span class="qt-label"><?= $nType === 'quote' ? 'Quoted' : 'In reply to' ?></span><br>
           <?php if ($nParentHref !== ''): ?>
             <a class="notification-snippet" href="<?= h($nParentHref) ?>"><?= h($nParentSnippet) ?></a>
           <?php else: ?>
@@ -12086,11 +12111,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
           <?php endif; ?>
         </div>
       <?php endif; ?>
-      <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
-    <?php elseif ($nSnippetHtml !== '' && $nType === 'quote'): ?>
-      <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
-    <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
-      <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
+      <?php if ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
+        <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
+      <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
+        <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
+      <?php endif; ?>
     <?php endif; ?>
     <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
     <div class="tweet-actions">

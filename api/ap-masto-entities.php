@@ -3910,6 +3910,41 @@ function ap_masto_status_from_mention(array $row): array
             }
         }
     }
+    // Reply parent teaser for notification lists (Ice Cubes / clients that only
+    // show status.content). VAAK's notifications UI strips this line when it
+    // renders the separate "In reply to" block.
+    if ($inReplyTo !== '') {
+        $parentPreview = '';
+        if (isset($parent) && is_array($parent)) {
+            $parentPreview = trim((string) ($parent['content_text'] ?? ''));
+            if ($parentPreview === '') {
+                $parentPreview = trim(strip_tags((string) ($parent['content_html'] ?? $parent['content'] ?? '')));
+            }
+        }
+        if ($parentPreview === '' || in_array($parentPreview, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+            if (!function_exists('ap_bsky_subject_post_preview_text')) {
+                $bskyLib = __DIR__ . '/ap-bsky.php';
+                if (is_file($bskyLib)) {
+                    require_once $bskyLib;
+                }
+            }
+            if (function_exists('ap_bsky_subject_post_preview_text')) {
+                $parentPreview = ap_bsky_subject_post_preview_text(
+                    $inReplyTo,
+                    (int) ($row['owner_user_id'] ?? 0)
+                );
+            }
+        }
+        if ($parentPreview === '' || in_array($parentPreview, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+            $parentPreview = 'your post';
+        }
+        if (function_exists('mb_substr')) {
+            $parentPreview = mb_substr($parentPreview, 0, 140);
+        } else {
+            $parentPreview = substr($parentPreview, 0, 140);
+        }
+        $text = '↩ ' . $parentPreview . ($text !== '' ? "\n\n" . $text : '');
+    }
     $extraActors = [];
     if (is_string($replyParentActor) && $replyParentActor !== '') {
         $extraActors[] = $replyParentActor;
