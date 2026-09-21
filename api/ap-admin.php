@@ -13646,7 +13646,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-conversation-preview { color: var(--muted); font-size: .82rem; }
     .dm-conversation-row.is-unread .dm-conversation-preview { color: var(--text); font-weight: 600; }
     .dm-conversation-badge { position: static; flex: 0 0 auto; }
-    .dm-pane { padding: .8rem; }
+    .dm-pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+      padding: .8rem;
+    }
+    .dm-pane .dm-thread {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: 0 .25rem .25rem 0;
+    }
     .dm-pane > .composer { margin-bottom: 0; }
     body.dm-fullscreen .shell {
       max-width: none;
@@ -13663,15 +13676,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     body.dm-fullscreen .dm-workspace {
       grid-template-columns: minmax(18rem, 26rem) minmax(0, 1fr);
-      min-height: calc(100vh - 5rem);
+      height: calc(100vh - 5rem);
+      min-height: 0;
     }
+    body.dm-fullscreen .dm-pane { height: 100%; }
     .dm-back-top { margin-right: auto; }
     @media (max-width: 760px) {
       body.dm-fullscreen .feed { padding-inline: .65rem; }
       .dm-workspace { grid-template-columns: 1fr; }
-      body.dm-fullscreen .dm-workspace { min-height: 0; }
+      body.dm-fullscreen .dm-workspace { height: auto; min-height: 0; }
       .dm-sidebar { max-height: 18rem; overflow-y: auto; }
       .dm-pane { padding: .65rem; }
+      .dm-pane .dm-thread { min-height: 12rem; max-height: 52dvh; }
     }
     .link-card {
       display: flex; gap: .75rem; margin: .65rem 0 0; padding: 0;
@@ -16068,15 +16084,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <script>
           (function () {
             function focusLatestDm() {
-              const feed = document.querySelector('.feed');
               const thread = document.getElementById('dm-thread');
-              if (!feed || !thread) return;
-              const last = document.getElementById('dm-message-last');
-              const feedRect = feed.getBoundingClientRect();
-              const targetRect = (last || thread).getBoundingClientRect();
-              const target = feed.scrollTop + targetRect.bottom - feedRect.bottom + 24;
-              const maxTop = Math.max(0, feed.scrollHeight - feed.clientHeight);
-              feed.scrollTop = Math.min(maxTop, Math.max(0, target));
+              if (!thread) return;
+              thread.scrollTop = Math.max(0, thread.scrollHeight - thread.clientHeight);
             }
             requestAnimationFrame(function () {
               requestAnimationFrame(focusLatestDm);
