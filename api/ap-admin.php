@@ -8546,6 +8546,45 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
     return $out;
 }
 
+/** Compact conversation rail used by the full-page DM workspace. */
+function admin_dm_conversation_list_html(array $conversations, string $activePeer = ''): string
+{
+    if ($conversations === []) {
+        return '<div class="empty">No direct messages yet.</div>';
+    }
+    $html = '';
+    foreach ($conversations as $conversation) {
+        if (!is_array($conversation)) {
+            continue;
+        }
+        $peer = rtrim((string) ($conversation['peer_actor_id'] ?? ''), '/');
+        if ($peer === '') {
+            continue;
+        }
+        $last = is_array($conversation['last'] ?? null) ? $conversation['last'] : [];
+        $unread = (int) ($conversation['unread'] ?? 0);
+        $preview = function_exists('admin_html_to_plain')
+            ? admin_html_to_plain((string) ($last['content'] ?? ''))
+            : strip_tags((string) ($last['content'] ?? ''));
+        $preview = trim(preg_replace('/\s+/u', ' ', $preview) ?? $preview);
+        if ($preview === '') {
+            $preview = 'Media or link';
+        }
+        $preview = function_exists('mb_strimwidth')
+            ? mb_strimwidth($preview, 0, 96, '…', 'UTF-8')
+            : substr($preview, 0, 93) . (strlen($preview) > 93 ? '...' : '');
+        $html .= '<a class="dm-conversation-row' . ($peer === $activePeer ? ' is-active' : '') . ($unread > 0 ? ' is-unread' : '') . '" href="?view=dms&amp;peer=' . rawurlencode($peer) . '">';
+        $html .= '<span class="dm-conversation-avatar">' . admin_avatar_img($peer) . '</span>';
+        $html .= '<span class="dm-conversation-copy"><span class="dm-conversation-name">' . actor_display_name_html($peer) . '</span>';
+        $html .= '<span class="dm-conversation-preview">' . h($preview) . '</span></span>';
+        if ($unread > 0) {
+            $html .= '<span class="nav-badge dm-conversation-badge">' . ($unread > 99 ? '99+' : (string) $unread) . '</span>';
+        }
+        $html .= '</a>';
+    }
+    return $html !== '' ? $html : '<div class="empty">No direct messages yet.</div>';
+}
+
 /** Viewer preference: highlight anti-AI posters. Removed from the UI. */
 function admin_viewer_anti_ai_enabled(): bool
 {
@@ -15950,11 +15989,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $dmUnread = ap_dm_unread_count();
         ?>
         <?php if ($dmPeer === ''): ?>
+          <div class="dm-workspace">
+            <aside class="dm-sidebar" aria-label="Direct message conversations">
+              <div class="dm-sidebar-title">Messages<?php if ($dmUnread > 0): ?> <span class="nav-badge dm-conversation-badge"><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span><?php endif; ?></div>
+              <?= admin_dm_conversation_list_html($dmConversations) ?>
+            </aside>
+            <section class="dm-pane">
           <?php if ($dmUnread > 0): ?>
-            <div class="meta" style="margin-bottom:.75rem;display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
-              <span class="nav-badge" style="position:static"><?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?></span>
-              <span>unread <?= $dmUnread === 1 ? 'message' : 'messages' ?> — open a thread to clear its badge</span>
-            </div>
+            <div class="meta" style="margin-bottom:.75rem">You have <?= $dmUnread > 99 ? '99+' : (string) (int) $dmUnread ?> unread <?= $dmUnread === 1 ? 'message' : 'messages' ?>.</div>
           <?php endif; ?>
           <form class="composer" method="post" action="?view=dms" style="margin-bottom:1rem">
             <input type="hidden" name="action" value="dm_send">
@@ -15966,38 +16008,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <button class="btn btn-primary" type="submit">Send DM</button>
             </div>
           </form>
-          <?php if (!$dmConversations): ?>
-            <div class="empty">No direct messages yet.</div>
-          <?php endif; ?>
-          <?php foreach ($dmConversations as $c): ?>
-            <?php
-              $last = $c['last'];
-              $previewHtml = admin_dm_html($last['content'] ?? null, is_array($last) ? $last : null);
-              $peerId = (string) $c['peer_actor_id'];
-              $peerUnread = (int) ($c['unread'] ?? 0);
-            ?>
-            <article class="tweet<?= $peerUnread > 0 ? ' tweet-dm-unread' : '' ?>">
-              <div class="tweet-hd">
-                <?= admin_avatar_img($peerId) ?>
-                <div class="tweet-hd-main">
-                  <div style="display:flex;align-items:center;gap:.45rem;flex-wrap:wrap">
-                    <span class="who"><?= actor_display_name_html($peerId) ?></span>
-                    <span class="meta"> <?= h(actor_handle($peerId)) ?></span>
-                    <?php if ($peerUnread > 0): ?>
-                      <span class="nav-badge" style="position:static" title="<?= (int) $peerUnread ?> unread"><?= $peerUnread > 99 ? '99+' : (string) $peerUnread ?></span>
-                    <?php endif; ?>
-                  </div>
-                  <div class="meta"><?= ($last['direction'] ?? '') === 'out' ? 'You' : 'Them' ?> · <?= h(relative_time((string) ($last['created_at'] ?? ''))) ?></div>
-                </div>
-              </div>
-              <div class="dm-bubble<?= ($last['direction'] ?? '') === 'out' ? ' dm-out' : ' dm-in' ?>"><?= $previewHtml !== '' ? $previewHtml : '<span class="meta">(no text)</span>' ?></div>
-              <div class="tweet-actions">
-                <a class="btn btn-primary" href="?view=dms&amp;peer=<?= urlencode($peerId) ?>" style="padding:.35rem .9rem;font-size:.85rem"><?= $peerUnread > 0 ? 'Open unread' : 'Open thread' ?></a>
-                <?= block_quick_actions($peerId, short_host($peerId), 'dms', $vaakOwnerId, !empty($vaakIsAdmin), 'dms') ?>
-              </div>
-            </article>
-          <?php endforeach; ?>
+            </section>
+          </div>
         <?php else: ?>
+          <div class="dm-workspace">
+            <aside class="dm-sidebar" aria-label="Direct message conversations">
+              <div class="dm-sidebar-title">Messages</div>
+              <?= admin_dm_conversation_list_html($dmConversations, $dmPeer) ?>
+            </aside>
+            <section class="dm-pane">
           <?php
             $thread = ap_dm_thread($dmPeer, 200);
             // Mark read after load so a lock/failure can't blank the thread
@@ -16091,6 +16110,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             window.addEventListener('load', focusLatestDm, { once: true });
           })();
           </script>
+            </section>
+          </div>
         <?php endif; ?>
 
       <?php elseif ($view === 'report'): ?>
