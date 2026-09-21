@@ -17,3 +17,5 @@ CREATE TABLE IF NOT EXISTS ap_media_warm_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_ap_media_warm_due
     ON ap_media_warm_queue(status, next_attempt_at, id);
+GRANT SELECT, INSERT, UPDATE, DELETE ON ap_media_warm_queue TO "www-data";
+GRANT USAGE, SELECT ON SEQUENCE ap_media_warm_queue_id_seq TO "www-data";
