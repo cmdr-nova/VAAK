@@ -6,6 +6,45 @@
  */
 declare(strict_types=1);
 
+/** Keep bootstrap failures human-readable instead of returning a blank page. */
+function vaak_render_failure(?Throwable $error = null): void
+{
+    if ($error !== null) {
+        error_log('[vaak-front] ' . get_class($error) . ': ' . $error->getMessage());
+    }
+    while (ob_get_level() > 0) @ob_end_clean();
+    http_response_code(503);
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    header('Retry-After: 60');
+    echo <<<'HTML'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#050505"><title>VAAK · Temporarily unavailable</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:2rem;display:grid;place-items:center;background:#050505;color:#e8e8e8;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(42rem,100%);text-align:center}.mark{margin:0 auto 2rem;color:#00ff9f;font:700 clamp(3.5rem,17vw,8rem)/.88 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 32px rgba(0,255,159,.28);white-space:pre;overflow:hidden}h1{margin:0;font-size:clamp(1.35rem,4vw,2rem);font-weight:650}p{margin:1rem auto 0;max-width:34rem;color:#999;font-size:1rem;line-height:1.55}
+</style></head><body><main>
+<pre class="mark" aria-label="VAAK">██╗   ██╗
+██║   ██║
+██║   ██║
+╚██╗ ██╔╝
+ ╚████╔╝
+  ╚═══╝</pre>
+<h1>Something's gone wrong, we're working on it.</h1>
+<p>Questions, contact cmdr_nova@mkultra.monster</p>
+</main></body></html>
+HTML;
+    exit;
+}
+
+set_exception_handler(static function (Throwable $error): void { vaak_render_failure($error); });
+register_shutdown_function(static function (): void {
+    $last = error_get_last();
+    if (is_array($last) && in_array((int) ($last['type'] ?? 0), [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        vaak_render_failure();
+    }
+});
+
 require_once dirname(__DIR__) . '/api/ap-auth.php';
 require_once dirname(__DIR__) . '/api/ap-version.php';
 
@@ -170,7 +209,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET' && ($_GET['mode'] ?? '') ===
 $notice = null;
 $error = null;
 $mode = preg_replace('/[^a-z]/', '', (string) ($_GET['mode'] ?? '')) ?: '';
-if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset') {
+if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset' && $mode !== '2fa') {
     $mode = '';
 }
 // Flash messages from PRG redirects (forgot / reset password).
@@ -193,7 +232,8 @@ if (isset($_GET['logout'])) {
 // Only handle auth forms here — compose/favourite/etc. POSTs must reach ap-admin.php
 $postAction = (string) ($_POST['action'] ?? '');
 $isAuthPost = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
-    && ($postAction === 'login' || $postAction === 'register' || $mode === 'login' || $mode === 'register');
+    && ($postAction === 'login' || $postAction === 'register' || $postAction === 'verify_2fa'
+        || $mode === 'login' || $mode === 'register' || $mode === '2fa');
 
 if ($isAuthPost) {
     $csrf = (string) ($_POST['csrf'] ?? '');
@@ -224,8 +264,14 @@ if ($isAuthPost) {
             header('Location: /vaak/?view=' . rawurlencode($next), true, 302);
             exit;
         }
-        $error = $res['error'] ?? 'Login failed.';
-        $mode = 'login';
+        if (!empty($res['requires_2fa'])) {
+            ap_auth_start_session();
+            $_SESSION['vaak_2fa_pending_next'] = preg_replace('/[^a-z_]/', '', (string) ($_GET['next'] ?? $_POST['next'] ?? '')) ?: 'home';
+            $mode = '2fa';
+        } else {
+            $error = $res['error'] ?? 'Login failed.';
+            $mode = 'login';
+        }
     } elseif ($postAction === 'register' || $mode === 'register') {
         $res = ap_auth_register(
             (string) ($_POST['invite'] ?? ''),
@@ -239,6 +285,16 @@ if ($isAuthPost) {
         }
         $error = $res['error'] ?? 'Registration failed.';
         $mode = 'register';
+    } elseif ($postAction === 'verify_2fa' || $mode === '2fa') {
+        ap_auth_start_session();
+        $next = preg_replace('/[^a-z_]/', '', (string) ($_SESSION['vaak_2fa_pending_next'] ?? $_POST['next'] ?? '')) ?: 'home';
+        $res = ap_auth_complete_2fa_login((string) ($_POST['code'] ?? ''));
+        if (!empty($res['ok'])) {
+            header('Location: /vaak/?view=' . rawurlencode($next), true, 302);
+            exit;
+        }
+        $error = $res['error'] ?? 'Two-factor verification failed.';
+        $mode = '2fa';
     }
 }
 
@@ -476,6 +532,15 @@ ASCII;
         <label for="login">Username or email</label>
         <input id="login" name="login" required autocomplete="username" placeholder="username or email">
         <button type="submit" id="forgot-submit">Email reset link</button>
+      </form>
+      <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
+    <?php elseif ($mode === '2fa'): ?>
+      <form method="post" action="/vaak/?mode=2fa" autocomplete="off">
+        <input type="hidden" name="csrf" value="<?= $csrf ?>">
+        <input type="hidden" name="action" value="verify_2fa">
+        <label for="code">Authenticator code or recovery code</label>
+        <input id="code" name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or XXXX-XXXX-XXXX" autofocus>
+        <button type="submit">Verify and log in</button>
       </form>
       <p class="switch"><a href="/vaak/?mode=login">Back to login</a></p>
       <script>

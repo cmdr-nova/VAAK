@@ -104,6 +104,9 @@ if (is_dir('/var/log/mkultra') && (is_writable('/var/log/mkultra') || @touch('/v
 
 // Avoid blank white screens: exceptions + fatals under federation write traffic.
 $adminRenderHiccup = static function (string $msg = ''): void {
+    if (function_exists('vaak_render_failure')) {
+        vaak_render_failure();
+    }
     if (!headers_sent()) {
         http_response_code(500);
         header('Content-Type: text/html; charset=utf-8');
@@ -17276,7 +17279,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <div class="tweet" style="margin-top:1rem">
           <div class="tweet-hd"><div class="who">Bluesky</div></div>
           <div class="body meta">
-            Optional Bluesky home timeline in VAAK via a native Bluesky / PDS login.
             Connected accounts mirror your VAAK <b>avatar</b>, <b>header</b>, and <b>bio</b>
             (long bios are truncated with a link to your full HTML profile).
             Use an
