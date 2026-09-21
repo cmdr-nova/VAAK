@@ -7306,6 +7306,7 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         // ignore
     }
 
+    return array_slice($out, 0, $limit);
 }
 
 /** @return list<array<string,mixed>> */
