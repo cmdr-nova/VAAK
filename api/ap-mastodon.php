@@ -175,6 +175,16 @@ function ap_masto_json(mixed $data, int $code = 200): void
     exit;
 }
 
+/** Build pagination URLs on the host the Mastodon client connected to. */
+function ap_masto_timeline_base_url(string $path): string
+{
+    $host = (string) ($_SERVER['HTTP_HOST'] ?? 'vaak.monster');
+    // HTTP_HOST may include a port for local/dev clients; keep it, but never
+    // allow arbitrary URL text to enter a generated Link header.
+    $host = preg_replace('/[^A-Za-z0-9.:-]/', '', $host) ?: 'vaak.monster';
+    return 'https://' . $host . $path;
+}
+
 /**
  * Mastodon-style Link pagination for timeline arrays (Ice Cubes uses these).
  *
@@ -186,7 +196,7 @@ function ap_masto_json_timeline(array $statuses, string $path, int $limit, array
     if ($statuses) {
         $first = (string) ($statuses[0]['id'] ?? '');
         $last = (string) ($statuses[count($statuses) - 1]['id'] ?? '');
-        $base = 'https://mkultra.monster' . $path;
+        $base = ap_masto_timeline_base_url($path);
         $parts = [];
         if ($last !== '') {
             $q = array_merge(['limit' => $limit, 'max_id' => $last], $extraQuery);
@@ -313,7 +323,7 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
     if ($statuses) {
         $first = (string) ($statuses[0]['id'] ?? '');
         $last = (string) ($statuses[count($statuses) - 1]['id'] ?? '');
-        $base = 'https://mkultra.monster' . $path;
+        $base = ap_masto_timeline_base_url($path);
         $parts = [];
         if ($last !== '') {
             $q = array_merge(['limit' => $limit, 'max_id' => $last], $extraQuery);
