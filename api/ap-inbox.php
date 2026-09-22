@@ -4190,6 +4190,11 @@ function ap_inbox_signer_is_followed(string $keyId): bool
 function ap_fetch_actor_doc(string $actorId): ?array
 {
     foreach (ap_key_fetch_candidates($actorId) as $url) {
+        $cacheKey = 'vaak:actor-doc:' . hash('sha256', rtrim($url, '/'));
+        $cached = ap_redis_json_get($cacheKey);
+        if (is_array($cached) && (($cached['type'] ?? '') !== '' || isset($cached['inbox']))) {
+            return $cached;
+        }
         // Authorized fetch first (signed as cmdr_nova); Bridgy handled inside ap_fetch_remote_as2
         $data = ap_fetch_remote_as2($url);
         if ($data === null) {
@@ -4199,6 +4204,7 @@ function ap_fetch_actor_doc(string $actorId): ?array
         if (($data['type'] ?? '') === '' && !isset($data['inbox'])) {
             continue;
         }
+        ap_redis_json_set($cacheKey, $data, 300);
         return $data;
     }
     return null;
