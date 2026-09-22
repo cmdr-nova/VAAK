@@ -9041,6 +9041,38 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
         $scores[$actorId]['sources'][$source] = true;
     };
 
+    // Include recent queued actions from both networks. This query is only run
+    // on a cache miss; normal suggestion requests serve the short-lived cache.
+    try {
+        $signalSt = ap_db()->prepare(
+            "SELECT platform, target_key, weight, metadata_json
+             FROM ap_user_signals
+             WHERE owner_user_id = ? AND created_at >= ?
+             ORDER BY id DESC LIMIT 2000"
+        );
+        $signalSt->execute([$ownerUserId, gmdate('c', time() - 90 * 86400)]);
+        foreach ($signalSt->fetchAll() as $signal) {
+            $meta = json_decode((string) ($signal['metadata_json'] ?? '{}'), true);
+            $actor = is_array($meta) ? trim((string) ($meta['target_actor'] ?? '')) : '';
+            if ($actor === '' && is_array($meta)) {
+                $actor = trim((string) ($meta['author_did'] ?? ''));
+            }
+            if ($actor === '' && is_array($meta)) {
+                $handle = trim((string) ($meta['author_handle'] ?? ''));
+                if ($handle !== '') {
+                    $actor = 'https://bsky.app/profile/' . rawurlencode(ltrim($handle, '@'));
+                }
+            }
+            if ($actor === '') continue;
+            $weight = (float) ($signal['weight'] ?? 0);
+            if ($weight > 0) {
+                $bump($actor, min(8.0, $weight * 2.5), 'recent_interactions');
+            }
+        }
+    } catch (Throwable $e) {
+        // Older installations may not have the signal table yet.
+    }
+
     // Past positive interactions: people whose posts we favourited / boosted
     try {
         $st = ap_db()->query(

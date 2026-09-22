@@ -11,6 +11,8 @@ function ap_signal_record(int $ownerUserId, string $platform, string $kind, stri
     try {
         $metadata = [
             'target_actor' => trim((string) ($payload['target_actor'] ?? '')),
+            'author_did' => trim((string) ($payload['author_did'] ?? '')),
+            'author_handle' => trim((string) ($payload['author_handle'] ?? '')),
             'object_id' => trim((string) ($payload['object_id'] ?? '')),
             'uri' => trim((string) ($payload['uri'] ?? '')),
         ];
