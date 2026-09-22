@@ -2809,6 +2809,11 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());
     }
+    // Wake active mixed-timeline streams. The stream still applies its normal
+    // since/visibility/deduplication checks, so older cache refreshes are cheap.
+    if (function_exists('ap_timeline_notify')) {
+        ap_timeline_notify('BskyCreate', $authorDid, $uri, $publishedAt);
+    }
     // Keep link map in sync.
     ap_bsky_index_feed_post_links($post);
 }
