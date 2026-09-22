@@ -4705,8 +4705,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     $ownerActorId = rtrim($ownerActorId, '/');
 
     if (array_intersect($want, $mentionTypes)) {
+        // The page only hydrates the first handful of notifications. Scan a
+        // bounded multiple of that page size instead of always walking 80
+        // rows, which made large mention tables slow even when the newest
+        // entries were valid.
+        $mentionScanLimit = max(20, min(80, $limit * 4));
         $st = ap_db()->prepare(
-            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 80'
+            'SELECT * FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT ' . $mentionScanLimit
         );
         $st->execute([$ownerUserId]);
         $seenActivityIds = [];

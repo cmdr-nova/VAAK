@@ -4147,7 +4147,10 @@ $followers = $isPartial ? [] : ap_followers_list($vaakActorId);
 $following = ap_following_list($vaakActorId);
 if ($vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
     if (function_exists('ap_bsky_admin_following_rows')) {
-        $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId));
+        // Notifications only need relationship membership; avoid resolving a
+        // profile cache entry for every followed Bluesky account on page load.
+        $resolveBskyHandles = $view !== 'mentions';
+        $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId, $resolveBskyHandles));
     }
     if (!$isPartial && function_exists('ap_bsky_admin_follower_rows')) {
         $followers = ap_bsky_merge_follow_rows($followers, ap_bsky_admin_follower_rows($vaakOwnerId, $vaakActorId));
@@ -4158,7 +4161,7 @@ if ($vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
 }
 // Scope remote_actors username lookups to the follow graph (not the whole table).
 $adminUnameByActor = [];
-if (!$isPartial) {
+if (!$isPartial && $view !== 'mentions') {
     $aliasActorIds = [];
     foreach (array_merge($followers, $following) as $grow) {
         if (!is_array($grow)) {
@@ -4248,8 +4251,8 @@ $adminIndexActorMap = static function (array $rows, bool $richAliases = true) us
     }
     return $map;
 };
-$followingIds = $adminIndexActorMap($following, !$isPartial);
-$followerIds = $isPartial ? [] : $adminIndexActorMap($followers, true);
+$followingIds = $adminIndexActorMap($following, !$isPartial && $view !== 'mentions');
+$followerIds = $isPartial ? [] : $adminIndexActorMap($followers, $view !== 'mentions');
 
 // AJAX: hydrate one thin boost card in place (no full timeline rebuild / no scroll reset)
 $hydrateBoost = $isPartial && (string) ($_GET['hydrate_boost'] ?? '') === '1';

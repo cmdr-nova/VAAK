@@ -3643,7 +3643,7 @@ function ap_bsky_graph_sync_list(int $ownerUserId, string $kind): array
 }
 
 /** @return list<array{actor_id:string,username:string,host:string,followed_at:string,bsky_did?:string}> */
-function ap_bsky_admin_following_rows(int $ownerUserId): array
+function ap_bsky_admin_following_rows(int $ownerUserId, bool $resolveHandles = true): array
 {
     $out = [];
     foreach (ap_bsky_graph_sync_list($ownerUserId, 'follow') as $row) {
@@ -3652,7 +3652,7 @@ function ap_bsky_admin_following_rows(int $ownerUserId): array
             continue;
         }
         $handle = '';
-        if (function_exists('ap_bsky_actor_profile_cache_get')) {
+        if ($resolveHandles && function_exists('ap_bsky_actor_profile_cache_get')) {
             $cached = ap_bsky_actor_profile_cache_get($did, $ownerUserId);
             $handle = trim((string) (($cached['profile']['handle'] ?? '') ?: ''));
         }
@@ -3666,7 +3666,7 @@ function ap_bsky_admin_following_rows(int $ownerUserId): array
             'followed_at' => (string) ($row['updated_at'] ?? gmdate('c')),
             'bsky_did' => $did,
         ];
-        if ($handle === '' && function_exists('ap_bsky_actor_refresh_enqueue')) {
+        if ($resolveHandles && $handle === '' && function_exists('ap_bsky_actor_refresh_enqueue')) {
             ap_bsky_actor_refresh_enqueue($ownerUserId, $did);
         }
     }
