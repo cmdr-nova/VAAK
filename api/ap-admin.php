@@ -26151,6 +26151,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const btn = ev.target && ev.target.closest ? ev.target.closest('.js-edit-post') : null;
     if (!btn) return;
     ev.preventDefault();
+    // The shared navigation listener runs in capture phase and briefly shows
+    // the page-loading pill for every same-origin anchor. Edit stays in the
+    // current document, so hand that navigation state back immediately rather
+    // than leaving the pill spinning while the modal is open.
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     openEditComposer(btn);
   });
 
