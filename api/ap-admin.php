@@ -4674,6 +4674,11 @@ function admin_home_favourite_actor_weights(int $ownerUserId): array
     if ($ownerUserId < 1) {
         return [];
     }
+    $redisKey = 'vaak:recommend:v1:favourite-actors:' . $ownerUserId;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) return $cached;
+    }
     try {
         $st = ap_db()->prepare(
             "SELECT target_actor AS actor_id, COUNT(*) AS favourite_count
@@ -4693,6 +4698,9 @@ function admin_home_favourite_actor_weights(int $ownerUserId): array
             if ($actor !== '' && $count > 0) {
                 $weights[$actor] = min(64, $count);
             }
+        }
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, $weights, 60);
         }
         return $weights;
     } catch (Throwable $e) {
@@ -4732,6 +4740,11 @@ function admin_home_favourite_tag_weights(int $ownerUserId): array
 {
     if ($ownerUserId < 1) {
         return [];
+    }
+    $redisKey = 'vaak:recommend:v1:favourite-tags:' . $ownerUserId;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) return $cached;
     }
     try {
         $db = ap_db();
@@ -4798,7 +4811,11 @@ function admin_home_favourite_tag_weights(int $ownerUserId): array
             }
         }
         arsort($weights);
-        return array_slice($weights, 0, 32, true);
+        $weights = array_slice($weights, 0, 32, true);
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, $weights, 120);
+        }
+        return $weights;
     } catch (Throwable $e) {
         // Optional personalization must never affect Home availability.
         return [];
@@ -4858,6 +4875,11 @@ function admin_home_item_preference_actor(array $item): string
 function admin_home_signal_actor_weights(int $ownerUserId): array
 {
     if ($ownerUserId < 1) return [];
+    $redisKey = 'vaak:recommend:v1:signals:' . $ownerUserId;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) return $cached;
+    }
     try {
         $st = ap_db()->prepare(
             "SELECT signal_type, weight, metadata_json, created_at
@@ -4894,6 +4916,9 @@ function admin_home_signal_actor_weights(int $ownerUserId): array
             // making a single old interaction permanently dominate Home.
             $decay = exp(-$age / (14 * 86400));
             $weights[$actor] = min(24.0, (float) ($weights[$actor] ?? 0) + ($base * $multiplier * $decay));
+        }
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, $weights, 45);
         }
         return $weights;
     } catch (Throwable $e) {

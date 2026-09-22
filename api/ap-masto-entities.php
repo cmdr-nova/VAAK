@@ -9202,6 +9202,14 @@ function ap_masto_suggestions_v2(int $limit = 40): array
 {
     $limit = max(1, min(80, $limit));
     $owner = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+    $redisKey = 'vaak:recommend:v1:suggestions:' . $owner . ':' . $limit;
+    if (function_exists('ap_redis_json_get')) {
+        $redisCached = ap_redis_json_get($redisKey);
+        if (is_array($redisCached) && isset($redisCached['created_at'], $redisCached['items'])
+            && is_array($redisCached['items']) && time() - (int) $redisCached['created_at'] <= 30) {
+            return $redisCached['items'];
+        }
+    }
     $path = ap_masto_suggestions_cache_path($owner, $limit);
     $now = time();
     $cached = null;
@@ -9216,6 +9224,9 @@ function ap_masto_suggestions_v2(int $limit = 40): array
     }
     try {
         $items = ap_masto_suggestions_v2_uncached($limit);
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, ['created_at' => $now, 'items' => $items], 300);
+        }
         @file_put_contents($path, json_encode(['created_at' => $now, 'items' => $items], JSON_UNESCAPED_SLASHES), LOCK_EX);
         return $items;
     } catch (Throwable $e) {

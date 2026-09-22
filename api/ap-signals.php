@@ -30,6 +30,13 @@ function ap_signal_record(int $ownerUserId, string $platform, string $kind, stri
             is_string($json) ? $json : '{}',
             ap_db_now(),
         ]);
+        if (function_exists('ap_redis_delete')) {
+            ap_redis_delete(
+                'vaak:recommend:v1:signals:' . $ownerUserId,
+                'vaak:recommend:v1:favourite-actors:' . $ownerUserId,
+                'vaak:recommend:v1:favourite-tags:' . $ownerUserId
+            );
+        }
     } catch (Throwable $e) {
         // Signals are advisory. A schema/lock problem must never fail a user action.
         error_log('[ap-signals] record: ' . $e->getMessage());

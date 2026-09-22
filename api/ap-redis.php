@@ -81,6 +81,14 @@ function ap_redis_json_set(string $key, array $value, int $ttlSeconds): bool
     }
 }
 
+function ap_redis_delete(string ...$keys): void
+{
+    $redis = ap_redis_client();
+    $keys = array_values(array_filter($keys, static fn($key): bool => is_string($key) && $key !== ''));
+    if (!$redis || $keys === []) return;
+    try { $redis->del($keys); } catch (Throwable $e) { error_log('[ap-redis] delete failed: ' . $e->getMessage()); }
+}
+
 /** Best-effort short lock used to coalesce refresh work. */
 function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
 {
