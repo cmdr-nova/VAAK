@@ -3599,7 +3599,9 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
-    // Bypass the short file cache so mobile polls see new mentions promptly.
+    // Use the short file cache so this lightweight badge poll cannot occupy a
+    // PHP worker on every request while the timeline is loading. The cache is
+    // refreshed frequently enough for notification badges and chimes.
     // latest_unread_id (not overall latest) drives the AIM chime — hydration
     // of the full notifications feed used to make overall latest_id jump around.
     $state = [
@@ -3610,7 +3612,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     ];
     try {
         if (function_exists('ap_masto_notifications_unread_state')) {
-            $state = ap_masto_notifications_unread_state(80, true);
+            $state = ap_masto_notifications_unread_state(80, false);
         } elseif (function_exists('ap_masto_notifications_unread_count')) {
             $state['count'] = ap_masto_notifications_unread_count(80);
         }
