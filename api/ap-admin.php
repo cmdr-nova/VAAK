@@ -21807,6 +21807,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     dmId: <?= json_encode($dmLatestIdNav) ?>,
   });
   const pollNotif = async () => {
+    const navigationToken = Number(window.__vaakNavigationToken || 0);
     try {
       const res = await fetch('?ajax=notif_unread', {
         credentials: 'same-origin',
@@ -21824,7 +21825,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       applyInboxUnread(count, data && data.dm_count, {
         // A tab swap/page handoff can overlap this request.  Update badges
         // during navigation, but never let that race produce a chime.
-        play: !window.__vaakNavigationPending,
+        play: !window.__vaakNavigationPending
+          && navigationToken === Number(window.__vaakNavigationToken || 0),
         notifId: unreadTip,
         lastReadId: data && data.last_read_id,
         dmId: data && data.latest_dm_id,
@@ -23944,6 +23946,7 @@ window.apAdminToast = function (msg, isErr) {
   // is fetched, otherwise the old stream can occupy a PHP-FPM worker.
   window.addEventListener('pagehide', () => {
     window.__vaakNavigationPending = true;
+    window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
     stopTimelineStream();
     if (streamFallbackTimer) {
       window.clearInterval(streamFallbackTimer);
@@ -24004,6 +24007,7 @@ window.apAdminToast = function (msg, isErr) {
     }
     if (nextView === viewName && !push) return;
     window.__vaakNavigationPending = true;
+    window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
@@ -26673,6 +26677,7 @@ if (VIEW === 'analytics') loadAnalytics();
     // before the browser gets a chance to run a zero-delay timer.
     if (!ev.defaultPrevented) {
       window.__vaakNavigationPending = true;
+      window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
       window.vaakShowLoading('Loading…');
     }
   }, true);
