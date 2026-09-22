@@ -12214,6 +12214,26 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     return array_slice($out, 0, $limit);
 }
 
+/** Wait for an ingestion notification, falling back to a short timeout. */
+function admin_timeline_stream_wait(int $timeoutMs = 3000): void
+{
+    try {
+        $db = ap_db();
+        if (ap_db_driver($db) !== 'pgsql' || !method_exists($db, 'pgsqlGetNotify')) {
+            usleep(max(250, min(5000, $timeoutMs)) * 1000);
+            return;
+        }
+        static $listening = false;
+        if (!$listening) {
+            $db->exec('LISTEN vaak_timeline_events');
+            $listening = true;
+        }
+        $db->pgsqlGetNotify(PDO::FETCH_ASSOC, max(250, min(5000, $timeoutMs)));
+    } catch (Throwable $e) {
+        usleep(max(250, min(5000, $timeoutMs)) * 1000);
+    }
+}
+
 /**
  * Build one bounded page for the authenticated Your Posts view.  Fediverse
  * outbox rows and cached Bluesky rows are paged independently, then merged by
@@ -12420,7 +12440,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
                 echo ": heartbeat\n\n";
             }
             @flush();
-            if (microtime(true) < $streamDeadline) sleep(3);
+            if (microtime(true) < $streamDeadline) admin_timeline_stream_wait(3000);
         }
         echo "event: close\ndata: {}\n\n";
         @flush();

@@ -4315,6 +4315,26 @@ function ap_db_now(): string
     return gmdate('c');
 }
 
+/** Wake active timeline streams without introducing a broker dependency. */
+function ap_timeline_notify(string $type, ?string $actorId, ?string $objectId, string $createdAt): void
+{
+    try {
+        $db = ap_db();
+        if (ap_db_driver($db) !== 'pgsql') return;
+        $payload = json_encode([
+            'type' => $type,
+            'actor' => rtrim((string) ($actorId ?? ''), '/'),
+            'object' => rtrim((string) ($objectId ?? ''), '/'),
+            'at' => $createdAt,
+        ], JSON_UNESCAPED_SLASHES);
+        if (is_string($payload)) {
+            $db->exec('SELECT pg_notify(\'vaak_timeline_events\', ' . $db->quote($payload) . ')');
+        }
+    } catch (Throwable $e) {
+        // Notifications are an optimization; never fail ingestion for them.
+    }
+}
+
 function ap_metrics_record(
     string $type,
     ?string $actorId,
@@ -4477,6 +4497,9 @@ function ap_metrics_record(
                 'object_id' => $objectId,
                 'created_at' => $when,
             ]);
+        }
+        if ($insertedId > 0) {
+            ap_timeline_notify($type, $actorId, $objectId, $when);
         }
     } catch (Throwable $e) {
         error_log('[ap-db] metrics_record: ' . $e->getMessage());
