@@ -2529,18 +2529,24 @@ function ap_profile_ensure_default(PDO $db): void
 
 function ap_profile_get(string $actorKey = 'cmdr_nova'): array
 {
+    $profileCacheKey = 'vaak:profile:v1:' . hash('sha256', trim($actorKey));
+    $cached = function_exists('ap_redis_json_get') ? ap_redis_json_get($profileCacheKey) : null;
+    if (is_array($cached) && isset($cached['actor_key'], $cached['name'], $cached['summary'])) {
+        return $cached;
+    }
     $stmt = ap_db()->prepare('SELECT * FROM actor_profile WHERE actor_key = ?');
     $stmt->execute([$actorKey]);
     $row = $stmt->fetch();
     $d = ap_profile_defaults($actorKey);
     if (!$row) {
+        if (function_exists('ap_redis_json_set')) ap_redis_json_set($profileCacheKey, $d, 60);
         return $d;
     }
     $atts = json_decode((string) ($row['attachment_json'] ?? '[]'), true);
     if (!is_array($atts)) {
         $atts = $d['attachment'];
     }
-    return [
+    $profile = [
         'actor_key' => (string) $row['actor_key'],
         'name' => ap_fix_utf8((string) $row['name']),
         'summary' => ap_fix_utf8((string) $row['summary']),
@@ -2586,6 +2592,8 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
             : false,
         'updated_at' => $row['updated_at'] ?? null,
     ];
+    if (function_exists('ap_redis_json_set')) ap_redis_json_set($profileCacheKey, $profile, 60);
+    return $profile;
 }
 
 /** Display name for clients (optional vanity ✓ when enabled). */
@@ -2877,6 +2885,9 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 
     // Public JSON snapshot for homepage bake / clients (best-effort).
     ap_profile_export_public_cache($actorKey);
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete('vaak:profile:v1:' . hash('sha256', trim($actorKey)));
+    }
 
     return ['ok' => true];
 }
