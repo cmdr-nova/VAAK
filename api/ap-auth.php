@@ -245,6 +245,43 @@ function ap_auth_user_by_id(int $id): ?array
     return is_array($row) ? $row : null;
 }
 
+/** @param list<int> $ids @return list<array<string,mixed>> */
+function ap_auth_users_by_ids(array $ids): array
+{
+    $clean = [];
+    foreach ($ids as $id) {
+        $id = (int) $id;
+        if ($id > 0 && !in_array($id, $clean, true)) {
+            $clean[] = $id;
+        }
+    }
+    if ($clean === []) {
+        return [];
+    }
+    $ph = implode(',', array_fill(0, count($clean), '?'));
+    $st = ap_db()->prepare(
+        'SELECT u.*, p.name AS profile_name, p.icon_url
+           FROM ap_users u
+           LEFT JOIN actor_profile p ON p.actor_key = u.actor_key
+          WHERE u.id IN (' . $ph . ') AND u.disabled_at IS NULL'
+    );
+    $st->execute($clean);
+    $rows = $st->fetchAll() ?: [];
+    $byId = [];
+    foreach ($rows as $row) {
+        if (is_array($row)) {
+            $byId[(int) ($row['id'] ?? 0)] = $row;
+        }
+    }
+    $ordered = [];
+    foreach ($clean as $id) {
+        if (isset($byId[$id])) {
+            $ordered[] = $byId[$id];
+        }
+    }
+    return $ordered;
+}
+
 /** @return list<array<string,mixed>> */
 function ap_auth_users_list(int $limit = 20, string $search = '', int $offset = 0): array
 {

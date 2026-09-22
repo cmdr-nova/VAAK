@@ -4191,9 +4191,10 @@ if ($view === 'stats') {
 }
 
 // Follow graphs: full pages need rich URL aliases; partials only need actor_id keys.
-$followers = $isPartial ? [] : ap_followers_list($vaakActorId);
-$following = ap_following_list($vaakActorId);
-if ($vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
+$accountSwitcherView = $view === 'account_switcher';
+$followers = ($isPartial || $accountSwitcherView) ? [] : ap_followers_list($vaakActorId);
+$following = $accountSwitcherView ? [] : ap_following_list($vaakActorId);
+if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
     if (function_exists('ap_bsky_admin_following_rows')) {
         // Notifications only need relationship membership; avoid resolving a
         // profile cache entry for every followed Bluesky account on page load.
@@ -4209,7 +4210,7 @@ if ($vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
 }
 // Scope remote_actors username lookups to the follow graph (not the whole table).
 $adminUnameByActor = [];
-if (!$isPartial && $view !== 'mentions') {
+if (!$isPartial && !$accountSwitcherView && $view !== 'mentions') {
     $aliasActorIds = [];
     foreach (array_merge($followers, $following) as $grow) {
         if (!is_array($grow)) {
@@ -12883,13 +12884,13 @@ try {
         }
         ap_masto_notifications_mark_read($markTip);
     }
-    if ($view !== 'mentions' && function_exists('ap_masto_notifications_unread_state')) {
+    if ($view !== 'mentions' && $view !== 'account_switcher' && function_exists('ap_masto_notifications_unread_state')) {
         $notifStateNav = ap_masto_notifications_unread_state(80, false);
         $notifUnreadNav = (int) ($notifStateNav['count'] ?? 0);
         $notifLatestUnreadIdNav = preg_replace('/\D+/', '', (string) ($notifStateNav['latest_unread_id'] ?? '')) ?: '';
         $notifLatestIdNav = preg_replace('/\D+/', '', (string) ($notifStateNav['latest_id'] ?? '')) ?: '';
         $notifLastReadIdNav = preg_replace('/\D+/', '', (string) ($notifStateNav['last_read_id'] ?? '0')) ?: '0';
-    } elseif ($view !== 'mentions' && function_exists('ap_masto_notifications_unread_count')) {
+    } elseif ($view !== 'mentions' && $view !== 'account_switcher' && function_exists('ap_masto_notifications_unread_count')) {
         $notifUnreadNav = ap_masto_notifications_unread_count(80);
     }
 } catch (Throwable $e) {
@@ -12906,7 +12907,7 @@ $notifLastReadIdNav = preg_replace('/\D+/', '', $notifLastReadIdNav) ?: '0';
 $dmLatestIdNav = '';
 try {
     $ownerForDmSeed = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
-    if ($ownerForDmSeed > 0) {
+    if ($ownerForDmSeed > 0 && $view !== 'account_switcher') {
         $dmSeedSt = ap_db()->prepare(
             "SELECT id FROM direct_messages
              WHERE owner_user_id = ? AND direction = 'in' AND read_at IS NULL AND deleted_at IS NULL
@@ -15481,7 +15482,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       padding: .25rem .55rem;
       font-size: .72rem;
     }
-    .account-switcher { margin-top: .65rem; text-align: left; }
+    .account-switcher { margin-top: .65rem; text-align: center; }
     .account-switcher > summary { cursor: pointer; color: var(--muted); font-size: .75rem; list-style: none; }
     .account-switcher > summary::-webkit-details-marker { display: none; }
     .account-switcher > summary::before { content: '⇄'; color: var(--primary); margin-right: .35rem; }
@@ -15525,11 +15526,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
       <?php
-        $switchAccountRows = [];
-        foreach (ap_auth_session_account_ids() as $switchId) {
-            $switchRow = ap_auth_user_by_id((int) $switchId);
-            if (is_array($switchRow)) { $switchAccountRows[] = $switchRow; }
-        }
+        $switchAccountRows = function_exists('ap_auth_users_by_ids')
+            ? ap_auth_users_by_ids(ap_auth_session_account_ids())
+            : [$vaakUser];
       ?>
       <details class="account-switcher"<?= $view === 'account_switcher' ? ' open' : '' ?>>
         <summary>Switch account</summary>
@@ -15542,7 +15541,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <input type="hidden" name="return_view" value="<?= h($view) ?>">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <button class="account-switcher__item<?= $switchRowId === $vaakOwnerId ? ' is-current' : '' ?>" type="submit">
-                <?= admin_avatar_img((string) ($switchRow['actor_id'] ?? ''), '', false) ?>
+                <?php $switchIcon = trim((string) ($switchRow['icon_url'] ?? '')); if ($switchIcon === '') { $switchIcon = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : '/img/avatar/default.jpg'; } ?>
+                <?php if ($switchIcon !== ''): ?><img src="<?= h($switchIcon) ?>" alt="" width="24" height="24" loading="lazy" decoding="async"><?php endif; ?>
                 <span><?= h('@' . (string) ($switchRow['username'] ?? $switchRowKey)) ?><?= $switchRowId === $vaakOwnerId ? ' · current' : '' ?></span>
               </button>
             </form>
@@ -17332,11 +17332,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'account_switcher'): ?>
         <?php
-          $sessionAccounts = [];
-          foreach (ap_auth_session_account_ids() as $sessionAccountId) {
-              $sessionAccount = ap_auth_user_by_id((int) $sessionAccountId);
-              if (is_array($sessionAccount)) { $sessionAccounts[] = $sessionAccount; }
-          }
+          $sessionAccounts = function_exists('ap_auth_users_by_ids')
+              ? ap_auth_users_by_ids(ap_auth_session_account_ids())
+              : [$vaakUser];
         ?>
         <section class="account-switcher-page">
           <div class="tweet" style="margin-bottom:1rem">
@@ -17355,7 +17353,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $sessionAccountKey = (string) ($sessionAccount['actor_key'] ?? $sessionAccount['username'] ?? '');
                 ?>
                 <div class="switch-account-row">
-                  <?= admin_avatar_img((string) ($sessionAccount['actor_id'] ?? ''), '', false) ?>
+                  <?php $sessionIcon = trim((string) ($sessionAccount['icon_url'] ?? '')); if ($sessionIcon === '') { $sessionIcon = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : '/img/avatar/default.jpg'; } ?>
+                  <?php if ($sessionIcon !== ''): ?><img src="<?= h($sessionIcon) ?>" alt="" width="42" height="42" loading="lazy" decoding="async"><?php endif; ?>
                   <div class="switch-account-meta">
                     <strong><?= h((string) ($sessionAccount['username'] ?? $sessionAccountKey)) ?></strong>
                     <div class="meta">@<?= h($sessionAccountKey) ?><?= $sessionAccountId === $vaakOwnerId ? ' · current' : '' ?></div>
