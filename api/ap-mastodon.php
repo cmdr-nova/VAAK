@@ -1467,6 +1467,12 @@ function ap_masto_api(string $method, string $path): void
     if ($path === '/api/v1/timelines/home' && $method === 'GET') {
         ap_masto_require_token('read');
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 40;
+        // iPhanpy 1.5.x currently repeats the head request without following
+        // rel="next". Give that client one normal Mastodon-sized page extra
+        // runway while retaining requested limits for other clients.
+        if (str_contains(strtolower((string) ($_SERVER['HTTP_USER_AGENT'] ?? '')), 'iphanpy')) {
+            $limit = max($limit, 40);
+        }
         $maxId = isset($_GET['max_id']) ? (string) $_GET['max_id'] : null;
         $sinceId = isset($_GET['since_id']) ? (string) $_GET['since_id'] : null;
         // Ice Cubes pull-to-refresh often uses min_id (same exclusive lower bound as since_id)
@@ -1603,6 +1609,9 @@ function ap_masto_api(string $method, string $path): void
         // Single-user shim: require auth even for "public" timelines (Ice Cubes always sends a token).
         ap_masto_require_token('read');
         $limit = isset($_GET['limit']) ? (int) $_GET['limit'] : 40;
+        if (str_contains(strtolower((string) ($_SERVER['HTTP_USER_AGENT'] ?? '')), 'iphanpy')) {
+            $limit = max($limit, 40);
+        }
         $maxId = isset($_GET['max_id']) ? (string) $_GET['max_id'] : null;
         $sinceId = isset($_GET['since_id']) ? (string) $_GET['since_id'] : null;
         if (($sinceId === null || $sinceId === '') && isset($_GET['min_id'])) {
