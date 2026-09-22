@@ -9356,6 +9356,29 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   } else {
                       $bodyChunk .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
                   }
+                  // Several ActivityPub bridges expose the quoted attachment
+                  // only in the outer event's media_urls. If hydration did not
+                  // provide a quoted media list, that attachment still belongs
+                  // inside the quote card, not below the parent post.
+                  if ($eMedia !== []) {
+                      $fallbackQuoteMedia = $eMedia;
+                      if ($quotedMediaUrls !== []) {
+                          $fallbackQuoteMedia = array_values(array_filter(
+                              $fallbackQuoteMedia,
+                              static function ($item) use ($quotedMediaUrls): bool {
+                                  $url = is_array($item)
+                                      ? (string) ($item['url'] ?? $item['preview_url'] ?? $item['preview'] ?? '')
+                                      : (is_string($item) ? $item : '');
+                                  return $url !== '' && !isset($quotedMediaUrls[rtrim($url, '/')]);
+                              }
+                          ));
+                      }
+                      if ($quotedMediaUrls === [] && $fallbackQuoteMedia !== []) {
+                          $rememberQuotedMedia($fallbackQuoteMedia);
+                          $bodyChunk .= admin_quote_media_html($fallbackQuoteMedia);
+                          $eMedia = [];
+                      }
+                  }
                   $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
