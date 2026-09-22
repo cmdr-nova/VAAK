@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-signals.php';
+
 /** Durable desired-state queue for account-scoped reversible interactions. */
 function ap_action_queue_make_tid(int $rowId): string
 {
@@ -88,6 +90,7 @@ function ap_action_queue_enqueue(
             $status = 'pending';
         }
         $db->commit();
+        ap_signal_record($ownerUserId, $platform, $kind, $targetKey, $desired, $payload);
         return ['ok' => true, 'id' => $id, 'revision' => $revision, 'status' => $status, 'coalesced' => false];
     } catch (Throwable $e) {
         if ($db->inTransaction()) $db->rollBack();

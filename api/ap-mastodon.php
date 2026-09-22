@@ -13,6 +13,7 @@ require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-r2.php';
 require_once __DIR__ . '/ap-masto-entities.php';
 require_once __DIR__ . '/ap-lists.php';
+require_once __DIR__ . '/ap-visibility.php';
 
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -1440,7 +1441,10 @@ function ap_masto_api(string $method, string $path): void
             return;
         }
         // Home = people you follow + your own posts (never DMs)
-        $homeStatuses = ap_masto_timeline_home_merged($limit, $maxId, $sinceId);
+        $homeStatuses = ap_visibility_filter_statuses(
+            ap_masto_timeline_home_merged($limit, $maxId, $sinceId),
+            (int) ap_db_masto_owner_user_id()
+        );
         ap_masto_timeline_cache_store($homeStatuses, '/api/v1/timelines/home', $limit, $maxId, $sinceId);
         ap_masto_json_timeline($homeStatuses, '/api/v1/timelines/home', $limit);
         return;
@@ -1594,6 +1598,7 @@ function ap_masto_api(string $method, string $path): void
                     break;
                 }
             }
+            $out = ap_visibility_filter_statuses($out, (int) ap_db_masto_owner_user_id());
             ap_masto_json_timeline($out, '/api/v1/timelines/public', $limit, ['local' => 'true']);
             return;
         }
@@ -1607,7 +1612,10 @@ function ap_masto_api(string $method, string $path): void
         if (ap_masto_timeline_cache_try('/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ)) {
             return;
         }
-        $fedStatuses = ap_masto_timeline_public_merged($limit, $maxId, $sinceId, $onlyMedia);
+        $fedStatuses = ap_visibility_filter_statuses(
+            ap_masto_timeline_public_merged($limit, $maxId, $sinceId, $onlyMedia),
+            (int) ap_db_masto_owner_user_id()
+        );
         ap_masto_timeline_cache_store($fedStatuses, '/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ);
         ap_masto_json_timeline($fedStatuses, '/api/v1/timelines/public', $limit, $extraQ);
         return;
