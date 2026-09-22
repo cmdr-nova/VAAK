@@ -6852,6 +6852,14 @@ function ap_masto_search(string $q, ?string $type = null, bool $resolve = false,
     if ($type !== null && !in_array($type, ['accounts', 'hashtags', 'statuses'], true)) {
         $type = null;
     }
+    $searchCacheKey = 'vaak:search:' . hash('sha256', (string) json_encode([
+        'q' => mb_strtolower($q), 'type' => $type, 'resolve' => $resolve, 'limit' => $limit,
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    $cachedSearch = ap_redis_json_get($searchCacheKey);
+    if (is_array($cachedSearch)
+        && isset($cachedSearch['accounts'], $cachedSearch['statuses'], $cachedSearch['hashtags'])) {
+        return $cachedSearch;
+    }
     $parts = ap_masto_search_query_parts($q);
     $wantAccounts = $type === null || $type === 'accounts';
     $wantTags = $type === null || $type === 'hashtags';
@@ -6870,11 +6878,13 @@ function ap_masto_search(string $q, ?string $type = null, bool $resolve = false,
     $statuses = ap_masto_search_sanitize_statuses($statuses);
     $accounts = ap_masto_search_sanitize_accounts($accounts);
 
-    return [
+    $result = [
         'accounts' => $accounts,
         'statuses' => $statuses,
         'hashtags' => $hashtags,
     ];
+    ap_redis_json_set($searchCacheKey, $result, 15);
+    return $result;
 }
 
 /**

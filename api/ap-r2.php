@@ -1247,6 +1247,10 @@ function ap_media_warm_enqueue_actor(string $actorId): bool
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return false;
     }
+    if (ap_redis_client('queue') !== null
+        && !ap_redis_lock('media-warm:actor:' . hash('sha256', $actorId), 20)) {
+        return false;
+    }
     try {
         $now = gmdate('c');
         $db = ap_db();
@@ -1279,6 +1283,10 @@ function ap_media_warm_enqueue_post(string $sourceUrl): bool
 {
     $sourceUrl = ap_profile_sanitize_https_url($sourceUrl) ?: '';
     if ($sourceUrl === '') return false;
+    if (ap_redis_client('queue') !== null
+        && !ap_redis_lock('media-warm:post:' . hash('sha256', $sourceUrl), 20)) {
+        return false;
+    }
     try {
         $now = gmdate('c');
         $db = ap_db();

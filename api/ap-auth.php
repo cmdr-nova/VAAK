@@ -777,6 +777,13 @@ function ap_auth_login_rate_path(): string
 /** @return bool true if attempts are still allowed */
 function ap_auth_login_rate_ok(bool $clear = false): bool
 {
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+    if ($clear) {
+        ap_redis_rate_clear('login:' . $ip);
+    } else {
+        $redisCount = ap_redis_rate_get('login:' . $ip);
+        if ($redisCount !== null && $redisCount > 8) return false;
+    }
     $path = ap_auth_login_rate_path();
     if ($clear) {
         @unlink($path);
@@ -803,6 +810,8 @@ function ap_auth_login_rate_ok(bool $clear = false): bool
 
 function ap_auth_login_rate_fail(): void
 {
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '0.0.0.0');
+    ap_redis_rate_count('login:' . $ip, 900);
     $path = ap_auth_login_rate_path();
     $fails = 0;
     $first = time();

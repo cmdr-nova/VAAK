@@ -108,6 +108,44 @@ function ap_redis_delete_pattern(string $pattern): void
     }
 }
 
+/** Increment a short-lived counter; null means Redis is unavailable. */
+function ap_redis_rate_count(string $bucket, int $windowSeconds = 900): ?int
+{
+    $redis = ap_redis_client('cache');
+    $bucket = trim($bucket);
+    if (!$redis || $bucket === '') return null;
+    $key = 'vaak:rate:' . hash('sha256', $bucket);
+    try {
+        $count = (int) $redis->incr($key);
+        if ($count === 1) $redis->expire($key, max(1, $windowSeconds));
+        return $count;
+    } catch (Throwable $e) {
+        error_log('[ap-redis] rate counter failed: ' . $e->getMessage());
+        return null;
+    }
+}
+
+function ap_redis_rate_clear(string $bucket): void
+{
+    $redis = ap_redis_client('cache');
+    $bucket = trim($bucket);
+    if (!$redis || $bucket === '') return;
+    try { $redis->del('vaak:rate:' . hash('sha256', $bucket)); } catch (Throwable $e) { /* best effort */ }
+}
+
+function ap_redis_rate_get(string $bucket): ?int
+{
+    $redis = ap_redis_client('cache');
+    $bucket = trim($bucket);
+    if (!$redis || $bucket === '') return null;
+    try {
+        $value = $redis->get('vaak:rate:' . hash('sha256', $bucket));
+        return $value === false ? 0 : (int) $value;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
 /** Best-effort short lock used to coalesce refresh work. */
 function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
 {
