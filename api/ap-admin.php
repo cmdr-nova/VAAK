@@ -21644,38 +21644,43 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   let notifSoundUnlocked = false;
   let lastPushSuppressAt = 0;
   let lastPushSuppressId = '';
-  const notifAudio = NOTIF_SOUND_ENABLED ? new Audio('?ajax=notif_sound&v=imrcv5') : null;
-  if (notifAudio) {
+  let notifAudio = null;
+  const ensureNotifAudio = () => {
+    if (!NOTIF_SOUND_ENABLED || notifAudio) return notifAudio;
+    notifAudio = new Audio('?ajax=notif_sound&v=imrcv5');
     notifAudio.preload = 'auto';
     notifAudio.volume = 0.9;
     notifAudio.setAttribute('playsinline', '');
-  }
+    return notifAudio;
+  };
   // Browsers block autoplay until a user gesture. Prime the element with a
   // muted play/pause cycle so Safari grants permission for future chimes.
   const unlockNotifSound = () => {
-    if (!NOTIF_SOUND_ENABLED || !notifAudio || notifSoundUnlocked) return;
+    if (!NOTIF_SOUND_ENABLED || notifSoundUnlocked) return;
+    const audio = ensureNotifAudio();
+    if (!audio) return;
     try {
-      notifAudio.muted = true;
-      notifAudio.volume = 0;
-      notifAudio.currentTime = 0;
-      const p = notifAudio.play();
+      audio.muted = true;
+      audio.volume = 0;
+      audio.currentTime = 0;
+      const p = audio.play();
       if (p && typeof p.then === 'function') {
         p.then(() => {
-          notifAudio.pause();
-          notifAudio.currentTime = 0;
-          notifAudio.muted = false;
-          notifAudio.volume = 0.9;
+          audio.pause();
+          audio.currentTime = 0;
+          audio.muted = false;
+          audio.volume = 0.9;
           notifSoundUnlocked = true;
           document.removeEventListener('pointerdown', unlockNotifSound);
           document.removeEventListener('keydown', unlockNotifSound);
         }).catch(() => {
-          notifAudio.muted = false;
-          notifAudio.volume = 0.9;
+          audio.muted = false;
+          audio.volume = 0.9;
         });
       }
     } catch (e) {
-      notifAudio.muted = false;
-      notifAudio.volume = 0.9;
+      audio.muted = false;
+      audio.volume = 0.9;
     }
   };
   if (NOTIF_SOUND_ENABLED) {
@@ -21684,7 +21689,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   }
 
   function playNotifSound(eventKey) {
-    if (!NOTIF_SOUND_ENABLED || !notifAudio || !notifSoundUnlocked) return;
+    if (!NOTIF_SOUND_ENABLED || !notifSoundUnlocked) return;
+    const audio = ensureNotifAudio();
+    if (!audio) return;
     // Background / unfocused tab: OS Web Push covers alerts — don't double-chime.
     if (document.visibilityState !== 'visible' || (typeof document.hasFocus === 'function' && !document.hasFocus())) {
       return;
@@ -21710,10 +21717,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       localStorage.setItem(key, JSON.stringify({ signature, at: now }));
     } catch (e) {}
     try {
-      notifAudio.muted = false;
-      notifAudio.volume = 0.9;
-      notifAudio.currentTime = 0;
-      const p = notifAudio.play();
+      audio.muted = false;
+      audio.volume = 0.9;
+      audio.currentTime = 0;
+      const p = audio.play();
       if (p && typeof p.catch === 'function') p.catch(() => {});
     } catch (e) {}
   }
