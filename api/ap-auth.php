@@ -617,6 +617,23 @@ function ap_auth_session_account_ids(): array
     if ($current > 0 && !in_array($current, $ids, true)) {
         array_unshift($ids, $current);
     }
+    // Restore durable managed-account links when a session cookie was renewed.
+    if ($current > 0) {
+        try {
+            $st = ap_db()->prepare(
+                'SELECT linked_user_id FROM ap_account_links WHERE owner_user_id = ? OR linked_user_id = ? ORDER BY linked_user_id'
+            );
+            $st->execute([$current, $current]);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $linked) {
+                $linked = (int) $linked;
+                if ($linked > 0 && !in_array($linked, $ids, true)) {
+                    $ids[] = $linked;
+                }
+            }
+        } catch (Throwable $e) {
+            // Older databases are upgraded lazily; session-only behavior is safe.
+        }
+    }
     $_SESSION['vaak_account_ids'] = $ids;
     return $ids;
 }
@@ -633,6 +650,31 @@ function ap_auth_session_set_account_ids(array $ids): void
         }
     }
     $_SESSION['vaak_account_ids'] = $clean;
+}
+
+/** Persist a verified managed-account relationship in both directions. */
+function ap_auth_link_account_pair(int $firstId, int $secondId): void
+{
+    if ($firstId < 1 || $secondId < 1 || $firstId === $secondId) {
+        return;
+    }
+    $now = ap_db_now();
+    $st = ap_db()->prepare(
+        'INSERT INTO ap_account_links (owner_user_id, linked_user_id, created_at) VALUES (?, ?, ?)'
+        . (ap_db_driver() === 'pgsql' ? ' ON CONFLICT (owner_user_id, linked_user_id) DO NOTHING' : ' OR IGNORE')
+    );
+    $st->execute([$firstId, $secondId, $now]);
+    $st->execute([$secondId, $firstId, $now]);
+}
+
+/** Remove a managed-account relationship in both directions. */
+function ap_auth_unlink_account_pair(int $firstId, int $secondId): void
+{
+    if ($firstId < 1 || $secondId < 1) {
+        return;
+    }
+    $st = ap_db()->prepare('DELETE FROM ap_account_links WHERE (owner_user_id = ? AND linked_user_id = ?) OR (owner_user_id = ? AND linked_user_id = ?)');
+    $st->execute([$firstId, $secondId, $secondId, $firstId]);
 }
 
 /** Switch to an account that has already been authenticated in this session. */
@@ -662,8 +704,8 @@ function ap_auth_login_user(array $user): void
 {
     ap_auth_start_session();
     session_regenerate_id(true);
-    $_SESSION['vaak_account_ids'] = [(int) ($user['id'] ?? 0)];
     $_SESSION['vaak_user_id'] = (int) ($user['id'] ?? 0);
+    $_SESSION['vaak_account_ids'] = ap_auth_session_account_ids();
     $_SESSION['vaak_actor_key'] = (string) ($user['actor_key'] ?? '');
     $_SESSION['vaak_is_admin'] = !empty($user['is_admin']) ? 1 : 0;
     $_SESSION['_vaak_cookie_touched'] = time();

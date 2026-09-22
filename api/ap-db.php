@@ -416,6 +416,24 @@ SQL);
         error_log('[ap-db] ap_wow_links not provisioned: ' . $e->getMessage());
     }
 
+    // Durable account-switcher relationships. Passwords are never stored;
+    // the relationship is created only after credentials are verified.
+    try {
+        if (!isset($present['ap_account_links'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_account_links (
+    owner_user_id BIGINT NOT NULL,
+    linked_user_id BIGINT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, linked_user_id)
+)
+SQL);
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_account_links_linked ON ap_account_links(linked_user_id, owner_user_id)');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] ap_account_links not provisioned: ' . $e->getMessage());
+    }
+
     $discussTablesReady = false;
     try {
         $discussTablesReady = isset(
@@ -489,7 +507,7 @@ SQL);
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
-        'ap_sl_links', 'ap_wow_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
+        'ap_sl_links', 'ap_wow_links', 'ap_account_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',
@@ -502,7 +520,7 @@ SQL);
     // Refresh only when bootstrap may have created something above.  On the
     // normal production path the first probe is authoritative and reusable.
     if (!$noticeTablesReady || !$discussTablesReady || !isset($present['vaak_blog_posts'])
-        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'], $present['ap_user_2fa'], $present['ap_pds_invites'])) {
+        || !isset($present['webmentions'], $present['ap_deprioritized_actors'], $present['bsky_sessions'], $present['ap_user_2fa'], $present['ap_pds_invites'], $present['ap_account_links'])) {
         $present = $loadPresentTables();
     }
     $missing = array_values(array_filter($requiredTables, static fn(string $table): bool => !isset($present[$table])));
@@ -1213,6 +1231,14 @@ CREATE TABLE IF NOT EXISTS ap_user_2fa (
     enabled_at TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ap_account_links (
+    owner_user_id INTEGER NOT NULL,
+    linked_user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, linked_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_account_links_linked ON ap_account_links(linked_user_id, owner_user_id);
 
 CREATE TABLE IF NOT EXISTS ap_password_resets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

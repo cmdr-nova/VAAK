@@ -646,6 +646,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $ids[] = $candidateId;
                 ap_auth_session_set_account_ids($ids);
             }
+            if ($candidateId > 0 && $candidateId !== $vaakOwnerId && function_exists('ap_auth_link_account_pair')) {
+                ap_auth_link_account_pair($vaakOwnerId, $candidateId);
+            }
             $notice = 'Account added. Select it below to switch.';
         }
     } elseif ($action === 'switch_account') {
@@ -668,6 +671,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         if ($removeId === $vaakOwnerId) {
             $error = 'The active account cannot be removed.';
         } else {
+            if (function_exists('ap_auth_unlink_account_pair')) {
+                ap_auth_unlink_account_pair($vaakOwnerId, $removeId);
+            }
             ap_auth_session_set_account_ids(array_values(array_filter(
                 ap_auth_session_account_ids(), static fn (int $id): bool => $id !== $removeId
             )));
@@ -15585,7 +15591,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <input type="hidden" name="return_view" value="<?= h($view) ?>">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <button class="account-switcher__item<?= $switchRowId === $vaakOwnerId ? ' is-current' : '' ?>" type="submit">
-                <?php $switchIcon = trim((string) ($switchRow['icon_url'] ?? '')); if ($switchIcon === '') { $switchIcon = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : '/img/avatar/default.jpg'; } ?>
+                <?php
+                  $switchProfile = $switchRowKey !== '' && function_exists('ap_profile_get') ? ap_profile_get($switchRowKey) : [];
+                  $switchIcon = function_exists('ap_local_avatar_url')
+                      ? ap_local_avatar_url((string) ($switchProfile['icon_url'] ?? $switchRow['icon_url'] ?? ''))
+                      : trim((string) ($switchProfile['icon_url'] ?? $switchRow['icon_url'] ?? ''));
+                ?>
                 <?php if ($switchIcon !== ''): ?><img src="<?= h($switchIcon) ?>" alt="" width="24" height="24" loading="lazy" decoding="async"><?php endif; ?>
                 <span><?= h('@' . (string) ($switchRow['username'] ?? $switchRowKey)) ?><?= $switchRowId === $vaakOwnerId ? ' · current' : '' ?></span>
               </button>
@@ -17397,7 +17408,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $sessionAccountKey = (string) ($sessionAccount['actor_key'] ?? $sessionAccount['username'] ?? '');
                 ?>
                 <div class="switch-account-row">
-                  <?php $sessionIcon = trim((string) ($sessionAccount['icon_url'] ?? '')); if ($sessionIcon === '') { $sessionIcon = defined('AP_REMOTE_AVATAR_FALLBACK') ? AP_REMOTE_AVATAR_FALLBACK : '/img/avatar/default.jpg'; } ?>
+                  <?php
+                    $sessionKey = (string) ($sessionAccount['actor_key'] ?? $sessionAccount['username'] ?? '');
+                    $sessionProfile = $sessionKey !== '' && function_exists('ap_profile_get') ? ap_profile_get($sessionKey) : [];
+                    $sessionIcon = function_exists('ap_local_avatar_url')
+                        ? ap_local_avatar_url((string) ($sessionProfile['icon_url'] ?? $sessionAccount['icon_url'] ?? ''))
+                        : trim((string) ($sessionProfile['icon_url'] ?? $sessionAccount['icon_url'] ?? ''));
+                  ?>
                   <?php if ($sessionIcon !== ''): ?><img src="<?= h($sessionIcon) ?>" alt="" width="42" height="42" loading="lazy" decoding="async"><?php endif; ?>
                   <div class="switch-account-meta">
                     <strong><?= h((string) ($sessionAccount['username'] ?? $sessionAccountKey)) ?></strong>
