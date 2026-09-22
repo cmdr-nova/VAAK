@@ -4275,11 +4275,17 @@ function ap_bsky_following_feed(
             }
         }
         if ($cached !== null) {
-            $prefsRaw = ap_bsky_get_preferences($ownerUserId);
-            $prefs = ap_bsky_parse_feed_prefs(
-                !empty($prefsRaw['ok']) && is_array($prefsRaw['preferences'] ?? null)
-                    ? $prefsRaw['preferences'] : []
-            );
+            // Do not turn a stale-feed fast path back into a network wait just
+            // to populate optional pinned-feed labels. The next warm request
+            // will refresh preferences normally.
+            $prefs = [];
+            $prefsPath = sys_get_temp_dir() . '/vaak-bsky-prefs-' . $ownerUserId . '.json';
+            if (is_file($prefsPath) && (time() - (int) @filemtime($prefsPath)) < 900) {
+                $prefsJson = json_decode((string) @file_get_contents($prefsPath), true);
+                if (is_array($prefsJson) && is_array($prefsJson['preferences'] ?? null)) {
+                    $prefs = ap_bsky_parse_feed_prefs($prefsJson['preferences']);
+                }
+            }
             $feed = ap_bsky_filter_hidden_authors($ownerUserId, $cached['feed']);
             ap_bsky_schedule_hide_refresh($ownerUserId);
             return [
