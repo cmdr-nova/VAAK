@@ -468,7 +468,7 @@ ASCII;
       box-shadow: 0 20px 70px rgba(0,0,0,.32);
     }
     .login-live-feed::before {
-      content: "PUBLIC LOCAL + FEDERATED TIMELINE"; display: block; margin: 0 0 1rem;
+      content: "WELCOME TO VAAK"; display: block; margin: 0 0 1rem;
       color: #00ff9f; font-size: .72rem; font-weight: 700; letter-spacing: .14em;
     }
     .login-feed-scroll { display: grid; gap: .8rem; max-height: calc(min(78vh, 54rem) - 4rem); overflow: auto; padding-right: .25rem; }
