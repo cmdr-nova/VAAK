@@ -14805,9 +14805,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       display: inline-flex; align-items: center; justify-content: center;
       border-radius: 999px; border: 1px solid transparent;
       font-size: 1rem; line-height: 1;
+      transition: color .15s ease, background-color .15s ease, border-color .15s ease, transform .12s ease, box-shadow .15s ease;
     }
-    .tweet-actions .icon-btn:hover { border-color: transparent; background: transparent; }
-    .tweet-actions .icon-btn.on { color: var(--primary); }
+    .tweet-actions .icon-btn:hover {
+      border-color: color-mix(in srgb, var(--primary) 42%, transparent);
+      background: color-mix(in srgb, var(--primary) 12%, transparent);
+      transform: translateY(-1px);
+    }
+    .tweet-actions .icon-btn:active { transform: scale(.88); }
+    .tweet-actions .icon-btn:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+    .tweet-actions .icon-btn.on {
+      color: var(--primary);
+      background: color-mix(in srgb, var(--primary) 14%, transparent);
+      border-color: color-mix(in srgb, var(--primary) 32%, transparent);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 8%, transparent);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .tweet-actions .icon-btn { transition: none; }
+      .tweet-actions .icon-btn:hover, .tweet-actions .icon-btn:active { transform: none; }
+    }
     .post-action-menu { position: relative; display: inline-block; z-index: 2; }
     .post-action-menu[open] { z-index: 80; }
     .post-action-menu > summary { list-style: none; cursor: pointer; }
@@ -22300,6 +22319,7 @@ window.apAdminToast = function (msg, isErr) {
     const optimisticActive = action === 'favourite_status'
       || action === 'bookmark_status' || action === 'reblog_status';
     applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive });
+    if (window.vaakHaptic) window.vaakHaptic(5);
     form.dataset.busy = '1';
     // Keep the visual state immediate, but prevent duplicate requests in flight.
     if (btn) btn.disabled = false;
@@ -22580,6 +22600,7 @@ window.apAdminToast = function (msg, isErr) {
       btn.title = optimisticOn ? 'Undo boost' : 'Boost on Bluesky';
       btn.setAttribute('aria-label', optimisticOn ? 'Undo boost' : 'Boost');
     } else if (action === 'bookmark') applyBskyBookmarkUi(btn, optimisticOn);
+    if (window.vaakHaptic) window.vaakHaptic(5);
     btn.dataset.busy = '1';
     btn.disabled = false;
     try {
