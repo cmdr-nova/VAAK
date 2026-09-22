@@ -1233,20 +1233,16 @@ function ap_bsky_reply_ref_for_parent(array $parent, int $ownerUserId): array
  */
 function ap_bsky_session_row(int $ownerUserId): ?array
 {
-    static $memo = [];
     if ($ownerUserId < 1) {
         return null;
-    }
-    if (array_key_exists($ownerUserId, $memo)) {
-        return $memo[$ownerUserId];
     }
     try {
         $st = ap_db()->prepare('SELECT * FROM bsky_sessions WHERE owner_user_id = ? LIMIT 1');
         $st->execute([$ownerUserId]);
         $row = $st->fetch();
-        return $memo[$ownerUserId] = is_array($row) ? $row : null;
+        return is_array($row) ? $row : null;
     } catch (Throwable $e) {
-        return $memo[$ownerUserId] = null;
+        return null;
     }
 }
 
