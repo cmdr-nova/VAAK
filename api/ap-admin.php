@@ -9017,6 +9017,20 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     $quotedStatus = null;
     $quotedStatusUrl = '';
     $quotedBsky = null;
+    // Some bridges include quoted attachments in the event's top-level media
+    // list as well as in the quoted object. Track those URLs so they can stay
+    // inside the quote card instead of rendering a duplicate outside it.
+    $quotedMediaUrls = [];
+    $rememberQuotedMedia = static function (array $items) use (&$quotedMediaUrls): void {
+        foreach ($items as $item) {
+            $url = is_array($item)
+                ? (string) ($item['url'] ?? $item['preview_url'] ?? $item['preview'] ?? '')
+                : (is_string($item) ? $item : '');
+            if ($url !== '' && str_starts_with($url, 'https://')) {
+                $quotedMediaUrls[rtrim($url, '/')] = true;
+            }
+        }
+    };
     if ($summaryRaw !== '' && str_contains($summaryRaw, '↪ QT')) {
         $chunks = preg_split('/\n\n↪ QT/u', $summaryRaw, 2);
         if (!is_array($chunks) || count($chunks) !== 2) {
@@ -9261,6 +9275,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                           $qMediaEv = $quotedBsky['media'];
                       }
                       if ($qMediaEv !== []) {
+                          $rememberQuotedMedia($qMediaEv);
                           $bodyChunk .= admin_quote_media_html($qMediaEv);
                       }
                       if ($quotedStatusUrl !== '') {
@@ -9279,6 +9294,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                               . '</div>';
                       }
                       if (!empty($quotedBsky['media']) && is_array($quotedBsky['media'])) {
+                          $rememberQuotedMedia($quotedBsky['media']);
                           $bodyChunk .= admin_quote_media_html($quotedBsky['media']);
                       }
                       $qOpen = (string) ($quotedBsky['url'] ?? $quotedStatusUrl);
@@ -9309,6 +9325,14 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               } elseif ($summaryRaw !== '') {
                   $bodyChunk .= '<div class="body feed-body">'
                       . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
+              }
+              if ($quotedMediaUrls !== [] && $eMedia !== []) {
+                  $eMedia = array_values(array_filter($eMedia, static function ($item) use ($quotedMediaUrls): bool {
+                      $url = is_array($item)
+                          ? (string) ($item['url'] ?? $item['preview_url'] ?? $item['preview'] ?? '')
+                          : (is_string($item) ? $item : '');
+                      return $url === '' || !isset($quotedMediaUrls[rtrim($url, '/')]);
+                  }));
               }
               $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
