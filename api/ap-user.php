@@ -20,6 +20,7 @@ require_once __DIR__ . '/ap-masto-entities.php';
 // have a connected ATProto session. This remains cache-only: profile renders
 // never perform a live Bluesky fetch.
 require_once __DIR__ . '/ap-bsky.php';
+require_once __DIR__ . '/ap-profile-html.php';
 
 $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
@@ -1294,62 +1295,6 @@ function ap_user_blog_markdown_html(string $markdown): string
     return implode("\n", $out);
 }
 
-/** Build share-card metadata for a local HTML profile post. */
-function ap_user_note_share_meta(string $actorKey, array $row, array $note, array $profile): array
-{
-    $name = trim((string) ($profile['name'] ?? '')) ?: ('@' . $actorKey);
-    $plain = trim(html_entity_decode(strip_tags((string) ($note['content'] ?? $row['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
-    if ($plain === '') {
-        $plain = trim((string) ($note['summary'] ?? ''));
-    }
-    if (function_exists('mb_strlen') && mb_strlen($plain) > 220) {
-        $plain = mb_substr($plain, 0, 217) . '…';
-    } elseif (strlen($plain) > 220) {
-        $plain = substr($plain, 0, 217) . '…';
-    }
-    $rowId = rtrim((string) ($row['id'] ?? ''), '/');
-    $url = '';
-    if (preg_match('#/notes/([a-f0-9]+)$#i', $rowId, $m)) {
-        $url = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/notes/' . strtolower($m[1]);
-    } elseif ($rowId !== '' && str_starts_with($rowId, 'https://')) {
-        $url = $rowId;
-    }
-    $image = '';
-    $attachments = $note['attachment'] ?? [];
-    if (is_array($attachments) && isset($attachments['type'])) {
-        $attachments = [$attachments];
-    }
-    if (is_array($attachments)) {
-        foreach ($attachments as $attachment) {
-            if (!is_array($attachment)) {
-                continue;
-            }
-            $mediaType = strtolower((string) ($attachment['mediaType'] ?? ''));
-            $candidate = is_string($attachment['url'] ?? null)
-                ? (string) $attachment['url']
-                : (is_array($attachment['url'] ?? null) ? (string) ($attachment['url']['href'] ?? '') : '');
-            if (!str_starts_with($candidate, 'https://') && is_string($attachment['preview'] ?? null)) {
-                $candidate = (string) $attachment['preview'];
-            }
-            if ($candidate !== '' && str_starts_with($candidate, 'https://')
-                && (str_starts_with($mediaType, 'image/') || $mediaType === '')) {
-                $image = $candidate;
-                break;
-            }
-        }
-    }
-    if ($image === '') {
-        $image = trim((string) ($profile['icon_url'] ?? ''));
-    }
-    return [
-        'title' => $name . ' · VAAK',
-        'description' => $plain !== '' ? $plain : 'A post from ' . $name . ' on VAAK.',
-        'url' => $url,
-        'image' => $image,
-    ];
-}
-
 /**
  * @param array<string,mixed> $row
  * @param array<string,mixed> $create
@@ -1377,7 +1322,7 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     }
     ap_user_html_shell_start(
         'Post · @' . $actorKey . '@mkultra.monster',
-        ap_user_note_share_meta($actorKey, $row, $note, $p)
+        ap_profile_html_share_meta($actorKey, $row, $note, $p)
     );
     echo '<div class="row" style="margin-bottom:1rem">';
     $avUrl = function_exists('ap_local_avatar_url')
@@ -1496,29 +1441,7 @@ function ap_user_html_shell_start(string $title, array $meta = []): void
     $metaDescription = trim((string) ($meta['description'] ?? ''));
     $metaUrl = trim((string) ($meta['url'] ?? ''));
     $metaImage = trim((string) ($meta['image'] ?? ''));
-    if ($metaTitle !== '') {
-        $safeMetaTitle = htmlspecialchars($metaTitle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        echo '<meta property="og:title" content="' . $safeMetaTitle . '">';
-        echo '<meta name="twitter:title" content="' . $safeMetaTitle . '">';
-    }
-    if ($metaDescription !== '') {
-        $safeMetaDescription = htmlspecialchars($metaDescription, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        echo '<meta name="description" content="' . $safeMetaDescription . '">';
-        echo '<meta property="og:description" content="' . $safeMetaDescription . '">';
-        echo '<meta name="twitter:description" content="' . $safeMetaDescription . '">';
-    }
-    if ($metaUrl !== '' && str_starts_with($metaUrl, 'https://')) {
-        $safeMetaUrl = htmlspecialchars($metaUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        echo '<link rel="canonical" href="' . $safeMetaUrl . '">';
-        echo '<meta property="og:url" content="' . $safeMetaUrl . '">';
-    }
-    echo '<meta property="og:type" content="article">';
-    echo '<meta name="twitter:card" content="' . ($metaImage !== '' ? 'summary_large_image' : 'summary') . '">';
-    if ($metaImage !== '' && str_starts_with($metaImage, 'https://')) {
-        $safeMetaImage = htmlspecialchars($metaImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        echo '<meta property="og:image" content="' . $safeMetaImage . '">';
-        echo '<meta name="twitter:image" content="' . $safeMetaImage . '">';
-    }
+    echo ap_profile_html_meta_tags($meta);
     echo '<link rel="icon" href="/vaak/profile-favicon.svg?v=20260907b" type="image/svg+xml">';
     echo '<link rel="shortcut icon" href="/vaak/profile-favicon.svg?v=20260907b" type="image/svg+xml">';
     echo '<link rel="icon" href="/vaak/profile-favicon.ico?v=20260907b" sizes="any">';
