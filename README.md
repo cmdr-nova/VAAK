@@ -1,103 +1,199 @@
 # VAAK
 
-**Status:** alpha  
-**Version:** `0.3.0` · `2026-09-22`
+VAAK is an open, multi-user social web application for the Fediverse. It
+implements ActivityPub and a Mastodon-compatible API while also connecting
+accounts to Bluesky and AT Protocol PDSs. The goal is a single, fast interface
+for reading, publishing, moderating, and carrying social identity across both
+networks.
 
-VAAK is the multi-user ActivityPub/Mastodon-compatible web application used by
-the Vaak instance. This repository contains only the VAAK application and its
-PHP API libraries; the surrounding NovaLandia website is intentionally excluded.
+VAAK is pronounced "vaak" and is currently **alpha** software. Interfaces,
+database migrations, and protocol behavior can change between releases. The
+repository is useful for people evaluating the project, contributing code, or
+running their own instance; it is not a one-command hosted-service installer.
 
-While VAAK is in **alpha**, expect breaking changes, incomplete surfaces, and
-frequent polish as federation, Bluesky integration, and multi-user flows settle.
-The in-app login page and sidebar show the same release label.
+## What VAAK Provides
 
-### Version numbering
+### Fediverse support
 
-| Field | Source of truth | Notes |
-|--------|------------------|--------|
-| Channel | `api/ap-version.php` → `VAAK_CHANNEL` | Currently `alpha` |
-| Semver | `VAAK_VERSION` | `0.x` while alpha; bump when shipping a meaningful batch |
-| Date stamp | `VAAK_VERSION_DATE` | Calendar date of the labeled release (`YYYY-MM-DD`) |
+- ActivityPub inbox, outbox, actor, object, WebFinger, NodeInfo, and HTTP
+  signature endpoints.
+- Mastodon-compatible timelines and API routes for clients such as Ice Cubes
+  and other Mastodon applications.
+- Home, Local, and Federated timelines with distinct scopes:
+  - **Home** combines followed accounts, local activity, and optional
+    personalized recommendations.
+  - **Local** contains activity from this VAAK instance only.
+  - **Federated** contains local activity and ActivityPub remote activity.
+- Queued follows, boosts, favourites, replies, quotes, moderation actions, and
+  federation delivery.
+- RSS and Atom feeds for public local profiles.
+- Webmentions and a public moderation-policy feed.
 
-UI helper: `vaak_version_label()` → e.g. `VAAK alpha 0.2.20 · 2026-09-20`.
+### Bluesky and AT Protocol
 
-Bump those three constants together when cutting a public sync. Prefer one
-version bump per published batch rather than per tiny commit. While in alpha,
-increment the patch number (`0.1.0` → `0.1.1`) for normal fix/feature batches;
-only bump the minor (`0.1.x` → `0.2.0`) for a particularly large milestone.
+- Optional per-account Bluesky/PDS connection using an app password or a VAAK
+  PDS account.
+- Native Bluesky timeline, profile, post, reply, quote, follow, favourite,
+  bookmark, moderation-list, and block/mute integration where supported.
+- Optional cross-posting from VAAK to Bluesky, with origin markers used to
+  deduplicate the ActivityPub and Bluesky copies.
+- Incremental, queued backfills for existing Bluesky posts, replies, boosts,
+  and media. Backfilled content is local profile/cache data and is not silently
+  re-federated.
+- Bluesky-aware search, trends, profiles, HTML profiles, favourites, and
+  bookmarks. Cached Bluesky data is used so pages do not wait on AppView/PDS
+  requests whenever a warm result is available.
+
+### Publishing and media
+
+- Composer with content warnings, visibility controls, emoji search, media
+  uploads, polls, audio recording, drafts, queueing, and drag-and-drop media.
+- Automatic textarea growth with a bounded scrollable maximum height.
+- Images, GIFs, video, audio, posters/thumbnails, and sensitive-media handling
+  across timelines, notifications, profiles, and HTML profiles.
+- Long-form Markdown-compatible blog posts with drafts and profile display.
+- Optional profile links for external identities such as Second Life and World
+  of Warcraft characters.
+
+### Profiles, moderation, and discovery
+
+- HTML profiles with posts, replies, boosts, media, infinite scrolling, and a
+  back-to-top control.
+- Per-account profile themes, interaction policies, badges, muted words,
+  personal blocks, server blocks, mutes, and moderation lists.
+- Moderation state is applied to both Fediverse and Bluesky content before it is
+  rendered. Cached reads must never bypass those checks.
+- Search, trending hashtags, links, posts, recommendations, followed tags,
+  lists, collections, notifications, direct messages, and VakkTok video view.
+
+## Architecture
+
+The application is intentionally split into a small front controller and
+protocol-focused PHP libraries:
+
+- `vaak/` contains the browser entry point, login page, shell, and UI.
+- `api/` contains the ActivityPub implementation, Mastodon compatibility
+  routes, authentication, database helpers, media handling, Bluesky/PDS
+  integration, profile rendering, search, and workers.
+- `deploy/` contains deployment service definitions that are safe to publish;
+  host-specific secrets and service overrides live outside the repository.
+
+PostgreSQL is the production source of truth for accounts, posts, relationships,
+moderation decisions, migrations, and durable queue rows. SQLite is useful for
+local diagnostics only. Redis is an acceleration and coordination layer, not a
+replacement for the database. It is used for short-lived read-through caches,
+timeline heads, trends, remote metadata, rate counters, duplicate-job locks,
+and queue wake-up signals. If Redis is unavailable, the application should
+fall back to slower database-backed behavior without weakening moderation or
+delivery correctness.
+
+Remote work is deliberately kept out of normal page rendering where possible.
+Workers handle federation delivery, fan-out, actions, actor/profile refreshes,
+media warming, Bluesky synchronization, backfills, search enrichment, and
+other retryable jobs. Requests should enqueue work and return quickly; workers
+use leases, retries, bounded batches, and idempotent writes.
+
+## Requirements
+
+- PHP 8.1+ with PDO, cURL, JSON, mbstring, and the extensions required by the
+  selected database and Redis client.
+- PostgreSQL for a production deployment.
+- Redis 8.x recommended for the cache and queue wake-up layer.
+- A web server capable of routing HTTPS requests to `vaak/index.php` and the
+  public ActivityPub/API endpoints.
+- Writable application state and media storage outside the public source tree.
+- TLS and a stable public hostname for ActivityPub federation.
+- Optional object storage (such as S3-compatible/R2) for uploaded media.
+- Optional Bluesky/PDS credentials and a PDS account when Bluesky integration is
+  enabled.
 
 ## Configuration
 
-Production configuration is supplied outside the web root by the deployment
-environment. The application expects PostgreSQL settings through `AP_DB_DSN`,
-`AP_DB_USER`, and `AP_DB_PASSWORD`, plus deployment-managed files under
-`/etc/mkultra/` for session secrets, federation keys, object storage, Web Push,
-and other integrations. Do not commit those files or their contents.
+Production configuration is supplied by the deployment environment, not by
+committed files. At minimum, a deployment normally provides:
 
-The public repository must never contain real passwords, access tokens, private
-keys, bearer tokens, database URLs, or user/runtime data.
-
-## Layout
-
-- `vaak/` - login and front-controller pages
-- `api/` - ActivityPub, Mastodon compatibility, authentication, federation, and
-  application libraries
-- `api/assets/` - notification sounds used by the VAAK UI
-
-Deployment routing and service configuration remain environment-specific and are
-not included here.
-
-### Required background workers
-
-Local posts and quote boosts are committed before federation delivery. The
-delivery queue is retried by `api/ap-publish-delivery-worker.php`; production
-deployments must run it as the `www-data` service account. The web request also
-attempts a short-lived async wake-up, but that is best-effort and must not be
-the only scheduler (PHP-FPM may have `exec` disabled).
-
-For a simple deployment, add a cron entry that loads the same environment file
-used by PHP-FPM:
-
-```cron
-* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-publish-delivery-worker.php --limit=25 >>/var/log/vaak-publish-delivery.log 2>&1
-* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-fanout-delivery-worker.php --limit=40 >>/var/log/vaak-fanout-delivery.log 2>&1
-* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-action-queue-worker.php --limit=20 >>/var/log/vaak-action-queue.log 2>&1
-* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-actor-refresh-worker.php --limit=12 >>/var/log/vaak-actor-refresh.log 2>&1
-* * * * * www-data . /etc/mkultra/vaak.env; export VAAK_SECRET AP_DB_DSN AP_DB_USER AP_DB_PASSWORD; /usr/bin/php /srv/mkultra/html/api/ap-media-warm-worker.php --limit=3 >>/var/log/vaak-media-warm.log 2>&1
+```text
+AP_DB_DSN
+AP_DB_USER
+AP_DB_PASSWORD
+VAAK_SECRET
 ```
 
-Keep the action/publication lines enabled at the normal one-minute cadence;
-media and actor-refresh workers are independently bounded and cannot consume
-their worker slots.
+Federation keys, session encryption, object storage, Web Push, mail, Redis,
+Bluesky/PDS, and other integration settings should be provided through the
+host's secret manager or environment file. Never commit passwords, access
+tokens, private keys, bearer tokens, database URLs, or runtime/user data.
 
-Maintenance also prunes terminal delivery/fan-out/media/profile-refresh rows
-after the queue retention window (seven days by default). User action history is
-kept separately. Durable publication and fan-out jobs use lower numeric
-priorities for replies and mentions so those deliveries are not held behind
-bulk work.
+## Background Workers
 
-Use a systemd timer instead when the host already manages application workers.
-The worker is idempotent and uses a lease, so overlapping timer invocations are
-safe; keep only one active timer on a host to avoid unnecessary database work.
-Deploy checks can query queue state without claiming work with
-`api/ap-publish-delivery-worker.php --health`.
+A production instance should run the workers appropriate to the enabled
+features. The repository includes workers for:
 
-## Public Feeds
+- publication and ActivityPub delivery;
+- fan-out and queued user actions;
+- actor/profile refresh and WebFinger warming;
+- media warming and preview generation;
+- Bluesky notifications, timeline warming, post backfills, and retries;
+- Redis queue wake-ups.
 
-Local actor profiles expose public outbox feeds at `/users/{username}/feed.xml`
-(RSS 2.0) and `/users/{username}/feed.atom` (Atom 1.0). Private and
-followers-only posts are excluded.
+Workers are safe to run from a systemd timer, supervisor, or cron schedule when
+they load the same environment as PHP-FPM. Use one scheduler per worker, keep
+batches bounded, and retain the lease/retry behavior. Inspect worker-specific
+help output before choosing command-line options; deployment paths and service
+users are host-specific.
 
-Public profiles advertise the Webmention endpoint at
-`/api/ap-webmention.php`. Verified mentions can be read as JSON with a
-`target` query parameter; unverified or blocked sources are rejected.
+## Public Protocol Surfaces
 
-Clients that need instance-wide moderation policy can read the public JSON
-feed at `/api/ap-moderation-feed.php`. It contains only active global actor and
-domain blocks; personal mutes, report details, and moderation notes are never
-included. Responses support ETags and short-lived caching.
+For a local account named `username`, a deployment commonly exposes:
 
-The admin Import/Export screen supports Mastodon-compatible CSV portability
-for follows, mutes, blocks, blocked domains, bookmarks, lists, and followed
-hashtags (`followed_tags.csv`). Imports merge into the current account and do
-not delete existing relationships.
+```text
+https://example.org/users/username
+https://example.org/users/username/outbox
+https://example.org/users/username/feed.xml
+https://example.org/users/username/feed.atom
+```
+
+The instance also exposes standard WebFinger, NodeInfo, ActivityPub, and
+Mastodon-compatible API surfaces. Public profiles advertise the Webmention
+endpoint. The moderation feed contains only active instance-wide actor/domain
+blocks; personal mutes, reports, and moderation notes are never published.
+
+## Development and Verification
+
+1. Copy the repository and provide a development environment with the required
+   PHP extensions and database settings.
+2. Keep secrets and runtime state outside the repository.
+3. Apply the application migrations through the configured database role.
+4. Run the web entry point behind HTTPS when testing federation behavior.
+5. Start only the workers needed for the features under test.
+
+Before a release or deployment, check:
+
+```bash
+git diff --check
+php -l api/changed-file.php
+```
+
+Also smoke-test logged-out pages, authentication, Home, Local, Federated,
+notifications, search, profiles, media, moderation, and Bluesky/Fediverse
+deduplication when those surfaces changed. Test Local and Federated separately:
+Bluesky content belongs in Home/Bluesky surfaces and must not leak into Local.
+
+## Versioning
+
+The release source of truth is `api/ap-version.php`. Keep the channel, semantic
+version, and release date synchronized with the visible login/sidebar labels.
+VAAK is still alpha, so versions remain below `1.0.0`. Bump the version for a
+meaningful release batch rather than every small commit.
+
+## Project Status
+
+VAAK is an active alpha project. Federation compatibility varies across remote
+software, and Bluesky/PDS behavior can differ between providers. Performance
+work therefore favors cache-first reads, bounded queues, stale-while-refresh
+behavior, and conservative fallbacks over making a remote service a hard
+dependency for every page.
+
+Issues, reproducible bugs, interoperability reports, and focused pull requests
+are welcome. Please do not include credentials, private federation data, or
+production database/media snapshots in reports or patches.
