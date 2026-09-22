@@ -12,6 +12,7 @@ require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-import-export.php'; // alsoKnownAs / movedTo on multi-user actor docs
 require_once __DIR__ . '/ap-sl-link.php';
+require_once __DIR__ . '/ap-wow-link.php';
 require_once __DIR__ . '/ap-featured.php';
 require_once __DIR__ . '/ap-feeds.php';
 require_once __DIR__ . '/ap-masto-entities.php';
@@ -544,19 +545,25 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<div><h1>' . $name . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@' . $safe . '@mkultra.monster</p>';
     $slLink = function_exists('ap_sl_link_for_actor_key') ? ap_sl_link_for_actor_key($actorKey) : null;
-    if (is_array($slLink) && !empty($slLink['sl_username'])) {
-        $slName = htmlspecialchars((string) $slLink['sl_username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $slHref = htmlspecialchars(
-            function_exists('ap_sl_viewer_profile_url')
-                ? ap_sl_viewer_profile_url((string) ($slLink['sl_agent_id'] ?? ''))
-                : 'https://secondlife.com/',
-            ENT_QUOTES,
-            'UTF-8'
-        );
-        echo '<p class="sl-link" style="margin:.55rem 0 0">'
-            . '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
-            . '<img src="/vaak/second-life.jpg" alt="" width="43" height="34" loading="lazy">'
-            . '</a></p>';
+    $wowLink = function_exists('ap_wow_link_for_actor_key') ? ap_wow_link_for_actor_key($actorKey) : null;
+    if ((is_array($slLink) && !empty($slLink['sl_username'])) || (is_array($wowLink) && !empty($wowLink['armory_url']))) {
+        echo '<div class="profile-world-links" style="display:flex;gap:.5rem;align-items:center;margin:.55rem 0 0">';
+        if (is_array($slLink) && !empty($slLink['sl_username'])) {
+            $slName = htmlspecialchars((string) $slLink['sl_username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $slHref = htmlspecialchars(function_exists('ap_sl_viewer_profile_url') ? ap_sl_viewer_profile_url((string) ($slLink['sl_agent_id'] ?? '')) : 'https://secondlife.com/', ENT_QUOTES, 'UTF-8');
+            echo '<a href="' . $slHref . '" rel="noopener noreferrer me" title="Open ' . $slName . ' in Second Life" aria-label="Open ' . $slName . ' in Second Life">'
+                . '<img src="/vaak/second-life.jpg" alt="Second Life" width="43" height="34" loading="lazy"></a>';
+        }
+        if (is_array($wowLink) && !empty($wowLink['armory_url'])) {
+            $wowName = htmlspecialchars((string) ($wowLink['character_name'] ?? 'World of Warcraft character'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $wowHref = htmlspecialchars((string) $wowLink['armory_url'], ENT_QUOTES, 'UTF-8');
+            $wowPortrait = htmlspecialchars((string) ($wowLink['portrait_url'] ?? ''), ENT_QUOTES, 'UTF-8');
+            if ($wowPortrait !== '') {
+                echo '<a href="' . $wowHref . '" target="_blank" rel="noopener noreferrer" title="Open ' . $wowName . ' Armory profile" aria-label="Open ' . $wowName . ' Armory profile">'
+                    . '<img src="' . $wowPortrait . '" alt="World of Warcraft" width="43" height="34" loading="lazy" referrerpolicy="no-referrer" style="object-fit:cover;border-radius:8px"></a>';
+            }
+        }
+        echo '</div>';
     }
     echo '</div></div>';
     if (trim(strip_tags($summary)) !== '') {

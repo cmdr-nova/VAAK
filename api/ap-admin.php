@@ -25,6 +25,7 @@ require_once __DIR__ . '/ap-masto-entities.php'; // status ids, favourites/bookm
 require_once __DIR__ . '/ap-bookmark-folders.php'; // VAAK bookmark folders (API-safe overlay)
 require_once __DIR__ . '/ap-queue.php'; // posting queue / scheduler
 require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
+require_once __DIR__ . '/ap-wow-link.php'; // Profile → Link World of Warcraft character
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
@@ -1625,6 +1626,28 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $notice = (string) ($res['notice'] ?? 'Unlinked.');
         } else {
             $error = $res['error'] ?? 'Could not unlink.';
+        }
+    } elseif ($action === 'wow_link_save') {
+        $view = 'profile';
+        $uid = (int) ($vaakUser['id'] ?? 0);
+        $res = ap_wow_link_save(
+            $uid,
+            (string) ($_POST['wow_armory_url'] ?? ''),
+            (string) ($_POST['wow_portrait_url'] ?? '')
+        );
+        if (!empty($res['ok'])) {
+            $notice = (string) ($res['notice'] ?? 'World of Warcraft character linked.');
+        } else {
+            $error = $res['error'] ?? 'Could not link that World of Warcraft character.';
+        }
+    } elseif ($action === 'wow_link_unlink') {
+        $view = 'profile';
+        $uid = (int) ($vaakUser['id'] ?? 0);
+        $res = ap_wow_unlink($uid);
+        if (!empty($res['ok'])) {
+            $notice = (string) ($res['notice'] ?? 'World of Warcraft character unlinked.');
+        } else {
+            $error = $res['error'] ?? 'Could not unlink that World of Warcraft character.';
         }
     } elseif ($action === 'featured_add') {
         $view = 'profile';
@@ -17899,6 +17922,49 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="composer-actions">
                 <span class="meta">Requires object IMs enabled in SL preferences</span>
                 <button class="btn btn-primary" type="submit"><?= is_array($slPending) ? 'Resend code' : 'Send code in-world' ?></button>
+              </div>
+            </form>
+          <?php endif; ?>
+        </div>
+
+        <?php
+          $wowLink = function_exists('ap_wow_link_for_user')
+              ? ap_wow_link_for_user((int) ($vaakUser['id'] ?? 0))
+              : null;
+        ?>
+        <div class="composer" style="margin-top:1.25rem">
+          <div class="meta" style="margin-bottom:.75rem">
+            <b style="color:var(--primary)">World of Warcraft character</b><br>
+            Link an official Armory character. VAAK stores the Armory URL and portrait so public profiles load quickly.
+          </div>
+          <?php if (is_array($wowLink)): ?>
+            <div style="display:flex;gap:.75rem;align-items:center;margin-bottom:.75rem;flex-wrap:wrap">
+              <img src="<?= h((string) $wowLink['portrait_url']) ?>" alt="" width="48" height="48"
+                   style="border-radius:10px;object-fit:cover;border:1px solid var(--border)" loading="lazy" referrerpolicy="no-referrer">
+              <div>
+                <div class="who"><?= h((string) $wowLink['character_name']) ?></div>
+                <div class="meta"><?= h((string) $wowLink['realm']) ?> · <a href="<?= h((string) $wowLink['armory_url']) ?>" target="_blank" rel="noopener noreferrer">Armory profile</a></div>
+              </div>
+            </div>
+            <form method="post" action="?view=profile" onsubmit="return confirm('Unlink this World of Warcraft character?');">
+              <input type="hidden" name="action" value="wow_link_unlink">
+              <div class="composer-actions">
+                <span class="meta">One character per VAAK account</span>
+                <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Unlink</button>
+              </div>
+            </form>
+          <?php else: ?>
+            <form method="post" action="?view=profile">
+              <input type="hidden" name="action" value="wow_link_save">
+              <label for="wow-armory-url">Armory character URL</label>
+              <input id="wow-armory-url" type="url" name="wow_armory_url" required maxlength="500"
+                     placeholder="https://worldofwarcraft.blizzard.com/en-us/worldsoul/us/armory/character/realm/name">
+              <label for="wow-portrait-url">Portrait URL <span class="meta">(optional override)</span></label>
+              <input id="wow-portrait-url" type="url" name="wow_portrait_url" maxlength="500"
+                     placeholder="https://render.worldofwarcraft.com/…-avatar.jpg">
+              <div class="composer-actions">
+                <span class="meta">The portrait is discovered automatically from the public Armory page when possible.</span>
+                <button class="btn btn-primary" type="submit">Link character</button>
               </div>
             </form>
           <?php endif; ?>
