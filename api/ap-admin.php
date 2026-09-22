@@ -4058,6 +4058,7 @@ $statsFollowingAll = 0;
 $statsMentionsOpen = 0;
 $statsUserRows = [];
 $queueHealthRows = [];
+$redisMetrics = [];
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
     $queueDefs = [
@@ -4097,6 +4098,9 @@ if ($view === 'queue_health') {
             error_log('[ap-admin] queue health ' . $qd['table'] . ': ' . $e->getMessage());
             $queueHealthRows[] = ['name' => $qd['name'], 'queued' => 0, 'active' => 0, 'failed' => 0, 'retries' => 0, 'oldest' => '', 'active_since' => '', 'next_due' => '', 'ok' => false];
         }
+    }
+    if (function_exists('ap_redis_metric_snapshot')) {
+        $redisMetrics = ap_redis_metric_snapshot();
     }
 }
 if ($view === 'stats') {
@@ -21385,6 +21389,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'active')) ?></div><div class="l">Active</div></div>
           <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'failed')) ?></div><div class="l">Failed</div></div>
           <div class="stat"><div class="n"><?= (int) array_sum(array_column($queueHealthRows, 'retries')) ?></div><div class="l">Attempts</div></div>
+        </div>
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Redis coordination</h3>
+          <div class="meta">Best-effort counters from the last seven days; database queues remain authoritative.</div>
+          <div class="stat-grid" style="margin-top:.7rem">
+            <div class="stat"><div class="n"><?= (int) ($redisMetrics['queue_push'] ?? 0) ?></div><div class="l">Wakeups queued</div></div>
+            <div class="stat"><div class="n"><?= (int) ($redisMetrics['queue_pop'] ?? 0) ?></div><div class="l">Wakeups consumed</div></div>
+            <div class="stat"><div class="n"><?= (int) ($redisMetrics['lock_acquired'] ?? 0) ?></div><div class="l">Locks acquired</div></div>
+            <div class="stat"><div class="n"><?= (int) ($redisMetrics['lock_contended'] ?? 0) ?></div><div class="l">Lock contention</div></div>
+          </div>
         </div>
         <div class="side-card" style="margin-top:1rem">
           <h3>Queue classes</h3>

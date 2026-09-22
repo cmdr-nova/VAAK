@@ -146,13 +146,48 @@ function ap_redis_rate_get(string $bucket): ?int
     }
 }
 
+/** Best-effort operational counters, kept separate from application data. */
+function ap_redis_metric_inc(string $name, int $amount = 1): void
+{
+    $redis = ap_redis_client('cache');
+    $name = preg_replace('/[^a-z0-9:_-]/i', '', trim($name)) ?: '';
+    if (!$redis || $name === '' || $amount === 0) return;
+    try {
+        $key = 'vaak:metric:' . $name;
+        $redis->incrBy($key, $amount);
+        $redis->expire($key, 604800);
+    } catch (Throwable $e) { /* metrics must never affect requests */ }
+}
+
+/** @return array<string,int> */
+function ap_redis_metric_snapshot(): array
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis) return [];
+    $out = [];
+    try {
+        $it = null;
+        while (($keys = $redis->scan($it, 'vaak:metric:*', 100)) !== false) {
+            foreach ($keys as $key) {
+                $name = substr((string) $key, strlen('vaak:metric:'));
+                $out[$name] = (int) $redis->get($key);
+            }
+            if ($it === 0) break;
+        }
+    } catch (Throwable $e) { return []; }
+    ksort($out);
+    return $out;
+}
+
 /** Best-effort short lock used to coalesce refresh work. */
 function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
 {
     $redis = ap_redis_client('queue');
     if (!$redis || $key === '') return false;
     try {
-        return (bool) $redis->set('vaak:lock:' . $key, (string) getmypid(), ['nx', 'ex' => max(1, $ttlSeconds)]);
+        $ok = (bool) $redis->set('vaak:lock:' . $key, (string) getmypid(), ['nx', 'ex' => max(1, $ttlSeconds)]);
+        ap_redis_metric_inc($ok ? 'lock_acquired' : 'lock_contended');
+        return $ok;
     } catch (Throwable $e) {
         error_log('[ap-redis] lock failed: ' . $e->getMessage());
         return false;
@@ -168,6 +203,7 @@ function ap_redis_queue_push(string $queue, string|int $item): bool
         $key = 'vaak:queue:' . preg_replace('/[^a-z0-9:_-]/i', '', $queue);
         $redis->lPush($key, (string) $item);
         $redis->expire($key, 86400);
+        ap_redis_metric_inc('queue_push');
         return true;
     } catch (Throwable $e) {
         error_log('[ap-redis] queue push failed: ' . $e->getMessage());
@@ -192,6 +228,7 @@ function ap_redis_queue_pop_any(array $queues, int $timeoutSeconds = 5): ?array
         $row = $redis->brPop($keys, max(1, min(30, $timeoutSeconds)));
         $redis->setOption(Redis::OPT_READ_TIMEOUT, 0.08);
         if (!is_array($row) || count($row) < 2) return null;
+        ap_redis_metric_inc('queue_pop');
         return ['queue' => substr((string) $row[0], strlen('vaak:queue:')), 'item' => (string) $row[1]];
     } catch (Throwable $e) {
         try { $redis->setOption(Redis::OPT_READ_TIMEOUT, 0.08); } catch (Throwable $ignored) {}
