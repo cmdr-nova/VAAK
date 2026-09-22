@@ -7407,10 +7407,21 @@ function admin_edit_post_button(
         $href = '?view=status&object=' . rawurlencode($noteId)
             . '&from=home&compose=1&edit_note=' . rawurlencode($noteId);
     }
+    // The compose modal is present on timeline/status pages. Open it in place
+    // instead of navigating through a full page render (which can be queued
+    // behind timeline streams); retain the href as a no-JS fallback.
+    $editAttrs = ' class="' . ($asMenuItem ? 'menu-action' : 'btn btn-ghost') . ' js-edit-post"'
+        . ' href="' . h($href) . '"'
+        . ' type="button" data-note-id="' . h($noteId) . '"'
+        . ' data-return-view="' . h($returnView) . '"'
+        . ' data-content-b64="' . h(base64_encode($plainText)) . '"'
+        . ' data-spoiler-b64="' . h(base64_encode($spoiler)) . '"'
+        . ' data-sensitive="' . ($sensitive ? '1' : '0') . '"'
+        . ($asMenuItem ? '' : ' style="padding:.25rem .7rem;font-size:.8rem"');
     if ($asMenuItem) {
-        return '<a class="menu-action" href="' . h($href) . '">Edit</a>';
+        return '<a' . $editAttrs . '>Edit</a>';
     }
-    return '<a class="btn btn-ghost" href="' . h($href) . '" style="padding:.25rem .7rem;font-size:.8rem">Edit</a>';
+    return '<a' . $editAttrs . '>Edit</a>';
 }
 
 /**
