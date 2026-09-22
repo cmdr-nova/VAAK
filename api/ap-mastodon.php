@@ -213,6 +213,14 @@ function ap_masto_timeline_cache_dir(): string
     return is_dir($dir) && is_writable($dir) ? $dir : sys_get_temp_dir();
 }
 
+function ap_masto_timeline_cache_key(string $path, int $limit, ?string $sinceId, array $extraQuery = []): string
+{
+    $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+    return 'vaak:timeline:v1:' . hash('sha256', json_encode([
+        'u' => $owner, 'p' => $path, 'l' => $limit, 's' => $sinceId, 'x' => $extraQuery,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+}
+
 /**
  * Serve a cached timeline JSON body when fresh. Returns true if responded.
  *
@@ -223,6 +231,19 @@ function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?
     // Only cache "head" polls (no max_id scroll pages) — those are Ice Cubes' frequent refresh.
     if ($maxId !== null && $maxId !== '') {
         return false;
+    }
+    $redisKey = ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery);
+    $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+    if (is_array($redisCached) && isset($redisCached['created_at'], $redisCached['body'])) {
+        $age = time() - (int) $redisCached['created_at'];
+        if ($age >= 0 && $age < $ttlSec && is_string($redisCached['body']) && $redisCached['body'] !== '') {
+            http_response_code(200);
+            header('Content-Type: application/json; charset=utf-8');
+            header('X-VAAK-TL-Cache: redis');
+            if (!empty($redisCached['link'])) header('Link: ' . (string) $redisCached['link']);
+            echo $redisCached['body'];
+            exit;
+        }
     }
     $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
     $key = hash('sha256', json_encode([
@@ -280,6 +301,11 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
     );
     if (!is_string($json) || $json === '') {
         return;
+    }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set(ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery), [
+            'created_at' => time(), 'body' => $json,
+        ], max(5, min(60, 20)));
     }
     @file_put_contents($file, $json, LOCK_EX);
     // Persist Link header bits for cache hits.

@@ -19,7 +19,7 @@ $scripts = [
 while (true) {
     $signal = ap_redis_queue_pop_any(array_keys($scripts), 5);
     if (!is_array($signal)) {
-        if ($once || ap_redis_client() === null) break;
+        if ($once || ap_redis_client('queue') === null) break;
         continue;
     }
     $queue = (string) ($signal['queue'] ?? '');
