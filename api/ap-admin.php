@@ -602,7 +602,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $contentLen = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
         $postLooksTruncated = $contentLen > 65536 && empty($_POST) && empty($_FILES);
         $csrfError = $postLooksTruncated
-            ? 'Upload too large or timed out while the server was receiving it. Videos must be under 50MB (images 10MB). Try a shorter/compressed clip, or upload on Wi‑Fi.'
+            ? 'Upload too large or timed out while the server was receiving it. Videos must be under 100MB (images 10MB). Try a shorter/compressed clip, or upload on Wi‑Fi.'
             : 'Session expired — refresh the page and try again.';
         if ($wantJsonCsrf) {
             header('Content-Type: application/json; charset=utf-8');
@@ -24353,7 +24353,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   // Match ap_media_ingest_upload caps — reject before wasting a mobile upload.
   const MEDIA_LIMITS = {
     image: 25 * 1024 * 1024,
-    video: 50 * 1024 * 1024,
+    video: 100 * 1024 * 1024,
     audio: 20 * 1024 * 1024,
   };
   function mediaKindForFile(file) {
@@ -26687,7 +26687,7 @@ function ap_admin_collect_media_uploads(): array
             continue;
         }
         if ($err === UPLOAD_ERR_INI_SIZE || $err === UPLOAD_ERR_FORM_SIZE) {
-            return ['ids' => [], 'error' => 'File too large for the server (video max 50MB, images 10MB, audio 20MB).'];
+            return ['ids' => [], 'error' => 'File too large for the server (video max 100MB, images 10MB, audio 20MB).'];
         }
         if ($err === UPLOAD_ERR_PARTIAL) {
             return ['ids' => [], 'error' => 'Upload was interrupted — try again on Wi‑Fi.'];

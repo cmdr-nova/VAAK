@@ -185,7 +185,7 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
     if ($uploadErr !== UPLOAD_ERR_OK) {
         $errMsg = match ($uploadErr) {
             UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE
-                => 'File too large for the server (video max 50MB, images 25MB, audio 20MB).',
+                => 'File too large for the server (video max 100MB, images 25MB, audio 20MB).',
             UPLOAD_ERR_PARTIAL => 'Upload was interrupted — try again on Wi‑Fi.',
             UPLOAD_ERR_NO_TMP_DIR, UPLOAD_ERR_CANT_WRITE
                 => 'Server could not store the upload. Try again in a moment.',
@@ -254,7 +254,7 @@ function ap_media_ingest_upload(array $file, ?string $description = null): array
         }
     } elseif (str_starts_with($mime, 'video/')) {
         $kind = 'video';
-        $max = 50 * 1024 * 1024;
+        $max = 100 * 1024 * 1024;
         if (!in_array($mime, ['video/mp4', 'video/webm', 'video/quicktime'], true)) {
             return ['ok' => false, 'error' => 'Unsupported video type'];
         }

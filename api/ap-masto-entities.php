@@ -1278,7 +1278,7 @@ function ap_masto_instance_v1(): array
                 ],
                 'image_size_limit' => 10485760,
                 'image_matrix_limit' => 16777216,
-                'video_size_limit' => 52428800,
+                'video_size_limit' => 104857600,
                 'video_frame_rate_limit' => 60,
                 'video_matrix_limit' => 8300032,
             ],
