@@ -90,6 +90,7 @@ $stats = [
     'bsky_posts_deleted' => 0,
     'bsky_post_links_deleted' => 0,
     'queue_rows_deleted' => 0,
+    'signal_rows_deleted' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
     'errors' => 0,
@@ -137,6 +138,23 @@ try {
                 // Older installations may not have every optional queue yet.
                 $log('queue retention skipped table=' . $queuePrune['table'] . ': ' . $e->getMessage());
             }
+        }
+
+        // Signals are only useful for recent personalization. Keep this bounded
+        // so long-lived instances do not accumulate an unindexed event log.
+        try {
+            $signalCutoff = $nowUtc->modify('-90 days')->format('c');
+            if ($dryRun) {
+                $st = $db->prepare('SELECT COUNT(*) FROM ap_user_signals WHERE created_at < ?');
+                $st->execute([$signalCutoff]);
+                $stats['signal_rows_deleted'] += (int) $st->fetchColumn();
+            } else {
+                $st = $db->prepare('DELETE FROM ap_user_signals WHERE created_at < ?');
+                $st->execute([$signalCutoff]);
+                $stats['signal_rows_deleted'] += $st->rowCount();
+            }
+        } catch (Throwable $e) {
+            $log('signal retention skipped: ' . $e->getMessage());
         }
 
         // --- Optional per-account local post retention ---

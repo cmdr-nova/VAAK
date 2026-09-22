@@ -155,6 +155,9 @@ function ap_action_queue_remote_state_already_applied(string $error, bool $desir
 
 function ap_action_queue_clear_caches(int $ownerUserId, string $platform): void
 {
+    if (function_exists('ap_masto_suggestions_cache_clear')) {
+        ap_masto_suggestions_cache_clear($ownerUserId);
+    }
     if ($platform === 'bsky' && function_exists('ap_bsky_tl_cache_clear_owner')) {
         ap_bsky_tl_cache_clear_owner($ownerUserId);
     }

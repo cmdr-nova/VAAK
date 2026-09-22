@@ -8813,6 +8813,33 @@ function ap_masto_suggestion_dismiss(string $actorId): void
         'INSERT INTO masto_suggestion_dismissals (owner_user_id, actor_id, dismissed_at) VALUES (?, ?, ?)
          ON CONFLICT(owner_user_id, actor_id) DO UPDATE SET dismissed_at = excluded.dismissed_at'
     )->execute([$ownerUserId, $actorId, ap_db_now()]);
+    ap_masto_suggestions_cache_clear($ownerUserId);
+}
+
+function ap_masto_suggestions_cache_path(int $ownerUserId, int $limit): string
+{
+    $dir = '/var/lib/mkultra/ap/suggestions';
+    if (!is_dir($dir) && is_writable(dirname($dir))) {
+        @mkdir($dir, 0750, true);
+    }
+    if (!is_dir($dir) || !is_writable($dir)) {
+        $dir = sys_get_temp_dir();
+    }
+    return rtrim($dir, '/') . '/suggestions-' . $ownerUserId . '-' . $limit . '.json';
+}
+
+function ap_masto_suggestions_cache_clear(?int $ownerUserId = null): void
+{
+    $dir = '/var/lib/mkultra/ap/suggestions';
+    if (!is_dir($dir) || !is_readable($dir)) {
+        return;
+    }
+    foreach (glob(rtrim($dir, '/') . '/suggestions-*.json') ?: [] as $path) {
+        if ($ownerUserId !== null && !str_contains(basename($path), 'suggestions-' . $ownerUserId . '-')) {
+            continue;
+        }
+        @unlink($path);
+    }
 }
 
 /**
@@ -8821,7 +8848,7 @@ function ap_masto_suggestion_dismiss(string $actorId): void
  *
  * @return list<array{source:string,sources?:list<string>,account:array}>
  */
-function ap_masto_suggestions_v2(int $limit = 40): array
+function ap_masto_suggestions_v2_uncached(int $limit = 40): array
 {
     $limit = max(1, min(80, $limit));
     $local = ap_masto_session_actor_id();
@@ -9103,6 +9130,36 @@ function ap_masto_suggestions_v2(int $limit = 40): array
         ];
     }
     return $out;
+}
+
+/** Cached recommendation serving; the expensive candidate build stays off the hot path. */
+function ap_masto_suggestions_v2(int $limit = 40): array
+{
+    $limit = max(1, min(80, $limit));
+    $owner = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+    $path = ap_masto_suggestions_cache_path($owner, $limit);
+    $now = time();
+    $cached = null;
+    if (is_file($path)) {
+        $decoded = json_decode((string) @file_get_contents($path), true);
+        if (is_array($decoded) && is_array($decoded['items'] ?? null)) {
+            $cached = $decoded;
+            if (($now - (int) ($decoded['created_at'] ?? 0)) <= 30) {
+                return $decoded['items'];
+            }
+        }
+    }
+    try {
+        $items = ap_masto_suggestions_v2_uncached($limit);
+        @file_put_contents($path, json_encode(['created_at' => $now, 'items' => $items], JSON_UNESCAPED_SLASHES), LOCK_EX);
+        return $items;
+    } catch (Throwable $e) {
+        if (is_array($cached) && is_array($cached['items'] ?? null)
+            && ($now - (int) ($cached['created_at'] ?? 0)) <= 300) {
+            return $cached['items'];
+        }
+        throw $e;
+    }
 }
 
 /**
