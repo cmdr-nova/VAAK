@@ -397,6 +397,25 @@ SQL);
         error_log('[ap-db] ap_pds_invites not provisioned: ' . $e->getMessage());
     }
 
+    // Optional World of Warcraft character links shown on HTML profiles.
+    try {
+        if (!isset($present['ap_wow_links'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_wow_links (
+    owner_user_id BIGINT PRIMARY KEY,
+    character_name TEXT NOT NULL,
+    realm TEXT NOT NULL,
+    armory_url TEXT NOT NULL,
+    portrait_url TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+SQL);
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] ap_wow_links not provisioned: ' . $e->getMessage());
+    }
+
     $discussTablesReady = false;
     try {
         $discussTablesReady = isset(
@@ -470,7 +489,7 @@ SQL);
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
         'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
-        'ap_sl_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
+        'ap_sl_links', 'ap_wow_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
         'masto_lists', 'masto_markers', 'masto_media', 'masto_pins', 'masto_polls',

@@ -12,17 +12,29 @@ function ap_wow_schema_ensure(): void
     if ($ready) {
         return;
     }
-    ap_db()->exec(
-        'CREATE TABLE IF NOT EXISTS ap_wow_links (
-            owner_user_id INTEGER PRIMARY KEY,
-            character_name TEXT NOT NULL,
-            realm TEXT NOT NULL,
-            armory_url TEXT NOT NULL,
-            portrait_url TEXT NOT NULL,
-            linked_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )'
-    );
+    try {
+        $db = ap_db();
+        if (ap_db_driver($db) === 'pgsql') {
+            // PostgreSQL tables are provisioned by the central AP bootstrap/migration.
+            $ready = true;
+            return;
+        }
+        $db->exec(
+            'CREATE TABLE IF NOT EXISTS ap_wow_links (
+                owner_user_id INTEGER PRIMARY KEY,
+                character_name TEXT NOT NULL,
+                realm TEXT NOT NULL,
+                armory_url TEXT NOT NULL,
+                portrait_url TEXT NOT NULL,
+                linked_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )'
+        );
+    } catch (Throwable $e) {
+        // Optional profile metadata must never take a public profile down.
+        $ready = true;
+        return;
+    }
     $ready = true;
 }
 
@@ -92,11 +104,15 @@ function ap_wow_link_for_user(int $userId): ?array
     if ($userId <= 0) {
         return null;
     }
-    ap_wow_schema_ensure();
-    $st = ap_db()->prepare('SELECT * FROM ap_wow_links WHERE owner_user_id = ? LIMIT 1');
-    $st->execute([$userId]);
-    $row = $st->fetch();
-    return is_array($row) ? $row : null;
+    try {
+        ap_wow_schema_ensure();
+        $st = ap_db()->prepare('SELECT * FROM ap_wow_links WHERE owner_user_id = ? LIMIT 1');
+        $st->execute([$userId]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
 }
 
 /** @return array<string,mixed>|null */
@@ -106,15 +122,19 @@ function ap_wow_link_for_actor_key(string $actorKey): ?array
     if ($actorKey === '') {
         return null;
     }
-    ap_wow_schema_ensure();
-    $st = ap_db()->prepare(
-        'SELECT w.* FROM ap_wow_links w
-         INNER JOIN ap_users u ON u.id = w.owner_user_id
-         WHERE u.actor_key = ? AND u.disabled_at IS NULL LIMIT 1'
-    );
-    $st->execute([$actorKey]);
-    $row = $st->fetch();
-    return is_array($row) ? $row : null;
+    try {
+        ap_wow_schema_ensure();
+        $st = ap_db()->prepare(
+            'SELECT w.* FROM ap_wow_links w
+             INNER JOIN ap_users u ON u.id = w.owner_user_id
+             WHERE u.actor_key = ? AND u.disabled_at IS NULL LIMIT 1'
+        );
+        $st->execute([$actorKey]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
 }
 
 /** @return array{ok:bool,error?:string,notice?:string} */
