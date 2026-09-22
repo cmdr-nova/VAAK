@@ -23595,6 +23595,10 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function pollNewer() {
+    // Head polling is scoped to Home. Local and Federated are explicit
+    // instance views; they must not inherit Home's pending-post banner or
+    // background stream while the tab is swapped in place.
+    if (viewName !== 'home') return;
     if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
     if (pollBusy || document.hidden) return;
@@ -24057,6 +24061,7 @@ window.apAdminToast = function (msg, isErr) {
     }, 1200);
   }
   function startTimelineStream() {
+    if (viewName !== 'home') return;
     if (!window.EventSource || document.hidden || window.__vaakNavigationPending || !nearTop() || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
     const url = '?view=' + encodeURIComponent(viewName)
       + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
@@ -24110,9 +24115,9 @@ window.apAdminToast = function (msg, isErr) {
       streamFallbackTimer = 0;
     }
   });
-  if (window.EventSource && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
+  if (window.EventSource && viewName === 'home' && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
     startTimelineStream();
-  } else {
+  } else if (viewName === 'home') {
     streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
   }
   document.addEventListener('visibilitychange', () => {
