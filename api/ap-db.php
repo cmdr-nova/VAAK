@@ -7087,15 +7087,23 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
     }
     if ($refresh) {
         unset($cache[$ownerUserId]);
+        if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:' . $ownerUserId);
     }
     if (!isset($cache[$ownerUserId])) {
-        $cache[$ownerUserId] = [];
-        foreach (ap_mutes_list($ownerUserId) as $row) {
-            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($id !== '') {
-                $cache[$ownerUserId][$id] = true;
-                $cache[$ownerUserId][$id . '/'] = true;
+        $redisKey = 'vaak:moderation:mutes:' . $ownerUserId;
+        $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+        if (is_array($redisCached)) {
+            $cache[$ownerUserId] = $redisCached;
+        } else {
+            $cache[$ownerUserId] = [];
+            foreach (ap_mutes_list($ownerUserId) as $row) {
+                $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($id !== '') {
+                    $cache[$ownerUserId][$id] = true;
+                    $cache[$ownerUserId][$id . '/'] = true;
+                }
             }
+            if (function_exists('ap_redis_json_set')) ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
         }
     }
     return $cache[$ownerUserId];
@@ -7247,15 +7255,23 @@ function ap_deprioritized_set_cached(int $ownerUserId, bool $refresh = false): a
     }
     if ($refresh) {
         unset($cache[$ownerUserId]);
+        if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:deprioritized:' . $ownerUserId);
     }
     if (!isset($cache[$ownerUserId])) {
-        $cache[$ownerUserId] = [];
-        foreach (ap_deprioritized_list($ownerUserId) as $row) {
-            $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($id !== '') {
-                $cache[$ownerUserId][$id] = true;
-                $cache[$ownerUserId][$id . '/'] = true;
+        $redisKey = 'vaak:moderation:deprioritized:' . $ownerUserId;
+        $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+        if (is_array($redisCached)) {
+            $cache[$ownerUserId] = $redisCached;
+        } else {
+            $cache[$ownerUserId] = [];
+            foreach (ap_deprioritized_list($ownerUserId) as $row) {
+                $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                if ($id !== '') {
+                    $cache[$ownerUserId][$id] = true;
+                    $cache[$ownerUserId][$id . '/'] = true;
+                }
             }
+            if (function_exists('ap_redis_json_set')) ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
         }
     }
     return $cache[$ownerUserId];
@@ -7933,9 +7949,15 @@ function ap_user_blocks_list_cached(int $ownerUserId, bool $refresh = false): ar
     }
     if ($refresh) {
         unset($cache[$ownerUserId]);
+        if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:blocks:' . $ownerUserId);
     }
     if (!isset($cache[$ownerUserId])) {
-        $cache[$ownerUserId] = ap_user_blocks_list($ownerUserId);
+        $redisKey = 'vaak:moderation:blocks:' . $ownerUserId;
+        $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+        $cache[$ownerUserId] = is_array($redisCached) ? $redisCached : ap_user_blocks_list($ownerUserId);
+        if ($redisCached === null && function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+        }
     }
     return $cache[$ownerUserId];
 }

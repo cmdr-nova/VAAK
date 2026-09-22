@@ -7775,6 +7775,10 @@ function ap_masto_trends_schedule_refresh(): void
     $scheduled = true;
     register_shutdown_function(static function (): void {
         try {
+            if (function_exists('ap_redis_client') && ap_redis_client('queue') !== null
+                && !ap_redis_lock('trends:refresh', 120)) {
+                return;
+            }
             if (function_exists('ignore_user_abort')) {
                 ignore_user_abort(true);
             }

@@ -1903,6 +1903,11 @@ function ap_fetch_remote_as2(string $url): ?array
     if ($url === '' || strlen($url) > 800 || !str_starts_with($url, 'https://')) {
         return null;
     }
+    $objectCacheKey = 'vaak:remote-as2:v1:' . hash('sha256', rtrim($url, '/'));
+    $cachedObject = function_exists('ap_redis_json_get') ? ap_redis_json_get($objectCacheKey) : null;
+    if (is_array($cachedObject) && (($cachedObject['type'] ?? '') !== '' || isset($cachedObject['id'], $cachedObject['actor']))) {
+        return $cachedObject;
+    }
     $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
     if ($host !== '' && ap_remote_fetch_circuit_open($host) > time()) {
         return null;
@@ -1917,6 +1922,7 @@ function ap_fetch_remote_as2(string $url): ?array
         $doc = ap_decode_as2_body(is_string($body) ? $body : null);
         if ($doc !== null) {
             ap_remote_fetch_circuit_success($host);
+            if (function_exists('ap_redis_json_set')) ap_redis_json_set($objectCacheKey, $doc, 60);
             return $doc;
         }
     }
