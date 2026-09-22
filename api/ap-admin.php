@@ -21777,8 +21777,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         && lastDmEventId !== '0'
         && dmEventId !== lastDmEventId
         && Number(dmEventId) > Number(lastDmEventId)
-        && d >= lastDmCount;
+        && d > lastDmCount;
       const notifAdvanced = n > 0
+        && n > lastNotifCount
         && notifEventId !== '0'
         && lastNotifEventId !== ''
         && lastNotifEventId !== '0'
