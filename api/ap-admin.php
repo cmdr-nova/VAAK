@@ -26192,6 +26192,14 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     // current document, so hand that navigation state back immediately rather
     // than leaving the pill spinning while the modal is open.
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    // Focused/thread layouts can contain only the modal shell, so use the
+    // server-rendered edit route as the canonical path. It renders the same
+    // edit_status composer with the existing note id and avoids an empty shell.
+    const href = btn.getAttribute('href') || '';
+    if (href) {
+      window.location.assign(href);
+      return;
+    }
     openEditComposer(btn);
   });
 
