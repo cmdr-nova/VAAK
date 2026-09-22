@@ -4924,6 +4924,11 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             if (function_exists('ap_masto_mention_notif_type') && ap_masto_mention_notif_type($row) === null) {
                 continue;
             }
+            $notifActor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($notifActor !== '' && function_exists('ap_row_is_hidden')
+                && ap_row_is_hidden($notifActor, null, $ownerUserId)) {
+                continue;
+            }
             $ids[] = ap_masto_notification_id_for_mention(
                 (int) ($row['id'] ?? 0),
                 isset($row['created_at']) ? (string) $row['created_at'] : null
@@ -4958,6 +4963,10 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             }
             $fa = rtrim((string) ($row['actor_id'] ?? ''), '/');
             if ($fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
+                continue;
+            }
+            if ($fa !== '' && function_exists('ap_row_is_hidden')
+                && ap_row_is_hidden($fa, null, $ownerUserId)) {
                 continue;
             }
             $ids[] = ap_masto_notification_id_for_follow_event(

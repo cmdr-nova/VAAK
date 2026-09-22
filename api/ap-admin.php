@@ -13154,11 +13154,15 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php endif; ?>
       <?php if ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
         <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
-      <?php elseif ($nSnippet !== '' && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
-        <div class="quote-block" style="margin-top:.55rem"><span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br><span class="notification-snippet"><?= h($snipShow) ?></span></div>
+      <?php elseif (($nSnippet !== '' || $nMedia !== []) && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
+        <div class="quote-block" style="margin-top:.55rem">
+          <span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br>
+          <?php if ($snipShow !== ''): ?><span class="notification-snippet"><?= h($snipShow) ?></span><?php endif; ?>
+          <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
+        </div>
       <?php endif; ?>
     <?php endif; ?>
-    <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
+    <?php if ($nMedia !== [] && !in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
     <div class="tweet-actions">
       <?php if ($profileHref !== ''): ?>
         <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
