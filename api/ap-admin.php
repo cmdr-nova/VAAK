@@ -109,21 +109,18 @@ $adminRenderHiccup = static function (string $msg = ''): void {
         vaak_render_failure();
     }
     if (!headers_sent()) {
-        http_response_code(500);
+        http_response_code(503);
         header('Content-Type: text/html; charset=utf-8');
-        header('Cache-Control: no-store');
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('Retry-After: 60');
     }
-    echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        . '<title>Admin hiccup</title></head>'
-        . '<body style="margin:0;font-family:system-ui,sans-serif;background:#0a0a0a;color:#eee">'
-        . '<main style="max-width:36rem;margin:3rem auto;padding:0 1.25rem">'
-        . '<div style="border:1px solid #333;border-radius:12px;padding:1.35rem;background:#121212">'
-        . '<h1 style="margin-top:0;font-size:1.25rem">Admin hiccup</h1>'
-        . '<p>This page failed to render — often a brief database contention or worker error. '
-        . '<a href="/vaak/?view=home" style="color:#7ee0ff">Retry Home</a> · '
-        . '<a href="javascript:location.reload()" style="color:#7ee0ff">Reload</a></p>'
-        . '<p style="color:#bbb;font-size:.86rem;margin-bottom:0">No private diagnostic details are shown here. If this persists, contact the server operator.</p>'
-        . '</div></main></body></html>';
+    echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        . '<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#050505"><title>VAAK · Temporarily unavailable</title>'
+        . '<style>:root{color-scheme:dark}*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:2rem;display:grid;place-items:center;background:#050505;color:#e8e8e8;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(42rem,100%);text-align:center}.mark{margin:0 auto 2rem;color:#00ff9f;font:700 clamp(3.5rem,17vw,8rem)/.88 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 32px rgba(0,255,159,.28);white-space:pre;overflow:hidden}h1{margin:0;font-size:clamp(1.35rem,4vw,2rem);font-weight:650}p{margin:1rem auto 0;max-width:34rem;color:#999;font-size:1rem;line-height:1.55}</style></head><body><main>'
+        . '<pre class="mark" aria-label="VAAK">██╗   ██╗\n██║   ██║\n██║   ██║\n╚██╗ ██╔╝\n ╚████╔╝\n  ╚═══╝</pre>'
+        . '<h1>Something&#039;s gone wrong, we&#039;re working on it.</h1>'
+        . '<p>Questions, contact cmdr_nova@mkultra.monster</p>'
+        . '</main></body></html>';
 };
 set_exception_handler(static function (Throwable $e) use ($adminRenderHiccup): void {
     $detail = get_class($e)
