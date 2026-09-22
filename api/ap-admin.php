@@ -22380,7 +22380,7 @@ window.apAdminToast = function (msg, isErr) {
     btn.setAttribute('aria-label', on ? tOn : tOff);
   }
 
-  async function watchBskyQueue(btn, queueId, revision, snapshot) {
+  async function watchBskyQueue(btn, queueId, revision, snapshot, actionKind = '') {
     let tries = 0;
     while (tries++ < 90) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -22401,6 +22401,9 @@ window.apAdminToast = function (msg, isErr) {
             delete btn.dataset.queuePending;
             delete btn.dataset.queueId;
             if (window.apQueueRepeatedClickReset) window.apQueueRepeatedClickReset(btn);
+          }
+          if (actionKind === 'bsky_repost' && typeof window.apAdminToast === 'function') {
+            window.apAdminToast('Boosted!');
           }
           return;
         }
@@ -22453,7 +22456,7 @@ window.apAdminToast = function (msg, isErr) {
       btn.dataset.queuePending = '1';
       btn.dataset.queueId = String(data.queue_id);
       btn.dataset.queueRevision = String(data.revision || '');
-      watchBskyQueue(btn, data.queue_id, data.revision, before || snapshotBskyButton(btn));
+      watchBskyQueue(btn, data.queue_id, data.revision, before || snapshotBskyButton(btn), postAction);
     }
     return data;
   }
@@ -22581,6 +22584,9 @@ window.apAdminToast = function (msg, isErr) {
     btn.disabled = false;
     try {
       const data = await postBskyAction(btn, postAction, before);
+      if (action === 'repost' && data.queued && typeof window.apAdminToast === 'function') {
+        window.apAdminToast('Boost queued.');
+      }
       if (action === 'like') {
         const on = !!data.liked;
         setBskyIcon(btn, 'heart', on, { on: 'Unlike', off: 'Like on Bluesky' });
