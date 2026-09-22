@@ -853,7 +853,8 @@ function ap_cmdr_extract_homepage_footer(string $homeHtml): string
     return substr($homeHtml, $start, $end + strlen('</footer>') - $start);
 }
 
-function ap_cmdr_shell_start(string $title): void
+/** @param array<string,string> $meta */
+function ap_cmdr_shell_start(string $title, array $meta = []): void
 {
     header('Content-Type: text/html; charset=utf-8');
     header('Vary: Accept');
@@ -861,12 +862,32 @@ function ap_cmdr_shell_start(string $title): void
     header('X-Robots-Tag: noindex, nofollow');
 
     if (ap_cmdr_use_site_shell()) {
-        ap_cmdr_site_shell_start($title);
+        ap_cmdr_site_shell_start($title, $meta);
         return;
     }
 
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</title>';
+    $metaTitle = trim((string) ($meta['title'] ?? ''));
+    $metaDescription = trim((string) ($meta['description'] ?? ''));
+    $metaUrl = trim((string) ($meta['url'] ?? ''));
+    $metaImage = trim((string) ($meta['image'] ?? ''));
+    if ($metaTitle !== '') {
+        $safe = htmlspecialchars($metaTitle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<meta property="og:title" content="' . $safe . '"><meta name="twitter:title" content="' . $safe . '">';
+    }
+    if ($metaDescription !== '') {
+        $safe = htmlspecialchars($metaDescription, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<meta name="description" content="' . $safe . '"><meta property="og:description" content="' . $safe . '"><meta name="twitter:description" content="' . $safe . '">';
+    }
+    if ($metaUrl !== '' && str_starts_with($metaUrl, 'https://')) {
+        $safe = htmlspecialchars($metaUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<link rel="canonical" href="' . $safe . '"><meta property="og:url" content="' . $safe . '">';
+    }
+    echo '<meta property="og:type" content="article"><meta name="twitter:card" content="' . ($metaImage !== '' ? 'summary_large_image' : 'summary') . '">';
+    if ($metaImage !== '' && str_starts_with($metaImage, 'https://')) {
+        echo '<meta property="og:image" content="' . htmlspecialchars($metaImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"><meta name="twitter:image" content="' . htmlspecialchars($metaImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">';
+    }
     echo '<link rel="icon" href="/vaak/profile-favicon.svg?v=20260907b" type="image/svg+xml">';
     echo '<link rel="shortcut icon" href="/vaak/profile-favicon.svg?v=20260907b" type="image/svg+xml">';
     echo '<link rel="icon" href="/vaak/profile-favicon.ico?v=20260907b" sizes="any">';
@@ -1087,7 +1108,8 @@ function ap_cmdr_lightbox_markup_and_script(): string
     return $html;
 }
 
-function ap_cmdr_site_shell_start(string $title): void
+/** @param array<string,string> $meta */
+function ap_cmdr_site_shell_start(string $title, array $meta = []): void
 {
     $homeHtml = ap_cmdr_homepage_html();
     $sidebar = ap_cmdr_extract_homepage_sidebar($homeHtml);
@@ -1097,6 +1119,26 @@ function ap_cmdr_site_shell_start(string $title): void
     echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">';
     echo '<meta name="viewport" content="width=device-width,initial-scale=1">';
     echo '<title>' . $safeTitle . '</title>';
+    $metaTitle = trim((string) ($meta['title'] ?? ''));
+    $metaDescription = trim((string) ($meta['description'] ?? ''));
+    $metaUrl = trim((string) ($meta['url'] ?? ''));
+    $metaImage = trim((string) ($meta['image'] ?? ''));
+    if ($metaTitle !== '') {
+        $safe = htmlspecialchars($metaTitle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<meta property="og:title" content="' . $safe . '"><meta name="twitter:title" content="' . $safe . '">';
+    }
+    if ($metaDescription !== '') {
+        $safe = htmlspecialchars($metaDescription, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<meta name="description" content="' . $safe . '"><meta property="og:description" content="' . $safe . '"><meta name="twitter:description" content="' . $safe . '">';
+    }
+    if ($metaUrl !== '' && str_starts_with($metaUrl, 'https://')) {
+        $safe = htmlspecialchars($metaUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        echo '<link rel="canonical" href="' . $safe . '"><meta property="og:url" content="' . $safe . '">';
+    }
+    echo '<meta property="og:type" content="article"><meta name="twitter:card" content="' . ($metaImage !== '' ? 'summary_large_image' : 'summary') . '">';
+    if ($metaImage !== '' && str_starts_with($metaImage, 'https://')) {
+        echo '<meta property="og:image" content="' . htmlspecialchars($metaImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"><meta name="twitter:image" content="' . htmlspecialchars($metaImage, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">';
+    }
     echo '<link rel="icon" href="/vaak/profile-favicon.svg?v=20260907b" type="image/svg+xml">';
     echo '<link rel="shortcut icon" href="/vaak/profile-favicon.svg?v=20260907b" type="image/svg+xml">';
     echo '<link rel="icon" href="/vaak/profile-favicon.ico?v=20260907b" sizes="any">';
@@ -1242,6 +1284,57 @@ function ap_cmdr_shell_end(): void
     echo '</body></html>';
 }
 
+/** Build share-card metadata for a cmdr_nova HTML profile post. */
+function ap_cmdr_note_share_meta(array $row, array $note, array $profile): array
+{
+    $name = trim((string) ($profile['name'] ?? '')) ?: '@cmdr_nova';
+    $plain = trim(html_entity_decode(strip_tags((string) ($note['content'] ?? $row['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
+    if ($plain === '') {
+        $plain = trim((string) ($note['summary'] ?? ''));
+    }
+    if (function_exists('mb_strlen') && mb_strlen($plain) > 220) {
+        $plain = mb_substr($plain, 0, 217) . '…';
+    } elseif (strlen($plain) > 220) {
+        $plain = substr($plain, 0, 217) . '…';
+    }
+    $rowId = rtrim((string) ($row['id'] ?? ''), '/');
+    $url = $rowId;
+    $image = '';
+    $attachments = $note['attachment'] ?? [];
+    if (is_array($attachments) && isset($attachments['type'])) {
+        $attachments = [$attachments];
+    }
+    if (is_array($attachments)) {
+        foreach ($attachments as $attachment) {
+            if (!is_array($attachment)) {
+                continue;
+            }
+            $mediaType = strtolower((string) ($attachment['mediaType'] ?? ''));
+            $candidate = is_string($attachment['url'] ?? null)
+                ? (string) $attachment['url']
+                : (is_array($attachment['url'] ?? null) ? (string) ($attachment['url']['href'] ?? '') : '');
+            if (!str_starts_with($candidate, 'https://') && is_string($attachment['preview'] ?? null)) {
+                $candidate = (string) $attachment['preview'];
+            }
+            if ($candidate !== '' && str_starts_with($candidate, 'https://')
+                && (str_starts_with($mediaType, 'image/') || $mediaType === '')) {
+                $image = $candidate;
+                break;
+            }
+        }
+    }
+    if ($image === '') {
+        $image = trim((string) ($profile['icon_url'] ?? ''));
+    }
+    return [
+        'title' => $name . ' · VAAK',
+        'description' => $plain !== '' ? $plain : 'A post from ' . $name . ' on VAAK.',
+        'url' => $url,
+        'image' => $image,
+    ];
+}
+
 function ap_cmdr_note_html(array $row, array $create): void
 {
     $note = is_array($create['object'] ?? null) ? $create['object'] : [];
@@ -1369,7 +1462,10 @@ function ap_cmdr_note_html(array $row, array $create): void
         }
     }
 
-    ap_cmdr_shell_start('Post · @cmdr_nova@mkultra.monster');
+    ap_cmdr_shell_start(
+        'Post · @cmdr_nova@mkultra.monster',
+        ap_cmdr_note_share_meta($row, $note, $p)
+    );
     echo '<div class="row" style="margin-bottom:1rem">';
     echo '<img class="av" src="' . $avatar . '" alt="" width="72" height="72" referrerpolicy="no-referrer">';
     $automatedBadge = !empty($p['automated'])
