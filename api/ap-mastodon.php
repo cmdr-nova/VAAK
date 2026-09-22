@@ -1468,7 +1468,7 @@ function ap_masto_api(string $method, string $path): void
         }
         // Home = people you follow + your own posts (never DMs)
         $homeStatuses = ap_visibility_filter_statuses(
-            ap_masto_timeline_home_merged($limit, $maxId, $sinceId),
+            ap_masto_timeline_home_merged($limit, $maxId, $sinceId, true),
             (int) ap_db_masto_owner_user_id()
         );
         ap_masto_timeline_cache_store($homeStatuses, '/api/v1/timelines/home', $limit, $maxId, $sinceId);

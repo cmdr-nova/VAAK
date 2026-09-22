@@ -6235,7 +6235,7 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
  *
  * @return list<array<string,mixed>>
  */
-function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?string $sinceId = null): array
+function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, bool $standardApi = false): array
 {
     $startedAt = microtime(true);
     $limit = max(1, min(80, $limit));
@@ -6251,7 +6251,12 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     }
 
     // Page follows with the real cursor (head-fetch + PHP filter starved remotes on page 2+).
-    $remote = ap_masto_timeline_events('home', max($limit + 10, 40), $maxId, $sinceId, false);
+    // API clients need full, chronological pages. Browser-only Home ranking can
+    // discard many rows after hydration, so fetch a larger bounded window here.
+    $remoteCap = $standardApi
+        ? min(400, max($limit * 4, $limit + 40))
+        : max($limit + 10, 40);
+    $remote = ap_masto_timeline_events('home', $remoteCap, $maxId, $sinceId, false);
     // Own posts/boosts: spice, not the whole plate — fetch a small cursor window then cap.
     $ownCap = max(1, min(3, (int) ceil($limit * 0.2)));
     $localRows = ap_masto_statuses_recent(max($ownCap * 3, 12), $before, $after);
@@ -6265,6 +6270,11 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     // Followed hashtags land in Home, but stay a spice mix — not the main course.
     // Cap conversion + deprioritize vs follows/own posts when assembling the page.
     $tagPosts = [];
+    if ($standardApi) {
+        // Followed-tag recommendations are a VAAK web enhancement, not part of
+        // the Mastodon-compatible Home contract consumed by mobile clients.
+        $tagPosts = [];
+    } else {
     try {
         $tagEventCap = min(10, max(4, (int) ceil($limit / 4)));
         foreach (ap_masto_followed_tag_event_rows($tagEventCap) as $row) {
@@ -6296,11 +6306,12 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     } catch (Throwable $e) {
         // ignore
     }
+    }
 
     $ownerForDeprio = function_exists('ap_db_masto_owner_user_id')
         ? (int) ap_db_masto_owner_user_id()
         : (function_exists('ap_db_default_owner_user_id') ? (int) ap_db_default_owner_user_id() : 0);
-    $deprioSet = ($ownerForDeprio > 0 && function_exists('ap_deprioritized_set_cached'))
+    $deprioSet = (!$standardApi && $ownerForDeprio > 0 && function_exists('ap_deprioritized_set_cached'))
         ? ap_deprioritized_set_cached($ownerForDeprio)
         : [];
     $deprioPenaltyHours = function_exists('ap_deprioritize_penalty_seconds')
