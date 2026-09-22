@@ -5947,8 +5947,9 @@ function ap_update_local_status(
         admin_tl_cache_clear();
     }
 
-    // Same Bridgy-first / background path as Creates — edits with media must not jam.
-    $fan = ap_deliver_public_activity($update, []);
+    // Edits are ActivityPub-only. Bluesky records are immutable, so never send
+    // an edit through the Bridgy bridge or any Bluesky crosspost path.
+    $fan = ap_deliver_public_activity($update, [], true);
     $delivered = $fan['delivered'];
     ap_metrics_record('Update', $actor, $noteId, null, strlen($contentHtml), 'compose_edit', $content);
     ap_log("update_status note=$noteId local_id=$localId delivered=$delivered queued={$fan['queued']} bridgy=" . ($fan['bridgy'] ? '1' : '0'));

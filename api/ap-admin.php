@@ -3956,32 +3956,6 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
     exit;
 }
 
-// AIM imrcv.wav for new DMs / notifications (admin-auth protected)
-if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_sound') {
-    $candidates = [
-        __DIR__ . '/assets/imrcv.wav',
-        __DIR__ . '/assets/message_sound.wav',
-    ];
-    $soundPath = null;
-    foreach ($candidates as $cand) {
-        if (is_file($cand) && is_readable($cand)) {
-            $soundPath = $cand;
-            break;
-        }
-    }
-    if ($soundPath === null) {
-        http_response_code(404);
-        header('Content-Type: text/plain; charset=utf-8');
-        echo 'notification sound missing';
-        exit;
-    }
-    header('Content-Type: audio/wav');
-    header('Cache-Control: public, max-age=3600');
-    header('Content-Length: ' . (string) filesize($soundPath));
-    readfile($soundPath);
-    exit;
-}
-
 $db = ap_db();
 $since24 = gmdate('c', time() - 86400);
 $since7 = gmdate('c', time() - 7 * 86400);
@@ -21630,16 +21604,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     el.removeAttribute('open');
   });
 
-  // Notification + DM badges, tab title, AIM imrcv chime
+  // Notification + DM badges and tab title
   const notifView = <?= json_encode($view === 'mentions') ?>;
   const dmView = <?= json_encode($view === 'dms') ?>;
   const notifBaseTitle = <?= json_encode('VAAK · ' . view_title($view)) ?>;
   const notifBadge = document.getElementById('notif-badge');
   const dmBadge = document.getElementById('dm-badge');
-  let lastNotifCount = <?= (int) $notifUnreadNav ?>;
-  let lastDmCount = <?= (int) $dmUnreadNav ?>;
-  // Digit-only snowflake compare — never chime for an id at/under the read marker,
-  // and never for an id we already announced (count flicker used to false-trigger).
+  // Digit-only snowflake comparison keeps unread-tip tracking stable across polls.
   const snowflakeDigits = (v) => String(v || '').replace(/\D+/g, '') || '0';
   const snowflakeNewer = (a, b) => {
     const x = snowflakeDigits(a);
@@ -21648,103 +21619,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     return x > y;
   };
   let lastReadNotifId = <?= json_encode($notifLastReadIdNav) ?>;
-  // Track the newest *unread* tip only — overall latest used to false-chime when
-  // the heavy notifications fetch hydrated in a different order than the light scan.
+  // Track the newest unread tip so badge state remains stable across polls.
   let lastNotifEventId = <?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>;
   let lastDmEventId = <?= json_encode($dmLatestIdNav) ?>;
-  let notifPollReady = false; // skip chime on the first poll after page load
   let notifPollTimer = null;
-  // Foreground AIM chime — background tabs rely on Web Push instead.
-  const NOTIF_SOUND_ENABLED = true;
-  let notifSoundUnlocked = false;
-  let lastPushSuppressAt = 0;
-  let lastPushSuppressId = '';
-  let notifAudio = null;
-  const ensureNotifAudio = () => {
-    if (!NOTIF_SOUND_ENABLED || notifAudio) return notifAudio;
-    notifAudio = new Audio('?ajax=notif_sound&v=imrcv5');
-    notifAudio.preload = 'auto';
-    notifAudio.volume = 0.9;
-    notifAudio.setAttribute('playsinline', '');
-    return notifAudio;
-  };
-  // Browsers block autoplay until a user gesture. Prime the element with a
-  // muted play/pause cycle so Safari grants permission for future chimes.
-  const unlockNotifSound = () => {
-    if (!NOTIF_SOUND_ENABLED || notifSoundUnlocked) return;
-    const audio = ensureNotifAudio();
-    if (!audio) return;
-    try {
-      audio.muted = true;
-      audio.volume = 0;
-      audio.currentTime = 0;
-      const p = audio.play();
-      if (p && typeof p.then === 'function') {
-        p.then(() => {
-          audio.pause();
-          audio.currentTime = 0;
-          audio.muted = false;
-          audio.volume = 0.9;
-          notifSoundUnlocked = true;
-          document.removeEventListener('pointerdown', unlockNotifSound);
-          document.removeEventListener('keydown', unlockNotifSound);
-        }).catch(() => {
-          audio.muted = false;
-          audio.volume = 0.9;
-        });
-      }
-    } catch (e) {
-      audio.muted = false;
-      audio.volume = 0.9;
-    }
-  };
-  if (NOTIF_SOUND_ENABLED) {
-    document.addEventListener('pointerdown', unlockNotifSound);
-    document.addEventListener('keydown', unlockNotifSound);
-  }
-
-  function playNotifSound(eventKey) {
-    if (!NOTIF_SOUND_ENABLED || !notifSoundUnlocked) return;
-    const audio = ensureNotifAudio();
-    if (!audio) return;
-    // Background / unfocused tab: OS Web Push covers alerts — don't double-chime.
-    if (document.visibilityState !== 'visible' || (typeof document.hasFocus === 'function' && !document.hasFocus())) {
-      return;
-    }
-    if (Date.now() < Number(window.__vaakNavigationSuppressUntil || 0)) return;
-    // Suppress if a service-worker push just landed for this tip.
-    const now = Date.now();
-    if (lastPushSuppressAt && (now - lastPushSuppressAt) < 60 * 1000) {
-      const tip = String(eventKey || '');
-      if (!lastPushSuppressId || tip.includes(lastPushSuppressId)) return;
-    }
-    // Avoid duplicate chimes when Safari has two Vaak tabs polling at
-    // different times, or when an unread counter briefly resets and rises
-    // again for the same notification set.
-    try {
-      const signature = String(eventKey || '');
-      if (!signature) return;
-      const key = 'vaak-notif-chime-v5';
-      const prior = JSON.parse(localStorage.getItem(key) || 'null');
-      if (prior && prior.signature === signature && (now - Number(prior.at || 0)) < 10 * 60 * 1000) {
-        return;
-      }
-      localStorage.setItem(key, JSON.stringify({ signature, at: now }));
-    } catch (e) {}
-    try {
-      audio.muted = false;
-      audio.volume = 0.9;
-      audio.currentTime = 0;
-      const p = audio.play();
-      if (p && typeof p.catch === 'function') p.catch(() => {});
-    } catch (e) {}
-  }
   if (navigator.serviceWorker) {
     navigator.serviceWorker.addEventListener('message', (ev) => {
       const data = ev && ev.data;
       if (!data || data.type !== 'vaak-push') return;
-      lastPushSuppressAt = Date.now();
-      lastPushSuppressId = String(data.notification_id || '');
       if (typeof window.vaakPollNotif === 'function') window.vaakPollNotif();
     });
   }
@@ -21762,7 +21644,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   }
 
   function applyInboxUnread(notifCount, dmCount, opts) {
-    const play = !!(opts && opts.play);
     // While reading Notifications the server marks them read — never resurrect
     // the badge/chime from a racing poll on this same page.
     let n = notifView ? 0 : Math.max(0, parseInt(notifCount, 10) || 0);
@@ -21781,34 +21662,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     document.title = titleBits.length
       ? ('(' + titleBits.join(' · ') + ') ' + notifBaseTitle)
       : notifBaseTitle;
-    // Chime only when a real unread tip advances past both the read marker and
-    // the tip we already announced — never on count flicker or overall-latest fallback.
-    let shouldPlay = false;
-    let eventKey = '';
-    if (play && notifPollReady) {
-      const dmAdvanced = d > 0
-        && dmEventId !== ''
-        && lastDmEventId !== ''
-        && lastDmEventId !== '0'
-        && dmEventId !== lastDmEventId
-        && Number(dmEventId) > Number(lastDmEventId)
-        && d > lastDmCount;
-      const notifAdvanced = n > 0
-        && n > lastNotifCount
-        && notifEventId !== '0'
-        && lastNotifEventId !== ''
-        && lastNotifEventId !== '0'
-        && notifEventId !== lastNotifEventId
-        && snowflakeNewer(notifEventId, lastReadNotifId)
-        && snowflakeNewer(notifEventId, lastNotifEventId);
-      if (dmAdvanced || notifAdvanced) {
-        shouldPlay = true;
-        eventKey = (dmAdvanced ? 'dm:' + dmEventId : '') + (notifAdvanced ? '|notif:' + notifEventId : '');
-      }
-    }
-    if (shouldPlay) playNotifSound(eventKey);
-    lastNotifCount = n;
-    lastDmCount = d;
     // Tip tracking: only advance from a real unread tip; when caught up, pin to read marker.
     if (n > 0 && notifEventId !== '0') {
       if (lastNotifEventId === '' || lastNotifEventId === '0'
@@ -21826,13 +21679,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
   }
   applyInboxUnread(<?= (int) $notifUnreadNav ?>, <?= (int) $dmUnreadNav ?>, {
-    play: false,
     notifId: <?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,
     lastReadId: <?= json_encode($notifLastReadIdNav) ?>,
     dmId: <?= json_encode($dmLatestIdNav) ?>,
   });
   const pollNotif = async () => {
-    const navigationToken = Number(window.__vaakNavigationToken || 0);
     try {
       const res = await fetch('?ajax=notif_unread', {
         credentials: 'same-origin',
@@ -21848,17 +21699,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ? data.latest_unread_id
         : '';
       applyInboxUnread(count, data && data.dm_count, {
-        // A tab swap/page handoff can overlap this request.  Update badges
-        // during navigation, but never let that race produce a chime.
-        play: !window.__vaakNavigationPending
-          && navigationToken === Number(window.__vaakNavigationToken || 0),
         notifId: unreadTip,
         lastReadId: data && data.last_read_id,
         dmId: data && data.latest_dm_id,
       });
     } catch (e) {
-    } finally {
-      notifPollReady = true;
     }
   };
   const notifPollMs = () => (document.visibilityState === 'visible' ? 12000 : 45000);
@@ -23971,8 +23816,6 @@ window.apAdminToast = function (msg, isErr) {
   // is fetched, otherwise the old stream can occupy a PHP-FPM worker.
   window.addEventListener('pagehide', () => {
     window.__vaakNavigationPending = true;
-    window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
-    window.__vaakNavigationSuppressUntil = Date.now() + 3000;
     stopTimelineStream();
     if (streamFallbackTimer) {
       window.clearInterval(streamFallbackTimer);
@@ -24033,8 +23876,6 @@ window.apAdminToast = function (msg, isErr) {
     }
     if (nextView === viewName && !push) return;
     window.__vaakNavigationPending = true;
-    window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
-    window.__vaakNavigationSuppressUntil = Date.now() + 3000;
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
@@ -26704,8 +26545,6 @@ if (VIEW === 'analytics') loadAnalytics();
     // before the browser gets a chance to run a zero-delay timer.
     if (!ev.defaultPrevented) {
       window.__vaakNavigationPending = true;
-      window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
-      window.__vaakNavigationSuppressUntil = Date.now() + 3000;
       window.vaakShowLoading('Loading…');
     }
   }, true);
