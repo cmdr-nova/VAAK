@@ -629,6 +629,54 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $action = '';
         $view = 'home';
     }
+    if ($action === 'switch_account_add') {
+        $login = trim((string) ($_POST['account_login'] ?? ''));
+        $password = (string) ($_POST['account_password'] ?? '');
+        $code = trim((string) ($_POST['account_2fa_code'] ?? ''));
+        $view = 'account_switcher';
+        $candidate = ($login !== '' && $password !== '') ? ap_auth_verify_credentials($login, $password) : null;
+        if (!is_array($candidate)) {
+            $error = 'Account credentials were not accepted.';
+        } elseif (ap_auth_2fa_enabled((int) ($candidate['id'] ?? 0))
+            && !ap_auth_2fa_verify_code((int) ($candidate['id'] ?? 0), $code)
+        ) {
+            $error = 'That account requires a valid two-factor code.';
+        } else {
+            $ids = ap_auth_session_account_ids();
+            $candidateId = (int) ($candidate['id'] ?? 0);
+            if (!in_array($candidateId, $ids, true)) {
+                $ids[] = $candidateId;
+                ap_auth_session_set_account_ids($ids);
+            }
+            $notice = 'Account added. Select it below to switch.';
+        }
+    } elseif ($action === 'switch_account') {
+        $targetId = (int) ($_POST['account_id'] ?? 0);
+        $target = ap_auth_user_by_id($targetId);
+        $allowed = in_array($targetId, ap_auth_session_account_ids(), true);
+        if (!is_array($target) || !$allowed) {
+            $error = 'That account is not available in this session.';
+            $view = 'account_switcher';
+        } elseif (!ap_auth_switch_user($target)) {
+            $error = 'Could not switch accounts.';
+            $view = 'account_switcher';
+        } else {
+            $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
+            header('Location: ?view=' . rawurlencode($returnView), true, 303);
+            exit;
+        }
+    } elseif ($action === 'switch_account_remove') {
+        $removeId = (int) ($_POST['account_id'] ?? 0);
+        if ($removeId === $vaakOwnerId) {
+            $error = 'The active account cannot be removed.';
+        } else {
+            ap_auth_session_set_account_ids(array_values(array_filter(
+                ap_auth_session_account_ids(), static fn (int $id): bool => $id !== $removeId
+            )));
+            $notice = 'Account removed from this browser session.';
+        }
+        $view = 'account_switcher';
+    }
     if ($action === 'action_queue_status') {
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: no-store');
@@ -7250,6 +7298,7 @@ function view_title(string $view): string
         'remote_profile' => 'Remote profile',
         'status' => 'Post',
         'security' => 'Security',
+        'account_switcher' => 'Switch account',
         'stats' => 'AP stats',
         'guestbook' => 'Guestbook',
         'support' => 'Support',
@@ -15432,6 +15481,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       padding: .25rem .55rem;
       font-size: .72rem;
     }
+    .account-switcher { margin-top: .65rem; text-align: left; }
+    .account-switcher > summary { cursor: pointer; color: var(--muted); font-size: .75rem; list-style: none; }
+    .account-switcher > summary::-webkit-details-marker { display: none; }
+    .account-switcher > summary::before { content: '⇄'; color: var(--primary); margin-right: .35rem; }
+    .account-switcher__menu { margin-top: .4rem; padding: .35rem; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+    .account-switcher__item { width: 100%; display: flex; align-items: center; gap: .4rem; padding: .38rem .42rem; border: 0; border-radius: 5px; background: transparent; color: var(--text); text-align: left; cursor: pointer; font: inherit; font-size: .72rem; }
+    .account-switcher__item:hover, .account-switcher__item.is-current { background: color-mix(in srgb, var(--primary) 12%, transparent); }
+    .account-switcher__item img { width: 24px; height: 24px; border-radius: 50%; object-fit: cover; flex: 0 0 24px; }
+    .account-switcher__manage { display: block; margin-top: .3rem; padding: .35rem .42rem; color: var(--primary); font-size: .7rem; }
+    .account-switcher-page { max-width: 44rem; }
+    .account-switcher-page .switch-account-list { display: grid; gap: .55rem; margin: .8rem 0 1.25rem; }
+    .switch-account-row { display: flex; align-items: center; gap: .7rem; padding: .7rem; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+    .switch-account-row img { width: 42px; height: 42px; border-radius: 50%; object-fit: cover; flex: 0 0 42px; }
+    .switch-account-row .switch-account-meta { min-width: 0; flex: 1; }
+    .switch-account-row .switch-account-actions { display: flex; gap: .4rem; flex-wrap: wrap; justify-content: flex-end; }
     .brand-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); display: block; margin: .4rem auto .45rem; }
   </style>
 </head>
@@ -15460,6 +15524,32 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
+      <?php
+        $switchAccountRows = [];
+        foreach (ap_auth_session_account_ids() as $switchId) {
+            $switchRow = ap_auth_user_by_id((int) $switchId);
+            if (is_array($switchRow)) { $switchAccountRows[] = $switchRow; }
+        }
+      ?>
+      <details class="account-switcher"<?= $view === 'account_switcher' ? ' open' : '' ?>>
+        <summary>Switch account</summary>
+        <div class="account-switcher__menu">
+          <?php foreach ($switchAccountRows as $switchRow): ?>
+            <?php $switchRowId = (int) ($switchRow['id'] ?? 0); $switchRowKey = (string) ($switchRow['actor_key'] ?? $switchRow['username'] ?? ''); ?>
+            <form method="post" action="?view=account_switcher">
+              <input type="hidden" name="action" value="switch_account">
+              <input type="hidden" name="account_id" value="<?= $switchRowId ?>">
+              <input type="hidden" name="return_view" value="<?= h($view) ?>">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <button class="account-switcher__item<?= $switchRowId === $vaakOwnerId ? ' is-current' : '' ?>" type="submit">
+                <?= admin_avatar_img((string) ($switchRow['actor_id'] ?? ''), '', false) ?>
+                <span><?= h('@' . (string) ($switchRow['username'] ?? $switchRowKey)) ?><?= $switchRowId === $vaakOwnerId ? ' · current' : '' ?></span>
+              </button>
+            </form>
+          <?php endforeach; ?>
+          <a class="account-switcher__manage" href="?view=account_switcher">Manage accounts</a>
+        </div>
+      </details>
     </div>
     <?php
       $dmUnreadNav = ap_dm_unread_count();
@@ -17239,6 +17329,69 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
+
+      <?php elseif ($view === 'account_switcher'): ?>
+        <?php
+          $sessionAccounts = [];
+          foreach (ap_auth_session_account_ids() as $sessionAccountId) {
+              $sessionAccount = ap_auth_user_by_id((int) $sessionAccountId);
+              if (is_array($sessionAccount)) { $sessionAccounts[] = $sessionAccount; }
+          }
+        ?>
+        <section class="account-switcher-page">
+          <div class="tweet" style="margin-bottom:1rem">
+            <div class="who">Switch accounts</div>
+            <div class="body meta" style="margin-top:.45rem">
+              Keep multiple VAAK accounts available in this browser and switch between them without signing out.
+              Account passwords are used only to verify ownership and are never stored here.
+            </div>
+          </div>
+          <div class="tweet" style="margin-bottom:1rem">
+            <div class="who">Accounts in this session</div>
+            <div class="switch-account-list">
+              <?php foreach ($sessionAccounts as $sessionAccount): ?>
+                <?php
+                  $sessionAccountId = (int) ($sessionAccount['id'] ?? 0);
+                  $sessionAccountKey = (string) ($sessionAccount['actor_key'] ?? $sessionAccount['username'] ?? '');
+                ?>
+                <div class="switch-account-row">
+                  <?= admin_avatar_img((string) ($sessionAccount['actor_id'] ?? ''), '', false) ?>
+                  <div class="switch-account-meta">
+                    <strong><?= h((string) ($sessionAccount['username'] ?? $sessionAccountKey)) ?></strong>
+                    <div class="meta">@<?= h($sessionAccountKey) ?><?= $sessionAccountId === $vaakOwnerId ? ' · current' : '' ?></div>
+                  </div>
+                  <div class="switch-account-actions">
+                    <?php if ($sessionAccountId !== $vaakOwnerId): ?>
+                      <form method="post" action="?view=account_switcher">
+                        <input type="hidden" name="action" value="switch_account">
+                        <input type="hidden" name="account_id" value="<?= $sessionAccountId ?>">
+                        <input type="hidden" name="return_view" value="home">
+                        <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                        <button class="btn btn-primary" type="submit">Switch</button>
+                      </form>
+                      <form method="post" action="?view=account_switcher">
+                        <input type="hidden" name="action" value="switch_account_remove">
+                        <input type="hidden" name="account_id" value="<?= $sessionAccountId ?>">
+                        <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                        <button class="btn btn-ghost" type="submit">Remove</button>
+                      </form>
+                    <?php endif; ?>
+                  </div>
+                </div>
+              <?php endforeach; ?>
+            </div>
+          </div>
+          <form class="composer" method="post" action="?view=account_switcher" autocomplete="off">
+            <input type="hidden" name="action" value="switch_account_add">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <div class="who">Add another account</div>
+            <div class="meta" style="margin:.45rem 0 .7rem">Use that account’s VAAK username or email and password. If it has 2FA enabled, enter its current code too.</div>
+            <input type="text" name="account_login" required autocomplete="username" placeholder="Username or email">
+            <input type="password" name="account_password" required autocomplete="current-password" placeholder="Password" style="margin-top:.55rem">
+            <input type="text" name="account_2fa_code" inputmode="numeric" autocomplete="one-time-code" placeholder="2FA code (if enabled)" style="margin-top:.55rem">
+            <div class="composer-actions" style="margin-top:.75rem"><button class="btn btn-primary" type="submit">Add account</button></div>
+          </form>
+        </section>
 
       <?php elseif ($view === 'security'): ?>
         <?php

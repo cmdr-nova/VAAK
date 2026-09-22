@@ -561,10 +561,71 @@ function ap_auth_current_user(): ?array
     return ap_auth_user_by_id($id);
 }
 
+/**
+ * Account ids that this browser session has explicitly authenticated.
+ * Passwords are never retained; the allowlist is session-only.
+ * @return list<int>
+ */
+function ap_auth_session_account_ids(): array
+{
+    ap_auth_start_session();
+    $ids = [];
+    foreach ((array) ($_SESSION['vaak_account_ids'] ?? []) as $id) {
+        $id = (int) $id;
+        if ($id > 0 && !in_array($id, $ids, true)) {
+            $ids[] = $id;
+        }
+    }
+    $current = (int) ($_SESSION['vaak_user_id'] ?? 0);
+    if ($current > 0 && !in_array($current, $ids, true)) {
+        array_unshift($ids, $current);
+    }
+    $_SESSION['vaak_account_ids'] = $ids;
+    return $ids;
+}
+
+/** @param array<int,mixed> $ids */
+function ap_auth_session_set_account_ids(array $ids): void
+{
+    ap_auth_start_session();
+    $clean = [];
+    foreach ($ids as $id) {
+        $id = (int) $id;
+        if ($id > 0 && !in_array($id, $clean, true)) {
+            $clean[] = $id;
+        }
+    }
+    $_SESSION['vaak_account_ids'] = $clean;
+}
+
+/** Switch to an account that has already been authenticated in this session. */
+function ap_auth_switch_user(array $user): bool
+{
+    $id = (int) ($user['id'] ?? 0);
+    if ($id < 1) {
+        return false;
+    }
+    $ids = ap_auth_session_account_ids();
+    if (!in_array($id, $ids, true)) {
+        return false;
+    }
+    ap_auth_start_session();
+    session_regenerate_id(true);
+    $_SESSION['vaak_account_ids'] = $ids;
+    $_SESSION['vaak_user_id'] = $id;
+    $_SESSION['vaak_actor_key'] = (string) ($user['actor_key'] ?? '');
+    $_SESSION['vaak_is_admin'] = !empty($user['is_admin']) ? 1 : 0;
+    $_SESSION['_vaak_cookie_touched'] = time();
+    ap_auth_csrf_token();
+    ap_auth_emit_session_cookie();
+    return true;
+}
+
 function ap_auth_login_user(array $user): void
 {
     ap_auth_start_session();
     session_regenerate_id(true);
+    $_SESSION['vaak_account_ids'] = [(int) ($user['id'] ?? 0)];
     $_SESSION['vaak_user_id'] = (int) ($user['id'] ?? 0);
     $_SESSION['vaak_actor_key'] = (string) ($user['actor_key'] ?? '');
     $_SESSION['vaak_is_admin'] = !empty($user['is_admin']) ? 1 : 0;
