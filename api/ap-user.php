@@ -609,6 +609,17 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $profileTotal = function_exists('ap_outbox_count_for_actor')
         ? ap_outbox_count_for_actor($actorKey)
         : 0;
+    if ($hideProfileReplies && $profileTotal > 0) {
+        try {
+            $replyCountStmt = ap_db()->prepare(
+                "SELECT COUNT(*) FROM outbox_notes WHERE actor_key = ? AND in_reply_to IS NOT NULL AND TRIM(in_reply_to) <> ''"
+            );
+            $replyCountStmt->execute([$actorKey]);
+            $profileTotal = max(0, $profileTotal - (int) $replyCountStmt->fetchColumn());
+        } catch (Throwable $e) {
+            // Keep the existing count if an older schema lacks in_reply_to.
+        }
+    }
     $notes = function_exists('ap_outbox_list_page')
         ? ap_outbox_list_page($profilePerPage, ($profilePage - 1) * $profilePerPage, $actorKey)
         : ap_outbox_list($profilePerPage, $actorKey);
