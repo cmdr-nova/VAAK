@@ -33,8 +33,10 @@ running their own instance; it is not a one-command hosted-service installer.
 
 - Optional per-account Bluesky/PDS connection using an app password or a VAAK
   PDS account.
-- Native Bluesky timeline, profile, post, reply, quote, follow, favourite,
-  bookmark, moderation-list, and block/mute integration where supported.
+- Bluesky profile, post, reply, quote, follow, favourite, bookmark,
+  moderation-list, and block/mute integration where supported. Bluesky content
+  is surfaced through VAAK's unified views rather than a separate native
+  Bluesky timeline.
 - Optional cross-posting from VAAK to Bluesky, with origin markers used to
   deduplicate the ActivityPub and Bluesky copies.
 - Incremental, queued backfills for existing Bluesky posts, replies, boosts,
