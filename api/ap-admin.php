@@ -26135,6 +26135,19 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (fallbackHref) window.location.href = fallbackHref;
       return;
     }
+    // A focused post can leave the shared panel carrying inline-composer
+    // presentation styles. Normalize the panel/form before opening so the
+    // modal never collapses to just its heading.
+    panel.classList.remove('compose-inline-panel');
+    panel.classList.add('compose-tools-ready');
+    panel.style.display = 'flex';
+    panel.style.visibility = 'visible';
+    const editForm = panel.querySelector('#compose-form');
+    if (editForm) {
+      editForm.style.display = 'flex';
+      editForm.style.visibility = 'visible';
+      editForm.style.opacity = '1';
+    }
     applyEditChrome(noteId, returnView);
     // Instant fallback from data attrs while we fetch fresh text from DB
     let content = '';
