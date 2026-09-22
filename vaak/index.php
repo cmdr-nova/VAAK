@@ -471,13 +471,13 @@ ASCII;
       content: "WELCOME TO VAAK"; display: block; margin: 0 0 1rem;
       color: #00ff9f; font-size: .72rem; font-weight: 700; letter-spacing: .14em;
     }
-    .login-feed-scroll { display: grid; gap: .8rem; max-height: calc(min(78vh, 54rem) - 4rem); overflow: auto; padding-right: .25rem; }
+    .login-feed-scroll { display: grid; gap: 0; max-height: calc(min(78vh, 54rem) - 4rem); overflow: auto; padding-right: .25rem; }
     .login-feed-item {
-      border: 1px solid #2a2a2a; border-radius: 14px; padding: 1rem 1.05rem;
-      background: #111; box-shadow: 0 8px 24px rgba(0,0,0,.18);
+      border: 0; border-bottom: 1px solid #2a2a2a; border-radius: 0; padding: 1rem .35rem;
+      background: transparent; box-shadow: none;
     }
-    .login-feed-head { display: flex; gap: .45rem; align-items: baseline; font-size: .78rem; flex-wrap: wrap; }
-    .login-feed-head strong { color: #eee; font-size: .9rem; }
+    .login-feed-head { display: flex; gap: .5rem; align-items: baseline; font-size: .82rem; flex-wrap: wrap; }
+    .login-feed-head strong { color: #eee; font-size: 1rem; }
     .login-feed-head span { color: #9c9c9c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .login-feed-body { margin-top: .6rem; color: #d7d7d7; font-size: .92rem; line-height: 1.35; }
     .login-feed-body a { color: #62f5aa; text-decoration: none; overflow-wrap:anywhere; }
@@ -487,7 +487,10 @@ ASCII;
     .login-feed-kind { margin-top:.55rem; color:#70f3b0; font-size:.76rem; font-weight:650; }
     .login-feed-quote { margin-top:.7rem; padding:.65rem .75rem; border-left:3px solid #70f3b0; border-radius:0 9px 9px 0; background:#191919; color:#aaa; font-size:.8rem; }
     .login-feed-quote a { color:#70f3b0; }
-    .login-feed-item.remote { border-color: rgba(126,224,255,.27); }
+    .login-feed-actions { display:flex; gap:1.1rem; margin-top:.8rem; font-size:.8rem; }
+    .login-feed-actions a { color:#999; text-decoration:none; }
+    .login-feed-actions a:hover { color:#eee; text-decoration:underline; }
+    .login-feed-item.remote { border-color: #2a2a2a; }
     .login-feed-empty { color: #777; font-size: .85rem; padding: 1rem; }
     .brand { text-align: center; margin-bottom: 1.75rem; }
     .brand pre {
@@ -565,6 +568,7 @@ ASCII;
             <?php foreach ((array) $item['media'] as $mediaUrl): if (is_string($mediaUrl) && str_starts_with($mediaUrl, 'https://')): ?><img src="<?= htmlspecialchars($mediaUrl, ENT_QUOTES, 'UTF-8') ?>" loading="lazy" alt="Attached media"><?php endif; endforeach; ?>
           </div><?php endif; ?>
           <?php if (!empty($item['quoted']) && str_starts_with((string) ($item['object_id'] ?? ''), 'https://')): ?><div class="login-feed-quote">Quoted post · <a href="<?= htmlspecialchars((string) $item['object_id'], ENT_QUOTES, 'UTF-8') ?>" target="_blank" rel="noopener noreferrer">Open quoted post</a></div><?php endif; ?>
+          <?php if (str_starts_with((string) ($item['object_id'] ?? ''), 'https://')): ?><div class="login-feed-actions"><a href="<?= htmlspecialchars((string) $item['object_id'], ENT_QUOTES, 'UTF-8') ?>" target="_blank" rel="noopener noreferrer">Open</a></div><?php endif; ?>
         </article>
       <?php endforeach; endif; ?>
     </div>
@@ -692,7 +696,8 @@ ASCII;
           const quoteUrl = /^https:\/\//.test(String(item.object_id || '')) ? String(item.object_id) : '';
           const quote = item.quoted && quoteUrl ? `<div class="login-feed-quote">Quoted post · <a href="${esc(quoteUrl)}" target="_blank" rel="noopener noreferrer">Open quoted post</a></div>` : '';
           const mediaHtml = media.length ? `<div class="login-feed-media">${media.map((u) => `<img src="${esc(u)}" loading="lazy" alt="Attached media">`).join('')}</div>` : '';
-          return `<article class="login-feed-item${item.remote ? ' remote' : ''}"><div class="login-feed-head"><strong>${esc(item.actor)}</strong><span>${esc(item.acct)}</span></div>${kind ? `<div class="login-feed-kind">${kind}</div>` : ''}<div class="login-feed-body">${format(item.content || '')}</div>${mediaHtml}${quote}</article>`;
+          const open = quoteUrl ? `<div class="login-feed-actions"><a href="${esc(quoteUrl)}" target="_blank" rel="noopener noreferrer">Open</a></div>` : '';
+          return `<article class="login-feed-item${item.remote ? ' remote' : ''}"><div class="login-feed-head"><strong>${esc(item.actor)}</strong><span>${esc(item.acct)}</span></div>${kind ? `<div class="login-feed-kind">${kind}</div>` : ''}<div class="login-feed-body">${format(item.content || '')}</div>${mediaHtml}${quote}${open}</article>`;
         }).join('');
       };
       const refresh = () => fetch('/vaak/?mode=public-feed', {credentials: 'same-origin', cache: 'no-store'})
