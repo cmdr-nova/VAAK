@@ -71,7 +71,7 @@ function vaak_login_public_feed(int $limit = 14): array
 
     try {
         $st = $db->prepare(
-            "SELECT actor_id, summary, created_at, visibility
+            "SELECT *
              FROM events
              WHERE type IN ('Create', 'Quote', 'QuotePost', 'Announce')
                AND COALESCE(action_taken, '') NOT IN ('deleted', 'reject')
@@ -87,10 +87,17 @@ function vaak_login_public_feed(int $limit = 14): array
             if ($actorId === '' || $text === '') {
                 continue;
             }
+            $media = json_decode((string) ($row['media_urls'] ?? '[]'), true);
+            if (!is_array($media)) $media = [];
             $items[] = [
                 'actor_id' => $actorId,
                 'content' => $text,
                 'created_at' => (string) ($row['created_at'] ?? ''),
+                'type' => (string) ($row['type'] ?? 'Create'),
+                'object_id' => rtrim((string) ($row['object_id'] ?? ''), '/'),
+                'media' => array_values(array_filter(array_map(static function ($m): string {
+                    return is_string($m) ? $m : (is_array($m) ? (string) ($m['url'] ?? $m['href'] ?? '') : '');
+                }, $media), static fn(string $u): bool => str_starts_with($u, 'https://'))),
             ];
         }
     } catch (Throwable $e) {
@@ -101,7 +108,7 @@ function vaak_login_public_feed(int $limit = 14): array
     // event log. They are restricted to explicit public visibility as well.
     try {
         $st = $db->query(
-            "SELECT id, content, published
+            "SELECT *
              FROM outbox_notes
              WHERE COALESCE(visibility, 'public') = 'public'
                AND COALESCE(content, '') <> ''
@@ -117,10 +124,21 @@ function vaak_login_public_feed(int $limit = 14): array
             if ($text === '') {
                 continue;
             }
+            $media = [];
+            $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+            foreach ((array) ($raw['object']['attachment'] ?? $raw['attachment'] ?? []) as $att) {
+                if (is_array($att)) {
+                    $u = (string) ($att['url'] ?? $att['href'] ?? '');
+                    if (str_starts_with($u, 'https://')) $media[] = $u;
+                }
+            }
             $items[] = [
                 'actor_id' => $m[1],
                 'content' => $text,
                 'created_at' => (string) ($row['published'] ?? ''),
+                'type' => 'Create',
+                'object_id' => $noteId,
+                'media' => array_slice(array_values(array_unique($media)), 0, 4),
             ];
         }
     } catch (Throwable $e) {
@@ -189,7 +207,12 @@ function vaak_login_public_feed(int $limit = 14): array
             'content' => mb_strimwidth($content, 0, 260, '…', 'UTF-8'),
             'created_at' => (string) ($item['created_at'] ?? ''),
             'remote' => !$isLocal,
+            'type' => (string) ($item['type'] ?? 'Create'),
+            'object_id' => (string) ($item['object_id'] ?? ''),
+            'media' => array_slice((array) ($item['media'] ?? []), 0, 4),
         ];
+        $itemsOut['boosted'] = in_array(strtolower($itemsOut['type']), ['announce', 'boost'], true);
+        $itemsOut['quoted'] = in_array(strtolower($itemsOut['type']), ['quote', 'quotepost'], true);
         $out[] = $itemsOut;
         if (count($out) >= $limit) {
             break;
@@ -199,6 +222,17 @@ function vaak_login_public_feed(int $limit = 14): array
         ap_redis_json_set($cacheKey, $out, 30);
     }
     return $out;
+}
+
+function vaak_login_text_html(string $text): string
+{
+    $html = htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $html = preg_replace_callback('/https:\/\/[^\s<]+/', static function (array $m): string {
+        $url = $m[0];
+        return '<a href="' . $url . '" target="_blank" rel="noopener noreferrer">' . $url . '</a>';
+    }, $html) ?? $html;
+    $html = preg_replace('/(^|\s)(#[a-z0-9_]+)/i', '$1<a href="/vaak/?view=search&amp;q=$2">$2</a>', $html) ?? $html;
+    return nl2br($html, false);
 }
 
 // A tiny JSON endpoint used only by the logged-out background preview.
@@ -439,13 +473,20 @@ ASCII;
     }
     .login-feed-scroll { display: grid; gap: .8rem; max-height: calc(min(78vh, 54rem) - 4rem); overflow: auto; padding-right: .25rem; }
     .login-feed-item {
-      border: 1px solid rgba(255,255,255,.16); border-radius: 12px; padding: .9rem 1rem;
+      border: 1px solid #2a2a2a; border-radius: 14px; padding: 1rem 1.05rem;
       background: #111; box-shadow: 0 8px 24px rgba(0,0,0,.18);
     }
-    .login-feed-head { display: flex; gap: .45rem; align-items: baseline; font-size: .78rem; }
+    .login-feed-head { display: flex; gap: .45rem; align-items: baseline; font-size: .78rem; flex-wrap: wrap; }
     .login-feed-head strong { color: #eee; font-size: .9rem; }
     .login-feed-head span { color: #9c9c9c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .login-feed-body { margin-top: .6rem; color: #d7d7d7; font-size: .92rem; line-height: 1.35; }
+    .login-feed-body a { color: #62f5aa; text-decoration: none; overflow-wrap:anywhere; }
+    .login-feed-body a:hover { text-decoration: underline; }
+    .login-feed-media { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.45rem; margin-top:.7rem; }
+    .login-feed-media img { width:100%; aspect-ratio: 16/10; object-fit:cover; border-radius:9px; border:1px solid #2a2a2a; background:#050505; }
+    .login-feed-kind { margin-top:.55rem; color:#70f3b0; font-size:.76rem; font-weight:650; }
+    .login-feed-quote { margin-top:.7rem; padding:.65rem .75rem; border-left:3px solid #70f3b0; border-radius:0 9px 9px 0; background:#191919; color:#aaa; font-size:.8rem; }
+    .login-feed-quote a { color:#70f3b0; }
     .login-feed-item.remote { border-color: rgba(126,224,255,.27); }
     .login-feed-empty { color: #777; font-size: .85rem; padding: 1rem; }
     .brand { text-align: center; margin-bottom: 1.75rem; }
@@ -518,7 +559,12 @@ ASCII;
       <?php else: foreach ($loginFeed as $item): ?>
         <article class="login-feed-item<?= !empty($item['remote']) ? ' remote' : '' ?>">
           <div class="login-feed-head"><strong><?= htmlspecialchars((string) $item['actor'], ENT_QUOTES, 'UTF-8') ?></strong><span><?= htmlspecialchars((string) $item['acct'], ENT_QUOTES, 'UTF-8') ?></span></div>
-          <div class="login-feed-body"><?= nl2br(htmlspecialchars((string) $item['content'], ENT_QUOTES, 'UTF-8')) ?></div>
+          <?php if (!empty($item['boosted']) || !empty($item['quoted'])): ?><div class="login-feed-kind"><?= !empty($item['boosted']) ? '↻ boosted a post' : '❞ quoted a post' ?></div><?php endif; ?>
+          <div class="login-feed-body"><?= vaak_login_text_html((string) $item['content']) ?></div>
+          <?php if (!empty($item['media'])): ?><div class="login-feed-media">
+            <?php foreach ((array) $item['media'] as $mediaUrl): if (is_string($mediaUrl) && str_starts_with($mediaUrl, 'https://')): ?><img src="<?= htmlspecialchars($mediaUrl, ENT_QUOTES, 'UTF-8') ?>" loading="lazy" alt="Attached media"><?php endif; endforeach; ?>
+          </div><?php endif; ?>
+          <?php if (!empty($item['quoted']) && str_starts_with((string) ($item['object_id'] ?? ''), 'https://')): ?><div class="login-feed-quote">Quoted post · <a href="<?= htmlspecialchars((string) $item['object_id'], ENT_QUOTES, 'UTF-8') ?>" target="_blank" rel="noopener noreferrer">Open quoted post</a></div><?php endif; ?>
         </article>
       <?php endforeach; endif; ?>
     </div>
@@ -632,9 +678,22 @@ ASCII;
       const list = document.getElementById('login-live-feed-list');
       if (!list) return;
       const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+      const format = (value) => {
+        let html = esc(value);
+        html = html.replace(/(https:\/\/[^\s<]+)/g, '<a href="$1" rel="noopener noreferrer" target="_blank">$1</a>');
+        html = html.replace(/(^|\s)(#[a-z0-9_]+)/gi, '$1<a href="/vaak/?view=search&q=$2">$2</a>');
+        return html.replace(/\n/g, '<br>');
+      };
       const render = (items) => {
         if (!Array.isArray(items) || !items.length) return;
-        list.innerHTML = items.map((item) => `<article class="login-feed-item${item.remote ? ' remote' : ''}"><div class="login-feed-head"><strong>${esc(item.actor)}</strong><span>${esc(item.acct)}</span></div><div class="login-feed-body">${esc(item.content).replace(/\n/g, '<br>')}</div></article>`).join('');
+        list.innerHTML = items.map((item) => {
+          const media = Array.isArray(item.media) ? item.media.filter((u) => /^https:\/\//.test(u)).slice(0, 4) : [];
+          const kind = item.boosted ? '↻ boosted a post' : (item.quoted ? '❞ quoted a post' : '');
+          const quoteUrl = /^https:\/\//.test(String(item.object_id || '')) ? String(item.object_id) : '';
+          const quote = item.quoted && quoteUrl ? `<div class="login-feed-quote">Quoted post · <a href="${esc(quoteUrl)}" target="_blank" rel="noopener noreferrer">Open quoted post</a></div>` : '';
+          const mediaHtml = media.length ? `<div class="login-feed-media">${media.map((u) => `<img src="${esc(u)}" loading="lazy" alt="Attached media">`).join('')}</div>` : '';
+          return `<article class="login-feed-item${item.remote ? ' remote' : ''}"><div class="login-feed-head"><strong>${esc(item.actor)}</strong><span>${esc(item.acct)}</span></div>${kind ? `<div class="login-feed-kind">${kind}</div>` : ''}<div class="login-feed-body">${format(item.content || '')}</div>${mediaHtml}${quote}</article>`;
+        }).join('');
       };
       const refresh = () => fetch('/vaak/?mode=public-feed', {credentials: 'same-origin', cache: 'no-store'})
         .then((response) => response.ok ? response.json() : null)
