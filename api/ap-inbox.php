@@ -2324,7 +2324,11 @@ function ap_activity_is_direct_message(array $activity): bool
             $addressesLocal = true;
         }
     }
-    if (!$addressesLocal && !ap_activity_touches_local($activity)) {
+    // Do not use ap_activity_touches_local() here: it intentionally detects any
+    // local URL in an activity, but a private post can link to a VAAK blog page
+    // while being addressed to somebody else. DMs require an actual audience,
+    // Mention tag, or content mention for this local actor.
+    if (!$addressesLocal && !ap_activity_addresses_local_actor($activity, rtrim(LOCAL_ACTOR, '/'))) {
         return false;
     }
     // Prefer Note-like objects
