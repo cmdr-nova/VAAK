@@ -26128,6 +26128,13 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (supportsInlineComposer && isComposerInline()) {
       placeComposerInModal();
     }
+    // Focused/thread layouts can omit the inline slot. Do not leave an empty
+    // modal shell if the shared panel was not actually attached with a form.
+    if (!panel.querySelector('#compose-form') || !panel.querySelector('#compose-content')) {
+      const fallbackHref = btn.getAttribute('href') || '';
+      if (fallbackHref) window.location.href = fallbackHref;
+      return;
+    }
     applyEditChrome(noteId, returnView);
     // Instant fallback from data attrs while we fetch fresh text from DB
     let content = '';
