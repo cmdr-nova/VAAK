@@ -61,6 +61,11 @@ ap_auth_start_session();
 function vaak_login_public_feed(int $limit = 14): array
 {
     $limit = max(1, min(24, $limit));
+    $cacheKey = 'vaak:login-public-feed:v1:' . $limit;
+    $cached = function_exists('ap_redis_json_get') ? ap_redis_json_get($cacheKey) : null;
+    if (is_array($cached)) {
+        return $cached;
+    }
     $db = ap_db();
     $items = [];
 
@@ -189,6 +194,9 @@ function vaak_login_public_feed(int $limit = 14): array
         if (count($out) >= $limit) {
             break;
         }
+    }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($cacheKey, $out, 30);
     }
     return $out;
 }
@@ -412,27 +420,27 @@ ASCII;
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
     body {
-      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      margin: 0; min-height: 100vh; display: grid; grid-template-columns: minmax(20rem, 25rem) minmax(28rem, 54rem);
+      align-items: center; justify-content: center; gap: clamp(2rem, 6vw, 7rem);
       background: #000; color: #e8e8e8; overflow-x: hidden; position: relative;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      padding: 1.5rem;
+      padding: clamp(1.5rem, 5vw, 4rem);
     }
-    main { width: min(22rem, 100%); position: relative; z-index: 2; }
+    main { width: min(25rem, 100%); position: relative; z-index: 2; grid-column: 1; grid-row: 1; }
     .login-live-feed {
-      position: fixed; z-index: 0; top: 0; right: 0; width: min(54vw, 760px); height: 100vh;
-      overflow: hidden; padding: 5vh 3vw 5vh 2vw; pointer-events: none;
-      opacity: .22; filter: saturate(.72) blur(.2px);
-      mask-image: linear-gradient(to left, #000 58%, transparent 100%);
-      -webkit-mask-image: linear-gradient(to left, #000 58%, transparent 100%);
+      position: relative; z-index: 1; width: 100%; max-height: min(78vh, 54rem); grid-column: 2; grid-row: 1;
+      overflow: hidden; padding: 1.25rem; pointer-events: auto;
+      border: 1px solid #252525; border-radius: 18px; background: #080808;
+      box-shadow: 0 20px 70px rgba(0,0,0,.32);
     }
     .login-live-feed::before {
-      content: "PUBLIC VAAK TIMELINE"; display: block; margin: 0 0 1rem 1rem;
-      color: #00ff9f; font-size: .72rem; font-weight: 700; letter-spacing: .18em;
+      content: "PUBLIC LOCAL + FEDERATED TIMELINE"; display: block; margin: 0 0 1rem;
+      color: #00ff9f; font-size: .72rem; font-weight: 700; letter-spacing: .14em;
     }
-    .login-feed-scroll { display: grid; gap: .8rem; transform: rotate(-1deg); }
+    .login-feed-scroll { display: grid; gap: .8rem; max-height: calc(min(78vh, 54rem) - 4rem); overflow: auto; padding-right: .25rem; }
     .login-feed-item {
-      border: 1px solid rgba(255,255,255,.2); border-radius: 14px; padding: .9rem 1rem;
-      background: rgba(12,12,12,.82); box-shadow: 0 12px 35px rgba(0,0,0,.22);
+      border: 1px solid rgba(255,255,255,.16); border-radius: 12px; padding: .9rem 1rem;
+      background: #111; box-shadow: 0 8px 24px rgba(0,0,0,.18);
     }
     .login-feed-head { display: flex; gap: .45rem; align-items: baseline; font-size: .78rem; }
     .login-feed-head strong { color: #eee; font-size: .9rem; }
@@ -495,10 +503,10 @@ ASCII;
       text-align: center; margin-top: 1.15rem; font-size: .72rem; color: #555; line-height: 1.35;
     }
     @media (max-width: 760px) {
-      body { align-items: flex-start; padding-top: 2.25rem; }
-      .login-live-feed { width: 100vw; opacity: .09; padding: 1.5rem .75rem; mask-image: linear-gradient(to bottom, transparent 0, #000 25%, #000 75%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 25%, #000 75%, transparent 100%); }
-      .login-feed-scroll { transform: none; }
-      main { max-width: 22rem; }
+      body { display: flex; flex-direction: column; align-items: stretch; gap: 1.5rem; padding: 2.25rem 1rem; }
+      .login-live-feed { order: 2; max-height: 50vh; padding: 1rem; }
+      .login-feed-scroll { max-height: calc(50vh - 3.5rem); }
+      main { max-width: 25rem; margin: 0 auto; }
     }
   </style>
 </head>
