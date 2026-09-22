@@ -312,12 +312,6 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
     if (!is_string($json) || $json === '') {
         return;
     }
-    if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set(ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery), [
-            'created_at' => time(), 'body' => $json,
-        ], max(5, min(60, 20)));
-    }
-    @file_put_contents($file, $json, LOCK_EX);
     // Persist Link header bits for cache hits.
     $link = '';
     if ($statuses) {
@@ -335,6 +329,12 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
         }
         $link = implode(', ', $parts);
     }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set(ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery), [
+            'created_at' => time(), 'body' => $json, 'link' => $link,
+        ], max(5, min(60, 20)));
+    }
+    @file_put_contents($file, $json, LOCK_EX);
     @file_put_contents($file . '.link', $link, LOCK_EX);
 }
 
