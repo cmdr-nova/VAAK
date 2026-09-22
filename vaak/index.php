@@ -454,24 +454,24 @@ ASCII;
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
     body {
-      margin: 0; min-height: 100vh; display: grid; grid-template-columns: minmax(20rem, 25rem) minmax(28rem, 54rem);
-      align-items: center; justify-content: center; gap: clamp(2rem, 6vw, 7rem);
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
       background: #000; color: #e8e8e8; overflow-x: hidden; position: relative;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      padding: clamp(1.5rem, 5vw, 4rem);
+      padding: 1.5rem;
     }
-    main { width: min(25rem, 100%); position: relative; z-index: 2; grid-column: 1; grid-row: 1; }
+    main { width: min(22rem, 100%); position: relative; z-index: 2; }
     .login-live-feed {
-      position: relative; z-index: 1; width: 100%; max-height: min(78vh, 54rem); grid-column: 2; grid-row: 1;
-      overflow: hidden; padding: 1.25rem; pointer-events: auto;
-      border: 1px solid #252525; border-radius: 18px; background: #080808;
-      box-shadow: 0 20px 70px rgba(0,0,0,.32);
+      position: fixed; z-index: 0; top: 0; right: 0; width: min(54vw, 760px); height: 100vh;
+      overflow: hidden; padding: 5vh 3vw 5vh 2vw; pointer-events: none;
+      opacity: .28; filter: saturate(.78) blur(.2px); transform: rotate(-1deg); transform-origin: 100% 50%;
+      mask-image: linear-gradient(to left, #000 58%, transparent 100%);
+      -webkit-mask-image: linear-gradient(to left, #000 58%, transparent 100%);
     }
     .login-live-feed::before {
-      content: "WELCOME TO VAAK"; display: block; margin: 0 0 1rem;
+      content: "WELCOME TO VAAK"; display: block; margin: 0 0 1rem 1rem;
       color: #00ff9f; font-size: .72rem; font-weight: 700; letter-spacing: .14em;
     }
-    .login-feed-scroll { display: grid; gap: 0; max-height: calc(min(78vh, 54rem) - 4rem); overflow: auto; padding-right: .25rem; }
+    .login-feed-scroll { display: grid; gap: 0; max-height: none; overflow: hidden; padding-right: .25rem; }
     .login-feed-item {
       border: 0; border-bottom: 1px solid #2a2a2a; border-radius: 0; padding: 1rem .35rem;
       background: transparent; box-shadow: none;
@@ -547,9 +547,9 @@ ASCII;
       text-align: center; margin-top: 1.15rem; font-size: .72rem; color: #555; line-height: 1.35;
     }
     @media (max-width: 760px) {
-      body { display: flex; flex-direction: column; align-items: stretch; gap: 1.5rem; padding: 2.25rem 1rem; }
-      .login-live-feed { order: 2; max-height: 50vh; padding: 1rem; }
-      .login-feed-scroll { max-height: calc(50vh - 3.5rem); }
+      body { align-items: flex-start; padding-top: 2.25rem; }
+      .login-live-feed { width: 100vw; opacity: .1; padding: 1.5rem .75rem; transform: none; mask-image: linear-gradient(to bottom, transparent 0, #000 25%, #000 75%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 25%, #000 75%, transparent 100%); }
+      .login-feed-scroll { transform: none; }
       main { max-width: 25rem; margin: 0 auto; }
     }
   </style>
