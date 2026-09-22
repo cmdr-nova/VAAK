@@ -511,7 +511,7 @@ ASCII;
   </style>
 </head>
 <body>
-  <aside class="login-live-feed" aria-hidden="true">
+  <aside class="login-live-feed" aria-label="Public Local and Federated timeline preview">
     <div class="login-feed-scroll" id="login-live-feed-list">
       <?php if (!$loginFeed): ?>
         <div class="login-feed-empty">Public posts will appear here.</div>
