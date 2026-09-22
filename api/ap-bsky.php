@@ -1233,16 +1233,20 @@ function ap_bsky_reply_ref_for_parent(array $parent, int $ownerUserId): array
  */
 function ap_bsky_session_row(int $ownerUserId): ?array
 {
+    static $memo = [];
     if ($ownerUserId < 1) {
         return null;
+    }
+    if (array_key_exists($ownerUserId, $memo)) {
+        return $memo[$ownerUserId];
     }
     try {
         $st = ap_db()->prepare('SELECT * FROM bsky_sessions WHERE owner_user_id = ? LIMIT 1');
         $st->execute([$ownerUserId]);
         $row = $st->fetch();
-        return is_array($row) ? $row : null;
+        return $memo[$ownerUserId] = is_array($row) ? $row : null;
     } catch (Throwable $e) {
-        return null;
+        return $memo[$ownerUserId] = null;
     }
 }
 
@@ -3935,6 +3939,14 @@ function ap_bsky_index_as2_note_links(array $note): void
  */
 function ap_bsky_get_preferences(int $ownerUserId): array
 {
+    $cachePath = sys_get_temp_dir() . '/vaak-bsky-prefs-' . $ownerUserId . '.json';
+    if (is_file($cachePath) && (time() - (int) @filemtime($cachePath)) < 600) {
+        $raw = @file_get_contents($cachePath);
+        $j = is_string($raw) ? json_decode($raw, true) : null;
+        if (is_array($j) && isset($j['preferences']) && is_array($j['preferences'])) {
+            return ['ok' => true, 'preferences' => $j['preferences'], 'cached' => true];
+        }
+    }
     $tok = ap_bsky_access_token($ownerUserId, false);
     if (empty($tok['ok'])) {
         $tok = ap_bsky_access_token($ownerUserId, true);
@@ -3944,14 +3956,6 @@ function ap_bsky_get_preferences(int $ownerUserId): array
     }
     $row = ap_bsky_session_row($ownerUserId);
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
-    $cachePath = sys_get_temp_dir() . '/vaak-bsky-prefs-' . $ownerUserId . '.json';
-    if (is_file($cachePath) && (time() - (int) @filemtime($cachePath)) < 600) {
-        $raw = @file_get_contents($cachePath);
-        $j = is_string($raw) ? json_decode($raw, true) : null;
-        if (is_array($j) && isset($j['preferences']) && is_array($j['preferences'])) {
-            return ['ok' => true, 'preferences' => $j['preferences'], 'cached' => true];
-        }
-    }
     $lastErr = 'getPreferences failed';
     $res = null;
     foreach (ap_bsky_feed_hosts($pds) as $apiHost) {
@@ -4169,6 +4173,22 @@ function ap_bsky_tl_cache_get(string $key, int $ttlSec = 60): ?array
     return $j;
 }
 
+/** Return an expired head while a queue worker refreshes it. */
+function ap_bsky_tl_cache_get_stale(string $key, int $maxAgeSec = 900): ?array
+{
+    $path = ap_bsky_tl_cache_dir() . '/' . preg_replace('/[^a-zA-Z0-9_.-]/', '_', $key) . '.json';
+    if (!is_file($path)) {
+        return null;
+    }
+    $age = time() - (int) @filemtime($path);
+    if ($age < 0 || $age >= max(120, $maxAgeSec)) {
+        return null;
+    }
+    $raw = @file_get_contents($path);
+    $j = is_string($raw) ? json_decode($raw, true) : null;
+    return is_array($j) && isset($j['feed']) && is_array($j['feed']) ? $j : null;
+}
+
 function ap_bsky_tl_cache_put(string $key, array $feed, ?string $cursor, string $source = 'home'): void
 {
     $path = ap_bsky_tl_cache_dir() . '/' . preg_replace('/[^a-zA-Z0-9_.-]/', '_', $key) . '.json';
@@ -4243,6 +4263,37 @@ function ap_bsky_following_feed(
 ): array {
     $t0 = microtime(true);
     $isHead = ($cursor === null || $cursor === '');
+    // The first paint should never wait for an expired Bluesky head. Serve the
+    // last warm page and let the queue worker refresh it for the next request.
+    if ($isHead && !$includeMerge && $prefsPreparsed === null) {
+        $fastKey = ap_bsky_tl_cache_key($ownerUserId, 'following', null, false);
+        $cached = ap_bsky_tl_cache_get($fastKey, 60);
+        if ($cached === null) {
+            $cached = ap_bsky_tl_cache_get_stale($fastKey, 900);
+            if ($cached !== null) {
+                ap_bsky_background_sync_enqueue($ownerUserId, 'timeline');
+            }
+        }
+        if ($cached !== null) {
+            $prefsRaw = ap_bsky_get_preferences($ownerUserId);
+            $prefs = ap_bsky_parse_feed_prefs(
+                !empty($prefsRaw['ok']) && is_array($prefsRaw['preferences'] ?? null)
+                    ? $prefsRaw['preferences'] : []
+            );
+            $feed = ap_bsky_filter_hidden_authors($ownerUserId, $cached['feed']);
+            ap_bsky_schedule_hide_refresh($ownerUserId);
+            return [
+                'ok' => true,
+                'feed' => array_slice($feed, 0, $limit),
+                'cursor' => $cached['cursor'] ?? null,
+                'source' => (string) ($cached['source'] ?? 'home'),
+                'prefs' => $prefs,
+                'cache' => 'stale',
+                'merge_pending' => !empty($prefs['mergeFeedEnabled']) && ($prefs['savedFeedUris'] ?? []) !== [],
+                'timing_ms' => (int) round((microtime(true) - $t0) * 1000),
+            ];
+        }
+    }
     $prefs = is_array($prefsPreparsed) ? $prefsPreparsed : null;
     if ($prefs === null) {
         $prefsRaw = ap_bsky_get_preferences($ownerUserId);
@@ -5117,11 +5168,11 @@ function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 /** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
 function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
 {
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs', 'reposts'], true)
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs', 'reposts', 'timeline'], true)
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
-    $cooldown = 300;
+    $cooldown = $collection === 'timeline' ? 45 : 300;
     try {
         $st = ap_db()->prepare('SELECT status, queued_at FROM bsky_actor_refresh_queue WHERE owner_user_id = ? AND actor_ref = ? LIMIT 1');
         $st->execute([$ownerUserId, $actorRef]);
@@ -6610,6 +6661,20 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                     $result = ap_bsky_get_bookmarks($owner, 200, true);
                 } elseif ($kind === 'bookmarks') {
                     $result = ['ok' => true, 'skipped' => true];
+                } elseif ($kind === 'timeline') {
+                    // Refresh only the durable head. Page requests consume the
+                    // previous head and never wait on this network call.
+                    $result = ap_bsky_get_timeline($owner, 40, null);
+                    if (!empty($result['ok']) && is_array($result['feed'] ?? null)) {
+                        $feed = ap_bsky_filter_hidden_authors($owner, $result['feed']);
+                        ap_bsky_index_feed_items($feed, $owner, 15);
+                        ap_bsky_tl_cache_put(
+                            ap_bsky_tl_cache_key($owner, 'following', null, false),
+                            $feed,
+                            isset($result['cursor']) && is_string($result['cursor']) ? $result['cursor'] : null,
+                            (string) ($result['source'] ?? 'home')
+                        );
+                    }
                 } elseif ($kind === 'follows') {
                     $result = function_exists('ap_bsky_follow_sync_worker')
                         ? ap_bsky_follow_sync_worker($owner)
