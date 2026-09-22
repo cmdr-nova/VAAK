@@ -4796,6 +4796,59 @@ function admin_home_item_preference_actor(array $item): string
 }
 
 /**
+ * Read a bounded set of recent local interaction signals for Home ranking.
+ * This never performs network work and is only called while rebuilding the
+ * short-lived ranked cache.
+ * @return array<string,float>
+ */
+function admin_home_signal_actor_weights(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) return [];
+    try {
+        $st = ap_db()->prepare(
+            "SELECT signal_type, weight, metadata_json, created_at
+             FROM ap_user_signals
+             WHERE owner_user_id = ? AND created_at >= ?
+             ORDER BY id DESC LIMIT 500"
+        );
+        $st->execute([$ownerUserId, gmdate('c', time() - 45 * 86400)]);
+        $weights = [];
+        $kindWeight = [
+            'like' => 1.4,
+            'boost' => 1.2,
+            'reply' => 1.0,
+            'bookmark' => 1.1,
+            'follow' => 0.6,
+        ];
+        $now = time();
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $base = (float) ($row['weight'] ?? 0);
+            if ($base <= 0) continue;
+            $meta = json_decode((string) ($row['metadata_json'] ?? '{}'), true);
+            if (!is_array($meta)) $meta = [];
+            $actor = rtrim(trim((string) ($meta['target_actor'] ?? '')), '/');
+            if ($actor === '') $actor = rtrim(trim((string) ($meta['author_did'] ?? '')), '/');
+            if ($actor === '') {
+                $handle = ltrim(trim((string) ($meta['author_handle'] ?? '')), '@');
+                if ($handle !== '') $actor = 'https://bsky.app/profile/' . rawurlencode($handle);
+            }
+            if ($actor === '') continue;
+            $kind = strtolower((string) ($row['signal_type'] ?? ''));
+            $multiplier = (float) ($kindWeight[$kind] ?? 0.5);
+            $age = max(0, $now - (strtotime((string) ($row['created_at'] ?? '')) ?: $now));
+            // Half-life of two weeks keeps recent intent useful without
+            // making a single old interaction permanently dominate Home.
+            $decay = exp(-$age / (14 * 86400));
+            $weights[$actor] = min(24.0, (float) ($weights[$actor] ?? 0) + ($base * $multiplier * $decay));
+        }
+        return $weights;
+    } catch (Throwable $e) {
+        // Recommendations are optional; a missing migration must not affect Home.
+        return [];
+    }
+}
+
+/**
  * Nudge recent posts from authors the user repeatedly favourites.
  *
  * The maximum adjustment is 30 minutes, so this cannot turn the feed into a
@@ -4807,6 +4860,11 @@ function admin_home_item_preference_actor(array $item): string
 function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): array
 {
     $weights = admin_home_favourite_actor_weights($ownerUserId);
+    foreach (admin_home_signal_actor_weights($ownerUserId) as $actor => $weight) {
+        // Keep the existing favourite counts as the primary signal while
+        // letting other recent actions provide a modest, bounded nudge.
+        $weights[$actor] = min(64, (float) ($weights[$actor] ?? 0) + $weight);
+    }
     $tagWeights = admin_home_favourite_tag_weights($ownerUserId);
     if ($weights === [] && $tagWeights === []) {
         return $timeline;
