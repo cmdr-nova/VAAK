@@ -26116,6 +26116,18 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   function openEditComposer(btn) {
     const noteId = btn.getAttribute('data-note-id') || '';
     const returnView = btn.getAttribute('data-return-view') || 'outbox';
+    const panel = getComposePanel();
+    // Timeline pages render one shared composer inline. Move that actual panel
+    // into the modal before changing its controls; otherwise a modal shell can
+    // open while the editable form remains hidden in the feed slot.
+    if (!panel) {
+      const fallbackHref = btn.getAttribute('href') || '';
+      if (fallbackHref) window.location.href = fallbackHref;
+      return;
+    }
+    if (supportsInlineComposer && isComposerInline()) {
+      placeComposerInModal();
+    }
     applyEditChrome(noteId, returnView);
     // Instant fallback from data attrs while we fetch fresh text from DB
     let content = '';
@@ -26143,7 +26155,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       // Only apply if still editing this note
       if (composeMode !== 'edit_status') return;
       if (noteIdField && noteIdField.value !== noteId) return;
-      fillEditFields(data.content || '', data.spoiler_text || '', !!data.sensitive);
+      // Keep the button's immediate text fallback when an older/media-only
+      // row has no content_text; never turn a usable edit form blank.
+      if (String(data.content || '') !== '' || content === '') {
+        fillEditFields(data.content || '', data.spoiler_text || '', !!data.sensitive);
+      }
     }).catch(() => { /* keep attribute fallback */ });
   }
 
