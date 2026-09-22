@@ -13220,8 +13220,10 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
             $snipShow = substr($nSnippet, 0, 280) . '…';
         }
         // Strip API reply-context prefix when we render a separate "In reply to" block.
-        if (is_string($snipShow) && preg_match('/^↩\s+.+/u', $snipShow)) {
-            $snipShow = preg_replace('/^↩\s+.+(?:\n\n|$)/u', '', $snipShow, 1) ?? $snipShow;
+        if (is_string($snipShow) && preg_match('/^↩\s+/u', $snipShow)) {
+            // API reply status content may contain a multiline parent teaser;
+            // strip the whole teaser, not just its first line.
+            $snipShow = preg_replace('/^↩\s+.*?(?:\n\n|$)/su', '', $snipShow, 1) ?? $snipShow;
             $snipShow = trim($snipShow);
             $nSnippet = $snipShow;
         }
