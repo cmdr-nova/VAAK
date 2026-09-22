@@ -3990,8 +3990,8 @@ $tlOffset = isset($_GET['offset']) ? max(0, (int) $_GET['offset']) : 0;
 $isPartial = isset($_GET['partial']) && (string) $_GET['partial'] === '1';
 // Live "anything new?" polls must stay cheap — skip full timeline rebuilds.
 $wantNewerPoll = $isPartial
-    && isset($_GET['newer'])
-    && (string) $_GET['newer'] === '1'
+    && ((isset($_GET['newer']) && (string) $_GET['newer'] === '1')
+        || (isset($_GET['stream']) && (string) $_GET['stream'] === '1'))
     && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true);
 
 // Stats-only event COUNTs (were previously paid on every full-page nav click).
@@ -12371,7 +12371,61 @@ if ($isPartial && $view === 'bluesky') {
 if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)) {
     // Live poll: items newer than the client's current head (no scroll jump on server).
     $wantNewer = isset($_GET['newer']) && (string) $_GET['newer'] === '1';
+    $wantStream = isset($_GET['stream']) && (string) $_GET['stream'] === '1';
     $sinceTs = isset($_GET['since']) ? (int) $_GET['since'] : 0;
+    if ($wantStream) {
+        // Keep each SSE connection bounded. The browser reconnects immediately
+        // after completion, while heartbeats keep proxies from buffering it.
+        header('Content-Type: text/event-stream; charset=utf-8');
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+        header('Connection: keep-alive');
+        header('X-Accel-Buffering: no');
+        @ini_set('output_buffering', 'off');
+        @ini_set('zlib.output_compression', '0');
+        @set_time_limit(28);
+        while (ob_get_level() > 0) @ob_end_flush();
+        echo ": vaak-stream\n\n";
+        @flush();
+        $streamSince = max(0, $sinceTs);
+        $streamDeadline = microtime(true) + 24.0;
+        while ($streamSince > 0 && microtime(true) < $streamDeadline) {
+            $slice = admin_tl_fetch_newer($view, $following, $streamSince, max(8, min(30, $tlLimit)));
+            $newest = $streamSince;
+            $html = '';
+            if ($slice !== []) {
+                ob_start();
+                foreach ($slice as $item) {
+                    $newest = max($newest, (int) ($item['sort'] ?? 0));
+                    if (admin_timeline_item_muted_by_words($item)) continue;
+                    if ($view === 'gallery') {
+                        admin_render_gallery_cell($item, $followingIds, 'gallery');
+                    } elseif ($view === 'vakktok') {
+                        admin_render_vakktok_cell($item);
+                    } else {
+                        admin_render_timeline_item($item, $followingIds, $view);
+                    }
+                }
+                $html = (string) ob_get_clean();
+            }
+            if ($newest > $streamSince || $html !== '') {
+                $payload = json_encode([
+                    'html' => $html,
+                    'count' => count($slice),
+                    'newest' => $newest,
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                echo "event: posts\n";
+                echo 'data: ' . (is_string($payload) ? $payload : '{}') . "\n\n";
+                $streamSince = max($streamSince, $newest);
+            } else {
+                echo ": heartbeat\n\n";
+            }
+            @flush();
+            if (microtime(true) < $streamDeadline) sleep(3);
+        }
+        echo "event: close\ndata: {}\n\n";
+        @flush();
+        exit;
+    }
     if ($wantNewer) {
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
@@ -23645,13 +23699,83 @@ window.apAdminToast = function (msg, isErr) {
     ptrCollapse();
   }, { passive: true });
 
-  // Auto-hydrate: poll for newer posts; keep ↻ Refresh for a full reload.
-  setInterval(pollNewer, POLL_MS);
+  // Auto-hydrate: use a bounded SSE stream for near-real-time updates. The
+  // established timestamp poll remains the fallback for older browsers,
+  // proxies that buffer SSE, and transient stream failures.
+  let timelineStream = null;
+  let streamReconnectTimer = 0;
+  let streamFallbackTimer = 0;
+  function stopTimelineStream() {
+    if (timelineStream) {
+      timelineStream.close();
+      timelineStream = null;
+    }
+    if (streamReconnectTimer) {
+      window.clearTimeout(streamReconnectTimer);
+      streamReconnectTimer = 0;
+    }
+  }
+  function scheduleStreamReconnect() {
+    if (streamReconnectTimer || document.hidden) return;
+    streamReconnectTimer = window.setTimeout(() => {
+      streamReconnectTimer = 0;
+      startTimelineStream();
+    }, 1200);
+  }
+  function startTimelineStream() {
+    if (!window.EventSource || document.hidden || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
+    const url = '?view=' + encodeURIComponent(viewName)
+      + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
+      + '&limit=' + encodeURIComponent(String(Math.min(24, limit)));
+    try {
+      timelineStream = new EventSource(url, { withCredentials: true });
+      timelineStream.addEventListener('posts', (event) => {
+        try {
+          const payload = JSON.parse(event.data || '{}');
+          const newest = parseInt(payload.newest || '0', 10);
+          if (newest > newestTs) {
+            newestTs = newest;
+            items.dataset.newest = String(newestTs);
+          }
+          const filtered = filterNewHtml(payload.html || '');
+          if (!filtered.count) return;
+          pendingHtml = filtered.html + pendingHtml;
+          pendingCount += filtered.count;
+          updateNewBtn();
+        } catch (e) {}
+      });
+      timelineStream.addEventListener('close', () => {
+        stopTimelineStream();
+        scheduleStreamReconnect();
+      });
+      timelineStream.onerror = () => {
+        stopTimelineStream();
+        if (!streamFallbackTimer) streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+        scheduleStreamReconnect();
+      };
+      if (streamFallbackTimer) {
+        window.clearInterval(streamFallbackTimer);
+        streamFallbackTimer = 0;
+      }
+    } catch (e) {
+      timelineStream = null;
+      if (!streamFallbackTimer) streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+    }
+  }
+  if (window.EventSource && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
+    startTimelineStream();
+  } else {
+    streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+  }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') pollNewer();
+    if (document.visibilityState === 'visible') {
+      pollNewer();
+      startTimelineStream();
+    } else {
+      stopTimelineStream();
+    }
   });
-  // Prime shortly after paint; subsequent checks use the two-minute cadence.
-  setTimeout(pollNewer, 5000);
+  setTimeout(() => { pollNewer(); startTimelineStream(); }, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
 
