@@ -4703,6 +4703,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         ? ap_db_owner_actor_id_for_user_id($ownerUserId)
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
+    $redisKey = 'vaak:notifications:v1:' . $ownerUserId . ':' . hash('sha256', json_encode([
+        'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+    if (function_exists('ap_redis_json_get')) {
+        $redisCached = ap_redis_json_get($redisKey);
+        if (is_array($redisCached)) return $redisCached;
+    }
 
     if (array_intersect($want, $mentionTypes)) {
         // The page only hydrates the first handful of notifications. Scan a
@@ -4845,6 +4852,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             break;
         }
     }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $out, 5);
+    }
     return $out;
 }
 
@@ -4872,6 +4882,18 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
     // Keep page-load badge snappy, but ajax polling must not sit on a 45s lie.
     $cacheTtl = $bypassCache ? 0 : 12;
+    $redisKey = 'vaak:notifications:v1:unread:' . $ownerUserId . ':' . $scan . ':' . hash('sha256', $lastRead);
+    if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
+        $redisCached = ap_redis_json_get($redisKey);
+        if (is_array($redisCached) && isset($redisCached['c'])) {
+            return [
+                'count' => max(0, min($scan, (int) $redisCached['c'])),
+                'last_read_id' => $lastRead,
+                'latest_unread_id' => (string) ($redisCached['u'] ?? ''),
+                'latest_id' => (string) ($redisCached['l'] ?? ''),
+            ];
+        }
+    }
     $cacheDir = '/var/lib/mkultra/ap';
     if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
         $cacheDir = sys_get_temp_dir();
@@ -5024,6 +5046,9 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         'l' => $latestId,
         'ts' => time(),
     ];
+    if ($cacheTtl > 0 && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $payload, $cacheTtl);
+    }
     @file_put_contents($cachePath, json_encode($payload), LOCK_EX);
     return [
         'count' => $count,
@@ -5123,6 +5148,9 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
         $ownerUserId = function_exists('ap_db_masto_owner_user_id')
             ? ap_db_masto_owner_user_id()
             : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+        if (function_exists('ap_redis_delete_pattern')) {
+            ap_redis_delete_pattern('vaak:notifications:v1:unread:' . (int) $ownerUserId . ':*');
+        }
         $cacheDir = '/var/lib/mkultra/ap';
         if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
             $cacheDir = sys_get_temp_dir();

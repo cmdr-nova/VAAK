@@ -1,7 +1,7 @@
 # VAAK
 
 **Status:** alpha  
-**Version:** `0.2.21` · `2026-09-21`
+**Version:** `0.3.0` · `2026-09-22`
 
 VAAK is the multi-user ActivityPub/Mastodon-compatible web application used by
 the Vaak instance. This repository contains only the VAAK application and its

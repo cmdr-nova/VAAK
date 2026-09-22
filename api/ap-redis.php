@@ -93,6 +93,21 @@ function ap_redis_delete(string ...$keys): void
     try { $redis->del($keys); } catch (Throwable $e) { error_log('[ap-redis] delete failed: ' . $e->getMessage()); }
 }
 
+function ap_redis_delete_pattern(string $pattern): void
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis || $pattern === '') return;
+    try {
+        $iterator = null;
+        while (($keys = $redis->scan($iterator, $pattern, 100)) !== false) {
+            if ($keys !== []) $redis->del($keys);
+            if ($iterator === 0) break;
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-redis] pattern delete failed: ' . $e->getMessage());
+    }
+}
+
 /** Best-effort short lock used to coalesce refresh work. */
 function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
 {

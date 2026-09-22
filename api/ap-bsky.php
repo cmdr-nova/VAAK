@@ -6270,6 +6270,12 @@ function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0,
         $keys[] = 'https://bsky.app/profile/' . rawurlencode($actorRef);
     }
     $keys = array_values(array_unique(array_filter($keys)));
+    $redisKey = 'vaak:profile:v1:bsky:' . ($ownerUserId > 0 ? $ownerUserId . ':' : 'public:')
+        . hash('sha256', implode("\n", $keys));
+    if (function_exists('ap_redis_json_get')) {
+        $redisCached = ap_redis_json_get($redisKey);
+        if (is_array($redisCached)) return $redisCached;
+    }
     try {
         $row = null;
         $st = $db->prepare('SELECT * FROM bsky_actor_profiles WHERE actor_ref = ? LIMIT 1');
@@ -6315,6 +6321,9 @@ function ap_bsky_actor_profile_cache_get(string $actorRef, int $ownerUserId = 0,
                 ];
             }
         }
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, $out, 300);
+        }
         return $out;
     } catch (Throwable $e) {
         return null;
@@ -6333,6 +6342,9 @@ function ap_bsky_actor_profile_cache_upsert(string $actorRef, int $ownerUserId, 
     $json = json_encode($profile, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($json)) return;
     $now = gmdate('c');
+    if (function_exists('ap_redis_delete_pattern')) {
+        ap_redis_delete_pattern('vaak:profile:v1:bsky:' . ($ownerUserId > 0 ? $ownerUserId . ':' : 'public:') . '*');
+    }
     try {
         $st = $db->prepare('INSERT INTO bsky_actor_profiles (actor_ref, did, profile_json, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (actor_ref) DO UPDATE SET did = excluded.did, profile_json = excluded.profile_json, updated_at = excluded.updated_at');
         $st->execute([$actorRef, $did !== '' ? $did : null, $json, $now]);
