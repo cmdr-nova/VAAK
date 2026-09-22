@@ -21822,7 +21822,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ? data.latest_unread_id
         : '';
       applyInboxUnread(count, data && data.dm_count, {
-        play: true,
+        // A tab swap/page handoff can overlap this request.  Update badges
+        // during navigation, but never let that race produce a chime.
+        play: !window.__vaakNavigationPending,
         notifId: unreadTip,
         lastReadId: data && data.last_read_id,
         dmId: data && data.latest_dm_id,
@@ -23888,14 +23890,14 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
   function scheduleStreamReconnect() {
-    if (streamReconnectTimer || document.hidden) return;
+    if (streamReconnectTimer || document.hidden || window.__vaakNavigationPending) return;
     streamReconnectTimer = window.setTimeout(() => {
       streamReconnectTimer = 0;
       startTimelineStream();
     }, 1200);
   }
   function startTimelineStream() {
-    if (!window.EventSource || document.hidden || !nearTop() || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
+    if (!window.EventSource || document.hidden || window.__vaakNavigationPending || !nearTop() || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
     const url = '?view=' + encodeURIComponent(viewName)
       + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
       + '&limit=' + encodeURIComponent(String(Math.min(24, limit)));
@@ -23937,6 +23939,17 @@ window.apAdminToast = function (msg, isErr) {
       if (!streamFallbackTimer) streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
     }
   }
+  // Full-page navigation must release the SSE connection immediately.  The
+  // browser may keep the old document alive briefly while the next timeline
+  // is fetched, otherwise the old stream can occupy a PHP-FPM worker.
+  window.addEventListener('pagehide', () => {
+    window.__vaakNavigationPending = true;
+    stopTimelineStream();
+    if (streamFallbackTimer) {
+      window.clearInterval(streamFallbackTimer);
+      streamFallbackTimer = 0;
+    }
+  });
   if (window.EventSource && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
     startTimelineStream();
   } else {
@@ -23990,6 +24003,14 @@ window.apAdminToast = function (msg, isErr) {
       return;
     }
     if (nextView === viewName && !push) return;
+    window.__vaakNavigationPending = true;
+    // The old view's stream/fallback poll must not keep running while the
+    // replacement timeline is being rendered.
+    stopTimelineStream();
+    if (streamFallbackTimer) {
+      window.clearInterval(streamFallbackTimer);
+      streamFallbackTimer = 0;
+    }
     tabSwapBusy = true;
     if (status) status.textContent = 'Loading…';
     items.classList.add('timeline-swapping');
@@ -24090,6 +24111,8 @@ window.apAdminToast = function (msg, isErr) {
       items.classList.remove('timeline-swapping');
       tabSwapBusy = false;
       loading = false;
+      window.__vaakNavigationPending = false;
+      syncTimelineStreamVisibility();
       // Timeline tabs are swapped in-place, so the shared capture-phase
       // navigation handler has no full-page `pageshow` event to clear its
       // indicator.  Hide it when the partial swap (or its error path) ends.
@@ -26648,13 +26671,19 @@ if (VIEW === 'analytics') loadAnalytics();
     if (destination.origin !== window.location.origin) return;
     // Show synchronously so the spinner is visible even when navigation starts
     // before the browser gets a chance to run a zero-delay timer.
-    if (!ev.defaultPrevented) window.vaakShowLoading('Loading…');
+    if (!ev.defaultPrevented) {
+      window.__vaakNavigationPending = true;
+      window.vaakShowLoading('Loading…');
+    }
   }, true);
   document.addEventListener('submit', function (ev) {
     if (ev.defaultPrevented) return;
     if (!ev.defaultPrevented) window.vaakShowLoading('Saving…');
   }, true);
-  window.addEventListener('pageshow', window.vaakHideLoading);
+  window.addEventListener('pageshow', function () {
+    window.__vaakNavigationPending = false;
+    window.vaakHideLoading();
+  });
   document.addEventListener('click', function (event) {
     const button = event.target.closest('[data-copy-value]');
     if (!button) return;
