@@ -4555,7 +4555,7 @@ function admin_tl_cache_key(string $view, array $following): string
     $owner = admin_owner_user_id();
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v3_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v4_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -5890,9 +5890,9 @@ $feedEvents = [];
 if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial && $view === 'feed'))) {
     $feedEventsRaw = [];
     try {
-        // Deep window so infinite scroll stays Federated — not a short stack of own posts.
+        // Deep window so infinite scroll stays Federated — include remote
+        // Fediverse activity and posts emitted by this instance.
         // Prefer Creates with text/media; order by created_at (14d retention), not insert id.
-        $ownActorLike = '%mkultra.monster/users/' . $vaakActorKey . '%';
         $stFeed = $db->prepare(
             "SELECT * FROM events
              WHERE type IN ('Create', 'Quote', 'QuotePost')
@@ -5903,10 +5903,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
                  OR (spoiler_text IS NOT NULL AND spoiler_text != '')
                  OR (sensitive IS NOT NULL AND sensitive != 0)
                )
-               AND (actor_id IS NULL OR actor_id NOT LIKE ?)
              ORDER BY created_at DESC, id DESC LIMIT 100"
         );
-        $stFeed->execute([$ownActorLike]);
+        $stFeed->execute();
         $feedEventsRaw = $stFeed->fetchAll() ?: [];
     } catch (Throwable $e) {
         error_log('[ap-admin] feed events: ' . $e->getMessage());
@@ -5931,12 +5930,12 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
             break;
         }
     }
-    // A few recent own posts only (≤24h) so you appear in the firehose without
-    // drowning page 2+ in day-old outbox cards.
-    $feedOwnCutoff = time() - 86400;
+    // Include local outbox posts that have not yet produced an events row.
+    // Keep this bounded to the same retention window as the federated firehose.
+    $feedOwnCutoff = time() - (14 * 86400);
     $feedOwnAdded = 0;
     foreach ($outbox as $n) {
-        if ($feedOwnAdded >= 3) {
+        if ($feedOwnAdded >= 20) {
             break;
         }
         $pub = strtotime((string) ($n['published'] ?? '')) ?: 0;
@@ -12517,7 +12516,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         $streamSince = max(0, $sinceTs);
         // Keep the request short so one idle browser tab cannot occupy a
         // PHP-FPM worker while a page is trying to load more history.
-        $streamDeadline = microtime(true) + 12.0;
+        // Keep idle streams short-lived so page navigations and API requests
+        // are not queued behind long-poll workers.
+        $streamDeadline = microtime(true) + 8.0;
         $streamFirstPass = true;
         while ($streamSince > 0 && microtime(true) < $streamDeadline) {
             if (!$streamFirstPass) {
@@ -21688,6 +21689,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     if (document.visibilityState !== 'visible' || (typeof document.hasFocus === 'function' && !document.hasFocus())) {
       return;
     }
+    if (Date.now() < Number(window.__vaakNavigationSuppressUntil || 0)) return;
     // Suppress if a service-worker push just landed for this tip.
     const now = Date.now();
     if (lastPushSuppressAt && (now - lastPushSuppressAt) < 60 * 1000) {
@@ -23947,6 +23949,7 @@ window.apAdminToast = function (msg, isErr) {
   window.addEventListener('pagehide', () => {
     window.__vaakNavigationPending = true;
     window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
+    window.__vaakNavigationSuppressUntil = Date.now() + 3000;
     stopTimelineStream();
     if (streamFallbackTimer) {
       window.clearInterval(streamFallbackTimer);
@@ -24008,6 +24011,7 @@ window.apAdminToast = function (msg, isErr) {
     if (nextView === viewName && !push) return;
     window.__vaakNavigationPending = true;
     window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
+    window.__vaakNavigationSuppressUntil = Date.now() + 3000;
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
@@ -26678,6 +26682,7 @@ if (VIEW === 'analytics') loadAnalytics();
     if (!ev.defaultPrevented) {
       window.__vaakNavigationPending = true;
       window.__vaakNavigationToken = Number(window.__vaakNavigationToken || 0) + 1;
+      window.__vaakNavigationSuppressUntil = Date.now() + 3000;
       window.vaakShowLoading('Loading…');
     }
   }, true);

@@ -5068,19 +5068,24 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
     if ($lastId !== null && $lastId !== '') {
         $candidates[] = $lastId;
     }
-    try {
-        $state = ap_masto_notifications_unread_state(80, true);
-        $candidates[] = (string) ($state['latest_id'] ?? '');
-        $candidates[] = (string) ($state['latest_unread_id'] ?? '');
-        $candidates[] = (string) ($state['last_read_id'] ?? '');
-    } catch (Throwable $e) {
-        // fall through
-    }
-    try {
-        $latest = ap_masto_notifications_fetch(1);
-        $candidates[] = (string) ($latest[0]['id'] ?? '');
-    } catch (Throwable $e) {
-        // fall through
+    // The admin page already performs a light scan to obtain $lastId. Avoid
+    // repeating that scan and hydrating another notification on page load when
+    // an explicit tip was supplied.
+    if ($lastId === null || $lastId === '') {
+        try {
+            $state = ap_masto_notifications_unread_state(80, true);
+            $candidates[] = (string) ($state['latest_id'] ?? '');
+            $candidates[] = (string) ($state['latest_unread_id'] ?? '');
+            $candidates[] = (string) ($state['last_read_id'] ?? '');
+        } catch (Throwable $e) {
+            // fall through
+        }
+        try {
+            $latest = ap_masto_notifications_fetch(1);
+            $candidates[] = (string) ($latest[0]['id'] ?? '');
+        } catch (Throwable $e) {
+            // fall through
+        }
     }
     try {
         $markers = ap_masto_markers_get();
