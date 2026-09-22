@@ -330,6 +330,18 @@ if (preg_match('#^/users/cmdr_nova/collections/(\d+)$#', $path, $cm)) {
 
 // Public stats for homepage hero hydration
 if ($path === '/users/cmdr_nova/stats') {
+    // Homepage hydration only needs a tiny aggregate payload. Keep it briefly
+    // cached so visitors do not each rebuild AP + Bluesky counts.
+    $statsCache = sys_get_temp_dir() . '/vaak-cmdr-nova-stats.json';
+    if (is_file($statsCache) && (time() - (int) @filemtime($statsCache)) < 45) {
+        $cachedStats = @file_get_contents($statsCache);
+        if (is_string($cachedStats) && $cachedStats !== '') {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: public, max-age=30, stale-while-revalidate=120');
+            echo $cachedStats;
+            exit;
+        }
+    }
     $site = ap_site_content_counts();
     $compose = ap_compose_post_count();
     $apFollowers = count(ap_followers_list(CMDR_ACTOR_ID));
@@ -345,9 +357,7 @@ if ($path === '/users/cmdr_nova/stats') {
             'bsky_following' => 0,
             'bsky_handle' => (function_exists('ap_profile_bsky_handle') ? ap_profile_bsky_handle('cmdr_nova') : null),
         ];
-    header('Content-Type: application/json; charset=utf-8');
-    header('Cache-Control: no-cache, max-age=0, must-revalidate');
-    echo json_encode([
+    $statsJson = json_encode([
         'posts' => ap_public_post_count(),
         'blog_posts' => (int) $site['blog_posts'],
         'notes' => (int) $site['notes'],
@@ -361,6 +371,12 @@ if ($path === '/users/cmdr_nova/stats') {
         'bsky_following' => (int) ($combined['bsky_following'] ?? 0),
         'bsky_handle' => $combined['bsky_handle'] ?? null,
     ], JSON_UNESCAPED_SLASHES);
+    if (is_string($statsJson)) {
+        @file_put_contents($statsCache, $statsJson, LOCK_EX);
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: public, max-age=30, stale-while-revalidate=120');
+    echo is_string($statsJson) ? $statsJson : '{}';
     exit;
 }
 
