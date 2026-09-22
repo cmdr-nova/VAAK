@@ -5375,11 +5375,14 @@ function ap_masto_status_from_event(array $row): ?array
                 $i++;
                 $ext = strtolower(pathinfo(parse_url($clean, PHP_URL_PATH) ?? '', PATHINFO_EXTENSION));
                 $type = in_array($ext, ['mp4', 'webm', 'mov', 'm4v'], true) ? 'video' : 'image';
+                $displayUrl = ($type === 'image' && function_exists('ap_remote_post_media_resolve'))
+                    ? ap_remote_post_media_resolve($clean)
+                    : $clean;
                 $media[] = [
                     'id' => ap_masto_event_status_id($eventId, isset($row['created_at']) ? (string) $row['created_at'] : null) . $i,
                     'type' => $type,
-                    'url' => $clean,
-                    'preview_url' => $clean,
+                    'url' => $displayUrl,
+                    'preview_url' => $displayUrl,
                     'remote_url' => $clean,
                     'preview_remote_url' => null,
                     'text_url' => null,
@@ -8247,12 +8250,18 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
             if (!str_starts_with($url, 'https://')) {
                 continue;
             }
+            $displayUrl = function_exists('ap_remote_post_media_resolve')
+                ? ap_remote_post_media_resolve($url)
+                : $url;
             $preview = trim((string) ($image['thumb'] ?? $url));
+            $previewUrl = function_exists('ap_remote_post_media_resolve')
+                ? ap_remote_post_media_resolve($preview)
+                : $preview;
             $out[] = [
                 'id' => $statusId . '#media-' . (++$n),
                 'type' => 'image',
-                'url' => $url,
-                'preview_url' => str_starts_with($preview, 'https://') ? $preview : $url,
+                'url' => $displayUrl,
+                'preview_url' => str_starts_with($previewUrl, 'https://') ? $previewUrl : $displayUrl,
                 'remote_url' => $url,
                 'text_url' => $url,
                 'description' => (string) ($image['alt'] ?? ''),

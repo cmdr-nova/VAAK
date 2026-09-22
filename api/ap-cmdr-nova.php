@@ -18,6 +18,7 @@ require_once __DIR__ . '/ap-link-preview.php';
 require_once __DIR__ . '/ap-featured.php'; // Profile Featured accounts tab
 require_once __DIR__ . '/ap-sl-link.php';
 require_once __DIR__ . '/ap-feeds.php';
+require_once __DIR__ . '/ap-bsky.php';
 
 $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
@@ -131,7 +132,10 @@ if (preg_match('#^/users/cmdr_nova/(outbox|followers|following)$#', $path, $m)) 
         }
         if (function_exists('ap_masto_reblog_rows') && function_exists('ap_masto_announce_activity_from_row')) {
             $cmdrUid = function_exists('ap_db_cmdr_nova_user_id') ? ap_db_cmdr_nova_user_id() : 1;
-            foreach (ap_masto_reblog_rows(80, null, $cmdrUid) as $rb) {
+            $reblogRows = function_exists('ap_masto_reblog_rows_for_html_profile')
+                ? ap_masto_reblog_rows_for_html_profile($cmdrUid, 5000, 0)
+                : ap_masto_reblog_rows(80, null, $cmdrUid);
+            foreach ($reblogRows as $rb) {
                 $announce = ap_masto_announce_activity_from_row($rb);
                 if ($announce === null) {
                     continue;
@@ -1611,6 +1615,9 @@ function ap_cmdr_html(): void
         $cmdrDid = is_array($cmdrSession) ? trim((string) ($cmdrSession['did'] ?? '')) : '';
         if ($cmdrDid !== '') {
             ap_bsky_own_posts_backfill_maybe_enqueue($cmdrUid, $cmdrDid);
+            if (function_exists('ap_bsky_background_sync_enqueue')) {
+                ap_bsky_background_sync_enqueue($cmdrUid, 'reposts');
+            }
         }
     }
 
@@ -2281,7 +2288,10 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     if (function_exists('ap_masto_reblog_rows')) {
         try {
             $cmdrUid = function_exists('ap_db_cmdr_nova_user_id') ? ap_db_cmdr_nova_user_id() : 1;
-            foreach (ap_masto_reblog_rows(80, null, $cmdrUid) as $rb) {
+            $reblogRows = function_exists('ap_masto_reblog_rows_for_html_profile')
+                ? ap_masto_reblog_rows_for_html_profile($cmdrUid, 5000, 0)
+                : ap_masto_reblog_rows(80, null, $cmdrUid);
+            foreach ($reblogRows as $rb) {
                 $announceId = trim((string) ($rb['announce_activity_id'] ?? ''));
                 $objectId = trim((string) ($rb['object_id'] ?? ''));
                 if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
@@ -2592,6 +2602,73 @@ function ap_cmdr_short_url_label(string $url): string
     return $label !== '' ? $label : $url;
 }
 
+/** Render the underlying object for a boost in the rich cmdr_nova profile. */
+function ap_cmdr_bsky_cached_item_for_url(string $url): ?array
+{
+    if (!preg_match('~^https://bsky\.app/profile/([^/]+)/post/([^/?#]+)~i', trim($url), $m)) return null;
+    $handle = rawurldecode($m[1]); $rkey = rawurldecode($m[2]);
+    static $cache = [];
+    if (!array_key_exists($handle, $cache)) {
+        $cache[$handle] = [];
+        try {
+            $st = ap_db()->prepare('SELECT raw_json, reason_json, bsky_uri FROM bsky_posts WHERE author_handle = ? ORDER BY indexed_at DESC LIMIT 500');
+            $st->execute([$handle]);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) continue;
+                $post = json_decode((string) ($row['raw_json'] ?? ''), true);
+                if (!is_array($post)) continue;
+                $uri = (string) ($row['bsky_uri'] ?? '');
+                if (!preg_match('~/([^/]+)$~', $uri, $um)) continue;
+                $item = ['post' => $post, 'bsky_uri' => $uri];
+                $reason = json_decode((string) ($row['reason_json'] ?? ''), true);
+                if (is_array($reason)) $item['reason'] = $reason;
+                $cache[$handle][$um[1]] = $item;
+            }
+        } catch (Throwable $e) { /* cache miss */ }
+    }
+    return $cache[$handle][$rkey] ?? null;
+}
+
+function ap_cmdr_boost_content_html(string $objectId): string
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '') {
+        return '<div class="body muted">(boost)</div>';
+    }
+    if (str_contains(strtolower($objectId), 'bsky.app/')) {
+        $item = ap_cmdr_bsky_cached_item_for_url($objectId);
+        if (!is_array($item) && function_exists('ap_bsky_at_uri_from_https') && preg_match('~^https://bsky\.app/profile/(did:[^/]+)/post/~i', $objectId)) {
+            $ownerId = function_exists('ap_db_owner_user_id_for_actor') ? (int) ap_db_owner_user_id_for_actor(CMDR_ACTOR_ID) : 0;
+            $uri = ap_bsky_at_uri_from_https($objectId, $ownerId);
+            $item = $uri !== null && function_exists('ap_bsky_post_item_by_uri') ? ap_bsky_post_item_by_uri($uri) : null;
+        }
+        $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+        if ($post !== []) {
+            $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+            $text = trim((string) ($record['text'] ?? $post['text'] ?? ''));
+            $body = htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $body = preg_replace_callback('~https?://[^\s<>]+~i', static fn(array $m): string => '<a href="' . htmlspecialchars($m[0], ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($m[0], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>', $body) ?? $body;
+            $media = '';
+            if (function_exists('ap_bsky_media_items_from_embeds')) {
+                foreach (ap_bsky_media_items_from_embeds($post['embed'] ?? ($record['embed'] ?? [])) as $m) {
+                    $url = trim((string) ($m['url'] ?? ''));
+                    if ($url === '' || !str_starts_with($url, 'https://')) continue;
+                    $media .= '<img src="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
+                }
+            }
+            if ($media !== '') $media = '<div class="media-row">' . $media . '</div>';
+            $href = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : $objectId;
+            return '<div class="body"><span class="badge">Bluesky</span>'
+                . ($body !== '' ? '<div class="note-body">' . nl2br($body) . '</div>' : ($media === '' ? '<div class="note-body muted">No text or cached media was available for this post.</div>' : '')) . $media
+                . '<p class="muted" style="font-size:.8rem"><a href="' . htmlspecialchars($href ?: $objectId, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">Open on Bluesky</a></p></div>';
+        }
+    }
+    $snippet = ap_cmdr_object_snippet($objectId, 500);
+    $body = $snippet !== '' ? htmlspecialchars($snippet, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : '<span class="muted">Unable to load the boosted post content.</span>';
+    $body = preg_replace_callback('~https?://[^\s<>]+~i', static fn(array $m): string => '<a href="' . htmlspecialchars($m[0], ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($m[0], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>', $body) ?? $body;
+    return '<div class="body"><span class="badge">Fediverse</span><div class="note-body">' . nl2br($body) . '</div><p class="muted" style="font-size:.8rem"><a href="' . htmlspecialchars($objectId, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">Open original post</a></p></div>';
+}
+
 function ap_cmdr_post_preview_html(array $n): string
 {
     $kind = (string) ($n['kind'] ?? 'compose');
@@ -2662,7 +2739,6 @@ function ap_cmdr_post_preview_html(array $n): string
     if ($isBoost) {
         $objectId = rtrim((string) ($n['object_id'] ?? $id), '/');
         $targetActor = rtrim((string) ($n['target_actor'] ?? ''), '/');
-        $snippet = $objectId !== '' ? ap_cmdr_object_snippet($objectId, 180) : '';
         $who = '';
         if ($targetActor !== '' && str_starts_with($targetActor, 'https://')) {
             if (function_exists('ap_cmdr_actor_handle_label')) {
@@ -2674,16 +2750,7 @@ function ap_cmdr_post_preview_html(array $n): string
         $boostLine = '<div class="boost-line">↻ boosted'
             . ($who !== '' ? ' ' . htmlspecialchars($who, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : '')
             . '</div>';
-        $body = '';
-        if ($snippet !== '') {
-            $body = '<div class="body">' . htmlspecialchars($snippet, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';
-        } elseif ($objectId !== '') {
-            $body = '<div class="body muted">'
-                . htmlspecialchars(ap_cmdr_short_url_label($objectId), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-                . '</div>';
-        } else {
-            $body = '<div class="body muted">(boost)</div>';
-        }
+        $body = ap_cmdr_boost_content_html($objectId);
         $published = (string) ($n['published'] ?? '');
         $dateLabel = $published;
         try {
@@ -2691,11 +2758,11 @@ function ap_cmdr_post_preview_html(array $n): string
         } catch (Throwable $e) {
             // keep
         }
-        return '<a class="post" href="' . $href . '">'
+        return '<div class="post">'
             . $boostLine
             . $body
             . '<div class="meta">' . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8')
-            . ' · <span class="badge">boost</span></div></a>'
+            . ' · <span class="badge">boost</span></div></div>'
             . ap_webmention_cards_html($hrefRaw);
     }
 

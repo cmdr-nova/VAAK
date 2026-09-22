@@ -334,6 +334,30 @@ SQL);
         error_log('[ap-db] bsky_sessions not provisioned: ' . $e->getMessage());
     }
 
+    // Remote post attachments are separate from actor avatar/header media.
+    // They are populated asynchronously and may be pruned independently.
+    try {
+        if (!isset($present['remote_post_media_cache'])) {
+            $db->exec(<<<'SQL'
+CREATE TABLE IF NOT EXISTS remote_post_media_cache (
+    id BIGSERIAL PRIMARY KEY,
+    source_url TEXT NOT NULL UNIQUE,
+    s3_key TEXT NOT NULL,
+    public_url TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    byte_size BIGINT NOT NULL DEFAULT 0,
+    original_byte_size BIGINT NOT NULL DEFAULT 0,
+    fetched_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+)
+SQL);
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_remote_post_media_used ON remote_post_media_cache(last_used_at)');
+            $db->exec('CREATE INDEX IF NOT EXISTS idx_remote_post_media_size ON remote_post_media_cache(byte_size)');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] remote_post_media_cache not provisioned: ' . $e->getMessage());
+    }
+
     // Per-user TOTP state. Secrets are encrypted by ap-auth; recovery codes
     // are stored only as password hashes. This table is local-only and never
     // participates in federation or remote requests.
@@ -1324,6 +1348,20 @@ CREATE TABLE IF NOT EXISTS remote_media_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_remote_media_used ON remote_media_cache(last_used_at);
 CREATE INDEX IF NOT EXISTS idx_remote_media_actor ON remote_media_cache(actor_id);
+
+CREATE TABLE IF NOT EXISTS remote_post_media_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_url TEXT NOT NULL UNIQUE,
+    s3_key TEXT NOT NULL,
+    public_url TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    byte_size INTEGER NOT NULL DEFAULT 0,
+    original_byte_size INTEGER NOT NULL DEFAULT 0,
+    fetched_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_remote_post_media_used ON remote_post_media_cache(last_used_at);
+CREATE INDEX IF NOT EXISTS idx_remote_post_media_size ON remote_post_media_cache(byte_size);
 
 CREATE TABLE IF NOT EXISTS ap_media_warm_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -9736,6 +9774,23 @@ function ap_masto_reblog_remove(string $statusId, ?int $ownerUserId = null): ?ar
     return $row;
 }
 
+/** Remove a stored boost by its underlying object URL (used by Bluesky undo workers). */
+function ap_masto_reblog_remove_by_object_id(string $objectId, ?int $ownerUserId = null): int
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '') return 0;
+    $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
+    try {
+        $st = ap_db()->prepare(
+            'DELETE FROM masto_reblogs WHERE owner_user_id = ? AND (object_id = ? OR object_id = ?)'
+        );
+        $st->execute([$ownerUserId, $objectId, $objectId . '/']);
+        return $st->rowCount();
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 /**
  * @return list<array<string,mixed>>
  */
@@ -9770,6 +9825,25 @@ function ap_masto_reblog_rows(int $limit = 40, ?string $maxId = null, ?int $owne
             $st->execute([$ownerUserId, $fetch]);
         }
         return $st->fetchAll();
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/** Full boost history for HTML profiles; unlike timeline reads, this is not
+ * constrained by the timeline over-fetch cap. Callers should paginate output. */
+function ap_masto_reblog_rows_for_html_profile(int $ownerUserId, int $limit = 5000, int $offset = 0): array
+{
+    $ownerUserId = max(1, $ownerUserId);
+    $limit = max(1, min(10000, $limit));
+    $offset = max(0, $offset);
+    try {
+        $st = ap_db()->prepare(
+            'SELECT * FROM masto_reblogs WHERE owner_user_id = ?
+             ORDER BY created_at DESC LIMIT ? OFFSET ?'
+        );
+        $st->execute([$ownerUserId, $limit, $offset]);
+        return $st->fetchAll() ?: [];
     } catch (Throwable $e) {
         return [];
     }

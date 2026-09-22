@@ -2790,6 +2790,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 } else {
                     $ajaxOut['reposted'] = false;
                     $ajaxOut['record_uri'] = '';
+                    if (!empty($res['ok']) && function_exists('ap_masto_reblog_remove_by_object_id')) {
+                        ap_masto_reblog_remove_by_object_id((string) ($objectRef !== '' ? $objectRef : $subject), $vaakOwnerId);
+                    }
                     $notice = !empty($res['ok']) ? 'Removed Bluesky boost.' : ('Unboost failed: ' . $ajaxOut['error']);
                 }
                 if (empty($res['ok'])) {
@@ -10111,10 +10114,13 @@ function admin_render_masto_status_card(
         $boosterAcct = (string) ($st['account']['acct'] ?? '');
         $boosterName = (string) ($st['account']['display_name'] ?? $boosterAcct);
         $boostWhen = (string) ($st['created_at'] ?? '');
+        $boostSource = admin_object_url_is_bluesky((string) ($st['reblog']['uri'] ?? $st['reblog']['url'] ?? ''))
+            ? 'Bluesky' : 'Fediverse';
         $boostHeader = '<div class="meta" style="margin-bottom:.45rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> '
             . htmlspecialchars($boosterName !== '' ? $boosterName : 'Someone', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
             . ' boosted'
             . ($boostWhen !== '' ? ' · ' . htmlspecialchars(relative_time($boostWhen), ENT_QUOTES, 'UTF-8') : '')
+            . ' <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">' . h($boostSource) . '</span>'
             . '</div>';
         $st = $st['reblog'];
     }
@@ -10614,6 +10620,7 @@ function admin_render_remote_boost_card(
                 <span style="opacity:.75"><?= h($boosterHandle) ?></span>
               <?php endif; ?>
               · <?= h(relative_time($created)) ?>
+              <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Fediverse</span>
               <?php if ($fromFollowedTag): ?><span class="tag" style="margin-left:.35rem">followed tag</span><?php endif; ?>
             </div>
             <div class="tweet-hd">
@@ -12543,7 +12550,10 @@ if ($isPartial && $view === 'mentions') {
         $notifFilter = 'all';
     }
     $notifTypes = $notifFilterOptions[$notifFilter]['types'];
-    $notifLimit = isset($_GET['limit']) ? max(1, min(40, (int) $_GET['limit'])) : 20;
+    // Keep the first notification response small enough to stay responsive on a
+    // cold cache. Older cards continue through the existing infinite-scroll
+    // endpoint, so this does not reduce the available notification history.
+    $notifLimit = isset($_GET['limit']) ? max(1, min(20, (int) $_GET['limit'])) : 10;
     $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
     // Partials skip followers by default — restore for Follow/relationship badges.
     if ($followerIds === []) {
@@ -16090,7 +16100,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               echo '<a class="btn ' . ($active ? 'btn-primary' : 'btn-ghost') . '" role="tab" aria-selected="' . ($active ? 'true' : 'false') . '" href="' . $notifFilterHref($filterKey) . '">' . h((string) $filterOption['label']) . '</a>';
           }
           echo '</nav>';
-          $notifLimit = 20;
+          // A cold notification render can hydrate remote account/status data;
+          // paint a small first page quickly and let infinite scroll fetch older
+          // cards in subsequent requests.
+          $notifLimit = 10;
           $adminNotifs = [];
           // First page only — older pages append via ?partial=1 (keeps scroll place).
           try {
@@ -25905,6 +25918,10 @@ if (VIEW === 'analytics') loadAnalytics();
       const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
       const data = await res.json().catch(() => null);
       if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
+      // This was an AJAX durable-queue action; there is no full-page
+      // navigation to trigger pageshow, so dismiss the global Saving pill as
+      // soon as the queue has accepted the desired state.
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       form.dataset.queuePending = '1'; form.dataset.queueId = String(data.queue_id); form.dataset.queueRevision = String(data.revision || '');
       actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
       button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following (action queued)' : 'Unfollowed (action queued)';

@@ -227,13 +227,20 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 }
                 if ($recordUri === '' && $kind === 'boost') {
                     $res = ap_bsky_unrepost_object($owner, (string) ($payload['uri'] ?? $target));
+                    if (!empty($res['ok']) && function_exists('ap_masto_reblog_remove_by_object_id')) {
+                        ap_masto_reblog_remove_by_object_id((string) ($payload['object_id'] ?? $target), $owner);
+                    }
                     return !empty($res['ok']) ? ['ok' => true, 'receipt' => []]
                         : ['ok' => false, 'error' => (string) ($res['error'] ?? 'Bluesky repost removal failed.')];
                 }
                 if ($recordUri === '') return ['ok' => true, 'receipt' => []];
                 $res = ap_bsky_delete_record_uri($owner, $recordUri);
                 $err = (string) ($res['error'] ?? 'Bluesky undo failed.');
-                return !empty($res['ok']) || ap_action_queue_remote_state_already_applied($err, false)
+                $alreadyGone = ap_action_queue_remote_state_already_applied($err, false);
+                if ((!empty($res['ok']) || $alreadyGone) && $kind === 'boost' && function_exists('ap_masto_reblog_remove_by_object_id')) {
+                    ap_masto_reblog_remove_by_object_id((string) ($payload['object_id'] ?? $target), $owner);
+                }
+                return !empty($res['ok']) || $alreadyGone
                     ? ['ok' => true, 'receipt' => []] : ['ok' => false, 'error' => $err];
             }
             if ($kind === 'bookmark') {

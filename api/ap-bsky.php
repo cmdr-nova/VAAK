@@ -5112,7 +5112,7 @@ function ap_bsky_bookmark_cache_import_legacy(int $ownerUserId): void
 /** Queue cache warming for user-scoped Bluesky collections; never fetch in a page render. */
 function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, bool $force = false): bool
 {
-    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs'], true)
+    if ($ownerUserId < 1 || !in_array($collection, ['bookmarks', 'favourites', 'lists', 'starter_packs', 'reposts'], true)
         || !ap_bsky_actor_refresh_migrate()) return false;
     $actorRef = '__vaak_sync__:' . $collection;
     $now = gmdate('c');
@@ -5134,6 +5134,55 @@ function ap_bsky_background_sync_enqueue(int $ownerUserId, string $collection, b
         error_log('[ap-bsky] collection refresh enqueue failed');
         return false;
     }
+}
+
+/** Reconcile locally stored profile reposts against Bluesky's authoritative repo records. */
+function ap_bsky_reconcile_own_reposts(int $ownerUserId): array
+{
+    $session = ap_bsky_session_row($ownerUserId);
+    if (!is_array($session) || trim((string) ($session['did'] ?? '')) === '') {
+        return ['ok' => true, 'skipped' => true, 'removed' => 0];
+    }
+    $tok = ap_bsky_access_token($ownerUserId, false);
+    if (empty($tok['ok'])) $tok = ap_bsky_access_token($ownerUserId, true);
+    if (empty($tok['ok'])) return ['ok' => false, 'error' => (string) ($tok['error'] ?? 'No Bluesky session')];
+    $pds = rtrim((string) ($session['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
+    $did = trim((string) $session['did']);
+    $current = [];
+    $currentRkeys = [];
+    $cursor = null;
+    for ($page = 0; $page < 50; $page++) {
+        $params = ['repo' => $did, 'collection' => 'app.bsky.feed.repost', 'limit' => '100'];
+        if ($cursor !== null && $cursor !== '') $params['cursor'] = $cursor;
+        $res = ap_bsky_xrpc($pds, 'com.atproto.repo.listRecords', 'GET', $params, null, (string) $tok['access'], 15);
+        if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Could not read Bluesky repost records')];
+        foreach ((array) ($res['json']['records'] ?? []) as $record) {
+            $subject = is_array($record['value']['subject'] ?? null) ? (string) ($record['value']['subject']['uri'] ?? '') : '';
+            if ($subject !== '') {
+                $current[$subject] = true;
+                if (preg_match('~/([^/]+)$~', $subject, $m)) $currentRkeys[$m[1]] = true;
+            }
+        }
+        $next = trim((string) ($res['json']['cursor'] ?? ''));
+        if ($next === '' || $next === $cursor) break;
+        $cursor = $next;
+    }
+    $removed = 0;
+    try {
+        $st = ap_db()->prepare("SELECT status_id, object_id FROM masto_reblogs WHERE owner_user_id = ? AND (status_id LIKE 'bsky-repost-%' OR announce_activity_id LIKE 'bsky-repost-%')");
+        $st->execute([$ownerUserId]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $object = trim((string) ($row['object_id'] ?? ''));
+            $uri = str_starts_with($object, 'at://') ? $object : '';
+            $present = $uri !== '' ? isset($current[$uri]) : (preg_match('~/([^/]+)$~', $object, $m) && isset($currentRkeys[$m[1]]));
+            if (!$present && function_exists('ap_masto_reblog_remove')) {
+                $removed += ap_masto_reblog_remove((string) ($row['status_id'] ?? ''), $ownerUserId) !== null ? 1 : 0;
+            }
+        }
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Local repost reconciliation failed'];
+    }
+    return ['ok' => true, 'removed' => $removed, 'remote_count' => count($current)];
 }
 
 
@@ -6438,6 +6487,16 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
     $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
     $db = ap_db();
     $now = gmdate('c');
+    // Keep HTML-profile repost state canonical even when the user undoes a
+    // repost directly in Bluesky rather than through VAAK. The enqueue helper
+    // applies a five-minute cooldown and coalesces pending work.
+    try {
+        foreach ($db->query('SELECT owner_user_id FROM bsky_sessions')->fetchAll(PDO::FETCH_COLUMN) ?: [] as $sessionOwner) {
+            ap_bsky_background_sync_enqueue((int) $sessionOwner, 'reposts');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] repost reconciliation enqueue failed: ' . $e->getMessage());
+    }
     $stale = gmdate('c', time() - 600);
     $staleJobs = $db->prepare("SELECT owner_user_id, actor_ref, attempts FROM bsky_actor_refresh_queue WHERE status = 'processing' AND locked_at < ?");
     $staleJobs->execute([$stale]);
@@ -6538,6 +6597,8 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                     $result = function_exists('ap_bsky_follow_sync_worker')
                         ? ap_bsky_follow_sync_worker($owner)
                         : ['ok' => true, 'skipped' => true];
+                } elseif ($kind === 'reposts') {
+                    $result = ap_bsky_reconcile_own_reposts($owner);
                 }
                 if (empty($result['ok'])) {
                     throw new RuntimeException((string) ($result['error'] ?? ($kind . ' synchronization failed')));

@@ -14,6 +14,11 @@ require_once __DIR__ . '/ap-import-export.php'; // alsoKnownAs / movedTo on mult
 require_once __DIR__ . '/ap-sl-link.php';
 require_once __DIR__ . '/ap-featured.php';
 require_once __DIR__ . '/ap-feeds.php';
+require_once __DIR__ . '/ap-masto-entities.php';
+// HTML profiles also surface cached Bluesky-native posts for accounts that
+// have a connected ATProto session. This remains cache-only: profile renders
+// never perform a live Bluesky fetch.
+require_once __DIR__ . '/ap-bsky.php';
 
 $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
 $path = parse_url($uri, PHP_URL_PATH) ?: '/';
@@ -493,17 +498,35 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle($actorKey, $p)
         : null;
-    if (function_exists('ap_db_owner_user_id_for_actor') && function_exists('ap_bsky_session_row') && function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
-        $profileOwnerId = ap_db_owner_user_id_for_actor($actorId);
-        $profileSession = $profileOwnerId > 0 ? ap_bsky_session_row($profileOwnerId) : null;
-        $profileDid = is_array($profileSession) ? trim((string) ($profileSession['did'] ?? '')) : '';
-        if ($profileDid !== '') {
+    $profileOwnerId = function_exists('ap_db_owner_user_id_for_actor')
+        ? ap_db_owner_user_id_for_actor($actorId) : 0;
+    $profileSession = ($profileOwnerId > 0 && function_exists('ap_bsky_session_row'))
+        ? ap_bsky_session_row($profileOwnerId) : null;
+    $profileDid = is_array($profileSession) ? trim((string) ($profileSession['did'] ?? '')) : '';
+    if ($profileDid !== '') {
+        // Keep both the historical backfill and the incremental author-feed
+        // refresh queued. Neither path performs a live Bluesky request here.
+        if (function_exists('ap_bsky_own_posts_backfill_maybe_enqueue')) {
             ap_bsky_own_posts_backfill_maybe_enqueue($profileOwnerId, $profileDid);
+        }
+        if (function_exists('ap_bsky_author_feed_refresh_enqueue')) {
+            ap_bsky_author_feed_refresh_enqueue($profileOwnerId, $profileDid, 0);
+        }
+        if (function_exists('ap_bsky_background_sync_enqueue')) {
+            ap_bsky_background_sync_enqueue($profileOwnerId, 'reposts');
         }
     }
 
     ap_user_html_shell_start('@' . $actorKey . '@mkultra.monster');
     echo '<span id="profile-top" aria-hidden="true"></span>';
+    $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    $viewerActor = is_array($viewer) ? rtrim((string) ($viewer['actor_id'] ?? ''), '/') : '';
+    $isOwner = $viewerActor !== '' && $viewerActor === rtrim($actorId, '/');
+    if ($isOwner) {
+        echo '<div class="owner-bar" style="margin:0 0 .85rem;padding:.55rem .75rem;border:1px solid #2a4a3a;border-radius:10px;background:rgba(80,160,120,.1);font-size:.86rem;color:#bfe;text-align:center">'
+            . 'Signed in as <b>@' . htmlspecialchars($actorKey, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</b> — '
+            . '<a href="/vaak/?view=outbox" style="color:#7ee0ff">Open VAAK</a></div>';
+    }
     if (!empty($p['image_url'])) {
         $banner = htmlspecialchars((string) $p['image_url'], ENT_QUOTES, 'UTF-8');
         echo '<div class="banner" style="background-image:url(\'' . $banner . '\')"></div>';
@@ -596,19 +619,79 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         $publicNotes[] = $n;
     }
     $profileBoosts = [];
+    $profileBoostTotal = 0;
     try {
         if (function_exists('ap_masto_reblog_rows') && function_exists('ap_db_owner_user_id_for_actor')) {
-            $ownerId = ap_db_owner_user_id_for_actor($actorId);
+            $ownerId = $profileOwnerId;
             if ($ownerId > 0) {
-                $profileBoosts = ap_masto_reblog_rows(200, null, $ownerId);
+                $allProfileBoosts = function_exists('ap_masto_reblog_rows_for_html_profile')
+                    ? ap_masto_reblog_rows_for_html_profile($ownerId, 5000, 0)
+                    : ap_masto_reblog_rows(80, null, $ownerId);
+                $profileBoostTotal = count($allProfileBoosts);
+                $profileBoosts = array_slice($allProfileBoosts, ($profilePage - 1) * $profilePerPage, $profilePerPage);
             }
         }
     } catch (Throwable $e) {
         $profileBoosts = [];
     }
 
+    // Historical Bluesky posts that were imported as ActivityPub notes already
+    // appear in $publicNotes. New Bluesky-native posts remain in the durable
+    // bsky_posts cache, so merge those cached rows into the profile directly.
+    // This also preserves Bluesky reposts via their reasonRepost marker.
+    $profileBskyPosts = [];
+    if ($profileDid !== '' && function_exists('ap_bsky_posts_for_author')) {
+        try {
+            $profileBskyPosts = ap_bsky_posts_for_author($profileDid, 80, 0);
+        } catch (Throwable $e) {
+            $profileBskyPosts = [];
+        }
+    }
+    $localNoteIds = [];
+    foreach ($publicNotes as $localNote) {
+        $localId = rtrim((string) ($localNote['id'] ?? ''), '/');
+        if ($localId !== '') {
+            $localNoteIds[$localId] = true;
+        }
+    }
+    $profileBskyPosts = array_values(array_filter($profileBskyPosts, static function (array $item) use ($localNoteIds): bool {
+        $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+        $uri = trim((string) ($post['uri'] ?? ''));
+        $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+        $fediId = rtrim((string) (($record['fediverseId'] ?? '') ?: ($record['fediverse_id'] ?? '')), '/');
+        if ($fediId === '' && $uri !== '' && function_exists('ap_bsky_post_link_by_uri')) {
+            $link = ap_bsky_post_link_by_uri($uri);
+            $fediId = is_array($link) ? rtrim((string) ($link['fediverse_id'] ?? ''), '/') : '';
+        }
+        return $fediId === '' || !isset($localNoteIds[$fediId]);
+    }));
+    $seenBskyUris = [];
+    $profileBskyPosts = array_values(array_filter($profileBskyPosts, static function (array $item) use (&$seenBskyUris): bool {
+        $uri = trim((string) (($item['post']['uri'] ?? '') ?: ''));
+        if ($uri === '' || isset($seenBskyUris[$uri])) {
+            return false;
+        }
+        $seenBskyUris[$uri] = true;
+        return true;
+    }));
+    $profileBskyCount = $profileBskyPosts !== [] ? count($profileBskyPosts) : 0;
+    $profileReplyNotes = [];
+    foreach (ap_outbox_list(200, $actorKey) as $replyNote) {
+        if (trim((string) ($replyNote['in_reply_to'] ?? '')) !== '') {
+            $profileReplyNotes[] = $replyNote;
+        }
+    }
+    $profileBskyReplies = array_values(array_filter($profileBskyPosts, static function (array $item): bool {
+        $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+        return is_array($post['record']['reply'] ?? null);
+    }));
+    $blogSlug = trim((string) ($_GET['post'] ?? ''));
+    $blogPost = $blogSlug !== '' ? ap_blog_post_get($actorKey, $blogSlug, true) : null;
+    $blogRows = ap_blog_posts_list($actorKey, true, 20, max(0, ($profilePage - 1) * 20));
+    $blogCount = count(ap_blog_posts_list($actorKey, true, 200, 0));
+
     $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
-    if (!in_array($tab, ['posts', 'media', 'featured'], true)) {
+    if (!in_array($tab, ['posts', 'media', 'replies', 'boosts', 'featured', 'blog'], true)) {
         $tab = 'posts';
     }
     $mediaNotes = [];
@@ -623,7 +706,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_featured_cards_for_actor_key($actorKey)
         : [];
     $featuredCount = count($featuredCards);
-    $profilePageCount = max(1, (int) ceil(max(1, $profileTotal) / $profilePerPage));
+    $profilePageCount = max(1, (int) ceil(max(1, $profileTotal + $profileBskyCount + $profileBoostTotal) / $profilePerPage));
     $apFollowing = count($following);
     $apFollowers = count($followers);
     $combined = function_exists('ap_profile_combined_follow_counts')
@@ -638,7 +721,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
 
     echo '<div class="stats">';
-    echo '<div><span class="n">' . ($profileTotal + count($profileBoosts)) . '</span><span class="l">Posts</span></div>';
+    echo '<div><span class="n">' . ($profileTotal + $profileBskyCount + $profileBoostTotal) . '</span><span class="l">Posts</span></div>';
     $bskyAttr = $bskyHandle !== null ? ' data-bsky-handle="' . htmlspecialchars($bskyHandle, ENT_QUOTES, 'UTF-8') . '"' : '';
     $bskyTitle = $bskyHandle !== null ? ' title="Includes ActivityPub and connected Bluesky counts"' : '';
     echo '<a href="/users/' . $safe . '/following"' . $bskyAttr . $bskyTitle . '><span class="n" data-bsky-count="following">' . (int) $combined['following'] . '</span><span class="l">Following</span></a>';
@@ -653,9 +736,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
         [
-            'posts' => ['Posts', $profileTotal + count($profileBoosts)],
+            'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
             'media' => ['Media', count($mediaNotes)],
+            'replies' => ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
+            'boosts' => ['Boosts', $profileBoostTotal],
             'featured' => ['Featured', $featuredCount],
+            'blog' => ['Blog', $blogCount],
         ] as $tKey => $tInfo
     ) {
         $href = $tKey === 'posts'
@@ -669,7 +755,30 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
     echo '</nav>';
 
-    if ($tab === 'media') {
+    if ($tab === 'blog') {
+        echo '<section id="profile-blog" class="posts profile-blog" aria-label="Blog">';
+        if ($blogPost) {
+            $blogTitle = htmlspecialchars((string) ($blogPost['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            echo '<article class="profile-blog-post"><div class="muted">' . htmlspecialchars((string) (($blogPost['category'] ?? '') ?: 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
+            echo '<h2>' . $blogTitle . '</h2><div class="muted">' . htmlspecialchars((string) ($blogPost['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . '</div>';
+            if (!empty($blogPost['tags']) && is_array($blogPost['tags'])) {
+                echo '<p class="muted">' . htmlspecialchars(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, $blogPost['tags']),), ENT_QUOTES, 'UTF-8') . '</p>';
+            }
+            echo '<div class="note-body">' . ap_user_blog_markdown_html((string) ($blogPost['body_markdown'] ?? '')) . '</div>';
+            echo '<p><a href="/users/' . $safe . '?tab=blog">← All blog posts</a></p></article>';
+        } elseif (!$blogRows) {
+            echo '<p class="muted">No public blog posts yet.</p>';
+        } else {
+            foreach ($blogRows as $blogRow) {
+                $slugSafe = rawurlencode((string) ($blogRow['slug'] ?? ''));
+                echo '<article class="profile-blog-post"><div class="muted">' . htmlspecialchars((string) (($blogRow['category'] ?? '') ?: 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
+                echo '<h2><a href="/users/' . $safe . '?tab=blog&amp;post=' . htmlspecialchars($slugSafe, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars((string) ($blogRow['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></h2>';
+                echo '<p>' . htmlspecialchars((string) ($blogRow['excerpt'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+                echo '<p class="muted">' . htmlspecialchars((string) ($blogRow['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . '</p></article>';
+            }
+        }
+        echo '</section>';
+    } elseif ($tab === 'media') {
         echo '<section id="profile-posts" class="posts profile-media-gallery profile-infinite" aria-label="Media" data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '" data-profile-tab="media">';
         if (!$mediaNotes) {
             echo '<p class="muted">No public media posts yet.</p>';
@@ -691,6 +800,40 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
         }
         echo '</section>';
+    } elseif ($tab === 'replies') {
+        echo '<section id="profile-replies" class="posts" aria-label="Replies">';
+        if (!$profileReplyNotes && !$profileBskyReplies) {
+            echo '<p class="muted">No replies yet.</p>';
+        } else {
+            foreach ($profileReplyNotes as $replyNote) {
+                echo ap_user_post_preview_html($actorKey, $replyNote);
+            }
+            foreach ($profileBskyReplies as $replyItem) {
+                echo ap_user_bsky_post_preview_html($actorKey, $replyItem);
+            }
+        }
+        echo '</section>';
+    } elseif ($tab === 'boosts') {
+        echo '<section id="profile-boosts" class="posts" aria-label="Boosts">';
+        if (!$profileBoosts) {
+            echo '<p class="muted">No boosts yet.</p>';
+        } else {
+            foreach ($profileBoosts as $boost) {
+                $object = rtrim((string) ($boost['object_id'] ?? ''), '/');
+                if ($object === '') {
+                    continue;
+                }
+                echo ap_user_boost_preview_html($actorKey, $boost, $profileOwnerId);
+            }
+            $boostPages = max(1, (int) ceil($profileBoostTotal / $profilePerPage));
+            if ($boostPages > 1) {
+                echo '<nav class="profile-pager" aria-label="Boost pages">';
+                if ($profilePage > 1) echo '<a href="?tab=boosts&amp;page=' . ($profilePage - 1) . '">← Newer boosts</a> ';
+                if ($profilePage < $boostPages) echo '<a href="?tab=boosts&amp;page=' . ($profilePage + 1) . '">Older boosts →</a>';
+                echo '</nav>';
+            }
+        }
+        echo '</section>';
     } elseif ($tab === 'featured') {
         echo '<section class="posts featured-section" aria-label="Featured">';
         echo function_exists('ap_featured_cards_html')
@@ -698,24 +841,44 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             : '<p class="muted">No featured accounts yet.</p>';
         echo '</section>';
     } else {
+        $profileItems = [];
+        foreach ($publicNotes as $note) {
+            $profileItems[] = ['sort' => strtotime((string) ($note['published'] ?? '')) ?: 0, 'kind' => 'local', 'row' => $note];
+        }
+        foreach ($profileBskyPosts as $bskyItem) {
+            $post = is_array($bskyItem['post'] ?? null) ? $bskyItem['post'] : [];
+            $profileItems[] = [
+                'sort' => strtotime((string) (($post['record']['createdAt'] ?? '') ?: ($post['indexedAt'] ?? ''))) ?: 0,
+                'kind' => 'bsky',
+                'item' => $bskyItem,
+            ];
+        }
+        foreach ($profileBoosts as $boost) {
+            $profileItems[] = [
+                'sort' => strtotime((string) ($boost['created_at'] ?? '')) ?: 0,
+                'kind' => 'boost',
+                'row' => $boost,
+            ];
+        }
+        usort($profileItems, static fn(array $a, array $b): int => (int) ($b['sort'] ?? 0) <=> (int) ($a['sort'] ?? 0));
+        $profileItems = array_slice($profileItems, ($profilePage - 1) * $profilePerPage, $profilePerPage);
         echo '<section id="profile-posts" class="posts profile-infinite" aria-label="Posts" data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '">';
-        if (!$publicNotes && !$profileBoosts) {
+        if (!$profileItems && !$profileBoostTotal) {
             echo '<p class="muted">No public posts yet.</p>';
         } else {
-            foreach ($publicNotes as $n) {
-                echo ap_user_post_preview_html($actorKey, $n);
-            }
-            foreach ($profileBoosts as $boost) {
-                $object = rtrim((string) ($boost['object_id'] ?? ''), '/');
-                if ($object === '') {
-                    continue;
+            foreach ($profileItems as $profileItem) {
+                if (($profileItem['kind'] ?? '') === 'bsky') {
+                    echo ap_user_bsky_post_preview_html($actorKey, $profileItem['item'] ?? []);
+                } elseif (($profileItem['kind'] ?? '') === 'boost' && is_array($profileItem['row'] ?? null)) {
+                    $boost = $profileItem['row'];
+                    $object = rtrim((string) ($boost['object_id'] ?? ''), '/');
+                    if ($object === '') {
+                        continue;
+                    }
+                    echo ap_user_boost_preview_html($actorKey, $boost, $profileOwnerId);
+                } elseif (is_array($profileItem['row'] ?? null)) {
+                    echo ap_user_post_preview_html($actorKey, $profileItem['row']);
                 }
-                $safeObject = htmlspecialchars($object, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-                $date = (string) ($boost['created_at'] ?? '');
-                echo '<article class="post profile-boost"><div class="muted">↻ boosted</div>'
-                    . '<a href="' . $safeObject . '" rel="noopener noreferrer">' . $safeObject . '</a>'
-                    . ($date !== '' ? '<time class="muted" datetime="' . htmlspecialchars($date, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars($date, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</time>' : '')
-                    . '</article>';
             }
         }
         if ($profilePageCount > $profilePage) {
@@ -850,6 +1013,249 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
     $html .= ap_webmention_cards_html((string) ($row['id'] ?? ''));
     $html .= '</article>';
     return $html;
+}
+
+/** Render one cached Bluesky post on a local HTML profile. */
+function ap_user_bsky_post_preview_html(string $actorKey, array $item, bool $showRepostLabel = true): string
+{
+    $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+    if ($post === []) {
+        return '';
+    }
+    $record = is_array($post['record'] ?? null) ? $post['record'] : [];
+    $text = trim((string) ($record['text'] ?? $post['text'] ?? ''));
+    $body = ap_user_bsky_richtext_html($text, is_array($record['facets'] ?? null) ? $record['facets'] : []);
+    $uri = trim((string) ($post['uri'] ?? $item['bsky_uri'] ?? ''));
+    $handle = trim((string) (($post['author']['handle'] ?? '') ?: ''));
+    $postUrl = function_exists('ap_bsky_post_url') ? ap_bsky_post_url($post) : '';
+    if ($postUrl === '' && $handle !== '' && preg_match('/([^/]+)$/', $uri, $m)) {
+        $postUrl = 'https://bsky.app/profile/' . rawurlencode($handle) . '/post/' . rawurlencode((string) $m[1]);
+    }
+    $created = (string) ($record['createdAt'] ?? $post['indexedAt'] ?? '');
+    $dateLabel = $created;
+    try {
+        $dateLabel = (new DateTimeImmutable($created))->format('M j, Y · g:i A T');
+    } catch (Throwable $e) {
+        // Keep the raw timestamp when Bluesky returns an unusual value.
+    }
+    $reason = is_array($item['reason'] ?? null) ? $item['reason'] : [];
+    $reasonType = strtolower((string) ($reason['$type'] ?? ''));
+    $isRepost = str_contains($reasonType, 'reasonrepost');
+    $mediaHtml = '';
+    if (function_exists('ap_bsky_media_items_from_embeds')) {
+        $media = ap_bsky_media_items_from_embeds($post['embed'] ?? ($record['embed'] ?? []));
+        foreach ($media as $m) {
+            $url = trim((string) ($m['url'] ?? ''));
+            if ($url === '' || !str_starts_with($url, 'https://')) {
+                continue;
+            }
+            $preview = trim((string) ($m['preview_url'] ?? $url));
+            if (str_contains((string) ($m['mediaType'] ?? ''), 'mpegURL')) {
+                $mediaHtml .= '<video controls preload="metadata" src="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" poster="' . htmlspecialchars($preview, ENT_QUOTES, 'UTF-8') . '"></video>';
+            } else {
+                $mediaHtml .= '<img src="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
+            }
+        }
+        if ($mediaHtml !== '') {
+            $mediaHtml = '<div class="media-row">' . $mediaHtml . '</div>';
+        }
+    }
+    $html = '<article class="post bsky-profile-post">';
+    if ($isRepost && $showRepostLabel) {
+        $html .= '<p class="muted" style="margin:0 0 .45rem">↻ boosted on Bluesky</p>';
+    }
+    $html .= '<p class="muted" style="margin:0 0 .45rem;font-size:.8rem"><span class="badge">Bluesky</span>';
+    if ($handle !== '') {
+        $html .= ' · @' . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+    $html .= '</p>';
+    if ($body !== '') {
+        $html .= '<div class="note-body">' . $body . '</div>';
+    } elseif ($mediaHtml === '') {
+        $html .= '<div class="note-body muted">No text content was cached for this post.</div>';
+    }
+    $html .= $mediaHtml;
+    if ($postUrl !== '') {
+        $html .= '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0"><a href="' . htmlspecialchars($postUrl, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($dateLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' · Open on Bluesky</a></p>';
+    } else {
+        $html .= '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0">' . htmlspecialchars($dateLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+    }
+    return $html . '</article>';
+}
+
+/** Render Bluesky UTF-8 text plus rich-text facets as safe HTML links. */
+function ap_user_bsky_richtext_html(string $text, array $facets = []): string
+{
+    if ($text === '') {
+        return '';
+    }
+    $escape = static fn(string $s): string => nl2br(htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'));
+    $ranges = [];
+    foreach ($facets as $facet) {
+        if (!is_array($facet) || !is_array($facet['index'] ?? null)) {
+            continue;
+        }
+        $start = (int) ($facet['index']['byteStart'] ?? -1);
+        $end = (int) ($facet['index']['byteEnd'] ?? -1);
+        if ($start < 0 || $end <= $start || $end > strlen($text)) {
+            continue;
+        }
+        $feature = is_array($facet['features'][0] ?? null) ? $facet['features'][0] : [];
+        $type = (string) ($feature['$type'] ?? '');
+        $href = '';
+        if (str_contains($type, '#link') && str_starts_with((string) ($feature['uri'] ?? ''), 'https://')) {
+            $href = (string) $feature['uri'];
+        } elseif (str_contains($type, '#tag')) {
+            $tag = ltrim(substr($text, $start, $end - $start), '#');
+            if ($tag !== '') {
+                $href = 'https://bsky.app/hashtag/' . rawurlencode($tag);
+            }
+        } elseif (str_contains($type, '#mention') && str_starts_with((string) ($feature['did'] ?? ''), 'did:')) {
+            $href = 'https://bsky.app/profile/' . rawurlencode((string) $feature['did']);
+        }
+        $ranges[] = [$start, $end, $href];
+    }
+    usort($ranges, static fn(array $a, array $b): int => $a[0] <=> $b[0]);
+    if ($ranges === []) {
+        // Older cache rows may not retain facets; still make ordinary URLs
+        // clickable without trusting any HTML from the post body.
+        $parts = preg_split('~(https?://[^\s<>]+)~i', $text, -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$text];
+        $html = '';
+        foreach ($parts as $part) {
+            if (preg_match('~^https?://[^\s<>]+$~i', $part)) {
+                $html .= '<a href="' . htmlspecialchars($part, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($part, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>';
+            } else {
+                $html .= $escape($part);
+            }
+        }
+        return $html;
+    }
+    $html = '';
+    $cursor = 0;
+    foreach ($ranges as [$start, $end, $href]) {
+        if ($start < $cursor) {
+            continue;
+        }
+        $html .= $escape(substr($text, $cursor, $start - $cursor));
+        $label = substr($text, $start, $end - $start);
+        $html .= $href !== ''
+            ? '<a href="' . htmlspecialchars($href, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . $escape($label) . '</a>'
+            : $escape($label);
+        $cursor = $end;
+    }
+    return $html . $escape(substr($text, $cursor));
+}
+
+/** Render the post behind a boost, rather than exposing only its URL. */
+function ap_user_bsky_cached_item_for_url(string $url): ?array
+{
+    if (!preg_match('~^https://bsky\.app/profile/([^/]+)/post/([^/?#]+)~i', trim($url), $m)) {
+        return null;
+    }
+    $handle = rawurldecode($m[1]);
+    $rkey = rawurldecode($m[2]);
+    static $cache = [];
+    if (!array_key_exists($handle, $cache)) {
+        $cache[$handle] = [];
+        try {
+            $st = ap_db()->prepare('SELECT raw_json, reason_json, bsky_uri FROM bsky_posts WHERE author_handle = ? ORDER BY indexed_at DESC LIMIT 500');
+            $st->execute([$handle]);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) continue;
+                $post = json_decode((string) ($row['raw_json'] ?? ''), true);
+                if (!is_array($post)) continue;
+                $uri = (string) ($row['bsky_uri'] ?? '');
+                if (!preg_match('~/([^/]+)$~', $uri, $um)) continue;
+                $item = ['post' => $post, 'bsky_uri' => $uri];
+                $reason = json_decode((string) ($row['reason_json'] ?? ''), true);
+                if (is_array($reason)) $item['reason'] = $reason;
+                $cache[$handle][$um[1]] = $item;
+            }
+        } catch (Throwable $e) { /* cache miss */ }
+    }
+    return $cache[$handle][$rkey] ?? null;
+}
+
+function ap_user_boost_preview_html(string $actorKey, array $boost, int $ownerUserId = 0): string
+{
+    $object = rtrim((string) ($boost['object_id'] ?? ''), '/');
+    if ($object === '') {
+        return '';
+    }
+    if (str_contains(strtolower($object), 'bsky.app/')) {
+        // Never resolve a remote handle during HTML rendering. The cache is
+        // populated by the background Bluesky worker and keeps profiles fast.
+        $item = ap_user_bsky_cached_item_for_url($object);
+        if (!is_array($item) && function_exists('ap_bsky_at_uri_from_https') && preg_match('~^https://bsky\.app/profile/(did:[^/]+)/post/~i', $object)) {
+            $uri = ap_bsky_at_uri_from_https($object, $ownerUserId);
+            $item = $uri !== null && function_exists('ap_bsky_post_item_by_uri') ? ap_bsky_post_item_by_uri($uri) : null;
+        }
+        if (is_array($item)) {
+            $boostedAt = (string) ($boost['created_at'] ?? '');
+            $boostDate = $boostedAt;
+            try { $boostDate = (new DateTimeImmutable($boostedAt))->format('M j, Y · g:i A T'); } catch (Throwable $e) { /* keep */ }
+            $date = $boostDate !== '' ? ' · ' . htmlspecialchars($boostDate, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : '';
+            return '<div class="profile-boost"><p class="muted profile-boost-label">↻ boosted on Bluesky' . $date . '</p>'
+                . ap_user_bsky_post_preview_html($actorKey, $item, false)
+                . '</div>';
+        }
+    }
+
+    $raw = '';
+    if (function_exists('ap_event_by_object_id')) {
+        $event = ap_event_by_object_id($object);
+        if (is_array($event)) {
+            $raw = (string) (($event['content'] ?? '') ?: ($event['summary'] ?? ''));
+        }
+    }
+    if ($raw === '') {
+        try {
+            $st = ap_db()->prepare('SELECT content FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+            $st->execute([$object, $object . '/']);
+            $row = $st->fetch();
+            $raw = is_array($row) ? (string) ($row['content'] ?? '') : '';
+        } catch (Throwable $e) {
+            // cache miss
+        }
+    }
+    $plain = trim(html_entity_decode(strip_tags($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $body = $plain !== ''
+        ? preg_replace_callback('~https?://[^\s<>]+~i', static fn(array $m): string => '<a href="' . htmlspecialchars($m[0], ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($m[0], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>', htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+        : '<span class="muted">Unable to load the boosted post content.</span>';
+    $boostedAt = (string) ($boost['created_at'] ?? '');
+    $boostDate = $boostedAt;
+    try { $boostDate = (new DateTimeImmutable($boostedAt))->format('M j, Y · g:i A T'); } catch (Throwable $e) { /* keep */ }
+    $date = $boostDate !== '' ? ' · ' . htmlspecialchars($boostDate, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : '';
+    return '<article class="post profile-boost"><p class="muted profile-boost-label">↻ boosted · Fediverse' . $date . '</p>'
+        . '<div class="note-body">' . nl2br((string) $body) . '</div>'
+        . '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0"><a href="' . htmlspecialchars($object, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">Open original post</a></p></article>';
+}
+
+/** Small safe Markdown renderer for published blog bodies on generic profiles. */
+function ap_user_blog_markdown_html(string $markdown): string
+{
+    $lines = preg_split('/\R/u', trim($markdown)) ?: [];
+    $out = [];
+    foreach ($lines as $line) {
+        $line = rtrim((string) $line);
+        if ($line === '') {
+            continue;
+        }
+        $safe = htmlspecialchars($line, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safe = preg_replace_callback('/\[([^\]]+)\]\((https:\/\/[^\s\)]+)\)/', static fn(array $m): string => '<a href="' . htmlspecialchars($m[2], ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($m[1], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>', $safe) ?? $safe;
+        $safe = preg_replace('/\*\*([^*]+)\*\*/', '<strong>$1</strong>', $safe) ?? $safe;
+        $safe = preg_replace('/(?<!\*)\*([^*]+)\*(?!\*)/', '<em>$1</em>', $safe) ?? $safe;
+        if (preg_match('/^###\s+(.+)$/', $line, $m)) {
+            $out[] = '<h4>' . htmlspecialchars($m[1], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</h4>';
+        } elseif (preg_match('/^##\s+(.+)$/', $line, $m)) {
+            $out[] = '<h3>' . htmlspecialchars($m[1], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</h3>';
+        } elseif (preg_match('/^#\s+(.+)$/', $line, $m)) {
+            $out[] = '<h2>' . htmlspecialchars($m[1], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</h2>';
+        } else {
+            $out[] = '<p>' . $safe . '</p>';
+        }
+    }
+    return implode("\n", $out);
 }
 
 /**

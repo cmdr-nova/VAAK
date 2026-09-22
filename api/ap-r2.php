@@ -945,6 +945,136 @@ function ap_remote_media_download(string $url, float $timeoutSec = 4.0): array
     return ['ok' => true, 'body' => $body, 'content_type' => $sniff];
 }
 
+/** Download a remote post image with the larger attachment limit. */
+function ap_remote_post_media_download(string $url, float $timeoutSec = 6.0): array
+{
+    $url = ap_profile_sanitize_https_url($url);
+    if ($url === null) return ['ok' => false, 'error' => 'Invalid media URL'];
+    $host = parse_url($url, PHP_URL_HOST);
+    if (!is_string($host) || $host === '' || (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($host))) {
+        return ['ok' => false, 'error' => 'Host not public'];
+    }
+    $ctx = stream_context_create([
+        'http' => [
+            'method' => 'GET', 'timeout' => max(1.0, min(15.0, $timeoutSec)),
+            'follow_location' => 0,
+            'header' => "Accept: image/*\r\nUser-Agent: mkultra-ap-media/1.0 (+https://mkultra.monster/users/cmdr_nova)\r\n",
+            'ignore_errors' => true,
+        ],
+        'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
+    ]);
+    $body = @file_get_contents($url, false, $ctx, 0, 8 * 1024 * 1024 + 1);
+    if (!is_string($body) || $body === '' || strlen($body) > 8 * 1024 * 1024) {
+        return ['ok' => false, 'error' => 'Remote image too large or unavailable'];
+    }
+    $statusLine = $http_response_header[0] ?? '';
+    if (!is_string($statusLine) || !preg_match('/\s200\s/', $statusLine)) {
+        return ['ok' => false, 'error' => 'Remote media HTTP ' . trim((string) $statusLine)];
+    }
+    $sniff = strtolower((string) ((new finfo(FILEINFO_MIME_TYPE))->buffer($body) ?: ''));
+    if (!in_array($sniff, ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'], true)) {
+        return ['ok' => false, 'error' => 'Unsupported image type'];
+    }
+    return ['ok' => true, 'body' => $body, 'content_type' => $sniff];
+}
+
+function ap_remote_post_media_get(string $sourceUrl): ?array
+{
+    try {
+        $st = ap_db()->prepare('SELECT * FROM remote_post_media_cache WHERE source_url = ? LIMIT 1');
+        $st->execute([$sourceUrl]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function ap_remote_post_media_touch(string $sourceUrl): void
+{
+    try {
+        ap_db()->prepare('UPDATE remote_post_media_cache SET last_used_at = ? WHERE source_url = ?')
+            ->execute([ap_db_now(), $sourceUrl]);
+    } catch (Throwable $e) {
+        // Cache touches are best-effort and never block media rendering.
+    }
+}
+
+/** Return a cached URL immediately, or queue a background warm on a miss. */
+function ap_remote_post_media_resolve(string $sourceUrl): string
+{
+    $sourceUrl = ap_profile_sanitize_https_url($sourceUrl) ?: '';
+    if ($sourceUrl === '') return '';
+    $cached = ap_remote_post_media_get($sourceUrl);
+    if (is_array($cached) && !empty($cached['public_url'])) {
+        ap_remote_post_media_touch($sourceUrl);
+        return (string) $cached['public_url'];
+    }
+    if (ap_media_warm_enqueue_post($sourceUrl)) {
+        ap_media_warm_worker_nudge();
+    }
+    return $sourceUrl;
+}
+
+function ap_remote_post_media_ensure(string $sourceUrl): ?string
+{
+    $sourceUrl = ap_profile_sanitize_https_url($sourceUrl) ?: '';
+    if ($sourceUrl === '') return null;
+    $lock = @fopen(sys_get_temp_dir() . '/vaak-post-media-' . hash('sha256', $sourceUrl) . '.lock', 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($lock)) fclose($lock);
+        return (string) (ap_remote_post_media_get($sourceUrl)['public_url'] ?? $sourceUrl);
+    }
+    try {
+        $cached = ap_remote_post_media_get($sourceUrl);
+        if (is_array($cached) && !empty($cached['public_url'])
+            && (time() - (strtotime((string) ($cached['fetched_at'] ?? '')) ?: 0)) < 14 * 86400) {
+            ap_remote_post_media_touch($sourceUrl);
+            return (string) $cached['public_url'];
+        }
+        $dl = ap_remote_post_media_download($sourceUrl);
+        if (empty($dl['ok'])) throw new RuntimeException((string) ($dl['error'] ?? 'download failed'));
+        $body = (string) $dl['body'];
+        $type = (string) $dl['content_type'];
+        $originalSize = strlen($body);
+        $tmp = tempnam(sys_get_temp_dir(), 'vaak-post-media');
+        if ($tmp === false || file_put_contents($tmp, $body) === false) throw new RuntimeException('temporary media write failed');
+        $converted = null;
+        if (in_array($type, ['image/jpeg', 'image/png'], true) && !ap_media_gif_is_animated($tmp)) {
+            $converted = ap_media_convert_to_webp($tmp);
+            if (is_array($converted) && strlen((string) ($converted['body'] ?? '')) < $originalSize) {
+                $body = (string) $converted['body'];
+                $type = 'image/webp';
+            }
+        }
+        @unlink($tmp);
+        if (is_array($converted) && !empty($converted['path'])) @unlink((string) $converted['path']);
+        $ext = match ($type) {
+            'image/png' => 'png', 'image/gif' => 'gif', 'image/avif' => 'avif', 'image/webp' => 'webp', default => 'jpg'
+        };
+        $key = 'cache/post-media/' . hash('sha256', $sourceUrl) . '.' . $ext;
+        $put = ap_r2_put_object($key, $body, $type);
+        if (empty($put['ok'])) throw new RuntimeException((string) ($put['error'] ?? 'R2 upload failed'));
+        if (is_array($cached) && !empty($cached['s3_key']) && $cached['s3_key'] !== ($put['key'] ?? '')) {
+            ap_r2_delete_object((string) $cached['s3_key']);
+        }
+        $now = ap_db_now();
+        ap_db()->prepare(
+            'INSERT INTO remote_post_media_cache (source_url, s3_key, public_url, content_type, byte_size, original_byte_size, fetched_at, last_used_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(source_url) DO UPDATE SET s3_key=excluded.s3_key, public_url=excluded.public_url,
+             content_type=excluded.content_type, byte_size=excluded.byte_size, original_byte_size=excluded.original_byte_size,
+             fetched_at=excluded.fetched_at, last_used_at=excluded.last_used_at'
+        )->execute([$sourceUrl, $put['key'], $put['public_url'], $type, strlen($body), $originalSize, $now, $now]);
+        return (string) $put['public_url'];
+    } catch (Throwable $e) {
+        error_log('[ap-r2] post media warm: ' . $e->getMessage());
+        return null;
+    } finally {
+        flock($lock, LOCK_UN); fclose($lock);
+    }
+}
+
 /**
  * Ensure avatar or header for an actor is cached in R2.
  * Returns public R2 URL on success, or null.
@@ -1144,6 +1274,43 @@ function ap_media_warm_enqueue_actor(string $actorId): bool
     }
 }
 
+/** Queue a remote post image warm, coalescing duplicate source URLs. */
+function ap_media_warm_enqueue_post(string $sourceUrl): bool
+{
+    $sourceUrl = ap_profile_sanitize_https_url($sourceUrl) ?: '';
+    if ($sourceUrl === '') return false;
+    try {
+        $now = gmdate('c');
+        $db = ap_db();
+        $st = $db->prepare(
+            "INSERT INTO ap_media_warm_queue
+             (job_type, target_key, media_kind, status, attempts, max_attempts, next_attempt_at, created_at, updated_at)
+             VALUES ('post_media', ?, 'image', 'pending', 0, 5, ?, ?, ?)
+             ON CONFLICT(job_type, target_key, media_kind) DO NOTHING"
+        );
+        $st->execute([$sourceUrl, $now, $now, $now]);
+        return $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        error_log('[ap-media-warm] post enqueue: ' . $e->getMessage());
+        return false;
+    }
+}
+
+function ap_media_warm_worker_nudge(): void
+{
+    $script = __DIR__ . '/ap-media-warm-worker.php';
+    if (!is_file($script)) return;
+    $lockPath = sys_get_temp_dir() . '/vaak-media-warm-worker.lock';
+    $lock = @fopen($lockPath, 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($lock)) fclose($lock);
+        return;
+    }
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    @exec('nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script) . ' --limit=3 >/dev/null 2>&1 </dev/null &');
+    flock($lock, LOCK_UN); fclose($lock);
+}
+
 /**
  * Queue a background warm of avatar/header for an actor.
  * The database row survives PHP/VPS restarts; a worker is nudged immediately
@@ -1157,22 +1324,7 @@ function ap_remote_media_warm_async(string $actorId): void
     if (!ap_media_warm_enqueue_actor($actorId)) {
         return;
     }
-    $script = __DIR__ . '/ap-media-warm-worker.php';
-    if (!is_file($script)) {
-        return;
-    }
-    $lockPath = sys_get_temp_dir() . '/vaak-media-warm-worker.lock';
-    $lock = @fopen($lockPath, 'c+');
-    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
-        if (is_resource($lock)) fclose($lock);
-        return;
-    }
-    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
-    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script)
-        . ' --limit=3 >/dev/null 2>&1 </dev/null &';
-    @exec($cmd);
-    flock($lock, LOCK_UN);
-    fclose($lock);
+    ap_media_warm_worker_nudge();
 }
 
 /** Run a bounded batch of durable remote actor-media jobs. */
@@ -1208,17 +1360,22 @@ function ap_media_warm_worker_run(int $limit = 3): array
             $ok = false;
             $error = '';
             try {
-                $actor = rtrim(trim((string) ($row['target_key'] ?? '')), '/');
-                if ($actor === '' || !str_starts_with($actor, 'https://')) {
-                    throw new RuntimeException('Invalid actor media target.');
+                $target = trim((string) ($row['target_key'] ?? ''));
+                if ($target === '' || !str_starts_with($target, 'https://')) {
+                    throw new RuntimeException('Invalid media target.');
                 }
-                if (function_exists('ap_remote_actor_ensure')) ap_remote_actor_ensure($actor, true);
-                $avatar = ap_remote_media_ensure($actor, 'avatar', false);
-                $header = ap_remote_media_ensure($actor, 'header', false);
-                // An actor may legitimately publish neither image. Treat a
-                // completed lookup as success so it is not retried forever.
-                $ok = true;
-                if (!$avatar && !$header) $error = 'Actor has no cached avatar/header.';
+                if ((string) ($row['job_type'] ?? '') === 'post_media') {
+                    $ok = ap_remote_post_media_ensure($target) !== null;
+                } else {
+                    $actor = rtrim($target, '/');
+                    if (function_exists('ap_remote_actor_ensure')) ap_remote_actor_ensure($actor, true);
+                    $avatar = ap_remote_media_ensure($actor, 'avatar', false);
+                    $header = ap_remote_media_ensure($actor, 'header', false);
+                    // An actor may legitimately publish neither image. Treat a
+                    // completed lookup as success so it is not retried forever.
+                    $ok = true;
+                    if (!$avatar && !$header) $error = 'Actor has no cached avatar/header.';
+                }
             } catch (Throwable $e) {
                 $error = substr($e->getMessage(), 0, 400);
             }
@@ -1362,6 +1519,39 @@ function ap_remote_media_cleanup(int $unusedDays = 7, int $limit = 200): array
         }
         ap_remote_media_delete_row((int) $row['id']);
         $deleted++;
+    }
+    return ['scanned' => count($rows), 'deleted' => $deleted, 'errors' => $errors];
+}
+
+/** Purge unused cached remote post images without touching local uploads. */
+function ap_remote_post_media_cleanup(int $unusedDays = 30, int $limit = 200, int $maxMb = 4096): array
+{
+    $deleted = 0; $errors = 0; $rows = [];
+    try {
+        $cutoff = gmdate('c', time() - max(1, $unusedDays) * 86400);
+        $st = ap_db()->prepare('SELECT * FROM remote_post_media_cache WHERE last_used_at < ? ORDER BY last_used_at ASC LIMIT ?');
+        $st->bindValue(1, $cutoff);
+        $st->bindValue(2, max(1, min(1000, $limit)), PDO::PARAM_INT);
+        $st->execute(); $rows = $st->fetchAll() ?: [];
+        $remove = static function (array $row) use (&$deleted, &$errors): bool {
+            $key = (string) ($row['s3_key'] ?? '');
+            if ($key !== '' && !str_contains(ltrim($key, '/'), 'cache/post-media/')) { $errors++; return false; }
+            if ($key !== '') { $result = ap_r2_delete_object($key); if (empty($result['ok'])) { $errors++; return false; } }
+            ap_db()->prepare('DELETE FROM remote_post_media_cache WHERE id = ?')->execute([(int) ($row['id'] ?? 0)]);
+            $deleted++; return true;
+        };
+        foreach ($rows as $row) $remove($row);
+        // Age is the normal policy; the byte budget is a hard upper bound for
+        // installations with a busy public timeline.
+        $budget = max(128, $maxMb) * 1024 * 1024;
+        while ($deleted < max(1, min(1000, $limit))) {
+            $total = (int) (ap_db()->query('SELECT COALESCE(SUM(byte_size), 0) FROM remote_post_media_cache')->fetchColumn() ?: 0);
+            if ($total <= $budget) break;
+            $old = ap_db()->query('SELECT * FROM remote_post_media_cache ORDER BY last_used_at ASC LIMIT 1')->fetch();
+            if (!is_array($old) || !$remove($old)) break;
+        }
+    } catch (Throwable $e) {
+        $errors++; error_log('[ap-r2] post media cleanup: ' . $e->getMessage());
     }
     return ['scanned' => count($rows), 'deleted' => $deleted, 'errors' => $errors];
 }
