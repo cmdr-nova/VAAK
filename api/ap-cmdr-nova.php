@@ -1592,6 +1592,31 @@ function ap_cmdr_html(): void
     // Resolve VAAK session before any HTML so pin/unpin owner chrome works.
     $isOwner = ap_cmdr_profile_owner_session();
 
+    // Public profile visits are read-only and identical for anonymous visitors.
+    // Reuse a short-lived rendered response so strangers do not all pay the
+    // cost of rebuilding the full posts/boosts/profile shell at once.
+    $profileCachePath = null;
+    $profileCacheBuffering = false;
+    $requestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if (!$isOwner && in_array($requestMethod, ['GET', 'HEAD'], true)) {
+        $cacheKey = hash('sha256', (string) ($_SERVER['REQUEST_URI'] ?? '/users/cmdr_nova'));
+        $profileCachePath = rtrim((string) sys_get_temp_dir(), DIRECTORY_SEPARATOR)
+            . DIRECTORY_SEPARATOR . 'vaak-cmdr-profile-' . $cacheKey . '.html';
+        $cacheTtl = 20;
+        if (is_readable($profileCachePath) && (time() - (int) @filemtime($profileCachePath)) < $cacheTtl) {
+            header('Content-Type: text/html; charset=utf-8');
+            header('Vary: Accept');
+            header('Cache-Control: public, max-age=20, stale-while-revalidate=60');
+            header('X-VAAK-Profile-Cache: HIT');
+            if ($requestMethod !== 'HEAD') {
+                readfile($profileCachePath);
+            }
+            return;
+        }
+        ob_start();
+        $profileCacheBuffering = true;
+    }
+
     $p = ap_profile_get('cmdr_nova');
     $hideProfileReplies = !empty($p['hide_profile_replies']);
     $hideProfileBoosts = !empty($p['hide_profile_boosts']);
@@ -1928,6 +1953,17 @@ function ap_cmdr_html(): void
     echo 'form.addEventListener("submit",function(ev){ev.preventDefault();var p=parseHandle(input.value);if(!p){setErr("Use a full address like @you@mastodon.social");input.focus();return;}setErr("");window.open("https://"+p.host+"/authorize_interaction?uri="+encodeURIComponent(ACTOR),"_blank","noopener,noreferrer");});';
     echo '})();</script>';
     ap_cmdr_shell_end();
+    if ($profileCacheBuffering && $profileCachePath !== null) {
+        $html = (string) ob_get_clean();
+        if ($html !== '' && strlen($html) <= 12 * 1024 * 1024) {
+            @file_put_contents($profileCachePath, $html, LOCK_EX);
+        }
+        header('Cache-Control: public, max-age=20, stale-while-revalidate=60');
+        header('X-VAAK-Profile-Cache: MISS');
+        if ($requestMethod !== 'HEAD') {
+            echo $html;
+        }
+    }
 }
 
 /**
