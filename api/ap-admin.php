@@ -23574,6 +23574,7 @@ window.apAdminToast = function (msg, isErr) {
     }, { root: sc.ioRoot, rootMargin: '180px', threshold: 0 });
     io.observe(sentinel);
     sc.onScroll(updateTopBtn);
+    sc.onScroll(syncTimelineStreamVisibility);
     updateTopBtn();
   }, { passive: true, capture: true });
 
@@ -23848,7 +23849,7 @@ window.apAdminToast = function (msg, isErr) {
     }, 1200);
   }
   function startTimelineStream() {
-    if (!window.EventSource || document.hidden || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
+    if (!window.EventSource || document.hidden || !nearTop() || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
     const url = '?view=' + encodeURIComponent(viewName)
       + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
       + '&limit=' + encodeURIComponent(String(Math.min(24, limit)));
@@ -23898,12 +23899,20 @@ window.apAdminToast = function (msg, isErr) {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       pollNewer();
-      startTimelineStream();
+      syncTimelineStreamVisibility();
     } else {
       stopTimelineStream();
     }
   });
-  setTimeout(() => { pollNewer(); startTimelineStream(); }, 5000);
+  function syncTimelineStreamVisibility() {
+    if (document.hidden || !nearTop()) {
+      stopTimelineStream();
+      return;
+    }
+    startTimelineStream();
+  }
+  sc.onScroll(syncTimelineStreamVisibility);
+  setTimeout(() => { pollNewer(); syncTimelineStreamVisibility(); }, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
 
