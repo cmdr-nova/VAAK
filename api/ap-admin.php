@@ -25341,6 +25341,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         ta.focus();
         try { ta.setSelectionRange(pos, pos); } catch (_) {}
         ta.dispatchEvent(new Event('input', { bubbles: true }));
+        // Selecting an emoji completes the picker action; collapse it so the
+        // composer stays compact and the next tap returns to the text field.
+        picker.hidden = true;
+        toggle.setAttribute('aria-expanded', 'false');
       });
       grid.appendChild(b);
       buttons.push(b);
@@ -25997,18 +26001,22 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         const feedEl = document.querySelector('.feed');
         const savedWindowY = window.scrollY || document.documentElement.scrollTop || 0;
         const savedFeedTop = feedEl ? feedEl.scrollTop : 0;
-        await window.novaPollTimeline();
-        if (typeof window.novaInsertPendingTimeline === 'function') {
-          window.novaInsertPendingTimeline({ scrollToTop: !wasFeedReply });
-        }
-        if (wasFeedReply) {
-          const restore = () => {
-            try { window.scrollTo(0, savedWindowY); } catch (e) {}
-            if (feedEl) feedEl.scrollTop = savedFeedTop;
-          };
-          restore();
-          requestAnimationFrame(restore);
-        }
+        // Reconcile the local card in the background. The post is already
+        // committed locally and federation is durable-queued, so closing the
+        // composer must not wait for a timeline rebuild.
+        Promise.resolve(window.novaPollTimeline()).then(() => {
+          if (typeof window.novaInsertPendingTimeline === 'function') {
+            window.novaInsertPendingTimeline({ scrollToTop: !wasFeedReply });
+          }
+          if (wasFeedReply) {
+            const restore = () => {
+              try { window.scrollTo(0, savedWindowY); } catch (e) {}
+              if (feedEl) feedEl.scrollTop = savedFeedTop;
+            };
+            restore();
+            requestAnimationFrame(restore);
+          }
+        }).catch(() => {});
       } else {
         window.location.reload();
       }
