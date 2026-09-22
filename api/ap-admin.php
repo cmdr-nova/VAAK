@@ -26231,7 +26231,13 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const submitBtn = document.getElementById('compose-submit-btn') || form.querySelector('button[type="submit"]');
     unlockPostAudio();
     const mode = composeMode;
-    const actionName = mode === 'queue_post' ? 'queue_post' : (mode === 'edit_status' ? 'edit_status' : 'reply');
+    // A server-rendered edit always carries the existing note id. Treat that
+    // as authoritative even if a stale client mode was initialized as reply;
+    // otherwise saving an edit can accidentally create a second post.
+    const editingNoteId = noteIdField && String(noteIdField.value || '').trim();
+    const actionName = mode === 'queue_post'
+      ? 'queue_post'
+      : (mode === 'edit_status' || editingNoteId !== '' ? 'edit_status' : 'reply');
     if (actionField) actionField.value = actionName;
     if (returnField && mode !== 'queue_post') {
       returnField.value = <?= json_encode($composerReturnView) ?>;
