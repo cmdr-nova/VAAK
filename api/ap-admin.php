@@ -17580,8 +17580,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <input name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit authenticator code" style="margin-top:.75rem">
           <div class="composer-actions"><span class="meta">The QR is generated in your browser.</span><button class="btn btn-primary" type="submit">Enable 2FA</button></div>
         </form>
-        <div id="vaak-totp-qr" hidden style="position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.78);place-items:center;padding:1rem" onclick="if(event.target===this)this.hidden=true">
-          <div class="tweet" style="max-width:24rem;text-align:center;background:#171717"><div class="who">Scan to add VAAK 2FA</div><div id="vaak-totp-qr-image" style="background:#fff;padding:1rem;margin:1rem auto;width:min(80vw,18rem);aspect-ratio:1"></div><button type="button" class="btn btn-ghost" onclick="this.closest('#vaak-totp-qr').hidden=true">Close</button></div>
+        <div id="vaak-totp-qr" hidden style="position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.78);place-items:center;padding:1rem" onclick="if(event.target===this){this.hidden=true;this.style.display='none'}">
+          <div class="tweet" style="max-width:24rem;text-align:center;background:#171717"><div class="who">Scan to add VAAK 2FA</div><div id="vaak-totp-qr-image" style="background:#fff;padding:1rem;margin:1rem auto;width:min(80vw,18rem);aspect-ratio:1"></div><button type="button" class="btn btn-ghost" onclick="var m=this.closest('#vaak-totp-qr');m.hidden=true;m.style.display='none'">Close</button></div>
         </div>
         <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
         <script>function vaakShowTotpQr(uri){var box=document.getElementById('vaak-totp-qr'),out=document.getElementById('vaak-totp-qr-image');if(!window.qrcode){alert('QR generator is unavailable. Use the Base32 setup key instead.');return;}var qr=qrcode(0,'M');qr.addData(uri);qr.make();out.innerHTML=qr.createSvgTag(5,0);box.hidden=false;box.style.display='grid';}</script>
