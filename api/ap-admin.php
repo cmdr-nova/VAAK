@@ -14546,6 +14546,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .compose-media-row {
       display: flex; flex-wrap: wrap; gap: .65rem; margin: .65rem 0 .25rem;
     }
+    .composer.is-dragover {
+      outline: 2px dashed var(--primary);
+      outline-offset: 5px;
+    }
     .compose-media-card {
       width: 7.5rem; background: #0c0c0c; border: 1px solid var(--border);
       border-radius: 10px; overflow: hidden; padding: .35rem;
@@ -25490,11 +25494,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const hint = document.getElementById('compose-media-hint');
     if (hint) hint.textContent = files.length ? (files.length + ' / ' + MAX) : '';
   }
-  input.addEventListener('change', () => {
-    const picked = Array.from(input.files || []);
+  function addComposeFiles(picked) {
     const existingCount = ((draftMediaField && draftMediaField.value) || '')
       .split(/[\s,]+/).filter((x) => parseInt(x, 10) > 0).length;
     for (const f of picked) {
+      if (!f || typeof f.size !== 'number') continue;
       if (files.length + existingCount >= MAX) {
         if (window.apAdminToast) window.apAdminToast('Too many media attachments (max ' + MAX + ').', true);
         break;
@@ -25507,10 +25511,47 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       files.push(f);
       alts.push('');
     }
+    syncInput();
+    render();
+  }
+  input.addEventListener('change', () => {
+    addComposeFiles(Array.from(input.files || []));
     // Clear the native input so the same file can be re-picked; we own `files`.
     try { input.value = ''; } catch (e) {}
     syncInput();
-    render();
+  });
+  // Accept files dragged from the desktop using the same validation and
+  // preview path as the media picker. Prevent the browser from navigating to
+  // the dropped file when the pointer leaves a child element.
+  let composeDragDepth = 0;
+  const hasDraggedFiles = (event) => {
+    const types = event && event.dataTransfer && event.dataTransfer.types;
+    return !!(types && Array.from(types).includes('Files'));
+  };
+  form.addEventListener('dragenter', (event) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    composeDragDepth += 1;
+    form.classList.add('is-dragover');
+  });
+  form.addEventListener('dragover', (event) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    form.classList.add('is-dragover');
+  });
+  form.addEventListener('dragleave', (event) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    composeDragDepth = Math.max(0, composeDragDepth - 1);
+    if (!composeDragDepth) form.classList.remove('is-dragover');
+  });
+  form.addEventListener('drop', (event) => {
+    if (!hasDraggedFiles(event)) return;
+    event.preventDefault();
+    composeDragDepth = 0;
+    form.classList.remove('is-dragover');
+    addComposeFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
   });
   let composeMode = <?= $composeIsEdit ? "'edit_status'" : "'reply'" ?>; // reply | queue_post | edit_status
   const actionField = document.getElementById('compose-action');
