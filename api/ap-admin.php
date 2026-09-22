@@ -7412,7 +7412,7 @@ function admin_edit_post_button(
     // behind timeline streams); retain the href as a no-JS fallback.
     $editAttrs = ' class="' . ($asMenuItem ? 'menu-action' : 'btn btn-ghost') . ' js-edit-post"'
         . ' href="' . h($href) . '"'
-        . ' type="button" data-note-id="' . h($noteId) . '"'
+        . ' data-note-id="' . h($noteId) . '"'
         . ' data-return-view="' . h($returnView) . '"'
         . ' data-content-b64="' . h(base64_encode($plainText)) . '"'
         . ' data-spoiler-b64="' . h(base64_encode($spoiler)) . '"'
