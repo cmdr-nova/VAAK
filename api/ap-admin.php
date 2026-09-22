@@ -12215,22 +12215,26 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
 }
 
 /** Wait for an ingestion notification, falling back to a short timeout. */
-function admin_timeline_stream_wait(int $timeoutMs = 3000): void
+function admin_timeline_stream_wait(int $timeoutMs = 3000): ?array
 {
     try {
         $db = ap_db();
         if (ap_db_driver($db) !== 'pgsql' || !method_exists($db, 'pgsqlGetNotify')) {
             usleep(max(250, min(5000, $timeoutMs)) * 1000);
-            return;
+            return null;
         }
         static $listening = false;
         if (!$listening) {
             $db->exec('LISTEN vaak_timeline_events');
             $listening = true;
         }
-        $db->pgsqlGetNotify(PDO::FETCH_ASSOC, max(250, min(5000, $timeoutMs)));
+        $note = $db->pgsqlGetNotify(PDO::FETCH_ASSOC, max(250, min(5000, $timeoutMs)));
+        if (!is_array($note)) return null;
+        $payload = json_decode((string) ($note['payload'] ?? ''), true);
+        return is_array($payload) ? $payload : null;
     } catch (Throwable $e) {
         usleep(max(250, min(5000, $timeoutMs)) * 1000);
+        return null;
     }
 }
 
@@ -12402,13 +12406,32 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         header('X-Accel-Buffering: no');
         @ini_set('output_buffering', 'off');
         @ini_set('zlib.output_compression', '0');
-        @set_time_limit(28);
+        @set_time_limit(16);
         while (ob_get_level() > 0) @ob_end_flush();
         echo ": vaak-stream\n\n";
         @flush();
         $streamSince = max(0, $sinceTs);
-        $streamDeadline = microtime(true) + 24.0;
+        // Keep the request short so one idle browser tab cannot occupy a
+        // PHP-FPM worker while a page is trying to load more history.
+        $streamDeadline = microtime(true) + 12.0;
+        $streamFirstPass = true;
         while ($streamSince > 0 && microtime(true) < $streamDeadline) {
+            if (!$streamFirstPass) {
+                $notification = admin_timeline_stream_wait(3000);
+                if ($notification === null) {
+                    echo ": heartbeat\n\n";
+                    @flush();
+                    continue;
+                }
+                // Cache refreshes and old backfills can notify Postgres too;
+                // they cannot add anything newer than the client's current
+                // head and should not trigger a full timeline scan.
+                $notifiedAt = strtotime((string) ($notification['at'] ?? '')) ?: 0;
+                if ($notifiedAt > 0 && $notifiedAt <= $streamSince) {
+                    continue;
+                }
+            }
+            $streamFirstPass = false;
             $slice = admin_tl_fetch_newer($view, $following, $streamSince, max(8, min(30, $tlLimit)));
             $newest = $streamSince;
             $html = '';
@@ -12436,11 +12459,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
                 echo "event: posts\n";
                 echo 'data: ' . (is_string($payload) ? $payload : '{}') . "\n\n";
                 $streamSince = max($streamSince, $newest);
-            } else {
-                echo ": heartbeat\n\n";
             }
             @flush();
-            if (microtime(true) < $streamDeadline) admin_timeline_stream_wait(3000);
         }
         echo "event: close\ndata: {}\n\n";
         @flush();
@@ -23748,8 +23768,9 @@ window.apAdminToast = function (msg, isErr) {
       + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
       + '&limit=' + encodeURIComponent(String(Math.min(24, limit)));
     try {
-      timelineStream = new EventSource(url, { withCredentials: true });
-      timelineStream.addEventListener('posts', (event) => {
+      const source = new EventSource(url, { withCredentials: true });
+      timelineStream = source;
+      source.addEventListener('posts', (event) => {
         try {
           const payload = JSON.parse(event.data || '{}');
           const newest = parseInt(payload.newest || '0', 10);
@@ -23764,11 +23785,13 @@ window.apAdminToast = function (msg, isErr) {
           updateNewBtn();
         } catch (e) {}
       });
-      timelineStream.addEventListener('close', () => {
+      source.addEventListener('close', () => {
+        if (timelineStream !== source) return;
         stopTimelineStream();
         scheduleStreamReconnect();
       });
-      timelineStream.onerror = () => {
+      source.onerror = () => {
+        if (timelineStream !== source) return;
         stopTimelineStream();
         if (!streamFallbackTimer) streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
         scheduleStreamReconnect();
