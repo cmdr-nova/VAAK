@@ -5858,7 +5858,10 @@ function ap_masto_peertube_prefer_create_event(array $row): array
 function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId = null, ?string $sinceId = null, bool $onlyMedia = false): array
 {
     $startedAt = microtime(true);
-    $limit = max(1, min(80, $limit));
+    // Mobile clients paginate through a filtered view (blocks, mutes, dedupe,
+    // visibility). Keep a generous but bounded source window so a page does
+    // not look like the end of the timeline after those filters run.
+    $limit = max(1, min(200, $limit));
     $params = [];
     // Home includes Creates + Announces (boosts) from people we follow.
     // Federated stays Create-focused for the public firehose.
@@ -5972,9 +5975,9 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // Order by created_at (not id): outbox backfill inserts older posts with
     // newer row ids, which otherwise push real recent inbox Creates out of the
     // over-fetch window and make Home look empty of follows.
-    // Over-fetch ×2 (was ×4) — enough for block/dedupe without converting hundreds of rows.
+    // Over-fetch to survive filtering without making unbounded queries.
     $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
-        . ' ORDER BY created_at DESC, id DESC LIMIT ' . (int) max($limit * 2, $limit + 10);
+        . ' ORDER BY created_at DESC, id DESC LIMIT ' . (int) min(800, max($limit * 4, $limit + 40));
     $queryStartedAt = microtime(true);
     $st = ap_db()->prepare($sql);
     $st->execute($params);
@@ -6147,7 +6150,13 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
 
     // Page remotes with the same cursor — fetching the head then filtering left
     // deep scroll with only local/boost leftovers.
-    $remote = ap_masto_timeline_events('federated', max($limit + 10, 40), $maxId, $sinceId, $onlyMedia);
+    $remote = ap_masto_timeline_events(
+        'federated',
+        min(200, max($limit * 4, $limit + 40)),
+        $maxId,
+        $sinceId,
+        $onlyMedia
+    );
     $ownCap = max(1, min(3, (int) ceil($limit * 0.2)));
     $local = [];
     foreach (ap_masto_statuses_recent(max($ownCap * 3, 12), $before, $after) as $r) {

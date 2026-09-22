@@ -1603,7 +1603,9 @@ function ap_masto_api(string $method, string $path): void
 
         if ($local) {
             // Local timeline = this single-user instance's own posts
-            $rows = ap_masto_statuses_recent($limit > 0 ? $limit : 40);
+            // Fetch past the requested page before applying the cursor; a
+            // head-only query would make page 2 appear empty immediately.
+            $rows = ap_masto_statuses_recent(min(200, max(($limit > 0 ? $limit : 40) * 4, 80)));
             $out = [];
             $before = ($maxId !== null && $maxId !== '') ? ap_masto_status_created_at_by_id((int) $maxId) : null;
             $after = ($sinceId !== null && $sinceId !== '') ? ap_masto_status_created_at_by_id((int) $sinceId) : null;
