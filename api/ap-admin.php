@@ -12208,6 +12208,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
 
     try {
         if ($view === 'local') {
+            // Local polling is restricted to actors hosted by this instance.
+            // Keep outbox rows for local posts that have not produced an event
+            // yet, then merge observed local activity without remote rows.
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
                  WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
@@ -12236,6 +12239,23 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                 $out[] = $item;
                 if (count($out) >= $limit) {
                     break;
+                }
+            }
+            if (count($out) < $limit) {
+                $st = $db->prepare(
+                    "SELECT * FROM events
+                     WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
+                       AND action_taken IN ('log', 'local_observe')
+                       AND actor_id LIKE 'https://mkultra.monster/users/%'
+                       AND created_at > ?
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?"
+                );
+                $st->execute([$sinceAt, $limit * 2]);
+                foreach ($st->fetchAll() ?: [] as $e) {
+                    if (!is_array($e)) continue;
+                    $pushEvent($e);
+                    if (count($out) >= $limit) break;
                 }
             }
         } elseif ($view === 'gallery' || $view === 'vakktok') {
@@ -23595,10 +23615,9 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function pollNewer() {
-    // Head polling is scoped to Home. Local and Federated are explicit
-    // instance views; they must not inherit Home's pending-post banner or
-    // background stream while the tab is swapped in place.
-    if (viewName !== 'home') return;
+    // Every standard timeline may poll, but the server scopes the query to
+    // the active view (Home, Local, or Federated).
+    if (!['home', 'local', 'feed'].includes(viewName)) return;
     if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
     if (pollBusy || document.hidden) return;
@@ -24061,7 +24080,7 @@ window.apAdminToast = function (msg, isErr) {
     }, 1200);
   }
   function startTimelineStream() {
-    if (viewName !== 'home') return;
+    if (!['home', 'local', 'feed'].includes(viewName)) return;
     if (!window.EventSource || document.hidden || window.__vaakNavigationPending || !nearTop() || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
     const url = '?view=' + encodeURIComponent(viewName)
       + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
@@ -24115,9 +24134,9 @@ window.apAdminToast = function (msg, isErr) {
       streamFallbackTimer = 0;
     }
   });
-  if (window.EventSource && viewName === 'home' && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
+  if (window.EventSource && ['home', 'local', 'feed'].includes(viewName) && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
     startTimelineStream();
-  } else if (viewName === 'home') {
+  } else if (['home', 'local', 'feed'].includes(viewName)) {
     streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
   }
   document.addEventListener('visibilitychange', () => {
