@@ -4904,6 +4904,46 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
     return $timeline;
 }
 
+/**
+ * Keep a thin but reliable followed-author baseline on the first Home page.
+ * Recommendations are additive; they must not replace explicitly followed
+ * content when that content is already in the local candidate set.
+ * @param list<array<string,mixed>> $timeline
+ * @return list<array<string,mixed>>
+ */
+function admin_home_apply_follower_fallback(array $timeline, int $pageSize = 15): array
+{
+    if ($timeline === [] || $pageSize < 1) return $timeline;
+    $followed = [];
+    foreach ($timeline as $index => $item) {
+        if (($item['home_source'] ?? '') === 'following') $followed[] = $index;
+    }
+    if ($followed === []) return $timeline;
+    $head = array_slice($timeline, 0, $pageSize);
+    $headFollowed = 0;
+    foreach ($head as $item) {
+        if (($item['home_source'] ?? '') === 'following') $headFollowed++;
+    }
+    $minimum = min(3, count($followed));
+    if ($headFollowed >= $minimum) return $timeline;
+
+    // Replace only recommendation-heavy slots, preserving local and already
+    // followed cards in the visible page.
+    $replace = [];
+    foreach ($head as $index => $item) {
+        if (!empty($item['from_tag']) || ($item['kind'] ?? '') === 'bsky') $replace[] = $index;
+    }
+    $cursor = $headFollowed;
+    foreach ($replace as $headIndex) {
+        if ($headFollowed >= $minimum || !isset($followed[$cursor])) break;
+        $sourceIndex = $followed[$cursor++];
+        if ($sourceIndex < $pageSize) continue;
+        [$timeline[$headIndex], $timeline[$sourceIndex]] = [$timeline[$sourceIndex], $timeline[$headIndex]];
+        $headFollowed++;
+    }
+    return $timeline;
+}
+
 
 /**
  * Keep the first Home page fedi-only (fast paint). Queue Bluesky ids into later
@@ -6097,6 +6137,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 'kind' => 'event',
                 'sort' => $sortTs,
                 'row' => $e,
+                'home_source' => 'following',
                 'deprioritized' => function_exists('ap_is_deprioritized_actor')
                     && ap_is_deprioritized_actor($aid, $homeOwnerId),
             ];
@@ -6406,6 +6447,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         }
         $homeTimeline = $capped;
     }
+    // Recommendations are additive: keep a few followed-author cards on the
+    // first page whenever the candidate set has enough follower content.
+    $homeTimeline = admin_home_apply_follower_fallback($homeTimeline, $tlLimit);
     // Seed ranked cache for subsequent infinite-scroll pages.
     // First page stays the fedi $homeTimeline slice; Bluesky ids start after it.
     if ($homeTimeline !== []) {
