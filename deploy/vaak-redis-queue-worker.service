@@ -1,0 +1,17 @@
+[Unit]
+Description=VAAK Redis queue wake-up worker
+After=redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/srv/mkultra/html/api
+ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-redis-queue-worker.php
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

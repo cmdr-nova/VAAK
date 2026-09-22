@@ -14,6 +14,9 @@ function ap_publish_delivery_enqueue(int $owner, string $noteId, array $payload)
         (owner_user_id,note_id,payload_json,status,priority,attempts,next_attempt_at,created_at,updated_at)
         VALUES (?,?,?,'pending',?,0,?,?,?) ON CONFLICT(note_id) DO NOTHING");
     $st->execute([$owner, $noteId, json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), $priority, $now, $now, $now]);
+    if (function_exists('ap_redis_queue_push')) {
+        ap_redis_queue_push('publish-delivery', $noteId);
+    }
     return true;
 }
 

@@ -90,6 +90,9 @@ function ap_action_queue_enqueue(
             $status = 'pending';
         }
         $db->commit();
+        if (function_exists('ap_redis_queue_push')) {
+            ap_redis_queue_push('actions', $id);
+        }
         ap_signal_record($ownerUserId, $platform, $kind, $targetKey, $desired, $payload);
         return ['ok' => true, 'id' => $id, 'revision' => $revision, 'status' => $status, 'coalesced' => false];
     } catch (Throwable $e) {

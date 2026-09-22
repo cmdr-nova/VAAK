@@ -5,6 +5,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-redis.php';
+
 /**
  * Runtime feature switches. Values come from the process environment so an
  * expensive enrichment path can be disabled without changing database data.

@@ -4356,6 +4356,9 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
             $st->execute([$activityKey, $inbox, $json, $keyId, $privPath, $priority, $now, $now, $now]);
             $queued += $st->rowCount();
         }
+        if ($queued > 0 && function_exists('ap_redis_queue_push')) {
+            ap_redis_queue_push('fanout-delivery', $activityKey);
+        }
         $worker = __DIR__ . '/ap-fanout-delivery-worker.php';
         if (is_file($worker)) {
             $php = ap_php_cli_binary();

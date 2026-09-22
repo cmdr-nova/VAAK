@@ -7673,6 +7673,16 @@ function ap_masto_trends_cache_info(string $kind): array
 function ap_masto_trends_cache_read(string $kind, int $minItems = 1, bool $allowStale = false): ?array
 {
     $info = ap_masto_trends_cache_info($kind);
+    $redisKey = 'vaak:trends:v2:' . preg_replace('/[^a-z]/', '', strtolower($kind));
+    $redisPayload = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+    if (is_array($redisPayload) && isset($redisPayload['items']) && is_array($redisPayload['items'])) {
+        $cachedAt = (int) ($redisPayload['cached_at'] ?? time());
+        $age = max(0, time() - $cachedAt);
+        $stale = $age >= (int) $info['ttl'];
+        if ((!$stale || $allowStale) && count($redisPayload['items']) >= $minItems) {
+            return ['items' => $redisPayload['items'], 'age' => $age, 'stale' => $stale];
+        }
+    }
     $path = $info['path'];
     if (!is_file($path)) {
         return null;
@@ -7755,6 +7765,10 @@ function ap_masto_trends_schedule_refresh(): void
 function ap_masto_trends_cache_set(string $kind, array $items): void
 {
     $info = ap_masto_trends_cache_info($kind);
+    $redisKey = 'vaak:trends:v2:' . preg_replace('/[^a-z]/', '', strtolower($kind));
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, ['cached_at' => time(), 'items' => array_values($items)], max(60, (int) $info['ttl'] * 2));
+    }
     $payload = json_encode([
         'checked_at' => gmdate('c'),
         'items' => array_values($items),
