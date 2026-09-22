@@ -600,6 +600,16 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] profile badges column not provisioned: ' . $e->getMessage());
     }
+    foreach (['hide_profile_replies', 'hide_profile_boosts'] as $profileVisibilityColumn) {
+        try {
+            $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = '{$profileVisibilityColumn}'")->fetchColumn();
+            if (!$hasColumn) {
+                $db->exec("ALTER TABLE actor_profile ADD COLUMN {$profileVisibilityColumn} INTEGER NOT NULL DEFAULT 0");
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-db] profile visibility column not provisioned: ' . $e->getMessage());
+        }
+    }
     try {
         $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'ap_reports' AND column_name = 'admin_notes'")->fetchColumn();
         if (!$hasColumn) {
@@ -794,6 +804,8 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     quote_policy TEXT NOT NULL DEFAULT 'anyone',
     forum_signature TEXT NOT NULL DEFAULT '',
     profile_badges TEXT NOT NULL DEFAULT '[]',
+    hide_profile_replies INTEGER NOT NULL DEFAULT 0,
+    hide_profile_boosts INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 SQL);
@@ -850,6 +862,12 @@ SQL);
     }
     if (!in_array('profile_badges', $profileNames, true)) {
         $db->exec("ALTER TABLE actor_profile ADD COLUMN profile_badges TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!in_array('hide_profile_replies', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN hide_profile_replies INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('hide_profile_boosts', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN hide_profile_boosts INTEGER NOT NULL DEFAULT 0');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -2375,6 +2393,8 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'quote_policy' => 'anyone',
         'forum_signature' => '',
         'profile_badges' => [],
+        'hide_profile_replies' => false,
+        'hide_profile_boosts' => false,
         'updated_at' => null,
     ];
 }
@@ -2496,6 +2516,12 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
         'forum_signature' => trim((string) ($row['forum_signature'] ?? '')),
         'profile_badges' => ap_profile_normalize_badges($row['profile_badges'] ?? []),
+        'hide_profile_replies' => array_key_exists('hide_profile_replies', $row)
+            ? !empty($row['hide_profile_replies'])
+            : false,
+        'hide_profile_boosts' => array_key_exists('hide_profile_boosts', $row)
+            ? !empty($row['hide_profile_boosts'])
+            : false,
         'updated_at' => $row['updated_at'] ?? null,
     ];
 }
@@ -2578,7 +2604,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2727,10 +2753,16 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $profileBadges = array_key_exists('profile_badges', $fields)
         ? ap_profile_normalize_badges($fields['profile_badges'])
         : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []);
+    $hideProfileReplies = array_key_exists('hide_profile_replies', $fields)
+        ? (!empty($fields['hide_profile_replies']) ? 1 : 0)
+        : (!empty($existingProfile['hide_profile_replies']) ? 1 : 0);
+    $hideProfileBoosts = array_key_exists('hide_profile_boosts', $fields)
+        ? (!empty($fields['hide_profile_boosts']) ? 1 : 0)
+        : (!empty($existingProfile['hide_profile_boosts']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2751,6 +2783,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            quote_policy = excluded.quote_policy,
            forum_signature = excluded.forum_signature,
            profile_badges = excluded.profile_badges,
+           hide_profile_replies = excluded.hide_profile_replies,
+           hide_profile_boosts = excluded.hide_profile_boosts,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2774,6 +2808,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $quotePolicy,
         $forumSignature,
         json_encode($profileBadges, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+        $hideProfileReplies,
+        $hideProfileBoosts,
         ap_db_now(),
     ]);
 

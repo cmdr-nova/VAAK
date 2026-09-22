@@ -1465,6 +1465,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'automated' => !empty($_POST['automated']),
                 'reply_policy' => (string) ($_POST['reply_policy'] ?? 'anyone'),
                 'quote_policy' => (string) ($_POST['quote_policy'] ?? 'anyone'),
+                'hide_profile_replies' => !empty($_POST['hide_profile_replies']),
+                'hide_profile_boosts' => !empty($_POST['hide_profile_boosts']),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
                 'profile_badges' => is_array($_POST['profile_badges'] ?? null) ? $_POST['profile_badges'] : [],
             ], $vaakActorKey);
@@ -17385,6 +17387,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </select>
             </label>
             <div class="meta profile-policy-note">These defaults are published with your posts and are enforced for incoming quote requests. You can still choose a post's visibility when composing.</div>
+          </div>
+
+          <div class="profile-policy-block" style="margin-top:.85rem">
+            <label class="profile-policy-row"><span><input type="checkbox" name="hide_profile_replies" value="1" <?= !empty($profile['hide_profile_replies']) ? 'checked' : '' ?>> Hide replies from my HTML profile</span></label>
+            <label class="profile-policy-row"><span><input type="checkbox" name="hide_profile_boosts" value="1" <?= !empty($profile['hide_profile_boosts']) ? 'checked' : '' ?>> Hide boosts from my HTML profile</span></label>
+            <div class="meta profile-policy-note">This only changes your public HTML profile. Replies and boosts remain available in VAAK timelines and ActivityPub.</div>
           </div>
 
           <div class="checks">

@@ -485,6 +485,8 @@ function ap_user_serve_collection_html(string $actorKey, string $actorId, string
 function ap_user_profile_html(string $actorKey, string $actorId): void
 {
     $p = ap_profile_get($actorKey);
+    $hideProfileReplies = !empty($p['hide_profile_replies']);
+    $hideProfileBoosts = !empty($p['hide_profile_boosts']);
     $followers = ap_followers_list($actorId);
     $following = ap_following_list($actorId);
     $name = htmlspecialchars((string) $p['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -616,6 +618,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         if (function_exists('ap_visibility_on_html_profile') && !ap_visibility_on_html_profile($vis)) {
             continue;
         }
+        if ($hideProfileReplies && trim((string) ($n['in_reply_to'] ?? '')) !== '') {
+            continue;
+        }
         $publicNotes[] = $n;
     }
     $profileBoosts = [];
@@ -623,7 +628,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     try {
         if (function_exists('ap_masto_reblog_rows') && function_exists('ap_db_owner_user_id_for_actor')) {
             $ownerId = $profileOwnerId;
-            if ($ownerId > 0) {
+            if ($ownerId > 0 && !$hideProfileBoosts) {
                 $allProfileBoosts = function_exists('ap_masto_reblog_rows_for_html_profile')
                     ? ap_masto_reblog_rows_for_html_profile($ownerId, 5000, 0)
                     : ap_masto_reblog_rows(80, null, $ownerId);
@@ -665,6 +670,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         }
         return $fediId === '' || !isset($localNoteIds[$fediId]);
     }));
+    if ($hideProfileReplies) {
+        $profileBskyPosts = array_values(array_filter($profileBskyPosts, static function (array $item): bool {
+            $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+            return !is_array($post['record']['reply'] ?? null);
+        }));
+    }
     $seenBskyUris = [];
     $profileBskyPosts = array_values(array_filter($profileBskyPosts, static function (array $item) use (&$seenBskyUris): bool {
         $uri = trim((string) (($item['post']['uri'] ?? '') ?: ''));
@@ -685,6 +696,10 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         $post = is_array($item['post'] ?? null) ? $item['post'] : [];
         return is_array($post['record']['reply'] ?? null);
     }));
+    if ($hideProfileReplies) {
+        $profileReplyNotes = [];
+        $profileBskyReplies = [];
+    }
     $blogSlug = trim((string) ($_GET['post'] ?? ''));
     $blogPost = $blogSlug !== '' ? ap_blog_post_get($actorKey, $blogSlug, true) : null;
     $blogRows = ap_blog_posts_list($actorKey, true, 20, max(0, ($profilePage - 1) * 20));
@@ -692,6 +707,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
 
     $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
     if (!in_array($tab, ['posts', 'media', 'replies', 'boosts', 'featured', 'blog'], true)) {
+        $tab = 'posts';
+    }
+    if (($tab === 'replies' && $hideProfileReplies) || ($tab === 'boosts' && $hideProfileBoosts)) {
         $tab = 'posts';
     }
     $mediaNotes = [];
@@ -735,14 +753,14 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
 
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
-        [
+        array_filter([
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
             'media' => ['Media', count($mediaNotes)],
-            'replies' => ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
-            'boosts' => ['Boosts', $profileBoostTotal],
+            'replies' => $hideProfileReplies ? null : ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
+            'boosts' => $hideProfileBoosts ? null : ['Boosts', $profileBoostTotal],
             'featured' => ['Featured', $featuredCount],
             'blog' => ['Blog', $blogCount],
-        ] as $tKey => $tInfo
+        ]) as $tKey => $tInfo
     ) {
         $href = $tKey === 'posts'
             ? '/users/' . $safe

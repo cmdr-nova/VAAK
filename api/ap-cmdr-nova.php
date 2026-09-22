@@ -1593,6 +1593,8 @@ function ap_cmdr_html(): void
     $isOwner = ap_cmdr_profile_owner_session();
 
     $p = ap_profile_get('cmdr_nova');
+    $hideProfileReplies = !empty($p['hide_profile_replies']);
+    $hideProfileBoosts = !empty($p['hide_profile_boosts']);
     $followers = [];
     $following = [];
     try {
@@ -1755,6 +1757,9 @@ function ap_cmdr_html(): void
     $perPage = 20;
     $page = max(1, (int) ($_GET['page'] ?? 1));
     $tab = ap_cmdr_normalize_profile_tab((string) ($_GET['tab'] ?? 'posts'));
+    if (($tab === 'replies' && $hideProfileReplies) || ($tab === 'boosts' && $hideProfileBoosts)) {
+        $tab = 'posts';
+    }
     $blogSlug = trim((string) ($_GET['post'] ?? ''));
     $blogPost = $blogSlug !== '' ? ap_blog_post_get('cmdr_nova', $blogSlug, true) : null;
     $blogRows = ap_blog_posts_list('cmdr_nova', true, 20, max(0, ($page - 1) * $perPage));
@@ -1800,14 +1805,14 @@ function ap_cmdr_html(): void
 
     echo '<nav class="profile-tabs" aria-label="Profile timeline">';
     foreach (
-        [
+        array_filter([
             'posts' => 'Posts',
-            'replies' => 'Replies',
-            'boosts' => 'Boosts',
+            'replies' => $hideProfileReplies ? null : 'Replies',
+            'boosts' => $hideProfileBoosts ? null : 'Boosts',
             'media' => 'Media',
             'featured' => 'Featured',
             'blog' => 'Blog',
-        ] as $tKey => $tLabel
+        ]) as $tKey => $tLabel
     ) {
         $href = $tKey === 'posts' ? '/users/cmdr_nova' : ('/users/cmdr_nova?tab=' . rawurlencode($tKey));
         $cls = $tab === $tKey ? ' class="is-active"' : '';
@@ -2252,6 +2257,9 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     $replies = [];
     $boosts = [];
     $media = [];
+    $profilePrefs = function_exists('ap_profile_get') ? ap_profile_get('cmdr_nova') : [];
+    $hideProfileReplies = !empty($profilePrefs['hide_profile_replies']);
+    $hideProfileBoosts = !empty($profilePrefs['hide_profile_boosts']);
 
     // AP outbox: compose, replies, quotes, polls, + syndicated blog/note shares.
     // HTML profile is discovery-facing: only fully public posts (not unlisted/private).
@@ -2270,7 +2278,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
             }
             $replyTo = rtrim(trim((string) ($row['in_reply_to'] ?? '')), '/');
             $mediaItems = ap_cmdr_profile_media_items($row);
-            if ($mediaItems !== []) {
+            if ($mediaItems !== [] && !($hideProfileReplies && $replyTo !== '' && str_starts_with($replyTo, 'https://'))) {
                 $row['_profile_media_items'] = $mediaItems;
                 $media[] = $row;
             }
@@ -2285,7 +2293,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     }
 
     // Own boosts (Announces) — HTML profile only; ActivityPub outbox already merges them
-    if (function_exists('ap_masto_reblog_rows')) {
+    if (!$hideProfileBoosts && function_exists('ap_masto_reblog_rows')) {
         try {
             $cmdrUid = function_exists('ap_db_cmdr_nova_user_id') ? ap_db_cmdr_nova_user_id() : 1;
             $reblogRows = function_exists('ap_masto_reblog_rows_for_html_profile')
@@ -2333,6 +2341,9 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     $sortDesc($posts);
     $sortDesc($replies);
     $sortDesc($boosts);
+    if ($hideProfileReplies) {
+        $replies = [];
+    }
 
     // Pinned posts (Ice Cubes + HTML profile) — surface at top of Posts tab
     $pinnedRows = [];
