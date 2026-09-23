@@ -773,6 +773,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $resolved = ap_masto_resolve_status_interaction($sid);
             if ($resolved === null && $objectId === '') {
                 $error = 'Status not found in local store.';
+            } elseif ($resolved !== null
+                && function_exists('ap_local_object_is_direct_message')
+                && ap_local_object_is_direct_message((string) ($resolved['object_id'] ?? $objectId))) {
+                // DMs are rendered through the Mastodon-compatible status
+                // layer for conversation UI, but they are never public status
+                // interactions. Do not let favourite/boost/bookmark endpoints
+                // turn a private message into a visible notification.
+                $error = 'Direct messages cannot be interacted with as public statuses.';
             } elseif ($action === 'reblog_status' || $action === 'unreblog_status') {
                 $interactKind = 'reblog';
                 if ($resolved === null) {
@@ -5785,6 +5793,9 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             if (!is_array($e)) {
                 continue;
             }
+            if (!admin_federated_timeline_item_allowed(['kind' => 'event', 'row' => $e])) {
+                continue;
+            }
             if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
                 continue;
             }
@@ -6028,6 +6039,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
         error_log('[ap-admin] feed events: ' . $e->getMessage());
     }
     foreach ($feedEventsRaw as $e) {
+        if (!is_array($e) || !admin_federated_timeline_item_allowed(['kind' => 'event', 'row' => $e])) {
+            continue;
+        }
         if (is_array($e) && admin_timeline_row_hidden($e, admin_owner_user_id())) {
             continue;
         }
@@ -6064,6 +6078,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
             'sort' => $pub,
             'row' => $n,
         ];
+        if (!admin_federated_timeline_item_allowed($outItem)) {
+            continue;
+        }
         if (admin_timeline_item_muted_by_words($outItem)) {
             continue;
         }
@@ -6085,6 +6102,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
             'sort' => $bSort,
             'row' => $rb,
         ];
+        if (!admin_federated_timeline_item_allowed($boostItem)) {
+            continue;
+        }
         if (admin_timeline_item_muted_by_words($boostItem)) {
             continue;
         }
@@ -9036,6 +9056,35 @@ function admin_local_timeline_item_allowed(array $item): bool
             && !admin_reblog_is_bsky($row);
     }
     return false;
+}
+
+/** Federated timeline accepts local posts and ActivityPub events only. */
+function admin_federated_timeline_item_allowed(array $item): bool
+{
+    $kind = (string) ($item['kind'] ?? '');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if ($kind === 'outbox') {
+        return vaak_is_local_url((string) ($row['id'] ?? ''))
+            && !admin_outbox_is_bsky_import($row);
+    }
+    if ($kind === 'boost') {
+        return vaak_is_local_url((string) ($row['owner_actor_id'] ?? ''))
+            && !admin_reblog_is_bsky($row);
+    }
+    if ($kind !== 'event') {
+        return false;
+    }
+    $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+    $object = strtolower(rtrim(trim((string) ($row['object_id'] ?? '')), '/'));
+    if ($actor === '' || str_starts_with($object, 'at://')
+        || str_contains($object, 'bsky.app/')
+        || str_contains($object, 'bsky.mkultra.monster/')) {
+        return false;
+    }
+    if (function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor)) {
+        return false;
+    }
+    return true;
 }
 
 /** Viewer preference: highlight anti-AI posters. Removed from the UI. */
@@ -12362,7 +12411,13 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     $out = [];
     $seen = [];
 
-    $pushEvent = static function (array $e) use (&$out, &$seen, $ownerId): void {
+    $pushEvent = static function (array $e) use (&$out, &$seen, $ownerId, $view): void {
+        if ($view === 'feed' && !admin_federated_timeline_item_allowed(['kind' => 'event', 'row' => $e])) {
+            return;
+        }
+        if ($view === 'local' && !admin_local_timeline_item_allowed(['kind' => 'event', 'row' => $e])) {
+            return;
+        }
         if (admin_timeline_row_hidden($e, $ownerId)) {
             return;
         }
@@ -12948,6 +13003,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         // actors back into the Local tab.
         if ($view === 'local') {
             $slice = array_values(array_filter($slice, 'admin_local_timeline_item_allowed'));
+        } elseif ($view === 'feed') {
+            $slice = array_values(array_filter($slice, 'admin_federated_timeline_item_allowed'));
         }
         // Prefetch masto rows for any outbox cards in this window
         $hydrateNotes = [];
@@ -13036,6 +13093,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     ob_start();
     foreach ($slice as $item) {
         if ($view === 'local' && !admin_local_timeline_item_allowed($item)) {
+            continue;
+        }
+        if ($view === 'feed' && !admin_federated_timeline_item_allowed($item)) {
             continue;
         }
         if (admin_timeline_item_muted_by_words($item)) {

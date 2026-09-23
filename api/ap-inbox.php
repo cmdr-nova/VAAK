@@ -1308,6 +1308,26 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             // Likes / boosts / quote activities of our posts are usually not
             // addressed to as:Public — still notifiable.
             if (in_array($type, ['Like', 'Announce', 'EmojiReact', 'Quote', 'QuotePost'], true)) {
+                // A direct message is stored separately and must never be
+                // converted into a public interaction notification. Some
+                // Misskey/Sharkey-compatible servers have emitted Like/Announce
+                // activities for private objects; reject those at ingestion.
+                if (is_string($objectId) && $objectId !== ''
+                    && function_exists('ap_local_object_is_private')
+                    && ap_local_object_is_private($objectId)) {
+                    $kind = $type === 'Announce' ? 'reblog' : (($type === 'Like' || $type === 'EmojiReact') ? 'like' : 'quote');
+                    if (function_exists('ap_mention_soft_delete_interaction')) {
+                        ap_mention_soft_delete_interaction(
+                            (string) ($actorId ?? ''),
+                            $objectId,
+                            $kind,
+                            ap_as_id($activity['id'] ?? null)
+                        );
+                    }
+                    ap_metrics_record($type, $actorId, $objectId, LOCAL_ACTOR, $bytes, 'local_private_interaction_skipped', null);
+                    ap_log('local_private_interaction_skipped type=' . $type . ' actor=' . ap_short((string) $actorId));
+                    return 'local_private_interaction_skipped';
+                }
                 ap_local_observe($activity);
                 $vis = ap_visibility_from_activity($activity);
                 // Announce of our post → target=us; Announce of others (rare here) → original author

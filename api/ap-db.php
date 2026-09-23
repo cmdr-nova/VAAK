@@ -5223,6 +5223,67 @@ function ap_normalize_visibility(mixed $visibility): string
     return 'public';
 }
 
+/**
+ * Return true when a local object is private or is stored as a direct message.
+ * Interaction activities targeting these objects must never become public
+ * favourites, boosts, bookmarks, or notifications.
+ */
+function ap_local_object_is_private(string $objectId): bool
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '') {
+        return false;
+    }
+    $ids = [$objectId, $objectId . '/'];
+    $db = ap_db();
+    try {
+        $st = $db->prepare(
+            'SELECT 1 FROM direct_messages WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL LIMIT 1'
+        );
+        $st->execute($ids);
+        if ($st->fetchColumn() !== false) {
+            return true;
+        }
+    } catch (Throwable) {
+        // Older installations may not have the DM table yet.
+    }
+    foreach ([
+        ['outbox_notes', 'id'],
+        ['masto_statuses', 'note_id'],
+        ['events', 'object_id'],
+    ] as [$table, $column]) {
+        try {
+            $st = $db->prepare("SELECT visibility FROM {$table} WHERE ({$column} = ? OR {$column} = ?) LIMIT 1");
+            $st->execute($ids);
+            $visibility = $st->fetchColumn();
+            if ($visibility !== false && ap_normalize_visibility($visibility) !== 'public') {
+                return true;
+            }
+        } catch (Throwable) {
+            // A missing optional table/column must not break federation.
+        }
+    }
+    return false;
+}
+
+/** True when an object URL belongs to the private direct-message store. */
+function ap_local_object_is_direct_message(string $objectId): bool
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId === '') {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT 1 FROM direct_messages WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL LIMIT 1'
+        );
+        $st->execute([$objectId, $objectId . '/']);
+        return $st->fetchColumn() !== false;
+    } catch (Throwable) {
+        return false;
+    }
+}
+
 /** HTML profile / public discovery: only fully public posts. */
 function ap_visibility_on_html_profile(string $visibility): bool
 {
@@ -8285,16 +8346,31 @@ function ap_muted_words_phrases_cached(int $ownerUserId, bool $refresh = false):
     }
     if ($refresh) {
         unset($cache[$ownerUserId]);
+        if (function_exists('ap_redis_delete')) {
+            ap_redis_delete('vaak:moderation:muted-words:' . $ownerUserId);
+        }
     }
     if (!isset($cache[$ownerUserId])) {
-        $phrases = [];
-        foreach (ap_muted_words_list($ownerUserId) as $row) {
-            $p = mb_strtolower(trim((string) ($row['phrase'] ?? '')), 'UTF-8');
-            if ($p !== '') {
-                $phrases[] = $p;
+        $redisKey = 'vaak:moderation:muted-words:' . $ownerUserId;
+        $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+        if (is_array($redisCached)) {
+            $cache[$ownerUserId] = array_values(array_filter(array_map(
+                static fn($p): string => mb_strtolower(trim((string) $p), 'UTF-8'),
+                $redisCached
+            ), static fn(string $p): bool => $p !== ''));
+        } else {
+            $phrases = [];
+            foreach (ap_muted_words_list($ownerUserId) as $row) {
+                $p = mb_strtolower(trim((string) ($row['phrase'] ?? '')), 'UTF-8');
+                if ($p !== '') {
+                    $phrases[] = $p;
+                }
+            }
+            $cache[$ownerUserId] = array_values(array_unique($phrases));
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
             }
         }
-        $cache[$ownerUserId] = array_values(array_unique($phrases));
     }
     return $cache[$ownerUserId];
 }
