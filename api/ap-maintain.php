@@ -37,6 +37,7 @@ $tmpMaxAgeHours = 48;
 $emojiDays = 30;
 $actorDays = 60;
 $queueDays = 7;
+$archiveDays = 365;
 
 foreach ($argv as $arg) {
     if ($arg === '--dry-run') {
@@ -67,6 +68,9 @@ foreach ($argv as $arg) {
     if (preg_match('/^--queue-days=(\d+)$/', $arg, $m)) {
         $queueDays = max(1, min(90, (int) $m[1]));
     }
+    if (preg_match('/^--archive-days=(\d+)$/', $arg, $m)) {
+        $archiveDays = max(30, min(1825, (int) $m[1]));
+    }
 }
 
 $lockPath = '/tmp/ap-maintain.lock';
@@ -90,6 +94,7 @@ $stats = [
     'bsky_posts_deleted' => 0,
     'bsky_post_links_deleted' => 0,
     'queue_rows_deleted' => 0,
+    'cold_archive_deleted' => 0,
     'signal_rows_deleted' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
@@ -101,11 +106,86 @@ $log = static function (string $msg) use ($dryRun): void {
     fwrite(STDOUT, sprintf("[%s]%s %s\n", gmdate('c'), $dryRun ? ' dry-run' : '', $msg));
 };
 
+/** Keep pruned federation/queue records in a compact cold tier. */
+function ap_maintain_ensure_cold_archive(PDO $db, bool $isPostgres): void
+{
+    $db->exec($isPostgres ? <<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_cold_archive (
+    id BIGSERIAL PRIMARY KEY,
+    source_table TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    UNIQUE(source_table, source_id)
+)
+SQL : <<<'SQL'
+CREATE TABLE IF NOT EXISTS ap_cold_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_table TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    UNIQUE(source_table, source_id)
+)
+SQL);
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_cold_archive_time ON ap_cold_archive(occurred_at DESC)');
+}
+
+/** @param list<string> $states */
+function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn, array $states, string $cutoff, bool $isPostgres): int
+{
+    $allowed = [
+        'ap_publish_delivery_queue', 'ap_fanout_delivery_queue',
+        'ap_media_warm_queue', 'bsky_actor_refresh_queue', 'events',
+    ];
+    if (!in_array($table, $allowed, true)) return 0;
+    $params = [$cutoff];
+    $where = "{$timeColumn} < ?";
+    if ($states !== []) {
+        $where .= ' AND status IN (' . implode(',', array_fill(0, count($states), '?')) . ')';
+        $params = array_merge($states, [$cutoff]);
+    }
+    $rows = $db->prepare("SELECT * FROM {$table} WHERE {$where}");
+    $rows->execute($params);
+    $insert = $db->prepare(
+        'INSERT INTO ap_cold_archive (source_table, source_id, occurred_at, payload_json, archived_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (source_table, source_id) DO NOTHING'
+    );
+    $count = 0;
+    foreach ($rows->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+        $id = (string) ($row['id'] ?? '');
+        if ($id === '') continue;
+        $payload = json_encode($row, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        if (!is_string($payload)) continue;
+        $insert->execute([$table, $id, (string) ($row[$timeColumn] ?? $cutoff), $payload, gmdate('c')]);
+        $count++;
+    }
+    return $count;
+}
+
 try {
     $db = ap_db();
     $isPostgres = ap_db_driver() === 'pgsql';
 
     if (!$vacuumOnly) {
+        try {
+            ap_maintain_ensure_cold_archive($db, $isPostgres);
+            $archiveCutoff = $nowUtc->modify('-' . $archiveDays . ' days')->format('c');
+            if ($dryRun) {
+                $st = $db->prepare('SELECT COUNT(*) FROM ap_cold_archive WHERE archived_at < ?');
+                $st->execute([$archiveCutoff]);
+                $stats['cold_archive_deleted'] = (int) $st->fetchColumn();
+            } else {
+                $st = $db->prepare('DELETE FROM ap_cold_archive WHERE archived_at < ?');
+                $st->execute([$archiveCutoff]);
+                $stats['cold_archive_deleted'] = $st->rowCount();
+            }
+        } catch (Throwable $e) {
+            $log('cold archive unavailable: ' . $e->getMessage());
+        }
         // --- Durable worker queue retention ---
         // Delivery and cache-warming rows are operational history, not user
         // content. Keep a short terminal history so the tables stay small and
@@ -130,6 +210,18 @@ try {
                     $stats['queue_rows_deleted'] += $n;
                     $log("would_delete queue_rows table={$queuePrune['table']} count={$n} older_than={$queueCutoff}");
                     continue;
+                }
+                try {
+                    ap_maintain_archive_expired(
+                        $db,
+                        $queuePrune['table'],
+                        $queuePrune['time'],
+                        $queuePrune['states'],
+                        $queueCutoff,
+                        $isPostgres
+                    );
+                } catch (Throwable $e) {
+                    $log('queue cold archive skipped table=' . $queuePrune['table'] . ': ' . $e->getMessage());
                 }
                 $st = $db->prepare($sql);
                 $st->execute($params);
@@ -254,6 +346,11 @@ try {
             if ($dryRun) {
                 $log("would_delete events older_than=$eventsCutoff count=$n");
             } else {
+                try {
+                    ap_maintain_archive_expired($db, 'events', 'created_at', [], $eventsCutoff, $isPostgres);
+                } catch (Throwable $e) {
+                    $log('events cold archive skipped: ' . $e->getMessage());
+                }
                 $del = $db->prepare('DELETE FROM events WHERE created_at < ?');
                 $del->execute([$eventsCutoff]);
                 $stats['events_deleted'] = $del->rowCount();
