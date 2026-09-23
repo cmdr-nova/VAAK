@@ -1650,7 +1650,7 @@ function ap_cmdr_html(): void
         if (!$profileCacheBackground && $cacheAge >= 0 && $cacheAge < $cacheTtl) {
             header('Content-Type: text/html; charset=utf-8');
             header('Vary: Accept');
-            header('Cache-Control: public, max-age=20, stale-while-revalidate=60');
+            header('Cache-Control: public, max-age=20, stale-while-revalidate=120');
             header('X-VAAK-Profile-Cache: HIT');
             if ($requestMethod !== 'HEAD') {
                 readfile($profileCachePath);
