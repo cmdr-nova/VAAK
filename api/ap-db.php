@@ -9442,7 +9442,8 @@ function ap_masto_statuses_recent(
     int $limit = 40,
     ?string $beforePublished = null,
     ?string $afterPublished = null,
-    ?string $actorKey = null
+    ?string $actorKey = null,
+    bool $excludeBskyImports = false
 ): array {
     $limit = max(1, min(80, $limit));
     $where = [];
@@ -9450,12 +9451,12 @@ function ap_masto_statuses_recent(
     $actorKey = strtolower(trim((string) $actorKey));
     $actorKey = preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '';
     if ($actorKey !== '') {
-        $where[] = 'note_id LIKE ?';
+        $where[] = 's.note_id LIKE ?';
         $params[] = 'https://mkultra.monster/users/' . $actorKey . '/notes/%';
     }
     if ($beforePublished !== null && $beforePublished !== '') {
         try {
-            $where[] = 'published < ?';
+            $where[] = 's.published < ?';
             $params[] = (new DateTimeImmutable($beforePublished))->format('c');
         } catch (Throwable $e) {
             // ignore bad cursor
@@ -9463,15 +9464,19 @@ function ap_masto_statuses_recent(
     }
     if ($afterPublished !== null && $afterPublished !== '') {
         try {
-            $where[] = 'published > ?';
+            $where[] = 's.published > ?';
             $params[] = (new DateTimeImmutable($afterPublished))->format('c');
         } catch (Throwable $e) {
             // ignore bad cursor
         }
     }
     $params[] = $limit;
-    $sql = 'SELECT * FROM masto_statuses'
+    $sql = 'SELECT s.* FROM masto_statuses s'
+        . ($excludeBskyImports ? ' LEFT JOIN outbox_notes o ON (o.id = s.note_id OR o.id = s.note_id || \'/\')' : '')
         . ($where !== [] ? ' WHERE ' . implode(' AND ', $where) : '')
+        . ($excludeBskyImports
+            ? ($where === [] ? ' WHERE ' : ' AND ') . "(o.raw_create_json IS NULL OR lower(o.raw_create_json) NOT LIKE '%vaakorigin%bluesky%')"
+            : '')
         . ' ORDER BY published DESC, local_id DESC LIMIT ?';
     $st = ap_db()->prepare($sql);
     $st->execute($params);

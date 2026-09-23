@@ -6006,6 +6006,21 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     $hydrateCap = $mode === 'home' ? $limit : min(count($rows), $limit + 8);
     foreach ($rows as $row) {
         $sourceRow = $row;
+        if ($mode !== 'home') {
+            $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+            $object = strtolower(rtrim(trim((string) ($row['object_id'] ?? '')), '/'));
+            // Federated is ActivityPub-only. A local ActivityPub Create is
+            // valid; native Bluesky/AT-URI rows are not. Local quote/boost
+            // actions are supplied separately by the merged timeline path.
+            if ($actor === '' || str_starts_with($object, 'at://')
+                || str_contains($object, 'bsky.app/')
+                || str_contains($object, 'bsky.mkultra.monster/')) {
+                continue;
+            }
+            if (function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor)) {
+                continue;
+            }
+        }
         if ($mode === 'home') {
             if (ap_timeline_row_is_hidden($sourceRow, $ownerUserId)) {
                 $hiddenCount++;
