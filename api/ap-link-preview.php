@@ -371,6 +371,7 @@ function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxByte
         }
         $buf = '';
         $headers = '';
+        $previewStarted = microtime(true);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => false,
             CURLOPT_FOLLOWLOCATION => false,
@@ -399,6 +400,9 @@ function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxByte
         $ok = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        if (function_exists('ap_timing_record')) {
+            ap_timing_record('link_preview.http', (microtime(true) - $previewStarted) * 1000.0);
+        }
         if ($providerCircuit !== '' && function_exists('ap_provider_circuit_failure')
             && ($ok === false || $code === 429 || $code >= 500)) {
             ap_provider_circuit_failure($providerCircuit);

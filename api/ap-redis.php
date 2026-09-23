@@ -240,6 +240,55 @@ function ap_redis_metric_snapshot(): array
     return $out;
 }
 
+/** Record bounded aggregate latency for an operational path (no payload data). */
+function ap_timing_record(string $name, float $milliseconds): void
+{
+    $redis = ap_redis_client('cache');
+    $name = preg_replace('/[^a-z0-9._:-]/i', '', trim($name)) ?: '';
+    if (!$redis || $name === '' || $milliseconds < 0) return;
+    try {
+        $key = 'vaak:timing:v1:' . $name;
+        $redis->hIncrBy($key, 'count', 1);
+        $redis->hIncrByFloat($key, 'total_ms', $milliseconds);
+        $currentMax = (float) ($redis->hGet($key, 'max_ms') ?: 0);
+        if ($milliseconds > $currentMax) {
+            $redis->hSet($key, 'max_ms', sprintf('%.3f', $milliseconds));
+        }
+        $redis->expire($key, 86400);
+    } catch (Throwable $e) {
+        // Telemetry must never affect request execution.
+    }
+}
+
+/** @return array<string,array{count:int,total_ms:float,max_ms:float}> */
+function ap_redis_timing_snapshot(): array
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis) return [];
+    $out = [];
+    try {
+        $it = null;
+        while (($keys = $redis->scan($it, 'vaak:timing:v1:*', 100)) !== false) {
+            foreach ($keys as $key) {
+                $name = substr((string) $key, strlen('vaak:timing:v1:'));
+                $row = $redis->hGetAll($key);
+                if ($name !== '' && is_array($row)) {
+                    $out[$name] = [
+                        'count' => (int) ($row['count'] ?? 0),
+                        'total_ms' => (float) ($row['total_ms'] ?? 0),
+                        'max_ms' => (float) ($row['max_ms'] ?? 0),
+                    ];
+                }
+            }
+            if ($it === 0) break;
+        }
+    } catch (Throwable $e) {
+        return [];
+    }
+    ksort($out);
+    return $out;
+}
+
 /** Best-effort short lock used to coalesce refresh work. */
 function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
 {

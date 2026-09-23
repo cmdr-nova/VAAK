@@ -1414,11 +1414,15 @@ function ap_bsky_xrpc(
     if ($payload !== null) {
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
     }
+    $xrpcStarted = microtime(true);
     $body = curl_exec($ch);
     $errno = curl_errno($ch);
     $err = curl_error($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('bluesky.xrpc', (microtime(true) - $xrpcStarted) * 1000.0);
+    }
     $rate = ap_bsky_parse_rate_limit_headers($respHeaders);
     if ($errno !== 0 || !is_string($body)) {
         if (function_exists('ap_provider_circuit_failure')) ap_provider_circuit_failure($providerCircuit);

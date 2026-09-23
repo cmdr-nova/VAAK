@@ -668,6 +668,7 @@ function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, i
             return ['body' => null, 'status' => 0];
         }
         $buf = '';
+        $remoteStarted = microtime(true);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => false,
             CURLOPT_FOLLOWLOCATION => false,
@@ -690,6 +691,9 @@ function ap_http_curl_get_ex(string $url, array $headers, int $timeoutSec = 8, i
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $errno = curl_errno($ch);
         curl_close($ch);
+        if (function_exists('ap_timing_record')) {
+            ap_timing_record('activitypub.fetch', (microtime(true) - $remoteStarted) * 1000.0);
+        }
         if ($ok !== false && $buf !== '' && $status >= 200 && $status < 300) {
             return ['body' => $buf, 'status' => $status];
         }

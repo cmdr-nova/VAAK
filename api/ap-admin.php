@@ -4079,6 +4079,7 @@ $statsMentionsOpen = 0;
 $statsUserRows = [];
 $queueHealthRows = [];
 $redisMetrics = [];
+$timingMetrics = [];
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
     $queueDefs = [
@@ -4121,6 +4122,9 @@ if ($view === 'queue_health') {
     }
     if (function_exists('ap_redis_metric_snapshot')) {
         $redisMetrics = ap_redis_metric_snapshot();
+    }
+    if (function_exists('ap_redis_timing_snapshot')) {
+        $timingMetrics = ap_redis_timing_snapshot();
     }
 }
 if ($view === 'stats') {
@@ -13165,6 +13169,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
             }
         }
         $adminTlPerfHydrateMs = (microtime(true) - $hydrateT0) * 1000.0;
+        if (function_exists('ap_timing_record')) {
+            ap_timing_record('timeline.hydrate', $adminTlPerfHydrateMs);
+        }
         $hasMore = ($tlOffset + $tlLimit) < $totalRanked;
         $nextOffset = $tlOffset + $tlLimit;
     } else {
@@ -13211,6 +13218,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         ap_masto_status_flags_prefetch(admin_timeline_status_ids($slice));
     }
     $adminTlPerfFlagsMs = (microtime(true) - $flagsT0) * 1000.0;
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timeline.flags', $adminTlPerfFlagsMs);
+    }
     $renderT0 = microtime(true);
     ob_start();
     foreach ($slice as $item) {
@@ -13234,6 +13244,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     $body = ob_get_clean();
     $adminTlPerfRenderMs = (microtime(true) - $renderT0) * 1000.0;
     $adminTlPerfTotalMs = (microtime(true) - $adminTlPerfT0) * 1000.0;
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timeline.render', $adminTlPerfTotalMs);
+    }
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
@@ -21830,6 +21843,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </table>
           </div>
         </div>
+        <?php if ($timingMetrics): ?>
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Recent path timings</h3>
+          <div class="meta" style="margin-bottom:.6rem">Aggregated Redis telemetry, retained for 24 hours; no request content is stored.</div>
+          <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem">
+            <thead><tr class="meta" style="text-align:left"><th style="padding:.35rem;border-bottom:1px solid var(--border)">Path</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Calls</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Average</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Max</th></tr></thead>
+            <tbody><?php foreach ($timingMetrics as $tm => $tv): ?><tr><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h((string) $tm) ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= (int) $tv['count'] ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format($tv['count'] > 0 ? $tv['total_ms'] / $tv['count'] : 0, 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format($tv['max_ms'], 1)) ?> ms</td></tr><?php endforeach; ?></tbody>
+          </table></div>
+        </div>
+        <?php endif; ?>
 
       <?php elseif ($view === 'stats'): ?>
         <div class="meta" style="margin-bottom:.85rem">
