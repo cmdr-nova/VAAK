@@ -3841,7 +3841,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
  *
  * @param array{age?:int,stale?:bool,empty?:bool}|null $meta
  */
-function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null): string
+function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null, bool $bypassFragment = false): string
 {
     $viewForTrends = preg_replace('/[^a-z_]/', '', $viewForTrends) ?: 'home';
     $trendTags = [];
@@ -3852,6 +3852,14 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $anyHit = false;
     $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
     $viewerId = is_array($viewer) ? (int) ($viewer['id'] ?? 0) : 0;
+    $fragmentKey = 'vaak:fragment:trends:v1:' . hash('sha256', $viewForTrends . ':' . $viewerId);
+    if (!$bypassFragment && function_exists('ap_redis_json_get')) {
+        $cachedFragment = ap_redis_json_get($fragmentKey);
+        if (is_array($cachedFragment) && is_string($cachedFragment['html'] ?? null)) {
+            $meta = is_array($cachedFragment['meta'] ?? null) ? $cachedFragment['meta'] : null;
+            return (string) $cachedFragment['html'];
+        }
+    }
     foreach (['tags' => 5, 'links' => 5, 'statuses' => 5] as $kind => $limit) {
         $row = function_exists('ap_masto_trends_cache_read')
             ? ap_masto_trends_cache_read($kind, 1, $allowStale)
@@ -3986,6 +3994,9 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         }
     }
     $html .= '</div>';
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($fragmentKey, ['html' => $html, 'meta' => $meta], 30);
+    }
     return $html;
 }
 
@@ -4008,7 +4019,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
             if (function_exists('ap_masto_trends_statuses')) {
                 ap_masto_trends_statuses(5);
             }
-            $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
+            $html = admin_trends_sidebar_html($viewForTrends, true, $meta, true);
         } else {
             $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
             if ($html === '') {
