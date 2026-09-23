@@ -9618,6 +9618,16 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         ? admin_global_actor_control($actorId)
         : null;
     $menu = '';
+    // Direct messages are an ActivityPub/Fediverse workflow. Bluesky actors
+    // have their own protocol and must not be routed through this composer.
+    $isFediverseActor = $actorId !== ''
+        && str_starts_with($actorId, 'https://')
+        && !str_contains(strtolower($actorId), 'bsky.app')
+        && !str_starts_with(strtolower($actorId), 'https://bsky.')
+        && !str_starts_with(strtolower($actorId), 'at://');
+    if ($isFediverseActor && !$isSelf && !is_array($personalBlock)) {
+        $menu .= '<a class="menu-action" href="?view=dms&amp;peer=' . h(rawurlencode($actorId)) . '">DM</a>';
+    }
     // Own-post Open/Edit/Pin/Note live in admin_own_post_action_bar()'s overflow.
     if (!$isSelf && $objectId !== '' && str_starts_with($objectId, 'https://')) {
         $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
