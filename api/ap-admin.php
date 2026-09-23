@@ -26483,6 +26483,9 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
           && String(form.querySelector('input[name="quote_object"]').value || '').trim());
       // Posted/queued — don't re-save as draft on close
       skipDraftOnClose = true;
+      // A completed post is no longer a recoverable composer draft. Remove the
+      // local backup before the shared composer is opened again.
+      try { localStorage.removeItem(COMPOSE_LS_KEY); } catch (e) {}
       if (draftIdField) draftIdField.value = '';
       if (draftMediaField) draftMediaField.value = '';
       await closeModal();
