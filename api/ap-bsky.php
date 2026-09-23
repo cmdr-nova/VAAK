@@ -3523,7 +3523,7 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20, int $offse
         return [];
     }
     ap_bsky_posts_migrate();
-    $limit = max(1, min(50, $limit));
+    $limit = max(1, min(200, $limit));
     $offset = max(0, $offset);
     try {
         $st = ap_db()->prepare(

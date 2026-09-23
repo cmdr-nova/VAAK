@@ -552,6 +552,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $needsReplyRows = $tab === 'replies';
     $needsBoostRows = in_array($tab, ['posts', 'boosts'], true) && !$hideProfileBoosts;
     $needsBlogRows = $tab === 'blog';
+    $profileFetchLimit = $tab === 'posts'
+        ? min(5000, max($profilePerPage, $profilePage * $profilePerPage))
+        : $profilePerPage;
 
     ap_user_html_shell_start('@' . $actorKey . '@mkultra.monster');
     echo '<span id="profile-top" aria-hidden="true"></span>';
@@ -659,8 +662,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         }
     }
     $notes = function_exists('ap_outbox_list_page')
-        ? ap_outbox_list_page($profilePerPage, ($profilePage - 1) * $profilePerPage, $actorKey)
-        : ap_outbox_list($profilePerPage, $actorKey);
+        ? ap_outbox_list_page(
+            $profileFetchLimit,
+            $tab === 'posts' ? 0 : (($profilePage - 1) * $profilePerPage),
+            $actorKey
+        )
+        : ap_outbox_list($profileFetchLimit, $actorKey);
     $publicNotes = [];
     foreach ($notes as $n) {
         $vis = (string) ($n['visibility'] ?? 'public');
@@ -685,10 +692,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                         : ap_masto_reblog_rows($profilePerPage, null, $ownerId);
                 } else {
                     $allProfileBoosts = function_exists('ap_masto_reblog_rows_for_html_profile')
-                        ? ap_masto_reblog_rows_for_html_profile($ownerId, 5000, 0)
-                        : ap_masto_reblog_rows(80, null, $ownerId);
-                    $profileBoostTotal = count($allProfileBoosts);
-                    $profileBoosts = array_slice($allProfileBoosts, ($profilePage - 1) * $profilePerPage, $profilePerPage);
+                        ? ap_masto_reblog_rows_for_html_profile($ownerId, $profileFetchLimit, 0)
+                        : ap_masto_reblog_rows($profileFetchLimit, null, $ownerId);
+                    $profileBoostTotal = function_exists('ap_masto_reblog_count_for_html_profile')
+                        ? ap_masto_reblog_count_for_html_profile($ownerId)
+                        : count($allProfileBoosts);
+                    $profileBoosts = $allProfileBoosts;
                 }
             } elseif ($ownerId > 0 && !$hideProfileBoosts && function_exists('ap_masto_reblog_count_for_html_profile')) {
                 $profileBoostTotal = ap_masto_reblog_count_for_html_profile($ownerId);
@@ -705,7 +714,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $profileBskyPosts = [];
     if ($needsBskyRows && $profileDid !== '' && function_exists('ap_bsky_posts_for_author')) {
         try {
-            $profileBskyPosts = ap_bsky_posts_for_author($profileDid, 80, 0);
+            $profileBskyPosts = ap_bsky_posts_for_author($profileDid, $profileFetchLimit, 0);
         } catch (Throwable $e) {
             $profileBskyPosts = [];
         }
