@@ -450,11 +450,28 @@ function ap_user_serve_collection_as2(string $actorKey, string $actorId, string 
 function ap_user_serve_collection_html(string $actorKey, string $actorId, string $col): void
 {
     $safe = htmlspecialchars($actorKey, ENT_QUOTES, 'UTF-8');
+    $profile = function_exists('ap_profile_get') ? ap_profile_get($actorKey) : [];
+    $bskyHandle = function_exists('ap_profile_bsky_handle')
+        ? ap_profile_bsky_handle($actorKey, is_array($profile) ? $profile : [])
+        : null;
     ap_user_html_shell_start(ucfirst($col) . ' · @' . $actorKey . '@mkultra.monster');
     echo '<p class="muted"><a href="/users/' . $safe . '">@' . $safe . '@mkultra.monster</a></p>';
-    echo '<h1>' . htmlspecialchars(ucfirst($col), ENT_QUOTES, 'UTF-8') . '</h1>';
+    $apFollowers = function_exists('ap_followers_count') ? ap_followers_count($actorId) : count(ap_followers_list($actorId));
+    $apFollowing = function_exists('ap_following_count') ? ap_following_count($actorId) : count(ap_following_list($actorId));
+    $combined = function_exists('ap_profile_combined_follow_counts')
+        ? ap_profile_combined_follow_counts($actorKey, (int) $apFollowers, (int) $apFollowing, false)
+        : ['followers' => (int) $apFollowers, 'following' => (int) $apFollowing, 'bsky_handle' => $bskyHandle];
+    $combinedCount = (int) ($combined[$col] ?? ($col === 'followers' ? $apFollowers : $apFollowing));
+    echo '<h1>' . htmlspecialchars(ucfirst($col), ENT_QUOTES, 'UTF-8') . ' <span class="muted">(' . $combinedCount . ')</span></h1>';
+    if ($bskyHandle !== null && trim($bskyHandle) !== '') {
+        echo '<p class="muted">Fediverse accounts listed below · Bluesky total included above · '
+            . '<a href="https://bsky.app/profile/' . rawurlencode(trim($bskyHandle)) . '" target="_blank" rel="noopener noreferrer">view Bluesky ' . strtolower($col) . '</a></p>';
+    }
     if ($col === 'outbox') {
-        $rows = ap_outbox_list(40, $actorKey);
+        $rows = array_values(array_filter(ap_outbox_list(40, $actorKey), static function (array $row): bool {
+            return !function_exists('ap_visibility_in_ap_outbox')
+                || ap_visibility_in_ap_outbox((string) ($row['visibility'] ?? 'public'));
+        }));
         if (!$rows) {
             echo '<p class="muted">No public posts yet.</p>';
         } else {
@@ -1108,7 +1125,9 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
     }
     $html .= '<div class="note-body">' . $content . '</div>';
     $html .= ap_user_note_media_html($note, true);
-    $html .= '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0"><a href="' . $id . '">' . $safeDate . '</a></p>';
+    // Keep generic profiles consistent with the rich profile: the timestamp
+    // is metadata, while the post itself remains the navigable object.
+    $html .= '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0">' . $safeDate . '</p>';
     $html .= ap_webmention_cards_html((string) ($row['id'] ?? ''));
     $html .= '</article>';
     return $html;
