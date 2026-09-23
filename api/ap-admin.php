@@ -14740,8 +14740,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     /* Phones (incl. landscape): short height catches ~844×390 class viewports that
    otherwise fall into the 72px tablet icon-rail and look “squished right”. */
 @media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
+      .compose-modal {
+        align-items: center;
+        padding: max(1rem, env(safe-area-inset-top))
+                 max(1rem, env(safe-area-inset-right))
+                 max(1rem, env(safe-area-inset-bottom))
+                 max(1rem, env(safe-area-inset-left));
+      }
       .compose-modal__panel {
         max-height: min(90dvh, 720px);
+        margin: 0;
+        border-radius: 16px;
         overflow-y: auto;
         -webkit-overflow-scrolling: touch;
       }
