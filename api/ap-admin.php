@@ -4617,7 +4617,7 @@ function admin_tl_cache_key(string $view, array $following): string
     $owner = admin_owner_user_id();
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v4_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v5_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -9019,6 +9019,25 @@ function admin_reblog_is_bsky(array $row): bool
         || str_contains($objectId, 'bsky.mkultra.monster/');
 }
 
+/** Local timeline cards must originate from a local actor/action. */
+function admin_local_timeline_item_allowed(array $item): bool
+{
+    $kind = (string) ($item['kind'] ?? '');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if ($kind === 'outbox') {
+        return vaak_is_local_url((string) ($row['id'] ?? ''))
+            && !admin_outbox_is_bsky_import($row);
+    }
+    if ($kind === 'event') {
+        return vaak_is_local_url((string) ($row['actor_id'] ?? ''));
+    }
+    if ($kind === 'boost') {
+        return vaak_is_local_url((string) ($row['owner_actor_id'] ?? ''))
+            && !admin_reblog_is_bsky($row);
+    }
+    return false;
+}
+
 /** Viewer preference: highlight anti-AI posters. Removed from the UI. */
 function admin_viewer_anti_ai_enabled(): bool
 {
@@ -12924,6 +12943,12 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         $sliceKeys = array_slice($adminTlRankedCached, $tlOffset, $tlLimit);
         $hydrateT0 = microtime(true);
         $slice = admin_tl_hydrate($sliceKeys);
+        // Cached indexes can outlive a timeline-rule change. Re-assert the
+        // Local boundary after hydration so stale entries cannot leak remote
+        // actors back into the Local tab.
+        if ($view === 'local') {
+            $slice = array_values(array_filter($slice, 'admin_local_timeline_item_allowed'));
+        }
         // Prefetch masto rows for any outbox cards in this window
         $hydrateNotes = [];
         foreach ($slice as $it) {
@@ -13010,6 +13035,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     $renderT0 = microtime(true);
     ob_start();
     foreach ($slice as $item) {
+        if ($view === 'local' && !admin_local_timeline_item_allowed($item)) {
+            continue;
+        }
         if (admin_timeline_item_muted_by_words($item)) {
             continue;
         }

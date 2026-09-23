@@ -6042,11 +6042,22 @@ function ap_followers_list(?string $ownerActorId = null): array
     if (isset($memo[$owner])) {
         return $memo[$owner];
     }
+    $redisKey = 'vaak:follow-graph:v1:followers:' . hash('sha256', $owner);
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) {
+            return $memo[$owner] = $cached;
+        }
+    }
     $st = ap_db()->prepare(
         'SELECT * FROM followers WHERE owner_actor_id = ? OR owner_actor_id = ? ORDER BY followed_at DESC'
     );
     $st->execute([$owner, $owner . '/']);
-    return $memo[$owner] = ($st->fetchAll() ?: []);
+    $rows = $st->fetchAll() ?: [];
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $rows, 120);
+    }
+    return $memo[$owner] = $rows;
 }
 
 function ap_following_list(?string $ownerActorId = null): array
@@ -6068,17 +6079,31 @@ function ap_following_list(?string $ownerActorId = null): array
     if (isset($memo[$owner])) {
         return $memo[$owner];
     }
+    $redisKey = 'vaak:follow-graph:v1:following:' . hash('sha256', $owner);
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) {
+            return $memo[$owner] = $cached;
+        }
+    }
     $st = ap_db()->prepare(
         'SELECT * FROM following WHERE owner_actor_id = ? OR owner_actor_id = ? ORDER BY followed_at DESC'
     );
     $st->execute([$owner, $owner . '/']);
-    return $memo[$owner] = ($st->fetchAll() ?: []);
+    $rows = $st->fetchAll() ?: [];
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $rows, 120);
+    }
+    return $memo[$owner] = $rows;
 }
 
 /** Invalidate request-local follow graph memos after follow/unfollow mutations. */
 function ap_follow_lists_reset_memo(): void
 {
     ap_follow_lists_cache_gen(true);
+    if (function_exists('ap_redis_delete_pattern')) {
+        ap_redis_delete_pattern('vaak:follow-graph:v1:*');
+    }
 }
 
 function ap_outbound_follow_count_recent(int $withinSeconds = 3600): int
