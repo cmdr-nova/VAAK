@@ -25377,11 +25377,20 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const participants = parseInt(ta.dataset.replyParticipantCount || '0', 10) || 0;
     const text = String(ta.value || '').toLowerCase();
     const authorPresent = required !== '' && new RegExp('(^|\\s)' + required.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '(?=\\s|$)').test(text);
-    const blocked = participants >= 2 && !authorPresent;
+    const replyTo = String(document.getElementById('compose-in-reply-to')?.value || '').trim();
+    const repliesToOtherPost = replyTo !== ''
+      && !/^https:\/\/mkultra\.monster\/users\/[^/]+\/notes\//i.test(replyTo);
+    // Followers-only replies are only valid for the author's own posts. Keep
+    // this restriction visible even when a modal lacks participant metadata;
+    // the publish endpoint enforces the same rule for bypassing clients.
+    const blocked = repliesToOtherPost || (participants >= 2 && !authorPresent);
     const privateOption = select.querySelector('option[value="private"]');
     if (privateOption) {
       privateOption.disabled = blocked;
-      privateOption.textContent = blocked ? 'Followers-only (parent author required)' : 'Followers-only';
+      privateOption.textContent = 'Followers-only';
+      privateOption.title = blocked
+        ? 'Followers-only replies are available only on your own posts.'
+        : '';
     }
     if (blocked && select.value === 'private') select.value = 'public';
   }
