@@ -15036,7 +15036,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .quote-block a.ext-link {
       color: var(--primary);
       text-decoration: none;
-      font-weight: 600;
+      font-weight: 500;
       overflow-wrap: anywhere;
       word-break: break-word;
     }
