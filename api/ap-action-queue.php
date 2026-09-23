@@ -356,6 +356,10 @@ function ap_action_queue_worker_run(int $limit = 20): array
     try {
         $db = ap_db();
         $limit = max(1, min(50, $limit));
+        $pending = (int) $db->query("SELECT COUNT(*) FROM ap_action_queue WHERE status = 'pending'")->fetchColumn();
+        if (function_exists('ap_worker_backpressure_limit')) {
+            $limit = ap_worker_backpressure_limit('actions', $limit, $pending);
+        }
         $now = gmdate('c');
         // Recover work abandoned by a killed worker after its lease expired.
         $stale = gmdate('c', time() - 600);

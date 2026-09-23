@@ -40,6 +40,10 @@ try {
     require_once __DIR__ . '/ap-bsky.php';
     require_once __DIR__ . '/ap-inbox.php';
     $db = ap_db();
+    $pendingCount = (int) $db->query("SELECT COUNT(*) FROM ap_fanout_delivery_queue WHERE status = 'pending'")->fetchColumn();
+    if (function_exists('ap_worker_backpressure_limit')) {
+        $limit = ap_worker_backpressure_limit('fanout-delivery', $limit, $pendingCount);
+    }
     $now = gmdate('c');
     $stale = gmdate('c', time() - 600);
     $db->prepare("UPDATE ap_fanout_delivery_queue SET status='pending', claimed_at=NULL, attempts=attempts+1, last_error='Worker lease expired', updated_at=? WHERE status='processing' AND claimed_at < ?")->execute([$now, $stale]);

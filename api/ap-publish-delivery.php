@@ -189,6 +189,11 @@ function ap_publish_delivery_worker_run(int $limit = 10): array
     if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) return $stats + ['busy' => 1];
     try {
         $db = ap_db();
+        $limit = max(1, min(50, $limit));
+        $pending = (int) $db->query("SELECT COUNT(*) FROM ap_publish_delivery_queue WHERE status = 'pending'")->fetchColumn();
+        if (function_exists('ap_worker_backpressure_limit')) {
+            $limit = ap_worker_backpressure_limit('publish-delivery', $limit, $pending);
+        }
         $now = gmdate('c');
         $staleAt = gmdate('c', time() - 600);
         $db->prepare("UPDATE ap_publish_delivery_queue SET status='failed',claimed_at=NULL,last_error='Worker lease repeatedly expired',updated_at=? WHERE status='processing' AND claimed_at < ? AND attempts >= 11")
@@ -196,7 +201,7 @@ function ap_publish_delivery_worker_run(int $limit = 10): array
         $db->prepare("UPDATE ap_publish_delivery_queue SET status='pending',attempts=attempts+1,claimed_at=NULL,last_error='Worker lease expired; retrying',updated_at=? WHERE status='processing' AND claimed_at < ?")
             ->execute([$now, $staleAt]);
         $st = $db->prepare("SELECT * FROM ap_publish_delivery_queue WHERE status='pending' AND next_attempt_at <= ? ORDER BY priority, next_attempt_at, id LIMIT ?");
-        $st->bindValue(1, $now); $st->bindValue(2, max(1, min(50, $limit)), PDO::PARAM_INT); $st->execute();
+        $st->bindValue(1, $now); $st->bindValue(2, $limit, PDO::PARAM_INT); $st->execute();
         foreach ($st->fetchAll() as $row) {
             $claim = $db->prepare("UPDATE ap_publish_delivery_queue SET status='processing',claimed_at=?,updated_at=? WHERE id=? AND status='pending'");
             $claim->execute([$now, $now, (int) $row['id']]);

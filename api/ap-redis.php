@@ -289,6 +289,17 @@ function ap_redis_timing_snapshot(): array
     return $out;
 }
 
+/** Lower a worker batch when backlog indicates upstream/database pressure. */
+function ap_worker_backpressure_limit(string $queue, int $requested, int $pending): int
+{
+    $requested = max(1, $requested);
+    $pending = max(0, $pending);
+    $factor = $pending >= 5000 ? 0.25 : ($pending >= 1000 ? 0.5 : ($pending >= 250 ? 0.75 : 1.0));
+    $limit = max(1, (int) floor($requested * $factor));
+    if ($factor < 1.0) ap_redis_metric_inc('worker_backpressure');
+    return $limit;
+}
+
 /** Best-effort short lock used to coalesce refresh work. */
 function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
 {

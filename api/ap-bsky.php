@@ -596,6 +596,15 @@ function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
     $stats = ['claimed' => 0, 'ok' => 0, 'failed' => 0, 'skipped' => 0, 'dead' => 0];
     ap_bsky_crosspost_retries_migrate();
     $limit = max(1, min(20, $limit));
+    $pending = 0;
+    try {
+        $pending = (int) ap_db()->query("SELECT COUNT(*) FROM bsky_crosspost_retries WHERE status = 'pending'")->fetchColumn();
+    } catch (Throwable $e) {
+        // Keep the safe caller-provided default when queue statistics fail.
+    }
+    if (function_exists('ap_worker_backpressure_limit')) {
+        $limit = ap_worker_backpressure_limit('bsky-crosspost', $limit, $pending);
+    }
     $now = gmdate('c');
     $rows = [];
     try {
@@ -6645,6 +6654,11 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
     if (!ap_bsky_actor_refresh_migrate()) return ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
     $stats = ['claimed' => 0, 'succeeded' => 0, 'retried' => 0, 'failed' => 0];
     $db = ap_db();
+    $limit = max(1, min(15, $limit));
+    $pending = (int) $db->query("SELECT COUNT(*) FROM bsky_actor_refresh_queue WHERE status = 'pending'")->fetchColumn();
+    if (function_exists('ap_worker_backpressure_limit')) {
+        $limit = ap_worker_backpressure_limit('bsky-refresh', $limit, $pending);
+    }
     $now = gmdate('c');
     // Keep HTML-profile repost state canonical even when the user undoes a
     // repost directly in Bluesky rather than through VAAK. The enqueue helper
@@ -6670,7 +6684,7 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
     }
     $st = $db->prepare("SELECT owner_user_id, actor_ref FROM bsky_actor_refresh_queue WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY CASE WHEN actor_ref LIKE '__vaak_sync__:%' THEN 0 ELSE 1 END, queued_at LIMIT ?");
     $st->bindValue(1, $now);
-    $st->bindValue(2, max(1, min(15, $limit)), PDO::PARAM_INT);
+    $st->bindValue(2, $limit, PDO::PARAM_INT);
     $st->execute();
     foreach ($st->fetchAll() ?: [] as $job) {
         $owner = (int) ($job['owner_user_id'] ?? 0);
