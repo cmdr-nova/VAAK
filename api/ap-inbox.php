@@ -5171,6 +5171,45 @@ function ap_publish_status_text(
     if ($visibility === 'direct') {
         $visibility = 'public';
     }
+
+    // A reply must never broaden the audience of its parent.  This is kept
+    // server-side so inline, modal, focused-post, API, and queued composers
+    // all receive the same protection.  Remote parents are only constrained
+    // when their visibility is already cached locally; an unresolved remote
+    // object is left to the normal federation policy.
+    if ($inReplyTo !== '') {
+        $parentVisibility = null;
+        try {
+            $parentKey = rtrim($inReplyTo, '/');
+            $st = ap_db()->prepare(
+                "SELECT visibility FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1"
+            );
+            $st->execute([$inReplyTo, $parentKey]);
+            $row = $st->fetch();
+            if (is_array($row) && isset($row['visibility'])) {
+                $parentVisibility = ap_normalize_visibility((string) $row['visibility']);
+            }
+            if ($parentVisibility === null) {
+                $st = ap_db()->prepare(
+                    "SELECT visibility FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1"
+                );
+                $st->execute([$inReplyTo, $parentKey]);
+                $row = $st->fetch();
+                if (is_array($row) && isset($row['visibility'])) {
+                    $parentVisibility = ap_normalize_visibility((string) $row['visibility']);
+                }
+            }
+        } catch (Throwable $e) {
+            ap_log('reply_parent_visibility_lookup_failed ' . $e->getMessage());
+        }
+        if ($parentVisibility === 'private' || $parentVisibility === 'direct') {
+            if ($visibility !== 'private') {
+                $visibility = 'private';
+            }
+        } elseif ($parentVisibility === 'unlisted' && $visibility === 'public') {
+            $visibility = 'unlisted';
+        }
+    }
     // A followers-only reply to somebody else's post is effectively a private
     // side conversation about that post's author. Keep VAAK's own composer from
     // creating that ambiguous privacy state; direct messages use ap_dm_send().
