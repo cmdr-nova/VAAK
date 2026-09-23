@@ -26143,6 +26143,13 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (visibilityWrap) visibilityWrap.style.display = '';
     const replyTo = document.getElementById('compose-in-reply-to');
     const toActor = document.getElementById('compose-to-actor');
+    const ta = document.getElementById('compose-content');
+    if (ta) {
+      // The composer panel is reused between replies and new posts. Do not
+      // carry reply-participant privacy state into the next composition.
+      delete ta.dataset.requiredReplyMention;
+      delete ta.dataset.replyParticipantCount;
+    }
     if (replyTo) {
       replyTo.style.display = '';
       if (replyTo.parentElement) replyTo.parentElement.style.display = '';
@@ -26151,6 +26158,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       toActor.style.display = '';
       if (toActor.parentElement) toActor.parentElement.style.display = '';
     }
+    syncReplyPrivacyGuard();
   }
   window.__apResetComposeChrome = resetComposeChrome;
 
