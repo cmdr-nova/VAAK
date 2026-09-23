@@ -504,8 +504,10 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
     $hideProfileReplies = !empty($p['hide_profile_replies']);
     $hideProfileBoosts = !empty($p['hide_profile_boosts']);
-    $followers = ap_followers_list($actorId);
-    $following = ap_following_list($actorId);
+    $followers = [];
+    $following = [];
+    $apFollowers = function_exists('ap_followers_count') ? ap_followers_count($actorId) : count(ap_followers_list($actorId));
+    $apFollowing = function_exists('ap_following_count') ? ap_following_count($actorId) : count(ap_following_list($actorId));
     $name = htmlspecialchars((string) $p['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $safe = htmlspecialchars($actorKey, ENT_QUOTES, 'UTF-8');
     $summary = function_exists('ap_html_sanitize_allowlist')
@@ -803,10 +805,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         default => $profileTotal + $profileBskyCount + $profileBoostTotal,
     };
     $profilePageCount = max(1, (int) ceil(max(1, $tabTotal) / $profilePerPage));
-    $apFollowing = count($following);
-    $apFollowers = count($followers);
     $combined = function_exists('ap_profile_combined_follow_counts')
-        ? ap_profile_combined_follow_counts($actorKey, $apFollowers, $apFollowing)
+        ? ap_profile_combined_follow_counts($actorKey, $apFollowers, $apFollowing, false)
         : [
             'followers' => $apFollowers,
             'following' => $apFollowing,

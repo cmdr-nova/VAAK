@@ -6257,6 +6257,58 @@ function ap_followers_list(?string $ownerActorId = null): array
     return $memo[$owner] = $rows;
 }
 
+function ap_followers_count(?string $ownerActorId = null): int
+{
+    $owner = rtrim((string) ($ownerActorId ?? ''), '/');
+    if ($owner === '') {
+        $owner = rtrim(ap_local_actor_id(), '/');
+    }
+    $key = 'vaak:follow-graph:v1:followers-count:' . hash('sha256', $owner);
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    try {
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM followers WHERE owner_actor_id = ? OR owner_actor_id = ?');
+        $st->execute([$owner, $owner . '/']);
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 120);
+        }
+        return $count;
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
+function ap_following_count(?string $ownerActorId = null): int
+{
+    $owner = rtrim((string) ($ownerActorId ?? ''), '/');
+    if ($owner === '') {
+        $owner = rtrim(ap_local_actor_id(), '/');
+    }
+    $key = 'vaak:follow-graph:v1:following-count:' . hash('sha256', $owner);
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    try {
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?');
+        $st->execute([$owner, $owner . '/']);
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 120);
+        }
+        return $count;
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 function ap_following_list(?string $ownerActorId = null): array
 {
     $owner = rtrim((string) ($ownerActorId ?? ''), '/');
@@ -6820,7 +6872,7 @@ function ap_profile_bsky_handle(string $actorKey, array $profile = []): ?string
  *
  * @return array{ok:bool,followers:int,following:int,posts:int,handle?:string,error?:string}
  */
-function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $forceRefresh = false): array
+function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $forceRefresh = false, bool $allowFetch = true): array
 {
     $handle = ltrim(trim($handle), '@');
     if ($handle === '' || !preg_match('/^[a-z0-9][a-z0-9._:-]*$/i', $handle)) {
@@ -6853,6 +6905,10 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $
                 ];
             }
         }
+    }
+
+    if (!$allowFetch) {
+        return ['ok' => false, 'followers' => 0, 'following' => 0, 'posts' => 0, 'handle' => $handle, 'error' => 'cache miss'];
     }
 
     $url = 'https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor=' . rawurlencode($handle);
@@ -6925,7 +6981,7 @@ function ap_profile_bsky_owner_id(string $actorKey): int
     }
 }
 
-function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, int $apFollowing): array
+function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, int $apFollowing, bool $allowRemoteFetch = true): array
 {
     $apFollowers = max(0, $apFollowers);
     $apFollowing = max(0, $apFollowing);
@@ -6933,7 +6989,7 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
     $bskyFollowers = 0;
     $bskyFollowing = 0;
     if (is_string($handle) && $handle !== '') {
-        $remote = ap_bsky_public_profile_counts($handle, 120, false);
+        $remote = ap_bsky_public_profile_counts($handle, 120, false, $allowRemoteFetch);
         if (!empty($remote['ok'])) {
             $bskyFollowers = (int) $remote['followers'];
             $bskyFollowing = (int) $remote['following'];

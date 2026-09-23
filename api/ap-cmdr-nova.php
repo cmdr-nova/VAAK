@@ -1653,16 +1653,12 @@ function ap_cmdr_html(): void
     $p = ap_profile_get('cmdr_nova');
     $hideProfileReplies = !empty($p['hide_profile_replies']);
     $hideProfileBoosts = !empty($p['hide_profile_boosts']);
-    $followers = [];
-    $following = [];
-    try {
-        $followers = ap_followers_list(CMDR_ACTOR_ID);
-        $following = ap_following_list(CMDR_ACTOR_ID);
-    } catch (Throwable $e) {
-        // leave empty
-    }
-    $followerCount = count($followers);
-    $followingCount = count($following);
+    $followerCount = function_exists('ap_followers_count')
+        ? ap_followers_count(CMDR_ACTOR_ID)
+        : count(ap_followers_list(CMDR_ACTOR_ID));
+    $followingCount = function_exists('ap_following_count')
+        ? ap_following_count(CMDR_ACTOR_ID)
+        : count(ap_following_list(CMDR_ACTOR_ID));
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle('cmdr_nova', $p)
         : null;
@@ -1832,7 +1828,7 @@ function ap_cmdr_html(): void
         : [];
     $featuredCount = count($featuredCards);
     $combined = function_exists('ap_profile_combined_follow_counts')
-        ? ap_profile_combined_follow_counts('cmdr_nova', (int) $followerCount, (int) $followingCount)
+        ? ap_profile_combined_follow_counts('cmdr_nova', (int) $followerCount, (int) $followingCount, false)
         : [
             'followers' => (int) $followerCount,
             'following' => (int) $followingCount,
