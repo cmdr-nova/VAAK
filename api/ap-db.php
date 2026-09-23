@@ -10109,6 +10109,29 @@ function ap_masto_reblog_rows_for_html_profile(int $ownerUserId, int $limit = 50
     }
 }
 
+function ap_masto_reblog_count_for_html_profile(int $ownerUserId): int
+{
+    $ownerUserId = max(1, $ownerUserId);
+    $key = 'vaak:profile:boost-count:v1:' . $ownerUserId;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    try {
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM masto_reblogs WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 60);
+        }
+        return $count;
+    } catch (Throwable) {
+        return 0;
+    }
+}
+
 /**
  * Rebuild a public Announce activity from a masto_reblogs row.
  * Remotes fetch /users/cmdr_nova/announces/{id} after inbox delivery; without

@@ -20578,7 +20578,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 $stBskyParentItem = ap_bsky_feed_item_from_any_url(
                     $stBskyParentUrl !== '' ? $stBskyParentUrl : $stBskyParentUri,
                     admin_owner_user_id(),
-                    false
+                    true
                 );
             }
           ?>
