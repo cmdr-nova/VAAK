@@ -3581,6 +3581,34 @@ function ap_bsky_posts_for_author(string $authorDid, int $limit = 20, int $offse
     }
 }
 
+/** Return the cached Bluesky post count for an author without loading bodies. */
+function ap_bsky_posts_count_for_author(string $authorDid): int
+{
+    $authorDid = trim($authorDid);
+    if ($authorDid === '' || !str_starts_with($authorDid, 'did:')) {
+        return 0;
+    }
+    $key = 'vaak:profile:bsky-count:v1:' . hash('sha256', $authorDid);
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    try {
+        ap_bsky_posts_migrate();
+        $st = ap_db()->prepare('SELECT COUNT(*) FROM bsky_posts WHERE author_did = ?');
+        $st->execute([$authorDid]);
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 60);
+        }
+        return $count;
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 /** Cached mixed-author posts for a VAAK custom list; refreshes are queued lazily. */
 function ap_bsky_posts_for_authors(array $authorDids, int $ownerUserId, int $limit = 40): array
 {

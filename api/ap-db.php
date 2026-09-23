@@ -5391,6 +5391,36 @@ function ap_blog_posts_list(string $actorKey, bool $publishedOnly = true, int $l
     }
 }
 
+function ap_blog_posts_count(string $actorKey, bool $publishedOnly = true): int
+{
+    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
+    if ($actorKey === '') {
+        return 0;
+    }
+    $key = 'vaak:profile:blog-count:v1:' . $actorKey . ':' . ($publishedOnly ? 'published' : 'all');
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    try {
+        $sql = 'SELECT COUNT(*) FROM vaak_blog_posts WHERE actor_key = ?';
+        if ($publishedOnly) {
+            $sql .= " AND status = 'published'";
+        }
+        $st = ap_db()->prepare($sql);
+        $st->execute([$actorKey]);
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 60);
+        }
+        return $count;
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 function ap_blog_post_get(string $actorKey, string $slug, bool $publishedOnly = true): ?array
 {
     $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');

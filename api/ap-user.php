@@ -487,6 +487,21 @@ function ap_user_serve_collection_html(string $actorKey, string $actorId, string
 function ap_user_profile_html(string $actorKey, string $actorId): void
 {
     $p = ap_profile_get($actorKey);
+    $profileViewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    $profileIsPublicRequest = !is_array($profileViewer);
+    $profileCacheSeed = $actorKey . '|' . (string) ($_SERVER['QUERY_STRING'] ?? '') . '|' . (string) ($p['updated'] ?? $p['updated_at'] ?? '');
+    $profileEtag = '"' . sha1($profileCacheSeed) . '"';
+    header('Vary: Accept, Cookie');
+    header('ETag: ' . $profileEtag);
+    if ($profileIsPublicRequest) {
+        header('Cache-Control: public, max-age=30, stale-while-revalidate=120');
+        if (trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? '')) === $profileEtag) {
+            http_response_code(304);
+            return;
+        }
+    } else {
+        header('Cache-Control: private, no-store');
+    }
     $hideProfileReplies = !empty($p['hide_profile_replies']);
     $hideProfileBoosts = !empty($p['hide_profile_boosts']);
     $followers = ap_followers_list($actorId);
@@ -521,9 +536,26 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         }
     }
 
+    // Decide the active surface before loading tab-specific data. Public profile
+    // requests are common, so avoid assembling replies, boosts, media, and blog
+    // archives when the visitor only asked for one of them.
+    $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
+    if (!in_array($tab, ['posts', 'media', 'replies', 'boosts', 'featured', 'blog'], true)) {
+        $tab = 'posts';
+    }
+    if (($tab === 'replies' && $hideProfileReplies) || ($tab === 'boosts' && $hideProfileBoosts)) {
+        $tab = 'posts';
+    }
+    $profilePerPage = 40;
+    $profilePage = max(1, (int) ($_GET['page'] ?? 1));
+    $needsBskyRows = in_array($tab, ['posts', 'replies'], true);
+    $needsReplyRows = $tab === 'replies';
+    $needsBoostRows = in_array($tab, ['posts', 'boosts'], true) && !$hideProfileBoosts;
+    $needsBlogRows = $tab === 'blog';
+
     ap_user_html_shell_start('@' . $actorKey . '@mkultra.monster');
     echo '<span id="profile-top" aria-hidden="true"></span>';
-    $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    $viewer = $profileViewer;
     $viewerActor = is_array($viewer) ? rtrim((string) ($viewer['actor_id'] ?? ''), '/') : '';
     $isOwner = $viewerActor !== '' && $viewerActor === rtrim($actorId, '/');
     if ($isOwner) {
@@ -612,8 +644,6 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
 
     // Backfilled Bluesky history can be large; paginate the profile instead of
     // rendering the entire archive in one response.
-    $profilePerPage = 40;
-    $profilePage = max(1, (int) ($_GET['page'] ?? 1));
     $profileTotal = function_exists('ap_outbox_count_for_actor')
         ? ap_outbox_count_for_actor($actorKey)
         : 0;
@@ -647,12 +677,21 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     try {
         if (function_exists('ap_masto_reblog_rows') && function_exists('ap_db_owner_user_id_for_actor')) {
             $ownerId = $profileOwnerId;
-            if ($ownerId > 0 && !$hideProfileBoosts) {
-                $allProfileBoosts = function_exists('ap_masto_reblog_rows_for_html_profile')
-                    ? ap_masto_reblog_rows_for_html_profile($ownerId, 5000, 0)
-                    : ap_masto_reblog_rows(80, null, $ownerId);
-                $profileBoostTotal = count($allProfileBoosts);
-                $profileBoosts = array_slice($allProfileBoosts, ($profilePage - 1) * $profilePerPage, $profilePerPage);
+            if ($ownerId > 0 && $needsBoostRows) {
+                if ($tab === 'boosts' && function_exists('ap_masto_reblog_count_for_html_profile')) {
+                    $profileBoostTotal = ap_masto_reblog_count_for_html_profile($ownerId);
+                    $profileBoosts = function_exists('ap_masto_reblog_rows_for_html_profile')
+                        ? ap_masto_reblog_rows_for_html_profile($ownerId, $profilePerPage, ($profilePage - 1) * $profilePerPage)
+                        : ap_masto_reblog_rows($profilePerPage, null, $ownerId);
+                } else {
+                    $allProfileBoosts = function_exists('ap_masto_reblog_rows_for_html_profile')
+                        ? ap_masto_reblog_rows_for_html_profile($ownerId, 5000, 0)
+                        : ap_masto_reblog_rows(80, null, $ownerId);
+                    $profileBoostTotal = count($allProfileBoosts);
+                    $profileBoosts = array_slice($allProfileBoosts, ($profilePage - 1) * $profilePerPage, $profilePerPage);
+                }
+            } elseif ($ownerId > 0 && !$hideProfileBoosts && function_exists('ap_masto_reblog_count_for_html_profile')) {
+                $profileBoostTotal = ap_masto_reblog_count_for_html_profile($ownerId);
             }
         }
     } catch (Throwable $e) {
@@ -664,7 +703,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     // bsky_posts cache, so merge those cached rows into the profile directly.
     // This also preserves Bluesky reposts via their reasonRepost marker.
     $profileBskyPosts = [];
-    if ($profileDid !== '' && function_exists('ap_bsky_posts_for_author')) {
+    if ($needsBskyRows && $profileDid !== '' && function_exists('ap_bsky_posts_for_author')) {
         try {
             $profileBskyPosts = ap_bsky_posts_for_author($profileDid, 80, 0);
         } catch (Throwable $e) {
@@ -704,11 +743,15 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         $seenBskyUris[$uri] = true;
         return true;
     }));
-    $profileBskyCount = $profileBskyPosts !== [] ? count($profileBskyPosts) : 0;
+    $profileBskyCount = $profileDid !== '' && function_exists('ap_bsky_posts_count_for_author')
+        ? ap_bsky_posts_count_for_author($profileDid)
+        : ($profileBskyPosts !== [] ? count($profileBskyPosts) : 0);
     $profileReplyNotes = [];
-    foreach (ap_outbox_list(200, $actorKey) as $replyNote) {
-        if (trim((string) ($replyNote['in_reply_to'] ?? '')) !== '') {
-            $profileReplyNotes[] = $replyNote;
+    if ($needsReplyRows) {
+        foreach (ap_outbox_list($profilePerPage, $actorKey) as $replyNote) {
+            if (trim((string) ($replyNote['in_reply_to'] ?? '')) !== '') {
+                $profileReplyNotes[] = $replyNote;
+            }
         }
     }
     $profileBskyReplies = array_values(array_filter($profileBskyPosts, static function (array $item): bool {
@@ -721,16 +764,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
     $blogSlug = trim((string) ($_GET['post'] ?? ''));
     $blogPost = $blogSlug !== '' ? ap_blog_post_get($actorKey, $blogSlug, true) : null;
-    $blogRows = ap_blog_posts_list($actorKey, true, 20, max(0, ($profilePage - 1) * 20));
-    $blogCount = count(ap_blog_posts_list($actorKey, true, 200, 0));
-
-    $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
-    if (!in_array($tab, ['posts', 'media', 'replies', 'boosts', 'featured', 'blog'], true)) {
-        $tab = 'posts';
-    }
-    if (($tab === 'replies' && $hideProfileReplies) || ($tab === 'boosts' && $hideProfileBoosts)) {
-        $tab = 'posts';
-    }
+    $blogRows = $needsBlogRows
+        ? ap_blog_posts_list($actorKey, true, 20, max(0, ($profilePage - 1) * 20))
+        : [];
+    $blogCount = function_exists('ap_blog_posts_count')
+        ? ap_blog_posts_count($actorKey, true)
+        : count($blogRows);
     $mediaNotes = [];
     foreach ($publicNotes as $mediaNote) {
         $create = json_decode((string) ($mediaNote['raw_create_json'] ?? ''), true);
@@ -739,11 +778,19 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             $mediaNotes[] = [$mediaNote, $noteObj];
         }
     }
-    $featuredCards = function_exists('ap_featured_cards_for_actor_key')
+    $featuredCards = $tab === 'featured' && function_exists('ap_featured_cards_for_actor_key')
         ? ap_featured_cards_for_actor_key($actorKey)
         : [];
     $featuredCount = count($featuredCards);
-    $profilePageCount = max(1, (int) ceil(max(1, $profileTotal + $profileBskyCount + $profileBoostTotal) / $profilePerPage));
+    $tabTotal = match ($tab) {
+        'media' => count($mediaNotes),
+        'replies' => count($profileReplyNotes) + count($profileBskyReplies),
+        'boosts' => $profileBoostTotal,
+        'featured' => $featuredCount,
+        'blog' => $blogCount,
+        default => $profileTotal + $profileBskyCount + $profileBoostTotal,
+    };
+    $profilePageCount = max(1, (int) ceil(max(1, $tabTotal) / $profilePerPage));
     $apFollowing = count($following);
     $apFollowers = count($followers);
     $combined = function_exists('ap_profile_combined_follow_counts')
@@ -793,7 +840,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '</nav>';
 
     if ($tab === 'blog') {
-        echo '<section id="profile-blog" class="posts profile-blog" aria-label="Blog">';
+        echo '<section id="profile-blog" class="posts profile-blog' . (!$blogPost ? ' profile-infinite' : '') . '" aria-label="Blog"'
+            . (!$blogPost ? ' data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '" data-profile-tab="blog"' : '') . '>';
         if ($blogPost) {
             $blogTitle = htmlspecialchars((string) ($blogPost['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
             echo '<article class="profile-blog-post"><div class="muted">' . htmlspecialchars((string) (($blogPost['category'] ?? '') ?: 'Blog'), ENT_QUOTES, 'UTF-8') . '</div>';
@@ -812,6 +860,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                 echo '<h2><a href="/users/' . $safe . '?tab=blog&amp;post=' . htmlspecialchars($slugSafe, ENT_QUOTES, 'UTF-8') . '">' . htmlspecialchars((string) ($blogRow['title'] ?? 'Untitled'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></h2>';
                 echo '<p>' . htmlspecialchars((string) ($blogRow['excerpt'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
                 echo '<p class="muted">' . htmlspecialchars((string) ($blogRow['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . '</p></article>';
+            }
+            if ($profilePageCount > $profilePage) {
+                echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
             }
         }
         echo '</section>';
@@ -838,7 +889,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         }
         echo '</section>';
     } elseif ($tab === 'replies') {
-        echo '<section id="profile-replies" class="posts" aria-label="Replies">';
+        echo '<section id="profile-replies" class="posts profile-infinite" aria-label="Replies" data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '" data-profile-tab="replies">';
         if (!$profileReplyNotes && !$profileBskyReplies) {
             echo '<p class="muted">No replies yet.</p>';
         } else {
@@ -849,9 +900,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                 echo ap_user_bsky_post_preview_html($actorKey, $replyItem);
             }
         }
+        if ($profilePageCount > $profilePage) {
+            echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
+        }
         echo '</section>';
     } elseif ($tab === 'boosts') {
-        echo '<section id="profile-boosts" class="posts" aria-label="Boosts">';
+        echo '<section id="profile-boosts" class="posts profile-infinite" aria-label="Boosts" data-profile-page="' . (int) $profilePage . '" data-profile-pages="' . (int) $profilePageCount . '" data-profile-tab="boosts">';
         if (!$profileBoosts) {
             echo '<p class="muted">No boosts yet.</p>';
         } else {
@@ -862,12 +916,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                 }
                 echo ap_user_boost_preview_html($actorKey, $boost, $profileOwnerId);
             }
-            $boostPages = max(1, (int) ceil($profileBoostTotal / $profilePerPage));
-            if ($boostPages > 1) {
-                echo '<nav class="profile-pager" aria-label="Boost pages">';
-                if ($profilePage > 1) echo '<a href="?tab=boosts&amp;page=' . ($profilePage - 1) . '">← Newer boosts</a> ';
-                if ($profilePage < $boostPages) echo '<a href="?tab=boosts&amp;page=' . ($profilePage + 1) . '">Older boosts →</a>';
-                echo '</nav>';
+            if ($profilePageCount > $profilePage) {
+                echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
             }
         }
         echo '</section>';
@@ -925,7 +975,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
 
     echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
-    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("profile-pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
+    echo '<script>(function(){const top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();const box=document.querySelector(".profile-infinite");if(!box||!window.IntersectionObserver)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin",headers:{"X-Requested-With":"profile-infinite"}});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector(".profile-infinite");if(!n)throw 0;const marker=box.querySelector(".profile-infinite-sentinel");Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("profile-pager"))box.insertBefore(el,marker);});page++;box.dataset.profilePage=String(page);if(page>=pages){if(marker)marker.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode($actorId, JSON_UNESCAPED_SLASHES) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';
