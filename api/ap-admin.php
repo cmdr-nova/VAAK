@@ -14752,7 +14752,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         max-height: none;
       }
     }
-    /* Flex slot for the body: resize can grow only within remaining modal space */
+    /* Flex slot for the body: the field grows with the draft, then scrolls. */
     .compose-textarea-wrap {
       flex: 1 1 0;
       min-height: 6rem;
@@ -14768,10 +14768,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       height: 100%;
       min-height: 6rem;
       max-height: 100%;
-      resize: vertical;
+      resize: none;
       overflow-y: auto; /* long text scrolls inside the box, not the modal */
       field-sizing: fixed;
       box-sizing: border-box;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-y;
     }
     /* Inline feed composer: these must beat .compose-modal__panel > .composer
        (higher specificity + later in the sheet) so first paint stays compact. */
@@ -25911,7 +25914,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   if (fab) fab.addEventListener('click', () => openModal());
   if (closeBtn) closeBtn.addEventListener('click', closeModal);
   modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
-  // Keep textarea resize inside its flex slot (avoids modal/form scrollbars)
+  // Keep the growing textarea inside its flex slot (avoids modal/form scrollbars)
   (function bindComposeResizeClamp() {
     const ta = document.getElementById('compose-content');
     if (!ta) return;
