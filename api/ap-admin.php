@@ -10926,6 +10926,12 @@ function admin_render_remote_boost_card(
     $mediaRow = is_array($innerEvent) ? ($innerEvent['media_urls'] ?? null) : ($e['media_urls'] ?? null);
     $mediaUrls = mention_media_urls($mediaRow);
     $summaryRaw = admin_media_placeholder_summary($summaryRaw, $mediaUrls);
+    // Some Fediverse servers persist a literal “(boost)” summary for a
+    // media-only reblog. The media itself is the content; do not render that
+    // transport placeholder above it.
+    if ($mediaUrls !== [] && preg_match('/^\(boost\)$/i', trim(strip_tags($summaryRaw)))) {
+        $summaryRaw = '';
+    }
     $eventId = (int) ($e['id'] ?? 0);
     $statusId = $eventId > 0
         ? ap_masto_event_status_id($eventId, $created !== '' ? $created : null)
@@ -10997,13 +11003,15 @@ function admin_render_remote_boost_card(
                   }
                   $boostInner .= '<div class="body feed-body">'
                       . admin_linkify_body_html($summaryRaw, $returnView, $boostMentions, $origActor !== '' ? $origActor : null) . '</div>';
-              } elseif ($objectId !== '' && $mediaUrls === []) {
-                  $boostInner .= '<div class="meta boost-hydrate-pending" style="margin-top:.35rem">'
-                      . '<span class="boost-hydrate-status">Loading boosted post…</span>'
-                      . ' · <a href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
-                      . '</div>';
-              } else {
-                  $boostInner .= '<div class="meta">(boost)</div>';
+              } elseif ($mediaUrls === []) {
+                  if ($objectId !== '') {
+                      $boostInner .= '<div class="meta boost-hydrate-pending" style="margin-top:.35rem">'
+                          . '<span class="boost-hydrate-status">Loading boosted post…</span>'
+                          . ' · <a href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
+                          . '</div>';
+                  } else {
+                      $boostInner .= '<div class="meta">(boost)</div>';
+                  }
               }
               $boostMedia = $mediaUrls;
               if ($boostMedia) {
