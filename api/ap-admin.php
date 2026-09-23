@@ -37,6 +37,7 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
 }
 require_once __DIR__ . '/ap-inbox.php';
+require_once __DIR__ . '/ap-visibility.php';
 
 const LOCAL_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
 
@@ -5251,6 +5252,38 @@ function admin_timeline_item_muted_by_words(array $item): bool
     );
 }
 
+/**
+ * Apply the owner's moderation state while hydrating ranked timeline entries.
+ * This keeps cached IDs cheap while preventing blocked/muted content from
+ * becoming a rendered card after a cache hit.
+ */
+function admin_timeline_item_hidden_by_moderation(array $item, int $ownerUserId): bool
+{
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    $kind = (string) ($item['kind'] ?? '');
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if ($kind === 'event' && admin_timeline_row_hidden($row, $ownerUserId)) {
+        return true;
+    }
+    if ($kind === 'bsky' && function_exists('ap_bsky_filter_hidden_authors')) {
+        if (ap_bsky_filter_hidden_authors($ownerUserId, [$row]) === []) {
+            return true;
+        }
+    }
+    if ($kind === 'boost') {
+        foreach (['actor_id', 'owner_actor_id', 'target_actor'] as $field) {
+            $actor = trim((string) ($row[$field] ?? ''));
+            if ($actor !== '' && function_exists('ap_visibility_actor_hidden')
+                && ap_visibility_actor_hidden($actor, $ownerUserId)) {
+                return true;
+            }
+        }
+    }
+    return admin_timeline_item_muted_by_words($item);
+}
+
 /** Hide a timeline row when either its visible actor or boosted original is blocked. */
 /**
  * True when an AP object id is a Bridgy “convert” mirror (prefer native fedi twin).
@@ -5691,6 +5724,13 @@ function admin_tl_hydrate(array $slice): array
                 'row' => $bItem,
             ];
         }
+    }
+    $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+    if ($ownerUserId > 0 && function_exists('admin_timeline_item_hidden_by_moderation')) {
+        $items = array_values(array_filter(
+            $items,
+            static fn(array $item): bool => !admin_timeline_item_hidden_by_moderation($item, $ownerUserId)
+        ));
     }
     return $items;
 }
