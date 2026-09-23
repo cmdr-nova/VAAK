@@ -1639,13 +1639,15 @@ function ap_cmdr_html(): void
     // cost of rebuilding the full posts/boosts/profile shell at once.
     $profileCachePath = null;
     $profileCacheBuffering = false;
+    $profileCacheBackground = !empty($GLOBALS['ap_cmdr_profile_cache_refresh']);
     $requestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     if (!$isOwner && in_array($requestMethod, ['GET', 'HEAD'], true)) {
         $cacheKey = hash('sha256', (string) ($_SERVER['REQUEST_URI'] ?? '/users/cmdr_nova'));
         $profileCachePath = rtrim((string) sys_get_temp_dir(), DIRECTORY_SEPARATOR)
             . DIRECTORY_SEPARATOR . 'vaak-cmdr-profile-' . $cacheKey . '.html';
         $cacheTtl = 20;
-        if (is_readable($profileCachePath) && (time() - (int) @filemtime($profileCachePath)) < $cacheTtl) {
+        $cacheAge = is_readable($profileCachePath) ? (time() - (int) @filemtime($profileCachePath)) : -1;
+        if (!$profileCacheBackground && $cacheAge >= 0 && $cacheAge < $cacheTtl) {
             header('Content-Type: text/html; charset=utf-8');
             header('Vary: Accept');
             header('Cache-Control: public, max-age=20, stale-while-revalidate=60');
@@ -1654,6 +1656,40 @@ function ap_cmdr_html(): void
                 readfile($profileCachePath);
             }
             return;
+        }
+        // Serve a bounded stale snapshot immediately, then refresh it after
+        // the response. A Redis/file lock prevents a stampede of refreshes.
+        if (!$profileCacheBackground && $cacheAge >= $cacheTtl && $cacheAge < 140) {
+            $stale = @file_get_contents($profileCachePath);
+            if (is_string($stale) && $stale !== '') {
+                $refreshLock = $profileCachePath . '.refresh.lock';
+                $lockHandle = @fopen($refreshLock, 'c');
+                $canRefresh = $lockHandle !== false && @flock($lockHandle, LOCK_EX | LOCK_NB);
+                if ($canRefresh) {
+                    register_shutdown_function(static function () use ($lockHandle): void {
+                        $GLOBALS['ap_cmdr_profile_cache_refresh'] = true;
+                        ob_start();
+                        try {
+                            ap_cmdr_html();
+                        } catch (Throwable $e) {
+                            error_log('[ap-cmdr] profile stale refresh: ' . $e->getMessage());
+                        }
+                        ob_end_clean();
+                        @flock($lockHandle, LOCK_UN);
+                        @fclose($lockHandle);
+                    });
+                } elseif (is_resource($lockHandle)) {
+                    @fclose($lockHandle);
+                }
+                header('Content-Type: text/html; charset=utf-8');
+                header('Vary: Accept');
+                header('Cache-Control: public, max-age=20, stale-while-revalidate=120');
+                header('X-VAAK-Profile-Cache: STALE');
+                if ($requestMethod !== 'HEAD') {
+                    echo $stale;
+                }
+                return;
+            }
         }
         ob_start();
         $profileCacheBuffering = true;
@@ -1825,13 +1861,24 @@ function ap_cmdr_html(): void
 
     $perPage = 20;
     $page = max(1, (int) ($_GET['page'] ?? 1));
+    $profileCursor = ap_cmdr_profile_cursor_decode((string) ($_GET['cursor'] ?? ''));
     $tab = ap_cmdr_normalize_profile_tab((string) ($_GET['tab'] ?? 'posts'));
     if (($tab === 'replies' && $hideProfileReplies) || ($tab === 'boosts' && $hideProfileBoosts)) {
         $tab = 'posts';
     }
     $blogSlug = trim((string) ($_GET['post'] ?? ''));
     $blogPost = $blogSlug !== '' ? ap_blog_post_get('cmdr_nova', $blogSlug, true) : null;
-    $blogRows = ap_blog_posts_list('cmdr_nova', true, 20, max(0, ($page - 1) * $perPage));
+    if ($profileCursor !== null && function_exists('ap_blog_posts_list_after')) {
+        $blogRows = ap_blog_posts_list_after('cmdr_nova', true, $perPage + 1, $profileCursor['published'], (int) $profileCursor['id']);
+    } else {
+        $blogRows = ap_blog_posts_list('cmdr_nova', true, $perPage + 1, max(0, ($page - 1) * $perPage));
+    }
+    $blogNextCursor = count($blogRows) > $perPage
+        ? ap_cmdr_profile_cursor_encode($blogRows[$perPage - 1])
+        : '';
+    if (count($blogRows) > $perPage) {
+        $blogRows = array_slice($blogRows, 0, $perPage);
+    }
     $featuredCards = function_exists('ap_featured_cards_for_actor_key')
         ? ap_featured_cards_for_actor_key('cmdr_nova')
         : [];
@@ -1849,7 +1896,7 @@ function ap_cmdr_html(): void
     // HTML profile feed = site blogs + notes + AP compose (no federation side effects).
     // Media and Featured tabs still need the post counts for their tab badges.
     $feedTab = in_array($tab, ['featured', 'blog'], true) ? 'posts' : $tab;
-    $postsData = ap_cmdr_posts_page($page, $perPage, $feedTab);
+    $postsData = ap_cmdr_posts_page($page, $perPage, $feedTab, $profileCursor);
     $counts = is_array($postsData['counts'] ?? null) ? $postsData['counts'] : ['posts' => 0, 'replies' => 0, 'boosts' => 0];
     $counts['featured'] = $featuredCount;
     $counts['media'] = (int) ($postsData['counts']['media'] ?? 0);
@@ -1897,7 +1944,7 @@ function ap_cmdr_html(): void
 
     if ($tab === 'blog') {
         $blogInfiniteAttrs = !$blogPost
-            ? ' id="profile-posts" class="posts profile-blog profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) max(1, (int) ceil($counts['blog'] / $perPage)) . '" data-profile-tab="blog"'
+            ? ' id="profile-posts" class="posts profile-blog profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) max(1, (int) ceil($counts['blog'] / $perPage)) . '" data-profile-tab="blog" data-profile-next-cursor="' . htmlspecialchars($blogNextCursor, ENT_QUOTES, 'UTF-8') . '"'
             : ' class="posts profile-blog"';
         echo '<section' . $blogInfiniteAttrs . ' aria-label="Blog">';
         if ($blogPost) {
@@ -1926,14 +1973,14 @@ function ap_cmdr_html(): void
                 echo '<p class="muted">' . htmlspecialchars((string) ($bp['published_at'] ?? ''), ENT_QUOTES, 'UTF-8') . ' · <a href="/users/cmdr_nova?tab=blog&amp;post=' . htmlspecialchars($slugSafe, ENT_QUOTES, 'UTF-8') . '">Read article</a></p>';
                 echo '</article>';
             }
-            if ((int) $counts['blog'] > $page * $perPage) {
+            if ($blogNextCursor !== '') {
                 echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
             }
         }
         echo '</section>';
     } elseif ($tab === 'media') {
         $mediaTotalPages = max(1, (int) ceil($tabTotal / $perPage));
-        echo '<section id="profile-posts" class="posts profile-media-gallery profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $mediaTotalPages . '" data-profile-tab="media" aria-label="Media">';
+        echo '<section id="profile-posts" class="posts profile-media-gallery profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $mediaTotalPages . '" data-profile-tab="media" data-profile-next-cursor="' . htmlspecialchars((string) ($postsData['next_cursor'] ?? ''), ENT_QUOTES, 'UTF-8') . '" aria-label="Media">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Media</h2>';
         if (!$postsData['rows']) {
             echo '<p class="muted">No public media posts yet.</p>';
@@ -1941,7 +1988,7 @@ function ap_cmdr_html(): void
             foreach ($postsData['rows'] as $mediaRow) {
                 echo ap_cmdr_profile_media_item_html($mediaRow);
             }
-            if ($mediaTotalPages > $page) {
+            if ((string) ($postsData['next_cursor'] ?? '') !== '') {
                 echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
             }
         }
@@ -1965,7 +2012,7 @@ function ap_cmdr_html(): void
             default => 'No public posts yet.',
         };
         $profileTotalPages = max(1, (int) ceil($tabTotal / $perPage));
-        $profileInfiniteAttrs = ' id="profile-posts" class="posts profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $profileTotalPages . '" data-profile-tab="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '"';
+        $profileInfiniteAttrs = ' id="profile-posts" class="posts profile-infinite" data-profile-page="' . (int) $page . '" data-profile-pages="' . (int) $profileTotalPages . '" data-profile-tab="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '" data-profile-next-cursor="' . htmlspecialchars((string) ($postsData['next_cursor'] ?? ''), ENT_QUOTES, 'UTF-8') . '"';
         echo '<section' . $profileInfiniteAttrs . ' aria-label="' . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">'
             . htmlspecialchars($sectionLabel, ENT_QUOTES, 'UTF-8') . '</h2>';
@@ -1976,7 +2023,7 @@ function ap_cmdr_html(): void
                 echo ap_cmdr_post_preview_html($n);
             }
         }
-        if ($profileTotalPages > $page) {
+        if ((string) ($postsData['next_cursor'] ?? '') !== '') {
             echo '<div class="profile-infinite-sentinel" aria-hidden="true" style="height:1px"></div>';
         }
         echo '</section>';
@@ -1984,7 +2031,7 @@ function ap_cmdr_html(): void
 
     echo '<p class="back"><a href="https://mkultra.monster/">← mkultra.monster</a> · <a href="/users/cmdr_nova/outbox">outbox</a></p>';
     echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
-    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();if(!box)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});page++;box.dataset.profilePage=String(page);if(page>=pages){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
+    echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();if(!box)return;let cursor=box.dataset.profileNextCursor||"",busy=false;const load=async()=>{if(busy||!cursor)return;busy=true;const requested=cursor;try{const u=new URL(location.href);u.searchParams.delete("page");u.searchParams.set("cursor",requested);const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});cursor=n.dataset.profileNextCursor||"";box.dataset.profileNextCursor=cursor;if(!cursor){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode(CMDR_ACTOR_ID) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';
@@ -2004,10 +2051,12 @@ function ap_cmdr_html(): void
         if ($html !== '' && strlen($html) <= 12 * 1024 * 1024) {
             @file_put_contents($profileCachePath, $html, LOCK_EX);
         }
-        header('Cache-Control: public, max-age=20, stale-while-revalidate=60');
-        header('X-VAAK-Profile-Cache: MISS');
-        if ($requestMethod !== 'HEAD') {
-            echo $html;
+        if (!$profileCacheBackground) {
+            header('Cache-Control: public, max-age=20, stale-while-revalidate=120');
+            header('X-VAAK-Profile-Cache: MISS');
+            if ($requestMethod !== 'HEAD') {
+                echo $html;
+            }
         }
     }
 }
@@ -2322,14 +2371,41 @@ function ap_cmdr_profile_media_item_html(array $row): string
     return '<article class="profile-media-item"><div class="profile-media-grid media-count-' . count($cells) . '">' . implode('', $cells) . '</div>' . $caption . $date . $open . '</article>';
 }
 
+/** Encode the stable published-time/object cursor used by HTML profile feeds. */
+function ap_cmdr_profile_cursor_encode(array $row): string
+{
+    $published = trim((string) ($row['published'] ?? $row['published_at'] ?? $row['updated_at'] ?? ''));
+    $id = trim((string) ($row['id'] ?? $row['slug'] ?? ''));
+    if ($published === '' || $id === '') {
+        return '';
+    }
+    $raw = json_encode(['published' => $published, 'id' => $id], JSON_UNESCAPED_SLASHES);
+    return is_string($raw) ? rtrim(strtr(base64_encode($raw), '+/', '-_'), '=') : '';
+}
+
+/** @return array{published:string,id:string}|null */
+function ap_cmdr_profile_cursor_decode(string $cursor): ?array
+{
+    $cursor = trim($cursor);
+    if ($cursor === '') {
+        return null;
+    }
+    $raw = base64_decode(strtr($cursor, '-_', '+/') . str_repeat('=', (4 - strlen($cursor) % 4) % 4), true);
+    $decoded = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($decoded) || trim((string) ($decoded['published'] ?? '')) === '' || trim((string) ($decoded['id'] ?? '')) === '') {
+        return null;
+    }
+    return ['published' => trim((string) $decoded['published']), 'id' => trim((string) $decoded['id'])];
+}
+
 /**
  * Paginated HTML profile feed: site blogs + notes + AP compose/blog/note.
  * Site archive items are display-only (not ActivityPub Creates).
  *
  * @param 'posts'|'replies'|'boosts'|'media' $tab
- * @return array{rows:list<array<string,mixed>>,total:int,page:int,per_page:int,tab:string,counts:array{posts:int,replies:int,boosts:int,media:int}}
+ * @return array{rows:list<array<string,mixed>>,total:int,page:int,per_page:int,tab:string,next_cursor:string,counts:array{posts:int,replies:int,boosts:int,media:int}}
  */
-function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts'): array
+function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts', ?array $cursor = null): array
 {
     $perPage = max(1, min(50, $perPage));
     $page = max(1, $page);
@@ -2417,7 +2493,8 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
 
     $sortDesc = static function (array &$items): void {
         usort($items, static function ($a, $b) {
-            return strcmp((string) ($b['published'] ?? ''), (string) ($a['published'] ?? ''));
+            $published = strcmp((string) ($b['published'] ?? ''), (string) ($a['published'] ?? ''));
+            return $published !== 0 ? $published : strcmp((string) ($b['id'] ?? ''), (string) ($a['id'] ?? ''));
         });
     };
     $sortDesc($posts);
@@ -2430,7 +2507,7 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     // Pinned posts (Ice Cubes + HTML profile) — surface at top of Posts tab
     $pinnedRows = [];
     $pinnedNoteIds = [];
-    if (($tab === 'posts' || $tab === 'all')) {
+    if (($tab === 'posts' || $tab === 'all') && $cursor === null) {
         // Bluesky profile pin without a local VAAK twin (historical Wafrn dual-publish).
         try {
             require_once __DIR__ . '/ap-bsky.php';
@@ -2525,14 +2602,29 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts')
     }
 
     $total = count($items);
-    $offset = ($page - 1) * $perPage;
-    $rows = array_slice($items, $offset, $perPage);
+    if ($cursor !== null) {
+        $items = array_values(array_filter($items, static function (array $row) use ($cursor): bool {
+            $published = (string) ($row['published'] ?? '');
+            $id = (string) ($row['id'] ?? '');
+            return $published < $cursor['published']
+                || ($published === $cursor['published'] && $id < $cursor['id']);
+        }));
+        $offset = 0;
+    } else {
+        $offset = ($page - 1) * $perPage;
+    }
+    $rows = array_slice($items, $offset, $perPage + 1);
+    $nextCursor = count($rows) > $perPage ? ap_cmdr_profile_cursor_encode($rows[$perPage - 1]) : '';
+    if (count($rows) > $perPage) {
+        $rows = array_slice($rows, 0, $perPage);
+    }
     return [
         'rows' => $rows,
         'total' => $total,
         'page' => $page,
         'per_page' => $perPage,
         'tab' => $tab,
+        'next_cursor' => $nextCursor,
         'counts' => $counts,
     ];
 }

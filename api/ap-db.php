@@ -5397,6 +5397,45 @@ function ap_blog_posts_list(string $actorKey, bool $publishedOnly = true, int $l
     }
 }
 
+/**
+ * Cursor variant for public profile infinite scroll. The published timestamp
+ * plus numeric row id provides a stable tie-breaker when new posts arrive.
+ * @return list<array<string,mixed>>
+ */
+function ap_blog_posts_list_after(string $actorKey, bool $publishedOnly, int $limit, string $beforePublished, int $beforeId): array
+{
+    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
+    $beforePublished = trim($beforePublished);
+    if ($actorKey === '' || $beforePublished === '' || $beforeId < 1) {
+        return [];
+    }
+    $limit = max(1, min(200, $limit));
+    try {
+        $sql = 'SELECT * FROM vaak_blog_posts WHERE actor_key = ?';
+        $params = [$actorKey];
+        if ($publishedOnly) {
+            $sql .= " AND status = 'published'";
+        }
+        $sql .= ' AND (COALESCE(published_at, updated_at) < ?'
+            . ' OR (COALESCE(published_at, updated_at) = ? AND id < ?))'
+            . ' ORDER BY COALESCE(published_at, updated_at) DESC, id DESC LIMIT ' . $limit;
+        $params[] = $beforePublished;
+        $params[] = $beforePublished;
+        $params[] = $beforeId;
+        $st = ap_db()->prepare($sql);
+        $st->execute($params);
+        $rows = $st->fetchAll() ?: [];
+        foreach ($rows as &$row) {
+            $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
+        }
+        unset($row);
+        return $rows;
+    } catch (Throwable $e) {
+        error_log('[ap-db] blog cursor list: ' . $e->getMessage());
+        return [];
+    }
+}
+
 function ap_blog_posts_count(string $actorKey, bool $publishedOnly = true): int
 {
     $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
