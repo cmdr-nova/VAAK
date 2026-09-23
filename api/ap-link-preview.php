@@ -356,8 +356,17 @@ function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxByte
         if ($current === '' || !ap_link_preview_url_allowed($current)) {
             return null;
         }
+        $providerHost = strtolower((string) (parse_url($current, PHP_URL_HOST) ?: ''));
+        $providerCircuit = $providerHost !== '' ? 'preview:' . $providerHost : '';
+        if ($providerCircuit !== '' && function_exists('ap_provider_circuit_allow')
+            && !ap_provider_circuit_allow($providerCircuit)) {
+            return null;
+        }
         $ch = curl_init($current);
         if ($ch === false) {
+            if ($providerCircuit !== '' && function_exists('ap_provider_circuit_failure')) {
+                ap_provider_circuit_failure($providerCircuit);
+            }
             return null;
         }
         $buf = '';
@@ -390,6 +399,13 @@ function ap_link_preview_http_get(string $url, int $timeoutSec = 4, int $maxByte
         $ok = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+        if ($providerCircuit !== '' && function_exists('ap_provider_circuit_failure')
+            && ($ok === false || $code === 429 || $code >= 500)) {
+            ap_provider_circuit_failure($providerCircuit);
+        } elseif ($providerCircuit !== '' && function_exists('ap_provider_circuit_success')
+            && $code >= 200 && $code < 500) {
+            ap_provider_circuit_success($providerCircuit);
+        }
         if ($code >= 300 && $code < 400) {
             if ($hop >= $maxHops) {
                 return null;

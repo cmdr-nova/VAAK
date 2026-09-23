@@ -146,6 +146,67 @@ function ap_redis_rate_get(string $bucket): ?int
     }
 }
 
+/**
+ * Provider circuit state is best-effort and Redis-backed. A provider is
+ * isolated after repeated transport/server failures, while a short probe
+ * lock lets one worker test recovery without stampeding the upstream.
+ */
+function ap_provider_circuit_key(string $provider): string
+{
+    return 'vaak:circuit:v1:' . hash('sha256', strtolower(trim($provider)));
+}
+
+function ap_provider_circuit_allow(string $provider, int $probeTtl = 15): bool
+{
+    $provider = trim($provider);
+    $redis = ap_redis_client('cache');
+    if (!$redis || $provider === '') return true;
+    try {
+        $state = ap_redis_json_get(ap_provider_circuit_key($provider));
+        if (!is_array($state)) return true;
+        $openUntil = (int) ($state['open_until'] ?? 0);
+        if ($openUntil > time()) return false;
+        if ($openUntil > 0 && !ap_redis_lock('circuit-probe:' . $provider, $probeTtl)) {
+            return false;
+        }
+        return true;
+    } catch (Throwable $e) {
+        return true;
+    }
+}
+
+function ap_provider_circuit_success(string $provider): void
+{
+    $provider = trim($provider);
+    if ($provider === '') return;
+    ap_redis_delete(ap_provider_circuit_key($provider));
+}
+
+function ap_provider_circuit_failure(string $provider, int $cooldown = 60): void
+{
+    $provider = trim($provider);
+    if ($provider === '') return;
+    $redis = ap_redis_client('cache');
+    if (!$redis) return;
+    try {
+        $key = ap_provider_circuit_key($provider);
+        $state = ap_redis_json_get($key);
+        $failures = is_array($state) ? (int) ($state['failures'] ?? 0) : 0;
+        $failures++;
+        $openUntil = 0;
+        if ($failures >= 3) {
+            $openUntil = time() + min(900, max(15, $cooldown) * (2 ** min(4, $failures - 3)));
+        }
+        ap_redis_json_set($key, [
+            'failures' => $failures,
+            'open_until' => $openUntil,
+            'updated_at' => time(),
+        ], 1800);
+    } catch (Throwable $e) {
+        // Circuit state must never turn an upstream failure into an app failure.
+    }
+}
+
 /** Best-effort operational counters, kept separate from application data. */
 function ap_redis_metric_inc(string $name, int $amount = 1): void
 {

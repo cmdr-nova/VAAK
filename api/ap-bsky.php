@@ -1367,6 +1367,11 @@ function ap_bsky_xrpc(
     if ($nsid === '' || !preg_match('/^[a-z0-9.-]+$/i', $nsid)) {
         return ['ok' => false, 'error' => 'Invalid XRPC method'];
     }
+    $providerHost = strtolower((string) (parse_url($base, PHP_URL_HOST) ?: $base));
+    $providerCircuit = 'bluesky:' . $providerHost;
+    if (function_exists('ap_provider_circuit_allow') && !ap_provider_circuit_allow($providerCircuit)) {
+        return ['ok' => false, 'error' => 'Bluesky provider temporarily unavailable', 'status' => 503, 'circuit_open' => true];
+    }
     $url = $base . '/xrpc/' . $nsid;
     if ($method === 'GET' && is_array($query) && $query !== []) {
         $url .= '?' . http_build_query($query);
@@ -1388,6 +1393,7 @@ function ap_bsky_xrpc(
     }
     $ch = curl_init($url);
     if ($ch === false) {
+        if (function_exists('ap_provider_circuit_failure')) ap_provider_circuit_failure($providerCircuit);
         return ['ok' => false, 'error' => 'curl_init failed'];
     }
     $connectTimeout = min(AP_BSKY_CONNECT_TIMEOUT, $timeoutSec);
@@ -1415,10 +1421,12 @@ function ap_bsky_xrpc(
     curl_close($ch);
     $rate = ap_bsky_parse_rate_limit_headers($respHeaders);
     if ($errno !== 0 || !is_string($body)) {
+        if (function_exists('ap_provider_circuit_failure')) ap_provider_circuit_failure($providerCircuit);
         return ['ok' => false, 'error' => $err !== '' ? $err : 'HTTP request failed', 'status' => $status] + $rate;
     }
     $json = json_decode($body, true);
     if ($status >= 200 && $status < 300) {
+        if (function_exists('ap_provider_circuit_success')) ap_provider_circuit_success($providerCircuit);
         return ['ok' => true, 'status' => $status, 'json' => $json, 'body' => $body] + $rate;
     }
     $msg = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
@@ -1434,6 +1442,11 @@ function ap_bsky_xrpc(
         if (empty($out['retry_after_sec'])) {
             $out['retry_after_sec'] = ap_bsky_rate_limit_fallback_delay_sec($rate);
         }
+    }
+    if ($status >= 500 || $status === 429) {
+        if (function_exists('ap_provider_circuit_failure')) ap_provider_circuit_failure($providerCircuit);
+    } else if (function_exists('ap_provider_circuit_success')) {
+        ap_provider_circuit_success($providerCircuit);
     }
     return $out;
 }
