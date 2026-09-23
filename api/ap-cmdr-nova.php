@@ -1629,8 +1629,10 @@ function ap_cmdr_note_html(array $row, array $create): void
 
 function ap_cmdr_html(): void
 {
-    // Resolve VAAK session before any HTML so pin/unpin owner chrome works.
-    $isOwner = ap_cmdr_profile_owner_session();
+    // Public profile reads never bootstrap the VAAK owner session.  The
+    // profile is intentionally read-only here; pin management remains
+    // available through authenticated VAAK actions and the Mastodon API.
+    $isOwner = false;
 
     // Public profile visits are read-only and identical for anonymous visitors.
     // Reuse a short-lived rendered response so strangers do not all pay the
@@ -2805,18 +2807,6 @@ function ap_cmdr_post_preview_html(array $n): string
             $bodyHtml = '<div class="body">' . $bodyHtml . '</div>';
         }
         $pinBarInner = '<span class="post-pin" title="Pinned" aria-hidden="true">📌</span>';
-        if (ap_cmdr_profile_owner_session()) {
-            $tab = preg_replace('/[^a-z]/', '', (string) ($_GET['tab'] ?? 'posts')) ?: 'posts';
-            $csrf = function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : '';
-            $pinBarInner = '<form method="post" action="/users/cmdr_nova" class="post-unpin-form" '
-                . 'onsubmit="return confirm(\'Clear this Bluesky pin from your profile?\');">'
-                . '<input type="hidden" name="csrf" value="' . htmlspecialchars($csrf, ENT_QUOTES, 'UTF-8') . '">'
-                . '<input type="hidden" name="action" value="clear_bsky_pin">'
-                . '<input type="hidden" name="tab" value="' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '">'
-                . '<button type="submit" class="post-pin post-pin--action" title="Unpin from profile" aria-label="Unpin from profile">📌</button>'
-                . '<span class="post-unpin-hint">unpin</span>'
-                . '</form>';
-        }
         return '<div class="post-wrap is-pinned" aria-label="Pinned post">'
             . '<div class="post-pin-bar">' . $pinBarInner . '</div>'
             . '<div class="post is-pinned">'
@@ -3080,12 +3070,9 @@ function ap_cmdr_post_preview_html(array $n): string
     }
 
     // Tiny thumbtack — absolute on the card edge (out of flow, no text reflow).
-    // When the profile owner is signed into VAAK, the pin becomes an Unpin control
-    // (outside the card <a> so it stays clickable).
-    $canUnpin = $isPinned
-        && !$isSite
-        && str_starts_with(rtrim($id, '/'), CMDR_ACTOR_ID . '/notes/')
-        && ap_cmdr_profile_owner_session();
+    // Pin management is intentionally kept in authenticated VAAK controls,
+    // so public profile reads remain cacheable even for the signed-in owner.
+    $canUnpin = false;
     $pinIcon = '';
     $unpinForm = '';
     if ($isPinned && $canUnpin) {
