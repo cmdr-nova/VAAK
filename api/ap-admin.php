@@ -14613,11 +14613,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 78%, #000));
       color: #04140c; font-size: 1.75rem; font-weight: 700; line-height: 1;
       box-shadow: 0 8px 28px rgba(0, 255, 159, 0.28);
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: transform .16s ease, box-shadow .16s ease, filter .16s ease;
     }
-    .compose-fab:hover { filter: brightness(1.06); }
-    /* The composer is inline at the feed top; keep the floating FAB out of
-       the way so the back-to-top control owns the lower corner. */
-    .compose-fab { display: none !important; }
+    .compose-fab:hover {
+      filter: brightness(1.08); transform: translateY(-2px) scale(1.03);
+      box-shadow: 0 10px 32px rgba(0, 255, 159, 0.36);
+    }
+    .compose-fab:active, .compose-fab.is-pressed { transform: translateY(0) scale(.94); }
+    .compose-fab:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+    .compose-fab i { font-size: 1.35rem; }
     .main { position: relative; }
     .feed-top-btn {
       /* Bottom-right of the feed column (not the viewport FAB corner) */
@@ -14648,7 +14653,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       .main .feed-top-btn {
         position: fixed;
         right: max(.85rem, env(safe-area-inset-right));
-        bottom: max(1rem, env(safe-area-inset-bottom));
+        bottom: max(5.25rem, calc(env(safe-area-inset-bottom) + 4.65rem));
         z-index: 75;
         width: 2.9rem; height: 2.9rem;
         background: var(--primary); color: #04140c;
@@ -24624,7 +24629,7 @@ window.apAdminToast = function (msg, isErr) {
 $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
 ?>
 <?php if ($showComposeFab): ?>
-<button type="button" class="compose-fab" id="compose-fab" title="Compose" aria-label="Compose">＋</button>
+<button type="button" class="compose-fab" id="compose-fab" title="Compose" aria-label="Compose"><i class="ph ph-pencil-simple" aria-hidden="true"></i></button>
 <div class="img-lightbox" id="img-lightbox" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Image preview">
   <button type="button" class="img-lightbox__close" id="img-lightbox-close" aria-label="Close">×</button>
   <img id="img-lightbox-img" src="" alt="">
@@ -24781,7 +24786,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const previews = document.getElementById('compose-media-previews');
   const form = document.getElementById('compose-form');
   (function bindComposerPressFeedback() {
-    const pressSel = '.compose-tool, .compose-inline-panel .btn, .compose-modal__panel .btn, .compose-modal__close, .alt-modal .btn';
+    const pressSel = '.compose-fab, .compose-tool, .compose-inline-panel .btn, .compose-modal__panel .btn, .compose-modal__close, .alt-modal .btn';
     const down = (e) => {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
       const el = e.target && e.target.closest ? e.target.closest(pressSel) : null;
@@ -24969,7 +24974,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     modal.hidden = true;
     modal.classList.remove('open');
     modal.setAttribute('aria-hidden', 'true');
-    if (fab) fab.setAttribute('aria-hidden', 'true');
+    if (fab) fab.removeAttribute('aria-hidden');
   }
   function placeComposerInModal() {
     if (!modal) return;
@@ -25903,16 +25908,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (altAiBtn) altAiBtn.disabled = false;
     }
   }
-  if (fab) fab.addEventListener('click', () => {
-    if (supportsInlineComposer && isComposerInline()) {
-      const target = document.querySelector('.compose-inline-panel');
-      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      const ta = document.getElementById('compose-content');
-      if (ta) setTimeout(() => ta.focus(), 260);
-      return;
-    }
-    openModal();
-  });
+  if (fab) fab.addEventListener('click', () => openModal());
   if (closeBtn) closeBtn.addEventListener('click', closeModal);
   modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
   // Keep textarea resize inside its flex slot (avoids modal/form scrollbars)
