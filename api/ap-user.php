@@ -748,11 +748,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         : ($profileBskyPosts !== [] ? count($profileBskyPosts) : 0);
     $profileReplyNotes = [];
     if ($needsReplyRows) {
-        foreach (ap_outbox_list($profilePerPage, $actorKey) as $replyNote) {
-            if (trim((string) ($replyNote['in_reply_to'] ?? '')) !== '') {
-                $profileReplyNotes[] = $replyNote;
-            }
-        }
+        $profileReplyNotes = function_exists('ap_outbox_replies_list_page')
+            ? ap_outbox_replies_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage)
+            : array_values(array_filter(
+                ap_outbox_list($profilePerPage, $actorKey),
+                static fn(array $replyNote): bool => trim((string) ($replyNote['in_reply_to'] ?? '')) !== ''
+            ));
     }
     $profileBskyReplies = array_values(array_filter($profileBskyPosts, static function (array $item): bool {
         $post = is_array($item['post'] ?? null) ? $item['post'] : [];
@@ -784,7 +785,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $featuredCount = count($featuredCards);
     $tabTotal = match ($tab) {
         'media' => count($mediaNotes),
-        'replies' => count($profileReplyNotes) + count($profileBskyReplies),
+        'replies' => (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : count($profileReplyNotes)) + count($profileBskyReplies),
         'boosts' => $profileBoostTotal,
         'featured' => $featuredCount,
         'blog' => $blogCount,
