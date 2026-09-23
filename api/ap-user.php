@@ -829,7 +829,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
     echo '</p>';
 
-    echo '<nav id="profile-tabs" class="profile-tabs" tabindex="-1" aria-label="Profile timeline">';
+    echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
     foreach (
         array_filter([
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
@@ -1541,6 +1541,7 @@ function ap_user_html_shell_start(string $title, array $meta = []): void
       .profile-tabs{display:flex;gap:.35rem;margin:1.15rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a;flex-wrap:wrap}
       .profile-tabs a{text-decoration:none;color:#aaa;font-size:.9rem;font-weight:600;padding:.45rem .9rem;border-radius:999px}
       .profile-tabs a:hover{color:#eee;background:#1a1a1a}
+      .profile-tabs a:focus:not(:focus-visible){outline:none}
       .profile-tabs a.is-active{color:#0b0b0b;background:#00ff9f}
       .profile-tabs a .tab-count{opacity:.7;font-weight:500;margin-left:.25rem;font-size:.8rem}
       .profile-media-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.8rem;align-items:start}

@@ -914,6 +914,7 @@ function ap_cmdr_shell_start(string $title, array $meta = []): void
       .profile-tabs{display:flex;gap:.35rem;margin:1.15rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a;flex-wrap:wrap}
       .profile-tabs a{appearance:none;text-decoration:none;color:#aaa;font-size:.9rem;font-weight:600;padding:.45rem .9rem;border-radius:999px;border:1px solid transparent;background:transparent}
       .profile-tabs a:hover{color:#eee;background:#1a1a1a}
+      .profile-tabs a:focus:not(:focus-visible){outline:none}
       .profile-tabs a.is-active{color:#0b0b0b;background:#00ff9f;border-color:#00ff9f}
       .profile-tabs a .tab-count{opacity:.7;font-weight:500;margin-left:.25rem;font-size:.8rem}
       .profile-tabs a.is-active .tab-count{opacity:.85}
@@ -1167,6 +1168,7 @@ function ap_cmdr_site_shell_start(string $title, array $meta = []): void
       body.ap-site-shell .ap-site-main .profile-tabs{display:flex;gap:.35rem;margin:1.15rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a;flex-wrap:wrap}
       body.ap-site-shell .ap-site-main .profile-tabs a{text-decoration:none;color:#aaa;font-size:.9rem;font-weight:600;padding:.45rem .9rem;border-radius:999px}
       body.ap-site-shell .ap-site-main .profile-tabs a.is-active{color:#0b0b0b;background:#00ff9f}
+      body.ap-site-shell .ap-site-main .profile-tabs a:focus:not(:focus-visible){outline:none}
       body.ap-site-shell .ap-site-main .featured-accounts{list-style:none;margin:0;padding:0}
       body.ap-site-shell .ap-site-main .featured-account{border-bottom:1px solid #2a2a2a}
       body.ap-site-shell .ap-site-main .featured-account-link{display:flex;align-items:center;gap:.85rem;padding:.85rem 0;color:inherit;text-decoration:none}
@@ -1863,7 +1865,7 @@ function ap_cmdr_html(): void
     }
     echo '</p>';
 
-    echo '<nav id="profile-tabs" class="profile-tabs" tabindex="-1" aria-label="Profile timeline">';
+    echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
     foreach (
         array_filter([
             'posts' => 'Posts',
