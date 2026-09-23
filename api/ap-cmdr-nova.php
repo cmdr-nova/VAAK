@@ -3214,10 +3214,29 @@ function ap_cmdr_collection_html(string $col): void
     $isFollowers = $col === 'followers';
     $title = $isFollowers ? 'Followers' : 'Following';
     $rows = $isFollowers ? ap_followers_list(CMDR_ACTOR_ID) : ap_following_list(CMDR_ACTOR_ID);
+    $apFollowers = function_exists('ap_followers_count')
+        ? ap_followers_count(CMDR_ACTOR_ID)
+        : count(ap_followers_list(CMDR_ACTOR_ID));
+    $apFollowing = function_exists('ap_following_count')
+        ? ap_following_count(CMDR_ACTOR_ID)
+        : count(ap_following_list(CMDR_ACTOR_ID));
+    $combined = function_exists('ap_profile_combined_follow_counts')
+        ? ap_profile_combined_follow_counts('cmdr_nova', (int) $apFollowers, (int) $apFollowing, false)
+        : ['followers' => $apFollowers, 'following' => $apFollowing, 'bsky_handle' => null];
+    $bskyHandle = function_exists('ap_profile_bsky_handle')
+        ? ap_profile_bsky_handle('cmdr_nova')
+        : ($combined['bsky_handle'] ?? null);
+    $combinedCount = (int) ($combined[$isFollowers ? 'followers' : 'following'] ?? count($rows));
 
     ap_cmdr_shell_start($title . ' · @cmdr_nova@mkultra.monster');
     echo '<p class="muted"><a href="/users/cmdr_nova">@cmdr_nova@mkultra.monster</a></p>';
-    echo '<h1>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . ' <span class="muted">(' . count($rows) . ')</span></h1>';
+    echo '<h1>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . ' <span class="muted">(' . $combinedCount . ')</span></h1>';
+    if (is_string($bskyHandle) && $bskyHandle !== '') {
+        $bskyUrl = 'https://bsky.app/profile/' . rawurlencode($bskyHandle);
+        echo '<p class="muted">Fediverse accounts listed below · Bluesky total included above · '
+            . '<a href="' . htmlspecialchars($bskyUrl, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">view Bluesky '
+            . ($isFollowers ? 'followers' : 'following') . '</a></p>';
+    }
 
     if (!$rows) {
         echo '<p class="muted" style="margin-top:1rem">Nobody here yet.</p>';
