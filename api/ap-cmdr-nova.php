@@ -1863,7 +1863,7 @@ function ap_cmdr_html(): void
     }
     echo '</p>';
 
-    echo '<nav class="profile-tabs" aria-label="Profile timeline">';
+    echo '<nav id="profile-tabs" class="profile-tabs" tabindex="-1" aria-label="Profile timeline">';
     foreach (
         array_filter([
             'posts' => 'Posts',
@@ -1874,7 +1874,9 @@ function ap_cmdr_html(): void
             'blog' => 'Blog',
         ]) as $tKey => $tLabel
     ) {
-        $href = $tKey === 'posts' ? '/users/cmdr_nova' : ('/users/cmdr_nova?tab=' . rawurlencode($tKey));
+        $href = $tKey === 'posts'
+            ? '/users/cmdr_nova#profile-tabs'
+            : ('/users/cmdr_nova?tab=' . rawurlencode($tKey) . '#profile-tabs');
         $cls = $tab === $tKey ? ' class="is-active"' : '';
         $aria = $tab === $tKey ? ' aria-current="page"' : '';
         $n = (int) ($counts[$tKey] ?? 0);
