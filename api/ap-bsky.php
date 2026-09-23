@@ -8916,7 +8916,8 @@ function ap_note_attach_bsky_proxy(array $note, string $bskyUri, ?string $bskyCi
 
 /**
  * Best-effort cross-post of a VAAK status to the user's connected Bluesky account.
- * Public/unlisted only. Splits long text into threads; attaches up to 4 images on the first post.
+ * Public only. Silent-public/unlisted and followers-only posts stay on the
+ * Fediverse and are never mirrored to Bluesky.
  *
  * Prefer calling this *before* ActivityPub fan-out so the Create can include FEP-fffd
  * proxy links (Wafrn / multi-protocol clients merge AP+Bluesky copies).
@@ -8938,7 +8939,7 @@ function ap_bsky_crosspost_status(
         return ['ok' => false, 'skipped' => true, 'error' => 'No owner'];
     }
     $visibility = strtolower(trim($visibility));
-    if (!in_array($visibility, ['public', 'unlisted'], true)) {
+    if ($visibility !== 'public') {
         return ['ok' => true, 'skipped' => true, 'error' => 'Visibility not cross-posted'];
     }
     $row = ap_bsky_session_row($ownerUserId);
