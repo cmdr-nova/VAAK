@@ -4252,10 +4252,14 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_
     if (function_exists('ap_bsky_admin_following_rows')) {
         // Notifications only need relationship membership; avoid resolving a
         // profile cache entry for every followed Bluesky account on page load.
-        $resolveBskyHandles = $view !== 'mentions';
+        // Timeline hydration only needs stable actor IDs. Resolving every
+        // Bluesky DID into a profile handle here can turn a tab switch into
+        // dozens of cache misses/XRPC refreshes; relationship pages resolve
+        // handles when they actually render those rows.
+        $resolveBskyHandles = in_array($view, ['following', 'followers'], true) && !$isPartial;
         $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId, $resolveBskyHandles));
     }
-    if (!$isPartial && function_exists('ap_bsky_admin_follower_rows')) {
+    if (!$isPartial && in_array($view, ['followers', 'following'], true) && function_exists('ap_bsky_admin_follower_rows')) {
         $followers = ap_bsky_merge_follow_rows($followers, ap_bsky_admin_follower_rows($vaakOwnerId, $vaakActorId));
     }
     if (in_array($view, ['following', 'followers'], true) && function_exists('ap_bsky_follow_sync_enqueue')) {
