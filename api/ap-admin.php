@@ -23848,6 +23848,10 @@ window.apAdminToast = function (msg, isErr) {
   let pendingCount = 0;
   let pollBusy = false;
   let tabSwapBusy = false;
+  // Long-lived SSE requests consume PHP-FPM workers even when idle. Keep the
+  // bounded polling fallback as the default; operators can opt into SSE only
+  // after sizing the FPM pool with VAAK_TIMELINE_SSE=1.
+  const TIMELINE_SSE_ENABLED = <?= json_encode(getenv('VAAK_TIMELINE_SSE') === '1') ?>;
   // ↑ button: ignore infinite-scroll fights until the user leaves the top (or pin expires).
   let stickToTop = false;
   let stickToTopTimer = 0;
@@ -24520,7 +24524,7 @@ window.apAdminToast = function (msg, isErr) {
     }, 1200);
   }
   function startTimelineStream() {
-    if (!['home', 'local', 'feed'].includes(viewName)) return;
+    if (!TIMELINE_SSE_ENABLED || !['home', 'local', 'feed'].includes(viewName)) return;
     if (!window.EventSource || document.hidden || window.__vaakNavigationPending || !nearTop() || isNotifTimeline || isOutboxTimeline || isBskyTimeline || timelineStream) return;
     const url = '?view=' + encodeURIComponent(viewName)
       + '&partial=1&stream=1&since=' + encodeURIComponent(String(newestTs))
@@ -24574,7 +24578,7 @@ window.apAdminToast = function (msg, isErr) {
       streamFallbackTimer = 0;
     }
   });
-  if (window.EventSource && ['home', 'local', 'feed'].includes(viewName) && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
+  if (TIMELINE_SSE_ENABLED && window.EventSource && ['home', 'local', 'feed'].includes(viewName) && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
     startTimelineStream();
   } else if (['home', 'local', 'feed'].includes(viewName)) {
     streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
