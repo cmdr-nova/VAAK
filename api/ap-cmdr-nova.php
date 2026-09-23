@@ -510,6 +510,11 @@ ap_cmdr_json($actor, $accept);
  */
 function ap_cmdr_profile_owner_session(): bool
 {
+    // The sidebar's View profile link can request the public rendering even
+    // while the owner is signed in; this keeps it on the shared fast cache.
+    if (isset($_GET['public']) && in_array((string) $_GET['public'], ['1', 'true'], true)) {
+        return false;
+    }
     if (array_key_exists('ap_cmdr_is_owner', $GLOBALS)) {
         return (bool) $GLOBALS['ap_cmdr_is_owner'];
     }

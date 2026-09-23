@@ -16027,7 +16027,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </a>
       <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
-      <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>" target="_blank" rel="noopener noreferrer">View profile</a>
+      <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">View profile</a>
       <?php
         $switchAccountRows = function_exists('ap_auth_users_by_ids')
             ? ap_auth_users_by_ids(ap_auth_session_account_ids())
