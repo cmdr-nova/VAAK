@@ -244,20 +244,30 @@ CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 8,
     next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
     last_error TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
 SQL);
-                try {
-                    ap_db()->exec(
-                        'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
-                         ON bsky_crosspost_retries (status, next_attempt_at)'
-                    );
-                } catch (Throwable $e) {
-                    // ignore
-                }
+            }
+            try {
+                ap_db()->exec('ALTER TABLE bsky_crosspost_retries ADD COLUMN IF NOT EXISTS claimed_at TEXT');
+            } catch (Throwable $e) {
+                // Existing schema or a restricted runtime; the worker will degrade safely.
+            }
+            try {
+                ap_db()->exec(
+                    'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
+                     ON bsky_crosspost_retries (status, next_attempt_at)'
+                );
+                ap_db()->exec(
+                    'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_lease
+                     ON bsky_crosspost_retries (status, claimed_at)'
+                );
+            } catch (Throwable $e) {
+                // Non-essential indexes may be installed by ops.
             }
         } else {
             ap_db()->exec(<<<'SQL'
@@ -269,6 +279,7 @@ CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 8,
     next_attempt_at TEXT NOT NULL,
+    claimed_at TEXT,
     last_error TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
@@ -276,12 +287,21 @@ CREATE TABLE IF NOT EXISTS bsky_crosspost_retries (
 )
 SQL);
             try {
+                ap_db()->exec('ALTER TABLE bsky_crosspost_retries ADD COLUMN claimed_at TEXT');
+            } catch (Throwable $e) {
+                // Existing schema or a restricted runtime; the worker will degrade safely.
+            }
+            try {
                 ap_db()->exec(
                     'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_due
                      ON bsky_crosspost_retries (status, next_attempt_at)'
                 );
+                ap_db()->exec(
+                    'CREATE INDEX IF NOT EXISTS idx_bsky_crosspost_retries_lease
+                     ON bsky_crosspost_retries (status, claimed_at)'
+                );
             } catch (Throwable $e) {
-                // ignore
+                // Non-essential indexes may be installed by ops.
             }
         }
     } catch (Throwable $e) {
@@ -421,7 +441,7 @@ function ap_bsky_crosspost_retry_mark_done(string $noteId): void
     try {
         $st = ap_db()->prepare(
             'UPDATE bsky_crosspost_retries
-             SET status = \'done\', updated_at = ?, last_error = NULL
+             SET status = \'done\', claimed_at = NULL, updated_at = ?, last_error = NULL
              WHERE note_id = ? OR note_id = ?'
         );
         $st->execute([gmdate('c'), $noteId, $noteId . '/']);
@@ -579,6 +599,13 @@ function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
     $now = gmdate('c');
     $rows = [];
     try {
+        $staleAt = gmdate('c', time() - 600);
+        ap_db()->prepare(
+            "UPDATE bsky_crosspost_retries
+             SET status = 'pending', claimed_at = NULL, next_attempt_at = ?,
+                 last_error = 'Worker lease expired', updated_at = ?
+             WHERE status = 'processing' AND claimed_at < ?"
+        )->execute([$now, $now, $staleAt]);
         $st = ap_db()->prepare(
             "SELECT * FROM bsky_crosspost_retries
              WHERE status = 'pending' AND next_attempt_at <= ?
@@ -599,8 +626,25 @@ function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
         if (!is_array($row)) {
             continue;
         }
-        $stats['claimed']++;
         $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+        if ($noteId === '') {
+            continue;
+        }
+        $claimedAt = gmdate('c');
+        try {
+            $claim = ap_db()->prepare(
+                "UPDATE bsky_crosspost_retries
+                 SET status = 'processing', claimed_at = ?, updated_at = ?
+                 WHERE (note_id = ? OR note_id = ?) AND status = 'pending'"
+            );
+            $claim->execute([$claimedAt, $claimedAt, $noteId, $noteId . '/']);
+            if ($claim->rowCount() !== 1) {
+                continue;
+            }
+        } catch (Throwable $e) {
+            continue;
+        }
+        $stats['claimed']++;
         $attempts = (int) ($row['attempts'] ?? 0) + 1;
         $maxAttempts = max(1, (int) ($row['max_attempts'] ?? 8));
         $res = ap_bsky_crosspost_retry_one($row);
@@ -626,7 +670,7 @@ function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
             try {
                 $u = ap_db()->prepare(
                     "UPDATE bsky_crosspost_retries
-                     SET next_attempt_at = ?, last_error = ?, status = 'pending', updated_at = ?
+                     SET next_attempt_at = ?, last_error = ?, status = 'pending', claimed_at = NULL, updated_at = ?
                      WHERE note_id = ? OR note_id = ?"
                 );
                 $u->execute([
@@ -654,7 +698,7 @@ function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
             try {
                 $u = ap_db()->prepare(
                     "UPDATE bsky_crosspost_retries
-                     SET status = 'dead', attempts = ?, last_error = ?, updated_at = ?
+                     SET status = 'dead', attempts = ?, last_error = ?, claimed_at = NULL, updated_at = ?
                      WHERE note_id = ? OR note_id = ?"
                 );
                 $u->execute([$attempts, mb_substr($err, 0, 500), gmdate('c'), $noteId, $noteId . '/']);
@@ -669,7 +713,7 @@ function ap_bsky_crosspost_retry_worker_run(int $limit = 5): array
         try {
             $u = ap_db()->prepare(
                 "UPDATE bsky_crosspost_retries
-                 SET attempts = ?, next_attempt_at = ?, last_error = ?, status = 'pending', updated_at = ?
+                 SET attempts = ?, next_attempt_at = ?, last_error = ?, status = 'pending', claimed_at = NULL, updated_at = ?
                  WHERE note_id = ? OR note_id = ?"
             );
             $u->execute([$attempts, $next, mb_substr($err, 0, 500), gmdate('c'), $noteId, $noteId . '/']);
