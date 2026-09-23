@@ -25240,6 +25240,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     }
 
     if (quoteObject) {
+      if (ta) {
+        delete ta.dataset.requiredReplyMention;
+        delete ta.dataset.replyParticipantCount;
+      }
       if (replyTo) {
         replyTo.value = '';
         replyTo.style.display = 'none';
@@ -25306,11 +25310,43 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         } else {
           ta.value = '';
         }
+        // The first seeded handle is the parent author. When a reply has
+        // multiple participants, keep privacy controls unavailable if that
+        // author handle is removed from the authored text.
+        if (mentionParts.length >= 2) {
+          ta.dataset.requiredReplyMention = mentionParts[0];
+          ta.dataset.replyParticipantCount = String(mentionParts.length);
+        } else {
+          delete ta.dataset.requiredReplyMention;
+          delete ta.dataset.replyParticipantCount;
+        }
       }
       if (title) title.textContent = isSelf ? 'Continue thread' : 'Reply';
       if (submitBtn) submitBtn.textContent = 'Reply';
       if (ta) ta.placeholder = isSelf ? 'Add to the thread…' : 'Write your reply…';
     }
+    if (ta && ta.dataset.privacyGuardBound !== '1') {
+      ta.dataset.privacyGuardBound = '1';
+      ta.addEventListener('input', syncReplyPrivacyGuard);
+    }
+    syncReplyPrivacyGuard();
+  }
+
+  function syncReplyPrivacyGuard() {
+    const ta = document.getElementById('compose-content');
+    const select = document.getElementById('compose-visibility');
+    if (!ta || !select) return;
+    const required = String(ta.dataset.requiredReplyMention || '').trim().toLowerCase();
+    const participants = parseInt(ta.dataset.replyParticipantCount || '0', 10) || 0;
+    const text = String(ta.value || '').toLowerCase();
+    const authorPresent = required !== '' && new RegExp('(^|\\s)' + required.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '(?=\\s|$)').test(text);
+    const blocked = participants >= 2 && !authorPresent;
+    const privateOption = select.querySelector('option[value="private"]');
+    if (privateOption) {
+      privateOption.disabled = blocked;
+      privateOption.textContent = blocked ? 'Followers-only (parent author required)' : 'Followers-only';
+    }
+    if (blocked && select.value === 'private') select.value = 'public';
   }
 
   function openComposeFromTimelineLink(url) {
@@ -25364,6 +25400,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     // Ignore the auto-inserted @handle seed if the user never typed more.
     const autoMention = (ta && ta.dataset.autoMention) ? String(ta.dataset.autoMention).trim() : '';
     if (autoMention && (text === autoMention || text === autoMention + ' ')) {
+      text = '';
+    }
+    // A reply containing only participant handles is not authored content;
+    // abandoning it should not create a draft merely because one handle was
+    // removed from the initial mention seed.
+    if (text !== '' && /^\s*(?:@[\w.!#$%&'*+\-/=?^`{|}~]+(?:@[\w.-]+)?\s*)+$/u.test(text)) {
       text = '';
     }
     const existingMedia = ((draftMediaField && draftMediaField.value) || '').trim();
