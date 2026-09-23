@@ -9049,7 +9049,19 @@ function admin_local_timeline_item_allowed(array $item): bool
             && !admin_outbox_is_bsky_import($row);
     }
     if ($kind === 'event') {
-        return vaak_is_local_url((string) ($row['actor_id'] ?? ''));
+        if (!vaak_is_local_url((string) ($row['actor_id'] ?? ''))) {
+            return false;
+        }
+        $object = strtolower(rtrim(trim((string) ($row['object_id'] ?? '')), '/'));
+        $type = strtolower((string) ($row['type'] ?? ''));
+        // Imported Bluesky history is represented as Creates; local
+        // Announce/Quote actions remain valid instance activity even when
+        // their target is a remote Bluesky object.
+        return !($type === 'create' && (
+            str_starts_with($object, 'at://')
+            || str_contains($object, 'bsky.app/')
+            || str_contains($object, 'bsky.mkultra.monster/')
+        ));
     }
     if ($kind === 'boost') {
         return vaak_is_local_url((string) ($row['owner_actor_id'] ?? ''))
@@ -9076,9 +9088,17 @@ function admin_federated_timeline_item_allowed(array $item): bool
     }
     $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
     $object = strtolower(rtrim(trim((string) ($row['object_id'] ?? '')), '/'));
-    if ($actor === '' || str_starts_with($object, 'at://')
+    $type = strtolower((string) ($row['type'] ?? ''));
+    $localActor = vaak_is_local_url($actor);
+    // A local quote/boost is ActivityPub-originated instance activity even
+    // when its quoted target is a Bluesky URL. Exclude Bluesky-native remote
+    // events and imports, but retain that local action.
+    $localAction = $localActor && in_array($type, ['announce', 'quote', 'quotepost'], true);
+    if ($actor === '' || (!$localAction && (
+        str_starts_with($object, 'at://')
         || str_contains($object, 'bsky.app/')
-        || str_contains($object, 'bsky.mkultra.monster/')) {
+        || str_contains($object, 'bsky.mkultra.monster/')
+    ))) {
         return false;
     }
     if (function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor)) {
