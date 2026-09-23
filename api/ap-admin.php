@@ -1369,7 +1369,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = 'Added to queue'
                     . ($queueScheduledLocal !== '' ? (' · ' . $queueScheduledLocal) : '')
                     . '.';
-                $view = 'queue';
+                // Keep the user on the timeline/media view where they queued
+                // the item. The queue page is a dashboard, not a redirect.
+                $view = $fallbackView;
             } else {
                 $error = $result['error'] ?? 'Could not queue post.';
                 $composerForceOpen = true;
@@ -1389,7 +1391,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'action' => 'queue_post',
                 'queue_id' => $queueId,
                 'scheduled_at' => $queueScheduledLocal,
-                'return_view' => 'queue',
+                'return_view' => $fallbackView,
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             exit;
         }
@@ -21515,7 +21517,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'queue'): ?>
         <?php
           $qSettings = ap_queue_settings_get();
-          $qPending = ap_queue_list_pending(100);
+          $qFilter = strtolower(trim((string) ($_GET['queue_filter'] ?? 'all')));
+          if (!in_array($qFilter, ['all', 'pending', 'publishing', 'failed'], true)) {
+              $qFilter = 'all';
+          }
+          $qAll = ap_queue_list_pending(200);
+          $qCounts = ['all' => count($qAll), 'pending' => 0, 'publishing' => 0, 'failed' => 0];
+          foreach ($qAll as $qCountRow) {
+              $qStateCount = (string) ($qCountRow['state'] ?? 'pending');
+              if (isset($qCounts[$qStateCount])) {
+                  $qCounts[$qStateCount]++;
+              }
+          }
+          $qPending = $qFilter === 'all'
+              ? $qAll
+              : array_values(array_filter($qAll, static fn(array $row): bool => (string) ($row['state'] ?? '') === $qFilter));
           $qPublished = ap_queue_list_published(15);
         ?>
         <form class="composer" method="post" action="?view=queue" style="margin-bottom:1rem">
@@ -21544,7 +21560,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </label>
           </div>
           <div class="composer-actions">
-            <span class="meta"><?= count($qPending) ?> upcoming</span>
+            <span class="meta"><?= (int) $qCounts['all'] ?> active · <?= (int) $qCounts['failed'] ?> failed</span>
             <button class="btn btn-primary" type="submit">Save window</button>
           </div>
         </form>
@@ -21553,7 +21569,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="flash err" style="margin:0 0 1rem">Queue is disabled — cron will not publish until you enable it.</div>
         <?php endif; ?>
 
-        <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Upcoming</h3>
+        <div class="queue-filter-bar" style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin:0 0 .75rem">
+          <span class="meta" style="margin-right:.2rem">Queue activity</span>
+          <?php foreach (['all' => 'All', 'pending' => 'Pending', 'publishing' => 'Publishing', 'failed' => 'Failed'] as $qFilterKey => $qFilterLabel): ?>
+            <a class="btn btn-ghost<?= $qFilter === $qFilterKey ? ' active' : '' ?>" href="?view=queue&amp;queue_filter=<?= h($qFilterKey) ?>" style="padding:.3rem .65rem;font-size:.8rem">
+              <?= h($qFilterLabel) ?> <span class="meta">(<?= (int) ($qCounts[$qFilterKey] ?? 0) ?>)</span>
+            </a>
+          <?php endforeach; ?>
+        </div>
+        <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem"><?= h($qFilter === 'all' ? 'Upcoming and active' : ucfirst($qFilter)) ?></h3>
         <?php if (!$qPending): ?>
           <div class="empty">Nothing queued. Use ＋ Compose → <b>Add to queue</b>.</div>
         <?php else: ?>
@@ -21568,6 +21592,25 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $qmedia = [];
               }
               $qmediaN = count($qmedia);
+              $qmediaItems = [];
+              if ($qmediaN > 0 && function_exists('ap_media_by_local_ids')) {
+                  try {
+                      $qmediaRows = ap_media_by_local_ids($qmedia);
+                      foreach ($qmediaRows as $qmediaRow) {
+                          $qmediaUrl = (string) ($qmediaRow['public_url'] ?? $qmediaRow['url'] ?? '');
+                          if (!str_starts_with($qmediaUrl, 'https://')) {
+                              continue;
+                          }
+                          $qmediaItems[] = [
+                              'url' => $qmediaUrl,
+                              'preview_url' => (string) ($qmediaRow['preview_url'] ?? ''),
+                              'mediaType' => (string) ($qmediaRow['mime'] ?? $qmediaRow['media_type'] ?? ''),
+                          ];
+                      }
+                  } catch (Throwable $e) {
+                      $qmediaItems = [];
+                  }
+              }
               $qVis = function_exists('ap_normalize_visibility')
                   ? ap_normalize_visibility($qi['visibility'] ?? 'public')
                   : 'public';
@@ -21589,6 +21632,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <?php if (!empty($qi['spoiler_text'])): ?> · CW<?php endif; ?>
                     <?php if (!empty($qi['in_reply_to'])): ?> · reply<?php endif; ?>
                     <?php if (!empty($qi['quote_object'])): ?> · quote<?php endif; ?>
+                    <?php if (!empty($qi['created_at'])): ?> · added <?= h(relative_time((string) $qi['created_at']) . ' ago') ?><?php endif; ?>
                   </div>
                 </div>
               </div>
@@ -21596,6 +21640,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <div class="body feed-body" style="white-space:pre-wrap"><?= h(mb_strlen($qplain) > 400 ? mb_substr($qplain, 0, 397) . '…' : $qplain) ?></div>
               <?php elseif ($qmediaN): ?>
                 <div class="meta">(media only)</div>
+              <?php endif; ?>
+              <?php if ($qmediaItems !== []): ?>
+                <div class="queue-media-preview" style="margin-top:.55rem"><?= admin_media_row_html($qmediaItems) ?></div>
               <?php endif; ?>
               <?php if (!empty($qi['last_error'])): ?>
                 <div class="meta" style="color:var(--danger);margin-top:.35rem"><?= h((string) $qi['last_error']) ?></div>
@@ -26674,7 +26721,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     queueBtn.addEventListener('click', () => {
       composeMode = 'queue_post';
       if (actionField) actionField.value = 'queue_post';
-      if (returnField) returnField.value = 'queue';
+      // Queueing is an inline action. Preserve the current timeline/media
+      // view instead of navigating to the queue dashboard.
+      const composeReturn = form.querySelector('input[name="compose_return_view"]');
+      if (returnField) returnField.value = composeReturn ? composeReturn.value : <?= json_encode($composerReturnView) ?>;
       form.requestSubmit();
     });
   }
@@ -26807,7 +26857,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         window.history.replaceState({}, '', u.pathname + u.search + u.hash);
       } catch (e) {}
       if (mode === 'queue_post') {
-        window.location.href = '?view=queue';
+        // The queue is durable and the item is already accepted. Leave the
+        // current timeline/media surface in place so browsing can continue.
         return;
       }
       // Soft-insert own post into the live timeline (home newer-poll now includes
