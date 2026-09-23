@@ -10410,6 +10410,15 @@ function ap_masto_own_reblogs_as_statuses(int $limit = 40, ?string $maxId = null
     $limit = max(1, min(80, $limit));
     $out = [];
     foreach (ap_masto_reblog_rows($limit, $maxId, $ownerUserId) as $row) {
+        $reblogStatusId = strtolower(trim((string) ($row['status_id'] ?? '')));
+        $reblogObjectId = strtolower(trim((string) ($row['object_id'] ?? '')));
+        // Bluesky-native reposts share the local reblog table, but are not
+        // ActivityPub boosts and must not leak into Local/Federated API feeds.
+        if (str_starts_with($reblogStatusId, 'bsky-repost-')
+            || str_starts_with($reblogObjectId, 'https://bsky.app/')
+            || str_contains($reblogObjectId, 'bsky.mkultra.monster/')) {
+            continue;
+        }
         $targetActor = (string) ($row['target_actor'] ?? '');
         if ($targetActor !== '' && function_exists('ap_row_is_hidden')
             && ap_row_is_hidden($targetActor, null, $ownerUserId)) {
