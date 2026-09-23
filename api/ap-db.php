@@ -4941,6 +4941,9 @@ function ap_following_upsert(string $actorId, ?string $ownerActorId = null): voi
     );
     $stmt->execute([$owner, $actorId, ap_db_now(), $host]);
     ap_follow_lists_reset_memo();
+    if (function_exists('ap_db_owner_user_id_for_actor')) {
+        ap_timeline_cache_invalidate_owner(ap_db_owner_user_id_for_actor($owner));
+    }
 }
 
 function ap_following_remove(string $actorId, ?string $ownerActorId = null): void
@@ -4952,6 +4955,9 @@ function ap_following_remove(string $actorId, ?string $ownerActorId = null): voi
         'DELETE FROM following WHERE owner_actor_id = ? AND (actor_id = ? OR actor_id = ?)'
     )->execute([$owner, $actorId, $actorId . '/']);
     ap_follow_lists_reset_memo();
+    if (function_exists('ap_db_owner_user_id_for_actor')) {
+        ap_timeline_cache_invalidate_owner(ap_db_owner_user_id_for_actor($owner));
+    }
 }
 
 /** True if the owner follows this actor (trailing-slash tolerant). */
@@ -6355,6 +6361,14 @@ function ap_follow_lists_reset_memo(): void
     }
 }
 
+/** Best-effort targeted invalidation for an owner's materialized timeline views. */
+function ap_timeline_cache_invalidate_owner(int $ownerUserId): void
+{
+    if ($ownerUserId > 0 && function_exists('admin_tl_cache_clear_owner')) {
+        admin_tl_cache_clear_owner($ownerUserId);
+    }
+}
+
 function ap_outbound_follow_count_recent(int $withinSeconds = 3600): int
 {
     $owner = rtrim(ap_local_actor_id(), '/');
@@ -7394,6 +7408,7 @@ function ap_mutes_cache_clear(?int $ownerUserId = null): void
         return;
     }
     ap_mutes_set_cached($ownerUserId, true);
+    ap_timeline_cache_invalidate_owner($ownerUserId);
 }
 
 function ap_is_muted_actor(?string $actorId, int $ownerUserId): bool
@@ -7562,6 +7577,7 @@ function ap_deprioritized_cache_clear(?int $ownerUserId = null): void
         return;
     }
     ap_deprioritized_set_cached($ownerUserId, true);
+    ap_timeline_cache_invalidate_owner($ownerUserId);
 }
 
 function ap_is_deprioritized_actor(?string $actorId, int $ownerUserId): bool
@@ -8247,6 +8263,7 @@ function ap_user_blocks_cache_clear(?int $ownerUserId = null): void
         return;
     }
     ap_user_blocks_list_cached($ownerUserId, true);
+    ap_timeline_cache_invalidate_owner($ownerUserId);
 }
 
 function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): bool
@@ -8574,6 +8591,7 @@ function ap_muted_words_cache_clear(?int $ownerUserId = null): void
         return;
     }
     ap_muted_words_phrases_cached($ownerUserId, true);
+    ap_timeline_cache_invalidate_owner($ownerUserId);
 }
 
 /**

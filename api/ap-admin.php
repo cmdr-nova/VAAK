@@ -4580,6 +4580,55 @@ function admin_tl_redis_key(string $key): string
     return 'vaak:timeline:ranked:v1:' . hash('sha256', $key);
 }
 
+function admin_tl_owner_index_key(int $ownerUserId): string
+{
+    return 'vaak:timeline:owner-index:v1:' . max(0, $ownerUserId);
+}
+
+function admin_tl_cache_register_owner(string $cacheKey): void
+{
+    $ownerUserId = admin_owner_user_id();
+    if ($ownerUserId < 1 || $cacheKey === '' || !function_exists('ap_redis_json_get') || !function_exists('ap_redis_json_set')) {
+        return;
+    }
+    $indexKey = admin_tl_owner_index_key($ownerUserId);
+    $keys = ap_redis_json_get($indexKey);
+    $keys = is_array($keys) ? array_values(array_filter($keys, 'is_string')) : [];
+    if (!in_array($cacheKey, $keys, true)) {
+        $keys[] = $cacheKey;
+    }
+    // Keep the index bounded; each owner normally has only a handful of view/follow-set keys.
+    if (count($keys) > 32) {
+        $keys = array_slice($keys, -32);
+    }
+    ap_redis_json_set($indexKey, $keys, 300);
+}
+
+function admin_tl_cache_clear_owner(int $ownerUserId): void
+{
+    $ownerUserId = max(0, $ownerUserId);
+    if ($ownerUserId < 1 || !function_exists('ap_redis_json_get')) {
+        return;
+    }
+    $indexKey = admin_tl_owner_index_key($ownerUserId);
+    $keys = ap_redis_json_get($indexKey);
+    if (is_array($keys)) {
+        foreach ($keys as $cacheKey) {
+            if (!is_string($cacheKey) || $cacheKey === '') {
+                continue;
+            }
+            if (function_exists('ap_redis_delete')) {
+                ap_redis_delete(admin_tl_redis_key($cacheKey));
+            }
+            $safe = preg_replace('/[^a-z0-9_]/', '', $cacheKey) ?: 'tl';
+            @unlink(admin_tl_cache_dir() . '/tl_' . $safe . '.json');
+        }
+    }
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete($indexKey);
+    }
+}
+
 /** @param list<array<string,mixed>> $following */
 function admin_owner_user_id(): int
 {
@@ -5148,6 +5197,7 @@ function admin_tl_cache_put(string $key, array $ranked): void
     // a safe fallback when Redis is unavailable or being restarted.
     if (function_exists('ap_redis_json_set')) {
         ap_redis_json_set(admin_tl_redis_key($key), $data, 180);
+        admin_tl_cache_register_owner($key);
     }
     $payload = json_encode($data, JSON_UNESCAPED_SLASHES);
     if (!is_string($payload) || $payload === '') {
@@ -5161,6 +5211,7 @@ function admin_tl_cache_clear(): void
 {
     if (function_exists('ap_redis_delete_pattern')) {
         ap_redis_delete_pattern('vaak:timeline:ranked:v1:*');
+        ap_redis_delete_pattern('vaak:timeline:owner-index:v1:*');
     }
     $dir = admin_tl_cache_dir();
     foreach (glob($dir . '/tl_*.json') ?: [] as $path) {
