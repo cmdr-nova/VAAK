@@ -5171,6 +5171,15 @@ function ap_publish_status_text(
     if ($visibility === 'direct') {
         $visibility = 'public';
     }
+    // A followers-only reply to somebody else's post is effectively a private
+    // side conversation about that post's author. Keep VAAK's own composer from
+    // creating that ambiguous privacy state; direct messages use ap_dm_send().
+    if ($visibility === 'private' && $inReplyTo !== '') {
+        $localActor = function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : rtrim(LOCAL_ACTOR, '/');
+        if ($localActor === '' || !str_starts_with(rtrim($inReplyTo, '/'), $localActor . '/notes/')) {
+            return ['ok' => false, 'error' => 'Followers-only replies are available only on your own posts. Use a direct message for a private conversation.'];
+        }
+    }
 
     // Mastodon-compatible addressing
     $publicId = 'https://www.w3.org/ns/activitystreams#Public';

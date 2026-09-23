@@ -7188,7 +7188,8 @@ function admin_render_compose_panel(bool $inline = false): void
         <select name="visibility" id="compose-visibility" style="max-width:18rem">
           <option value="public"<?= $composeVis === 'public' ? ' selected' : '' ?>>Public</option>
           <option value="unlisted"<?= $composeVis === 'unlisted' ? ' selected' : '' ?>>Silent public</option>
-          <option value="private"<?= $composeVis === 'private' ? ' selected' : '' ?>>Followers-only</option>
+          <?php $privateReplyDisabled = $prefillReplyTo !== '' && !vaak_is_own_url($prefillReplyTo); ?>
+          <option value="private"<?= $composeVis === 'private' ? ' selected' : '' ?><?= $privateReplyDisabled ? ' disabled' : '' ?>>Followers-only<?= $privateReplyDisabled ? ' (own posts only)' : '' ?></option>
         </select>
       </label>
       <label class="composer-check">
