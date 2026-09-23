@@ -7035,6 +7035,35 @@ $autoOpenComposer = $composerForceOpen
     || $prefillQuoteObject !== ''
     || $prefillEditNote !== ''
     || $prefillDraftId > 0;
+
+// Preserve reply-participant context for the server-rendered composer too.
+// Modal replies receive this metadata from applyReplyQuoteChrome(), while a
+// direct/inline compose navigation needs it present in the initial markup.
+$prefillReplyPrivacyAuthor = '';
+$prefillReplyPrivacyParticipants = 0;
+if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote === '' && $prefillMention !== '') {
+    $privacyHandles = [];
+    foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
+        $part = trim((string) $part);
+        if ($part === '') {
+            continue;
+        }
+        $h = function_exists('admin_reply_mention_handle')
+            ? admin_reply_mention_handle(null, $part)
+            : ('@' . ltrim($part, '@'));
+        if ($h === '' || (function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))) {
+            continue;
+        }
+        $key = strtolower(ltrim($h, '@'));
+        if ($key === '') {
+            continue;
+        }
+        $privacyHandles[$key] = $h;
+    }
+    $privacyHandles = array_values($privacyHandles);
+    $prefillReplyPrivacyAuthor = strtolower((string) ($privacyHandles[0] ?? ''));
+    $prefillReplyPrivacyParticipants = count($privacyHandles);
+}
 $composerReturnView = $view;
 $draftsCountNav = function_exists('ap_drafts_count') ? ap_drafts_count() : 0;
 if (function_exists('ap_blog_posts_list')) {
@@ -7109,7 +7138,8 @@ function admin_render_compose_panel(bool $inline = false): void
 {
     global $prefillEditNote, $prefillDraftId, $prefillReplyTo, $prefillQuoteObject,
         $prefillEditSpoiler, $prefillEditContent, $prefillEditSensitive, $prefillVisibility,
-        $prefillDraftMediaIds, $prefillActor, $vaakHandle, $vaakUsername, $composerReturnView;
+        $prefillDraftMediaIds, $prefillActor, $vaakHandle, $vaakUsername, $composerReturnView,
+        $prefillReplyPrivacyAuthor, $prefillReplyPrivacyParticipants;
     $prefillEditNote = (string) ($prefillEditNote ?? '');
     $prefillDraftId = (int) ($prefillDraftId ?? 0);
     $prefillReplyTo = (string) ($prefillReplyTo ?? '');
@@ -7123,6 +7153,8 @@ function admin_render_compose_panel(bool $inline = false): void
     $vaakHandle = (string) ($vaakHandle ?? '');
     $vaakUsername = (string) ($vaakUsername ?? '');
     $composerReturnView = (string) ($composerReturnView ?? 'home');
+    $prefillReplyPrivacyAuthor = strtolower((string) ($prefillReplyPrivacyAuthor ?? ''));
+    $prefillReplyPrivacyParticipants = (int) ($prefillReplyPrivacyParticipants ?? 0);
     ?>
   <div class="compose-modal__panel<?= $inline ? ' compose-inline-panel compose-tools-ready' : '' ?>"
        role="<?= $inline ? 'region' : 'dialog' ?>"<?= $inline ? '' : ' aria-modal="true"' ?>
@@ -7176,7 +7208,7 @@ function admin_render_compose_panel(bool $inline = false): void
       <?php endif; ?>
       <input name="spoiler_text" maxlength="500" placeholder="Content warning (optional)" style="margin-bottom:.5rem;flex:0 0 auto" value="<?= h($prefillEditSpoiler) ?>">
       <div class="compose-textarea-wrap">
-        <textarea name="content" id="compose-content" rows="2" maxlength="2000" placeholder="<?= h($composePlaceholder) ?>" style="height:96px"><?= h($prefillEditContent) ?></textarea>
+        <textarea name="content" id="compose-content" rows="2" maxlength="2000" placeholder="<?= h($composePlaceholder) ?>" style="height:96px"<?= $prefillReplyPrivacyAuthor !== '' ? ' data-required-reply-mention="' . h($prefillReplyPrivacyAuthor) . '"' : '' ?><?= $prefillReplyPrivacyParticipants >= 2 ? ' data-reply-participant-count="' . (int) $prefillReplyPrivacyParticipants . '"' : '' ?>><?= h($prefillEditContent) ?></textarea>
         <div class="meta compose-char-count" id="compose-char-count" style="margin-top:.35rem;text-align:right">0 / 2,000</div>
       </div>
       <div class="compose-emoji-wrap" style="margin:.45rem 0 .25rem;flex:0 0 auto">
@@ -25325,6 +25357,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (submitBtn) submitBtn.textContent = 'Reply';
       if (ta) ta.placeholder = isSelf ? 'Add to the thread…' : 'Write your reply…';
     }
+    bindReplyPrivacyGuard();
+  }
+
+  function bindReplyPrivacyGuard() {
+    const ta = document.getElementById('compose-content');
     if (ta && ta.dataset.privacyGuardBound !== '1') {
       ta.dataset.privacyGuardBound = '1';
       ta.addEventListener('input', syncReplyPrivacyGuard);
@@ -25348,6 +25385,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     }
     if (blocked && select.value === 'private') select.value = 'public';
   }
+
+  // The inline composer is rendered server-side and may never pass through
+  // applyReplyQuoteChrome(), so bind its privacy guard on the initial page.
+  document.addEventListener('DOMContentLoaded', bindReplyPrivacyGuard);
+  if (document.readyState !== 'loading') bindReplyPrivacyGuard();
 
   function openComposeFromTimelineLink(url) {
     let parsed;
