@@ -121,16 +121,18 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     }
 
     if (empty($payload['fedi_done'])) {
-        $fan = ($visibility === 'public')
+        $fan = ($visibility === 'local')
+            ? ['delivered' => 0, 'queued' => 0]
+            : (($visibility === 'public')
             ? ap_deliver_public_activity($create, $priority, $pendingQuote)
-            : ap_deliver_followers_activity($create, $priority);
+            : ap_deliver_followers_activity($create, $priority));
         $payload['fedi_done'] = true;
         $db->prepare('UPDATE ap_publish_delivery_queue SET payload_json = ?, updated_at = ? WHERE id = ?')
             ->execute([json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), gmdate('c'), (int) $row['id']]);
         ap_log('publish_delivery fedi note=' . $row['note_id'] . ' delivered=' . (int) ($fan['delivered'] ?? 0) . ' queued=' . (int) ($fan['queued'] ?? 0));
     }
     $quoteId = (string) ($payload['quote_object_id'] ?? '');
-    if ($quoteId !== '' && $pendingQuote && empty($payload['quote_request_done'])) {
+    if ($quoteId !== '' && $pendingQuote && $visibility !== 'local' && empty($payload['quote_request_done'])) {
         if (!ap_quote_request_send($quoteId, $note)) return ['ok' => false, 'error' => 'Quote authorization request could not be queued.'];
         $payload['quote_request_done'] = true;
         $db->prepare('UPDATE ap_publish_delivery_queue SET payload_json = ?, updated_at = ? WHERE id = ?')
@@ -142,7 +144,7 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     if (empty($payload['bsky_done'])) {
         require_once __DIR__ . '/ap-bsky.php';
         $bsky = null;
-        if (!$pendingQuote && ap_bsky_session_row($owner) !== null) {
+        if ($visibility !== 'local' && !$pendingQuote && ap_bsky_session_row($owner) !== null) {
             $bsky = ap_bsky_crosspost_status(
                 $owner,
                 (string) ($payload['content'] ?? ''),

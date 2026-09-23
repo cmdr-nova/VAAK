@@ -638,7 +638,10 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
         'in_reply_to_account_id' => $replyAccountId,
         'sensitive' => !empty($row['sensitive']),
         'spoiler_text' => (string) ($row['spoiler_text'] ?? ''),
-        'visibility' => (string) ($row['visibility'] ?? 'public'),
+        // Mastodon clients do not define a local-only enum. Keep VAAK's
+        // internal value in web/local data, but expose it as unlisted through
+        // the compatibility API rather than returning an invalid enum.
+        'visibility' => (($row['visibility'] ?? 'public') === 'local') ? 'unlisted' : (string) ($row['visibility'] ?? 'public'),
         'language' => 'en',
         'uri' => $url,
         'url' => $url,
@@ -6180,7 +6183,7 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
             continue;
         }
         // Public timeline: skip DMs
-        if (($status['visibility'] ?? '') === 'direct') {
+        if (in_array(($status['visibility'] ?? ''), ['direct', 'local'], true)) {
             continue;
         }
         $local[] = $status;

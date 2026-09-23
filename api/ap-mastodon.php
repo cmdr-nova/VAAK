@@ -1998,11 +1998,12 @@ function ap_masto_api(string $method, string $path): void
             }
             $quoteObjectId = preg_replace('/#announce-\d+$/', '', $quoteObjectId) ?? $quoteObjectId;
         }
-        // Visibility must reach publish (Ice Cubes sends public|unlisted|private|direct).
+        // Visibility must reach publish (Ice Cubes sends public|unlisted|private|direct;
+        // VAAK web/API clients may also use local for instance-only posts).
         // direct is handled above via ap_dm_send — never treat public/unlisted/private mentions as DMs.
         $visibility = function_exists('ap_normalize_visibility')
             ? ap_normalize_visibility($visibility)
-            : (in_array($visibility, ['public', 'unlisted', 'private'], true) ? $visibility : 'public');
+            : (in_array($visibility, ['public', 'unlisted', 'private', 'local'], true) ? $visibility : 'public');
         $res = ap_publish_status_text(
             $status,
             $inReplyTo,

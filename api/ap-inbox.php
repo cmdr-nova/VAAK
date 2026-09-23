@@ -5112,7 +5112,7 @@ function ap_quote_response_handle(array $activity, string $responseType): ?strin
 
 /**
  * Publish a Note as @cmdr_nova (admin compose + queue + Mastodon API).
- * Visibility: public | unlisted (silent public) | private (followers-only).
+ * Visibility: public | unlisted (silent public) | private (followers-only) | local.
  *
  * @param list<int> $mediaLocalIds
  * @param array{options?:list<string>,expires_in?:int,multiple?:bool}|null $poll
@@ -5241,7 +5241,11 @@ function ap_publish_status_text(
         } catch (Throwable $e) {
             ap_log('reply_parent_visibility_lookup_failed ' . $e->getMessage());
         }
-        if ($parentVisibility === 'private' || $parentVisibility === 'direct') {
+        if ($parentVisibility === 'local') {
+            // A local-only parent must not gain a wider audience through a
+            // reply, even when the reply composer or API requests public.
+            $visibility = 'local';
+        } elseif ($parentVisibility === 'private' || $parentVisibility === 'direct') {
             if ($visibility !== 'private') {
                 $visibility = 'private';
             }
@@ -5262,7 +5266,13 @@ function ap_publish_status_text(
     // Mastodon-compatible addressing
     $publicId = 'https://www.w3.org/ns/activitystreams#Public';
     $followersId = $actor . '/followers';
-    if ($visibility === 'unlisted') {
+    if ($visibility === 'local') {
+        // Local-only posts are readable from VAAK's local store, but are never
+        // sent to remote ActivityPub inboxes. Keep a local audience marker in
+        // the stored AS2 object for clients that inspect it.
+        $to = [$actor . '/followers'];
+        $cc = [];
+    } elseif ($visibility === 'unlisted') {
         // Silent public: to=followers, cc=Public
         $to = [$followersId];
         $cc = [$publicId];
@@ -5585,9 +5595,11 @@ function ap_publish_status_text(
     }
 
     // Public: Bridgy + followers + shared inboxes. Unlisted/private: followers only.
-    $fan = ($visibility === 'public')
+    $fan = ($visibility === 'local')
+        ? ['delivered' => 0, 'queued' => 0, 'bridgy' => false]
+        : (($visibility === 'public')
         ? ap_deliver_public_activity($create, $priorityExtra, $quoteApprovalPending)
-        : ap_deliver_followers_activity($create, $priorityExtra);
+        : ap_deliver_followers_activity($create, $priorityExtra));
     $delivered = $fan['delivered'];
     $queued = $fan['queued'];
 
@@ -5599,7 +5611,7 @@ function ap_publish_status_text(
             : (str_starts_with($quoteObjectId, 'https://bsky.app/')
                 || str_starts_with($quoteObjectId, 'at://')
                 || str_contains($quoteObjectId, 'bsky.brid.gy'));
-        if (!$quoteIsBsky) {
+        if (!$quoteIsBsky && $visibility !== 'local') {
             // FEP-044f requests explicit authorization from the quoted author. Until
             // their signed authorization arrives, Mastodon-compatible clients see
             // this quote as pending and VAAK suppresses the embedded post preview.

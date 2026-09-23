@@ -6456,7 +6456,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             "SELECT * FROM outbox_notes
              WHERE id LIKE 'https://mkultra.monster/users/%'
                AND id NOT LIKE ?
-               AND COALESCE(visibility, 'public') IN ('public', 'unlisted')
+               AND COALESCE(visibility, 'public') IN ('public', 'unlisted', 'local')
              ORDER BY published DESC LIMIT 40"
         );
         $stOb->execute(['https://mkultra.monster/users/' . $vaakActorKey . '/%']);
@@ -7348,7 +7348,7 @@ function admin_render_compose_panel(bool $inline = false): void
             : ($prefillQuoteObject !== ''
                 ? 'Add commentary (optional)…'
                 : ($composeIsSelfReply ? 'Add to the thread…' : ($prefillReplyTo !== '' ? 'Write your reply…' : "What's happening?")));
-        $composeVis = in_array($prefillVisibility, ['public', 'unlisted', 'private'], true)
+        $composeVis = in_array($prefillVisibility, ['public', 'unlisted', 'private', 'local'], true)
             ? $prefillVisibility
             : 'public';
       ?>
@@ -7386,6 +7386,7 @@ function admin_render_compose_panel(bool $inline = false): void
         <select name="visibility" id="compose-visibility" style="max-width:18rem">
           <option value="public"<?= $composeVis === 'public' ? ' selected' : '' ?>>Public</option>
           <option value="unlisted"<?= $composeVis === 'unlisted' ? ' selected' : '' ?>>Silent public</option>
+          <option value="local"<?= $composeVis === 'local' ? ' selected' : '' ?>>Local only</option>
           <?php $privateReplyDisabled = $prefillReplyTo !== '' && !vaak_is_own_url($prefillReplyTo); ?>
           <option value="private"<?= $composeVis === 'private' ? ' selected' : '' ?><?= $privateReplyDisabled ? ' disabled' : '' ?>>Followers-only<?= $privateReplyDisabled ? ' (own posts only)' : '' ?></option>
         </select>
@@ -9187,6 +9188,7 @@ function admin_federated_timeline_item_allowed(array $item): bool
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     if ($kind === 'outbox') {
         return vaak_is_local_url((string) ($row['id'] ?? ''))
+            && ap_normalize_visibility($row['visibility'] ?? 'public') !== 'local'
             && !admin_outbox_is_bsky_import($row);
     }
     if ($kind === 'boost') {
@@ -9194,6 +9196,9 @@ function admin_federated_timeline_item_allowed(array $item): bool
             && !admin_reblog_is_bsky($row);
     }
     if ($kind !== 'event') {
+        return false;
+    }
+    if (ap_normalize_visibility($row['visibility'] ?? 'public') === 'local') {
         return false;
     }
     $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
@@ -10647,7 +10652,7 @@ function relative_time(mixed $iso): string
     return intdiv($d, 86400) . 'd';
 }
 
-/** Normalize + human label for post audience (public / silent / followers-only). */
+/** Normalize + human label for post audience. */
 function admin_visibility_meta(mixed $visibility): array
 {
     $v = function_exists('ap_normalize_visibility')
@@ -10658,6 +10663,9 @@ function admin_visibility_meta(mixed $visibility): array
     }
     if ($v === 'private') {
         return ['key' => 'private', 'label' => 'Followers-only'];
+    }
+    if ($v === 'local') {
+        return ['key' => 'local', 'label' => 'Local only'];
     }
     return ['key' => 'public', 'label' => 'Public'];
 }
@@ -21563,7 +21571,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $qVis = function_exists('ap_normalize_visibility')
                   ? ap_normalize_visibility($qi['visibility'] ?? 'public')
                   : 'public';
-              $qVisLabel = $qVis === 'unlisted' ? 'silent' : ($qVis === 'private' ? 'followers' : 'public');
+              $qVisLabel = $qVis === 'unlisted' ? 'silent' : ($qVis === 'private' ? 'followers' : ($qVis === 'local' ? 'local only' : 'public'));
             ?>
             <article class="tweet">
               <div class="tweet-hd">

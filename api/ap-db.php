@@ -5216,10 +5216,13 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
     return $touched;
 }
 
-/** Normalize compose audience: public | unlisted | private. */
+/** Normalize compose audience: public | unlisted | private | local. */
 function ap_normalize_visibility(mixed $visibility): string
 {
     $v = strtolower(trim((string) $visibility));
+    if (in_array($v, ['local', 'local_only', 'instance', 'instance_only'], true)) {
+        return 'local';
+    }
     if ($v === 'unlisted' || $v === 'silent' || $v === 'silent_public') {
         return 'unlisted';
     }
