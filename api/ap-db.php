@@ -5993,6 +5993,59 @@ function ap_outbox_replies_count(string $actorKey): int
     }
 }
 
+/** @return list<array<string,mixed>> */
+function ap_outbox_media_list_page(string $actorKey, int $limit = 40, int $offset = 0): array
+{
+    $actorKey = strtolower(trim($actorKey));
+    $limit = max(1, min(200, $limit));
+    $offset = max(0, $offset);
+    if ($actorKey === '') {
+        return [];
+    }
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
+    try {
+        $st = ap_db()->prepare(
+            'SELECT * FROM outbox_notes
+             WHERE id LIKE ? AND raw_create_json LIKE \'%"attachment"%\'
+             ORDER BY published DESC LIMIT ? OFFSET ?'
+        );
+        $st->execute([$prefix . '%', $limit, $offset]);
+        return $st->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+function ap_outbox_media_count(string $actorKey): int
+{
+    $actorKey = strtolower(trim($actorKey));
+    if ($actorKey === '') {
+        return 0;
+    }
+    $key = 'vaak:profile:media-count:v1:' . $actorKey;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
+    try {
+        $st = ap_db()->prepare(
+            'SELECT COUNT(*) FROM outbox_notes
+             WHERE id LIKE ? AND raw_create_json LIKE \'%"attachment"%\''
+        );
+        $st->execute([$prefix . '%']);
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 60);
+        }
+        return $count;
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 function ap_outbox_count_for_actor(string $actorKey): int
 {
     $prefix = 'https://mkultra.monster/users/' . rawurlencode(strtolower(trim($actorKey))) . '/';

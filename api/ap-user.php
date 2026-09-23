@@ -661,13 +661,15 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             // Keep the existing count if an older schema lacks in_reply_to.
         }
     }
-    $notes = function_exists('ap_outbox_list_page')
+    $notes = $tab === 'media' && function_exists('ap_outbox_media_list_page')
+        ? ap_outbox_media_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage)
+        : (function_exists('ap_outbox_list_page')
         ? ap_outbox_list_page(
             $profileFetchLimit,
             $tab === 'posts' ? 0 : (($profilePage - 1) * $profilePerPage),
             $actorKey
         )
-        : ap_outbox_list($profileFetchLimit, $actorKey);
+        : ap_outbox_list($profileFetchLimit, $actorKey));
     $publicNotes = [];
     foreach ($notes as $n) {
         $vis = (string) ($n['visibility'] ?? 'public');
@@ -793,7 +795,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         : [];
     $featuredCount = count($featuredCards);
     $tabTotal = match ($tab) {
-        'media' => count($mediaNotes),
+        'media' => function_exists('ap_outbox_media_count') ? ap_outbox_media_count($actorKey) : count($mediaNotes),
         'replies' => (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : count($profileReplyNotes)) + count($profileBskyReplies),
         'boosts' => $profileBoostTotal,
         'featured' => $featuredCount,
