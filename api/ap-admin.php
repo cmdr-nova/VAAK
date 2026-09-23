@@ -4566,6 +4566,12 @@ function admin_tl_cache_dir(): string
     return is_dir($dir) && is_writable($dir) ? $dir : sys_get_temp_dir();
 }
 
+/** Redis key for the short-lived ranked timeline index (IDs only, no card HTML). */
+function admin_tl_redis_key(string $key): string
+{
+    return 'vaak:timeline:ranked:v1:' . hash('sha256', $key);
+}
+
 /** @param list<array<string,mixed>> $following */
 function admin_owner_user_id(): int
 {
@@ -5126,10 +5132,16 @@ function admin_tl_cache_put(string $key, array $ranked): void
     }
     $safe = preg_replace('/[^a-z0-9_]/', '', $key) ?: 'tl';
     $path = admin_tl_cache_dir() . '/tl_' . $safe . '.json';
-    $payload = json_encode([
+    $data = [
         'ts' => time(),
         'ranked' => $ranked,
-    ], JSON_UNESCAPED_SLASHES);
+    ];
+    // Redis is the shared hot path across PHP workers; the local file remains
+    // a safe fallback when Redis is unavailable or being restarted.
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set(admin_tl_redis_key($key), $data, 180);
+    }
+    $payload = json_encode($data, JSON_UNESCAPED_SLASHES);
     if (!is_string($payload) || $payload === '') {
         return;
     }
@@ -5139,6 +5151,9 @@ function admin_tl_cache_put(string $key, array $ranked): void
 /** Drop short-lived Home/Federated ranked caches (e.g. after muted-words change). */
 function admin_tl_cache_clear(): void
 {
+    if (function_exists('ap_redis_delete_pattern')) {
+        ap_redis_delete_pattern('vaak:timeline:ranked:v1:*');
+    }
     $dir = admin_tl_cache_dir();
     foreach (glob($dir . '/tl_*.json') ?: [] as $path) {
         @unlink($path);
@@ -5376,6 +5391,27 @@ function admin_tl_cache_get(string $key, int $ttlSec = 180): ?array
 {
     if ($key === '') {
         return null;
+    }
+    // Check the shared Redis cache before touching disk. Redis TTL bounds the
+    // entry, while the embedded timestamp keeps the fallback semantics equal.
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get(admin_tl_redis_key($key));
+        if (is_array($cached) && isset($cached['ranked']) && is_array($cached['ranked'])) {
+            $ts = (int) ($cached['ts'] ?? 0);
+            if ($ts > 0 && (time() - $ts) <= $ttlSec) {
+                /** @var list<array{k:string,id:string,t?:int}> $ranked */
+                $ranked = [];
+                foreach ($cached['ranked'] as $row) {
+                    if (!is_array($row) || empty($row['k']) || empty($row['id'])) continue;
+                    $ranked[] = [
+                        'k' => (string) $row['k'],
+                        'id' => (string) $row['id'],
+                        't' => !empty($row['t']) ? 1 : 0,
+                    ];
+                }
+                if ($ranked !== []) return $ranked;
+            }
+        }
     }
     $safe = preg_replace('/[^a-z0-9_]/', '', $key) ?: 'tl';
     $path = admin_tl_cache_dir() . '/tl_' . $safe . '.json';
