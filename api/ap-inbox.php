@@ -2329,6 +2329,21 @@ function ap_activity_is_direct_message(array $activity): bool
     if (ap_activity_extract_poll_vote($activity) !== null) {
         return false;
     }
+    // Federation can arrive through a shared inbox. Resolve the local actor
+    // bound to this request instead of assuming the legacy cmdr_nova actor;
+    // otherwise a private activity addressed to another local account could
+    // be stored in the wrong mailbox.
+    $localActor = '';
+    $requestActor = function_exists('ap_request_actor_get') ? ap_request_actor_get() : null;
+    if (is_array($requestActor) && !empty($requestActor['id'])) {
+        $localActor = rtrim((string) $requestActor['id'], '/');
+    }
+    if ($localActor === '' && function_exists('ap_local_actor_id')) {
+        $localActor = rtrim((string) ap_local_actor_id(), '/');
+    }
+    if ($localActor === '') {
+        $localActor = rtrim((string) LOCAL_ACTOR, '/');
+    }
     $audience = ap_audience_values($activity);
     $addressesLocal = false;
     foreach ($audience as $id) {
@@ -2340,7 +2355,7 @@ function ap_activity_is_direct_message(array $activity): bool
         if (str_contains($id, '/followers')) {
             return false;
         }
-        if (rtrim($id, '/') === rtrim(LOCAL_ACTOR, '/') || str_contains($id, '/users/cmdr_nova')) {
+        if (rtrim($id, '/') === $localActor) {
             $addressesLocal = true;
         }
     }
@@ -2348,7 +2363,7 @@ function ap_activity_is_direct_message(array $activity): bool
     // local URL in an activity, but a private post can link to a VAAK blog page
     // while being addressed to somebody else. DMs require an actual audience,
     // Mention tag, or content mention for this local actor.
-    if (!$addressesLocal && !ap_activity_addresses_local_actor($activity, rtrim(LOCAL_ACTOR, '/'))) {
+    if (!$addressesLocal && !ap_activity_addresses_local_actor($activity, $localActor)) {
         return false;
     }
     // Prefer Note-like objects
