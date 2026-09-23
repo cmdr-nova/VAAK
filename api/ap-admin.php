@@ -8912,6 +8912,58 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
     return $html !== '' ? $html : '<div class="empty">No direct messages yet.</div>';
 }
 
+/** Render cached context for a DM that references another post. */
+function admin_dm_reply_context_html(string $replyTo, string $returnView = 'dms'): string
+{
+    $replyTo = rtrim(trim($replyTo), '/');
+    if ($replyTo === '' || !str_starts_with($replyTo, 'https://')) {
+        return '';
+    }
+    $summary = '';
+    $author = '';
+    try {
+        $row = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($replyTo) : null;
+        if (is_array($row)) {
+            $summary = trim((string) ($row['summary'] ?? ''));
+            $author = trim((string) ($row['actor_id'] ?? ''));
+        }
+        if ($summary === '' && function_exists('ap_masto_status_by_note_id')) {
+            $row = ap_masto_status_by_note_id($replyTo);
+            if (is_array($row)) {
+                $summary = trim((string) ($row['content_text'] ?? ''));
+                $author = trim((string) ($row['actor_id'] ?? $row['account_id'] ?? ''));
+            }
+        }
+        if ($summary === '') {
+            $st = ap_db()->prepare(
+                'SELECT content FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1'
+            );
+            $st->execute([$replyTo, $replyTo . '/']);
+            $outbox = $st->fetch();
+            if (is_array($outbox)) {
+                $summary = trim(strip_tags((string) ($outbox['content'] ?? '')));
+            }
+        }
+    } catch (Throwable $e) {
+        // A missing/private remote parent should not prevent the DM rendering.
+    }
+    $summary = trim(html_entity_decode(strip_tags($summary), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($summary !== '') {
+        $summary = mb_substr($summary, 0, 320);
+    }
+    $label = $author !== '' ? actor_handle($author) : (parse_url($replyTo, PHP_URL_HOST) ?: 'referenced post');
+    $html = '<div class="quote-block dm-reply-context">'
+        . '<div class="meta">In reply to ' . h($label) . '</div>';
+    if ($summary !== '') {
+        $html .= '<div class="dm-reply-context__text">' . h($summary) . '</div>';
+    } else {
+        $html .= '<div class="meta">Referenced post</div>';
+    }
+    $html .= '<a class="meta" href="' . h(admin_status_href($replyTo, $returnView)) . '">Open referenced post</a>'
+        . '</div>';
+    return $html;
+}
+
 /** Bluesky-native history imported for Your Posts, but not a local-federation post. */
 function admin_outbox_is_bsky_import(array $row): bool
 {
@@ -16681,6 +16733,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $isOut = ($m['direction'] ?? '') === 'out';
               $msgHtml = admin_dm_html($m['content'] ?? null, $m);
               $msgObj = (string) ($m['object_id'] ?? '');
+              $dmReplyContext = admin_dm_reply_context_html((string) ($m['in_reply_to'] ?? ''), 'dms');
             ?>
             <article class="tweet"<?= $dmIndex === count($thread) - 1 ? ' id="dm-message-last"' : '' ?>>
               <div class="tweet-hd">
@@ -16692,6 +16745,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </div>
               </div>
+              <?= $dmReplyContext ?>
               <div class="dm-bubble<?= $isOut ? ' dm-out' : ' dm-in' ?>"><?= $msgHtml !== '' ? $msgHtml : '<span class="meta">(no text in this message)</span>' ?></div>
               <?php
                 $dMedia = mention_media_urls($m['media_urls'] ?? null);
