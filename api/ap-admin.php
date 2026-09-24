@@ -7780,8 +7780,10 @@ function admin_pin_post_button(string $noteId, string $returnView = 'outbox', st
     }
     $pinned = function_exists('ap_masto_status_is_pinned') && ap_masto_status_is_pinned($localId);
     $action = $pinned ? 'unpin_status' : 'pin_status';
-    $label = $pinned ? 'Unpin' : 'Pin';
-    $title = $pinned ? 'Unpin from profile' : 'Pin on profile (HTML + Ice Cubes, max 5)';
+    $label = $pinned ? 'Unpin from profile' : 'Pin to profile';
+    $title = $pinned
+        ? 'Remove this post from your HTML profile pin'
+        : 'Pin on your HTML profile and Ice Cubes (max 5)';
     $actionUrl = '?view=' . rawurlencode($returnView);
     if ($returnView === 'status') {
         $actionUrl .= '&object=' . rawurlencode($noteId);
@@ -7809,7 +7811,7 @@ function admin_pin_post_button(string $noteId, string $returnView = 'outbox', st
 }
 
 /**
- * Overflow for the signed-in user's own posts: Open, Edit, Pin, Note.
+ * Overflow for the signed-in user's own posts: Open, Edit, Pin/Unpin to profile, Note.
  */
 function admin_own_post_overflow(
     string $noteId,
@@ -21936,8 +21938,69 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           // combined page so the next offset cannot repeat the second half of
           // the initial Fediverse/Bluesky windows.
           $yourPostPage = array_slice($yourPostItems, 0, 40);
+
+          // Always surface current profile pins at the top of page 1 so Unpin
+          // is reachable without hunting through history.
+          $pinnedOutboxRows = [];
+          $pinnedNoteIds = [];
+          if ($tlOffset === 0 && function_exists('ap_masto_pinned_statuses')) {
+              $pinnedStatuses = ap_masto_pinned_statuses(5, (string) $vaakActorKey);
+              foreach ($pinnedStatuses as $ps) {
+                  if (!is_array($ps)) {
+                      continue;
+                  }
+                  $pnid = rtrim((string) ($ps['note_id'] ?? ''), '/');
+                  if ($pnid === '' || isset($pinnedNoteIds[$pnid])) {
+                      continue;
+                  }
+                  $pinnedNoteIds[$pnid] = true;
+                  $prow = null;
+                  try {
+                      $stPin = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+                      $stPin->execute([$pnid, $pnid . '/']);
+                      $prow = $stPin->fetch();
+                  } catch (Throwable $e) {
+                      $prow = null;
+                  }
+                  if (!is_array($prow)) {
+                      // Synthesize a minimal outbox-shaped row from masto_statuses.
+                      $prow = [
+                          'id' => $pnid,
+                          'content' => (string) ($ps['content_text'] ?? ''),
+                          'published' => (string) ($ps['created_at'] ?? ''),
+                          'in_reply_to' => '',
+                          'visibility' => (string) ($ps['visibility'] ?? 'public'),
+                          'raw_create_json' => '',
+                      ];
+                  }
+                  $pinnedOutboxRows[] = $prow;
+              }
+              if ($pinnedNoteIds !== []) {
+                  $yourPostPage = array_values(array_filter(
+                      $yourPostPage,
+                      static function (array $item) use ($pinnedNoteIds): bool {
+                          if (($item['kind'] ?? '') !== 'outbox' || !is_array($item['row'] ?? null)) {
+                              return true;
+                          }
+                          $id = rtrim((string) ($item['row']['id'] ?? ''), '/');
+                          return $id === '' || !isset($pinnedNoteIds[$id]);
+                      }
+                  ));
+              }
+          }
         ?>
-        <?php if (!$yourPostPage): ?><div class="empty">No posts yet. Use the ＋ button to compose.</div><?php endif; ?>
+        <?php if ($pinnedOutboxRows !== []): ?>
+          <div class="side-card" style="margin:0 0 1rem;padding:.85rem 1rem">
+            <h3 style="margin:0 0 .35rem;font-size:.95rem">Pinned on profile</h3>
+            <div class="meta" style="margin-bottom:.75rem">These posts appear at the top of your HTML profile. Use ⋯ → Unpin from profile to remove one.</div>
+            <div class="your-posts-pinned">
+              <?php foreach ($pinnedOutboxRows as $pinnedRow): ?>
+                <?php admin_render_outbox_card($pinnedRow, 'outbox'); ?>
+              <?php endforeach; ?>
+            </div>
+          </div>
+        <?php endif; ?>
+        <?php if (!$yourPostPage && $pinnedOutboxRows === []): ?><div class="empty">No posts yet. Use the ＋ button to compose.</div><?php endif; ?>
         <div id="timeline-items" class="your-posts-feed" data-view="outbox" data-offset="<?= (int) ($tlOffset + 40) ?>" data-limit="40" data-has-more="<?= $outboxHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($yourPostPage[0]['sort']) ? $yourPostPage[0]['sort'] : time()) ?>">
           <?php foreach ($yourPostPage as $yourPost): ?>
             <?php if ($yourPost['kind'] === 'bsky'): ?>
