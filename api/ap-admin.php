@@ -13331,6 +13331,13 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
 
 // AJAX fragment for Notifications infinite scroll / soft-nav shell.
 if ($isPartial && $view === 'mentions') {
+    // Release the session lock so concurrent badge polls / soft-nav do not serialize
+    // behind each other (classic PHP session lock → flaky first click).
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     $notifFilter = strtolower(trim((string) ($_GET['notification_filter'] ?? 'all')));
     $notifFilterOptions = [
         'all' => ['label' => 'All', 'types' => []],
@@ -24996,39 +25003,65 @@ window.apAdminToast = function (msg, isErr) {
 
 <script>
 // Soft-nav into Notifications without reloading rails/CSS. Falls back to a
-// full navigation if the shell partial fails.
+// full navigation if the shell partial fails or looks wrong.
 (function () {
   const nav = document.getElementById('nav-notifications');
   if (!nav) return;
+  nav.setAttribute('data-vaak-soft-nav', 'mentions');
   let busy = false;
+  let leaving = false;
+  function hardOpenNotifications() {
+    leaving = true;
+    window.__vaakNavigationPending = true;
+    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
+    window.location.assign('?view=mentions');
+  }
   async function softOpenNotifications(push) {
-    if (busy) return;
+    if (busy || leaving) return;
+    try {
+      const cur = new URL(window.location.href);
+      if ((cur.searchParams.get('view') || '') === 'mentions'
+          && document.querySelector('.notification-tabs, #timeline-items[data-view="mentions"]')) {
+        return;
+      }
+    } catch (e) {}
     const main = document.querySelector('section.main');
     if (!main) {
-      window.location.href = '?view=mentions';
+      hardOpenNotifications();
       return;
     }
     busy = true;
     window.__vaakNavigationPending = true;
-    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading();
+    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     try {
       const url = '?view=mentions&partial=1&shell=1&limit=10';
       const res = await fetch(url, {
         credentials: 'same-origin',
-        headers: { 'Accept': 'text/html' },
+        headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
         cache: 'no-store'
       });
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        leaving = true;
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('notifSoft');
+        else hardOpenNotifications();
         return;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
+      // Require the soft-nav marker so a full document / wrong partial cannot
+      // silently replace the main pane and look like a no-op.
+      if (res.headers.get('X-VAAK-View') !== 'mentions') {
+        throw new Error('missing-shell-header');
+      }
       const html = await res.text();
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
-        window.vaakRedirectToLogin('notifSoft-html');
+        leaving = true;
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('notifSoft-html');
+        else hardOpenNotifications();
         return;
       }
-      if (!html.trim()) throw new Error('empty');
+      if (!html.trim() || html.indexOf('Notifications') === -1) {
+        throw new Error('bad-shell');
+      }
       main.innerHTML = html;
       document.title = 'Notifications · VAAK';
       const mobileTitle = document.querySelector('.mobile-topbar__title');
@@ -25054,7 +25087,6 @@ window.apAdminToast = function (msg, isErr) {
         const foldRoot = document.getElementById('timeline-items');
         if (foldRoot) window.novaEnhanceTweetFolds(foldRoot);
       }
-      // Lightweight infinite scroll for soft-nav (timeline boot is page-scoped).
       (function bindNotifScroll() {
         const items = document.getElementById('timeline-items');
         const sentinel = document.getElementById('timeline-sentinel');
@@ -25070,20 +25102,24 @@ window.apAdminToast = function (msg, isErr) {
           loading = true;
           if (status) status.textContent = 'Loading…';
           try {
-            const url = '?view=mentions&partial=1'
+            const moreUrl = '?view=mentions&partial=1'
               + '&notification_filter=' + encodeURIComponent(filter)
               + '&notifications_max_id=' + encodeURIComponent(maxId)
               + '&limit=' + encodeURIComponent(String(limit));
-            const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' }, cache: 'no-store' });
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            const html = await res.text();
-            hasMore = res.headers.get('X-Has-More') === '1';
-            maxId = res.headers.get('X-Next-Max-Id') || '';
+            const moreRes = await fetch(moreUrl, {
+              credentials: 'same-origin',
+              headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+              cache: 'no-store'
+            });
+            if (!moreRes.ok) throw new Error('HTTP ' + moreRes.status);
+            const moreHtml = await moreRes.text();
+            hasMore = moreRes.headers.get('X-Has-More') === '1';
+            maxId = moreRes.headers.get('X-Next-Max-Id') || '';
             items.dataset.hasMore = hasMore ? '1' : '0';
             items.dataset.maxId = maxId;
-            if (html.trim()) {
+            if (moreHtml.trim()) {
               const tmp = document.createElement('div');
-              tmp.innerHTML = html;
+              tmp.innerHTML = moreHtml;
               while (tmp.firstChild) items.appendChild(tmp.firstChild);
             }
             if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
@@ -25096,23 +25132,33 @@ window.apAdminToast = function (msg, isErr) {
         }, { root: null, rootMargin: '400px 0px', threshold: 0 });
         io.observe(sentinel);
       })();
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+      window.__vaakNavigationPending = false;
     } catch (e) {
-      window.location.href = '?view=mentions';
+      hardOpenNotifications();
       return;
     } finally {
       busy = false;
-      window.__vaakNavigationPending = false;
-      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+      // If we kicked a full navigation, leave the pill up until pageshow.
+      if (!leaving) {
+        window.__vaakNavigationPending = false;
+        if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+      }
     }
   }
+  // Capture + stopImmediatePropagation so the global link spinner does not
+  // race with soft-nav (it runs in capture before preventDefault on bubble).
   nav.addEventListener('click', (ev) => {
     if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || nav.target === '_blank') return;
     ev.preventDefault();
+    ev.stopPropagation();
+    if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
     softOpenNotifications(true);
-  });
+  }, true);
   window.addEventListener('popstate', () => {
     const u = new URL(window.location.href);
-    if ((u.searchParams.get('view') || '') === 'mentions' && !document.getElementById('timeline-items')) {
+    if ((u.searchParams.get('view') || '') === 'mentions'
+        && !document.querySelector('.notification-tabs, #timeline-items[data-view="mentions"]')) {
       softOpenNotifications(false);
     }
   });
@@ -27806,6 +27852,8 @@ if (VIEW === 'analytics') loadAnalytics();
     if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
     const link = ev.target.closest && ev.target.closest('a[href]');
     if (!link || link.target === '_blank' || link.hasAttribute('download')) return;
+    // Soft-nav links manage their own loading state.
+    if (link.getAttribute('data-vaak-soft-nav')) return;
     const href = link.getAttribute('href') || '';
     if (!href || href[0] === '#' || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
     let destination;
