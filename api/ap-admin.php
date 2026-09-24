@@ -13397,9 +13397,13 @@ if ($isPartial && $view === 'mentions') {
         $notifFilterHref = static function (string $filter): string {
             return '?view=mentions&notification_filter=' . rawurlencode($filter);
         };
+        // Match the full-page shell: .main > .topbar + .feed.timeline-feed.
+        // Without .feed (overflow-y:auto), soft-nav paints Notifications but
+        // the clipped main column cannot scroll until a full reload.
         echo '<div class="topbar"><h1>Notifications</h1><div class="topbar-actions">'
             . '<a class="btn btn-ghost" href="?view=mentions&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>'
             . '</div></div>';
+        echo '<div class="feed timeline-feed">';
         echo '<nav class="notification-tabs" aria-label="Notification filters" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
         foreach ($notifFilterOptions as $filterKey => $filterOption) {
             $active = $notifFilter === $filterKey;
@@ -13424,6 +13428,7 @@ if ($isPartial && $view === 'mentions') {
                 . ($hasMore ? 'Scroll for more…' : 'End of notifications') . '</div>';
             echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
         }
+        echo '</div>';
         exit;
     }
     foreach ($adminNotifs as $n) {
@@ -25063,6 +25068,10 @@ window.apAdminToast = function (msg, isErr) {
         throw new Error('bad-shell');
       }
       main.innerHTML = html;
+      const feedEl = main.querySelector('.feed');
+      if (feedEl) {
+        try { feedEl.scrollTop = 0; } catch (e) {}
+      }
       document.title = 'Notifications · VAAK';
       const mobileTitle = document.querySelector('.mobile-topbar__title');
       if (mobileTitle) mobileTitle.innerHTML = '<span>VAAK</span> · Notifications';
@@ -25091,6 +25100,7 @@ window.apAdminToast = function (msg, isErr) {
         const items = document.getElementById('timeline-items');
         const sentinel = document.getElementById('timeline-sentinel');
         const status = document.getElementById('timeline-status');
+        const feed = main.querySelector('.feed') || document.querySelector('section.main > .feed');
         if (!items || !sentinel) return;
         let loading = false;
         let hasMore = items.dataset.hasMore === '1';
@@ -25129,7 +25139,7 @@ window.apAdminToast = function (msg, isErr) {
           } finally {
             loading = false;
           }
-        }, { root: null, rootMargin: '400px 0px', threshold: 0 });
+        }, { root: feed || null, rootMargin: '400px 0px', threshold: 0 });
         io.observe(sentinel);
       })();
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
