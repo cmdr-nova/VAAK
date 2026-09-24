@@ -4649,6 +4649,9 @@ function admin_tl_cache_clear_owner(int $ownerUserId): void
     if (function_exists('ap_redis_delete')) {
         ap_redis_delete($indexKey);
     }
+    if (function_exists('ap_redis_delete_pattern')) {
+        ap_redis_delete_pattern('vaak:fragment:tl:v1:' . $ownerUserId . ':*');
+    }
 }
 
 /** @param list<array<string,mixed>> $following */
@@ -9440,16 +9443,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 && ap_bsky_at_uri_from_any_url($quotedStatusUrl) !== null
             ) {
                 $ownerForBsky = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+                // Timeline paint stays cache-only; warm AppView in the background.
                 $quotedBsky = ap_bsky_post_preview_from_url($quotedStatusUrl, $ownerForBsky, false);
-                if ($quotedBsky === null) {
-                    $bskyQuoteBudget = &$GLOBALS['admin_bsky_quote_fetch_budget'];
-                    if (!isset($bskyQuoteBudget) || !is_int($bskyQuoteBudget)) {
-                        $bskyQuoteBudget = 3; // small paint budget per request
-                    }
-                    if ($bskyQuoteBudget > 0) {
-                        $bskyQuoteBudget--;
-                        $quotedBsky = ap_bsky_post_preview_from_url($quotedStatusUrl, $ownerForBsky, true);
-                    }
+                if ($quotedBsky === null && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+                    ap_bsky_post_preview_warm_enqueue($quotedStatusUrl, $ownerForBsky);
                 }
             }
         }
@@ -10814,7 +10811,11 @@ function admin_render_masto_status_card(
         if ($pendingUrl !== '' && function_exists('ap_quote_target_is_bluesky')
             && ap_quote_target_is_bluesky($pendingUrl) && function_exists('ap_bsky_post_preview_from_url')) {
             $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
-            $bskyPending = ap_bsky_post_preview_from_url($pendingUrl, $ownerForBsky, true);
+            // Cache-only on cards; enqueue AppView warm on miss.
+            $bskyPending = ap_bsky_post_preview_from_url($pendingUrl, $ownerForBsky, false);
+            if ($bskyPending === null && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+                ap_bsky_post_preview_warm_enqueue($pendingUrl, $ownerForBsky);
+            }
         }
         if (is_array($bskyPending) && (trim((string) ($bskyPending['text'] ?? '')) !== ''
             || trim((string) ($bskyPending['handle'] ?? '')) !== '')) {
@@ -11593,7 +11594,11 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 && (str_starts_with($qUrl, 'https://bsky.app/') || str_starts_with($qUrl, 'at://') || str_contains($qUrl, 'bsky.brid.gy'))
                 && function_exists('ap_bsky_post_preview_from_url')) {
                 $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
-                $bskyQuotePrev = ap_bsky_post_preview_from_url($qUrl, $ownerForBsky, true);
+                // Never sync-fetch Bluesky quotes during timeline paint.
+                $bskyQuotePrev = ap_bsky_post_preview_from_url($qUrl, $ownerForBsky, false);
+                if ($bskyQuotePrev === null && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+                    ap_bsky_post_preview_warm_enqueue($qUrl, $ownerForBsky);
+                }
                 if (is_array($bskyQuotePrev)) {
                     if (trim((string) ($bskyQuotePrev['text'] ?? '')) !== '') {
                         $plain = trim((string) $bskyQuotePrev['text']);
@@ -13118,6 +13123,46 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     }
     $adminTlPerfT0 = microtime(true);
     $adminTlPerfHydrateMs = 0.0;
+    // Short-lived HTML fragment cache for identical head/page windows.
+    // Keyed by owner + view + offset + ranked-cache identity so mutations that
+    // clear the ranked index also miss here after invalidation.
+    $adminTlFragmentHit = false;
+    $adminTlFragmentKey = '';
+    if ($tlOffset === 0 && in_array($view, ['home', 'local', 'feed'], true)
+        && function_exists('ap_redis_json_get') && function_exists('ap_redis_json_set')) {
+        $fragOwner = admin_owner_user_id();
+        $fragIdentity = ($adminTlCacheKey !== '' ? $adminTlCacheKey : $view)
+            . '|' . ($adminTlFromCache ? 'hit' : 'miss')
+            . '|' . (string) $tlLimit;
+        if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+            $headIds = [];
+            foreach (array_slice($adminTlRankedCached, 0, $tlLimit) as $row) {
+                if (is_array($row)) {
+                    $headIds[] = (string) ($row['k'] ?? '') . ':' . (string) ($row['id'] ?? '');
+                }
+            }
+            $fragIdentity .= '|' . hash('sha256', implode(',', $headIds));
+        }
+        $adminTlFragmentKey = 'vaak:fragment:tl:v1:' . $fragOwner . ':' . hash('sha256', $fragIdentity);
+        $fragCached = ap_redis_json_get($adminTlFragmentKey);
+        if (is_array($fragCached) && is_string($fragCached['html'] ?? null) && $fragCached['html'] !== '') {
+            $adminTlPerfTotalMs = (microtime(true) - $adminTlPerfT0) * 1000.0;
+            if (function_exists('ap_timing_record')) {
+                ap_timing_record('timeline.render', $adminTlPerfTotalMs);
+            }
+            header('Content-Type: text/html; charset=utf-8');
+            header('Cache-Control: no-store');
+            header('X-Has-More: ' . (!empty($fragCached['has_more']) ? '1' : '0'));
+            header('X-Next-Offset: ' . (string) (int) ($fragCached['next_offset'] ?? $tlLimit));
+            header('X-TL-Cache: fragment');
+            header('X-TL-Hydrate-Ms: 0');
+            header('X-TL-Flags-Ms: 0');
+            header('X-TL-Render-Ms: 0');
+            header('X-TL-Partial-Ms: ' . (string) (int) round($adminTlPerfTotalMs));
+            echo (string) $fragCached['html'];
+            exit;
+        }
+    }
     if ($adminTlFromCache && is_array($adminTlRankedCached)) {
         $totalRanked = count($adminTlRankedCached);
         // Past the cached head → re-query older remotes by created_at cursor and append.
@@ -13261,6 +13306,14 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     if (function_exists('ap_timing_record')) {
         ap_timing_record('timeline.render', $adminTlPerfTotalMs);
     }
+    if ($adminTlFragmentKey !== '' && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($adminTlFragmentKey, [
+            'html' => $body,
+            'has_more' => $hasMore ? 1 : 0,
+            'next_offset' => $nextOffset,
+            'ts' => time(),
+        ], 25);
+    }
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
@@ -13274,24 +13327,36 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     exit;
 }
 
-// AJAX fragment for Notifications infinite scroll (append older cards; keep scroll place).
+// AJAX fragment for Notifications infinite scroll / soft-nav shell.
 if ($isPartial && $view === 'mentions') {
     $notifFilter = strtolower(trim((string) ($_GET['notification_filter'] ?? 'all')));
     $notifFilterOptions = [
-        'all' => ['types' => []],
-        'mentions' => ['types' => ['mention']],
-        'favourites' => ['types' => ['favourite']],
-        'boosts_quotes' => ['types' => ['reblog', 'quote']],
+        'all' => ['label' => 'All', 'types' => []],
+        'mentions' => ['label' => 'Mentions', 'types' => ['mention']],
+        'favourites' => ['label' => 'Favourites', 'types' => ['favourite']],
+        'boosts_quotes' => ['label' => 'Boosts/Quotes', 'types' => ['reblog', 'quote']],
     ];
     if (!isset($notifFilterOptions[$notifFilter])) {
         $notifFilter = 'all';
     }
     $notifTypes = $notifFilterOptions[$notifFilter]['types'];
+    $notifShell = isset($_GET['shell']) && (string) $_GET['shell'] === '1';
     // Keep the first notification response small enough to stay responsive on a
     // cold cache. Older cards continue through the existing infinite-scroll
     // endpoint, so this does not reduce the available notification history.
     $notifLimit = isset($_GET['limit']) ? max(1, min(20, (int) $_GET['limit'])) : 10;
     $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
+    // Soft-nav first page has no max_id; infinite scroll passes one.
+    if ($notifShell) {
+        $notifMaxId = null;
+        if (function_exists('ap_masto_notifications_mark_read')) {
+            try {
+                ap_masto_notifications_mark_read();
+            } catch (Throwable $e) {
+                // non-fatal
+            }
+        }
+    }
     // Partials skip followers by default — restore for Follow/relationship badges.
     if ($followerIds === []) {
         try {
@@ -13318,6 +13383,40 @@ if ($isPartial && $view === 'mentions') {
     header('Cache-Control: no-store');
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
     header('X-Next-Max-Id: ' . $nextMaxId);
+    header('X-VAAK-View: mentions');
+    if ($notifShell) {
+        $notifFilterHref = static function (string $filter): string {
+            return '?view=mentions&notification_filter=' . rawurlencode($filter);
+        };
+        echo '<div class="topbar"><h1>Notifications</h1><div class="topbar-actions">'
+            . '<a class="btn btn-ghost" href="?view=mentions&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>'
+            . '</div></div>';
+        echo '<nav class="notification-tabs" aria-label="Notification filters" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
+        foreach ($notifFilterOptions as $filterKey => $filterOption) {
+            $active = $notifFilter === $filterKey;
+            echo '<a class="btn ' . ($active ? 'btn-primary' : 'btn-ghost') . '" role="tab" aria-selected="'
+                . ($active ? 'true' : 'false') . '" href="' . $notifFilterHref($filterKey) . '">'
+                . h((string) $filterOption['label']) . '</a>';
+        }
+        echo '</nav>';
+        if (!$adminNotifs) {
+            echo '<div class="empty">No notifications yet.</div>';
+        } else {
+            echo '<div id="timeline-items" data-view="mentions" data-filter="' . h($notifFilter)
+                . '" data-limit="' . (int) $notifLimit . '" data-max-id="' . h($nextMaxId)
+                . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-offset="0" data-newest="0">';
+            foreach ($adminNotifs as $n) {
+                if (is_array($n)) {
+                    admin_render_notification_card($n, $followingIds, $followerIds);
+                }
+            }
+            echo '</div>';
+            echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
+                . ($hasMore ? 'Scroll for more…' : 'End of notifications') . '</div>';
+            echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
+        }
+        exit;
+    }
     foreach ($adminNotifs as $n) {
         if (is_array($n)) {
             admin_render_notification_card($n, $followingIds, $followerIds);
@@ -14595,7 +14694,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .composer { padding: 1rem; margin-bottom: 1rem; }
     .composer textarea {
-      width: 100%; min-height: 96px; max-height: 500px; resize: none;
+      width: 100%; min-height: 96px; max-height: 240px; resize: none;
       box-sizing: border-box;
       background: #0c0c0c; color: var(--text);
       border: 1px solid var(--border); border-radius: 10px;
@@ -14738,7 +14837,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       display: block; min-height: 0;
     }
     .compose-inline-panel #compose-content {
-      height: 96px; min-height: 96px; max-height: 500px;
+      height: 96px; min-height: 96px; max-height: 240px;
       field-sizing: fixed; flex: none;
       overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
     }
@@ -15083,7 +15182,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .compose-modal__panel.compose-inline-panel #compose-content {
       height: 96px !important;
       min-height: 96px !important;
-      max-height: 500px !important;
+      max-height: 240px !important;
       flex: none !important;
       field-sizing: fixed !important;
     }
@@ -24833,6 +24932,131 @@ window.apAdminToast = function (msg, isErr) {
 <?php endif; ?>
 
 <script>
+// Soft-nav into Notifications without reloading rails/CSS. Falls back to a
+// full navigation if the shell partial fails.
+(function () {
+  const nav = document.getElementById('nav-notifications');
+  if (!nav) return;
+  let busy = false;
+  async function softOpenNotifications(push) {
+    if (busy) return;
+    const main = document.querySelector('section.main');
+    if (!main) {
+      window.location.href = '?view=mentions';
+      return;
+    }
+    busy = true;
+    window.__vaakNavigationPending = true;
+    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading();
+    try {
+      const url = '?view=mentions&partial=1&shell=1&limit=10';
+      const res = await fetch(url, {
+        credentials: 'same-origin',
+        headers: { 'Accept': 'text/html' },
+        cache: 'no-store'
+      });
+      if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('notifSoft');
+        return;
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const html = await res.text();
+      if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
+        window.vaakRedirectToLogin('notifSoft-html');
+        return;
+      }
+      if (!html.trim()) throw new Error('empty');
+      main.innerHTML = html;
+      document.title = 'Notifications · VAAK';
+      const mobileTitle = document.querySelector('.mobile-topbar__title');
+      if (mobileTitle) mobileTitle.innerHTML = '<span>VAAK</span> · Notifications';
+      document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/[?&]view=([a-z_]+)/);
+        a.classList.toggle('active', (m ? m[1] : '') === 'mentions');
+      });
+      const badge = document.getElementById('notif-badge');
+      if (badge) {
+        badge.hidden = true;
+        badge.textContent = '';
+      }
+      if (push !== false) {
+        const u = new URL(window.location.href);
+        u.searchParams.set('view', 'mentions');
+        u.searchParams.delete('_r');
+        u.searchParams.delete('notification_filter');
+        history.pushState({ vaakNotif: true }, '', u.pathname + u.search);
+      }
+      if (typeof window.novaEnhanceTweetFolds === 'function') {
+        const foldRoot = document.getElementById('timeline-items');
+        if (foldRoot) window.novaEnhanceTweetFolds(foldRoot);
+      }
+      // Lightweight infinite scroll for soft-nav (timeline boot is page-scoped).
+      (function bindNotifScroll() {
+        const items = document.getElementById('timeline-items');
+        const sentinel = document.getElementById('timeline-sentinel');
+        const status = document.getElementById('timeline-status');
+        if (!items || !sentinel) return;
+        let loading = false;
+        let hasMore = items.dataset.hasMore === '1';
+        let maxId = items.dataset.maxId || '';
+        const filter = items.dataset.filter || 'all';
+        const limit = parseInt(items.dataset.limit || '10', 10) || 10;
+        const io = new IntersectionObserver(async (entries) => {
+          if (!entries.some((e) => e.isIntersecting) || loading || !hasMore || !maxId) return;
+          loading = true;
+          if (status) status.textContent = 'Loading…';
+          try {
+            const url = '?view=mentions&partial=1'
+              + '&notification_filter=' + encodeURIComponent(filter)
+              + '&notifications_max_id=' + encodeURIComponent(maxId)
+              + '&limit=' + encodeURIComponent(String(limit));
+            const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' }, cache: 'no-store' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const html = await res.text();
+            hasMore = res.headers.get('X-Has-More') === '1';
+            maxId = res.headers.get('X-Next-Max-Id') || '';
+            items.dataset.hasMore = hasMore ? '1' : '0';
+            items.dataset.maxId = maxId;
+            if (html.trim()) {
+              const tmp = document.createElement('div');
+              tmp.innerHTML = html;
+              while (tmp.firstChild) items.appendChild(tmp.firstChild);
+            }
+            if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
+          } catch (e) {
+            if (status) status.textContent = 'Could not load more';
+            hasMore = false;
+          } finally {
+            loading = false;
+          }
+        }, { root: null, rootMargin: '400px 0px', threshold: 0 });
+        io.observe(sentinel);
+      })();
+    } catch (e) {
+      window.location.href = '?view=mentions';
+      return;
+    } finally {
+      busy = false;
+      window.__vaakNavigationPending = false;
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    }
+  }
+  nav.addEventListener('click', (ev) => {
+    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || nav.target === '_blank') return;
+    ev.preventDefault();
+    softOpenNotifications(true);
+  });
+  window.addEventListener('popstate', () => {
+    const u = new URL(window.location.href);
+    if ((u.searchParams.get('view') || '') === 'mentions' && !document.getElementById('timeline-items')) {
+      softOpenNotifications(false);
+    }
+  });
+})();
+</script>
+
+<script>
 // Trends sidebar: show cached HTML immediately (SSR and/or sessionStorage),
 // and only quietly refresh in the background about every 15 minutes.
 (function () {
@@ -25483,22 +25707,33 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       ta.style.height = max + 'px';
     }
   }
+  let composeScrollCap = null;
   function autoGrowComposeTextarea() {
     const ta = document.getElementById('compose-content');
     if (!ta) return;
     const inline = !!ta.closest('.compose-inline-panel');
-    const empty = !(ta.value || '').trim();
+    const value = ta.value || '';
+    const empty = !value.trim();
     if (inline && empty) {
+      composeScrollCap = null;
       ta.style.height = '96px';
       ta.style.overflowY = 'hidden';
       return;
     }
+    const shouldScrollByLength = value.length >= 400;
     ta.style.height = '0px';
-    const max = 500;
     const contentHeight = ta.scrollHeight;
+    // On wide fields, 400 characters can occupy less than the visual height
+    // cap. Capture the height at the threshold so scrolling begins at the
+    // requested character count rather than waiting for ~1,800 characters.
+    if (!shouldScrollByLength) composeScrollCap = null;
+    if (shouldScrollByLength && composeScrollCap === null) {
+      composeScrollCap = Math.max(96, Math.min(contentHeight - 1, 240));
+    }
+    const max = composeScrollCap === null ? 240 : composeScrollCap;
     const next = Math.min(Math.max(contentHeight, 96), max);
     ta.style.height = next + 'px';
-    ta.style.overflowY = contentHeight > max ? 'auto' : 'hidden';
+    ta.style.overflowY = shouldScrollByLength || contentHeight > max ? 'auto' : 'hidden';
   }
   function saveComposeLocalBackup() {
     if (composeMode === 'edit_status') return;
@@ -26259,10 +26494,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   (function bindComposeResizeClamp() {
     const ta = document.getElementById('compose-content');
     if (!ta) return;
-    const clampSoon = () => requestAnimationFrame(() => {
-      clampComposeTextarea();
-      autoGrowComposeTextarea();
-    });
+    // Pointer release also fires after a touch/mouse scroll. Re-running the
+    // grow routine there briefly collapses the field to 0px and restores its
+    // height, which resets scrollTop and makes it impossible to scroll back
+    // through a long draft on phones and desktop. Pointer release only needs
+    // the safety clamp; input/resize observers handle actual growth.
+    const clampSoon = () => requestAnimationFrame(clampComposeTextarea);
     ta.addEventListener('input', autoGrowComposeTextarea);
     ta.addEventListener('mouseup', clampSoon);
     ta.addEventListener('pointerup', clampSoon);

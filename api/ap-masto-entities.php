@@ -867,7 +867,11 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
         // Bluesky quotes are not AS2 — synthesize a minimal status from AppView/cache
         // so Status/Home masto cards aren't stuck on "pending".
         $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
-        $prev = ap_bsky_post_preview_from_url($quoteObjectUrl, $ownerForBsky, true);
+        // Timeline/list paints pass allowFetch=false; status detail may fetch.
+        $prev = ap_bsky_post_preview_from_url($quoteObjectUrl, $ownerForBsky, $allowFetch);
+        if ($prev === null && !$allowFetch && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+            ap_bsky_post_preview_warm_enqueue($quoteObjectUrl, $ownerForBsky);
+        }
         if (is_array($prev) && (trim((string) ($prev['text'] ?? '')) !== '' || trim((string) ($prev['handle'] ?? '')) !== '')) {
             $handle = ltrim((string) ($prev['handle'] ?? ''), '@');
             $display = trim((string) ($prev['display'] ?? ''));
@@ -4856,7 +4860,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
     }
     if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, $out, 5);
+        // Long enough to make Notifications soft-nav / reopen feel cached,
+        // short enough that new activity still appears after a brief pause.
+        ap_redis_json_set($redisKey, $out, 45);
     }
     return $out;
 }
@@ -4883,8 +4889,8 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     $ownerUserId = function_exists('ap_db_masto_owner_user_id')
         ? ap_db_masto_owner_user_id()
         : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
-    // Keep page-load badge snappy, but ajax polling must not sit on a 45s lie.
-    $cacheTtl = $bypassCache ? 0 : 12;
+    // Keep page-load badge snappy, but ajax polling must not sit on a long lie.
+    $cacheTtl = $bypassCache ? 0 : 20;
     $redisKey = 'vaak:notifications:v1:unread:' . $ownerUserId . ':' . $scan . ':' . hash('sha256', $lastRead);
     if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);

@@ -283,7 +283,16 @@ CREATE TABLE IF NOT EXISTS vaak_blog_posts (
 SQL);
             $db->exec('CREATE INDEX IF NOT EXISTS idx_vaak_blog_actor_published ON vaak_blog_posts(actor_key, status, published_at DESC, id DESC)');
         }
-        $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS canonical_url TEXT NOT NULL DEFAULT ''");
+        // PHP-FPM roles often have DML but not ownership. Only ALTER when missing.
+        $hasCanonical = (bool) $db->query(
+            "SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'vaak_blog_posts'
+               AND column_name = 'canonical_url'"
+        )->fetchColumn();
+        if (!$hasCanonical) {
+            $db->exec("ALTER TABLE vaak_blog_posts ADD COLUMN IF NOT EXISTS canonical_url TEXT NOT NULL DEFAULT ''");
+        }
     } catch (Throwable $e) {
         error_log('[ap-db] blog table not provisioned: ' . $e->getMessage());
     }
@@ -576,7 +585,18 @@ SQL);
             'idx_masto_reblogs_owner_created' =>
                 'CREATE INDEX IF NOT EXISTS idx_masto_reblogs_owner_created ON masto_reblogs(owner_user_id, created_at DESC)',
         ];
-        foreach ($interactionIndexes as $sql) {
+        $names = array_keys($interactionIndexes);
+        $ph = implode(',', array_fill(0, count($names), '?'));
+        $st = $db->prepare(
+            "SELECT indexname FROM pg_indexes
+             WHERE schemaname = current_schema() AND indexname IN ($ph)"
+        );
+        $st->execute($names);
+        $have = array_fill_keys(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN) ?: []), true);
+        foreach ($interactionIndexes as $name => $sql) {
+            if (isset($have[$name])) {
+                continue;
+            }
             $db->exec($sql);
         }
     } catch (Throwable $e) {

@@ -4979,6 +4979,36 @@ function ap_bsky_post_preview_from_url(string $url, int $ownerUserId = 0, bool $
 }
 
 /**
+ * Queue a background AppView warm for a Bluesky quote/post URL.
+ * Timeline paint stays cache-only; the next render can show the hydrated quote.
+ */
+function ap_bsky_post_preview_warm_enqueue(string $url, int $ownerUserId = 0): bool
+{
+    $atUri = function_exists('ap_bsky_at_uri_from_any_url') ? ap_bsky_at_uri_from_any_url($url) : null;
+    if (!is_string($atUri) || !str_starts_with($atUri, 'at://')) {
+        return false;
+    }
+    $lockKey = 'bsky-post-warm:' . hash('sha256', $atUri);
+    if (function_exists('ap_redis_lock') && !ap_redis_lock($lockKey, 45)) {
+        return false;
+    }
+    $worker = __DIR__ . '/ap-bsky-post-warm.php';
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : PHP_BINARY;
+    if (!is_file($worker) || !is_string($php) || $php === '') {
+        return false;
+    }
+    $lockPath = sys_get_temp_dir() . '/vaak-bsky-post-warm-' . hash('sha256', $atUri) . '.lock';
+    @file_put_contents($lockPath, (string) time());
+    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($worker)
+        . ' --uri=' . escapeshellarg($atUri)
+        . ' --owner=' . escapeshellarg((string) max(0, $ownerUserId))
+        . ' --lock=' . escapeshellarg($lockPath)
+        . ' >/dev/null 2>&1 </dev/null &';
+    exec($cmd);
+    return true;
+}
+
+/**
  * Load a Bluesky post as a FeedViewPost-shaped item (cache, then public getPosts).
  * Used by the status/thread view so Open-from-notifications can render native
  * like/repost buttons instead of a dead ActivityPub favourite form.
