@@ -7080,12 +7080,24 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
     $uid = ap_profile_bsky_owner_id($actorKey);
     $fromGraph = false;
 
-    // Wafrn-style: prefer durable local Bluesky graph counts (no AppView on paint).
-    if ($uid > 0 && function_exists('ap_bsky_graph_sync_ready') && ap_bsky_graph_sync_ready($uid)
-        && function_exists('ap_bsky_graph_sync_count')) {
-        $bskyFollowing = ap_bsky_graph_sync_count($uid, 'follow');
-        $bskyFollowers = ap_bsky_graph_sync_count($uid, 'follower');
-        $fromGraph = true;
+    // Wafrn-style: prefer durable local snapshot (no AppView on paint).
+    // Use getProfile totals stored at sync time — Bluesky's followersCount can
+    // exceed the enumerable getFollowers list (hidden/deactivated accounts).
+    if ($uid > 0 && function_exists('ap_bsky_graph_sync_profile_counts')) {
+        if (!function_exists('ap_bsky_follow_sync_worker')) {
+            $bskyLib = __DIR__ . '/ap-bsky.php';
+            if (is_file($bskyLib)) {
+                require_once $bskyLib;
+            }
+        }
+        $snap = function_exists('ap_bsky_graph_sync_profile_counts')
+            ? ap_bsky_graph_sync_profile_counts($uid)
+            : null;
+        if (is_array($snap) && !empty($snap['ok'])) {
+            $bskyFollowing = (int) ($snap['following'] ?? 0);
+            $bskyFollowers = (int) ($snap['followers'] ?? 0);
+            $fromGraph = true;
+        }
     }
 
     if (!$fromGraph && is_string($handle) && $handle !== '') {

@@ -3779,6 +3779,45 @@ function ap_bsky_graph_sync_ready(int $ownerUserId): bool
     }
 }
 
+/**
+ * @return array{ok:bool,followers:int,following:int,edge_followers:int,edge_following:int,synced_at?:string}|null
+ */
+function ap_bsky_graph_sync_profile_counts(int $ownerUserId): ?array
+{
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    ap_bsky_graph_sync_migrate();
+    try {
+        $st = ap_db()->prepare(
+            "SELECT bsky_uri FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'meta' AND target_did = 'graph_sync_v1' LIMIT 1"
+        );
+        $st->execute([$ownerUserId]);
+        $raw = $st->fetchColumn();
+        if (!is_string($raw) || $raw === '') {
+            return null;
+        }
+        $j = json_decode($raw, true);
+        if (!is_array($j)) {
+            return null;
+        }
+        $edgeFollowing = max(0, (int) ($j['following'] ?? 0));
+        $edgeFollowers = max(0, (int) ($j['followers'] ?? 0));
+        $following = max($edgeFollowing, (int) ($j['profile_following'] ?? $edgeFollowing));
+        $followers = max($edgeFollowers, (int) ($j['profile_followers'] ?? $edgeFollowers));
+        return [
+            'ok' => true,
+            'followers' => $followers,
+            'following' => $following,
+            'edge_followers' => $edgeFollowers,
+            'edge_following' => $edgeFollowing,
+            'synced_at' => isset($j['synced_at']) ? (string) $j['synced_at'] : null,
+        ];
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
 /** @return list<array{actor_id:string,username:string,host:string,followed_at:string,bsky_did?:string}> */
 function ap_bsky_admin_following_rows(int $ownerUserId, bool $resolveHandles = true): array
 {
@@ -6600,7 +6639,7 @@ function ap_bsky_actor_viewer_cache_update(int $ownerUserId, string $did, ?strin
     }
 }
 
-function ap_bsky_follow_sync_enqueue(int $ownerUserId, ?PDO $db = null): void
+function ap_bsky_follow_sync_enqueue(int $ownerUserId, ?PDO $db = null, bool $force = false): void
 {
     $db ??= ap_db();
     if ($ownerUserId < 1 || ap_bsky_session_row($ownerUserId) === null || !ap_bsky_actor_refresh_migrate($db)) {
@@ -6615,12 +6654,19 @@ function ap_bsky_follow_sync_enqueue(int $ownerUserId, ?PDO $db = null): void
         if (is_array($existing)) {
             $status = (string) ($existing['status'] ?? '');
             $queuedAt = strtotime((string) ($existing['queued_at'] ?? '')) ?: 0;
-            if (in_array($status, ['pending', 'processing'], true)
-                || ($status === 'succeeded' && $queuedAt > time() - 600)) {
+            if (in_array($status, ['pending', 'processing'], true)) {
+                return;
+            }
+            // Manual refresh from Profile settings bypasses the cooldown.
+            if (!$force && $status === 'succeeded' && $queuedAt > time() - 600) {
                 return;
             }
         }
-        $up = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
+        if ($force) {
+            $up = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL");
+        } else {
+            $up = $db->prepare("INSERT INTO bsky_actor_refresh_queue (owner_user_id, actor_ref, status, queued_at, next_attempt_at, attempts) VALUES (?, ?, 'pending', ?, ?, 0) ON CONFLICT (owner_user_id, actor_ref) DO UPDATE SET status = 'pending', queued_at = excluded.queued_at, next_attempt_at = excluded.next_attempt_at, attempts = 0, locked_at = NULL, last_error = NULL WHERE bsky_actor_refresh_queue.status IN ('succeeded', 'failed')");
+        }
         $up->execute([$ownerUserId, $actorRef, $now, $now]);
     } catch (Throwable $e) {
         error_log('[ap-bsky] follow sync enqueue failed');
@@ -6737,6 +6783,21 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             }
         }
 
+        // AppView getProfile totals (can be higher than enumerable getFollowers
+        // pages — Bluesky hides some accounts from the list but still counts them).
+        $profileFollowers = count($followers);
+        $profileFollowing = count($follows);
+        $handleForProfile = is_array($session) ? ltrim((string) ($session['handle'] ?? ''), '@') : '';
+        $actorRef = $handleForProfile !== '' ? $handleForProfile : $repo;
+        $prof = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actorRef], null, null, 12);
+        if (empty($prof['ok']) && $bearer !== '') {
+            $prof = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actorRef], null, $bearer, 12);
+        }
+        if (!empty($prof['ok']) && is_array($prof['json'] ?? null)) {
+            $profileFollowers = max(0, (int) ($prof['json']['followersCount'] ?? $profileFollowers));
+            $profileFollowing = max(0, (int) ($prof['json']['followsCount'] ?? $profileFollowing));
+        }
+
         // Mark graph ready for HTML profile counts (survives empty graphs).
         ap_bsky_graph_sync_upsert(
             $ownerUserId,
@@ -6745,6 +6806,8 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             json_encode([
                 'following' => count($follows),
                 'followers' => count($followers),
+                'profile_following' => $profileFollowing,
+                'profile_followers' => $profileFollowers,
                 'synced_at' => gmdate('c'),
             ], JSON_UNESCAPED_SLASHES),
             'pull'
@@ -6789,8 +6852,8 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             $cachePath = $cacheDir . '/' . hash('sha256', strtolower($handle)) . '.json';
             @file_put_contents($cachePath, json_encode([
                 'ok' => true,
-                'followers' => count($followers),
-                'following' => count($follows),
+                'followers' => $profileFollowers,
+                'following' => $profileFollowing,
                 'posts' => 0,
                 'handle' => $handle,
                 'source' => 'graph_sync',
@@ -6802,6 +6865,8 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             'count' => count($follows),
             'following' => count($follows),
             'followers' => count($followers),
+            'profile_following' => $profileFollowing,
+            'profile_followers' => $profileFollowers,
         ];
     } catch (Throwable $e) {
         if ($db->inTransaction()) {

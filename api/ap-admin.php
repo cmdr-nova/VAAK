@@ -2989,7 +2989,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             echo json_encode($ajaxOut, JSON_UNESCAPED_SLASHES);
             exit;
         }
-    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile') {
+    } elseif ($action === 'bsky_create_account' || $action === 'bsky_connect' || $action === 'bsky_disconnect' || $action === 'bsky_sync_profile' || $action === 'bsky_refresh_follow_sync') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'profile')) ?: 'profile';
         if (!function_exists('ap_bsky_tab_enabled') || !ap_bsky_tab_enabled()) {
             $error = 'Bluesky tab is disabled on this instance.';
@@ -3022,6 +3022,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         . (!empty($sync['truncated']) ? ' (bio truncated with profile link).' : '.');
                 } else {
                     $error = 'Bluesky profile sync failed: ' . (string) ($sync['error'] ?? 'unknown error');
+                }
+            }
+        } elseif ($action === 'bsky_refresh_follow_sync') {
+            if (!function_exists('ap_bsky_follow_sync_worker')) {
+                $error = 'Bluesky follow sync unavailable.';
+            } else {
+                @set_time_limit(120);
+                if (function_exists('ap_bsky_follow_sync_enqueue')) {
+                    ap_bsky_follow_sync_enqueue($vaakOwnerId, null, true);
+                }
+                $sync = ap_bsky_follow_sync_worker($vaakOwnerId);
+                if (!empty($sync['ok'])) {
+                    $pf = (int) ($sync['profile_followers'] ?? $sync['followers'] ?? 0);
+                    $pg = (int) ($sync['profile_following'] ?? $sync['following'] ?? 0);
+                    $notice = 'Bluesky follow graph refreshed: '
+                        . number_format($pf) . ' followers / '
+                        . number_format($pg) . ' following on Bluesky. '
+                        . 'HTML profile totals update on the next page load.';
+                } else {
+                    $error = 'Bluesky follow sync failed: ' . (string) ($sync['error'] ?? 'unknown error');
                 }
             }
         } else {
@@ -18793,12 +18813,33 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 password below to refresh the session — posts will not mirror until you do.
               </div>
             <?php endif; ?>
+            <?php
+              $bskyGraphSnap = function_exists('ap_bsky_graph_sync_profile_counts')
+                  ? ap_bsky_graph_sync_profile_counts($vaakOwnerId)
+                  : null;
+            ?>
+            <?php if (is_array($bskyGraphSnap) && !empty($bskyGraphSnap['ok'])): ?>
+              <div class="meta" style="margin:.35rem 0">
+                Cached Bluesky graph for HTML profile:
+                <b><?= number_format((int) ($bskyGraphSnap['followers'] ?? 0)) ?></b> followers /
+                <b><?= number_format((int) ($bskyGraphSnap['following'] ?? 0)) ?></b> following
+                <?php if (!empty($bskyGraphSnap['synced_at'])): ?>
+                  <span title="<?= h((string) $bskyGraphSnap['synced_at']) ?>">· last sync <?= h(substr((string) $bskyGraphSnap['synced_at'], 0, 16)) ?>Z</span>
+                <?php endif; ?>
+              </div>
+            <?php endif; ?>
             <div style="display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.5rem">
               <form method="post" action="?view=atmosphere" style="display:inline">
                 <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                 <input type="hidden" name="action" value="bsky_sync_profile">
                 <input type="hidden" name="return_view" value="atmosphere">
                 <button class="btn btn-primary" type="submit">Re-sync avatar / header / bio</button>
+              </form>
+              <form method="post" action="?view=atmosphere" style="display:inline" onsubmit="return confirm('Refresh Bluesky follow/follower counts for your HTML profile? This can take up to a minute.');">
+                <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                <input type="hidden" name="action" value="bsky_refresh_follow_sync">
+                <input type="hidden" name="return_view" value="atmosphere">
+                <button class="btn btn-ghost" type="submit">Refresh Bluesky follow counts</button>
               </form>
               <form method="post" action="?view=atmosphere" style="display:inline">
                 <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
