@@ -8224,6 +8224,66 @@ function admin_render_vakktok_cell(array $item): void
     echo '</article>';
 }
 
+/**
+ * Split an enriched timeline summary into commentary + quoted QT payload.
+ * Always prefer rendering the quoted half as a .quote-block card.
+ *
+ * @return array{commentary:string,quoted:string}|null
+ */
+function admin_split_quote_summary(string $summaryRaw): ?array
+{
+    $summaryRaw = trim($summaryRaw);
+    if ($summaryRaw === '') {
+        return null;
+    }
+    // Normalize odd markers into the canonical form.
+    $norm = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)?\s*QT\b/u', "\n↪ QT", $summaryRaw);
+    if (!is_string($norm)) {
+        $norm = $summaryRaw;
+    }
+    $norm = ltrim($norm, "\n");
+    if (!str_contains($norm, '↪ QT')) {
+        if (preg_match('/^(.*?)(?:\n|^)RE:\s*(https:\/\/[^\s<>]+)\s*$/us', $summaryRaw, $m)) {
+            $commentary = trim((string) ($m[1] ?? ''));
+            $url = rtrim((string) ($m[2] ?? ''), '.,);]');
+            if ($url !== '') {
+                return [
+                    'commentary' => $commentary,
+                    'quoted' => '↪ QT: ' . $url,
+                ];
+            }
+        }
+        return null;
+    }
+    $chunks = preg_split('/\n\n↪ QT/u', $norm, 2);
+    if (!is_array($chunks) || count($chunks) !== 2) {
+        $chunks = preg_split('/\n↪ QT/u', $norm, 2);
+    }
+    if (!is_array($chunks) || count($chunks) !== 2) {
+        if (preg_match('/^↪ QT/u', $norm)) {
+            return ['commentary' => '', 'quoted' => $norm];
+        }
+        return null;
+    }
+    $commentary = trim((string) $chunks[0]);
+    $quoted = trim('↪ QT' . $chunks[1]);
+    if (preg_match('/^↪ QT(Create|Announce|Update|Note|QuotePost)\b/u', $quoted)
+        || (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($quoted))) {
+        $quoted = '↪ QT: (quoted post unavailable)';
+    }
+    if (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($commentary)) {
+        $commentary = '';
+    }
+    if (str_contains($commentary, '↪ QT')) {
+        $again = preg_split('/\n\n↪ QT|\n↪ QT/u', $commentary, 2);
+        $commentary = is_array($again) ? trim((string) ($again[0] ?? '')) : $commentary;
+    }
+    return [
+        'commentary' => $commentary,
+        'quoted' => $quoted,
+    ];
+}
+
 /** Media strip inside a quote-block (quoted post attachments). */
 function admin_quote_media_html(array $items): string
 {
@@ -9417,59 +9477,36 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
             }
         }
     };
-    if ($summaryRaw !== '' && str_contains($summaryRaw, '↪ QT')) {
-        $chunks = preg_split('/\n\n↪ QT/u', $summaryRaw, 2);
-        if (!is_array($chunks) || count($chunks) !== 2) {
-            // Tolerate single newline between commentary and QT marker
-            $chunks = preg_split('/\n↪ QT/u', $summaryRaw, 2);
+    // Always prefer a quote-block card over leaving raw "↪ QT …" in the body.
+    $quoteParts = admin_split_quote_summary($summaryRaw);
+    if (is_array($quoteParts)) {
+        $quoted = (string) ($quoteParts['quoted'] ?? '');
+        $commentary = (string) ($quoteParts['commentary'] ?? '');
+        if (preg_match('#https://[^\s<>]+#u', $quoted, $qm)) {
+            $quotedStatusUrl = rtrim((string) $qm[0], '.,);]');
+        } elseif (preg_match('#(?:^|\n)RE:\s*(https://[^\s<>]+)#u', $commentary, $rm)) {
+            $quotedStatusUrl = rtrim((string) $rm[1], '.,);]');
         }
-        if (is_array($chunks) && count($chunks) === 2) {
-            $commentary = trim($chunks[0]);
-            $quoted = trim('↪ QT' . $chunks[1]);
-            if ($summaryIsAs2Dump($quoted) || preg_match('/^↪ QT(Create|Announce|Update|Note|QuotePost)\b/u', $quoted)) {
-                $quoted = '↪ QT: (quoted post unavailable)';
-            }
-            if ($summaryIsAs2Dump($commentary)) {
-                $commentary = '';
-            }
-            $quoteParts = [
-                'commentary' => $commentary,
-                'quoted' => $quoted,
-            ];
-            // Wafrn and older Mastodon-compatible servers often provide only
-            // a QT marker plus the quoted object URL. Hydrate from Vaak's
-            // cache when possible; otherwise keep the fallback compact.
-            if (preg_match('#https://[^\s<>]+#u', $quoted, $qm)) {
-                $quotedStatusUrl = rtrim((string) $qm[0], '.,);]');
-            } elseif (preg_match('#(?:^|\n)RE:\s*(https://[^\s<>]+)#u', $commentary, $rm)) {
-                // Many servers put the quoted permalink only in the RE: prefix.
-                $quotedStatusUrl = rtrim((string) $rm[1], '.,);]');
-            }
-            if ($quotedStatusUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
-                $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
-            }
-            // Bridgy Fed Bluesky quotes often only carry a URL stub. Hydrate from
-            // bsky_posts / public AppView so Home shows the quoted body instead of
-            // just "Open quoted".
-            $qStatusPlain = '';
-            if (is_array($quotedStatus)) {
-                $qStatusPlain = function_exists('admin_html_to_plain')
-                    ? trim(admin_html_to_plain((string) ($quotedStatus['content'] ?? '')))
-                    : trim(strip_tags((string) ($quotedStatus['content'] ?? '')));
-            }
-            if (
-                $quotedStatusUrl !== ''
-                && $qStatusPlain === ''
-                && function_exists('ap_bsky_post_preview_from_url')
-                && function_exists('ap_bsky_at_uri_from_any_url')
-                && ap_bsky_at_uri_from_any_url($quotedStatusUrl) !== null
-            ) {
-                $ownerForBsky = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
-                // Timeline paint stays cache-only; warm AppView in the background.
-                $quotedBsky = ap_bsky_post_preview_from_url($quotedStatusUrl, $ownerForBsky, false);
-                if ($quotedBsky === null && function_exists('ap_bsky_post_preview_warm_enqueue')) {
-                    ap_bsky_post_preview_warm_enqueue($quotedStatusUrl, $ownerForBsky);
-                }
+        if ($quotedStatusUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
+            $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
+        }
+        $qStatusPlain = '';
+        if (is_array($quotedStatus)) {
+            $qStatusPlain = function_exists('admin_html_to_plain')
+                ? trim(admin_html_to_plain((string) ($quotedStatus['content'] ?? '')))
+                : trim(strip_tags((string) ($quotedStatus['content'] ?? '')));
+        }
+        if (
+            $quotedStatusUrl !== ''
+            && $qStatusPlain === ''
+            && function_exists('ap_bsky_post_preview_from_url')
+            && function_exists('ap_bsky_at_uri_from_any_url')
+            && ap_bsky_at_uri_from_any_url($quotedStatusUrl) !== null
+        ) {
+            $ownerForBsky = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+            $quotedBsky = ap_bsky_post_preview_from_url($quotedStatusUrl, $ownerForBsky, false);
+            if ($quotedBsky === null && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+                ap_bsky_post_preview_warm_enqueue($quotedStatusUrl, $ownerForBsky);
             }
         }
     }
@@ -9726,8 +9763,48 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   }
                   $bodyChunk .= '</div>';
               } elseif ($summaryRaw !== '') {
-                  $bodyChunk .= '<div class="body feed-body">'
-                      . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
+                  // Last chance: never dump raw ↪ QT into the post body.
+                  $lateParts = admin_split_quote_summary($summaryRaw);
+                  if (is_array($lateParts)) {
+                      if (($lateParts['commentary'] ?? '') !== '') {
+                          $bodyChunk .= '<div class="body feed-body">'
+                              . admin_linkify_body_html((string) $lateParts['commentary'], $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
+                      }
+                      $qFallbackText = '';
+                      $qFallbackAcct = '';
+                      $lateQuoted = (string) ($lateParts['quoted'] ?? '');
+                      if (preg_match('/^↪ QT(?:\s+@(\S+))?\s*:\s*(.*)$/us', $lateQuoted, $qfm)) {
+                          $qFallbackAcct = trim((string) ($qfm[1] ?? ''));
+                          $qFallbackText = trim((string) ($qfm[2] ?? ''));
+                          if (str_starts_with($qFallbackText, 'https://') && !str_contains($qFallbackText, ' ')) {
+                              if ($quotedStatusUrl === '') {
+                                  $quotedStatusUrl = rtrim($qFallbackText, '.,);]');
+                              }
+                              $qFallbackText = '';
+                          }
+                          if ($qFallbackText === '(quoted post unavailable)' || $qFallbackText === '(quoted post)') {
+                              $qFallbackText = '';
+                          }
+                      }
+                      $bodyChunk .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+                      if ($qFallbackAcct !== '') {
+                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qFallbackAcct) . '</div>';
+                      }
+                      if ($qFallbackText !== '') {
+                          $bodyChunk .= '<div style="margin-top:.25rem">'
+                              . admin_linkify_body_html(mb_substr($qFallbackText, 0, 400), $returnView, [])
+                              . '</div>';
+                      } elseif ($quotedStatusUrl !== '') {
+                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
+                              . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted post</a></div>';
+                      } else {
+                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
+                      }
+                      $bodyChunk .= '</div>';
+                  } else {
+                      $bodyChunk .= '<div class="body feed-body">'
+                          . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
+                  }
               }
               if ($quotedMediaUrls !== [] && $eMedia !== []) {
                   $eMedia = array_values(array_filter($eMedia, static function ($item) use ($quotedMediaUrls): bool {
@@ -10791,17 +10868,25 @@ function admin_render_masto_status_card(
     $cwSensitive = !empty($st['sensitive']) || $cwSpoiler !== '';
 
     $bodyInner = '';
+    $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
+    // If the status already carries a structured quote, never also show raw ↪ QT
+    // lines in the commentary body.
+    if ($plain !== '' && is_array($quote)) {
+        $splitPlain = admin_split_quote_summary($plain);
+        if (is_array($splitPlain)) {
+            $plain = (string) ($splitPlain['commentary'] ?? '');
+        }
+    }
     if ($plain !== '') {
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
             . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef !== '' ? $actorRef : null) . '</div>';
     }
-    $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
+
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
         $qst = $quote['quoted_status'];
         $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
         $qacct = (string) ($qst['account']['acct'] ?? '');
         $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
-        $qlabel = $qacct !== '' ? '@' . $qacct : 'Quoted';
         $qMentions = [];
         if (!empty($qst['mentions']) && is_array($qst['mentions'])) {
             foreach ($qst['mentions'] as $qm) {
@@ -10810,7 +10895,10 @@ function admin_render_masto_status_card(
                 }
             }
         }
-        $bodyInner .= '<div class="quote-block"><span class="qt-label">' . h($qlabel) . '</span>';
+        $bodyInner .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+        if ($qacct !== '') {
+            $bodyInner .= '<div class="meta" style="margin-top:.3rem">@' . h($qacct) . '</div>';
+        }
         if ($qplain !== '') {
             $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
                 . admin_linkify_body_html(mb_substr($qplain, 0, 400), $returnView, $qMentions) . '</div>';
@@ -10849,7 +10937,10 @@ function admin_render_masto_status_card(
             if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($qOpen, 'https://bsky.app/')) {
                 $qOpen = ap_bsky_normalize_web_url($qOpen);
             }
-            $bodyInner .= '<div class="quote-block"><span class="qt-label">' . h($qAcct) . '</span>';
+            $bodyInner .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
+            if ($qAcct !== '') {
+                $bodyInner .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
+            }
             if ($qText !== '') {
                 $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
                     . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView) . '</div>';
