@@ -6398,7 +6398,7 @@ function ap_bsky_owner_follows_ref(int $ownerUserId, string $ref): bool
     $handle = null;
     if (str_starts_with($ref, 'did:')) {
         $did = $ref;
-    } elseif (preg_match('#^https://bsky\.app/profile/([^/?#]+)#i', $ref, $m)) {
+    } elseif (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $ref, $m)) {
         $part = rawurldecode($m[1]);
         if (str_starts_with($part, 'did:')) {
             $did = $part;
