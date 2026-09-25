@@ -3740,6 +3740,45 @@ function ap_bsky_graph_sync_list(int $ownerUserId, string $kind): array
     }
 }
 
+/** Local Bluesky graph edge count (Wafrn-style durable counts; no AppView). */
+function ap_bsky_graph_sync_count(int $ownerUserId, string $kind): int
+{
+    if ($ownerUserId < 1 || $kind === '') {
+        return 0;
+    }
+    ap_bsky_graph_sync_migrate();
+    try {
+        $st = ap_db()->prepare(
+            'SELECT COUNT(*) FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = ?'
+        );
+        $st->execute([$ownerUserId, $kind]);
+        return max(0, (int) $st->fetchColumn());
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
+/**
+ * True when a Bluesky follow/follower backfill has landed at least once.
+ * Meta row kind=meta target_did=graph_sync_v1 is written by the sync worker.
+ */
+function ap_bsky_graph_sync_ready(int $ownerUserId): bool
+{
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    ap_bsky_graph_sync_migrate();
+    try {
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'meta' AND target_did = 'graph_sync_v1' LIMIT 1"
+        );
+        $st->execute([$ownerUserId]);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 /** @return list<array{actor_id:string,username:string,host:string,followed_at:string,bsky_did?:string}> */
 function ap_bsky_admin_following_rows(int $ownerUserId, bool $resolveHandles = true): array
 {
@@ -6595,6 +6634,8 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
     if ($repo === '' || !str_starts_with($repo, 'did:')) {
         return ['ok' => false, 'error' => 'Connected Bluesky DID unavailable'];
     }
+
+    // Outgoing follows — authoritative repo records (Wafrn syncBskyFollows following half).
     $follows = [];
     $cursor = null;
     for ($page = 0; $page < 25; $page++) {
@@ -6627,6 +6668,47 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
     if ($cursor !== null) {
         return ['ok' => false, 'error' => 'Bluesky follow list exceeds the safe per-run page limit'];
     }
+
+    // Incoming followers — AppView graph (same idea as Wafrn getFollowers pages).
+    // Prefer the session token; fall back to the public AppView.
+    $followers = [];
+    $cursor = null;
+    $tok = function_exists('ap_bsky_access_token') ? ap_bsky_access_token($ownerUserId, false) : ['ok' => false];
+    $bearer = (!empty($tok['ok']) && is_string($tok['access'] ?? null)) ? (string) $tok['access'] : '';
+    for ($page = 0; $page < 25; $page++) {
+        $query = ['actor' => $repo, 'limit' => 100];
+        if (is_string($cursor) && $cursor !== '') {
+            $query['cursor'] = $cursor;
+        }
+        $res = null;
+        if ($bearer !== '') {
+            $res = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.graph.getFollowers', 'GET', $query, null, $bearer, 20);
+        }
+        if (!is_array($res) || empty($res['ok'])) {
+            $res = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.graph.getFollowers', 'GET', $query, null, null, 20);
+        }
+        if (empty($res['ok']) || !is_array($res['json'] ?? null)) {
+            // Following half still succeeded — keep going with empty followers
+            // rather than failing the whole sync (private/rate-limit edges).
+            error_log('[ap-bsky] follower sync partial fail owner=' . $ownerUserId . ' err=' . (string) ($res['error'] ?? 'fail'));
+            break;
+        }
+        foreach ((array) ($res['json']['followers'] ?? []) as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $did = trim((string) ($row['did'] ?? ''));
+            if (str_starts_with($did, 'did:')) {
+                $followers[$did] = null;
+            }
+        }
+        $cursor = isset($res['json']['cursor']) && is_string($res['json']['cursor']) && $res['json']['cursor'] !== ''
+            ? $res['json']['cursor'] : null;
+        if ($cursor === null) {
+            break;
+        }
+    }
+
     ap_bsky_graph_sync_migrate();
     $db = ap_db();
     try {
@@ -6642,6 +6724,32 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
                 ap_bsky_graph_sync_delete($ownerUserId, 'follow', $did);
             }
         }
+
+        $existingF = $db->prepare("SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = 'follower'");
+        $existingF->execute([$ownerUserId]);
+        $existingFollowerDids = array_map('strval', $existingF->fetchAll(PDO::FETCH_COLUMN) ?: []);
+        foreach ($followers as $did => $_uri) {
+            ap_bsky_graph_sync_upsert($ownerUserId, 'follower', $did, null, 'pull');
+        }
+        foreach ($existingFollowerDids as $did) {
+            if (!array_key_exists($did, $followers)) {
+                ap_bsky_graph_sync_delete($ownerUserId, 'follower', $did);
+            }
+        }
+
+        // Mark graph ready for HTML profile counts (survives empty graphs).
+        ap_bsky_graph_sync_upsert(
+            $ownerUserId,
+            'meta',
+            'graph_sync_v1',
+            json_encode([
+                'following' => count($follows),
+                'followers' => count($followers),
+                'synced_at' => gmdate('c'),
+            ], JSON_UNESCAPED_SLASHES),
+            'pull'
+        );
+
         $profiles = $db->prepare('SELECT DISTINCT did FROM bsky_actor_profiles WHERE did IS NOT NULL AND did <> ?');
         $profiles->execute(['']);
         foreach ($profiles->fetchAll(PDO::FETCH_COLUMN) ?: [] as $did) {
@@ -6650,7 +6758,51 @@ function ap_bsky_follow_sync_worker(int $ownerUserId): array
             }
         }
         $db->commit();
-        return ['ok' => true, 'count' => count($follows)];
+
+        // Keep the short AppView counts file warm so any leftover readers stay consistent.
+        $handle = '';
+        if (is_array($session)) {
+            $handle = ltrim((string) ($session['handle'] ?? ''), '@');
+        }
+        if ($handle === '') {
+            try {
+                $stH = $db->prepare('SELECT actor_key, username FROM ap_users WHERE id = ? LIMIT 1');
+                $stH->execute([$ownerUserId]);
+                $urow = $stH->fetch();
+                if (is_array($urow) && function_exists('ap_profile_bsky_handle')) {
+                    $akey = (string) (($urow['actor_key'] ?? '') ?: ($urow['username'] ?? ''));
+                    $h = $akey !== '' ? ap_profile_bsky_handle($akey) : null;
+                    if (is_string($h) && $h !== '') {
+                        $handle = $h;
+                    }
+                }
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+        if ($handle !== '' && function_exists('ap_bsky_public_profile_counts')) {
+            // Force-write via allowFetch path would hit AppView; write file directly.
+            $cacheDir = sys_get_temp_dir() . '/vaak-bsky-counts';
+            if (!is_dir($cacheDir)) {
+                @mkdir($cacheDir, 0700, true);
+            }
+            $cachePath = $cacheDir . '/' . hash('sha256', strtolower($handle)) . '.json';
+            @file_put_contents($cachePath, json_encode([
+                'ok' => true,
+                'followers' => count($followers),
+                'following' => count($follows),
+                'posts' => 0,
+                'handle' => $handle,
+                'source' => 'graph_sync',
+            ], JSON_UNESCAPED_SLASHES), LOCK_EX);
+        }
+
+        return [
+            'ok' => true,
+            'count' => count($follows),
+            'following' => count($follows),
+            'followers' => count($followers),
+        ];
     } catch (Throwable $e) {
         if ($db->inTransaction()) {
             $db->rollBack();
@@ -6695,7 +6847,12 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
     // applies a five-minute cooldown and coalesces pending work.
     try {
         foreach ($db->query('SELECT owner_user_id FROM bsky_sessions')->fetchAll(PDO::FETCH_COLUMN) ?: [] as $sessionOwner) {
-            ap_bsky_background_sync_enqueue((int) $sessionOwner, 'reposts');
+            $uid = (int) $sessionOwner;
+            ap_bsky_background_sync_enqueue($uid, 'reposts');
+            // Wafrn-style: keep local Bluesky follow/follower graph warm for HTML profiles.
+            if (function_exists('ap_bsky_follow_sync_enqueue')) {
+                ap_bsky_follow_sync_enqueue($uid, $db);
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] repost reconciliation enqueue failed: ' . $e->getMessage());

@@ -6968,16 +6968,29 @@ function ap_bsky_public_profile_counts(string $handle, int $ttlSec = 120, bool $
     $ttlSec = max(30, min(900, $ttlSec));
     if (!$forceRefresh && is_file($cachePath)) {
         $age = time() - (int) @filemtime($cachePath);
-        if ($age >= 0 && $age < $ttlSec) {
-            $raw = @file_get_contents($cachePath);
-            $cached = is_string($raw) ? json_decode($raw, true) : null;
-            if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
+        $raw = @file_get_contents($cachePath);
+        $cached = is_string($raw) ? json_decode($raw, true) : null;
+        if (is_array($cached) && isset($cached['followers'], $cached['following'])) {
+            // Fresh hit within TTL.
+            if ($age >= 0 && $age < $ttlSec) {
                 return [
                     'ok' => !empty($cached['ok']),
                     'followers' => (int) $cached['followers'],
                     'following' => (int) $cached['following'],
                     'posts' => (int) ($cached['posts'] ?? 0),
                     'handle' => (string) ($cached['handle'] ?? $handle),
+                ];
+            }
+            // HTML profiles pass allowFetch=false: prefer last-known over a
+            // misleading AP-only total while background refresh catches up.
+            if (!$allowFetch && !empty($cached['ok'])) {
+                return [
+                    'ok' => true,
+                    'followers' => (int) $cached['followers'],
+                    'following' => (int) $cached['following'],
+                    'posts' => (int) ($cached['posts'] ?? 0),
+                    'handle' => (string) ($cached['handle'] ?? $handle),
+                    'stale' => true,
                 ];
             }
         }
@@ -7064,22 +7077,44 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
     $handle = function_exists('ap_profile_bsky_handle') ? ap_profile_bsky_handle($actorKey) : null;
     $bskyFollowers = 0;
     $bskyFollowing = 0;
-    if (is_string($handle) && $handle !== '') {
+    $uid = ap_profile_bsky_owner_id($actorKey);
+    $fromGraph = false;
+
+    // Wafrn-style: prefer durable local Bluesky graph counts (no AppView on paint).
+    if ($uid > 0 && function_exists('ap_bsky_graph_sync_ready') && ap_bsky_graph_sync_ready($uid)
+        && function_exists('ap_bsky_graph_sync_count')) {
+        $bskyFollowing = ap_bsky_graph_sync_count($uid, 'follow');
+        $bskyFollowers = ap_bsky_graph_sync_count($uid, 'follower');
+        $fromGraph = true;
+    }
+
+    if (!$fromGraph && is_string($handle) && $handle !== '') {
+        // Fallback: last-known AppView/file snapshot (may be stale).
         $remote = ap_bsky_public_profile_counts($handle, 120, false, $allowRemoteFetch);
         if (!empty($remote['ok'])) {
             $bskyFollowers = (int) $remote['followers'];
             $bskyFollowing = (int) $remote['following'];
         }
-        if (function_exists('ap_bsky_profile_counts_enqueue')) {
-            $uid = ap_profile_bsky_owner_id($actorKey);
-            if ($uid < 1 && function_exists('ap_db_default_owner_user_id')) {
-                $uid = ap_db_default_owner_user_id();
+    }
+
+    if ($uid > 0) {
+        // Keep the graph warm in the background (coalesced ~10m).
+        if (function_exists('ap_bsky_follow_sync_enqueue')) {
+            // Lazy-load helper from ap-bsky.php when HTML profile runs via ap-user.
+            if (!function_exists('ap_bsky_follow_sync_worker')) {
+                $bskyLib = __DIR__ . '/ap-bsky.php';
+                if (is_file($bskyLib)) {
+                    require_once $bskyLib;
+                }
             }
-            if ($uid > 0) {
-                ap_bsky_profile_counts_enqueue($uid, $handle);
+            if (function_exists('ap_bsky_follow_sync_enqueue')) {
+                ap_bsky_follow_sync_enqueue($uid);
             }
+        } elseif (is_string($handle) && $handle !== '' && function_exists('ap_bsky_profile_counts_enqueue')) {
+            ap_bsky_profile_counts_enqueue($uid, $handle);
         }
     }
+
     return [
         'followers' => $apFollowers + $bskyFollowers,
         'following' => $apFollowing + $bskyFollowing,
@@ -7088,6 +7123,7 @@ function ap_profile_combined_follow_counts(string $actorKey, int $apFollowers, i
         'bsky_followers' => $bskyFollowers,
         'bsky_following' => $bskyFollowing,
         'bsky_handle' => $handle,
+        'bsky_source' => $fromGraph ? 'graph_sync' : 'appview_cache',
     ];
 }
 
