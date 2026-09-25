@@ -349,7 +349,7 @@ if ($path === '/users/cmdr_nova/stats') {
     $apFollowers = count(ap_followers_list(CMDR_ACTOR_ID));
     $apFollowing = count(ap_following_list(CMDR_ACTOR_ID));
     $combined = function_exists('ap_profile_combined_follow_counts')
-        ? ap_profile_combined_follow_counts('cmdr_nova', $apFollowers, $apFollowing)
+        ? ap_profile_combined_follow_counts('cmdr_nova', $apFollowers, $apFollowing, false)
         : [
             'followers' => $apFollowers,
             'following' => $apFollowing,
