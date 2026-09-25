@@ -2141,7 +2141,7 @@ function ap_bsky_get_timeline(int $ownerUserId, int $limit = 40, ?string $cursor
  *
  * @return array{ok:bool,error?:string,feed?:list<array>,cursor?:?string,source?:string}
  */
-function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cursor = null): array
+function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cursor = null, ?string $actor = null): array
 {
     $tok = ap_bsky_access_token($ownerUserId, false);
     if (empty($tok['ok'])) {
@@ -2157,7 +2157,7 @@ function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cur
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $handle = (string) ($row['handle'] ?? '');
     $did = (string) ($row['did'] ?? '');
-    $actor = $handle !== '' ? $handle : $did;
+    $actor = is_string($actor) && trim($actor) !== '' ? trim($actor) : ($handle !== '' ? $handle : $did);
     if ($actor === '') {
         return ['ok' => false, 'error' => 'Missing Bluesky actor'];
     }
@@ -2201,6 +2201,32 @@ function ap_bsky_get_author_feed(int $ownerUserId, int $limit = 40, ?string $cur
             $feed = is_array($af['json']['feed'] ?? null) ? $af['json']['feed'] : [];
             ap_bsky_index_feed_items($feed, $ownerUserId, count($feed));
             ap_bsky_import_own_feed_as_local($ownerUserId, $feed);
+            // Drop durable cache rows in this page's window that AppView no longer returns.
+            $authorDid = $did;
+            if (!str_starts_with($actor, 'did:')) {
+                foreach ($feed as $feedItem) {
+                    if (!is_array($feedItem)) {
+                        continue;
+                    }
+                    $p = is_array($feedItem['post'] ?? null) ? $feedItem['post'] : [];
+                    $ad = trim((string) ($p['author']['did'] ?? ''));
+                    if (str_starts_with($ad, 'did:')) {
+                        $authorDid = $ad;
+                        break;
+                    }
+                }
+                if (!str_starts_with($authorDid, 'did:') && function_exists('ap_bsky_resolve_handle_did')) {
+                    $resolved = ap_bsky_resolve_handle_did(ltrim($actor, '@'), $ownerUserId);
+                    if (is_string($resolved) && str_starts_with($resolved, 'did:')) {
+                        $authorDid = $resolved;
+                    }
+                }
+            } else {
+                $authorDid = $actor;
+            }
+            if (str_starts_with($authorDid, 'did:')) {
+                ap_bsky_reconcile_author_cache_deletes($authorDid, $feed, $ownerUserId);
+            }
             return [
                 'ok' => true,
                 'feed' => $feed,
@@ -3990,11 +4016,265 @@ function ap_bsky_author_feed_refresh_enqueue(int $ownerUserId, string $authorDid
     }
 }
 
+
+/**
+ * Remove a Bluesky post from the durable cache when AppView/PDS say it is gone.
+ * Does not delete dual-publish map rows (those need local Note + federation Delete).
+ *
+ * @return bool True when a bsky_posts row was removed
+ */
+function ap_bsky_tombstone_uri(string $uri, ?int $ownerUserId = null): bool
+{
+    $uri = trim($uri);
+    if (!str_starts_with($uri, 'at://')) {
+        return false;
+    }
+    ap_bsky_posts_migrate();
+    $removed = false;
+    try {
+        $st = ap_db()->prepare('DELETE FROM bsky_posts WHERE bsky_uri = ?');
+        $st->execute([$uri]);
+        $removed = $st->rowCount() > 0;
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] tombstone_uri posts: ' . $e->getMessage());
+    }
+    // Drop orphan link rows that are not protecting a local crosspost map.
+    try {
+        ap_db()->prepare(
+            'DELETE FROM bsky_post_links
+             WHERE bsky_uri = ?
+               AND NOT EXISTS (SELECT 1 FROM bsky_crossposts c WHERE c.bsky_uri = bsky_post_links.bsky_uri)'
+        )->execute([$uri]);
+    } catch (Throwable $e) {
+        try {
+            ap_db()->prepare(
+                'DELETE FROM bsky_post_links
+                 WHERE bsky_uri = ?
+                   AND bsky_uri NOT IN (SELECT bsky_uri FROM bsky_crossposts WHERE bsky_uri IS NOT NULL)'
+            )->execute([$uri]);
+        } catch (Throwable $e2) {
+            // ignore
+        }
+    }
+    if ($removed) {
+        $owners = [];
+        if ($ownerUserId !== null && $ownerUserId > 0) {
+            $owners[] = $ownerUserId;
+        } else {
+            try {
+                foreach (ap_db()->query('SELECT owner_user_id FROM bsky_sessions')->fetchAll(PDO::FETCH_COLUMN) ?: [] as $oid) {
+                    $oid = (int) $oid;
+                    if ($oid > 0) {
+                        $owners[] = $oid;
+                    }
+                }
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+        foreach (array_unique($owners) as $oid) {
+            if (function_exists('ap_bsky_tl_cache_clear_owner')) {
+                ap_bsky_tl_cache_clear_owner((int) $oid);
+            }
+            if (function_exists('admin_tl_cache_clear_owner')) {
+                admin_tl_cache_clear_owner((int) $oid);
+            } elseif (function_exists('ap_redis_delete_pattern')) {
+                ap_redis_delete_pattern('vaak:fragment:tl:v1:' . (int) $oid . ':*');
+                ap_redis_delete_pattern('vaak:timeline:ranked:v1:*');
+            }
+        }
+    }
+    return $removed;
+}
+
+/**
+ * Batch-check AppView getPosts and tombstone URIs that no longer resolve.
+ *
+ * @param list<string> $uris
+ * @return int Number of tombstoned URIs
+ */
+function ap_bsky_purge_missing_uris(array $uris, ?int $ownerUserId = null): int
+{
+    $clean = [];
+    foreach ($uris as $uri) {
+        $uri = trim((string) $uri);
+        if (str_starts_with($uri, 'at://')) {
+            $clean[$uri] = true;
+        }
+    }
+    $list = array_keys($clean);
+    if ($list === []) {
+        return 0;
+    }
+    $tombstoned = 0;
+    foreach (array_chunk($list, 25) as $chunk) {
+        $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
+            'uris' => implode(',', $chunk),
+        ], null, null, 10);
+        $found = [];
+        if (!empty($got['ok']) && is_array($got['json']['posts'] ?? null)) {
+            foreach ($got['json']['posts'] as $post) {
+                if (!is_array($post)) {
+                    continue;
+                }
+                $u = trim((string) ($post['uri'] ?? ''));
+                if (str_starts_with($u, 'at://')) {
+                    $found[$u] = true;
+                }
+            }
+        } elseif (empty($got['ok'])) {
+            // Network/API failure — do not mass-tombstone on a bad response.
+            continue;
+        }
+        foreach ($chunk as $uri) {
+            if (!isset($found[$uri]) && ap_bsky_tombstone_uri($uri, $ownerUserId)) {
+                $tombstoned++;
+            }
+        }
+    }
+    return $tombstoned;
+}
+
+/**
+ * After an author feed page is fetched, drop local cache rows in that time
+ * window that AppView no longer returns (deleted on PDS).
+ *
+ * @param list<array<string,mixed>> $feed
+ * @return int Tombstoned count
+ */
+function ap_bsky_reconcile_author_cache_deletes(string $authorDid, array $feed, ?int $ownerUserId = null): int
+{
+    $authorDid = trim($authorDid);
+    if (!str_starts_with($authorDid, 'did:') || $feed === []) {
+        return 0;
+    }
+    $live = [];
+    $oldest = null;
+    foreach ($feed as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $post = is_array($item['post'] ?? null) ? $item['post'] : null;
+        if ($post === null) {
+            continue;
+        }
+        $uri = trim((string) ($post['uri'] ?? ''));
+        if (str_starts_with($uri, 'at://')) {
+            $live[$uri] = true;
+        }
+        $rec = is_array($post['record'] ?? null) ? $post['record'] : [];
+        $ts = strtotime((string) ($rec['createdAt'] ?? $post['indexedAt'] ?? '')) ?: null;
+        if ($ts !== null && ($oldest === null || $ts < $oldest)) {
+            $oldest = $ts;
+        }
+    }
+    if ($live === [] || $oldest === null) {
+        return 0;
+    }
+    // Small slack so clock skew does not keep a just-deleted sibling.
+    $cutoff = gmdate('c', max(0, $oldest - 120));
+    ap_bsky_posts_migrate();
+    $candidates = [];
+    try {
+        $st = ap_db()->prepare(
+            'SELECT bsky_uri FROM bsky_posts
+             WHERE author_did = ?
+               AND (
+                 (published_at IS NOT NULL AND published_at >= ?)
+                 OR (indexed_at IS NOT NULL AND indexed_at >= ?)
+               )'
+        );
+        $st->execute([$authorDid, $cutoff, $cutoff]);
+        $candidates = array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN) ?: []);
+    } catch (Throwable $e) {
+        return 0;
+    }
+    $n = 0;
+    foreach ($candidates as $uri) {
+        if ($uri === '' || isset($live[$uri])) {
+            continue;
+        }
+        // Confirm with AppView before deleting (author feed filters can omit posts).
+        if (ap_bsky_purge_missing_uris([$uri], $ownerUserId) > 0) {
+            $n++;
+        }
+    }
+    return $n;
+}
+
 /**
  * Prune durable Bluesky posts older than cutoff (ISO-8601), same window as events.
  *
  * @return array{posts:int,links:int}
  */
+
+/**
+ * After a Home timeline warm, sample recent cached posts from authors in the
+ * feed and tombstone any AppView says are gone (deleted on PDS).
+ *
+ * @param list<array<string,mixed>> $feed
+ * @return int
+ */
+function ap_bsky_reconcile_timeline_cache_deletes(int $ownerUserId, array $feed): int
+{
+    if ($ownerUserId < 1 || $feed === []) {
+        return 0;
+    }
+    $live = [];
+    $authors = [];
+    foreach ($feed as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $post = is_array($item['post'] ?? null) ? $item['post'] : null;
+        if ($post === null) {
+            continue;
+        }
+        $uri = trim((string) ($post['uri'] ?? ''));
+        if (str_starts_with($uri, 'at://')) {
+            $live[$uri] = true;
+        }
+        $did = trim((string) ($post['author']['did'] ?? ''));
+        if (str_starts_with($did, 'did:')) {
+            $authors[$did] = true;
+        }
+    }
+    $authorList = array_keys($authors);
+    if ($authorList === []) {
+        return 0;
+    }
+    // Cap authors sampled per warm to keep XRPC cheap.
+    $authorList = array_slice($authorList, 0, 12);
+    ap_bsky_posts_migrate();
+    $cutoff = gmdate('c', time() - 14 * 86400);
+    $ph = implode(',', array_fill(0, count($authorList), '?'));
+    $params = $authorList;
+    $params[] = $cutoff;
+    $candidates = [];
+    try {
+        $st = ap_db()->prepare(
+            "SELECT bsky_uri FROM bsky_posts
+             WHERE author_did IN ($ph)
+               AND seen_at >= ?
+             ORDER BY seen_at DESC
+             LIMIT 40"
+        );
+        $st->execute($params);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $uri) {
+            $uri = (string) $uri;
+            if ($uri !== '' && !isset($live[$uri])) {
+                $candidates[] = $uri;
+            }
+        }
+    } catch (Throwable $e) {
+        return 0;
+    }
+    if ($candidates === []) {
+        return 0;
+    }
+    return ap_bsky_purge_missing_uris(array_slice($candidates, 0, 25), $ownerUserId);
+}
+
 function ap_bsky_posts_prune(string $cutoffIso, bool $dryRun = false): array
 {
     ap_bsky_posts_migrate();
@@ -4526,6 +4806,13 @@ function ap_bsky_following_feed(
             error_log('[ap-bsky] delete reconcile: ' . $e->getMessage());
         }
     }
+    if ($isHead && $feed !== [] && function_exists('ap_bsky_reconcile_timeline_cache_deletes')) {
+        try {
+            ap_bsky_reconcile_timeline_cache_deletes($ownerUserId, $feed);
+        } catch (Throwable $e) {
+            error_log('[ap-bsky] timeline delete reconcile: ' . $e->getMessage());
+        }
+    }
 
     $mergePending = !$includeMerge && !empty($prefs['mergeFeedEnabled']) && $isHead && ($prefs['savedFeedUris'] ?? []) !== [];
 
@@ -4830,8 +5117,12 @@ function ap_bsky_quote_preview(array $post): ?array
     }
     $vType = (string) ($viewRecord['$type'] ?? '');
     if ($vType !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Blocked') || str_contains($vType, 'Detached'))) {
+        $goneUri = isset($viewRecord['uri']) ? trim((string) $viewRecord['uri']) : '';
+        if ($goneUri !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Detached'))) {
+            ap_bsky_tombstone_uri($goneUri, null);
+        }
         return [
-            'uri' => isset($viewRecord['uri']) ? (string) $viewRecord['uri'] : null,
+            'uri' => $goneUri !== '' ? $goneUri : null,
             'handle' => '',
             'display' => 'Unavailable',
             'text' => str_contains($vType, 'Blocked') ? 'Quoted post is blocked' : 'Quoted post unavailable',
@@ -5047,6 +5338,8 @@ function ap_bsky_post_preview_from_url(string $url, int $ownerUserId = 0, bool $
     $posts = is_array($got['json']['posts'] ?? null) ? $got['json']['posts'] : [];
     $post = is_array($posts[0] ?? null) ? $posts[0] : null;
     if ($post === null) {
+        // AppView says the URI is gone — drop durable cache so Home/profile stop showing it.
+        ap_bsky_tombstone_uri($atUri, $ownerUserId > 0 ? $ownerUserId : null);
         return null;
     }
     // Persist for next Home paint (and native Bluesky mix).
@@ -5131,6 +5424,7 @@ function ap_bsky_feed_item_from_any_url(string $url, int $ownerUserId = 0, bool 
     $posts = is_array($got['json']['posts'] ?? null) ? $got['json']['posts'] : [];
     $post = is_array($posts[0] ?? null) ? $posts[0] : null;
     if ($post === null) {
+        ap_bsky_tombstone_uri($atUri, $ownerUserId > 0 ? $ownerUserId : null);
         return null;
     }
     $item = ['post' => $post, 'bsky_uri' => (string) ($post['uri'] ?? $atUri)];
@@ -7119,6 +7413,12 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                             isset($result['cursor']) && is_string($result['cursor']) ? $result['cursor'] : null,
                             (string) ($result['source'] ?? 'home')
                         );
+                        if (function_exists('ap_bsky_reconcile_deleted_crossposts')) {
+                            ap_bsky_reconcile_deleted_crossposts($owner, 12);
+                        }
+                        if ($feed !== [] && function_exists('ap_bsky_reconcile_timeline_cache_deletes')) {
+                            ap_bsky_reconcile_timeline_cache_deletes($owner, $feed);
+                        }
                     }
                 } elseif ($kind === 'follows') {
                     $result = function_exists('ap_bsky_follow_sync_worker')
@@ -7139,6 +7439,16 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
                 throw new RuntimeException((string) ($result['error'] ?? 'Profile fetch failed'));
             }
             ap_bsky_actor_profile_cache_upsert($actorRef, $owner, $result['profile']);
+            // Refresh recent posts + tombstone deletes in that window.
+            $feedActor = trim((string) ($result['profile']['did'] ?? $actorRef));
+            if ($feedActor === '') {
+                $feedActor = $actorRef;
+            }
+            $feedRes = ap_bsky_get_author_feed($owner, 40, null, $feedActor);
+            if (empty($feedRes['ok'])) {
+                // Profile succeeded; feed refresh is best-effort (private/blocked authors).
+                error_log('[ap-bsky] author feed refresh soft-fail owner=' . $owner . ' actor=' . $feedActor . ' err=' . (string) ($feedRes['error'] ?? 'fail'));
+            }
             $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'succeeded', attempts = 0, locked_at = NULL, last_error = NULL WHERE owner_user_id = ? AND actor_ref = ?")->execute([$owner, $actorRef]);
             $stats['succeeded']++;
         } catch (Throwable $e) {
