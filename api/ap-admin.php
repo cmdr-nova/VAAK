@@ -883,7 +883,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $notice = 'Favourited.';
                 } elseif ($action === 'unfavourite_status') {
                     $interactKind = 'favourite';
-                    $prev = ap_masto_favourite_remove($statusId);
+                    $prev = ap_masto_favourite_remove($statusId, null, $objectId !== '' ? $objectId : null);
                     if ($prev && !empty($prev['like_activity_id']) && !empty($prev['object_id']) && !empty($prev['target_actor'])) {
                         ap_cmdr_send_undo_like((string) $prev['like_activity_id'], (string) $prev['object_id'], (string) $prev['target_actor']);
                     }
@@ -898,7 +898,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     $notice = 'Bookmarked.';
                 } else {
                     $interactKind = 'bookmark';
-                    ap_masto_bookmark_remove($statusId);
+                    ap_masto_bookmark_remove($statusId, null, $objectId !== '' ? $objectId : null);
                     $interactOk = true;
                     $interactActive = false;
                     $notice = 'Bookmark removed.';
@@ -2873,6 +2873,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if ($action === 'bsky_unlike') {
                     $ajaxOut['liked'] = false;
                     $ajaxOut['record_uri'] = '';
+                    if (!empty($res['ok']) && function_exists('ap_masto_favourite_remove')) {
+                        $unlikeKeys = admin_bsky_bookmark_keys($subject, $vaakOwnerId);
+                        ap_masto_favourite_remove(
+                            (string) ($unlikeKeys['status_id'] ?? ''),
+                            $vaakOwnerId,
+                            (string) ($unlikeKeys['object_id'] ?? $subject)
+                        );
+                    }
                     $notice = !empty($res['ok']) ? 'Unliked on Bluesky.' : ('Unlike failed: ' . $ajaxOut['error']);
                 } else {
                     $ajaxOut['reposted'] = false;
@@ -2908,9 +2916,15 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 if (function_exists('ap_bsky_tl_cache_clear_owner')) {
                     ap_bsky_tl_cache_clear_owner($vaakOwnerId);
                 }
-                if ($bmKeys['status_id'] !== '' && function_exists('ap_masto_bookmark_remove')) {
+                if (($bmKeys['status_id'] !== '' || $bmKeys['object_id'] !== '')
+                    && function_exists('ap_masto_bookmark_remove')
+                ) {
                     try {
-                        ap_masto_bookmark_remove($bmKeys['status_id'], $vaakOwnerId);
+                        ap_masto_bookmark_remove(
+                            (string) ($bmKeys['status_id'] ?? ''),
+                            $vaakOwnerId,
+                            (string) ($bmKeys['object_id'] ?? $subject)
+                        );
                     } catch (Throwable $e) {
                         // ignore
                     }
@@ -2932,8 +2946,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $error = $notice;
                 $notice = '';
             }
-            if (!empty($res['ok']) && function_exists('ap_bsky_tl_cache_clear_owner')) {
-                ap_bsky_tl_cache_clear_owner($vaakOwnerId);
+            if (!empty($res['ok'])) {
+                if (function_exists('ap_bsky_tl_cache_clear_owner')) {
+                    ap_bsky_tl_cache_clear_owner($vaakOwnerId);
+                }
+                $likeKeys = admin_bsky_bookmark_keys($subject, $vaakOwnerId);
+                $ajaxOut['status_id'] = $likeKeys['status_id'];
+                $ajaxOut['object_id'] = $likeKeys['object_id'];
+                if ($likeKeys['status_id'] !== '' && function_exists('ap_masto_favourite_add')) {
+                    try {
+                        ap_masto_favourite_add(
+                            $likeKeys['status_id'],
+                            $likeKeys['object_id'],
+                            null,
+                            is_string($res['uri'] ?? null) ? (string) $res['uri'] : null,
+                            $vaakOwnerId
+                        );
+                    } catch (Throwable $e) {
+                        // ignore
+                    }
+                }
             }
         } elseif ($action === 'bsky_repost') {
             $res = ap_bsky_create_repost($vaakOwnerId, ['uri' => $subject, 'cid' => $cid]);
@@ -9603,8 +9635,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     if ($statusId === '' && $eventId > 0) {
         $statusId = ap_masto_event_status_id($eventId, isset($e['created_at']) ? (string) $e['created_at'] : null);
     }
-    $fav = $statusId !== '' && ap_masto_status_is_favourited($statusId);
-    $bm = $statusId !== '' && ap_masto_status_is_bookmarked($statusId);
+    $fav = ($statusId !== '' || $objectId !== '')
+        && ap_masto_status_is_favourited($statusId, null, $objectId !== '' ? $objectId : null);
+    $bm = ($statusId !== '' || $objectId !== '')
+        && ap_masto_status_is_bookmarked($statusId, null, $objectId !== '' ? $objectId : null);
     $boosted = $statusId !== '' && ap_masto_status_is_reblogged($statusId);
     $isOwnEvent = $aid !== '' && vaak_is_own_url($aid);
     $isOtherLocal = $aid !== ''
@@ -10935,9 +10969,11 @@ function admin_render_masto_status_card(
     }
     $following = $actorRef !== '' && admin_is_following($followingIds, $actorRef);
     $sid = (string) ($st['id'] ?? '');
-    $fav = $sid !== '' && function_exists('ap_masto_status_is_favourited') && ap_masto_status_is_favourited($sid);
+    $fav = ($sid !== '' || $uri !== '') && function_exists('ap_masto_status_is_favourited')
+        && ap_masto_status_is_favourited($sid, null, $uri !== '' ? $uri : null);
     $boosted = $sid !== '' && function_exists('ap_masto_status_is_reblogged') && ap_masto_status_is_reblogged($sid);
-    $bm = $sid !== '' && function_exists('ap_masto_status_is_bookmarked') && ap_masto_status_is_bookmarked($sid);
+    $bm = ($sid !== '' || $uri !== '') && function_exists('ap_masto_status_is_bookmarked')
+        && ap_masto_status_is_bookmarked($sid, null, $uri !== '' ? $uri : null);
     $isLocal = $uri !== '' && vaak_is_own_url($uri);
     $cwSpoiler = trim((string) ($st['spoiler_text'] ?? ''));
     $cwSensitive = !empty($st['sensitive']) || $cwSpoiler !== '';
@@ -11151,6 +11187,7 @@ function admin_render_masto_status_card(
                 <?php
                   $stBskyAt = '';
                   $stBskyCid = '';
+                  $stBskyLikeRecord = '';
                   if (str_starts_with($uri, 'at://')) {
                       $stBskyAt = $uri;
                   } elseif (function_exists('ap_bsky_at_uri_from_any_url')) {
@@ -11163,13 +11200,47 @@ function admin_render_masto_status_card(
                       $stBskyItem = ap_bsky_post_item_by_uri($stBskyAt);
                       if (is_array($stBskyItem) && is_array($stBskyItem['post'] ?? null)) {
                           $stBskyCid = (string) ($stBskyItem['post']['cid'] ?? '');
+                          $stBskyViewer = is_array($stBskyItem['post']['viewer'] ?? null)
+                              ? $stBskyItem['post']['viewer'] : [];
+                          $stBskyLikeRecord = is_string($stBskyViewer['like'] ?? null)
+                              ? (string) $stBskyViewer['like'] : '';
+                          if ($stBskyLikeRecord !== '') {
+                              $fav = true;
+                          }
+                      }
+                  }
+                  $stBskyBmKeys = $stBskyAt !== ''
+                      ? admin_bsky_bookmark_keys($stBskyAt, (int) ($GLOBALS['vaak_owner_id'] ?? 0))
+                      : ['status_id' => $sid, 'object_id' => $uri];
+                  if (!$bm && $stBskyBmKeys['status_id'] !== ''
+                      && function_exists('ap_masto_status_is_bookmarked')
+                      && ap_masto_status_is_bookmarked(
+                          (string) $stBskyBmKeys['status_id'],
+                          null,
+                          (string) ($stBskyBmKeys['object_id'] ?? $uri)
+                      )
+                  ) {
+                      $bm = true;
+                  }
+                  $stBskyObjectRef = $uri;
+                  if (function_exists('ap_bsky_https_url_from_at_uri') && $stBskyAt !== '') {
+                      $httpsRef = ap_bsky_https_url_from_at_uri($stBskyAt, null);
+                      if (is_string($httpsRef) && str_starts_with($httpsRef, 'https://')) {
+                          $stBskyObjectRef = $httpsRef;
                       }
                   }
                 ?>
                 <button type="button" class="icon-btn bsky-action<?= $fav ? ' on' : '' ?>" data-bsky-action="like"
-                  data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>" data-record-uri=""
-                  data-object-ref="<?= h($uri) ?>" data-return-view="<?= h($returnView) ?>"
+                  data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>" data-record-uri="<?= h($stBskyLikeRecord) ?>"
+                  data-object-ref="<?= h($stBskyObjectRef) ?>" data-return-view="<?= h($returnView) ?>"
                   title="<?= $fav ? 'Unlike' : 'Like on Bluesky' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like on Bluesky' ?>" aria-pressed="<?= $fav ? 'true' : 'false' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                <button type="button" class="icon-btn bsky-action<?= $bm ? ' on' : '' ?>" data-bsky-action="bookmark"
+                  data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>"
+                  data-status-id="<?= h((string) ($stBskyBmKeys['status_id'] ?? '')) ?>"
+                  data-object-id="<?= h((string) ($stBskyBmKeys['object_id'] ?? $uri)) ?>"
+                  data-object-ref="<?= h($stBskyObjectRef) ?>" data-return-view="<?= h($returnView) ?>"
+                  data-bm-picker="<?= $bm ? '1' : '0' ?>"
+                  title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bm ? 'true' : 'false' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
               <?php elseif ($sid !== '' && $uri !== ''): ?>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
@@ -11372,8 +11443,10 @@ function admin_render_remote_boost_card(
     $alreadyFollowing = $origActor !== '' && (
         !empty($followingIds[$origActor]) || !empty($followingIds[rtrim($origActor, '/')])
     );
-    $fav = $statusId !== '' && ap_masto_status_is_favourited($statusId);
-    $bm = $statusId !== '' && ap_masto_status_is_bookmarked($statusId);
+    $fav = ($statusId !== '' || $objectId !== '')
+        && ap_masto_status_is_favourited($statusId, null, $objectId !== '' ? $objectId : null);
+    $bm = ($statusId !== '' || $objectId !== '')
+        && ap_masto_status_is_bookmarked($statusId, null, $objectId !== '' ? $objectId : null);
     $boosted = $statusId !== '' && ap_masto_status_is_reblogged($statusId);
     $replyObjectId = $objectId;
     $canReply = $objectId !== '' && str_starts_with($objectId, 'https://');
@@ -11588,8 +11661,10 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $alreadyFollowing = $targetActor !== '' && (
         !empty($followingIds[$targetActor]) || !empty($followingIds[rtrim($targetActor, '/')])
     );
-    $fav = $statusId !== '' && ap_masto_status_is_favourited($statusId);
-    $bm = $statusId !== '' && ap_masto_status_is_bookmarked($statusId);
+    $fav = ($statusId !== '' || $objectId !== '')
+        && ap_masto_status_is_favourited($statusId, null, $objectId !== '' ? $objectId : null);
+    $bm = ($statusId !== '' || $objectId !== '')
+        && ap_masto_status_is_bookmarked($statusId, null, $objectId !== '' ? $objectId : null);
     $boosted = true;
     ?>
           <article class="tweet tweet-boost"<?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
@@ -14162,10 +14237,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         } elseif (in_array($nType, ['mention', 'quote'], true) && $nStatusId !== ''
             && preg_match('/^\d+$/', $nStatusId) && $nStatusUri !== ''
             && !str_contains($nStatusUri, '/bites-received/')) {
-            $nFav = function_exists('ap_masto_status_is_favourited') && ap_masto_status_is_favourited($nStatusId);
             $nObjectId = function_exists('ap_masto_mention_target_object_id')
                 ? ap_masto_mention_target_object_id($nStatusUri)
                 : $nStatusUri;
+            $nFav = function_exists('ap_masto_status_is_favourited')
+                && ap_masto_status_is_favourited($nStatusId, null, $nObjectId !== '' ? $nObjectId : null);
             ?>
         <form method="post" action="?view=mentions" style="display:inline">
           <input type="hidden" name="action" value="<?= $nFav ? 'unfavourite_status' : 'favourite_status' ?>">

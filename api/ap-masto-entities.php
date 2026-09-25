@@ -424,14 +424,15 @@ function ap_masto_disambiguate_mod_id(
     return $best;
 }
 
-/** Fill favourited/bookmarked/reblogged from local masto_* tables (status id string). */
+/** Fill favourited/bookmarked/reblogged from local masto_* tables (status id + object URL). */
 function ap_masto_apply_interaction_flags(array $status): array
 {
     $id = (string) ($status['id'] ?? '');
-    if ($id !== '') {
-        $status['favourited'] = ap_masto_status_is_favourited($id);
-        $status['bookmarked'] = ap_masto_status_is_bookmarked($id);
-        $status['reblogged'] = ap_masto_status_is_reblogged($id);
+    $objectId = (string) ($status['uri'] ?? $status['url'] ?? '');
+    if ($id !== '' || $objectId !== '') {
+        $status['favourited'] = ap_masto_status_is_favourited($id, null, $objectId !== '' ? $objectId : null);
+        $status['bookmarked'] = ap_masto_status_is_bookmarked($id, null, $objectId !== '' ? $objectId : null);
+        $status['reblogged'] = $id !== '' && ap_masto_status_is_reblogged($id);
     }
     if (isset($status['reblog']) && is_array($status['reblog'])) {
         $status['reblog'] = ap_masto_apply_interaction_flags($status['reblog']);
@@ -9818,6 +9819,20 @@ function ap_masto_search_statuses(string $q, int $limit): array
                                 continue;
                             }
                         }
+                        // Prefer Create/Update for the same object URL so fav/bookmark
+                        // keys match Open (which resolves via ap_event_by_object_id).
+                        $evType = strtolower((string) ($row['type'] ?? ''));
+                        $evObject = rtrim((string) ($row['object_id'] ?? ''), '/');
+                        if ($evObject !== '' && !in_array($evType, ['create', 'update'], true)
+                            && function_exists('ap_event_by_object_id')
+                        ) {
+                            $canon = ap_event_by_object_id($evObject);
+                            if (is_array($canon) && !empty($canon['id'])
+                                && (int) ($canon['id'] ?? 0) !== (int) ($row['id'] ?? 0)
+                            ) {
+                                $row = $canon;
+                            }
+                        }
                         $status = ap_masto_status_from_event($row);
                         if (is_array($status)) {
                             $push($status);
@@ -9930,6 +9945,18 @@ function ap_masto_search_statuses(string $q, int $limit): array
                 $sum = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
                 if (!preg_match('/#' . preg_quote($tagName, '/') . '\b/ui', $sum)) {
                     continue;
+                }
+            }
+            $evType = strtolower((string) ($row['type'] ?? ''));
+            $evObject = rtrim((string) ($row['object_id'] ?? ''), '/');
+            if ($evObject !== '' && !in_array($evType, ['create', 'update'], true)
+                && function_exists('ap_event_by_object_id')
+            ) {
+                $canon = ap_event_by_object_id($evObject);
+                if (is_array($canon) && !empty($canon['id'])
+                    && (int) ($canon['id'] ?? 0) !== (int) ($row['id'] ?? 0)
+                ) {
+                    $row = $canon;
                 }
             }
             $status = ap_masto_status_from_event($row);

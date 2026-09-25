@@ -2343,7 +2343,7 @@ function ap_masto_api(string $method, string $path): void
             return;
         }
         if ($action === 'unfavourite') {
-            $prev = ap_masto_favourite_remove($statusId);
+            $prev = ap_masto_favourite_remove($statusId, null, $objectId !== '' ? $objectId : null);
             if ($prev && !empty($prev['like_activity_id']) && str_starts_with((string) $prev['like_activity_id'], 'at://')) {
                 require_once __DIR__ . '/ap-bsky.php';
                 $ownerId = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
@@ -2372,7 +2372,7 @@ function ap_masto_api(string $method, string $path): void
             return;
         }
         // unbookmark
-        ap_masto_bookmark_remove($statusId);
+        ap_masto_bookmark_remove($statusId, null, $objectId !== '' ? $objectId : null);
         $status['bookmarked'] = false;
         ap_masto_json($status);
         return;

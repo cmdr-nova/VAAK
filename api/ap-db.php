@@ -9921,33 +9921,187 @@ function ap_masto_status_unpin(int $localId): array
 /**
  * Request-scoped interaction flags (fav / bookmark / reblog).
  * Prefill via ap_masto_status_flags_prefetch() to avoid N+1 on timelines.
+ * object_id hits are memoized under fav_obj / bm_obj so search Announce ids and
+ * Open Create ids for the same post URL stay consistent.
  *
- * @var array{fav?:array<string,bool>,bm?:array<string,bool>,rb?:array<string,bool>}|null
+ * @var array{fav?:array<string,bool>,bm?:array<string,bool>,rb?:array<string,bool>,fav_obj?:array<string,bool>,bm_obj?:array<string,bool>}|null
  */
 $GLOBALS['ap_masto_flag_memo'] = $GLOBALS['ap_masto_flag_memo'] ?? null;
 
+/** @return list<string> */
+function ap_masto_object_id_lookup_keys(string $objectId): array
+{
+    $objectId = trim($objectId);
+    if ($objectId === '') {
+        return [];
+    }
+    $keys = [];
+    $add = static function (string $v) use (&$keys): void {
+        $v = trim($v);
+        if ($v === '') {
+            return;
+        }
+        $keys[$v] = true;
+        $trimmed = rtrim($v, '/');
+        if ($trimmed !== '') {
+            $keys[$trimmed] = true;
+            $keys[$trimmed . '/'] = true;
+        }
+    };
+    $add($objectId);
+    // Bluesky cards may store at://, https://bsky.app/..., or bsky:<hash>.
+    if (str_starts_with($objectId, 'at://')) {
+        $add('bsky:' . substr(hash('sha256', $objectId), 0, 32));
+        if (function_exists('ap_bsky_https_url_from_at_uri')) {
+            $https = ap_bsky_https_url_from_at_uri($objectId, null);
+            if (is_string($https) && str_starts_with($https, 'https://')) {
+                $add($https);
+            }
+        }
+    } elseif (str_contains($objectId, 'bsky.app/') || str_starts_with($objectId, 'bsky:')) {
+        if (function_exists('ap_bsky_at_uri_from_any_url')) {
+            $at = ap_bsky_at_uri_from_any_url($objectId);
+            if (is_string($at) && str_starts_with($at, 'at://')) {
+                $add($at);
+                $add('bsky:' . substr(hash('sha256', $at), 0, 32));
+            }
+        }
+    }
+    return array_keys($keys);
+}
+
+/**
+ * Stable status_id + object_id for fav/bookmark writes.
+ * Prefers local note snowflake, then Create/Update event snowflake, so search
+ * Announce rows and Open Create rows share one key for the same post URL.
+ *
+ * @return array{status_id:string,object_id:string}
+ */
+function ap_masto_canonical_interaction_keys(string $statusId, string $objectId = ''): array
+{
+    $statusId = trim($statusId);
+    $objectId = trim($objectId);
+    $canonObject = $objectId !== '' ? rtrim($objectId, '/') : '';
+
+    if ($canonObject !== '' && str_starts_with($canonObject, 'https://')) {
+        try {
+            if (function_exists('vaak_is_own_url') && vaak_is_own_url($canonObject)
+                && function_exists('ap_masto_status_by_note_id')
+            ) {
+                $local = ap_masto_status_by_note_id($canonObject);
+                if (is_array($local) && !empty($local['local_id']) && function_exists('ap_masto_snowflake_id')) {
+                    return [
+                        'status_id' => (string) ap_masto_snowflake_id(
+                            (string) ($local['published'] ?? gmdate('c')),
+                            (int) $local['local_id'],
+                            0
+                        ),
+                        'object_id' => $canonObject,
+                    ];
+                }
+            }
+            if (function_exists('ap_event_by_object_id')) {
+                $ev = ap_event_by_object_id($canonObject);
+                if (is_array($ev) && !empty($ev['id']) && function_exists('ap_masto_event_status_id')) {
+                    $type = strtolower((string) ($ev['type'] ?? ''));
+                    if (in_array($type, ['create', 'update', ''], true) || $type === '') {
+                        return [
+                            'status_id' => ap_masto_event_status_id(
+                                (int) $ev['id'],
+                                isset($ev['created_at']) ? (string) $ev['created_at'] : null
+                            ),
+                            'object_id' => $canonObject,
+                        ];
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // keep caller keys
+        }
+    }
+
+    if ($canonObject !== '' && (str_starts_with($canonObject, 'at://') || str_contains($canonObject, 'bsky.app/'))) {
+        $at = $canonObject;
+        if (!str_starts_with($at, 'at://') && function_exists('ap_bsky_at_uri_from_any_url')) {
+            $converted = ap_bsky_at_uri_from_any_url($canonObject);
+            if (is_string($converted) && str_starts_with($converted, 'at://')) {
+                $at = $converted;
+            }
+        }
+        if (str_starts_with($at, 'at://')) {
+            $owner = function_exists('ap_db_default_owner_user_id') ? (int) ap_db_default_owner_user_id() : 0;
+            if (function_exists('ap_bsky_local_note_id_for_at_uri')) {
+                $noteId = ap_bsky_local_note_id_for_at_uri($at, $owner);
+                if (is_string($noteId) && $noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
+                    $st = ap_masto_status_by_note_id($noteId);
+                    if (is_array($st) && !empty($st['local_id']) && function_exists('ap_masto_snowflake_id')) {
+                        return [
+                            'status_id' => (string) ap_masto_snowflake_id(
+                                (string) ($st['published'] ?? gmdate('c')),
+                                (int) $st['local_id'],
+                                0
+                            ),
+                            'object_id' => $noteId,
+                        ];
+                    }
+                }
+            }
+            $https = $canonObject;
+            if (function_exists('ap_bsky_https_url_from_at_uri')) {
+                $mapped = ap_bsky_https_url_from_at_uri($at, null);
+                if (is_string($mapped) && str_starts_with($mapped, 'https://')) {
+                    $https = $mapped;
+                }
+            }
+            return [
+                'status_id' => 'bsky:' . substr(hash('sha256', $at), 0, 32),
+                'object_id' => $https,
+            ];
+        }
+    }
+
+    return [
+        'status_id' => $statusId !== '' ? $statusId : ($canonObject !== '' ? $canonObject : ''),
+        'object_id' => $canonObject !== '' ? $canonObject : $statusId,
+    ];
+}
+
 /**
  * Batch-load fav/bookmark/reblog flags for many Mastodon status ids (one query each).
+ * Optional object URLs also mark matching status ids via object_id rows.
  *
  * @param list<string|int> $statusIds
+ * @param list<string> $objectIds
  */
-function ap_masto_status_flags_prefetch(array $statusIds): void
+function ap_masto_status_flags_prefetch(array $statusIds, array $objectIds = []): void
 {
     $ids = [];
     foreach ($statusIds as $sid) {
         $s = trim((string) $sid);
-        if ($s !== '' && preg_match('/^\d+$/', $s)) {
+        if ($s !== '') {
             $ids[$s] = true;
         }
     }
-    if ($ids === []) {
+    $objKeys = [];
+    foreach ($objectIds as $oid) {
+        foreach (ap_masto_object_id_lookup_keys((string) $oid) as $k) {
+            $objKeys[$k] = true;
+        }
+    }
+    if ($ids === [] && $objKeys === []) {
         return;
     }
     $list = array_keys($ids);
     if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
-        $GLOBALS['ap_masto_flag_memo'] = ['fav' => [], 'bm' => [], 'rb' => []];
+        $GLOBALS['ap_masto_flag_memo'] = ['fav' => [], 'bm' => [], 'rb' => [], 'fav_obj' => [], 'bm_obj' => []];
     }
     $memo = &$GLOBALS['ap_masto_flag_memo'];
+    if (!isset($memo['fav_obj']) || !is_array($memo['fav_obj'])) {
+        $memo['fav_obj'] = [];
+    }
+    if (!isset($memo['bm_obj']) || !is_array($memo['bm_obj'])) {
+        $memo['bm_obj'] = [];
+    }
     foreach ($list as $id) {
         if (!isset($memo['fav'][$id])) {
             $memo['fav'][$id] = false;
@@ -9959,11 +10113,13 @@ function ap_masto_status_flags_prefetch(array $statusIds): void
             $memo['rb'][$id] = false;
         }
     }
-    $chunks = array_chunk($list, 400);
     $ownerUserId = ap_db_default_owner_user_id();
     try {
         $db = ap_db();
-        foreach ($chunks as $chunk) {
+        foreach (array_chunk($list, 400) as $chunk) {
+            if ($chunk === []) {
+                continue;
+            }
             $ph = implode(',', array_fill(0, count($chunk), '?'));
             $params = array_merge([$ownerUserId], $chunk);
             $st = $db->prepare("SELECT status_id FROM masto_favourites WHERE owner_user_id = ? AND status_id IN ($ph)");
@@ -9976,10 +10132,36 @@ function ap_masto_status_flags_prefetch(array $statusIds): void
             foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
                 $memo['bm'][(string) $hit] = true;
             }
-            $st = $db->prepare("SELECT status_id FROM masto_reblogs WHERE owner_user_id = ? AND status_id IN ($ph)");
+            $numeric = array_values(array_filter($chunk, static fn($v) => (bool) preg_match('/^\d+$/', (string) $v)));
+            if ($numeric !== []) {
+                $phN = implode(',', array_fill(0, count($numeric), '?'));
+                $st = $db->prepare("SELECT status_id FROM masto_reblogs WHERE owner_user_id = ? AND status_id IN ($phN)");
+                $st->execute(array_merge([$ownerUserId], $numeric));
+                foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
+                    $memo['rb'][(string) $hit] = true;
+                }
+            }
+        }
+        $objList = array_keys($objKeys);
+        foreach (array_chunk($objList, 200) as $chunk) {
+            if ($chunk === []) {
+                continue;
+            }
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $params = array_merge([$ownerUserId], $chunk);
+            $st = $db->prepare("SELECT object_id FROM masto_favourites WHERE owner_user_id = ? AND object_id IN ($ph)");
             $st->execute($params);
             foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
-                $memo['rb'][(string) $hit] = true;
+                foreach (ap_masto_object_id_lookup_keys((string) $hit) as $k) {
+                    $memo['fav_obj'][$k] = true;
+                }
+            }
+            $st = $db->prepare("SELECT object_id FROM masto_bookmarks WHERE owner_user_id = ? AND object_id IN ($ph)");
+            $st->execute($params);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $hit) {
+                foreach (ap_masto_object_id_lookup_keys((string) $hit) as $k) {
+                    $memo['bm_obj'][$k] = true;
+                }
             }
         }
     } catch (Throwable $e) {
@@ -9987,48 +10169,111 @@ function ap_masto_status_flags_prefetch(array $statusIds): void
     }
 }
 
-function ap_masto_status_is_favourited(string $statusId, ?int $ownerUserId = null): bool
+function ap_masto_status_is_favourited(string $statusId, ?int $ownerUserId = null, ?string $objectId = null): bool
 {
-    if ($statusId === '') {
+    $statusId = trim($statusId);
+    $objectId = $objectId !== null ? trim($objectId) : '';
+    if ($statusId === '' && $objectId === '') {
         return false;
     }
     $memo = $GLOBALS['ap_masto_flag_memo'] ?? null;
-    if (is_array($memo) && isset($memo['fav'][$statusId])) {
-        return (bool) $memo['fav'][$statusId];
+    if ($statusId !== '' && is_array($memo) && isset($memo['fav'][$statusId]) && $memo['fav'][$statusId]) {
+        return true;
     }
+    if ($objectId !== '' && is_array($memo) && !empty($memo['fav_obj'])) {
+        foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+            if (!empty($memo['fav_obj'][$k])) {
+                if ($statusId !== '') {
+                    $GLOBALS['ap_masto_flag_memo']['fav'][$statusId] = true;
+                }
+                return true;
+            }
+        }
+    }
+    // Memoized negative for status_id alone — still allow object_id fallback below.
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     try {
-        $st = ap_db()->prepare('SELECT 1 FROM masto_favourites WHERE owner_user_id = ? AND status_id = ?');
-        $st->execute([$ownerUserId, $statusId]);
-        $hit = (bool) $st->fetchColumn();
-        if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
-            $GLOBALS['ap_masto_flag_memo'] = ['fav' => [], 'bm' => [], 'rb' => []];
+        $hit = false;
+        if ($statusId !== '') {
+            $st = ap_db()->prepare('SELECT 1 FROM masto_favourites WHERE owner_user_id = ? AND status_id = ?');
+            $st->execute([$ownerUserId, $statusId]);
+            $hit = (bool) $st->fetchColumn();
         }
-        $GLOBALS['ap_masto_flag_memo']['fav'][$statusId] = $hit;
+        if (!$hit && $objectId !== '') {
+            $keys = ap_masto_object_id_lookup_keys($objectId);
+            if ($keys !== []) {
+                $ph = implode(',', array_fill(0, count($keys), '?'));
+                $st = ap_db()->prepare("SELECT 1 FROM masto_favourites WHERE owner_user_id = ? AND object_id IN ($ph) LIMIT 1");
+                $st->execute(array_merge([$ownerUserId], $keys));
+                $hit = (bool) $st->fetchColumn();
+            }
+        }
+        if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
+            $GLOBALS['ap_masto_flag_memo'] = ['fav' => [], 'bm' => [], 'rb' => [], 'fav_obj' => [], 'bm_obj' => []];
+        }
+        if ($statusId !== '') {
+            $GLOBALS['ap_masto_flag_memo']['fav'][$statusId] = $hit;
+        }
+        if ($hit && $objectId !== '') {
+            foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+                $GLOBALS['ap_masto_flag_memo']['fav_obj'][$k] = true;
+            }
+        }
         return $hit;
     } catch (Throwable $e) {
         return false;
     }
 }
 
-function ap_masto_status_is_bookmarked(string $statusId, ?int $ownerUserId = null): bool
+function ap_masto_status_is_bookmarked(string $statusId, ?int $ownerUserId = null, ?string $objectId = null): bool
 {
-    if ($statusId === '') {
+    $statusId = trim($statusId);
+    $objectId = $objectId !== null ? trim($objectId) : '';
+    if ($statusId === '' && $objectId === '') {
         return false;
     }
     $memo = $GLOBALS['ap_masto_flag_memo'] ?? null;
-    if (is_array($memo) && isset($memo['bm'][$statusId])) {
-        return (bool) $memo['bm'][$statusId];
+    if ($statusId !== '' && is_array($memo) && isset($memo['bm'][$statusId]) && $memo['bm'][$statusId]) {
+        return true;
+    }
+    if ($objectId !== '' && is_array($memo) && !empty($memo['bm_obj'])) {
+        foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+            if (!empty($memo['bm_obj'][$k])) {
+                if ($statusId !== '') {
+                    $GLOBALS['ap_masto_flag_memo']['bm'][$statusId] = true;
+                }
+                return true;
+            }
+        }
     }
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
     try {
-        $st = ap_db()->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?');
-        $st->execute([$ownerUserId, $statusId]);
-        $hit = (bool) $st->fetchColumn();
-        if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
-            $GLOBALS['ap_masto_flag_memo'] = ['fav' => [], 'bm' => [], 'rb' => []];
+        $hit = false;
+        if ($statusId !== '') {
+            $st = ap_db()->prepare('SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?');
+            $st->execute([$ownerUserId, $statusId]);
+            $hit = (bool) $st->fetchColumn();
         }
-        $GLOBALS['ap_masto_flag_memo']['bm'][$statusId] = $hit;
+        if (!$hit && $objectId !== '') {
+            $keys = ap_masto_object_id_lookup_keys($objectId);
+            if ($keys !== []) {
+                $ph = implode(',', array_fill(0, count($keys), '?'));
+                $st = ap_db()->prepare("SELECT 1 FROM masto_bookmarks WHERE owner_user_id = ? AND object_id IN ($ph) LIMIT 1");
+                $st->execute(array_merge([$ownerUserId], $keys));
+                $hit = (bool) $st->fetchColumn();
+            }
+        }
+        if (!isset($GLOBALS['ap_masto_flag_memo']) || !is_array($GLOBALS['ap_masto_flag_memo'])) {
+            $GLOBALS['ap_masto_flag_memo'] = ['fav' => [], 'bm' => [], 'rb' => [], 'fav_obj' => [], 'bm_obj' => []];
+        }
+        if ($statusId !== '') {
+            $GLOBALS['ap_masto_flag_memo']['bm'][$statusId] = $hit;
+        }
+        if ($hit && $objectId !== '') {
+            foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+                $GLOBALS['ap_masto_flag_memo']['bm_obj'][$k] = true;
+            }
+        }
         return $hit;
     } catch (Throwable $e) {
         return false;
@@ -10073,6 +10318,8 @@ function ap_masto_favourite_by_object_id(string $objectId, ?int $ownerUserId = n
 
 /**
  * Idempotent local favourite insert. Keeps the first created_at; fills like_activity_id if new.
+ * Canonicalizes status_id to the Create/local note snowflake when object_id is known so
+ * search Announce cards and Open Create cards share one favourite row.
  */
 function ap_masto_favourite_add(
     string $statusId,
@@ -10081,6 +10328,9 @@ function ap_masto_favourite_add(
     ?string $likeActivityId,
     ?int $ownerUserId = null
 ): void {
+    $keys = ap_masto_canonical_interaction_keys($statusId, $objectId);
+    $statusId = $keys['status_id'];
+    $objectId = $keys['object_id'];
     if ($statusId === '') {
         return;
     }
@@ -10095,6 +10345,21 @@ function ap_masto_favourite_add(
         return;
     }
     $objectId = $objectId !== '' ? $objectId : $statusId;
+    // Drop alias rows for the same object (Announce snowflake, mention id, …).
+    if ($objectId !== '' && $objectId !== $statusId) {
+        try {
+            $aliasKeys = ap_masto_object_id_lookup_keys($objectId);
+            if ($aliasKeys !== []) {
+                $ph = implode(',', array_fill(0, count($aliasKeys), '?'));
+                ap_db()->prepare(
+                    "DELETE FROM masto_favourites
+                     WHERE owner_user_id = ? AND object_id IN ($ph) AND status_id <> ?"
+                )->execute(array_merge([$ownerUserId], $aliasKeys, [$statusId]));
+            }
+        } catch (Throwable $e) {
+            // non-fatal
+        }
+    }
     ap_db()->prepare(
         'INSERT INTO masto_favourites (owner_user_id, owner_actor_id, status_id, object_id, target_actor, like_activity_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -10104,16 +10369,65 @@ function ap_masto_favourite_add(
            target_actor = COALESCE(excluded.target_actor, masto_favourites.target_actor),
            like_activity_id = COALESCE(excluded.like_activity_id, masto_favourites.like_activity_id)'
     )->execute([$ownerUserId, $ownerActorId, $statusId, $objectId, $targetActor, $likeActivityId, gmdate('c')]);
+    if (isset($GLOBALS['ap_masto_flag_memo']) && is_array($GLOBALS['ap_masto_flag_memo'])) {
+        $GLOBALS['ap_masto_flag_memo']['fav'][$statusId] = true;
+        foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+            $GLOBALS['ap_masto_flag_memo']['fav_obj'][$k] = true;
+        }
+    }
 }
 
 /** @return array<string,mixed>|null the removed row, if any */
-function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null): ?array
+function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null, ?string $objectId = null): ?array
 {
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    $row = ap_masto_favourite_row($statusId, $ownerUserId);
+    $statusId = trim($statusId);
+    $objectId = $objectId !== null ? trim($objectId) : '';
+    $row = $statusId !== '' ? ap_masto_favourite_row($statusId, $ownerUserId) : null;
+    if ($row === null && $objectId !== '') {
+        try {
+            $keys = ap_masto_object_id_lookup_keys($objectId);
+            if ($keys !== []) {
+                $ph = implode(',', array_fill(0, count($keys), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT * FROM masto_favourites WHERE owner_user_id = ? AND object_id IN ($ph)
+                     ORDER BY created_at DESC LIMIT 1"
+                );
+                $st->execute(array_merge([$ownerUserId], $keys));
+                $found = $st->fetch();
+                if (is_array($found)) {
+                    $row = $found;
+                    $statusId = (string) ($found['status_id'] ?? $statusId);
+                    $objectId = (string) ($found['object_id'] ?? $objectId);
+                }
+            }
+        } catch (Throwable $e) {
+            // fall through
+        }
+    }
     if ($row) {
-        ap_db()->prepare('DELETE FROM masto_favourites WHERE owner_user_id = ? AND status_id = ?')
-            ->execute([$ownerUserId, $statusId]);
+        $delOid = trim((string) ($row['object_id'] ?? $objectId));
+        if ($delOid !== '') {
+            $keys = ap_masto_object_id_lookup_keys($delOid);
+            if ($keys !== []) {
+                $ph = implode(',', array_fill(0, count($keys), '?'));
+                ap_db()->prepare(
+                    "DELETE FROM masto_favourites WHERE owner_user_id = ? AND object_id IN ($ph)"
+                )->execute(array_merge([$ownerUserId], $keys));
+            }
+        }
+        if ($statusId !== '') {
+            ap_db()->prepare('DELETE FROM masto_favourites WHERE owner_user_id = ? AND status_id = ?')
+                ->execute([$ownerUserId, $statusId]);
+        }
+        if (isset($GLOBALS['ap_masto_flag_memo']) && is_array($GLOBALS['ap_masto_flag_memo'])) {
+            if ($statusId !== '') {
+                $GLOBALS['ap_masto_flag_memo']['fav'][$statusId] = false;
+            }
+            foreach (ap_masto_object_id_lookup_keys($delOid !== '' ? $delOid : $objectId) as $k) {
+                $GLOBALS['ap_masto_flag_memo']['fav_obj'][$k] = false;
+            }
+        }
     }
     return $row;
 }
@@ -10158,6 +10472,9 @@ function ap_masto_favourite_rows(int $limit = 40, ?string $maxId = null, ?int $o
 
 function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerUserId = null): void
 {
+    $keys = ap_masto_canonical_interaction_keys($statusId, (string) ($objectId ?? ''));
+    $statusId = $keys['status_id'];
+    $objectId = $keys['object_id'] !== '' ? $keys['object_id'] : $objectId;
     if ($statusId === '') {
         return;
     }
@@ -10171,28 +10488,86 @@ function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerU
         error_log('[ap-db] bookmark_add refused: owner actor unresolved');
         return;
     }
+    if (is_string($objectId) && $objectId !== '' && $objectId !== $statusId) {
+        try {
+            $aliasKeys = ap_masto_object_id_lookup_keys($objectId);
+            if ($aliasKeys !== []) {
+                $ph = implode(',', array_fill(0, count($aliasKeys), '?'));
+                ap_db()->prepare(
+                    "DELETE FROM masto_bookmarks
+                     WHERE owner_user_id = ? AND object_id IN ($ph) AND status_id <> ?"
+                )->execute(array_merge([$ownerUserId], $aliasKeys, [$statusId]));
+            }
+        } catch (Throwable $e) {
+            // non-fatal
+        }
+    }
     ap_db()->prepare(
         'INSERT INTO masto_bookmarks (owner_user_id, owner_actor_id, status_id, object_id, created_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(owner_user_id, status_id) DO NOTHING'
     )->execute([$ownerUserId, $ownerActorId, $statusId, $objectId, gmdate('c')]);
+    if (isset($GLOBALS['ap_masto_flag_memo']) && is_array($GLOBALS['ap_masto_flag_memo'])) {
+        $GLOBALS['ap_masto_flag_memo']['bm'][$statusId] = true;
+        if (is_string($objectId) && $objectId !== '') {
+            foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+                $GLOBALS['ap_masto_flag_memo']['bm_obj'][$k] = true;
+            }
+        }
+    }
 }
 
-function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null): void
+function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null, ?string $objectId = null): void
 {
-    if ($statusId === '') {
-        return;
-    }
+    $statusId = trim($statusId);
+    $objectId = $objectId !== null ? trim($objectId) : '';
     $ownerUserId = $ownerUserId ?? ap_db_default_owner_user_id();
-    ap_db()->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?')
-        ->execute([$ownerUserId, $statusId]);
+    $removedIds = [];
+    if ($statusId !== '') {
+        ap_db()->prepare('DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND status_id = ?')
+            ->execute([$ownerUserId, $statusId]);
+        $removedIds[] = $statusId;
+    }
+    if ($objectId !== '') {
+        $keys = ap_masto_object_id_lookup_keys($objectId);
+        if ($keys !== []) {
+            try {
+                $ph = implode(',', array_fill(0, count($keys), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT status_id FROM masto_bookmarks WHERE owner_user_id = ? AND object_id IN ($ph)"
+                );
+                $st->execute(array_merge([$ownerUserId], $keys));
+                foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $sid) {
+                    $removedIds[] = (string) $sid;
+                }
+                ap_db()->prepare(
+                    "DELETE FROM masto_bookmarks WHERE owner_user_id = ? AND object_id IN ($ph)"
+                )->execute(array_merge([$ownerUserId], $keys));
+            } catch (Throwable $e) {
+                // non-fatal
+            }
+        }
+    }
+    if (isset($GLOBALS['ap_masto_flag_memo']) && is_array($GLOBALS['ap_masto_flag_memo'])) {
+        foreach ($removedIds as $sid) {
+            $GLOBALS['ap_masto_flag_memo']['bm'][$sid] = false;
+        }
+        foreach (ap_masto_object_id_lookup_keys($objectId) as $k) {
+            $GLOBALS['ap_masto_flag_memo']['bm_obj'][$k] = false;
+        }
+    }
     // VAAK folder overlay — keep memberships from orphaning after any client unbookmarks
-    if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
-        vaak_bookmark_folders_on_unbookmark($statusId, $ownerUserId);
-    } elseif (is_file(__DIR__ . '/ap-bookmark-folders.php')) {
-        require_once __DIR__ . '/ap-bookmark-folders.php';
+    foreach (array_unique($removedIds) as $sid) {
+        if ($sid === '') {
+            continue;
+        }
         if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
-            vaak_bookmark_folders_on_unbookmark($statusId, $ownerUserId);
+            vaak_bookmark_folders_on_unbookmark($sid, $ownerUserId);
+        } elseif (is_file(__DIR__ . '/ap-bookmark-folders.php')) {
+            require_once __DIR__ . '/ap-bookmark-folders.php';
+            if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
+                vaak_bookmark_folders_on_unbookmark($sid, $ownerUserId);
+            }
         }
     }
 }

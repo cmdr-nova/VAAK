@@ -232,6 +232,18 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                         ? ap_bsky_create_like($owner, ['uri' => (string) ($payload['uri'] ?? $target), 'cid' => (string) ($payload['cid'] ?? '')], $rkey)
                         : ap_bsky_create_repost($owner, ['uri' => (string) ($payload['uri'] ?? $target), 'cid' => (string) ($payload['cid'] ?? '')], $rkey);
                     if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Bluesky action failed.'), 'receipt' => $receipt];
+                    if ($kind === 'like' && function_exists('ap_masto_favourite_add')) {
+                        $likeSid = (string) ($payload['status_id'] ?? '');
+                        $likeOid = (string) ($payload['object_id'] ?? $payload['uri'] ?? $target);
+                        if ($likeSid === '' && $likeOid !== '' && function_exists('ap_masto_canonical_interaction_keys')) {
+                            $likeKeys = ap_masto_canonical_interaction_keys('', $likeOid);
+                            $likeSid = $likeKeys['status_id'];
+                            $likeOid = $likeKeys['object_id'];
+                        }
+                        if ($likeSid !== '') {
+                            ap_masto_favourite_add($likeSid, $likeOid !== '' ? $likeOid : $likeSid, null, null, $owner);
+                        }
+                    }
                     return ['ok' => true, 'receipt' => ['record_uri' => (string) ($res['uri'] ?? $receipt['record_uri'] ?? ''), 'collection' => $collection]];
                 }
                 if ($recordUri === '' && $kind === 'boost') {
@@ -249,6 +261,11 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 if ((!empty($res['ok']) || $alreadyGone) && $kind === 'boost' && function_exists('ap_masto_reblog_remove_by_object_id')) {
                     ap_masto_reblog_remove_by_object_id((string) ($payload['object_id'] ?? $target), $owner);
                 }
+                if ((!empty($res['ok']) || $alreadyGone) && $kind === 'like' && function_exists('ap_masto_favourite_remove')) {
+                    $unlikeSid = (string) ($payload['status_id'] ?? '');
+                    $unlikeOid = (string) ($payload['object_id'] ?? $payload['uri'] ?? $target);
+                    ap_masto_favourite_remove($unlikeSid, $owner, $unlikeOid !== '' ? $unlikeOid : null);
+                }
                 return !empty($res['ok']) || $alreadyGone
                     ? ['ok' => true, 'receipt' => []] : ['ok' => false, 'error' => $err];
             }
@@ -263,9 +280,15 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                 }
                 if (function_exists('ap_bsky_tl_cache_clear_owner')) ap_bsky_tl_cache_clear_owner($owner);
                 $statusId = (string) ($payload['status_id'] ?? '');
-                if ($statusId !== '') {
-                    if ($want) ap_masto_bookmark_add($statusId, (string) ($payload['object_id'] ?? $target), $owner);
-                    else ap_masto_bookmark_remove($statusId, $owner);
+                $bmOid = (string) ($payload['object_id'] ?? $target);
+                if ($statusId === '' && $bmOid !== '' && function_exists('ap_masto_canonical_interaction_keys')) {
+                    $bmKeys = ap_masto_canonical_interaction_keys('', $bmOid);
+                    $statusId = $bmKeys['status_id'];
+                    $bmOid = $bmKeys['object_id'];
+                }
+                if ($statusId !== '' || $bmOid !== '') {
+                    if ($want) ap_masto_bookmark_add($statusId !== '' ? $statusId : $bmOid, $bmOid !== '' ? $bmOid : $statusId, $owner);
+                    else ap_masto_bookmark_remove($statusId, $owner, $bmOid !== '' ? $bmOid : null);
                 }
                 return ['ok' => true, 'receipt' => []];
             }
@@ -294,7 +317,7 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                     ap_masto_favourite_add($sid, $obj, $actor !== '' ? $actor : null, is_string($likeId) ? $likeId : null, $owner);
                     return ['ok' => true, 'receipt' => ['like_activity_id' => (string) ($likeId ?? ''), 'object_id' => $obj, 'target_actor' => $actor]];
                 }
-                $prev = ap_masto_favourite_remove($sid, $owner);
+                $prev = ap_masto_favourite_remove($sid, $owner, $obj !== '' ? $obj : null);
                 $likeId = (string) ($prev['like_activity_id'] ?? $receipt['like_activity_id'] ?? '');
                 if ($likeId !== '' && $obj !== '' && $actor !== '') {
                     $localActor = rtrim(ap_local_actor_id(), '/');
@@ -306,8 +329,9 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
             }
             if ($kind === 'bookmark') {
                 $sid = (string) ($payload['status_id'] ?? $target);
-                if ($want) ap_masto_bookmark_add($sid, (string) ($payload['object_id'] ?? $target), $owner);
-                else ap_masto_bookmark_remove($sid, $owner);
+                $bmOid = (string) ($payload['object_id'] ?? $target);
+                if ($want) ap_masto_bookmark_add($sid, $bmOid !== '' ? $bmOid : null, $owner);
+                else ap_masto_bookmark_remove($sid, $owner, $bmOid !== '' ? $bmOid : null);
                 return ['ok' => true, 'receipt' => []];
             }
             if ($kind === 'follow') {
