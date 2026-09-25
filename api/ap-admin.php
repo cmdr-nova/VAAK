@@ -8285,6 +8285,50 @@ function admin_split_quote_summary(string $summaryRaw): ?array
 }
 
 /** Media strip inside a quote-block (quoted post attachments). */
+/**
+ * Shared quote-card chrome for Fediverse + Bluesky timelines.
+ *
+ * @param array{acct?:string,text?:string,url?:string,media?:list<mixed>,open_label?:string,open_external?:bool} $opts
+ */
+function admin_quote_card_html(array $opts, string $returnView = 'home'): string
+{
+    $acct = trim((string) ($opts['acct'] ?? ''));
+    $text = trim((string) ($opts['text'] ?? ''));
+    $url = trim((string) ($opts['url'] ?? ''));
+    $media = is_array($opts['media'] ?? null) ? $opts['media'] : [];
+    $openLabel = trim((string) ($opts['open_label'] ?? 'Open quoted'));
+    $openExternal = !empty($opts['open_external']);
+    $html = '<div class="quote-block"><span class="qt-label">Quoted</span>';
+    if ($acct !== '') {
+        if ($acct[0] !== '@' && !str_starts_with($acct, 'http')) {
+            $acct = '@' . ltrim($acct, '@');
+        }
+        $html .= '<div class="meta" style="margin-top:.3rem">' . h($acct) . '</div>';
+    }
+    if ($text !== '') {
+        if (mb_strlen($text) > 400) {
+            $text = mb_substr($text, 0, 397) . '…';
+        }
+        $html .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
+            . admin_linkify_body_html($text, $returnView) . '</div>';
+    }
+    if ($media !== [] && function_exists('admin_quote_media_html')) {
+        $html .= admin_quote_media_html($media);
+    }
+    if ($url !== '' && $url !== 'https://bsky.app/') {
+        $href = function_exists('admin_status_href') && !$openExternal
+            ? admin_status_href($url, $returnView)
+            : $url;
+        $html .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($href) . '"'
+            . ($openExternal ? ' target="_blank" rel="noopener noreferrer"' : '')
+            . '>' . h($openLabel !== '' ? $openLabel : 'Open quoted') . '</a></div>';
+    } elseif ($text === '' && $acct === '' && $media === []) {
+        $html .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
+    }
+    $html .= '</div>';
+    return $html;
+}
+
 function admin_quote_media_html(array $items): string
 {
     if ($items === [] || !function_exists('admin_media_row_html')) {
@@ -12169,28 +12213,20 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
 
     $quoteHtml = '';
     if (is_array($quote)) {
-        $qlabel = $isQuoteBoost ? 'Quote' : 'Quoted';
+        // Same card chrome as Fediverse quotes (label + @acct + body + media).
         $qAcct = $quote['handle'] !== '' ? '@' . $quote['handle'] : (string) ($quote['display'] ?? '');
-        $quoteHtml = '<div class="quote-block"><span class="qt-label">' . h($qlabel) . '</span>';
-        if ($qAcct !== '') {
-            $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
-        }
         $qText = trim((string) ($quote['text'] ?? ''));
         if ($qText !== '') {
-            $qTextLink = preg_replace('#(?<![\w./:@])(www\.[^\s<]+)#iu', 'https://$1', $qText) ?? $qText;
-            $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
-                . admin_linkify_body_html(mb_substr($qTextLink, 0, 400), 'bluesky')
-                . '</div>';
+            $qText = preg_replace('#(?<![\w./:@])(www\.[^\s<]+)#iu', 'https://$1', $qText) ?? $qText;
         }
-        if (!empty($quote['media']) && is_array($quote['media'])) {
-            $quoteHtml .= admin_quote_media_html($quote['media']);
-        }
-        $qUrl = (string) ($quote['url'] ?? '');
-        if ($qUrl !== '' && $qUrl !== 'https://bsky.app/') {
-            $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="'
-                . h($qUrl) . '" target="_blank" rel="noopener noreferrer">Open quoted</a></div>';
-        }
-        $quoteHtml .= '</div>';
+        $quoteHtml = admin_quote_card_html([
+            'acct' => $qAcct,
+            'text' => $qText,
+            'url' => (string) ($quote['url'] ?? ''),
+            'media' => is_array($quote['media'] ?? null) ? $quote['media'] : [],
+            'open_label' => 'Open quoted',
+            'open_external' => true,
+        ], 'bluesky');
     }
 
     // Same lightbox triggers as federated cards (not raw <a target=_blank>).
@@ -12237,27 +12273,15 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     if ($quote !== null && is_array($quote) && $quoteHtml !== '') {
         // Re-linkify quote body with home context when mixed into Home.
         if ($isHome && ($quote['text'] ?? '') !== '') {
-            $qlabel = $isQuoteBoost ? 'Quote' : 'Quoted';
             $qAcct = $quote['handle'] !== '' ? '@' . $quote['handle'] : (string) ($quote['display'] ?? '');
-            $quoteHtml = '<div class="quote-block"><span class="qt-label">' . h($qlabel) . '</span>';
-            if ($qAcct !== '') {
-                $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
-            }
-            $qTextHome = trim((string) ($quote['text'] ?? ''));
-            if ($qTextHome !== '') {
-                $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
-                    . admin_linkify_body_html(mb_substr($qTextHome, 0, 400), $linkView)
-                    . '</div>';
-            }
-            if (!empty($quote['media']) && is_array($quote['media'])) {
-                $quoteHtml .= admin_quote_media_html($quote['media']);
-            }
-            $qUrl = (string) ($quote['url'] ?? '');
-            if ($qUrl !== '' && $qUrl !== 'https://bsky.app/') {
-                $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="'
-                    . h($qUrl) . '" target="_blank" rel="noopener noreferrer">Open quoted</a></div>';
-            }
-            $quoteHtml .= '</div>';
+            $quoteHtml = admin_quote_card_html([
+                'acct' => $qAcct,
+                'text' => trim((string) ($quote['text'] ?? '')),
+                'url' => (string) ($quote['url'] ?? ''),
+                'media' => is_array($quote['media'] ?? null) ? $quote['media'] : [],
+                'open_label' => 'Open quoted',
+                'open_external' => true,
+            ], $linkView);
         }
     }
     ?>
