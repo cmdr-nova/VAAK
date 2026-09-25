@@ -4377,6 +4377,22 @@ $adminIndexActorMap = static function (array $rows, bool $richAliases = true) us
             $map['https://' . $host . '/users/' . $uname] = true;
             $map['https://' . $host . '/users/' . rawurlencode($uname)] = true;
         }
+        // Bluesky: index both DID and handle profile URLs so search/remote_profile
+        // Follow buttons match graph_sync membership.
+        $bskyDid = trim((string) ($row['bsky_did'] ?? ''));
+        if (str_starts_with($bskyDid, 'did:')) {
+            $map['https://bsky.app/profile/' . $bskyDid] = true;
+            $map['https://bsky.app/profile/' . rawurlencode($bskyDid)] = true;
+            $map[$bskyDid] = true;
+        }
+        $bskyHandle = strtolower(trim((string) ($row['bsky_handle'] ?? '')));
+        if ($bskyHandle === '' && $host === 'bsky.app' && $uname !== '' && str_contains($uname, '.')) {
+            $bskyHandle = strtolower($uname);
+        }
+        if ($bskyHandle !== '' && !str_starts_with($bskyHandle, 'did:')) {
+            $map['https://bsky.app/profile/' . $bskyHandle] = true;
+            $map['https://bsky.app/profile/' . rawurlencode($bskyHandle)] = true;
+        }
     }
     return $map;
 };
@@ -8496,6 +8512,15 @@ function admin_is_following(array $followingIds, string ...$refs): bool
         if (!empty($followingIds[$ref]) || !empty($followingIds[$root]) || !empty($followingIds[$root . '/'])) {
             return true;
         }
+        // Bluesky follows live in bsky_graph_sync (DID), while UI/search often
+        // pass https://bsky.app/profile/{handle}. Check the durable graph too.
+        if (function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($root)
+            && function_exists('ap_bsky_owner_follows_ref')) {
+            $ownerId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+            if ($ownerId > 0 && ap_bsky_owner_follows_ref($ownerId, $root)) {
+                return true;
+            }
+        }
         // /@user ↔ /users/user
         if (preg_match('#^(https://[^/]+)/@([^/]+)/?$#', $root, $m)) {
             $alt = $m[1] . '/users/' . rawurlencode(rawurldecode($m[2]));
@@ -10330,11 +10355,15 @@ function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $
         $avatar = is_string($profile['avatar'] ?? null) ? (string) $profile['avatar'] : '';
         $bio = is_string($profile['description'] ?? null) ? $profile['description'] : '';
         $viewer = is_array($cached['viewer'] ?? null) ? $cached['viewer'] : null;
-        $following = $viewer !== null
-            ? (is_string($viewer['following'] ?? null) && $viewer['following'] !== '')
-            : ($did !== '' && function_exists('ap_bsky_graph_sync_get')
-                && is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', $did)));
-        $followsYou = !empty($viewer['followedBy']);
+        $vf = is_array($viewer) ? ($viewer['following'] ?? null) : null;
+        $following = (is_string($vf) && $vf !== '') || $vf === true;
+        if (!$following && function_exists('ap_bsky_owner_follows_ref')) {
+            $following = ap_bsky_owner_follows_ref($ownerUserId, $did !== '' ? $did : $actorId)
+                || ($handle !== '' && ap_bsky_owner_follows_ref($ownerUserId, $handle));
+        } elseif (!$following && $did !== '' && function_exists('ap_bsky_graph_sync_get')) {
+            $following = is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', $did));
+        }
+        $followsYou = is_array($viewer) && !empty($viewer['followedBy']);
         $loading = !is_array($cached) || $profile === [];
         $connected = function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($ownerUserId));
         $canFollow = !$own && $connected;
@@ -21293,11 +21322,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           'image_source_url' => $rpHeader,
                       ];
                       $viewer = is_array($cachedBsky['viewer'] ?? null) ? $cachedBsky['viewer'] : [];
-                      $rpBskyFollowing = !empty($viewer['following']);
+                      // AppView viewer.following is an AT-URI string when following.
+                      $vf = $viewer['following'] ?? null;
+                      $rpBskyFollowing = (is_string($vf) && $vf !== '') || $vf === true;
                       $rpBskyFollowsYou = !empty($viewer['followedBy']);
-                      if (!$rpBskyFollowing && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
+                      if (!$rpBskyFollowing && function_exists('ap_bsky_owner_follows_ref')) {
+                          foreach ([$rpBskyDid, $rpBskyHandle, $rpActor] as $followRef) {
+                              if (is_string($followRef) && $followRef !== ''
+                                  && ap_bsky_owner_follows_ref($vaakOwnerId, $followRef)) {
+                                  $rpBskyFollowing = true;
+                                  break;
+                              }
+                          }
+                      } elseif (!$rpBskyFollowing && $rpBskyDid !== '' && function_exists('ap_bsky_graph_sync_get')) {
                           $rpBskyFollowing = is_array(ap_bsky_graph_sync_get($vaakOwnerId, 'follow', $rpBskyDid));
                       }
+                  }
+                  if ($rpBskyDid !== '' && function_exists('ap_bsky_author_feed_refresh_enqueue')) {
+                      ap_bsky_author_feed_refresh_enqueue($vaakOwnerId, $rpBskyDid);
                   }
                   if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
                       $rpBskyPosts = ap_bsky_posts_for_author($rpBskyDid, 40);

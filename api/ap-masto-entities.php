@@ -1446,6 +1446,34 @@ function ap_masto_relationship_for_account_id(string $accountId): array
             $followActors[$a] = true;
             $followById[ap_masto_remote_account_id($a)] = $a;
         }
+        // Bluesky follows are durable in bsky_graph_sync, not the AP following table.
+        $ownerId = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+        if ($ownerId > 0 && function_exists('ap_bsky_graph_sync_list')) {
+            foreach (ap_bsky_graph_sync_list($ownerId, 'follow') as $row) {
+                $did = trim((string) ($row['target_did'] ?? ''));
+                if (!str_starts_with($did, 'did:')) {
+                    continue;
+                }
+                $urls = [
+                    'https://bsky.app/profile/' . $did,
+                    'https://bsky.app/profile/' . rawurlencode($did),
+                ];
+                $handle = '';
+                if (function_exists('ap_bsky_actor_profile_cache_get')) {
+                    $cached = ap_bsky_actor_profile_cache_get($did, $ownerId);
+                    $handle = strtolower(trim((string) (($cached['profile']['handle'] ?? '') ?: '')));
+                }
+                if ($handle !== '' && !str_starts_with($handle, 'did:')) {
+                    $urls[] = 'https://bsky.app/profile/' . $handle;
+                    $urls[] = 'https://bsky.app/profile/' . rawurlencode($handle);
+                }
+                foreach ($urls as $u) {
+                    $u = rtrim($u, '/');
+                    $followActors[$u] = true;
+                    $followById[ap_masto_remote_account_id($u)] = $u;
+                }
+            }
+        }
         foreach (ap_followers_list() as $f) {
             $a = rtrim((string) ($f['actor_id'] ?? ''), '/');
             if ($a !== '') {

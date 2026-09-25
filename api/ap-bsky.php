@@ -3836,11 +3836,13 @@ function ap_bsky_admin_following_rows(int $ownerUserId, bool $resolveHandles = t
             ? ap_bsky_actor_profile_url($handle !== '' ? $handle : $did)
             : ('https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did));
         $out[] = [
+            // Prefer handle URL when known; DID URL always available via bsky_did aliases.
             'actor_id' => $actor,
             'username' => $handle !== '' ? $handle : $did,
             'host' => 'bsky.app',
             'followed_at' => (string) ($row['updated_at'] ?? gmdate('c')),
             'bsky_did' => $did,
+            'bsky_handle' => $handle,
         ];
         if ($resolveHandles && $handle === '' && function_exists('ap_bsky_actor_refresh_enqueue')) {
             ap_bsky_actor_refresh_enqueue($ownerUserId, $did);
@@ -6356,6 +6358,9 @@ function ap_bsky_graph_sync_upsert(
                updated_at = excluded.updated_at'
         );
         $st->execute([$ownerUserId, $kind, $did, $bskyUri, $source, gmdate('c')]);
+        if ($kind === 'follow' && function_exists('ap_redis_delete')) {
+            ap_redis_delete('vaak:bsky:followed-handles:' . $ownerUserId);
+        }
     } catch (Throwable $e) {
         error_log('[ap-bsky] graph_sync_upsert: ' . $e->getMessage());
     }
@@ -6376,12 +6381,95 @@ function ap_bsky_graph_sync_get(int $ownerUserId, string $kind, string $did): ?a
     }
 }
 
+/**
+ * Whether this VAAK owner follows a Bluesky identity (DID, handle, or bsky.app URL).
+ * Uses durable bsky_graph_sync; resolves handles via profile cache then identity API.
+ */
+function ap_bsky_owner_follows_ref(int $ownerUserId, string $ref): bool
+{
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    $ref = trim($ref);
+    if ($ref === '') {
+        return false;
+    }
+    $did = null;
+    $handle = null;
+    if (str_starts_with($ref, 'did:')) {
+        $did = $ref;
+    } elseif (preg_match('#^https://bsky\.app/profile/([^/?#]+)#i', $ref, $m)) {
+        $part = rawurldecode($m[1]);
+        if (str_starts_with($part, 'did:')) {
+            $did = $part;
+        } else {
+            $handle = strtolower(ltrim($part, '@'));
+        }
+    } elseif (str_starts_with($ref, 'at://did:')) {
+        if (preg_match('#^at://(did:[^/]+)#', $ref, $m)) {
+            $did = $m[1];
+        }
+    } elseif (str_contains($ref, '.') && !str_contains($ref, '@') && !str_starts_with($ref, 'https://')) {
+        $handle = strtolower(ltrim($ref, '@'));
+    }
+    if (is_string($did) && str_starts_with($did, 'did:')
+        && is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', $did))) {
+        return true;
+    }
+    if ($handle !== null && $handle !== '') {
+        // Short-TTL map of followed handles → DIDs (avoids scanning the full
+        // graph + profile cache on every search/profile Follow button).
+        $mapKey = 'vaak:bsky:followed-handles:' . $ownerUserId;
+        $handleMap = null;
+        if (function_exists('ap_redis_json_get')) {
+            $cachedMap = ap_redis_json_get($mapKey);
+            if (is_array($cachedMap)) {
+                $handleMap = $cachedMap;
+            }
+        }
+        if (!is_array($handleMap)) {
+            $handleMap = [];
+            foreach (ap_bsky_graph_sync_list($ownerUserId, 'follow') as $row) {
+                $tdid = trim((string) ($row['target_did'] ?? ''));
+                if (!str_starts_with($tdid, 'did:')) {
+                    continue;
+                }
+                if (function_exists('ap_bsky_actor_profile_cache_get')) {
+                    $cached = ap_bsky_actor_profile_cache_get($tdid, $ownerUserId);
+                    $h = strtolower(trim((string) (($cached['profile']['handle'] ?? '') ?: '')));
+                    if ($h !== '' && !str_starts_with($h, 'did:')) {
+                        $handleMap[$h] = $tdid;
+                    }
+                }
+            }
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set($mapKey, $handleMap, 90);
+            }
+        }
+        if (isset($handleMap[$handle]) && is_string($handleMap[$handle])) {
+            return true;
+        }
+        // Last resort: resolve handle → DID (may hit identity.resolveHandle).
+        if (function_exists('ap_bsky_resolve_handle_did')) {
+            $resolved = ap_bsky_resolve_handle_did($handle, $ownerUserId);
+            if (is_string($resolved) && str_starts_with($resolved, 'did:')
+                && is_array(ap_bsky_graph_sync_get($ownerUserId, 'follow', $resolved))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 function ap_bsky_graph_sync_delete(int $ownerUserId, string $kind, string $did): void
 {
     try {
         ap_db()->prepare(
             'DELETE FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = ? AND target_did = ?'
         )->execute([$ownerUserId, $kind, $did]);
+        if ($kind === 'follow' && function_exists('ap_redis_delete')) {
+            ap_redis_delete('vaak:bsky:followed-handles:' . $ownerUserId);
+        }
     } catch (Throwable $e) {
         // ignore
     }
