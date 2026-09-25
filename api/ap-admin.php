@@ -13521,11 +13521,10 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
         echo '</div></div>';
         $feedClass = 'feed' . (in_array($view, ['home', 'local', 'feed', 'gallery'], true) ? ' timeline-feed' : '');
         echo '<div class="' . $feedClass . '">';
-        if (in_array($view, ['home', 'local', 'feed'], true) && function_exists('admin_render_compose_panel')) {
-            $GLOBALS['admin_compose_panel_inline'] = true;
-            echo '<div class="compose-inline-slot" id="compose-inline-slot">';
-            admin_render_compose_panel(true);
-            echo '</div>';
+        if (in_array($view, ['home', 'local', 'feed'], true)) {
+            // Empty slot — soft-nav reattaches the live composer panel so AJAX
+            // submit / media / emoji handlers stay bound.
+            echo '<div class="compose-inline-slot" id="compose-inline-slot"></div>';
         }
         $itemsClass = $view === 'gallery' ? 'gallery-grid' : '';
         echo '<div id="timeline-items"' . ($itemsClass !== '' ? ' class="' . $itemsClass . '"' : '')
@@ -25509,7 +25508,18 @@ window.apAdminToast = function (msg, isErr) {
         return;
       }
       if (!html.trim()) throw new Error('empty-shell');
+      const livePanel = document.querySelector('.compose-modal__panel');
+      if (livePanel && main.contains(livePanel)) {
+        const modalShell = document.getElementById('compose-modal');
+        if (modalShell) {
+          livePanel.classList.remove('compose-inline-panel');
+          modalShell.appendChild(livePanel);
+        }
+      }
       main.innerHTML = html;
+      if (typeof window.vaakAdoptComposerAfterSoftNav === 'function') {
+        window.vaakAdoptComposerAfterSoftNav();
+      }
       const feedEl = main.querySelector('.feed');
       if (feedEl) { try { feedEl.scrollTop = 0; } catch (e) {} }
       updateChrome(view);
@@ -26052,7 +26062,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     applyComposerToolbarChrome(panel);
   }
   function placeComposerInline() {
-    if (!supportsInlineComposer || !modal) return;
+    const liveItems = document.getElementById('timeline-items');
+    const liveFeed = document.querySelector('.feed');
+    const canInline = !!(modal && liveFeed && liveItems
+      && ['home', 'local', 'feed'].includes(liveItems.dataset.view || ''));
+    if (!canInline || !modal) return;
     const panel = getComposePanel();
     if (!panel) return;
     panel.classList.add('compose-inline-panel');
@@ -26075,6 +26089,22 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     modal.setAttribute('aria-hidden', 'true');
     if (fab) fab.removeAttribute('aria-hidden');
   }
+  window.vaakAdoptComposerAfterSoftNav = function () {
+    const panel = getComposePanel();
+    if (!panel) return false;
+    const slot = document.getElementById('compose-inline-slot');
+    const items = document.getElementById('timeline-items');
+    const view = items ? (items.dataset.view || '') : '';
+    if (slot && ['home', 'local', 'feed'].includes(view)) {
+      placeComposerInline();
+      return true;
+    }
+    if (panel.classList.contains('compose-inline-panel')) {
+      placeComposerInModal();
+    }
+    return true;
+  };
+
   function placeComposerInModal() {
     if (!modal) return;
     const panel = getComposePanel();
@@ -26318,6 +26348,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }, 20000);
   window.addEventListener('pagehide', () => { saveComposeLocalBackup(); });
   window.addEventListener('beforeunload', (e) => {
+    const liveForm = document.getElementById('compose-form');
+    if (liveForm && liveForm.dataset.busy === '1') return;
     if (!composeHasDraftableContent()) return;
     if (draftIdField && draftIdField.value) return;
     saveComposeLocalBackup();
@@ -27508,8 +27540,13 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       }
     });
   }
-  form.addEventListener('submit', async (ev) => {
+  document.addEventListener('submit', async (ev) => {
+    const submitForm = ev.target;
+    if (!(submitForm instanceof HTMLFormElement) || submitForm.id !== 'compose-form') return;
     ev.preventDefault();
+    ev.stopPropagation();
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    const form = submitForm;
     syncInput();
     if (form.dataset.busy === '1') return;
     form.dataset.busy = '1';
@@ -27672,7 +27709,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       // shared capture-phase Saving… indicator.
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     }
-  });
+  }, true);
 })();
 </script>
 <?php endif; ?>
@@ -28290,7 +28327,10 @@ if (VIEW === 'analytics') loadAnalytics();
   }, true);
   document.addEventListener('submit', function (ev) {
     if (ev.defaultPrevented) return;
-    if (!ev.defaultPrevented) window.vaakShowLoading('Saving…');
+    const form = ev.target;
+    if (form && form.id === 'compose-form') return;
+    if (form && form.getAttribute('data-ajax-submit') === '1') return;
+    window.vaakShowLoading('Saving…');
   }, true);
   window.addEventListener('pageshow', function () {
     window.__vaakNavigationPending = false;
