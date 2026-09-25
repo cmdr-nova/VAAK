@@ -25058,12 +25058,14 @@ window.apAdminToast = function (msg, isErr) {
   let leaving = false;
   function hardOpenNotifications() {
     leaving = true;
+    if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     window.location.assign('?view=mentions');
   }
   async function softOpenNotifications(push) {
     if (busy || leaving) return;
+    if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     try {
       const cur = new URL(window.location.href);
       if ((cur.searchParams.get('view') || '') === 'mentions'
@@ -25423,6 +25425,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (!rail.classList.contains('mobile-open')) backdrop.hidden = true;
     }, 200);
   }
+  // Soft-nav (Notifications) stops propagation in capture — expose close for those paths.
+  window.vaakCloseMobileNav = closeNav;
   function toggleNav() {
     if (rail.classList.contains('mobile-open')) closeNav();
     else openNav();
@@ -25447,9 +25451,14 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
 
   btn.addEventListener('click', toggleNav);
   backdrop.addEventListener('click', closeNav);
-  rail.querySelectorAll('a[href]').forEach((a) => {
-    a.addEventListener('click', () => { if (isMobile()) closeNav(); });
-  });
+  // Capture on the rail so we close before any soft-nav stopImmediatePropagation
+  // on a child link (Notifications). Full page navigations still benefit too.
+  rail.addEventListener('click', (ev) => {
+    if (!isMobile()) return;
+    const link = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+    if (!link || !rail.contains(link)) return;
+    closeNav();
+  }, true);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && rail.classList.contains('mobile-open')) closeNav();
   });
