@@ -12966,13 +12966,20 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
 // AJAX fragment for Your Posts infinite scroll. Keep this before the broader
 // timeline fragment so outbox requests never trigger a timeline rebuild.
 if ($isPartial && $view === 'outbox') {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     $outboxOffset = max(0, (int) ($_GET['offset'] ?? 0));
     $outboxLimit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $wantOutboxShell = isset($_GET['shell']) && (string) $_GET['shell'] === '1' && $outboxOffset === 0;
     $page = admin_outbox_page((int) $vaakOwnerId, (string) $vaakActorKey, $outboxOffset, $outboxLimit);
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     header('X-Has-More: ' . (!empty($page['has_more']) ? '1' : '0'));
     header('X-Next-Offset: ' . (int) ($page['next_offset'] ?? ($outboxOffset + $outboxLimit)));
+    header('X-VAAK-View: outbox');
     ob_start();
     foreach (($page['items'] ?? []) as $item) {
         if (($item['kind'] ?? '') === 'bsky') {
@@ -12981,7 +12988,29 @@ if ($isPartial && $view === 'outbox') {
             admin_render_outbox_card($item['row'], 'outbox');
         }
     }
-    echo ob_get_clean();
+    $outboxBody = ob_get_clean();
+    if ($wantOutboxShell) {
+        $nextOff = (int) ($page['next_offset'] ?? ($outboxOffset + $outboxLimit));
+        $hasMore = !empty($page['has_more']);
+        echo '<div class="topbar"><h1>Your posts</h1><div class="topbar-actions">'
+            . '<a class="btn btn-ghost" href="?view=outbox&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>'
+            . '</div></div>';
+        echo '<div class="feed">';
+        if ($outboxBody === '') {
+            echo '<div class="empty">No posts yet. Use the ＋ button to compose.</div>';
+        }
+        echo '<div id="timeline-items" class="your-posts-feed" data-view="outbox" data-offset="'
+            . $nextOff . '" data-limit="' . (int) $outboxLimit . '" data-has-more="'
+            . ($hasMore ? '1' : '0') . '" data-newest="0">';
+        echo $outboxBody;
+        echo '</div>';
+        echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
+            . ($hasMore ? 'Scroll for more…' : ($outboxBody !== '' ? 'End of posts' : '')) . '</div>';
+        echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
+        echo '</div>';
+        exit;
+    }
+    echo $outboxBody;
     exit;
 }
 
@@ -13036,6 +13065,13 @@ if ($isPartial && $view === 'bluesky') {
 
 // AJAX fragment for Home / Local / Federated / Gallery infinite scroll
 if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'], true)) {
+    if (isset($_GET['shell']) && (string) $_GET['shell'] === '1') {
+        if (function_exists('ap_auth_session_write_close')) {
+            ap_auth_session_write_close();
+        } elseif (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+    }
     // Live poll: items newer than the client's current head (no scroll jump on server).
     $wantNewer = isset($_GET['newer']) && (string) $_GET['newer'] === '1';
     $wantStream = isset($_GET['stream']) && (string) $_GET['stream'] === '1';
@@ -13345,6 +13381,48 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok'
     header('X-TL-Flags-Ms: ' . (string) (int) round($adminTlPerfFlagsMs));
     header('X-TL-Render-Ms: ' . (string) (int) round($adminTlPerfRenderMs));
     header('X-TL-Partial-Ms: ' . (string) (int) round($adminTlPerfTotalMs));
+    header('X-VAAK-View: ' . $view);
+    $wantShell = isset($_GET['shell']) && (string) $_GET['shell'] === '1' && $tlOffset === 0;
+    if ($wantShell && in_array($view, ['home', 'local', 'feed', 'gallery'], true)) {
+        $shellTitles = [
+            'home' => 'Home',
+            'local' => 'Local',
+            'feed' => 'Federation feed',
+            'gallery' => 'Gallery',
+        ];
+        $title = $shellTitles[$view] ?? $view;
+        echo '<div class="topbar' . (in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '') . '">';
+        echo '<h1>' . h($title) . '</h1><div class="topbar-actions">';
+        if (in_array($view, ['home', 'local', 'feed'], true)) {
+            echo '<nav class="timeline-tabs" aria-label="Timeline views">';
+            foreach (['home' => 'Home', 'local' => 'Local', 'feed' => 'Federated'] as $tabView => $tabLabel) {
+                $active = $view === $tabView ? ' active' : '';
+                echo '<a class="' . trim($active) . '" href="?view=' . h($tabView) . '">' . h($tabLabel) . '</a>';
+            }
+            echo '</nav>';
+        }
+        echo '<a class="btn btn-ghost" href="?view=' . h($view) . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>';
+        echo '</div></div>';
+        $feedClass = 'feed' . (in_array($view, ['home', 'local', 'feed', 'gallery'], true) ? ' timeline-feed' : '');
+        echo '<div class="' . $feedClass . '">';
+        if (in_array($view, ['home', 'local', 'feed'], true) && function_exists('admin_render_compose_panel')) {
+            $GLOBALS['admin_compose_panel_inline'] = true;
+            echo '<div class="compose-inline-slot" id="compose-inline-slot">';
+            admin_render_compose_panel(true);
+            echo '</div>';
+        }
+        $itemsClass = $view === 'gallery' ? 'gallery-grid' : '';
+        echo '<div id="timeline-items"' . ($itemsClass !== '' ? ' class="' . $itemsClass . '"' : '')
+            . ' data-view="' . h($view) . '" data-offset="' . (int) $nextOffset . '" data-limit="' . (int) $tlLimit
+            . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-newest="' . (int) time() . '">';
+        echo $body;
+        echo '</div>';
+        echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
+            . ($hasMore ? 'Scroll for more…' : ($body !== '' ? 'End of timeline' : '')) . '</div>';
+        echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
+        echo '</div>';
+        exit;
+    }
     echo $body;
     exit;
 }
@@ -16217,13 +16295,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
     ?>
     <nav class="nav">
-      <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home"><span class="ico">⌂</span><span class="label">Home</span></a>
+      <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home" data-vaak-soft-nav="home"><span class="ico">⌂</span><span class="label">Home</span></a>
       <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span><span class="nav-badge"<?= $noticesUnreadNav > 0 ? '' : ' hidden' ?>><?= $noticesUnreadNav > 99 ? '99+' : (string) (int) $noticesUnreadNav ?></span></a>
       <hr class="nav-sep">
-      <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
+      <a class="<?= $view === 'gallery' ? 'active' : '' ?>" href="?view=gallery" data-vaak-soft-nav="gallery"><span class="ico">▦</span><span class="label">Gallery</span></a>
       <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span><span class="nav-badge"<?= $discussUnreadNav > 0 ? '' : ' hidden' ?>><?= $discussUnreadNav > 99 ? '99+' : (string) (int) $discussUnreadNav ?></span></a>
       <hr class="nav-sep">
-      <a class="<?= $view === 'mentions' ? 'active' : '' ?>" href="?view=mentions" id="nav-notifications">
+      <a class="<?= $view === 'mentions' ? 'active' : '' ?>" href="?view=mentions" id="nav-notifications" data-vaak-soft-nav="mentions">
         <span class="ico">＠</span><span class="label">Notifications</span>
         <span class="nav-badge" id="notif-badge"<?= $notifUnreadNav > 0 ? '' : ' hidden' ?>><?= h($notifBadgeLabel) ?></span>
       </a>
@@ -16248,7 +16326,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <details class="nav-group" data-nav-key="you" <?= $navYouOpen ? 'open' : '' ?>>
         <summary><span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span></summary>
         <div class="nav-sub">
-          <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
+          <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox" data-vaak-soft-nav="outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'queue' ? 'active' : '' ?>" href="?view=queue"><span class="ico">⏱</span><span class="label">Queue</span></a>
           <a class="<?= $view === 'drafts' ? 'active' : '' ?>" href="?view=drafts" id="nav-drafts">
@@ -16371,9 +16449,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed'], true)): ?>
           <nav class="timeline-tabs" aria-label="Timeline views">
-            <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home">Home</a>
-            <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local">Local</a>
-            <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed">Federated</a>
+            <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home" data-vaak-soft-nav="home">Home</a>
+            <a class="<?= $view === 'local' ? 'active' : '' ?>" href="?view=local" data-vaak-soft-nav="local">Local</a>
+            <a class="<?= $view === 'feed' ? 'active' : '' ?>" href="?view=feed" data-vaak-soft-nav="feed">Federated</a>
           </nav>
         <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed', 'gallery', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile', 'users'], true)): ?>
@@ -25018,6 +25096,33 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  window.vaakSwapTimelineView = swapTimelineView;
+  window.vaakBootTimeline = function (nextView) {
+    // Soft-nav landed on a timeline page while this boot script is still alive.
+    // Rebind to the new DOM nodes from the shell response.
+    nextView = String(nextView || viewName || 'home');
+    try { stopTimelineStream(); } catch (e) {}
+    if (streamFallbackTimer) {
+      window.clearInterval(streamFallbackTimer);
+      streamFallbackTimer = 0;
+    }
+    items = document.getElementById('timeline-items');
+    status = document.getElementById('timeline-status');
+    sentinel = document.getElementById('timeline-sentinel');
+    if (!items) return false;
+    viewName = items.dataset.view || nextView;
+    offset = parseInt(items.dataset.offset || '0', 10) || 0;
+    limit = parseInt(items.dataset.limit || '15', 10) || 15;
+    hasMore = items.dataset.hasMore === '1';
+    newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
+    loading = false;
+    pendingHtml = '';
+    pendingCount = 0;
+    if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(items);
+    if (typeof window.novaEnqueueBoostHydrates === 'function') window.novaEnqueueBoostHydrates(items);
+    try { syncTimelineStreamVisibility(); } catch (e) {}
+    return true;
+  };
   document.querySelectorAll('.timeline-tabs a').forEach((a) => {
     a.addEventListener('click', (ev) => {
       if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || a.target === '_blank') return;
@@ -25048,41 +25153,120 @@ window.apAdminToast = function (msg, isErr) {
 <?php endif; ?>
 
 <script>
-// Soft-nav into Notifications without reloading rails/CSS. Falls back to a
-// full navigation if the shell partial fails or looks wrong.
+// Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
+// swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
-  const nav = document.getElementById('nav-notifications');
-  if (!nav) return;
-  nav.setAttribute('data-vaak-soft-nav', 'mentions');
+  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'gallery']);
+  const TL_TITLES = {
+    home: 'Home',
+    local: 'Local',
+    feed: 'Federation feed',
+    mentions: 'Notifications',
+    outbox: 'Your posts',
+    gallery: 'Gallery'
+  };
   let busy = false;
   let leaving = false;
-  function hardOpenNotifications() {
+
+  function hardNav(view) {
     leaving = true;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
-    window.location.assign('?view=mentions');
+    window.location.assign('?view=' + encodeURIComponent(view));
   }
-  async function softOpenNotifications(push) {
-    if (busy || leaving) return;
+
+  function updateChrome(view) {
+    document.title = (TL_TITLES[view] || view) + ' · VAAK';
+    const mobileTitle = document.querySelector('.mobile-topbar__title');
+    if (mobileTitle) mobileTitle.innerHTML = '<span>VAAK</span> · ' + (TL_TITLES[view] || view);
+    document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
+      const href = a.getAttribute('href') || '';
+      const m = href.match(/[?&]view=([a-z_]+)/);
+      a.classList.toggle('active', (m ? m[1] : '') === view);
+    });
+    if (view === 'mentions') {
+      const badge = document.getElementById('notif-badge');
+      if (badge) { badge.hidden = true; badge.textContent = ''; }
+    }
+  }
+
+  function bindNotifScroll(main) {
+    const items = document.getElementById('timeline-items');
+    const sentinel = document.getElementById('timeline-sentinel');
+    const status = document.getElementById('timeline-status');
+    const feed = main.querySelector('.feed') || document.querySelector('section.main > .feed');
+    if (!items || !sentinel) return;
+    let loading = false;
+    let hasMore = items.dataset.hasMore === '1';
+    let maxId = items.dataset.maxId || '';
+    const filter = items.dataset.filter || 'all';
+    const limit = parseInt(items.dataset.limit || '10', 10) || 10;
+    const io = new IntersectionObserver(async (entries) => {
+      if (!entries.some((e) => e.isIntersecting) || loading || !hasMore || !maxId) return;
+      loading = true;
+      if (status) status.textContent = 'Loading…';
+      try {
+        const moreUrl = '?view=mentions&partial=1'
+          + '&notification_filter=' + encodeURIComponent(filter)
+          + '&notifications_max_id=' + encodeURIComponent(maxId)
+          + '&limit=' + encodeURIComponent(String(limit));
+        const moreRes = await fetch(moreUrl, {
+          credentials: 'same-origin',
+          headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+          cache: 'no-store'
+        });
+        if (!moreRes.ok) throw new Error('HTTP ' + moreRes.status);
+        const moreHtml = await moreRes.text();
+        hasMore = moreRes.headers.get('X-Has-More') === '1';
+        maxId = moreRes.headers.get('X-Next-Max-Id') || '';
+        items.dataset.hasMore = hasMore ? '1' : '0';
+        items.dataset.maxId = maxId;
+        if (moreHtml.trim()) {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = moreHtml;
+          while (tmp.firstChild) items.appendChild(tmp.firstChild);
+        }
+        if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
+      } catch (e) {
+        if (status) status.textContent = 'Could not load more';
+        hasMore = false;
+      } finally {
+        loading = false;
+      }
+    }, { root: feed || null, rootMargin: '400px 0px', threshold: 0 });
+    io.observe(sentinel);
+  }
+
+  async function softNavTo(view, push) {
+    view = String(view || '');
+    if (!SOFT_VIEWS.has(view) || busy || leaving) return;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
-    try {
-      const cur = new URL(window.location.href);
-      if ((cur.searchParams.get('view') || '') === 'mentions'
-          && document.querySelector('.notification-tabs, #timeline-items[data-view="mentions"]')) {
+
+    // Already on a home/local/feed page: reuse the in-place timeline swap.
+    if (['home', 'local', 'feed'].includes(view) && typeof window.vaakSwapTimelineView === 'function') {
+      const cur = new URL(window.location.href).searchParams.get('view') || '';
+      if (['home', 'local', 'feed'].includes(cur)) {
+        if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
+        await window.vaakSwapTimelineView(view, push !== false);
+        updateChrome(view);
         return;
       }
-    } catch (e) {}
+    }
+
     const main = document.querySelector('section.main');
     if (!main) {
-      hardOpenNotifications();
+      hardNav(view);
       return;
     }
+
+    // Mentions / outbox / gallery / cold home entry: fetch a main-pane shell.
     busy = true;
     window.__vaakNavigationPending = true;
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     try {
-      const url = '?view=mentions&partial=1&shell=1&limit=10';
+      const url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
+        + encodeURIComponent(view === 'mentions' ? '10' : (view === 'outbox' ? '20' : '15'));
       const res = await fetch(url, {
         credentials: 'same-origin',
         headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
@@ -25090,131 +25274,134 @@ window.apAdminToast = function (msg, isErr) {
       });
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
         leaving = true;
-        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('notifSoft');
-        else hardOpenNotifications();
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav');
+        else hardNav(view);
         return;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      // Require the soft-nav marker so a full document / wrong partial cannot
-      // silently replace the main pane and look like a no-op.
-      if (res.headers.get('X-VAAK-View') !== 'mentions') {
-        throw new Error('missing-shell-header');
-      }
+      if (res.headers.get('X-VAAK-View') !== view) throw new Error('missing-shell-header');
       const html = await res.text();
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
         leaving = true;
-        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('notifSoft-html');
-        else hardOpenNotifications();
+        if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav-html');
+        else hardNav(view);
         return;
       }
-      if (!html.trim() || html.indexOf('Notifications') === -1) {
-        throw new Error('bad-shell');
-      }
+      if (!html.trim()) throw new Error('empty-shell');
       main.innerHTML = html;
       const feedEl = main.querySelector('.feed');
-      if (feedEl) {
-        try { feedEl.scrollTop = 0; } catch (e) {}
-      }
-      document.title = 'Notifications · VAAK';
-      const mobileTitle = document.querySelector('.mobile-topbar__title');
-      if (mobileTitle) mobileTitle.innerHTML = '<span>VAAK</span> · Notifications';
-      document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
-        const href = a.getAttribute('href') || '';
-        const m = href.match(/[?&]view=([a-z_]+)/);
-        a.classList.toggle('active', (m ? m[1] : '') === 'mentions');
-      });
-      const badge = document.getElementById('notif-badge');
-      if (badge) {
-        badge.hidden = true;
-        badge.textContent = '';
-      }
+      if (feedEl) { try { feedEl.scrollTop = 0; } catch (e) {} }
+      updateChrome(view);
       if (push !== false) {
         const u = new URL(window.location.href);
-        u.searchParams.set('view', 'mentions');
+        u.searchParams.set('view', view);
         u.searchParams.delete('_r');
         u.searchParams.delete('notification_filter');
-        history.pushState({ vaakNotif: true }, '', u.pathname + u.search);
+        history.pushState({ vaakSoft: view }, '', u.pathname + u.search);
       }
       if (typeof window.novaEnhanceTweetFolds === 'function') {
         const foldRoot = document.getElementById('timeline-items');
         if (foldRoot) window.novaEnhanceTweetFolds(foldRoot);
       }
-      (function bindNotifScroll() {
-        const items = document.getElementById('timeline-items');
-        const sentinel = document.getElementById('timeline-sentinel');
-        const status = document.getElementById('timeline-status');
-        const feed = main.querySelector('.feed') || document.querySelector('section.main > .feed');
-        if (!items || !sentinel) return;
-        let loading = false;
-        let hasMore = items.dataset.hasMore === '1';
-        let maxId = items.dataset.maxId || '';
-        const filter = items.dataset.filter || 'all';
-        const limit = parseInt(items.dataset.limit || '10', 10) || 10;
-        const io = new IntersectionObserver(async (entries) => {
-          if (!entries.some((e) => e.isIntersecting) || loading || !hasMore || !maxId) return;
-          loading = true;
-          if (status) status.textContent = 'Loading…';
-          try {
-            const moreUrl = '?view=mentions&partial=1'
-              + '&notification_filter=' + encodeURIComponent(filter)
-              + '&notifications_max_id=' + encodeURIComponent(maxId)
-              + '&limit=' + encodeURIComponent(String(limit));
-            const moreRes = await fetch(moreUrl, {
-              credentials: 'same-origin',
-              headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
-              cache: 'no-store'
-            });
-            if (!moreRes.ok) throw new Error('HTTP ' + moreRes.status);
-            const moreHtml = await moreRes.text();
-            hasMore = moreRes.headers.get('X-Has-More') === '1';
-            maxId = moreRes.headers.get('X-Next-Max-Id') || '';
-            items.dataset.hasMore = hasMore ? '1' : '0';
-            items.dataset.maxId = maxId;
-            if (moreHtml.trim()) {
-              const tmp = document.createElement('div');
-              tmp.innerHTML = moreHtml;
-              while (tmp.firstChild) items.appendChild(tmp.firstChild);
-            }
-            if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
-          } catch (e) {
-            if (status) status.textContent = 'Could not load more';
-            hasMore = false;
-          } finally {
-            loading = false;
+      if (view === 'mentions') {
+        bindNotifScroll(main);
+      } else if (['home', 'local', 'feed', 'gallery', 'outbox'].includes(view)) {
+        if (typeof window.vaakBootTimeline === 'function') {
+          const ok = window.vaakBootTimeline(view);
+          if (!ok && ['home', 'local', 'feed'].includes(view)) {
+            // Boot script never loaded (landed on a non-timeline page first).
+            hardNav(view);
+            return;
           }
-        }, { root: feed || null, rootMargin: '400px 0px', threshold: 0 });
-        io.observe(sentinel);
-      })();
+        } else if (['home', 'local', 'feed'].includes(view)) {
+          hardNav(view);
+          return;
+        } else {
+          // Lightweight infinite scroll for outbox/gallery when boot is absent.
+          bindGenericScroll(view, main);
+        }
+      }
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       window.__vaakNavigationPending = false;
     } catch (e) {
-      hardOpenNotifications();
+      hardNav(view);
       return;
     } finally {
       busy = false;
-      // If we kicked a full navigation, leave the pill up until pageshow.
       if (!leaving) {
         window.__vaakNavigationPending = false;
         if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       }
     }
   }
-  // Capture + stopImmediatePropagation so the global link spinner does not
-  // race with soft-nav (it runs in capture before preventDefault on bubble).
-  nav.addEventListener('click', (ev) => {
-    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || nav.target === '_blank') return;
+
+  function bindGenericScroll(view, main) {
+    const items = document.getElementById('timeline-items');
+    const sentinel = document.getElementById('timeline-sentinel');
+    const status = document.getElementById('timeline-status');
+    const feed = main.querySelector('.feed');
+    if (!items || !sentinel) return;
+    let loading = false;
+    let hasMore = items.dataset.hasMore === '1';
+    let offset = parseInt(items.dataset.offset || '0', 10) || 0;
+    const limit = parseInt(items.dataset.limit || '20', 10) || 20;
+    const io = new IntersectionObserver(async (entries) => {
+      if (!entries.some((e) => e.isIntersecting) || loading || !hasMore) return;
+      loading = true;
+      if (status) status.textContent = 'Loading…';
+      try {
+        const moreUrl = '?view=' + encodeURIComponent(view)
+          + '&partial=1&offset=' + encodeURIComponent(String(offset))
+          + '&limit=' + encodeURIComponent(String(limit));
+        const moreRes = await fetch(moreUrl, {
+          credentials: 'same-origin',
+          headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+          cache: 'no-store'
+        });
+        if (!moreRes.ok) throw new Error('HTTP ' + moreRes.status);
+        const moreHtml = await moreRes.text();
+        hasMore = moreRes.headers.get('X-Has-More') === '1';
+        const nextOff = parseInt(moreRes.headers.get('X-Next-Offset') || String(offset + limit), 10);
+        offset = nextOff > 0 ? nextOff : (offset + limit);
+        items.dataset.hasMore = hasMore ? '1' : '0';
+        items.dataset.offset = String(offset);
+        if (moreHtml.trim()) {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = moreHtml;
+          while (tmp.firstChild) items.appendChild(tmp.firstChild);
+        }
+        if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End';
+      } catch (e) {
+        if (status) status.textContent = 'Could not load more';
+        hasMore = false;
+      } finally {
+        loading = false;
+      }
+    }, { root: feed || null, rootMargin: '400px 0px', threshold: 0 });
+    io.observe(sentinel);
+  }
+
+  document.addEventListener('click', (ev) => {
+    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+    const link = ev.target && ev.target.closest ? ev.target.closest('a[data-vaak-soft-nav]') : null;
+    if (!link || link.target === '_blank') return;
+    const view = link.getAttribute('data-vaak-soft-nav') || '';
+    if (!SOFT_VIEWS.has(view)) return;
     ev.preventDefault();
     ev.stopPropagation();
     if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
-    softOpenNotifications(true);
+    softNavTo(view, true);
   }, true);
+
   window.addEventListener('popstate', () => {
     const u = new URL(window.location.href);
-    if ((u.searchParams.get('view') || '') === 'mentions'
-        && !document.querySelector('.notification-tabs, #timeline-items[data-view="mentions"]')) {
-      softOpenNotifications(false);
-    }
+    const view = u.searchParams.get('view') || 'home';
+    if (!SOFT_VIEWS.has(view)) return;
+    softNavTo(view, false);
   });
+
+  // Back-compat for anything still calling the old notifications helper.
+  window.vaakSoftNavTo = softNavTo;
 })();
 </script>
 
