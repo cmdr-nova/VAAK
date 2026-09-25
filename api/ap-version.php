@@ -7,7 +7,7 @@ declare(strict_types=1);
  */
 const VAAK_VERSION = '0.3.22';
 const VAAK_CHANNEL = 'alpha';
-const VAAK_VERSION_DATE = '2026-09-24';
+const VAAK_VERSION_DATE = '2026-09-25';
 
 /** e.g. "VAAK alpha 0.1.0 · 2026-09-10" */
 function vaak_version_label(): string
