@@ -2345,11 +2345,14 @@ function ap_masto_unglue_bare_handles(string $text): string
     if ($text === '' || !str_contains($text, '@')) {
         return $text;
     }
-    // Only bare @user tokens — never touch @user@host (negative lookahead for @).
-    // Without that, "@aliceamour@beige.party" was split into "@alice amour@…" whenever
-    // a shorter bare username like "alice" existed in the actor cache (aceofcosmicspace posts).
+    // Only bare @user tokens — never touch @user@host (negative lookahead for @)
+    // or Bluesky-style @handle.domain (negative lookahead for '.').
+    // Without the @ lookahead, "@aliceamour@beige.party" was split into
+    // "@alice amour@…" whenever a shorter bare username like "alice" existed
+    // in the actor cache. Without the '.' lookahead, "@jackvalinsky.com" was
+    // matched as "@jackvalinsky" and then prefix-split on "jac" (social.lol).
     return preg_replace_callback(
-        '/(^|[^\w@])@([A-Za-z][\w]{1,40})(?![@\w])/u',
+        '/(^|[^\w@])@([A-Za-z][\w]{1,40})(?![@\w.])/u',
         static function (array $m): string {
             $token = $m[2];
             // Real camelCase / multi-cap handles that exist as-is
@@ -2366,6 +2369,10 @@ function ap_masto_unglue_bare_handles(string $text): string
                 }
                 // Don't invent splits that leave a host-looking remainder ("amour@beige.party")
                 if (str_contains($rest, '@')) {
+                    continue;
+                }
+                // Don't invent splits that look like a domain was glued on.
+                if (str_contains($rest, '.')) {
                     continue;
                 }
                 if (ap_masto_resolve_bare_username($prefix) !== null) {

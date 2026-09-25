@@ -8843,8 +8843,10 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
         }
     }
 
-    // Bare @user — resolve via known mentions or local actor cache
-    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{2,32})(?![A-Za-z0-9_@])/u', $plain, $bm, PREG_SET_ORDER)) {
+    // Bare @user — resolve via known mentions or local actor cache.
+    // Negative lookahead includes '.' so @jackvalinsky.com is left for the
+    // Bluesky-handle matcher (otherwise "jac" on social.lol steals the prefix).
+    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{2,32})(?![A-Za-z0-9_@.])/u', $plain, $bm, PREG_SET_ORDER)) {
         foreach ($bm as $hit) {
             $user = $hit[2];
             $userKey = strtolower($user);

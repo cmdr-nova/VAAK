@@ -9096,6 +9096,48 @@ function ap_bsky_build_facets(string $text): array
         }
     }
 
+
+    // @handles with a domain (Bluesky) — mention/link facets so clients link them.
+    // Bare @user without a dot is ambiguous across networks; skip those here.
+    if (preg_match_all('/(^|[^A-Za-z0-9_@])@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})(?![A-Za-z0-9.@])/u', $text, $hm, PREG_OFFSET_CAPTURE)) {
+        $hn = count($hm[0]);
+        for ($hi = 0; $hi < $hn; $hi++) {
+            $full = $hm[0][$hi][0];
+            $fullStart = $hm[0][$hi][1];
+            $handleRaw = $hm[2][$hi][0];
+            $handle = strtolower($handleRaw);
+            $atPos = strpos($full, '@');
+            if ($atPos === false || $handle === '') {
+                continue;
+            }
+            $byteStart = $fullStart + $atPos;
+            $byteEnd = $byteStart + strlen('@' . $handleRaw);
+            if ($byteEnd <= $byteStart) {
+                continue;
+            }
+            $did = function_exists('ap_bsky_resolve_handle_did')
+                ? ap_bsky_resolve_handle_did($handle, 0)
+                : null;
+            if (is_string($did) && str_starts_with($did, 'did:')) {
+                $facets[] = [
+                    'index' => ['byteStart' => $byteStart, 'byteEnd' => $byteEnd],
+                    'features' => [[
+                        '$type' => 'app.bsky.richtext.facet#mention',
+                        'did' => $did,
+                    ]],
+                ];
+            } else {
+                $facets[] = [
+                    'index' => ['byteStart' => $byteStart, 'byteEnd' => $byteEnd],
+                    'features' => [[
+                        '$type' => 'app.bsky.richtext.facet#link',
+                        'uri' => 'https://bsky.app/profile/' . rawurlencode($handle),
+                    ]],
+                ];
+            }
+        }
+    }
+
     usort($facets, static fn($a, $b) => ($a['index']['byteStart'] <=> $b['index']['byteStart']));
     return $facets;
 }
