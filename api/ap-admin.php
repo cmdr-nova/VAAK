@@ -9119,7 +9119,21 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
     $text = function_exists('admin_html_to_plain')
         ? trim(admin_html_to_plain((string) ($st['content'] ?? '')))
         : trim(html_entity_decode(strip_tags((string) ($st['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    $url = (string) ($st['uri'] ?? $st['url'] ?? $fallbackUrl);
+    // Prefer ActivityPub object id (uri) so status view can find the event.
+    // Web permalinks like /@user/123 miss Pleroma /posts/ rows without remapping.
+    $url = (string) ($st['uri'] ?? '');
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        $url = (string) ($st['url'] ?? $fallbackUrl);
+    }
+    if ($url !== '' && function_exists('ap_event_by_object_id') && !is_array(ap_event_by_object_id($url))
+        && function_exists('ap_masto_object_url_lookup_candidates')) {
+        foreach (ap_masto_object_url_lookup_candidates($url) as $cand) {
+            if (is_array(ap_event_by_object_id($cand))) {
+                $url = $cand;
+                break;
+            }
+        }
+    }
     $media = function_exists('admin_quote_media_items_from_status_like')
         ? admin_quote_media_items_from_status_like($st['media_attachments'] ?? [])
         : [];
@@ -11799,10 +11813,31 @@ function admin_render_masto_status_card(
         }
         $bodyInner .= admin_quote_card_html($qOpts, $returnView);
     } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
-        // Last-chance Bluesky hydrate for Status cards when masto entity stayed pending.
+        // Recover quote URL from status fields / local outbox AS2 when pending.
         $pendingUrl = '';
         if (!empty($st['quote_url']) && is_string($st['quote_url'])) {
             $pendingUrl = (string) $st['quote_url'];
+        }
+        if ($pendingUrl === '' && $uri !== '' && vaak_is_own_url($uri)
+            && function_exists('ap_masto_quote_url_from_create_json')) {
+            try {
+                $qst = ap_db()->prepare('SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+                $qst->execute([$uri, rtrim($uri, '/') . '/']);
+                $pendingUrl = (string) (ap_masto_quote_url_from_create_json((string) ($qst->fetchColumn() ?: '')) ?? '');
+            } catch (Throwable $e) {
+                $pendingUrl = '';
+            }
+        }
+        // Cache hit for the quoted object → render a real quote card.
+        if ($pendingUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
+            $pendingQuoted = ap_masto_lookup_status_by_object_url($pendingUrl, 0, false, true);
+            if (is_array($pendingQuoted)) {
+                $bodyInner .= admin_quote_card_html(
+                    admin_quote_opts_from_status($pendingQuoted, $pendingUrl),
+                    $returnView
+                );
+                $pendingUrl = ''; // done
+            }
         }
         $bskyPending = null;
         if ($pendingUrl !== '' && function_exists('ap_quote_target_is_bluesky')
@@ -11818,8 +11853,8 @@ function admin_render_masto_status_card(
             || trim((string) ($bskyPending['handle'] ?? '')) !== ''
             || !empty($bskyPending['media']))) {
             $bodyInner .= admin_quote_card_html(admin_quote_opts_from_bsky($bskyPending, $pendingUrl), $returnView);
-        } else {
-            if ($pendingUrl !== '' && function_exists('ap_quote_target_warm_async')) {
+        } elseif ($pendingUrl !== '') {
+            if (function_exists('ap_quote_target_warm_async')) {
                 ap_quote_target_warm_async($pendingUrl);
             }
             $bodyInner .= admin_quote_card_html([
@@ -21889,15 +21924,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               if (function_exists('ap_masto_mention_target_object_id')) {
                   $stObject = ap_masto_mention_target_object_id($stObject);
               }
-              // Web permalinks (https://host/@user/123) → canonical AS2 id + cache fetch
-              if (function_exists('ap_masto_url_looks_like_status')
-                  && ap_masto_url_looks_like_status($stObject)
-                  && function_exists('ap_event_by_object_id')
-                  && !is_array(ap_event_by_object_id($stObject))
-                  && function_exists('ap_masto_resolve_pasted_status_url')) {
-                  $resolvedSt = ap_masto_resolve_pasted_status_url($stObject);
-                  if (is_string($resolvedSt) && str_starts_with($resolvedSt, 'https://')) {
-                      $stObject = $resolvedSt;
+              // Web permalinks (https://host/@user/123) and Pleroma /posts/ forms
+              // → try every lookup candidate against the local event store first.
+              if (function_exists('ap_event_by_object_id') && !is_array(ap_event_by_object_id($stObject))) {
+                  $stCands = function_exists('ap_masto_object_url_lookup_candidates')
+                      ? ap_masto_object_url_lookup_candidates($stObject)
+                      : [$stObject];
+                  foreach ($stCands as $stCand) {
+                      $hit = ap_event_by_object_id($stCand);
+                      if (is_array($hit)) {
+                          $stObject = $stCand;
+                          $stEvent = $hit;
+                          break;
+                      }
+                  }
+                  if ($stEvent === null
+                      && function_exists('ap_masto_url_looks_like_status')
+                      && ap_masto_url_looks_like_status($stObject)
+                      && function_exists('ap_masto_resolve_pasted_status_url')) {
+                      $resolvedSt = ap_masto_resolve_pasted_status_url($stObject);
+                      if (is_string($resolvedSt) && str_starts_with($resolvedSt, 'https://')) {
+                          $stObject = $resolvedSt;
+                          $stEvent = ap_event_by_object_id($stObject);
+                      }
                   }
               }
               $isSyntheticBite = str_contains($stObject, '/bites-received/');
@@ -21914,7 +21963,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           $stLocalStatus = ap_masto_status_from_row($localRow, true, true);
                       }
                   }
-                  if (!$isSyntheticBite && $stLocalStatus === null) {
+                  if (!$isSyntheticBite && $stLocalStatus === null && $stEvent === null) {
                       $stEvent = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($stObject) : null;
                   }
                   $stType = is_array($stEvent) ? strtolower((string) ($stEvent['type'] ?? '')) : '';
@@ -22114,24 +22163,72 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php elseif (!is_array($stEvent) && !is_array($stLocalStatus)): ?>
           <?php if (!empty($isSyntheticBite) || str_contains($stObject, '/bites-received/')): ?>
             <div class="empty">No associated post — this was an account bite, not a post bite.</div>
-          <?php elseif (!empty($stMaybeHydrateFocus)): ?>
+          <?php else: ?>
+            <?php
+              // Last-chance sync ensure across URL candidates (Pleroma /posts/,
+              // Mastodon /statuses/, /@user/id web forms) before showing failure.
+              if ($stObject !== '' && str_starts_with($stObject, 'https://')
+                  && function_exists('ap_masto_ensure_remote_note_event')) {
+                  $ensureCands = function_exists('ap_masto_object_url_lookup_candidates')
+                      ? ap_masto_object_url_lookup_candidates($stObject)
+                      : [$stObject];
+                  foreach ($ensureCands as $ec) {
+                      try {
+                          $ensured = ap_masto_ensure_remote_note_event($ec);
+                      } catch (Throwable $e) {
+                          $ensured = null;
+                      }
+                      if (is_array($ensured)) {
+                          $stEvent = $ensured;
+                          $stObject = $ec;
+                          break;
+                      }
+                      if (function_exists('ap_event_by_object_id')) {
+                          $hit = ap_event_by_object_id($ec);
+                          if (is_array($hit)) {
+                              $stEvent = $hit;
+                              $stObject = $ec;
+                              break;
+                          }
+                      }
+                  }
+              }
+            ?>
+            <?php if (is_array($stEvent)): ?>
+              <div id="status-focus">
+                <?php
+                  $focusStatus = function_exists('ap_masto_status_from_event')
+                      ? ap_masto_status_from_event($stEvent)
+                      : null;
+                  if (is_array($focusStatus)) {
+                      if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusStatus['id'])) {
+                          ap_masto_status_flags_prefetch([(string) $focusStatus['id']]);
+                      }
+                      admin_render_masto_status_card($focusStatus, $followingIds, $stFrom, true, false);
+                  } else {
+                      admin_render_event_tweet($stEvent, $followingIds, $stFrom);
+                  }
+                ?>
+              </div>
+            <?php elseif (!empty($stMaybeHydrateFocus) || ($stObject !== '' && str_starts_with($stObject, 'https://'))): ?>
             <div id="status-thread-focus"
                  data-object="<?= h($stObject) ?>"
                  data-from="<?= h($stFrom) ?>"
                  data-need-more="1">
               <div class="meta status-thread-loading" style="padding:1rem 0">Loading this post…</div>
               <div class="meta" style="margin-top:.35rem">
-                <a href="<?= h(admin_remote_object_href($stObject)) ?>" target="_blank" rel="noopener noreferrer">Open on remote</a>
-                · <a href="?view=status&amp;object=<?= urlencode($stObject) ?>&amp;from=<?= urlencode($stFrom) ?>&amp;refresh_thread=1">Retry</a>
+                <a href="?view=status&amp;object=<?= urlencode($stObject) ?>&amp;from=<?= urlencode($stFrom) ?>&amp;refresh_thread=1">Retry</a>
+                · <a href="<?= h(admin_remote_object_href($stObject)) ?>" target="_blank" rel="noopener noreferrer">Open on remote</a>
               </div>
             </div>
-          <?php else: ?>
+            <?php else: ?>
             <div class="empty">
               Couldn’t load that post in this instance’s store.
               <?php if ($stObject !== ''): ?>
                 <div style="margin-top:.75rem"><a href="<?= h(admin_remote_object_href($stObject)) ?>" target="_blank" rel="noopener noreferrer">Open on remote</a></div>
               <?php endif; ?>
             </div>
+            <?php endif; ?>
           <?php endif; ?>
         <?php else: ?>
           <?php

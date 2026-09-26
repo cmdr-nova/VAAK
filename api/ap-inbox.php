@@ -2866,16 +2866,29 @@ function ap_object_url_lookup_candidates(string $objectUrl): array
             $cands[] = rtrim($note, '/');
         }
     }
-    // https://host/@user/123 ↔ https://host/users/user/statuses/123
+    // https://host/@user/123 ↔ Mastodon /statuses/ ↔ Pleroma/Akkoma /posts/
     if (preg_match('#^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
-        $cands[] = $m[1] . '/users/' . rawurlencode($m[2]) . '/statuses/' . $m[3];
-        $cands[] = $m[1] . '/ap/users/' . rawurlencode($m[2]) . '/statuses/' . $m[3];
+        $host = $m[1];
+        $user = rawurlencode($m[2]);
+        $id = $m[3];
+        $cands[] = $host . '/users/' . $user . '/statuses/' . $id;
+        $cands[] = $host . '/ap/users/' . $user . '/statuses/' . $id;
+        $cands[] = $host . '/users/' . $user . '/posts/' . $id;
+        $cands[] = $host . '/ap/users/' . $user . '/posts/' . $id;
     }
-    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/statuses/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/(statuses|posts)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $host = $m[1];
+        $userEnc = $m[2];
         $user = rawurldecode($m[2]);
-        $cands[] = $m[1] . '/@' . $user . '/' . $m[3];
-        $cands[] = $m[1] . '/users/' . $m[2] . '/statuses/' . $m[3];
-        $cands[] = $m[1] . '/ap/users/' . $m[2] . '/statuses/' . $m[3];
+        $kind = strtolower($m[3]);
+        $id = $m[4];
+        $alt = $kind === 'statuses' ? 'posts' : 'statuses';
+        $cands[] = $host . '/@' . $user . '/' . $id;
+        $cands[] = $host . '/users/' . $userEnc . '/statuses/' . $id;
+        $cands[] = $host . '/ap/users/' . $userEnc . '/statuses/' . $id;
+        $cands[] = $host . '/users/' . $userEnc . '/posts/' . $id;
+        $cands[] = $host . '/ap/users/' . $userEnc . '/posts/' . $id;
+        $cands[] = $host . '/users/' . $userEnc . '/' . $alt . '/' . $id;
     }
     $parent = ap_quote_post_parent_url($objectUrl);
     if (is_string($parent) && $parent !== '') {
