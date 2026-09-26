@@ -9758,7 +9758,7 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
     }
 
     // Protect URLs so #fragments / @ in paths aren't treated as tags/mentions;
-    // later restored as clickable external links.
+    // later restored as clickable links (status URLs → in-app Open).
     $placeholders = [];
     $protect = static function (string $text) use (&$placeholders): string {
         return preg_replace_callback(
@@ -9886,11 +9886,21 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
         foreach ($keys as $key) {
             $val = $placeholders[$key];
             if (str_starts_with($key, "\x01U")) {
-                // Bare URL → clickable external link (opens source like the video preview)
-                $href = htmlspecialchars($val, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-                $label = htmlspecialchars($val, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-                $val = '<a class="ext-link" href="' . $href . '" target="_blank" rel="noopener noreferrer">'
-                    . $label . '</a>';
+                $urlRaw = (string) $val;
+                $label = htmlspecialchars($urlRaw, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                // Status / post URLs open inside VAAK; other links stay external.
+                $isStatusUrl = (function_exists('ap_masto_url_looks_like_status') && ap_masto_url_looks_like_status($urlRaw))
+                    || (bool) preg_match('#^https://[^/]+/(?:users|@)[^/]+/(?:statuses|posts)/\d+#i', $urlRaw)
+                    || (bool) preg_match('#^https://bsky\.app/profile/[^/]+/post/#i', $urlRaw)
+                    || (bool) preg_match('#^https://[^/]+/ap/(?:users|actor)s?/[^/]+/statuses/#i', $urlRaw);
+                if ($isStatusUrl && function_exists('admin_status_href')) {
+                    $href = htmlspecialchars(admin_status_href($urlRaw, $returnView), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                    $val = '<a class="status-link" href="' . $href . '">' . $label . '</a>';
+                } else {
+                    $href = htmlspecialchars($urlRaw, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                    $val = '<a class="ext-link" href="' . $href . '" target="_blank" rel="noopener noreferrer">'
+                        . $label . '</a>';
+                }
             }
             $escaped = str_replace($key, $val, $escaped);
         }
@@ -16698,6 +16708,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .feed-body a.ext-link,
     .quote-block a.mention,
     .quote-block a.hashtag,
+    .quote-block a.status-link,
     .quote-block a.ext-link {
       color: var(--primary);
       text-decoration: none;
@@ -16710,6 +16721,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .feed-body a.ext-link:hover,
     .quote-block a.mention:hover,
     .quote-block a.hashtag:hover,
+    .quote-block a.status-link:hover,
     .quote-block a.ext-link:hover {
       text-decoration: underline;
       text-underline-offset: 2px;
@@ -23824,14 +23836,55 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     requestAnimationFrame(() => enhanceTweetFolds(root));
   }
   // Clicking a quote card opens the quoted post in VAAK (?view=status…),
-  // while nested links/media/buttons keep their own behavior.
+  // while nested media/buttons keep their own behavior. Status URLs inside
+  // the quote (including legacy ext-links) also stay in-app.
   function openQuoteBlock(qb) {
     if (!qb || !qb.classList || !qb.classList.contains('quote-block--openable')) return;
     const href = qb.getAttribute('data-href') || '';
     if (!href || href === '#') return;
     window.location.href = href;
   }
+  function looksLikeStatusUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+      const u = new URL(url, window.location.href);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+      const p = u.pathname || '';
+      return /\/(?:users|@)[^/]+\/(?:statuses|posts)\/\d+/i.test(p)
+        || /\/ap\/(?:users|actors?)\/[^/]+\/statuses\//i.test(p)
+        || /^\/profile\/[^/]+\/post\//i.test(p)
+        || (u.hostname === 'bsky.app' && /\/profile\/[^/]+\/post\//i.test(p));
+    } catch (e) {
+      return false;
+    }
+  }
   document.addEventListener('click', (ev) => {
+    const a = ev.target && ev.target.closest ? ev.target.closest('a') : null;
+    // Status permalinks inside quotes (or leftover ext-links) → in-app Open.
+    if (a && a.closest('.quote-block')) {
+      const href = a.getAttribute('href') || '';
+      const qb = a.closest('.quote-block--openable');
+      if (a.classList.contains('status-link')) {
+        return; // already in-app
+      }
+      if (looksLikeStatusUrl(href) || (qb && href && href.indexOf('view=status') === -1 && looksLikeStatusUrl(href))) {
+        const inApp = (qb && qb.getAttribute('data-href')) || null;
+        if (inApp) {
+          ev.preventDefault();
+          window.location.href = inApp;
+          return;
+        }
+        if (looksLikeStatusUrl(href)) {
+          ev.preventDefault();
+          const u = new URL(window.location.href);
+          u.searchParams.set('view', 'status');
+          u.searchParams.set('object', href);
+          if (!u.searchParams.get('from')) u.searchParams.set('from', 'home');
+          window.location.href = u.pathname + u.search;
+          return;
+        }
+      }
+    }
     const qb = ev.target && ev.target.closest ? ev.target.closest('.quote-block--openable') : null;
     if (!qb) return;
     if (ev.target.closest('a, button, .note-media-trigger, .media-cell, video, audio, .link-card, input, textarea, select, label')) {
