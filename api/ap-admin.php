@@ -8062,6 +8062,26 @@ function admin_media_is_video(string $url, ?string $mediaType = null): bool
     return (bool) preg_match('/\.(mp4|webm|mov|m4v|m3u8)(\?|$)/i', $path);
 }
 
+/**
+ * Best-effort poster frame for remote videos when events.media_urls only stored
+ * the playable URL. Mastodon-family hosts keep a still under /small/*.png next
+ * to /original/*.mp4 — same pattern Wafrn benefits from via cached media.
+ */
+function admin_guess_video_poster_url(string $url): string
+{
+    $url = trim($url);
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        return '';
+    }
+    // Mastodon / Hometown / glitch-soc media attachments
+    if (preg_match('#^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$#i', $url, $m)) {
+        return $m[1] . '/small/' . $m[2] . '.png';
+    }
+    // PeerTube-style static thumbnails next to the playable file are uncommon
+    // enough that we leave those to preload=metadata / explicit preview_url.
+    return '';
+}
+
 function admin_media_is_audio(string $url, ?string $mediaType = null): bool
 {
     $mt = strtolower(trim((string) $mediaType));
@@ -8615,6 +8635,14 @@ function admin_render_vakktok_cell(array $item): void
     } catch (Throwable $e) {
         // Remote videos may not have a local poster.
     }
+    if ($poster === '' || !str_starts_with($poster, 'https://')) {
+        $thumb = (string) ($video['thumbnail'] ?? $video['preview_url'] ?? $video['poster'] ?? '');
+        if (str_starts_with($thumb, 'https://')) {
+            $poster = $thumb;
+        } elseif (function_exists('admin_guess_video_poster_url')) {
+            $poster = admin_guess_video_poster_url($url);
+        }
+    }
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     echo '<article class="vakktok-item" data-vakktok-video="1">';
     echo '<video class="vakktok-video" controls loop playsinline preload="metadata" src="' . h($url) . '"';
@@ -8846,10 +8874,16 @@ function admin_media_row_html(array $items, string $hint = ''): string
         }
         if (admin_media_is_video($url, $mt)) {
             $hasVideo = true;
+            if ($preview === '' || !str_starts_with($preview, 'https://')) {
+                $preview = admin_guess_video_poster_url($url);
+            }
             $isHls = (bool) preg_match('/\.m3u8(?:$|[?#])/i', $url)
                 || in_array(strtolower(trim((string) $mt)), ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true);
             $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($url) . '"';
-            $cells[] = '<video class="media-video" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '"' . $sourceAttr . ' controls loop playsinline preload="none"'
+            // Wafrn-style: preload=metadata so progressive MP4s show a first
+            // frame even without a poster. Prefer an explicit poster when we
+            // have one (local ffmpeg still, Bluesky thumbnail, Mastodon /small/).
+            $cells[] = '<video class="media-video" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '"' . $sourceAttr . ' controls loop playsinline preload="metadata"'
                 . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
