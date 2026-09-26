@@ -26676,8 +26676,15 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const timelineItems = document.getElementById('timeline-items');
   // Home / Local / Federated share one composer panel: inline at top of feed,
   // or pop-out modal for reply/quote/edit. Must be moved back to the slot on close.
-  const supportsInlineComposer = !!(modal && timelineFeed && timelineItems
-    && ['home', 'local', 'feed'].includes(timelineItems.dataset.view || ''));
+  // Recompute from the live timeline node — soft-nav can leave the page on
+  // outbox/favourites while this script (and a stale const) still thinks it is Home.
+  function supportsInlineComposerNow() {
+    const items = document.getElementById('timeline-items') || timelineItems;
+    const feed = document.querySelector('.feed') || timelineFeed;
+    return !!(modal && feed && items
+      && ['home', 'local', 'feed'].includes(items.dataset.view || ''));
+  }
+  const supportsInlineComposer = supportsInlineComposerNow();
   function getComposePanel() {
     return document.querySelector('.compose-modal__panel');
   }
@@ -26788,11 +26795,11 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     applyComposerToolbarChrome(panel);
   }
   function placeComposerInline() {
+    const canInline = supportsInlineComposerNow();
+    if (!canInline || !modal) return;
     const liveItems = document.getElementById('timeline-items');
     const liveFeed = document.querySelector('.feed');
-    const canInline = !!(modal && liveFeed && liveItems
-      && ['home', 'local', 'feed'].includes(liveItems.dataset.view || ''));
-    if (!canInline || !modal) return;
+    if (!liveFeed || !liveItems) return;
     const panel = getComposePanel();
     if (!panel) return;
     panel.classList.add('compose-inline-panel');
@@ -27094,7 +27101,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       restoreComposeLocalBackup();
     }
     // Reply/quote/edit pop-out needs the panel back inside the modal shell.
-    if (supportsInlineComposer && isComposerInline()) {
+    if (supportsInlineComposerNow() && isComposerInline()) {
       placeComposerInModal();
     }
     const transitionToken = ++composeModalTransitionToken;
@@ -27557,7 +27564,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       }
       clearComposeFieldsAfterClose();
       // Rehome the shared composer after the exit animation finishes.
-      if (supportsInlineComposer) placeComposerInline();
+      if (supportsInlineComposerNow()) placeComposerInline();
       else modal.hidden = true;
     };
     const reducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -28136,46 +28143,49 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
 
   function applyEditChrome(noteId, returnView) {
     // Move into the modal panel first so field refs target the form we submit.
-    if (supportsInlineComposer && isComposerInline()) {
+    if (isComposerInline()) {
       placeComposerInModal();
     }
-    const form = activeComposeForm();
-    refreshComposeFieldRefs(form);
+    const liveForm = activeComposeForm();
+    refreshComposeFieldRefs(liveForm);
     resetComposeChrome();
-    refreshComposeFieldRefs(form);
+    refreshComposeFieldRefs(liveForm);
     composeMode = 'edit_status';
     if (actionField) actionField.value = 'edit_status';
     if (noteIdField) noteIdField.value = noteId || '';
     if (returnField) returnField.value = returnView || 'outbox';
-    const title = (form && form.closest('.compose-modal__panel') || document)
-      .querySelector('#compose-modal-title') || document.getElementById('compose-modal-title');
-    const submitBtn = composeField('#compose-submit-btn', form) || document.getElementById('compose-submit-btn');
+    const panelRoot = (liveForm && liveForm.closest('.compose-modal__panel')) || getComposePanel() || document;
+    const title = panelRoot.querySelector('#compose-modal-title') || document.getElementById('compose-modal-title');
+    const submitBtn = composeField('#compose-submit-btn', liveForm) || document.getElementById('compose-submit-btn');
     if (title) title.textContent = 'Edit post';
     if (submitBtn) submitBtn.textContent = 'Save edit';
     // Keep media as-is on edit (API keeps existing attachments); hide new uploads for now
-    const qBtn = composeField('#compose-queue-btn', form) || queueBtn;
-    const dBtn = composeField('#compose-draft-btn', form) || draftBtn;
+    const qBtn = composeField('#compose-queue-btn', liveForm) || queueBtn;
+    const dBtn = composeField('#compose-draft-btn', liveForm) || draftBtn;
     if (qBtn) qBtn.style.display = 'none';
     if (dBtn) dBtn.style.display = 'none';
     if (draftIdField) draftIdField.value = '';
     if (draftMediaField) draftMediaField.value = '';
-    const mInput = composeField('#compose-media-input', form) || mediaInput;
-    const mHint = composeField('#compose-media-hint', form) || mediaHint;
+    const mInput = composeField('#compose-media-input', liveForm) || mediaInput;
+    const mHint = composeField('#compose-media-hint', liveForm) || mediaHint;
     if (mInput) {
       const lab = mInput.closest('label');
       if (lab) lab.style.display = 'none';
     }
-    if (mHint) mHint.textContent = 'Media stays attached; text/CW edit only for now';
-    const vis = composeField('#compose-visibility', form);
+    if (mHint) {
+      mHint.style.display = '';
+      mHint.textContent = 'Media stays attached; text/CW edit only for now';
+    }
+    const vis = composeField('#compose-visibility', liveForm);
     const visWrap = vis ? vis.closest('label') : visibilityWrap;
     if (visWrap) visWrap.style.display = 'none';
-    const replyTo = composeField('#compose-in-reply-to', form);
+    const replyTo = composeField('#compose-in-reply-to', liveForm);
     if (replyTo) {
       replyTo.value = '';
       if (replyTo.parentElement) replyTo.parentElement.style.display = 'none';
       else replyTo.style.display = 'none';
     }
-    const toActor = composeField('#compose-to-actor', form);
+    const toActor = composeField('#compose-to-actor', liveForm);
     if (toActor && toActor.type !== 'hidden') {
       toActor.value = '';
       toActor.style.display = 'none';
@@ -28183,34 +28193,50 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
 
   function fillEditFields(content, spoilerText, sensitive) {
-    const ta = document.getElementById('compose-content');
-    if (ta) ta.value = content || '';
-    const spoiler = form.querySelector('input[name="spoiler_text"]');
+    // Always target the live panel form. Module-level `form` can point at a
+    // detached Home inline node after soft-nav, leaving the visible modal empty.
+    const liveForm = activeComposeForm() || form;
+    const ta = (liveForm && liveForm.querySelector('#compose-content'))
+      || document.getElementById('compose-content');
+    if (ta) {
+      ta.value = content || '';
+      ta.placeholder = 'Edit your post…';
+      try { autoGrowComposeTextarea(); } catch (e) {}
+    }
+    if (!liveForm) return;
+    const spoiler = liveForm.querySelector('input[name="spoiler_text"]');
     if (spoiler) spoiler.value = spoilerText || '';
-    const sens = form.querySelector('input[name="sensitive"]');
-    if (sens) sens.checked = !!sensitive;
+    const sens = liveForm.querySelector('input[name="sensitive"]');
+    if (sens) {
+      sens.checked = !!sensitive;
+      const sensBtn = liveForm.querySelector('.composer-check .compose-tool[aria-pressed]');
+      if (sensBtn) sensBtn.setAttribute('aria-pressed', sensitive ? 'true' : 'false');
+    }
   }
 
   function openEditComposer(btn) {
     const noteId = btn.getAttribute('data-note-id') || '';
     const returnView = btn.getAttribute('data-return-view') || 'outbox';
-    const panel = getComposePanel();
+    const fallbackHref = btn.getAttribute('href') || '';
+    const goFullPageEdit = () => {
+      if (fallbackHref) window.location.assign(fallbackHref);
+    };
+    let panel = getComposePanel();
     // Timeline pages render one shared composer inline. Move that actual panel
     // into the modal before changing its controls; otherwise a modal shell can
     // open while the editable form remains hidden in the feed slot.
     if (!panel) {
-      const fallbackHref = btn.getAttribute('href') || '';
-      if (fallbackHref) window.location.href = fallbackHref;
+      goFullPageEdit();
       return;
     }
-    if (supportsInlineComposer && isComposerInline()) {
+    if (isComposerInline()) {
       placeComposerInModal();
+      panel = getComposePanel() || panel;
     }
     // Focused/thread layouts can omit the inline slot. Do not leave an empty
     // modal shell if the shared panel was not actually attached with a form.
     if (!panel.querySelector('#compose-form') || !panel.querySelector('#compose-content')) {
-      const fallbackHref = btn.getAttribute('href') || '';
-      if (fallbackHref) window.location.href = fallbackHref;
+      goFullPageEdit();
       return;
     }
     // A focused post can leave the shared panel carrying inline-composer
@@ -28237,28 +28263,44 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (sb64) spoilerText = b64ToUtf8(sb64);
     else spoilerText = btn.getAttribute('data-spoiler') || '';
     const sensitive = btn.getAttribute('data-sensitive') === '1';
+    // Set edit mode before openModal so local draft restore cannot clobber fields.
+    composeMode = 'edit_status';
     fillEditFields(content, spoilerText, sensitive);
-    openModal();
-    const ta = document.getElementById('compose-content');
-    if (ta) setTimeout(() => ta.focus(), 50);
+    openModal({ skipBackup: true });
+    // Re-assert chrome after openModal/placeComposerInModal so title/submit
+    // never stick on Compose/Post from a prior reset.
+    applyEditChrome(noteId, returnView);
+    fillEditFields(content, spoilerText, sensitive);
+    const ta = (editForm && editForm.querySelector('#compose-content'))
+      || document.getElementById('compose-content');
+    if (ta) setTimeout(() => { try { ta.focus({ preventScroll: true }); } catch (e) { ta.focus(); } }, 50);
 
-    if (!noteId) return;
+    if (!noteId) {
+      if (!(content || '').trim()) goFullPageEdit();
+      return;
+    }
     // Authoritative load: masto_statuses.content_text (blank lines intact)
     fetch('?op=edit_draft&note_id=' + encodeURIComponent(noteId), {
       credentials: 'same-origin',
       headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       cache: 'no-store'
     }).then((res) => res.json()).then((data) => {
-      if (!data || !data.ok) return;
-      // Only apply if still editing this note
       if (composeMode !== 'edit_status') return;
       if (noteIdField && noteIdField.value !== noteId) return;
-      // Keep the button's immediate text fallback when an older/media-only
-      // row has no content_text; never turn a usable edit form blank.
-      if (String(data.content || '') !== '' || content === '') {
-        fillEditFields(data.content || '', data.spoiler_text || '', !!data.sensitive);
+      if (data && data.ok) {
+        // Keep the button's immediate text fallback when an older/media-only
+        // row has no content_text; never turn a usable edit form blank.
+        if (String(data.content || '') !== '' || content === '') {
+          fillEditFields(data.content || '', data.spoiler_text || '', !!data.sensitive);
+        }
+        return;
       }
-    }).catch(() => { /* keep attribute fallback */ });
+      // In-place hydrate failed and we had no attribute text — use the PHP
+      // ?edit_note= composer so the user is never left with an empty Edit box.
+      if (!(content || '').trim()) goFullPageEdit();
+    }).catch(() => {
+      if (composeMode === 'edit_status' && !(content || '').trim()) goFullPageEdit();
+    });
   }
 
   document.addEventListener('click', (ev) => {
