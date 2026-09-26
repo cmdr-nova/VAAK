@@ -339,6 +339,55 @@ function ap_redis_lock(string $key, int $ttlSeconds = 30): bool
     }
 }
 
+/** Release a lock we hold (best-effort; TTL remains the safety net). */
+function ap_redis_unlock(string $key): void
+{
+    $redis = ap_redis_client('queue');
+    if (!$redis || $key === '') {
+        return;
+    }
+    try {
+        $full = 'vaak:lock:' . $key;
+        $holder = $redis->get($full);
+        if (is_string($holder) && $holder === (string) getmypid()) {
+            $redis->del($full);
+        }
+    } catch (Throwable $e) {
+        // unlock must never affect requests
+    }
+}
+
+/**
+ * After losing a stampede lock, poll $fetch until it returns a non-null value
+ * or $maxWaitMs elapses. Prefer slow-correct rebuild over hanging the request.
+ *
+ * @param callable():mixed $fetch
+ * @return mixed|null
+ */
+function ap_redis_stampede_wait(callable $fetch, int $maxWaitMs = 200)
+{
+    $maxWaitMs = max(0, min(500, $maxWaitMs));
+    if ($maxWaitMs < 1) {
+        return null;
+    }
+    $deadline = microtime(true) + ($maxWaitMs / 1000.0);
+    $sliceUs = 40000; // 40ms
+    while (microtime(true) < $deadline) {
+        try {
+            $value = $fetch();
+        } catch (Throwable $e) {
+            $value = null;
+        }
+        if ($value !== null) {
+            ap_redis_metric_inc('stampede_wait_hit');
+            return $value;
+        }
+        usleep($sliceUs);
+    }
+    ap_redis_metric_inc('stampede_wait_timeout');
+    return null;
+}
+
 /** Publish a durable database queue ID as a fast worker wake-up signal. */
 function ap_redis_queue_push(string $queue, string|int $item): bool
 {

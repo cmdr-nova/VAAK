@@ -4604,6 +4604,7 @@ $adminTlFromCache = false;
 $adminTlForceRefresh = isset($_GET['_r']);
 $adminTlCachedHasMore = false;
 $adminTlCachedTotal = 0;
+$adminTlStampedeLock = '';
 if (
     !$wantNewerPoll
     && !$adminTlForceRefresh
@@ -4612,6 +4613,32 @@ if (
     $adminTlCacheKey = admin_tl_cache_key($view, $following);
     $adminTlRankedCached = admin_tl_cache_get($adminTlCacheKey);
     $adminTlFromCache = is_array($adminTlRankedCached);
+    // Stampede lock: one PHP-FPM worker rebuilds a cold ranked TL; peers wait
+    // briefly for the cache, then fall through to a slow rebuild if needed.
+    if (
+        !$adminTlFromCache
+        && $adminTlCacheKey !== ''
+        && function_exists('ap_redis_lock')
+        && in_array($view, ['home', 'feed', 'local'], true)
+    ) {
+        $adminTlStampedeLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
+            . substr(hash('sha256', $adminTlCacheKey), 0, 12);
+        if (!ap_redis_lock($adminTlStampedeLock, 45)) {
+            $peerCached = function_exists('ap_redis_stampede_wait')
+                ? ap_redis_stampede_wait(
+                    static function () use ($adminTlCacheKey) {
+                        return admin_tl_cache_get($adminTlCacheKey);
+                    },
+                    250
+                )
+                : null;
+            if (is_array($peerCached)) {
+                $adminTlRankedCached = $peerCached;
+                $adminTlFromCache = true;
+            }
+            $adminTlStampedeLock = '';
+        }
+    }
 }
 
 // Outbox cards: home / federated mix-in + Your posts
@@ -6427,6 +6454,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'feed' || ($isPartial &&
     if ($feedTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('feed', $following);
         admin_tl_cache_put($ck, admin_tl_rank_from_timeline($feedTimeline));
+        if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+            $adminTlStampedeLock = '';
+        }
     }
 }
 
@@ -6860,6 +6891,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
+        if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+            $adminTlStampedeLock = '';
+        }
     }
 }
 $homeEvents = array_map(static fn($i) => $i['row'], array_filter($homeTimeline, static fn($i) => $i['kind'] === 'event'));
@@ -6970,7 +7005,16 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'local' || ($isPartial &
     if ($localTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('local', $following);
         admin_tl_cache_put($ck, admin_tl_rank_from_timeline($localTimeline));
+        if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+            $adminTlStampedeLock = '';
+        }
     }
+}
+// Empty rebuild still releases the stampede lock so peers are not stuck waiting.
+if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+    ap_redis_unlock($adminTlStampedeLock);
+    $adminTlStampedeLock = '';
 }
 
 // Gallery: media-only posts (federated Creates with attachments + local outbox with media).

@@ -6631,6 +6631,8 @@ function ap_following_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
         && function_exists('ap_redis_relsets_enabled')
         && ap_redis_relsets_enabled();
     $redisKey = $useRedis ? ('vaak:relset:v1:following:' . $ownerUserId . ':' . $mode) : '';
+    $holdRelLock = false;
+    $relLock = '';
     if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($redisKey);
         if (is_array($cached)) {
@@ -6642,9 +6644,28 @@ function ap_following_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
         if (function_exists('ap_redis_relset_metric')) {
             ap_redis_relset_metric('miss');
         }
+        // Stampede: one worker rebuilds; peers wait briefly for the filled key.
+        $relLock = 'relset-rebuild:following:' . $ownerUserId . ':' . $mode;
+        $holdRelLock = function_exists('ap_redis_lock') && ap_redis_lock($relLock, 20);
+        if (!$holdRelLock && function_exists('ap_redis_stampede_wait')) {
+            $peer = ap_redis_stampede_wait(
+                static function () use ($redisKey) {
+                    return ap_redis_json_get($redisKey);
+                },
+                150
+            );
+            if (is_array($peer)) {
+                return $GLOBALS['ap_relset_memo'][$memoKey] = $peer;
+            }
+        }
     } elseif (function_exists('ap_redis_relset_metric') && function_exists('ap_redis_relsets_enabled')
         && !ap_redis_relsets_enabled()) {
         ap_redis_relset_metric('bypass');
+        $holdRelLock = false;
+        $relLock = '';
+    } else {
+        $holdRelLock = false;
+        $relLock = '';
     }
 
     $rows = ap_following_list($owner !== '' ? $owner : null);
@@ -6656,6 +6677,9 @@ function ap_following_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
     $map = ap_actor_id_membership_map($rows, $richAliases);
     if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
         ap_redis_json_set($redisKey, $map, 180);
+    }
+    if (!empty($holdRelLock) && !empty($relLock) && function_exists('ap_redis_unlock')) {
+        ap_redis_unlock($relLock);
     }
     return $GLOBALS['ap_relset_memo'][$memoKey] = $map;
 }
@@ -6689,6 +6713,8 @@ function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
         && function_exists('ap_redis_relsets_enabled')
         && ap_redis_relsets_enabled();
     $redisKey = $useRedis ? ('vaak:relset:v1:followers:' . $ownerUserId . ':' . $mode) : '';
+    $holdRelLock = false;
+    $relLock = '';
     if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($redisKey);
         if (is_array($cached)) {
@@ -6700,6 +6726,19 @@ function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
         if (function_exists('ap_redis_relset_metric')) {
             ap_redis_relset_metric('miss');
         }
+        $relLock = 'relset-rebuild:followers:' . $ownerUserId . ':' . $mode;
+        $holdRelLock = function_exists('ap_redis_lock') && ap_redis_lock($relLock, 20);
+        if (!$holdRelLock && function_exists('ap_redis_stampede_wait')) {
+            $peer = ap_redis_stampede_wait(
+                static function () use ($redisKey) {
+                    return ap_redis_json_get($redisKey);
+                },
+                150
+            );
+            if (is_array($peer)) {
+                return $GLOBALS['ap_relset_memo'][$memoKey] = $peer;
+            }
+        }
     }
 
     $rows = ap_followers_list($owner !== '' ? $owner : null);
@@ -6710,6 +6749,9 @@ function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
     $map = ap_actor_id_membership_map($rows, $richAliases);
     if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
         ap_redis_json_set($redisKey, $map, 180);
+    }
+    if ($holdRelLock && $relLock !== '' && function_exists('ap_redis_unlock')) {
+        ap_redis_unlock($relLock);
     }
     return $GLOBALS['ap_relset_memo'][$memoKey] = $map;
 }

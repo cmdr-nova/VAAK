@@ -4749,9 +4749,27 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     $redisKey = 'vaak:notifications:v1:' . $ownerUserId . ':' . hash('sha256', json_encode([
         'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want,
     ], JSON_UNESCAPED_SLASHES) ?: '');
+    $notifStampedeLock = '';
+    $holdNotifLock = false;
     if (function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
-        if (is_array($redisCached)) return $redisCached;
+        if (is_array($redisCached)) {
+            return $redisCached;
+        }
+        // Coalesce cold notification list rebuilds after idle.
+        $notifStampedeLock = 'notif-rebuild:' . substr(hash('sha256', $redisKey), 0, 16);
+        $holdNotifLock = function_exists('ap_redis_lock') && ap_redis_lock($notifStampedeLock, 30);
+        if (!$holdNotifLock && function_exists('ap_redis_stampede_wait')) {
+            $peer = ap_redis_stampede_wait(
+                static function () use ($redisKey) {
+                    return ap_redis_json_get($redisKey);
+                },
+                200
+            );
+            if (is_array($peer)) {
+                return $peer;
+            }
+        }
     }
 
     if (array_intersect($want, $mentionTypes)) {
@@ -4900,6 +4918,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         // short enough that new activity still appears after a brief pause.
         ap_redis_json_set($redisKey, $out, 45);
     }
+    if ($holdNotifLock && $notifStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+        ap_redis_unlock($notifStampedeLock);
+    }
     return $out;
 }
 
@@ -4928,6 +4949,8 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     // Keep page-load badge snappy, but ajax polling must not sit on a long lie.
     $cacheTtl = $bypassCache ? 0 : 20;
     $redisKey = 'vaak:notifications:v1:unread:' . $ownerUserId . ':' . $scan . ':' . hash('sha256', $lastRead);
+    $unreadStampedeLock = '';
+    $holdUnreadLock = false;
     if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
         if (is_array($redisCached) && isset($redisCached['c'])) {
@@ -4937,6 +4960,25 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
                 'latest_unread_id' => (string) ($redisCached['u'] ?? ''),
                 'latest_id' => (string) ($redisCached['l'] ?? ''),
             ];
+        }
+        $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
+        $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
+        if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
+            $peer = ap_redis_stampede_wait(
+                static function () use ($redisKey) {
+                    $row = ap_redis_json_get($redisKey);
+                    return (is_array($row) && isset($row['c'])) ? $row : null;
+                },
+                150
+            );
+            if (is_array($peer) && isset($peer['c'])) {
+                return [
+                    'count' => max(0, min($scan, (int) $peer['c'])),
+                    'last_read_id' => $lastRead,
+                    'latest_unread_id' => (string) ($peer['u'] ?? ''),
+                    'latest_id' => (string) ($peer['l'] ?? ''),
+                ];
+            }
         }
     }
     $cacheDir = '/var/lib/mkultra/ap';
@@ -5095,6 +5137,9 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         ap_redis_json_set($redisKey, $payload, $cacheTtl);
     }
     @file_put_contents($cachePath, json_encode($payload), LOCK_EX);
+    if ($holdUnreadLock && $unreadStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+        ap_redis_unlock($unreadStampedeLock);
+    }
     return [
         'count' => $count,
         'last_read_id' => $lastRead,
