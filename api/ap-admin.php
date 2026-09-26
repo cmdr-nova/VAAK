@@ -3708,27 +3708,58 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
+    // Release session so folder-tab clicks / badge polls are not serialized.
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     $folderId = (int) ($_GET['folder'] ?? 0);
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
     $items = [];
+    $refreshing = false;
     if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
         && ap_bsky_session_row($vaakOwnerId) !== null) {
         if ($folderId > 0 && function_exists('vaak_bookmark_folder_match_keys')) {
             $keys = vaak_bookmark_folder_match_keys($folderId, $vaakOwnerId, 500);
+            $objectIds = array_values(array_unique(array_filter(array_map(
+                'strval',
+                $keys['object_ids'] ?? []
+            ))));
+            // Also accept status_ids that are bsky: hashes / at:// leftovers.
+            foreach ($keys['status_ids'] ?? [] as $sid) {
+                $sid = trim((string) $sid);
+                if (str_starts_with($sid, 'at://') || str_starts_with($sid, 'https://bsky.app/')) {
+                    $objectIds[] = $sid;
+                }
+            }
             $result = function_exists('ap_bsky_get_bookmarks_for_uris')
-                ? ap_bsky_get_bookmarks_for_uris($vaakOwnerId, array_keys($keys['object_ids'] ?? []), $limit)
+                ? ap_bsky_get_bookmarks_for_uris($vaakOwnerId, $objectIds, $limit)
                 : ['ok' => true, 'bookmarks' => []];
+            // Kick a background refresh without blocking this fragment.
+            if (function_exists('ap_bsky_get_bookmarks')) {
+                $probe = ap_bsky_get_bookmarks($vaakOwnerId, 1);
+                $refreshing = !empty($probe['refreshing']);
+            }
         } else {
             $result = ap_bsky_get_bookmarks($vaakOwnerId, $limit);
+            $refreshing = !empty($result['refreshing']);
         }
         if (!empty($result['ok']) && is_array($result['bookmarks'] ?? null)) {
             $items = $result['bookmarks'];
         }
     }
     if ($items === []) {
-        echo '<div class="empty" data-bsky-bookmark-empty>No cached Bluesky bookmarks yet. They will appear after the background sync completes.</div>';
+        echo '<div class="empty" data-bsky-bookmark-empty>'
+            . ($folderId > 0
+                ? 'No Bluesky bookmarks in this folder.'
+                : ($refreshing
+                    ? 'Bluesky bookmarks are refreshing in the background. Reload shortly.'
+                    : 'No cached Bluesky bookmarks yet. They will appear after the background sync completes.'))
+            . '</div>';
         exit;
+    }
+    if ($refreshing) {
+        echo '<p class="meta">Showing cached Bluesky bookmarks while they refresh in the background.</p>';
     }
     echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>';
     foreach ($items as $item) {
@@ -12212,10 +12243,16 @@ function admin_load_bsky_status_item(string $objectUrl, int $ownerUserId = 0): ?
 function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
 {
     $atUri = trim($atUri);
+    static $memo = [];
+    $memoKey = $atUri . '|' . (int) $ownerUserId;
+    if ($atUri !== '' && isset($memo[$memoKey])) {
+        return $memo[$memoKey];
+    }
     $objectId = $atUri;
     $statusId = '';
+    // Cache-only: never PDS-fetch or outbox-scan while rendering cards / folder tabs.
     if ($atUri !== '' && function_exists('ap_bsky_local_note_id_for_at_uri')) {
-        $noteId = ap_bsky_local_note_id_for_at_uri($atUri, $ownerUserId);
+        $noteId = ap_bsky_local_note_id_for_at_uri($atUri, $ownerUserId, false);
         if (is_string($noteId) && $noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
             $st = ap_masto_status_by_note_id($noteId);
             if (is_array($st) && !empty($st['local_id'])) {
@@ -12235,7 +12272,11 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
             }
         }
     }
-    return ['status_id' => $statusId, 'object_id' => $objectId];
+    $out = ['status_id' => $statusId, 'object_id' => $objectId];
+    if ($atUri !== '') {
+        $memo[$memoKey] = $out;
+    }
+    return $out;
 }
 
 /**
@@ -17243,52 +17284,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }));
           if ($bmFolderFilter < 1) {
               $bmList = array_slice($bmList, 0, $bookmarkLimit);
-          }
-          $bskyBookmarkItems = [];
-          $bookmarkRefreshing = false;
-          if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
-              && ap_bsky_session_row($vaakOwnerId) !== null) {
-              $bskyFetchLimit = $bmFolderFilter > 0 ? 200 : $bookmarkLimit;
-              $bskyResult = ap_bsky_get_bookmarks($vaakOwnerId, $bskyFetchLimit);
-              $bookmarkRefreshing = !empty($bskyResult['refreshing']);
-              if (!empty($bskyResult['ok']) && is_array($bskyResult['bookmarks'] ?? null)) {
-                  $bskyBookmarkItems = $bskyResult['bookmarks'];
-              }
-          }
-          $bskyBookmarkKeys = [];
-          foreach ($bskyBookmarkItems as $bItem) {
-              $post = is_array($bItem['post'] ?? null) ? $bItem['post'] : [];
-              $uri = (string) ($post['uri'] ?? '');
-              if ($uri === '') {
-                  continue;
-              }
-              $keys = admin_bsky_bookmark_keys($uri, $vaakOwnerId);
-              if ($keys['status_id'] !== '') {
-                  $bskyBookmarkKeys[$keys['status_id']] = true;
-              }
-          }
-          if ($bskyBookmarkKeys !== []) {
-              $bmList = array_values(array_filter($bmList, static function ($st) use ($bskyBookmarkKeys): bool {
-                  return !isset($bskyBookmarkKeys[(string) ($st['id'] ?? '')]);
-              }));
-          }
-          if ($bmFolderFilter > 0) {
-              $folderKeys = $allowed ?? [];
-              $folderObjects = $allowedObjects ?? [];
-              $bskyBookmarkItems = array_values(array_filter($bskyBookmarkItems, static function ($item) use ($folderKeys, $folderObjects, $vaakOwnerId): bool {
-                  $post = is_array($item['post'] ?? null) ? $item['post'] : [];
-                  $uri = (string) ($post['uri'] ?? '');
-                  if ($uri === '') {
-                      return false;
-                  }
-                  $keys = admin_bsky_bookmark_keys($uri, $vaakOwnerId);
-                  return ($keys['status_id'] !== '' && isset($folderKeys[$keys['status_id']]))
-                      || ($keys['object_id'] !== '' && isset($folderObjects[rtrim($keys['object_id'], '/')]))
-                      || isset($folderObjects[rtrim($uri, '/')]);
-              }));
+          } else {
               $bmList = array_slice($bmList, 0, $bookmarkLimit);
-              $bskyBookmarkItems = array_slice($bskyBookmarkItems, 0, $bookmarkLimit);
           }
+          // Bluesky bookmarks load via ?ajax=bookmarks_bsky after first paint.
+          // Sync rendering called admin_bsky_bookmark_keys → PDS/outbox scans per
+          // card and locked PHP-FPM when switching folder tabs.
+          $bskyBookmarksEnabled = function_exists('ap_bsky_get_bookmarks')
+              && function_exists('ap_bsky_session_row')
+              && ap_bsky_session_row($vaakOwnerId) !== null;
+          // Drop local twin rows that are only mirrors of Bluesky bookmarks
+          // (status_id begins with bsky:) so the async Bluesky list owns them.
+          $bmList = array_values(array_filter($bmList, static function ($st): bool {
+              $sid = (string) ($st['id'] ?? '');
+              $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
+              return !(str_starts_with($sid, 'bsky:') || str_starts_with($uri, 'at://')
+                  || str_contains($uri, 'bsky.app/'));
+          }));
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
@@ -17319,15 +17331,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
           </form>
         <?php endif; ?>
-        <?php if (!$bmList && !$bskyBookmarkItems): ?>
-          <div class="empty"><?= $bookmarkRefreshing && $bmFolderFilter < 1 ? 'Bluesky bookmarks are refreshing in the background. Reload this page shortly.' : ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') ?></div>
+        <?php if (!$bmList && !$bskyBookmarksEnabled): ?>
+          <div class="empty"><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
+        <?php elseif (!$bmList && $bskyBookmarksEnabled): ?>
+          <div class="empty" id="bookmarks-empty-fedi" hidden><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
         <?php endif; ?>
-        <?php if ($bookmarkRefreshing && $bskyBookmarkItems): ?><p class="meta">Showing cached Bluesky bookmarks while they refresh in the background.</p><?php endif; ?>
-        <?php if ($bskyBookmarkItems): ?>
-          <h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>
-          <?php foreach ($bskyBookmarkItems as $bskyBookmarkItem): ?>
-            <?php admin_render_bsky_feed_item($bskyBookmarkItem, 'following', 'bookmarks'); ?>
-          <?php endforeach; ?>
+        <?php if ($bskyBookmarksEnabled): ?>
+          <div id="bookmarks-bsky-slot"
+               data-folder="<?= (int) $bmFolderFilter ?>"
+               data-limit="<?= (int) $bookmarkLimit ?>"
+               aria-live="polite">
+            <div class="meta" style="padding:.75rem 0">Loading Bluesky bookmarks…</div>
+          </div>
         <?php endif; ?>
         <?php if ($bmList): ?>
           <?php foreach ($bmList as $st): ?>
@@ -17379,10 +17394,37 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </article>
           <?php endforeach; ?>
         <?php endif; ?>
-        <?php if ($bookmarkLimit < 80 && (count($bmList) >= $bookmarkLimit || count($bskyBookmarkItems) >= $bookmarkLimit)): ?>
+        <?php if ($bookmarkLimit < 80 && count($bmList) >= $bookmarkLimit): ?>
           <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
             <a class="btn btn-ghost" href="?view=bookmarks<?= $bmFolderFilter > 0 ? '&amp;folder=' . $bmFolderFilter : '' ?>&amp;limit=<?= min(80, $bookmarkLimit + 20) ?>">Show 20 more bookmarks</a>
           </div>
+        <?php endif; ?>
+        <?php if ($bskyBookmarksEnabled): ?>
+<script>
+(function loadBookmarksBsky() {
+  const slot = document.getElementById('bookmarks-bsky-slot');
+  if (!slot || slot.dataset.loaded === '1') return;
+  slot.dataset.loaded = '1';
+  const folder = slot.getAttribute('data-folder') || '0';
+  const limit = slot.getAttribute('data-limit') || '20';
+  const url = '?ajax=bookmarks_bsky&folder=' + encodeURIComponent(folder)
+    + '&limit=' + encodeURIComponent(limit);
+  fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } })
+    .then((res) => res.ok ? res.text() : Promise.reject(new Error('bookmarks_bsky ' + res.status)))
+    .then((html) => {
+      const trimmed = (html || '').trim();
+      slot.innerHTML = trimmed !== '' ? trimmed : '';
+      const empty = document.getElementById('bookmarks-empty-fedi');
+      const hasBsky = trimmed !== '' && !slot.querySelector('[data-bsky-bookmark-empty]');
+      if (empty && !hasBsky && !document.querySelector('.tweet')) {
+        empty.hidden = false;
+      }
+    })
+    .catch(() => {
+      slot.innerHTML = '<div class="meta">Couldn’t load Bluesky bookmarks right now.</div>';
+    });
+})();
+</script>
         <?php endif; ?>
 
       <?php elseif ($view === 'mentions'): ?>

@@ -849,7 +849,11 @@ function ap_bsky_crosspost_by_note_id(string $noteId): ?array
 /**
  * @return array{note_id:string,bsky_uri:string,bsky_cid:?string,owner_user_id:?int}|null
  */
-function ap_bsky_crosspost_by_uri(string $bskyUri): ?array
+/**
+ * @param bool $allowOutboxScan Unindexed LIKE over outbox_notes (~100ms+ each).
+ *        Keep false on list/render paths (Bookmarks folder tabs, card chrome).
+ */
+function ap_bsky_crosspost_by_uri(string $bskyUri, bool $allowOutboxScan = false): ?array
 {
     $bskyUri = trim($bskyUri);
     // Accept bsky.app HTTPS and normalize to at:// when possible via map table scan of https… no —
@@ -863,18 +867,26 @@ function ap_bsky_crosspost_by_uri(string $bskyUri): ?array
     if (!str_starts_with($bskyUri, 'at://')) {
         return null;
     }
+    static $memo = [];
+    $memoKey = $bskyUri . ':' . ($allowOutboxScan ? '1' : '0');
+    if (array_key_exists($memoKey, $memo)) {
+        return $memo[$memoKey];
+    }
     ap_bsky_crossposts_migrate();
     try {
         $st = ap_db()->prepare('SELECT * FROM bsky_crossposts WHERE bsky_uri = ? LIMIT 1');
         $st->execute([$bskyUri]);
         $row = $st->fetch();
         if (is_array($row)) {
-            return $row;
+            return $memo[$memoKey] = $row;
         }
     } catch (Throwable $e) {
-        // fall through to raw_create_json fallback
+        // fall through
     }
-    // Fallback: scan recent outbox raw JSON (unindexed — last resort).
+    if (!$allowOutboxScan) {
+        return $memo[$memoKey] = null;
+    }
+    // Fallback: scan recent outbox raw JSON (unindexed — last resort / repair only).
     try {
         $st = ap_db()->prepare(
             "SELECT id, raw_create_json FROM outbox_notes
@@ -894,7 +906,7 @@ function ap_bsky_crosspost_by_uri(string $bskyUri): ?array
             if ($uri === $bskyUri) {
                 $cid = isset($obj['blueskyCid']) ? (string) $obj['blueskyCid'] : null;
                 ap_bsky_crosspost_save((string) $row['id'], $uri, $cid);
-                return [
+                return $memo[$memoKey] = [
                     'note_id' => (string) $row['id'],
                     'bsky_uri' => $uri,
                     'bsky_cid' => $cid,
@@ -905,7 +917,7 @@ function ap_bsky_crosspost_by_uri(string $bskyUri): ?array
     } catch (Throwable $e) {
         // ignore
     }
-    return null;
+    return $memo[$memoKey] = null;
 }
 
 /**
@@ -960,19 +972,26 @@ function ap_bsky_local_note_id_for_at_uri(string $atUri, int $ownerUserId = 0, b
             return null;
         }
     }
-    $map = ap_bsky_crosspost_by_uri($atUri);
+    static $memo = [];
+    $memoKey = $atUri . '|' . (int) $ownerUserId . '|' . ($allowFetch ? '1' : '0');
+    if (array_key_exists($memoKey, $memo)) {
+        return $memo[$memoKey];
+    }
+    // Indexed maps only on the hot path. Outbox LIKE scans and PDS getRecord
+    // belong to explicit repair/fetch callers — never Bookmarks list paint.
+    $map = ap_bsky_crosspost_by_uri($atUri, false);
     if (is_array($map) && !empty($map['note_id'])) {
-        return (string) $map['note_id'];
+        return $memo[$memoKey] = (string) $map['note_id'];
     }
     $link = function_exists('ap_bsky_post_link_by_uri') ? ap_bsky_post_link_by_uri($atUri) : null;
     if (is_array($link)) {
         $fedi = rtrim((string) ($link['fediverse_id'] ?? $link['ap_object_id'] ?? ''), '/');
         if ($fedi !== '' && str_contains($fedi, '/notes/')) {
-            return $fedi;
+            return $memo[$memoKey] = $fedi;
         }
     }
     if (!$allowFetch) {
-        return null;
+        return $memo[$memoKey] = null;
     }
     // Read fediverseId from the Bluesky record (Wafrn-compatible dual-publish marker).
     if ($ownerUserId < 1) {
@@ -984,14 +1003,14 @@ function ap_bsky_local_note_id_for_at_uri(string $atUri, int $ownerUserId = 0, b
         }
     }
     if ($ownerUserId < 1 || !preg_match('~^at://([^/]+)/(app\.bsky\.feed\.post)/([^/]+)$~', $atUri, $m)) {
-        return null;
+        return $memo[$memoKey] = null;
     }
     $tok = ap_bsky_access_token($ownerUserId, false);
     if (empty($tok['ok'])) {
         $tok = ap_bsky_access_token($ownerUserId, true);
     }
     if (empty($tok['ok'])) {
-        return null;
+        return $memo[$memoKey] = null;
     }
     $row = ap_bsky_session_row($ownerUserId);
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
@@ -1007,16 +1026,80 @@ function ap_bsky_local_note_id_for_at_uri(string $atUri, int $ownerUserId = 0, b
         }
     }
     if (empty($got['ok'])) {
-        return null;
+        return $memo[$memoKey] = null;
     }
     $value = is_array($got['json']['value'] ?? null) ? $got['json']['value'] : [];
     $fedi = trim((string) ($value['fediverseId'] ?? ''));
     $cid = (string) ($got['json']['cid'] ?? '');
     if ($fedi !== '' && str_starts_with($fedi, 'https://mkultra.monster/users/')) {
         ap_bsky_crosspost_save($fedi, $atUri, $cid !== '' ? $cid : null, $ownerUserId);
-        return $fedi;
+        return $memo[$memoKey] = $fedi;
     }
-    return null;
+    return $memo[$memoKey] = null;
+}
+
+/**
+ * Cache-only Bluesky bookmarks for a set of AT/https object refs (folder tabs).
+ *
+ * @param list<string> $objectIds
+ * @return array{ok:bool,bookmarks:list<array<string,mixed>>}
+ */
+function ap_bsky_get_bookmarks_for_uris(int $ownerUserId, array $objectIds, int $limit = 80): array
+{
+    if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) {
+        return ['ok' => true, 'bookmarks' => []];
+    }
+    $want = [];
+    foreach ($objectIds as $oid) {
+        $oid = trim((string) $oid);
+        if ($oid === '') {
+            continue;
+        }
+        if (str_starts_with($oid, 'at://')) {
+            $want[$oid] = true;
+            continue;
+        }
+        if (str_starts_with($oid, 'https://bsky.app/') && function_exists('ap_bsky_at_uri_from_any_url')) {
+            $at = ap_bsky_at_uri_from_any_url($oid);
+            if (is_string($at) && str_starts_with($at, 'at://')) {
+                $want[$at] = true;
+            }
+        }
+    }
+    if ($want === []) {
+        return ['ok' => true, 'bookmarks' => []];
+    }
+    $limit = max(1, min(200, $limit));
+    $uris = array_keys($want);
+    $out = [];
+    try {
+        foreach (array_chunk($uris, 100) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $st = ap_db()->prepare(
+                "SELECT post_json, bookmarked_at, bookmark_uri FROM bsky_bookmark_cache
+                 WHERE owner_user_id = ? AND bookmark_uri IN ($ph)
+                 ORDER BY bookmarked_at DESC, bookmark_uri DESC"
+            );
+            $st->execute(array_merge([$ownerUserId], $chunk));
+            foreach ($st->fetchAll() ?: [] as $row) {
+                $item = json_decode((string) ($row['post_json'] ?? ''), true);
+                if (!is_array($item) || !is_array($item['post'] ?? null)) {
+                    continue;
+                }
+                $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
+                $item['post']['viewer']['bookmarked'] = true;
+                $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
+                $out[] = $item;
+                if (count($out) >= $limit) {
+                    return ['ok' => true, 'bookmarks' => $out];
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] bookmarks_for_uris failed');
+        return ['ok' => true, 'bookmarks' => []];
+    }
+    return ['ok' => true, 'bookmarks' => $out];
 }
 
 /**
