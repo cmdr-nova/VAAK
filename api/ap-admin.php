@@ -25582,7 +25582,27 @@ window.apAdminToast = function (msg, isErr) {
     stickToTopTimer = window.setTimeout(() => {
       stickToTop = false;
       stickToTopTimer = 0;
+      // IntersectionObserver only fires on threshold crossings. If the sentinel
+      // stayed visible the whole time stickToTop was armed, resume paging.
+      maybeLoadMoreIfNeeded();
     }, 2000);
+  }
+
+  function sentinelNeedsMore() {
+    if (!hasMore || loading || stickToTop || !sentinel) return false;
+    try {
+      const rect = sentinel.getBoundingClientRect();
+      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      // Match the IO rootMargin (~180px): trigger when the sentinel is near
+      // or below the viewport bottom.
+      return rect.top < (vh + 220);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function maybeLoadMoreIfNeeded() {
+    if (sentinelNeedsMore()) loadMore();
   }
 
   async function loadMore() {
@@ -25703,27 +25723,41 @@ window.apAdminToast = function (msg, isErr) {
       loading = false;
       if (stickToTop) {
         sc.setTop(0, false);
+      } else {
+        // Short first pages / soft-nav: sentinel can remain intersecting after a
+        // finished page with no new IO event — keep filling until content grows.
+        window.requestAnimationFrame(() => maybeLoadMoreIfNeeded());
       }
     }
   }
 
-  let io = new IntersectionObserver((entries) => {
-    if (stickToTop) return;
-    if (entries.some((en) => en.isIntersecting)) loadMore();
-  }, { root: sc.ioRoot, rootMargin: '180px', threshold: 0 });
-  io.observe(sentinel);
-
-  // Re-bind observer if layout flips (rotate / resize across the mobile breakpoint).
-  window.addEventListener('resize', () => {
-    const next = scrollApi();
-    if (next.mode === sc.mode) return;
-    io.disconnect();
-    sc = next;
+  let io = null;
+  function bindInfiniteScrollObserver() {
+    if (io) {
+      try { io.disconnect(); } catch (e) {}
+      io = null;
+    }
+    if (!sentinel) return;
+    sc = scrollApi();
     io = new IntersectionObserver((entries) => {
       if (stickToTop) return;
       if (entries.some((en) => en.isIntersecting)) loadMore();
     }, { root: sc.ioRoot, rootMargin: '180px', threshold: 0 });
     io.observe(sentinel);
+    // Soft-nav / short feeds: sentinel may already be on screen with no crossing.
+    window.requestAnimationFrame(() => maybeLoadMoreIfNeeded());
+  }
+  bindInfiniteScrollObserver();
+
+  // Re-bind observer if layout flips (rotate / resize across the mobile breakpoint).
+  window.addEventListener('resize', () => {
+    const next = scrollApi();
+    if (next.mode === sc.mode) {
+      maybeLoadMoreIfNeeded();
+      return;
+    }
+    sc = next;
+    bindInfiniteScrollObserver();
     sc.onScroll(updateTopBtn);
     sc.onScroll(syncTimelineStreamVisibility);
     updateTopBtn();
@@ -26244,10 +26278,23 @@ window.apAdminToast = function (msg, isErr) {
     hasMore = items.dataset.hasMore === '1';
     newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
     loading = false;
+    stickToTop = false;
+    if (stickToTopTimer) {
+      window.clearTimeout(stickToTopTimer);
+      stickToTopTimer = 0;
+    }
     pendingHtml = '';
     pendingCount = 0;
+    notifMaxId = items.dataset.maxId || '';
+    notifFilter = items.dataset.filter || 'all';
+    bskyCursor = items.dataset.cursor || '';
+    bskyFeed = items.dataset.feed || 'following';
+    bskySource = items.dataset.source || 'home';
     if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(items);
     if (typeof window.novaEnqueueBoostHydrates === 'function') window.novaEnqueueBoostHydrates(items);
+    // Critical: soft-nav replaces #timeline-sentinel. Re-observe the live node
+    // or infinite scroll stalls on the static "Scroll for more…" label.
+    bindInfiniteScrollObserver();
     try { syncTimelineStreamVisibility(); } catch (e) {}
     if (typeof window.vaakBindFeedTopBtn === 'function') {
       window.vaakBindFeedTopBtn(document.querySelector('section.main'));
