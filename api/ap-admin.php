@@ -28308,21 +28308,20 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     if (!btn) return;
     ev.preventDefault();
     // The shared navigation listener runs in capture phase and briefly shows
-    // the page-loading pill for every same-origin anchor. Edit stays in the
-    // current document, so hand that navigation state back immediately rather
-    // than leaving the pill spinning while the modal is open.
+    // the page-loading pill for every same-origin anchor. Edit navigates to
+    // the server-rendered composer, so clear that indicator immediately.
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
-    // Prefer in-place edit when the compose modal exists. Full-page
-    // ?edit_note= navigation remains the no-JS / no-modal fallback and must
-    // never be the default — soft-nav composer adoption + duplicate #compose-form
-    // IDs have caused edits to post as new replies.
-    if (modal && typeof openEditComposer === 'function') {
-      openEditComposer(btn);
-      return;
-    }
+    // Canonical Edit path (restored from 03e05dc / Sep 22): full-page
+    // ?edit_note= so PHP prefills edit_status chrome + body. In-place
+    // openEditComposer keeps regressing to an empty Compose/Post shell after
+    // soft-nav composer adoption (seen again in 0.3.36–0.3.38).
     const href = btn.getAttribute('href') || '';
     if (href) {
       window.location.assign(href);
+      return;
+    }
+    if (modal && typeof openEditComposer === 'function') {
+      openEditComposer(btn);
     }
   });
 
