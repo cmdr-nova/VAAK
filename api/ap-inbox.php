@@ -5505,6 +5505,18 @@ function ap_publish_status_text(
         if (is_string($combined) && $combined !== '') {
             $feedSummary = $combined;
         }
+        // Compose stores remote quotes as URL stubs (no sync fetch on the
+        // critical path). Warm the target so the next Home paint can show the
+        // full quoted text, media, and link preview.
+        if (function_exists('ap_quote_target_warm_async')) {
+            ap_quote_target_warm_async($quoteObjectId);
+        } elseif (function_exists('ap_masto_ensure_remote_note_event') === false
+            && is_file(__DIR__ . '/ap-masto-entities.php')) {
+            require_once __DIR__ . '/ap-masto-entities.php';
+            if (function_exists('ap_quote_target_warm_async')) {
+                ap_quote_target_warm_async($quoteObjectId);
+            }
+        }
     }
     ap_metrics_record('Create', $actor, $noteId, null, strlen($contentHtml), 'compose', $feedSummary, null, null, null, '', false, $visibility);
 

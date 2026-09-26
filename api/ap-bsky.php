@@ -5296,7 +5296,7 @@ function ap_bsky_quote_preview(array $post): ?array
     if ($text === '' && $handle === '' && $media === []) {
         return null;
     }
-    return [
+    $out = [
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
         'display' => $display,
@@ -5304,6 +5304,41 @@ function ap_bsky_quote_preview(array $post): ?array
         'url' => $url,
         'media' => $media,
     ];
+    // Preserve external link embeds so quote cards can show a link preview.
+    foreach ($embeds as $em) {
+        if (!is_array($em)) {
+            continue;
+        }
+        $et = (string) ($em['$type'] ?? '');
+        if ((str_contains($et, 'external') || isset($em['external'])) && is_array($em['external'] ?? null)) {
+            $ext = $em['external'];
+            $out['external'] = $ext;
+            $out['card'] = [
+                'url' => (string) ($ext['uri'] ?? ''),
+                'title' => (string) ($ext['title'] ?? ''),
+                'description' => (string) ($ext['description'] ?? ''),
+                'image' => (string) ($ext['thumb'] ?? ''),
+                'provider_name' => '',
+            ];
+            break;
+        }
+    }
+    if (!isset($out['external']) && is_array($value['embed'] ?? null)) {
+        $ve = $value['embed'];
+        $vet = (string) ($ve['$type'] ?? '');
+        if ((str_contains($vet, 'external') || isset($ve['external'])) && is_array($ve['external'] ?? null)) {
+            $ext = $ve['external'];
+            $out['external'] = $ext;
+            $out['card'] = [
+                'url' => (string) ($ext['uri'] ?? ''),
+                'title' => (string) ($ext['title'] ?? ''),
+                'description' => (string) ($ext['description'] ?? ''),
+                'image' => (string) ($ext['thumb'] ?? ''),
+                'provider_name' => '',
+            ];
+        }
+    }
+    return $out;
 }
 
 /**
@@ -5372,13 +5407,22 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
     if ($text === '' && $media !== []) {
         $text = '📷 Image';
     }
-    if ($text === '' && $handle === '' && $uri === '' && $media === []) {
+    $external = null;
+    if (function_exists('ap_bsky_post_external')) {
+        $external = ap_bsky_post_external($post);
+    }
+    if ($text === '' && is_array($external)) {
+        $extTitle = trim((string) ($external['title'] ?? ''));
+        $extUri = trim((string) ($external['uri'] ?? ''));
+        $text = $extTitle !== '' ? $extTitle : ($extUri !== '' ? $extUri : '🔗 Link');
+    }
+    if ($text === '' && $handle === '' && $uri === '' && $media === [] && !is_array($external)) {
         return null;
     }
     $url = $uri !== ''
         ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null)
         : 'https://bsky.app/';
-    return [
+    $out = [
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
         'display' => $display,
@@ -5386,6 +5430,17 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
         'url' => $url,
         'media' => $media,
     ];
+    if (is_array($external)) {
+        $out['external'] = $external;
+        $out['card'] = [
+            'url' => (string) ($external['uri'] ?? ''),
+            'title' => (string) ($external['title'] ?? ''),
+            'description' => (string) ($external['description'] ?? ''),
+            'image' => (string) ($external['thumb'] ?? ''),
+            'provider_name' => '',
+        ];
+    }
+    return $out;
 }
 
 /**

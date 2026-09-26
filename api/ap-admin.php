@@ -8997,8 +8997,18 @@ function admin_split_quote_summary(string $summaryRaw): ?array
 /** Media strip inside a quote-block (quoted post attachments). */
 /**
  * Shared quote-card chrome for Fediverse + Bluesky timelines.
+ * Quote-boosts should show the full quoted payload: text, media, and link cards.
  *
- * @param array{acct?:string,text?:string,url?:string,media?:list<mixed>,open_label?:string,open_external?:bool} $opts
+ * @param array{
+ *   acct?:string,
+ *   text?:string,
+ *   url?:string,
+ *   media?:list<mixed>,
+ *   card?:array<string,mixed>|null,
+ *   mentions?:list<array<string,mixed>>,
+ *   open_label?:string,
+ *   open_external?:bool
+ * } $opts
  */
 function admin_quote_card_html(array $opts, string $returnView = 'home'): string
 {
@@ -9006,6 +9016,8 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     $text = trim((string) ($opts['text'] ?? ''));
     $url = trim((string) ($opts['url'] ?? ''));
     $media = is_array($opts['media'] ?? null) ? $opts['media'] : [];
+    $card = is_array($opts['card'] ?? null) ? $opts['card'] : null;
+    $mentions = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
     $openLabel = trim((string) ($opts['open_label'] ?? 'Open quoted'));
     $openExternal = !empty($opts['open_external']);
     $html = '<div class="quote-block"><span class="qt-label">Quoted</span>';
@@ -9016,14 +9028,30 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
         $html .= '<div class="meta" style="margin-top:.3rem">' . h($acct) . '</div>';
     }
     if ($text !== '') {
-        if (mb_strlen($text) > 400) {
-            $text = mb_substr($text, 0, 397) . '…';
-        }
+        // Keep the full quoted body (timeline posts already cap length elsewhere).
         $html .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
-            . admin_linkify_body_html($text, $returnView) . '</div>';
+            . admin_linkify_body_html($text, $returnView, $mentions) . '</div>';
     }
     if ($media !== [] && function_exists('admin_quote_media_html')) {
         $html .= admin_quote_media_html($media);
+    }
+    // Link preview for URL-only / article quotes (Guardian, YouTube, etc.).
+    if ($media === [] && function_exists('ap_link_preview_html')) {
+        if ($card === null && $text !== '' && function_exists('ap_link_preview_card_for_status_text')) {
+            $card = ap_link_preview_card_for_status_text($text, false, false);
+            if ($card === null && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_warm_async')) {
+                $warmUrl = ap_link_preview_extract_url($text);
+                if (is_string($warmUrl) && $warmUrl !== '') {
+                    ap_link_preview_warm_async($warmUrl);
+                }
+            }
+        }
+        if (is_array($card)) {
+            $cardHtml = ap_link_preview_html(array_merge($card, ['status' => 'ok']), true);
+            if ($cardHtml !== '') {
+                $html .= '<div class="quote-link-card" style="margin-top:.45rem">' . $cardHtml . '</div>';
+            }
+        }
     }
     if ($url !== '' && $url !== 'https://bsky.app/') {
         $href = function_exists('admin_status_href') && !$openExternal
@@ -9032,11 +9060,85 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
         $html .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($href) . '"'
             . ($openExternal ? ' target="_blank" rel="noopener noreferrer"' : '')
             . '>' . h($openLabel !== '' ? $openLabel : 'Open quoted') . '</a></div>';
-    } elseif ($text === '' && $acct === '' && $media === []) {
+    } elseif ($text === '' && $acct === '' && $media === [] && $card === null) {
         $html .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
     }
     $html .= '</div>';
     return $html;
+}
+
+/**
+ * Build quote-card opts from a Mastodon-shaped status (local cache / API entity).
+ *
+ * @param array<string,mixed> $st
+ * @return array<string,mixed>
+ */
+function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): array
+{
+    $acct = (string) ($st['account']['acct'] ?? '');
+    $text = function_exists('admin_html_to_plain')
+        ? trim(admin_html_to_plain((string) ($st['content'] ?? '')))
+        : trim(html_entity_decode(strip_tags((string) ($st['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $url = (string) ($st['uri'] ?? $st['url'] ?? $fallbackUrl);
+    $media = function_exists('admin_quote_media_items_from_status_like')
+        ? admin_quote_media_items_from_status_like($st['media_attachments'] ?? [])
+        : [];
+    $card = is_array($st['card'] ?? null) ? $st['card'] : null;
+    $mentions = [];
+    if (!empty($st['mentions']) && is_array($st['mentions'])) {
+        foreach ($st['mentions'] as $m) {
+            if (is_array($m)) {
+                $mentions[] = $m;
+            }
+        }
+    }
+    return [
+        'acct' => $acct !== '' ? ('@' . ltrim($acct, '@')) : '',
+        'text' => $text,
+        'url' => $url,
+        'media' => $media,
+        'card' => $card,
+        'mentions' => $mentions,
+        'open_label' => 'Open quoted',
+        'open_external' => false,
+    ];
+}
+
+/**
+ * Build quote-card opts from a Bluesky quote preview array.
+ *
+ * @param array<string,mixed> $prev
+ * @return array<string,mixed>
+ */
+function admin_quote_opts_from_bsky(array $prev, string $fallbackUrl = ''): array
+{
+    $handle = ltrim((string) ($prev['handle'] ?? ''), '@');
+    $text = trim((string) ($prev['text'] ?? ''));
+    $url = (string) ($prev['url'] ?? $fallbackUrl);
+    if ($url !== '' && function_exists('ap_bsky_normalize_web_url') && str_starts_with($url, 'https://bsky.app/')) {
+        $url = ap_bsky_normalize_web_url($url);
+    }
+    $media = is_array($prev['media'] ?? null) ? $prev['media'] : [];
+    $card = is_array($prev['card'] ?? null) ? $prev['card'] : null;
+    if ($card === null && is_array($prev['external'] ?? null)) {
+        $ext = $prev['external'];
+        $card = [
+            'url' => (string) ($ext['uri'] ?? $ext['url'] ?? ''),
+            'title' => (string) ($ext['title'] ?? ''),
+            'description' => (string) ($ext['description'] ?? ''),
+            'image' => (string) ($ext['thumb'] ?? $ext['image'] ?? ''),
+            'provider_name' => '',
+        ];
+    }
+    return [
+        'acct' => $handle !== '' ? ('@' . $handle) : '',
+        'text' => $text,
+        'url' => $url,
+        'media' => $media,
+        'card' => $card,
+        'open_label' => 'Open original',
+        'open_external' => true,
+    ];
 }
 
 function admin_quote_media_html(array $items): string
@@ -10264,6 +10366,11 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
         }
         if ($quotedStatusUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
             $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
+            // Cache miss: queue a background ensure so the next paint can show
+            // full quoted text/media/link cards instead of a bare URL stub.
+            if ($quotedStatus === null && function_exists('ap_quote_target_warm_async')) {
+                ap_quote_target_warm_async($quotedStatusUrl);
+            }
         }
         $qStatusPlain = '';
         if (is_array($quotedStatus)) {
@@ -10422,9 +10529,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   if ($quoteParts['quoted'] !== '' && function_exists('ap_masto_content_with_mentions')) {
                       $qMentions = ap_masto_content_with_mentions($quoteParts['quoted'], [])['mentions'] ?? [];
                   }
-                  $bodyChunk .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
-                  // Fallback text/acct from the already-enriched "↪ QT @acct: text" line
-                  // when the remote object is not in local cache (common; no sync HTTP on paint).
+                  // Prefer one shared quote card: full text + media + link preview.
                   $qFallbackAcct = '';
                   $qFallbackText = '';
                   if (preg_match('/^↪ QT(?:\s+@(\S+))?\s*:\s*(.*)$/us', (string) ($quoteParts['quoted'] ?? ''), $qfm)) {
@@ -10434,111 +10539,62 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                           $qFallbackText = '';
                       }
                       if (str_starts_with($qFallbackText, 'https://') && !str_contains($qFallbackText, ' ')) {
-                          // URL-only stub — keep for linking, not as body text
                           if ($quotedStatusUrl === '') {
                               $quotedStatusUrl = rtrim($qFallbackText, '.,);]');
                           }
                           $qFallbackText = '';
                       }
                   }
+                  $quoteOpts = null;
                   if (is_array($quotedStatus)) {
-                      $qAcct = (string) ($quotedStatus['account']['acct'] ?? '');
-                      $qText = admin_html_to_plain((string) ($quotedStatus['content'] ?? ''));
-                      if ($qAcct !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qAcct) . '</div>';
-                      } elseif ($qFallbackAcct !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qFallbackAcct) . '</div>';
-                      } elseif (is_array($quotedBsky) && ($quotedBsky['handle'] ?? '') !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h((string) $quotedBsky['handle']) . '</div>';
+                      $quoteOpts = admin_quote_opts_from_status($quotedStatus, $quotedStatusUrl);
+                      if (($quoteOpts['acct'] ?? '') === '' && $qFallbackAcct !== '') {
+                          $quoteOpts['acct'] = '@' . ltrim($qFallbackAcct, '@');
                       }
-                      if ($qText !== '') {
-                          $bodyChunk .= '<div style="margin-top:.25rem">'
-                              . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView, [])
-                              . '</div>';
-                      } elseif ($qFallbackText !== '') {
-                          $bodyChunk .= '<div style="margin-top:.25rem">'
-                              . admin_linkify_body_html(mb_substr($qFallbackText, 0, 400), $returnView, $qMentions)
-                              . '</div>';
-                      } elseif (is_array($quotedBsky) && trim((string) ($quotedBsky['text'] ?? '')) !== '') {
-                          $bodyChunk .= '<div style="margin-top:.25rem">'
-                              . admin_linkify_body_html(mb_substr((string) $quotedBsky['text'], 0, 400), $returnView, [])
-                              . '</div>';
+                      if (($quoteOpts['text'] ?? '') === '' && $qFallbackText !== '') {
+                          $quoteOpts['text'] = $qFallbackText;
+                          $quoteOpts['mentions'] = $qMentions;
                       }
-                      $qMediaEv = admin_quote_media_items_from_status_like($quotedStatus['media_attachments'] ?? []);
-                      if ($qMediaEv === [] && is_array($quotedBsky) && !empty($quotedBsky['media']) && is_array($quotedBsky['media'])) {
-                          $qMediaEv = $quotedBsky['media'];
+                      if (($quoteOpts['media'] ?? []) === [] && is_array($quotedBsky) && !empty($quotedBsky['media'])) {
+                          $quoteOpts['media'] = $quotedBsky['media'];
                       }
-                      if ($qMediaEv !== []) {
-                          $rememberQuotedMedia($qMediaEv);
-                          $bodyChunk .= admin_quote_media_html($qMediaEv);
-                      }
-                      if ($quotedStatusUrl !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
-                              . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted</a></div>';
-                      }
-                  } elseif (is_array($quotedBsky) && (trim((string) ($quotedBsky['text'] ?? '')) !== '' || ($quotedBsky['handle'] ?? '') !== '' || !empty($quotedBsky['media']))) {
-                      $qAcct = ($quotedBsky['handle'] ?? '') !== '' ? (string) $quotedBsky['handle'] : '';
-                      if ($qAcct !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qAcct) . '</div>';
-                      }
-                      $qText = trim((string) ($quotedBsky['text'] ?? ''));
-                      if ($qText !== '') {
-                          $bodyChunk .= '<div style="margin-top:.25rem">'
-                              . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView, [])
-                              . '</div>';
-                      }
-                      if (!empty($quotedBsky['media']) && is_array($quotedBsky['media'])) {
-                          $rememberQuotedMedia($quotedBsky['media']);
-                          $bodyChunk .= admin_quote_media_html($quotedBsky['media']);
-                      }
-                      $qOpen = (string) ($quotedBsky['url'] ?? $quotedStatusUrl);
-                      if ($qOpen !== '' && $qOpen !== 'https://bsky.app/') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
-                              . h(admin_status_href($qOpen, $returnView)) . '">Open quoted</a></div>';
-                      }
-                  } elseif ($qFallbackText !== '' || $qFallbackAcct !== '') {
-                      if ($qFallbackAcct !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qFallbackAcct) . '</div>';
-                      }
-                      if ($qFallbackText !== '') {
-                          $bodyChunk .= '<div style="margin-top:.25rem">'
-                              . admin_linkify_body_html(mb_substr($qFallbackText, 0, 400), $returnView, $qMentions)
-                              . '</div>';
-                      }
-                      if ($quotedStatusUrl !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
-                              . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted</a></div>';
-                      }
-                  } elseif ($quotedStatusUrl !== '') {
-                      $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
-                          . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted post</a></div>';
-                  } else {
-                      $bodyChunk .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
+                  } elseif (is_array($quotedBsky)
+                      && (trim((string) ($quotedBsky['text'] ?? '')) !== ''
+                          || ($quotedBsky['handle'] ?? '') !== ''
+                          || !empty($quotedBsky['media']))) {
+                      $quoteOpts = admin_quote_opts_from_bsky($quotedBsky, $quotedStatusUrl);
+                  } elseif ($qFallbackText !== '' || $qFallbackAcct !== '' || $quotedStatusUrl !== '') {
+                      $quoteOpts = [
+                          'acct' => $qFallbackAcct !== '' ? ('@' . ltrim($qFallbackAcct, '@')) : '',
+                          'text' => $qFallbackText,
+                          'url' => $quotedStatusUrl,
+                          'media' => [],
+                          'mentions' => $qMentions,
+                          'open_label' => 'Open quoted',
+                          'open_external' => false,
+                      ];
                   }
                   // Several ActivityPub bridges expose the quoted attachment
-                  // only in the outer event's media_urls. If hydration did not
-                  // provide a quoted media list, that attachment still belongs
-                  // inside the quote card, not below the parent post.
-                  if ($eMedia !== []) {
-                      $fallbackQuoteMedia = $eMedia;
-                      if ($quotedMediaUrls !== []) {
-                          $fallbackQuoteMedia = array_values(array_filter(
-                              $fallbackQuoteMedia,
-                              static function ($item) use ($quotedMediaUrls): bool {
-                                  $url = is_array($item)
-                                      ? (string) ($item['url'] ?? $item['preview_url'] ?? $item['preview'] ?? '')
-                                      : (is_string($item) ? $item : '');
-                                  return $url !== '' && !isset($quotedMediaUrls[rtrim($url, '/')]);
-                              }
-                          ));
-                      }
-                      if ($quotedMediaUrls === [] && $fallbackQuoteMedia !== []) {
-                          $rememberQuotedMedia($fallbackQuoteMedia);
-                          $bodyChunk .= admin_quote_media_html($fallbackQuoteMedia);
+                  // only in the outer event's media_urls. Keep those inside the card.
+                  if (is_array($quoteOpts) && $eMedia !== []) {
+                      $haveMedia = is_array($quoteOpts['media'] ?? null) && $quoteOpts['media'] !== [];
+                      if (!$haveMedia) {
+                          $quoteOpts['media'] = $eMedia;
+                          $rememberQuotedMedia($eMedia);
                           $eMedia = [];
                       }
                   }
-                  $bodyChunk .= '</div>';
+                  if (is_array($quoteOpts)) {
+                      if (!empty($quoteOpts['media']) && is_array($quoteOpts['media'])) {
+                          $rememberQuotedMedia($quoteOpts['media']);
+                      }
+                      $bodyChunk .= admin_quote_card_html($quoteOpts, $returnView);
+                  } else {
+                      $bodyChunk .= admin_quote_card_html([
+                          'url' => $quotedStatusUrl,
+                          'open_label' => 'Open quoted post',
+                      ], $returnView);
+                  }
               } elseif ($summaryRaw !== '') {
                   // Last chance: never dump raw ↪ QT into the post body.
                   $lateParts = admin_split_quote_summary($summaryRaw);
@@ -10563,21 +10619,27 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                               $qFallbackText = '';
                           }
                       }
-                      $bodyChunk .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
-                      if ($qFallbackAcct !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">@' . h($qFallbackAcct) . '</div>';
+                      if ($quotedStatusUrl !== '' && $quotedStatus === null
+                          && function_exists('ap_masto_lookup_status_by_object_url')) {
+                          $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
+                          if ($quotedStatus === null && function_exists('ap_quote_target_warm_async')) {
+                              ap_quote_target_warm_async($quotedStatusUrl);
+                          }
                       }
-                      if ($qFallbackText !== '') {
-                          $bodyChunk .= '<div style="margin-top:.25rem">'
-                              . admin_linkify_body_html(mb_substr($qFallbackText, 0, 400), $returnView, [])
-                              . '</div>';
-                      } elseif ($quotedStatusUrl !== '') {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem"><a href="'
-                              . h(admin_status_href($quotedStatusUrl, $returnView)) . '">Open quoted post</a></div>';
+                      if (is_array($quotedStatus)) {
+                          $lateOpts = admin_quote_opts_from_status($quotedStatus, $quotedStatusUrl);
+                          if (($lateOpts['acct'] ?? '') === '' && $qFallbackAcct !== '') {
+                              $lateOpts['acct'] = '@' . ltrim($qFallbackAcct, '@');
+                          }
+                          $bodyChunk .= admin_quote_card_html($lateOpts, $returnView);
                       } else {
-                          $bodyChunk .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
+                          $bodyChunk .= admin_quote_card_html([
+                              'acct' => $qFallbackAcct !== '' ? ('@' . ltrim($qFallbackAcct, '@')) : '',
+                              'text' => $qFallbackText,
+                              'url' => $quotedStatusUrl,
+                              'open_label' => 'Open quoted post',
+                          ], $returnView);
                       }
-                      $bodyChunk .= '</div>';
                   } else {
                       $bodyChunk .= '<div class="body feed-body">'
                           . admin_linkify_body_html($summaryRaw, $returnView, $eventMentions, $aid !== '' ? $aid : null) . '</div>';
@@ -11678,22 +11740,14 @@ function admin_render_masto_status_card(
                 }
             }
         }
-        $bodyInner .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
-        if ($qacct !== '') {
-            $bodyInner .= '<div class="meta" style="margin-top:.3rem">@' . h($qacct) . '</div>';
+        $qOpts = admin_quote_opts_from_status($qst, $quri);
+        if (($qOpts['text'] ?? '') === '' && $qplain !== '') {
+            $qOpts['text'] = $qplain;
         }
-        if ($qplain !== '') {
-            $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
-                . admin_linkify_body_html(mb_substr($qplain, 0, 400), $returnView, $qMentions) . '</div>';
+        if ($qMentions !== []) {
+            $qOpts['mentions'] = $qMentions;
         }
-        $qMediaItems = admin_quote_media_items_from_status_like($qst['media_attachments'] ?? []);
-        if ($qMediaItems !== []) {
-            $bodyInner .= admin_quote_media_html($qMediaItems);
-        }
-        if ($quri !== '') {
-            $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="' . h(admin_status_href($quri, $returnView)) . '">Open quoted</a></div>';
-        }
-        $bodyInner .= '</div>';
+        $bodyInner .= admin_quote_card_html($qOpts, $returnView);
     } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
         // Last-chance Bluesky hydrate for Status cards when masto entity stayed pending.
         $pendingUrl = '';
@@ -11711,33 +11765,18 @@ function admin_render_masto_status_card(
             }
         }
         if (is_array($bskyPending) && (trim((string) ($bskyPending['text'] ?? '')) !== ''
-            || trim((string) ($bskyPending['handle'] ?? '')) !== '')) {
-            $qAcct = trim((string) (($bskyPending['handle'] ?? '') !== ''
-                ? ('@' . $bskyPending['handle'])
-                : ($bskyPending['display'] ?? 'Quoted')));
-            $qText = trim((string) ($bskyPending['text'] ?? ''));
-            $qOpen = (string) ($bskyPending['url'] ?? $pendingUrl);
-            if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($qOpen, 'https://bsky.app/')) {
-                $qOpen = ap_bsky_normalize_web_url($qOpen);
-            }
-            $bodyInner .= '<div class="quote-block"><span class="qt-label">Quoted</span>';
-            if ($qAcct !== '') {
-                $bodyInner .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
-            }
-            if ($qText !== '') {
-                $bodyInner .= '<div style="margin-top:.35rem;white-space:pre-wrap">'
-                    . admin_linkify_body_html(mb_substr($qText, 0, 400), $returnView) . '</div>';
-            }
-            if (!empty($bskyPending['media']) && is_array($bskyPending['media'])) {
-                $bodyInner .= admin_quote_media_html($bskyPending['media']);
-            }
-            if ($qOpen !== '' && $qOpen !== 'https://bsky.app/') {
-                $bodyInner .= '<div class="meta" style="margin-top:.35rem"><a href="'
-                    . h($qOpen) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
-            }
-            $bodyInner .= '</div>';
+            || trim((string) ($bskyPending['handle'] ?? '')) !== ''
+            || !empty($bskyPending['media']))) {
+            $bodyInner .= admin_quote_card_html(admin_quote_opts_from_bsky($bskyPending, $pendingUrl), $returnView);
         } else {
-            $bodyInner .= '<div class="quote-block meta">Quoted post (not cached yet)</div>';
+            if ($pendingUrl !== '' && function_exists('ap_quote_target_warm_async')) {
+                ap_quote_target_warm_async($pendingUrl);
+            }
+            $bodyInner .= admin_quote_card_html([
+                'url' => $pendingUrl,
+                'text' => '',
+                'open_label' => 'Quoted post (not cached yet) — open',
+            ], $returnView);
         }
     }
     if ($media) {
@@ -12600,37 +12639,6 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 $plain = '';
             }
             if ($qUrl || $tomb || $plain !== '' || !empty($bskyQuotePrev)) {
-                $quoteHtml = '<div class="quote-block"><span class="qt-label">Quoted</span><br>';
-                if (is_array($bskyQuotePrev ?? null)) {
-                    $qAcct = trim((string) (($bskyQuotePrev['display'] ?? '') !== '' ? $bskyQuotePrev['display'] : ($bskyQuotePrev['handle'] ?? '')));
-                    if ($qAcct !== '') {
-                        $quoteHtml .= '<div class="meta" style="margin-top:.3rem">' . h($qAcct) . '</div>';
-                    }
-                    if ($plain !== '') {
-                        if (mb_strlen($plain) > 280) {
-                            $plain = mb_substr($plain, 0, 277) . '…';
-                        }
-                        $quoteHtml .= '<div style="margin-top:.25rem;white-space:pre-wrap">' . h($plain) . '</div>';
-                    }
-                    if (!empty($bskyQuotePrev['media']) && is_array($bskyQuotePrev['media'])) {
-                        $quoteHtml .= admin_quote_media_html($bskyQuotePrev['media']);
-                    }
-                } elseif ($tomb || ($plain === '' && !$qUrl)) {
-                    $quoteHtml .= '(quoted post unavailable)';
-                } elseif ($plain !== '') {
-                    if (mb_strlen($plain) > 280) {
-                        $plain = mb_substr($plain, 0, 277) . '…';
-                    }
-                    $quoteHtml .= h($plain);
-                    if (is_array($qDoc ?? null)) {
-                        $qAttMedia = admin_quote_media_items_from_status_like($qDoc['attachment'] ?? []);
-                        if ($qAttMedia !== []) {
-                            $quoteHtml .= admin_quote_media_html($qAttMedia);
-                        }
-                    }
-                } else {
-                    $quoteHtml .= '<span class="mono">' . h((string) $qUrl) . '</span>';
-                }
                 $openUrl = is_array($bskyQuotePrev ?? null) && !empty($bskyQuotePrev['url'])
                     ? (string) $bskyQuotePrev['url']
                     : (is_string($qUrl) ? $qUrl : '');
@@ -12638,10 +12646,35 @@ function admin_render_outbox_card(array $n, string $returnView): void
                     && str_starts_with($openUrl, 'https://bsky.app/')) {
                     $openUrl = ap_bsky_normalize_web_url($openUrl);
                 }
-                if ($openUrl !== '') {
-                    $quoteHtml .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($openUrl) . '" target="_blank" rel="noopener noreferrer">Open original</a></div>';
+                if (is_array($bskyQuotePrev ?? null)) {
+                    $bqOpts = admin_quote_opts_from_bsky($bskyQuotePrev, $openUrl);
+                    if (($bqOpts['text'] ?? '') === '' && $plain !== '') {
+                        $bqOpts['text'] = $plain;
+                    }
+                    $quoteHtml = admin_quote_card_html($bqOpts, $returnView);
+                } elseif ($tomb) {
+                    $quoteHtml = admin_quote_card_html([
+                        'text' => 'Quoted post unavailable',
+                        'url' => $openUrl,
+                        'open_external' => true,
+                        'open_label' => 'Open original',
+                    ], $returnView);
+                } else {
+                    $qAttMedia = [];
+                    if (is_array($qDoc ?? null)) {
+                        $qAttMedia = admin_quote_media_items_from_status_like($qDoc['attachment'] ?? []);
+                    }
+                    if ($plain === '' && $openUrl !== '' && function_exists('ap_quote_target_warm_async')) {
+                        ap_quote_target_warm_async($openUrl);
+                    }
+                    $quoteHtml = admin_quote_card_html([
+                        'text' => $plain,
+                        'url' => $openUrl,
+                        'media' => $qAttMedia,
+                        'open_external' => true,
+                        'open_label' => 'Open original',
+                    ], $returnView);
                 }
-                $quoteHtml .= '</div>';
             }
         }
     }
@@ -21621,7 +21654,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endforeach; ?>
         <?php if (count($followingFiltered) > $followLimit): ?>
           <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
-            <a class="btn btn-ghost" href="?view=following&amp;network=<?= h($followNet) ?>&amp;limit=<?= min(200, $followLimit + 40) ?>">Show 40 more</a>
+            <a class="btn btn-ghost" href="?view=following&amp;network=<?= h($followNet) ?>&amp;limit=<?= min(200, $followLimit + 40) ?>" data-vaak-soft-nav="following" data-follow-network="<?= h($followNet) ?>">Show 40 more</a>
           </div>
         <?php endif; ?>
 
@@ -26417,6 +26450,11 @@ window.apAdminToast = function (msg, isErr) {
           u.searchParams.set('network', extra.network);
         } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
           u.searchParams.delete('network');
+        }
+        if ((view === 'following' || view === 'followers') && extra.limit) {
+          u.searchParams.set('limit', String(extra.limit));
+        } else if (view !== 'following' && view !== 'followers') {
+          u.searchParams.delete('limit');
         }
         if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
         else if (view !== 'bookmarks') u.searchParams.delete('folder');

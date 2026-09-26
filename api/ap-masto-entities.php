@@ -2572,6 +2572,44 @@ function ap_masto_account_by_id(string $accountId): ?array
 }
 
 /**
+ * Background-warm a quote target so timeline quote cards can show full text,
+ * media, and link previews without blocking compose/paint.
+ */
+function ap_quote_target_warm_async(string $objectUrl): void
+{
+    $objectUrl = rtrim(trim($objectUrl), '/');
+    if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return;
+    }
+    if (function_exists('ap_bsky_at_uri_from_any_url') && ap_bsky_at_uri_from_any_url($objectUrl) !== null) {
+        if (function_exists('ap_bsky_post_preview_warm_enqueue')) {
+            $owner = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+            ap_bsky_post_preview_warm_enqueue($objectUrl, $owner);
+        }
+        return;
+    }
+    $lockPath = sys_get_temp_dir() . '/vaak-quote-warm-' . hash('sha256', $objectUrl) . '.lock';
+    $lock = @fopen($lockPath, 'c+');
+    if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+        return;
+    }
+    @fwrite($lock, (string) time());
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : PHP_BINARY;
+    $worker = __DIR__ . '/ap-quote-target-warm.php';
+    if (!is_file($worker) || !is_string($php) || $php === '') {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        return;
+    }
+    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($worker)
+        . ' ' . escapeshellarg($objectUrl)
+        . ' >>/tmp/vaak-quote-warm.log 2>&1 &';
+    @exec($cmd);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+}
+
+/**
  * Fetch a remote Note (if missing) and cache it as an events row for threading.
  *
  * @return array<string,mixed>|null events row
