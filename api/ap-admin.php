@@ -8082,6 +8082,27 @@ function admin_guess_video_poster_url(string $url): string
     return '';
 }
 
+/** True when a URL can be used as an HTML video poster (image, not the video itself). */
+function admin_media_is_image_poster_url(string $url): bool
+{
+    $url = trim($url);
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        return false;
+    }
+    if (admin_media_is_video($url) || admin_media_is_audio($url)) {
+        return false;
+    }
+    $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?? ''));
+    if ($path !== '' && preg_match('/\.(png|jpe?g|gif|webp|avif)(\?|$)/i', $path)) {
+        return true;
+    }
+    // Bluesky/CDN thumbs often omit a file extension but are still images.
+    if (str_contains($url, 'cdn.bsky.app/') || str_contains($url, '/img/') || str_contains($url, 'thumbnail')) {
+        return true;
+    }
+    return false;
+}
+
 function admin_media_is_audio(string $url, ?string $mediaType = null): bool
 {
     $mt = strtolower(trim((string) $mediaType));
@@ -8860,12 +8881,12 @@ function admin_media_row_html(array $items, string $hint = ''): string
         }
         // Older cached event/attachment payloads only kept the media URL.
         // Recover locally generated video posters from the authoritative media row.
-        if ($preview === '') {
+        if ($preview === '' || !admin_media_is_image_poster_url($preview)) {
             try {
                 $pst = ap_db()->prepare('SELECT preview_url FROM masto_media WHERE public_url = ? AND preview_url IS NOT NULL LIMIT 1');
                 $pst->execute([$url]);
                 $dbPreview = $pst->fetchColumn();
-                if (is_string($dbPreview) && str_starts_with($dbPreview, 'https://')) {
+                if (is_string($dbPreview) && admin_media_is_image_poster_url($dbPreview)) {
                     $preview = $dbPreview;
                 }
             } catch (Throwable $e) {
@@ -8874,17 +8895,21 @@ function admin_media_row_html(array $items, string $hint = ''): string
         }
         if (admin_media_is_video($url, $mt)) {
             $hasVideo = true;
-            if ($preview === '' || !str_starts_with($preview, 'https://')) {
+            // ap_masto_status_from_event used to set preview_url to the MP4 itself.
+            // Browsers ignore non-image poster URLs → black box with a play button.
+            if (!admin_media_is_image_poster_url($preview)) {
                 $preview = admin_guess_video_poster_url($url);
             }
             $isHls = (bool) preg_match('/\.m3u8(?:$|[?#])/i', $url)
                 || in_array(strtolower(trim((string) $mt)), ['application/x-mpegurl', 'application/vnd.apple.mpegurl'], true);
             $sourceAttr = $isHls ? ' data-hls-src="' . h($url) . '"' : ' src="' . h($url) . '"';
+            $posterAttr = admin_media_is_image_poster_url($preview) ? ' poster="' . h($preview) . '"' : '';
+            $warmUrl = admin_media_is_image_poster_url($preview) ? $preview : $url;
             // Wafrn-style: preload=metadata so progressive MP4s show a first
-            // frame even without a poster. Prefer an explicit poster when we
-            // have one (local ffmpeg still, Bluesky thumbnail, Mastodon /small/).
-            $cells[] = '<video class="media-video" data-media-warm-url="' . h($preview !== '' ? $preview : $url) . '"' . $sourceAttr . ' controls loop playsinline preload="metadata"'
-                . (str_starts_with($preview, 'https://') ? ' poster="' . h($preview) . '"' : '')
+            // frame even without a poster. Prefer an explicit image poster when
+            // we have one (local ffmpeg still, Bluesky thumbnail, Mastodon /small/).
+            $cells[] = '<video class="media-video" data-media-warm-url="' . h($warmUrl) . '"' . $sourceAttr . ' controls loop playsinline preload="metadata"'
+                . $posterAttr
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
             $cells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'

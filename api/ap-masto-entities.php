@@ -5511,15 +5511,26 @@ function ap_masto_status_from_event(array $row): ?array
                 }
                 $i++;
                 $ext = strtolower(pathinfo(parse_url($clean, PHP_URL_PATH) ?? '', PATHINFO_EXTENSION));
-                $type = in_array($ext, ['mp4', 'webm', 'mov', 'm4v'], true) ? 'video' : 'image';
+                $type = in_array($ext, ['mp4', 'webm', 'mov', 'm4v', 'm3u8'], true) ? 'video' : 'image';
                 $displayUrl = ($type === 'image' && function_exists('ap_remote_post_media_resolve'))
                     ? ap_remote_post_media_resolve($clean)
                     : $clean;
+                // Never use the playable video URL as preview_url — HTML video
+                // poster must be an image (Mastodon /small/*.png or Bluesky thumb).
+                $previewUrl = $displayUrl;
+                if ($type === 'video') {
+                    $previewUrl = function_exists('admin_guess_video_poster_url')
+                        ? admin_guess_video_poster_url($clean)
+                        : '';
+                    if ($previewUrl === '' && preg_match('#^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$#i', $clean, $pm)) {
+                        $previewUrl = $pm[1] . '/small/' . $pm[2] . '.png';
+                    }
+                }
                 $media[] = [
                     'id' => ap_masto_event_status_id($eventId, isset($row['created_at']) ? (string) $row['created_at'] : null) . $i,
                     'type' => $type,
                     'url' => $displayUrl,
-                    'preview_url' => $displayUrl,
+                    'preview_url' => $previewUrl !== '' ? $previewUrl : null,
                     'remote_url' => $clean,
                     'preview_remote_url' => null,
                     'text_url' => null,
