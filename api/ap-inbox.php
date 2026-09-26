@@ -2867,6 +2867,7 @@ function ap_object_url_lookup_candidates(string $objectUrl): array
         }
     }
     // https://host/@user/123 ↔ Mastodon /statuses/ ↔ Pleroma/Akkoma /posts/
+    // ↔ Misskey/Sharkey/VAAK /notes/{id} (note ids are often opaque alphanumerics)
     if (preg_match('#^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
         $host = $m[1];
         $user = rawurlencode($m[2]);
@@ -2875,20 +2876,28 @@ function ap_object_url_lookup_candidates(string $objectUrl): array
         $cands[] = $host . '/ap/users/' . $user . '/statuses/' . $id;
         $cands[] = $host . '/users/' . $user . '/posts/' . $id;
         $cands[] = $host . '/ap/users/' . $user . '/posts/' . $id;
+        $cands[] = $host . '/users/' . $user . '/notes/' . $id;
+        $cands[] = $host . '/notes/' . $id;
     }
-    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/(statuses|posts)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/(statuses|posts|notes)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
         $host = $m[1];
         $userEnc = $m[2];
         $user = rawurldecode($m[2]);
-        $kind = strtolower($m[3]);
         $id = $m[4];
-        $alt = $kind === 'statuses' ? 'posts' : 'statuses';
         $cands[] = $host . '/@' . $user . '/' . $id;
-        $cands[] = $host . '/users/' . $userEnc . '/statuses/' . $id;
-        $cands[] = $host . '/ap/users/' . $userEnc . '/statuses/' . $id;
-        $cands[] = $host . '/users/' . $userEnc . '/posts/' . $id;
-        $cands[] = $host . '/ap/users/' . $userEnc . '/posts/' . $id;
-        $cands[] = $host . '/users/' . $userEnc . '/' . $alt . '/' . $id;
+        foreach (['statuses', 'posts', 'notes'] as $kind) {
+            $cands[] = $host . '/users/' . $userEnc . '/' . $kind . '/' . $id;
+            $cands[] = $host . '/ap/users/' . $userEnc . '/' . $kind . '/' . $id;
+        }
+        $cands[] = $host . '/notes/' . $id;
+    }
+    // Bare Misskey/Sharkey/VAAK note URLs
+    if (preg_match('#^(https://[^/]+)/notes/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $host = $m[1];
+        $id = $m[2];
+        $cands[] = $host . '/notes/' . $id;
+        // Without a username we cannot invent /@user/id, but statuses/posts
+        // under a placeholder user are not useful — keep the notes form only.
     }
     $parent = ap_quote_post_parent_url($objectUrl);
     if (is_string($parent) && $parent !== '') {

@@ -947,14 +947,21 @@ function ap_masto_object_url_lookup_candidates(string $objectUrl): array
         $id = $m[3];
         $cands[] = $host . '/users/' . $user . '/statuses/' . $id;
         $cands[] = $host . '/users/' . $user . '/posts/' . $id;
+        $cands[] = $host . '/users/' . $user . '/notes/' . $id;
+        $cands[] = $host . '/notes/' . $id;
     }
-    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/(statuses|posts)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+    if (preg_match('#^(https://[^/]+)/(?:ap/)?users/([^/]+)/(statuses|posts|notes)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
         $host = $m[1];
         $user = rawurldecode($m[2]);
         $id = $m[4];
         $cands[] = $host . '/@' . $user . '/' . $id;
         $cands[] = $host . '/users/' . $m[2] . '/statuses/' . $id;
         $cands[] = $host . '/users/' . $m[2] . '/posts/' . $id;
+        $cands[] = $host . '/users/' . $m[2] . '/notes/' . $id;
+        $cands[] = $host . '/notes/' . $id;
+    }
+    if (preg_match('#^(https://[^/]+)/notes/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $cands[] = $m[1] . '/notes/' . $m[2];
     }
     return array_values(array_unique($cands));
 }
