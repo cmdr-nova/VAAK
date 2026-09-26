@@ -185,10 +185,9 @@ if (!function_exists('ap_profile_quote_card_html')) {
                     ? trim(ap_html_to_plain_text($htmlContent))
                     : trim(html_entity_decode(strip_tags($htmlContent), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
                 $openUrl = (string) ($st['url'] ?? $st['uri'] ?? $quoteUrl);
-                // Rebuild a note-shaped object for the shared media renderer.
-                $noteLike = [
-                    'attachment' => [],
-                ];
+                // Build media inline — ap_user_note_media_html lives in ap-user.php and
+                // is not loaded on the cmdr_nova rich profile renderer.
+                $cells = [];
                 foreach (is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [] as $att) {
                     if (!is_array($att)) {
                         continue;
@@ -197,21 +196,34 @@ if (!function_exists('ap_profile_quote_card_html')) {
                     if ($u === '' || !str_starts_with($u, 'https://')) {
                         continue;
                     }
-                    $type = (string) ($att['type'] ?? 'image');
-                    $mt = $type === 'video' || $type === 'gifv' ? 'video/mp4'
-                        : ($type === 'audio' ? 'audio/mpeg' : 'image/jpeg');
-                    if (!empty($att['preview_url']) && is_string($att['preview_url'])) {
-                        // keep
+                    $safe = htmlspecialchars($u, ENT_QUOTES, 'UTF-8');
+                    $type = strtolower((string) ($att['type'] ?? 'image'));
+                    $poster = (string) ($att['preview_url'] ?? '');
+                    $safePoster = str_starts_with($poster, 'https://')
+                        ? htmlspecialchars($poster, ENT_QUOTES, 'UTF-8') : '';
+                    if ($type === 'video' || $type === 'gifv'
+                        || (bool) preg_match('/\.(mp4|webm|mov|m4v|m3u8)(\?|$)/i', (string) (parse_url($u, PHP_URL_PATH) ?? ''))) {
+                        $cells[] = '<video class="media-video" src="' . $safe . '" controls playsinline preload="metadata"'
+                            . ($safePoster !== '' ? ' poster="' . $safePoster . '"' : '')
+                            . ' referrerpolicy="no-referrer"></video>';
+                    } elseif ($type === 'audio') {
+                        $cells[] = '<audio class="media-audio" src="' . $safe . '" controls preload="metadata"></audio>';
+                    } else {
+                        if ($allowNestedLinks) {
+                            $cells[] = '<button type="button" class="note-media-trigger media-cell" data-full="'
+                                . $safe . '" aria-label="View full image">'
+                                . '<img src="' . $safe . '" alt="" loading="lazy" referrerpolicy="no-referrer"></button>';
+                        } else {
+                            $cells[] = '<img src="' . $safe . '" alt="" loading="lazy" referrerpolicy="no-referrer">';
+                        }
                     }
-                    $noteLike['attachment'][] = [
-                        'type' => $type === 'video' || $type === 'gifv' ? 'Video' : ($type === 'audio' ? 'Audio' : 'Image'),
-                        'mediaType' => $mt,
-                        'url' => $u,
-                        'thumbnail' => (string) ($att['preview_url'] ?? ''),
-                    ];
+                    if (count($cells) >= 4) {
+                        break;
+                    }
                 }
-                if ($noteLike['attachment'] !== [] && function_exists('ap_user_note_media_html')) {
-                    $mediaHtml = ap_user_note_media_html($noteLike, $allowNestedLinks);
+                if ($cells !== []) {
+                    $mediaHtml = '<div class="media-row media-count-' . count($cells)
+                        . '" style="margin-top:.45rem">' . implode('', $cells) . '</div>';
                 }
                 if (is_array($st['card'] ?? null) && function_exists('ap_link_preview_html')) {
                     $cardHtml = ap_link_preview_html(array_merge($st['card'], ['status' => 'ok']), $allowNestedLinks);
