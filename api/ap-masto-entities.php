@@ -6116,9 +6116,10 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // over-fetch window and make Home look empty of follows.
     // Over-fetch to survive filtering without making unbounded queries.
     // Federated/API pages: keep the SQL window tight (Ice Cubes ~5–10s client
-    // timeouts). Home may need a wider window for follow-graph sparsity.
+    // timeouts). Home needs some over-fetch for follow-graph sparsity, but not
+    // the old limit*4→800 stampede that made every Home refresh multi-second.
     $sqlLimit = $mode === 'home'
-        ? (int) min(800, max($limit * 4, $limit + 40))
+        ? (int) min(240, max($limit * 2, $limit + 40))
         : (int) min(200, max($limit * 2, $limit + 24));
     $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
         . ' ORDER BY created_at DESC, id DESC LIMIT ' . $sqlLimit;
@@ -6421,10 +6422,10 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     }
 
     // Page follows with the real cursor (head-fetch + PHP filter starved remotes on page 2+).
-    // API clients need full, chronological pages. Browser-only Home ranking can
-    // discard many rows after hydration, so fetch a larger bounded window here.
+    // Pass a modest cap — ap_masto_timeline_events already over-fetches for home.
+    // limit*4 here + *4 inside was hydrating 160+ statuses (~4–5s) for Ice Cubes Home.
     $remoteCap = $standardApi
-        ? min(400, max($limit * 4, $limit + 40))
+        ? min(80, max($limit * 2, $limit + 20))
         : max($limit + 10, 40);
     $remote = ap_masto_timeline_events('home', $remoteCap, $maxId, $sinceId, false);
     // Own posts/boosts: spice, not the whole plate — fetch a small cursor window then cap.

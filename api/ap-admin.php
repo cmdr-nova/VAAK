@@ -5117,12 +5117,14 @@ if (
         $adminTlStampedeLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
             . substr(hash('sha256', $adminTlCacheKey), 0, 12);
         if (!ap_redis_lock($adminTlStampedeLock, 45)) {
+            // Home rebuilds can take several seconds; a 250ms wait made every
+            // concurrent soft-nav / refresh fall through and stampede PHP-FPM.
             $peerCached = function_exists('ap_redis_stampede_wait')
                 ? ap_redis_stampede_wait(
                     static function () use ($adminTlCacheKey) {
                         return admin_tl_cache_get($adminTlCacheKey);
                     },
-                    250
+                    8000
                 )
                 : null;
             if (is_array($peerCached)) {
@@ -5884,7 +5886,7 @@ function admin_tl_cache_put(string $key, array $ranked): void
     // Redis is the shared hot path across PHP workers; the local file remains
     // a safe fallback when Redis is unavailable or being restarted.
     if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set(admin_tl_redis_key($key), $data, 180);
+        ap_redis_json_set(admin_tl_redis_key($key), $data, 300);
         admin_tl_cache_register_owner($key);
     }
     $payload = json_encode($data, JSON_UNESCAPED_SLASHES);
@@ -6166,7 +6168,7 @@ function admin_timeline_row_hidden(array $row, int $ownerUserId): bool
 /**
  * @return list<array{k:string,id:string,t?:int}>|null
  */
-function admin_tl_cache_get(string $key, int $ttlSec = 180): ?array
+function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
 {
     if ($key === '') {
         return null;
@@ -6977,15 +6979,17 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             foreach ($chunks as $chunk) {
                 $ph = implode(',', array_fill(0, count($chunk), '?'));
                 try {
-                    // Deep enough that infinite scroll can keep mixing fedi within
-                    // the retention window before falling through to Bluesky-only.
+                    // Ranked index seed — enough for several infinite-scroll
+                    // pages without scanning 300 full event rows on every miss.
                     $st = $db->prepare(
-                        "SELECT * FROM events
+                        "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
+                                action_taken, spoiler_text, sensitive, raw_json
+                         FROM events
                          WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
                            AND (action_taken = 'log' OR action_taken = 'local_observe')
                            AND actor_id IN ($ph)
                          ORDER BY created_at DESC, id DESC
-                         LIMIT 300"
+                         LIMIT 120"
                     );
                     $st->execute($chunk);
                     foreach ($st->fetchAll() ?: [] as $erow) {
@@ -7002,7 +7006,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 }
                 return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
             });
-            $homeRaw = array_slice($homeRaw, 0, 300);
+            $homeRaw = array_slice($homeRaw, 0, 120);
         }
         foreach ($homeRaw as $e) {
             $sourceAid = rtrim((string) ($e['actor_id'] ?? ''), '/');
