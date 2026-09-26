@@ -9026,7 +9026,17 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     $mentions = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
     $openLabel = trim((string) ($opts['open_label'] ?? 'Open quoted'));
     $openExternal = !empty($opts['open_external']);
-    $html = '<div class="quote-block"><span class="qt-label">Quoted</span>';
+    // Always prefer in-app status view so clicking the quote opens in VAAK.
+    $inAppHref = '';
+    if ($url !== '' && $url !== 'https://bsky.app/' && function_exists('admin_status_href')) {
+        $inAppHref = admin_status_href($url, $returnView);
+    }
+    $openable = $inAppHref !== '' && $inAppHref !== '#';
+    $html = '<div class="quote-block' . ($openable ? ' quote-block--openable' : '') . '"'
+        . ($openable
+            ? ' data-href="' . h($inAppHref) . '" role="link" tabindex="0" title="Open quoted post"'
+            : '')
+        . '><span class="qt-label">Quoted</span>';
     if ($acct !== '') {
         if ($acct[0] !== '@' && !str_starts_with($acct, 'http')) {
             $acct = '@' . ltrim($acct, '@');
@@ -9072,12 +9082,21 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
         }
     }
     if ($url !== '' && $url !== 'https://bsky.app/') {
-        $href = function_exists('admin_status_href') && !$openExternal
-            ? admin_status_href($url, $returnView)
-            : $url;
-        $html .= '<div class="meta" style="margin-top:.35rem"><a href="' . h($href) . '"'
-            . ($openExternal ? ' target="_blank" rel="noopener noreferrer"' : '')
-            . '>' . h($openLabel !== '' ? $openLabel : 'Open quoted') . '</a></div>';
+        $html .= '<div class="meta" style="margin-top:.35rem">';
+        if ($openable) {
+            $html .= '<a href="' . h($inAppHref) . '">'
+                . h($openLabel !== '' ? $openLabel : 'Open quoted') . '</a>';
+        }
+        if ($openExternal && str_starts_with($url, 'https://')) {
+            if ($openable) {
+                $html .= ' · ';
+            }
+            $html .= '<a href="' . h($url) . '" target="_blank" rel="noopener noreferrer">Open original</a>';
+        } elseif (!$openable) {
+            $html .= '<a href="' . h($url) . '" target="_blank" rel="noopener noreferrer">'
+                . h($openLabel !== '' ? $openLabel : 'Open quoted') . '</a>';
+        }
+        $html .= '</div>';
     } elseif ($text === '' && $acct === '' && $media === [] && $card === null) {
         $html .= '<div class="meta" style="margin-top:.3rem">Quoted post unavailable</div>';
     }
@@ -17202,6 +17221,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: var(--panel-2); border-radius: 0 10px 10px 0;
       color: var(--muted); white-space: pre-wrap; line-height: 1.4;
     }
+    .quote-block--openable {
+      cursor: pointer;
+      transition: background .12s ease, border-color .12s ease;
+    }
+    .quote-block--openable:hover,
+    .quote-block--openable:focus-visible {
+      background: color-mix(in srgb, var(--panel-2) 70%, var(--primary-dim));
+      outline: none;
+    }
     .quote-block .notification-snippet { white-space: pre-wrap; }
     .tweet-notif .quote-block { white-space: normal; }
     /* Bluesky cards build quote HTML as a compact string — don't preserve
@@ -23795,6 +23823,32 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   function scheduleTweetFolds(root) {
     requestAnimationFrame(() => enhanceTweetFolds(root));
   }
+  // Clicking a quote card opens the quoted post in VAAK (?view=status…),
+  // while nested links/media/buttons keep their own behavior.
+  function openQuoteBlock(qb) {
+    if (!qb || !qb.classList || !qb.classList.contains('quote-block--openable')) return;
+    const href = qb.getAttribute('data-href') || '';
+    if (!href || href === '#') return;
+    window.location.href = href;
+  }
+  document.addEventListener('click', (ev) => {
+    const qb = ev.target && ev.target.closest ? ev.target.closest('.quote-block--openable') : null;
+    if (!qb) return;
+    if (ev.target.closest('a, button, .note-media-trigger, .media-cell, video, audio, .link-card, input, textarea, select, label')) {
+      return;
+    }
+    ev.preventDefault();
+    openQuoteBlock(qb);
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    const qb = ev.target && ev.target.classList && ev.target.classList.contains('quote-block--openable')
+      ? ev.target
+      : null;
+    if (!qb) return;
+    ev.preventDefault();
+    openQuoteBlock(qb);
+  });
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => scheduleTweetFolds(document));
   } else {
