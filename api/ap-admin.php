@@ -6983,7 +6983,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                     // pages without scanning 300 full event rows on every miss.
                     $st = $db->prepare(
                         "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
-                                action_taken, spoiler_text, sensitive, raw_json
+                                action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
                          FROM events
                          WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
                            AND (action_taken = 'log' OR action_taken = 'local_observe')
