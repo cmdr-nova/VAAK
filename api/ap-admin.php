@@ -2832,6 +2832,32 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     'object_id' => (string) ($_POST['bsky_object_id'] ?? $keys['object_id'] ?? $subject),
                 ], $receipt);
                 if (!empty($queue['ok'])) {
+                    // Mirror into local fav/bookmark immediately so Open/search agree
+                    // before the Bluesky worker finishes.
+                    $localSid = (string) ($keys['status_id'] ?? '');
+                    $localOid = (string) ($keys['object_id'] ?? $subject);
+                    if ($queueKind === 'like' && $localSid !== '') {
+                        try {
+                            if ($desired && function_exists('ap_masto_favourite_add')) {
+                                ap_masto_favourite_add($localSid, $localOid, null, null, $vaakOwnerId);
+                            } elseif (!$desired && function_exists('ap_masto_favourite_remove')) {
+                                ap_masto_favourite_remove($localSid, $vaakOwnerId, $localOid !== '' ? $localOid : null);
+                            }
+                        } catch (Throwable $e) {
+                            // non-fatal — worker still owns the remote action
+                        }
+                    }
+                    if ($queueKind === 'bookmark' && ($localSid !== '' || $localOid !== '')) {
+                        try {
+                            if ($desired && function_exists('ap_masto_bookmark_add')) {
+                                ap_masto_bookmark_add($localSid !== '' ? $localSid : $localOid, $localOid, $vaakOwnerId);
+                            } elseif (!$desired && function_exists('ap_masto_bookmark_remove')) {
+                                ap_masto_bookmark_remove($localSid, $vaakOwnerId, $localOid !== '' ? $localOid : null);
+                            }
+                        } catch (Throwable $e) {
+                            // non-fatal
+                        }
+                    }
                     header('Content-Type: application/json; charset=utf-8');
                     header('Cache-Control: no-store');
                     http_response_code(202);
@@ -12253,6 +12279,24 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $liked = $likeRecord !== '';
     $reposted = $repostRecord !== '';
     $bookmarked = !empty($viewer['bookmarked']) || !empty($viewer['bookmark']);
+    // Local VAAK fav/bookmark rows win over stale AppView viewer flags (search → Open).
+    if ($uri !== '') {
+        $localBmKeys = function_exists('admin_bsky_bookmark_keys')
+            ? admin_bsky_bookmark_keys($uri, (int) ($GLOBALS['vaak_owner_id'] ?? 0))
+            : ['status_id' => '', 'object_id' => $uri];
+        $localSid = (string) ($localBmKeys['status_id'] ?? '');
+        $localOid = (string) ($localBmKeys['object_id'] ?? $uri);
+        if (!$liked && function_exists('ap_masto_status_is_favourited')
+            && ap_masto_status_is_favourited($localSid, null, $localOid !== '' ? $localOid : $uri)
+        ) {
+            $liked = true;
+        }
+        if (!$bookmarked && function_exists('ap_masto_status_is_bookmarked')
+            && ap_masto_status_is_bookmarked($localSid, null, $localOid !== '' ? $localOid : $uri)
+        ) {
+            $bookmarked = true;
+        }
+    }
     $reason = is_array($item['reason'] ?? null) ? $item['reason'] : null;
     $reasonLabel = '';
     $isRepost = false;

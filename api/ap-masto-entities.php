@@ -9759,20 +9759,32 @@ function ap_masto_search_statuses(string $q, int $limit): array
     }
     if (function_exists('ap_search_fts_available') && ap_search_fts_available()) {
         $hits = ap_search_fts_query($q, max($limit * 3, 40), $tagName);
-        // Hydrate FTS hits in three bounded set-based queries.  The previous
-        // loop performed one database round-trip per hit, so a trending tag
-        // could briefly exhaust the PHP-FPM pool while rendering search.
+        // Hydrate FTS hits in bounded set-based queries (incl. bsky_post via object_id).
+        // Hashtag search previously ignored ~90% bsky_post FTS hits and fell back to a
+        // sequential lower(text) LIKE scan on bsky_posts — that made tag clicks feel slow.
         $hitIds = ['status' => [], 'mention' => [], 'event' => []];
+        $bskyUris = [];
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
-            if ($pk > 0 && isset($hitIds[$source])) $hitIds[$source][$pk] = true;
+            if ($pk > 0 && isset($hitIds[$source])) {
+                $hitIds[$source][$pk] = true;
+            }
+            if ($source === 'bsky_post') {
+                $oid = trim((string) ($hit['object_id'] ?? ''));
+                if (str_starts_with($oid, 'at://')) {
+                    $bskyUris[$oid] = true;
+                }
+            }
         }
-        $hydrated = ['status' => [], 'mention' => [], 'event' => []];
+        $hydrated = ['status' => [], 'mention' => [], 'event' => [], 'bsky_post' => []];
+        $canonByObject = [];
         try {
             foreach ($hitIds as $source => $idsMap) {
                 $ids = array_keys($idsMap);
-                if ($ids === []) continue;
+                if ($ids === []) {
+                    continue;
+                }
                 foreach (array_chunk($ids, 120) as $chunk) {
                     $ph = implode(',', array_fill(0, count($chunk), '?'));
                     $sql = $source === 'status'
@@ -9784,7 +9796,64 @@ function ap_masto_search_statuses(string $q, int $limit): array
                     $st->execute($chunk);
                     $key = $source === 'status' ? 'local_id' : 'id';
                     foreach ($st->fetchAll() ?: [] as $row) {
-                        if (is_array($row)) $hydrated[$source][(int) ($row[$key] ?? 0)] = $row;
+                        if (is_array($row)) {
+                            $hydrated[$source][(int) ($row[$key] ?? 0)] = $row;
+                        }
+                    }
+                }
+            }
+            // Batch-remap Announce/Like FTS rows onto Create/Update for the same object URL.
+            $announceObjects = [];
+            foreach ($hydrated['event'] as $evRow) {
+                $evType = strtolower((string) ($evRow['type'] ?? ''));
+                $evObject = rtrim((string) ($evRow['object_id'] ?? ''), '/');
+                if ($evObject !== '' && !in_array($evType, ['create', 'update'], true)) {
+                    $announceObjects[$evObject] = true;
+                    $announceObjects[$evObject . '/'] = true;
+                }
+            }
+            if ($announceObjects !== []) {
+                $oids = array_keys($announceObjects);
+                foreach (array_chunk($oids, 80) as $chunk) {
+                    $ph = implode(',', array_fill(0, count($chunk), '?'));
+                    $st = ap_db()->prepare(
+                        "SELECT * FROM events
+                         WHERE (object_id IN ($ph))
+                           AND type IN ('Create', 'Update')
+                           AND COALESCE(action_taken, '') != 'deleted'
+                         ORDER BY CASE type WHEN 'Create' THEN 0 ELSE 1 END ASC, id DESC"
+                    );
+                    $st->execute($chunk);
+                    foreach ($st->fetchAll() ?: [] as $cr) {
+                        if (!is_array($cr)) {
+                            continue;
+                        }
+                        $oid = rtrim((string) ($cr['object_id'] ?? ''), '/');
+                        if ($oid !== '' && !isset($canonByObject[$oid])) {
+                            $canonByObject[$oid] = $cr;
+                        }
+                    }
+                }
+            }
+            if ($bskyUris !== []) {
+                if (function_exists('ap_bsky_posts_migrate')) {
+                    ap_bsky_posts_migrate();
+                }
+                $uris = array_keys($bskyUris);
+                foreach (array_chunk($uris, 80) as $chunk) {
+                    $ph = implode(',', array_fill(0, count($chunk), '?'));
+                    $st = ap_db()->prepare(
+                        "SELECT bsky_uri, raw_json FROM bsky_posts WHERE bsky_uri IN ($ph) AND raw_json IS NOT NULL"
+                    );
+                    $st->execute($chunk);
+                    foreach ($st->fetchAll() ?: [] as $brow) {
+                        if (!is_array($brow)) {
+                            continue;
+                        }
+                        $uriKey = (string) ($brow['bsky_uri'] ?? '');
+                        if ($uriKey !== '') {
+                            $hydrated['bsky_post'][$uriKey] = $brow;
+                        }
                     }
                 }
             }
@@ -9795,21 +9864,27 @@ function ap_masto_search_statuses(string $q, int $limit): array
         foreach ($hits as $hit) {
             $source = (string) ($hit['source'] ?? '');
             $pk = (int) ($hit['source_pk'] ?? 0);
-            if ($pk <= 0) {
-                continue;
-            }
             try {
                 if ($source === 'status') {
+                    if ($pk <= 0) {
+                        continue;
+                    }
                     $row = $hydrated['status'][$pk] ?? null;
                     if (is_array($row)) {
                         $push(ap_masto_status_from_row($row));
                     }
                 } elseif ($source === 'mention') {
+                    if ($pk <= 0) {
+                        continue;
+                    }
                     $row = $hydrated['mention'][$pk] ?? null;
                     if (is_array($row)) {
                         $push(ap_masto_status_from_mention($row));
                     }
                 } elseif ($source === 'event') {
+                    if ($pk <= 0) {
+                        continue;
+                    }
                     $row = $hydrated['event'][$pk] ?? null;
                     if (is_array($row)) {
                         if ($tagName !== '') {
@@ -9819,23 +9894,32 @@ function ap_masto_search_statuses(string $q, int $limit): array
                                 continue;
                             }
                         }
-                        // Prefer Create/Update for the same object URL so fav/bookmark
-                        // keys match Open (which resolves via ap_event_by_object_id).
                         $evType = strtolower((string) ($row['type'] ?? ''));
                         $evObject = rtrim((string) ($row['object_id'] ?? ''), '/');
                         if ($evObject !== '' && !in_array($evType, ['create', 'update'], true)
-                            && function_exists('ap_event_by_object_id')
+                            && isset($canonByObject[$evObject])
                         ) {
-                            $canon = ap_event_by_object_id($evObject);
-                            if (is_array($canon) && !empty($canon['id'])
-                                && (int) ($canon['id'] ?? 0) !== (int) ($row['id'] ?? 0)
-                            ) {
-                                $row = $canon;
-                            }
+                            $row = $canonByObject[$evObject];
                         }
                         $status = ap_masto_status_from_event($row);
                         if (is_array($status)) {
                             $push($status);
+                        }
+                    }
+                } elseif ($source === 'bsky_post') {
+                    $oid = trim((string) ($hit['object_id'] ?? ''));
+                    $brow = $oid !== '' ? ($hydrated['bsky_post'][$oid] ?? null) : null;
+                    if (is_array($brow)) {
+                        $raw = json_decode((string) ($brow['raw_json'] ?? ''), true);
+                        $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
+                        if (is_array($post)) {
+                            $text = (string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? ''));
+                            if ($tagName === '' || preg_match('/#' . preg_quote($tagName, '/') . '\b/ui', $text)) {
+                                $status = ap_masto_bsky_trend_status($post);
+                                if (is_array($status)) {
+                                    $push($status);
+                                }
+                            }
                         }
                     }
                 }
@@ -9846,40 +9930,41 @@ function ap_masto_search_statuses(string $q, int $limit): array
                 break;
             }
         }
-        // Merge the local Bluesky cache before treating an FTS hit as final.
-        // This is intentionally cache-only: no AppView/PDS request belongs on
-        // the interactive search path.
-        try {
-            if (function_exists('ap_bsky_posts_migrate')) {
-                ap_bsky_posts_migrate();
+        // LIKE scan only when FTS hydration under-filled (legacy / sparse index).
+        // Hashtag queries with indexed bsky_post docs should skip this path.
+        if (count($out) < $limit) {
+            try {
+                if (function_exists('ap_bsky_posts_migrate')) {
+                    ap_bsky_posts_migrate();
+                }
+                $needle = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $qLower) . '%';
+                $bskySt = ap_db()->prepare(
+                    'SELECT raw_json FROM bsky_posts
+                     WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE \'\\\'
+                     ORDER BY published_at DESC LIMIT ?'
+                );
+                $bskySt->execute([gmdate('c', time() - (30 * 86400)), $needle, max(40, ($limit - count($out)) * 3)]);
+                foreach ($bskySt->fetchAll() ?: [] as $bskyRow) {
+                    $raw = json_decode((string) ($bskyRow['raw_json'] ?? ''), true);
+                    $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
+                    if (!is_array($post)) {
+                        continue;
+                    }
+                    $text = (string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? ''));
+                    if ($tagName !== '' && !preg_match('/#' . preg_quote($tagName, '/') . '\\b/ui', $text)) {
+                        continue;
+                    }
+                    $status = ap_masto_bsky_trend_status($post);
+                    if (is_array($status)) {
+                        $push($status);
+                    }
+                    if (count($out) >= $limit) {
+                        break;
+                    }
+                }
+            } catch (Throwable $e) {
+                // Optional Bluesky cache must never break local search.
             }
-            $needle = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $qLower) . '%';
-            $bskySt = ap_db()->prepare(
-                'SELECT raw_json FROM bsky_posts
-                 WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE \'\\\'
-                 ORDER BY published_at DESC LIMIT ?'
-            );
-            $bskySt->execute([gmdate('c', time() - (30 * 86400)), $needle, max(80, $limit * 5)]);
-            foreach ($bskySt->fetchAll() ?: [] as $bskyRow) {
-                $raw = json_decode((string) ($bskyRow['raw_json'] ?? ''), true);
-                $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
-                if (!is_array($post)) {
-                    continue;
-                }
-                $text = (string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? ''));
-                if ($tagName !== '' && !preg_match('/#' . preg_quote($tagName, '/') . '\\b/ui', $text)) {
-                    continue;
-                }
-                $status = ap_masto_bsky_trend_status($post);
-                if (is_array($status)) {
-                    $push($status);
-                }
-                if (count($out) >= $limit) {
-                    break;
-                }
-            }
-        } catch (Throwable $e) {
-            // Optional Bluesky cache must never break local search.
         }
         if ($out) {
             return array_slice($out, 0, $limit);
@@ -9947,20 +10032,25 @@ function ap_masto_search_statuses(string $q, int $limit): array
                     continue;
                 }
             }
-            $evType = strtolower((string) ($row['type'] ?? ''));
-            $evObject = rtrim((string) ($row['object_id'] ?? ''), '/');
-            if ($evObject !== '' && !in_array($evType, ['create', 'update'], true)
-                && function_exists('ap_event_by_object_id')
-            ) {
-                $canon = ap_event_by_object_id($evObject);
-                if (is_array($canon) && !empty($canon['id'])
-                    && (int) ($canon['id'] ?? 0) !== (int) ($row['id'] ?? 0)
-                ) {
-                    $row = $canon;
-                }
-            }
             $status = ap_masto_status_from_event($row);
             if (is_array($status)) {
+                // Canonicalize Announce → Create when cheap (single lookup is OK here;
+                // this LIKE fallback is already a cold path).
+                $evType = strtolower((string) ($row['type'] ?? ''));
+                $evObject = rtrim((string) ($row['object_id'] ?? ''), '/');
+                if ($evObject !== '' && !in_array($evType, ['create', 'update'], true)
+                    && function_exists('ap_event_by_object_id')
+                ) {
+                    $canon = ap_event_by_object_id($evObject);
+                    if (is_array($canon) && !empty($canon['id'])
+                        && (int) ($canon['id'] ?? 0) !== (int) ($row['id'] ?? 0)
+                    ) {
+                        $canonStatus = ap_masto_status_from_event($canon);
+                        if (is_array($canonStatus)) {
+                            $status = $canonStatus;
+                        }
+                    }
+                }
                 $push($status);
             }
             if (count($out) >= $limit) {
