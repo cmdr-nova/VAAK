@@ -4987,6 +4987,16 @@ function ap_actor_is_followed(string $actorId, ?string $ownerActorId = null): bo
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
         return false;
     }
+    if (function_exists('ap_following_id_set')) {
+        $set = ap_following_id_set($ownerActorId, null, true);
+        if (!empty($set[$actorId]) || !empty($set[$actorId . '/'])) {
+            return true;
+        }
+        // Still allow exact list scan fallback only when set is empty (cold/disabled).
+        if ($set !== []) {
+            return false;
+        }
+    }
     foreach (ap_following_list($ownerActorId) as $row) {
         if (rtrim((string) ($row['actor_id'] ?? ''), '/') === $actorId) {
             return true;
@@ -6439,6 +6449,20 @@ function ap_follow_lists_reset_memo(?string $ownerActorId = null): void
     if ($owner === '') {
         $owner = rtrim(ap_local_actor_id(), '/');
     }
+    $uid = 0;
+    if ($owner !== '' && function_exists('ap_db_owner_user_id_for_actor')) {
+        $uid = (int) ap_db_owner_user_id_for_actor($owner);
+    }
+    // Clear request-local compact set memos for this owner.
+    if (isset($GLOBALS['ap_relset_memo']) && is_array($GLOBALS['ap_relset_memo'])) {
+        foreach (array_keys($GLOBALS['ap_relset_memo']) as $memoKey) {
+            if ($owner !== '' && str_contains((string) $memoKey, $owner)) {
+                unset($GLOBALS['ap_relset_memo'][$memoKey]);
+            } elseif ($uid > 0 && str_starts_with((string) $memoKey, (string) $uid . '|')) {
+                unset($GLOBALS['ap_relset_memo'][$memoKey]);
+            }
+        }
+    }
     if ($owner === '' || !function_exists('ap_redis_delete')) {
         if (function_exists('ap_redis_relset_metric')) {
             ap_redis_relset_metric('invalidate');
@@ -6452,16 +6476,314 @@ function ap_follow_lists_reset_memo(?string $ownerActorId = null): void
         'vaak:follow-graph:v1:following-count:' . $hash,
         'vaak:follow-graph:v1:followers-count:' . $hash,
     ];
-    // Compact relset keys (Phase 2) — delete now so later ships stay coherent.
-    if (function_exists('ap_db_owner_user_id_for_actor')) {
-        $uid = (int) ap_db_owner_user_id_for_actor($owner);
-        if ($uid > 0) {
-            $keys[] = 'vaak:relset:v1:following:' . $uid;
-            $keys[] = 'vaak:relset:v1:followers:' . $uid;
-            $keys[] = 'vaak:bsky:followed-handles:' . $uid;
-        }
+    if ($uid > 0) {
+        $keys[] = 'vaak:relset:v1:following:' . $uid . ':rich';
+        $keys[] = 'vaak:relset:v1:following:' . $uid . ':bare';
+        $keys[] = 'vaak:relset:v1:followers:' . $uid . ':rich';
+        $keys[] = 'vaak:relset:v1:followers:' . $uid . ':bare';
+        $keys[] = 'vaak:relset:v1:blocks-actors:' . $uid;
+        $keys[] = 'vaak:bsky:followed-handles:' . $uid;
     }
     ap_redis_delete(...$keys);
+    if (function_exists('ap_redis_relset_metric')) {
+        ap_redis_relset_metric('invalidate');
+    }
+}
+
+/**
+ * Build a membership map from follow/follower rows (Wafrn-style ID set).
+ * Includes trailing-slash variants, /@user ↔ /users/user aliases, and Bluesky
+ * DID/handle profile URLs when present on the row.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @return array<string,bool>
+ */
+function ap_actor_id_membership_map(array $rows, bool $richAliases = true): array
+{
+    $map = [];
+    $unameByActor = [];
+    if ($richAliases) {
+        $aliasActorIds = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $ga = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($ga !== '') {
+                $aliasActorIds[$ga] = true;
+                $aliasActorIds[$ga . '/'] = true;
+            }
+        }
+        if ($aliasActorIds !== []) {
+            try {
+                foreach (array_chunk(array_keys($aliasActorIds), 400) as $chunk) {
+                    $ph = implode(',', array_fill(0, count($chunk), '?'));
+                    $st = ap_db()->prepare(
+                        "SELECT actor_id, username, host FROM remote_actors
+                         WHERE actor_id IN ($ph)
+                           AND username IS NOT NULL AND username != ''"
+                    );
+                    $st->execute($chunk);
+                    foreach ($st->fetchAll() ?: [] as $ra) {
+                        if (!is_array($ra)) {
+                            continue;
+                        }
+                        $rid = rtrim((string) ($ra['actor_id'] ?? ''), '/');
+                        $ru = trim((string) ($ra['username'] ?? ''));
+                        if ($rid !== '' && $ru !== '' && !ctype_digit($ru)) {
+                            $unameByActor[$rid] = [
+                                'username' => $ru,
+                                'host' => strtolower(trim((string) ($ra['host'] ?? ''))),
+                            ];
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                // remote_actors may be empty
+            }
+        }
+    }
+    foreach ($rows as $row) {
+        if (!is_array($row) || empty($row['actor_id'])) {
+            continue;
+        }
+        $aid = rtrim((string) $row['actor_id'], '/');
+        $map[$aid] = true;
+        $map[$aid . '/'] = true;
+        $map[(string) $row['actor_id']] = true;
+        if (!$richAliases) {
+            continue;
+        }
+        $host = (string) ($row['host'] ?? '');
+        if ($host === '') {
+            $h = parse_url($aid, PHP_URL_HOST);
+            $host = is_string($h) ? strtolower($h) : '';
+        } else {
+            $host = strtolower($host);
+        }
+        $uname = (string) ($row['username'] ?? '');
+        if ($uname === '' && isset($unameByActor[$aid])) {
+            $uname = $unameByActor[$aid]['username'];
+            if ($unameByActor[$aid]['host'] !== '') {
+                $host = $unameByActor[$aid]['host'];
+            }
+        }
+        if ($uname === '') {
+            $path = (string) (parse_url($aid, PHP_URL_PATH) ?? '');
+            if (preg_match('#/(?:users|@)([^/]+)/?$#i', $path, $pm)
+                && !ctype_digit(rawurldecode($pm[1]))) {
+                $uname = rawurldecode($pm[1]);
+            }
+        }
+        if ($uname !== '' && ctype_digit($uname)) {
+            $uname = '';
+        }
+        if ($host !== '' && $uname !== '') {
+            $map['https://' . $host . '/@' . $uname] = true;
+            $map['https://' . $host . '/users/' . $uname] = true;
+            $map['https://' . $host . '/users/' . rawurlencode($uname)] = true;
+        }
+        $bskyDid = trim((string) ($row['bsky_did'] ?? ''));
+        if (str_starts_with($bskyDid, 'did:')) {
+            $map['https://bsky.app/profile/' . $bskyDid] = true;
+            $map['https://bsky.app/profile/' . rawurlencode($bskyDid)] = true;
+            $map[$bskyDid] = true;
+        }
+        $bskyHandle = strtolower(trim((string) ($row['bsky_handle'] ?? '')));
+        if ($bskyHandle === '' && $host === 'bsky.app' && $uname !== '' && str_contains($uname, '.')) {
+            $bskyHandle = strtolower($uname);
+        }
+        if ($bskyHandle !== '' && !str_starts_with($bskyHandle, 'did:')) {
+            $map['https://bsky.app/profile/' . $bskyHandle] = true;
+            $map['https://bsky.app/profile/' . rawurlencode($bskyHandle)] = true;
+        }
+    }
+    return $map;
+}
+
+/**
+ * Compact following membership set for card paint / Follow buttons.
+ * Merges Fediverse following rows with Bluesky graph_sync follows (no handle XRPC).
+ *
+ * @return array<string,bool>
+ */
+function ap_following_id_set(?string $ownerActorId = null, ?int $ownerUserId = null, bool $richAliases = true): array
+{
+    $owner = rtrim(trim((string) ($ownerActorId ?? '')), '/');
+    if ($owner === '') {
+        $owner = rtrim(ap_local_actor_id(), '/');
+    }
+    if ($ownerUserId === null || $ownerUserId < 1) {
+        $ownerUserId = $owner !== '' && function_exists('ap_db_owner_user_id_for_actor')
+            ? (int) ap_db_owner_user_id_for_actor($owner)
+            : 0;
+    }
+    $mode = $richAliases ? 'rich' : 'bare';
+    $memoKey = (string) $ownerUserId . '|' . $owner . '|following|' . $mode;
+    if (!isset($GLOBALS['ap_relset_memo']) || !is_array($GLOBALS['ap_relset_memo'])) {
+        $GLOBALS['ap_relset_memo'] = [];
+    }
+    if (isset($GLOBALS['ap_relset_memo'][$memoKey]) && is_array($GLOBALS['ap_relset_memo'][$memoKey])) {
+        return $GLOBALS['ap_relset_memo'][$memoKey];
+    }
+
+    $useRedis = $ownerUserId > 0
+        && function_exists('ap_redis_relsets_enabled')
+        && ap_redis_relsets_enabled();
+    $redisKey = $useRedis ? ('vaak:relset:v1:following:' . $ownerUserId . ':' . $mode) : '';
+    if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
+            return $GLOBALS['ap_relset_memo'][$memoKey] = $cached;
+        }
+        if (function_exists('ap_redis_relset_metric')) {
+            ap_redis_relset_metric('miss');
+        }
+    } elseif (function_exists('ap_redis_relset_metric') && function_exists('ap_redis_relsets_enabled')
+        && !ap_redis_relsets_enabled()) {
+        ap_redis_relset_metric('bypass');
+    }
+
+    $rows = ap_following_list($owner !== '' ? $owner : null);
+    if ($ownerUserId > 0 && function_exists('ap_bsky_admin_following_rows')
+        && function_exists('ap_bsky_merge_follow_rows')) {
+        // Cache-only Bluesky rows (no per-DID handle resolve / XRPC).
+        $rows = ap_bsky_merge_follow_rows($rows, ap_bsky_admin_following_rows($ownerUserId, false));
+    }
+    $map = ap_actor_id_membership_map($rows, $richAliases);
+    if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $map, 180);
+    }
+    return $GLOBALS['ap_relset_memo'][$memoKey] = $map;
+}
+
+/**
+ * Compact followers membership set (AP followers + optional Bluesky follower rows).
+ *
+ * @return array<string,bool>
+ */
+function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = null, bool $richAliases = true): array
+{
+    $owner = rtrim(trim((string) ($ownerActorId ?? '')), '/');
+    if ($owner === '') {
+        $owner = rtrim(ap_local_actor_id(), '/');
+    }
+    if ($ownerUserId === null || $ownerUserId < 1) {
+        $ownerUserId = $owner !== '' && function_exists('ap_db_owner_user_id_for_actor')
+            ? (int) ap_db_owner_user_id_for_actor($owner)
+            : 0;
+    }
+    $mode = $richAliases ? 'rich' : 'bare';
+    $memoKey = (string) $ownerUserId . '|' . $owner . '|followers|' . $mode;
+    if (!isset($GLOBALS['ap_relset_memo']) || !is_array($GLOBALS['ap_relset_memo'])) {
+        $GLOBALS['ap_relset_memo'] = [];
+    }
+    if (isset($GLOBALS['ap_relset_memo'][$memoKey]) && is_array($GLOBALS['ap_relset_memo'][$memoKey])) {
+        return $GLOBALS['ap_relset_memo'][$memoKey];
+    }
+
+    $useRedis = $ownerUserId > 0
+        && function_exists('ap_redis_relsets_enabled')
+        && ap_redis_relsets_enabled();
+    $redisKey = $useRedis ? ('vaak:relset:v1:followers:' . $ownerUserId . ':' . $mode) : '';
+    if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
+            return $GLOBALS['ap_relset_memo'][$memoKey] = $cached;
+        }
+        if (function_exists('ap_redis_relset_metric')) {
+            ap_redis_relset_metric('miss');
+        }
+    }
+
+    $rows = ap_followers_list($owner !== '' ? $owner : null);
+    if ($ownerUserId > 0 && $owner !== '' && function_exists('ap_bsky_admin_follower_rows')
+        && function_exists('ap_bsky_merge_follow_rows')) {
+        $rows = ap_bsky_merge_follow_rows($rows, ap_bsky_admin_follower_rows($ownerUserId, $owner));
+    }
+    $map = ap_actor_id_membership_map($rows, $richAliases);
+    if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $map, 180);
+    }
+    return $GLOBALS['ap_relset_memo'][$memoKey] = $map;
+}
+
+/**
+ * Fast actor-scope block membership (domain blocks remain on the full row list).
+ *
+ * @return array<string,bool>
+ */
+function ap_blocks_actor_id_set(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    $memoKey = $ownerUserId . '|blocks-actors';
+    if (!isset($GLOBALS['ap_relset_memo']) || !is_array($GLOBALS['ap_relset_memo'])) {
+        $GLOBALS['ap_relset_memo'] = [];
+    }
+    if (isset($GLOBALS['ap_relset_memo'][$memoKey]) && is_array($GLOBALS['ap_relset_memo'][$memoKey])) {
+        return $GLOBALS['ap_relset_memo'][$memoKey];
+    }
+    $useRedis = function_exists('ap_redis_relsets_enabled') && ap_redis_relsets_enabled();
+    $redisKey = $useRedis ? ('vaak:relset:v1:blocks-actors:' . $ownerUserId) : '';
+    if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
+            return $GLOBALS['ap_relset_memo'][$memoKey] = $cached;
+        }
+        if (function_exists('ap_redis_relset_metric')) {
+            ap_redis_relset_metric('miss');
+        }
+    }
+    $map = [];
+    foreach (ap_user_blocks_list_cached($ownerUserId) as $b) {
+        if (!is_array($b) || (string) ($b['scope'] ?? '') !== 'actor') {
+            continue;
+        }
+        $v = rtrim((string) ($b['value'] ?? ''), '/');
+        if ($v !== '') {
+            $map[$v] = true;
+            $map[$v . '/'] = true;
+        }
+    }
+    if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $map, 180);
+    }
+    return $GLOBALS['ap_relset_memo'][$memoKey] = $map;
+}
+
+/** Invalidate compact following ID sets for a Bluesky graph_sync owner. */
+function ap_following_id_set_invalidate_owner(int $ownerUserId): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    if (isset($GLOBALS['ap_relset_memo']) && is_array($GLOBALS['ap_relset_memo'])) {
+        foreach (array_keys($GLOBALS['ap_relset_memo']) as $memoKey) {
+            if (str_starts_with((string) $memoKey, (string) $ownerUserId . '|')) {
+                unset($GLOBALS['ap_relset_memo'][$memoKey]);
+            }
+        }
+    }
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete(
+            'vaak:relset:v1:following:' . $ownerUserId . ':rich',
+            'vaak:relset:v1:following:' . $ownerUserId . ':bare',
+            'vaak:relset:v1:followers:' . $ownerUserId . ':rich',
+            'vaak:relset:v1:followers:' . $ownerUserId . ':bare',
+            'vaak:bsky:followed-handles:' . $ownerUserId
+        );
+    }
     if (function_exists('ap_redis_relset_metric')) {
         ap_redis_relset_metric('invalidate');
     }
@@ -8435,6 +8757,12 @@ function ap_user_blocks_cache_clear(?int $ownerUserId = null): void
         return;
     }
     ap_user_blocks_list_cached($ownerUserId, true);
+    if (isset($GLOBALS['ap_relset_memo'][$ownerUserId . '|blocks-actors'])) {
+        unset($GLOBALS['ap_relset_memo'][$ownerUserId . '|blocks-actors']);
+    }
+    if (function_exists('ap_redis_delete')) {
+        ap_redis_delete('vaak:relset:v1:blocks-actors:' . $ownerUserId);
+    }
     ap_timeline_cache_invalidate_owner($ownerUserId);
 }
 
@@ -8449,10 +8777,20 @@ function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): 
         $h = parse_url($actorId, PHP_URL_HOST);
         $host = is_string($h) ? strtolower($h) : null;
     }
+    if ($actorId !== null && $actorId !== '' && function_exists('ap_blocks_actor_id_set')) {
+        $actorSet = ap_blocks_actor_id_set($ownerUserId);
+        if (!empty($actorSet[$actorId]) || !empty($actorSet[$actorId . '/'])) {
+            return true;
+        }
+    }
     foreach (ap_user_blocks_list_cached($ownerUserId) as $b) {
         $scope = (string) ($b['scope'] ?? '');
         $value = (string) ($b['value'] ?? '');
         if ($scope === 'actor' && $actorId !== null && $actorId !== '') {
+            // Already checked via compact set when available.
+            if (function_exists('ap_blocks_actor_id_set')) {
+                continue;
+            }
             $v = rtrim($value, '/');
             if ($v !== '' && ($actorId === $v || $actorId . '/' === $v || $actorId === $v . '/')) {
                 return true;

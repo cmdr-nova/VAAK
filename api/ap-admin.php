@@ -4485,8 +4485,22 @@ $adminIndexActorMap = static function (array $rows, bool $richAliases = true) us
     }
     return $map;
 };
-$followingIds = $adminIndexActorMap($following, !$isPartial && $view !== 'mentions');
-$followerIds = $isPartial ? [] : $adminIndexActorMap($followers, $view !== 'mentions');
+$relsetRich = !$isPartial && $view !== 'mentions';
+if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_following_id_set')) {
+    // Compact Redis membership set (Fediverse + Bluesky graph_sync). Full
+    // $following rows remain available for the Following page renderer.
+    $followingIds = ap_following_id_set($vaakActorId, $vaakOwnerId, $relsetRich);
+} else {
+    $followingIds = $adminIndexActorMap($following, $relsetRich);
+}
+if ($isPartial || $accountSwitcherView) {
+    $followerIds = [];
+} elseif ($vaakOwnerId > 0 && function_exists('ap_followers_id_set')
+    && in_array($view, ['following', 'followers', 'remote_profile', 'search', 'home', 'feed', 'local', 'gallery'], true)) {
+    $followerIds = ap_followers_id_set($vaakActorId, $vaakOwnerId, $relsetRich);
+} else {
+    $followerIds = $adminIndexActorMap($followers, $relsetRich);
+}
 
 // AJAX: hydrate one thin boost card in place (no full timeline rebuild / no scroll reset)
 $hydrateBoost = $isPartial && (string) ($_GET['hydrate_boost'] ?? '') === '1';
@@ -4529,7 +4543,9 @@ if ($hydrateBoost) {
         }
         $GLOBALS['admin_boost_fetch_budget'] = 1;
         if ($followingIds === [] || count($followingIds) < 3) {
-            $followingIds = $adminIndexActorMap($following, true);
+            $followingIds = ($vaakOwnerId > 0 && function_exists('ap_following_id_set'))
+                ? ap_following_id_set($vaakActorId, $vaakOwnerId, true)
+                : $adminIndexActorMap($following, true);
         }
         ob_start();
         admin_render_boost_card($localRow, $followingIds, $returnView);
@@ -4569,7 +4585,9 @@ if ($hydrateBoost) {
     $GLOBALS['admin_boost_fetch_budget'] = 1;
     // Rich following aliases help Follow button state on the hydrated card
     if ($followingIds === [] || count($followingIds) < 3) {
-        $followingIds = $adminIndexActorMap($following, true);
+        $followingIds = ($vaakOwnerId > 0 && function_exists('ap_following_id_set'))
+            ? ap_following_id_set($vaakActorId, $vaakOwnerId, true)
+            : $adminIndexActorMap($following, true);
     }
     ob_start();
     admin_render_remote_boost_card($e, $followingIds, $returnView, false);

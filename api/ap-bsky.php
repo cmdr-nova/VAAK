@@ -6735,8 +6735,12 @@ function ap_bsky_graph_sync_upsert(
                updated_at = excluded.updated_at'
         );
         $st->execute([$ownerUserId, $kind, $did, $bskyUri, $source, gmdate('c')]);
-        if ($kind === 'follow' && function_exists('ap_redis_delete')) {
-            ap_redis_delete('vaak:bsky:followed-handles:' . $ownerUserId);
+        if ($kind === 'follow') {
+            if (function_exists('ap_following_id_set_invalidate_owner')) {
+                ap_following_id_set_invalidate_owner($ownerUserId);
+            } elseif (function_exists('ap_redis_delete')) {
+                ap_redis_delete('vaak:bsky:followed-handles:' . $ownerUserId);
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] graph_sync_upsert: ' . $e->getMessage());
@@ -6844,8 +6848,12 @@ function ap_bsky_graph_sync_delete(int $ownerUserId, string $kind, string $did):
         ap_db()->prepare(
             'DELETE FROM bsky_graph_sync WHERE owner_user_id = ? AND kind = ? AND target_did = ?'
         )->execute([$ownerUserId, $kind, $did]);
-        if ($kind === 'follow' && function_exists('ap_redis_delete')) {
-            ap_redis_delete('vaak:bsky:followed-handles:' . $ownerUserId);
+        if ($kind === 'follow') {
+            if (function_exists('ap_following_id_set_invalidate_owner')) {
+                ap_following_id_set_invalidate_owner($ownerUserId);
+            } elseif (function_exists('ap_redis_delete')) {
+                ap_redis_delete('vaak:bsky:followed-handles:' . $ownerUserId);
+            }
         }
     } catch (Throwable $e) {
         // ignore
