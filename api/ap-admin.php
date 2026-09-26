@@ -16878,7 +16878,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </nav>
         <?php endif; ?>
         <?php if (in_array($view, ['home', 'local', 'feed', 'gallery', 'mentions', 'dms', 'favourites', 'bookmarks', 'outbox', 'queue', 'drafts', 'followers', 'following', 'blocks', 'profile', 'users'], true)): ?>
-          <a class="btn btn-ghost" href="?view=<?= h($view) ?><?= $view === 'dms' && !empty($_GET['peer']) ? '&amp;peer=' . urlencode((string) $_GET['peer']) : '' ?>&amp;_r=<?= time() ?>" title="Reload this view">↻ Refresh</a>
+          <?php
+            $refreshExtra = '';
+            if ($view === 'dms' && !empty($_GET['peer'])) {
+                $refreshExtra .= '&amp;peer=' . urlencode((string) $_GET['peer']);
+            }
+            if ($view === 'favourites' && in_array(strtolower((string) ($_GET['network'] ?? '')), ['fedi', 'bsky'], true)) {
+                $refreshExtra .= '&amp;network=' . urlencode(strtolower((string) $_GET['network']));
+            }
+            if (in_array($view, ['followers', 'following'], true) && in_array(strtolower((string) ($_GET['network'] ?? '')), ['all', 'fedi', 'bsky'], true)) {
+                $refreshExtra .= '&amp;network=' . urlencode(strtolower((string) $_GET['network']));
+            }
+          ?>
+          <a class="btn btn-ghost" href="?view=<?= h($view) ?><?= $refreshExtra ?>&amp;_r=<?= time() ?>" title="Reload this view">↻ Refresh</a>
         <?php endif; ?>
       </div>
     </div>
@@ -16900,7 +16912,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       }());
     </script>
 
-    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions'], true) ? ' timeline-feed' : '' ?><?= $view === 'remote_profile' ? ' remote-profile-feed' : '' ?>">
+    <div class="feed<?= in_array($view, ['guestbook','support','analytics'], true) ? ' wide-feed' : '' ?><?= in_array($view, ['home', 'local', 'feed', 'bluesky', 'mentions', 'favourites', 'bookmarks'], true) ? ' timeline-feed' : '' ?><?= $view === 'remote_profile' ? ' remote-profile-feed' : '' ?>">
       <?php if (in_array($view, ['home', 'local', 'feed'], true) && !$autoOpenComposer): ?>
         <?php $GLOBALS['admin_compose_panel_inline'] = true; ?>
         <div class="compose-inline-slot" id="compose-inline-slot">
@@ -17319,41 +17331,56 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'favourites'): ?>
 
         <?php
-          $favRows = ap_masto_favourites_list(40, null);
-          // Bluesky likes mirrored into masto_favourites only have URL stubs —
-          // those belong in the Bluesky favourites fragment (full cards).
-          $favRows = array_values(array_filter($favRows, static function ($st): bool {
-              if (!is_array($st)) {
-                  return false;
-              }
-              $sid = (string) ($st['id'] ?? '');
-              $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
-              return !(str_starts_with($sid, 'bsky:')
-                  || str_starts_with($uri, 'at://')
-                  || str_contains($uri, 'bsky.app/'));
-          }));
-          $favHasMore = count($favRows) > 20;
-          $favList = array_slice($favRows, 0, 20);
           $bskyFavEnabled = function_exists('ap_bsky_get_favourites')
               && function_exists('ap_bsky_session_row')
               && ap_bsky_session_row($vaakOwnerId) !== null;
-          if (!$favList && !$bskyFavEnabled):
+          $favNet = strtolower(trim((string) ($_GET['network'] ?? 'fedi')));
+          if (!in_array($favNet, ['fedi', 'bsky'], true)) {
+              $favNet = 'fedi';
+          }
+          if ($favNet === 'bsky' && !$bskyFavEnabled) {
+              $favNet = 'fedi';
+          }
+          $favTabHref = static function (string $net): string {
+              return '?view=favourites&network=' . rawurlencode($net);
+          };
         ?>
-          <div class="empty">No favourites yet.</div>
-        <?php else: ?>
-          <?php if ($favList): ?>
-          <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
-            <?php foreach ($favList as $st): admin_render_favourite_status_card($st); endforeach; ?>
-            <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
-          </div>
-          <?php elseif ($bskyFavEnabled): ?>
-          <div class="empty" id="favourites-empty-fedi" hidden>No Fediverse favourites yet.</div>
-          <?php endif; ?>
-        <?php endif; ?>
         <?php if ($bskyFavEnabled): ?>
-        <div data-bsky-favourites-fragment data-offset="0" data-limit="20" aria-live="polite">
-          <div class="meta" style="padding:.75rem 0">Loading Bluesky favourites…</div>
-        </div>
+        <nav class="notification-tabs" aria-label="Favourites network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
+          <a class="btn <?= $favNet === 'fedi' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'fedi' ? 'true' : 'false' ?>" href="<?= h($favTabHref('fedi')) ?>" style="padding:.3rem .7rem;font-size:.82rem">Fediverse</a>
+          <a class="btn <?= $favNet === 'bsky' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'bsky' ? 'true' : 'false' ?>" href="<?= h($favTabHref('bsky')) ?>" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>
+        </nav>
+        <?php endif; ?>
+
+        <?php if ($favNet === 'fedi'): ?>
+          <?php
+            $favRows = ap_masto_favourites_list(40, null);
+            // Bluesky likes mirrored into masto_favourites only have URL stubs.
+            $favRows = array_values(array_filter($favRows, static function ($st): bool {
+                if (!is_array($st)) {
+                    return false;
+                }
+                $sid = (string) ($st['id'] ?? '');
+                $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
+                return !(str_starts_with($sid, 'bsky:')
+                    || str_starts_with($uri, 'at://')
+                    || str_contains($uri, 'bsky.app/'));
+            }));
+            $favHasMore = count($favRows) > 20;
+            $favList = array_slice($favRows, 0, 20);
+          ?>
+          <?php if (!$favList): ?>
+            <div class="empty">No Fediverse favourites yet.</div>
+          <?php else: ?>
+            <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
+              <?php foreach ($favList as $st): admin_render_favourite_status_card($st); endforeach; ?>
+              <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
+            </div>
+          <?php endif; ?>
+        <?php else: ?>
+          <div data-bsky-favourites-fragment data-offset="0" data-limit="20" aria-live="polite">
+            <div class="meta" style="padding:.75rem 0">Loading Bluesky favourites…</div>
+          </div>
 <script>
 (function loadFavouritesBsky() {
   const fragment = document.querySelector('[data-bsky-favourites-fragment]');
@@ -17385,6 +17412,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         current.dataset.hasMore = next.dataset.hasMore || '0';
       }
       current.dataset.loaded = '1';
+      if (typeof window.vaakBindFeedTopBtn === 'function') {
+        window.vaakBindFeedTopBtn(document.querySelector('section.main'));
+      }
       if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(current);
       let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
       if (!sentinel) {
@@ -22856,9 +22886,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php endif; ?>
     </div>
-    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky', 'outbox', 'search'], true)): ?>
+    <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky', 'outbox', 'search', 'favourites', 'bookmarks', 'mentions'], true)): ?>
+      <?php if (in_array($view, ['home', 'feed', 'local', 'gallery', 'vakktok', 'bluesky'], true)): ?>
       <button type="button" class="feed-new-btn" id="feed-new-btn" hidden>New posts</button>
-      <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to latest" aria-label="Back to latest posts">↑</button>
+      <?php endif; ?>
+      <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
     <?php endif; ?>
   </section>
 </div>
