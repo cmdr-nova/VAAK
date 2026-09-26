@@ -236,7 +236,7 @@ function ap_masto_timeline_cache_key(string $path, int $limit, ?string $sinceId,
  *
  * @param array<string,scalar|null> $extraQuery
  */
-function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?string $sinceId, array $extraQuery = [], int $ttlSec = 20): bool
+function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?string $sinceId, array $extraQuery = [], int $ttlSec = 45): bool
 {
     // Only cache "head" polls (no max_id scroll pages) — those are Ice Cubes' frequent refresh.
     if ($maxId !== null && $maxId !== '') {
@@ -332,7 +332,7 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
     if (function_exists('ap_redis_json_set')) {
         ap_redis_json_set(ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery), [
             'created_at' => time(), 'body' => $json, 'link' => $link,
-        ], max(5, min(60, 20)));
+        ], max(5, min(90, 45)));
     }
     @file_put_contents($file, $json, LOCK_EX);
     @file_put_contents($file . '.link', $link, LOCK_EX);
@@ -1665,12 +1665,45 @@ function ap_masto_api(string $method, string $path): void
         if (ap_masto_timeline_cache_try('/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ)) {
             return;
         }
-        $fedStatuses = ap_visibility_filter_statuses(
-            ap_masto_timeline_public_merged($limit, $maxId, $sinceId, $onlyMedia),
-            (int) ap_db_masto_owner_user_id()
-        );
-        ap_masto_timeline_cache_store($fedStatuses, '/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ);
-        ap_masto_json_timeline($fedStatuses, '/api/v1/timelines/public', $limit, $extraQ);
+        // Stampede lock for cold Federated head polls — Ice Cubes refreshes can
+        // pile up while hydrate is still ~a few seconds.
+        $fedLockKey = '';
+        $fedGotLock = true;
+        if (($maxId === null || $maxId === '') && function_exists('ap_redis_lock')) {
+            $fedLockKey = 'vaak:tl:public:build:' . ap_masto_timeline_cache_key(
+                '/api/v1/timelines/public',
+                $limit,
+                $sinceId,
+                $extraQ
+            );
+            $fedGotLock = ap_redis_lock($fedLockKey, 20);
+            if (!$fedGotLock && function_exists('ap_redis_stampede_wait')) {
+                $waited = ap_redis_stampede_wait(static function () use ($limit, $maxId, $sinceId, $extraQ) {
+                    return ap_masto_timeline_cache_try(
+                        '/api/v1/timelines/public',
+                        $limit,
+                        $maxId,
+                        $sinceId,
+                        $extraQ
+                    ) ? true : null;
+                }, 8000);
+                if ($waited) {
+                    return;
+                }
+            }
+        }
+        try {
+            $fedStatuses = ap_visibility_filter_statuses(
+                ap_masto_timeline_public_merged($limit, $maxId, $sinceId, $onlyMedia),
+                (int) ap_db_masto_owner_user_id()
+            );
+            ap_masto_timeline_cache_store($fedStatuses, '/api/v1/timelines/public', $limit, $maxId, $sinceId, $extraQ);
+            ap_masto_json_timeline($fedStatuses, '/api/v1/timelines/public', $limit, $extraQ);
+        } finally {
+            if ($fedGotLock && $fedLockKey !== '' && function_exists('ap_redis_unlock')) {
+                ap_redis_unlock($fedLockKey);
+            }
+        }
         return;
     }
 

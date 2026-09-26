@@ -6115,8 +6115,13 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // newer row ids, which otherwise push real recent inbox Creates out of the
     // over-fetch window and make Home look empty of follows.
     // Over-fetch to survive filtering without making unbounded queries.
+    // Federated/API pages: keep the SQL window tight (Ice Cubes ~5–10s client
+    // timeouts). Home may need a wider window for follow-graph sparsity.
+    $sqlLimit = $mode === 'home'
+        ? (int) min(800, max($limit * 4, $limit + 40))
+        : (int) min(200, max($limit * 2, $limit + 24));
     $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
-        . ' ORDER BY created_at DESC, id DESC LIMIT ' . (int) min(800, max($limit * 4, $limit + 40));
+        . ' ORDER BY created_at DESC, id DESC LIMIT ' . $sqlLimit;
     $queryStartedAt = microtime(true);
     $st = ap_db()->prepare($sql);
     $st->execute($params);
@@ -6302,11 +6307,13 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
     $before = ($maxId !== null && $maxId !== '') ? ap_masto_status_created_at_by_id((int) $maxId) : null;
     $after = ($sinceId !== null && $sinceId !== '') ? ap_masto_status_created_at_by_id((int) $sinceId) : null;
 
-    // Page remotes with the same cursor — fetching the head then filtering left
-    // deep scroll with only local/boost leftovers.
+    // Pass the client page size through. ap_masto_timeline_events already
+    // over-fetches SQL rows and hydrates a small overflow for diversity —
+    // multiplying here again (limit*4 then *4 inside) was hydrating ~160+
+    // statuses for Ice Cubes Federated and timing out mobile clients.
     $remote = ap_masto_timeline_events(
         'federated',
-        min(200, max($limit * 4, $limit + 40)),
+        $limit,
         $maxId,
         $sinceId,
         $onlyMedia
