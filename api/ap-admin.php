@@ -589,6 +589,21 @@ if (isset($_GET['op']) && (string) $_GET['op'] === 'edit_draft') {
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $action = (string) ($_POST['action'] ?? '');
+    // Hard guard: a compose POST that carries our own note_id is ALWAYS an edit.
+    // Stale client mode (reply) + duplicate compose forms have repeatedly created
+    // a second post instead of updating the existing one.
+    if (in_array($action, ['reply', 'queue_post', ''], true)) {
+        $editNoteGuard = trim((string) ($_POST['note_id'] ?? ''));
+        if (
+            $editNoteGuard !== ''
+            && function_exists('vaak_is_own_url')
+            && vaak_is_own_url($editNoteGuard)
+            && str_contains($editNoteGuard, '/notes/')
+        ) {
+            $action = 'edit_status';
+            $_POST['action'] = 'edit_status';
+        }
+    }
     // CSRF: session token (login/register already use the same helper)
     $csrfToken = (string) ($_POST['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
     if (!ap_auth_csrf_ok($csrfToken)) {
@@ -27889,18 +27904,40 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     form.classList.remove('is-dragover');
     addComposeFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
   });
-  const actionField = document.getElementById('compose-action');
+  // Prefer the active compose panel — Home has both inline + modal forms with
+  // duplicate IDs; document.getElementById() would stick to the wrong one.
+  function activeComposeForm() {
+    const panel = typeof getComposePanel === 'function' ? getComposePanel() : document.querySelector('.compose-modal__panel');
+    if (panel) {
+      const f = panel.querySelector('#compose-form') || panel.querySelector('form.composer');
+      if (f) return f;
+    }
+    return document.getElementById('compose-form');
+  }
+  function composeField(sel, form) {
+    const root = form || activeComposeForm();
+    return root ? root.querySelector(sel) : document.querySelector(sel);
+  }
+  let actionField = composeField('#compose-action');
+  let returnField = composeField('#compose-return-view');
+  let noteIdField = composeField('#compose-note-id');
   // Derive from the live form field — $composeIsEdit is scoped inside
   // admin_render_compose_panel() and is not available in this page script.
-  let composeMode = (actionField && actionField.value === 'edit_status') ? 'edit_status' : 'reply'; // reply | queue_post | edit_status
-  const returnField = document.getElementById('compose-return-view');
-  const noteIdField = document.getElementById('compose-note-id');
-  const queueBtn = document.getElementById('compose-queue-btn');
-  const mediaInput = document.getElementById('compose-media-input');
-  const mediaHint = document.getElementById('compose-media-hint');
-  const submitProgress = document.getElementById('compose-submit-progress');
-  const submitProgressBar = document.getElementById('compose-submit-progress-bar');
-  const submitProgressLabel = document.getElementById('compose-submit-progress-label');
+  let composeMode = (
+    (actionField && actionField.value === 'edit_status')
+    || (noteIdField && String(noteIdField.value || '').includes('/notes/'))
+  ) ? 'edit_status' : 'reply'; // reply | queue_post | edit_status
+  const queueBtn = composeField('#compose-queue-btn') || document.getElementById('compose-queue-btn');
+  const mediaInput = composeField('#compose-media-input') || document.getElementById('compose-media-input');
+  const mediaHint = composeField('#compose-media-hint') || document.getElementById('compose-media-hint');
+  const submitProgress = composeField('#compose-submit-progress') || document.getElementById('compose-submit-progress');
+  const submitProgressBar = composeField('#compose-submit-progress-bar') || document.getElementById('compose-submit-progress-bar');
+  const submitProgressLabel = composeField('#compose-submit-progress-label') || document.getElementById('compose-submit-progress-label');
+  function refreshComposeFieldRefs(form) {
+    actionField = composeField('#compose-action', form);
+    returnField = composeField('#compose-return-view', form);
+    noteIdField = composeField('#compose-note-id', form);
+  }
   const postAudio = new Audio('/api/assets/post.wav?v=1');
   postAudio.preload = 'auto';
   postAudio.volume = 0.9;
@@ -28064,33 +28101,47 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
 
   function applyEditChrome(noteId, returnView) {
+    // Move into the modal panel first so field refs target the form we submit.
+    if (supportsInlineComposer && isComposerInline()) {
+      placeComposerInModal();
+    }
+    const form = activeComposeForm();
+    refreshComposeFieldRefs(form);
     resetComposeChrome();
+    refreshComposeFieldRefs(form);
     composeMode = 'edit_status';
     if (actionField) actionField.value = 'edit_status';
     if (noteIdField) noteIdField.value = noteId || '';
     if (returnField) returnField.value = returnView || 'outbox';
-    const title = document.getElementById('compose-modal-title');
-    const submitBtn = document.getElementById('compose-submit-btn');
+    const title = (form && form.closest('.compose-modal__panel') || document)
+      .querySelector('#compose-modal-title') || document.getElementById('compose-modal-title');
+    const submitBtn = composeField('#compose-submit-btn', form) || document.getElementById('compose-submit-btn');
     if (title) title.textContent = 'Edit post';
     if (submitBtn) submitBtn.textContent = 'Save edit';
     // Keep media as-is on edit (API keeps existing attachments); hide new uploads for now
-    if (queueBtn) queueBtn.style.display = 'none';
-    if (draftBtn) draftBtn.style.display = 'none';
+    const qBtn = composeField('#compose-queue-btn', form) || queueBtn;
+    const dBtn = composeField('#compose-draft-btn', form) || draftBtn;
+    if (qBtn) qBtn.style.display = 'none';
+    if (dBtn) dBtn.style.display = 'none';
     if (draftIdField) draftIdField.value = '';
     if (draftMediaField) draftMediaField.value = '';
-    if (mediaInput) {
-      const lab = mediaInput.closest('label');
+    const mInput = composeField('#compose-media-input', form) || mediaInput;
+    const mHint = composeField('#compose-media-hint', form) || mediaHint;
+    if (mInput) {
+      const lab = mInput.closest('label');
       if (lab) lab.style.display = 'none';
     }
-    if (mediaHint) mediaHint.textContent = 'Media stays attached; text/CW edit only for now';
-    if (visibilityWrap) visibilityWrap.style.display = 'none';
-    const replyTo = document.getElementById('compose-in-reply-to');
+    if (mHint) mHint.textContent = 'Media stays attached; text/CW edit only for now';
+    const vis = composeField('#compose-visibility', form);
+    const visWrap = vis ? vis.closest('label') : visibilityWrap;
+    if (visWrap) visWrap.style.display = 'none';
+    const replyTo = composeField('#compose-in-reply-to', form);
     if (replyTo) {
       replyTo.value = '';
       if (replyTo.parentElement) replyTo.parentElement.style.display = 'none';
       else replyTo.style.display = 'none';
     }
-    const toActor = document.getElementById('compose-to-actor');
+    const toActor = composeField('#compose-to-actor', form);
     if (toActor && toActor.type !== 'hidden') {
       toActor.value = '';
       toActor.style.display = 'none';
@@ -28185,15 +28236,18 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     // current document, so hand that navigation state back immediately rather
     // than leaving the pill spinning while the modal is open.
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
-    // Focused/thread layouts can contain only the modal shell, so use the
-    // server-rendered edit route as the canonical path. It renders the same
-    // edit_status composer with the existing note id and avoids an empty shell.
+    // Prefer in-place edit when the compose modal exists. Full-page
+    // ?edit_note= navigation remains the no-JS / no-modal fallback and must
+    // never be the default — soft-nav composer adoption + duplicate #compose-form
+    // IDs have caused edits to post as new replies.
+    if (modal && typeof openEditComposer === 'function') {
+      openEditComposer(btn);
+      return;
+    }
     const href = btn.getAttribute('href') || '';
     if (href) {
       window.location.assign(href);
-      return;
     }
-    openEditComposer(btn);
   });
 
   if (queueBtn) {
@@ -28226,21 +28280,34 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     ev.stopPropagation();
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     const form = submitForm;
+    refreshComposeFieldRefs(form);
     syncInput();
     if (form.dataset.busy === '1') return;
     form.dataset.busy = '1';
-    const submitBtn = document.getElementById('compose-submit-btn') || form.querySelector('button[type="submit"]');
+    const submitBtn = form.querySelector('#compose-submit-btn') || form.querySelector('button[type="submit"]');
     unlockPostAudio();
-    const mode = composeMode;
-    // A server-rendered edit always carries the existing note id. Treat that
-    // as authoritative even if a stale client mode was initialized as reply;
-    // otherwise saving an edit can accidentally create a second post.
-    const editingNoteId = noteIdField && String(noteIdField.value || '').trim();
+    const formAction = form.querySelector('#compose-action');
+    const formNoteId = form.querySelector('#compose-note-id');
+    const formReturn = form.querySelector('#compose-return-view');
+    // Authoritative edit signal: the submitted form's own note_id / action.
+    // Never trust module-level getElementById refs (duplicate inline+modal IDs).
+    const editingNoteId = String((formNoteId && formNoteId.value) || (noteIdField && noteIdField.value) || '').trim();
+    const isOwnNoteEdit = editingNoteId !== '' && editingNoteId.indexOf('/notes/') !== -1;
+    let mode = composeMode;
+    if (isOwnNoteEdit) mode = 'edit_status';
+    else if (formAction && formAction.value === 'edit_status') mode = 'edit_status';
+    else if (formAction && formAction.value === 'queue_post') mode = 'queue_post';
     const actionName = mode === 'queue_post'
       ? 'queue_post'
-      : (mode === 'edit_status' || editingNoteId !== '' ? 'edit_status' : 'reply');
+      : (mode === 'edit_status' || isOwnNoteEdit ? 'edit_status' : 'reply');
+    composeMode = mode === 'queue_post' ? 'queue_post' : (actionName === 'edit_status' ? 'edit_status' : 'reply');
+    if (formAction) formAction.value = actionName;
     if (actionField) actionField.value = actionName;
-    if (returnField && mode !== 'queue_post') {
+    if (formNoteId && isOwnNoteEdit) formNoteId.value = editingNoteId;
+    if (noteIdField && isOwnNoteEdit) noteIdField.value = editingNoteId;
+    if (formReturn && mode !== 'queue_post') {
+      formReturn.value = <?= json_encode($composerReturnView) ?>;
+    } else if (returnField && mode !== 'queue_post') {
       returnField.value = <?= json_encode($composerReturnView) ?>;
     }
     if (submitBtn) submitBtn.disabled = true;
@@ -28249,7 +28316,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     try {
       // Pre-upload local files so the publish POST stays small (avoids mobile
       // “session expired” when PHP empties a huge multipart body).
-      if (files.length && mode !== 'edit_status') {
+      if (files.length && actionName !== 'edit_status') {
         const up = await preUploadPendingComposeFiles();
         if (!up.ok) {
           if (window.apAdminToast) window.apAdminToast(up.error || 'Media upload failed.', true);
@@ -28260,6 +28327,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       const fd = new FormData(form);
       fd.set('ajax', '1');
       fd.set('action', actionName);
+      if (isOwnNoteEdit) fd.set('note_id', editingNoteId);
       if (window.vaakCsrfApply) window.vaakCsrfApply(fd);
       else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
       // Drop any leftover file inputs — media already lives in draft_media_ids.
@@ -28270,7 +28338,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       const data = await submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, null);
       setSubmitProgress(hadMedia ? 'finalizing' : 'posting', 100);
       if (!data || !data.ok) {
-        const failMsg = mode === 'queue_post' ? 'Queue failed.' : (mode === 'edit_status' ? 'Edit failed.' : 'Post failed.');
+        const failMsg = actionName === 'queue_post' ? 'Queue failed.' : (actionName === 'edit_status' ? 'Edit failed.' : 'Post failed.');
         if (window.apAdminToast) {
           window.apAdminToast((data && (data.error || data.notice)) || failMsg, true);
         } else {
@@ -28284,9 +28352,9 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       // or federation delivery before dismissing the page-level save marker.
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       if (window.apAdminToast) {
-        const okMsg = mode === 'queue_post'
+        const okMsg = actionName === 'queue_post'
           ? 'Added to queue.'
-          : (mode === 'edit_status' ? 'Post updated.' : (data.kind === 'quote' ? 'Quote posted.' : 'Posted.'));
+          : (actionName === 'edit_status' ? 'Post updated.' : (data.kind === 'quote' ? 'Quote posted.' : 'Posted.'));
         window.apAdminToast(data.success_toast || okMsg);
         // Bluesky rate-limit: fedi post succeeded; mirror was queued for later.
         if (data.toast) {
