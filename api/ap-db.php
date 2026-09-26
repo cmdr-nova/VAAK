@@ -6336,7 +6336,7 @@ function ap_followers_list(?string $ownerActorId = null): array
     $st->execute([$owner, $owner . '/']);
     $rows = $st->fetchAll() ?: [];
     if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, $rows, 120);
+        ap_redis_json_set($redisKey, $rows, function_exists('ap_redis_follow_graph_ttl') ? ap_redis_follow_graph_ttl() : 300);
     }
     return $memo[$owner] = $rows;
 }
@@ -6359,7 +6359,7 @@ function ap_followers_count(?string $ownerActorId = null): int
         $st->execute([$owner, $owner . '/']);
         $count = max(0, (int) $st->fetchColumn());
         if (function_exists('ap_redis_json_set')) {
-            ap_redis_json_set($key, ['count' => $count], 120);
+            ap_redis_json_set($key, ['count' => $count], function_exists('ap_redis_follow_graph_ttl') ? ap_redis_follow_graph_ttl() : 300);
         }
         return $count;
     } catch (Throwable $e) {
@@ -6385,7 +6385,7 @@ function ap_following_count(?string $ownerActorId = null): int
         $st->execute([$owner, $owner . '/']);
         $count = max(0, (int) $st->fetchColumn());
         if (function_exists('ap_redis_json_set')) {
-            ap_redis_json_set($key, ['count' => $count], 120);
+            ap_redis_json_set($key, ['count' => $count], function_exists('ap_redis_follow_graph_ttl') ? ap_redis_follow_graph_ttl() : 300);
         }
         return $count;
     } catch (Throwable $e) {
@@ -6431,7 +6431,7 @@ function ap_following_list(?string $ownerActorId = null): array
     $st->execute([$owner, $owner . '/']);
     $rows = $st->fetchAll() ?: [];
     if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, $rows, 120);
+        ap_redis_json_set($redisKey, $rows, function_exists('ap_redis_follow_graph_ttl') ? ap_redis_follow_graph_ttl() : 300);
     }
     return $memo[$owner] = $rows;
 }
@@ -6676,7 +6676,7 @@ function ap_following_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
     }
     $map = ap_actor_id_membership_map($rows, $richAliases);
     if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, $map, 180);
+        ap_redis_json_set($redisKey, $map, function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300);
     }
     if (!empty($holdRelLock) && !empty($relLock) && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($relLock);
@@ -6748,7 +6748,7 @@ function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
     }
     $map = ap_actor_id_membership_map($rows, $richAliases);
     if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, $map, 180);
+        ap_redis_json_set($redisKey, $map, function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300);
     }
     if ($holdRelLock && $relLock !== '' && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($relLock);
@@ -6799,7 +6799,7 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
         }
     }
     if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($redisKey, $map, 180);
+        ap_redis_json_set($redisKey, $map, function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300);
     }
     return $GLOBALS['ap_relset_memo'][$memoKey] = $map;
 }
@@ -7920,7 +7920,11 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
                 }
             }
             if (function_exists('ap_redis_json_set')) {
-                ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+                ap_redis_json_set(
+                    $redisKey,
+                    $cache[$ownerUserId],
+                    function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300
+                );
             }
         }
     }
@@ -8090,7 +8094,13 @@ function ap_deprioritized_set_cached(int $ownerUserId, bool $refresh = false): a
                     $cache[$ownerUserId][$id . '/'] = true;
                 }
             }
-            if (function_exists('ap_redis_json_set')) ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set(
+                    $redisKey,
+                    $cache[$ownerUserId],
+                    function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300
+                );
+            }
         }
     }
     return $cache[$ownerUserId];
@@ -8785,7 +8795,11 @@ function ap_user_blocks_list_cached(int $ownerUserId, bool $refresh = false): ar
             }
             $cache[$ownerUserId] = ap_user_blocks_list($ownerUserId);
             if (function_exists('ap_redis_json_set')) {
-                ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+                ap_redis_json_set(
+                    $redisKey,
+                    $cache[$ownerUserId],
+                    function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300
+                );
             }
         }
     }
@@ -9129,7 +9143,11 @@ function ap_muted_words_phrases_cached(int $ownerUserId, bool $refresh = false):
             }
             $cache[$ownerUserId] = array_values(array_unique($phrases));
             if (function_exists('ap_redis_json_set')) {
-                ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+                ap_redis_json_set(
+                    $redisKey,
+                    $cache[$ownerUserId],
+                    function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300
+                );
             }
         }
     }

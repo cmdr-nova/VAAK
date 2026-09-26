@@ -234,6 +234,26 @@ function ap_redis_relsets_enabled(): bool
     return ap_redis_client('cache') !== null;
 }
 
+/**
+ * TTL for owner relationship/moderation sets after Phase 4.
+ * Invalidation on follow/block/mute is proven; keep shorter than Wafrn's 600s
+ * until hit rates are observed in production.
+ */
+function ap_redis_relset_ttl(): int
+{
+    $env = getenv('VAAK_REDIS_RELSET_TTL');
+    if ($env !== false && ctype_digit(trim((string) $env))) {
+        return max(60, min(900, (int) trim((string) $env)));
+    }
+    return 300;
+}
+
+/** TTL for full follow-graph row lists / counts (Following page, etc.). */
+function ap_redis_follow_graph_ttl(): int
+{
+    return ap_redis_relset_ttl();
+}
+
 /** Record a relationship-cache hit/miss/invalidate for ops dashboards. */
 function ap_redis_relset_metric(string $kind): void
 {
