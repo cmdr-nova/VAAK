@@ -27642,8 +27642,10 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     form.classList.remove('is-dragover');
     addComposeFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
   });
-  let composeMode = <?= $composeIsEdit ? "'edit_status'" : "'reply'" ?>; // reply | queue_post | edit_status
   const actionField = document.getElementById('compose-action');
+  // Derive from the live form field — $composeIsEdit is scoped inside
+  // admin_render_compose_panel() and is not available in this page script.
+  let composeMode = (actionField && actionField.value === 'edit_status') ? 'edit_status' : 'reply'; // reply | queue_post | edit_status
   const returnField = document.getElementById('compose-return-view');
   const noteIdField = document.getElementById('compose-note-id');
   const queueBtn = document.getElementById('compose-queue-btn');
