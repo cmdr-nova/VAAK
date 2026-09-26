@@ -15262,7 +15262,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <script>
     (function () {
       const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
-      const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink'];
+      const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink', 'bone'];
       const value = localStorage.getItem(key);
       if (allowed.includes(value)) document.documentElement.dataset.accent = value;
     }());
@@ -15289,6 +15289,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     :root[data-accent="purple"] { --primary:#c084fc; --primary-dim:rgba(192,132,252,.15); --bg-glow:#181020; }
     :root[data-accent="orange"] { --primary:#ff9f43; --primary-dim:rgba(255,159,67,.15); --bg-glow:#201810; }
     :root[data-accent="pink"] { --primary:#ff70c7; --primary-dim:rgba(255,112,199,.15); --bg-glow:#201018; }
+    :root[data-accent="bone"] { --primary:#d4cfc4; --primary-dim:rgba(212,207,196,.16); --bg-glow:#1a1916; }
     * { box-sizing: border-box; }
     html { background: #101010; color-scheme: dark; }
     body {
@@ -19505,13 +19506,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <option value="purple">Purple</option>
             <option value="orange">Orange</option>
             <option value="pink">Pink</option>
+            <option value="bone">Bone</option>
           </select>
           <script>
             (function () {
               const select = document.getElementById('vaak-accent-select');
               if (!select) return;
               const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
-              const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink'];
+              const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink', 'bone'];
               const current = localStorage.getItem(key);
               select.value = allowed.includes(current) ? current : 'green';
               select.addEventListener('change', function () {
