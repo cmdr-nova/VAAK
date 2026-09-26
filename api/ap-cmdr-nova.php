@@ -1423,7 +1423,9 @@ function ap_cmdr_note_html(array $row, array $create): void
             echo ap_link_preview_html(ap_link_preview_for_url($cardUrl, true));
         }
     }
-    if ($quoteUrl !== '') {
+    if ($quoteUrl !== '' && function_exists('ap_profile_quote_card_html')) {
+        echo ap_profile_quote_card_html($quoteUrl, true);
+    } elseif ($quoteUrl !== '') {
         $qSnippet = ap_cmdr_object_snippet($quoteUrl, 220);
         $qSafe = htmlspecialchars($quoteUrl, ENT_QUOTES, 'UTF-8');
         echo '<div class="quote-block"><span class="qt-label">Quoted</span>';
@@ -2967,7 +2969,11 @@ function ap_cmdr_post_preview_html(array $n): string
         $quoteUrl = rtrim($obj['_misskey_quote'], '/');
     }
     $quoteHtml = '';
-    if ($quoteUrl !== '') {
+    if ($quoteUrl !== '' && function_exists('ap_profile_quote_card_html')) {
+        // Nested anchors break the outer .post link wrapper — keep quote media
+        // but render Open original as plain text.
+        $quoteHtml = ap_profile_quote_card_html($quoteUrl, false);
+    } elseif ($quoteUrl !== '') {
         $qSnippet = ap_cmdr_object_snippet($quoteUrl, 160);
         // No nested <a> inside the outer .post link — browsers break the card layout
         $quoteHtml = '<div class="quote-block"><span class="qt-label">Quoted</span>';

@@ -9038,7 +9038,19 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     // Link preview for URL-only / article quotes (Guardian, YouTube, etc.).
     if ($media === [] && function_exists('ap_link_preview_html')) {
         if ($card === null && $text !== '' && function_exists('ap_link_preview_card_for_status_text')) {
+            // Cache-first, then a tiny per-request fetch budget so already-posted
+            // quote-boosts can pick up link cards without a second refresh.
             $card = ap_link_preview_card_for_status_text($text, false, false);
+            if ($card === null) {
+                $budget = &$GLOBALS['admin_quote_link_preview_budget'];
+                if (!isset($budget) || !is_int($budget)) {
+                    $budget = 2;
+                }
+                if ($budget > 0) {
+                    $budget--;
+                    $card = ap_link_preview_card_for_status_text($text, false, true);
+                }
+            }
             if ($card === null && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_warm_async')) {
                 $warmUrl = ap_link_preview_extract_url($text);
                 if (is_string($warmUrl) && $warmUrl !== '') {
@@ -12638,7 +12650,24 @@ function admin_render_outbox_card(array $n, string $returnView): void
             if ($plain !== '' && function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
                 $plain = '';
             }
-            if ($qUrl || $tomb || $plain !== '' || !empty($bskyQuotePrev)) {
+            // Compose stores remote quotes as "↪ QT: https://…". Treat a bare URL
+            // as a stub and hydrate from the cached status (text/media/card).
+            $plainIsUrlStub = $plain !== '' && str_starts_with($plain, 'https://') && !str_contains($plain, ' ');
+            if ($plainIsUrlStub) {
+                if ((!is_string($qUrl) || $qUrl === '') && str_starts_with($plain, 'https://')) {
+                    $qUrl = rtrim($plain, '.,);]');
+                }
+                $plain = '';
+            }
+            $quotedStatus = null;
+            if (!$tomb && empty($bskyQuotePrev) && is_string($qUrl) && $qUrl !== ''
+                && function_exists('ap_masto_lookup_status_by_object_url')) {
+                $quotedStatus = ap_masto_lookup_status_by_object_url($qUrl, 0, false);
+                if ($quotedStatus === null && function_exists('ap_quote_target_warm_async')) {
+                    ap_quote_target_warm_async($qUrl);
+                }
+            }
+            if ($qUrl || $tomb || $plain !== '' || !empty($bskyQuotePrev) || is_array($quotedStatus)) {
                 $openUrl = is_array($bskyQuotePrev ?? null) && !empty($bskyQuotePrev['url'])
                     ? (string) $bskyQuotePrev['url']
                     : (is_string($qUrl) ? $qUrl : '');
@@ -12659,6 +12688,11 @@ function admin_render_outbox_card(array $n, string $returnView): void
                         'open_external' => true,
                         'open_label' => 'Open original',
                     ], $returnView);
+                } elseif (is_array($quotedStatus)) {
+                    $quoteHtml = admin_quote_card_html(
+                        admin_quote_opts_from_status($quotedStatus, $openUrl),
+                        $returnView
+                    );
                 } else {
                     $qAttMedia = [];
                     if (is_array($qDoc ?? null)) {

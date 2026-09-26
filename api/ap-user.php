@@ -1124,7 +1124,40 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
             . htmlspecialchars($note['summary'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
     }
     $html .= '<div class="note-body">' . $content . '</div>';
-    $html .= ap_user_note_media_html($note, true);
+    $mediaHtml = ap_user_note_media_html($note, true);
+    $html .= $mediaHtml;
+    if ($mediaHtml === '' && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_for_url')) {
+        require_once __DIR__ . '/ap-link-preview.php';
+        $cardUrl = ap_link_preview_extract_url((string) ($note['content'] ?? $row['content'] ?? ''));
+        if ($cardUrl !== null) {
+            $card = ap_link_preview_for_url($cardUrl, false);
+            if ($card === null) {
+                $budget = &$GLOBALS['ap_profile_post_link_budget'];
+                if (!isset($budget) || !is_int($budget)) {
+                    $budget = 2;
+                }
+                if ($budget > 0) {
+                    $budget--;
+                    $card = ap_link_preview_for_url($cardUrl, true);
+                } elseif (function_exists('ap_link_preview_warm_async')) {
+                    ap_link_preview_warm_async($cardUrl);
+                }
+            }
+            if (is_array($card) && function_exists('ap_link_preview_html')) {
+                $html .= ap_link_preview_html(array_merge($card, ['status' => 'ok']), true);
+            }
+        }
+    }
+    $quoteUrl = '';
+    foreach (['quote', 'quoteUrl', '_misskey_quote'] as $qk) {
+        if (!empty($note[$qk]) && is_string($note[$qk]) && str_starts_with($note[$qk], 'https://')) {
+            $quoteUrl = rtrim($note[$qk], '/');
+            break;
+        }
+    }
+    if ($quoteUrl !== '' && function_exists('ap_profile_quote_card_html')) {
+        $html .= ap_profile_quote_card_html($quoteUrl, true);
+    }
     // Keep generic profiles consistent with the rich profile: the timestamp
     // is metadata, while the post itself remains the navigable object.
     $html .= '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0">' . $safeDate . '</p>';
