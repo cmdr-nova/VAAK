@@ -9075,34 +9075,11 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
             }
         }
         if (is_array($card)) {
-            $cardHtml = ap_link_preview_html(array_merge($card, ['status' => 'ok']), true);
+            // Non-interactive: an <a target="_blank"> link-card covers most of
+            // the quote and was sending clicks to the remote instance.
+            $cardHtml = ap_link_preview_html(array_merge($card, ['status' => 'ok']), false);
             if ($cardHtml !== '') {
-                // Status permalink previews inside a quote must not steal the
-                // click out to the remote instance — point them in-app, and
-                // mark the card so the quote click handler can prefer the
-                // quoted post when the preview is just chrome.
-                $cardUrl = trim((string) ($card['url'] ?? ''));
-                $cardIsStatus = $cardUrl !== '' && (
-                    (function_exists('ap_masto_url_looks_like_status') && ap_masto_url_looks_like_status($cardUrl))
-                    || (bool) preg_match('#/(?:statuses|posts)/\d+#i', $cardUrl)
-                    || (bool) preg_match('#^https://bsky\.app/profile/[^/]+/post/#i', $cardUrl)
-                );
-                if ($cardIsStatus && function_exists('admin_status_href')) {
-                    $inAppCard = admin_status_href($cardUrl, $returnView);
-                    $cardHtml = preg_replace(
-                        '#(<a\s+[^>]*class="link-card"[^>]*href=")[^"]*(")#i',
-                        '$1' . htmlspecialchars($inAppCard, ENT_QUOTES, 'UTF-8') . '$2',
-                        $cardHtml,
-                        1
-                    ) ?? $cardHtml;
-                    $cardHtml = preg_replace(
-                        '#\s+target="_blank"#i',
-                        '',
-                        $cardHtml,
-                        1
-                    ) ?? $cardHtml;
-                }
-                $html .= '<div class="quote-link-card" data-quote-chrome="1" style="margin-top:.45rem">'
+                $html .= '<div class="quote-link-card" data-quote-chrome="1" style="margin-top:.45rem;pointer-events:none">'
                     . $cardHtml . '</div>';
             }
         }
@@ -23861,57 +23838,36 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   function scheduleTweetFolds(root) {
     requestAnimationFrame(() => enhanceTweetFolds(root));
   }
-  // Clicking a quote card opens the quoted post in VAAK (?view=status…).
-  // Link-preview chrome inside the quote often covers most of the card and
-  // used to be target=_blank to a remote status — that stole the click.
+  // Any activation of an openable quote card opens the quoted post in VAAK.
+  // Capture + stopImmediatePropagation so target=_blank / remote anchors cannot win.
   function openQuoteBlock(qb) {
     if (!qb || !qb.classList || !qb.classList.contains('quote-block--openable')) return false;
     const href = qb.getAttribute('data-href') || '';
     if (!href || href === '#') return false;
-    window.location.href = href;
+    window.location.assign(href);
     return true;
   }
-  function looksLikeStatusUrl(url) {
-    if (!url || typeof url !== 'string') return false;
-    try {
-      const u = new URL(url, window.location.href);
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
-      // In-app status view
-      if ((u.searchParams.get('view') || '') === 'status' && u.searchParams.get('object')) return true;
-      const p = u.pathname || '';
-      return /\/(?:users|@)[^/]+\/(?:statuses|posts)\/\d+/i.test(p)
-        || /\/ap\/(?:users|actors?)\/[^/]+\/statuses\//i.test(p)
-        || /\/@(?:[^/]+)\/\d+/i.test(p)
-        || (u.hostname === 'bsky.app' && /\/profile\/[^/]+\/post\//i.test(p));
-    } catch (e) {
-      return false;
+  function quoteActivationTarget(ev) {
+    const t = ev.target;
+    if (!t || !t.closest) return null;
+    // Media controls stay usable.
+    if (t.closest('video, audio, .note-media-trigger, .media-cell, button, input, textarea, select, label')) {
+      return null;
     }
+    return t.closest('.quote-block--openable');
   }
-  document.addEventListener('click', (ev) => {
-    if (ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
-    const qb = ev.target && ev.target.closest ? ev.target.closest('.quote-block--openable') : null;
+  function onQuoteActivate(ev) {
+    const qb = quoteActivationTarget(ev);
     if (!qb) return;
-    // Real controls inside the quote keep their behavior.
-    if (ev.target.closest('button, .note-media-trigger, .media-cell, video, audio, input, textarea, select, label')) {
-      return;
-    }
+    // Allow explicit "Open original" (Bluesky) only.
     const a = ev.target.closest ? ev.target.closest('a') : null;
-    if (a) {
-      const href = a.getAttribute('href') || '';
-      // Link-preview chrome or any status permalink → open the quoted post in VAAK.
-      if (a.classList.contains('link-card') || a.closest('[data-quote-chrome="1"]') || looksLikeStatusUrl(href)) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        openQuoteBlock(qb);
-        return;
-      }
-      // Non-status external links (articles, etc.) keep default.
-      return;
-    }
+    if (a && /open original/i.test((a.textContent || '').trim())) return;
     ev.preventDefault();
-    ev.stopPropagation();
+    ev.stopImmediatePropagation();
     openQuoteBlock(qb);
-  }, true);
+  }
+  document.addEventListener('click', onQuoteActivate, true);
+  document.addEventListener('auxclick', onQuoteActivate, true);
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
     const qb = ev.target && ev.target.classList && ev.target.classList.contains('quote-block--openable')
