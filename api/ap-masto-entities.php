@@ -5522,7 +5522,7 @@ function ap_masto_status_from_event(array $row): ?array
                     $previewUrl = function_exists('admin_guess_video_poster_url')
                         ? admin_guess_video_poster_url($clean)
                         : '';
-                    if ($previewUrl === '' && preg_match('#^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$#i', $clean, $pm)) {
+                    if ($previewUrl === '' && preg_match('~^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$~i', $clean, $pm)) {
                         $previewUrl = $pm[1] . '/small/' . $pm[2] . '.png';
                     }
                 }

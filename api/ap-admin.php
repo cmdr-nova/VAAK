@@ -8073,8 +8073,9 @@ function admin_guess_video_poster_url(string $url): string
     if ($url === '' || !str_starts_with($url, 'https://')) {
         return '';
     }
-    // Mastodon / Hometown / glitch-soc media attachments
-    if (preg_match('#^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$#i', $url, $m)) {
+    // Mastodon / Hometown / glitch-soc media attachments.
+    // Use ~ delimiters — a # delimiter would collide with [^/?#].
+    if (preg_match('~^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$~i', $url, $m)) {
         return $m[1] . '/small/' . $m[2] . '.png';
     }
     // PeerTube-style static thumbnails next to the playable file are uncommon
