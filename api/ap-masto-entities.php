@@ -7008,7 +7008,8 @@ function ap_masto_search(string $q, ?string $type = null, bool $resolve = false,
         'statuses' => $statuses,
         'hashtags' => $hashtags,
     ];
-    ap_redis_json_set($searchCacheKey, $result, 15);
+    $searchTtl = function_exists('ap_redis_search_ttl') ? ap_redis_search_ttl() : 45;
+    ap_redis_json_set($searchCacheKey, $result, $searchTtl);
     return $result;
 }
 

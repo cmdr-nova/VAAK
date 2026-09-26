@@ -254,6 +254,94 @@ function ap_redis_follow_graph_ttl(): int
     return ap_redis_relset_ttl();
 }
 
+/**
+ * Short TTL for rendered Library HTML fragments (Favourites/Bookmarks Bluesky ajax).
+ * Keep short — cards include live fav/bookmark chrome; mutations invalidate.
+ */
+function ap_redis_fragment_ttl(): int
+{
+    $env = getenv('VAAK_REDIS_FRAGMENT_TTL');
+    if ($env !== false && ctype_digit(trim((string) $env))) {
+        return max(15, min(180, (int) trim((string) $env)));
+    }
+    return 45;
+}
+
+/** TTL for Mastodon/API search result packs (shared, non-personalized). */
+function ap_redis_search_ttl(): int
+{
+    $env = getenv('VAAK_REDIS_SEARCH_TTL');
+    if ($env !== false && ctype_digit(trim((string) $env))) {
+        return max(15, min(120, (int) trim((string) $env)));
+    }
+    return 45;
+}
+
+/**
+ * @param 'favourites_bsky'|'bookmarks_bsky'|'favourites_fedi' $kind
+ */
+function ap_redis_library_html_key(string $kind, int $ownerUserId, string $suffix): string
+{
+    $kind = preg_replace('/[^a-z0-9_]/', '', strtolower($kind)) ?: 'frag';
+    return 'vaak:fragment:lib:v1:' . $kind . ':' . max(0, $ownerUserId) . ':' . hash('sha256', $suffix);
+}
+
+/**
+ * @return array{html:string,has_more?:bool}|null
+ */
+function ap_redis_library_html_get(string $kind, int $ownerUserId, string $suffix): ?array
+{
+    if ($ownerUserId < 1 || !function_exists('ap_redis_json_get')) {
+        return null;
+    }
+    $cached = ap_redis_json_get(ap_redis_library_html_key($kind, $ownerUserId, $suffix));
+    if (!is_array($cached) || !isset($cached['html']) || !is_string($cached['html']) || $cached['html'] === '') {
+        ap_redis_metric_inc('fragment_miss');
+        return null;
+    }
+    ap_redis_metric_inc('fragment_hit');
+    return $cached;
+}
+
+function ap_redis_library_html_set(
+    string $kind,
+    int $ownerUserId,
+    string $suffix,
+    string $html,
+    ?bool $hasMore = null
+): void {
+    if ($ownerUserId < 1 || $html === '' || !function_exists('ap_redis_json_set')) {
+        return;
+    }
+    $payload = ['html' => $html, 'ts' => time()];
+    if ($hasMore !== null) {
+        $payload['has_more'] = $hasMore;
+    }
+    ap_redis_json_set(
+        ap_redis_library_html_key($kind, $ownerUserId, $suffix),
+        $payload,
+        ap_redis_fragment_ttl()
+    );
+}
+
+/** Drop Favourites/Bookmarks rendered HTML for an owner (all offsets/folders). */
+function ap_redis_library_html_invalidate(int $ownerUserId, ?string $kind = null): void
+{
+    if ($ownerUserId < 1 || !function_exists('ap_redis_delete_pattern')) {
+        return;
+    }
+    if ($kind !== null && $kind !== '') {
+        $kind = preg_replace('/[^a-z0-9_]/', '', strtolower($kind)) ?: '';
+        if ($kind !== '') {
+            ap_redis_delete_pattern('vaak:fragment:lib:v1:' . $kind . ':' . $ownerUserId . ':*');
+            ap_redis_metric_inc('fragment_invalidate');
+            return;
+        }
+    }
+    ap_redis_delete_pattern('vaak:fragment:lib:v1:*:' . $ownerUserId . ':*');
+    ap_redis_metric_inc('fragment_invalidate');
+}
+
 /** Record a relationship-cache hit/miss/invalidate for ops dashboards. */
 function ap_redis_relset_metric(string $kind): void
 {

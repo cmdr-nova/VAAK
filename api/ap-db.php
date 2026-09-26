@@ -10835,6 +10835,9 @@ function ap_masto_favourite_add(
             $GLOBALS['ap_masto_flag_memo']['fav_obj'][$k] = true;
         }
     }
+    if (function_exists('ap_redis_library_html_invalidate')) {
+        ap_redis_library_html_invalidate($ownerUserId, 'favourites_bsky');
+    }
 }
 
 /** @return array<string,mixed>|null the removed row, if any */
@@ -10887,6 +10890,9 @@ function ap_masto_favourite_remove(string $statusId, ?int $ownerUserId = null, ?
             foreach (ap_masto_object_id_lookup_keys($delOid !== '' ? $delOid : $objectId) as $k) {
                 $GLOBALS['ap_masto_flag_memo']['fav_obj'][$k] = false;
             }
+        }
+        if (function_exists('ap_redis_library_html_invalidate')) {
+            ap_redis_library_html_invalidate($ownerUserId, 'favourites_bsky');
         }
     }
     return $row;
@@ -10975,6 +10981,9 @@ function ap_masto_bookmark_add(string $statusId, ?string $objectId, ?int $ownerU
             }
         }
     }
+    if (function_exists('ap_redis_library_html_invalidate')) {
+        ap_redis_library_html_invalidate($ownerUserId, 'bookmarks_bsky');
+    }
 }
 
 function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null, ?string $objectId = null): void
@@ -11029,6 +11038,9 @@ function ap_masto_bookmark_remove(string $statusId, ?int $ownerUserId = null, ?s
                 vaak_bookmark_folders_on_unbookmark($sid, $ownerUserId);
             }
         }
+    }
+    if (function_exists('ap_redis_library_html_invalidate')) {
+        ap_redis_library_html_invalidate($ownerUserId, 'bookmarks_bsky');
     }
 }
 

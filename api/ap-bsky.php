@@ -5663,6 +5663,9 @@ function ap_bsky_bookmark_cache_clear(int $ownerUserId, ?string $removeUri = nul
     } catch (Throwable $e) {
         error_log('[ap-bsky] bookmark cache invalidation failed');
     }
+    if (function_exists('ap_redis_library_html_invalidate')) {
+        ap_redis_library_html_invalidate($ownerUserId, 'bookmarks_bsky');
+    }
 }
 
 /** PostgreSQL bookmark-cache tables are provisioned by the owner-run migration. */
@@ -5946,6 +5949,9 @@ function ap_bsky_favourite_cache_clear(int $ownerUserId, ?string $removeUri = nu
         )->execute([$ownerUserId, '1970-01-01T00:00:00+00:00', gmdate('c')]);
     } catch (Throwable $e) {
         // ignore
+    }
+    if (function_exists('ap_redis_library_html_invalidate')) {
+        ap_redis_library_html_invalidate($ownerUserId, 'favourites_bsky');
     }
 }
 

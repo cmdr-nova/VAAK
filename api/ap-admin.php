@@ -3744,6 +3744,15 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     $folderId = (int) ($_GET['folder'] ?? 0);
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
+    $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
+    if (function_exists('ap_redis_library_html_get')) {
+        $fragHit = ap_redis_library_html_get('bookmarks_bsky', $vaakOwnerId, $fragSuffix);
+        if (is_array($fragHit)) {
+            header('X-VAAK-Fragment: hit');
+            echo $fragHit['html'];
+            exit;
+        }
+    }
     $items = [];
     $refreshing = false;
     if (function_exists('ap_bsky_get_bookmarks') && function_exists('ap_bsky_session_row')
@@ -3777,6 +3786,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
             $items = $result['bookmarks'];
         }
     }
+    ob_start();
     if ($items === []) {
         echo '<div class="empty" data-bsky-bookmark-empty>'
             . ($folderId > 0
@@ -3785,15 +3795,21 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
                     ? 'Bluesky bookmarks are refreshing in the background. Reload shortly.'
                     : 'No cached Bluesky bookmarks yet. They will appear after the background sync completes.'))
             . '</div>';
-        exit;
+    } else {
+        if ($refreshing) {
+            echo '<p class="meta">Showing cached Bluesky bookmarks while they refresh in the background.</p>';
+        }
+        echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>';
+        foreach ($items as $item) {
+            admin_render_bsky_feed_item($item, 'following', 'bookmarks');
+        }
     }
-    if ($refreshing) {
-        echo '<p class="meta">Showing cached Bluesky bookmarks while they refresh in the background.</p>';
+    $html = ob_get_clean();
+    if (function_exists('ap_redis_library_html_set')) {
+        ap_redis_library_html_set('bookmarks_bsky', $vaakOwnerId, $fragSuffix, $html);
     }
-    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>';
-    foreach ($items as $item) {
-        admin_render_bsky_feed_item($item, 'following', 'bookmarks');
-    }
+    header('X-VAAK-Fragment: miss');
+    echo $html;
     exit;
 }
 
@@ -3806,6 +3822,16 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     }
     $offset = max(0, (int) ($_GET['offset'] ?? 0));
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
+    if (function_exists('ap_redis_library_html_get')) {
+        $fragHit = ap_redis_library_html_get('favourites_bsky', $vaakOwnerId, $fragSuffix);
+        if (is_array($fragHit)) {
+            header('X-Has-More: ' . (!empty($fragHit['has_more']) ? '1' : '0'));
+            header('X-VAAK-Fragment: hit');
+            echo $fragHit['html'];
+            exit;
+        }
+    }
     $items = [];
     $hasMore = false;
     $refreshing = false;
@@ -3820,26 +3846,33 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
         $hasMore = !empty($result['has_more']);
         $refreshing = !empty($result['refreshing']);
     }
-    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    ob_start();
     echo '<div data-bsky-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-loaded="1">';
     if ($items === [] && $offset === 0) {
         echo '<div class="empty" data-bsky-favourite-empty>'
             . ($refreshing
                 ? 'Bluesky favourites are refreshing in the background. Reload shortly.'
                 : 'No cached Bluesky favourites yet. They will appear after the background sync completes.')
-            . '</div></div>';
-        exit;
-    }
-    if ($offset === 0) {
-        if ($refreshing) {
-            echo '<p class="meta">Showing cached Bluesky favourites while they refresh in the background.</p>';
+            . '</div>';
+    } else {
+        if ($offset === 0) {
+            if ($refreshing) {
+                echo '<p class="meta">Showing cached Bluesky favourites while they refresh in the background.</p>';
+            }
+            echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
         }
-        echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
-    }
-    foreach ($items as $item) {
-        admin_render_bsky_feed_item($item, 'following', 'favourites');
+        foreach ($items as $item) {
+            admin_render_bsky_feed_item($item, 'following', 'favourites');
+        }
     }
     echo '</div>';
+    $html = ob_get_clean();
+    if (function_exists('ap_redis_library_html_set')) {
+        ap_redis_library_html_set('favourites_bsky', $vaakOwnerId, $fragSuffix, $html, $hasMore);
+    }
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    header('X-VAAK-Fragment: miss');
+    echo $html;
     exit;
 }
 
@@ -20897,7 +20930,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
               $searchCachePath = $searchCacheKey !== '' ? rtrim($searchCacheDir, '/') . '/s_' . $searchCacheKey . '.json' : '';
               $searchCacheHit = false;
-              if ($searchCachePath !== '' && is_file($searchCachePath) && (time() - (int) @filemtime($searchCachePath)) < 20) {
+              $searchDiskTtl = function_exists('ap_redis_search_ttl') ? ap_redis_search_ttl() : 45;
+              if ($searchCachePath !== '' && is_file($searchCachePath) && (time() - (int) @filemtime($searchCachePath)) < $searchDiskTtl) {
                   $cachedSearch = json_decode((string) @file_get_contents($searchCachePath), true);
                   if (is_array($cachedSearch) && isset($cachedSearch['accounts'], $cachedSearch['hashtags'], $cachedSearch['statuses'])) {
                       $sresults = $cachedSearch;
