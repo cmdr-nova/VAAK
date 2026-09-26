@@ -3828,6 +3828,141 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     exit;
 }
 
+// Soft-nav shells for Favourites / Bookmarks (partial=1&shell=1).
+// Do not rely on $isPartial here — that flag is reassigned later in the file.
+if (isset($_GET['partial'], $_GET['shell'])
+    && (string) $_GET['partial'] === '1'
+    && (string) $_GET['shell'] === '1'
+    && in_array($view, ['favourites', 'bookmarks'], true)
+) {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-VAAK-View: ' . $view);
+    $bskyOn = function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+        && function_exists('ap_bsky_session_row') && ap_bsky_session_row($vaakOwnerId) !== null;
+
+    if ($view === 'favourites') {
+        $favNet = strtolower(trim((string) ($_GET['network'] ?? 'fedi')));
+        if (!in_array($favNet, ['fedi', 'bsky'], true) || ($favNet === 'bsky' && !$bskyOn)) {
+            $favNet = 'fedi';
+        }
+        echo '<div class="topbar"><h1>Favourites</h1><div class="topbar-actions">'
+            . '<a class="btn btn-ghost" href="?view=favourites&amp;network=' . h(urlencode($favNet))
+            . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>'
+            . '</div></div>';
+        echo '<div class="feed timeline-feed">';
+        if ($bskyOn) {
+            echo '<nav class="notification-tabs" aria-label="Favourites network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
+            echo '<a class="btn ' . ($favNet === 'fedi' ? 'btn-primary' : 'btn-ghost')
+                . '" href="?view=favourites&amp;network=fedi" data-vaak-soft-nav="favourites" data-fav-network="fedi" style="padding:.3rem .7rem;font-size:.82rem">Fediverse</a>';
+            echo '<a class="btn ' . ($favNet === 'bsky' ? 'btn-primary' : 'btn-ghost')
+                . '" href="?view=favourites&amp;network=bsky" data-vaak-soft-nav="favourites" data-fav-network="bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>';
+            echo '</nav>';
+        }
+        if ($favNet === 'bsky') {
+            echo '<div data-bsky-favourites-fragment data-offset="0" data-limit="20" aria-live="polite">'
+                . '<div class="meta" style="padding:.75rem 0">Loading Bluesky favourites…</div></div>';
+        } else {
+            $favRows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list(40, null) : [];
+            $favRows = array_values(array_filter($favRows, static function ($st): bool {
+                if (!is_array($st)) {
+                    return false;
+                }
+                $sid = (string) ($st['id'] ?? '');
+                $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
+                return !(str_starts_with($sid, 'bsky:')
+                    || str_starts_with($uri, 'at://')
+                    || str_contains($uri, 'bsky.app/'));
+            }));
+            $favHasMore = count($favRows) > 20;
+            $favList = array_slice($favRows, 0, 20);
+            if ($favList === []) {
+                echo '<div class="empty">No Fediverse favourites yet.</div>';
+            } else {
+                echo '<div data-fedi-favourites-fragment data-offset="' . (int) count($favList)
+                    . '" data-limit="20" data-has-more="' . ($favHasMore ? '1' : '0') . '">';
+                foreach ($favList as $st) {
+                    admin_render_favourite_status_card($st);
+                }
+                echo '<div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
+                    . ($favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites') . '</div></div>';
+            }
+        }
+        echo '</div>';
+        echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
+        exit;
+    }
+
+    // bookmarks shell
+    $bmFolderFilter = (int) ($_GET['folder'] ?? 0);
+    $bookmarkLimit = 20;
+    echo '<div class="topbar"><h1>Bookmarks</h1><div class="topbar-actions">'
+        . '<a class="btn btn-ghost" href="?view=bookmarks'
+        . ($bmFolderFilter > 0 ? '&amp;folder=' . $bmFolderFilter : '')
+        . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>'
+        . '</div></div>';
+    echo '<div class="feed timeline-feed">';
+    $bmFolders = function_exists('vaak_bookmark_folders_list')
+        ? vaak_bookmark_folders_list($vaakOwnerId) : [];
+    if ($bmFolders !== [] || true) {
+        echo '<nav class="notification-tabs" aria-label="Bookmark folders" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
+        echo '<a class="btn ' . ($bmFolderFilter < 1 ? 'btn-primary' : 'btn-ghost')
+            . '" href="?view=bookmarks" data-vaak-soft-nav="bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>';
+        foreach ($bmFolders as $bf) {
+            $bfid = (int) ($bf['id'] ?? 0);
+            if ($bfid < 1) {
+                continue;
+            }
+            echo '<a class="btn ' . ($bmFolderFilter === $bfid ? 'btn-primary' : 'btn-ghost')
+                . '" href="?view=bookmarks&amp;folder=' . $bfid
+                . '" data-vaak-soft-nav="bookmarks" data-bm-folder="' . $bfid
+                . '" style="padding:.3rem .7rem;font-size:.82rem">'
+                . h((string) ($bf['title'] ?? 'Folder')) . '</a>';
+        }
+        echo '</nav>';
+    }
+    $matchKeys = ['status_ids' => [], 'object_ids' => []];
+    if ($bmFolderFilter > 0 && function_exists('vaak_bookmark_folder_match_keys')) {
+        $matchKeys = vaak_bookmark_folder_match_keys($bmFolderFilter, $vaakOwnerId, 500);
+    }
+    $bmList = ($bmFolderFilter > 0 && function_exists('ap_masto_bookmarks_for_status_ids'))
+        ? ap_masto_bookmarks_for_status_ids($matchKeys['status_ids'], $vaakOwnerId)
+        : (function_exists('ap_masto_bookmarks_list') ? ap_masto_bookmarks_list($bookmarkLimit, null) : []);
+    $bmList = array_values(array_filter($bmList, static function ($st): bool {
+        if (!is_array($st)) {
+            return false;
+        }
+        $sid = (string) ($st['id'] ?? '');
+        $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
+        return !(str_starts_with($sid, 'bsky:')
+            || str_starts_with($uri, 'at://')
+            || str_contains($uri, 'bsky.app/'));
+    }));
+    $bmList = array_slice($bmList, 0, $bookmarkLimit);
+    if ($bmList === []) {
+        echo '<div class="empty">' . ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') . '</div>';
+    } else {
+        foreach ($bmList as $st) {
+            if (function_exists('admin_render_masto_status_card')) {
+                admin_render_masto_status_card($st, [], 'bookmarks', false, true);
+            }
+        }
+    }
+    if ($bskyOn) {
+        echo '<div id="bookmarks-bsky-slot" data-folder="' . (int) $bmFolderFilter
+            . '" data-limit="' . (int) $bookmarkLimit . '" aria-live="polite">'
+            . '<div class="meta" style="padding:.75rem 0">Loading Bluesky bookmarks…</div></div>';
+    }
+    echo '</div>';
+    echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
+    exit;
+}
+
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
@@ -16736,8 +16871,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <details class="nav-group" data-nav-key="library" <?= $navLibraryOpen ? 'open' : '' ?>>
         <summary><span class="ico">☰</span><span class="label">Library</span></summary>
         <div class="nav-sub">
-          <a class="<?= $view === 'favourites' ? 'active' : '' ?>" href="?view=favourites"><span class="ico"><i class="ph ph-star" aria-hidden="true"></i></span><span class="label">Favourites</span></a>
-          <a class="<?= $view === 'bookmarks' ? 'active' : '' ?>" href="?view=bookmarks"><span class="ico"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></span><span class="label">Bookmarks</span></a>
+          <a class="<?= $view === 'favourites' ? 'active' : '' ?>" href="?view=favourites" data-vaak-soft-nav="favourites"><span class="ico"><i class="ph ph-star" aria-hidden="true"></i></span><span class="label">Favourites</span></a>
+          <a class="<?= $view === 'bookmarks' ? 'active' : '' ?>" href="?view=bookmarks" data-vaak-soft-nav="bookmarks"><span class="ico"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></span><span class="label">Bookmarks</span></a>
           <a class="<?= $view === 'followers' ? 'active' : '' ?>" href="?view=followers"><span class="ico">◎</span><span class="label">Followers</span></a>
           <a class="<?= $view === 'following' ? 'active' : '' ?>" href="?view=following"><span class="ico">⇄</span><span class="label">Following</span></a>
           <a class="<?= $view === 'tags' ? 'active' : '' ?>" href="?view=tags"><span class="ico">＃</span><span class="label">Hashtags</span></a>
@@ -17347,8 +17482,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
         <?php if ($bskyFavEnabled): ?>
         <nav class="notification-tabs" aria-label="Favourites network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
-          <a class="btn <?= $favNet === 'fedi' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'fedi' ? 'true' : 'false' ?>" href="<?= h($favTabHref('fedi')) ?>" style="padding:.3rem .7rem;font-size:.82rem">Fediverse</a>
-          <a class="btn <?= $favNet === 'bsky' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'bsky' ? 'true' : 'false' ?>" href="<?= h($favTabHref('bsky')) ?>" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>
+          <a class="btn <?= $favNet === 'fedi' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'fedi' ? 'true' : 'false' ?>" href="<?= h($favTabHref('fedi')) ?>" data-vaak-soft-nav="favourites" data-fav-network="fedi" style="padding:.3rem .7rem;font-size:.82rem">Fediverse</a>
+          <a class="btn <?= $favNet === 'bsky' ? 'btn-primary' : 'btn-ghost' ?>" role="tab" aria-selected="<?= $favNet === 'bsky' ? 'true' : 'false' ?>" href="<?= h($favTabHref('bsky')) ?>" data-vaak-soft-nav="favourites" data-fav-network="bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky</a>
         </nav>
         <?php endif; ?>
 
@@ -17381,68 +17516,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div data-bsky-favourites-fragment data-offset="0" data-limit="20" aria-live="polite">
             <div class="meta" style="padding:.75rem 0">Loading Bluesky favourites…</div>
           </div>
-<script>
-(function loadFavouritesBsky() {
-  const fragment = document.querySelector('[data-bsky-favourites-fragment]');
-  if (!fragment || fragment.dataset.bound === '1') return;
-  fragment.dataset.bound = '1';
-  let current = fragment;
-  let loading = false;
-  const load = async (replace) => {
-    if (loading || (!replace && current.dataset.hasMore !== '1' && current.dataset.loaded === '1')) return;
-    loading = true;
-    try {
-      const offset = replace ? 0 : (parseInt(current.dataset.offset || '0', 10) || 0);
-      const limit = current.dataset.limit || '20';
-      const res = await fetch('?ajax=favourites_bsky&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
-        credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
-      });
-      if (!res.ok) throw new Error('favourite fragment ' + res.status);
-      const html = await res.text();
-      const holder = document.createElement('div');
-      holder.innerHTML = html;
-      const next = holder.firstElementChild;
-      if (!next) return;
-      if (replace) {
-        current.replaceWith(next);
-        current = next;
-      } else {
-        while (next.firstChild) current.appendChild(next.firstChild);
-        current.dataset.offset = next.dataset.offset || String(offset);
-        current.dataset.hasMore = next.dataset.hasMore || '0';
-      }
-      current.dataset.loaded = '1';
-      if (typeof window.vaakBindFeedTopBtn === 'function') {
-        window.vaakBindFeedTopBtn(document.querySelector('section.main'));
-      }
-      if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(current);
-      let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
-      if (!sentinel) {
-        sentinel = document.createElement('div');
-        sentinel.setAttribute('data-bsky-favourites-sentinel', '1');
-        sentinel.className = 'meta';
-        sentinel.style.cssText = 'padding:1rem 0 2rem;text-align:center';
-        current.appendChild(sentinel);
-      }
-      sentinel.textContent = current.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Bluesky favourites';
-      if (current.dataset.hasMore === '1' && !sentinel.dataset.observed) {
-        sentinel.dataset.observed = '1';
-        const feed = document.querySelector('.feed');
-        const feedStyle = feed ? window.getComputedStyle(feed) : null;
-        const observerRoot = feed && feedStyle && ['auto', 'scroll'].includes(feedStyle.overflowY) ? feed : null;
-        new IntersectionObserver((entries) => {
-          if (entries.some((entry) => entry.isIntersecting)) load(false);
-        }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
-      }
-    } catch (e) {
-      if (replace) current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
-    } finally {
-      loading = false;
-    }
-  };
-  load(true);
-})();
-</script>
+        <?php /* Bluesky fav boot: window.vaakBootFavouritesBsky */ ?>
         <?php endif; ?>
 
       <?php elseif ($view === 'bookmarks'): ?>
@@ -17526,10 +17600,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
         <section class="side-card" style="margin-bottom:1rem">
           <div style="display:flex;flex-wrap:wrap;gap:.45rem;align-items:center;margin-bottom:.65rem">
-            <a class="btn <?= $bmFolderFilter < 1 ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>
+            <a class="btn <?= $bmFolderFilter < 1 ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks" data-vaak-soft-nav="bookmarks" style="padding:.3rem .7rem;font-size:.82rem">All</a>
             <?php foreach ($bmFolders as $bf): ?>
               <?php $bfid = (int) ($bf['id'] ?? 0); ?>
-              <a class="btn <?= $bmFolderFilter === $bfid ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks&amp;folder=<?= $bfid ?>" style="padding:.3rem .7rem;font-size:.82rem">
+              <a class="btn <?= $bmFolderFilter === $bfid ? 'btn-primary' : 'btn-ghost' ?>" href="?view=bookmarks&amp;folder=<?= $bfid ?>" data-vaak-soft-nav="bookmarks" data-bm-folder="<?= $bfid ?>" style="padding:.3rem .7rem;font-size:.82rem">
                 <?= h((string) ($bf['title'] ?? 'Folder')) ?>
                 <span class="meta">(<?= (int) ($bf['item_count'] ?? 0) ?>)</span>
               </a>
@@ -17621,33 +17695,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <a class="btn btn-ghost" href="?view=bookmarks<?= $bmFolderFilter > 0 ? '&amp;folder=' . $bmFolderFilter : '' ?>&amp;limit=<?= min(80, $bookmarkLimit + 20) ?>">Show 20 more bookmarks</a>
           </div>
         <?php endif; ?>
-        <?php if ($bskyBookmarksEnabled): ?>
-<script>
-(function loadBookmarksBsky() {
-  const slot = document.getElementById('bookmarks-bsky-slot');
-  if (!slot || slot.dataset.loaded === '1') return;
-  slot.dataset.loaded = '1';
-  const folder = slot.getAttribute('data-folder') || '0';
-  const limit = slot.getAttribute('data-limit') || '20';
-  const url = '?ajax=bookmarks_bsky&folder=' + encodeURIComponent(folder)
-    + '&limit=' + encodeURIComponent(limit);
-  fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } })
-    .then((res) => res.ok ? res.text() : Promise.reject(new Error('bookmarks_bsky ' + res.status)))
-    .then((html) => {
-      const trimmed = (html || '').trim();
-      slot.innerHTML = trimmed !== '' ? trimmed : '';
-      const empty = document.getElementById('bookmarks-empty-fedi');
-      const hasBsky = trimmed !== '' && !slot.querySelector('[data-bsky-bookmark-empty]');
-      if (empty && !hasBsky && !document.querySelector('.tweet')) {
-        empty.hidden = false;
-      }
-    })
-    .catch(() => {
-      slot.innerHTML = '<div class="meta">Couldn’t load Bluesky bookmarks right now.</div>';
-    });
-})();
-</script>
-        <?php endif; ?>
+        <?php /* Bluesky bookmarks boot: window.vaakBootBookmarks */ ?>
 
       <?php elseif ($view === 'mentions'): ?>
         <?php
@@ -25712,15 +25760,16 @@ window.apAdminToast = function (msg, isErr) {
 // Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
 // swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
-  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'gallery']);
+  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'gallery', 'favourites', 'bookmarks']);
   const TL_TITLES = {
     home: 'Home', local: 'Local', feed: 'Federation feed',
-    mentions: 'Notifications', outbox: 'Your posts', gallery: 'Gallery'
+    mentions: 'Notifications', outbox: 'Your posts', gallery: 'Gallery',
+    favourites: 'Favourites', bookmarks: 'Bookmarks'
   };
   let busy = false;
   let leaving = false;
 
-  function hardNav(view, filter) {
+  function hardNav(view, filter, extra) {
     leaving = true;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
@@ -25729,7 +25778,25 @@ window.apAdminToast = function (msg, isErr) {
     if (view === 'mentions' && filter && filter !== 'all') {
       url += '&notification_filter=' + encodeURIComponent(filter);
     }
+    if (extra && typeof extra === 'object') {
+      Object.keys(extra).forEach((k) => {
+        if (extra[k] != null && extra[k] !== '') url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
+      });
+    }
     window.location.assign(url);
+  }
+
+  function bootLibraryView(view, main) {
+    if (view === 'favourites') {
+      const net = (new URL(window.location.href)).searchParams.get('network') || 'fedi';
+      if (net === 'bsky' && typeof window.vaakBootFavouritesBsky === 'function') {
+        window.vaakBootFavouritesBsky(main);
+      } else if (typeof window.vaakBootFavouritesFedi === 'function') {
+        window.vaakBootFavouritesFedi(main);
+      }
+    } else if (view === 'bookmarks' && typeof window.vaakBootBookmarks === 'function') {
+      window.vaakBootBookmarks(main);
+    }
   }
 
   function updateChrome(view) {
@@ -25890,9 +25957,10 @@ window.apAdminToast = function (msg, isErr) {
     io.observe(sentinel);
   }
 
-  async function softNavTo(view, push, filter) {
+  async function softNavTo(view, push, filter, extra) {
     view = String(view || '');
     filter = filter == null ? '' : String(filter);
+    extra = extra && typeof extra === 'object' ? extra : {};
     if (!SOFT_VIEWS.has(view) || busy || leaving) return;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
 
@@ -25908,7 +25976,7 @@ window.apAdminToast = function (msg, isErr) {
     }
 
     const main = document.querySelector('section.main');
-    if (!main) { hardNav(view, filter); return; }
+    if (!main) { hardNav(view, filter, extra); return; }
 
     busy = true;
     window.__vaakNavigationPending = true;
@@ -25917,6 +25985,8 @@ window.apAdminToast = function (msg, isErr) {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
         + encodeURIComponent(view === 'mentions' ? '10' : (view === 'outbox' ? '20' : '15'));
       if (view === 'mentions' && filter) url += '&notification_filter=' + encodeURIComponent(filter);
+      if (view === 'favourites' && extra.network) url += '&network=' + encodeURIComponent(extra.network);
+      if (view === 'bookmarks' && extra.folder) url += '&folder=' + encodeURIComponent(extra.folder);
       const res = await fetch(url, {
         credentials: 'same-origin',
         headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
@@ -25925,7 +25995,7 @@ window.apAdminToast = function (msg, isErr) {
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
         leaving = true;
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav');
-        else hardNav(view, filter);
+        else hardNav(view, filter, extra);
         return;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -25934,7 +26004,7 @@ window.apAdminToast = function (msg, isErr) {
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
         leaving = true;
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav-html');
-        else hardNav(view, filter);
+        else hardNav(view, filter, extra);
         return;
       }
       if (!html.trim()) throw new Error('empty-shell');
@@ -25959,22 +26029,28 @@ window.apAdminToast = function (msg, isErr) {
         u.searchParams.delete('_r');
         if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
         else u.searchParams.delete('notification_filter');
-        history.pushState({ vaakSoft: view, filter: filter || '' }, '', u.pathname + u.search);
+        if (view === 'favourites' && extra.network) u.searchParams.set('network', extra.network);
+        else if (view !== 'favourites') u.searchParams.delete('network');
+        if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
+        else if (view !== 'bookmarks') u.searchParams.delete('folder');
+        history.pushState({ vaakSoft: view, filter: filter || '', extra }, '', u.pathname + u.search);
       }
       if (typeof window.novaEnhanceTweetFolds === 'function') {
-        const foldRoot = document.getElementById('timeline-items');
+        const foldRoot = document.getElementById('timeline-items') || main.querySelector('.feed');
         if (foldRoot) window.novaEnhanceTweetFolds(foldRoot);
       }
       bindFeedTopBtn(main);
       if (view === 'mentions') {
         bindNotifScroll(main);
+      } else if (['favourites', 'bookmarks'].includes(view)) {
+        bootLibraryView(view, main);
       } else if (['home', 'local', 'feed', 'gallery', 'outbox'].includes(view)) {
         if (typeof window.vaakBootTimeline === 'function') {
           const ok = window.vaakBootTimeline(view);
-          if (!ok && ['home', 'local', 'feed'].includes(view)) { hardNav(view, filter); return; }
+          if (!ok && ['home', 'local', 'feed'].includes(view)) { hardNav(view, filter, extra); return; }
           bindFeedTopBtn(main);
         } else if (['home', 'local', 'feed'].includes(view)) {
-          hardNav(view, filter); return;
+          hardNav(view, filter, extra); return;
         } else {
           bindGenericScroll(view, main);
         }
@@ -25982,7 +26058,7 @@ window.apAdminToast = function (msg, isErr) {
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       window.__vaakNavigationPending = false;
     } catch (e) {
-      hardNav(view, filter); return;
+      hardNav(view, filter, extra); return;
     } finally {
       busy = false;
       if (!leaving) {
@@ -26001,14 +26077,28 @@ window.apAdminToast = function (msg, isErr) {
     ev.preventDefault();
     ev.stopPropagation();
     if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
-    softNavTo(view, true, link.getAttribute('data-notif-filter') || '');
+    const extra = {};
+    if (view === 'favourites') {
+      extra.network = link.getAttribute('data-fav-network')
+        || (new URL(link.href, window.location.href)).searchParams.get('network')
+        || 'fedi';
+    }
+    if (view === 'bookmarks') {
+      const folder = link.getAttribute('data-bm-folder')
+        || (new URL(link.href, window.location.href)).searchParams.get('folder');
+      if (folder) extra.folder = folder;
+    }
+    softNavTo(view, true, link.getAttribute('data-notif-filter') || '', extra);
   }, true);
 
   window.addEventListener('popstate', () => {
     const u = new URL(window.location.href);
     const view = u.searchParams.get('view') || 'home';
     if (!SOFT_VIEWS.has(view)) return;
-    softNavTo(view, false, u.searchParams.get('notification_filter') || '');
+    const extra = {};
+    if (view === 'favourites') extra.network = u.searchParams.get('network') || 'fedi';
+    if (view === 'bookmarks' && u.searchParams.get('folder')) extra.folder = u.searchParams.get('folder');
+    softNavTo(view, false, u.searchParams.get('notification_filter') || '', extra);
   });
 
   if (document.getElementById('feed-top-btn')) {
@@ -26017,6 +26107,163 @@ window.apAdminToast = function (msg, isErr) {
 
   window.vaakSoftNavTo = softNavTo;
   window.vaakBindFeedTopBtn = bindFeedTopBtn;
+})();
+</script>
+
+<script>
+// Favourites / Bookmarks boots used by full-page load and soft-nav shells.
+(function () {
+  function feedRoot(main) {
+    return (main && main.querySelector('.feed')) || document.querySelector('section.main > .feed');
+  }
+
+  window.vaakBootFavouritesBsky = function (main) {
+    const root = main || document.querySelector('section.main');
+    const fragment = root ? root.querySelector('[data-bsky-favourites-fragment]') : document.querySelector('[data-bsky-favourites-fragment]');
+    if (!fragment || fragment.dataset.bound === '1') return;
+    fragment.dataset.bound = '1';
+    let current = fragment;
+    let loading = false;
+    const load = async (replace) => {
+      if (loading || (!replace && current.dataset.hasMore !== '1' && current.dataset.loaded === '1')) return;
+      loading = true;
+      try {
+        const offset = replace ? 0 : (parseInt(current.dataset.offset || '0', 10) || 0);
+        const limit = current.dataset.limit || '20';
+        const res = await fetch('?ajax=favourites_bsky&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
+          credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
+        });
+        if (!res.ok) throw new Error('favourite fragment ' + res.status);
+        const html = await res.text();
+        const holder = document.createElement('div');
+        holder.innerHTML = html;
+        const next = holder.firstElementChild;
+        if (!next) return;
+        if (replace) {
+          current.replaceWith(next);
+          current = next;
+        } else {
+          while (next.firstChild) current.appendChild(next.firstChild);
+          current.dataset.offset = next.dataset.offset || String(offset);
+          current.dataset.hasMore = next.dataset.hasMore || '0';
+        }
+        current.dataset.loaded = '1';
+        if (typeof window.vaakBindFeedTopBtn === 'function') {
+          window.vaakBindFeedTopBtn(document.querySelector('section.main'));
+        }
+        if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(current);
+        let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
+        if (!sentinel) {
+          sentinel = document.createElement('div');
+          sentinel.setAttribute('data-bsky-favourites-sentinel', '1');
+          sentinel.className = 'meta';
+          sentinel.style.cssText = 'padding:1rem 0 2rem;text-align:center';
+          current.appendChild(sentinel);
+        }
+        sentinel.textContent = current.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Bluesky favourites';
+        if (current.dataset.hasMore === '1' && !sentinel.dataset.observed) {
+          sentinel.dataset.observed = '1';
+          const feed = feedRoot(root);
+          const feedStyle = feed ? window.getComputedStyle(feed) : null;
+          const observerRoot = feed && feedStyle && ['auto', 'scroll'].includes(feedStyle.overflowY) ? feed : null;
+          new IntersectionObserver((entries) => {
+            if (entries.some((entry) => entry.isIntersecting)) load(false);
+          }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
+        }
+      } catch (e) {
+        if (replace) current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
+      } finally {
+        loading = false;
+      }
+    };
+    load(true);
+  };
+
+  window.vaakBootFavouritesFedi = function (main) {
+    const root = main || document.querySelector('section.main');
+    const frag = root ? root.querySelector('[data-fedi-favourites-fragment]') : document.querySelector('[data-fedi-favourites-fragment]');
+    if (!frag || frag.dataset.bound === '1') return;
+    frag.dataset.bound = '1';
+    let busy = false;
+    const arm = () => {
+      const sentinel = frag.querySelector('[data-fedi-favourites-sentinel]');
+      if (!sentinel || frag.dataset.hasMore !== '1' || sentinel.dataset.observed === '1') return;
+      sentinel.dataset.observed = '1';
+      const feed = feedRoot(root);
+      const style = feed ? window.getComputedStyle(feed) : null;
+      const observerRoot = feed && style && ['auto', 'scroll'].includes(style.overflowY) ? feed : null;
+      new IntersectionObserver((entries) => {
+        if (entries.some((e) => e.isIntersecting)) load();
+      }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
+    };
+    const load = async () => {
+      if (busy || frag.dataset.hasMore !== '1') return;
+      busy = true;
+      try {
+        const offset = parseInt(frag.dataset.offset || '0', 10) || 0;
+        const limit = frag.dataset.limit || '20';
+        const res = await fetch('?ajax=favourites_fedi&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
+          credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
+        });
+        if (!res.ok) throw new Error('fedi favs ' + res.status);
+        const html = await res.text();
+        const holder = document.createElement('div');
+        holder.innerHTML = html;
+        const next = holder.firstElementChild;
+        if (!next) return;
+        const cards = next.querySelectorAll('article.tweet');
+        cards.forEach((card) => frag.insertBefore(card, frag.querySelector('[data-fedi-favourites-sentinel]')));
+        frag.dataset.offset = next.dataset.offset || String(offset + cards.length);
+        frag.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
+        const sentinel = frag.querySelector('[data-fedi-favourites-sentinel]');
+        if (sentinel) sentinel.textContent = frag.dataset.hasMore === '1' ? 'Scroll for more…' : 'End of Fediverse favourites';
+        if (frag.dataset.hasMore === '1') {
+          const s = frag.querySelector('[data-fedi-favourites-sentinel]');
+          if (s) s.dataset.observed = '0';
+          arm();
+        }
+      } catch (e) {
+        frag.dataset.hasMore = '0';
+      } finally {
+        busy = false;
+      }
+    };
+    arm();
+  };
+
+  window.vaakBootBookmarks = function (main) {
+    const root = main || document.querySelector('section.main');
+    const slot = root ? root.querySelector('#bookmarks-bsky-slot') : document.getElementById('bookmarks-bsky-slot');
+    if (!slot || slot.dataset.loaded === '1') return;
+    slot.dataset.loaded = '1';
+    const folder = slot.getAttribute('data-folder') || '0';
+    const limit = slot.getAttribute('data-limit') || '20';
+    const url = '?ajax=bookmarks_bsky&folder=' + encodeURIComponent(folder)
+      + '&limit=' + encodeURIComponent(limit);
+    fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html' } })
+      .then((res) => res.ok ? res.text() : Promise.reject(new Error('bookmarks_bsky ' + res.status)))
+      .then((html) => {
+        const trimmed = (html || '').trim();
+        slot.innerHTML = trimmed !== '' ? trimmed : '';
+        if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(slot);
+        if (typeof window.vaakBindFeedTopBtn === 'function') {
+          window.vaakBindFeedTopBtn(document.querySelector('section.main'));
+        }
+      })
+      .catch(() => {
+        slot.innerHTML = '<div class="meta">Couldn’t load Bluesky bookmarks right now.</div>';
+      });
+  };
+
+  // Full-page boots (soft-nav calls these explicitly after shell swap).
+  if (document.querySelector('[data-bsky-favourites-fragment]')) {
+    window.vaakBootFavouritesBsky(document.querySelector('section.main'));
+  } else if (document.querySelector('[data-fedi-favourites-fragment]')) {
+    window.vaakBootFavouritesFedi(document.querySelector('section.main'));
+  }
+  if (document.getElementById('bookmarks-bsky-slot')) {
+    window.vaakBootBookmarks(document.querySelector('section.main'));
+  }
 })();
 </script>
 
@@ -28549,112 +28796,7 @@ if (VIEW === 'analytics') loadAnalytics();
 })();
 </script>
 
-<script>
-// Fediverse favourites infinite scroll
-// (Bluesky favourites load from the inline script in the Favourites view.)
-(function () {
-  const root = document.querySelector('[data-fedi-favourites-fragment]');
-  if (!root) return;
-  let busy = false;
-  const arm = () => {
-    const sentinel = root.querySelector('[data-fedi-favourites-sentinel]');
-    if (!sentinel || root.dataset.hasMore !== '1' || sentinel.dataset.observed === '1') return;
-    sentinel.dataset.observed = '1';
-    const feed = document.querySelector('.feed');
-    const style = feed ? window.getComputedStyle(feed) : null;
-    const observerRoot = feed && style && ['auto', 'scroll'].includes(style.overflowY) ? feed : null;
-    new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) load(); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
-  };
-  const load = async () => {
-    if (busy || root.dataset.hasMore !== '1') return;
-    busy = true;
-    try {
-      const offset = parseInt(root.dataset.offset || '0', 10) || 0;
-      const limit = root.dataset.limit || '20';
-      const res = await fetch('?ajax=favourites_fedi&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), { credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store' });
-      if (!res.ok) throw new Error('fedi fav ' + res.status);
-      const html = await res.text();
-      const holder = document.createElement('div');
-      holder.innerHTML = html;
-      const next = holder.firstElementChild;
-      if (!next) return;
-      const cards = next.querySelectorAll('article.tweet');
-      cards.forEach((card) => root.insertBefore(card, root.querySelector('[data-fedi-favourites-sentinel]')));
-      root.dataset.offset = next.dataset.offset || String(offset + cards.length);
-      root.dataset.hasMore = next.dataset.hasMore || '0';
-      const oldSent = root.querySelector('[data-fedi-favourites-sentinel]');
-      if (oldSent) oldSent.dataset.observed = '0';
-      if (root.dataset.hasMore !== '1' && oldSent) oldSent.textContent = 'End of Fediverse favourites';
-      arm();
-    } catch (e) {
-      console.warn(e);
-    } finally {
-      busy = false;
-    }
-  };
-  arm();
-})();
-</script>
-<script>
-// Favourites: load Bluesky likes from the durable cache after the Fediverse shell.
-(function () {
-  const fragment = document.querySelector('[data-bsky-favourites-fragment]');
-  if (!fragment) return;
-  let current = fragment;
-  let loading = false;
-  const load = async (replace) => {
-    if (loading || (!replace && current.dataset.hasMore !== '1' && current.dataset.loaded === '1')) return;
-    loading = true;
-    try {
-      const offset = replace ? 0 : (parseInt(current.dataset.offset || '0', 10) || 0);
-      const limit = current.dataset.limit || '20';
-      const res = await fetch('?ajax=favourites_bsky&offset=' + encodeURIComponent(offset) + '&limit=' + encodeURIComponent(limit), {
-        credentials: 'same-origin', headers: { Accept: 'text/html' }, cache: 'no-store'
-      });
-      if (!res.ok) throw new Error('favourite fragment ' + res.status);
-      const html = await res.text();
-      const holder = document.createElement('div');
-      holder.innerHTML = html;
-      const next = holder.firstElementChild;
-      if (!next) return;
-      if (replace || !current.dataset.loaded) {
-        current.replaceWith(next);
-        current = next;
-      } else {
-        Array.from(next.querySelectorAll('article.tweet')).forEach((card) => current.appendChild(card));
-        current.dataset.offset = next.dataset.offset || current.dataset.offset;
-        current.dataset.hasMore = next.dataset.hasMore || '0';
-      }
-      current.dataset.loaded = '1';
-      let sentinel = current.querySelector('[data-bsky-favourites-sentinel]');
-      if (!sentinel && current.dataset.hasMore === '1') {
-        sentinel = document.createElement('div');
-        sentinel.setAttribute('data-bsky-favourites-sentinel', '1');
-        sentinel.className = 'meta';
-        sentinel.style.cssText = 'padding:1rem 0 2rem;text-align:center';
-        sentinel.textContent = 'Scroll for more…';
-        current.appendChild(sentinel);
-      }
-      if (sentinel && current.dataset.hasMore === '1' && sentinel.dataset.observed !== '1') {
-        sentinel.dataset.observed = '1';
-        const feed = document.querySelector('.feed');
-        const style = feed ? window.getComputedStyle(feed) : null;
-        const observerRoot = feed && style && ['auto', 'scroll'].includes(style.overflowY) ? feed : null;
-        new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) load(false); }, { root: observerRoot, rootMargin: '180px' }).observe(sentinel);
-      }
-    } catch (e) {
-      if (!current.dataset.loaded) {
-        current.innerHTML = '<div class="empty">Bluesky favourites are still refreshing in the background.</div>';
-      }
-      console.warn(e);
-    } finally {
-      loading = false;
-    }
-  };
-  load(true);
-})();
-</script>
-
+<!-- Fediverse favourites scroll: window.vaakBootFavouritesFedi -->
 <script>
 // Shared navigation feedback for full-page loads and form submissions.
 (function () {
