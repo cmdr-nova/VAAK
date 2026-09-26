@@ -7235,7 +7235,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         if ($homeBoostAdded >= 5) {
             break;
         }
-        $bSort = strtotime((string) ($rb['created_at'] ?? '')) ?: 0;
+        // Bluesky-native reposts: sort by the real boost time (reason.indexedAt),
+        // not when the import worker wrote the masto_reblogs row.
+        $bSort = strtotime(admin_reblog_display_time($rb)) ?: (strtotime((string) ($rb['created_at'] ?? '')) ?: 0);
         if ($bSort < $homeOwnCutoff) {
             continue;
         }
@@ -12315,6 +12317,39 @@ function admin_render_remote_boost_card(
 }
 
 /**
+ * Best boost timestamp for Bluesky-native reposts (reason.indexedAt), else created_at.
+ *
+ * @param array<string,mixed> $rb masto_reblogs row
+ */
+function admin_reblog_display_time(array $rb): string
+{
+    $created = (string) ($rb['created_at'] ?? '');
+    if (!admin_reblog_is_bsky($rb)) {
+        return $created;
+    }
+    $objectId = (string) ($rb['object_id'] ?? '');
+    if ($objectId === '' || !function_exists('ap_bsky_at_uri_from_any_url') || !function_exists('ap_bsky_post_item_by_uri')) {
+        return $created;
+    }
+    $at = ap_bsky_at_uri_from_any_url($objectId);
+    if (!is_string($at) || $at === '') {
+        return $created;
+    }
+    $item = ap_bsky_post_item_by_uri($at);
+    if (!is_array($item)) {
+        return $created;
+    }
+    $reason = is_array($item['reason'] ?? null) ? $item['reason'] : [];
+    $indexed = trim((string) ($reason['indexedAt'] ?? ''));
+    if ($indexed !== '') {
+        return $indexed;
+    }
+    $post = is_array($item['post'] ?? null) ? $item['post'] : [];
+    $postIndexed = trim((string) ($post['indexedAt'] ?? ''));
+    return $postIndexed !== '' ? $postIndexed : $created;
+}
+
+/**
  * Render one of our boosts as a Mastodon-style wrapper card.
  *
  * @param array<string,mixed> $rb masto_reblogs row
@@ -12323,12 +12358,47 @@ function admin_render_remote_boost_card(
 function admin_render_boost_card(array $rb, array $followingIds, string $returnView): void
 {
     $objectId = (string) ($rb['object_id'] ?? '');
-    $created = (string) ($rb['created_at'] ?? '');
+    $created = admin_reblog_display_time($rb);
     $statusId = (string) ($rb['status_id'] ?? '');
     $boostId = (string) ($rb['boost_status_id'] ?? '');
     $targetActor = (string) ($rb['target_actor'] ?? '');
     $boosterActor = rtrim((string) ($rb['owner_actor_id'] ?? ''), '/');
     $sessionActor = rtrim(vaak_actor_id(), '/');
+
+    // Bluesky-native reposts: render the real post from ATProto cache with the
+    // reasonRepost header (original author + text/media), not an empty Fedi shell.
+    if (admin_reblog_is_bsky($rb) && $objectId !== ''
+        && function_exists('ap_bsky_at_uri_from_any_url') && function_exists('ap_bsky_post_item_by_uri')) {
+        $at = ap_bsky_at_uri_from_any_url($objectId);
+        $item = is_string($at) && $at !== '' ? ap_bsky_post_item_by_uri($at) : null;
+        if (is_array($item) && is_array($item['post'] ?? null)) {
+            // Ensure reasonRepost is present so the card shows as a boost.
+            if (!is_array($item['reason'] ?? null) || !str_contains(strtolower((string) (($item['reason']['$type'] ?? ''))), 'reasonrepost')) {
+                $owner = admin_owner_user_id();
+                $session = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($owner) : null;
+                $selfDid = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+                $selfHandle = is_array($session) ? trim((string) ($session['handle'] ?? '')) : '';
+                if ($selfDid !== '') {
+                    $item['reason'] = [
+                        '$type' => 'app.bsky.feed.defs#reasonRepost',
+                        'by' => [
+                            'did' => $selfDid,
+                            'handle' => $selfHandle !== '' ? $selfHandle : 'valerie.bsky.mkultra.monster',
+                            'displayName' => 'You',
+                        ],
+                        'indexedAt' => $created,
+                    ];
+                }
+            }
+            admin_render_bsky_feed_item($item, 'following', $returnView === 'home' ? 'home' : 'bluesky');
+            return;
+        }
+        // Cache miss: warm and show a thin stub rather than an empty Valerie card.
+        if (function_exists('ap_bsky_post_preview_warm_enqueue')) {
+            ap_bsky_post_preview_warm_enqueue($objectId, admin_owner_user_id());
+        }
+    }
+
     if ($boosterActor !== '' && $boosterActor === $sessionActor) {
         $boostWho = 'You boosted';
     } elseif ($boosterActor !== '') {
@@ -13023,13 +13093,27 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $reason = is_array($item['reason'] ?? null) ? $item['reason'] : null;
     $reasonLabel = '';
     $isRepost = false;
+    $reasonIndexedAt = '';
     if (is_array($reason)) {
         $rt = (string) ($reason['$type'] ?? '');
         if (str_contains($rt, 'reasonRepost')) {
             $isRepost = true;
             $by = is_array($reason['by'] ?? null) ? $reason['by'] : [];
             $rh = (string) ($by['handle'] ?? $by['displayName'] ?? 'someone');
-            $reasonLabel = 'Reposted by @' . $rh;
+            $reasonIndexedAt = trim((string) ($reason['indexedAt'] ?? ''));
+            $selfDid = '';
+            $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+            if ($ownerId > 0 && function_exists('ap_bsky_session_row')) {
+                $sess = ap_bsky_session_row($ownerId);
+                $selfDid = is_array($sess) ? trim((string) ($sess['did'] ?? '')) : '';
+            }
+            $byDid = trim((string) ($by['did'] ?? ''));
+            if ($selfDid !== '' && $byDid === $selfDid) {
+                $reasonLabel = 'You boosted';
+            } else {
+                $rdn = trim((string) ($by['displayName'] ?? ''));
+                $reasonLabel = ($rdn !== '' ? $rdn . ' · ' : '') . '@' . ltrim($rh, '@') . ' boosted';
+            }
         }
     }
     $feedSource = (string) ($item['_vaak_feed_source'] ?? '');
@@ -13160,7 +13244,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     ?>
     <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>">
       <?php if ($reasonLabel !== ''): ?>
-        <div class="meta" style="margin:0 0 .35rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($reasonLabel) ?></div>
+        <div class="meta" style="margin:0 0 .35rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($reasonLabel) ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
       <?php endif; ?>
       <?php if (!$isHome && $feedSource !== ''): ?>
         <div class="meta" style="margin:0 0 .35rem">☁ From saved feed</div>
@@ -13189,8 +13273,12 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
                 <span class="meta"> @<?= h($handle) ?></span>
               <?php endif; ?>
             <?php endif; ?>
-            <?php if ($created !== ''): ?>
-              <span class="meta"> · <?= h(relative_time($created)) ?></span>
+            <?php
+              // For own Bluesky boosts, prefer the boost time over the original post time.
+              $displayCreated = ($isRepost && $reasonIndexedAt !== '') ? $reasonIndexedAt : $created;
+            ?>
+            <?php if ($displayCreated !== ''): ?>
+              <span class="meta"> · <?= h(relative_time($displayCreated)) ?></span>
             <?php endif; ?>
             <span class="tag" title="From Bluesky">Bluesky</span>
             <?= admin_anti_ai_tag_html($text, $authorDid !== '' ? $authorDid : null) ?>
