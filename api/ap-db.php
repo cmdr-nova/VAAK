@@ -4851,7 +4851,7 @@ function ap_follower_upsert(
         );
         $stmt->execute([$owner, $actorId, $inbox, $sharedInbox, $now, $now, $username, $host]);
     }
-    ap_follow_lists_reset_memo();
+    ap_follow_lists_reset_memo($owner);
 }
 
 function ap_follower_remove(string $actorId, ?string $ownerActorId = null): void
@@ -4861,7 +4861,7 @@ function ap_follower_remove(string $actorId, ?string $ownerActorId = null): void
     ap_db()->prepare(
         'DELETE FROM followers WHERE owner_actor_id = ? AND (actor_id = ? OR actor_id = ?)'
     )->execute([$owner, $actorId, $actorId . '/']);
-    ap_follow_lists_reset_memo();
+    ap_follow_lists_reset_memo($owner);
 }
 
 /** Store an inbound Follow until the local account approves or rejects it. */
@@ -4960,7 +4960,7 @@ function ap_following_upsert(string $actorId, ?string $ownerActorId = null): voi
          ON CONFLICT(owner_actor_id, actor_id) DO NOTHING'
     );
     $stmt->execute([$owner, $actorId, ap_db_now(), $host]);
-    ap_follow_lists_reset_memo();
+    ap_follow_lists_reset_memo($owner);
     if (function_exists('ap_db_owner_user_id_for_actor')) {
         ap_timeline_cache_invalidate_owner(ap_db_owner_user_id_for_actor($owner));
     }
@@ -4974,7 +4974,7 @@ function ap_following_remove(string $actorId, ?string $ownerActorId = null): voi
     $db->prepare(
         'DELETE FROM following WHERE owner_actor_id = ? AND (actor_id = ? OR actor_id = ?)'
     )->execute([$owner, $actorId, $actorId . '/']);
-    ap_follow_lists_reset_memo();
+    ap_follow_lists_reset_memo($owner);
     if (function_exists('ap_db_owner_user_id_for_actor')) {
         ap_timeline_cache_invalidate_owner(ap_db_owner_user_id_for_actor($owner));
     }
@@ -6311,7 +6311,13 @@ function ap_followers_list(?string $ownerActorId = null): array
     if (function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($redisKey);
         if (is_array($cached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
             return $memo[$owner] = $cached;
+        }
+        if (function_exists('ap_redis_relset_metric')) {
+            ap_redis_relset_metric('miss');
         }
     }
     $st = ap_db()->prepare(
@@ -6400,7 +6406,13 @@ function ap_following_list(?string $ownerActorId = null): array
     if (function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($redisKey);
         if (is_array($cached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
             return $memo[$owner] = $cached;
+        }
+        if (function_exists('ap_redis_relset_metric')) {
+            ap_redis_relset_metric('miss');
         }
     }
     $st = ap_db()->prepare(
@@ -6414,12 +6426,44 @@ function ap_following_list(?string $ownerActorId = null): array
     return $memo[$owner] = $rows;
 }
 
-/** Invalidate request-local follow graph memos after follow/unfollow mutations. */
-function ap_follow_lists_reset_memo(): void
+/**
+ * Invalidate request-local + Redis follow-graph caches after follow mutations.
+ * Always owner-scoped when an actor id is known — never wipe every account's graph.
+ *
+ * @param string|null $ownerActorId Owner actor URL; defaults to the session local actor.
+ */
+function ap_follow_lists_reset_memo(?string $ownerActorId = null): void
 {
     ap_follow_lists_cache_gen(true);
-    if (function_exists('ap_redis_delete_pattern')) {
-        ap_redis_delete_pattern('vaak:follow-graph:v1:*');
+    $owner = rtrim(trim((string) ($ownerActorId ?? '')), '/');
+    if ($owner === '') {
+        $owner = rtrim(ap_local_actor_id(), '/');
+    }
+    if ($owner === '' || !function_exists('ap_redis_delete')) {
+        if (function_exists('ap_redis_relset_metric')) {
+            ap_redis_relset_metric('invalidate');
+        }
+        return;
+    }
+    $hash = hash('sha256', $owner);
+    $keys = [
+        'vaak:follow-graph:v1:following:' . $hash,
+        'vaak:follow-graph:v1:followers:' . $hash,
+        'vaak:follow-graph:v1:following-count:' . $hash,
+        'vaak:follow-graph:v1:followers-count:' . $hash,
+    ];
+    // Compact relset keys (Phase 2) — delete now so later ships stay coherent.
+    if (function_exists('ap_db_owner_user_id_for_actor')) {
+        $uid = (int) ap_db_owner_user_id_for_actor($owner);
+        if ($uid > 0) {
+            $keys[] = 'vaak:relset:v1:following:' . $uid;
+            $keys[] = 'vaak:relset:v1:followers:' . $uid;
+            $keys[] = 'vaak:bsky:followed-handles:' . $uid;
+        }
+    }
+    ap_redis_delete(...$keys);
+    if (function_exists('ap_redis_relset_metric')) {
+        ap_redis_relset_metric('invalidate');
     }
 }
 
@@ -7495,8 +7539,14 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
         $redisKey = 'vaak:moderation:mutes:' . $ownerUserId;
         $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
         if (is_array($redisCached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
             $cache[$ownerUserId] = $redisCached;
         } else {
+            if (function_exists('ap_redis_relset_metric') && function_exists('ap_redis_client') && ap_redis_client('cache')) {
+                ap_redis_relset_metric('miss');
+            }
             $cache[$ownerUserId] = [];
             foreach (ap_mutes_list($ownerUserId) as $row) {
                 $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
@@ -7505,7 +7555,9 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
                     $cache[$ownerUserId][$id . '/'] = true;
                 }
             }
-            if (function_exists('ap_redis_json_set')) ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+            }
         }
     }
     return $cache[$ownerUserId];
@@ -8358,9 +8410,19 @@ function ap_user_blocks_list_cached(int $ownerUserId, bool $refresh = false): ar
     if (!isset($cache[$ownerUserId])) {
         $redisKey = 'vaak:moderation:blocks:' . $ownerUserId;
         $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
-        $cache[$ownerUserId] = is_array($redisCached) ? $redisCached : ap_user_blocks_list($ownerUserId);
-        if ($redisCached === null && function_exists('ap_redis_json_set')) {
-            ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+        if (is_array($redisCached)) {
+            if (function_exists('ap_redis_relset_metric')) {
+                ap_redis_relset_metric('hit');
+            }
+            $cache[$ownerUserId] = $redisCached;
+        } else {
+            if (function_exists('ap_redis_relset_metric') && function_exists('ap_redis_client') && ap_redis_client('cache')) {
+                ap_redis_relset_metric('miss');
+            }
+            $cache[$ownerUserId] = ap_user_blocks_list($ownerUserId);
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set($redisKey, $cache[$ownerUserId], 60);
+            }
         }
     }
     return $cache[$ownerUserId];

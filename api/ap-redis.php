@@ -220,6 +220,30 @@ function ap_redis_metric_inc(string $name, int $amount = 1): void
     } catch (Throwable $e) { /* metrics must never affect requests */ }
 }
 
+/**
+ * Kill switch for Wafrn-style relationship-set acceleration (Phase 2+).
+ * When disabled, callers must use the existing Postgres / full-list paths.
+ * Broader Redis outage is still handled by ap_redis_client() returning null.
+ */
+function ap_redis_relsets_enabled(): bool
+{
+    $flag = getenv('VAAK_REDIS_RELSETS');
+    if ($flag !== false && in_array(strtolower(trim((string) $flag)), ['0', 'false', 'off', 'no'], true)) {
+        return false;
+    }
+    return ap_redis_client('cache') !== null;
+}
+
+/** Record a relationship-cache hit/miss/invalidate for ops dashboards. */
+function ap_redis_relset_metric(string $kind): void
+{
+    $kind = strtolower(trim($kind));
+    if (!in_array($kind, ['hit', 'miss', 'invalidate', 'bypass'], true)) {
+        return;
+    }
+    ap_redis_metric_inc('relset_' . $kind);
+}
+
 /** @return array<string,int> */
 function ap_redis_metric_snapshot(): array
 {
