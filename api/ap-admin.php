@@ -4577,8 +4577,12 @@ if ($view === 'stats') {
 }
 
 // Follow graphs: full pages need rich URL aliases; partials only need actor_id keys.
+// Soft-nav shells for Following/Followers still need the full row lists.
 $accountSwitcherView = $view === 'account_switcher';
-$followers = ($isPartial || $accountSwitcherView) ? [] : ap_followers_list($vaakActorId);
+$shellFollowGraph = $isPartial
+    && isset($_GET['shell']) && (string) $_GET['shell'] === '1'
+    && in_array($view, ['following', 'followers'], true);
+$followers = (($isPartial && !$shellFollowGraph) || $accountSwitcherView) ? [] : ap_followers_list($vaakActorId);
 $following = $accountSwitcherView ? [] : ap_following_list($vaakActorId);
 if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
     if (function_exists('ap_bsky_admin_following_rows')) {
@@ -4588,10 +4592,12 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_
         // Bluesky DID into a profile handle here can turn a tab switch into
         // dozens of cache misses/XRPC refreshes; relationship pages resolve
         // handles when they actually render those rows.
-        $resolveBskyHandles = in_array($view, ['following', 'followers'], true) && !$isPartial;
+        $resolveBskyHandles = in_array($view, ['following', 'followers'], true)
+            && (!$isPartial || $shellFollowGraph);
         $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId, $resolveBskyHandles));
     }
-    if (!$isPartial && in_array($view, ['followers', 'following'], true) && function_exists('ap_bsky_admin_follower_rows')) {
+    if ((!$isPartial || $shellFollowGraph) && in_array($view, ['followers', 'following'], true)
+        && function_exists('ap_bsky_admin_follower_rows')) {
         $followers = ap_bsky_merge_follow_rows($followers, ap_bsky_admin_follower_rows($vaakOwnerId, $vaakActorId));
     }
     if (in_array($view, ['following', 'followers'], true) && function_exists('ap_bsky_follow_sync_enqueue')) {
@@ -4600,7 +4606,7 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_
 }
 // Scope remote_actors username lookups to the follow graph (not the whole table).
 $adminUnameByActor = [];
-if (!$isPartial && !$accountSwitcherView && $view !== 'mentions') {
+if ((!$isPartial || !empty($shellFollowGraph)) && !$accountSwitcherView && $view !== 'mentions') {
     $aliasActorIds = [];
     foreach (array_merge($followers, $following) as $grow) {
         if (!is_array($grow)) {
@@ -4734,6 +4740,259 @@ if ($isPartial || $accountSwitcherView) {
     $followerIds = ap_followers_id_set($vaakActorId, $vaakOwnerId, $relsetRich);
 } else {
     $followerIds = $adminIndexActorMap($followers, $relsetRich);
+}
+
+// Soft-nav shells for Following / Followers / Search (after follow rows are loaded).
+if (isset($_GET['partial'], $_GET['shell'])
+    && (string) $_GET['partial'] === '1'
+    && (string) $_GET['shell'] === '1'
+    && in_array($view, ['following', 'followers', 'search'], true)
+) {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-VAAK-View: ' . $view);
+    $shellTitle = match ($view) {
+        'followers' => 'Followers',
+        'following' => 'Following',
+        default => 'Search',
+    };
+    $shellNet = strtolower(trim((string) ($_GET['network'] ?? ($view === 'search' ? '' : 'all'))));
+    if ($view !== 'search' && !in_array($shellNet, ['all', 'fedi', 'bsky'], true)) {
+        $shellNet = 'all';
+    }
+    $refreshQs = '?view=' . rawurlencode($view);
+    if ($view !== 'search' && $shellNet !== '') {
+        $refreshQs .= '&amp;network=' . rawurlencode($shellNet);
+    }
+    if ($view === 'search') {
+        $sqShell = trim((string) ($_GET['q'] ?? ''));
+        $stypeShell = preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '';
+        if ($sqShell !== '') {
+            $refreshQs .= '&amp;q=' . rawurlencode($sqShell);
+        }
+        if ($stypeShell !== '') {
+            $refreshQs .= '&amp;type=' . rawurlencode($stypeShell);
+        }
+        if (!isset($_GET['q']) || !empty($_GET['resolve'])) {
+            $refreshQs .= '&amp;resolve=1';
+        }
+    }
+    echo '<div class="topbar"><h1>' . h($shellTitle) . '</h1><div class="topbar-actions">'
+        . '<a class="btn btn-ghost" href="' . $refreshQs . '&amp;_r=' . rawurlencode((string) time())
+        . '" title="Reload this view">↻</a></div></div>';
+    echo '<div class="feed timeline-feed">';
+    if ($view === 'search') {
+        // Reuse the full search body by capturing the same branch via include flag.
+        $GLOBALS['vaak_soft_nav_search_shell'] = true;
+        // Inline a lightweight empty/search shell; full results still soft-nav with q=.
+        $sq = trim((string) ($_GET['q'] ?? ''));
+        $stype = preg_replace('/[^a-z]/', '', (string) ($_GET['type'] ?? '')) ?: '';
+        $sresolve = !isset($_GET['q']) || !empty($_GET['resolve']);
+        echo '<form class="composer" method="get" action="?view=search" style="margin:0 0 1rem">';
+        echo '<input type="hidden" name="view" value="search">';
+        echo '<input name="q" type="search" value="' . h($sq) . '" required placeholder="text · #tag · @user@instance · or https://…/post URL" autofocus>';
+        echo '<div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin:.6rem 0">';
+        echo '<label class="meta"><input type="radio" name="type" value=""' . ($stype === '' ? ' checked' : '') . '> All</label>';
+        echo '<label class="meta"><input type="radio" name="type" value="accounts"' . ($stype === 'accounts' ? ' checked' : '') . '> Accounts</label>';
+        echo '<label class="meta"><input type="radio" name="type" value="hashtags"' . ($stype === 'hashtags' ? ' checked' : '') . '> Hashtags</label>';
+        echo '<label class="meta"><input type="radio" name="type" value="statuses"' . ($stype === 'statuses' ? ' checked' : '') . '> Posts</label>';
+        echo '<label class="meta"><input type="checkbox" name="resolve" value="1"' . ($sresolve ? ' checked' : '') . '> Resolve remote</label>';
+        echo '</div><div class="composer-actions"><span class="meta"><a href="?view=tags">Hashtags</a></span>';
+        echo '<button class="btn btn-primary" type="submit">Search / Open</button></div></form>';
+        if ($sq === '') {
+            echo '<div class="empty">Search posts, tags, or accounts — or paste a remote post URL above.</div>';
+        } else {
+            // Run the same search path as the full page for soft-nav result swaps.
+            require_once __DIR__ . '/ap-masto-entities.php';
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+            $sresults = ap_masto_search($sq, $stype !== '' ? $stype : null, $sresolve, 25);
+            $sOwner = admin_owner_user_id();
+            if (function_exists('ap_actor_is_content_blocked') && $sOwner > 0) {
+                $sresults['accounts'] = array_values(array_filter(
+                    is_array($sresults['accounts'] ?? null) ? $sresults['accounts'] : [],
+                    static function ($acc) use ($sOwner): bool {
+                        if (!is_array($acc)) {
+                            return false;
+                        }
+                        $uri = rtrim((string) ($acc['uri'] ?? $acc['url'] ?? ''), '/');
+                        return $uri === '' || !ap_actor_is_content_blocked($uri, null, $sOwner);
+                    }
+                ));
+                $sresults['statuses'] = array_values(array_filter(
+                    is_array($sresults['statuses'] ?? null) ? $sresults['statuses'] : [],
+                    static function ($st) use ($sOwner): bool {
+                        if (!is_array($st)) {
+                            return false;
+                        }
+                        $acct = $st['account'] ?? null;
+                        $uri = '';
+                        if (is_array($acct)) {
+                            $uri = rtrim((string) ($acct['uri'] ?? $acct['url'] ?? ''), '/');
+                        }
+                        return $uri === '' || !ap_actor_is_content_blocked($uri, null, $sOwner);
+                    }
+                ));
+            }
+            $acctN = count($sresults['accounts'] ?? []);
+            $tagN = count($sresults['hashtags'] ?? []);
+            $stN = count($sresults['statuses'] ?? []);
+            if ($acctN + $tagN + $stN === 0) {
+                echo '<div class="empty">No results for “' . h($sq) . '”.</div>';
+            } else {
+                echo '<div class="meta" style="margin:0 0 .75rem">' . ($acctN + $tagN + $stN) . ' result'
+                    . (($acctN + $tagN + $stN) === 1 ? '' : 's') . '</div>';
+                if (($stype === '' || $stype === 'accounts') && $acctN > 0) {
+                    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Accounts</h3>';
+                    foreach (array_slice($sresults['accounts'], 0, 25) as $acc) {
+                        if (!is_array($acc)) {
+                            continue;
+                        }
+                        $aUri = (string) ($acc['uri'] ?? $acc['url'] ?? '');
+                        $aAcct = (string) ($acc['acct'] ?? '');
+                        $aName = (string) ($acc['display_name'] ?? $aAcct);
+                        echo '<article class="tweet"><div class="tweet-hd">';
+                        echo admin_avatar_img($aUri !== '' ? $aUri : null);
+                        echo '<div class="tweet-hd-main"><div class="who">';
+                        if ($aUri !== '') {
+                            echo '<a href="?view=remote_profile&amp;actor=' . h(urlencode($aUri)) . '" style="color:inherit;text-decoration:none">' . h($aName) . '</a>';
+                        } else {
+                            echo h($aName);
+                        }
+                        echo '</div><div class="meta">@' . h($aAcct) . '</div></div></div></article>';
+                    }
+                }
+                if (($stype === '' || $stype === 'hashtags') && $tagN > 0) {
+                    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Hashtags</h3>';
+                    foreach (array_slice($sresults['hashtags'], 0, 25) as $tag) {
+                        if (!is_array($tag)) {
+                            continue;
+                        }
+                        $tName = ltrim((string) ($tag['name'] ?? ''), '#');
+                        if ($tName === '') {
+                            continue;
+                        }
+                        echo '<article class="tweet"><a href="?view=search&amp;q=' . h(urlencode('#' . $tName))
+                            . '&amp;type=statuses" data-vaak-soft-nav="search" data-search-q="' . h('#' . $tName)
+                            . '" data-search-type="statuses">#' . h($tName) . '</a></article>';
+                    }
+                }
+                if (($stype === '' || $stype === 'statuses') && $stN > 0) {
+                    echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Posts</h3>';
+                    foreach (array_slice($sresults['statuses'], 0, 25) as $st) {
+                        if (is_array($st)) {
+                            admin_render_masto_status_card($st, $followingIds, 'search', false, true);
+                        }
+                    }
+                }
+            }
+        }
+    } elseif ($view === 'followers' || $view === 'following') {
+        $rowsSrc = $view === 'followers' ? $followers : $following;
+        $followNet = $shellNet;
+        $followLimit = max(40, min(200, (int) ($_GET['limit'] ?? 40)));
+        $filtered = $rowsSrc;
+        if ($followNet === 'bsky') {
+            $filtered = array_values(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
+        } elseif ($followNet === 'fedi') {
+            $filtered = array_values(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
+        }
+        $shown = array_slice($filtered, 0, $followLimit);
+        $nAll = count($rowsSrc);
+        $nBsky = count(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
+        $nFedi = $nAll - $nBsky;
+        echo '<nav class="notification-tabs" aria-label="' . h($shellTitle) . ' network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">';
+        foreach (['all' => ['All', $nAll], 'fedi' => ['Fediverse', $nFedi], 'bsky' => ['Bluesky', $nBsky]] as $netKey => $netMeta) {
+            echo '<a class="btn ' . ($followNet === $netKey ? 'btn-primary' : 'btn-ghost')
+                . '" href="?view=' . h($view) . '&amp;network=' . h($netKey)
+                . '" data-vaak-soft-nav="' . h($view) . '" data-follow-network="' . h($netKey)
+                . '" style="padding:.3rem .7rem;font-size:.82rem">' . h($netMeta[0])
+                . ' <span class="meta">(' . (int) $netMeta[1] . ')</span></a>';
+        }
+        echo '</nav>';
+        echo '<form class="composer" method="post" action="?view=following" style="margin-bottom:1rem">';
+        echo '<input type="hidden" name="action" value="follow_remote">';
+        echo '<input type="hidden" name="return_view" value="following">';
+        echo '<div class="meta" style="margin-bottom:.5rem">Follow someone as <b style="color:var(--primary)">' . h($vaakHandle) . '</b></div>';
+        echo '<input name="actor_id" type="text" required placeholder="@you@instance.example or https://…/users/…">';
+        echo '<div class="composer-actions"><span class="meta">' . count($filtered) . ' showing · Fediverse and Bluesky</span>';
+        echo '<button class="btn btn-primary" type="submit">Follow</button></div></form>';
+        if ($filtered === []) {
+            echo '<div class="empty">' . ($view === 'followers'
+                ? 'No followers yet. Fediverse followers and Bluesky accounts that follow you show up here.'
+                : 'Not following anyone yet. Use Follow back on Followers, or paste a Fediverse / Bluesky handle above.') . '</div>';
+        }
+        foreach ($shown as $f) {
+            if (!is_array($f)) {
+                continue;
+            }
+            $fActor = rtrim((string) ($f['actor_id'] ?? ''), '/');
+            $fHost = (string) ($f['host'] ?? short_host($fActor));
+            $already = isset($followingIds[$fActor]) || isset($followingIds[$fActor . '/'])
+                || isset($followingIds[(string) ($f['actor_id'] ?? '')]);
+            $fMuted = $fActor !== '' && function_exists('ap_is_muted_actor') && ap_is_muted_actor($fActor, $vaakOwnerId);
+            $fBlockedMe = $fActor !== '' && function_exists('ap_user_is_blocked') && ap_user_is_blocked($fActor, $fHost, $vaakOwnerId);
+            $fBlockedSrv = $fActor !== '' && function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($fActor);
+            echo '<article class="tweet"><div class="tweet-hd">';
+            echo admin_avatar_img($f['actor_id'] ?? null);
+            echo '<div class="tweet-hd-main"><div class="who"><a href="?view=remote_profile&amp;actor='
+                . h(urlencode((string) $f['actor_id'])) . '" style="color:inherit;text-decoration:none">'
+                . h(actor_handle($f['actor_id'], $f['username'] ?? null)) . '</a></div>';
+            echo '<div class="meta">' . h(relative_time((string) ($f['followed_at'] ?? ''))) . '</div></div></div>';
+            echo '<div class="mono">' . h((string) ($f['actor_id'] ?? '')) . '</div><div class="tags">';
+            echo '<span class="tag">' . h($fHost !== '' ? $fHost : short_host($fActor)) . '</span>';
+            if ($fHost === 'bsky.app' || str_contains($fActor, 'bsky.app')) {
+                echo '<span class="tag">Bluesky</span>';
+            }
+            if ($view === 'followers' && $already) {
+                echo '<span class="tag">following</span>';
+            }
+            if ($fMuted) {
+                echo '<span class="tag">muted for me</span>';
+            }
+            if ($fBlockedMe) {
+                echo '<span class="tag" style="color:var(--danger)">blocked for me</span>';
+            }
+            if ($fBlockedSrv) {
+                echo '<span class="tag" style="color:var(--danger)">blocked server-wide</span>';
+            }
+            echo '</div><div class="tweet-actions">';
+            echo '<a href="?view=remote_profile&amp;actor=' . h(urlencode((string) $f['actor_id'])) . '">Profile</a>';
+            if ($view === 'followers' && !$already) {
+                echo '<form method="post" action="?view=following" style="display:inline">'
+                    . '<input type="hidden" name="action" value="follow_remote">'
+                    . '<input type="hidden" name="return_view" value="following">'
+                    . '<input type="hidden" name="actor_id" value="' . h((string) $f['actor_id']) . '">'
+                    . '<button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow back</button></form>';
+            } else {
+                echo '<form method="post" action="?view=following" style="display:inline" onsubmit="return confirm(\'Unfollow this account?\');">'
+                    . '<input type="hidden" name="action" value="unfollow_remote">'
+                    . '<input type="hidden" name="actor_id" value="' . h((string) $f['actor_id']) . '">'
+                    . '<button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Unfollow</button></form>';
+            }
+            echo '<a href="' . h(admin_remote_actor_href((string) $f['actor_id'], isset($f['username']) ? (string) $f['username'] : null))
+                . '" target="_blank" rel="noopener noreferrer">'
+                . h(admin_open_profile_label((string) ($f['actor_id'] ?? ''))) . '</a>';
+            echo block_quick_actions($fActor, $fHost, $view, $vaakOwnerId, !empty($vaakIsAdmin), $view);
+            echo '</div></article>';
+        }
+        if (count($filtered) > $followLimit) {
+            echo '<div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">'
+                . '<a class="btn btn-ghost" href="?view=' . h($view) . '&amp;network=' . h($followNet)
+                . '&amp;limit=' . min(200, $followLimit + 40) . '" data-vaak-soft-nav="' . h($view)
+                . '" data-follow-network="' . h($followNet) . '">Show 40 more</a></div>';
+        }
+    }
+    echo '</div>';
+    echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
+    exit;
 }
 
 // AJAX: hydrate one thin boost card in place (no full timeline rebuild / no scroll reset)
@@ -16902,7 +17161,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 <header class="mobile-topbar" id="mobile-topbar">
   <button type="button" class="mobile-topbar__menu" id="mobile-menu-btn" aria-label="Open menu" aria-controls="admin-rail-left" aria-expanded="false">☰</button>
   <div class="mobile-topbar__title"><span>VAAK</span> · <?= h(view_title($view)) ?></div>
-  <a class="mobile-topbar__search" href="?view=search" aria-label="Search">⌕</a>
+  <a class="mobile-topbar__search" href="?view=search" data-vaak-soft-nav="search" aria-label="Search">⌕</a>
 </header>
 <div class="shell">
   <aside class="rail-left" id="admin-rail-left">
@@ -16981,8 +17240,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <div class="nav-sub">
           <a class="<?= $view === 'favourites' ? 'active' : '' ?>" href="?view=favourites" data-vaak-soft-nav="favourites"><span class="ico"><i class="ph ph-star" aria-hidden="true"></i></span><span class="label">Favourites</span></a>
           <a class="<?= $view === 'bookmarks' ? 'active' : '' ?>" href="?view=bookmarks" data-vaak-soft-nav="bookmarks"><span class="ico"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></span><span class="label">Bookmarks</span></a>
-          <a class="<?= $view === 'followers' ? 'active' : '' ?>" href="?view=followers"><span class="ico">◎</span><span class="label">Followers</span></a>
-          <a class="<?= $view === 'following' ? 'active' : '' ?>" href="?view=following"><span class="ico">⇄</span><span class="label">Following</span></a>
+          <a class="<?= $view === 'followers' ? 'active' : '' ?>" href="?view=followers" data-vaak-soft-nav="followers"><span class="ico">◎</span><span class="label">Followers</span></a>
+          <a class="<?= $view === 'following' ? 'active' : '' ?>" href="?view=following" data-vaak-soft-nav="following"><span class="ico">⇄</span><span class="label">Following</span></a>
           <a class="<?= $view === 'tags' ? 'active' : '' ?>" href="?view=tags"><span class="ico">＃</span><span class="label">Hashtags</span></a>
           <a class="<?= $view === 'collections' ? 'active' : '' ?>" href="?view=collections"><span class="ico">▦</span><span class="label">Collections</span></a>
           <a class="<?= $view === 'lists' ? 'active' : '' ?>" href="?view=lists"><span class="ico">☰</span><span class="label">Lists</span></a>
@@ -21205,7 +21464,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $followersShown = array_slice($followersFiltered, 0, $followLimit);
           $followTab = static function (string $viewName, string $net, string $label, int $count, string $cur) : string {
               $cls = $cur === $net ? 'btn-primary' : 'btn-ghost';
-              return '<a class="btn ' . $cls . '" href="?view=' . rawurlencode($viewName) . '&amp;network=' . rawurlencode($net) . '" style="padding:.3rem .7rem;font-size:.82rem">' . h($label) . ' <span class="meta">(' . $count . ')</span></a>';
+              return '<a class="btn ' . $cls . '" href="?view=' . rawurlencode($viewName) . '&amp;network=' . rawurlencode($net)
+                  . '" data-vaak-soft-nav="' . h($viewName) . '" data-follow-network="' . h($net)
+                  . '" style="padding:.3rem .7rem;font-size:.82rem">' . h($label) . ' <span class="meta">(' . $count . ')</span></a>';
           };
           $nAll = count($followers);
           $nBsky = count(array_filter($followers, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
@@ -21280,7 +21541,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endforeach; ?>
         <?php if (count($followersFiltered) > $followLimit): ?>
           <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
-            <a class="btn btn-ghost" href="?view=followers&amp;network=<?= h($followNet) ?>&amp;limit=<?= min(200, $followLimit + 40) ?>">Show 40 more</a>
+            <a class="btn btn-ghost" href="?view=followers&amp;network=<?= h($followNet) ?>&amp;limit=<?= min(200, $followLimit + 40) ?>" data-vaak-soft-nav="followers" data-follow-network="<?= h($followNet) ?>">Show 40 more</a>
           </div>
         <?php endif; ?>
 
@@ -21303,9 +21564,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $nFedi = $nAll - $nBsky;
         ?>
         <nav class="notification-tabs" aria-label="Following network" style="display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem">
-          <a class="btn <?= $followNet === 'all' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=all" style="padding:.3rem .7rem;font-size:.82rem">All <span class="meta">(<?= $nAll ?>)</span></a>
-          <a class="btn <?= $followNet === 'fedi' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=fedi" style="padding:.3rem .7rem;font-size:.82rem">Fediverse <span class="meta">(<?= $nFedi ?>)</span></a>
-          <a class="btn <?= $followNet === 'bsky' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky <span class="meta">(<?= $nBsky ?>)</span></a>
+          <a class="btn <?= $followNet === 'all' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=all" data-vaak-soft-nav="following" data-follow-network="all" style="padding:.3rem .7rem;font-size:.82rem">All <span class="meta">(<?= $nAll ?>)</span></a>
+          <a class="btn <?= $followNet === 'fedi' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=fedi" data-vaak-soft-nav="following" data-follow-network="fedi" style="padding:.3rem .7rem;font-size:.82rem">Fediverse <span class="meta">(<?= $nFedi ?>)</span></a>
+          <a class="btn <?= $followNet === 'bsky' ? 'btn-primary' : 'btn-ghost' ?>" href="?view=following&amp;network=bsky" data-vaak-soft-nav="following" data-follow-network="bsky" style="padding:.3rem .7rem;font-size:.82rem">Bluesky <span class="meta">(<?= $nBsky ?>)</span></a>
         </nav>
         <form class="composer" method="post" action="?view=following" style="margin-bottom:1rem">
           <input type="hidden" name="action" value="follow_remote">
@@ -25869,11 +26130,12 @@ window.apAdminToast = function (msg, isErr) {
 // Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
 // swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
-  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'gallery', 'favourites', 'bookmarks']);
+  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'gallery', 'favourites', 'bookmarks', 'following', 'followers', 'search']);
   const TL_TITLES = {
     home: 'Home', local: 'Local', feed: 'Federation feed',
     mentions: 'Notifications', outbox: 'Your posts', gallery: 'Gallery',
-    favourites: 'Favourites', bookmarks: 'Bookmarks'
+    favourites: 'Favourites', bookmarks: 'Bookmarks',
+    following: 'Following', followers: 'Followers', search: 'Search'
   };
   let busy = false;
   let leaving = false;
@@ -25917,6 +26179,10 @@ window.apAdminToast = function (msg, isErr) {
       const m = href.match(/[?&]view=([a-z_]+)/);
       a.classList.toggle('active', (m ? m[1] : '') === view);
     });
+    if (['following', 'followers', 'favourites', 'bookmarks', 'tags', 'collections', 'lists'].includes(view)) {
+      const lib = document.querySelector('#admin-rail-left details.nav-group[data-nav-key="library"]');
+      if (lib) lib.open = true;
+    }
     if (view === 'mentions') {
       const badge = document.getElementById('notif-badge');
       if (badge) { badge.hidden = true; badge.textContent = ''; }
@@ -26095,7 +26361,16 @@ window.apAdminToast = function (msg, isErr) {
         + encodeURIComponent(view === 'mentions' ? '10' : (view === 'outbox' ? '20' : '15'));
       if (view === 'mentions' && filter) url += '&notification_filter=' + encodeURIComponent(filter);
       if (view === 'favourites' && extra.network) url += '&network=' + encodeURIComponent(extra.network);
+      if ((view === 'following' || view === 'followers') && extra.network) {
+        url += '&network=' + encodeURIComponent(extra.network);
+        if (extra.limit) url += '&limit=' + encodeURIComponent(String(extra.limit));
+      }
       if (view === 'bookmarks' && extra.folder) url += '&folder=' + encodeURIComponent(extra.folder);
+      if (view === 'search') {
+        if (extra.q) url += '&q=' + encodeURIComponent(extra.q);
+        if (extra.type) url += '&type=' + encodeURIComponent(extra.type);
+        if (extra.resolve) url += '&resolve=1';
+      }
       const res = await fetch(url, {
         credentials: 'same-origin',
         headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
@@ -26138,10 +26413,25 @@ window.apAdminToast = function (msg, isErr) {
         u.searchParams.delete('_r');
         if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
         else u.searchParams.delete('notification_filter');
-        if (view === 'favourites' && extra.network) u.searchParams.set('network', extra.network);
-        else if (view !== 'favourites') u.searchParams.delete('network');
+        if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
+          u.searchParams.set('network', extra.network);
+        } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
+          u.searchParams.delete('network');
+        }
         if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
         else if (view !== 'bookmarks') u.searchParams.delete('folder');
+        if (view === 'search') {
+          if (extra.q) u.searchParams.set('q', String(extra.q));
+          else u.searchParams.delete('q');
+          if (extra.type) u.searchParams.set('type', String(extra.type));
+          else u.searchParams.delete('type');
+          if (extra.resolve) u.searchParams.set('resolve', '1');
+          else u.searchParams.delete('resolve');
+        } else {
+          u.searchParams.delete('q');
+          u.searchParams.delete('type');
+          u.searchParams.delete('resolve');
+        }
         history.pushState({ vaakSoft: view, filter: filter || '', extra }, '', u.pathname + u.search);
       }
       if (typeof window.novaEnhanceTweetFolds === 'function') {
@@ -26153,6 +26443,8 @@ window.apAdminToast = function (msg, isErr) {
         bindNotifScroll(main);
       } else if (['favourites', 'bookmarks'].includes(view)) {
         bootLibraryView(view, main);
+      } else if (['following', 'followers', 'search'].includes(view)) {
+        bindFeedTopBtn(main);
       } else if (['home', 'local', 'feed', 'gallery', 'outbox'].includes(view)) {
         if (typeof window.vaakBootTimeline === 'function') {
           const ok = window.vaakBootTimeline(view);
@@ -26187,15 +26479,28 @@ window.apAdminToast = function (msg, isErr) {
     ev.stopPropagation();
     if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
     const extra = {};
+    const linkUrl = new URL(link.href, window.location.href);
     if (view === 'favourites') {
       extra.network = link.getAttribute('data-fav-network')
-        || (new URL(link.href, window.location.href)).searchParams.get('network')
+        || linkUrl.searchParams.get('network')
         || 'fedi';
+    }
+    if (view === 'following' || view === 'followers') {
+      extra.network = link.getAttribute('data-follow-network')
+        || linkUrl.searchParams.get('network')
+        || 'all';
+      const lim = linkUrl.searchParams.get('limit');
+      if (lim) extra.limit = lim;
     }
     if (view === 'bookmarks') {
       const folder = link.getAttribute('data-bm-folder')
-        || (new URL(link.href, window.location.href)).searchParams.get('folder');
+        || linkUrl.searchParams.get('folder');
       if (folder) extra.folder = folder;
+    }
+    if (view === 'search') {
+      extra.q = link.getAttribute('data-search-q') || linkUrl.searchParams.get('q') || '';
+      extra.type = link.getAttribute('data-search-type') || linkUrl.searchParams.get('type') || '';
+      if (linkUrl.searchParams.get('resolve') || !extra.q) extra.resolve = '1';
     }
     softNavTo(view, true, link.getAttribute('data-notif-filter') || '', extra);
   }, true);
@@ -26206,7 +26511,16 @@ window.apAdminToast = function (msg, isErr) {
     if (!SOFT_VIEWS.has(view)) return;
     const extra = {};
     if (view === 'favourites') extra.network = u.searchParams.get('network') || 'fedi';
+    if (view === 'following' || view === 'followers') {
+      extra.network = u.searchParams.get('network') || 'all';
+      if (u.searchParams.get('limit')) extra.limit = u.searchParams.get('limit');
+    }
     if (view === 'bookmarks' && u.searchParams.get('folder')) extra.folder = u.searchParams.get('folder');
+    if (view === 'search') {
+      extra.q = u.searchParams.get('q') || '';
+      extra.type = u.searchParams.get('type') || '';
+      if (u.searchParams.get('resolve') || !extra.q) extra.resolve = '1';
+    }
     softNavTo(view, false, u.searchParams.get('notification_filter') || '', extra);
   });
 
