@@ -9271,6 +9271,38 @@ function ap_bsky_clear_profile_pinned_post(int $ownerUserId): array
 }
 
 /**
+ * After a Bluesky mirror lands for a note already pinned in VAAK, push pinnedPost.
+ * Covers the race where Pin runs before crosspost finishes.
+ */
+function ap_bsky_maybe_sync_pin_after_crosspost(int $ownerUserId, string $noteId): void
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($ownerUserId < 1 || $noteId === '' || !function_exists('ap_masto_status_by_note_id')) {
+        return;
+    }
+    try {
+        $row = ap_masto_status_by_note_id($noteId);
+        if (!is_array($row)) {
+            return;
+        }
+        $localId = (int) ($row['local_id'] ?? 0);
+        if ($localId <= 0 || !function_exists('ap_masto_status_is_pinned')) {
+            return;
+        }
+        if (!ap_masto_status_is_pinned($localId, $ownerUserId)) {
+            return;
+        }
+        $res = ap_bsky_sync_pin_to_bluesky($ownerUserId);
+        if (!empty($res['ok']) && empty($res['cleared']) && !empty($res['uri'])) {
+            ap_log('bsky_pin_sync_after_crosspost note=' . ap_short($noteId)
+                . ' uri=' . ap_short((string) $res['uri']));
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] pin sync after crosspost: ' . $e->getMessage());
+    }
+}
+
+/**
  * Push VAAK's newest pin (with Bluesky twin) to app.bsky.actor.profile pinnedPost.
  * Clears Bluesky pin when VAAK has no mapped pins.
  *
