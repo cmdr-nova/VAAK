@@ -15857,6 +15857,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       min-height: 0;
     }
     body.dm-fullscreen .dm-pane { height: 100%; }
+    /* Peer open: thread fills the pane; composer stays pinned under it. */
+    body.dm-fullscreen.dm-peer-open .dm-pane-header,
+    body.dm-fullscreen.dm-peer-open .dm-pane > .composer { flex: 0 0 auto; }
+    body.dm-fullscreen.dm-peer-open .dm-pane > .composer { margin-top: .75rem; }
     body.blog-fullscreen .shell {
       max-width: none;
       grid-template-columns: minmax(0, 1fr);
@@ -15884,13 +15888,30 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       .blog-editor .blog-fields { grid-template-columns: 1fr; }
     }
     .dm-back-top { margin-right: auto; }
-    @media (max-width: 760px) {
-      body.dm-fullscreen .feed { padding-inline: .65rem; }
+    @media (max-width: 760px), (max-width: 950px) and (max-height: 520px) {
+      body.dm-fullscreen .feed { padding-inline: .65rem; padding-bottom: .5rem; }
       .dm-workspace { grid-template-columns: 1fr; }
       body.dm-fullscreen .dm-workspace { height: auto; min-height: 0; }
-      .dm-sidebar { max-height: 18rem; overflow-y: auto; }
+      .dm-sidebar { max-height: min(40dvh, 18rem); overflow-y: auto; }
       .dm-pane { padding: .65rem; }
       .dm-pane .dm-thread { min-height: 12rem; max-height: 52dvh; }
+      /* Conversation open: hide the list so the thread can use the viewport. */
+      body.dm-fullscreen.dm-peer-open .dm-sidebar { display: none; }
+      body.dm-fullscreen.dm-peer-open .dm-workspace {
+        height: calc(100dvh - 7.25rem - env(safe-area-inset-bottom, 0px));
+        min-height: 18rem;
+      }
+      body.dm-fullscreen.dm-peer-open .dm-pane {
+        height: 100%;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      body.dm-fullscreen.dm-peer-open .dm-pane .dm-thread {
+        flex: 1 1 auto;
+        min-height: 0;
+        max-height: none;
+      }
     }
     .link-card {
       display: flex; gap: .75rem; margin: .65rem 0 0; padding: 0;
@@ -17391,7 +17412,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .brand-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); display: block; margin: .4rem auto .45rem; }
   </style>
 </head>
-<body class="<?= $view === 'dms' ? 'dm-fullscreen' : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
+<body class="<?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
   <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
 </div>
@@ -18411,7 +18432,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 }
             }
           ?>
-          <div style="margin-bottom:.75rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
+          <div class="dm-pane-header" style="margin-bottom:.75rem;display:flex;flex-wrap:wrap;gap:.5rem;align-items:center">
             <div class="page-back"><a class="btn btn-ghost" href="?view=dms">← All conversations</a></div>
             <?= admin_avatar_img($dmPeer) ?>
             <div>
@@ -18486,18 +18507,46 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           (function () {
             function focusLatestDm() {
               const thread = document.getElementById('dm-thread');
+              const last = document.getElementById('dm-message-last');
               if (!thread) return;
-              // The thread is the overflow container. Run after layout and
-              // again after avatars/media settle so flex sizing cannot leave
-              // the view parked at the oldest message.
+              // Prefer anchoring the newest message; also set scrollTop so the
+              // overflow container itself ends at the bottom (mobile + desktop).
+              if (last && typeof last.scrollIntoView === 'function') {
+                try {
+                  last.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'instant' });
+                } catch (e) {
+                  last.scrollIntoView(false);
+                }
+              }
               thread.scrollTop = thread.scrollHeight;
             }
-            [0, 50, 250].forEach(function (delay) {
-              window.setTimeout(function () {
+            function scheduleFocus() {
+              requestAnimationFrame(function () {
+                focusLatestDm();
                 requestAnimationFrame(focusLatestDm);
-              }, delay);
+              });
+            }
+            [0, 50, 150, 400, 900].forEach(function (delay) {
+              window.setTimeout(scheduleFocus, delay);
             });
-            window.addEventListener('load', focusLatestDm, { once: true });
+            window.addEventListener('load', scheduleFocus, { once: true });
+            // Avatars/images can grow the thread after first paint.
+            if (typeof ResizeObserver === 'function') {
+              const thread = document.getElementById('dm-thread');
+              if (thread) {
+                let roTimer = 0;
+                const ro = new ResizeObserver(function () {
+                  if (roTimer) window.clearTimeout(roTimer);
+                  roTimer = window.setTimeout(focusLatestDm, 30);
+                });
+                ro.observe(thread);
+                window.setTimeout(function () { try { ro.disconnect(); } catch (e) {} }, 4000);
+              }
+            }
+            document.querySelectorAll('#dm-thread img').forEach(function (img) {
+              if (img.complete) return;
+              img.addEventListener('load', focusLatestDm, { once: true });
+            });
           })();
           </script>
             </section>
