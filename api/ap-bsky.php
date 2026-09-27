@@ -9292,6 +9292,20 @@ function ap_bsky_maybe_sync_pin_after_crosspost(int $ownerUserId, string $noteId
         if (!ap_masto_status_is_pinned($localId, $ownerUserId)) {
             return;
         }
+        // Twin for this note — if Bluesky already has it pinned, stop (no retry churn).
+        $map = function_exists('ap_bsky_crosspost_by_note_id')
+            ? ap_bsky_crosspost_by_note_id($noteId)
+            : null;
+        $wantUri = is_array($map) ? rtrim((string) ($map['bsky_uri'] ?? ''), '/') : '';
+        if ($wantUri !== '') {
+            $have = ap_bsky_get_profile_pinned_post($ownerUserId);
+            $haveUri = is_array($have) ? rtrim((string) ($have['uri'] ?? ''), '/') : '';
+            if ($haveUri !== '' && $haveUri === $wantUri) {
+                ap_log('bsky_pin_sync_after_crosspost skip=already_pinned note=' . ap_short($noteId)
+                    . ' uri=' . ap_short($wantUri));
+                return;
+            }
+        }
         // Never clear from a crosspost retry — only attach when a twin exists.
         $res = ap_bsky_sync_pin_to_bluesky($ownerUserId, false);
         if (!empty($res['ok']) && empty($res['cleared']) && !empty($res['uri'])) {
@@ -9350,6 +9364,23 @@ function ap_bsky_sync_pin_to_bluesky(int $ownerUserId, bool $allowClear = false)
     if (!empty($existing['ok']) && is_array($existing['json']['value'] ?? null)) {
         $record = $existing['json']['value'];
         $record['$type'] = 'app.bsky.actor.profile';
+    }
+    // Already pinned to the same strongRef — treat as done (no putRecord / no retry).
+    if ($pinRef !== null) {
+        $cur = is_array($record['pinnedPost'] ?? null) ? $record['pinnedPost'] : null;
+        $curUri = is_array($cur) ? rtrim((string) ($cur['uri'] ?? ''), '/') : '';
+        $curCid = is_array($cur) ? (string) ($cur['cid'] ?? '') : '';
+        $wantUri = rtrim((string) ($pinRef['uri'] ?? ''), '/');
+        $wantCid = (string) ($pinRef['cid'] ?? '');
+        if ($curUri !== '' && $curUri === $wantUri && ($wantCid === '' || $curCid === '' || $curCid === $wantCid)) {
+            return [
+                'ok' => true,
+                'uri' => $wantUri,
+                'cleared' => false,
+                'skipped' => true,
+                'error' => 'Already pinned on Bluesky',
+            ];
+        }
     }
     if ($pinRef !== null) {
         $record['pinnedPost'] = $pinRef;
