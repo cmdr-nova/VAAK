@@ -5201,7 +5201,12 @@ if (
             admin_render_timeline_item($item, $followingIds, $view);
         }
         $shellBody = (string) ob_get_clean();
-        $shellHasMore = count($adminTlRankedCached) > $shellLimit || $shellBody !== '';
+        // Ranked length alone drives paging. Empty first paint still needs
+        // hasMore=1 so the client fill path can run (mutes/stale keys).
+        $shellHasMore = count($adminTlRankedCached) > $shellLimit;
+        if ($shellBody === '') {
+            $shellHasMore = true;
+        }
         $shellNext = $shellLimit;
         $shellCache = 'hit';
     } elseif ($adminTlStampedeLock !== '') {
@@ -25875,12 +25880,14 @@ window.apAdminToast = function (msg, isErr) {
     // Critical: soft-nav replaces #timeline-sentinel. Re-observe the live node
     // or infinite scroll stalls on the static "Scroll for more…" label.
     bindInfiniteScrollObserver();
-    // Fast soft-nav skeleton (cache miss): kick an immediate page fill.
-    if (items.dataset.needsFill === '1' && hasMore && typeof loadMore === 'function') {
+    // Soft-nav skeleton / empty first paint: always attempt one fill from
+    // offset 0, even when the shell said hasMore=0 (short ranked cache).
+    if (items.dataset.needsFill === '1' && typeof loadMore === 'function') {
       items.dataset.needsFill = '0';
-      // Soft-nav shells set offset to the page size already; refill from 0.
       offset = 0;
       items.dataset.offset = '0';
+      hasMore = true;
+      items.dataset.hasMore = '1';
       setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
     }
     try { syncTimelineStreamVisibility(); } catch (e) {}
