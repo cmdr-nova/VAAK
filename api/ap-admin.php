@@ -16964,7 +16964,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     <nav class="nav">
       <a class="<?= $view === 'home' ? 'active' : '' ?>" href="?view=home" data-vaak-soft-nav="home"><span class="ico">⌂</span><span class="label">Home</span></a>
       <a class="<?= $view === 'notices' ? 'active' : '' ?>" href="?view=notices"><span class="ico">▤</span><span class="label">Notices</span><span class="nav-badge"<?= $noticesUnreadNav > 0 ? '' : ' hidden' ?>><?= $noticesUnreadNav > 99 ? '99+' : (string) (int) $noticesUnreadNav ?></span></a>
-      <hr class="nav-sep">
       <a class="<?= $view === 'discuss' ? 'active' : '' ?>" href="?view=discuss"><span class="ico">▤</span><span class="label">Discuss</span><span class="nav-badge"<?= $discussUnreadNav > 0 ? '' : ' hidden' ?>><?= $discussUnreadNav > 99 ? '99+' : (string) (int) $discussUnreadNav ?></span></a>
       <hr class="nav-sep">
       <a class="<?= $view === 'mentions' ? 'active' : '' ?>" href="?view=mentions" id="nav-notifications" data-vaak-soft-nav="mentions">
