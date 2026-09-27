@@ -9292,7 +9292,8 @@ function ap_bsky_maybe_sync_pin_after_crosspost(int $ownerUserId, string $noteId
         if (!ap_masto_status_is_pinned($localId, $ownerUserId)) {
             return;
         }
-        $res = ap_bsky_sync_pin_to_bluesky($ownerUserId);
+        // Never clear from a crosspost retry — only attach when a twin exists.
+        $res = ap_bsky_sync_pin_to_bluesky($ownerUserId, false);
         if (!empty($res['ok']) && empty($res['cleared']) && !empty($res['uri'])) {
             ap_log('bsky_pin_sync_after_crosspost note=' . ap_short($noteId)
                 . ' uri=' . ap_short((string) $res['uri']));
@@ -9304,11 +9305,13 @@ function ap_bsky_maybe_sync_pin_after_crosspost(int $ownerUserId, string $noteId
 
 /**
  * Push VAAK's newest pin (with Bluesky twin) to app.bsky.actor.profile pinnedPost.
- * Clears Bluesky pin when VAAK has no mapped pins.
  *
- * @return array{ok:bool,error?:string,uri?:?string,cleared?:bool}
+ * @param bool $allowClear When true (explicit Unpin only), remove Bluesky
+ *        pinnedPost if no VAAK pin has a Bluesky twin. Retries / Pin must pass
+ *        false so a missing twin never wipes an existing Bluesky pin.
+ * @return array{ok:bool,error?:string,uri?:?string,cleared?:bool,skipped?:bool}
  */
-function ap_bsky_sync_pin_to_bluesky(int $ownerUserId): array
+function ap_bsky_sync_pin_to_bluesky(int $ownerUserId, bool $allowClear = false): array
 {
     $row = ap_bsky_session_row($ownerUserId);
     if ($row === null) {
@@ -9327,6 +9330,17 @@ function ap_bsky_sync_pin_to_bluesky(int $ownerUserId): array
     if ($did === '') {
         return ['ok' => false, 'error' => 'Missing DID'];
     }
+    $pinRef = ap_bsky_pinned_strong_ref_from_vaak($ownerUserId);
+    if ($pinRef === null && !$allowClear) {
+        // Pin / crosspost retry with no twin yet — leave Bluesky pin untouched.
+        return [
+            'ok' => true,
+            'uri' => null,
+            'cleared' => false,
+            'skipped' => true,
+            'error' => 'No Bluesky twin for pinned post yet',
+        ];
+    }
     $existing = ap_bsky_xrpc($pds, 'com.atproto.repo.getRecord', 'GET', [
         'repo' => $did,
         'collection' => 'app.bsky.actor.profile',
@@ -9337,7 +9351,6 @@ function ap_bsky_sync_pin_to_bluesky(int $ownerUserId): array
         $record = $existing['json']['value'];
         $record['$type'] = 'app.bsky.actor.profile';
     }
-    $pinRef = ap_bsky_pinned_strong_ref_from_vaak($ownerUserId);
     if ($pinRef !== null) {
         $record['pinnedPost'] = $pinRef;
     } else {
@@ -10305,6 +10318,8 @@ function ap_bsky_crosspost_status_inner(
                 $fediverseId
             );
         }
+        // If the user pinned in VAAK before this mirror finished, attach now.
+        ap_bsky_maybe_sync_pin_after_crosspost($ownerUserId, $fediverseId);
     }
 
     return [

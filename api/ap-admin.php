@@ -1265,12 +1265,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = 'Pinned — shows on your HTML profile and in Ice Cubes.';
                 if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
                     require_once __DIR__ . '/ap-bsky.php';
-                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId);
-                    if (!empty($bpin['ok']) && empty($bpin['cleared'])) {
+                    // Pin never clears Bluesky — missing twin waits for crosspost retry.
+                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, false);
+                    if (!empty($bpin['ok']) && !empty($bpin['uri']) && empty($bpin['skipped'])) {
                         $notice .= ' Bluesky pin updated.';
-                    } elseif (!empty($bpin['ok']) && !empty($bpin['cleared'])) {
-                        // pinned a post with no Bluesky twin yet
-                    } elseif (!empty($bpin['error']) && $bpin['error'] !== 'Bluesky not connected') {
+                    } elseif (!empty($bpin['ok']) && !empty($bpin['skipped'])) {
+                        $notice .= ' Bluesky pin will sync when the mirror is ready.';
+                    } elseif (!empty($bpin['error']) && $bpin['error'] !== 'Bluesky not connected'
+                        && empty($bpin['skipped'])) {
                         $notice .= ' (Bluesky pin: ' . (string) $bpin['error'] . ')';
                     }
                 }
@@ -1283,7 +1285,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = 'Unpinned.';
                 if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
                     require_once __DIR__ . '/ap-bsky.php';
-                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId);
+                    // Explicit Unpin is the only path allowed to clear Bluesky pinnedPost.
+                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, true);
                     if (!empty($bpin['ok'])) {
                         $notice .= !empty($bpin['cleared'])
                             ? ' Bluesky pin cleared.'
@@ -3262,7 +3265,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     }
                 }
                 if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
-                    ap_bsky_sync_pin_to_bluesky($vaakOwnerId);
+                    ap_bsky_sync_pin_to_bluesky($vaakOwnerId, false);
                 }
             } else {
                 $error = $res['error'] ?? 'Bluesky connect failed.';

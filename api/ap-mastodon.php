@@ -2442,7 +2442,7 @@ function ap_masto_api(string $method, string $path): void
             require_once __DIR__ . '/ap-bsky.php';
             $owner = function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0;
             if ($owner > 0) {
-                ap_bsky_sync_pin_to_bluesky($owner);
+                ap_bsky_sync_pin_to_bluesky($owner, false);
             }
         }
         if (empty($res['ok'])) {
@@ -2463,7 +2463,7 @@ function ap_masto_api(string $method, string $path): void
             require_once __DIR__ . '/ap-bsky.php';
             $owner = function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0;
             if ($owner > 0) {
-                ap_bsky_sync_pin_to_bluesky($owner);
+                ap_bsky_sync_pin_to_bluesky($owner, true);
             }
         }
         ap_masto_json(ap_masto_status_from_row(ap_masto_status_by_local_id((int) $row['local_id']) ?: $row));
