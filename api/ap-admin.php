@@ -16158,14 +16158,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       display: block; flex: none; max-height: none;
     }
     .compose-inline-panel .composer textarea { min-height: 96px; }
-    .compose-inline-panel .composer textarea { overflow-y: hidden; }
     .compose-inline-panel .compose-textarea-wrap {
       flex: 0 0 auto; max-height: none; overflow: visible;
       display: block; min-height: 0;
     }
+    /* Inline: JS auto-grows to ~8 lines, then scrolls (do not lock height). */
     .compose-inline-panel #compose-content {
-      height: 96px; min-height: 96px; max-height: 240px;
-      field-sizing: fixed; flex: none;
+      min-height: 96px; max-height: 13rem; /* ~8 lines + padding */
+      height: auto; field-sizing: fixed; flex: none;
+      overflow-y: hidden;
       overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
     }
     .compose-inline-panel .compose-inline-options {
@@ -16507,9 +16508,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       height: auto !important;
     }
     .compose-modal__panel.compose-inline-panel #compose-content {
-      height: 96px !important;
       min-height: 96px !important;
-      max-height: 240px !important;
+      max-height: 13rem !important; /* ~8 lines; JS sets height up to this */
       flex: none !important;
       field-sizing: fixed !important;
     }
@@ -27933,23 +27933,30 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const inline = !!ta.closest('.compose-inline-panel');
     const value = ta.value || '';
     const empty = !value.trim();
+    // Inline: grow with content up to ~8 lines, then scroll.
+    // Modal: grow to 240px, and start scrolling once past ~400 characters.
+    const maxGrow = inline ? Math.round(13 * 16) : 240; // 13rem ≈ 8 lines
     if (inline && empty) {
       composeScrollCap = null;
       ta.style.height = '96px';
       ta.style.overflowY = 'hidden';
       return;
     }
-    const shouldScrollByLength = value.length >= 400;
     ta.style.height = '0px';
     const contentHeight = ta.scrollHeight;
-    // On wide fields, 400 characters can occupy less than the visual height
-    // cap. Capture the height at the threshold so scrolling begins at the
-    // requested character count rather than waiting for ~1,800 characters.
+    if (inline) {
+      composeScrollCap = null;
+      const next = Math.min(Math.max(contentHeight, 96), maxGrow);
+      ta.style.height = next + 'px';
+      ta.style.overflowY = contentHeight > maxGrow ? 'auto' : 'hidden';
+      return;
+    }
+    const shouldScrollByLength = value.length >= 400;
     if (!shouldScrollByLength) composeScrollCap = null;
     if (shouldScrollByLength && composeScrollCap === null) {
-      composeScrollCap = Math.max(96, Math.min(contentHeight - 1, 240));
+      composeScrollCap = Math.max(96, Math.min(contentHeight - 1, maxGrow));
     }
-    const max = composeScrollCap === null ? 240 : composeScrollCap;
+    const max = composeScrollCap === null ? maxGrow : composeScrollCap;
     const next = Math.min(Math.max(contentHeight, 96), max);
     ta.style.height = next + 'px';
     ta.style.overflowY = shouldScrollByLength || contentHeight > max ? 'auto' : 'hidden';

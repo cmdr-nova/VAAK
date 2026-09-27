@@ -1,6 +1,6 @@
 # VAAK
 
-**Current release:** alpha **0.4.7** · 2026-09-27
+**Current release:** alpha **0.4.8** · 2026-09-27
 
 VAAK (pronounced “vaak”) is a multi-user social web client for the Fediverse, with optional Bluesky / AT Protocol connection. One interface for reading, posting, following, moderating, and carrying identity across both networks.
 
