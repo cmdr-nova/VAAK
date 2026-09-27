@@ -10384,7 +10384,11 @@ function admin_poll_block_html(string $noteId, bool $interactive = true, string 
     $html .= '<span class="poll-label">' . h($label) . '</span>';
     if ($canVote) {
         $inputType = $multiple ? 'checkbox' : 'radio';
-        $html .= '<form method="post" action="?view=' . h($returnView) . '" class="poll-vote-form">'
+        $formAction = '?view=' . rawurlencode($returnView);
+        if ($returnView === 'status') {
+            $formAction .= '&object=' . rawurlencode($noteId);
+        }
+        $html .= '<form method="post" action="' . h($formAction) . '" class="poll-vote-form">'
             . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
             . '<input type="hidden" name="action" value="poll_vote">'
             . '<input type="hidden" name="poll_id" value="' . $pollLocalId . '">'
@@ -11979,9 +11983,17 @@ function admin_render_masto_status_card(
     if ($media) {
         $bodyInner .= admin_media_row_html($media);
     }
+    // Status Open / masto cards: attach poll UI (timeline outbox path already does).
+    $pollHtml = '';
+    if ($uri !== '' && function_exists('admin_poll_block_html')) {
+        $pollHtml = admin_poll_block_html($uri, true, $returnView === 'status' ? 'status' : $returnView);
+    }
+    if ($pollHtml !== '') {
+        $bodyInner .= $pollHtml;
+    }
     $hasMedia = $media !== [];
     $cardHtml = '';
-    if (!$hasMedia && function_exists('ap_link_preview_html')) {
+    if (!$hasMedia && $pollHtml === '' && function_exists('ap_link_preview_html')) {
         if (is_array($st['card'] ?? null)) {
             $cardHtml = ap_link_preview_html(array_merge($st['card'], ['status' => 'ok']), true);
         }
@@ -16498,7 +16510,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .compose-poll-panel {
       margin: .65rem 0 .35rem; padding: .65rem .75rem;
-      border: 1px solid var(--border); border-radius: 12px; background: #0c0c0c;
+      border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border));
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--primary-dim) 55%, #0c0c0c);
     }
     .compose-poll-panel[hidden] { display: none !important; }
     .compose-poll-options {
@@ -16508,33 +16522,59 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       width: 100%; max-width: 100%;
     }
     .compose-poll-panel select { max-width: 18rem; }
+    .compose-tool[aria-pressed="true"][aria-label="Create poll"],
+    .compose-tool.is-poll-open {
+      color: var(--primary);
+      border-color: var(--primary);
+      background: var(--primary-dim);
+    }
     .poll-block {
       margin: .65rem 0 0; padding: .55rem .7rem;
-      border-radius: 10px; border: 1px solid var(--border); background: #0e1218;
+      border-radius: 10px;
+      border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+      background: color-mix(in srgb, var(--primary-dim) 70%, #0c0c0c);
     }
     .poll-block .poll-label {
       display: block; font-size: .72rem; text-transform: uppercase;
-      letter-spacing: .05em; color: var(--muted); margin-bottom: .4rem;
+      letter-spacing: .05em; color: var(--primary); margin-bottom: .4rem;
     }
     .poll-block .poll-opt {
       position: relative; display: block; margin: .28rem 0; padding: .4rem .55rem;
-      border-radius: 8px; border: 1px solid #333; background: #141820;
+      border-radius: 8px;
+      border: 1px solid color-mix(in srgb, var(--primary) 18%, var(--border));
+      background: color-mix(in srgb, var(--primary-dim) 35%, #121212);
       color: var(--text); font-size: .88rem; overflow: hidden;
     }
     .poll-block .poll-opt--vote {
       display: flex; align-items: center; gap: .45rem; cursor: pointer;
     }
+    .poll-block .poll-opt--vote:hover {
+      border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+      background: var(--primary-dim);
+    }
+    .poll-block .poll-opt--vote input {
+      accent-color: var(--primary);
+    }
     .poll-block .poll-opt--result { display: flex; align-items: center; gap: .5rem; }
     .poll-block .poll-opt-bar {
-      position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--primary) 22%, transparent);
+      position: absolute; inset: 0 auto 0 0;
+      background: color-mix(in srgb, var(--primary) 28%, transparent);
       pointer-events: none;
     }
     .poll-block .poll-opt-text { position: relative; z-index: 1; flex: 1 1 auto; }
     .poll-block .poll-opt-count {
       position: relative; z-index: 1; flex: 0 0 auto;
-      font-size: .75rem; color: var(--muted);
+      font-size: .75rem; color: var(--primary);
     }
     .poll-block .poll-meta { margin-top: .4rem; font-size: .75rem; color: var(--muted); }
+    .poll-block .poll-vote-form .btn {
+      border-color: color-mix(in srgb, var(--primary) 40%, var(--border));
+      color: var(--primary);
+    }
+    .poll-block .poll-vote-form .btn:hover {
+      background: var(--primary-dim);
+      border-color: var(--primary);
+    }
     .composer.is-dragover {
       outline: 2px dashed var(--primary);
       outline-offset: 5px;
