@@ -1896,13 +1896,16 @@ function ap_cmdr_html(): void
         $bskyHandle = (string) $combined['bsky_handle'];
     }
     // HTML profile feed = site blogs + notes + AP compose (no federation side effects).
-    // Media and Featured tabs still need the post counts for their tab badges.
+    // Featured/Blog use posts counts for badges; Pinned has its own rows.
     $feedTab = in_array($tab, ['featured', 'blog'], true) ? 'posts' : $tab;
     $postsData = ap_cmdr_posts_page($page, $perPage, $feedTab, $profileCursor);
-    $counts = is_array($postsData['counts'] ?? null) ? $postsData['counts'] : ['posts' => 0, 'replies' => 0, 'boosts' => 0];
+    $counts = is_array($postsData['counts'] ?? null) ? $postsData['counts'] : ['posts' => 0, 'replies' => 0, 'boosts' => 0, 'pinned' => 0];
     $counts['featured'] = $featuredCount;
     $counts['media'] = (int) ($postsData['counts']['media'] ?? 0);
     $counts['blog'] = count(ap_blog_posts_list('cmdr_nova', true, 200, 0));
+    if (!isset($counts['pinned'])) {
+        $counts['pinned'] = count(ap_cmdr_pinned_profile_rows());
+    }
     $tabTotal = (int) ($postsData['total'] ?? 0);
     // Keep the headline Posts metric aligned with the Posts tab. Replies have
     // their own tab and should not make the primary count appear inconsistent.
@@ -1924,6 +1927,7 @@ function ap_cmdr_html(): void
     echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
     foreach (
         array_filter([
+            'pinned' => ((int) ($counts['pinned'] ?? 0) > 0) ? 'Pinned' : null,
             'posts' => 'Posts',
             'replies' => $hideProfileReplies ? null : 'Replies',
             'boosts' => $hideProfileBoosts ? null : 'Boosts',
@@ -2001,6 +2005,17 @@ function ap_cmdr_html(): void
         echo function_exists('ap_featured_cards_html')
             ? ap_featured_cards_html($featuredCards)
             : '<p class="muted">No featured accounts yet.</p>';
+        echo '</section>';
+    } elseif ($tab === 'pinned') {
+        echo '<section id="profile-posts" class="posts" aria-label="Pinned">';
+        echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Pinned</h2>';
+        if (!$postsData['rows']) {
+            echo '<p class="muted">No pinned posts yet.</p>';
+        } else {
+            foreach ($postsData['rows'] as $n) {
+                echo ap_cmdr_post_preview_html($n);
+            }
+        }
         echo '</section>';
     } else {
         $sectionLabel = match ($tab) {
@@ -2506,73 +2521,13 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts',
         $replies = [];
     }
 
-    // Pinned posts (Ice Cubes + HTML profile) — surface at top of Posts tab
-    $pinnedRows = [];
+    // Pinned posts live on the Pinned tab (newest first). Posts tab stays chronological.
+    $pinnedRows = ap_cmdr_pinned_profile_rows();
     $pinnedNoteIds = [];
-    if (($tab === 'posts' || $tab === 'all') && $cursor === null) {
-        // Bluesky profile pin without a local VAAK twin (historical Wafrn dual-publish).
-        try {
-            require_once __DIR__ . '/ap-bsky.php';
-            if (function_exists('ap_bsky_html_pin_row_for_owner')) {
-                $ownerUid = 0;
-                try {
-                    $ust = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ? OR username = ? LIMIT 1');
-                    $ust->execute(['cmdr_nova', 'cmdr_nova']);
-                    $ownerUid = (int) ($ust->fetchColumn() ?: 0);
-                } catch (Throwable $e) {
-                    $ownerUid = 0;
-                }
-                if ($ownerUid > 0) {
-                    $bskyPinRow = ap_bsky_html_pin_row_for_owner($ownerUid);
-                    if (is_array($bskyPinRow)) {
-                        $pinnedRows[] = $bskyPinRow;
-                    }
-                }
-            }
-        } catch (Throwable $e) {
-            error_log('[ap-cmdr] bsky html pin: ' . $e->getMessage());
-        }
-    }
-    if (function_exists('ap_masto_pinned_statuses') && ($tab === 'posts' || $tab === 'all')) {
-        try {
-            foreach (ap_masto_pinned_statuses(5) as $prow) {
-                if (!is_array($prow)) {
-                    continue;
-                }
-                $nid = rtrim((string) ($prow['note_id'] ?? ''), '/');
-                if ($nid === '') {
-                    continue;
-                }
-                $pinnedNoteIds[$nid] = true;
-                // Prefer full outbox row when present
-                $match = null;
-                foreach ($posts as $p) {
-                    $pid = rtrim((string) ($p['id'] ?? ''), '/');
-                    if ($pid === $nid) {
-                        $match = $p;
-                        break;
-                    }
-                }
-                if ($match === null) {
-                    try {
-                        $ost = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
-                        $ost->execute([$nid, $nid . '/']);
-                        $orow = $ost->fetch();
-                        if (is_array($orow)) {
-                            $match = $orow;
-                        }
-                    } catch (Throwable $e) {
-                        $match = null;
-                    }
-                }
-                if (is_array($match)) {
-                    $match['_pinned'] = true;
-                    $pinnedRows[] = $match;
-                }
-            }
-        } catch (Throwable $e) {
-            $pinnedRows = [];
-            $pinnedNoteIds = [];
+    foreach ($pinnedRows as $pr) {
+        $pid = rtrim((string) ($pr['id'] ?? ''), '/');
+        if ($pid !== '') {
+            $pinnedNoteIds[$pid] = true;
         }
     }
     if ($pinnedNoteIds !== []) {
@@ -2583,23 +2538,24 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts',
     }
 
     $counts = [
-        'posts' => count($posts) + count($pinnedRows),
+        'pinned' => count($pinnedRows),
+        'posts' => count($posts),
         'replies' => count($replies),
         'boosts' => count($boosts),
         'media' => count($media),
     ];
     if ($tab === 'all') {
         $items = array_merge($pinnedRows, $posts, $replies, $boosts);
-        // Keep pins first; sort the rest
         $rest = array_slice($items, count($pinnedRows));
         $sortDesc($rest);
         $items = array_merge($pinnedRows, $rest);
     } else {
         $items = match ($tab) {
+            'pinned' => $pinnedRows,
             'replies' => $replies,
             'boosts' => $boosts,
             'media' => $media,
-            default => array_merge($pinnedRows, $posts),
+            default => $posts,
         };
     }
 
@@ -2672,7 +2628,78 @@ function ap_cmdr_blog_markdown_html(string $markdown): string
 function ap_cmdr_normalize_profile_tab(string $tab): string
 {
     $tab = strtolower(trim($tab));
-    return in_array($tab, ['posts', 'replies', 'boosts', 'media', 'featured', 'blog', 'all'], true) ? $tab : 'posts';
+    return in_array($tab, ['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog', 'all'], true) ? $tab : 'posts';
+}
+
+/**
+ * Build HTML-profile pin rows (newest pinned_at first). Includes Bluesky-only
+ * mirror pin when there is no local twin.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_cmdr_pinned_profile_rows(): array
+{
+    $pinnedRows = [];
+    $seen = [];
+    try {
+        require_once __DIR__ . '/ap-bsky.php';
+        if (function_exists('ap_bsky_html_pin_row_for_owner')) {
+            $ownerUid = 0;
+            try {
+                $ust = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ? OR username = ? LIMIT 1');
+                $ust->execute(['cmdr_nova', 'cmdr_nova']);
+                $ownerUid = (int) ($ust->fetchColumn() ?: 0);
+            } catch (Throwable $e) {
+                $ownerUid = 0;
+            }
+            if ($ownerUid > 0) {
+                $bskyPinRow = ap_bsky_html_pin_row_for_owner($ownerUid);
+                if (is_array($bskyPinRow)) {
+                    $bid = rtrim((string) ($bskyPinRow['id'] ?? ''), '/');
+                    if ($bid !== '') {
+                        $seen[$bid] = true;
+                    }
+                    $bskyPinRow['_pinned'] = true;
+                    $pinnedRows[] = $bskyPinRow;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-cmdr] bsky html pin: ' . $e->getMessage());
+    }
+    if (!function_exists('ap_masto_pinned_statuses')) {
+        return $pinnedRows;
+    }
+    try {
+        foreach (ap_masto_pinned_statuses(5) as $prow) {
+            if (!is_array($prow)) {
+                continue;
+            }
+            $nid = rtrim((string) ($prow['note_id'] ?? ''), '/');
+            if ($nid === '' || isset($seen[$nid])) {
+                continue;
+            }
+            $seen[$nid] = true;
+            $match = null;
+            try {
+                $ost = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+                $ost->execute([$nid, $nid . '/']);
+                $orow = $ost->fetch();
+                if (is_array($orow)) {
+                    $match = $orow;
+                }
+            } catch (Throwable $e) {
+                $match = null;
+            }
+            if (is_array($match)) {
+                $match['_pinned'] = true;
+                $pinnedRows[] = $match;
+            }
+        }
+    } catch (Throwable $e) {
+        // keep whatever we have
+    }
+    return $pinnedRows;
 }
 
 /**

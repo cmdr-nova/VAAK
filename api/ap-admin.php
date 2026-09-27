@@ -1262,20 +1262,15 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } elseif ($action === 'pin_status') {
             $res = function_exists('ap_masto_status_pin') ? ap_masto_status_pin($localId) : ['ok' => false, 'error' => 'Pin unavailable'];
             if (!empty($res['ok'])) {
-                $notice = !empty($res['replaced'])
-                    ? 'Pinned — previous pin replaced. Shows on your HTML profile.'
-                    : 'Pinned — shows on your HTML profile.';
+                $notice = 'Pinned — shows on your HTML profile Pinned tab (up to 5).';
                 if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
                     require_once __DIR__ . '/ap-bsky.php';
-                    // Replacing a pin may clear Bluesky if the new post has no twin yet
-                    // (old Bluesky pin must not linger). First-time pin still waits on mirror.
-                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, !empty($res['replaced']));
+                    // Bluesky has one pin: newest VAAK pin with a twin. Never clear here.
+                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, false);
                     if (!empty($bpin['ok']) && !empty($bpin['uri']) && empty($bpin['skipped'])) {
-                        $notice .= ' Bluesky pin updated.';
-                    } elseif (!empty($bpin['ok']) && !empty($bpin['cleared'])) {
-                        $notice .= ' Bluesky pin cleared until the new mirror is ready.';
+                        $notice .= ' Bluesky pin set to the newest mirrored pin.';
                     } elseif (!empty($bpin['ok']) && !empty($bpin['skipped'])) {
-                        $notice .= ' Bluesky pin will sync when the mirror is ready.';
+                        $notice .= ' Bluesky pin will follow the newest mirror when ready.';
                     } elseif (!empty($bpin['error']) && $bpin['error'] !== 'Bluesky not connected'
                         && empty($bpin['skipped'])) {
                         $notice .= ' (Bluesky pin: ' . (string) $bpin['error'] . ')';
@@ -8780,8 +8775,8 @@ function admin_pin_post_button(string $noteId, string $returnView = 'outbox', st
     $action = $pinned ? 'unpin_status' : 'pin_status';
     $label = $pinned ? 'Unpin from profile' : 'Pin to profile';
     $title = $pinned
-        ? 'Remove this post from your profile pin'
-        : 'Pin on your HTML profile (replaces any current pin)';
+        ? 'Remove this post from your profile pins'
+        : 'Pin on your HTML profile (up to 5; Bluesky uses the newest)';
     $actionUrl = '?view=' . rawurlencode($returnView);
     if ($returnView === 'status') {
         $actionUrl .= '&object=' . rawurlencode($noteId);

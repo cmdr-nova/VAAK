@@ -9318,7 +9318,8 @@ function ap_bsky_maybe_sync_pin_after_crosspost(int $ownerUserId, string $noteId
 }
 
 /**
- * Push VAAK's newest pin (with Bluesky twin) to app.bsky.actor.profile pinnedPost.
+ * Push VAAK's newest pin that has a Bluesky twin to profile pinnedPost.
+ * HTML profiles may show up to 5 pins; Bluesky only gets this one (latest).
  *
  * @param bool $allowClear When true (explicit Unpin only), remove Bluesky
  *        pinnedPost if no VAAK pin has a Bluesky twin. Retries / Pin must pass

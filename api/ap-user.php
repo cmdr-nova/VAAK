@@ -559,7 +559,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     // requests are common, so avoid assembling replies, boosts, media, and blog
     // archives when the visitor only asked for one of them.
     $tab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
-    if (!in_array($tab, ['posts', 'media', 'replies', 'boosts', 'featured', 'blog'], true)) {
+    if (!in_array($tab, ['pinned', 'posts', 'media', 'replies', 'boosts', 'featured', 'blog'], true)) {
         $tab = 'posts';
     }
     if (($tab === 'replies' && $hideProfileReplies) || ($tab === 'boosts' && $hideProfileBoosts)) {
@@ -813,7 +813,32 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         ? ap_featured_cards_for_actor_key($actorKey)
         : [];
     $featuredCount = count($featuredCards);
+    $pinnedNotes = [];
+    if (function_exists('ap_masto_pinned_statuses')) {
+        try {
+            foreach (ap_masto_pinned_statuses(5, $actorKey) as $prow) {
+                if (!is_array($prow)) {
+                    continue;
+                }
+                $nid = rtrim((string) ($prow['note_id'] ?? ''), '/');
+                if ($nid === '') {
+                    continue;
+                }
+                $ost = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1');
+                $ost->execute([$nid, $nid . '/']);
+                $orow = $ost->fetch();
+                if (is_array($orow)) {
+                    $orow['_pinned'] = true;
+                    $pinnedNotes[] = $orow;
+                }
+            }
+        } catch (Throwable $e) {
+            $pinnedNotes = [];
+        }
+    }
+    $pinnedCount = count($pinnedNotes);
     $tabTotal = match ($tab) {
+        'pinned' => $pinnedCount,
         'media' => function_exists('ap_outbox_media_count') ? ap_outbox_media_count($actorKey) : count($mediaNotes),
         'replies' => (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : count($profileReplyNotes)) + count($profileBskyReplies),
         'boosts' => $profileBoostTotal,
@@ -849,6 +874,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
     foreach (
         array_filter([
+            'pinned' => $pinnedCount > 0 ? ['Pinned', $pinnedCount] : null,
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
             'media' => ['Media', count($mediaNotes)],
             'replies' => $hideProfileReplies ? null : ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
@@ -955,6 +981,16 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         echo function_exists('ap_featured_cards_html')
             ? ap_featured_cards_html($featuredCards)
             : '<p class="muted">No featured accounts yet.</p>';
+        echo '</section>';
+    } elseif ($tab === 'pinned') {
+        echo '<section id="profile-posts" class="posts" aria-label="Pinned">';
+        if (!$pinnedNotes) {
+            echo '<p class="muted">No pinned posts yet.</p>';
+        } else {
+            foreach ($pinnedNotes as $pinNote) {
+                echo ap_user_post_preview_html($actorKey, $pinNote);
+            }
+        }
         echo '</section>';
     } else {
         $profileItems = [];

@@ -10314,10 +10314,10 @@ function ap_masto_pinned_statuses(int $limit = 5, ?string $actorKey = null): arr
 }
 
 /**
- * Pin a local status. VAAK keeps a single pin per account — pinning a new
- * post replaces any previous pin (matches Bluesky's one pinnedPost).
+ * Pin a local status. Up to 5 pins per account (HTML profile Pinned tab).
+ * Bluesky's single pinnedPost follows the newest pin that has a Bluesky twin.
  * Only notes under the session actor may be pinned.
- * @return array{ok:bool,error?:string,replaced?:bool}
+ * @return array{ok:bool,error?:string}
  */
 function ap_masto_status_pin(int $localId): array
 {
@@ -10340,16 +10340,18 @@ function ap_masto_status_pin(int $localId): array
         return ['ok' => false, 'error' => 'Cannot pin direct messages'];
     }
     if (ap_masto_status_is_pinned($localId, $ownerUserId)) {
-        return ['ok' => true, 'replaced' => false];
+        return ['ok' => true];
     }
     $db = ap_db();
     try {
         $db->beginTransaction();
         $stc = $db->prepare('SELECT COUNT(*) FROM masto_pins WHERE owner_user_id = ?');
         $stc->execute([$ownerUserId]);
-        $replaced = ((int) $stc->fetchColumn()) > 0;
-        // One pin at a time — drop any previous pins for this account.
-        $db->prepare('DELETE FROM masto_pins WHERE owner_user_id = ?')->execute([$ownerUserId]);
+        $count = (int) $stc->fetchColumn();
+        if ($count >= 5) {
+            $db->rollBack();
+            return ['ok' => false, 'error' => 'You cannot pin more than 5 statuses'];
+        }
         $db->prepare(
             'INSERT INTO masto_pins (owner_user_id, status_local_id, pinned_at) VALUES (?, ?, ?)'
         )->execute([$ownerUserId, $localId, gmdate('c')]);
@@ -10360,7 +10362,7 @@ function ap_masto_status_pin(int $localId): array
         }
         return ['ok' => false, 'error' => 'Could not pin'];
     }
-    return ['ok' => true, 'replaced' => $replaced];
+    return ['ok' => true];
 }
 
 /**
