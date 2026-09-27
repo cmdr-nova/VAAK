@@ -8572,16 +8572,42 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
  */
 function ap_masto_bsky_trend_status(array $post): ?array
 {
+    // Mastodon API / trends refresh can run without ap-bsky.php loaded.
+    // Without the URL helper every Bluesky status converts to null and the
+    // Explore/sidebar cache is permanently fedi-only until TTL expiry.
+    if (!function_exists('ap_bsky_https_url_from_at_uri')) {
+        $bskyPath = __DIR__ . '/ap-bsky.php';
+        if (is_file($bskyPath)) {
+            require_once $bskyPath;
+        }
+    }
     $uri = trim((string) ($post['uri'] ?? ''));
     $author = is_array($post['author'] ?? null) ? $post['author'] : [];
     $did = trim((string) ($author['did'] ?? ''));
-    if ($uri === '' || $did === '' || !function_exists('ap_bsky_https_url_from_at_uri')) {
+    if ($uri === '' || $did === '') {
         return null;
     }
     $handle = trim((string) ($author['handle'] ?? ''));
-    $url = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
+    if (function_exists('ap_bsky_https_url_from_at_uri')) {
+        $url = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
+    } else {
+        // Minimal fallback so trends still mix if ap-bsky failed to load.
+        $actor = $handle !== '' ? $handle : $did;
+        $rkey = '';
+        if (preg_match('~^at://[^/]+/app\.bsky\.feed\.post/([^/\s?]+)~', $uri, $m)) {
+            $rkey = (string) $m[1];
+        }
+        $actorPath = str_starts_with($actor, 'did:') ? $actor : rawurlencode($actor);
+        $url = $rkey !== ''
+            ? ('https://bsky.app/profile/' . $actorPath . '/post/' . rawurlencode($rkey))
+            : ('https://bsky.app/profile/' . $actorPath);
+    }
     $text = trim((string) (($post['record']['text'] ?? '') ?: ($post['text'] ?? '')));
     $media = ap_masto_bsky_media_attachments($post, $uri);
+    $displayName = trim((string) ($author['displayName'] ?? ''));
+    if ($displayName === '') {
+        $displayName = $handle !== '' ? $handle : $did;
+    }
     return [
         'id' => $uri,
         'url' => $url,
@@ -8594,10 +8620,12 @@ function ap_masto_bsky_trend_status(array $post): ?array
             'id' => $did,
             'url' => function_exists('ap_bsky_actor_profile_url')
                 ? ap_bsky_actor_profile_url($handle !== '' ? $handle : $did)
-                : 'https://bsky.app/profile/' . rawurlencode($handle !== '' ? $handle : $did),
+                : 'https://bsky.app/profile/' . (str_starts_with($handle !== '' ? $handle : $did, 'did:')
+                    ? ($handle !== '' ? $handle : $did)
+                    : rawurlencode($handle !== '' ? $handle : $did)),
             'username' => $handle !== '' ? $handle : $did,
             'acct' => $handle !== '' ? $handle : $did,
-            'display_name' => (string) ($author['displayName'] ?? $handle ?: $did),
+            'display_name' => $displayName,
             'avatar' => (string) ($author['avatar'] ?? ''),
         ],
         'reblogs_count' => (int) ($post['repostCount'] ?? 0),
