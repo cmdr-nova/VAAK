@@ -6100,7 +6100,7 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
     if ($ownerUserId < 1 || !function_exists('ap_bsky_home_rank_keys')) {
         return $ranked;
     }
-    $firstPage = max(8, $firstPage);
+    $firstPage = max(0, $firstPage);
     $ownDid = '';
     if (function_exists('ap_bsky_session_row')) {
         $sess = ap_bsky_session_row($ownerUserId);
@@ -6150,6 +6150,10 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
     if ($queued === []) {
         return $ranked;
     }
+    // No Fediverse head (muted follows / empty AP graph) — Bluesky-only Home seed.
+    if ($ranked === []) {
+        return array_slice($queued, 0, 60);
+    }
     $head = array_slice($ranked, 0, $firstPage);
     $tail = array_slice($ranked, $firstPage);
     $out = $head;
@@ -6161,7 +6165,7 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
             if ($sinceBsky < 2 && $out !== []) {
                 break;
             }
-            if (($bskyEmitted + 1) / max(1, count($out) + 1) > 0.30) {
+            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.30) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -6170,6 +6174,7 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
             $sinceBsky = 0;
         }
     };
+    $flush(); // allow Bluesky right after a short fedi head
     foreach ($tail as $item) {
         $out[] = $item;
         $sinceBsky++;
@@ -6472,13 +6477,30 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
         }
     }
     if ($timeline === []) {
-        return;
+        // Home can still be Bluesky-only for accounts whose AP follows are muted/empty.
+        if ($view !== 'home') {
+            return;
+        }
+    } else {
+        usort($timeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+        if (count($timeline) > 160) {
+            $timeline = array_slice($timeline, 0, 160);
+        }
     }
-    usort($timeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
-    if (count($timeline) > 160) {
-        $timeline = array_slice($timeline, 0, 160);
+    $ranked = $timeline !== [] ? admin_tl_rank_from_timeline($timeline) : [];
+    // Match full Home: keep a short fedi head, then mix Bluesky following posts.
+    if ($view === 'home' && function_exists('admin_home_queue_bsky_after_first_page')) {
+        $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+        if ($ownerUserId > 0) {
+            $fediN = count($ranked);
+            // Thin AP head (e.g. only own notes) → shorter head so Bluesky shows sooner.
+            $head = $fediN > 0 && $fediN < 12 ? min(5, max(3, $fediN)) : 15;
+            if ($fediN === 0) {
+                $head = 0;
+            }
+            $ranked = admin_home_queue_bsky_after_first_page($ranked, $ownerUserId, max(1, $head));
+        }
     }
-    $ranked = admin_tl_rank_from_timeline($timeline);
     if ($ranked !== []) {
         admin_tl_cache_put($cacheKey, $ranked);
     }
