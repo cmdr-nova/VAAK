@@ -4805,23 +4805,56 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     ], JSON_UNESCAPED_SLASHES) ?: '');
     $notifStampedeLock = '';
     $holdNotifLock = false;
+    $notifFreshSec = 45;
+    $notifStaleSec = 300; // Ice Cubes retries fast; serve stale rather than 3–5s cold rebuilds
+    $unwrapNotifCache = static function (?array $cached): ?array {
+        if (!is_array($cached)) {
+            return null;
+        }
+        // New envelope: {ts, items}; legacy: bare notification list
+        if (isset($cached['items']) && is_array($cached['items'])) {
+            return [
+                'ts' => (int) ($cached['ts'] ?? 0),
+                'items' => $cached['items'],
+            ];
+        }
+        if ($cached === [] || array_is_list($cached)) {
+            return ['ts' => time(), 'items' => $cached];
+        }
+        return null;
+    };
     if (function_exists('ap_redis_json_get')) {
-        $redisCached = ap_redis_json_get($redisKey);
-        if (is_array($redisCached)) {
-            return $redisCached;
+        $wrapped = $unwrapNotifCache(ap_redis_json_get($redisKey));
+        if (is_array($wrapped)) {
+            $age = time() - (int) ($wrapped['ts'] ?? 0);
+            $items = $wrapped['items'];
+            if ($age >= 0 && $age <= $notifFreshSec) {
+                return $items;
+            }
+            if ($age >= 0 && $age <= $notifStaleSec) {
+                // Stale-while-revalidate: answer Ice Cubes immediately, refresh after.
+                ap_masto_notifications_schedule_rebuild(
+                    $redisKey,
+                    $limit,
+                    $maxId,
+                    $sinceId,
+                    $want
+                );
+                return $items;
+            }
         }
         // Coalesce cold notification list rebuilds after idle.
         $notifStampedeLock = 'notif-rebuild:' . substr(hash('sha256', $redisKey), 0, 16);
         $holdNotifLock = function_exists('ap_redis_lock') && ap_redis_lock($notifStampedeLock, 30);
         if (!$holdNotifLock && function_exists('ap_redis_stampede_wait')) {
             $peer = ap_redis_stampede_wait(
-                static function () use ($redisKey) {
-                    return ap_redis_json_get($redisKey);
+                static function () use ($redisKey, $unwrapNotifCache) {
+                    return $unwrapNotifCache(ap_redis_json_get($redisKey));
                 },
                 200
             );
-            if (is_array($peer)) {
-                return $peer;
+            if (is_array($peer) && isset($peer['items']) && is_array($peer['items'])) {
+                return $peer['items'];
             }
         }
     }
@@ -4949,7 +4982,12 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
     $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
     foreach ($items as $item) {
-        $ent = ap_masto_notification_entity($item);
+        try {
+            $ent = ap_masto_notification_entity($item);
+        } catch (Throwable $e) {
+            error_log('[ap-masto] notification entity: ' . $e->getMessage());
+            continue;
+        }
         if ($ent === null) {
             continue;
         }
@@ -4968,14 +5006,60 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
     }
     if (function_exists('ap_redis_json_set')) {
-        // Long enough to make Notifications soft-nav / reopen feel cached,
-        // short enough that new activity still appears after a brief pause.
-        ap_redis_json_set($redisKey, $out, 45);
+        // Keep 5 minutes for stale-while-revalidate; freshness is gated by ts.
+        ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $out], 300);
     }
     if ($holdNotifLock && $notifStampedeLock !== '' && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($notifStampedeLock);
     }
     return $out;
+}
+
+/**
+ * After answering Ice Cubes from a stale notifications cache, refresh in the
+ * background so the next open is fresh without a multi-second wait.
+ *
+ * @param list<string> $want
+ */
+function ap_masto_notifications_schedule_rebuild(
+    string $redisKey,
+    int $limit,
+    ?string $maxId,
+    ?string $sinceId,
+    array $want
+): void {
+    static $scheduled = [];
+    if ($redisKey === '' || isset($scheduled[$redisKey])) {
+        return;
+    }
+    $scheduled[$redisKey] = true;
+    register_shutdown_function(static function () use ($redisKey, $limit, $maxId, $sinceId, $want): void {
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            $lock = 'notif-rebuild:' . substr(hash('sha256', $redisKey), 0, 16);
+            if (function_exists('ap_redis_lock') && !ap_redis_lock($lock, 30)) {
+                return;
+            }
+            try {
+                // Delete envelope so fetch rebuilds synchronously (no stale loop).
+                if (function_exists('ap_redis_delete')) {
+                    ap_redis_delete($redisKey);
+                }
+                ap_masto_notifications_fetch($limit, $maxId, $sinceId, $want, []);
+            } finally {
+                if (function_exists('ap_redis_unlock')) {
+                    ap_redis_unlock($lock);
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-masto] notif rebuild: ' . $e->getMessage());
+        }
+    });
 }
 
 /**
