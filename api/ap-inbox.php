@@ -5549,9 +5549,15 @@ function ap_publish_status_text(
         require_once __DIR__ . '/ap-publish-delivery.php';
         $deliveryOwnerId = function_exists('ap_db_owner_user_id_for_actor')
             ? ap_db_owner_user_id_for_actor($actor) : 0;
+        // Queue Bluesky text with poll option titles when commentary is empty
+        // (Bluesky has no native polls; empty text would skip the mirror).
+        $deliveryContent = $content;
+        if ($deliveryContent === '' && is_array($pollNorm) && !empty($pollNorm['options'])) {
+            $deliveryContent = "📊 Poll:\n• " . implode("\n• ", $pollNorm['options']);
+        }
         $deliveryPayload = [
             'local_id' => $localId,
-            'content' => $content,
+            'content' => $deliveryContent,
             'visibility' => $visibility,
             'media_local_ids' => $mediaLocalIds,
             'spoiler_text' => $spoilerText,
@@ -5691,9 +5697,15 @@ function ap_publish_status_text(
                     $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Quote awaits Fediverse authorization'];
                     ap_log('bsky_crosspost_deferred_quote note=' . $localId);
                 } else {
+                    // Bluesky has no native polls — mirror option titles as text
+                    // so empty poll posts are not skipped as "Nothing to cross-post".
+                    $bskyText = $content;
+                    if ($bskyText === '' && is_array($pollNorm) && !empty($pollNorm['options'])) {
+                        $bskyText = "📊 Poll:\n• " . implode("\n• ", $pollNorm['options']);
+                    }
                     $bsky = ap_bsky_crosspost_status(
                         $bskyOwnerId,
-                        $content,
+                        $bskyText,
                         $visibility,
                         $mediaLocalIds,
                         $spoilerText,

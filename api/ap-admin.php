@@ -765,6 +765,75 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             }
         }
     }
+    if ($action === 'poll_vote') {
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
+        $view = $returnView;
+        $pollId = (int) ($_POST['poll_id'] ?? 0);
+        $choicesRaw = $_POST['choices'] ?? [];
+        if (!is_array($choicesRaw)) {
+            $choicesRaw = $choicesRaw !== '' && $choicesRaw !== null ? [$choicesRaw] : [];
+        }
+        $choices = [];
+        foreach ($choicesRaw as $c) {
+            if (is_int($c) || (is_string($c) && ctype_digit($c))) {
+                $choices[] = (int) $c;
+            } elseif (is_string($c) && trim($c) !== '') {
+                $choices[] = trim($c);
+            }
+        }
+        $wantJsonPoll = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        $pollHtml = '';
+        $noteIdForPoll = trim((string) ($_POST['note_id'] ?? ''));
+        if ($pollId <= 0) {
+            $error = 'Invalid poll.';
+        } elseif ($choices === []) {
+            $error = 'Pick at least one option.';
+        } else {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+            $voter = function_exists('vaak_actor_id') ? vaak_actor_id() : '';
+            if ($voter === '') {
+                $error = 'Not signed in.';
+            } else {
+                $vres = ap_masto_poll_vote($pollId, $voter, $choices);
+                if (!empty($vres['ok'])) {
+                    $notice = 'Vote recorded.';
+                    if ($noteIdForPoll === '') {
+                        try {
+                            $pst = ap_db()->prepare('SELECT note_id FROM masto_polls WHERE local_id = ?');
+                            $pst->execute([$pollId]);
+                            $noteIdForPoll = (string) ($pst->fetchColumn() ?: '');
+                        } catch (Throwable $e) {
+                            $noteIdForPoll = '';
+                        }
+                    }
+                    if ($noteIdForPoll !== '' && function_exists('admin_poll_block_html')) {
+                        $pollHtml = admin_poll_block_html($noteIdForPoll, true);
+                    }
+                } else {
+                    $error = $vres['error'] ?? 'Could not vote.';
+                }
+            }
+        }
+        if ($wantJsonPoll) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            echo json_encode([
+                'ok' => $error === null,
+                'error' => $error,
+                'notice' => $notice,
+                'poll_html' => $pollHtml,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if ($returnView === 'status' && $noteIdForPoll !== '') {
+            $_GET['object'] = $noteIdForPoll;
+        }
+    }
     if (in_array($action, ['favourite_status', 'unfavourite_status', 'bookmark_status', 'unbookmark_status', 'reblog_status', 'unreblog_status'], true)) {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $view = $returnView;
@@ -1032,12 +1101,61 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         }
         $mediaPack = ap_admin_collect_media_uploads();
         $mediaIds = array_values(array_unique(array_merge($draftMedia, $mediaPack['ids'])));
-        if ($mediaPack['error'] !== null) {
+        // Optional poll: options[] + expires_in + multiple
+        $poll = null;
+        $pollRaw = $_POST['poll'] ?? null;
+        if (is_array($pollRaw)) {
+            $optsIn = $pollRaw['options'] ?? [];
+            if (!is_array($optsIn)) {
+                $optsIn = [];
+            }
+            $opts = [];
+            foreach ($optsIn as $o) {
+                $t = trim((string) $o);
+                if ($t === '') {
+                    continue;
+                }
+                if (mb_strlen($t) > 50) {
+                    $error = 'Poll option too long (max 50).';
+                    break;
+                }
+                $opts[] = $t;
+                if (count($opts) >= 4) {
+                    break;
+                }
+            }
+            if ($error === null) {
+                $expiresIn = (int) ($pollRaw['expires_in'] ?? 86400);
+                if (count($opts) < 2) {
+                    $error = 'Poll needs 2–4 options.';
+                } elseif ($expiresIn < 300 || $expiresIn > 604800) {
+                    $error = 'Poll duration must be between 5 minutes and 7 days.';
+                } else {
+                    $poll = [
+                        'options' => $opts,
+                        'expires_in' => $expiresIn,
+                        'multiple' => !empty($pollRaw['multiple']),
+                    ];
+                }
+            }
+        }
+        if ($error !== null) {
+            $composerForceOpen = true;
+            $view = $returnView;
+        } elseif ($poll !== null && $isQuote) {
+            $error = 'Cannot combine poll with quote.';
+            $composerForceOpen = true;
+            $view = $returnView;
+        } elseif ($poll !== null && $mediaIds) {
+            $error = "Polls can't include media yet.";
+            $composerForceOpen = true;
+            $view = $returnView;
+        } elseif ($mediaPack['error'] !== null) {
             $error = $mediaPack['error'];
             $composerForceOpen = true;
             $view = $returnView;
-        } elseif (!$isQuote && $content === '' && !$mediaIds) {
-            $error = 'Post text or media required (max 2000 chars).';
+        } elseif (!$isQuote && $content === '' && !$mediaIds && $poll === null) {
+            $error = 'Post text, media, or poll required (max 2000 chars).';
             $composerForceOpen = true;
             $view = $returnView;
         } elseif (mb_strlen($content) > 2000) {
@@ -1068,8 +1186,9 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $spoiler,
                 $sensitive,
                 $quoteObject !== '' ? $quoteObject : null,
-                $mediaIds,
-                $visibility
+                $poll !== null ? [] : $mediaIds,
+                $visibility,
+                $poll
             );
             if (!empty($result['ok'])) {
                 if ($fromDraftId > 0) {
@@ -1078,7 +1197,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $delivered = (int) ($result['delivered'] ?? 0);
                 $queued = (int) ($result['queued'] ?? 0);
                 $notice = $isQuote ? 'Quote posted.' : 'Posted to Your posts.';
-                if ($mediaIds) {
+                if ($poll !== null) {
+                    $notice .= ' · poll';
+                }
+                if ($mediaIds && $poll === null) {
                     $notice .= ' · ' . count($mediaIds) . ' media';
                 }
                 if (empty($result['delivery_pending']) && ($delivered > 0 || $queued > 0)) {
@@ -8213,6 +8335,29 @@ function admin_render_compose_panel(bool $inline = false): void
           <i class="ph ph-microphone" aria-hidden="true"></i>
         </button>
       <?php endif; ?>
+      <div class="compose-poll-panel" id="compose-poll-panel" hidden>
+        <div class="compose-poll-options" id="compose-poll-options">
+          <input type="text" name="poll[options][]" maxlength="50" placeholder="Option 1" disabled>
+          <input type="text" name="poll[options][]" maxlength="50" placeholder="Option 2" disabled>
+        </div>
+        <button type="button" class="btn btn-ghost" id="compose-poll-add" style="padding:.3rem .7rem;font-size:.82rem">Add option</button>
+        <label class="meta" style="display:flex;flex-direction:column;gap:.3rem;margin:.45rem 0 0">
+          Duration
+          <select name="poll[expires_in]" disabled>
+            <option value="300">5 minutes</option>
+            <option value="1800">30 minutes</option>
+            <option value="3600">1 hour</option>
+            <option value="21600">6 hours</option>
+            <option value="86400" selected>1 day</option>
+            <option value="259200">3 days</option>
+            <option value="604800">7 days</option>
+          </select>
+        </label>
+        <label class="composer-check" style="margin-top:.45rem">
+          <input type="checkbox" name="poll[multiple]" value="1" disabled>
+          <span>Allow multiple choices</span>
+        </label>
+      </div>
       <?php if ($prefillQuoteObject === '' && !$composeIsEdit): ?>
         <input name="in_reply_to" id="compose-in-reply-to" value="<?= h($prefillReplyTo) ?>" placeholder="Reply-to object URL (optional)"<?= $composeIsSelfReply ? ' readonly' : '' ?>>
         <?php if (!$composeIsSelfReply): ?>
@@ -10127,10 +10272,167 @@ function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerH
 }
 
 /**
- * Render one federation/home event as a tweet card.
- *
- * @param array<string,bool> $followingIds
+ * Mastodon-like poll bar UI for a note. Interactive when we have a local poll id.
  */
+function admin_poll_block_html(string $noteId, bool $interactive = true, string $returnView = 'home'): string
+{
+    $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
+        return '';
+    }
+    $row = null;
+    $choices = null;
+    $multiple = false;
+    $expired = false;
+    $expiresAt = '';
+    $votesCount = 0;
+    $votersCount = 0;
+    $voted = false;
+    $pollLocalId = 0;
+    try {
+        $st = ap_db()->prepare('SELECT * FROM masto_polls WHERE note_id = ? OR note_id = ? LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $row = $st->fetch();
+    } catch (Throwable $e) {
+        $row = null;
+    }
+    if (is_array($row)) {
+        $pollLocalId = (int) ($row['local_id'] ?? 0);
+        $multiple = !empty($row['multiple']);
+        $votesCount = (int) ($row['votes_count'] ?? 0);
+        $votersCount = (int) ($row['voters_count'] ?? 0);
+        $expiresAt = (string) ($row['expires_at'] ?? '');
+        $decoded = json_decode((string) ($row['options_json'] ?? '[]'), true);
+        $choices = is_array($decoded) ? $decoded : [];
+        try {
+            if ($expiresAt !== '') {
+                $expired = (new DateTimeImmutable($expiresAt)) <= new DateTimeImmutable('now');
+            }
+        } catch (Throwable $e) {
+            $expired = false;
+        }
+        $voters = json_decode((string) ($row['voters_json'] ?? '[]'), true);
+        if (!is_array($voters)) {
+            $voters = [];
+        }
+        $me = function_exists('vaak_actor_id') ? rtrim(vaak_actor_id(), '/') : '';
+        if ($me !== '') {
+            foreach ($voters as $v) {
+                if (rtrim((string) $v, '/') === $me) {
+                    $voted = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        // Display-only fallback: local Create JSON oneOf/anyOf
+        try {
+            $ost = ap_db()->prepare(
+                'SELECT raw_create_json FROM outbox_notes WHERE id = ? OR id = ? LIMIT 1'
+            );
+            $ost->execute([$noteId, $noteId . '/']);
+            $raw = (string) ($ost->fetchColumn() ?: '');
+            if ($raw !== '') {
+                $decoded = json_decode($raw, true);
+                $obj = is_array($decoded) ? ($decoded['object'] ?? $decoded) : null;
+                if (is_array($obj)) {
+                    $choices = $obj['oneOf'] ?? $obj['anyOf'] ?? null;
+                    $multiple = isset($obj['anyOf']);
+                    if (!empty($obj['endTime']) && is_string($obj['endTime'])) {
+                        $expiresAt = (string) $obj['endTime'];
+                        try {
+                            $expired = (new DateTimeImmutable($expiresAt)) <= new DateTimeImmutable('now');
+                        } catch (Throwable $e) {
+                            $expired = false;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            $choices = null;
+        }
+    }
+    if (!is_array($choices) || $choices === []) {
+        return '';
+    }
+    $opts = [];
+    $totalVotes = 0;
+    foreach ($choices as $ch) {
+        if (!is_array($ch)) {
+            continue;
+        }
+        $title = trim((string) ($ch['title'] ?? $ch['name'] ?? ''));
+        if ($title === '') {
+            continue;
+        }
+        $vc = (int) ($ch['votes_count'] ?? 0);
+        $totalVotes += $vc;
+        $opts[] = ['title' => $title, 'votes' => $vc];
+    }
+    if ($opts === []) {
+        return '';
+    }
+    if ($votesCount <= 0) {
+        $votesCount = $totalVotes;
+    }
+    $showResults = $expired || $voted || !$interactive || $pollLocalId <= 0;
+    $canVote = $interactive && $pollLocalId > 0 && !$expired && !$voted;
+    $label = 'Poll' . ($expired ? ' · closed' : ($voted ? ' · voted' : ''));
+    $html = '<div class="poll-block" data-note-id="' . h($noteId) . '"'
+        . ($pollLocalId > 0 ? ' data-poll-id="' . $pollLocalId . '"' : '') . '>';
+    $html .= '<span class="poll-label">' . h($label) . '</span>';
+    if ($canVote) {
+        $inputType = $multiple ? 'checkbox' : 'radio';
+        $html .= '<form method="post" action="?view=' . h($returnView) . '" class="poll-vote-form">'
+            . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+            . '<input type="hidden" name="action" value="poll_vote">'
+            . '<input type="hidden" name="poll_id" value="' . $pollLocalId . '">'
+            . '<input type="hidden" name="note_id" value="' . h($noteId) . '">'
+            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">';
+        foreach ($opts as $i => $opt) {
+            $html .= '<label class="poll-opt poll-opt--vote">'
+                . '<input type="' . $inputType . '" name="choices[]" value="' . $i . '">'
+                . '<span>' . h($opt['title']) . '</span></label>';
+        }
+        $html .= '<button class="btn btn-ghost" type="submit" style="margin-top:.4rem;padding:.3rem .7rem;font-size:.82rem">Vote</button>'
+            . '</form>';
+    } else {
+        foreach ($opts as $opt) {
+            $pct = ($showResults && $votesCount > 0)
+                ? (int) round(($opt['votes'] / $votesCount) * 100)
+                : 0;
+            $html .= '<div class="poll-opt' . ($showResults ? ' poll-opt--result' : '') . '">'
+                . '<div class="poll-opt-bar" style="width:' . $pct . '%"></div>'
+                . '<span class="poll-opt-text">' . h($opt['title']) . '</span>';
+            if ($showResults) {
+                $html .= '<span class="poll-opt-count">' . $pct . '% · ' . (int) $opt['votes'] . '</span>';
+            }
+            $html .= '</div>';
+        }
+    }
+    $metaParts = [];
+    if ($showResults) {
+        $metaParts[] = $votesCount . ' vote' . ($votesCount === 1 ? '' : 's');
+        if ($votersCount > 0) {
+            $metaParts[] = $votersCount . ' voter' . ($votersCount === 1 ? '' : 's');
+        }
+    }
+    if ($expiresAt !== '') {
+        try {
+            $metaParts[] = ($expired ? 'ended ' : 'ends ')
+                . (new DateTimeImmutable($expiresAt))->setTimezone(new DateTimeZone('UTC'))->format('M j, Y · H:i') . ' UTC';
+        } catch (Throwable $e) {
+            // skip bad expires
+        }
+    }
+    if ($metaParts !== []) {
+        $html .= '<div class="poll-meta">' . h(implode(' · ', $metaParts)) . '</div>';
+    }
+    $html .= '</div>';
+    return $html;
+}
+
 /**
  * True when an inbound event is an empty followers-only firehose stub
  * (no text/media) — useless "reply to parent post" cards on Federated.
@@ -10525,7 +10827,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   }));
               }
               $mediaChunk = $eMedia ? admin_media_row_html($eMedia) : '';
-              echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk);
+              $pollChunk = ($objectId !== '' && function_exists('admin_poll_block_html'))
+                  ? admin_poll_block_html($objectId, true, (string) $returnView)
+                  : '';
+              echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyChunk . $mediaChunk . $pollChunk);
             ?>
             <div class="tags">
               <?php if (!empty($e['target_actor'])): ?><span class="tag">target <?= h(basename(parse_url((string) $e['target_actor'], PHP_URL_PATH) ?: '')) ?></span><?php endif; ?>
@@ -12746,13 +13051,17 @@ function admin_render_outbox_card(array $n, string $returnView): void
             <?php endif; ?>
             <?php
               $ownInner = '';
-              if ($bodyPlain !== '' && $bodyPlain !== '(quote)') {
+              if ($bodyPlain !== '' && !in_array($bodyPlain, ['(quote)', '(media)', '(poll)'], true)) {
                   $ownInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
                       . admin_linkify_body_html($bodyPlain, $returnView, [], $actor !== '' ? $actor : null) . '</div>';
               }
               $ownInner .= $quoteHtml . $mediaHtml;
+              $pollHtml = ($noteId !== '' && function_exists('admin_poll_block_html'))
+                  ? admin_poll_block_html($noteId, true, (string) $returnView)
+                  : '';
+              $ownInner .= $pollHtml;
               $linkCardHtml = '';
-              if ($mediaHtml === '' && $bodyPlain !== '' && function_exists('ap_link_preview_for_url') && function_exists('ap_link_preview_extract_url')) {
+              if ($mediaHtml === '' && $pollHtml === '' && $bodyPlain !== '' && function_exists('ap_link_preview_for_url') && function_exists('ap_link_preview_extract_url')) {
                   $cardUrl = ap_link_preview_extract_url($bodyPlain);
                   if ($cardUrl !== null) {
                       // Cache-only — never sync-fetch OG cards on timeline render
@@ -15767,6 +16076,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .compose-modal__panel > .composer > .quote-block,
     .compose-modal__panel > .composer > .composer-check,
     .compose-modal__panel > .composer > .compose-media-row,
+    .compose-modal__panel > .composer > .compose-poll-panel,
     .compose-modal__panel > .composer > .composer-actions,
     .compose-modal__panel > .composer > label,
     .compose-modal__panel > .composer > input:not([type="hidden"]) {
@@ -16186,6 +16496,45 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .compose-media-row {
       display: flex; flex-wrap: wrap; gap: .65rem; margin: .65rem 0 .25rem;
     }
+    .compose-poll-panel {
+      margin: .65rem 0 .35rem; padding: .65rem .75rem;
+      border: 1px solid var(--border); border-radius: 12px; background: #0c0c0c;
+    }
+    .compose-poll-panel[hidden] { display: none !important; }
+    .compose-poll-options {
+      display: flex; flex-direction: column; gap: .4rem; margin-bottom: .45rem;
+    }
+    .compose-poll-options input[type="text"] {
+      width: 100%; max-width: 100%;
+    }
+    .compose-poll-panel select { max-width: 18rem; }
+    .poll-block {
+      margin: .65rem 0 0; padding: .55rem .7rem;
+      border-radius: 10px; border: 1px solid var(--border); background: #0e1218;
+    }
+    .poll-block .poll-label {
+      display: block; font-size: .72rem; text-transform: uppercase;
+      letter-spacing: .05em; color: var(--muted); margin-bottom: .4rem;
+    }
+    .poll-block .poll-opt {
+      position: relative; display: block; margin: .28rem 0; padding: .4rem .55rem;
+      border-radius: 8px; border: 1px solid #333; background: #141820;
+      color: var(--text); font-size: .88rem; overflow: hidden;
+    }
+    .poll-block .poll-opt--vote {
+      display: flex; align-items: center; gap: .45rem; cursor: pointer;
+    }
+    .poll-block .poll-opt--result { display: flex; align-items: center; gap: .5rem; }
+    .poll-block .poll-opt-bar {
+      position: absolute; inset: 0 auto 0 0; background: color-mix(in srgb, var(--primary) 22%, transparent);
+      pointer-events: none;
+    }
+    .poll-block .poll-opt-text { position: relative; z-index: 1; flex: 1 1 auto; }
+    .poll-block .poll-opt-count {
+      position: relative; z-index: 1; flex: 0 0 auto;
+      font-size: .75rem; color: var(--muted);
+    }
+    .poll-block .poll-meta { margin-top: .4rem; font-size: .75rem; color: var(--muted); }
     .composer.is-dragover {
       outline: 2px dashed var(--primary);
       outline-offset: 5px;
@@ -24342,6 +24691,55 @@ window.apAdminToast = function (msg, isErr) {
     }
   });
 })();
+
+(function bindPollVotes() {
+  document.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement) || !form.classList.contains('poll-vote-form')) return;
+    const actionInput = form.querySelector('input[name="action"]');
+    if (!actionInput || actionInput.value !== 'poll_vote') return;
+    const checked = form.querySelectorAll('input[name="choices[]"]:checked');
+    if (!checked.length) {
+      ev.preventDefault();
+      if (window.apAdminToast) window.apAdminToast('Pick at least one option.', true);
+      return;
+    }
+    ev.preventDefault();
+    if (form.dataset.busy === '1') return;
+    form.dataset.busy = '1';
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    try {
+      const fd = new FormData(form);
+      fd.set('ajax', '1');
+      const res = await fetch(form.getAttribute('action') || window.location.href, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok) {
+        if (window.apAdminToast) window.apAdminToast((data && data.error) || 'Could not vote.', true);
+        return;
+      }
+      const block = form.closest('.poll-block');
+      if (block && data.poll_html) {
+        const wrap = document.createElement('div');
+        wrap.innerHTML = String(data.poll_html);
+        const next = wrap.firstElementChild;
+        if (next) block.replaceWith(next);
+      }
+      if (window.apAdminToast) window.apAdminToast(data.notice || 'Vote recorded.');
+    } catch (err) {
+      if (window.apAdminToast) window.apAdminToast('Network error — try again.', true);
+    } finally {
+      form.dataset.busy = '0';
+      if (btn) btn.disabled = false;
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    }
+  });
+})();
 </script>
 <script>
 // Bluesky like/boost/bookmark on every view that can render a Bluesky card
@@ -27098,13 +27496,20 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     const pollBtn = document.createElement('button');
     pollBtn.type = 'button';
     pollBtn.className = 'compose-tool';
+    pollBtn.id = 'compose-poll-toggle';
     pollBtn.innerHTML = '<i class="ph ph-chart-bar" aria-hidden="true"></i>';
     pollBtn.title = 'Create poll';
     pollBtn.setAttribute('aria-label', 'Create poll');
+    pollBtn.setAttribute('aria-pressed', 'false');
     pollBtn.addEventListener('click', () => {
-      if (window.apAdminToast) window.apAdminToast('Polls are not supported by Vaak yet.', true);
+      if (typeof window.vaakToggleComposePoll === 'function') {
+        window.vaakToggleComposePoll();
+      }
     });
     tools.appendChild(pollBtn);
+    if (typeof window.vaakSyncComposePollChrome === 'function') {
+      window.vaakSyncComposePollChrome();
+    }
     const recordBtnInline = composeForm.querySelector('#compose-record-btn');
     if (recordBtnInline) {
       recordBtnInline.className = 'compose-tool';
@@ -27310,6 +27715,108 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   const draftBtn = document.getElementById('compose-draft-btn');
   let draftSaveBusy = false;
   let skipDraftOnClose = false;
+
+  function composePollPanel() {
+    const form = (typeof activeComposeForm === 'function' && activeComposeForm())
+      || document.getElementById('compose-form');
+    return form ? form.querySelector('#compose-poll-panel') : document.getElementById('compose-poll-panel');
+  }
+  function composePollFieldsDisabled(disabled) {
+    const panel = composePollPanel();
+    if (!panel) return;
+    panel.querySelectorAll('input, select').forEach((el) => {
+      el.disabled = !!disabled;
+    });
+  }
+  function composePollIsEditOrQuote() {
+    const form = (typeof activeComposeForm === 'function' && activeComposeForm())
+      || document.getElementById('compose-form');
+    if (!form) return false;
+    const action = form.querySelector('#compose-action');
+    if (action && String(action.value || '') === 'edit_status') return true;
+    const noteId = form.querySelector('#compose-note-id');
+    if (noteId && String(noteId.value || '').trim()) return true;
+    const quote = form.querySelector('input[name="quote_object"]');
+    if (quote && String(quote.value || '').trim()) return true;
+    return false;
+  }
+  function setComposePollOpen(open) {
+    const panel = composePollPanel();
+    const form = (typeof activeComposeForm === 'function' && activeComposeForm())
+      || document.getElementById('compose-form');
+    const toggle = form
+      ? form.querySelector('#compose-poll-toggle')
+      : document.getElementById('compose-poll-toggle');
+    const draft = form
+      ? form.querySelector('#compose-draft-btn')
+      : document.getElementById('compose-draft-btn');
+    const queue = form
+      ? form.querySelector('#compose-queue-btn')
+      : document.getElementById('compose-queue-btn');
+    if (!panel) return;
+    if (open) {
+      panel.hidden = false;
+      composePollFieldsDisabled(false);
+      if (toggle) toggle.setAttribute('aria-pressed', 'true');
+      if (draft) draft.disabled = true;
+      if (queue) queue.disabled = true;
+    } else {
+      panel.hidden = true;
+      composePollFieldsDisabled(true);
+      if (toggle) toggle.setAttribute('aria-pressed', 'false');
+      if (draft) draft.disabled = false;
+      if (queue) queue.disabled = false;
+    }
+  }
+  window.vaakToggleComposePoll = function () {
+    if (composePollIsEditOrQuote()) {
+      if (window.apAdminToast) window.apAdminToast('Polls are not available while editing or quoting.', true);
+      return;
+    }
+    const panel = composePollPanel();
+    if (!panel) return;
+    setComposePollOpen(!!panel.hidden);
+  };
+  window.vaakSyncComposePollChrome = function () {
+    const form = (typeof activeComposeForm === 'function' && activeComposeForm())
+      || document.getElementById('compose-form');
+    const toggle = form
+      ? form.querySelector('#compose-poll-toggle')
+      : document.getElementById('compose-poll-toggle');
+    const blocked = composePollIsEditOrQuote();
+    if (toggle) {
+      toggle.style.display = blocked ? 'none' : '';
+      toggle.disabled = blocked;
+    }
+    if (blocked) {
+      setComposePollOpen(false);
+    }
+  };
+  (function bindComposePollControls() {
+    const form = document.getElementById('compose-form');
+    if (!form) return;
+    const addBtn = form.querySelector('#compose-poll-add');
+    if (addBtn) {
+      addBtn.addEventListener('click', () => {
+        const wrap = form.querySelector('#compose-poll-options');
+        if (!wrap) return;
+        const inputs = wrap.querySelectorAll('input[name="poll[options][]"]');
+        if (inputs.length >= 4) {
+          if (window.apAdminToast) window.apAdminToast('Polls allow up to 4 options.', true);
+          return;
+        }
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.name = 'poll[options][]';
+        inp.maxLength = 50;
+        inp.placeholder = 'Option ' + (inputs.length + 1);
+        inp.disabled = !!form.querySelector('#compose-poll-panel[hidden]');
+        wrap.appendChild(inp);
+        if (inputs.length + 1 >= 4) addBtn.disabled = true;
+      });
+    }
+    window.vaakSyncComposePollChrome();
+  })();
 
   function clampComposeTextarea() {
     const ta = document.getElementById('compose-content');
@@ -27577,6 +28084,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       if (title) title.textContent = 'Quote';
       if (submitBtn) submitBtn.textContent = 'Quote';
       if (ta) ta.placeholder = 'Add commentary (optional)…';
+      if (typeof setComposePollOpen === 'function') setComposePollOpen(false);
+      if (typeof window.vaakSyncComposePollChrome === 'function') window.vaakSyncComposePollChrome();
     } else {
       const isSelf = !!replyUrl
         && /https:\/\/mkultra\.monster\/users\/[^/]+\/notes\//i.test(replyUrl);
@@ -28449,6 +28958,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       toActor.style.display = '';
       if (toActor.parentElement) toActor.parentElement.style.display = '';
     }
+    if (typeof setComposePollOpen === 'function') setComposePollOpen(false);
+    if (typeof window.vaakSyncComposePollChrome === 'function') window.vaakSyncComposePollChrome();
     syncReplyPrivacyGuard();
   }
   window.__apResetComposeChrome = resetComposeChrome;
@@ -28512,6 +29023,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       toActor.value = '';
       toActor.style.display = 'none';
     }
+    if (typeof setComposePollOpen === 'function') setComposePollOpen(false);
+    if (typeof window.vaakSyncComposePollChrome === 'function') window.vaakSyncComposePollChrome();
   }
 
   function fillEditFields(content, spoilerText, sensitive) {
@@ -29331,6 +29844,7 @@ if (VIEW === 'analytics') loadAnalytics();
 <?php
 
 /**
+ * @param array{options?:list<string>,expires_in?:int,multiple?:bool}|null $poll
  * @return array{ok:bool,error?:string,create_id?:string,delivered?:int,queued?:int}
  */
 function ap_local_post_reply(
@@ -29341,7 +29855,8 @@ function ap_local_post_reply(
     ?bool $sensitive = null,
     ?string $quoteObjectId = null,
     array $mediaLocalIds = [],
-    string $visibility = 'public'
+    string $visibility = 'public',
+    ?array $poll = null
 ): array {
     $localActor = function_exists('ap_local_actor_id') ? ap_local_actor_id() : LOCAL_ACTOR;
     $replyTo = ($inReplyTo === ''
@@ -29357,7 +29872,7 @@ function ap_local_post_reply(
         $spoilerText,
         $sensitive,
         $quoteObjectId,
-        null,
+        $poll,
         $visibility
     );
 }
