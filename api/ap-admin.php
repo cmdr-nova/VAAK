@@ -812,7 +812,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                         }
                     }
                     if ($noteIdForPoll !== '' && function_exists('admin_poll_block_html')) {
-                        $pollHtml = admin_poll_block_html($noteIdForPoll, true);
+                        $pollHtml = admin_poll_block_html($noteIdForPoll, true, $returnView);
                     }
                 } else {
                     $error = $vres['error'] ?? 'Could not vote.';
