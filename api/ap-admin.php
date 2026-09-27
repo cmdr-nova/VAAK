@@ -1262,13 +1262,18 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         } elseif ($action === 'pin_status') {
             $res = function_exists('ap_masto_status_pin') ? ap_masto_status_pin($localId) : ['ok' => false, 'error' => 'Pin unavailable'];
             if (!empty($res['ok'])) {
-                $notice = 'Pinned — shows on your HTML profile and in Ice Cubes.';
+                $notice = !empty($res['replaced'])
+                    ? 'Pinned — previous pin replaced. Shows on your HTML profile.'
+                    : 'Pinned — shows on your HTML profile.';
                 if (function_exists('ap_bsky_sync_pin_to_bluesky')) {
                     require_once __DIR__ . '/ap-bsky.php';
-                    // Pin never clears Bluesky — missing twin waits for crosspost retry.
-                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, false);
+                    // Replacing a pin may clear Bluesky if the new post has no twin yet
+                    // (old Bluesky pin must not linger). First-time pin still waits on mirror.
+                    $bpin = ap_bsky_sync_pin_to_bluesky($vaakOwnerId, !empty($res['replaced']));
                     if (!empty($bpin['ok']) && !empty($bpin['uri']) && empty($bpin['skipped'])) {
                         $notice .= ' Bluesky pin updated.';
+                    } elseif (!empty($bpin['ok']) && !empty($bpin['cleared'])) {
+                        $notice .= ' Bluesky pin cleared until the new mirror is ready.';
                     } elseif (!empty($bpin['ok']) && !empty($bpin['skipped'])) {
                         $notice .= ' Bluesky pin will sync when the mirror is ready.';
                     } elseif (!empty($bpin['error']) && $bpin['error'] !== 'Bluesky not connected'
@@ -8775,8 +8780,8 @@ function admin_pin_post_button(string $noteId, string $returnView = 'outbox', st
     $action = $pinned ? 'unpin_status' : 'pin_status';
     $label = $pinned ? 'Unpin from profile' : 'Pin to profile';
     $title = $pinned
-        ? 'Remove this post from your HTML profile pin'
-        : 'Pin on your HTML profile and Ice Cubes (max 5)';
+        ? 'Remove this post from your profile pin'
+        : 'Pin on your HTML profile (replaces any current pin)';
     $actionUrl = '?view=' . rawurlencode($returnView);
     if ($returnView === 'status') {
         $actionUrl .= '&object=' . rawurlencode($noteId);
