@@ -5257,13 +5257,16 @@ if (
         $adminTlStampedeLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
             . substr(hash('sha256', $adminTlCacheKey), 0, 12);
         if (!ap_redis_lock($adminTlStampedeLock, 45)) {
-            // Soft-nav shells must not wait — return a skeleton and fill via
-            // infinite-scroll. Full page / offset loads wait briefly for a peer.
+            // Soft-nav shells and full-page first paint must not wait long —
+            // return/defer and fill via infinite-scroll. Deep offset loads wait longer.
             $wantSoftShellEarly = isset($_GET['partial'], $_GET['shell'])
                 && (string) $_GET['partial'] === '1'
                 && (string) $_GET['shell'] === '1'
                 && (int) ($_GET['offset'] ?? 0) === 0;
-            $waitMs = $wantSoftShellEarly ? 200 : 2000;
+            $wantFullPageFirst = !$isPartial
+                && (int) ($_GET['offset'] ?? 0) === 0
+                && in_array($view, ['home', 'local', 'feed'], true);
+            $waitMs = ($wantSoftShellEarly || $wantFullPageFirst) ? 200 : 2000;
             $peerCached = function_exists('ap_redis_stampede_wait')
                 ? ap_redis_stampede_wait(
                     static function () use ($adminTlCacheKey) {
@@ -5284,6 +5287,34 @@ if (
             $adminTlStampedeLock = '';
         }
     }
+}
+
+// Full-page Home/Local/Federated cache miss: skip the synchronous rebuild
+// (account switch / cold cache was 30–90s). Empty first paint + client fill +
+// lean ranked warm after response — same idea as soft-nav shell.
+$adminTlFullPageDefer = false;
+if (
+    !$isPartial
+    && !$adminTlFromCache
+    && (int) ($_GET['offset'] ?? 0) === 0
+    && in_array($view, ['home', 'local', 'feed'], true)
+) {
+    $warmLock = $adminTlStampedeLock;
+    if ($adminTlStampedeLock !== '') {
+        if (function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+        }
+        $adminTlStampedeLock = '';
+    }
+    if ($warmLock === '' && $adminTlCacheKey !== '') {
+        $warmLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
+            . substr(hash('sha256', $adminTlCacheKey), 0, 12);
+    }
+    admin_tl_schedule_ranked_warm($view, $following, $adminTlCacheKey, $warmLock);
+    $adminTlFullPageDefer = true;
+    $adminTlFromCache = true;
+    $adminTlRankedCached = [];
+    $adminTlCachedHasMore = true;
 }
 
 // Fast soft-nav shell for Home/Local/Federated: never block on a full ranked
@@ -17963,6 +17994,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $homeHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($homeTimeline) > $tlLimit || !empty($GLOBALS['admin_home_queued_bsky']));
+          $homeNeedsFill = !empty($adminTlFullPageDefer) || ($homePage === [] && $homeHasMore);
+          if ($homeNeedsFill) {
+              $homeHasMore = true;
+          }
           $homeOnboard = admin_home_onboarding_state(
               is_array($vaakUser) ? $vaakUser : null,
               (string) $vaakActorId
@@ -17990,10 +18025,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
           <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" data-onboarding="1" hidden></div>
         <?php endif; ?>
-        <?php if (!$homeTimeline): ?>
+        <?php if (!$homeTimeline && empty($adminTlFullPageDefer)): ?>
           <div class="empty">Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</div>
         <?php endif; ?>
-        <div id="timeline-items" data-view="home" data-offset="<?= (int) count($homePage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($homePage[0]['sort']) ? $homePage[0]['sort'] : time()) ?>">
+        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) count($homePage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($homePage[0]['sort']) ? $homePage[0]['sort'] : time()) ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?>>
           <?php foreach ($homePage as $homeIndex => $item): ?>
             <?php
               if (admin_timeline_item_muted_by_words($item)) {
@@ -18011,7 +18046,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
           <?php endif; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeHasMore ? 'Scroll for more…' : ($homeTimeline ? 'End of timeline' : '') ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeNeedsFill ? 'Loading timeline…' : ($homeHasMore ? 'Scroll for more…' : ($homeTimeline ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'local'): ?>
@@ -18020,14 +18055,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $localHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($localTimeline) > $tlLimit);
+          $localNeedsFill = !empty($adminTlFullPageDefer) || ($localPage === [] && $localHasMore);
+          if ($localNeedsFill) {
+              $localHasMore = true;
+          }
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($localPage));
           }
         ?>
-        <?php if (!$localTimeline): ?>
+        <?php if (!$localTimeline && empty($adminTlFullPageDefer)): ?>
           <div class="empty">No local posts yet. When anyone on this instance posts, it shows up here.</div>
         <?php endif; ?>
-        <div id="timeline-items" data-view="local" data-offset="<?= (int) count($localPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($localPage[0]['sort']) ? $localPage[0]['sort'] : time()) ?>">
+        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) count($localPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($localPage[0]['sort']) ? $localPage[0]['sort'] : time()) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?>>
           <?php foreach ($localPage as $item): ?>
             <?php
               if (admin_timeline_item_muted_by_words($item)) {
@@ -18037,7 +18076,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             ?>
           <?php endforeach; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $localHasMore ? 'Scroll for more…' : ($localTimeline ? 'End of timeline' : '') ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $localNeedsFill ? 'Loading timeline…' : ($localHasMore ? 'Scroll for more…' : ($localTimeline ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'feed'): ?>
@@ -18046,12 +18085,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $feedHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($feedTimeline) > $tlLimit);
+          $feedNeedsFill = !empty($adminTlFullPageDefer) || ($feedPage === [] && $feedHasMore);
+          if ($feedNeedsFill) {
+              $feedHasMore = true;
+          }
           if (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($feedPage));
           }
         ?>
-        <?php if (!$feedTimeline): ?><div class="empty">No federation events yet.</div><?php endif; ?>
-        <div id="timeline-items" data-view="feed" data-offset="<?= (int) count($feedPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($feedPage[0]['sort']) ? $feedPage[0]['sort'] : time()) ?>">
+        <?php if (!$feedTimeline && empty($adminTlFullPageDefer)): ?><div class="empty">No federation events yet.</div><?php endif; ?>
+        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) count($feedPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($feedPage[0]['sort']) ? $feedPage[0]['sort'] : time()) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?>>
           <?php foreach ($feedPage as $item): ?>
             <?php
               if (admin_timeline_item_muted_by_words($item)) {
@@ -18061,7 +18104,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             ?>
           <?php endforeach; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $feedHasMore ? 'Scroll for more…' : ($feedTimeline ? 'End of timeline' : '') ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= !empty($feedNeedsFill) ? 'Loading timeline…' : ($feedHasMore ? 'Scroll for more…' : ($feedTimeline ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'favourites'): ?>
