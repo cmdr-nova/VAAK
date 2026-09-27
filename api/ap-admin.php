@@ -6326,8 +6326,12 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                  ORDER BY created_at DESC, id DESC
                  LIMIT 160"
             );
+            $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
             foreach ($st->fetchAll() ?: [] as $erow) {
                 if (!is_array($erow)) {
+                    continue;
+                }
+                if ($ownerUserId > 0 && admin_timeline_row_hidden($erow, $ownerUserId)) {
                     continue;
                 }
                 $timeline[] = [
@@ -6350,8 +6354,12 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                  ORDER BY created_at DESC, id DESC
                  LIMIT 160"
             );
+            $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
             foreach ($st->fetchAll() ?: [] as $erow) {
                 if (!is_array($erow)) {
+                    continue;
+                }
+                if ($ownerUserId > 0 && admin_timeline_row_hidden($erow, $ownerUserId)) {
                     continue;
                 }
                 $timeline[] = [
@@ -6364,14 +6372,28 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
             return;
         }
     } else {
-        // home: followed actors + self (matches full Home mix of follows + own notes)
+        // home: ActivityPub follows + self. Skip Bluesky DIDs/bsky.app URLs (no
+        // events rows) and globally muted/blocked actors — otherwise a single
+        // muted flood follow can fill the lean cache and hydrate to an empty UI.
+        $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
         $actorIds = [];
         foreach ($following as $frow) {
             $fa = rtrim((string) ($frow['actor_id'] ?? ''), '/');
-            if ($fa !== '') {
-                $actorIds[$fa] = true;
-                $actorIds[$fa . '/'] = true;
+            if ($fa === '' || !str_starts_with($fa, 'https://')) {
+                continue;
             }
+            if (str_contains($fa, 'bsky.app/')) {
+                continue;
+            }
+            $host = (string) ($frow['host'] ?? '');
+            if ($host === '' && function_exists('ap_actor_host')) {
+                $host = (string) (ap_actor_host($fa) ?? '');
+            }
+            if (function_exists('ap_row_is_hidden') && ap_row_is_hidden($fa, $host !== '' ? $host : null, $ownerUserId > 0 ? $ownerUserId : null)) {
+                continue;
+            }
+            $actorIds[$fa] = true;
+            $actorIds[$fa . '/'] = true;
         }
         $self = '';
         if (function_exists('ap_local_actor_id')) {
@@ -6381,42 +6403,81 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
             $actorIds[$self] = true;
             $actorIds[$self . '/'] = true;
         }
-        if ($actorIds === []) {
-            return;
+        if ($actorIds !== []) {
+            try {
+                $perActor = [];
+                foreach (array_chunk(array_keys($actorIds), 400) as $chunk) {
+                    $ph = implode(',', array_fill(0, count($chunk), '?'));
+                    $st = $db->prepare(
+                        "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
+                                action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
+                         FROM events
+                         WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
+                           AND (action_taken = 'log' OR action_taken = 'local_observe')
+                           AND actor_id IN ($ph)
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT 240"
+                    );
+                    $st->execute($chunk);
+                    foreach ($st->fetchAll() ?: [] as $erow) {
+                        if (!is_array($erow)) {
+                            continue;
+                        }
+                        if ($ownerUserId > 0 && admin_timeline_row_hidden($erow, $ownerUserId)) {
+                            continue;
+                        }
+                        if (function_exists('admin_event_is_empty_private_stub') && admin_event_is_empty_private_stub($erow)) {
+                            continue;
+                        }
+                        $aid = rtrim((string) ($erow['actor_id'] ?? ''), '/');
+                        $n = $perActor[$aid] ?? 0;
+                        if ($n >= 25) {
+                            continue; // keep lean seed diverse
+                        }
+                        $perActor[$aid] = $n + 1;
+                        $timeline[] = [
+                            'kind' => 'event',
+                            'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
+                            'row' => $erow,
+                        ];
+                    }
+                }
+            } catch (Throwable $e) {
+                // fall through to outbox seed
+            }
         }
-        try {
-            foreach (array_chunk(array_keys($actorIds), 400) as $chunk) {
-                $ph = implode(',', array_fill(0, count($chunk), '?'));
+        // Own notes live in outbox_notes more often than events.
+        if ($self !== '' && str_starts_with($self, 'https://mkultra.monster/users/')) {
+            try {
                 $st = $db->prepare(
-                    "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
-                            action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
-                     FROM events
-                     WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
-                       AND (action_taken = 'log' OR action_taken = 'local_observe')
-                       AND actor_id IN ($ph)
-                     ORDER BY created_at DESC, id DESC
-                     LIMIT 120"
+                    "SELECT * FROM outbox_notes
+                     WHERE id LIKE ?
+                     ORDER BY published DESC
+                     LIMIT 40"
                 );
-                $st->execute($chunk);
-                foreach ($st->fetchAll() ?: [] as $erow) {
-                    if (!is_array($erow)) {
+                $st->execute([$self . '/notes/%']);
+                foreach ($st->fetchAll() ?: [] as $nrow) {
+                    if (!is_array($nrow)) {
                         continue;
                     }
                     $timeline[] = [
-                        'kind' => 'event',
-                        'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
-                        'row' => $erow,
+                        'kind' => 'outbox',
+                        'sort' => strtotime((string) ($nrow['published'] ?? '')) ?: 0,
+                        'row' => $nrow,
                     ];
                 }
+            } catch (Throwable $e) {
+                // optional
             }
-        } catch (Throwable $e) {
-            return;
         }
     }
     if ($timeline === []) {
         return;
     }
     usort($timeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    if (count($timeline) > 160) {
+        $timeline = array_slice($timeline, 0, 160);
+    }
     $ranked = admin_tl_rank_from_timeline($timeline);
     if ($ranked !== []) {
         admin_tl_cache_put($cacheKey, $ranked);
