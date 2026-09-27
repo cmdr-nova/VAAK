@@ -5549,21 +5549,17 @@ function ap_publish_status_text(
         require_once __DIR__ . '/ap-publish-delivery.php';
         $deliveryOwnerId = function_exists('ap_db_owner_user_id_for_actor')
             ? ap_db_owner_user_id_for_actor($actor) : 0;
-        // Queue Bluesky text with poll option titles when commentary is empty
-        // (Bluesky has no native polls; empty text would skip the mirror).
-        $deliveryContent = $content;
-        if ($deliveryContent === '' && is_array($pollNorm) && !empty($pollNorm['options'])) {
-            $deliveryContent = "📊 Poll:\n• " . implode("\n• ", $pollNorm['options']);
-        }
+        // Bluesky has no native polls — never mirror Question posts there.
         $deliveryPayload = [
             'local_id' => $localId,
-            'content' => $deliveryContent,
+            'content' => $content,
             'visibility' => $visibility,
             'media_local_ids' => $mediaLocalIds,
             'spoiler_text' => $spoilerText,
             'in_reply_to' => $inReplyTo,
             'quote_object_id' => $quoteObjectId,
             'quote_approval_pending' => $quoteApprovalPending,
+            'skip_bsky' => $pollNorm !== null,
         ];
         if (ap_publish_delivery_enqueue($deliveryOwnerId, $noteId, $deliveryPayload)) {
             // Best effort immediate wake; the scheduled worker is the durable
@@ -5576,13 +5572,16 @@ function ap_publish_status_text(
                     if ($warmUrl !== null) ap_link_preview_warm_async($warmUrl);
                 } catch (Throwable $e) { /* preview warming is optional */ }
             }
-            ap_log("publish_status queued create=$createId local_id=$localId visibility=$visibility");
+            ap_log("publish_status queued create=$createId local_id=$localId visibility=$visibility"
+                . ($pollNorm !== null ? ' skip_bsky=poll' : ''));
             return [
                 'ok' => true, 'note_id' => $noteId, 'create_id' => $createId,
                 'local_id' => $localId, 'published' => $published,
                 'content_html' => $contentHtml, 'visibility' => $visibility,
                 'delivered' => 0, 'queued' => 1, 'delivery_pending' => true,
-                'bsky' => ['ok' => true, 'queued' => true],
+                'bsky' => $pollNorm !== null
+                    ? ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only']
+                    : ['ok' => true, 'queued' => true],
             ];
         }
     } catch (Throwable $e) {
@@ -5691,21 +5690,18 @@ function ap_publish_status_text(
                 $bskyOwnerId = 0;
             }
             if ($bskyOwnerId > 0) {
-                if ($quoteApprovalPending) {
+                if ($pollNorm !== null) {
+                    $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only'];
+                    ap_log('bsky_crosspost_skip local_id=' . $localId . ' err=poll');
+                } elseif ($quoteApprovalPending) {
                     // Do not leak an unapproved Fediverse quote through its
                     // Bluesky mirror. The Accept handler retries this mirror.
                     $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Quote awaits Fediverse authorization'];
                     ap_log('bsky_crosspost_deferred_quote note=' . $localId);
                 } else {
-                    // Bluesky has no native polls — mirror option titles as text
-                    // so empty poll posts are not skipped as "Nothing to cross-post".
-                    $bskyText = $content;
-                    if ($bskyText === '' && is_array($pollNorm) && !empty($pollNorm['options'])) {
-                        $bskyText = "📊 Poll:\n• " . implode("\n• ", $pollNorm['options']);
-                    }
                     $bsky = ap_bsky_crosspost_status(
                         $bskyOwnerId,
-                        $bskyText,
+                        $content,
                         $visibility,
                         $mediaLocalIds,
                         $spoilerText,

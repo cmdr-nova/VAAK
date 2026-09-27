@@ -546,32 +546,18 @@ function ap_bsky_crosspost_retry_one(array $row): array
     if (in_array($plain, ['(media)', '(poll)', '(quote)'], true)) {
         $plain = '';
     }
-    // Poll-only posts store empty commentary; append option titles for Bluesky.
-    if ($plain === '' && $localId > 0) {
+    // Bluesky has no native polls — never mirror Question / masto_polls rows.
+    if ($localId > 0 || $noteId !== '') {
         try {
-            $pst = ap_db()->prepare('SELECT options_json FROM masto_polls WHERE status_local_id = ? OR note_id = ? OR note_id = ? LIMIT 1');
+            $pst = ap_db()->prepare(
+                'SELECT 1 FROM masto_polls WHERE status_local_id = ? OR note_id = ? OR note_id = ? LIMIT 1'
+            );
             $pst->execute([$localId, $noteId, $noteId . '/']);
-            $prow = $pst->fetch();
-            if (is_array($prow)) {
-                $opts = json_decode((string) ($prow['options_json'] ?? '[]'), true);
-                $titles = [];
-                if (is_array($opts)) {
-                    foreach ($opts as $opt) {
-                        if (!is_array($opt)) {
-                            continue;
-                        }
-                        $t = trim((string) ($opt['title'] ?? $opt['name'] ?? ''));
-                        if ($t !== '') {
-                            $titles[] = $t;
-                        }
-                    }
-                }
-                if ($titles !== []) {
-                    $plain = "📊 Poll:\n• " . implode("\n• ", $titles);
-                }
+            if ($pst->fetchColumn()) {
+                return ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only'];
             }
         } catch (Throwable $e) {
-            // keep empty
+            // continue
         }
     }
 

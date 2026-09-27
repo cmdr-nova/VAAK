@@ -144,7 +144,11 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     if (empty($payload['bsky_done'])) {
         require_once __DIR__ . '/ap-bsky.php';
         $bsky = null;
-        if ($visibility !== 'local' && !$pendingQuote && ap_bsky_session_row($owner) !== null) {
+        // Bluesky has no native polls — Fediverse Question posts stay off ATProto.
+        if (!empty($payload['skip_bsky'])) {
+            $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only'];
+            ap_log('publish_delivery skip_bsky note=' . $row['note_id']);
+        } elseif ($visibility !== 'local' && !$pendingQuote && ap_bsky_session_row($owner) !== null) {
             $bsky = ap_bsky_crosspost_status(
                 $owner,
                 (string) ($payload['content'] ?? ''),
