@@ -66,7 +66,7 @@ running their own instance; it is not a one-command hosted-service installer.
 - Moderation state is applied to both Fediverse and Bluesky content before it is
   rendered. Cached reads must never bypass those checks.
 - Search, trending hashtags, links, posts, recommendations, followed tags,
-  lists, collections, notifications, direct messages, and VakkTok video view.
+  lists, collections, notifications, and direct messages.
 
 ## Architecture
 
