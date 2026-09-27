@@ -4012,6 +4012,13 @@ if (isset($_GET['partial'], $_GET['shell'])
 }
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
+    // Never hold the session lock during badge polls — Home rebuilds were
+    // serializing these to 10–20s under soft-nav contention.
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
     // Use the short file cache so this lightweight badge poll cannot occupy a
@@ -4153,6 +4160,11 @@ if (
 
 // Deferred Home suggestions (keeps first paint off the suggestion scorer).
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     $onboard = admin_home_onboarding_state(
@@ -4334,6 +4346,11 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
 
 // Deferred trends sidebar (cache-first; background refresh when stale).
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     header('Content-Type: text/html; charset=utf-8');
     $forceRefresh = !empty($_GET['refresh']);
     $viewForTrends = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
@@ -5117,14 +5134,24 @@ if (
         $adminTlStampedeLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
             . substr(hash('sha256', $adminTlCacheKey), 0, 12);
         if (!ap_redis_lock($adminTlStampedeLock, 45)) {
-            // Home rebuilds can take several seconds; a 250ms wait made every
-            // concurrent soft-nav / refresh fall through and stampede PHP-FPM.
+            // Soft-nav shells must not wait — return a skeleton and fill via
+            // infinite-scroll. Full page / offset loads wait briefly for a peer.
+            $wantSoftShellEarly = isset($_GET['partial'], $_GET['shell'])
+                && (string) $_GET['partial'] === '1'
+                && (string) $_GET['shell'] === '1'
+                && (int) ($_GET['offset'] ?? 0) === 0;
+            $waitMs = $wantSoftShellEarly ? 200 : 2000;
             $peerCached = function_exists('ap_redis_stampede_wait')
                 ? ap_redis_stampede_wait(
                     static function () use ($adminTlCacheKey) {
-                        return admin_tl_cache_get($adminTlCacheKey);
+                        // Prefer fresh, then accept slightly stale for navigation.
+                        $hit = admin_tl_cache_get($adminTlCacheKey, 300);
+                        if (is_array($hit)) {
+                            return $hit;
+                        }
+                        return admin_tl_cache_get($adminTlCacheKey, 900);
                     },
-                    8000
+                    $waitMs
                 )
                 : null;
             if (is_array($peerCached)) {
@@ -5134,6 +5161,89 @@ if (
             $adminTlStampedeLock = '';
         }
     }
+}
+
+// Fast soft-nav shell for Home/Local/Federated: never block on a full ranked
+// rebuild. Cache hit → hydrate first page. Cache miss → empty skeleton so the
+// client can page-fill while one worker rebuilds in the background.
+if (
+    isset($_GET['partial'], $_GET['shell'])
+    && (string) $_GET['partial'] === '1'
+    && (string) $_GET['shell'] === '1'
+    && (int) ($_GET['offset'] ?? 0) === 0
+    && in_array($view, ['home', 'local', 'feed'], true)
+) {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $shellLimit = max(8, min(40, (int) ($_GET['limit'] ?? 15)));
+    $shellBody = '';
+    $shellHasMore = true;
+    $shellNext = $shellLimit;
+    $shellCache = 'miss';
+    if ($adminTlFromCache && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+        $shellKeys = array_slice($adminTlRankedCached, 0, $shellLimit);
+        $shellSlice = admin_tl_hydrate($shellKeys);
+        if ($view === 'local') {
+            $shellSlice = array_values(array_filter($shellSlice, 'admin_local_timeline_item_allowed'));
+        } elseif ($view === 'feed') {
+            $shellSlice = array_values(array_filter($shellSlice, 'admin_federated_timeline_item_allowed'));
+        }
+        if (function_exists('ap_masto_status_flags_prefetch')) {
+            ap_masto_status_flags_prefetch(admin_timeline_status_ids($shellSlice));
+        }
+        ob_start();
+        foreach ($shellSlice as $item) {
+            if (admin_timeline_item_muted_by_words($item)) {
+                continue;
+            }
+            admin_render_timeline_item($item, $followingIds, $view);
+        }
+        $shellBody = (string) ob_get_clean();
+        $shellHasMore = count($adminTlRankedCached) > $shellLimit || $shellBody !== '';
+        $shellNext = $shellLimit;
+        $shellCache = 'hit';
+    } elseif ($adminTlStampedeLock !== '') {
+        // We own the rebuild lock — release it so a later fill request can rebuild.
+        // Soft-nav itself stays fast.
+        if (function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+        }
+        $adminTlStampedeLock = '';
+    }
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-VAAK-View: ' . $view);
+    header('X-Has-More: ' . ($shellHasMore ? '1' : '0'));
+    header('X-Next-Offset: ' . (int) $shellNext);
+    header('X-TL-Cache: ' . $shellCache);
+    $shellTitles = ['home' => 'Home', 'local' => 'Local', 'feed' => 'Federation feed'];
+    $title = $shellTitles[$view] ?? $view;
+    echo '<div class="topbar topbar-timeline"><h1>' . h($title) . '</h1><div class="topbar-actions">';
+    echo '<nav class="timeline-tabs" aria-label="Timeline views">';
+    foreach (['home' => 'Home', 'local' => 'Local', 'feed' => 'Federated'] as $tabView => $tabLabel) {
+        $active = $view === $tabView ? ' active' : '';
+        echo '<a class="' . trim($active) . '" href="?view=' . h($tabView) . '" data-vaak-soft-nav="' . h($tabView) . '">' . h($tabLabel) . '</a>';
+    }
+    echo '</nav>';
+    echo '<a class="btn btn-ghost" href="?view=' . h($view) . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>';
+    echo '</div></div>';
+    echo '<div class="feed timeline-feed">';
+    echo '<div class="compose-inline-slot" id="compose-inline-slot"></div>';
+    echo '<div id="timeline-items" data-view="' . h($view) . '" data-offset="' . (int) $shellNext
+        . '" data-limit="' . (int) $shellLimit . '" data-has-more="' . ($shellHasMore ? '1' : '0')
+        . '" data-newest="' . (int) time() . '" data-needs-fill="' . ($shellBody === '' ? '1' : '0') . '">';
+    echo $shellBody;
+    echo '</div>';
+    echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
+        . ($shellBody === '' ? 'Loading timeline…' : ($shellHasMore ? 'Scroll for more…' : 'End of timeline'))
+        . '</div>';
+    echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
+    echo '</div>';
+    echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
+    exit;
 }
 
 // Outbox cards: home / federated mix-in + Your posts
@@ -26527,6 +26637,14 @@ window.apAdminToast = function (msg, isErr) {
     // Critical: soft-nav replaces #timeline-sentinel. Re-observe the live node
     // or infinite scroll stalls on the static "Scroll for more…" label.
     bindInfiniteScrollObserver();
+    // Fast soft-nav skeleton (cache miss): kick an immediate page fill.
+    if (items.dataset.needsFill === '1' && hasMore && typeof loadMore === 'function') {
+      items.dataset.needsFill = '0';
+      // Soft-nav shells set offset to the page size already; refill from 0.
+      offset = 0;
+      items.dataset.offset = '0';
+      setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
+    }
     try { syncTimelineStreamVisibility(); } catch (e) {}
     if (typeof window.vaakBindFeedTopBtn === 'function') {
       window.vaakBindFeedTopBtn(document.querySelector('section.main'));
