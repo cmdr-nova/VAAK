@@ -171,6 +171,11 @@ $error = null;
 $twoFaSetup = null;
 $twoFaRecoveryCodes = [];
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
+// Account switcher lands with ?switched=1&as=actor_key (303 after switch_account).
+if (isset($_GET['switched']) && (string) $_GET['switched'] === '1') {
+    $as = strtolower(preg_replace('/[^a-z0-9_]/', '', (string) ($_GET['as'] ?? '')) ?? '');
+    $notice = $as !== '' ? ('Switched to @' . $as . '.') : 'Account switched.';
+}
 $composerForceOpen = false;
 // Legacy ?view=compose → Your posts + open floating composer
 if ($view === 'compose') {
@@ -678,7 +683,20 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $view = 'account_switcher';
         } else {
             $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
-            header('Location: ?view=' . rawurlencode($returnView), true, 303);
+            if (!in_array($returnView, ['home', 'local', 'feed', 'outbox', 'mentions', 'profile'], true)) {
+                $returnView = 'home';
+            }
+            // Land on Home so the switched account gets a lean first-page seed
+            // (fast) instead of waiting on a full ranked rebuild.
+            if (!in_array($returnView, ['home', 'local', 'feed'], true)) {
+                $returnView = 'home';
+            }
+            $switchedKey = (string) ($target['actor_key'] ?? $target['username'] ?? '');
+            $q = '?view=' . rawurlencode($returnView) . '&switched=1';
+            if ($switchedKey !== '') {
+                $q .= '&as=' . rawurlencode($switchedKey);
+            }
+            header('Location: ' . $q, true, 303);
             exit;
         }
     } elseif ($action === 'switch_account_remove') {
@@ -5289,32 +5307,47 @@ if (
     }
 }
 
-// Full-page Home/Local/Federated cache miss: skip the synchronous rebuild
-// (account switch / cold cache was 30–90s). Empty first paint + client fill +
-// lean ranked warm after response — same idea as soft-nav shell.
+// Full-page Home/Local/Federated cache miss (account switch / cold cache):
+// seed a lean ranked index synchronously for first paint (fast SQL), then
+// hydrate. Avoids 30–90s full rebuild AND empty timelines after switch.
 $adminTlFullPageDefer = false;
 if (
     !$isPartial
     && !$adminTlFromCache
     && (int) ($_GET['offset'] ?? 0) === 0
     && in_array($view, ['home', 'local', 'feed'], true)
+    && $adminTlCacheKey !== ''
 ) {
     $warmLock = $adminTlStampedeLock;
+    try {
+        admin_tl_lean_ranked_warm($view, $following, $adminTlCacheKey);
+        $seeded = admin_tl_cache_get($adminTlCacheKey, 300);
+        if (is_array($seeded) && $seeded !== []) {
+            $adminTlRankedCached = $seeded;
+            $adminTlFromCache = true;
+            $adminTlCachedHasMore = count($seeded) > $tlLimit;
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] lean seed: ' . $e->getMessage());
+    }
     if ($adminTlStampedeLock !== '') {
         if (function_exists('ap_redis_unlock')) {
             ap_redis_unlock($adminTlStampedeLock);
         }
         $adminTlStampedeLock = '';
     }
-    if ($warmLock === '' && $adminTlCacheKey !== '') {
-        $warmLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
-            . substr(hash('sha256', $adminTlCacheKey), 0, 12);
+    if (!$adminTlFromCache) {
+        // Still cold — empty shell + background warm + client fill.
+        if ($warmLock === '') {
+            $warmLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
+                . substr(hash('sha256', $adminTlCacheKey), 0, 12);
+        }
+        admin_tl_schedule_ranked_warm($view, $following, $adminTlCacheKey, $warmLock);
+        $adminTlFullPageDefer = true;
+        $adminTlFromCache = true;
+        $adminTlRankedCached = [];
+        $adminTlCachedHasMore = true;
     }
-    admin_tl_schedule_ranked_warm($view, $following, $adminTlCacheKey, $warmLock);
-    $adminTlFullPageDefer = true;
-    $adminTlFromCache = true;
-    $adminTlRankedCached = [];
-    $adminTlCachedHasMore = true;
 }
 
 // Fast soft-nav shell for Home/Local/Federated: never block on a full ranked
@@ -6331,7 +6364,7 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
             return;
         }
     } else {
-        // home: followed actors only
+        // home: followed actors + self (matches full Home mix of follows + own notes)
         $actorIds = [];
         foreach ($following as $frow) {
             $fa = rtrim((string) ($frow['actor_id'] ?? ''), '/');
@@ -6339,6 +6372,14 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 $actorIds[$fa] = true;
                 $actorIds[$fa . '/'] = true;
             }
+        }
+        $self = '';
+        if (function_exists('ap_local_actor_id')) {
+            $self = rtrim((string) ap_local_actor_id(), '/');
+        }
+        if ($self !== '') {
+            $actorIds[$self] = true;
+            $actorIds[$self . '/'] = true;
         }
         if ($actorIds === []) {
             return;
@@ -25972,6 +26013,17 @@ window.apAdminToast = function (msg, isErr) {
   }
   bindInfiniteScrollObserver();
 
+  // Full-page account switch / cold shell: needs-fill must run even when
+  // soft-nav boot did not (hard navigation after switch_account).
+  if (items && items.dataset.needsFill === '1') {
+    items.dataset.needsFill = '0';
+    offset = 0;
+    items.dataset.offset = '0';
+    hasMore = true;
+    items.dataset.hasMore = '1';
+    setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
+  }
+
   // Re-bind observer if layout flips (rotate / resize across the mobile breakpoint).
   window.addEventListener('resize', () => {
     const next = scrollApi();
@@ -26412,7 +26464,8 @@ window.apAdminToast = function (msg, isErr) {
         status.textContent = hasMore ? 'Scroll for more…' : (html.trim() ? 'End of timeline' : '');
       }
       // Empty-state hint when the partial returns nothing.
-      if (!html.trim()) {
+      // Soft-nav skeleton with needs-fill: wait for loadMore — do not flash empty state.
+      if (!html.trim() && items.dataset.needsFill !== '1') {
         const empty = document.createElement('div');
         empty.className = 'empty';
         if (nextView === 'local') {
