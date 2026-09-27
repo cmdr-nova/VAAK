@@ -23850,6 +23850,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }, 0);
   });
 
+  // Pin/Unpin (and other menu submits) can wait on Bluesky sync before navigate —
+  // dismiss the portaled overflow immediately so it does not hang open.
+  document.addEventListener('click', function (ev) {
+    var action = ev.target && ev.target.closest && ev.target.closest('.post-action-menu__body .menu-action');
+    if (!action) return;
+    // Keep the menu for client-only edit (opens compose without navigation).
+    if (action.classList.contains('js-edit-post')) return;
+    vaakClosePostActionMenus();
+  }, true);
+
   window.addEventListener('resize', function () {
     var open = document.querySelector('.post-action-menu[open]');
     if (open) vaakPlacePostActionMenu(open);
