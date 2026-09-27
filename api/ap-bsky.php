@@ -8,6 +8,8 @@
  */
 declare(strict_types=1);
 
+require_once __DIR__ . '/ap-bsky-urls.php';
+
 const AP_BSKY_DEFAULT_PDS = 'https://bsky.social';
 const AP_BSKY_VAAK_PDS = 'https://bsky.mkultra.monster';
 const AP_BSKY_PUBLIC_API = 'https://public.api.bsky.app';
@@ -10603,72 +10605,6 @@ function ap_bsky_reconcile_deleted_crossposts(int $ownerUserId, int $limit = 15)
 // ---------------------------------------------------------------------------
 // Bluesky → VAAK notifications (mentions / replies / quotes / reposts / likes)
 // ---------------------------------------------------------------------------
-
-function ap_bsky_actor_profile_url(string $handleOrDid): string
-{
-    $h = ltrim(trim($handleOrDid), '@');
-    if ($h === '') {
-        return 'https://bsky.app/';
-    }
-    // did:plc:… paths keep colons; handles are percent-encoded.
-    // Never emit did%3Aplc%3A… — the bsky.app SPA 404s ("Post not found").
-    if (str_starts_with($h, 'did%3A') || str_starts_with($h, 'did%3a')) {
-        $h = rawurldecode($h);
-    }
-    $path = str_starts_with($h, 'did:') ? $h : rawurlencode($h);
-    return 'https://bsky.app/profile/' . $path;
-}
-
-/**
- * Normalize a bsky.app web URL so DID profile paths keep literal colons.
- * Encoded did%3Aplc%3A… links 404 in the Bluesky web app.
- */
-function ap_bsky_normalize_web_url(string $url): string
-{
-    $url = trim($url);
-    if ($url === '' || !str_starts_with($url, 'https://bsky.app/')) {
-        return $url;
-    }
-    if (preg_match('~^(https://bsky\.app/profile/)([^/]+)(/post/[^/?#]+)?(.*)$~i', $url, $m)) {
-        $actor = rawurldecode($m[2]);
-        // DIDs must stay unencoded; handles may be re-encoded safely.
-        $actorPath = str_starts_with($actor, 'did:') ? $actor : rawurlencode($actor);
-        $post = $m[3] ?? '';
-        if ($post !== '' && preg_match('~^/post/([^/?#]+)~', $post, $pm)) {
-            $post = '/post/' . rawurlencode(rawurldecode($pm[1]));
-        }
-        return $m[1] . $actorPath . $post . ($m[4] ?? '');
-    }
-    return $url;
-}
-
-/**
- * Convert an AT-URI (or already-https URL) into a browser URL on bsky.app.
- */
-function ap_bsky_https_url_from_at_uri(string $uri, ?string $authorHandle = null): string
-{
-    $uri = trim($uri);
-    if ($uri === '') {
-        return 'https://bsky.app/';
-    }
-    if (str_starts_with($uri, 'https://')) {
-        return ap_bsky_normalize_web_url($uri);
-    }
-    // at://did:…/app.bsky.feed.post/RKEY  (use ~ delimiter — # appears in URLs)
-    if (preg_match('~^at://([^/]+)/app\.bsky\.feed\.post/([^/\s?]+)~', $uri, $m)) {
-        $actor = ($authorHandle !== null && $authorHandle !== '') ? $authorHandle : $m[1];
-        if (str_starts_with($actor, 'did%3A') || str_starts_with($actor, 'did%3a')) {
-            $actor = rawurldecode($actor);
-        }
-        // bsky.app keeps did:plc:… colons unencoded in profile paths.
-        $actorPath = str_starts_with($actor, 'did:') ? $actor : rawurlencode($actor);
-        return 'https://bsky.app/profile/' . $actorPath . '/post/' . rawurlencode($m[2]);
-    }
-    if (preg_match('~^at://([^/]+)~', $uri, $m)) {
-        return ap_bsky_actor_profile_url($authorHandle !== null && $authorHandle !== '' ? $authorHandle : $m[1]);
-    }
-    return 'https://bsky.app/';
-}
 
 /**
  * File watermark fallback when bsky_sessions lacks notif_* columns.

@@ -474,7 +474,8 @@ function ap_redis_unlock(string $key): void
  */
 function ap_redis_stampede_wait(callable $fetch, int $maxWaitMs = 200)
 {
-    $maxWaitMs = max(0, min(500, $maxWaitMs));
+    // Allow multi-second waits for full-page TL peers (soft-nav uses ~200ms).
+    $maxWaitMs = max(0, min(8000, $maxWaitMs));
     if ($maxWaitMs < 1) {
         return null;
     }

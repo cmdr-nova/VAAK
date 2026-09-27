@@ -4011,8 +4011,7 @@ if (isset($_GET['partial'], $_GET['shell'])
 }
 
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
-    // Never hold the session lock during badge polls — Home rebuilds were
-    // serializing these to 10–20s under soft-nav contention.
+    // Release session lock so badge polls do not block behind Home rebuilds.
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
@@ -5190,6 +5189,7 @@ if (
         } elseif ($view === 'feed') {
             $shellSlice = array_values(array_filter($shellSlice, 'admin_federated_timeline_item_allowed'));
         }
+        admin_tl_prefetch_masto_for_slice($shellSlice);
         if (function_exists('ap_masto_status_flags_prefetch')) {
             ap_masto_status_flags_prefetch(admin_timeline_status_ids($shellSlice));
         }
@@ -5209,13 +5209,21 @@ if (
         }
         $shellNext = $shellLimit;
         $shellCache = 'hit';
-    } elseif ($adminTlStampedeLock !== '') {
-        // We own the rebuild lock — release it so a later fill request can rebuild.
-        // Soft-nav itself stays fast.
-        if (function_exists('ap_redis_unlock')) {
-            ap_redis_unlock($adminTlStampedeLock);
+    } else {
+        // Cache miss: free the stampede lock for fill, and warm a lean ranked
+        // index after the response so a closed tab cannot leave TL cold.
+        $warmLock = $adminTlStampedeLock;
+        if ($adminTlStampedeLock !== '') {
+            if (function_exists('ap_redis_unlock')) {
+                ap_redis_unlock($adminTlStampedeLock);
+            }
+            $adminTlStampedeLock = '';
         }
-        $adminTlStampedeLock = '';
+        if ($warmLock === '' && $adminTlCacheKey !== '') {
+            $warmLock = 'tl-rebuild:' . (int) $vaakOwnerId . ':' . $view . ':'
+                . substr(hash('sha256', $adminTlCacheKey), 0, 12);
+        }
+        admin_tl_schedule_ranked_warm($view, $following, $adminTlCacheKey, $warmLock);
     }
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
@@ -6016,6 +6024,205 @@ function admin_tl_cache_clear(): void
     $dir = admin_tl_cache_dir();
     foreach (glob($dir . '/tl_*.json') ?: [] as $path) {
         @unlink($path);
+    }
+}
+
+/**
+ * Batch-load masto_statuses rows for outbox cards in a hydrated window.
+ *
+ * @param list<array{kind?:string,row?:array<string,mixed>}> $slice
+ */
+function admin_tl_prefetch_masto_for_slice(array $slice): void
+{
+    $hydrateNotes = [];
+    foreach ($slice as $it) {
+        if (($it['kind'] ?? '') !== 'outbox') {
+            continue;
+        }
+        $nid = rtrim((string) ($it['row']['id'] ?? ''), '/');
+        if ($nid !== '') {
+            $hydrateNotes[$nid] = true;
+            $hydrateNotes[$nid . '/'] = true;
+        }
+    }
+    if ($hydrateNotes === []) {
+        return;
+    }
+    if (!isset($GLOBALS['admin_masto_by_note']) || !is_array($GLOBALS['admin_masto_by_note'])) {
+        $GLOBALS['admin_masto_by_note'] = [];
+    }
+    try {
+        foreach (array_chunk(array_keys($hydrateNotes), 400) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $st = ap_db()->prepare(
+                "SELECT note_id, local_id, content_text, spoiler_text, sensitive, visibility
+                 FROM masto_statuses WHERE note_id IN ($ph)"
+            );
+            $st->execute($chunk);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                $key = rtrim((string) ($row['note_id'] ?? ''), '/');
+                if ($key !== '') {
+                    $GLOBALS['admin_masto_by_note'][$key] = $row;
+                    $GLOBALS['admin_masto_by_note'][$key . '/'] = $row;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        // per-card fallback via admin_masto_row_for_note
+    }
+}
+
+/**
+ * After a soft-nav skeleton response, warm a lean ranked index in the background
+ * so a closed tab cannot leave Home/Local/Federated cold until the next visit.
+ */
+function admin_tl_schedule_ranked_warm(string $view, array $following, string $cacheKey, string $lockKey): void
+{
+    static $scheduled = [];
+    if ($cacheKey === '' || !in_array($view, ['home', 'local', 'feed'], true)) {
+        return;
+    }
+    if (isset($scheduled[$cacheKey])) {
+        return;
+    }
+    $scheduled[$cacheKey] = true;
+    register_shutdown_function(static function () use ($view, $following, $cacheKey, $lockKey): void {
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            if ($lockKey !== '' && function_exists('ap_redis_lock') && !ap_redis_lock($lockKey, 45)) {
+                return;
+            }
+            if (is_array(admin_tl_cache_get($cacheKey, 300))) {
+                return;
+            }
+            admin_tl_lean_ranked_warm($view, $following, $cacheKey);
+        } catch (Throwable $e) {
+            error_log('[ap-admin] ranked warm: ' . $e->getMessage());
+        } finally {
+            if ($lockKey !== '' && function_exists('ap_redis_unlock')) {
+                ap_redis_unlock($lockKey);
+            }
+        }
+    });
+}
+
+/**
+ * Lean ranked seed (events firehose / follow set) — enough for soft-nav fill.
+ * Full Home ranking (Bluesky merge, favourite boost) still happens on a later
+ * full rebuild when the user stays on the timeline.
+ *
+ * @param list<array<string,mixed>> $following
+ */
+function admin_tl_lean_ranked_warm(string $view, array $following, string $cacheKey): void
+{
+    $db = ap_db();
+    $timeline = [];
+    if ($view === 'local') {
+        try {
+            $st = $db->query(
+                "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
+                        action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
+                 FROM events
+                 WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
+                   AND (action_taken = 'log' OR action_taken = 'local_observe')
+                   AND actor_id LIKE 'https://mkultra.monster/users/%'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 160"
+            );
+            foreach ($st->fetchAll() ?: [] as $erow) {
+                if (!is_array($erow)) {
+                    continue;
+                }
+                $timeline[] = [
+                    'kind' => 'event',
+                    'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
+                    'row' => $erow,
+                ];
+            }
+        } catch (Throwable $e) {
+            return;
+        }
+    } elseif ($view === 'feed') {
+        try {
+            $st = $db->query(
+                "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
+                        action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
+                 FROM events
+                 WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
+                   AND (action_taken = 'log' OR action_taken = 'local_observe')
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 160"
+            );
+            foreach ($st->fetchAll() ?: [] as $erow) {
+                if (!is_array($erow)) {
+                    continue;
+                }
+                $timeline[] = [
+                    'kind' => 'event',
+                    'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
+                    'row' => $erow,
+                ];
+            }
+        } catch (Throwable $e) {
+            return;
+        }
+    } else {
+        // home: followed actors only
+        $actorIds = [];
+        foreach ($following as $frow) {
+            $fa = rtrim((string) ($frow['actor_id'] ?? ''), '/');
+            if ($fa !== '') {
+                $actorIds[$fa] = true;
+                $actorIds[$fa . '/'] = true;
+            }
+        }
+        if ($actorIds === []) {
+            return;
+        }
+        try {
+            foreach (array_chunk(array_keys($actorIds), 400) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = $db->prepare(
+                    "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
+                            action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
+                     FROM events
+                     WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
+                       AND (action_taken = 'log' OR action_taken = 'local_observe')
+                       AND actor_id IN ($ph)
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 120"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll() ?: [] as $erow) {
+                    if (!is_array($erow)) {
+                        continue;
+                    }
+                    $timeline[] = [
+                        'kind' => 'event',
+                        'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
+                        'row' => $erow,
+                    ];
+                }
+            }
+        } catch (Throwable $e) {
+            return;
+        }
+    }
+    if ($timeline === []) {
+        return;
+    }
+    usort($timeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    $ranked = admin_tl_rank_from_timeline($timeline);
+    if ($ranked !== []) {
+        admin_tl_cache_put($cacheKey, $ranked);
     }
 }
 
@@ -13962,42 +14169,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         } elseif ($view === 'feed') {
             $slice = array_values(array_filter($slice, 'admin_federated_timeline_item_allowed'));
         }
-        // Prefetch masto rows for any outbox cards in this window
-        $hydrateNotes = [];
-        foreach ($slice as $it) {
-            if (($it['kind'] ?? '') === 'outbox') {
-                $nid = rtrim((string) ($it['row']['id'] ?? ''), '/');
-                if ($nid !== '') {
-                    $hydrateNotes[$nid] = true;
-                    $hydrateNotes[$nid . '/'] = true;
-                }
-            }
-        }
-        if ($hydrateNotes !== []) {
-            try {
-                $idList = array_keys($hydrateNotes);
-                foreach (array_chunk($idList, 400) as $chunk) {
-                    $ph = implode(',', array_fill(0, count($chunk), '?'));
-                    $st = ap_db()->prepare(
-                        "SELECT note_id, local_id, content_text, spoiler_text, sensitive, visibility
-                         FROM masto_statuses WHERE note_id IN ($ph)"
-                    );
-                    $st->execute($chunk);
-                    foreach ($st->fetchAll() ?: [] as $row) {
-                        if (!is_array($row)) {
-                            continue;
-                        }
-                        $key = rtrim((string) ($row['note_id'] ?? ''), '/');
-                        if ($key !== '') {
-                            $GLOBALS['admin_masto_by_note'][$key] = $row;
-                            $GLOBALS['admin_masto_by_note'][$key . '/'] = $row;
-                        }
-                    }
-                }
-            } catch (Throwable $e) {
-                // per-card fallback
-            }
-        }
+        admin_tl_prefetch_masto_for_slice($slice);
         $adminTlPerfHydrateMs = (microtime(true) - $hydrateT0) * 1000.0;
         if (function_exists('ap_timing_record')) {
             ap_timing_record('timeline.hydrate', $adminTlPerfHydrateMs);
@@ -14084,40 +14256,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
     header('X-TL-Render-Ms: ' . (string) (int) round($adminTlPerfRenderMs));
     header('X-TL-Partial-Ms: ' . (string) (int) round($adminTlPerfTotalMs));
     header('X-VAAK-View: ' . $view);
-    $wantShell = isset($_GET['shell']) && (string) $_GET['shell'] === '1' && $tlOffset === 0;
-    if ($wantShell && in_array($view, ['home', 'local', 'feed'], true)) {
-        $shellTitles = [
-            'home' => 'Home',
-            'local' => 'Local',
-            'feed' => 'Federation feed',
-        ];
-        $title = $shellTitles[$view] ?? $view;
-        echo '<div class="topbar topbar-timeline">';
-        echo '<h1>' . h($title) . '</h1><div class="topbar-actions">';
-        echo '<nav class="timeline-tabs" aria-label="Timeline views">';
-        foreach (['home' => 'Home', 'local' => 'Local', 'feed' => 'Federated'] as $tabView => $tabLabel) {
-            $active = $view === $tabView ? ' active' : '';
-            echo '<a class="' . trim($active) . '" href="?view=' . h($tabView) . '">' . h($tabLabel) . '</a>';
-        }
-        echo '</nav>';
-        echo '<a class="btn btn-ghost" href="?view=' . h($view) . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>';
-        echo '</div></div>';
-        echo '<div class="feed timeline-feed">';
-        // Empty slot — soft-nav reattaches the live composer panel so AJAX
-        // submit / media / emoji handlers stay bound.
-        echo '<div class="compose-inline-slot" id="compose-inline-slot"></div>';
-        echo '<div id="timeline-items"'
-            . ' data-view="' . h($view) . '" data-offset="' . (int) $nextOffset . '" data-limit="' . (int) $tlLimit
-            . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-newest="' . (int) time() . '">';
-        echo $body;
-        echo '</div>';
-        echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
-            . ($hasMore ? 'Scroll for more…' : ($body !== '' ? 'End of timeline' : '')) . '</div>';
-        echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
-        echo '</div>';
-        echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
-        exit;
-    }
+    // Soft-nav shells for home/local/feed exit earlier (fast cache/skeleton path).
     echo $body;
     exit;
 }
@@ -17949,12 +18088,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
             <script>
           (function () {
+            const thread = document.getElementById('dm-thread');
+            if (!thread) return;
+            let stickToBottom = true;
+            function nearBottom() {
+              return (thread.scrollHeight - thread.scrollTop - thread.clientHeight) < 80;
+            }
             function focusLatestDm() {
-              const thread = document.getElementById('dm-thread');
+              if (!stickToBottom) return;
               const last = document.getElementById('dm-message-last');
-              if (!thread) return;
-              // Prefer anchoring the newest message; also set scrollTop so the
-              // overflow container itself ends at the bottom (mobile + desktop).
               if (last && typeof last.scrollIntoView === 'function') {
                 try {
                   last.scrollIntoView({ block: 'end', inline: 'nearest', behavior: 'instant' });
@@ -17970,26 +18112,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 requestAnimationFrame(focusLatestDm);
               });
             }
+            thread.addEventListener('scroll', function () {
+              stickToBottom = nearBottom();
+            }, { passive: true });
             [0, 50, 150, 400, 900].forEach(function (delay) {
               window.setTimeout(scheduleFocus, delay);
             });
             window.addEventListener('load', scheduleFocus, { once: true });
-            // Avatars/images can grow the thread after first paint.
             if (typeof ResizeObserver === 'function') {
-              const thread = document.getElementById('dm-thread');
-              if (thread) {
-                let roTimer = 0;
-                const ro = new ResizeObserver(function () {
-                  if (roTimer) window.clearTimeout(roTimer);
-                  roTimer = window.setTimeout(focusLatestDm, 30);
-                });
-                ro.observe(thread);
-                window.setTimeout(function () { try { ro.disconnect(); } catch (e) {} }, 4000);
-              }
+              let roTimer = 0;
+              const ro = new ResizeObserver(function () {
+                if (!stickToBottom) return;
+                if (roTimer) window.clearTimeout(roTimer);
+                roTimer = window.setTimeout(focusLatestDm, 30);
+              });
+              ro.observe(thread);
+              window.setTimeout(function () { try { ro.disconnect(); } catch (e) {} }, 4000);
             }
             document.querySelectorAll('#dm-thread img').forEach(function (img) {
               if (img.complete) return;
-              img.addEventListener('load', focusLatestDm, { once: true });
+              img.addEventListener('load', function () {
+                if (stickToBottom) focusLatestDm();
+              }, { once: true });
             });
           })();
           </script>

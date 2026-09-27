@@ -8572,13 +8572,13 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
  */
 function ap_masto_bsky_trend_status(array $post): ?array
 {
-    // Mastodon API / trends refresh can run without ap-bsky.php loaded.
-    // Without the URL helper every Bluesky status converts to null and the
-    // Explore/sidebar cache is permanently fedi-only until TTL expiry.
+    // Prefer thin URL helpers; avoid parsing full ap-bsky.php on trends rebuild.
     if (!function_exists('ap_bsky_https_url_from_at_uri')) {
-        $bskyPath = __DIR__ . '/ap-bsky.php';
-        if (is_file($bskyPath)) {
-            require_once $bskyPath;
+        $urlsPath = __DIR__ . '/ap-bsky-urls.php';
+        if (is_file($urlsPath)) {
+            require_once $urlsPath;
+        } elseif (is_file(__DIR__ . '/ap-bsky.php')) {
+            require_once __DIR__ . '/ap-bsky.php';
         }
     }
     $uri = trim((string) ($post['uri'] ?? ''));
