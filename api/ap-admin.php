@@ -5588,6 +5588,21 @@ if (
     $shellHasMore = true;
     $shellNext = $shellLimit;
     $shellCache = 'miss';
+    $shellFragmentKey = 'vaak:fragment:tl-shell:v1:' . (int) $vaakOwnerId . ':'
+        . $view . ':' . $shellLimit . ':' . substr(hash('sha256', $adminTlCacheKey), 0, 16);
+    if (function_exists('ap_redis_json_get')) {
+        $cachedShell = ap_redis_json_get($shellFragmentKey);
+        if (is_array($cachedShell) && is_string($cachedShell['html'] ?? null) && $cachedShell['html'] !== '') {
+            header('Content-Type: text/html; charset=utf-8');
+            header('Cache-Control: no-store');
+            header('X-VAAK-View: ' . $view);
+            header('X-Has-More: ' . (!empty($cachedShell['has_more']) ? '1' : '0'));
+            header('X-Next-Offset: ' . (int) ($cachedShell['next'] ?? $shellLimit));
+            header('X-TL-Cache: shell');
+            echo $cachedShell['html'];
+            exit;
+        }
+    }
     if ($adminTlFromCache && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
         $shellKeys = array_slice($adminTlRankedCached, 0, $shellLimit);
         $shellSlice = admin_tl_hydrate($shellKeys);
@@ -5632,6 +5647,7 @@ if (
         }
         admin_tl_schedule_ranked_warm($view, $following, $adminTlCacheKey, $warmLock);
     }
+    ob_start();
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     header('X-VAAK-View: ' . $view);
@@ -5662,6 +5678,15 @@ if (
     echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
     echo '</div>';
     echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
+    $shellHtml = (string) ob_get_clean();
+    if (function_exists('ap_redis_json_set') && $shellHtml !== '') {
+        ap_redis_json_set($shellFragmentKey, [
+            'html' => $shellHtml,
+            'has_more' => $shellHasMore,
+            'next' => $shellNext,
+        ], 5);
+    }
+    echo $shellHtml;
     exit;
 }
 
@@ -30678,6 +30703,51 @@ if (VIEW === 'analytics') loadAnalytics();
   } else {
     videos.forEach(prepare);
   }
+})();
+</script>
+<script>
+(function () {
+  // Keep timeline media from continuing to play after the reader scrolls away.
+  // This is shared by full loads, soft-nav swaps, and infinite-scroll cards.
+  let observer = null;
+  const observed = new WeakSet();
+  function observeVideos(root) {
+    if (!observer) return;
+    const scope = root && root.querySelectorAll ? root : document;
+    scope.querySelectorAll('video.media-video').forEach((video) => {
+      if (observed.has(video)) return;
+      observed.add(video);
+      observer.observe(video);
+    });
+  }
+  function pauseAll() {
+    document.querySelectorAll('video.media-video').forEach((video) => {
+      if (!video.paused) video.pause();
+    });
+  }
+  if ('IntersectionObserver' in window) {
+    observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting && entry.intersectionRatio >= 0.15) return;
+        const video = entry.target;
+        if (!video.paused) video.pause();
+      });
+    }, { threshold: [0, 0.15] });
+    observeVideos(document);
+    const mutations = new MutationObserver((records) => {
+      records.forEach((record) => {
+        record.addedNodes.forEach((node) => {
+          if (node.nodeType === 1) observeVideos(node);
+        });
+      });
+    });
+    if (document.body) mutations.observe(document.body, { childList: true, subtree: true });
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) pauseAll();
+  });
+  window.vaakPauseTimelineVideos = pauseAll;
+  window.vaakBindTimelineVideos = observeVideos;
 })();
 </script>
 <script>
