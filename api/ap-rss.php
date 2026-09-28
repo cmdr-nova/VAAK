@@ -1011,11 +1011,10 @@ function ap_rss_http_error_message(int $status, string $url = ''): string
     }
     // YouTube still advertises /feeds/videos.xml on channel pages, but many brand/network
     // channels (and sometimes most channels) get a hard 404 from the Atom endpoint.
-    // Readers like Inoreader often use the YouTube Data API instead of this public feed.
     // (Channel-name hint is applied in ap_rss_add_feed — not here — to avoid recursive fetches.)
     if ($status === 404 && ap_rss_host_is_youtube($url) && str_contains(strtolower((string) (parse_url($url, PHP_URL_PATH) ?: '')), '/feeds/')) {
         return 'YouTube’s public RSS/Atom feed returned 404 for this channel. '
-            . 'Inoreader often does not use this public feed. Try another source URL, or a channel whose /feeds/videos.xml still works.';
+            . 'The channel page may still work, but this feed URL is unavailable. Try a different feed URL.';
     }
     if ($status > 0) {
         return 'HTTP ' . $status;
