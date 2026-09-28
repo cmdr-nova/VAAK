@@ -11405,14 +11405,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 <?php endif; ?>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
-                <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
-                  <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
-                  <input type="hidden" name="target_actor" value="<?= h($aid) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-                </form>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($objectId) ?>&amp;quote_status_id=<?= urlencode($statusId) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $boosted ? 'unreblog_status' : 'reblog_status' ?>">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
@@ -11421,7 +11414,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <input type="hidden" name="target_actor" value="<?= h($aid) ?>">
                   <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
                 </form>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($objectId) ?>&amp;quote_status_id=<?= urlencode($statusId) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
                 <?php if ($objectId !== '' && !$isOwnEvent): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline" onsubmit="return confirm('Bite this post?');">
                   <input type="hidden" name="action" value="bite_remote">
@@ -11431,6 +11423,14 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   <button class="icon-btn" type="submit" title="Bite (Wafrn)" aria-label="Bite"><i class="ph ph-tooth" aria-hidden="true"></i></button>
                 </form>
                 <?php endif; ?>
+                <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
+                  <input type="hidden" name="target_actor" value="<?= h($aid) ?>">
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                </form>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
@@ -12712,14 +12712,7 @@ function admin_render_masto_status_card(
                   data-bm-picker="<?= $bm ? '1' : '0' ?>"
                   title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bm ? 'true' : 'false' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
               <?php elseif ($sid !== '' && $uri !== ''): ?>
-                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
-                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
-                  <input type="hidden" name="object_id" value="<?= h($uri) ?>">
-                  <input type="hidden" name="target_actor" value="<?= h($actorRef) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-                </form>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($uri) ?>&amp;quote_status_id=<?= urlencode($sid) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $boosted ? 'unreblog_status' : 'reblog_status' ?>">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
@@ -12728,7 +12721,6 @@ function admin_render_masto_status_card(
                   <input type="hidden" name="target_actor" value="<?= h($actorRef) ?>">
                   <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
                 </form>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($uri) ?>&amp;quote_status_id=<?= urlencode($sid) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
                 <?php if (!$isLocal): ?>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline" onsubmit="return confirm('Bite this post?');">
                   <input type="hidden" name="action" value="bite_remote">
@@ -12738,6 +12730,14 @@ function admin_render_masto_status_card(
                   <button class="icon-btn" type="submit" title="Bite (Wafrn)" aria-label="Bite"><i class="ph ph-tooth" aria-hidden="true"></i></button>
                 </form>
                 <?php endif; ?>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($uri) ?>">
+                  <input type="hidden" name="target_actor" value="<?= h($actorRef) ?>">
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                </form>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
@@ -13032,20 +13032,20 @@ function admin_render_remote_boost_card(
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
-                  <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
-                  <input type="hidden" name="target_actor" value="<?= h($origActor) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-                </form>
-                <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $boosted ? 'unreblog_status' : 'reblog_status' ?>">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
                   <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
                   <input type="hidden" name="target_actor" value="<?= h($origActor) ?>">
                   <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                </form>
+                <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
+                  <input type="hidden" name="target_actor" value="<?= h($origActor) ?>">
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
                 </form>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
@@ -13248,20 +13248,20 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
-                  <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
-                  <input type="hidden" name="target_actor" value="<?= h($targetActor) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-                </form>
-                <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="unreblog_status">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
                   <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
                   <input type="hidden" name="target_actor" value="<?= h($targetActor) ?>">
                   <button class="icon-btn on" type="submit" title="Undo boost" aria-label="Undo boost"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                </form>
+                <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($objectId) ?>">
+                  <input type="hidden" name="target_actor" value="<?= h($targetActor) ?>">
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
                 </form>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
