@@ -6977,7 +6977,23 @@ function ap_block_upsert(string $scope, string $value, string $kind = 'block', ?
     $idRow = $db->prepare('SELECT id FROM ap_blocks WHERE scope = ? AND value = ?');
     $idRow->execute([$scope, $value]);
     $id = (int) ($idRow->fetch()['id'] ?? 0);
-    return ['ok' => true, 'id' => $id, 'scope' => $scope, 'value' => $value, 'side_effects' => $side];
+    $out = ['ok' => true, 'id' => $id, 'scope' => $scope, 'value' => $value, 'side_effects' => $side];
+    // Actor block/suspend: full block — reject inbound locally AND notify remotes via Block
+    // fan-out from local accounts. Domain blocks stay local reject (no mass Block fan-out).
+    // Server-wide mute stays local-only (no ActivityPub Mute).
+    if ($scope === 'actor' && in_array($kind, ['block', 'suspend'], true)) {
+        if (!function_exists('ap_instance_federate_actor_block')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+        }
+        if (function_exists('ap_instance_federate_actor_block')) {
+            $fed = ap_instance_federate_actor_block($value, true);
+            $out['federated'] = $fed;
+        }
+    }
+    return $out;
 }
 
 /**
@@ -7007,12 +7023,25 @@ function ap_block_remove(int $id): array
     }
     ap_block_cache_clear();
     $restored = ap_block_undo_side_effects($scope, $value);
-    return [
+    $out = [
         'ok' => true,
         'scope' => $scope,
         'value' => $value,
         'mentions_restored' => (int) ($restored['mentions_restored'] ?? 0),
     ];
+    $prevKind = (string) ($row['kind'] ?? 'block');
+    if ($scope === 'actor' && in_array($prevKind, ['block', 'suspend'], true) && $value !== '') {
+        if (!function_exists('ap_instance_federate_actor_block')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+        }
+        if (function_exists('ap_instance_federate_actor_block')) {
+            $out['federated'] = ap_instance_federate_actor_block($value, false);
+        }
+    }
+    return $out;
 }
 
 /**

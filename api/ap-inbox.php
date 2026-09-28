@@ -3595,7 +3595,125 @@ function ap_unfollow_remote_actor(string $actorId, ?string $followActivityId = n
  *
  * @return array{ok:bool,error?:string,delivered?:bool,already_local?:bool}
  */
-function ap_block_remote_actor(string $actorId): array
+/**
+ * Signing identity for a local /users/{key} actor (optional override for fan-out).
+ *
+ * @return array{id:string,key_id:string,priv:string}|null
+ */
+function ap_identity_for_local_actor(string $localActorId): ?array
+{
+    $localActorId = rtrim(trim($localActorId), '/');
+    if ($localActorId === '' || !preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $localActorId, $m)) {
+        return null;
+    }
+    $actorKey = strtolower($m[1]);
+    $paths = function_exists('ap_actor_key_paths')
+        ? ap_actor_key_paths($actorKey)
+        : [
+            'private' => '/etc/mkultra/ap-inbox/' . $actorKey . '_private.pem',
+            'public' => '/etc/mkultra/ap-inbox/' . $actorKey . '_public.pem',
+        ];
+    $priv = (string) ($paths['private'] ?? '');
+    if ($priv === '' || !is_file($priv)) {
+        return null;
+    }
+    $id = 'https://mkultra.monster/users/' . $actorKey;
+    return [
+        'id' => $id,
+        'key_id' => $id . '#main-key',
+        'priv' => $priv,
+    ];
+}
+
+/**
+ * Local actors that should notify a remote of an instance-wide Block.
+ * Prefer accounts with a follow relationship; always include the current session actor.
+ *
+ * @return list<string>
+ */
+function ap_local_actors_for_instance_block_fanout(string $targetActorId): array
+{
+    $targetActorId = rtrim(trim($targetActorId), '/');
+    $alt = $targetActorId . '/';
+    $out = [];
+    $add = static function (string $id) use (&$out): void {
+        $id = rtrim($id, '/');
+        if ($id !== '' && str_starts_with($id, 'https://mkultra.monster/users/') && !isset($out[$id])) {
+            $out[$id] = true;
+        }
+    };
+    $session = rtrim((string) (ap_outbound_identity()['id'] ?? ''), '/');
+    if ($session !== '') {
+        $add($session);
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT DISTINCT owner_actor_id AS a FROM followers WHERE actor_id = ? OR actor_id = ?
+             UNION
+             SELECT DISTINCT owner_actor_id AS a FROM following WHERE actor_id = ? OR actor_id = ?'
+        );
+        $st->execute([$targetActorId, $alt, $targetActorId, $alt]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $a) {
+            $add((string) $a);
+        }
+        // Instance-wide: also notify from every local account that has keys (full server block).
+        $users = ap_db()->query(
+            "SELECT actor_id FROM ap_users
+             WHERE actor_id LIKE 'https://mkultra.monster/users/%'
+             ORDER BY id ASC
+             LIMIT 80"
+        );
+        foreach ($users->fetchAll(PDO::FETCH_COLUMN) ?: [] as $a) {
+            $add((string) $a);
+        }
+    } catch (Throwable $e) {
+        // keep session actor at least
+    }
+    return array_keys($out);
+}
+
+/**
+ * Federate Block/Undo from all relevant local actors for a server-wide actor block.
+ *
+ * @return array{ok:bool,attempted:int,delivered:int}
+ */
+function ap_instance_federate_actor_block(string $targetActorId, bool $blocking = true): array
+{
+    $targetActorId = rtrim(trim($targetActorId), '/');
+    if ($targetActorId === '' || !str_starts_with($targetActorId, 'https://')) {
+        return ['ok' => false, 'attempted' => 0, 'delivered' => 0];
+    }
+    $attempted = 0;
+    $delivered = 0;
+    foreach (ap_local_actors_for_instance_block_fanout($targetActorId) as $localId) {
+        $ident = ap_identity_for_local_actor($localId);
+        if ($ident === null) {
+            continue;
+        }
+        $attempted++;
+        $res = $blocking
+            ? ap_block_remote_actor($targetActorId, $ident)
+            : ap_unblock_remote_actor($targetActorId, $ident);
+        if (!empty($res['delivered'])) {
+            $delivered++;
+        }
+    }
+    ap_log(
+        'instance_block_fanout target=' . ap_short($targetActorId)
+        . ' blocking=' . ($blocking ? '1' : '0')
+        . ' attempted=' . $attempted
+        . ' delivered=' . $delivered
+    );
+    return ['ok' => true, 'attempted' => $attempted, 'delivered' => $delivered];
+}
+
+/**
+ * Federate a personal Block (Mastodon-compatible). Required for Bridgy Fed opt-out.
+ *
+ * @param array{id?:string,key_id?:string,priv?:string}|null $ident Override signing identity (instance fan-out).
+ * @return array{ok:bool,error?:string,delivered?:bool}
+ */
+function ap_block_remote_actor(string $actorId, ?array $ident = null): array
 {
     $rawInput = trim($actorId);
     $resolved = ap_resolve_actor_ref($rawInput);
@@ -3606,7 +3724,9 @@ function ap_block_remote_actor(string $actorId): array
         return ['ok' => false, 'error' => 'Could not resolve actor to block'];
     }
     $targetId = rtrim($resolved, '/');
-    $ident = ap_outbound_identity();
+    $ident = is_array($ident) && !empty($ident['id']) && !empty($ident['key_id']) && !empty($ident['priv'])
+        ? $ident
+        : ap_outbound_identity();
     $localId = rtrim((string) ($ident['id'] ?? ''), '/');
     if ($localId === '' || !str_starts_with($localId, 'https://')) {
         return ['ok' => false, 'error' => 'Not signed in as a local account'];
@@ -3659,7 +3779,7 @@ function ap_block_remote_actor(string $actorId): array
         if (ap_is_blocked_inbox($inbox)) {
             continue;
         }
-        if (ap_deliver_signed_json($inbox, $block, $ident['key_id'], $ident['priv'], 8.0)) {
+        if (ap_deliver_signed_json($inbox, $block, (string) $ident['key_id'], (string) $ident['priv'], 8.0)) {
             $delivered = true;
             $usedInbox = $inbox;
             break;
@@ -3677,6 +3797,7 @@ function ap_block_remote_actor(string $actorId): array
     );
     ap_log(
         'block_remote target=' . ap_short($targetId)
+        . ' from=' . ap_short($localId)
         . ' delivered=' . ($delivered ? '1' : '0')
         . ' inbox=' . ap_short($usedInbox)
     );
@@ -3695,9 +3816,10 @@ function ap_block_remote_actor(string $actorId): array
 /**
  * Federate Undo(Block) when a personal block is removed.
  *
+ * @param array{id?:string,key_id?:string,priv?:string}|null $ident
  * @return array{ok:bool,error?:string,delivered?:bool}
  */
-function ap_unblock_remote_actor(string $actorId): array
+function ap_unblock_remote_actor(string $actorId, ?array $ident = null): array
 {
     $rawInput = trim($actorId);
     $resolved = ap_resolve_actor_ref($rawInput);
@@ -3708,7 +3830,9 @@ function ap_unblock_remote_actor(string $actorId): array
         return ['ok' => false, 'error' => 'Could not resolve actor to unblock'];
     }
     $targetId = rtrim($resolved, '/');
-    $ident = ap_outbound_identity();
+    $ident = is_array($ident) && !empty($ident['id']) && !empty($ident['key_id']) && !empty($ident['priv'])
+        ? $ident
+        : ap_outbound_identity();
     $localId = rtrim((string) ($ident['id'] ?? ''), '/');
     if ($localId === '' || !str_starts_with($localId, 'https://')) {
         return ['ok' => false, 'error' => 'Not signed in as a local account'];
@@ -3753,13 +3877,13 @@ function ap_unblock_remote_actor(string $actorId): array
         if (ap_is_blocked_inbox($inbox)) {
             continue;
         }
-        if (ap_deliver_signed_json($inbox, $undo, $ident['key_id'], $ident['priv'], 8.0)) {
+        if (ap_deliver_signed_json($inbox, $undo, (string) $ident['key_id'], (string) $ident['priv'], 8.0)) {
             $delivered = true;
             break;
         }
     }
     ap_metrics_record('Undo', $localId, $undoId, $targetId, strlen(json_encode($undo) ?: ''), 'manual_unblock', null);
-    ap_log('unblock_remote target=' . ap_short($targetId) . ' delivered=' . ($delivered ? '1' : '0'));
+    ap_log('unblock_remote target=' . ap_short($targetId) . ' from=' . ap_short($localId) . ' delivered=' . ($delivered ? '1' : '0'));
     return ['ok' => true, 'delivered' => $delivered];
 }
 

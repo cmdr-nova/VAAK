@@ -2574,6 +2574,14 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     . ', hid mentions ' . (int) ($side['mentions_hidden'] ?? 0);
                 if ($kind === 'block' || $kind === 'suspend') {
                     $notice .= ' · inbound federation from them is now rejected (HTTP 403).';
+                    if (($result['scope'] ?? '') === 'actor' && is_array($result['federated'] ?? null)) {
+                        $fed = $result['federated'];
+                        $notice .= ' · Block notified '
+                            . (int) ($fed['delivered'] ?? 0) . '/'
+                            . (int) ($fed['attempted'] ?? 0) . ' local accounts.';
+                    } elseif (($result['scope'] ?? '') === 'domain') {
+                        $notice .= ' · Domain blocks are enforced locally (no per-user Block fan-out).';
+                    }
                 }
                 $reportId = (int) ($_POST['report_id'] ?? 0);
                 $adminNote = trim((string) ($_POST['admin_note'] ?? ''));
@@ -2601,6 +2609,12 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     . ($removed['value'] ?? ('#' . $id))
                     . ' · restored mentions ' . (int) ($removed['mentions_restored'] ?? 0)
                     . ' (follows are not auto-restored — re-follow if you want them back).';
+                if (($removed['scope'] ?? '') === 'actor' && is_array($removed['federated'] ?? null)) {
+                    $fed = $removed['federated'];
+                    $notice .= ' · Undo(Block) notified '
+                        . (int) ($fed['delivered'] ?? 0) . '/'
+                        . (int) ($fed['attempted'] ?? 0) . ' local accounts.';
+                }
             } else {
                 $error = $removed['error'] ?? 'Block not found.';
             }
@@ -19605,7 +19619,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'blocks'): ?>
         <div class="meta" style="margin-bottom:1rem">
           <b>Server-wide controls</b>:
-          <b>Block / Suspend</b> fully reject inbound federation (HTTP 403) and stop outbound delivery to that user/instance;
+          <b>Block / Suspend</b> fully reject inbound federation (HTTP 403), stop outbound delivery, and for actor blocks also send ActivityPub <code>Block</code> from local accounts so remotes learn; domain blocks stay local reject (no mass fan-out);
           <b>Global mute</b> only hides their content locally (they can still federate).
           Personal mutes/blocks live under <a href="?view=profile">Profile</a>.
         </div>
