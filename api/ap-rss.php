@@ -122,6 +122,26 @@ function ap_rss_item_by_id(int $itemId, ?int $ownerUserId = null): ?array
     return is_array($row) ? $row : null;
 }
 
+/**
+ * Short display name for a feed (e.g. "IGN Articles" → "IGN").
+ */
+function ap_rss_display_title(string $title): string
+{
+    $title = trim(html_entity_decode($title, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($title === '') {
+        return 'RSS';
+    }
+    // Strip common channel suffixes once (case-insensitive).
+    // Keep words like "News" in brand names (e.g. "BBC News").
+    $cleaned = preg_replace(
+        '/[\s\-–—|:]*\b(articles?|rss|atom|feeds?|blog)\s*$/iu',
+        '',
+        $title
+    );
+    $cleaned = trim((string) $cleaned, " \t\n\r\0\x0B\-–—|:");
+    return $cleaned !== '' ? $cleaned : $title;
+}
+
 /** Look up an RSS item by the local mirror note created for boost/quote/fav. */
 function ap_rss_item_by_mirror_note_id(string $noteId): ?array
 {

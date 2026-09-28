@@ -9501,7 +9501,9 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
         }
     }
     if (is_array($rssItem)) {
-        $feedTitle = trim((string) ($rssItem['feed_title'] ?? ''));
+        $feedTitle = function_exists('ap_rss_display_title')
+            ? ap_rss_display_title((string) ($rssItem['feed_title'] ?? ''))
+            : trim((string) ($rssItem['feed_title'] ?? 'RSS'));
         if ($feedTitle === '') {
             $feedTitle = 'RSS';
         }
@@ -9514,6 +9516,20 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
         }
         // Prefer the article URL for “Open original”; keep note URL for in-app open.
         $articleUrl = trim((string) ($rssItem['url'] ?? ''));
+        $image = trim((string) ($rssItem['image_url'] ?? ''));
+        if ($image !== '' && !preg_match('#^https://#i', $image)) {
+            $image = '';
+        }
+        $card = null;
+        if ($articleUrl !== '') {
+            $card = [
+                'url' => $articleUrl,
+                'title' => (string) ($rssItem['title'] ?? ''),
+                'description' => $summary,
+                'image' => $image !== '' ? $image : null,
+                'provider_name' => $feedTitle,
+            ];
+        }
         return [
             'acct' => $feedTitle,
             'is_rss' => true,
@@ -9522,7 +9538,7 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
             'open_external' => $articleUrl !== '',
             'open_label' => 'Open quoted',
             'media' => [],
-            'card' => $articleUrl !== '' ? ['url' => $articleUrl, 'title' => (string) ($rssItem['title'] ?? ''), 'description' => $summary] : null,
+            'card' => $card,
             'mentions' => [],
         ];
     }
@@ -14066,7 +14082,9 @@ function admin_render_rss_item(array $row, string $returnView): void
         return;
     }
     $feedId = (int) ($row['feed_id'] ?? 0);
-    $feedTitle = trim((string) ($row['feed_title'] ?? ''));
+    $feedTitle = function_exists('ap_rss_display_title')
+        ? ap_rss_display_title((string) ($row['feed_title'] ?? ''))
+        : trim((string) ($row['feed_title'] ?? ''));
     if ($feedTitle === '') {
         $feedTitle = 'RSS';
     }
@@ -23930,7 +23948,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php foreach ($rssFeeds as $rf): ?>
             <?php
               $rfid = (int) ($rf['id'] ?? 0);
-              $rftitle = trim((string) ($rf['title'] ?? ''));
+              $rftitle = function_exists('ap_rss_display_title')
+                  ? ap_rss_display_title((string) ($rf['title'] ?? ''))
+                  : trim((string) ($rf['title'] ?? ''));
               if ($rftitle === '') {
                   $rftitle = (string) ($rf['feed_url'] ?? 'Feed');
               }
@@ -23979,7 +23999,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Recent items</h3>
           <?php foreach ($rssPreview as $rp): ?>
             <div class="meta" style="margin-bottom:.45rem;overflow-wrap:anywhere">
-              <b><?= h((string) ($rp['feed_title'] ?? 'Feed')) ?></b>
+              <b><?= h(function_exists('ap_rss_display_title') ? ap_rss_display_title((string) ($rp['feed_title'] ?? 'Feed')) : (string) ($rp['feed_title'] ?? 'Feed')) ?></b>
               · <?= h(relative_time((string) ($rp['published_at'] ?? ($rp['ingested_at'] ?? '')))) ?>
               · <?php if (!empty($rp['url'])): ?><a href="<?= h((string) $rp['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h(mb_strimwidth((string) ($rp['title'] ?? $rp['url']), 0, 100, '…', 'UTF-8')) ?></a><?php else: ?><?= h((string) ($rp['title'] ?? 'Item')) ?><?php endif; ?>
             </div>
