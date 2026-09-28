@@ -13,6 +13,7 @@ function ap_rss_migrate(): void
     }
     $done = true;
     $db = ap_db();
+    try {
     $db->exec(
         "CREATE TABLE IF NOT EXISTS rss_feeds (
             id BIGSERIAL PRIMARY KEY,
@@ -48,6 +49,13 @@ function ap_rss_migrate(): void
     $db->exec('CREATE INDEX IF NOT EXISTS idx_rss_feeds_owner ON rss_feeds (owner_user_id, enabled)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_rss_items_feed_pub ON rss_items (feed_id, published_at DESC NULLS LAST)');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_rss_items_pub ON rss_items (published_at DESC NULLS LAST)');
+    } catch (Throwable $e) {
+        // Tables may be provisioned by ops when the app role cannot CREATE.
+        if (stripos($e->getMessage(), 'permission denied') === false
+            && stripos($e->getMessage(), 'already exists') === false) {
+            throw $e;
+        }
+    }
 }
 
 /** @return list<array<string,mixed>> */
