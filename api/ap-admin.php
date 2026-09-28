@@ -32,6 +32,7 @@ require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
 require_once __DIR__ . '/ap-bsky.php'; // Phase A Bluesky tab (opt-in, feature-flagged)
 require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline actions
+require_once __DIR__ . '/ap-rss.php'; // You → RSS → Home mix
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -87,6 +88,9 @@ $vaakOwnerId = (int) ($vaakUser['id'] ?? 0);
 $GLOBALS['vaak_user'] = $vaakUser;
 $GLOBALS['vaak_is_admin'] = $vaakIsAdmin;
 $GLOBALS['vaak_owner_id'] = $vaakOwnerId;
+if ($vaakOwnerId > 0 && function_exists('ap_rss_migrate')) {
+    ap_rss_migrate();
+}
 
 $vaakActorKey = (string) ($vaakUser['actor_key'] ?? 'cmdr_nova');
 $vaakActorId = rtrim((string) ($vaakUser['actor_id'] ?? ('https://mkultra.monster/users/' . $vaakActorKey)), '/');
@@ -3822,6 +3826,153 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     . ' tokens · apps ' . (int) ($purge['apps_deleted'] ?? 0) . '.';
             }
         }
+    } elseif (in_array($action, ['rss_add', 'rss_remove', 'rss_remove_feed', 'rss_refresh', 'rss_favourite', 'rss_bookmark', 'rss_boost', 'rss_quote'], true)) {
+        $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'rss')) ?: 'rss';
+        if (!in_array($returnView, ['rss', 'home', 'local', 'feed', 'outbox'], true)) {
+            $returnView = 'rss';
+        }
+        // CRUD stays on You → RSS; Home overflow remove + card actions honor return_view.
+        $view = in_array($action, ['rss_add', 'rss_refresh'], true)
+            ? 'rss'
+            : $returnView;
+        $ownerId = $vaakOwnerId > 0 ? $vaakOwnerId : admin_owner_user_id();
+        if ($ownerId < 1) {
+            $error = 'Not signed in.';
+        } elseif ($action === 'rss_add') {
+            $view = 'rss';
+            $res = ap_rss_add_feed($ownerId, (string) ($_POST['feed_url'] ?? ''));
+            if (!empty($res['ok'])) {
+                $notice = !empty($res['discovered'])
+                    ? 'Feed discovered and added.'
+                    : 'Feed added.';
+                if (function_exists('admin_tl_cache_clear_owner')) {
+                    admin_tl_cache_clear_owner($ownerId);
+                }
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not add feed.');
+            }
+        } elseif ($action === 'rss_remove' || $action === 'rss_remove_feed') {
+            $feedId = (int) ($_POST['feed_id'] ?? 0);
+            $res = ap_rss_remove_feed($ownerId, $feedId);
+            if (!empty($res['ok'])) {
+                $notice = 'Feed removed.';
+                if (function_exists('admin_tl_cache_clear_owner')) {
+                    admin_tl_cache_clear_owner($ownerId);
+                }
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not remove feed.');
+            }
+            $view = in_array($returnView, ['rss', 'home'], true) ? $returnView : 'rss';
+        } elseif ($action === 'rss_refresh') {
+            $view = 'rss';
+            $feedId = (int) ($_POST['feed_id'] ?? 0);
+            $feed = ap_rss_feed_by_id($feedId, $ownerId);
+            if ($feed === null) {
+                $error = 'Feed not found.';
+            } else {
+                $last = strtotime((string) ($feed['last_fetched_at'] ?? '')) ?: 0;
+                if ($last > 0 && (time() - $last) < 90) {
+                    $notice = 'Already refreshed recently — try again in a minute.';
+                } else {
+                    $res = ap_rss_refresh_feed($feedId, $ownerId);
+                    if (!empty($res['ok'])) {
+                        $added = (int) ($res['added'] ?? 0);
+                        $notice = $added > 0
+                            ? ('Feed refreshed · ' . $added . ' new item' . ($added === 1 ? '' : 's') . '.')
+                            : 'Feed refreshed · no new items.';
+                        if (function_exists('admin_tl_cache_clear_owner')) {
+                            admin_tl_cache_clear_owner($ownerId);
+                        }
+                    } else {
+                        $error = (string) ($res['error'] ?? 'Could not refresh feed.');
+                    }
+                }
+            }
+        } else {
+            // favourite / bookmark / boost / quote — materialize mirror note first
+            $itemId = (int) ($_POST['item_id'] ?? 0);
+            $mat = ap_rss_materialize_note($ownerId, $itemId);
+            if (empty($mat['ok'])) {
+                $error = (string) ($mat['error'] ?? 'Could not prepare RSS item.');
+            } else {
+                $noteId = rtrim((string) ($mat['note_id'] ?? ''), '/');
+                $localId = (int) ($mat['local_id'] ?? 0);
+                $statusId = '';
+                $mrow = null;
+                if ($noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
+                    $mrow = ap_masto_status_by_note_id($noteId);
+                    if (is_array($mrow)) {
+                        $localId = (int) ($mrow['local_id'] ?? $localId);
+                        if ($localId > 0 && function_exists('ap_masto_snowflake_id')) {
+                            $statusId = ap_masto_snowflake_id(
+                                (string) ($mrow['published'] ?? gmdate('c')),
+                                $localId,
+                                0
+                            );
+                        }
+                    }
+                }
+                if ($action === 'rss_quote') {
+                    if ($noteId === '') {
+                        $error = 'Mirror note missing.';
+                    } else {
+                        $q = '?view=' . rawurlencode($returnView !== '' ? $returnView : 'home')
+                            . '&compose=1&quote_object=' . rawurlencode($noteId);
+                        if ($statusId !== '') {
+                            $q .= '&quote_status_id=' . rawurlencode($statusId);
+                        }
+                        header('Location: ' . $q, true, 303);
+                        exit;
+                    }
+                } elseif ($statusId === '' || $noteId === '') {
+                    $error = 'Mirror status not ready yet.';
+                } elseif ($action === 'rss_favourite') {
+                    $isFav = function_exists('ap_masto_status_is_favourited')
+                        && ap_masto_status_is_favourited($statusId, null, $noteId);
+                    if ($isFav) {
+                        ap_masto_favourite_remove($statusId, null, $noteId);
+                        $notice = 'Removed favourite.';
+                    } else {
+                        ap_masto_favourite_add($statusId, $noteId, $vaakActorId);
+                        $notice = 'Favourited.';
+                    }
+                } elseif ($action === 'rss_bookmark') {
+                    $isBm = function_exists('ap_masto_status_is_bookmarked')
+                        && ap_masto_status_is_bookmarked($statusId, null, $noteId);
+                    if ($isBm) {
+                        ap_masto_bookmark_remove($statusId, null, $noteId);
+                        $notice = 'Bookmark removed.';
+                    } else {
+                        ap_masto_bookmark_add($statusId, $noteId);
+                        $notice = 'Bookmarked.';
+                    }
+                } elseif ($action === 'rss_boost') {
+                    if (!function_exists('ap_masto_resolve_status_interaction') || !function_exists('ap_masto_reblog_perform')) {
+                        $error = 'Boost unavailable.';
+                    } else {
+                        $resolved = ap_masto_resolve_status_interaction((int) $statusId);
+                        if ($resolved === null && $localId > 0) {
+                            $resolved = ap_masto_resolve_status_interaction($localId);
+                        }
+                        if ($resolved === null) {
+                            $error = 'Mirror status not found.';
+                        } else {
+                            $undo = function_exists('ap_masto_status_is_reblogged')
+                                && ap_masto_status_is_reblogged($statusId);
+                            $res = ap_masto_reblog_perform($resolved, $undo);
+                            if (!empty($res['ok'])) {
+                                $notice = $undo ? 'Boost removed.' : 'Boosted.';
+                                if (function_exists('admin_tl_cache_clear_owner')) {
+                                    admin_tl_cache_clear_owner($ownerId);
+                                }
+                            } else {
+                                $error = (string) ($res['error'] ?? 'Boost failed.');
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -5711,6 +5862,10 @@ function admin_tl_rank_entry(array $item): ?array
         $id = (string) ($row['bsky_uri'] ?? ($row['post']['uri'] ?? ''));
         return $id !== '' ? ['k' => 'bsky', 'id' => $id] : null;
     }
+    if ($kind === 'rss') {
+        $id = (string) (int) ($row['id'] ?? 0);
+        return $id !== '0' ? ['k' => 'rss', 'id' => $id] : null;
+    }
     return null;
 }
 
@@ -6183,6 +6338,75 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
     return $out;
 }
 
+/**
+ * Queue RSS item ids into later Home pages at ~20% with ≥2 other cards between.
+ *
+ * @param list<array{k:string,id:string,t?:int}> $ranked
+ * @return list<array{k:string,id:string,t?:int}>
+ */
+function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, int $firstPage = 15): array
+{
+    if ($ownerUserId < 1 || !function_exists('ap_rss_home_rank_keys')) {
+        return $ranked;
+    }
+    $firstPage = max(0, $firstPage);
+    $keys = ap_rss_home_rank_keys($ownerUserId, 40);
+    if ($keys === []) {
+        return $ranked;
+    }
+    $seenRss = [];
+    foreach ($ranked as $row) {
+        if ((string) ($row['k'] ?? '') === 'rss') {
+            $id = (string) ($row['id'] ?? '');
+            if ($id !== '') {
+                $seenRss[$id] = true;
+            }
+        }
+    }
+    $queued = [];
+    foreach ($keys as $row) {
+        $uri = (string) ($row['uri'] ?? '');
+        if ($uri === '' || $uri === '0' || isset($seenRss[$uri])) {
+            continue;
+        }
+        $queued[] = ['k' => 'rss', 'id' => $uri];
+        $seenRss[$uri] = true;
+    }
+    if ($queued === []) {
+        return $ranked;
+    }
+    if ($ranked === []) {
+        return array_slice($queued, 0, 40);
+    }
+    $head = array_slice($ranked, 0, $firstPage);
+    $tail = array_slice($ranked, $firstPage);
+    $out = $head;
+    $qi = 0;
+    $rssEmitted = 0;
+    $sinceRss = 2;
+    $flush = static function () use (&$out, &$queued, &$qi, &$rssEmitted, &$sinceRss): void {
+        while (isset($queued[$qi])) {
+            if ($sinceRss < 2 && $out !== []) {
+                break;
+            }
+            if ($out !== [] && ($rssEmitted + 1) / max(1, count($out) + 1) > 0.20) {
+                break;
+            }
+            $out[] = $queued[$qi];
+            $qi++;
+            $rssEmitted++;
+            $sinceRss = 0;
+        }
+    };
+    $flush();
+    foreach ($tail as $item) {
+        $out[] = $item;
+        $sinceRss++;
+        $flush();
+    }
+    return $out;
+}
+
 /** @param list<array{k:string,id:string,t?:int}> $ranked */
 function admin_tl_cache_put(string $key, array $ranked): void
 {
@@ -6488,7 +6712,7 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
         }
     }
     $ranked = $timeline !== [] ? admin_tl_rank_from_timeline($timeline) : [];
-    // Match full Home: keep a short fedi head, then mix Bluesky following posts.
+    // Match full Home: keep a short fedi head, then mix Bluesky following posts + RSS.
     if ($view === 'home' && function_exists('admin_home_queue_bsky_after_first_page')) {
         $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
         if ($ownerUserId > 0) {
@@ -6499,6 +6723,9 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 $head = 0;
             }
             $ranked = admin_home_queue_bsky_after_first_page($ranked, $ownerUserId, max(1, $head));
+            if (function_exists('admin_home_queue_rss_after_first_page')) {
+                $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, max(1, $head));
+            }
         }
     }
     if ($ranked !== []) {
@@ -6520,6 +6747,15 @@ function admin_timeline_item_muted_by_words(array $item): bool
     $row = $item['row'] ?? null;
     if (!is_array($row)) {
         return false;
+    }
+    if ($kind === 'rss') {
+        $blob = trim((string) ($row['title'] ?? '') . "\n" . (string) ($row['summary_text'] ?? ''));
+        return $blob !== '' && ap_row_matches_muted_words(
+            ['summary' => $blob],
+            'event',
+            [],
+            admin_owner_user_id()
+        );
     }
     $extra = [];
     if ($kind === 'outbox') {
@@ -7008,6 +7244,22 @@ function admin_tl_hydrate(array $slice): array
                 'kind' => 'bsky',
                 'sort' => strtotime($indexed) ?: 0,
                 'row' => $bItem,
+            ];
+        } elseif ($k === 'rss') {
+            $rid = (int) $id;
+            if ($rid < 1 || !function_exists('ap_rss_item_by_id')) {
+                continue;
+            }
+            $ownerForRss = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+            $rItem = ap_rss_item_by_id($rid, $ownerForRss > 0 ? $ownerForRss : null);
+            if (!is_array($rItem)) {
+                continue;
+            }
+            $pub = (string) ($rItem['published_at'] ?? ($rItem['ingested_at'] ?? ''));
+            $items[] = [
+                'kind' => 'rss',
+                'sort' => strtotime($pub) ?: 0,
+                'row' => $rItem,
             ];
         }
     }
@@ -7938,6 +8190,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         ) {
             $ranked = admin_home_queue_bsky_after_first_page($ranked, $homeOwnerId, $tlLimit);
         }
+        if (function_exists('admin_home_queue_rss_after_first_page')) {
+            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, $tlLimit);
+        }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
         if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
@@ -8660,6 +8915,7 @@ function view_title(string $view): string
         'outbox' => 'Your posts',
         'queue' => 'Queue',
         'drafts' => 'Drafts',
+        'rss' => 'RSS',
         'compose' => 'Compose',
         'profile' => 'Profile',
         'remote_profile' => 'Remote profile',
@@ -13742,8 +13998,177 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
         }
         return;
     }
+    if ($kind === 'rss') {
+        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+        if ($row !== []) {
+            admin_render_rss_item($row, $returnView);
+        }
+        return;
+    }
     $fromTag = !empty($item['from_tag']) || !empty($item['row']['_from_followed_tag']);
     admin_render_event_tweet($item['row'], $followingIds, $returnView, $fromTag);
+}
+
+/**
+ * Home/RSS card: feed title as display name (no @handle), favicon avatar,
+ * favourite/bookmark/boost/quote via materialize — no reply.
+ *
+ * @param array<string,mixed> $row
+ */
+function admin_render_rss_item(array $row, string $returnView): void
+{
+    $itemId = (int) ($row['id'] ?? 0);
+    if ($itemId < 1) {
+        return;
+    }
+    $feedId = (int) ($row['feed_id'] ?? 0);
+    $feedTitle = trim((string) ($row['feed_title'] ?? ''));
+    if ($feedTitle === '') {
+        $feedTitle = 'RSS';
+    }
+    $favicon = trim((string) ($row['feed_favicon'] ?? ''));
+    $title = trim((string) ($row['title'] ?? ''));
+    $summary = trim((string) ($row['summary_text'] ?? ''));
+    if ($summary !== '') {
+        $summary = mb_strimwidth($summary, 0, 320, '…', 'UTF-8');
+    }
+    $url = trim((string) ($row['url'] ?? ''));
+    $image = trim((string) ($row['image_url'] ?? ''));
+    $published = (string) ($row['published_at'] ?? ($row['ingested_at'] ?? ''));
+    $host = '';
+    if ($url !== '') {
+        $h = parse_url($url, PHP_URL_HOST);
+        $host = is_string($h) ? strtolower($h) : '';
+    }
+    $fallbackAv = defined('AP_REMOTE_AVATAR_FALLBACK')
+        ? AP_REMOTE_AVATAR_FALLBACK
+        : 'https://mkultra.monster/img/avatar/default.jpg';
+    $avSrc = ($favicon !== '' && preg_match('#^https?://#i', $favicon)) ? $favicon : $fallbackAv;
+
+    $mirrorNoteId = rtrim(trim((string) ($row['mirror_note_id'] ?? '')), '/');
+    $statusId = '';
+    $fav = false;
+    $bm = false;
+    $boosted = false;
+    if ($mirrorNoteId !== '' && function_exists('ap_masto_status_by_note_id')) {
+        $mrow = ap_masto_status_by_note_id($mirrorNoteId);
+        if (is_array($mrow) && !empty($mrow['local_id']) && function_exists('ap_masto_snowflake_id')) {
+            $statusId = ap_masto_snowflake_id(
+                (string) ($mrow['published'] ?? gmdate('c')),
+                (int) $mrow['local_id'],
+                0
+            );
+            if ($statusId !== '') {
+                $fav = function_exists('ap_masto_status_is_favourited')
+                    && ap_masto_status_is_favourited($statusId, null, $mirrorNoteId);
+                $bm = function_exists('ap_masto_status_is_bookmarked')
+                    && ap_masto_status_is_bookmarked($statusId, null, $mirrorNoteId);
+                $boosted = function_exists('ap_masto_status_is_reblogged')
+                    && ap_masto_status_is_reblogged($statusId);
+            }
+        }
+    }
+
+    $linkCardHtml = '';
+    if ($url !== '' && preg_match('#^https?://#i', $url)) {
+        $card = null;
+        if (function_exists('ap_link_preview_cache_get')) {
+            if (!function_exists('ap_link_preview_for_url')) {
+                @require_once __DIR__ . '/ap-link-preview.php';
+            }
+            $card = ap_link_preview_cache_get($url);
+        }
+        if (is_array($card) && function_exists('ap_link_preview_html')) {
+            $linkCardHtml = ap_link_preview_html($card, true);
+        } else {
+            $titleH = h($title !== '' ? $title : ($host !== '' ? $host : $url));
+            $descH = $summary !== '' ? '<div class="link-card__desc">' . h($summary) . '</div>' : '';
+            $provH = $host !== '' ? '<div class="link-card__provider">' . h($host) . '</div>' : '';
+            $imgH = ($image !== '' && preg_match('#^https?://#i', $image))
+                ? '<div class="link-card__media"><img src="' . h($image) . '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>'
+                : '';
+            $linkCardHtml = '<a class="link-card" href="' . h($url) . '" target="_blank" rel="nofollow noopener noreferrer">'
+                . $imgH
+                . '<div class="link-card__body">' . $provH . '<div class="link-card__title">' . $titleH . '</div>' . $descH . '</div>'
+                . '</a>';
+        }
+    }
+
+    $overflow = '';
+    if ($url !== '') {
+        $overflow .= '<a class="menu-action" href="' . h($url) . '" target="_blank" rel="noopener noreferrer">Open</a>';
+    }
+    if ($feedId > 0) {
+        $overflow .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Remove this RSS feed from your Home mix?\');">'
+            . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+            . '<input type="hidden" name="action" value="rss_remove_feed">'
+            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+            . '<input type="hidden" name="feed_id" value="' . $feedId . '">'
+            . '<button class="menu-action" type="submit" style="color:var(--danger)">Remove feed</button>'
+            . '</form>';
+    }
+    ?>
+    <article class="tweet" data-rss-item="<?= $itemId ?>">
+      <div class="tweet-hd">
+        <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($feedTitle) ?>">
+        <div class="tweet-hd-main">
+          <div>
+            <span class="who"><?= h($feedTitle) ?></span>
+            <span class="meta"> · <?= h(relative_time($published)) ?></span>
+            <span class="tag" title="From an RSS/Atom feed you added">RSS</span>
+          </div>
+          <?php if ($host !== ''): ?>
+            <div class="meta"><?= h($host) ?></div>
+          <?php endif; ?>
+        </div>
+      </div>
+      <?php if ($title !== ''): ?>
+        <div class="body feed-body" style="font-weight:600"><?= h($title) ?></div>
+      <?php endif; ?>
+      <?php if ($summary !== '' && ($linkCardHtml === '' || $title === '')): ?>
+        <div class="body feed-body"><?= h($summary) ?></div>
+      <?php elseif ($summary !== '' && $title !== ''): ?>
+        <div class="body feed-body meta" style="margin-top:.25rem"><?= h($summary) ?></div>
+      <?php endif; ?>
+      <?= $linkCardHtml ?>
+      <div class="tweet-actions">
+        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="rss_favourite">
+          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+          <input type="hidden" name="item_id" value="<?= $itemId ?>">
+          <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+        </form>
+        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="rss_boost">
+          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+          <input type="hidden" name="item_id" value="<?= $itemId ?>">
+          <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+        </form>
+        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="rss_quote">
+          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+          <input type="hidden" name="item_id" value="<?= $itemId ?>">
+          <button class="icon-btn" type="submit" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></button>
+        </form>
+        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="rss_bookmark">
+          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+          <input type="hidden" name="item_id" value="<?= $itemId ?>">
+          <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+        </form>
+        <?php if ($overflow !== ''): ?>
+          <details class="post-action-menu">
+            <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
+            <div class="post-action-menu__body"><?= $overflow ?></div>
+          </details>
+        <?php endif; ?>
+      </div>
+    </article>
+    <?php
 }
 
 /**
@@ -14661,7 +15086,11 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             : ($view === 'local' ? $localTimeline : $homeTimeline);
         $rankedMiss = admin_tl_rank_from_timeline($timeline);
         if ($view === 'home') {
-            $rankedMiss = admin_home_queue_bsky_after_first_page($rankedMiss, admin_owner_user_id(), $tlLimit);
+            $homeOwnerMiss = admin_owner_user_id();
+            $rankedMiss = admin_home_queue_bsky_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
+            if (function_exists('admin_home_queue_rss_after_first_page')) {
+                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
+            }
         }
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.
         while ($tlOffset + $tlLimit > count($rankedMiss) && $rankedMiss !== []) {
@@ -17647,7 +18076,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = false;
-      $navYouOpen = false;
+      $navYouOpen = ($view === 'rss');
       $navAdminOpen = false;
       $navSiteOpen = false;
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
@@ -17684,6 +18113,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <div class="nav-sub">
           <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox" data-vaak-soft-nav="outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
+          <a class="<?= $view === 'rss' ? 'active' : '' ?>" href="?view=rss"><span class="ico">📰</span><span class="label">RSS</span></a>
           <a class="<?= $view === 'queue' ? 'active' : '' ?>" href="?view=queue"><span class="ico">⏱</span><span class="label">Queue</span></a>
           <a class="<?= $view === 'drafts' ? 'active' : '' ?>" href="?view=drafts" id="nav-drafts">
             <span class="ico">📄</span><span class="label">Drafts</span>
@@ -23412,6 +23842,103 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endif; ?>
               </div>
             </article>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
+      <?php elseif ($view === 'rss'): ?>
+        <?php
+          $rssFeeds = function_exists('ap_rss_feeds_for_owner') ? ap_rss_feeds_for_owner($vaakOwnerId) : [];
+          $rssPreview = [];
+          if ($vaakOwnerId > 0) {
+              try {
+                  $stRssPrev = ap_db()->prepare(
+                      "SELECT i.id, i.title, i.url, i.published_at, i.ingested_at, f.title AS feed_title
+                       FROM rss_items i
+                       JOIN rss_feeds f ON f.id = i.feed_id
+                       WHERE f.owner_user_id = ?
+                       ORDER BY COALESCE(i.published_at, i.ingested_at) DESC, i.id DESC
+                       LIMIT 10"
+                  );
+                  $stRssPrev->execute([$vaakOwnerId]);
+                  $rssPreview = $stRssPrev->fetchAll(PDO::FETCH_ASSOC) ?: [];
+              } catch (Throwable $e) {
+                  $rssPreview = [];
+              }
+          }
+        ?>
+        <div class="meta" style="margin-bottom:1rem">
+          Add RSS/Atom feeds to mix into <b>Home</b> (~20% of later pages). Polling runs in the background — Refresh here pulls once.
+        </div>
+        <form class="composer" method="post" action="?view=rss" style="margin-bottom:1.25rem">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="rss_add">
+          <input type="hidden" name="return_view" value="rss">
+          <label class="meta" style="display:block;margin-bottom:.35rem">Feed or site URL</label>
+          <input name="feed_url" type="url" required maxlength="2048" placeholder="https://example.com/feed.xml" style="width:100%">
+          <div class="composer-actions">
+            <span class="meta">Up to 40 feeds · https only</span>
+            <button class="btn btn-primary" type="submit">Add feed</button>
+          </div>
+        </form>
+        <?php if (!$rssFeeds): ?>
+          <div class="empty">No feeds yet. Paste an RSS/Atom URL (or a site homepage) above.</div>
+        <?php else: ?>
+          <?php foreach ($rssFeeds as $rf): ?>
+            <?php
+              $rfid = (int) ($rf['id'] ?? 0);
+              $rftitle = trim((string) ($rf['title'] ?? ''));
+              if ($rftitle === '') {
+                  $rftitle = (string) ($rf['feed_url'] ?? 'Feed');
+              }
+              $rferr = trim((string) ($rf['last_error'] ?? ''));
+              $rfcount = (int) ($rf['item_count'] ?? 0);
+            ?>
+            <article class="tweet">
+              <div class="tweet-hd">
+                <div class="tweet-hd-main">
+                  <div>
+                    <span class="who"><?= h($rftitle) ?></span>
+                    <span class="meta"> · <?= $rfcount ?> item<?= $rfcount === 1 ? '' : 's' ?></span>
+                  </div>
+                  <div class="meta" style="overflow-wrap:anywhere"><?= h((string) ($rf['feed_url'] ?? '')) ?></div>
+                  <div class="meta">
+                    Last fetch <?= h(relative_time((string) ($rf['last_fetched_at'] ?? ''))) ?>
+                    <?php if ($rferr !== ''): ?>
+                      · <span style="color:var(--danger)"><?= h(mb_strimwidth($rferr, 0, 120, '…', 'UTF-8')) ?></span>
+                    <?php endif; ?>
+                  </div>
+                </div>
+              </div>
+              <div class="tweet-actions">
+                <form method="post" action="?view=rss" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="rss_refresh">
+                  <input type="hidden" name="return_view" value="rss">
+                  <input type="hidden" name="feed_id" value="<?= $rfid ?>">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Refresh</button>
+                </form>
+                <form method="post" action="?view=rss" style="display:inline" onsubmit="return confirm('Remove this feed?');">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="rss_remove">
+                  <input type="hidden" name="return_view" value="rss">
+                  <input type="hidden" name="feed_id" value="<?= $rfid ?>">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem;color:var(--danger)">Remove</button>
+                </form>
+                <?php if (!empty($rf['site_url'])): ?>
+                  <a class="btn btn-ghost" href="<?= h((string) $rf['site_url']) ?>" target="_blank" rel="noopener noreferrer" style="padding:.25rem .7rem;font-size:.8rem">Site</a>
+                <?php endif; ?>
+              </div>
+            </article>
+          <?php endforeach; ?>
+        <?php endif; ?>
+        <?php if ($rssPreview): ?>
+          <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Recent items</h3>
+          <?php foreach ($rssPreview as $rp): ?>
+            <div class="meta" style="margin-bottom:.45rem;overflow-wrap:anywhere">
+              <b><?= h((string) ($rp['feed_title'] ?? 'Feed')) ?></b>
+              · <?= h(relative_time((string) ($rp['published_at'] ?? ($rp['ingested_at'] ?? '')))) ?>
+              · <?php if (!empty($rp['url'])): ?><a href="<?= h((string) $rp['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h(mb_strimwidth((string) ($rp['title'] ?? $rp['url']), 0, 100, '…', 'UTF-8')) ?></a><?php else: ?><?= h((string) ($rp['title'] ?? 'Item')) ?><?php endif; ?>
+            </div>
           <?php endforeach; ?>
         <?php endif; ?>
 
