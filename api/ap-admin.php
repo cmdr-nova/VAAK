@@ -3843,7 +3843,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $res = ap_rss_add_feed($ownerId, (string) ($_POST['feed_url'] ?? ''));
             if (!empty($res['ok'])) {
                 if (!empty($res['deferred'])) {
-                    $notice = 'Feed saved. First fetch is waiting on a temporary rate limit — items will appear after the next successful poll.';
+                    $notice = 'Feed saved. First fetch is waiting (rate limit or RSSHub temporarily unavailable) — items will appear after the next successful poll.';
                 } elseif (!empty($res['discovered'])) {
                     $notice = 'Feed discovered and added.';
                 } else {
@@ -23949,7 +23949,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <label class="meta" style="display:block;margin-bottom:.35rem">Feed or site URL</label>
           <input name="feed_url" type="url" required maxlength="2048" placeholder="https://example.com/feed.xml" style="width:100%">
           <div class="composer-actions">
-            <span class="meta">Up to 40 feeds · https only</span>
+            <span class="meta">Up to 40 feeds · https only · Pixiv user pages via RSSHub</span>
             <button class="btn btn-primary" type="submit">Add feed</button>
           </div>
         </form>

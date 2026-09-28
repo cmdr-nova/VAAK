@@ -404,6 +404,17 @@ function ap_rss_provisional_meta(string $feedUrl): array
             $title = $blog;
         }
     }
+    // RSSHub Pixiv user route → readable provisional title + real Pixiv site link.
+    $path = is_array($parts) ? (string) ($parts['path'] ?? '') : '';
+    if (preg_match('#/pixiv/user/(\d+)#i', $path, $m)) {
+        $title = 'Pixiv user ' . $m[1];
+        $site = 'https://www.pixiv.net/users/' . $m[1];
+        return [
+            'title' => $title,
+            'site_url' => $site,
+            'favicon_url' => 'https://www.pixiv.net/favicon.ico',
+        ];
+    }
     return [
         'title' => $title,
         'site_url' => $site,
@@ -433,6 +444,60 @@ function ap_rss_resolve_deferrable_feed_url(string $url): ?string
         return null;
     }
     return 'https://' . $host . '/rss';
+}
+
+/**
+ * Public/self-hosted RSSHub base (no trailing slash).
+ * Override with AP_RSSHUB_BASE when the default public demo blocks your IP or lacks Pixiv tokens.
+ */
+function ap_rss_rsshub_base(): string
+{
+    $raw = trim((string) (getenv('AP_RSSHUB_BASE') ?: ''));
+    if ($raw === '' || !preg_match('#^https://#i', $raw)) {
+        $raw = 'https://rsshub.app';
+    }
+    return rtrim($raw, '/');
+}
+
+function ap_rss_host_is_pixiv(string $url): bool
+{
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    return $host === 'pixiv.net' || str_ends_with($host, '.pixiv.net');
+}
+
+/**
+ * Map site URLs that have no native feed into an RSSHub route (https only).
+ * Pixiv: https://www.pixiv.net/users/15288095 → {RSSHUB}/pixiv/user/15288095
+ */
+function ap_rss_rewrite_via_rsshub(string $url): ?string
+{
+    $parts = parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) {
+        return null;
+    }
+    $host = strtolower((string) $parts['host']);
+    $path = (string) ($parts['path'] ?? '');
+
+    // Already an RSSHub pixiv route — leave as-is.
+    if (preg_match('#^https://[^/]+/pixiv/user/\d+#i', $url)) {
+        return null;
+    }
+
+    if ($host === 'pixiv.net' || str_ends_with($host, '.pixiv.net')) {
+        // /users/123, /en/users/123, optional trailing /artworks etc.
+        if (preg_match('#(?:^|/)(?:en/)?users/(\d+)(?:/|$)#i', $path, $m)) {
+            return ap_rss_rsshub_base() . '/pixiv/user/' . $m[1];
+        }
+        // member.php?id=123 (legacy)
+        $q = [];
+        parse_str((string) ($parts['query'] ?? ''), $q);
+        $legacyId = trim((string) ($q['id'] ?? ''));
+        if ($legacyId !== '' && ctype_digit($legacyId) && str_contains(strtolower($path), 'member.php')) {
+            return ap_rss_rsshub_base() . '/pixiv/user/' . $legacyId;
+        }
+    }
+
+    return null;
 }
 
 /**
@@ -486,6 +551,13 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
     if ($url === null) {
         return ['ok' => false, 'error' => 'Enter an https:// feed or site URL'];
     }
+    // Pixiv user pages → RSSHub /pixiv/user/:id (public or AP_RSSHUB_BASE instance).
+    $viaRsshub = false;
+    $rewritten = ap_rss_rewrite_via_rsshub($url);
+    if ($rewritten !== null && $rewritten !== $url) {
+        $url = $rewritten;
+        $viaRsshub = true;
+    }
     $existing = ap_db()->prepare('SELECT id FROM rss_feeds WHERE owner_user_id = ? AND feed_url = ?');
     $existing->execute([$ownerUserId, $url]);
     if ($existing->fetchColumn()) {
@@ -505,7 +577,7 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         return ['ok' => false, 'error' => 'Feed limit reached (40)'];
     }
 
-    $discovered = false;
+    $discovered = $viaRsshub;
     // Interactive add: one attempt so a Tumblr 429 does not stall the page for retries.
     $fetch = ap_rss_http_get($url, '', '', ['max_attempts' => 1]);
     if ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
@@ -517,6 +589,9 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         if ($err === '') {
             $err = ap_rss_http_error_message($status, $url);
         }
+        if ($viaRsshub) {
+            $err = ap_rss_rsshub_failure_message($status, $fetch['body'] ?? '', $err);
+        }
         $rateLimited = ($status === 429 || $status === 503);
 
         // Save locally on rate-limit when we already know the feed URL (Tumblr /rss, etc.).
@@ -524,10 +599,14 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         if ($rateLimited && $deferUrl !== null) {
             return ap_rss_add_feed_deferred($ownerUserId, $deferUrl, $err, $deferUrl !== $url);
         }
+        // RSSHub Pixiv (or other rewritten) URL: defer on soft failures so poller can retry.
+        if ($viaRsshub && ($rateLimited || $status === 403 || $status === 502 || $status === 0)) {
+            return ap_rss_add_feed_deferred($ownerUserId, $url, $err, true);
+        }
         // Direct feed path with a hard fetch failure: do not stampede discovery.
-        if (ap_rss_url_looks_like_feed_path($url)) {
+        if (ap_rss_url_looks_like_feed_path($url) || $viaRsshub) {
             if ($rateLimited) {
-                return ap_rss_add_feed_deferred($ownerUserId, $url, $err, false);
+                return ap_rss_add_feed_deferred($ownerUserId, $url, $err, $viaRsshub);
             }
             if ($status === 404 && ap_rss_host_is_youtube($url)) {
                 $label = ap_rss_youtube_channel_hint($url);
@@ -1047,6 +1126,24 @@ function ap_rss_youtube_channel_hint(string $feedUrl): string
         return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     }
     return '';
+}
+
+/** Friendlier errors when an RSSHub-backed route (Pixiv, etc.) fails to load. */
+function ap_rss_rsshub_failure_message(int $status, string $body, string $fallback): string
+{
+    $snip = strtolower(substr($body, 0, 800));
+    if (str_contains($snip, 'pixiv') && (str_contains($snip, 'refresh') || str_contains($snip, 'not login') || str_contains($snip, 'config'))) {
+        return 'This RSSHub instance cannot fetch Pixiv (missing Pixiv login/token). '
+            . 'Point AP_RSSHUB_BASE at an instance that has PIXIV_REFRESHTOKEN configured, or paste a working feed URL.';
+    }
+    if ($status === 403 || str_contains($snip, 'restrict access') || str_contains($snip, 'just a moment')) {
+        return 'The RSSHub instance blocked this request (common on public demos from server IPs). '
+            . 'Set AP_RSSHUB_BASE to a usable instance, or paste that instance’s /pixiv/user/… feed URL directly.';
+    }
+    if ($status === 502 || $status === 503 || $status === 0) {
+        return 'RSSHub is temporarily unavailable for this Pixiv feed. The subscription can be saved and retried later, or set AP_RSSHUB_BASE to another instance.';
+    }
+    return $fallback !== '' ? $fallback : ('RSSHub HTTP ' . $status);
 }
 
 function ap_rss_http_error_message(int $status, string $url = ''): string
