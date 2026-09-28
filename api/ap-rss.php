@@ -447,6 +447,16 @@ function ap_rss_resolve_deferrable_feed_url(string $url): ?string
 }
 
 /**
+ * Pixiv→RSSHub rewrite is off by default (needs a usable self-hosted instance + PIXIV_REFRESHTOKEN).
+ * Re-enable later with AP_RSSHUB_ENABLED=1 and optional AP_RSSHUB_BASE=https://your-rsshub.
+ */
+function ap_rss_rsshub_enabled(): bool
+{
+    $v = strtolower(trim((string) (getenv('AP_RSSHUB_ENABLED') ?: '')));
+    return in_array($v, ['1', 'true', 'yes', 'on'], true);
+}
+
+/**
  * Public/self-hosted RSSHub base (no trailing slash).
  * Override with AP_RSSHUB_BASE when the default public demo blocks your IP or lacks Pixiv tokens.
  */
@@ -468,9 +478,13 @@ function ap_rss_host_is_pixiv(string $url): bool
 /**
  * Map site URLs that have no native feed into an RSSHub route (https only).
  * Pixiv: https://www.pixiv.net/users/15288095 → {RSSHUB}/pixiv/user/15288095
+ * No-op unless AP_RSSHUB_ENABLED is set.
  */
 function ap_rss_rewrite_via_rsshub(string $url): ?string
 {
+    if (!ap_rss_rsshub_enabled()) {
+        return null;
+    }
     $parts = parse_url($url);
     if (!is_array($parts) || empty($parts['host'])) {
         return null;

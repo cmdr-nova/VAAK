@@ -23949,7 +23949,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <label class="meta" style="display:block;margin-bottom:.35rem">Feed or site URL</label>
           <input name="feed_url" type="url" required maxlength="2048" placeholder="https://example.com/feed.xml" style="width:100%">
           <div class="composer-actions">
-            <span class="meta">Up to 40 feeds · https only · Pixiv user pages via RSSHub</span>
+            <span class="meta">Up to 40 feeds · https only</span>
             <button class="btn btn-primary" type="submit">Add feed</button>
           </div>
         </form>
