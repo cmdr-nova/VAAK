@@ -480,6 +480,12 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
             if ($rateLimited) {
                 return ap_rss_add_feed_deferred($ownerUserId, $url, $err, false);
             }
+            if ($status === 404 && ap_rss_host_is_youtube($url)) {
+                $label = ap_rss_youtube_channel_hint($url);
+                if ($label !== '' && !str_contains($err, $label)) {
+                    $err = '“' . $label . '”: ' . $err;
+                }
+            }
             return ['ok' => false, 'error' => $err];
         }
 
@@ -951,6 +957,49 @@ function ap_rss_host_backoff_set(string $url, int $seconds): void
     $map[$host] = max((int) ($map[$host] ?? 0), time() + max(1, $seconds));
 }
 
+function ap_rss_host_is_youtube(string $url): bool
+{
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    return $host !== '' && (
+        $host === 'youtube.com'
+        || str_ends_with($host, '.youtube.com')
+        || $host === 'youtu.be'
+        || str_ends_with($host, '.youtu.be')
+    );
+}
+
+/** Best-effort channel label for clearer YouTube feed errors (no API key). */
+function ap_rss_youtube_channel_hint(string $feedUrl): string
+{
+    $parts = parse_url($feedUrl);
+    if (!is_array($parts)) {
+        return '';
+    }
+    $q = [];
+    parse_str((string) ($parts['query'] ?? ''), $q);
+    $channelId = trim((string) ($q['channel_id'] ?? ''));
+    if ($channelId === '' || !preg_match('/^UC[\w-]{20,}$/', $channelId)) {
+        return '';
+    }
+    $page = ap_rss_http_get(
+        'https://www.youtube.com/channel/' . rawurlencode($channelId),
+        '',
+        '',
+        ['max_attempts' => 1]
+    );
+    if (!$page['ok'] || $page['body'] === '') {
+        return '';
+    }
+    $html = $page['body'];
+    if (preg_match('/<meta\s+property="og:title"\s+content="([^"]+)"/i', $html, $m)) {
+        return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    }
+    if (preg_match('/itemprop="name"\s+content="([^"]+)"/i', $html, $m)) {
+        return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    }
+    return '';
+}
+
 function ap_rss_http_error_message(int $status, string $url = ''): string
 {
     if ($status === 429) {
@@ -959,6 +1008,14 @@ function ap_rss_http_error_message(int $status, string $url = ''): string
     }
     if ($status === 503) {
         return 'Feed host temporarily unavailable (HTTP 503). Try again shortly.';
+    }
+    // YouTube still advertises /feeds/videos.xml on channel pages, but many brand/network
+    // channels (and sometimes most channels) get a hard 404 from the Atom endpoint.
+    // Readers like Inoreader often use the YouTube Data API instead of this public feed.
+    // (Channel-name hint is applied in ap_rss_add_feed — not here — to avoid recursive fetches.)
+    if ($status === 404 && ap_rss_host_is_youtube($url) && str_contains(strtolower((string) (parse_url($url, PHP_URL_PATH) ?: '')), '/feeds/')) {
+        return 'YouTube’s public RSS/Atom feed returned 404 for this channel. '
+            . 'Inoreader often does not use this public feed. Try another source URL, or a channel whose /feeds/videos.xml still works.';
     }
     if ($status > 0) {
         return 'HTTP ' . $status;
