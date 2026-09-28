@@ -239,6 +239,58 @@ function ap_rss_pick_best_image(array $candidates): string
     return $best;
 }
 
+/** Pull Reddit selftext from Atom/RSS HTML (`<div class="md">…</div>`). */
+function ap_rss_extract_reddit_selftext(string $html): string
+{
+    $html = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($html === '') {
+        return '';
+    }
+    if (preg_match('/<div class="md">(.*?)<\/div>/is', $html, $m)) {
+        $text = trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $text = trim(preg_replace('/\s+/u', ' ', $text) ?? $text);
+        return $text;
+    }
+    return '';
+}
+
+/**
+ * Drop Reddit “submitted by /u/… [link] [comments]” chrome while keeping selftext.
+ * Older ingest rows often append that footer after the real body — strip the tail, do not nuke all.
+ */
+function ap_rss_strip_reddit_boilerplate(string $summary): string
+{
+    $s = trim(preg_replace('/\s+/u', ' ', $summary) ?? $summary);
+    if ($s === '') {
+        return '';
+    }
+    $s = preg_replace('/\s*submitted by\s+\/?u\/\S+.*/iu', '', $s) ?? $s;
+    $s = preg_replace('/\s*\[link\]\s*\[comments\]\s*$/iu', '', $s) ?? $s;
+    $s = trim($s);
+    if ($s === '' || preg_match('/^submitted by\b/i', $s) || preg_match('/^\[link\]/i', $s)) {
+        return '';
+    }
+    return $s;
+}
+
+/**
+ * Build summary_text from feed HTML/plaintext (prefer Reddit selftext when present).
+ */
+function ap_rss_summary_from_html(string $html, string $itemUrl = ''): string
+{
+    $host = strtolower((string) (parse_url($itemUrl, PHP_URL_HOST) ?: ''));
+    $isReddit = $host !== '' && (str_ends_with($host, 'reddit.com') || str_ends_with($host, 'redd.it'));
+    if ($isReddit) {
+        $self = ap_rss_extract_reddit_selftext($html);
+        if ($self !== '') {
+            return $self;
+        }
+    }
+    $plain = trim(html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $plain = trim(preg_replace('/\s+/u', ' ', $plain) ?? $plain);
+    return ap_rss_strip_reddit_boilerplate($plain);
+}
+
 /**
  * True when the item is mostly media (image post) rather than an article with a hero image.
  */
@@ -248,40 +300,37 @@ function ap_rss_item_is_media_forward(string $summary, string $imageUrl, string 
     if ($imageUrl === '' || !preg_match('#^https://#i', $imageUrl)) {
         return false;
     }
+    $clean = ap_rss_display_summary($summary);
+    $hasRealText = mb_strlen($clean) >= 72;
     $host = strtolower((string) (parse_url($itemUrl, PHP_URL_HOST) ?: ''));
-    if ($host !== '' && (str_ends_with($host, 'reddit.com') || str_ends_with($host, 'redd.it'))) {
-        return true;
-    }
+    $isReddit = $host !== '' && (str_ends_with($host, 'reddit.com') || str_ends_with($host, 'redd.it'));
     $imgHost = strtolower((string) (parse_url($imageUrl, PHP_URL_HOST) ?: ''));
-    if ($imgHost === 'i.redd.it' || str_contains($imgHost, 'preview.redd.it') || $imgHost === 'i.imgur.com') {
+    $redditImage = $imgHost === 'i.redd.it'
+        || str_contains($imgHost, 'preview.redd.it')
+        || $imgHost === 'i.imgur.com'
+        || str_contains($imgHost, 'redd.it');
+
+    // Reddit image posts → media row. Text posts with selftext keep the summary (even if a thumb exists).
+    if ($isReddit) {
+        return $redditImage && !$hasRealText;
+    }
+    if ($redditImage && !$hasRealText) {
         return true;
     }
-    $s = trim(preg_replace('/\s+/u', ' ', $summary) ?? $summary);
-    if ($s === '') {
-        return true;
-    }
-    // Reddit / image-board boilerplate after strip_tags.
-    if (preg_match('/^submitted by\b/i', $s) || preg_match('/\[link\].*\[comments\]/i', $s)) {
+    if ($clean === '') {
         return true;
     }
     // Very short caption beside a real image → treat as media post.
-    if (mb_strlen($s) <= 96) {
+    if (mb_strlen($clean) <= 96) {
         return true;
     }
     return false;
 }
 
-/** Drop Reddit/image-feed boilerplate so Home cards show title + media. */
+/** Clean summary for Home cards (keeps Reddit selftext; drops footer chrome). */
 function ap_rss_display_summary(string $summary): string
 {
-    $s = trim(preg_replace('/\s+/u', ' ', $summary) ?? $summary);
-    if ($s === '') {
-        return '';
-    }
-    if (preg_match('/^submitted by\b/i', $s) || preg_match('/\[link\].*\[comments\]/i', $s)) {
-        return '';
-    }
-    return $s;
+    return ap_rss_strip_reddit_boilerplate($summary);
 }
 
 function ap_rss_is_mirror_note_id(string $noteId): bool
@@ -1327,7 +1376,6 @@ function ap_rss_parse_rss_item(DOMXPath $xp, DOMElement $item): array
     $htmlBlob = $encoded !== '' ? $encoded : $desc;
     $pub = trim(ap_rss_dom_text($xp, $item, 'pubDate'));
     $published = ap_rss_parse_date($pub);
-    $summary = trim(html_entity_decode(strip_tags($htmlBlob), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     $candidates = ap_rss_images_from_html($htmlBlob);
     $mediaThumb = trim((string) $xp->evaluate('string(.//media:thumbnail/@url)', $item));
     $mediaContent = trim((string) $xp->evaluate('string(.//media:content/@url)', $item));
@@ -1356,7 +1404,7 @@ function ap_rss_parse_rss_item(DOMXPath $xp, DOMElement $item): array
         'guid' => $guid,
         'url' => $itemUrl,
         'title' => $title,
-        'summary_text' => $summary,
+        'summary_text' => ap_rss_summary_from_html($htmlBlob, $itemUrl),
         'image_url' => ap_rss_pick_best_image($candidates),
         'published_at' => $published,
     ];
@@ -1388,7 +1436,6 @@ function ap_rss_parse_atom_entry(DOMXPath $xp, DOMElement $entry): array
     if ($summaryHtml === '') {
         $summaryHtml = trim((string) $xp->evaluate('string(./atom:content|./atom:summary)', $entry));
     }
-    $summary = trim(html_entity_decode(strip_tags($summaryHtml), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     $pub = trim((string) $xp->evaluate('string(./atom:published|./atom:updated)', $entry));
     $published = ap_rss_parse_date($pub);
     $candidates = ap_rss_images_from_html($summaryHtml);
@@ -1405,7 +1452,7 @@ function ap_rss_parse_atom_entry(DOMXPath $xp, DOMElement $entry): array
         'guid' => $guid,
         'url' => $itemUrl,
         'title' => $title,
-        'summary_text' => $summary,
+        'summary_text' => ap_rss_summary_from_html($summaryHtml, $itemUrl),
         'image_url' => ap_rss_pick_best_image($candidates),
         'published_at' => $published,
     ];

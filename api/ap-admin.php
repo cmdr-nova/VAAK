@@ -14069,7 +14069,7 @@ function admin_render_rss_item(array $row, string $returnView): void
         ? ap_rss_display_summary($summaryRaw)
         : $summaryRaw;
     if ($summary !== '') {
-        $summary = mb_strimwidth($summary, 0, 320, '…', 'UTF-8');
+        $summary = mb_strimwidth($summary, 0, 360, '…', 'UTF-8');
     }
     $url = trim((string) ($row['url'] ?? ''));
     $image = trim((string) ($row['image_url'] ?? ''));
@@ -14095,18 +14095,20 @@ function admin_render_rss_item(array $row, string $returnView): void
 
     // Image-heavy items (Reddit photo posts, short-caption feeds) use the same
     // media-row/lightbox as Fediverse/Bluesky attachments instead of a link card.
+    // Text-heavy Reddit selfposts keep a body summary instead.
     $mediaForward = function_exists('ap_rss_item_is_media_forward')
         ? ap_rss_item_is_media_forward($summaryRaw, $image, $url)
-        : ($image !== '' && preg_match('#^https://#i', $image) && (
-            str_ends_with($host, 'reddit.com') || str_ends_with($host, 'redd.it') || $summary === ''
-        ));
+        : ($image !== '' && preg_match('#^https://#i', $image) && $summary === '');
     $mediaHtml = '';
     if ($mediaForward && $image !== '' && preg_match('#^https://#i', $image) && function_exists('admin_media_row_html')) {
         $mediaHtml = admin_media_row_html([['url' => $image, 'mediaType' => 'image/*']]);
     }
 
     $linkCardHtml = '';
-    if ($url !== '' && preg_match('#^https?://#i', $url) && $mediaHtml === '') {
+    // When we already show a real text summary, skip a bulky link-card that repeats the title;
+    // Open remains in the overflow menu.
+    $showLinkCard = $url !== '' && preg_match('#^https?://#i', $url) && $mediaHtml === '' && $summary === '';
+    if ($showLinkCard) {
         $card = null;
         if (function_exists('ap_link_preview_cache_get')) {
             if (!function_exists('ap_link_preview_for_url')) {
@@ -14118,14 +14120,13 @@ function admin_render_rss_item(array $row, string $returnView): void
             $linkCardHtml = ap_link_preview_html($card, true);
         } else {
             $titleH = h($title !== '' ? $title : ($host !== '' ? $host : $url));
-            $descH = $summary !== '' ? '<div class="link-card__desc">' . h($summary) . '</div>' : '';
             $provH = $host !== '' ? '<div class="link-card__provider">' . h($host) . '</div>' : '';
             $imgH = ($image !== '' && preg_match('#^https?://#i', $image))
                 ? '<div class="link-card__media"><img src="' . h($image) . '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>'
                 : '';
             $linkCardHtml = '<a class="link-card" href="' . h($url) . '" target="_blank" rel="nofollow noopener noreferrer">'
                 . $imgH
-                . '<div class="link-card__body">' . $provH . '<div class="link-card__title">' . $titleH . '</div>' . $descH . '</div>'
+                . '<div class="link-card__body">' . $provH . '<div class="link-card__title">' . $titleH . '</div></div>'
                 . '</a>';
         }
     }
@@ -14161,12 +14162,13 @@ function admin_render_rss_item(array $row, string $returnView): void
       <?php if ($title !== ''): ?>
         <div class="body feed-body" style="font-weight:600"><?= h($title) ?></div>
       <?php endif; ?>
-      <?php if ($summary !== '' && $mediaHtml === '' && ($linkCardHtml === '' || $title === '')): ?>
-        <div class="body feed-body"><?= h($summary) ?></div>
-      <?php elseif ($summary !== '' && $mediaHtml === '' && $title !== ''): ?>
-        <div class="body feed-body meta" style="margin-top:.25rem"><?= h($summary) ?></div>
-      <?php elseif ($summary !== '' && $mediaHtml !== ''): ?>
-        <div class="body feed-body" style="margin-top:.25rem"><?= h($summary) ?></div>
+      <?php if ($summary !== ''): ?>
+        <div class="body feed-body" style="margin-top:.35rem;white-space:pre-wrap;overflow-wrap:anywhere"><?= h($summary) ?></div>
+      <?php endif; ?>
+      <?php if ($summary !== '' && $url !== '' && $mediaHtml === '' && $linkCardHtml === ''): ?>
+        <div class="meta" style="margin-top:.45rem">
+          <a href="<?= h($url) ?>" target="_blank" rel="nofollow noopener noreferrer">Open original</a>
+        </div>
       <?php endif; ?>
       <?= $mediaHtml ?>
       <?= $linkCardHtml ?>
