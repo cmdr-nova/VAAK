@@ -3185,10 +3185,11 @@ function ap_masto_remote_status_id_from_object_url(string $objectUrl): ?string
     if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
         return null;
     }
-    if (preg_match('#/statuses/(\d+)(?:/|$)#', $objectUrl, $m)) {
+    // Mastodon snowflakes are digits; GoToSocial uses ULID/base32 ids in the same path.
+    if (preg_match('#/statuses/([A-Za-z0-9]+)(?:/|$)#', $objectUrl, $m)) {
         return $m[1];
     }
-    if (preg_match('#/@[^/]+/(\d+)(?:/|$)#', $objectUrl, $m)) {
+    if (preg_match('#/@[^/]+/([A-Za-z0-9]+)(?:/|$)#', $objectUrl, $m)) {
         return $m[1];
     }
     return null;
@@ -5850,10 +5851,32 @@ function ap_masto_status_from_event(array $row): ?array
             $origActor = $origActor ?: $actorId;
         }
         $inner = $status;
+        // Empty boost shells (common when we only saw an Announce of a GoToSocial
+        // note under authorized-fetch) — try to hydrate the real Create/Note once.
+        $innerPlain = trim(html_entity_decode(strip_tags((string) ($inner['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $innerMedia = is_array($inner['media_attachments'] ?? null) ? $inner['media_attachments'] : [];
+        if ($innerPlain === '' && $innerMedia === [] && $objectId !== ''
+            && empty($row['_skip_announce_hydrate'])
+            && function_exists('ap_masto_ensure_remote_note_event')
+        ) {
+            $ensured = ap_masto_ensure_remote_note_event($objectId);
+            $ensType = is_array($ensured) ? strtolower((string) ($ensured['type'] ?? '')) : '';
+            if (is_array($ensured) && in_array($ensType, ['create', 'update'], true)) {
+                $ensured['_skip_announce_hydrate'] = true;
+                $hydrated = ap_masto_status_from_event($ensured);
+                if (is_array($hydrated)) {
+                    $inner = $hydrated;
+                }
+            }
+        }
         if ($origActor !== '' && rtrim($origActor, '/') !== rtrim($actorId, '/')) {
-            $inner['account'] = (ap_masto_local_actor_key_from_url($origActor) !== null)
-                ? ap_masto_account_for_local_url($origActor)
-                : ap_masto_remote_account($origActor);
+            // Keep hydrated Create author when present; otherwise use resolved original actor.
+            $innerAcctUri = rtrim((string) (($inner['account']['uri'] ?? null) ?: ($inner['account']['url'] ?? '')), '/');
+            if ($innerAcctUri === '' || $innerAcctUri === rtrim($actorId, '/')) {
+                $inner['account'] = (ap_masto_local_actor_key_from_url($origActor) !== null)
+                    ? ap_masto_account_for_local_url($origActor)
+                    : ap_masto_remote_account($origActor);
+            }
         }
         // Prefer a Create-event snowflake for the inner status id when available
         $innerId = $inner['id'];

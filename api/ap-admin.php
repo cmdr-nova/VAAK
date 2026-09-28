@@ -12548,6 +12548,19 @@ function admin_render_masto_status_card(
     if ($cardHtml !== '') {
         $bodyInner .= $cardHtml;
     }
+    // Empty remote shells (Announce-only cache, authorized-fetch peers, deleted notes):
+    // show a clear placeholder instead of a blank who/when card in threads.
+    if (trim(strip_tags($bodyInner)) === ''
+        && $uri !== ''
+        && str_starts_with($uri, 'https://')
+        && !$isLocal
+    ) {
+        $bodyInner = '<div class="body feed-body meta">'
+            . 'This post isn’t cached with text or media on VAAK yet '
+            . '(often we only saw a boost, or the remote requires authorized fetch). '
+            . '<a href="' . h(admin_remote_object_href($uri)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
+            . '</div>';
+    }
 
     $actionBase = '?view=' . rawurlencode($returnView);
     if ($returnView === 'status' && $uri !== '') {
