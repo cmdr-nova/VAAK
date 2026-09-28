@@ -6344,12 +6344,14 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
     $qi = 0;
     $rssEmitted = 0;
     $sinceRss = 2;
+    // Space RSS like a peer network (~15% share, ≥3 non-RSS between inserts)
+    // so many subscriptions cannot carpet Home.
     $flush = static function () use (&$out, &$queued, &$qi, &$rssEmitted, &$sinceRss): void {
         while (isset($queued[$qi])) {
-            if ($sinceRss < 2 && $out !== []) {
+            if ($sinceRss < 3 && $out !== []) {
                 break;
             }
-            if ($out !== [] && ($rssEmitted + 1) / max(1, count($out) + 1) > 0.20) {
+            if ($out !== [] && ($rssEmitted + 1) / max(1, count($out) + 1) > 0.15) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -17554,6 +17556,26 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       text-transform: uppercase; letter-spacing: .06em;
       display: flex; align-items: center; justify-content: space-between; gap: .5rem;
     }
+    details.rss-feed-fold {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: .65rem;
+      overflow: hidden;
+    }
+    details.rss-feed-fold > summary {
+      text-transform: none;
+      letter-spacing: 0;
+      font-size: .95rem;
+      color: var(--text);
+    }
+    details.rss-feed-fold[open] > summary {
+      border-bottom: 1px solid var(--border);
+    }
+    details.rss-feed-items > summary {
+      list-style: none;
+      color: var(--muted);
+    }
     details.side-drop > summary::-webkit-details-marker { display: none; }
     details.side-drop > summary::after {
       content: '▸'; color: var(--muted); font-size: .75rem; transition: transform .15s ease;
@@ -23869,27 +23891,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'rss'): ?>
         <?php
           $rssFeeds = function_exists('ap_rss_feeds_for_owner') ? ap_rss_feeds_for_owner($vaakOwnerId) : [];
-          $rssPreview = [];
-          if ($vaakOwnerId > 0) {
-              try {
-                  $stRssPrev = ap_db()->prepare(
-                      "SELECT i.id, i.title, i.url, i.published_at, i.ingested_at, f.title AS feed_title
-                       FROM rss_items i
-                       JOIN rss_feeds f ON f.id = i.feed_id
-                       WHERE f.owner_user_id = ?
-                       ORDER BY COALESCE(i.published_at, i.ingested_at) DESC, i.id DESC
-                       LIMIT 10"
-                  );
-                  $stRssPrev->execute([$vaakOwnerId]);
-                  $rssPreview = $stRssPrev->fetchAll(PDO::FETCH_ASSOC) ?: [];
-              } catch (Throwable $e) {
-                  $rssPreview = [];
-              }
-          }
         ?>
         <div class="meta" style="margin-bottom:1rem">
-          Add RSS/Atom feeds to mix into <b>Home</b> (~20% of later pages). Polling runs in the background — Refresh here pulls once.
-          Favourite and bookmark stay on VAAK only (nothing is posted to your Fediverse account).
+          Add RSS/Atom feeds to mix into <b>Home</b> (evenly spaced with Fediverse and Bluesky — more feeds do not flood the timeline).
+          Polling runs in the background; Refresh pulls once. Favourite and bookmark stay on VAAK only.
         </div>
         <?php
           $rssMirrorCount = 0;
@@ -23935,53 +23940,71 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
               $rferr = trim((string) ($rf['last_error'] ?? ''));
               $rfcount = (int) ($rf['item_count'] ?? 0);
+              $rfItems = ($rfid > 0 && function_exists('ap_rss_items_for_feed'))
+                  ? ap_rss_items_for_feed($rfid, $vaakOwnerId, 8)
+                  : [];
             ?>
-            <article class="tweet">
-              <div class="tweet-hd">
-                <div class="tweet-hd-main">
-                  <div>
-                    <span class="who"><?= h($rftitle) ?></span>
-                    <span class="meta"> · <?= $rfcount ?> item<?= $rfcount === 1 ? '' : 's' ?></span>
-                  </div>
-                  <div class="meta" style="overflow-wrap:anywhere"><?= h((string) ($rf['feed_url'] ?? '')) ?></div>
-                  <div class="meta">
-                    Last fetch <?= h(relative_time((string) ($rf['last_fetched_at'] ?? ''))) ?>
-                    <?php if ($rferr !== ''): ?>
-                      · <span style="color:var(--danger)"><?= h(mb_strimwidth($rferr, 0, 120, '…', 'UTF-8')) ?></span>
-                    <?php endif; ?>
-                  </div>
+            <details class="side-drop rss-feed-fold">
+              <summary>
+                <span>
+                  <span class="who" style="text-transform:none;letter-spacing:0;color:var(--text)"><?= h($rftitle) ?></span>
+                  <span class="meta"> · <?= $rfcount ?> item<?= $rfcount === 1 ? '' : 's' ?></span>
+                  <?php if ($rferr !== ''): ?>
+                    <span class="meta" style="color:var(--danger)"> · error</span>
+                  <?php endif; ?>
+                </span>
+                <span class="meta" aria-hidden="true">▾</span>
+              </summary>
+              <div style="padding:0 .9rem .9rem">
+                <div class="meta" style="margin:0 0 .55rem;overflow-wrap:anywhere"><?= h((string) ($rf['feed_url'] ?? '')) ?></div>
+                <div class="meta" style="margin:0 0 .65rem">
+                  Last fetch <?= h(relative_time((string) ($rf['last_fetched_at'] ?? ''))) ?>
+                  <?php if ($rferr !== ''): ?>
+                    · <span style="color:var(--danger)"><?= h(mb_strimwidth($rferr, 0, 160, '…', 'UTF-8')) ?></span>
+                  <?php endif; ?>
                 </div>
-              </div>
-              <div class="tweet-actions">
-                <form method="post" action="?view=rss" style="display:inline">
-                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                  <input type="hidden" name="action" value="rss_refresh">
-                  <input type="hidden" name="return_view" value="rss">
-                  <input type="hidden" name="feed_id" value="<?= $rfid ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Refresh</button>
-                </form>
-                <form method="post" action="?view=rss" style="display:inline" onsubmit="return confirm('Remove this feed?');">
-                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                  <input type="hidden" name="action" value="rss_remove">
-                  <input type="hidden" name="return_view" value="rss">
-                  <input type="hidden" name="feed_id" value="<?= $rfid ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem;color:var(--danger)">Remove</button>
-                </form>
-                <?php if (!empty($rf['site_url'])): ?>
-                  <a class="btn btn-ghost" href="<?= h((string) $rf['site_url']) ?>" target="_blank" rel="noopener noreferrer" style="padding:.25rem .7rem;font-size:.8rem">Site</a>
+                <div class="tweet-actions" style="margin:0 0 .75rem">
+                  <form method="post" action="?view=rss" style="display:inline">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                    <input type="hidden" name="action" value="rss_refresh">
+                    <input type="hidden" name="return_view" value="rss">
+                    <input type="hidden" name="feed_id" value="<?= $rfid ?>">
+                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Refresh</button>
+                  </form>
+                  <form method="post" action="?view=rss" style="display:inline" onsubmit="return confirm('Remove this feed?');">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                    <input type="hidden" name="action" value="rss_remove">
+                    <input type="hidden" name="return_view" value="rss">
+                    <input type="hidden" name="feed_id" value="<?= $rfid ?>">
+                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem;color:var(--danger)">Remove</button>
+                  </form>
+                  <?php if (!empty($rf['site_url'])): ?>
+                    <a class="btn btn-ghost" href="<?= h((string) $rf['site_url']) ?>" target="_blank" rel="noopener noreferrer" style="padding:.25rem .7rem;font-size:.8rem">Site</a>
+                  <?php endif; ?>
+                </div>
+                <?php if (!$rfItems): ?>
+                  <div class="meta">No items yet — try Refresh.</div>
+                <?php else: ?>
+                  <details class="rss-feed-items">
+                    <summary class="meta" style="cursor:pointer;user-select:none;margin-bottom:.35rem">
+                      Latest items (<?= count($rfItems) ?>) ▾
+                    </summary>
+                    <div style="padding:.15rem 0 0 .15rem">
+                      <?php foreach ($rfItems as $rp): ?>
+                        <div class="meta" style="margin-bottom:.4rem;overflow-wrap:anywhere">
+                          <?= h(relative_time((string) ($rp['published_at'] ?? ($rp['ingested_at'] ?? '')))) ?>
+                          · <?php if (!empty($rp['url'])): ?>
+                            <a href="<?= h((string) $rp['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h(mb_strimwidth((string) ($rp['title'] ?? $rp['url']), 0, 110, '…', 'UTF-8')) ?></a>
+                          <?php else: ?>
+                            <?= h((string) ($rp['title'] ?? 'Item')) ?>
+                          <?php endif; ?>
+                        </div>
+                      <?php endforeach; ?>
+                    </div>
+                  </details>
                 <?php endif; ?>
               </div>
-            </article>
-          <?php endforeach; ?>
-        <?php endif; ?>
-        <?php if ($rssPreview): ?>
-          <h3 style="font-size:.95rem;color:var(--muted);margin:1.25rem 0 .5rem">Recent items</h3>
-          <?php foreach ($rssPreview as $rp): ?>
-            <div class="meta" style="margin-bottom:.45rem;overflow-wrap:anywhere">
-              <b><?= h(function_exists('ap_rss_display_title') ? ap_rss_display_title((string) ($rp['feed_title'] ?? 'Feed')) : (string) ($rp['feed_title'] ?? 'Feed')) ?></b>
-              · <?= h(relative_time((string) ($rp['published_at'] ?? ($rp['ingested_at'] ?? '')))) ?>
-              · <?php if (!empty($rp['url'])): ?><a href="<?= h((string) $rp['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h(mb_strimwidth((string) ($rp['title'] ?? $rp['url']), 0, 100, '…', 'UTF-8')) ?></a><?php else: ?><?= h((string) ($rp['title'] ?? 'Item')) ?><?php endif; ?>
-            </div>
+            </details>
           <?php endforeach; ?>
         <?php endif; ?>
 

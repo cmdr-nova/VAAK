@@ -393,17 +393,19 @@ function ap_rss_upsert_items(int $feedId, array $items): int
 }
 
 /**
- * Recent RSS keys for Home ranking.
+ * Recent RSS keys for Home ranking — even across feeds so many subscriptions
+ * cannot crowd out Fediverse/Bluesky. At most one item per feed, then shuffled.
  *
  * @return list<array{uri:string,feed_id:int,published_at:?string}>
  */
-function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 40): array
+function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 16): array
 {
     ap_rss_migrate();
     if ($ownerUserId < 1) {
         return [];
     }
-    $limit = max(1, min(80, $limit));
+    $limit = max(1, min(24, $limit));
+    // Pull a wider window, then keep the newest item per feed.
     $st = ap_db()->prepare(
         "SELECT i.id, i.feed_id, i.published_at, i.url
          FROM rss_items i
@@ -411,16 +413,14 @@ function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 40): array
          WHERE f.owner_user_id = ? AND f.enabled = TRUE
            AND (i.published_at IS NULL OR i.published_at >= NOW() - INTERVAL '14 days')
          ORDER BY COALESCE(i.published_at, i.ingested_at) DESC, i.id DESC
-         LIMIT {$limit}"
+         LIMIT 120"
     );
     $st->execute([$ownerUserId]);
-    $out = [];
+    $byFeed = [];
     $seenUrl = [];
-    $perFeed = [];
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
         $fid = (int) ($row['feed_id'] ?? 0);
-        $n = $perFeed[$fid] ?? 0;
-        if ($n >= 2) {
+        if ($fid < 1 || isset($byFeed[$fid])) {
             continue;
         }
         $url = rtrim((string) ($row['url'] ?? ''), '/');
@@ -430,14 +430,49 @@ function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 40): array
         if ($url !== '') {
             $seenUrl[$url] = true;
         }
-        $perFeed[$fid] = $n + 1;
-        $out[] = [
+        $byFeed[$fid] = [
             'uri' => (string) (int) ($row['id'] ?? 0),
             'feed_id' => $fid,
             'published_at' => isset($row['published_at']) ? (string) $row['published_at'] : null,
         ];
     }
-    return $out;
+    $out = array_values($byFeed);
+    // Shuffle so Home does not always prefer the same busy feeds first.
+    if (count($out) > 1) {
+        $seed = crc32((string) $ownerUserId . '|' . gmdate('Y-m-d-H'));
+        mt_srand($seed);
+        for ($i = count($out) - 1; $i > 0; $i--) {
+            $j = mt_rand(0, $i);
+            if ($j === $i) {
+                continue;
+            }
+            $tmp = $out[$i];
+            $out[$i] = $out[$j];
+            $out[$j] = $tmp;
+        }
+        mt_srand();
+    }
+    return array_slice($out, 0, $limit);
+}
+
+/** Latest items for one feed (RSS page collapsed preview). */
+function ap_rss_items_for_feed(int $feedId, int $ownerUserId, int $limit = 8): array
+{
+    ap_rss_migrate();
+    if ($feedId < 1 || $ownerUserId < 1) {
+        return [];
+    }
+    $limit = max(1, min(20, $limit));
+    $st = ap_db()->prepare(
+        "SELECT i.id, i.title, i.url, i.published_at, i.ingested_at
+         FROM rss_items i
+         JOIN rss_feeds f ON f.id = i.feed_id
+         WHERE i.feed_id = ? AND f.owner_user_id = ?
+         ORDER BY COALESCE(i.published_at, i.ingested_at) DESC, i.id DESC
+         LIMIT {$limit}"
+    );
+    $st->execute([$feedId, $ownerUserId]);
+    return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
 }
 
 /** Synthetic status id for local-only fav/bookmark of an RSS item (never federated). */
