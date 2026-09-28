@@ -9392,6 +9392,7 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     $mentions = is_array($opts['mentions'] ?? null) ? $opts['mentions'] : [];
     $openLabel = trim((string) ($opts['open_label'] ?? 'Open quoted'));
     $openExternal = !empty($opts['open_external']);
+    $isRss = !empty($opts['is_rss']);
     // Always prefer in-app status view so clicking the quote opens in VAAK.
     $inAppHref = '';
     if ($url !== '' && $url !== 'https://bsky.app/' && function_exists('admin_status_href')) {
@@ -9404,10 +9405,19 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
             : '')
         . '><span class="qt-label">Quoted</span>';
     if ($acct !== '') {
-        if ($acct[0] !== '@' && !str_starts_with($acct, 'http')) {
-            $acct = '@' . ltrim($acct, '@');
+        // RSS mirrors are local notes owned by you, but the quote should show
+        // the feed title (e.g. IGN) — not @yourhandle.
+        if ($isRss) {
+            $html .= '<div class="meta" style="margin-top:.3rem">'
+                . h($acct)
+                . ' <span class="tag" title="From an RSS/Atom feed">RSS</span>'
+                . '</div>';
+        } else {
+            if ($acct[0] !== '@' && !str_starts_with($acct, 'http')) {
+                $acct = '@' . ltrim($acct, '@');
+            }
+            $html .= '<div class="meta" style="margin-top:.3rem">' . h($acct) . '</div>';
         }
-        $html .= '<div class="meta" style="margin-top:.3rem">' . h($acct) . '</div>';
     }
     if ($text !== '') {
         // Keep the full quoted body (timeline posts already cap length elsewhere).
@@ -9482,6 +9492,40 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
 function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): array
 {
     $acct = (string) ($st['account']['acct'] ?? '');
+    $noteUrl = trim((string) ($st['url'] ?? ($st['uri'] ?? $fallbackUrl)));
+    $rssItem = null;
+    if ($noteUrl !== '' && function_exists('ap_rss_item_by_mirror_note_id')) {
+        $rssItem = ap_rss_item_by_mirror_note_id($noteUrl);
+        if ($rssItem === null && !empty($st['id']) && is_string($st['id']) && str_starts_with($st['id'], 'https://')) {
+            $rssItem = ap_rss_item_by_mirror_note_id((string) $st['id']);
+        }
+    }
+    if (is_array($rssItem)) {
+        $feedTitle = trim((string) ($rssItem['feed_title'] ?? ''));
+        if ($feedTitle === '') {
+            $feedTitle = 'RSS';
+        }
+        $text = trim((string) ($rssItem['title'] ?? ''));
+        $summary = trim((string) ($rssItem['summary_text'] ?? ''));
+        if ($summary !== '') {
+            $text = $text !== ''
+                ? ($text . "\n\n" . mb_strimwidth($summary, 0, 240, '…', 'UTF-8'))
+                : mb_strimwidth($summary, 0, 280, '…', 'UTF-8');
+        }
+        // Prefer the article URL for “Open original”; keep note URL for in-app open.
+        $articleUrl = trim((string) ($rssItem['url'] ?? ''));
+        return [
+            'acct' => $feedTitle,
+            'is_rss' => true,
+            'text' => $text,
+            'url' => $noteUrl !== '' ? $noteUrl : $fallbackUrl,
+            'open_external' => $articleUrl !== '',
+            'open_label' => 'Open quoted',
+            'media' => [],
+            'card' => $articleUrl !== '' ? ['url' => $articleUrl, 'title' => (string) ($rssItem['title'] ?? ''), 'description' => $summary] : null,
+            'mentions' => [],
+        ];
+    }
     $text = function_exists('admin_html_to_plain')
         ? trim(admin_html_to_plain((string) ($st['content'] ?? '')))
         : trim(html_entity_decode(strip_tags((string) ($st['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));

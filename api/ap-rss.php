@@ -122,6 +122,27 @@ function ap_rss_item_by_id(int $itemId, ?int $ownerUserId = null): ?array
     return is_array($row) ? $row : null;
 }
 
+/** Look up an RSS item by the local mirror note created for boost/quote/fav. */
+function ap_rss_item_by_mirror_note_id(string $noteId): ?array
+{
+    ap_rss_migrate();
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
+        return null;
+    }
+    $st = ap_db()->prepare(
+        'SELECT i.*, f.title AS feed_title, f.favicon_url AS feed_favicon, f.site_url AS feed_site_url,
+                f.feed_url AS feed_url, f.owner_user_id, f.id AS feed_id
+         FROM rss_items i
+         JOIN rss_feeds f ON f.id = i.feed_id
+         WHERE i.mirror_note_id = ? OR i.mirror_note_id = ?
+         LIMIT 1'
+    );
+    $st->execute([$noteId, $noteId . '/']);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    return is_array($row) ? $row : null;
+}
+
 /**
  * @return array{ok:bool,error?:string,feed_id?:int,discovered?:bool}
  */
