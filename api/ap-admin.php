@@ -9393,9 +9393,11 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     $openLabel = trim((string) ($opts['open_label'] ?? 'Open quoted'));
     $openExternal = !empty($opts['open_external']);
     $isRss = !empty($opts['is_rss']);
-    // Always prefer in-app status view so clicking the quote opens in VAAK.
+    $articleUrl = trim((string) ($opts['article_url'] ?? ''));
+    // Always prefer in-app status view so clicking the quote opens in VAAK —
+    // except RSS mirrors, which open the article on the web (not Your Posts).
     $inAppHref = '';
-    if ($url !== '' && $url !== 'https://bsky.app/' && function_exists('admin_status_href')) {
+    if (!$isRss && $url !== '' && $url !== 'https://bsky.app/' && function_exists('admin_status_href')) {
         $inAppHref = admin_status_href($url, $returnView);
     }
     $openable = $inAppHref !== '' && $inAppHref !== '#';
@@ -9460,7 +9462,12 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
             }
         }
     }
-    if ($url !== '' && $url !== 'https://bsky.app/') {
+    if ($isRss && $articleUrl !== '' && str_starts_with($articleUrl, 'https://')) {
+        $html .= '<div class="meta" style="margin-top:.35rem">'
+            . '<a href="' . h($articleUrl) . '" target="_blank" rel="noopener noreferrer">'
+            . h($openLabel !== '' ? $openLabel : 'Open article') . '</a>'
+            . '</div>';
+    } elseif ($url !== '' && $url !== 'https://bsky.app/') {
         $html .= '<div class="meta" style="margin-top:.35rem">';
         if ($openable) {
             $html .= '<a href="' . h($inAppHref) . '">'
@@ -9535,8 +9542,9 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
             'is_rss' => true,
             'text' => $text,
             'url' => $noteUrl !== '' ? $noteUrl : $fallbackUrl,
-            'open_external' => $articleUrl !== '',
-            'open_label' => 'Open quoted',
+            'article_url' => $articleUrl,
+            'open_external' => true,
+            'open_label' => 'Open article',
             'media' => [],
             'card' => $card,
             'mentions' => [],
@@ -14805,6 +14813,12 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
         error_log('[ap-admin] outbox page Bluesky cache: ' . $e->getMessage());
     }
 
+    $rssMirrors = [];
+    if ($ownerId > 0 && function_exists('ap_rss_mirror_note_ids_for_owner')) {
+        foreach (ap_rss_mirror_note_ids_for_owner($ownerId) as $mid) {
+            $rssMirrors[rtrim($mid, '/')] = true;
+        }
+    }
     $localIds = [];
     $items = [];
     foreach ($outbox as $row) {
@@ -14812,6 +14826,10 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
             continue;
         }
         $id = rtrim((string) ($row['id'] ?? ''), '/');
+        // Hide RSS interaction mirrors — they are not real "Your Posts".
+        if ($id !== '' && isset($rssMirrors[$id])) {
+            continue;
+        }
         if ($id !== '') {
             $localIds[$id] = true;
         }
@@ -22555,6 +22573,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'status'): ?>
         <?php
           $stObject = trim((string) ($_GET['object'] ?? ''));
+          // RSS interaction mirrors are not real posts — send people to the article.
+          if ($stObject !== '' && function_exists('ap_rss_item_by_mirror_note_id')) {
+              $rssMirror = ap_rss_item_by_mirror_note_id($stObject);
+              if (is_array($rssMirror)) {
+                  $article = trim((string) ($rssMirror['url'] ?? ''));
+                  if ($article !== '' && str_starts_with($article, 'https://')) {
+                      header('Location: ' . $article, true, 302);
+                      exit;
+                  }
+                  header('Location: ?view=rss', true, 302);
+                  exit;
+              }
+          }
           $stFrom = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home';
           $stBackHref = match ($stFrom) {
               'mentions' => '?view=mentions',
@@ -24082,8 +24113,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php
           $yourPostItems = [];
           $localNoteIds = [];
+          $rssMirrorsOutbox = [];
+          if ($vaakOwnerId > 0 && function_exists('ap_rss_mirror_note_ids_for_owner')) {
+              foreach (ap_rss_mirror_note_ids_for_owner($vaakOwnerId) as $mid) {
+                  $rssMirrorsOutbox[rtrim($mid, '/')] = true;
+              }
+          }
           foreach ($outbox as $n) {
               $noteId = rtrim((string) ($n['id'] ?? ''), '/');
+              if ($noteId !== '' && isset($rssMirrorsOutbox[$noteId])) {
+                  continue; // RSS interaction mirrors are not Your Posts
+              }
               if ($noteId !== '') $localNoteIds[$noteId] = true;
               $yourPostItems[] = [
                   'kind' => 'outbox',

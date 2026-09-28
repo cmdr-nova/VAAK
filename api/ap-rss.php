@@ -142,6 +142,42 @@ function ap_rss_display_title(string $title): string
     return $cleaned !== '' ? $cleaned : $title;
 }
 
+function ap_rss_is_mirror_note_id(string $noteId): bool
+{
+    return ap_rss_item_by_mirror_note_id($noteId) !== null;
+}
+
+/**
+ * Note ids used as RSS interaction mirrors (hidden from Your Posts).
+ *
+ * @return list<string>
+ */
+function ap_rss_mirror_note_ids_for_owner(int $ownerUserId): array
+{
+    ap_rss_migrate();
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    $st = ap_db()->prepare(
+        'SELECT i.mirror_note_id
+         FROM rss_items i
+         JOIN rss_feeds f ON f.id = i.feed_id
+         WHERE f.owner_user_id = ?
+           AND i.mirror_note_id IS NOT NULL
+           AND i.mirror_note_id <> \'\''
+    );
+    $st->execute([$ownerUserId]);
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $id) {
+        $id = rtrim(trim((string) $id), '/');
+        if ($id !== '') {
+            $out[$id] = true;
+            $out[$id . '/'] = true;
+        }
+    }
+    return array_keys($out);
+}
+
 /** Look up an RSS item by the local mirror note created for boost/quote/fav. */
 function ap_rss_item_by_mirror_note_id(string $noteId): ?array
 {
