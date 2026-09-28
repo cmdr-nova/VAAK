@@ -14060,12 +14060,18 @@ function admin_render_rss_item(array $row, string $returnView): void
     }
     $favicon = trim((string) ($row['feed_favicon'] ?? ''));
     $title = trim((string) ($row['title'] ?? ''));
-    $summary = trim((string) ($row['summary_text'] ?? ''));
+    $summaryRaw = trim((string) ($row['summary_text'] ?? ''));
+    $summary = function_exists('ap_rss_display_summary')
+        ? ap_rss_display_summary($summaryRaw)
+        : $summaryRaw;
     if ($summary !== '') {
         $summary = mb_strimwidth($summary, 0, 320, '…', 'UTF-8');
     }
     $url = trim((string) ($row['url'] ?? ''));
     $image = trim((string) ($row['image_url'] ?? ''));
+    if ($image !== '' && function_exists('ap_rss_upgrade_image_url')) {
+        $image = ap_rss_upgrade_image_url($image);
+    }
     $published = (string) ($row['published_at'] ?? ($row['ingested_at'] ?? ''));
     $host = '';
     if ($url !== '') {
@@ -14083,8 +14089,20 @@ function admin_render_rss_item(array $row, string $returnView): void
     $bm = function_exists('ap_masto_status_is_bookmarked')
         && ap_masto_status_is_bookmarked($statusId, null, $statusId);
 
+    // Image-heavy items (Reddit photo posts, short-caption feeds) use the same
+    // media-row/lightbox as Fediverse/Bluesky attachments instead of a link card.
+    $mediaForward = function_exists('ap_rss_item_is_media_forward')
+        ? ap_rss_item_is_media_forward($summaryRaw, $image, $url)
+        : ($image !== '' && preg_match('#^https://#i', $image) && (
+            str_ends_with($host, 'reddit.com') || str_ends_with($host, 'redd.it') || $summary === ''
+        ));
+    $mediaHtml = '';
+    if ($mediaForward && $image !== '' && preg_match('#^https://#i', $image) && function_exists('admin_media_row_html')) {
+        $mediaHtml = admin_media_row_html([['url' => $image, 'mediaType' => 'image/*']]);
+    }
+
     $linkCardHtml = '';
-    if ($url !== '' && preg_match('#^https?://#i', $url)) {
+    if ($url !== '' && preg_match('#^https?://#i', $url) && $mediaHtml === '') {
         $card = null;
         if (function_exists('ap_link_preview_cache_get')) {
             if (!function_exists('ap_link_preview_for_url')) {
@@ -14139,11 +14157,14 @@ function admin_render_rss_item(array $row, string $returnView): void
       <?php if ($title !== ''): ?>
         <div class="body feed-body" style="font-weight:600"><?= h($title) ?></div>
       <?php endif; ?>
-      <?php if ($summary !== '' && ($linkCardHtml === '' || $title === '')): ?>
+      <?php if ($summary !== '' && $mediaHtml === '' && ($linkCardHtml === '' || $title === '')): ?>
         <div class="body feed-body"><?= h($summary) ?></div>
-      <?php elseif ($summary !== '' && $title !== ''): ?>
+      <?php elseif ($summary !== '' && $mediaHtml === '' && $title !== ''): ?>
         <div class="body feed-body meta" style="margin-top:.25rem"><?= h($summary) ?></div>
+      <?php elseif ($summary !== '' && $mediaHtml !== ''): ?>
+        <div class="body feed-body" style="margin-top:.25rem"><?= h($summary) ?></div>
       <?php endif; ?>
+      <?= $mediaHtml ?>
       <?= $linkCardHtml ?>
       <div class="tweet-actions">
         <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">

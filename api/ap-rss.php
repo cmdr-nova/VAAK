@@ -142,6 +142,148 @@ function ap_rss_display_title(string $title): string
     return $cleaned !== '' ? $cleaned : $title;
 }
 
+/**
+ * Prefer a full-size image URL for timeline media (Reddit previews → i.redd.it, bump tiny widths).
+ */
+function ap_rss_upgrade_image_url(string $url): string
+{
+    $url = trim(html_entity_decode($url, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($url === '' || !preg_match('#^https://#i', $url)) {
+        return '';
+    }
+    // preview.redd.it/<id>.<ext>?… → i.redd.it/<id>.<ext> (full image for native posts)
+    if (preg_match('#^https://preview\.redd\.it/([A-Za-z0-9]+)(\.[A-Za-z0-9]+)(?:\?|$)#i', $url, $m)) {
+        return 'https://i.redd.it/' . $m[1] . $m[2];
+    }
+    // Tiny Reddit thumbs: raise width so the media row is usable even before re-poll.
+    if (preg_match('#^https://(?:external-)?preview\.redd\.it/#i', $url)
+        && preg_match('/[?&]width=(\d+)/i', $url, $wm)
+        && (int) $wm[1] < 640
+    ) {
+        $url = preg_replace('/([?&])width=\d+/i', '${1}width=960', $url) ?? $url;
+        $url = preg_replace('/([?&])height=\d+/i', '', $url) ?? $url;
+        $url = preg_replace('/([?&])crop=[^&]*/i', '', $url) ?? $url;
+        $url = preg_replace('/\?&/', '?', $url) ?? $url;
+        $url = preg_replace('/&&+/', '&', $url) ?? $url;
+        $url = rtrim($url, '?&');
+    }
+    return $url;
+}
+
+/**
+ * Collect https image candidates from HTML (img src + direct media hrefs).
+ *
+ * @return list<string>
+ */
+function ap_rss_images_from_html(string $html): array
+{
+    $html = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $out = [];
+    if (preg_match_all('/<img[^>]+src=["\']([^"\']+)["\']/i', $html, $m)) {
+        foreach ($m[1] as $src) {
+            $src = trim((string) $src);
+            if (preg_match('#^https://#i', $src)) {
+                $out[] = $src;
+            }
+        }
+    }
+    // Reddit Atom wraps the direct file as [link] → i.redd.it / v.redd.it
+    if (preg_match_all('#https://(?:i|v)\.redd\.it/[A-Za-z0-9._/?=&%-]+#i', $html, $rm)) {
+        foreach ($rm[0] as $src) {
+            $out[] = rtrim((string) $src, '.,);]');
+        }
+    }
+    return $out;
+}
+
+/**
+ * Score candidates and return the best https image URL (empty if none).
+ *
+ * @param list<string> $candidates
+ */
+function ap_rss_pick_best_image(array $candidates): string
+{
+    $best = '';
+    $bestScore = -1;
+    foreach ($candidates as $raw) {
+        $url = ap_rss_upgrade_image_url((string) $raw);
+        if ($url === '') {
+            continue;
+        }
+        $score = 0;
+        $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+        if ($host === 'i.redd.it' || $host === 'i.imgur.com') {
+            $score += 100;
+        } elseif (str_contains($host, 'preview.redd.it')) {
+            $score += 40;
+        } elseif (str_contains($host, 'redd.it') || str_contains($host, 'imgur.com')) {
+            $score += 60;
+        } else {
+            $score += 20;
+        }
+        if (preg_match('/[?&]width=(\d+)/i', $url, $wm)) {
+            $score += min(50, (int) ((int) $wm[1] / 20));
+        }
+        if (preg_match('/\.(jpe?g|png|webp|gif)(?:$|[?#])/i', $url)) {
+            $score += 10;
+        }
+        // Prefer non-square 140 thumbs.
+        if (preg_match('/[?&]width=1[0-4]\d\b/i', $url)) {
+            $score -= 30;
+        }
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $best = $url;
+        }
+    }
+    return $best;
+}
+
+/**
+ * True when the item is mostly media (image post) rather than an article with a hero image.
+ */
+function ap_rss_item_is_media_forward(string $summary, string $imageUrl, string $itemUrl = ''): bool
+{
+    $imageUrl = trim($imageUrl);
+    if ($imageUrl === '' || !preg_match('#^https://#i', $imageUrl)) {
+        return false;
+    }
+    $host = strtolower((string) (parse_url($itemUrl, PHP_URL_HOST) ?: ''));
+    if ($host !== '' && (str_ends_with($host, 'reddit.com') || str_ends_with($host, 'redd.it'))) {
+        return true;
+    }
+    $imgHost = strtolower((string) (parse_url($imageUrl, PHP_URL_HOST) ?: ''));
+    if ($imgHost === 'i.redd.it' || str_contains($imgHost, 'preview.redd.it') || $imgHost === 'i.imgur.com') {
+        return true;
+    }
+    $s = trim(preg_replace('/\s+/u', ' ', $summary) ?? $summary);
+    if ($s === '') {
+        return true;
+    }
+    // Reddit / image-board boilerplate after strip_tags.
+    if (preg_match('/^submitted by\b/i', $s) || preg_match('/\[link\].*\[comments\]/i', $s)) {
+        return true;
+    }
+    // Very short caption beside a real image → treat as media post.
+    if (mb_strlen($s) <= 96) {
+        return true;
+    }
+    return false;
+}
+
+/** Drop Reddit/image-feed boilerplate so Home cards show title + media. */
+function ap_rss_display_summary(string $summary): string
+{
+    $s = trim(preg_replace('/\s+/u', ' ', $summary) ?? $summary);
+    if ($s === '') {
+        return '';
+    }
+    if (preg_match('/^submitted by\b/i', $s) || preg_match('/\[link\].*\[comments\]/i', $s)) {
+        return '';
+    }
+    return $s;
+}
+
 function ap_rss_is_mirror_note_id(string $noteId): bool
 {
     return ap_rss_item_by_mirror_note_id($noteId) !== null;
@@ -831,26 +973,41 @@ function ap_rss_parse_rss_item(DOMXPath $xp, DOMElement $item): array
         $guid = $link !== '' ? $link : $title;
     }
     $desc = trim(ap_rss_dom_text($xp, $item, 'description'));
-    if ($desc === '') {
-        $desc = trim(ap_rss_dom_text($xp, $item, 'content:encoded'));
-    }
+    $encoded = trim(ap_rss_dom_text($xp, $item, 'content:encoded'));
+    $htmlBlob = $encoded !== '' ? $encoded : $desc;
     $pub = trim(ap_rss_dom_text($xp, $item, 'pubDate'));
     $published = ap_rss_parse_date($pub);
-    $summary = trim(html_entity_decode(strip_tags($desc), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    $img = '';
-    if (preg_match('/<img[^>]+src=["\']([^"\']+)["\']/i', $desc, $m) && preg_match('#^https://#i', $m[1])) {
-        $img = $m[1];
+    $summary = trim(html_entity_decode(strip_tags($htmlBlob), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $candidates = ap_rss_images_from_html($htmlBlob);
+    $mediaThumb = trim((string) $xp->evaluate('string(.//media:thumbnail/@url)', $item));
+    $mediaContent = trim((string) $xp->evaluate('string(.//media:content/@url)', $item));
+    if ($mediaContent !== '') {
+        $candidates[] = $mediaContent;
     }
-    $media = trim((string) $xp->evaluate('string(.//media:thumbnail/@url|.//media:content/@url)', $item));
-    if ($img === '' && preg_match('#^https://#i', $media)) {
-        $img = $media;
+    if ($mediaThumb !== '') {
+        $candidates[] = $mediaThumb;
     }
+    // RSS enclosure (image/*)
+    foreach ($xp->query('./enclosure', $item) ?: [] as $enc) {
+        if (!($enc instanceof DOMElement)) {
+            continue;
+        }
+        $encUrl = trim((string) $enc->getAttribute('url'));
+        $encType = strtolower(trim((string) $enc->getAttribute('type')));
+        if ($encUrl === '' || !preg_match('#^https://#i', $encUrl)) {
+            continue;
+        }
+        if ($encType === '' || str_starts_with($encType, 'image/') || preg_match('/\.(jpe?g|png|webp|gif)(?:$|[?#])/i', $encUrl)) {
+            $candidates[] = $encUrl;
+        }
+    }
+    $itemUrl = preg_match('#^https://#i', $link) ? $link : (preg_match('#^https://#i', $guid) ? $guid : '');
     return [
         'guid' => $guid,
-        'url' => preg_match('#^https://#i', $link) ? $link : (preg_match('#^https://#i', $guid) ? $guid : ''),
+        'url' => $itemUrl,
         'title' => $title,
         'summary_text' => $summary,
-        'image_url' => $img,
+        'image_url' => ap_rss_pick_best_image($candidates),
         'published_at' => $published,
     ];
 }
@@ -864,24 +1021,42 @@ function ap_rss_parse_atom_entry(DOMXPath $xp, DOMElement $entry): array
     }
     $id = trim((string) $xp->evaluate('string(./atom:id)', $entry));
     $guid = $id !== '' ? $id : $link;
-    $summary = trim((string) $xp->evaluate('string(./atom:summary)', $entry));
-    if ($summary === '') {
-        $summary = trim((string) $xp->evaluate('string(./atom:content)', $entry));
+    // Keep raw HTML for image extraction before strip_tags.
+    $summaryHtml = '';
+    foreach ($entry->childNodes ?: [] as $n) {
+        if (!($n instanceof DOMElement)) {
+            continue;
+        }
+        $ln = strtolower((string) ($n->localName ?? ''));
+        if ($ln === 'content' || ($ln === 'summary' && $summaryHtml === '')) {
+            $summaryHtml = (string) $n->textContent;
+            if ($ln === 'content') {
+                break;
+            }
+        }
     }
-    $summary = trim(html_entity_decode(strip_tags($summary), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($summaryHtml === '') {
+        $summaryHtml = trim((string) $xp->evaluate('string(./atom:content|./atom:summary)', $entry));
+    }
+    $summary = trim(html_entity_decode(strip_tags($summaryHtml), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     $pub = trim((string) $xp->evaluate('string(./atom:published|./atom:updated)', $entry));
     $published = ap_rss_parse_date($pub);
-    $img = '';
-    $media = trim((string) $xp->evaluate('string(.//media:thumbnail/@url|.//media:content/@url)', $entry));
-    if (preg_match('#^https://#i', $media)) {
-        $img = $media;
+    $candidates = ap_rss_images_from_html($summaryHtml);
+    $mediaThumb = trim((string) $xp->evaluate('string(.//media:thumbnail/@url)', $entry));
+    $mediaContent = trim((string) $xp->evaluate('string(.//media:content/@url)', $entry));
+    if ($mediaContent !== '') {
+        $candidates[] = $mediaContent;
     }
+    if ($mediaThumb !== '') {
+        $candidates[] = $mediaThumb;
+    }
+    $itemUrl = preg_match('#^https://#i', $link) ? $link : (preg_match('#^https://#i', $guid) ? $guid : '');
     return [
         'guid' => $guid,
-        'url' => preg_match('#^https://#i', $link) ? $link : (preg_match('#^https://#i', $guid) ? $guid : ''),
+        'url' => $itemUrl,
         'title' => $title,
         'summary_text' => $summary,
-        'image_url' => $img,
+        'image_url' => ap_rss_pick_best_image($candidates),
         'published_at' => $published,
     ];
 }
