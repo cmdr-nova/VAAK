@@ -52,11 +52,18 @@ if ($feedId > 0) {
 $ok = 0;
 $fail = 0;
 $added = 0;
+$skipped = 0;
 foreach ($feeds as $feed) {
     $id = (int) ($feed['id'] ?? 0);
     $url = (string) ($feed['feed_url'] ?? '');
     echo '[' . gmdate('c') . "] feed={$id} url={$url}\n";
     if ($dryRun) {
+        continue;
+    }
+    // Host still cooling down from a prior 429 in this process — leave for next tick.
+    if (function_exists('ap_rss_host_backoff_until') && ap_rss_host_backoff_until($url) > time()) {
+        $skipped++;
+        echo "  skip host backoff\n";
         continue;
     }
     $res = ap_rss_refresh_feed($id);
@@ -69,6 +76,11 @@ foreach ($feeds as $feed) {
         $fail++;
         echo '  FAIL ' . (string) ($res['error'] ?? 'error') . "\n";
     }
-    usleep(250000);
+    // Tumblr is especially aggressive from datacenter IPs — pause longer between blogs.
+    $pauseUs = (function_exists('ap_rss_host_is_tumblr') && ap_rss_host_is_tumblr($url))
+        ? 1200000
+        : 350000;
+    usleep($pauseUs);
 }
-echo '[' . gmdate('c') . "] done feeds=" . count($feeds) . " ok={$ok} fail={$fail} added={$added}\n";
+echo '[' . gmdate('c') . "] done feeds=" . count($feeds)
+    . " ok={$ok} fail={$fail} skipped={$skipped} added={$added}\n";

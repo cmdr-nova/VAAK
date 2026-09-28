@@ -371,8 +371,22 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         $feedUrl = $url;
         $parsed = ap_rss_parse_feed($fetch['body'], $feedUrl);
     } else {
+        $status = (int) ($fetch['status'] ?? 0);
+        // Direct feed URLs (…/rss) must not trigger discovery stampedes — that worsens Tumblr 429s
+        // and turns a rate-limit into a misleading "could not find feed" error.
+        if (ap_rss_url_looks_like_feed_path($url) || $status === 429 || $status === 503) {
+            $err = trim((string) ($fetch['error'] ?? ''));
+            if ($err === '') {
+                $err = ap_rss_http_error_message($status, $url);
+            }
+            return ['ok' => false, 'error' => $err];
+        }
         $alt = ap_rss_discover_feed_url($url, $fetch['body'] ?? '');
         if ($alt === null) {
+            $err = trim((string) ($fetch['error'] ?? ''));
+            if ($status >= 400 && $err !== '') {
+                return ['ok' => false, 'error' => $err];
+            }
             return ['ok' => false, 'error' => 'Could not find an RSS/Atom feed at that URL'];
         }
         $discovered = true;
@@ -384,7 +398,11 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         }
         $fetch = ap_rss_http_get($feedUrl);
         if (!$fetch['ok'] || !ap_rss_looks_like_feed($fetch['body'])) {
-            return ['ok' => false, 'error' => 'Found a feed link but could not load it'];
+            $err = trim((string) ($fetch['error'] ?? ''));
+            if ($err === '') {
+                $err = 'Found a feed link but could not load it';
+            }
+            return ['ok' => false, 'error' => $err];
         }
         $parsed = ap_rss_parse_feed($fetch['body'], $feedUrl);
     }
@@ -759,14 +777,107 @@ function ap_rss_looks_like_feed(string $body): bool
     return (bool) preg_match('/<(rss|feed|rdf:RDF)\\b/i', $snip);
 }
 
+/** True when the URL path already looks like a feed (skip discovery stampedes). */
+function ap_rss_url_looks_like_feed_path(string $url): bool
+{
+    $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?: ''));
+    if ($path === '') {
+        return false;
+    }
+    if (preg_match('#/(rss|feed|atom)(/|\.xml)?$#', $path)) {
+        return true;
+    }
+    return (bool) preg_match('#\.(rss|atom|xml)$#', $path);
+}
+
+function ap_rss_host_is_tumblr(string $url): bool
+{
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    return $host !== '' && (str_ends_with($host, '.tumblr.com') || $host === 'tumblr.com' || str_ends_with($host, '.tumblr.co'));
+}
+
+/** Normalize host key for process-local fetch backoff (*.tumblr.com → tumblr.com). */
+function ap_rss_host_backoff_key(string $url): string
+{
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    if ($host === '') {
+        return '';
+    }
+    // Tumblr rate-limits by edge/IP across blogs.
+    if (str_ends_with($host, '.tumblr.com') || $host === 'tumblr.com') {
+        return 'tumblr.com';
+    }
+    return $host;
+}
+
+/**
+ * Process-local host backoff after 429/503 so one poll run does not hammer Tumblr.
+ *
+ * @return array<string,int>
+ */
+function &ap_rss_host_backoff_map(): array
+{
+    static $until = [];
+    return $until;
+}
+
+function ap_rss_host_backoff_until(string $url): int
+{
+    $host = ap_rss_host_backoff_key($url);
+    if ($host === '') {
+        return 0;
+    }
+    $map = &ap_rss_host_backoff_map();
+    return (int) ($map[$host] ?? 0);
+}
+
+function ap_rss_host_backoff_set(string $url, int $seconds): void
+{
+    $host = ap_rss_host_backoff_key($url);
+    if ($host === '') {
+        return;
+    }
+    $map = &ap_rss_host_backoff_map();
+    $map[$host] = max((int) ($map[$host] ?? 0), time() + max(1, $seconds));
+}
+
+function ap_rss_http_error_message(int $status, string $url = ''): string
+{
+    if ($status === 429) {
+        $who = ap_rss_host_is_tumblr($url) ? 'Tumblr' : 'That host';
+        return $who . ' is rate-limiting feed fetches right now (HTTP 429). Wait a minute and try again.';
+    }
+    if ($status === 503) {
+        return 'Feed host temporarily unavailable (HTTP 503). Try again shortly.';
+    }
+    if ($status > 0) {
+        return 'HTTP ' . $status;
+    }
+    return 'fetch failed';
+}
+
 /**
  * @return array{ok:bool,status:int,body:string,etag:string,last_modified:string,error:string}
  */
 function ap_rss_http_get(string $url, string $etag = '', string $lastModified = ''): array
 {
+    $backoffLeft = ap_rss_host_backoff_until($url) - time();
+    if ($backoffLeft > 0) {
+        return [
+            'ok' => false,
+            'status' => 429,
+            'body' => '',
+            'etag' => '',
+            'last_modified' => '',
+            'error' => ap_rss_http_error_message(429, $url),
+        ];
+    }
+
     $headers = [
-        'Accept: application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8',
-        'User-Agent: VAAK-RSS/1.0 (+https://mkultra.monster)',
+        'Accept: application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7',
+        // Browser-ish feed reader UA — Tumblr is harsher on bare bot strings from datacenter IPs.
+        'User-Agent: Mozilla/5.0 (compatible; VAAK-RSS/0.5; +https://vaak.monster/)',
+        'Accept-Language: en-US,en;q=0.8',
     ];
     if ($etag !== '') {
         $headers[] = 'If-None-Match: ' . $etag;
@@ -774,47 +885,91 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
     if ($lastModified !== '') {
         $headers[] = 'If-Modified-Since: ' . $lastModified;
     }
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 4,
-        CURLOPT_CONNECTTIMEOUT => 6,
-        CURLOPT_TIMEOUT => 12,
-        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-        CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_HEADER => true,
-    ]);
-    $raw = curl_exec($ch);
-    $errno = curl_errno($ch);
-    $err = (string) curl_error($ch);
-    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    curl_close($ch);
-    if ($errno !== CURLE_OK || !is_string($raw)) {
-        return ['ok' => false, 'status' => $status, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => $err !== '' ? $err : 'fetch failed'];
-    }
-    $headerBlob = substr($raw, 0, $headerSize);
-    $body = substr($raw, $headerSize);
-    if (strlen($body) > 2_500_000) {
-        return ['ok' => false, 'status' => $status, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => 'Feed too large'];
-    }
-    $newEtag = '';
-    $newLm = '';
-    if (preg_match('/^ETag:\\s*(.+)$/mi', $headerBlob, $m)) {
-        $newEtag = trim($m[1]);
-    }
-    if (preg_match('/^Last-Modified:\\s*(.+)$/mi', $headerBlob, $m)) {
-        $newLm = trim($m[1]);
-    }
-    return [
-        'ok' => $status === 200,
-        'status' => $status,
-        'body' => $body,
-        'etag' => $newEtag,
-        'last_modified' => $newLm,
-        'error' => $status === 200 ? '' : ('HTTP ' . $status),
+
+    $attempt = 0;
+    $maxAttempts = 3;
+    $last = [
+        'ok' => false,
+        'status' => 0,
+        'body' => '',
+        'etag' => '',
+        'last_modified' => '',
+        'error' => 'fetch failed',
     ];
+    while ($attempt < $maxAttempts) {
+        $attempt++;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 4,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_TIMEOUT => 18,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_HEADER => true,
+            CURLOPT_ENCODING => '', // accept gzip/br when available
+        ]);
+        $raw = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $err = (string) curl_error($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        curl_close($ch);
+        if ($errno !== CURLE_OK || !is_string($raw)) {
+            $last = ['ok' => false, 'status' => $status, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => $err !== '' ? $err : 'fetch failed'];
+            break;
+        }
+        $headerBlob = substr($raw, 0, $headerSize);
+        $body = substr($raw, $headerSize);
+        if (strlen($body) > 2_500_000) {
+            return ['ok' => false, 'status' => $status, 'body' => '', 'etag' => '', 'last_modified' => '', 'error' => 'Feed too large'];
+        }
+        $newEtag = '';
+        $newLm = '';
+        $retryAfter = 0;
+        if (preg_match('/^ETag:\\s*(.+)$/mi', $headerBlob, $m)) {
+            $newEtag = trim($m[1]);
+        }
+        if (preg_match('/^Last-Modified:\\s*(.+)$/mi', $headerBlob, $m)) {
+            $newLm = trim($m[1]);
+        }
+        if (preg_match('/^Retry-After:\\s*(\d+)\s*$/mi', $headerBlob, $m)) {
+            $retryAfter = max(1, min(120, (int) $m[1]));
+        }
+        if ($status === 200 || $status === 304) {
+            return [
+                'ok' => $status === 200,
+                'status' => $status,
+                'body' => $body,
+                'etag' => $newEtag,
+                'last_modified' => $newLm,
+                'error' => '',
+            ];
+        }
+        $last = [
+            'ok' => false,
+            'status' => $status,
+            'body' => $body,
+            'etag' => $newEtag,
+            'last_modified' => $newLm,
+            'error' => ap_rss_http_error_message($status, $url),
+        ];
+        if ($status !== 429 && $status !== 503) {
+            break;
+        }
+        $sleep = $retryAfter > 0 ? $retryAfter : (2 * $attempt);
+        $sleep = max(1, min(20, $sleep));
+        ap_rss_host_backoff_set($url, $sleep + 5);
+        if ($attempt >= $maxAttempts) {
+            break;
+        }
+        sleep($sleep);
+    }
+    if (($last['status'] ?? 0) === 429 || ($last['status'] ?? 0) === 503) {
+        ap_rss_host_backoff_set($url, 45);
+    }
+    return $last;
 }
 
 function ap_rss_discover_feed_url(string $pageUrl, string $html): ?string
@@ -838,11 +993,39 @@ function ap_rss_discover_feed_url(string $pageUrl, string $html): ?string
             }
         }
     }
-    // Common fallbacks
-    $base = preg_replace('#/$#', '', $pageUrl) ?? $pageUrl;
-    foreach (['/feed', '/rss', '/atom.xml', '/feed.xml', '/index.xml'] as $suffix) {
+
+    $parts = parse_url($pageUrl);
+    $origin = '';
+    if (is_array($parts) && !empty($parts['scheme']) && !empty($parts['host'])) {
+        $origin = $parts['scheme'] . '://' . $parts['host'] . (isset($parts['port']) ? ':' . $parts['port'] : '');
+    }
+    // Tumblr blogs always expose /rss — try that alone (no stampede of /feed variants).
+    if ($origin !== '' && ap_rss_host_is_tumblr($pageUrl)) {
+        $try = $origin . '/rss';
+        if ($try !== $pageUrl) {
+            usleep(400000);
+            $fetch = ap_rss_http_get($try);
+            if ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
+                return $try;
+            }
+        }
+        return null;
+    }
+
+    // Common fallbacks (origin-based so /blog/post URLs do not become /blog/post/rss).
+    $base = $origin !== '' ? $origin : (preg_replace('#/$#', '', $pageUrl) ?? $pageUrl);
+    foreach (['/feed', '/rss', '/atom.xml', '/feed.xml', '/index.xml'] as $i => $suffix) {
         $try = $base . $suffix;
+        if ($try === $pageUrl) {
+            continue;
+        }
+        if ($i > 0) {
+            usleep(350000);
+        }
         $fetch = ap_rss_http_get($try);
+        if (($fetch['status'] ?? 0) === 429) {
+            return null;
+        }
         if ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
             return $try;
         }
