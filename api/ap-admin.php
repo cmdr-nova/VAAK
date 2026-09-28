@@ -6299,7 +6299,7 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
 }
 
 /**
- * Queue RSS item ids into later Home pages at ~20% with ≥2 other cards between.
+ * Queue RSS item ids into later Home pages (~15%, ≥3 other cards between).
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
@@ -6310,7 +6310,7 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
         return $ranked;
     }
     $firstPage = max(0, $firstPage);
-    $keys = ap_rss_home_rank_keys($ownerUserId, 40);
+    $keys = ap_rss_home_rank_keys($ownerUserId, 16);
     if ($keys === []) {
         return $ranked;
     }
@@ -6336,7 +6336,7 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
         return $ranked;
     }
     if ($ranked === []) {
-        return array_slice($queued, 0, 40);
+        return array_slice($queued, 0, 16);
     }
     $head = array_slice($ranked, 0, $firstPage);
     $tail = array_slice($ranked, $firstPage);
