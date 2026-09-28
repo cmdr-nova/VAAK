@@ -3826,7 +3826,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     . ' tokens · apps ' . (int) ($purge['apps_deleted'] ?? 0) . '.';
             }
         }
-    } elseif (in_array($action, ['rss_add', 'rss_remove', 'rss_remove_feed', 'rss_refresh', 'rss_favourite', 'rss_bookmark', 'rss_boost', 'rss_quote'], true)) {
+    } elseif (in_array($action, ['rss_add', 'rss_remove', 'rss_remove_feed', 'rss_refresh', 'rss_favourite', 'rss_bookmark', 'rss_boost', 'rss_quote', 'rss_cleanup_mirrors'], true)) {
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'rss')) ?: 'rss';
         if (!in_array($returnView, ['rss', 'home', 'local', 'feed', 'outbox'], true)) {
             $returnView = 'rss';
@@ -3888,87 +3888,47 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     }
                 }
             }
-        } else {
-            // favourite / bookmark / boost / quote — materialize mirror note first
+        } elseif ($action === 'rss_boost' || $action === 'rss_quote') {
+            $error = 'Boost and quote are not available on RSS items (they would publish as you).';
+        } elseif ($action === 'rss_cleanup_mirrors') {
+            $view = 'rss';
+            $res = ap_rss_cleanup_mirror_notes($ownerId);
+            $n = (int) ($res['deleted'] ?? 0);
+            $notice = $n > 0
+                ? ('Removed ' . $n . ' federated RSS mirror post' . ($n === 1 ? '' : 's') . ' from your account.')
+                : 'No RSS mirror posts left to remove.';
+            if (function_exists('admin_tl_cache_clear_owner')) {
+                admin_tl_cache_clear_owner($ownerId);
+            }
+        } elseif ($action === 'rss_favourite' || $action === 'rss_bookmark') {
+            // Local-only — never materialize / federate a note as the user.
             $itemId = (int) ($_POST['item_id'] ?? 0);
-            $mat = ap_rss_materialize_note($ownerId, $itemId);
-            if (empty($mat['ok'])) {
-                $error = (string) ($mat['error'] ?? 'Could not prepare RSS item.');
+            $item = function_exists('ap_rss_item_by_id') ? ap_rss_item_by_id($itemId, $ownerId) : null;
+            if (!is_array($item)) {
+                $error = 'RSS item not found.';
             } else {
-                $noteId = rtrim((string) ($mat['note_id'] ?? ''), '/');
-                $localId = (int) ($mat['local_id'] ?? 0);
-                $statusId = '';
-                $mrow = null;
-                if ($noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
-                    $mrow = ap_masto_status_by_note_id($noteId);
-                    if (is_array($mrow)) {
-                        $localId = (int) ($mrow['local_id'] ?? $localId);
-                        if ($localId > 0 && function_exists('ap_masto_snowflake_id')) {
-                            $statusId = ap_masto_snowflake_id(
-                                (string) ($mrow['published'] ?? gmdate('c')),
-                                $localId,
-                                0
-                            );
-                        }
-                    }
-                }
-                if ($action === 'rss_quote') {
-                    if ($noteId === '') {
-                        $error = 'Mirror note missing.';
-                    } else {
-                        $q = '?view=' . rawurlencode($returnView !== '' ? $returnView : 'home')
-                            . '&compose=1&quote_object=' . rawurlencode($noteId);
-                        if ($statusId !== '') {
-                            $q .= '&quote_status_id=' . rawurlencode($statusId);
-                        }
-                        header('Location: ' . $q, true, 303);
-                        exit;
-                    }
-                } elseif ($statusId === '' || $noteId === '') {
-                    $error = 'Mirror status not ready yet.';
-                } elseif ($action === 'rss_favourite') {
+                // Keep both keys non-https so canonical lookup does not rewrite them.
+                $statusId = ap_rss_local_status_id($itemId);
+                $objectId = $statusId;
+                if ($action === 'rss_favourite') {
                     $isFav = function_exists('ap_masto_status_is_favourited')
-                        && ap_masto_status_is_favourited($statusId, null, $noteId);
+                        && ap_masto_status_is_favourited($statusId, $ownerId, $objectId);
                     if ($isFav) {
-                        ap_masto_favourite_remove($statusId, null, $noteId);
+                        ap_masto_favourite_remove($statusId, $ownerId, $objectId);
                         $notice = 'Removed favourite.';
                     } else {
-                        ap_masto_favourite_add($statusId, $noteId, $vaakActorId);
-                        $notice = 'Favourited.';
+                        ap_masto_favourite_add($statusId, $objectId, null, null, $ownerId);
+                        $notice = 'Favourited (saved on VAAK only — not federated).';
                     }
-                } elseif ($action === 'rss_bookmark') {
+                } else {
                     $isBm = function_exists('ap_masto_status_is_bookmarked')
-                        && ap_masto_status_is_bookmarked($statusId, null, $noteId);
+                        && ap_masto_status_is_bookmarked($statusId, $ownerId, $objectId);
                     if ($isBm) {
-                        ap_masto_bookmark_remove($statusId, null, $noteId);
+                        ap_masto_bookmark_remove($statusId, $ownerId, $objectId);
                         $notice = 'Bookmark removed.';
                     } else {
-                        ap_masto_bookmark_add($statusId, $noteId);
-                        $notice = 'Bookmarked.';
-                    }
-                } elseif ($action === 'rss_boost') {
-                    if (!function_exists('ap_masto_resolve_status_interaction') || !function_exists('ap_masto_reblog_perform')) {
-                        $error = 'Boost unavailable.';
-                    } else {
-                        $resolved = ap_masto_resolve_status_interaction((int) $statusId);
-                        if ($resolved === null && $localId > 0) {
-                            $resolved = ap_masto_resolve_status_interaction($localId);
-                        }
-                        if ($resolved === null) {
-                            $error = 'Mirror status not found.';
-                        } else {
-                            $undo = function_exists('ap_masto_status_is_reblogged')
-                                && ap_masto_status_is_reblogged($statusId);
-                            $res = ap_masto_reblog_perform($resolved, $undo);
-                            if (!empty($res['ok'])) {
-                                $notice = $undo ? 'Boost removed.' : 'Boosted.';
-                                if (function_exists('admin_tl_cache_clear_owner')) {
-                                    admin_tl_cache_clear_owner($ownerId);
-                                }
-                            } else {
-                                $error = (string) ($res['error'] ?? 'Boost failed.');
-                            }
-                        }
+                        ap_masto_bookmark_add($statusId, $objectId, $ownerId);
+                        $notice = 'Bookmarked (saved on VAAK only — not federated).';
                     }
                 }
             }
@@ -14115,29 +14075,11 @@ function admin_render_rss_item(array $row, string $returnView): void
         : 'https://mkultra.monster/img/avatar/default.jpg';
     $avSrc = ($favicon !== '' && preg_match('#^https?://#i', $favicon)) ? $favicon : $fallbackAv;
 
-    $mirrorNoteId = rtrim(trim((string) ($row['mirror_note_id'] ?? '')), '/');
-    $statusId = '';
-    $fav = false;
-    $bm = false;
-    $boosted = false;
-    if ($mirrorNoteId !== '' && function_exists('ap_masto_status_by_note_id')) {
-        $mrow = ap_masto_status_by_note_id($mirrorNoteId);
-        if (is_array($mrow) && !empty($mrow['local_id']) && function_exists('ap_masto_snowflake_id')) {
-            $statusId = ap_masto_snowflake_id(
-                (string) ($mrow['published'] ?? gmdate('c')),
-                (int) $mrow['local_id'],
-                0
-            );
-            if ($statusId !== '') {
-                $fav = function_exists('ap_masto_status_is_favourited')
-                    && ap_masto_status_is_favourited($statusId, null, $mirrorNoteId);
-                $bm = function_exists('ap_masto_status_is_bookmarked')
-                    && ap_masto_status_is_bookmarked($statusId, null, $mirrorNoteId);
-                $boosted = function_exists('ap_masto_status_is_reblogged')
-                    && ap_masto_status_is_reblogged($statusId);
-            }
-        }
-    }
+    $statusId = function_exists('ap_rss_local_status_id') ? ap_rss_local_status_id($itemId) : ('rss:' . $itemId);
+    $fav = function_exists('ap_masto_status_is_favourited')
+        && ap_masto_status_is_favourited($statusId, null, $statusId);
+    $bm = function_exists('ap_masto_status_is_bookmarked')
+        && ap_masto_status_is_bookmarked($statusId, null, $statusId);
 
     $linkCardHtml = '';
     if ($url !== '' && preg_match('#^https?://#i', $url)) {
@@ -14207,28 +14149,14 @@ function admin_render_rss_item(array $row, string $returnView): void
           <input type="hidden" name="action" value="rss_favourite">
           <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
           <input type="hidden" name="item_id" value="<?= $itemId ?>">
-          <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-        </form>
-        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <input type="hidden" name="action" value="rss_boost">
-          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-          <input type="hidden" name="item_id" value="<?= $itemId ?>">
-          <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
-        </form>
-        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <input type="hidden" name="action" value="rss_quote">
-          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-          <input type="hidden" name="item_id" value="<?= $itemId ?>">
-          <button class="icon-btn" type="submit" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></button>
+          <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike (VAAK only)' : 'Favourite (VAAK only)' ?>" aria-label="<?= $fav ? 'Unlike' : 'Favourite' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
         </form>
         <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="hidden" name="action" value="rss_bookmark">
           <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
           <input type="hidden" name="item_id" value="<?= $itemId ?>">
-          <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+          <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark (VAAK only)' : 'Bookmark (VAAK only)' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
         </form>
         <?php if ($overflow !== ''): ?>
           <details class="post-action-menu">
@@ -23961,7 +23889,27 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
         <div class="meta" style="margin-bottom:1rem">
           Add RSS/Atom feeds to mix into <b>Home</b> (~20% of later pages). Polling runs in the background — Refresh here pulls once.
+          Favourite and bookmark stay on VAAK only (nothing is posted to your Fediverse account).
         </div>
+        <?php
+          $rssMirrorCount = 0;
+          if ($vaakOwnerId > 0 && function_exists('ap_rss_mirror_note_ids_for_owner')) {
+              $rssMirrorCount = (int) (count(ap_rss_mirror_note_ids_for_owner($vaakOwnerId)) / 2);
+          }
+        ?>
+        <?php if ($rssMirrorCount > 0): ?>
+          <div class="side-card" style="border-color:color-mix(in srgb, var(--danger) 35%, var(--border));margin-bottom:1rem">
+            <div class="meta" style="margin:0 0 .5rem">
+              Older RSS boost/quote experiments left <b><?= (int) $rssMirrorCount ?></b> federated mirror post<?= $rssMirrorCount === 1 ? '' : 's' ?> on your account.
+            </div>
+            <form method="post" action="?view=rss" onsubmit="return confirm('Delete those mirror posts from your account and send Deletes to the Fediverse?');">
+              <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+              <input type="hidden" name="action" value="rss_cleanup_mirrors">
+              <input type="hidden" name="return_view" value="rss">
+              <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Remove federated RSS mirrors</button>
+            </form>
+          </div>
+        <?php endif; ?>
         <form class="composer" method="post" action="?view=rss" style="margin-bottom:1.25rem">
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
           <input type="hidden" name="action" value="rss_add">

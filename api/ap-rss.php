@@ -440,8 +440,69 @@ function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 40): array
     return $out;
 }
 
+/** Synthetic status id for local-only fav/bookmark of an RSS item (never federated). */
+function ap_rss_local_status_id(int $itemId): string
+{
+    return 'rss:' . max(0, $itemId);
+}
+
 /**
- * Materialize a public local note for boost/quote/favourite federation.
+ * Delete federated mirror notes created by the old boost/quote materialize path.
+ * Favourites/bookmarks for RSS are local-only and must not publish as the user.
+ *
+ * @return array{ok:bool,deleted:int}
+ */
+function ap_rss_cleanup_mirror_notes(int $ownerUserId): array
+{
+    ap_rss_migrate();
+    if ($ownerUserId < 1) {
+        return ['ok' => false, 'deleted' => 0];
+    }
+    $st = ap_db()->prepare(
+        'SELECT i.id AS item_id, i.mirror_note_id
+         FROM rss_items i
+         JOIN rss_feeds f ON f.id = i.feed_id
+         WHERE f.owner_user_id = ?
+           AND i.mirror_note_id IS NOT NULL
+           AND i.mirror_note_id <> \'\''
+    );
+    $st->execute([$ownerUserId]);
+    $deleted = 0;
+    if (!function_exists('ap_delete_local_status')) {
+        if (!defined('AP_INBOX_LIB_ONLY')) {
+            define('AP_INBOX_LIB_ONLY', true);
+        }
+        require_once __DIR__ . '/ap-inbox.php';
+    }
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+        $noteId = rtrim(trim((string) ($row['mirror_note_id'] ?? '')), '/');
+        $itemId = (int) ($row['item_id'] ?? 0);
+        if ($noteId === '') {
+            continue;
+        }
+        $localId = 0;
+        if (function_exists('ap_masto_status_by_note_id')) {
+            $mrow = ap_masto_status_by_note_id($noteId);
+            if (is_array($mrow)) {
+                $localId = (int) ($mrow['local_id'] ?? 0);
+            }
+        }
+        if ($localId > 0 && function_exists('ap_delete_local_status')) {
+            $res = ap_delete_local_status($localId);
+            if (!empty($res['ok'])) {
+                $deleted++;
+            }
+        }
+        if ($itemId > 0) {
+            ap_db()->prepare('UPDATE rss_items SET mirror_note_id = NULL WHERE id = ?')->execute([$itemId]);
+        }
+    }
+    return ['ok' => true, 'deleted' => $deleted];
+}
+
+/**
+ * @deprecated Prefer local-only fav/bookmark via ap_rss_local_status_id.
+ * Kept for one release so old mirrors can still be cleaned up.
  *
  * @return array{ok:bool,error?:string,note_id?:string,local_id?:int}
  */
