@@ -899,6 +899,177 @@ function ap_rss_local_status_id(int $itemId): string
     return 'rss:' . max(0, $itemId);
 }
 
+/** Parse `rss:123` → 123 (0 if not an RSS local status id). */
+function ap_rss_parse_local_status_id(string $statusId): int
+{
+    $statusId = trim($statusId);
+    if (!preg_match('/^rss:(\d+)$/', $statusId, $m)) {
+        return 0;
+    }
+    return (int) $m[1];
+}
+
+/**
+ * Mastodon-shaped status entity for Bookmarks / Favourites lists (local-only).
+ *
+ * @param array<string,mixed> $row rss_items row (+ feed_* columns)
+ * @return array<string,mixed>
+ */
+function ap_rss_item_to_masto_status(array $row): array
+{
+    $itemId = (int) ($row['id'] ?? 0);
+    $statusId = ap_rss_local_status_id($itemId);
+    $title = trim((string) ($row['title'] ?? ''));
+    $summary = function_exists('ap_rss_display_summary')
+        ? ap_rss_display_summary((string) ($row['summary_text'] ?? ''))
+        : trim((string) ($row['summary_text'] ?? ''));
+    $url = trim((string) ($row['url'] ?? ''));
+    $image = trim((string) ($row['image_url'] ?? ''));
+    if ($image !== '' && function_exists('ap_rss_upgrade_image_url')) {
+        $image = ap_rss_upgrade_image_url($image);
+    }
+    $feedTitle = function_exists('ap_rss_display_title')
+        ? ap_rss_display_title((string) ($row['feed_title'] ?? ''))
+        : trim((string) ($row['feed_title'] ?? ''));
+    if ($feedTitle === '') {
+        $feedTitle = 'RSS';
+    }
+    $favicon = trim((string) ($row['feed_favicon'] ?? ''));
+    $published = (string) ($row['published_at'] ?? ($row['ingested_at'] ?? gmdate('c')));
+    $created = function_exists('ap_masto_format_time')
+        ? ap_masto_format_time($published)
+        : $published;
+
+    $bodyParts = [];
+    if ($title !== '') {
+        $bodyParts[] = $title;
+    }
+    if ($summary !== '' && $summary !== $title) {
+        $bodyParts[] = mb_strimwidth($summary, 0, 500, '…', 'UTF-8');
+    }
+    $plain = trim(implode("\n\n", $bodyParts));
+    $content = $plain !== ''
+        ? '<p>' . nl2br(htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>'
+        : '';
+
+    $media = [];
+    $mediaForward = function_exists('ap_rss_item_is_media_forward')
+        ? ap_rss_item_is_media_forward((string) ($row['summary_text'] ?? ''), $image, $url)
+        : ($image !== '' && $summary === '');
+    if ($mediaForward && $image !== '' && preg_match('#^https://#i', $image)) {
+        $media[] = [
+            'id' => $statusId . '-img',
+            'type' => 'image',
+            'url' => $image,
+            'preview_url' => $image,
+            'remote_url' => $image,
+            'mediaType' => 'image/*',
+            'description' => null,
+            'blurhash' => null,
+        ];
+    }
+
+    $card = null;
+    if ($url !== '' && preg_match('#^https?://#i', $url) && $media === []) {
+        $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+        $card = [
+            'url' => $url,
+            'title' => $title !== '' ? $title : ($host !== '' ? $host : $url),
+            'description' => $summary,
+            'type' => 'link',
+            'author_name' => $feedTitle,
+            'author_url' => '',
+            'provider_name' => $host,
+            'provider_url' => $host !== '' ? ('https://' . $host . '/') : '',
+            'html' => '',
+            'width' => 0,
+            'height' => 0,
+            'image' => ($image !== '' && preg_match('#^https://#i', $image)) ? $image : null,
+            'embed_url' => '',
+            'blurhash' => null,
+        ];
+    }
+
+    $avatar = ($favicon !== '' && preg_match('#^https?://#i', $favicon))
+        ? $favicon
+        : (defined('AP_REMOTE_AVATAR_FALLBACK')
+            ? AP_REMOTE_AVATAR_FALLBACK
+            : 'https://mkultra.monster/img/avatar/default.jpg');
+
+    $acct = preg_replace('/\s+/', '', strtolower($feedTitle)) ?: 'rss';
+    $acct = substr(preg_replace('/[^a-z0-9._-]/', '', $acct) ?? 'rss', 0, 30) ?: 'rss';
+
+    return [
+        'id' => $statusId,
+        'created_at' => $created,
+        'in_reply_to_id' => null,
+        'in_reply_to_account_id' => null,
+        'sensitive' => false,
+        'spoiler_text' => '',
+        'visibility' => 'public',
+        'language' => null,
+        'uri' => $url !== '' ? $url : $statusId,
+        'url' => $url !== '' ? $url : $statusId,
+        'replies_count' => 0,
+        'reblogs_count' => 0,
+        'favourites_count' => 0,
+        'edited_at' => null,
+        'favourited' => false,
+        'reblogged' => false,
+        'muted' => false,
+        'bookmarked' => false,
+        'pinned' => false,
+        'content' => $content,
+        'reblog' => null,
+        'application' => ['name' => 'RSS', 'website' => null],
+        'account' => [
+            'id' => 'rss-feed:' . (int) ($row['feed_id'] ?? 0),
+            'username' => $acct,
+            'acct' => $feedTitle,
+            'display_name' => $feedTitle,
+            'locked' => false,
+            'bot' => true,
+            'discoverable' => false,
+            'group' => false,
+            'created_at' => $created,
+            'note' => 'RSS feed',
+            'url' => trim((string) ($row['feed_site_url'] ?? $row['feed_url'] ?? '')),
+            'uri' => trim((string) ($row['feed_url'] ?? '')),
+            'avatar' => $avatar,
+            'avatar_static' => $avatar,
+            'header' => '',
+            'header_static' => '',
+            'followers_count' => 0,
+            'following_count' => 0,
+            'statuses_count' => 0,
+            'last_status_at' => null,
+            'emojis' => [],
+            'fields' => [],
+        ],
+        'media_attachments' => $media,
+        'mentions' => [],
+        'tags' => [['name' => 'RSS', 'url' => '']],
+        'emojis' => [],
+        'card' => $card,
+        'poll' => null,
+        'vaak_rss_item_id' => $itemId,
+    ];
+}
+
+/** Load an RSS item as a Mastodon status by synthetic id `rss:123`. */
+function ap_rss_status_by_local_id(string $statusId, ?int $ownerUserId = null): ?array
+{
+    $itemId = ap_rss_parse_local_status_id($statusId);
+    if ($itemId < 1) {
+        return null;
+    }
+    $row = ap_rss_item_by_id($itemId, $ownerUserId);
+    if ($row === null) {
+        return null;
+    }
+    return ap_rss_item_to_masto_status($row);
+}
+
 /**
  * Delete federated mirror notes created by the old boost/quote materialize path.
  * Favourites/bookmarks for RSS are local-only and must not publish as the user.

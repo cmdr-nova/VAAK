@@ -868,7 +868,83 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $interactOk = false;
         $interactActive = null; // post-action toggle state
         $interactKind = null;   // favourite|bookmark|reblog
-        if ($statusId === '' || !preg_match('/^\d+$/', $statusId)) {
+        // RSS items use synthetic ids (rss:123) — same UI/folder picker as fedi/Bluesky,
+        // but local-only (never federate / never queue outbound).
+        $isRssLocal = str_starts_with($statusId, 'rss:')
+            || str_starts_with($objectId, 'rss:');
+        if ($isRssLocal) {
+            if (!function_exists('ap_rss_parse_local_status_id')) {
+                @require_once __DIR__ . '/ap-rss.php';
+            }
+            $rssKey = str_starts_with($statusId, 'rss:') ? $statusId : $objectId;
+            $rssItemId = function_exists('ap_rss_parse_local_status_id')
+                ? ap_rss_parse_local_status_id($rssKey)
+                : 0;
+            $rssItem = ($rssItemId > 0 && function_exists('ap_rss_item_by_id'))
+                ? ap_rss_item_by_id($rssItemId, $vaakOwnerId)
+                : null;
+            if ($action === 'reblog_status' || $action === 'unreblog_status') {
+                $error = 'RSS items cannot be boosted.';
+            } elseif (!is_array($rssItem)) {
+                $error = 'RSS item not found.';
+            } else {
+                $statusId = function_exists('ap_rss_local_status_id')
+                    ? ap_rss_local_status_id($rssItemId)
+                    : ('rss:' . $rssItemId);
+                $objectId = $statusId;
+                if ($action === 'favourite_status') {
+                    $interactKind = 'favourite';
+                    ap_masto_favourite_add($statusId, $objectId, null, null, $vaakOwnerId);
+                    $interactOk = true;
+                    $interactActive = true;
+                    $notice = 'Favourited.';
+                } elseif ($action === 'unfavourite_status') {
+                    $interactKind = 'favourite';
+                    ap_masto_favourite_remove($statusId, $vaakOwnerId, $objectId);
+                    $interactOk = true;
+                    $interactActive = false;
+                    $notice = 'Removed favourite.';
+                } elseif ($action === 'bookmark_status') {
+                    $interactKind = 'bookmark';
+                    ap_masto_bookmark_add($statusId, $objectId, $vaakOwnerId);
+                    $interactOk = true;
+                    $interactActive = true;
+                    $notice = 'Bookmarked.';
+                } else { // unbookmark_status
+                    $interactKind = 'bookmark';
+                    ap_masto_bookmark_remove($statusId, $vaakOwnerId, $objectId);
+                    if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
+                        vaak_bookmark_folders_on_unbookmark($statusId, $vaakOwnerId);
+                    }
+                    $interactOk = true;
+                    $interactActive = false;
+                    $notice = 'Bookmark removed.';
+                }
+            }
+            if ($wantJson) {
+                header('Content-Type: application/json; charset=utf-8');
+                header('Cache-Control: no-store');
+                $folderIds = [];
+                if ($interactOk && $interactKind === 'bookmark' && $interactActive && $statusId !== '') {
+                    $folderIds = function_exists('vaak_bookmark_folders_for_status')
+                        ? vaak_bookmark_folders_for_status($statusId, $vaakOwnerId)
+                        : [];
+                }
+                echo json_encode([
+                    'ok' => $interactOk && $error === null,
+                    'error' => $error,
+                    'notice' => $notice,
+                    'action' => $action,
+                    'kind' => $interactKind,
+                    'active' => $interactActive,
+                    'status_id' => $statusId,
+                    'object_id' => $objectId,
+                    'folder_ids' => $folderIds,
+                    'open_folder_picker' => $interactOk && $interactKind === 'bookmark' && $interactActive,
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+        } elseif ($statusId === '' || !preg_match('/^\d+$/', $statusId)) {
             $error = 'Invalid status id.';
         } else {
             if (!defined('AP_INBOX_LIB_ONLY')) {
@@ -4253,6 +4329,19 @@ if (isset($_GET['partial'], $_GET['shell'])
         echo '<div class="empty">' . ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') . '</div>';
     } else {
         foreach ($bmList as $st) {
+            $bmSid = (string) ($st['id'] ?? '');
+            if (str_starts_with($bmSid, 'rss:')
+                && function_exists('ap_rss_parse_local_status_id')
+                && function_exists('ap_rss_item_by_id')
+                && function_exists('admin_render_rss_item')
+            ) {
+                $rssId = ap_rss_parse_local_status_id($bmSid);
+                $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $vaakOwnerId) : null;
+                if (is_array($rssRow)) {
+                    admin_render_rss_item($rssRow, 'bookmarks');
+                    continue;
+                }
+            }
             if (function_exists('admin_render_masto_status_card')) {
                 admin_render_masto_status_card($st, [], 'bookmarks', false, true);
             }
@@ -14175,17 +14264,19 @@ function admin_render_rss_item(array $row, string $returnView): void
       <div class="tweet-actions">
         <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <input type="hidden" name="action" value="rss_favourite">
+          <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
           <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-          <input type="hidden" name="item_id" value="<?= $itemId ?>">
-          <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike (VAAK only)' : 'Favourite (VAAK only)' ?>" aria-label="<?= $fav ? 'Unlike' : 'Favourite' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+          <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
+          <input type="hidden" name="object_id" value="<?= h($statusId) ?>">
+          <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
         </form>
         <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <input type="hidden" name="action" value="rss_bookmark">
+          <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
           <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-          <input type="hidden" name="item_id" value="<?= $itemId ?>">
-          <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Remove bookmark (VAAK only)' : 'Bookmark (VAAK only)' ?>" aria-label="<?= $bm ? 'Remove bookmark' : 'Bookmark' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+          <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
+          <input type="hidden" name="object_id" value="<?= h($statusId) ?>">
+          <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
         </form>
         <?php if ($overflow !== ''): ?>
           <details class="post-action-menu">
@@ -15452,8 +15543,21 @@ header('Content-Type: text/html; charset=utf-8');
  */
 function admin_render_favourite_status_card(array $st): void
 {
-    $acct = (string) ($st['account']['acct'] ?? '?');
     $sid = (string) ($st['id'] ?? '');
+    if (str_starts_with($sid, 'rss:')
+        && function_exists('ap_rss_parse_local_status_id')
+        && function_exists('ap_rss_item_by_id')
+        && function_exists('admin_render_rss_item')
+    ) {
+        $rssId = ap_rss_parse_local_status_id($sid);
+        $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
+        $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $owner > 0 ? $owner : null) : null;
+        if (is_array($rssRow)) {
+            admin_render_rss_item($rssRow, 'favourites');
+            return;
+        }
+    }
+    $acct = (string) ($st['account']['acct'] ?? '?');
     $oid = (string) ($st['uri'] ?? '');
     $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
     echo '<article class="tweet relay-card"><div class="tweet-hd">';
@@ -18898,8 +19002,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php if ($bmList): ?>
           <?php foreach ($bmList as $st): ?>
             <?php
-              $acct = (string) ($st['account']['acct'] ?? '?');
               $sid = (string) ($st['id'] ?? '');
+              if (str_starts_with($sid, 'rss:')
+                  && function_exists('ap_rss_parse_local_status_id')
+                  && function_exists('ap_rss_item_by_id')
+                  && function_exists('admin_render_rss_item')
+              ) {
+                  $rssId = ap_rss_parse_local_status_id($sid);
+                  $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $vaakOwnerId) : null;
+                  if (is_array($rssRow)) {
+                      admin_render_rss_item($rssRow, 'bookmarks');
+                      continue;
+                  }
+              }
+              $acct = (string) ($st['account']['acct'] ?? '?');
               $oid = (string) ($st['uri'] ?? '');
               $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
             ?>

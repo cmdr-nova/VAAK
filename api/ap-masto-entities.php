@@ -10610,8 +10610,26 @@ function ap_masto_favourites_list(int $limit = 40, ?string $maxId = null): array
  */
 function ap_masto_interaction_row_to_status(array $row, string $flag): ?array
 {
-    $sid = (int) ($row['status_id'] ?? 0);
+    $statusIdRaw = trim((string) ($row['status_id'] ?? ''));
+    $sid = (int) $statusIdRaw; // numeric Mastodon/snowflake ids only; "rss:123" → 0
     $status = null;
+
+    // Local-only RSS bookmarks/favourites (status_id = rss:{item_id}).
+    if ($status === null && (str_starts_with($statusIdRaw, 'rss:')
+        || str_starts_with(trim((string) ($row['object_id'] ?? '')), 'rss:'))
+    ) {
+        if (!function_exists('ap_rss_status_by_local_id')) {
+            @require_once __DIR__ . '/ap-rss.php';
+        }
+        $rssKey = str_starts_with($statusIdRaw, 'rss:')
+            ? $statusIdRaw
+            : trim((string) ($row['object_id'] ?? ''));
+        if (function_exists('ap_rss_status_by_local_id')) {
+            $owner = (int) ($row['owner_user_id'] ?? 0);
+            $status = ap_rss_status_by_local_id($rssKey, $owner > 0 ? $owner : null);
+        }
+    }
+
     if ($sid > 0) {
         $resolved = ap_masto_resolve_status_interaction($sid);
         if ($resolved !== null) {
