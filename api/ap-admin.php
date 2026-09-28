@@ -3842,9 +3842,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             $view = 'rss';
             $res = ap_rss_add_feed($ownerId, (string) ($_POST['feed_url'] ?? ''));
             if (!empty($res['ok'])) {
-                $notice = !empty($res['discovered'])
-                    ? 'Feed discovered and added.'
-                    : 'Feed added.';
+                if (!empty($res['deferred'])) {
+                    $notice = 'Feed saved. First fetch is waiting on a temporary rate limit — items will appear after the next successful poll.';
+                } elseif (!empty($res['discovered'])) {
+                    $notice = 'Feed discovered and added.';
+                } else {
+                    $notice = 'Feed added.';
+                }
                 if (function_exists('admin_tl_cache_clear_owner')) {
                     admin_tl_cache_clear_owner($ownerId);
                 }
@@ -23961,6 +23965,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
               $rferr = trim((string) ($rf['last_error'] ?? ''));
               $rfcount = (int) ($rf['item_count'] ?? 0);
+              $rfWaiting = $rferr !== '' && (
+                  stripos($rferr, 'rate-limit') !== false
+                  || stripos($rferr, '429') !== false
+                  || stripos($rferr, 'Waiting for first fetch') !== false
+                  || empty($rf['last_fetched_at'])
+              );
               $rfItems = ($rfid > 0 && function_exists('ap_rss_items_for_feed'))
                   ? ap_rss_items_for_feed($rfid, $vaakOwnerId, 8)
                   : [];
@@ -23971,7 +23981,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <span class="who" style="text-transform:none;letter-spacing:0;color:var(--text)"><?= h($rftitle) ?></span>
                   <span class="meta"> · <?= $rfcount ?> item<?= $rfcount === 1 ? '' : 's' ?></span>
                   <?php if ($rferr !== ''): ?>
-                    <span class="meta" style="color:var(--danger)"> · error</span>
+                    <span class="meta" style="color:<?= $rfWaiting ? 'var(--muted)' : 'var(--danger)' ?>"> · <?= $rfWaiting ? 'waiting' : 'error' ?></span>
                   <?php endif; ?>
                 </span>
                 <span class="meta" aria-hidden="true">▾</span>
@@ -23979,9 +23989,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div style="padding:0 .9rem .9rem">
                 <div class="meta" style="margin:0 0 .55rem;overflow-wrap:anywhere"><?= h((string) ($rf['feed_url'] ?? '')) ?></div>
                 <div class="meta" style="margin:0 0 .65rem">
-                  Last fetch <?= h(relative_time((string) ($rf['last_fetched_at'] ?? ''))) ?>
+                  <?php if (empty($rf['last_fetched_at'])): ?>
+                    Not fetched yet
+                  <?php else: ?>
+                    Last fetch <?= h(relative_time((string) $rf['last_fetched_at'])) ?>
+                  <?php endif; ?>
                   <?php if ($rferr !== ''): ?>
-                    · <span style="color:var(--danger)"><?= h(mb_strimwidth($rferr, 0, 160, '…', 'UTF-8')) ?></span>
+                    · <span style="color:<?= $rfWaiting ? 'var(--muted)' : 'var(--danger)' ?>"><?= h(mb_strimwidth($rferr, 0, 160, '…', 'UTF-8')) ?></span>
                   <?php endif; ?>
                 </div>
                 <div class="tweet-actions" style="margin:0 0 .75rem">
@@ -24004,7 +24018,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <?php endif; ?>
                 </div>
                 <?php if (!$rfItems): ?>
-                  <div class="meta">No items yet — try Refresh.</div>
+                  <div class="meta"><?= $rfWaiting
+                      ? 'No items yet — saved locally; will fetch when the host rate limit clears (or tap Refresh).'
+                      : 'No items yet — try Refresh.' ?></div>
                 <?php else: ?>
                   <details class="rss-feed-items">
                     <summary class="meta" style="cursor:pointer;user-select:none;margin-bottom:.35rem">

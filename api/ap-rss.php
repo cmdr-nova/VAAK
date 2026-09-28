@@ -341,8 +341,91 @@ function ap_rss_item_by_mirror_note_id(string $noteId): ?array
     return is_array($row) ? $row : null;
 }
 
+/** Best-guess title/site when we save a feed before the first successful fetch. */
+function ap_rss_provisional_meta(string $feedUrl): array
+{
+    $parts = parse_url($feedUrl);
+    $host = is_array($parts) ? strtolower((string) ($parts['host'] ?? '')) : '';
+    $site = ($host !== '') ? ('https://' . $host . '/') : '';
+    $title = $host !== '' ? $host : $feedUrl;
+    if ($host !== '' && (str_ends_with($host, '.tumblr.com') || $host === 'www.tumblr.com')) {
+        $blog = preg_replace('/\.tumblr\.com$/i', '', $host) ?? $host;
+        $blog = preg_replace('/^www\./i', '', $blog) ?? $blog;
+        if ($blog !== '' && $blog !== 'tumblr' && $blog !== 'www') {
+            $title = $blog;
+        }
+    }
+    return [
+        'title' => $title,
+        'site_url' => $site,
+        'favicon_url' => $site !== '' ? ($site . 'favicon.ico') : '',
+    ];
+}
+
 /**
- * @return array{ok:bool,error?:string,feed_id?:int,discovered?:bool}
+ * Known feed path (or Tumblr blog → /rss) that we can subscribe to without a live fetch.
+ * Used so 429s still create a local subscription; the poller fills items later.
+ */
+function ap_rss_resolve_deferrable_feed_url(string $url): ?string
+{
+    if (ap_rss_url_looks_like_feed_path($url)) {
+        return $url;
+    }
+    if (!ap_rss_host_is_tumblr($url)) {
+        return null;
+    }
+    $parts = parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) {
+        return null;
+    }
+    $host = strtolower((string) $parts['host']);
+    // Blog host only (skip tumblr.com explore/search pages).
+    if ($host === 'tumblr.com' || $host === 'www.tumblr.com') {
+        return null;
+    }
+    return 'https://' . $host . '/rss';
+}
+
+/**
+ * Insert a feed row with no items yet; poller/refresh will fetch when the host cools down.
+ *
+ * @return array{ok:bool,error?:string,feed_id?:int,deferred?:bool,discovered?:bool}
+ */
+function ap_rss_add_feed_deferred(int $ownerUserId, string $feedUrl, string $lastError, bool $discovered = false): array
+{
+    $dup = ap_db()->prepare('SELECT id FROM rss_feeds WHERE owner_user_id = ? AND feed_url = ?');
+    $dup->execute([$ownerUserId, $feedUrl]);
+    if ($dup->fetchColumn()) {
+        return ['ok' => false, 'error' => 'That feed is already added'];
+    }
+    $meta = ap_rss_provisional_meta($feedUrl);
+    $st = ap_db()->prepare(
+        'INSERT INTO rss_feeds
+         (owner_user_id, feed_url, site_url, title, favicon_url, etag, last_modified, last_fetched_at, last_error, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, TRUE, NOW())
+         RETURNING id'
+    );
+    $st->execute([
+        $ownerUserId,
+        $feedUrl,
+        $meta['site_url'],
+        $meta['title'],
+        $meta['favicon_url'],
+        '',
+        '',
+        mb_substr($lastError !== '' ? $lastError : 'Waiting for first fetch', 0, 500),
+    ]);
+    $feedId = (int) $st->fetchColumn();
+    return [
+        'ok' => true,
+        'feed_id' => $feedId,
+        'deferred' => true,
+        'discovered' => $discovered,
+    ];
+}
+
+/**
+ * @return array{ok:bool,error?:string,feed_id?:int,discovered?:bool,deferred?:bool}
  */
 function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
 {
@@ -359,6 +442,14 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
     if ($existing->fetchColumn()) {
         return ['ok' => false, 'error' => 'That feed is already added'];
     }
+    // Tumblr homepage → canonical /rss (may already be subscribed).
+    $tumblrRss = ap_rss_resolve_deferrable_feed_url($url);
+    if ($tumblrRss !== null && $tumblrRss !== $url) {
+        $existing->execute([$ownerUserId, $tumblrRss]);
+        if ($existing->fetchColumn()) {
+            return ['ok' => false, 'error' => 'That feed is already added'];
+        }
+    }
     $countSt = ap_db()->prepare('SELECT COUNT(*) FROM rss_feeds WHERE owner_user_id = ?');
     $countSt->execute([$ownerUserId]);
     if ((int) $countSt->fetchColumn() >= 40) {
@@ -366,24 +457,38 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
     }
 
     $discovered = false;
-    $fetch = ap_rss_http_get($url);
+    // Interactive add: one attempt so a Tumblr 429 does not stall the page for retries.
+    $fetch = ap_rss_http_get($url, '', '', ['max_attempts' => 1]);
     if ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
         $feedUrl = $url;
         $parsed = ap_rss_parse_feed($fetch['body'], $feedUrl);
     } else {
         $status = (int) ($fetch['status'] ?? 0);
-        // Direct feed URLs (…/rss) must not trigger discovery stampedes — that worsens Tumblr 429s
-        // and turns a rate-limit into a misleading "could not find feed" error.
-        if (ap_rss_url_looks_like_feed_path($url) || $status === 429 || $status === 503) {
-            $err = trim((string) ($fetch['error'] ?? ''));
-            if ($err === '') {
-                $err = ap_rss_http_error_message($status, $url);
+        $err = trim((string) ($fetch['error'] ?? ''));
+        if ($err === '') {
+            $err = ap_rss_http_error_message($status, $url);
+        }
+        $rateLimited = ($status === 429 || $status === 503);
+
+        // Save locally on rate-limit when we already know the feed URL (Tumblr /rss, etc.).
+        $deferUrl = ap_rss_resolve_deferrable_feed_url($url);
+        if ($rateLimited && $deferUrl !== null) {
+            return ap_rss_add_feed_deferred($ownerUserId, $deferUrl, $err, $deferUrl !== $url);
+        }
+        // Direct feed path with a hard fetch failure: do not stampede discovery.
+        if (ap_rss_url_looks_like_feed_path($url)) {
+            if ($rateLimited) {
+                return ap_rss_add_feed_deferred($ownerUserId, $url, $err, false);
             }
             return ['ok' => false, 'error' => $err];
         }
+
         $alt = ap_rss_discover_feed_url($url, $fetch['body'] ?? '');
         if ($alt === null) {
-            $err = trim((string) ($fetch['error'] ?? ''));
+            // Tumblr blog with no HTML to scrape — still subscribe to /rss deferred.
+            if ($deferUrl !== null && ($rateLimited || $status >= 400)) {
+                return ap_rss_add_feed_deferred($ownerUserId, $deferUrl, $err, true);
+            }
             if ($status >= 400 && $err !== '') {
                 return ['ok' => false, 'error' => $err];
             }
@@ -396,15 +501,20 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
         if ($dup->fetchColumn()) {
             return ['ok' => false, 'error' => 'That feed is already added'];
         }
-        $fetch = ap_rss_http_get($feedUrl);
-        if (!$fetch['ok'] || !ap_rss_looks_like_feed($fetch['body'])) {
-            $err = trim((string) ($fetch['error'] ?? ''));
-            if ($err === '') {
-                $err = 'Found a feed link but could not load it';
+        $fetch = ap_rss_http_get($feedUrl, '', '', ['max_attempts' => 1]);
+        if ($fetch['ok'] && ap_rss_looks_like_feed($fetch['body'])) {
+            $parsed = ap_rss_parse_feed($fetch['body'], $feedUrl);
+        } else {
+            $status2 = (int) ($fetch['status'] ?? 0);
+            $err2 = trim((string) ($fetch['error'] ?? ''));
+            if ($err2 === '') {
+                $err2 = ap_rss_http_error_message($status2, $feedUrl);
             }
-            return ['ok' => false, 'error' => $err];
+            if ($status2 === 429 || $status2 === 503 || ap_rss_url_looks_like_feed_path($feedUrl)) {
+                return ap_rss_add_feed_deferred($ownerUserId, $feedUrl, $err2, true);
+            }
+            return ['ok' => false, 'error' => $err2 !== '' ? $err2 : 'Found a feed link but could not load it'];
         }
-        $parsed = ap_rss_parse_feed($fetch['body'], $feedUrl);
     }
     if ($parsed === null) {
         return ['ok' => false, 'error' => 'Feed XML could not be parsed'];
@@ -429,7 +539,7 @@ function ap_rss_add_feed(int $ownerUserId, string $rawUrl): array
     ]);
     $feedId = (int) $st->fetchColumn();
     ap_rss_upsert_items($feedId, $parsed['items']);
-    return ['ok' => true, 'feed_id' => $feedId, 'discovered' => $discovered];
+    return ['ok' => true, 'feed_id' => $feedId, 'discovered' => $discovered, 'deferred' => false];
 }
 
 /**
@@ -857,9 +967,10 @@ function ap_rss_http_error_message(int $status, string $url = ''): string
 }
 
 /**
+ * @param array{max_attempts?:int} $opts Interactive add uses max_attempts=1 so 429 does not stall the page.
  * @return array{ok:bool,status:int,body:string,etag:string,last_modified:string,error:string}
  */
-function ap_rss_http_get(string $url, string $etag = '', string $lastModified = ''): array
+function ap_rss_http_get(string $url, string $etag = '', string $lastModified = '', array $opts = []): array
 {
     $backoffLeft = ap_rss_host_backoff_until($url) - time();
     if ($backoffLeft > 0) {
@@ -887,7 +998,7 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
     }
 
     $attempt = 0;
-    $maxAttempts = 3;
+    $maxAttempts = max(1, min(4, (int) ($opts['max_attempts'] ?? 3)));
     $last = [
         'ok' => false,
         'status' => 0,
@@ -1270,18 +1381,34 @@ function ap_rss_parse_date(string $raw): ?string
     return gmdate('c', $t);
 }
 
-/** Feeds due for polling (oldest fetch first). */
+/**
+ * Feeds due for polling.
+ * Never-fetched (deferred / rate-limited adds) and recent errors retry sooner than healthy feeds.
+ */
 function ap_rss_feeds_due(int $limit = 20, int $minAgeMinutes = 10): array
 {
     ap_rss_migrate();
     $limit = max(1, min(50, $limit));
+    $minAgeMinutes = max(1, min(180, $minAgeMinutes));
+    $errorRetryMinutes = min(5, $minAgeMinutes);
     $st = ap_db()->prepare(
         "SELECT * FROM rss_feeds
          WHERE enabled = TRUE
-           AND (last_fetched_at IS NULL OR last_fetched_at < NOW() - make_interval(mins => ?))
-         ORDER BY last_fetched_at NULLS FIRST, id ASC
+           AND (
+             last_fetched_at IS NULL
+             OR (COALESCE(last_error, '') <> '' AND last_fetched_at < NOW() - make_interval(mins => ?))
+             OR (COALESCE(last_error, '') = '' AND last_fetched_at < NOW() - make_interval(mins => ?))
+           )
+         ORDER BY
+           CASE
+             WHEN last_fetched_at IS NULL THEN 0
+             WHEN COALESCE(last_error, '') <> '' THEN 1
+             ELSE 2
+           END,
+           last_fetched_at NULLS FIRST,
+           id ASC
          LIMIT {$limit}"
     );
-    $st->execute([$minAgeMinutes]);
+    $st->execute([$errorRetryMinutes, $minAgeMinutes]);
     return $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
 }
