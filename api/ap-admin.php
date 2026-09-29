@@ -17,6 +17,13 @@ header('Cache-Control: no-store');
 header('X-Robots-Tag: noindex, nofollow');
 
 require_once __DIR__ . '/ap-db.php';
+
+$vaakRequestStartedAt = microtime(true);
+register_shutdown_function(static function () use ($vaakRequestStartedAt): void {
+    if (!function_exists('ap_slow_route_record')) return;
+    $route = (string) ($_SERVER['REQUEST_URI'] ?? '/vaak/');
+    ap_slow_route_record($route, (microtime(true) - $vaakRequestStartedAt) * 1000.0);
+});
 require_once __DIR__ . '/ap-auth.php';
 require_once __DIR__ . '/ap-version.php';
 require_once __DIR__ . '/ap-collections.php'; // Library → Collections (starter packs)
@@ -4791,23 +4798,26 @@ $statsFollowingAll = 0;
 $statsMentionsOpen = 0;
 $statsUserRows = [];
 $queueHealthRows = [];
+$queueDependencyRows = [];
 $redisMetrics = [];
 $timingMetrics = [];
+$slowRouteRows = [];
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
     $queueDefs = [
-        ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
-        ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
-        ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
-        ['name' => 'Remote media warming', 'table' => 'ap_media_warm_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
-        ['name' => 'Scheduled posts', 'table' => 'ap_post_queue', 'state' => 'state', 'queued' => ['pending'], 'active' => ['publishing'], 'failed' => ['failed'], 'time' => 'scheduled_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
-        ['name' => 'Actor/profile refresh', 'table' => 'bsky_actor_refresh_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'locked_at', 'created' => 'queued_at'],
+        ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Federation fan-out', 'table' => 'ap_fanout_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Remote media warming', 'table' => 'ap_media_warm_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Scheduled posts', 'table' => 'ap_post_queue', 'state' => 'state', 'queued' => ['pending'], 'active' => ['publishing'], 'success' => ['published'], 'failed' => ['failed'], 'time' => 'scheduled_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
+        ['name' => 'Actor/profile refresh', 'table' => 'bsky_actor_refresh_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'locked_at', 'created' => 'queued_at'],
     ];
     foreach ($queueDefs as $qd) {
         try {
             $states = static fn(array $values): string => implode(',', array_map(static fn(string $v): string => "'" . str_replace("'", "''", $v) . "'", $values));
             $queuedStates = $states($qd['queued']);
             $activeStates = $states($qd['active']);
+            $successStates = $states($qd['success']);
             $failedStates = $states($qd['failed']);
             $sql = 'SELECT '
                 . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$queuedStates})) AS queued, "
@@ -4815,29 +4825,74 @@ if ($view === 'queue_health') {
                 . "COUNT(*) FILTER (WHERE {$qd['state']} IN ({$failedStates})) AS failed, "
                 . "COALESCE(SUM(attempts), 0) AS retries, "
                 . "MIN(CASE WHEN {$qd['state']} IN ({$activeStates}) THEN {$qd['active_time']} END) AS active_since, "
-                . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}, {$activeStates}, {$failedStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS oldest, "
-                . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}) THEN {$qd['time']} END) AS next_due "
+                . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}, {$activeStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS oldest, "
+                . "MIN(CASE WHEN {$qd['state']} IN ({$queuedStates}) THEN {$qd['time']} END) AS next_due, "
+                . "MAX(CASE WHEN {$qd['state']} IN ({$successStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS last_success, "
+                . "MAX(CASE WHEN {$qd['state']} IN ({$failedStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS last_failure, "
+                . "MIN(CASE WHEN {$qd['state']} IN ({$failedStates}) THEN COALESCE({$qd['time']}, {$qd['created']}) END) AS oldest_failed "
                 . "FROM {$qd['table']}";
             $row = $db->query($sql)->fetch() ?: [];
             $oldest = trim((string) ($row['oldest'] ?? ''));
             $nextDue = trim((string) ($row['next_due'] ?? ''));
             $activeSince = trim((string) ($row['active_since'] ?? ''));
+            $lastSuccess = trim((string) ($row['last_success'] ?? ''));
+            $lastFailure = trim((string) ($row['last_failure'] ?? ''));
+            $oldestFailed = trim((string) ($row['oldest_failed'] ?? ''));
             $queueHealthRows[] = [
                 'name' => $qd['name'], 'queued' => (int) ($row['queued'] ?? 0),
                 'active' => (int) ($row['active'] ?? 0), 'failed' => (int) ($row['failed'] ?? 0),
                 'retries' => (int) ($row['retries'] ?? 0),
-                'oldest' => $oldest, 'active_since' => $activeSince, 'next_due' => $nextDue, 'ok' => true,
+                'oldest' => $oldest, 'active_since' => $activeSince, 'next_due' => $nextDue,
+                'last_success' => $lastSuccess, 'last_failure' => $lastFailure,
+                'oldest_failed' => $oldestFailed, 'ok' => true,
             ];
         } catch (Throwable $e) {
             error_log('[ap-admin] queue health ' . $qd['table'] . ': ' . $e->getMessage());
-            $queueHealthRows[] = ['name' => $qd['name'], 'queued' => 0, 'active' => 0, 'failed' => 0, 'retries' => 0, 'oldest' => '', 'active_since' => '', 'next_due' => '', 'ok' => false];
+            $queueHealthRows[] = ['name' => $qd['name'], 'queued' => 0, 'active' => 0, 'failed' => 0, 'retries' => 0, 'oldest' => '', 'active_since' => '', 'next_due' => '', 'last_success' => '', 'last_failure' => '', 'oldest_failed' => '', 'ok' => false];
         }
+    }
+    // Parent/child visibility for durable federation publication. A parent
+    // activity may have one child per remote inbox; this summary is read-only
+    // and deliberately tolerates older installs without the fan-out table.
+    try {
+        $dep = $db->query(
+            "SELECT activity_key,
+                    COUNT(*) AS children,
+                    COUNT(*) FILTER (WHERE status = 'succeeded') AS succeeded,
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                    COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                    COALESCE(SUM(attempts), 0) AS attempts,
+                    MIN(CASE WHEN status IN ('pending','processing','failed') THEN COALESCE(next_attempt_at, created_at) END) AS oldest_open,
+                    MAX(updated_at) AS updated_at
+             FROM ap_fanout_delivery_queue
+             GROUP BY activity_key
+             ORDER BY MAX(updated_at) DESC
+             LIMIT 25"
+        );
+        foreach ($dep->fetchAll() ?: [] as $row) {
+            $queueDependencyRows[] = [
+                'activity' => (string) ($row['activity_key'] ?? ''),
+                'children' => (int) ($row['children'] ?? 0),
+                'succeeded' => (int) ($row['succeeded'] ?? 0),
+                'pending' => (int) ($row['pending'] ?? 0),
+                'processing' => (int) ($row['processing'] ?? 0),
+                'failed' => (int) ($row['failed'] ?? 0),
+                'attempts' => (int) ($row['attempts'] ?? 0),
+                'oldest_open' => trim((string) ($row['oldest_open'] ?? '')),
+            ];
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-admin] queue dependency summary: ' . $e->getMessage());
     }
     if (function_exists('ap_redis_metric_snapshot')) {
         $redisMetrics = ap_redis_metric_snapshot();
     }
     if (function_exists('ap_redis_timing_snapshot')) {
         $timingMetrics = ap_redis_timing_snapshot();
+    }
+    if (function_exists('ap_slow_route_snapshot')) {
+        $slowRouteRows = ap_slow_route_snapshot(20);
     }
 }
 if ($view === 'stats') {
@@ -5973,12 +6028,21 @@ function admin_tl_rank_entry(array $item): ?array
 function admin_tl_rank_from_timeline(array $timeline): array
 {
     $out = [];
+    $seen = [];
     foreach ($timeline as $item) {
         if (!is_array($item)) {
             continue;
         }
         $entry = admin_tl_rank_entry($item);
         if ($entry !== null) {
+            // A post can arrive through more than one merge source (for
+            // example a followed event plus a local/outbox fallback). Keep
+            // one ranked key so an offset page cannot repeat a boundary card.
+            $dedupeKey = (string) ($entry['k'] ?? '') . ':' . rtrim((string) ($entry['id'] ?? ''), '/');
+            if ($dedupeKey === ':' || isset($seen[$dedupeKey])) {
+                continue;
+            }
+            $seen[$dedupeKey] = true;
             $out[] = $entry;
         }
     }
@@ -6342,7 +6406,7 @@ function admin_home_apply_follower_fallback(array $timeline, int $pageSize = 15)
 
 /**
  * Keep the first Home page fedi-only (fast paint). Queue Bluesky ids into later
- * pages at ~30% with ≥2 fedi cards between, skipping dual-published twins.
+ * pages at ~40% with ≥2 fedi cards between, skipping dual-published twins.
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
@@ -6417,7 +6481,7 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
             if ($sinceBsky < 2 && $out !== []) {
                 break;
             }
-            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.30) {
+            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.40) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -7623,7 +7687,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             }
         }
         usort($homeCand, static fn($a, $b) => ($b['sort'] ?? 0) <=> ($a['sort'] ?? 0));
-        // Soft-space Bluesky in the extend window (~30%, ≥2 fedi between).
+        // Soft-space Bluesky in the extend window (~40%, ≥2 fedi between).
         $bskyEmitted = 0;
         $sinceBsky = 2; // allow a Bluesky card first in the extend window
         $deferred = [];
@@ -7631,7 +7695,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             $isBsky = ((string) ($cand['k'] ?? '')) === 'bsky';
             if ($isBsky) {
                 if (($sinceBsky < 2 && $added !== [])
-                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.30)
+                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.40)
                 ) {
                     $deferred[] = $cand;
                     continue;
@@ -7644,7 +7708,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                     if ($sinceBsky < 2) {
                         break;
                     }
-                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.30) {
+                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.40) {
                         break;
                     }
                     $d = array_shift($deferred);
@@ -8168,7 +8232,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     } else {
         usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
     }
-    // Soft cap Bluesky share (~30%) so Home stays fedi-first when AT cache is busy.
+    // Soft cap Bluesky share (~40%) so Home remains mixed when AP activity is slow.
     // Defer surplus Bluesky (don't drop) so later pages / deeper scroll still get them.
     if ($homeTimeline) {
         $cappedBsky = [];
@@ -8180,7 +8244,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 if ($sinceBsky < 2 && $cappedBsky !== []) {
                     break;
                 }
-                if (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.30) {
+                if (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.40) {
                     break;
                 }
                 $cappedBsky[] = array_shift($deferredBsky);
@@ -8192,7 +8256,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             $isBsky = ((string) ($item['kind'] ?? '')) === 'bsky';
             if ($isBsky) {
                 if (($sinceBsky < 2 && $cappedBsky !== [])
-                    || (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.30)
+                    || (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.40)
                 ) {
                     $deferredBsky[] = $item;
                     continue;
@@ -11826,11 +11890,6 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $pr
             ? AP_REMOTE_AVATAR_FALLBACK
             : 'https://mkultra.monster/img/avatar/default.jpg';
     }
-    try {
-        $alt = actor_handle($actorId);
-    } catch (Throwable $e) {
-        $alt = '';
-    }
     $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
         ? AP_REMOTE_AVATAR_FALLBACK
         : 'https://mkultra.monster/img/avatar/default.jpg';
@@ -11838,8 +11897,7 @@ function admin_avatar_img(?string $actorId, string $class = 'tweet-av', bool $pr
     return '<img class="' . h($class) . '" src="' . h($url) . '" alt="" width="40" height="40" '
         . ($profileHover ? admin_profile_hover_attr($actorId) : '')
         . 'loading="lazy" decoding="async" referrerpolicy="no-referrer" '
-        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'" '
-        . 'title="' . h($alt) . '">';
+        . 'onerror="this.onerror=null;this.src=\'' . h($fallback) . '\'">';
 }
 
 function admin_profile_hover_attr(?string $actorId): string
@@ -15400,13 +15458,18 @@ if ($isPartial && $view === 'mentions') {
             $followerIds = [];
         }
     }
+    // Soft-nav shells should paint immediately. Notification entity hydration
+    // can involve remote account/status cache misses, so load the first page
+    // asynchronously after the shell is visible instead of blocking navigation.
     $adminNotifs = [];
-    try {
-        $adminNotifs = function_exists('ap_masto_notifications_fetch')
-            ? ap_masto_notifications_fetch($notifLimit, $notifMaxId, null, $notifTypes)
-            : [];
-    } catch (Throwable $e) {
-        error_log('[ap-admin] notifications partial: ' . $e->getMessage());
+    if (!$notifShell) {
+        try {
+            $adminNotifs = function_exists('ap_masto_notifications_fetch')
+                ? ap_masto_notifications_fetch($notifLimit, $notifMaxId, null, $notifTypes)
+                : [];
+        } catch (Throwable $e) {
+            error_log('[ap-admin] notifications partial: ' . $e->getMessage());
+        }
     }
     $nextMaxId = '';
     if ($adminNotifs !== []) {
@@ -15438,31 +15501,24 @@ if ($isPartial && $view === 'mentions') {
                 . h((string) $filterOption['label']) . '</a>';
         }
         echo '</nav>';
-        if (!$adminNotifs) {
-            echo '<div class="empty">No notifications yet.</div>';
-        } else {
-            echo '<div id="timeline-items" data-view="mentions" data-filter="' . h($notifFilter)
-                . '" data-limit="' . (int) $notifLimit . '" data-max-id="' . h($nextMaxId)
-                . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-offset="0" data-newest="0">';
-            foreach ($adminNotifs as $n) {
-                if (is_array($n)) {
-                    admin_render_notification_card($n, $followingIds, $followerIds);
-                }
-            }
-            echo '</div>';
-            echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
-                . ($hasMore ? 'Scroll for more…' : 'End of notifications') . '</div>';
-            echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
+        $initialPending = $adminNotifs === [] && $notifShell;
+        echo '<div id="timeline-items" data-view="mentions" data-filter="' . h($notifFilter)
+            . '" data-limit="' . (int) $notifLimit . '" data-max-id="' . h($nextMaxId)
+            . '" data-has-more="' . ($initialPending ? '1' : ($hasMore ? '1' : '0'))
+            . '" data-initial-pending="' . ($initialPending ? '1' : '0')
+            . '" data-offset="0" data-newest="0">';
+        if (!$initialPending) {
+            admin_render_notification_stream($adminNotifs, $followingIds, $followerIds);
         }
+        echo '</div>';
+        echo '<div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center">'
+            . ($initialPending ? '<span class="timeline-status-loading"><span class="vaak-spinner" aria-hidden="true"></span><span>Loading…</span></span>' : ($hasMore ? 'Scroll for more…' : 'End of notifications')) . '</div>';
+        echo '<div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>';
         echo '</div>';
         echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
         exit;
     }
-    foreach ($adminNotifs as $n) {
-        if (is_array($n)) {
-            admin_render_notification_card($n, $followingIds, $followerIds);
-        }
-    }
+    admin_render_notification_stream($adminNotifs, $followingIds, $followerIds);
     exit;
 }
 
@@ -16025,6 +16081,94 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         echo '<div class="meta" style="padding:.5rem 0;color:var(--muted)">Skipped a notification (temporary error).</div>';
     }
 
+}
+
+/**
+ * Group repeated like/boost notifications for the VAAK Notifications view.
+ * The underlying notification rows remain unchanged; this is presentation
+ * only and therefore cannot affect unread IDs, moderation, or pagination.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @return list<array<string,mixed>>
+ */
+function admin_group_notification_rows(array $rows): array
+{
+    $out = [];
+    $index = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $type = (string) ($row['type'] ?? 'mention');
+        $status = is_array($row['status'] ?? null) ? $row['status'] : [];
+        $statusKey = rtrim((string) ($status['uri'] ?? $status['url'] ?? ''), '/');
+        $canGroup = in_array($type, ['favourite', 'reblog'], true) && $statusKey !== '';
+        $key = $canGroup ? $type . ':' . $statusKey : 'single:' . (string) ($row['id'] ?? count($out));
+        if (!$canGroup || !isset($index[$key])) {
+            $row['_group_count'] = 1;
+            $row['_group_accounts'] = [is_array($row['account'] ?? null) ? $row['account'] : []];
+            $index[$key] = count($out);
+            $out[] = $row;
+            continue;
+        }
+        $idx = $index[$key];
+        $out[$idx]['_group_count'] = (int) ($out[$idx]['_group_count'] ?? 1) + 1;
+        $acct = is_array($row['account'] ?? null) ? $row['account'] : [];
+        $acctId = (string) ($acct['id'] ?? $acct['uri'] ?? $acct['url'] ?? '');
+        $seen = [];
+        foreach (($out[$idx]['_group_accounts'] ?? []) as $existing) {
+            if (is_array($existing)) {
+                $seen[(string) ($existing['id'] ?? $existing['uri'] ?? $existing['url'] ?? '')] = true;
+            }
+        }
+        if ($acct !== [] && !isset($seen[$acctId]) && count($out[$idx]['_group_accounts']) < 6) {
+            $out[$idx]['_group_accounts'][] = $acct;
+        }
+    }
+    return $out;
+}
+
+/** Render grouped notification rows with Mastodon-style avatar tiles. */
+function admin_render_notification_stream(array $rows, array $followingIds, array $followerIds): void
+{
+    foreach (admin_group_notification_rows($rows) as $n) {
+        $count = (int) ($n['_group_count'] ?? 1);
+        if ($count <= 1) {
+            admin_render_notification_card($n, $followingIds, $followerIds);
+            continue;
+        }
+        $type = (string) ($n['type'] ?? 'favourite');
+        $accounts = is_array($n['_group_accounts'] ?? null) ? $n['_group_accounts'] : [];
+        $status = is_array($n['status'] ?? null) ? $n['status'] : [];
+        $statusUrl = (string) ($status['url'] ?? $status['uri'] ?? '');
+        $label = $type === 'reblog' ? 'boosted your post' : 'liked your post';
+        echo '<article class="tweet tweet-notif tweet-notif-grouped">';
+        echo '<div class="tweet-hd" style="align-items:center">';
+        echo '<div class="notification-avatar-stack" style="display:flex;align-items:center;min-width:3rem">';
+        $shown = 0;
+        foreach ($accounts as $acct) {
+            if (!is_array($acct)) continue;
+            $ref = function_exists('admin_account_actor_ref') ? admin_account_actor_ref($acct) : (string) ($acct['uri'] ?? $acct['url'] ?? '');
+            $href = $ref !== '' ? '?view=remote_profile&actor=' . rawurlencode($ref) . '&from=mentions' : '';
+            $avatar = admin_avatar_img($ref !== '' ? $ref : null);
+            echo $href !== '' ? '<a href="' . h($href) . '" title="Open profile" style="margin-right:-.35rem">' . $avatar . '</a>' : $avatar;
+            if (++$shown >= 6) break;
+        }
+        echo '</div><div class="tweet-hd-main"><div class="meta" style="color:var(--primary)">'
+            . h($count . ' people ' . $label) . '</div><div class="meta">'
+            . h(relative_time((string) ($n['created_at'] ?? ''))) . '</div></div></div>';
+        $snippet = trim(admin_html_to_plain((string) ($status['content'] ?? '')));
+        if ($snippet !== '') {
+            if (function_exists('mb_substr')) $snippet = mb_substr($snippet, 0, 280) . (mb_strlen($snippet) > 280 ? '…' : '');
+            else $snippet = substr($snippet, 0, 280) . (strlen($snippet) > 280 ? '…' : '');
+            echo '<div class="quote-block" style="margin-top:.55rem"><span class="qt-label">Your post</span><br>'
+                . '<span class="notification-snippet">' . h($snippet) . '</span></div>';
+        }
+        if ($statusUrl !== '') {
+            echo '<div class="tweet-actions"><a class="btn btn-ghost" href="' . h(admin_status_href($statusUrl, 'mentions')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a></div>';
+        }
+        echo '</article>';
+    }
 }
 
 /**
@@ -19174,9 +19318,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="empty">No notifications yet.</div>
         <?php else: ?>
           <div id="timeline-items" data-view="mentions" data-filter="<?= h($notifFilter) ?>" data-limit="<?= (int) $notifLimit ?>" data-max-id="<?= h($notifNextMaxId) ?>" data-has-more="<?= $notifHasMore ? '1' : '0' ?>" data-offset="0" data-newest="0">
-            <?php foreach ($adminNotifs as $n): ?>
-              <?php admin_render_notification_card(is_array($n) ? $n : [], $followingIds, $followerIds); ?>
-            <?php endforeach; ?>
+            <?php admin_render_notification_stream($adminNotifs, $followingIds, $followerIds); ?>
           </div>
           <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $notifHasMore ? 'Scroll for more…' : 'End of notifications' ?></div>
           <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
@@ -24453,6 +24595,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Active since</th>
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Oldest pending</th>
                 <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Next retry</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Last success</th>
+                <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Oldest failure</th>
               </tr></thead>
               <tbody>
               <?php foreach ($queueHealthRows as $qh): ?>
@@ -24465,12 +24609,41 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['active_since'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['active_since'])) ?><?php endif; ?></td>
                   <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok']): ?>unavailable<?php elseif ($qh['oldest'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['oldest'])) ?><?php endif; ?></td>
                   <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['next_due'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['next_due'])) ?><?php endif; ?></td>
+                  <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['last_success'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['last_success'])) ?><?php endif; ?></td>
+                  <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?php if (!$qh['ok'] || $qh['oldest_failed'] === ''): ?>—<?php else: ?><?= h(relative_time((string) $qh['oldest_failed'])) ?><?php endif; ?></td>
                 </tr>
               <?php endforeach; ?>
               </tbody>
             </table>
           </div>
         </div>
+        <?php if ($queueDependencyRows): ?>
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Federation delivery dependencies</h3>
+          <div class="meta" style="margin-bottom:.6rem">Each parent activity is shown with its durable per-inbox child deliveries.</div>
+          <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem">
+            <thead><tr class="meta" style="text-align:left">
+              <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Activity</th>
+              <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Children</th>
+              <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Done</th>
+              <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Open</th>
+              <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Failed</th>
+              <th style="padding:.35rem .4rem;border-bottom:1px solid var(--border)">Attempts</th>
+            </tr></thead><tbody>
+            <?php foreach ($queueDependencyRows as $qd): ?>
+              <tr>
+                <td class="meta" style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent);max-width:20rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= h((string) $qd['activity']) ?>"><?= h((string) $qd['activity']) ?></td>
+                <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qd['children'] ?></td>
+                <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qd['succeeded'] ?></td>
+                <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qd['pending'] + (int) $qd['processing'] ?></td>
+                <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)<?= (int) $qd['failed'] > 0 ? ';color:var(--danger)' : '' ?>"><?= (int) $qd['failed'] ?></td>
+                <td style="padding:.45rem .4rem;border-bottom:1px solid color-mix(in srgb, var(--border) 70%, transparent)"><?= (int) $qd['attempts'] ?></td>
+              </tr>
+            <?php endforeach; ?>
+            </tbody>
+          </table></div>
+        </div>
+        <?php endif; ?>
         <?php if ($timingMetrics): ?>
         <div class="side-card" style="margin-top:1rem">
           <h3>Recent path timings</h3>
@@ -24481,6 +24654,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </table></div>
         </div>
         <?php endif; ?>
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Slow routes</h3>
+          <div class="meta" style="margin-bottom:.6rem">Requests above one second, aggregated for 24 hours. Paths only; query strings and content are never stored.</div>
+          <?php if (!$slowRouteRows): ?>
+            <div class="empty">No slow routes recorded.</div>
+          <?php else: ?>
+            <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem">
+              <thead><tr class="meta" style="text-align:left"><th style="padding:.35rem;border-bottom:1px solid var(--border)">Route</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Calls</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Last</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Max</th></tr></thead>
+              <tbody><?php foreach ($slowRouteRows as $sr): ?><tr><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h((string) $sr['route']) ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= (int) $sr['count'] ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format((float) $sr['last_ms'], 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format((float) $sr['max_ms'], 1)) ?> ms</td></tr><?php endforeach; ?></tbody>
+            </table></div>
+          <?php endif; ?>
+        </div>
 
       <?php elseif ($view === 'stats'): ?>
         <div class="meta" style="margin-bottom:.85rem">
@@ -26851,10 +27036,21 @@ window.apAdminToast = function (msg, isErr) {
           items.dataset.offset = String(offset);
         }
         if (html.trim()) {
+          // Ranked windows can change between the initial paint and an
+          // infinite-scroll request (especially when a cache is rebuilt).
+          // Apply the same stable-key filter used by newer-post polling so a
+          // boundary card is never appended twice.
+          const filteredPage = filterNewHtml(html);
+          if (!filteredPage.count) {
+            // The server returned only cards already on screen. Keep walking
+            // the cursor/offset while more data exists rather than stopping
+            // at the duplicate page.
+            continue;
+          }
           // Append-only: do NOT "restore" scroll after the await. That fought the
           // ↑ button — user scrolls up during loadMore, then we yanked them back
           // to the sentinel and IntersectionObserver looped.
-          items.insertAdjacentHTML('beforeend', html);
+          items.insertAdjacentHTML('beforeend', filteredPage.html);
           inserted = true;
           if (typeof window.novaEnhanceTweetFolds === 'function') {
             window.novaEnhanceTweetFolds(items);
@@ -27630,8 +27826,52 @@ window.apAdminToast = function (msg, isErr) {
     let loading = false;
     let hasMore = items.dataset.hasMore === '1';
     let maxId = items.dataset.maxId || '';
+    let initialPending = items.dataset.initialPending === '1';
     const filter = items.dataset.filter || 'all';
     const limit = parseInt(items.dataset.limit || '10', 10) || 10;
+    async function loadInitial() {
+      if (!initialPending || loading) return;
+      initialPending = false;
+      loading = true;
+      const skeleton = insertScrollSkeleton(status);
+      setStatusLoading(status);
+      try {
+        const firstUrl = '?view=mentions&partial=1'
+          + '&notification_filter=' + encodeURIComponent(filter)
+          + '&limit=' + encodeURIComponent(String(limit));
+        const firstRes = await fetch(firstUrl, {
+          credentials: 'same-origin',
+          headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
+          cache: 'no-store'
+        });
+        if (!firstRes.ok) throw new Error('HTTP ' + firstRes.status);
+        const firstHtml = await firstRes.text();
+        if (firstHtml.trim()) {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = firstHtml;
+          while (tmp.firstChild) items.appendChild(tmp.firstChild);
+          if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(items);
+        }
+        hasMore = firstRes.headers.get('X-Has-More') === '1';
+        maxId = firstRes.headers.get('X-Next-Max-Id') || '';
+        items.dataset.hasMore = hasMore ? '1' : '0';
+        items.dataset.maxId = maxId;
+        if (!firstHtml.trim()) {
+          items.innerHTML = '<div class="empty">No notifications yet.</div>';
+          hasMore = false;
+          items.dataset.hasMore = '0';
+        }
+        if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
+      } catch (e) {
+        if (status) status.textContent = 'Could not load notifications — try Refresh';
+        hasMore = false;
+        items.dataset.hasMore = '0';
+      } finally {
+        if (skeleton && skeleton.parentNode) skeleton.parentNode.removeChild(skeleton);
+        loading = false;
+      }
+    }
+    loadInitial();
     const io = new IntersectionObserver(async (entries) => {
       if (!entries.some((e) => e.isIntersecting) || loading || !hasMore || !maxId) return;
       loading = true;

@@ -509,12 +509,62 @@ function ap_user_serve_collection_html(string $actorKey, string $actorId, string
 function ap_user_profile_html(string $actorKey, string $actorId): void
 {
     $p = ap_profile_get($actorKey);
-    $profileViewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    // Do not start an anonymous PHP session for public profile reads. A
+    // session_start() on an unauthenticated request emits vaak_sess, which
+    // prevents shared HTTP caches from treating the profile as public. Only
+    // consult auth when the browser actually supplied our session cookie.
+    $authCookieName = defined('AP_AUTH_SESSION_NAME') ? AP_AUTH_SESSION_NAME : 'vaak_sess';
+    $hasAuthCookie = isset($_COOKIE[$authCookieName]) && trim((string) $_COOKIE[$authCookieName]) !== '';
+    $profileViewer = ($hasAuthCookie && function_exists('ap_auth_current_user'))
+        ? ap_auth_current_user() : null;
     $profileIsPublicRequest = !is_array($profileViewer);
-    $profileCacheSeed = $actorKey . '|' . (string) ($_SERVER['QUERY_STRING'] ?? '') . '|' . (string) ($p['updated'] ?? $p['updated_at'] ?? '');
+    $profileOwnerId = function_exists('ap_db_owner_user_id_for_actor')
+        ? ap_db_owner_user_id_for_actor($actorId) : 0;
+    $profileRevisionParts = [
+        $actorKey,
+        (string) ($_SERVER['QUERY_STRING'] ?? ''),
+        (string) ($p['updated'] ?? $p['updated_at'] ?? ''),
+    ];
+    $profileLastModifiedTs = strtotime((string) ($p['updated'] ?? $p['updated_at'] ?? '')) ?: 0;
+    try {
+        $db = ap_db();
+        $st = $db->prepare('SELECT COALESCE(MAX(published), \'\') FROM outbox_notes WHERE actor_key = ?');
+        $st->execute([$actorKey]);
+        $latestOutbox = (string) ($st->fetchColumn() ?: '');
+        if ($latestOutbox !== '') {
+            $profileRevisionParts[] = $latestOutbox;
+            $profileLastModifiedTs = max($profileLastModifiedTs, strtotime($latestOutbox) ?: 0);
+        }
+        if ($profileOwnerId > 0) {
+            $st = $db->prepare('SELECT COALESCE(MAX(updated_at), \'\'), COALESCE(MAX(indexed_at), \'\') FROM bsky_posts WHERE owner_user_id = ?');
+            $st->execute([$profileOwnerId]);
+            $bskyRevision = $st->fetch(PDO::FETCH_NUM) ?: [];
+            foreach ($bskyRevision as $part) {
+                $part = (string) $part;
+                if ($part !== '') {
+                    $profileRevisionParts[] = $part;
+                    $profileLastModifiedTs = max($profileLastModifiedTs, strtotime($part) ?: 0);
+                }
+            }
+            $st = $db->prepare('SELECT COALESCE(MAX(created_at), \'\') FROM masto_reblogs WHERE owner_user_id = ?');
+            $st->execute([$profileOwnerId]);
+            $latestBoost = (string) ($st->fetchColumn() ?: '');
+            if ($latestBoost !== '') {
+                $profileRevisionParts[] = $latestBoost;
+                $profileLastModifiedTs = max($profileLastModifiedTs, strtotime($latestBoost) ?: 0);
+            }
+        }
+    } catch (Throwable $e) {
+        // Cache validators are an optimization; profile rendering remains
+        // available if an older schema lacks one of these tables/columns.
+    }
+    $profileCacheSeed = implode('|', $profileRevisionParts);
     $profileEtag = '"' . sha1($profileCacheSeed) . '"';
     header('Vary: Accept, Cookie');
     header('ETag: ' . $profileEtag);
+    if ($profileLastModifiedTs > 0) {
+        header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $profileLastModifiedTs) . ' GMT');
+    }
     if ($profileIsPublicRequest) {
         header('Cache-Control: public, max-age=30, stale-while-revalidate=120');
         if (trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? '')) === $profileEtag) {
@@ -541,8 +591,6 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $bskyHandle = function_exists('ap_profile_bsky_handle')
         ? ap_profile_bsky_handle($actorKey, $p)
         : null;
-    $profileOwnerId = function_exists('ap_db_owner_user_id_for_actor')
-        ? ap_db_owner_user_id_for_actor($actorId) : 0;
     $profileSession = ($profileOwnerId > 0 && function_exists('ap_bsky_session_row'))
         ? ap_bsky_session_row($profileOwnerId) : null;
     $profileDid = is_array($profileSession) ? trim((string) ($profileSession['did'] ?? '')) : '';
@@ -731,6 +779,55 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         }
     } catch (Throwable $e) {
         $profileBoosts = [];
+    }
+    // Profile boost cards otherwise resolve each Fediverse target event
+    // separately. Prefetch the bounded page in one query; the renderer keeps
+    // its existing per-card fallback for cache misses and older schemas.
+    $GLOBALS['ap_profile_boost_events'] = [];
+    if ($profileBoosts !== [] && function_exists('ap_db')) {
+        $boostObjects = [];
+        foreach ($profileBoosts as $boostRow) {
+            if (!is_array($boostRow)) {
+                continue;
+            }
+            $object = rtrim(trim((string) ($boostRow['object_id'] ?? '')), '/');
+            if ($object !== '' && str_starts_with($object, 'https://') && !str_contains(strtolower($object), 'bsky.app/')) {
+                $boostObjects[$object] = true;
+            }
+        }
+        if ($boostObjects !== []) {
+            try {
+                $objects = array_keys($boostObjects);
+                $ph = implode(',', array_fill(0, count($objects), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT * FROM events
+                     WHERE rtrim(object_id, '/') IN ($ph)
+                       AND COALESCE(action_taken, '') != 'deleted'
+                     ORDER BY CASE type
+                                WHEN 'Create' THEN 0
+                                WHEN 'Update' THEN 1
+                                WHEN 'Announce' THEN 10
+                                WHEN 'Like' THEN 11
+                                ELSE 5
+                              END ASC,
+                              id DESC"
+                );
+                $st->execute($objects);
+                $prefetched = [];
+                foreach ($st->fetchAll() ?: [] as $eventRow) {
+                    if (!is_array($eventRow)) {
+                        continue;
+                    }
+                    $key = rtrim(trim((string) ($eventRow['object_id'] ?? '')), '/');
+                    if ($key !== '' && !isset($prefetched[$key])) {
+                        $prefetched[$key] = $eventRow;
+                    }
+                }
+                $GLOBALS['ap_profile_boost_events'] = $prefetched;
+            } catch (Throwable $e) {
+                // Keep the existing per-card fallback if batching is unavailable.
+            }
+        }
     }
 
     // Historical Bluesky posts that were imported as ActivityPub notes already
@@ -1394,11 +1491,15 @@ function ap_user_boost_preview_html(string $actorKey, array $boost, int $ownerUs
     }
 
     $raw = '';
-    if (function_exists('ap_event_by_object_id')) {
+    $event = null;
+    $prefetchedEvents = $GLOBALS['ap_profile_boost_events'] ?? [];
+    if (is_array($prefetchedEvents) && isset($prefetchedEvents[$object]) && is_array($prefetchedEvents[$object])) {
+        $event = $prefetchedEvents[$object];
+    } elseif (function_exists('ap_event_by_object_id')) {
         $event = ap_event_by_object_id($object);
-        if (is_array($event)) {
-            $raw = (string) (($event['content'] ?? '') ?: ($event['summary'] ?? ''));
-        }
+    }
+    if (is_array($event)) {
+        $raw = (string) (($event['content'] ?? '') ?: ($event['summary'] ?? ''));
     }
     if ($raw === '') {
         try {

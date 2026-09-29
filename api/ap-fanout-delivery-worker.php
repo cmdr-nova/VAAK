@@ -72,8 +72,12 @@ try {
         $attempts = (int) $row['attempts'] + 1;
         $terminal = $attempts >= 12;
         $delay = $circuitUntil > time() ? max(60, $circuitUntil - time()) : min(3600, 15 * (2 ** min(8, $attempts - 1)));
+        $detail = trim((string) ($GLOBALS['ap_delivery_last_error'] ?? ''));
+        if ($detail === '') {
+            $detail = $circuitUntil > time() ? 'Remote host circuit is open' : 'Remote inbox delivery failed';
+        }
         $db->prepare('UPDATE ap_fanout_delivery_queue SET status=?, attempts=?, next_attempt_at=?, claimed_at=NULL, last_error=?, updated_at=? WHERE id=?')->execute([
-            $terminal ? 'failed' : 'pending', $attempts, gmdate('c', time() + $delay), 'Remote inbox delivery failed', gmdate('c'), (int) $row['id']
+            $terminal ? 'failed' : 'pending', $attempts, gmdate('c', time() + $delay), substr($detail, 0, 500), gmdate('c'), (int) $row['id']
         ]);
         $stats[$terminal ? 'failed' : 'retried']++;
     }

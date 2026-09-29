@@ -6968,6 +6968,34 @@ function ap_bsky_owner_follows_ref(int $ownerUserId, string $ref): bool
     return false;
 }
 
+/**
+ * Rebuild the cache-only handle → DID map used by relationship checks.
+ * This intentionally reads only durable graph/profile caches; it never calls
+ * the Bluesky network from a maintenance run.
+ */
+function ap_bsky_followed_handle_map_warm(int $ownerUserId): int
+{
+    if ($ownerUserId < 1 || !function_exists('ap_bsky_graph_sync_list')) {
+        return 0;
+    }
+    $map = [];
+    foreach (ap_bsky_graph_sync_list($ownerUserId, 'follow') as $row) {
+        $did = trim((string) ($row['target_did'] ?? ''));
+        if (!str_starts_with($did, 'did:') || !function_exists('ap_bsky_actor_profile_cache_get')) {
+            continue;
+        }
+        $cached = ap_bsky_actor_profile_cache_get($did, $ownerUserId);
+        $handle = strtolower(trim((string) (($cached['profile']['handle'] ?? '') ?: '')));
+        if ($handle !== '' && !str_starts_with($handle, 'did:')) {
+            $map[$handle] = $did;
+        }
+    }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set('vaak:bsky:followed-handles:' . $ownerUserId, $map, 300);
+    }
+    return count($map);
+}
+
 function ap_bsky_graph_sync_delete(int $ownerUserId, string $kind, string $did): void
 {
     try {
@@ -8061,7 +8089,10 @@ function ap_bsky_hide_did_remove(int $ownerUserId, string $did, string $reason, 
 /** @return array<string,true> did => true */
 function ap_bsky_hide_did_set(int $ownerUserId): array
 {
-    static $cache = [];
+    if (!isset($GLOBALS['ap_bsky_hide_did_cache']) || !is_array($GLOBALS['ap_bsky_hide_did_cache'])) {
+        $GLOBALS['ap_bsky_hide_did_cache'] = [];
+    }
+    $cache =& $GLOBALS['ap_bsky_hide_did_cache'];
     if (isset($cache[$ownerUserId])) {
         return $cache[$ownerUserId];
     }
@@ -8088,7 +8119,12 @@ function ap_bsky_hide_did_set(int $ownerUserId): array
 
 function ap_bsky_hide_did_set_clear_cache(?int $ownerUserId = null): void
 {
-    // static cache is per-request; no-op helper for future APCu
+    if (!isset($GLOBALS['ap_bsky_hide_did_cache']) || !is_array($GLOBALS['ap_bsky_hide_did_cache'])) return;
+    if ($ownerUserId === null || $ownerUserId < 1) {
+        $GLOBALS['ap_bsky_hide_did_cache'] = [];
+    } else {
+        unset($GLOBALS['ap_bsky_hide_did_cache'][$ownerUserId]);
+    }
 }
 
 /**
@@ -8285,6 +8321,12 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
 
     // Hide-set memo can be stale within this long request — clear request cache.
     ap_bsky_hide_did_set_clear_cache($ownerUserId);
+    if (function_exists('ap_timeline_cache_invalidate_owner')) {
+        ap_timeline_cache_invalidate_owner($ownerUserId);
+    }
+    if (function_exists('ap_notification_projection_invalidate_owner')) {
+        ap_notification_projection_invalidate_owner($ownerUserId);
+    }
 
     return [
         'ok' => true,

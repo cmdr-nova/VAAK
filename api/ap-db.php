@@ -748,6 +748,43 @@ function ap_db_execute_retry(string $sql, array $params = [], int $tries = 8): P
     return false;
 }
 
+/** Rebuildable notification projection invalidation helpers. */
+function ap_notification_projection_invalidate_owner(int $ownerUserId): void
+{
+    if ($ownerUserId <= 0) return;
+    try {
+        ap_db()->prepare('DELETE FROM ap_notification_projection WHERE owner_user_id = ?')->execute([$ownerUserId]);
+        if (function_exists('ap_redis_delete_pattern')) {
+            ap_redis_delete_pattern('vaak:notifications:v1:' . $ownerUserId . ':*');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] notification projection owner invalidation skipped: ' . $e->getMessage());
+    }
+}
+
+function ap_notification_projection_invalidate_status(string $statusId): void
+{
+    $statusId = rtrim(trim($statusId), '/');
+    if ($statusId === '') return;
+    try {
+        ap_db()->prepare('DELETE FROM ap_notification_projection WHERE status_id = ? OR status_id = ?')->execute([$statusId, $statusId . '/']);
+    } catch (Throwable $e) {
+        error_log('[ap-db] notification projection status invalidation skipped: ' . $e->getMessage());
+    }
+}
+
+function ap_notification_projection_invalidate_all(): void
+{
+    try {
+        ap_db()->exec('DELETE FROM ap_notification_projection');
+        if (function_exists('ap_redis_delete_pattern')) {
+            ap_redis_delete_pattern('vaak:notifications:v1:*');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] notification projection global invalidation skipped: ' . $e->getMessage());
+    }
+}
+
 function ap_db_migrate(PDO $db): void
 {
     $db->exec(<<<'SQL'
@@ -813,6 +850,22 @@ CREATE TABLE IF NOT EXISTS mentions (
 CREATE INDEX IF NOT EXISTS idx_mentions_created ON mentions(created_at);
 -- Legacy single-user unique on object_id alone breaks multi-user notifications;
 -- ownership is UNIQUE(owner_user_id, object_id) after Slice F.
+
+-- Compact owner-scoped notification read model.  It is a rebuildable projection;
+-- mentions/events remain authoritative for privacy, moderation, and deletion.
+CREATE TABLE IF NOT EXISTS ap_notification_projection (
+    owner_user_id INTEGER NOT NULL,
+    notification_id TEXT NOT NULL,
+    notification_type TEXT NOT NULL,
+    actor_id TEXT NOT NULL DEFAULT '',
+    status_id TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, notification_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_notif_projection_page
+    ON ap_notification_projection(owner_user_id, created_at DESC, notification_id DESC);
 
 CREATE TABLE IF NOT EXISTS outbox_notes (
     id TEXT PRIMARY KEY,
@@ -4608,6 +4661,9 @@ function ap_events_mark_object_deleted(string $objectId): int
         if ($n > 0 && function_exists('ap_search_fts_delete_object')) {
             ap_search_fts_delete_object($objectId);
         }
+        if ($n > 0 && function_exists('ap_notification_projection_invalidate_status')) {
+            ap_notification_projection_invalidate_status($objectId);
+        }
         return $n;
     } catch (Throwable $e) {
         error_log('[ap-db] events_mark_object_deleted: ' . $e->getMessage());
@@ -4659,7 +4715,16 @@ function ap_events_mark_interaction_undone(
                AND action_taken IN ('log', 'local_observe', 'local_fav_update')"
         );
         $st->execute($params);
-        return (int) $st->rowCount();
+        $n = (int) $st->rowCount();
+        if ($n > 0 && function_exists('ap_notification_projection_invalidate_status')) {
+            if ($objectId !== '') {
+                ap_notification_projection_invalidate_status($objectId);
+            }
+            // An activity-only Undo may not carry the target status; the
+            // interaction helper below still performs the owner/global
+            // invalidation when its mention row is found.
+        }
+        return $n;
     } catch (Throwable $e) {
         error_log('[ap-db] events_mark_interaction_undone: ' . $e->getMessage());
         return 0;
@@ -4684,6 +4749,9 @@ function ap_events_refresh_create_from_update(
     $objectId = rtrim(trim($objectId), '/');
     if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
         return false;
+    }
+    if (function_exists('ap_notification_projection_invalidate_status')) {
+        ap_notification_projection_invalidate_status($objectId);
     }
     $visibility = ap_normalize_visibility($visibility);
     $spoilerText = mb_substr(trim(ap_fix_utf8($spoilerText)), 0, 500);
@@ -5185,6 +5253,9 @@ function ap_mention_soft_delete(string $objectId): int
     if ($n > 0 && function_exists('ap_search_fts_delete_object')) {
         ap_search_fts_delete_object($objectId);
     }
+    if ($n > 0) {
+        ap_notification_projection_invalidate_all();
+    }
     return $n;
 }
 
@@ -5241,6 +5312,10 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
         );
         $st->execute([$now, $stableId, $actorId, $actorId . '/', $likePattern]);
         $touched += $st->rowCount();
+    }
+
+    if ($touched > 0) {
+        ap_notification_projection_invalidate_all();
     }
 
     return $touched;
@@ -7968,6 +8043,7 @@ function ap_mutes_cache_clear(?int $ownerUserId = null): void
     }
     ap_mutes_set_cached($ownerUserId, true);
     ap_timeline_cache_invalidate_owner($ownerUserId);
+    ap_notification_projection_invalidate_owner($ownerUserId);
 }
 
 function ap_is_muted_actor(?string $actorId, int $ownerUserId): bool
@@ -8143,6 +8219,7 @@ function ap_deprioritized_cache_clear(?int $ownerUserId = null): void
     }
     ap_deprioritized_set_cached($ownerUserId, true);
     ap_timeline_cache_invalidate_owner($ownerUserId);
+    ap_notification_projection_invalidate_owner($ownerUserId);
 }
 
 function ap_is_deprioritized_actor(?string $actorId, int $ownerUserId): bool

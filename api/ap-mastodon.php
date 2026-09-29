@@ -1418,7 +1418,7 @@ function ap_masto_api(string $method, string $path): void
     }
 
     // Single grouped notification — only ungrouped-{id} / numeric ids (not "policy").
-    if (preg_match('#^/api/v2/notifications/(ungrouped-\d+|\d+)$#', $path, $gm) && $method === 'GET') {
+    if (preg_match('#^/api/v2/notifications/([A-Za-z0-9_-]+)$#', $path, $gm) && $method === 'GET') {
         ap_masto_require_token('read');
         $key = $gm[1];
         $nid = null;
@@ -1427,11 +1427,23 @@ function ap_masto_api(string $method, string $path): void
         } elseif (ctype_digit($key)) {
             $nid = $key;
         }
-        if ($nid === null) {
-            ap_masto_json(['error' => 'Record not found'], 404);
-            return;
+        $n = $nid !== null ? ap_masto_notification_by_id($nid) : null;
+        if ($n === null && $key !== '') {
+            foreach (ap_masto_notifications_grouped_fetch(80) ['notification_groups'] ?? [] as $candidate) {
+                if (is_array($candidate) && (string) ($candidate['group_key'] ?? '') === $key) {
+                    $n = null;
+                    // The detail route is primarily used to expand the group;
+                    // return the group metadata even when it contains several
+                    // underlying notifications.
+                    ap_masto_json([
+                        'accounts' => [],
+                        'statuses' => [],
+                        'notification_groups' => [$candidate],
+                    ]);
+                    return;
+                }
+            }
         }
-        $n = ap_masto_notification_by_id($nid);
         if (!$n) {
             ap_masto_json(['error' => 'Record not found'], 404);
             return;

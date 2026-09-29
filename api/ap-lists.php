@@ -746,8 +746,16 @@ function ap_lists_moderation_action_for_actor(?string $actorId, ?int $ownerUserI
 
 function ap_lists_moderation_cache_clear(?int $ownerUserId = null): void
 {
-    if ($ownerUserId === null) unset($GLOBALS['ap_moderation_list_cache']);
-    else unset($GLOBALS['ap_moderation_list_cache'][$ownerUserId]);
+    if ($ownerUserId === null) {
+        unset($GLOBALS['ap_moderation_list_cache']);
+        if (function_exists('ap_bsky_hide_did_set_clear_cache')) ap_bsky_hide_did_set_clear_cache(null);
+        if (function_exists('ap_notification_projection_invalidate_all')) ap_notification_projection_invalidate_all();
+        return;
+    }
+    unset($GLOBALS['ap_moderation_list_cache'][$ownerUserId]);
+    if (function_exists('ap_bsky_hide_did_set_clear_cache')) ap_bsky_hide_did_set_clear_cache($ownerUserId);
+    if (function_exists('ap_timeline_cache_invalidate_owner')) ap_timeline_cache_invalidate_owner($ownerUserId);
+    if (function_exists('ap_notification_projection_invalidate_owner')) ap_notification_projection_invalidate_owner($ownerUserId);
 }
 
 /**

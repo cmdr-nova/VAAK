@@ -40,12 +40,15 @@ function ap_redis_client(string $purpose = 'cache'): ?Redis
     try {
         $redis = new Redis();
         if (!@$redis->connect($host, $port, 0.08, null, 50, 0.08)) {
+            error_log('[ap-redis] ' . $purpose . ' connection unavailable; falling back to authoritative DB/filesystem paths');
             return null;
         }
         if ($password !== null && $password !== '' && !@$redis->auth($password)) {
+            error_log('[ap-redis] ' . $purpose . ' authentication failed; acceleration disabled for this request');
             return null;
         }
         if ($db > 0 && !@$redis->select($db)) {
+            error_log('[ap-redis] ' . $purpose . ' database selection failed; acceleration disabled for this request');
             return null;
         }
         $redis->setOption(Redis::OPT_SERIALIZER, Redis::SERIALIZER_NONE);
@@ -55,6 +58,55 @@ function ap_redis_client(string $purpose = 'cache'): ?Redis
         $clients[$purpose] = null;
     }
     return $clients[$purpose] instanceof Redis ? $clients[$purpose] : null;
+}
+
+/**
+ * Read-only Redis health/ACL diagnostics for maintenance and startup checks.
+ * Redis remains optional: this function never throws and never changes state.
+ *
+ * @return array<string,mixed>
+ */
+function ap_redis_health_check(string $purpose = 'cache'): array
+{
+    $purpose = $purpose === 'queue' ? 'queue' : 'cache';
+    $started = microtime(true);
+    $redis = ap_redis_client($purpose);
+    $out = [
+        'purpose' => $purpose,
+        'available' => false,
+        'latency_ms' => null,
+        'db' => null,
+        'acl' => ['ok' => false, 'user' => null, 'error' => null],
+        'warnings' => [],
+    ];
+    if (!$redis) {
+        $out['warnings'][] = 'Redis unavailable; authoritative database/filesystem paths remain active';
+        return $out;
+    }
+    try {
+        $pong = $redis->ping();
+        $out['available'] = $pong !== false;
+        $out['latency_ms'] = round((microtime(true) - $started) * 1000, 2);
+        $out['db'] = method_exists($redis, 'getDbNum') ? $redis->getDbNum() : null;
+        if (!$out['available']) {
+            $out['warnings'][] = 'Redis PING failed';
+        }
+    } catch (Throwable $e) {
+        $out['warnings'][] = 'Redis PING failed: ' . substr($e->getMessage(), 0, 160);
+        return $out;
+    }
+    try {
+        $user = $redis->rawCommand('ACL', 'WHOAMI');
+        if (is_string($user) && trim($user) !== '') {
+            $out['acl'] = ['ok' => true, 'user' => $user, 'error' => null];
+        } else {
+            $out['acl']['error'] = 'ACL WHOAMI returned no username';
+        }
+    } catch (Throwable $e) {
+        $out['acl']['error'] = substr($e->getMessage(), 0, 160);
+        $out['warnings'][] = 'ACL WHOAMI unavailable; verify the Redis user permissions';
+    }
+    return $out;
 }
 
 function ap_redis_json_get(string $key): ?array
@@ -419,6 +471,57 @@ function ap_redis_timing_snapshot(): array
     }
     ksort($out);
     return $out;
+}
+
+/** Record slow route metadata without storing query strings or request data. */
+function ap_slow_route_record(string $route, float $milliseconds, float $thresholdMs = 1000.0): void
+{
+    $redis = ap_redis_client('cache');
+    $route = parse_url($route, PHP_URL_PATH) ?: $route;
+    $route = preg_replace('/[^a-z0-9_\/?.:-]/i', '', trim((string) $route)) ?: '';
+    if (!$redis || $route === '' || $milliseconds < $thresholdMs) return;
+    try {
+        $key = 'vaak:slow-route:v1:' . hash('sha256', $route);
+        $redis->hMSet($key, [
+            'route' => substr($route, 0, 180),
+            'count' => (int) ($redis->hGet($key, 'count') ?: 0) + 1,
+            'last_ms' => sprintf('%.1f', $milliseconds),
+            'max_ms' => sprintf('%.1f', max($milliseconds, (float) ($redis->hGet($key, 'max_ms') ?: 0))),
+            'last_at' => gmdate('c'),
+        ]);
+        $redis->expire($key, 86400);
+    } catch (Throwable $e) {
+        // Diagnostics must never affect request execution.
+    }
+}
+
+/** @return list<array{route:string,count:int,last_ms:float,max_ms:float,last_at:string}> */
+function ap_slow_route_snapshot(int $limit = 20): array
+{
+    $redis = ap_redis_client('cache');
+    if (!$redis) return [];
+    $out = [];
+    try {
+        $it = null;
+        while (($keys = $redis->scan($it, 'vaak:slow-route:v1:*', 100)) !== false) {
+            foreach ($keys as $key) {
+                $row = $redis->hGetAll($key);
+                if (!is_array($row) || (string) ($row['route'] ?? '') === '') continue;
+                $out[] = [
+                    'route' => (string) $row['route'],
+                    'count' => (int) ($row['count'] ?? 0),
+                    'last_ms' => (float) ($row['last_ms'] ?? 0),
+                    'max_ms' => (float) ($row['max_ms'] ?? 0),
+                    'last_at' => (string) ($row['last_at'] ?? ''),
+                ];
+            }
+            if ($it === 0) break;
+        }
+        usort($out, static fn(array $a, array $b): int => $b['max_ms'] <=> $a['max_ms']);
+        return array_slice($out, 0, max(1, min(100, $limit)));
+    } catch (Throwable $e) {
+        return [];
+    }
 }
 
 /** Lower a worker batch when backlog indicates upstream/database pressure. */

@@ -83,6 +83,7 @@ if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
 $stats = [
     'events_deleted' => 0,
     'mentions_deleted' => 0,
+    'notification_projection_deleted' => 0,
     'oauth_deleted' => 0,
     'tmp_deleted' => 0,
     'emoji_deleted' => 0,
@@ -96,6 +97,7 @@ $stats = [
     'queue_rows_deleted' => 0,
     'cold_archive_deleted' => 0,
     'signal_rows_deleted' => 0,
+    'relationship_sets_warmed' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
     'errors' => 0,
@@ -169,6 +171,31 @@ function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn,
 try {
     $db = ap_db();
     $isPostgres = ap_db_driver() === 'pgsql';
+
+    // Warm the owner-scoped relationship sets outside web requests. Redis is
+    // only a read-through accelerator; these helpers rebuild from PostgreSQL
+    // when a set is absent, so an empty/unavailable cache remains safe.
+    if (!$dryRun && function_exists('ap_db_default_owner_user_id')) {
+        $warmOwner = (int) ap_db_default_owner_user_id();
+        if ($warmOwner > 0) {
+            try {
+                ap_following_id_set(null, $warmOwner, true);
+                ap_followers_id_set(null, $warmOwner, true);
+                ap_blocks_actor_id_set($warmOwner);
+                $stats['relationship_sets_warmed'] = 3;
+                $bskyLib = __DIR__ . '/ap-bsky.php';
+                if (is_file($bskyLib)) {
+                    require_once $bskyLib;
+                    if (function_exists('ap_bsky_followed_handle_map_warm')) {
+                        ap_bsky_followed_handle_map_warm($warmOwner);
+                        $stats['relationship_sets_warmed']++;
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-maintain] relationship set warm: ' . $e->getMessage());
+            }
+        }
+    }
 
     if (!$vacuumOnly) {
         try {
@@ -405,6 +432,31 @@ try {
         } catch (Throwable $e) {
             $stats['errors']++;
             $log('mentions purge error: ' . $e->getMessage());
+        }
+
+        // --- Notification projection retention ---
+        // The projection is rebuildable and must stay bounded; authoritative
+        // mentions/events retention and privacy checks remain independent.
+        try {
+            $projectionCutoff = $nowUtc->modify('-30 days')->format('c');
+            $st = $db->prepare('SELECT COUNT(*) FROM ap_notification_projection WHERE updated_at < ?');
+            $st->execute([$projectionCutoff]);
+            $n = (int) $st->fetchColumn();
+            if ($n > 0) {
+                if ($dryRun) {
+                    $log("would_delete notification_projection older_than=$projectionCutoff count=$n");
+                } else {
+                    $del = $db->prepare('DELETE FROM ap_notification_projection WHERE updated_at < ?');
+                    $del->execute([$projectionCutoff]);
+                    $stats['notification_projection_deleted'] = $del->rowCount();
+                    $log("deleted notification_projection count={$stats['notification_projection_deleted']}");
+                }
+            } else {
+                $log('notification projection prune: nothing stale');
+            }
+        } catch (Throwable $e) {
+            // Older installations may not have the optional projection yet.
+            $log('notification projection prune skipped: ' . $e->getMessage());
         }
 
         // --- Soft-deleted DMs ---

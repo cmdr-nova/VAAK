@@ -1239,6 +1239,14 @@ function ap_masto_status_media_attachments(int $statusLocalId): array
     if ($statusLocalId <= 0 || !function_exists('ap_masto_media_entity')) {
         return [];
     }
+    if (isset($GLOBALS['ap_notification_media_rows'][$statusLocalId])
+        && is_array($GLOBALS['ap_notification_media_rows'][$statusLocalId])) {
+        $out = [];
+        foreach ($GLOBALS['ap_notification_media_rows'][$statusLocalId] as $row) {
+            if (is_array($row)) $out[] = ap_masto_media_entity($row);
+        }
+        return $out;
+    }
     $st = ap_db()->prepare('SELECT * FROM masto_media WHERE status_local_id = ? ORDER BY local_id ASC');
     $st->execute([$statusLocalId]);
     $out = [];
@@ -4229,6 +4237,24 @@ function ap_masto_resolve_pasted_status_url(string $url): ?string
 }
 
 /**
+ * Request-local lookup for notification target statuses prefetched in one
+ * bounded query. The database remains authoritative; this only avoids
+ * repeating note_id SELECTs while hydrating one notification page.
+ */
+function ap_masto_notification_prefetched_status(string $objectId): ?array
+{
+    $key = rtrim(trim($objectId), '/');
+    if ($key === '' || !isset($GLOBALS['ap_notification_status_rows'])
+        || !is_array($GLOBALS['ap_notification_status_rows'])) {
+        return null;
+    }
+    $row = $GLOBALS['ap_notification_status_rows'][$key]
+        ?? $GLOBALS['ap_notification_status_rows'][$key . '/']
+        ?? null;
+    return is_array($row) ? $row : null;
+}
+
+/**
  * Resolve a local post that was liked/boosted (notes URL, statuses URL, or outbox id).
  *
  * @return array<string,mixed>|null Mastodon Status entity
@@ -4241,7 +4267,8 @@ function ap_masto_resolve_our_liked_status(string $objectId): ?array
     }
 
     // Direct note_id / object URL hit
-    $local = ap_masto_status_by_note_id($objectId);
+    $local = ap_masto_notification_prefetched_status($objectId)
+        ?? ap_masto_status_by_note_id($objectId);
     if (is_array($local)) {
         return ap_masto_status_from_row($local);
     }
@@ -4698,10 +4725,14 @@ function ap_masto_notification_entity(array $item): ?array
 
     $createdAt = isset($row['created_at']) ? (string) $row['created_at'] : null;
     $id = ap_masto_notification_id_for_mention((int) $row['id'], $createdAt);
+    $groupRef = is_array($status) && !empty($status['id'])
+        ? (string) $status['id']
+        : ($objectId !== '' ? rtrim($objectId, '/') : (string) $id);
+    $groupKey = $type . '-' . substr(hash('sha256', ($actorId !== '' ? rtrim($actorId, '/') : '-') . '|' . $groupRef), 0, 24);
     return [
         'id' => $id,
         'type' => $type,
-        'group_key' => 'ungrouped-' . $id,
+        'group_key' => $groupKey,
         'created_at' => ap_masto_format_time($createdAt),
         'account' => $account,
         'status' => $status,
@@ -4710,7 +4741,11 @@ function ap_masto_notification_entity(array $item): ?array
 
 /**
  * Mastodon 4.3+ / Ice Cubes grouped notifications payload.
- * One group per notification (ungrouped-*) — enough for clients that only call /api/v2/notifications.
+ * Repeated favourite/reblog events sharing a target are collapsed into one
+ * opaque group key; unsupported or non-targeted events remain individual.
+ * Account payloads are de-duplicated in the root `accounts` array; groups
+ * carry only sampled account IDs. That root array is also the full-account
+ * expansion path for clients that need actor details.
  *
  * @param list<string> $types
  * @param list<string> $exclude
@@ -4722,6 +4757,7 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
     $accounts = [];
     $statuses = [];
     $groups = [];
+    $groupIndex = [];
     foreach ($notifs as $n) {
         if (!is_array($n)) {
             continue;
@@ -4746,9 +4782,36 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
             ? $n['group_key']
             : ('ungrouped-' . $nid);
         $type = (string) ($n['type'] ?? 'mention');
+        // Mastodon groups adjacent notifications that refer to the same
+        // actor/status.  Keep the key deterministic so clients can retain
+        // selection state between refreshes, while leaving the v1 endpoint
+        // (which returns one entity per notification) untouched.
+        if (str_starts_with($groupKey, 'ungrouped-') && ($acctId !== '' || $statusId !== null)) {
+            $groupKey = $type . ':' . ($acctId !== '' ? $acctId : '-') . ':' . ($statusId ?? '-');
+        }
         // Mastodon returns most_recent_notification_id as an integer; Ice Cubes
         // decoding can fail if this is a string.
         $nidInt = (int) $nid;
+        if (isset($groupIndex[$groupKey])) {
+            $idx = $groupIndex[$groupKey];
+            $existing = $groups[$idx];
+            $existing['notifications_count'] = (int) ($existing['notifications_count'] ?? 1) + 1;
+            $existing['page_min_id'] = (string) min((int) ($existing['page_min_id'] ?? $nidInt), $nidInt);
+            $existing['page_max_id'] = (string) max((int) ($existing['page_max_id'] ?? $nidInt), $nidInt);
+            $existing['most_recent_notification_id'] = max((int) ($existing['most_recent_notification_id'] ?? 0), $nidInt);
+            $existing['latest_page_notification_at'] = max(
+                strtotime((string) ($existing['latest_page_notification_at'] ?? '')) ?: 0,
+                strtotime((string) ($n['created_at'] ?? '')) ?: 0
+            ) > (strtotime((string) ($existing['latest_page_notification_at'] ?? '')) ?: 0)
+                ? (string) ($n['created_at'] ?? $existing['latest_page_notification_at'])
+                : $existing['latest_page_notification_at'];
+            if ($acctId !== '' && !in_array($acctId, $existing['sample_account_ids'] ?? [], true)
+                && count($existing['sample_account_ids'] ?? []) < 3) {
+                $existing['sample_account_ids'][] = $acctId;
+            }
+            $groups[$idx] = $existing;
+            continue;
+        }
         $group = [
             'group_key' => $groupKey,
             'notifications_count' => 1,
@@ -4762,6 +4825,7 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
         if (in_array($type, ['mention', 'status', 'reblog', 'favourite', 'poll', 'update', 'quote', 'quoted_update'], true)) {
             $group['status_id'] = $statusId;
         }
+        $groupIndex[$groupKey] = count($groups);
         $groups[] = $group;
     }
     return [
@@ -4771,6 +4835,89 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
     ];
 }
 
+/** Write a bounded, rebuildable notification response projection. */
+function ap_notification_projection_write(int $ownerUserId, array $items): void
+{
+    if ($ownerUserId <= 0 || $items === []) {
+        return;
+    }
+    try {
+        $db = ap_db();
+        $st = $db->prepare(
+            'INSERT INTO ap_notification_projection
+                (owner_user_id, notification_id, notification_type, actor_id, status_id, payload_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(owner_user_id, notification_id) DO UPDATE SET
+                notification_type = excluded.notification_type,
+                actor_id = excluded.actor_id,
+                status_id = excluded.status_id,
+                payload_json = excluded.payload_json,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at'
+        );
+        $now = gmdate('c');
+        foreach (array_slice($items, 0, 80) as $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $notificationId = trim((string) ($item['id'] ?? ''));
+            if ($notificationId === '') {
+                continue;
+            }
+            $account = is_array($item['account'] ?? null) ? $item['account'] : [];
+            $status = is_array($item['status'] ?? null) ? $item['status'] : [];
+            $created = trim((string) ($item['created_at'] ?? $now));
+            $payload = json_encode($item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (!is_string($payload) || $payload === '') {
+                continue;
+            }
+            $st->execute([
+                $ownerUserId,
+                $notificationId,
+                (string) ($item['type'] ?? 'mention'),
+                (string) ($account['id'] ?? ''),
+                (string) ($status['id'] ?? ''),
+                $payload,
+                $created !== '' ? $created : $now,
+                $now,
+            ]);
+        }
+    } catch (Throwable $e) {
+        // Projection writes are rebuildable and must never break notifications.
+        error_log('[ap-masto] notification projection write skipped: ' . $e->getMessage());
+    }
+}
+
+/** @return list<array<string,mixed>> */
+function ap_notification_projection_read(int $ownerUserId, int $limit, array $want, array $exclude): array
+{
+    if ($ownerUserId <= 0 || $limit < 1) return [];
+    try {
+        $cutoff = gmdate('c', time() - 900);
+        $st = ap_db()->prepare(
+            'SELECT payload_json FROM ap_notification_projection
+             WHERE owner_user_id = ? AND updated_at >= ?
+             ORDER BY created_at DESC, notification_id DESC LIMIT 80'
+        );
+        $st->execute([$ownerUserId, $cutoff]);
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $item = json_decode((string) ($row['payload_json'] ?? ''), true);
+            if (!is_array($item)) continue;
+            $type = (string) ($item['type'] ?? '');
+            if ($type === '' || !in_array($type, $want, true) || in_array($type, $exclude, true)) continue;
+            $acct = is_array($item['account'] ?? null) ? $item['account'] : [];
+            $actor = (string) ($acct['id'] ?? '');
+            if ($actor !== '' && function_exists('ap_row_is_hidden') && ap_row_is_hidden($actor, null, $ownerUserId)) continue;
+            $out[] = $item;
+            if (count($out) >= $limit) break;
+        }
+        return count($out) >= $limit ? $out : [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
 /**
  * @param list<string> $types empty = all supported
  * @param list<string> $exclude
@@ -4778,6 +4925,12 @@ function ap_masto_notifications_grouped_fetch(int $limit = 40, ?string $maxId = 
  */
 function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
 {
+    $notifStartedAt = microtime(true);
+    $recordNotifTiming = static function (string $phase, float $startedAt): void {
+        if (function_exists('ap_timing_record')) {
+            ap_timing_record('notifications.' . $phase, (microtime(true) - $startedAt) * 1000.0);
+        }
+    };
     $limit = max(1, min(80, $limit));
     // favourites, mentions, boosts, quote-boosts, bites, poll ended, favourited-status edits, follows, subscribed posts
     $want = ['mention', 'follow', 'favourite', 'reblog', 'quote', 'poll', 'update', 'bite', 'status'];
@@ -4788,6 +4941,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         $want = array_values(array_diff($want, $exclude));
     }
     if (!$want) {
+        $recordNotifTiming('total', $notifStartedAt);
         return [];
     }
 
@@ -4802,7 +4956,9 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
     $redisKey = 'vaak:notifications:v1:' . $ownerUserId . ':' . hash('sha256', json_encode([
-        'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want,
+        // Include exclusions so an Ice Cubes request using exclude_types cannot
+        // reuse a cache entry built for a different notification filter.
+        'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,
     ], JSON_UNESCAPED_SLASHES) ?: '');
     $notifStampedeLock = '';
     $holdNotifLock = false;
@@ -4830,6 +4986,8 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             $age = time() - (int) ($wrapped['ts'] ?? 0);
             $items = $wrapped['items'];
             if ($age >= 0 && $age <= $notifFreshSec) {
+                $recordNotifTiming('cache_fresh', $notifStartedAt);
+                $recordNotifTiming('total', $notifStartedAt);
                 return $items;
             }
             if ($age >= 0 && $age <= $notifStaleSec) {
@@ -4841,6 +4999,8 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                     $sinceId,
                     $want
                 );
+                $recordNotifTiming('cache_stale', $notifStartedAt);
+                $recordNotifTiming('total', $notifStartedAt);
                 return $items;
             }
         }
@@ -4860,6 +5020,23 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
     }
 
+    // Redis may be empty after a restart.  Reuse a recent owner-scoped
+    // projection only when it can satisfy the complete first page; otherwise
+    // fall through to authoritative mention/event queries.
+    if ($maxId === null && $sinceId === null) {
+        $projectionStartedAt = microtime(true);
+        $projected = ap_notification_projection_read($ownerUserId, $limit, $want, $exclude);
+        if ($projected !== []) {
+            $recordNotifTiming('projection_hit', $projectionStartedAt);
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected], 300);
+            }
+            $recordNotifTiming('total', $notifStartedAt);
+            return $projected;
+        }
+    }
+
+    $queryStartedAt = microtime(true);
     if (array_intersect($want, $mentionTypes)) {
         // The page only hydrates the first handful of notifications. Scan a
         // bounded multiple of that page size instead of always walking 80
@@ -4972,6 +5149,93 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         }
     }
 
+    // Batch-load known remote actor rows before entity hydration. This keeps
+    // Ice Cubes notification requests from repeating one DB lookup per card;
+    // unknown actors still follow the existing async warm path in
+    // ap_masto_remote_account(). PostgreSQL remains authoritative.
+    $prefetchIds = [];
+    foreach ($items as $item) {
+        $actorId = (string) ($item['row']['actor_id'] ?? '');
+        if ($actorId !== '') {
+            $prefetchIds[$actorId] = true;
+        }
+    }
+    $actorPrefetchStartedAt = microtime(true);
+    if ($prefetchIds !== [] && function_exists('ap_remote_actors_prefetch')) {
+        ap_remote_actors_prefetch(array_keys($prefetchIds));
+    }
+    // Favourite/reblog notifications often point at local notes. Prefetch
+    // those target rows in one bounded query so each card does not repeat a
+    // note_id lookup. This is request-local and never replaces privacy checks.
+    $statusPrefetchStartedAt = microtime(true);
+    $statusTargets = [];
+    foreach ($items as $item) {
+        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+        $kind = (string) ($item['kind'] ?? '');
+        if ($kind !== 'mention') {
+            continue;
+        }
+        $type = ap_masto_mention_notif_type($row);
+        if (!in_array($type, ['favourite', 'reblog', 'quote', 'update', 'bite', 'status', 'mention'], true)) {
+            continue;
+        }
+        $target = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
+        if ($target !== '' && str_starts_with($target, 'https://')) {
+            $statusTargets[rtrim($target, '/')] = true;
+        }
+    }
+    $GLOBALS['ap_notification_status_rows'] = [];
+    $GLOBALS['ap_notification_media_rows'] = [];
+    $mediaPrefetchStartedAt = microtime(true);
+    if ($statusTargets !== []) {
+        try {
+            foreach (array_chunk(array_keys($statusTargets), 80) as $chunk) {
+                $lookup = [];
+                foreach ($chunk as $target) {
+                    $lookup[] = $target;
+                    $lookup[] = $target . '/';
+                }
+                $ph = implode(',', array_fill(0, count($lookup), '?'));
+                $st = ap_db()->prepare("SELECT * FROM masto_statuses WHERE note_id IN ($ph)");
+                $st->execute($lookup);
+                foreach ($st->fetchAll() ?: [] as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $noteId = rtrim((string) ($row['note_id'] ?? ''), '/');
+                    if ($noteId !== '') {
+                        $GLOBALS['ap_notification_status_rows'][$noteId] = $row;
+                        $GLOBALS['ap_notification_status_rows'][$noteId . '/'] = $row;
+                    }
+                }
+            }
+            $localIds = [];
+            foreach ($GLOBALS['ap_notification_status_rows'] as $prefetchedRow) {
+                if (is_array($prefetchedRow) && (int) ($prefetchedRow['local_id'] ?? 0) > 0) {
+                    $localIds[(int) $prefetchedRow['local_id']] = true;
+                }
+            }
+            if ($localIds !== []) {
+                $ids = array_keys($localIds);
+                foreach (array_chunk($ids, 80) as $idChunk) {
+                    $ph = implode(',', array_fill(0, count($idChunk), '?'));
+                    $mediaSt = ap_db()->prepare("SELECT * FROM masto_media WHERE status_local_id IN ($ph) ORDER BY status_local_id, local_id");
+                    $mediaSt->execute($idChunk);
+                    foreach ($mediaSt->fetchAll() ?: [] as $mediaRow) {
+                        $sid = (int) ($mediaRow['status_local_id'] ?? 0);
+                        if ($sid > 0) $GLOBALS['ap_notification_media_rows'][$sid][] = $mediaRow;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // Per-status fallback remains available if the batch query fails.
+        }
+    }
+    $recordNotifTiming('media_prefetch', $mediaPrefetchStartedAt);
+    $recordNotifTiming('query', $queryStartedAt);
+    $recordNotifTiming('actor_prefetch', $actorPrefetchStartedAt);
+    $recordNotifTiming('status_prefetch', $statusPrefetchStartedAt);
+
     usort($items, static function ($a, $b) {
         return $b['sort'] <=> $a['sort'];
     });
@@ -4982,6 +5246,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     // hydrating the whole backlog (was ~4–11s for /api/v2/notifications).
     $sinceIdInt = ($sinceId !== null && $sinceId !== '') ? (int) $sinceId : 0;
     $maxIdInt = ($maxId !== null && $maxId !== '') ? (int) $maxId : 0;
+    $hydrateStartedAt = microtime(true);
     foreach ($items as $item) {
         try {
             $ent = ap_masto_notification_entity($item);
@@ -5006,6 +5271,10 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             break;
         }
     }
+    $recordNotifTiming('hydrate', $hydrateStartedAt);
+    // Warm the durable projection only on a cache rebuild.  Cache hits remain
+    // read-only and the projection is never authoritative for privacy rules.
+    ap_notification_projection_write($ownerUserId, $out);
     if (function_exists('ap_redis_json_set')) {
         // Keep 5 minutes for stale-while-revalidate; freshness is gated by ts.
         ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $out], 300);
@@ -5013,6 +5282,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     if ($holdNotifLock && $notifStampedeLock !== '' && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($notifStampedeLock);
     }
+    $recordNotifTiming('total', $notifStartedAt);
     return $out;
 }
 
@@ -7412,8 +7682,9 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     $qLower = $parts['lower'];
     $seen = [];
     $out = [];
+    $remoteRefs = [];
 
-    $addActor = static function (string $actorId) use (&$seen, &$out, $limit): void {
+    $addActor = static function (string $actorId) use (&$seen, &$out, &$remoteRefs, $limit): void {
         $actorId = rtrim(trim($actorId), '/');
         if ($actorId === '' || isset($seen['u:' . $actorId]) || count($out) >= $limit) {
             return;
@@ -7456,16 +7727,38 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
                 return;
             }
         }
-        $acct = ap_masto_remote_account($actorId);
-        $aid = (string) ($acct['id'] ?? '');
-        // Same person under /users/name and /ap/users/snowflake → one search hit
-        if ($aid !== '' && isset($seen['id:' . $aid])) {
+        // Defer remote account serialization until all bounded search sources
+        // have been collected, allowing one actor-cache prefetch for the page.
+        $remoteRefs[] = $actorId;
+    };
+    $flushRemote = static function () use (&$remoteRefs, &$seen, &$out, $limit): void {
+        if ($remoteRefs === [] || count($out) >= $limit) {
             return;
         }
-        if ($aid !== '') {
-            $seen['id:' . $aid] = true;
+        $remoteRefs = array_values(array_unique($remoteRefs));
+        if (function_exists('ap_remote_actors_prefetch')) {
+            ap_remote_actors_prefetch(array_slice($remoteRefs, 0, max($limit * 3, 60)));
         }
-        $out[] = $acct;
+        foreach ($remoteRefs as $actorId) {
+            if (count($out) >= $limit) {
+                break;
+            }
+            try {
+                $acct = ap_masto_remote_account($actorId);
+            } catch (Throwable $e) {
+                continue;
+            }
+            $aid = (string) ($acct['id'] ?? '');
+            // Same person under /users/name and /ap/users/snowflake → one search hit
+            if ($aid !== '' && isset($seen['id:' . $aid])) {
+                continue;
+            }
+            if ($aid !== '') {
+                $seen['id:' . $aid] = true;
+            }
+            $out[] = $acct;
+        }
+        $remoteRefs = [];
     };
 
     // Exact / handle resolve first when asked (Ice Cubes “add account”).
@@ -7602,9 +7895,11 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         // (that would match nothing useful and dilute results). Fall through only
         // when we still have room and this wasn't purely an instance browse.
         if (!empty($parts['is_host']) && count($out) > 0) {
+            $flushRemote();
             return array_slice($out, 0, $limit);
         }
         if (!empty($parts['is_host'])) {
+            $flushRemote();
             return array_slice($out, 0, $limit);
         }
     }
@@ -7673,6 +7968,7 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         // ignore
     }
 
+    $flushRemote();
     return array_slice($out, 0, $limit);
 }
 
@@ -9542,6 +9838,33 @@ function ap_masto_suggestions_v2_uncached(int $limit = 40): array
     uasort($scores, static function (array $a, array $b): int {
         return $b['score'] <=> $a['score'];
     });
+
+    // Recommendation cards are served from a short-lived cache, but a cache
+    // miss can still score dozens of candidates. Warm the bounded candidate
+    // window in one remote_actors query before account serialization so the
+    // cache-only account builder does not perform one metadata lookup per row.
+    if (function_exists('ap_remote_actors_prefetch') && $scores !== []) {
+        $prefetchIds = [];
+        $prefetchCap = min(count($scores), max(80, $limit * 4));
+        foreach (array_slice(array_keys($scores), 0, $prefetchCap) as $candidateId) {
+            $candidateId = rtrim(trim((string) $candidateId), '/');
+            if ($candidateId === '' || !str_starts_with($candidateId, 'https://')) {
+                continue;
+            }
+            $prefetchIds[$candidateId] = true;
+            if (preg_match('~^(https://[^/]+)/@([^/?#]+)$~', $candidateId, $pm)) {
+                $prefetchIds[$pm[1] . '/users/' . rawurlencode(rawurldecode($pm[2]))] = true;
+            } elseif (preg_match('~^(https://[^/]+)/users/([^/?#]+)$~', $candidateId, $pm)) {
+                $user = rawurldecode($pm[2]);
+                if ($user !== '' && !preg_match('/^\d{6,}$/', $user)) {
+                    $prefetchIds[$pm[1] . '/@' . rawurlencode($user)] = true;
+                }
+            }
+        }
+        if ($prefetchIds !== []) {
+            ap_remote_actors_prefetch(array_keys($prefetchIds));
+        }
+    }
 
     $out = [];
     // Oversample so we can skip thin/uncached profile shells without sync-fetching.

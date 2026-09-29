@@ -1131,6 +1131,12 @@ function ap_route_verified_activity(array $activity, int $bytes): string
         $deletedMentions = 0;
         $deletedEvents = 0;
         foreach (array_values(array_unique($deleteIds)) as $did) {
+            // A deleted remote status may have projection rows even when no
+            // local mention/event row was materialized. Invalidate by status
+            // unconditionally before applying the row-level tombstones.
+            if (function_exists('ap_notification_projection_invalidate_status')) {
+                ap_notification_projection_invalidate_status((string) $did);
+            }
             if (function_exists('ap_mention_soft_delete')) {
                 $deletedMentions += ap_mention_soft_delete($did);
             }
@@ -4407,12 +4413,15 @@ function ap_fetch_actor_doc(string $actorId): ?array
 
 function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId, string $privPath, float $timeoutSec = 10.0): bool
 {
+    $GLOBALS['ap_delivery_last_error'] = '';
     $parts = parse_url($inboxUrl);
     if (!is_array($parts) || ($parts['scheme'] ?? '') !== 'https') {
+        $GLOBALS['ap_delivery_last_error'] = 'Invalid HTTPS inbox URL';
         return false;
     }
     $host = (string) ($parts['host'] ?? '');
     if ($host === '' || !ap_host_resolves_public($host)) {
+        $GLOBALS['ap_delivery_last_error'] = 'Inbox host is unavailable or not public';
         return false;
     }
     $path = (string) ($parts['path'] ?? '/');
@@ -4425,15 +4434,18 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
 
     $body = json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($body)) {
+        $GLOBALS['ap_delivery_last_error'] = 'Activity JSON encoding failed';
         return false;
     }
 
     $privPem = @file_get_contents($privPath);
     if (!is_string($privPem) || $privPem === '') {
+        $GLOBALS['ap_delivery_last_error'] = 'Signing key is unavailable';
         return false;
     }
     $priv = openssl_pkey_get_private($privPem);
     if ($priv === false) {
+        $GLOBALS['ap_delivery_last_error'] = 'Signing key could not be opened';
         return false;
     }
 
@@ -4447,6 +4459,7 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     $signing = "(request-target): post {$path}\nhost: {$host}\ndate: {$date}\ndigest: {$digest}";
     $sigRaw = '';
     if (!openssl_sign($signing, $sigRaw, $priv, OPENSSL_ALGO_SHA256)) {
+        $GLOBALS['ap_delivery_last_error'] = 'Activity signature generation failed';
         return false;
     }
     $sigHeader = sprintf(
@@ -4485,6 +4498,9 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     $statusLine = $http_response_header[0] ?? '';
     $ok = is_string($statusLine) && preg_match('/\s(2\d\d)\s/', $statusLine);
     if (!$ok) {
+        $GLOBALS['ap_delivery_last_error'] = trim($statusLine) !== ''
+            ? trim($statusLine) . (is_string($resp) && trim($resp) !== '' ? ' ' . ap_short($resp, 180) : '')
+            : 'No HTTP response from inbox';
         ap_log('deliver_fail inbox=' . ap_short($inboxUrl, 80) . ' status=' . ap_short($statusLine, 80)
             . ' body=' . ap_short(is_string($resp) ? $resp : '', 120));
     } elseif (is_string($resp) && $resp !== '' && $resp !== 'ok' && !str_starts_with(ltrim($resp), '{')) {
@@ -4528,8 +4544,10 @@ function ap_deliver_fanout_background(array $activity, array $inboxUrls, string 
     if (!$inboxUrls) {
         return false;
     }
-    // Prefer one durable child job per inbox. This survives PHP-FPM restarts
-    // and makes retries independent for each remote server.
+    // Prefer one durable, deterministic child job per inbox. The
+    // (activity_key,inbox_url) uniqueness constraint makes retries and
+    // duplicate enqueue attempts idempotent while keeping each remote
+    // delivery independently inspectable.
     try {
         $activityKey = (string) ($activity['id'] ?? '');
         if ($activityKey === '') {
@@ -6413,6 +6431,9 @@ function ap_delete_local_status(int $localId): array
     }
     ap_db()->prepare('DELETE FROM masto_statuses WHERE local_id = ?')->execute([$localId]);
     ap_db()->prepare('UPDATE masto_media SET status_local_id = NULL WHERE status_local_id = ?')->execute([$localId]);
+    if (function_exists('ap_notification_projection_invalidate_status')) {
+        ap_notification_projection_invalidate_status($noteId);
+    }
     try {
         ap_db()->prepare('DELETE FROM site_syndications WHERE note_id = ?')->execute([$noteId]);
     } catch (Throwable $e) {

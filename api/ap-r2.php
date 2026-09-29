@@ -1018,11 +1018,18 @@ function ap_remote_post_media_resolve(string $sourceUrl): string
 
 function ap_remote_post_media_ensure(string $sourceUrl): ?string
 {
+    $GLOBALS['ap_media_last_error'] = '';
     $sourceUrl = ap_profile_sanitize_https_url($sourceUrl) ?: '';
     if ($sourceUrl === '') return null;
     $lock = @fopen(sys_get_temp_dir() . '/vaak-post-media-' . hash('sha256', $sourceUrl) . '.lock', 'c+');
     if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
         if (is_resource($lock)) fclose($lock);
+        return (string) (ap_remote_post_media_get($sourceUrl)['public_url'] ?? $sourceUrl);
+    }
+    $slot = ap_remote_media_download_slot((string) (parse_url($sourceUrl, PHP_URL_HOST) ?: 'unknown'));
+    if ($slot === null) {
+        flock($lock, LOCK_UN);
+        fclose($lock);
         return (string) (ap_remote_post_media_get($sourceUrl)['public_url'] ?? $sourceUrl);
     }
     try {
@@ -1068,10 +1075,59 @@ function ap_remote_post_media_ensure(string $sourceUrl): ?string
         )->execute([$sourceUrl, $put['key'], $put['public_url'], $type, strlen($body), $originalSize, $now, $now]);
         return (string) $put['public_url'];
     } catch (Throwable $e) {
+        $GLOBALS['ap_media_last_error'] = substr($e->getMessage(), 0, 400);
         error_log('[ap-r2] post media warm: ' . $e->getMessage());
         return null;
     } finally {
         flock($lock, LOCK_UN); fclose($lock);
+        ap_remote_media_download_slot_release($slot);
+    }
+}
+
+/**
+ * Acquire one process-wide media-download slot plus one slot for the remote
+ * host. This keeps a single busy instance from consuming all workers while
+ * preserving the existing per-URL lock below. The lock files are ephemeral
+ * coordination only; PostgreSQL/R2 remain authoritative.
+ *
+ * @return array{global:resource,host:resource}|null
+ */
+function ap_remote_media_download_slot(string $host): ?array
+{
+    $host = strtolower(preg_replace('/[^a-z0-9.-]/', '', $host) ?: 'unknown');
+    $base = sys_get_temp_dir() . '/vaak-media-slots';
+    if (!is_dir($base)) @mkdir($base, 0700, true);
+    $hostLock = @fopen($base . '/host-' . hash('sha256', $host) . '.lock', 'c+');
+    if ($hostLock === false || !flock($hostLock, LOCK_EX | LOCK_NB)) {
+        if (is_resource($hostLock)) fclose($hostLock);
+        return null;
+    }
+    $globalLock = null;
+    for ($i = 0; $i < 4; $i++) {
+        $candidate = @fopen($base . '/slot-' . $i . '.lock', 'c+');
+        if ($candidate !== false && flock($candidate, LOCK_EX | LOCK_NB)) {
+            $globalLock = $candidate;
+            break;
+        }
+        if (is_resource($candidate)) fclose($candidate);
+    }
+    if (!is_resource($globalLock)) {
+        flock($hostLock, LOCK_UN);
+        fclose($hostLock);
+        return null;
+    }
+    return ['global' => $globalLock, 'host' => $hostLock];
+}
+
+/** @param array{global:resource,host:resource}|null $slot */
+function ap_remote_media_download_slot_release(?array $slot): void
+{
+    if (!is_array($slot)) return;
+    foreach (['global', 'host'] as $key) {
+        if (isset($slot[$key]) && is_resource($slot[$key])) {
+            flock($slot[$key], LOCK_UN);
+            fclose($slot[$key]);
+        }
     }
 }
 
@@ -1168,10 +1224,16 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
     if (!$force && is_file($negativePath) && ((int) @file_get_contents($negativePath)) > time()) {
         return $cached ? (string) $cached['public_url'] : $source;
     }
+    $host = (string) (parse_url($source, PHP_URL_HOST) ?: 'unknown');
+    $slot = ap_remote_media_download_slot($host);
+    if ($slot === null) {
+        return $cached ? (string) $cached['public_url'] : $source;
+    }
     $lockPath = sys_get_temp_dir() . '/vaak-media-fetch-' . hash('sha256', $actorId . '|' . $kind . '|' . $source) . '.lock';
     $lock = @fopen($lockPath, 'c+');
     if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
         if (is_resource($lock)) fclose($lock);
+        ap_remote_media_download_slot_release($slot);
         return $cached ? (string) $cached['public_url'] : $source;
     }
     try {
@@ -1237,6 +1299,7 @@ function ap_remote_media_ensure(string $actorId, string $kind = 'avatar', bool $
     } finally {
         flock($lock, LOCK_UN);
         fclose($lock);
+        ap_remote_media_download_slot_release($slot);
     }
 }
 
@@ -1374,6 +1437,9 @@ function ap_media_warm_worker_run(int $limit = 3): array
                 }
                 if ((string) ($row['job_type'] ?? '') === 'post_media') {
                     $ok = ap_remote_post_media_ensure($target) !== null;
+                    if (!$ok && trim((string) ($GLOBALS['ap_media_last_error'] ?? '')) !== '') {
+                        $error = (string) $GLOBALS['ap_media_last_error'];
+                    }
                 } else {
                     $actor = rtrim($target, '/');
                     if (function_exists('ap_remote_actor_ensure')) ap_remote_actor_ensure($actor, true);
@@ -1532,34 +1598,82 @@ function ap_remote_media_cleanup(int $unusedDays = 7, int $limit = 200): array
 }
 
 /** Purge unused cached remote post images without touching local uploads. */
-function ap_remote_post_media_cleanup(int $unusedDays = 30, int $limit = 200, int $maxMb = 4096): array
+function ap_remote_post_media_cleanup(int $unusedDays = 30, int $limit = 200, int $maxMb = 4096, int $maxHostMb = 1024): array
 {
-    $deleted = 0; $errors = 0; $rows = [];
+    $deleted = 0; $errors = 0; $rows = []; $bytesDeleted = 0; $hostEvictions = 0; $warnings = [];
+    $limit = max(1, min(1000, $limit));
+    $budget = max(128, $maxMb) * 1024 * 1024;
+    $hostBudget = max(64, min($maxMb, $maxHostMb)) * 1024 * 1024;
+    $hostOf = static function (array $row): string {
+        $host = parse_url((string) ($row['source_url'] ?? ''), PHP_URL_HOST);
+        return is_string($host) && $host !== '' ? strtolower($host) : 'unknown';
+    };
     try {
         $cutoff = gmdate('c', time() - max(1, $unusedDays) * 86400);
         $st = ap_db()->prepare('SELECT * FROM remote_post_media_cache WHERE last_used_at < ? ORDER BY last_used_at ASC LIMIT ?');
         $st->bindValue(1, $cutoff);
         $st->bindValue(2, max(1, min(1000, $limit)), PDO::PARAM_INT);
         $st->execute(); $rows = $st->fetchAll() ?: [];
-        $remove = static function (array $row) use (&$deleted, &$errors): bool {
+        $remove = static function (array $row) use (&$deleted, &$errors, &$bytesDeleted): bool {
             $key = (string) ($row['s3_key'] ?? '');
             if ($key !== '' && !str_contains(ltrim($key, '/'), 'cache/post-media/')) { $errors++; return false; }
             if ($key !== '') { $result = ap_r2_delete_object($key); if (empty($result['ok'])) { $errors++; return false; } }
             ap_db()->prepare('DELETE FROM remote_post_media_cache WHERE id = ?')->execute([(int) ($row['id'] ?? 0)]);
-            $deleted++; return true;
+            $deleted++;
+            $bytesDeleted += max(0, (int) ($row['byte_size'] ?? 0));
+            return true;
         };
         foreach ($rows as $row) $remove($row);
         // Age is the normal policy; the byte budget is a hard upper bound for
         // installations with a busy public timeline.
-        $budget = max(128, $maxMb) * 1024 * 1024;
-        while ($deleted < max(1, min(1000, $limit))) {
+        // Enforce a per-source-host budget first so one image host cannot
+        // crowd every other remote source out of the cache.
+        if ($deleted < $limit && $hostBudget > 0) {
+            $all = ap_db()->query('SELECT * FROM remote_post_media_cache ORDER BY last_used_at ASC')->fetchAll() ?: [];
+            $hostBytes = [];
+            foreach ($all as $row) {
+                if (!is_array($row)) continue;
+                $host = $hostOf($row);
+                $hostBytes[$host] = ($hostBytes[$host] ?? 0) + max(0, (int) ($row['byte_size'] ?? 0));
+            }
+            foreach ($all as $row) {
+                if ($deleted >= $limit || !is_array($row)) break;
+                $host = $hostOf($row);
+                if (($hostBytes[$host] ?? 0) <= $hostBudget) continue;
+                if ($remove($row)) {
+                    $hostBytes[$host] -= max(0, (int) ($row['byte_size'] ?? 0));
+                    $hostEvictions++;
+                }
+            }
+        }
+        while ($deleted < $limit) {
             $total = (int) (ap_db()->query('SELECT COALESCE(SUM(byte_size), 0) FROM remote_post_media_cache')->fetchColumn() ?: 0);
-            if ($total <= $budget) break;
+            if ($total <= $budget) {
+                if ($total >= (int) floor($budget * 0.9)) {
+                    $warnings[] = 'remote post-media cache is above 90% of its global byte budget';
+                }
+                break;
+            }
             $old = ap_db()->query('SELECT * FROM remote_post_media_cache ORDER BY last_used_at ASC LIMIT 1')->fetch();
             if (!is_array($old) || !$remove($old)) break;
+        }
+        $remainingTotal = (int) (ap_db()->query('SELECT COALESCE(SUM(byte_size), 0) FROM remote_post_media_cache')->fetchColumn() ?: 0);
+        if ($remainingTotal >= (int) floor($budget * 0.9)
+            && !in_array('remote post-media cache is above 90% of its global byte budget', $warnings, true)) {
+            $warnings[] = $remainingTotal > $budget
+                ? 'remote post-media cache remains above its global byte budget after this cleanup pass'
+                : 'remote post-media cache is above 90% of its global byte budget';
         }
     } catch (Throwable $e) {
         $errors++; error_log('[ap-r2] post media cleanup: ' . $e->getMessage());
     }
-    return ['scanned' => count($rows), 'deleted' => $deleted, 'errors' => $errors];
+    return [
+        'scanned' => count($rows),
+        'deleted' => $deleted,
+        'errors' => $errors,
+        'bytes_deleted' => $bytesDeleted,
+        'host_evictions' => $hostEvictions,
+        'quota_bytes' => $budget,
+        'warnings' => array_values(array_unique($warnings)),
+    ];
 }
