@@ -66,6 +66,50 @@ function ap_bsky_effective_timeout(int $timeoutSec): int
     return max(1, min($timeoutSec, (int) floor($left)));
 }
 
+/**
+ * Validate remote media URLs before a worker downloads them.
+ *
+ * Profile images and video URLs can originate in remote ActivityPub/Bluesky
+ * objects, so HTTPS alone is not sufficient: a hostile actor could point a
+ * blob at a private or metadata address.  Keep this check local to the
+ * Bluesky downloader and do not follow redirects, which also avoids DNS
+ * rebinding through an untrusted Location header.
+ */
+function ap_bsky_remote_media_url_allowed(string $url): bool
+{
+    if ($url === '' || strlen($url) > 2000 || !str_starts_with(strtolower($url), 'https://')) {
+        return false;
+    }
+    $parts = parse_url($url);
+    if (!is_array($parts) || !is_string($parts['host'] ?? null) || $parts['host'] === ''
+        || !empty($parts['user']) || !empty($parts['pass'])) {
+        return false;
+    }
+    $host = strtolower((string) $parts['host']);
+    if ($host === 'localhost' || str_ends_with($host, '.localhost') || str_ends_with($host, '.local')) {
+        return false;
+    }
+    $isPublic = static function (string $ip): bool {
+        return filter_var($ip, FILTER_VALIDATE_IP) !== false
+            && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
+    };
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        return $isPublic($host);
+    }
+    $records = @dns_get_record($host, DNS_A | DNS_AAAA);
+    if (!is_array($records) || $records === []) {
+        $fallback = @gethostbyname($host);
+        return is_string($fallback) && $fallback !== $host && $isPublic($fallback);
+    }
+    foreach ($records as $record) {
+        $ip = $record['ip'] ?? $record['ipv6'] ?? null;
+        if (!is_string($ip) || !$isPublic($ip)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 function ap_bsky_tab_enabled(): bool
 {
     return function_exists('ap_feature_enabled')
@@ -8488,7 +8532,7 @@ function ap_bsky_bio_from_vaak_summary(string $summaryHtml, string $profileUrl):
 function ap_bsky_fetch_image_bytes(string $url): array
 {
     $url = trim($url);
-    if ($url === '' || !str_starts_with($url, 'https://')) {
+    if (!ap_bsky_remote_media_url_allowed($url)) {
         return ['ok' => false, 'error' => 'Invalid image URL'];
     }
     $ch = curl_init($url);
@@ -8504,8 +8548,7 @@ function ap_bsky_fetch_image_bytes(string $url): array
     }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => min(AP_BSKY_CONNECT_TIMEOUT, $dlTimeout),
         CURLOPT_TIMEOUT => $dlTimeout,
         CURLOPT_USERAGENT => 'VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',
@@ -8664,7 +8707,7 @@ function ap_bsky_upload_blob(string $pdsHost, string $accessJwt, string $bytes, 
 function ap_bsky_fetch_video_bytes(string $url, string $hintMime = ''): array
 {
     $url = trim($url);
-    if ($url === '' || !str_starts_with($url, 'https://')) {
+    if (!ap_bsky_remote_media_url_allowed($url)) {
         return ['ok' => false, 'error' => 'Invalid video URL'];
     }
     $ch = curl_init($url);
@@ -8673,8 +8716,7 @@ function ap_bsky_fetch_video_bytes(string $url, string $hintMime = ''): array
     }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_FOLLOWLOCATION => false,
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_TIMEOUT => 120,
         CURLOPT_USERAGENT => 'VAAK-Bluesky/1.0 (+https://mkultra.monster/vaak)',

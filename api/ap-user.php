@@ -7,6 +7,11 @@
 declare(strict_types=1);
 
 header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: SAMEORIGIN');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+}
 
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
