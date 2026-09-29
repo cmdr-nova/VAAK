@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh VAAK Wafrn friend-server catalog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=www-data
+ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-wafrn-friend-refresh.php

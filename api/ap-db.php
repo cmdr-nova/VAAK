@@ -4038,7 +4038,8 @@ function ap_wafrn_friend_inboxes(int $limit = 20): array
     $limit = max(1, min(40, $limit));
     $raw = getenv('VAAK_WAFRN_FRIEND_HOSTS');
     if (!is_string($raw) || trim($raw) === '') {
-        $catalog = __DIR__ . '/deploy/wafrn-friend-hosts.txt';
+        $runtimeCatalog = '/var/lib/mkultra/ap/wafrn-friend-hosts.txt';
+        $catalog = is_file($runtimeCatalog) ? $runtimeCatalog : __DIR__ . '/deploy/wafrn-friend-hosts.txt';
         $raw = is_file($catalog) ? (string) @file_get_contents($catalog) : 'waffles.baeddel.social';
     }
     $out = [];

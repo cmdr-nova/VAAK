@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh VAAK Wafrn friend-server catalog daily
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=24h
+Unit=ap-wafrn-friend-refresh.service
+
+[Install]
+WantedBy=timers.target
