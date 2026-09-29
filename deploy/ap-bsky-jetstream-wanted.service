@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh VAAK Bluesky Jetstream wanted DID filter
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=www-data
+WorkingDirectory=/srv/mkultra/html/api
+Environment=AP_DB_DSN=pgsql:dbname=novalandia
+Environment=VAAK_JETSTREAM_STATE=/var/lib/mkultra/ap/jetstream
+ExecStart=/usr/bin/php /srv/mkultra/html/api/ap-bsky-jetstream-wanted.php

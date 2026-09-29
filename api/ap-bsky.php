@@ -2703,6 +2703,67 @@ function ap_bsky_post_observation_touch(string $bskyUri, int $ownerUserId, ?PDO 
     }
 }
 
+/** Return connected VAAK owners who follow or own a Bluesky DID. */
+function ap_bsky_jetstream_observer_ids(string $did, ?PDO $db = null): array
+{
+    $did = trim($did);
+    if (!str_starts_with($did, 'did:')) return [];
+    $db ??= ap_db();
+    $owners = [];
+    try {
+        $st = $db->prepare("SELECT DISTINCT owner_user_id FROM bsky_graph_sync WHERE kind = 'follow' AND target_did = ?
+            UNION SELECT owner_user_id FROM bsky_sessions WHERE did = ?");
+        $st->execute([$did, $did]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $owner) {
+            $owner = (int) $owner;
+            if ($owner > 0) $owners[$owner] = true;
+        }
+    } catch (Throwable $e) {
+        // The stream is optional; a missing relationship cache must not stop it.
+    }
+    return array_keys($owners);
+}
+
+/** Ingest one filtered Jetstream commit into the shared canonical cache. */
+function ap_bsky_jetstream_ingest_event(array $event): array
+{
+    $did = trim((string) ($event['did'] ?? ''));
+    $commit = is_array($event['commit'] ?? null) ? $event['commit'] : [];
+    $collection = trim((string) ($commit['collection'] ?? ''));
+    $action = trim((string) ($commit['operation'] ?? $commit['action'] ?? ''));
+    $rkey = trim((string) ($commit['rkey'] ?? ''));
+    if (!str_starts_with($did, 'did:') || $collection === '' || $rkey === '') {
+        return ['ok' => false, 'ignored' => true, 'error' => 'Invalid Jetstream commit'];
+    }
+    $uri = 'at://' . $did . '/' . $collection . '/' . $rkey;
+    $owners = ap_bsky_jetstream_observer_ids($did);
+    if ($collection === 'app.bsky.feed.post' && $action === 'create') {
+        $record = is_array($commit['record'] ?? null) ? $commit['record'] : [];
+        $post = [
+            'uri' => $uri,
+            'cid' => (string) ($commit['cid'] ?? ''),
+            'author' => ['did' => $did],
+            'record' => $record,
+        ];
+        ap_bsky_post_upsert_from_feed_item($post, null);
+        foreach ($owners as $owner) ap_bsky_post_observation_touch($uri, (int) $owner);
+        return ['ok' => true, 'type' => 'post', 'owners' => count($owners)];
+    }
+    if ($action === 'delete' && ($collection === 'app.bsky.feed.post' || $collection === 'app.bsky.feed.repost')) {
+        ap_bsky_tombstone_uri($uri);
+        try {
+            ap_db()->prepare('DELETE FROM bsky_post_observations WHERE bsky_uri = ?')->execute([$uri]);
+        } catch (Throwable $e) { /* optional relation cleanup */ }
+        return ['ok' => true, 'type' => 'delete', 'owners' => count($owners)];
+    }
+    // Reposts/likes/follows still reconcile through the account-scoped workers;
+    // enqueue recent author refreshes for observers without blocking the stream.
+    if ($collection === 'app.bsky.feed.repost' && $action === 'create') {
+        foreach ($owners as $owner) ap_bsky_author_feed_refresh_enqueue((int) $owner, $did, 60);
+    }
+    return ['ok' => true, 'ignored' => true, 'owners' => count($owners)];
+}
+
 /**
  * Bluesky label values that should blur media like Fediverse "sensitive".
  *
@@ -4266,6 +4327,11 @@ function ap_bsky_tombstone_uri(string $uri, ?int $ownerUserId = null): bool
         $removed = $st->rowCount() > 0;
     } catch (Throwable $e) {
         error_log('[ap-bsky] tombstone_uri posts: ' . $e->getMessage());
+    }
+    try {
+        ap_db()->prepare('DELETE FROM bsky_post_observations WHERE bsky_uri = ?')->execute([$uri]);
+    } catch (Throwable $e) {
+        // Older installations may not have run the shared-observation migration yet.
     }
     // Drop orphan link rows that are not protecting a local crosspost map.
     try {

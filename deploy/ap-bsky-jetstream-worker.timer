@@ -1,0 +1,10 @@
+[Unit]
+Description=Process VAAK shared Bluesky Jetstream events
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=5s
+Unit=ap-bsky-jetstream-worker.service
+
+[Install]
+WantedBy=timers.target

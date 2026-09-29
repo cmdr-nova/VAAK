@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh VAAK Bluesky Jetstream wanted DID filter
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=ap-bsky-jetstream-wanted.service
+
+[Install]
+WantedBy=timers.target
