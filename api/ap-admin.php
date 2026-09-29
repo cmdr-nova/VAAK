@@ -26346,6 +26346,12 @@ window.apAdminToast = function (msg, isErr) {
       + '<button type="button" class="btn btn-ghost" data-bm-unbookmark="1">Remove bookmark</button>'
       + '</div>';
     pop.innerHTML = html;
+    // Re-measure after replacing the loading placeholder; otherwise the
+    // finished menu keeps its initial position until the next scroll event.
+    positionFolderPopover(pop, anchorBtn);
+    requestAnimationFrame(() => {
+      if (folderPopover === pop) positionFolderPopover(pop, anchorBtn);
+    });
 
     pop.addEventListener('change', async (ev) => {
       const input = ev.target;
