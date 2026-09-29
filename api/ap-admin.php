@@ -21302,8 +21302,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta" style="margin:.25rem 0 .75rem">Plain text only. HTML, scripts, and control characters are rejected.</div>
 
           <?php $profileBadgeCatalog = ap_profile_badge_catalog(); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? []); ?>
-          <fieldset style="border:1px solid var(--border);border-radius:10px;padding:.75rem;margin:0 0 1rem">
-            <legend style="padding:0 .35rem;color:var(--text)">Profile badges <span class="meta">(up to 6)</span></legend>
+          <details style="border:1px solid var(--border);border-radius:10px;padding:.55rem .75rem;margin:0 0 1rem">
+            <summary style="cursor:pointer;color:var(--text);font-weight:650">Profile badges <span class="meta">(up to 6 · <?= count($selectedProfileBadges) ?> selected)</span></summary>
+            <fieldset style="border:0;padding:.55rem 0 0;margin:0">
             <div class="meta" style="margin:0 0 .65rem">Optional flair shown on your HTML profile only. These badges are not federated.</div>
             <div class="meta" style="margin:0 0 .65rem">These badges are part of a test and more will be coming soon.</div>
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.45rem .75rem">
@@ -21315,7 +21316,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 </label>
               <?php endforeach; ?>
             </div>
-          </fieldset>
+            </fieldset>
+          </details>
 
           <label for="pf-icon-file">Upload avatar (JPEG / PNG / WebP / GIF · max 2&nbsp;MB)</label>
           <input id="pf-icon-file" type="file" name="icon_file" accept="image/jpeg,image/png,image/webp,image/gif">
@@ -21914,7 +21916,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <label for="profile-list-search">Search your mutes, deprioritized accounts, and blocks</label>
           <input id="profile-list-search" type="search" placeholder="Filter these lists…" autocomplete="off">
         </div>
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted accounts</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted accounts</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide from <b>your</b> Home / Federated / Notifications. Follow stays. Also available on remote profiles.
         </div>
@@ -21961,7 +21963,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Deprioritized on Home</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Soft-rank these accounts lower on <b>Home</b> only (⋯ → Deprioritize). They still appear on Federated, Local, and notifications. Mute/block still fully hide.
         </div>
@@ -21991,7 +21993,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted words</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:1.25rem 0 .5rem">Muted words</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Hide posts on your Home &amp; Federated when text/CW contains a phrase (case-insensitive substring).
         </div>
@@ -22031,7 +22033,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php endif; ?>
         </details>
 
-        <details open class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:2rem 0 .5rem">Your blocks</summary>
+        <details class="profile-list-section"><summary style="cursor:pointer;font-size:1rem;font-weight:650;margin:2rem 0 .5rem">Your blocks</summary>
         <div class="meta" style="margin-bottom:.75rem">
           Personal blocks hide that account’s <b>profile and posts</b> from you (timelines, search, profile pages). Mutes only filter timelines/notifications.
           <?php if (!empty($vaakIsAdmin)): ?>
