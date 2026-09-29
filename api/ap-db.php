@@ -3825,10 +3825,10 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
         ];
         $ctxExtra['FeaturedCollection'] = 'https://w3id.org/fep/7aa9#FeaturedCollection';
         $ctxExtra['canFeature'] = 'https://w3id.org/fep/7aa9#canFeature';
-        // Wafrn-compatible Asks extension. Level 2 means authenticated users
-        // may ask this actor; Wafrn uses level 1 for anonymous asks.
-        $ctxExtra['AskQuestion'] = 'https://wafrn.net/ns#AskQuestion';
     }
+    // Wafrn-compatible Asks extension. Level 2 means authenticated users may
+    // ask this actor; Wafrn uses level 1 for anonymous asks.
+    $ctxExtra['AskQuestion'] = 'https://wafrn.net/ns#AskQuestion';
     $actorAttachments = ap_cmdr_actor_attachments_with_policies(
         is_array($p['attachment'] ?? null) ? $p['attachment'] : []
     );
@@ -3894,10 +3894,10 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
             'publicKeyPem' => $publicKeyPem,
         ],
     ];
+    if (!empty($p['asks_enabled'])) $actor['_wafrn_asks'] = '2';
     if ($rich) {
         $actor['featured'] = $id . '/collections/featured';
         $actor['featuredCollections'] = $id . '/featuredCollections';
-        if (!empty($p['asks_enabled'])) $actor['_wafrn_asks'] = '2';
     } else {
         $actor['featured'] = $id . '/collections/featured';
     }
