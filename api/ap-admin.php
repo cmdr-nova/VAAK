@@ -24650,7 +24650,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endif; ?>
               <?php endif; ?>
               <?php if (!$rpIsBsky): ?>
-                <?php if (!$rpIsLocal && !$rpIsOwn && function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor)): ?>
+                <?php if (!$rpIsOwn && ($rpIsLocal || (function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor)))): ?>
                   <details style="display:inline-block;vertical-align:middle"><summary class="btn btn-ghost" style="cursor:pointer;list-style:none">Ask</summary>
                     <form class="composer" method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="position:absolute;z-index:5;width:min(22rem,90vw);margin-top:.35rem;padding:.65rem">
                       <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="ask_send"><input type="hidden" name="target_actor" value="<?= h($rpActor) ?>"><input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
