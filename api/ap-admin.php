@@ -11939,14 +11939,6 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                   $evMentionSeed = admin_reply_mention_seed($aid, null, is_array($eventMentions ?? null) ? $eventMentions : []);
                 ?>
                 <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyObjectId) ?>&amp;to=<?= urlencode($aid) ?><?= admin_reply_mention_query($evMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
-                <?php if ($aid !== '' && !$alreadyFollowing): ?>
-                  <form method="post" action="?view=following" style="display:inline">
-                    <input type="hidden" name="action" value="follow_remote">
-                    <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                    <input type="hidden" name="actor_id" value="<?= h($aid) ?>">
-                    <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                  </form>
-                <?php endif; ?>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($objectId) ?>&amp;quote_status_id=<?= urlencode($statusId) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
@@ -13284,14 +13276,6 @@ function admin_render_masto_status_card(
                   <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
-              <?php if ($actorRef !== '' && !$following && !$isLocal): ?>
-                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
-                  <input type="hidden" name="action" value="follow_remote">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="actor_id" value="<?= h($actorRef) ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                </form>
-              <?php endif; ?>
               <?php if ($uri !== ''): ?>
                 <a href="<?= h(admin_remote_object_href($uri, $st['url'] ?? null)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
               <?php endif; ?>
@@ -13543,14 +13527,6 @@ function admin_render_remote_boost_card(
               echo admin_cw_gate_html($boostSpoiler, $boostSensitive, $boostInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($origActor !== '' && !$alreadyFollowing && !vaak_is_own_url($origActor)): ?>
-                <form method="post" action="?view=following" style="display:inline">
-                  <input type="hidden" name="action" value="follow_remote">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="actor_id" value="<?= h($origActor) ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                </form>
-              <?php endif; ?>
               <?php if ($canReply): ?>
                 <?php
                   $boostExtraMentions = [];
@@ -13775,14 +13751,6 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               <?php if ($objectId !== ''): ?>
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
                 <a href="<?= h(admin_remote_object_href($objectId)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
-              <?php endif; ?>
-              <?php if ($targetActor !== '' && !$alreadyFollowing): ?>
-                <form method="post" action="?view=following" style="display:inline">
-                  <input type="hidden" name="action" value="follow_remote">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="actor_id" value="<?= h($targetActor) ?>">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
-                </form>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
