@@ -4037,9 +4037,10 @@ function ap_wafrn_friend_inboxes(int $limit = 20): array
 {
     $limit = max(1, min(40, $limit));
     $raw = getenv('VAAK_WAFRN_FRIEND_HOSTS');
-    $raw = is_string($raw) && trim($raw) !== ''
-        ? $raw
-        : 'waffles.baeddel.social';
+    if (!is_string($raw) || trim($raw) === '') {
+        $catalog = __DIR__ . '/deploy/wafrn-friend-hosts.txt';
+        $raw = is_file($catalog) ? (string) @file_get_contents($catalog) : 'waffles.baeddel.social';
+    }
     $out = [];
     foreach (preg_split('/[,\s]+/', $raw) ?: [] as $value) {
         $value = trim((string) $value);

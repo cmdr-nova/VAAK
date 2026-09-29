@@ -20,6 +20,7 @@ CURSOR_FILE = STATE_DIR / "cursor"
 INCOMING = STATE_DIR / "incoming"
 MAX_EVENTS = 500
 MAX_BYTES = 8 * 1024 * 1024
+MAX_FILTER_DIDS_IN_URL = 25
 COLLECTIONS = [
     "app.bsky.feed.post",
     "app.bsky.feed.repost",
@@ -49,13 +50,17 @@ def persist_cursor(value):
 
 def stream_url(dids, since):
     query = [("wantedCollections", collection) for collection in COLLECTIONS]
-    query.extend(("wantedDids", did) for did in dids)
+    # Jetstream accepts repeated wantedDids, but the intermediary nginx layer
+    # rejects very large WebSocket request URIs.  For larger graphs we use the
+    # same collections-only stream and apply the DID filter before spooling.
+    if len(dids) <= MAX_FILTER_DIDS_IN_URL:
+        query.extend(("wantedDids", did) for did in dids)
     if since > 0:
         query.append(("cursor", str(since)))
     return ENDPOINT + ("&" if "?" in ENDPOINT else "?") + urllib.parse.urlencode(query)
 
 
-def spool(ws):
+def spool(ws, wanted):
     path = INCOMING / ("events-%d-%d.jsonl" % (int(time.time()), os.getpid()))
     handle = path.open("a", encoding="utf-8")
     count = 0
@@ -67,6 +72,8 @@ def spool(ws):
                 raise RuntimeError("Jetstream closed")
             event = json.loads(raw)
             if not isinstance(event, dict) or event.get("kind") != "commit":
+                continue
+            if event.get("did") not in wanted:
                 continue
             line = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
             handle.write(line)
@@ -98,7 +105,7 @@ def main():
         try:
             ws = websocket.create_connection(stream_url(dids, cursor()), timeout=45)
             backoff = 2
-            spool(ws)
+            spool(ws, set(dids))
         except Exception as exc:
             print("jetstream reconnect: %s" % exc, flush=True)
             time.sleep(min(backoff, 120))
