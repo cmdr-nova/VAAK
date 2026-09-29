@@ -703,10 +703,10 @@ $vaakAdminOnlyActions = [
                     if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
                     require_once __DIR__ . '/ap-inbox.php';
                     $askReplyTo = trim((string) ($askRow['ask_id'] ?? ''));
-                    $posted = ap_local_post_reply($answer, $askReplyTo, (string) ($askRow['asker_actor'] ?? ''), '', false, null, [], 'public', null);
+                    $posted = ap_local_post_reply($answer, '', (string) ($askRow['asker_actor'] ?? ''), '', false, null, [], 'public', null);
                     if (!empty($posted['ok'])) {
                         $now = ap_db_now();
-                        ap_db()->prepare('UPDATE ap_asks SET answered = 1, updated_at = ? WHERE id = ? AND owner_user_id = ?')->execute([$now, $askId, $vaakOwnerId]);
+                        ap_db()->prepare('UPDATE ap_asks SET answered = 1, answer_note_id = ?, updated_at = ? WHERE id = ? AND owner_user_id = ?')->execute([(string) ($posted['note_id'] ?? ''), $now, $askId, $vaakOwnerId]);
                         $notice = 'Answer posted.';
                     } else {
                         $error = (string) ($posted['error'] ?? 'Could not post answer.');
@@ -13882,6 +13882,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
     $content = (string) ($n['content'] ?? '');
     $published = (string) ($n['published'] ?? '');
     $replyTo = (string) ($n['in_reply_to'] ?? '');
+    $askContext = function_exists('ap_ask_answer_for_note') ? ap_ask_answer_for_note($noteId) : null;
     $mediaHtml = '';
     $quoteHtml = '';
     $raw = (string) ($n['raw_create_json'] ?? '');
@@ -14196,6 +14197,12 @@ function admin_render_outbox_card(array $n, string $returnView): void
               </div>
             <?php elseif ($replyTo !== ''): ?>
               <div class="meta" style="margin:.25rem 0 .35rem">↩ parent post</div>
+            <?php endif; ?>
+            <?php if (is_array($askContext)): ?>
+              <div class="ask-container" style="display:flex;gap:.65rem;align-items:flex-start;margin:.5rem 0 .75rem;padding:.65rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+                <?= admin_avatar_img((string) ($askContext['asker_actor'] ?? '')) ?>
+                <div><div class="meta"><b><?= h(actor_handle((string) ($askContext['asker_actor'] ?? 'anonymous'))) ?></b> asked:</div><div class="body" style="margin-top:.25rem;white-space:pre-wrap"><?= h((string) ($askContext['question'] ?? '')) ?></div></div>
+              </div>
             <?php endif; ?>
             <?php
               $ownInner = '';

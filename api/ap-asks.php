@@ -16,16 +16,32 @@ function ap_asks_migrate(): void
             asked_actor TEXT NOT NULL,
             owner_user_id INTEGER NOT NULL DEFAULT 1,
             answered INTEGER NOT NULL DEFAULT 0,
+            answer_note_id TEXT,
             ap_object TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )");
+        // Portable upgrade for databases created before Ask answers were linked
+        // to their resulting public post.
+        try { ap_db()->exec('ALTER TABLE ap_asks ADD COLUMN answer_note_id TEXT'); } catch (Throwable $e) { /* already exists */ }
         ap_db()->exec('CREATE INDEX IF NOT EXISTS idx_ap_asks_owner ON ap_asks(owner_user_id, answered, created_at DESC)');
         ap_db()->exec("CREATE TABLE IF NOT EXISTS ap_wafrn_friend_servers (
             host TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
             note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         )");
     } catch (Throwable $e) { error_log('[asks] migrate: ' . $e->getMessage()); }
+}
+
+function ap_ask_answer_for_note(string $noteId): ?array
+{
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '') return null;
+    try {
+        $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE answer_note_id = ? OR answer_note_id = ? ORDER BY id DESC LIMIT 1');
+        $st->execute([$noteId, $noteId . '/']);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) { return null; }
 }
 
 function ap_wafrn_ask_level_from_actor(array $doc): int

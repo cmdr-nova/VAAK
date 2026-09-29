@@ -1299,6 +1299,7 @@ function ap_cmdr_note_html(array $row, array $create): void
         : '';
     $avatar = htmlspecialchars((string) ($p['icon_url'] ?: '/img/avatar/current-wafrn-avatar.webp'), ENT_QUOTES, 'UTF-8');
     $noteId = htmlspecialchars((string) ($row['id'] ?? ''), ENT_QUOTES, 'UTF-8');
+    $askContext = function_exists('ap_ask_answer_for_note') ? ap_ask_answer_for_note((string) ($row['id'] ?? '')) : null;
 
     $mediaHtml = '';
     $atts = $note['attachment'] ?? [];
@@ -1422,6 +1423,10 @@ function ap_cmdr_note_html(array $row, array $create): void
         echo '<p class="reply-line">↩ reply to <a href="' . $rSafe . '"'
             . ($localParent ? '' : ' target="_blank" rel="noopener noreferrer"') . '>'
             . $label . '</a></p>';
+    }
+    if (is_array($askContext)) {
+        echo '<div class="ask-container" style="display:flex;gap:.65rem;align-items:flex-start;margin:.5rem 0 .75rem;padding:.7rem;border:1px solid #333;border-radius:10px;background:#171717">'
+            . '<div><div class="muted"><strong>' . htmlspecialchars((string) ($askContext['asker_actor'] ?? 'anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</strong> asked:</div><div class="ask-text" style="margin-top:.3rem;white-space:pre-wrap">' . htmlspecialchars((string) ($askContext['question'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div></div></div>';
     }
     if ($cw !== '') {
         echo '<p class="cw"><strong>CW</strong> · ' . htmlspecialchars($cw, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
@@ -2908,6 +2913,7 @@ function ap_cmdr_post_preview_html(array $n): string
     $href = $hrefRaw !== '' ? htmlspecialchars($hrefRaw, ENT_QUOTES, 'UTF-8') : '#';
     $create = json_decode((string) ($n['raw_create_json'] ?? ''), true);
     $obj = (is_array($create) && is_array($create['object'] ?? null)) ? $create['object'] : [];
+    $askContext = function_exists('ap_ask_answer_for_note') ? ap_ask_answer_for_note($id) : null;
     $cw = '';
     if (!empty($obj['summary']) && is_string($obj['summary'])) {
         $cw = trim($obj['summary']);
@@ -3038,6 +3044,12 @@ function ap_cmdr_post_preview_html(array $n): string
             : htmlspecialchars(ap_cmdr_short_url_label($replyTo), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         // Plain text inside outer <a class="post"> — avoid nested anchors
         $replyHtml = '<div class="reply-line">↩ reply to ' . $label . '</div>';
+    }
+    $askHtml = '';
+    if (is_array($askContext)) {
+        $askHtml = '<div class="ask-container" style="margin:.45rem 0 .65rem;padding:.6rem;border:1px solid #333;border-radius:10px;background:#171717">'
+            . '<div class="muted"><strong>' . htmlspecialchars((string) ($askContext['asker_actor'] ?? 'anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</strong> asked:</div>'
+            . '<div class="ask-text" style="margin-top:.25rem;white-space:pre-wrap">' . htmlspecialchars((string) ($askContext['question'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div></div>';
     }
 
     $published = (string) ($n['published'] ?? '');
@@ -3232,6 +3244,7 @@ function ap_cmdr_post_preview_html(array $n): string
         . ($isPinned ? ' aria-label="Pinned post"' : '') . '>';
     $card .= $pinIcon;
     $card .= $replyHtml;
+    $card .= $askHtml;
     if ($content !== '') {
         $card .= '<div class="body">' . $content . '</div>';
     } elseif ($quoteHtml === '' && $pollHtml === '' && $thumb === '' && $linkCardHtml === '') {
