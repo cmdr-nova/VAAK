@@ -17,6 +17,7 @@ const CMDR_ACTOR_ID = 'https://mkultra.monster/users/cmdr_nova';
 const CMDR_PUB = '/etc/mkultra/ap-inbox/cmdr_nova_public.pem';
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-collections.php';
 require_once __DIR__ . '/ap-import-export.php'; // alsoKnownAs / movedTo on actor doc
 require_once __DIR__ . '/ap-link-preview.php';
