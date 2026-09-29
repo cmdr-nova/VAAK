@@ -44,6 +44,62 @@ function ap_ask_answer_for_note(string $noteId): ?array
     } catch (Throwable $e) { return null; }
 }
 
+/**
+ * Resolve the cached identity shown alongside an answered Ask.
+ * Never performs a synchronous remote actor fetch; the normal actor warmers
+ * can fill remote_actors/media caches for the next render.
+ *
+ * @return array{display_name:string,handle:string,avatar:string}
+ */
+function ap_ask_actor_identity(string $actor): array
+{
+    $actor = rtrim(trim($actor), '/');
+    $fallback = defined('AP_REMOTE_AVATAR_FALLBACK')
+        ? AP_REMOTE_AVATAR_FALLBACK
+        : 'https://mkultra.monster/img/avatar/default.webp';
+    if ($actor === '' || !str_starts_with($actor, 'https://')) {
+        return ['display_name' => 'Anonymous', 'handle' => '', 'avatar' => $fallback];
+    }
+    $local = function_exists('ap_local_user_by_actor_id') ? ap_local_user_by_actor_id($actor) : null;
+    if (is_array($local)) {
+        $key = (string) ($local['actor_key'] ?? '');
+        $profile = $key !== '' && function_exists('ap_profile_get') ? ap_profile_get($key) : [];
+        $avatar = function_exists('ap_local_avatar_url')
+            ? ap_local_avatar_url((string) ($profile['icon_url'] ?? ''))
+            : $fallback;
+        return [
+            'display_name' => trim((string) (($profile['name'] ?? '') ?: ($key !== '' ? $key : 'Local user'))),
+            'handle' => $key !== '' ? '@' . $key . '@mkultra.monster' : '',
+            'avatar' => $avatar,
+        ];
+    }
+    $label = function_exists('ap_remote_actor_label')
+        ? ap_remote_actor_label($actor, false)
+        : ['display_name' => '', 'handle' => ''];
+    $row = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actor) : null;
+    $avatar = '';
+    if (function_exists('ap_peer_avatar_override')) {
+        $avatar = (string) (ap_peer_avatar_override($actor) ?? '');
+    }
+    if ($avatar === '' && is_array($row)) {
+        $avatar = (string) ($row['icon_source_url'] ?? '');
+    }
+    if ($avatar === '' && function_exists('ap_remote_media_get')) {
+        $cached = ap_remote_media_get($actor, 'avatar');
+        if (is_array($cached)) {
+            $avatar = (string) ($cached['public_url'] ?? '');
+        }
+    }
+    if (!str_starts_with($avatar, 'https://')) {
+        $avatar = $fallback;
+    }
+    return [
+        'display_name' => trim((string) (($label['display_name'] ?? '') ?: ($label['username'] ?? 'user'))),
+        'handle' => (string) ($label['handle'] ?? ''),
+        'avatar' => $avatar,
+    ];
+}
+
 function ap_wafrn_ask_level_from_actor(array $doc): int
 {
     $v = (int) ($doc['_wafrn_asks'] ?? 0);

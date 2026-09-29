@@ -3053,8 +3053,16 @@ function ap_cmdr_post_preview_html(array $n): string
     }
     $askHtml = '';
     if (is_array($askContext)) {
+        $askerActor = (string) (($askContext['asker_actor'] ?? '') ?: '');
+        $askerIdentity = function_exists('ap_ask_actor_identity')
+            ? ap_ask_actor_identity($askerActor)
+            : ['display_name' => 'Anonymous', 'handle' => '', 'avatar' => 'https://mkultra.monster/img/avatar/default.webp'];
+        $askerName = htmlspecialchars((string) ($askerIdentity['display_name'] ?? 'Anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $askerHandle = htmlspecialchars((string) ($askerIdentity['handle'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $askerAvatar = htmlspecialchars((string) ($askerIdentity['avatar'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $askHtml = '<div class="ask-container" style="margin:.45rem 0 .65rem;padding:.6rem 0;border-bottom:1px solid #333">'
-            . '<div class="muted"><strong>' . htmlspecialchars((string) ($askContext['asker_actor'] ?? 'anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</strong> asked:</div>'
+            . '<div style="display:flex;align-items:center;gap:.5rem"><img src="' . $askerAvatar . '" alt="" width="32" height="32" loading="lazy" referrerpolicy="no-referrer" style="border-radius:50%;object-fit:cover">'
+            . '<div class="muted"><strong>' . $askerName . '</strong>' . ($askerHandle !== '' ? '<br><span style="font-size:.85em">' . $askerHandle . '</span>' : '') . ' asked:</div></div>'
             . '<div class="ask-text" style="margin-top:.25rem;white-space:pre-wrap">' . htmlspecialchars((string) ($askContext['question'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div></div>';
     }
 

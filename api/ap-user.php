@@ -1264,10 +1264,17 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
     $askContext = function_exists('ap_ask_answer_for_note')
         ? ap_ask_answer_for_note((string) ($row['id'] ?? '')) : null;
     if (is_array($askContext)) {
-        $asker = htmlspecialchars((string) (($askContext['asker_actor'] ?? '') ?: 'anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $askerActor = (string) (($askContext['asker_actor'] ?? '') ?: '');
+        $askerIdentity = function_exists('ap_ask_actor_identity')
+            ? ap_ask_actor_identity($askerActor)
+            : ['display_name' => 'Anonymous', 'handle' => '', 'avatar' => 'https://mkultra.monster/img/avatar/default.webp'];
+        $askerName = htmlspecialchars((string) ($askerIdentity['display_name'] ?? 'Anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $askerHandle = htmlspecialchars((string) ($askerIdentity['handle'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $askerAvatar = htmlspecialchars((string) ($askerIdentity['avatar'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $question = htmlspecialchars((string) ($askContext['question'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $html .= '<div class="ask-context" style="margin:0 0 .7rem;padding:.65rem .75rem;border-left:3px solid #777;background:rgba(255,255,255,.035)">'
-            . '<div class="muted"><strong>' . $asker . '</strong> asked:</div>'
+            . '<div style="display:flex;align-items:center;gap:.5rem"><img src="' . $askerAvatar . '" alt="" width="32" height="32" loading="lazy" referrerpolicy="no-referrer" style="border-radius:50%;object-fit:cover">'
+            . '<div class="muted"><strong>' . $askerName . '</strong>' . ($askerHandle !== '' ? '<br><span style="font-size:.85em">' . $askerHandle . '</span>' : '') . ' asked:</div></div>'
             . '<div style="margin-top:.3rem;white-space:pre-wrap">' . $question . '</div></div>';
     }
     if (!empty($note['summary']) && is_string($note['summary'])) {
