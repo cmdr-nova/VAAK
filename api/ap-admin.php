@@ -697,18 +697,19 @@ $vaakAdminOnlyActions = [
                 } elseif (!empty($askRow['answered'])) {
                     $error = 'This Ask has already been answered.';
                 } else {
-                    // Wafrn treats the answer as a normal ActivityPub reply to
-                    // the AskQuestion activity. Keeping the Ask IRI as
-                    // inReplyTo lets compatible servers/thread views associate
-                    // the answer without exposing the private question text.
+                    // Answers are conversational and should appear immediately,
+                    // unlike scheduled posts. Keep the Ask IRI as inReplyTo so
+                    // Wafrn-compatible servers can associate the response.
+                    if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
+                    require_once __DIR__ . '/ap-inbox.php';
                     $askReplyTo = trim((string) ($askRow['ask_id'] ?? ''));
-                    $queued = ap_queue_enqueue($answer, '', false, $askReplyTo, '', '', [], 'public');
-                    if (!empty($queued['ok'])) {
+                    $posted = ap_local_post_reply($answer, $askReplyTo, (string) ($askRow['asker_actor'] ?? ''), '', false, null, [], 'public', null);
+                    if (!empty($posted['ok'])) {
                         $now = ap_db_now();
                         ap_db()->prepare('UPDATE ap_asks SET answered = 1, updated_at = ? WHERE id = ? AND owner_user_id = ?')->execute([$now, $askId, $vaakOwnerId]);
-                        $notice = 'Answer queued for posting.';
+                        $notice = 'Answer posted.';
                     } else {
-                        $error = (string) ($queued['error'] ?? 'Could not queue answer.');
+                        $error = (string) ($posted['error'] ?? 'Could not post answer.');
                     }
                 }
             } catch (Throwable $e) {
