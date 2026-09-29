@@ -3209,7 +3209,7 @@ function ap_cmdr_post_preview_html(array $n): string
     } elseif ($kind === 'poll' || $pollHtml !== '') {
         $badge .= ' · <span class="badge">poll</span>';
     }
-    if ($replyTo !== '' && $quoteUrl === '') {
+    if (!is_array($askContext) && $replyTo !== '' && $quoteUrl === '') {
         $badge .= ' · <span class="badge">reply</span>';
     }
 
