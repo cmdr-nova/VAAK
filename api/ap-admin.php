@@ -702,7 +702,6 @@ $vaakAdminOnlyActions = [
                     // Wafrn-compatible servers can associate the response.
                     if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
                     require_once __DIR__ . '/ap-inbox.php';
-                    $askReplyTo = trim((string) ($askRow['ask_id'] ?? ''));
                     $posted = ap_local_post_reply($answer, '', (string) ($askRow['asker_actor'] ?? ''), '', false, null, [], 'public', null);
                     if (!empty($posted['ok'])) {
                         $now = ap_db_now();
@@ -14199,7 +14198,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
               <div class="meta" style="margin:.25rem 0 .35rem">↩ parent post</div>
             <?php endif; ?>
             <?php if (is_array($askContext)): ?>
-              <div class="ask-container" style="display:flex;gap:.65rem;align-items:flex-start;margin:.5rem 0 .75rem;padding:.65rem;border:1px solid var(--border);border-radius:10px;background:var(--panel-2)">
+              <div class="ask-container" style="display:flex;gap:.65rem;align-items:flex-start;margin:.5rem 0 .75rem;padding:.65rem 0;border-bottom:1px solid var(--border)">
                 <?= admin_avatar_img((string) ($askContext['asker_actor'] ?? '')) ?>
                 <div><div class="meta"><b><?= h(actor_handle((string) ($askContext['asker_actor'] ?? 'anonymous'))) ?></b> asked:</div><div class="body" style="margin-top:.25rem;white-space:pre-wrap"><?= h((string) ($askContext['question'] ?? '')) ?></div></div>
               </div>
@@ -18221,6 +18220,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .remote-profile-feed > article.tweet:hover,
     .remote-profile-feed > .remote-profile-posts > article.tweet:hover { background: transparent; }
+    .remote-profile-posts > article.tweet,
+    .asks-list > article.tweet {
+      background: transparent; border: 0; border-bottom: 1px solid var(--border);
+      border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
+    }
+    .remote-profile-posts > article.tweet:hover,
+    .asks-list > article.tweet:hover { background: transparent; }
+    .asks-list > article.tweet:last-child { border-bottom: 0; }
     .remote-profile-tabs { display:flex; gap:.35rem; flex-wrap:wrap; margin:1.2rem 0 .5rem; border-bottom:1px solid var(--border); }
     .remote-profile-tabs a { color:var(--muted); text-decoration:none; padding:.65rem .8rem; border-bottom:2px solid transparent; }
     .remote-profile-tabs a.is-active { color:var(--text); border-color:var(--primary); }
@@ -19992,6 +19999,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php $askRows = []; try { $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 100'); $st->execute([$vaakOwnerId]); $askRows = $st->fetchAll() ?: []; } catch (Throwable $e) {} ?>
         <h2 style="font-size:1.05rem;margin:0 0 .5rem">Asks</h2><p class="meta">Wafrn-compatible questions received by this account. They are private until you answer them in a post.</p>
         <?php if (!$askRows): ?><div class="empty">No Asks yet.</div><?php endif; ?>
+        <div class="asks-list">
         <?php foreach ($askRows as $ask): ?>
           <article class="tweet">
             <div class="meta">From <?= h((string) ($ask['asker_actor'] ?? 'anonymous')) ?> · <?= h((string) ($ask['created_at'] ?? '')) ?><?= !empty($ask['answered']) ? ' · answered' : '' ?></div>
@@ -20007,6 +20015,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           </article>
         <?php endforeach; ?>
+        </div>
 
       <?php elseif ($view === 'friend_servers'): ?>
         <?php
