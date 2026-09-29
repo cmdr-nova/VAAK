@@ -2770,6 +2770,9 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'downranking_enabled' => array_key_exists('downranking_enabled', $row)
             ? !empty($row['downranking_enabled'])
             : true,
+        'asks_enabled' => array_key_exists('asks_enabled', $row)
+            ? !empty($row['asks_enabled'])
+            : true,
         'updated_at' => $row['updated_at'] ?? null,
     ];
     if (function_exists('ap_redis_json_set')) ap_redis_json_set($profileCacheKey, $profile, 60);
