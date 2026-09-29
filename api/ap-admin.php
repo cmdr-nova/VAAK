@@ -12210,7 +12210,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
             . ($isBlocked ? 'Unblock for me' : 'Block for me') . '</button>'
             . '</form>';
         } else {
-            $menu .= '<span class="menu-action" aria-disabled="true" title="Administrators cannot be blocked">Admin account — cannot be blocked</span>';
+            $menu .= '<span class="menu-action menu-action-disabled" aria-disabled="true" title="Administrators cannot be blocked">Admin account — cannot be blocked</span>';
         }
         $menu .= '<form method="post" action="?view=' . h($returnView) . '">'
             . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
@@ -18404,6 +18404,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       text-decoration: none; white-space: nowrap;
     }
     .post-action-menu__body .menu-action:hover { background: #242424; color: var(--primary); }
+    .post-action-menu__body .menu-action-disabled {
+      white-space: normal; overflow-wrap: anywhere; cursor: not-allowed;
+      color: var(--muted); line-height: 1.25;
+    }
+    .post-action-menu__body .menu-action-disabled:hover { background: transparent; color: var(--muted); }
     .post-action-menu__body .menu-action.danger { color: var(--danger); }
     .tweet.tweet-focus {
       outline: 2px solid var(--primary);

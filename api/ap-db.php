@@ -2603,6 +2603,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
 function ap_profile_badge_catalog(): array
 {
     return [
+        'admin' => ['label' => 'Admin', 'emoji' => '🛡️'],
         'rainbow' => ['label' => 'Rainbow pride', 'emoji' => '🏳️‍🌈'],
         'trans' => ['label' => 'Trans pride', 'emoji' => '🏳️‍⚧️'],
         'bi' => ['label' => 'Bisexual pride', 'emoji' => '🩷💜💙'],
