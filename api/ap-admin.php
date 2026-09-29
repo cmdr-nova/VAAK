@@ -681,6 +681,21 @@ $vaakAdminOnlyActions = [
         $view = 'remote_profile';
         $_GET['actor'] = $target;
         $_GET['from'] = (string) ($_POST['return_from'] ?? 'home');
+    } elseif ($action === 'ask_ignore') {
+        $askId = (int) ($_POST['ask_id'] ?? 0);
+        $view = 'asks';
+        if ($askId < 1) {
+            $error = 'Ask not found.';
+        } else {
+            try {
+                $st = ap_db()->prepare('DELETE FROM ap_asks WHERE id = ? AND owner_user_id = ? AND asked_actor = ? AND answered = 0');
+                $st->execute([$askId, $vaakOwnerId, $vaakActorId]);
+                $notice = $st->rowCount() > 0 ? 'Ask ignored.' : 'Ask not found or already answered.';
+            } catch (Throwable $e) {
+                error_log('[ap-admin] ask ignore: ' . $e->getMessage());
+                $error = 'Could not ignore this Ask right now.';
+            }
+        }
     } elseif ($action === 'ask_answer') {
         $askId = (int) ($_POST['ask_id'] ?? 0);
         $answer = trim((string) ($_POST['content'] ?? ''));
@@ -20052,6 +20067,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <input type="hidden" name="ask_id" value="<?= (int) ($ask['id'] ?? 0) ?>">
                 <textarea name="content" maxlength="2000" required placeholder="Write your answer…" style="min-height:5rem"></textarea>
                 <div class="composer-actions"><span class="meta">Your answer will be posted publicly.</span><button class="btn btn-primary" type="submit">Answer &amp; post</button></div>
+              </form>
+              <form method="post" action="?view=asks" style="margin-top:.4rem">
+                <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                <input type="hidden" name="action" value="ask_ignore">
+                <input type="hidden" name="ask_id" value="<?= (int) ($ask['id'] ?? 0) ?>">
+                <button class="btn btn-ghost" type="submit">Ignore / delete</button>
               </form>
             <?php endif; ?>
           </article>

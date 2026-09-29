@@ -98,6 +98,7 @@ $stats = [
     'cold_archive_deleted' => 0,
     'signal_rows_deleted' => 0,
     'downrank_suppression_deleted' => 0,
+    'asks_deleted' => 0,
     'relationship_sets_warmed' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
@@ -199,6 +200,28 @@ try {
     }
 
     if (!$vacuumOnly) {
+        // Unanswered Asks are intentionally temporary. They are private inbox
+        // requests, not permanent posts, and expire 48 hours after receipt.
+        try {
+            $askCutoff = $nowUtc->modify('-48 hours')->format('c');
+            $st = $db->prepare('SELECT COUNT(*) FROM ap_asks WHERE answered = 0 AND created_at < ?');
+            $st->execute([$askCutoff]);
+            $n = (int) $st->fetchColumn();
+            if ($dryRun) {
+                $log("would_delete expired unanswered Asks count={$n} older_than={$askCutoff}");
+            } elseif ($n > 0) {
+                $del = $db->prepare('DELETE FROM ap_asks WHERE answered = 0 AND created_at < ?');
+                $del->execute([$askCutoff]);
+                $stats['asks_deleted'] = $del->rowCount();
+                $log("deleted expired unanswered Asks count={$stats['asks_deleted']} older_than={$askCutoff}");
+            } else {
+                $log("unanswered Ask cleanup: nothing older than {$askCutoff}");
+            }
+        } catch (Throwable $e) {
+            // Older installations may not have the optional Ask table yet.
+            $log('Ask cleanup skipped: ' . $e->getMessage());
+        }
+
         try {
             ap_maintain_ensure_cold_archive($db, $isPostgres);
             $archiveCutoff = $nowUtc->modify('-' . $archiveDays . ' days')->format('c');
