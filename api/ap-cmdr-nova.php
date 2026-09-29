@@ -1413,7 +1413,7 @@ function ap_cmdr_note_html(array $row, array $create): void
         : '';
     echo '<div><h1 style="font-size:1.1rem">' . $name . $vanityBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0"><a href="/users/cmdr_nova">@cmdr_nova@mkultra.monster</a></p></div></div>';
-    if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+    if (!is_array($askContext) && $replyTo !== '' && str_starts_with($replyTo, 'https://')) {
         $rSnippet = ap_cmdr_object_snippet($replyTo, 140);
         $rSafe = htmlspecialchars($replyTo, ENT_QUOTES, 'UTF-8');
         $label = $rSnippet !== ''
@@ -3038,7 +3038,7 @@ function ap_cmdr_post_preview_html(array $n): string
         $replyTo = rtrim($obj['inReplyTo'], '/');
     }
     $replyHtml = '';
-    if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+    if (!is_array($askContext) && $replyTo !== '' && str_starts_with($replyTo, 'https://')) {
         $rSnippet = ap_cmdr_object_snippet($replyTo, 100);
         $label = $rSnippet !== ''
             ? htmlspecialchars($rSnippet, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')

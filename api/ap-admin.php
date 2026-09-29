@@ -14190,7 +14190,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 <div class="meta">mkultra.monster<?php if ($ownVisMeta['key'] !== 'public'): ?> <span class="tag" title="Audience"><?= h($ownVisLabel) ?></span><?php endif; ?></div>
               </div>
             </div>
-            <?php if ($replyTo !== '' && str_starts_with($replyTo, 'https://')): ?>
+            <?php if (!is_array($askContext) && $replyTo !== '' && str_starts_with($replyTo, 'https://')): ?>
               <div class="meta" style="margin:.25rem 0 .35rem">
                 ↩ reply to
                 <a href="<?= h(admin_status_href($replyTo, $returnView)) ?>">parent post</a>
