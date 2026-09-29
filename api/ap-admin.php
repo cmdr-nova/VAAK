@@ -18430,6 +18430,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       position: fixed; z-index: 80; min-width: 220px; max-width: min(320px, 92vw);
       background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
       box-shadow: 0 12px 40px rgba(0,0,0,.45); padding: .65rem .7rem; color: var(--text);
+      overflow-y: auto; overscroll-behavior: contain;
     }
     .bm-folder-popover h4 { margin: 0 0 .45rem; font-size: .85rem; }
     .bm-folder-popover label {
@@ -26247,13 +26248,21 @@ window.apAdminToast = function (msg, isErr) {
   function positionFolderPopover(pop, anchorBtn) {
     const rect = anchorBtn.getBoundingClientRect();
     const gap = 6;
+    const pad = 8;
     const width = pop.offsetWidth || 240;
-    const height = pop.offsetHeight || 200;
-    const left = Math.min(window.innerWidth - width - 8, Math.max(8, rect.left));
+    const viewportHeight = window.innerHeight;
+    const spaceAbove = Math.max(0, rect.top - gap - pad);
+    const spaceBelow = Math.max(0, viewportHeight - rect.bottom - gap - pad);
+    const naturalHeight = Math.max(0, pop.scrollHeight || pop.offsetHeight || 200);
+    const useAbove = spaceBelow < naturalHeight && spaceAbove > spaceBelow;
+    const available = Math.max(120, Math.max(spaceAbove, spaceBelow));
+    pop.style.maxHeight = Math.min(naturalHeight, available) + 'px';
+    const height = Math.min(naturalHeight, available);
+    const left = Math.min(window.innerWidth - width - pad, Math.max(pad, rect.left));
     const below = rect.bottom + gap;
-    const top = below + height <= window.innerHeight - 8
-      ? below
-      : Math.max(8, rect.top - height - gap);
+    const top = useAbove
+      ? Math.max(pad, rect.top - height - gap)
+      : Math.min(viewportHeight - pad - height, below);
     pop.style.left = left + 'px';
     pop.style.top = top + 'px';
   }
