@@ -144,6 +144,7 @@ function ap_publish_delivery_execute(array $row, array $payload): array
     if (empty($payload['bsky_done'])) {
         require_once __DIR__ . '/ap-bsky.php';
         $bsky = null;
+        $askContext = null;
         // Bluesky has no native polls — Fediverse Question posts stay off ATProto.
         if (!empty($payload['skip_bsky'])) {
             $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only'];
@@ -161,13 +162,17 @@ function ap_publish_delivery_execute(array $row, array $payload): array
                     $bskyContent = ap_ask_bluesky_mirror_text($bskyContent, $askContext);
                 }
             }
+            // The Ask itself is Fediverse-only, so it cannot be a resolvable
+            // Bluesky reply parent. Mirror the paired question/answer as a
+            // standalone Bluesky post instead.
+            $bskyReplyTo = is_array($askContext) ? null : ($replyTo !== '' ? $replyTo : null);
             $bsky = ap_bsky_crosspost_status(
                 $owner,
                 $bskyContent,
                 $visibility,
                 array_values(array_map('intval', $payload['media_local_ids'] ?? [])),
                 (string) ($payload['spoiler_text'] ?? ''),
-                $replyTo !== '' ? $replyTo : null,
+                $bskyReplyTo,
                 $quoteId !== '' ? $quoteId : null,
                 (string) $row['note_id']
             );
