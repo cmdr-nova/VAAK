@@ -5549,6 +5549,28 @@ function ap_publish_status_text(
             ? ap_note_interaction_policy_for_actor((string) (basename(rtrim($actor, '/')) ?: 'cmdr_nova'))
             : ap_note_interaction_policy_public(),
     ];
+    // Wafrn associates an answer with its Ask through an AskQuestion tag on
+    // the Note. inReplyTo alone is rendered as an ordinary standalone reply.
+    // Keep the representation as metadata (rather than prepending it to the
+    // visible answer) so non-Wafrn clients do not show the question twice.
+    $askContext = null;
+    if ($inReplyTo !== '' && function_exists('ap_ask_by_id')) {
+        $askContext = ap_ask_by_id($inReplyTo);
+    }
+    if (is_array($askContext)) {
+        $askQuestion = trim((string) ($askContext['question'] ?? ''));
+        $askerActor = rtrim(trim((string) ($askContext['asker_actor'] ?? '')), '/');
+        if ($askQuestion !== '' && $askerActor !== '') {
+            $askRepresentation = '<p><a href="' . htmlspecialchars((string) ($askContext['ask_id'] ?? $inReplyTo), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">asked</a></p><blockquote>'
+                . htmlspecialchars($askQuestion, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote>';
+            $note['tag'][] = [
+                'type' => 'AskQuestion',
+                'name' => $askQuestion,
+                'representation' => $askRepresentation,
+                'actor' => $askerActor,
+            ];
+        }
+    }
     if ($spoilerText !== '') {
         // ActivityPub / Mastodon CW text
         $note['summary'] = $spoilerText;
