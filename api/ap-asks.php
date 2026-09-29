@@ -134,6 +134,33 @@ function ap_wafrn_ask_level_from_actor(array $doc): int
     return in_array($v, [1, 2], true) ? $v : 0;
 }
 
+/**
+ * Fetch a Wafrn actor, tolerating the common /users/name form used by
+ * Mastodon-style search results. Wafrn's canonical actor path is
+ * /fediverse/blog/name, and that is where its _wafrn_asks marker lives.
+ *
+ * @return array{actor:string,document:array<string,mixed>}|null
+ */
+function ap_wafrn_ask_actor_document(string $targetActor): ?array
+{
+    $targetActor = rtrim(trim($targetActor), '/');
+    if ($targetActor === '' || !str_starts_with($targetActor, 'https://')) return null;
+    $candidates = [$targetActor];
+    $parts = parse_url($targetActor);
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    $path = trim((string) ($parts['path'] ?? ''), '/');
+    if ($host !== '' && preg_match('~^(?:users|@)/([^/]+)$~i', $path, $m)) {
+        $candidates[] = 'https://' . $host . '/fediverse/blog/' . rawurlencode($m[1]);
+    }
+    foreach (array_values(array_unique($candidates)) as $candidate) {
+        $doc = ap_fetch_as2_object($candidate);
+        if (!is_array($doc) || ap_wafrn_ask_level_from_actor($doc) === 0) continue;
+        $canonical = rtrim((string) ($doc['id'] ?? $candidate), '/');
+        return ['actor' => $canonical !== '' ? $canonical : $candidate, 'document' => $doc];
+    }
+    return null;
+}
+
 function ap_wafrn_actor_host_known(string $actor): bool
 {
     $host = strtolower((string) (parse_url($actor, PHP_URL_HOST) ?: ''));
@@ -173,13 +200,17 @@ function ap_ask_send(string $targetActor, string $question, int $ownerUserId): a
     $question = trim(strip_tags($question));
     if (!str_starts_with($targetActor, 'https://') || $question === '') return ['ok'=>false,'error'=>'Actor and question are required.'];
     if (strlen($question) > 10240) $question = mb_substr($question, 0, 10240);
-    $doc = ap_fetch_as2_object($targetActor);
-    if (!is_array($doc) || ap_wafrn_ask_level_from_actor($doc) === 0) return ['ok'=>false,'error'=>'This profile does not advertise Wafrn Asks.'];
+    $actorDoc = ap_wafrn_ask_actor_document($targetActor);
+    if (!is_array($actorDoc)) return ['ok'=>false,'error'=>'This profile does not advertise Wafrn Asks.'];
+    $targetActor = (string) ($actorDoc['actor'] ?? $targetActor);
+    $doc = is_array($actorDoc['document'] ?? null) ? $actorDoc['document'] : [];
     $inbox = (string) (($doc['endpoints']['sharedInbox'] ?? '') ?: ($doc['inbox'] ?? ''));
     if ($inbox === '') return ['ok'=>false,'error'=>'That profile has no reachable inbox.'];
     $owner = ap_db_owner_actor_id_for_user_id($ownerUserId);
     $actor = rtrim($owner, '/');
     $id = 'https://mkultra.monster/fediverse/asks/' . bin2hex(random_bytes(12));
+    // VAAK never sends anonymous Asks: the authenticated local actor is always
+    // included, regardless of the recipient's Wafrn level marker.
     $activity = ['@context'=>['https://www.w3.org/ns/activitystreams',['AskQuestion'=>'https://wafrn.net/ns#AskQuestion']], 'id'=>$id, 'type'=>'AskQuestion', 'actor'=>$actor, 'object'=>$targetActor, 'target'=>$targetActor, 'content'=>$question, 'to'=>[$targetActor]];
     $ok = ap_deliver_signed_json($inbox, $activity, ap_local_key_id(), ap_local_priv_path(), 8.0);
     if (!$ok) return ['ok'=>false,'error'=>'The Ask could not be delivered.'];

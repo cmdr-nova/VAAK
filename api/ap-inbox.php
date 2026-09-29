@@ -5581,7 +5581,12 @@ function ap_publish_status_text(
         // ActivityPub / Mastodon CW text
         $note['summary'] = $spoilerText;
     }
-    if ($inReplyTo !== '') {
+    // Wafrn associates an answer with its AskQuestion tag. Pointing
+    // inReplyTo at the standalone /fediverse/asks URL makes Wafrn try to
+    // ingest that non-Post object as a normal thread parent, which can result
+    // in a missing answer or a failed inbox job. Keep inReplyTo for ordinary
+    // replies, but omit it for Ask answers.
+    if ($inReplyTo !== '' && !is_array($askContext)) {
         $note['inReplyTo'] = $inReplyTo;
     }
     if ($as2MentionTags !== []) {
