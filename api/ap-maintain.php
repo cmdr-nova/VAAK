@@ -97,6 +97,7 @@ $stats = [
     'queue_rows_deleted' => 0,
     'cold_archive_deleted' => 0,
     'signal_rows_deleted' => 0,
+    'downrank_suppression_deleted' => 0,
     'relationship_sets_warmed' => 0,
     'analyzed' => 0,
     'vacuumed' => 0,
@@ -653,6 +654,25 @@ try {
         } catch (Throwable $e) {
             $stats['errors']++;
             $log('link_preview purge error: ' . $e->getMessage());
+        }
+
+        // --- Expired temporary Home downranking signals ---
+        try {
+            $nowIso = $nowUtc->format('c');
+            $st = $db->prepare('SELECT COUNT(*) FROM ap_home_suppression WHERE suppressed_until < ?');
+            $st->execute([$nowIso]);
+            $n = (int) $st->fetchColumn();
+            if ($n > 0 && !$dryRun) {
+                $del = $db->prepare('DELETE FROM ap_home_suppression WHERE suppressed_until < ?');
+                $del->execute([$nowIso]);
+                $stats['downrank_suppression_deleted'] = $del->rowCount();
+                $log('deleted expired home downranking signals count=' . $stats['downrank_suppression_deleted']);
+            } else {
+                $log(($dryRun ? 'would_delete' : 'downranking cleanup') . ' expired home downranking signals count=' . $n);
+            }
+        } catch (Throwable $e) {
+            // Older installations may not have the optional table yet.
+            $log('downranking cleanup skipped: ' . $e->getMessage());
         }
     }
 

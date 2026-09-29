@@ -1,0 +1,2 @@
+ALTER TABLE actor_profile
+    ADD COLUMN IF NOT EXISTS downranking_enabled INTEGER NOT NULL DEFAULT 1;

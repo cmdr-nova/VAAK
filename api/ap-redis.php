@@ -439,12 +439,18 @@ function ap_timing_record(string $name, float $milliseconds): void
             $redis->hSet($key, 'max_ms', sprintf('%.3f', $milliseconds));
         }
         $redis->expire($key, 86400);
+        // Keep a small rolling sample so operators can see tail latency.
+        // This is bounded and contains timing only—never request data.
+        $sampleKey = $key . ':samples';
+        $redis->lPush($sampleKey, sprintf('%.3f', $milliseconds));
+        $redis->lTrim($sampleKey, 0, 255);
+        $redis->expire($sampleKey, 86400);
     } catch (Throwable $e) {
         // Telemetry must never affect request execution.
     }
 }
 
-/** @return array<string,array{count:int,total_ms:float,max_ms:float}> */
+/** @return array<string,array{count:int,total_ms:float,max_ms:float,p50_ms?:float,p95_ms?:float,p99_ms?:float}> */
 function ap_redis_timing_snapshot(): array
 {
     $redis = ap_redis_client('cache');
@@ -455,13 +461,28 @@ function ap_redis_timing_snapshot(): array
         while (($keys = $redis->scan($it, 'vaak:timing:v1:*', 100)) !== false) {
             foreach ($keys as $key) {
                 $name = substr((string) $key, strlen('vaak:timing:v1:'));
+                if ($name === '' || str_ends_with($name, ':samples')) {
+                    continue;
+                }
                 $row = $redis->hGetAll($key);
                 if ($name !== '' && is_array($row)) {
-                    $out[$name] = [
+                    $metric = [
                         'count' => (int) ($row['count'] ?? 0),
                         'total_ms' => (float) ($row['total_ms'] ?? 0),
                         'max_ms' => (float) ($row['max_ms'] ?? 0),
                     ];
+                    $samples = array_map('floatval', $redis->lRange((string) $key . ':samples', 0, 255) ?: []);
+                    if ($samples !== []) {
+                        sort($samples, SORT_NUMERIC);
+                        $quantile = static function (float $q) use ($samples): float {
+                            $index = (int) ceil($q * count($samples)) - 1;
+                            return (float) $samples[max(0, min(count($samples) - 1, $index))];
+                        };
+                        $metric['p50_ms'] = round($quantile(0.50), 3);
+                        $metric['p95_ms'] = round($quantile(0.95), 3);
+                        $metric['p99_ms'] = round($quantile(0.99), 3);
+                    }
+                    $out[$name] = $metric;
                 }
             }
             if ($it === 0) break;

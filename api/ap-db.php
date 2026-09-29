@@ -517,7 +517,7 @@ SQL);
         'ap_collection_memberships', 'ap_collections', 'ap_drafts', 'ap_featured_accounts',
         'ap_instance_docs', 'ap_instance_rules', 'ap_invite_codes', 'ap_muted_words',
         'ap_mutes', 'ap_deprioritized_actors', 'ap_post_queue', 'ap_action_queue', 'ap_publish_delivery_queue', 'ap_post_subscriptions', 'ap_queue_settings',
-        'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges',
+        'ap_relays', 'ap_reports', 'ap_search_docs', 'ap_search_meta', 'ap_sl_challenges', 'ap_home_downrank_terms', 'ap_home_downrank_audit',
         'ap_sl_links', 'ap_wow_links', 'ap_account_links', 'ap_user_blocks', 'ap_users', 'ap_password_resets', 'app_auth', 'direct_messages',
         'events', 'followers', 'following', 'ap_follow_requests', 'link_preview_cards', 'masto_account_actors',
         'masto_bookmarks', 'masto_favourites', 'masto_followed_tags', 'masto_list_accounts',
@@ -636,6 +636,22 @@ SQL);
         }
     } catch (Throwable $e) {
         error_log('[ap-db] automated profile column not provisioned: ' . $e->getMessage());
+    }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'algorithm_enabled'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN algorithm_enabled INTEGER NOT NULL DEFAULT 1');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] algorithm preference column not provisioned: ' . $e->getMessage());
+    }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'downranking_enabled'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN downranking_enabled INTEGER NOT NULL DEFAULT 1');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] downranking preference column not provisioned: ' . $e->getMessage());
     }
     foreach (['reply_policy', 'quote_policy'] as $policyColumn) {
         try {
@@ -918,8 +934,45 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     profile_badges TEXT NOT NULL DEFAULT '[]',
     hide_profile_replies INTEGER NOT NULL DEFAULT 0,
     hide_profile_boosts INTEGER NOT NULL DEFAULT 0,
+    algorithm_enabled INTEGER NOT NULL DEFAULT 1,
+    downranking_enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ap_home_suppression (
+    owner_user_id INTEGER NOT NULL,
+    actor_id TEXT NOT NULL,
+    score INTEGER NOT NULL DEFAULT 0,
+    categories_json TEXT NOT NULL DEFAULT '[]',
+    suppressed_until TEXT NOT NULL,
+    last_object_id TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (owner_user_id, actor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ap_home_suppression_until
+    ON ap_home_suppression(owner_user_id, suppressed_until);
+CREATE TABLE IF NOT EXISTS ap_home_downrank_terms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phrase TEXT NOT NULL UNIQUE,
+    category TEXT NOT NULL DEFAULT 'custom',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_home_downrank_terms_enabled
+    ON ap_home_downrank_terms(enabled, category, phrase);
+CREATE TABLE IF NOT EXISTS ap_home_downrank_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_user_id INTEGER NOT NULL DEFAULT 0,
+    admin_actor TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL DEFAULT '',
+    term_id INTEGER NOT NULL DEFAULT 0,
+    phrase TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ap_home_downrank_audit_created
+    ON ap_home_downrank_audit(created_at DESC, id DESC);
 SQL);
 
     // Additive column for display-only remote media URLs (never bytes)
@@ -980,6 +1033,12 @@ SQL);
     }
     if (!in_array('hide_profile_boosts', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN hide_profile_boosts INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('algorithm_enabled', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN algorithm_enabled INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!in_array('downranking_enabled', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN downranking_enabled INTEGER NOT NULL DEFAULT 1');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -2530,6 +2589,8 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'profile_badges' => [],
         'hide_profile_replies' => false,
         'hide_profile_boosts' => false,
+        'algorithm_enabled' => true,
+        'downranking_enabled' => true,
         'updated_at' => null,
     ];
 }
@@ -2663,6 +2724,12 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'hide_profile_boosts' => array_key_exists('hide_profile_boosts', $row)
             ? !empty($row['hide_profile_boosts'])
             : false,
+        'algorithm_enabled' => array_key_exists('algorithm_enabled', $row)
+            ? !empty($row['algorithm_enabled'])
+            : true,
+        'downranking_enabled' => array_key_exists('downranking_enabled', $row)
+            ? !empty($row['downranking_enabled'])
+            : true,
         'updated_at' => $row['updated_at'] ?? null,
     ];
     if (function_exists('ap_redis_json_set')) ap_redis_json_set($profileCacheKey, $profile, 60);
@@ -2747,7 +2814,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool,algorithm_enabled?:bool,downranking_enabled?:bool} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -2902,10 +2969,16 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $hideProfileBoosts = array_key_exists('hide_profile_boosts', $fields)
         ? (!empty($fields['hide_profile_boosts']) ? 1 : 0)
         : (!empty($existingProfile['hide_profile_boosts']) ? 1 : 0);
+    $algorithmEnabled = array_key_exists('algorithm_enabled', $fields)
+        ? (!empty($fields['algorithm_enabled']) ? 1 : 0)
+        : (!empty($existingProfile['algorithm_enabled']) ? 1 : 0);
+    $downrankingEnabled = array_key_exists('downranking_enabled', $fields)
+        ? (!empty($fields['downranking_enabled']) ? 1 : 0)
+        : (!empty($existingProfile['downranking_enabled']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -2928,6 +3001,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            profile_badges = excluded.profile_badges,
            hide_profile_replies = excluded.hide_profile_replies,
            hide_profile_boosts = excluded.hide_profile_boosts,
+           algorithm_enabled = excluded.algorithm_enabled,
+           downranking_enabled = excluded.downranking_enabled,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -2953,6 +3028,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         json_encode($profileBadges, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
         $hideProfileReplies,
         $hideProfileBoosts,
+        $algorithmEnabled,
+        $downrankingEnabled,
         ap_db_now(),
     ]);
 

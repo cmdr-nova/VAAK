@@ -899,9 +899,20 @@ function ap_remote_media_download(string $url, float $timeoutSec = 4.0): array
     if (!is_string($host) || $host === '') {
         return ['ok' => false, 'error' => 'Bad host'];
     }
+    $providerCircuit = 'media:' . strtolower($host);
+    if (function_exists('ap_provider_circuit_allow')
+        && !ap_provider_circuit_allow($providerCircuit)) {
+        return ['ok' => false, 'error' => 'Remote media host temporarily unavailable', 'circuit_open' => true];
+    }
+    $fail = static function (string $message, bool $trip = true) use ($providerCircuit): array {
+        if ($trip && function_exists('ap_provider_circuit_failure')) {
+            ap_provider_circuit_failure($providerCircuit, 45);
+        }
+        return ['ok' => false, 'error' => $message];
+    };
     // Reuse inbox SSRF guard when available
     if (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($host)) {
-        return ['ok' => false, 'error' => 'Host not public'];
+        return $fail('Host not public');
     }
     $timeoutSec = max(1.0, min(10.0, $timeoutSec));
     $ctx = stream_context_create([
@@ -919,14 +930,16 @@ function ap_remote_media_download(string $url, float $timeoutSec = 4.0): array
     ]);
     $body = @file_get_contents($url, false, $ctx, 0, 2 * 1024 * 1024 + 1);
     if (!is_string($body) || $body === '') {
-        return ['ok' => false, 'error' => 'Download failed'];
+        return $fail('Download failed');
     }
     if (strlen($body) > 2 * 1024 * 1024) {
-        return ['ok' => false, 'error' => 'Remote media too large'];
+        return $fail('Remote media too large', false);
     }
     $statusLine = $http_response_header[0] ?? '';
     if (!is_string($statusLine) || !preg_match('/\s200\s/', $statusLine)) {
-        return ['ok' => false, 'error' => 'Remote media HTTP ' . trim($statusLine)];
+        preg_match('/\s(\d{3})\s/', (string) $statusLine, $statusMatch);
+        $statusCode = (int) ($statusMatch[1] ?? 0);
+        return $fail('Remote media HTTP ' . trim($statusLine), $statusCode === 0 || $statusCode >= 500 || $statusCode === 429);
     }
     $ctype = 'application/octet-stream';
     foreach ($http_response_header as $h) {
@@ -940,7 +953,10 @@ function ap_remote_media_download(string $url, float $timeoutSec = 4.0): array
     $sniff = strtolower($sniff);
     $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
     if (!in_array($sniff, $allowed, true)) {
-        return ['ok' => false, 'error' => 'Unsupported image type (' . $sniff . ')'];
+        return $fail('Unsupported image type (' . $sniff . ')', false);
+    }
+    if (function_exists('ap_provider_circuit_success')) {
+        ap_provider_circuit_success($providerCircuit);
     }
     return ['ok' => true, 'body' => $body, 'content_type' => $sniff];
 }
@@ -954,6 +970,17 @@ function ap_remote_post_media_download(string $url, float $timeoutSec = 6.0): ar
     if (!is_string($host) || $host === '' || (function_exists('ap_host_resolves_public') && !ap_host_resolves_public($host))) {
         return ['ok' => false, 'error' => 'Host not public'];
     }
+    $providerCircuit = 'media:' . strtolower($host);
+    if (function_exists('ap_provider_circuit_allow')
+        && !ap_provider_circuit_allow($providerCircuit)) {
+        return ['ok' => false, 'error' => 'Remote media host temporarily unavailable', 'circuit_open' => true];
+    }
+    $fail = static function (string $message, bool $trip = true) use ($providerCircuit): array {
+        if ($trip && function_exists('ap_provider_circuit_failure')) {
+            ap_provider_circuit_failure($providerCircuit, 45);
+        }
+        return ['ok' => false, 'error' => $message];
+    };
     $ctx = stream_context_create([
         'http' => [
             'method' => 'GET', 'timeout' => max(1.0, min(15.0, $timeoutSec)),
@@ -964,16 +991,24 @@ function ap_remote_post_media_download(string $url, float $timeoutSec = 6.0): ar
         'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
     ]);
     $body = @file_get_contents($url, false, $ctx, 0, 8 * 1024 * 1024 + 1);
-    if (!is_string($body) || $body === '' || strlen($body) > 8 * 1024 * 1024) {
-        return ['ok' => false, 'error' => 'Remote image too large or unavailable'];
+    if (!is_string($body) || $body === '') {
+        return $fail('Remote image too large or unavailable');
+    }
+    if (strlen($body) > 8 * 1024 * 1024) {
+        return $fail('Remote image too large or unavailable', false);
     }
     $statusLine = $http_response_header[0] ?? '';
     if (!is_string($statusLine) || !preg_match('/\s200\s/', $statusLine)) {
-        return ['ok' => false, 'error' => 'Remote media HTTP ' . trim((string) $statusLine)];
+        preg_match('/\s(\d{3})\s/', (string) $statusLine, $statusMatch);
+        $statusCode = (int) ($statusMatch[1] ?? 0);
+        return $fail('Remote media HTTP ' . trim((string) $statusLine), $statusCode === 0 || $statusCode >= 500 || $statusCode === 429);
     }
     $sniff = strtolower((string) ((new finfo(FILEINFO_MIME_TYPE))->buffer($body) ?: ''));
     if (!in_array($sniff, ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/avif'], true)) {
-        return ['ok' => false, 'error' => 'Unsupported image type'];
+        return $fail('Unsupported image type', false);
+    }
+    if (function_exists('ap_provider_circuit_success')) {
+        ap_provider_circuit_success($providerCircuit);
     }
     return ['ok' => true, 'body' => $body, 'content_type' => $sniff];
 }

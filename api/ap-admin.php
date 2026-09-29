@@ -15,6 +15,11 @@ if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
 }
 header('Cache-Control: no-store');
 header('X-Robots-Tag: noindex, nofollow');
+$vaakCorrelationId = trim((string) ($_SERVER['HTTP_X_REQUEST_ID'] ?? ''));
+if ($vaakCorrelationId === '' || !preg_match('/^[A-Za-z0-9._:-]{8,96}$/', $vaakCorrelationId)) {
+    $vaakCorrelationId = bin2hex(random_bytes(8));
+}
+header('X-VAAK-Request-ID: ' . $vaakCorrelationId);
 
 require_once __DIR__ . '/ap-db.php';
 
@@ -209,7 +214,7 @@ if ($view === 'gallery' || $view === 'vakktok') {
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
     'moderation', 'blocks', 'relays', 'stats', 'queue_health', 'invites', 'users', 'policies',
-    'guestbook', 'support', 'analytics',
+    'guestbook', 'support', 'analytics', 'downranking', 'downranked',
 ];
 // Security is under You for every account (own OAuth tokens / password).
 if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
@@ -656,6 +661,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         'invite_create',
         'user_ban', 'user_unban',
         'policies_save_privacy', 'policies_save_conduct', 'policies_save_rules',
+        'downrank_term_add', 'downrank_term_delete', 'downrank_signal_clear', 'downrank_term_preview',
     ];
     // revoke_oauth_token + change_password are per-user (scoped in handlers)
     if ($action !== '' && in_array($action, $vaakAdminOnlyActions, true) && empty($vaakIsAdmin)) {
@@ -1327,7 +1333,18 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 }
                 $successMessages = $isQuote
                     ? ['Quote sent!', 'Sent that quote into orbit!', 'Quote posted!']
-                    : ['Post sent!', 'You farted!', 'Shot that one into space!'];
+                    : [
+                        'Post sent!',
+                        'You farted!',
+                        'Shot that one into space!',
+                        'TOOT.',
+                        'Posted, but at what cost?',
+                        'SKEET SKEET.',
+                        'Posted.',
+                        'Ok.',
+                        "Where is Mankrik's wife?",
+                        'Failed. NOT! Gotcha!',
+                    ];
                 $composeSuccessToast = $successMessages[array_rand($successMessages)];
                 $view = $returnView !== '' ? $returnView : 'outbox';
             } else {
@@ -1779,6 +1796,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 'quote_policy' => (string) ($_POST['quote_policy'] ?? 'anyone'),
                 'hide_profile_replies' => !empty($_POST['hide_profile_replies']),
                 'hide_profile_boosts' => !empty($_POST['hide_profile_boosts']),
+                'algorithm_enabled' => !empty($_POST['algorithm_enabled']),
+                'downranking_enabled' => !empty($_POST['downranking_enabled']),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
                 'profile_badges' => is_array($_POST['profile_badges'] ?? null) ? $_POST['profile_badges'] : [],
             ], $vaakActorKey);
@@ -2604,7 +2623,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                     }
                 }
                 $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'blocks')) ?: 'blocks';
-                $view = in_array($returnView, ['moderation', 'remote_profile', 'blocks'], true) ? $returnView : 'blocks';
+                if ($returnView === 'downranked') {
+                    admin_home_downrank_audit($kind === 'mute' ? 'server_mute' : 'server_block', (string) ($result['value'] ?? $_POST['actor_id'] ?? ''), 0, '', ['reason' => $reason]);
+                }
+                $view = in_array($returnView, ['moderation', 'remote_profile', 'blocks', 'downranked'], true) ? $returnView : 'blocks';
             } else {
                 $error = $result['error'] ?? 'Block failed.';
             }
@@ -3580,6 +3602,94 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $notice = $disable ? 'User banned and OAuth tokens revoked.' : 'User unbanned.';
             } else {
                 $error = $res['error'] ?? 'Could not update user status.';
+            }
+        }
+    } elseif ($action === 'downrank_term_preview') {
+        $view = 'downranking';
+        if (!$vaakIsAdmin) {
+            $error = 'Admin only.';
+            $view = 'home';
+        } else {
+            $previewPhrase = trim(preg_replace('/\s+/u', ' ', (string) ($_POST['preview_phrase'] ?? '')));
+            $downrankPreview = ['phrase' => $previewPhrase, 'count' => 0, 'samples' => []];
+            if ($previewPhrase === '' || mb_strlen($previewPhrase) > 120) {
+                $error = 'Enter a phrase between 2 and 120 characters to preview.';
+            } else {
+                try {
+                    $st = ap_db()->prepare("SELECT actor_id, object_id, host, summary, content, created_at FROM events WHERE type = 'Create' AND action_taken IN ('log','local_observe') AND visibility IN ('public','unlisted') AND created_at >= ? ORDER BY created_at DESC LIMIT 2000");
+                    $st->execute([gmdate('c', time() - 30 * 86400)]);
+                    foreach ($st->fetchAll() ?: [] as $row) {
+                        $text = implode("\n", array_map(static fn(string $key): string => (string) ($row[$key] ?? ''), ['summary', 'content']));
+                        if (!admin_home_phrase_matches_text($text, $previewPhrase)) continue;
+                        $downrankPreview['count']++;
+                        if (count($downrankPreview['samples']) < 8) {
+                            $downrankPreview['samples'][] = ['actor_id' => (string) ($row['actor_id'] ?? ''), 'host' => (string) ($row['host'] ?? ''), 'created_at' => (string) ($row['created_at'] ?? '')];
+                        }
+                    }
+                    admin_home_downrank_audit('term_previewed', '', 0, $previewPhrase, ['matches' => $downrankPreview['count']]);
+                } catch (Throwable $e) {
+                    $error = 'Could not preview this phrase against cached posts.';
+                }
+            }
+        }
+    } elseif ($action === 'downrank_signal_clear') {
+        $view = 'downranked';
+        if (!$vaakIsAdmin) {
+            $error = 'Admin only.';
+            $view = 'home';
+        } else {
+            $actor = rtrim(trim((string) ($_POST['actor_id'] ?? '')), '/');
+            if ($actor === '') {
+                $error = 'Missing actor.';
+            } else {
+                try {
+                    $st = ap_db()->prepare('DELETE FROM ap_home_suppression WHERE actor_id = ?');
+                    $st->execute([$actor]);
+                    admin_home_downrank_audit('signal_cleared', $actor, 0, '', ['rows' => $st->rowCount()]);
+                    $notice = 'Temporary downranking signal removed for this actor.';
+                } catch (Throwable $e) {
+                    $error = 'Could not clear the downranking signal.';
+                }
+            }
+        }
+    } elseif ($action === 'downrank_term_add' || $action === 'downrank_term_delete') {
+        $view = 'downranking';
+        if (!$vaakIsAdmin) {
+            $error = 'Admin only.';
+            $view = 'home';
+        } else {
+            try {
+                $db = ap_db();
+                if ($action === 'downrank_term_delete') {
+                    $termId = (int) ($_POST['term_id'] ?? 0);
+                    if ($termId < 1) {
+                        $error = 'Invalid vocabulary entry.';
+                    } else {
+                        $old = $db->prepare('SELECT phrase, category FROM ap_home_downrank_terms WHERE id = ?');
+                        $old->execute([$termId]);
+                        $oldRow = $old->fetch() ?: [];
+                        $db->prepare('DELETE FROM ap_home_downrank_terms WHERE id = ?')->execute([$termId]);
+                        admin_home_downrank_audit('term_removed', '', $termId, (string) ($oldRow['phrase'] ?? ''), ['category' => (string) ($oldRow['category'] ?? '')]);
+                        $notice = 'Downranking phrase removed.';
+                    }
+                } else {
+                    $phrase = trim(preg_replace('/\\s+/u', ' ', (string) ($_POST['phrase'] ?? '')));
+                    $category = preg_replace('/[^a-z0-9_-]/i', '', (string) ($_POST['category'] ?? 'custom')) ?: 'custom';
+                    $allowedCategories = ['protected_class', 'sexualized_harassment', 'custom'];
+                    if (!in_array($category, $allowedCategories, true)) $category = 'custom';
+                    if ($phrase === '' || mb_strlen($phrase) < 2 || mb_strlen($phrase) > 120) {
+                        $error = 'Enter a phrase between 2 and 120 characters.';
+                    } else {
+                        $now = gmdate('c');
+                        $db->prepare('INSERT INTO ap_home_downrank_terms (phrase, category, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?) ON CONFLICT (phrase) DO UPDATE SET category = EXCLUDED.category, enabled = 1, updated_at = EXCLUDED.updated_at')
+                            ->execute([$phrase, $category, $now, $now]);
+                        admin_home_downrank_audit('term_saved', '', 0, $phrase, ['category' => $category]);
+                        $notice = 'Downranking phrase saved.';
+                    }
+                }
+            } catch (Throwable $e) {
+                $error = 'Could not update the downranking vocabulary.';
+                error_log('[vaak] downranking vocabulary: ' . $e->getMessage());
             }
         }
     } elseif ($action === 'policies_save_privacy' || $action === 'policies_save_conduct' || $action === 'policies_save_rules') {
@@ -4625,7 +4735,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
 
     $html = '<div class="side-card"><h3>Trending tags</h3>';
     if ($trendTags === []) {
-        $html .= '<div class="meta">No hashtag signal yet…</div>';
+        $html .= '<div class="meta empty-state">No hashtag signal yet…</div>';
     } else {
         foreach ($trendTags as $tg) {
             if (!is_array($tg)) {
@@ -4647,7 +4757,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $html .= '</div>';
     $html .= '<div class="side-card"><h3>Trending links</h3>';
     if ($trendLinks === []) {
-        $html .= '<div class="meta">No link signal yet…</div>';
+        $html .= '<div class="meta empty-state">No link signal yet…</div>';
     } else {
         foreach ($trendLinks as $ln) {
             if (!is_array($ln)) {
@@ -4683,7 +4793,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $html .= '</div>';
     $html .= '<div class="side-card"><h3>Trending posts</h3>';
     if ($trendStatuses === []) {
-        $html .= '<div class="meta">No post signal yet…</div>';
+        $html .= '<div class="meta empty-state">No post signal yet…</div>';
     } else {
         foreach ($trendStatuses as $ts) {
             if (!is_array($ts)) {
@@ -4802,8 +4912,22 @@ $queueDependencyRows = [];
 $redisMetrics = [];
 $timingMetrics = [];
 $slowRouteRows = [];
+$healthDb = ['ok' => false, 'latency_ms' => null, 'error' => null];
+$healthRedisCache = [];
+$healthRedisQueue = [];
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
+    $healthDbStarted = microtime(true);
+    try {
+        $db->query('SELECT 1')->fetchColumn();
+        $healthDb = ['ok' => true, 'latency_ms' => round((microtime(true) - $healthDbStarted) * 1000, 2), 'error' => null];
+    } catch (Throwable $e) {
+        $healthDb = ['ok' => false, 'latency_ms' => round((microtime(true) - $healthDbStarted) * 1000, 2), 'error' => substr($e->getMessage(), 0, 160)];
+    }
+    if (function_exists('ap_redis_health_check')) {
+        $healthRedisCache = ap_redis_health_check('cache');
+        $healthRedisQueue = ap_redis_health_check('queue');
+    }
     $queueDefs = [
         ['name' => 'User actions', 'table' => 'ap_action_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
         ['name' => 'Federation delivery', 'table' => 'ap_publish_delivery_queue', 'state' => 'status', 'queued' => ['pending'], 'active' => ['processing'], 'success' => ['succeeded'], 'failed' => ['failed'], 'time' => 'next_attempt_at', 'active_time' => 'claimed_at', 'created' => 'created_at'],
@@ -5406,12 +5530,12 @@ if (isset($_GET['partial'], $_GET['shell'])
                     . '<input type="hidden" name="action" value="follow_remote">'
                     . '<input type="hidden" name="return_view" value="following">'
                     . '<input type="hidden" name="actor_id" value="' . h((string) $f['actor_id']) . '">'
-                    . '<button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow back</button></form>';
+                    . '<button class="btn btn-primary btn-compact" type="submit">Follow back</button></form>';
             } else {
                 echo '<form method="post" action="?view=following" style="display:inline" onsubmit="return confirm(\'Unfollow this account?\');">'
                     . '<input type="hidden" name="action" value="unfollow_remote">'
                     . '<input type="hidden" name="actor_id" value="' . h((string) $f['actor_id']) . '">'
-                    . '<button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Unfollow</button></form>';
+                    . '<button class="btn btn-ghost btn-compact" type="submit">Unfollow</button></form>';
             }
             echo '<a href="' . h(admin_remote_actor_href((string) $f['actor_id'], isset($f['username']) ? (string) $f['username'] : null))
                 . '" target="_blank" rel="noopener noreferrer">'
@@ -5723,7 +5847,9 @@ if (
         echo '<a class="' . trim($active) . '" href="?view=' . h($tabView) . '" data-vaak-soft-nav="' . h($tabView) . '">' . h($tabLabel) . '</a>';
     }
     echo '</nav>';
-    echo '<a class="btn btn-ghost" href="?view=' . h($view) . '&amp;_r=' . rawurlencode((string) time()) . '" title="Reload this view">↻</a>';
+    // Timeline reloads should reuse the warm ranked cache; the live poller and
+    // background warmer handle freshness without forcing a cold rebuild.
+    echo '<a class="btn btn-ghost" href="?view=' . h($view) . '" title="Reload this view">↻</a>';
     echo '</div></div>';
     echo '<div class="feed timeline-feed">';
     echo '<div class="compose-inline-slot" id="compose-inline-slot"></div>';
@@ -5972,16 +6098,25 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Fingerprint follow-set + owner (per-user mutes/words/blocks)
     $owner = admin_owner_user_id();
+    // Home ranking is a user preference; never serve an algorithmic cache to
+    // an account that has opted into chronological/follow-only mode (or vice versa).
+    $algorithmMode = 'na';
+    if ($view === 'home' && function_exists('ap_profile_get')) {
+        $actorKey = (string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova');
+        $profile = ap_profile_get($actorKey);
+        $algorithmMode = (!array_key_exists('algorithm_enabled', $profile)
+            || !empty($profile['algorithm_enabled'])) ? 'on' : 'off';
+    }
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v5_' . $view . '_u' . $owner . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v6_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
  * Compact ranked index entry for one timeline card.
  *
  * @param array{kind?:string,row?:array<string,mixed>,from_tag?:bool} $item
- * @return array{k:string,id:string,t?:int}|null
+ * @return array{k:string,id:string,t?:int,s?:string}|null
  */
 function admin_tl_rank_entry(array $item): ?array
 {
@@ -6000,30 +6135,35 @@ function admin_tl_rank_entry(array $item): ?array
         if (!empty($item['from_tag'])) {
             $entry['t'] = 1;
         }
+        $source = trim((string) ($item['home_source'] ?? ''));
+        if ($source === '') {
+            $source = !empty($item['from_tag']) ? 'hashtag' : 'fediverse';
+        }
+        $entry['s'] = $source;
         return $entry;
     }
     if ($kind === 'outbox') {
         $id = rtrim((string) ($row['id'] ?? ''), '/');
-        return $id !== '' ? ['k' => 'outbox', 'id' => $id] : null;
+        return $id !== '' ? ['k' => 'outbox', 'id' => $id, 's' => 'local'] : null;
     }
     if ($kind === 'boost') {
         $id = (string) ($row['status_id'] ?? '');
-        return $id !== '' ? ['k' => 'boost', 'id' => $id] : null;
+        return $id !== '' ? ['k' => 'boost', 'id' => $id, 's' => 'boost'] : null;
     }
     if ($kind === 'bsky') {
         $id = (string) ($row['bsky_uri'] ?? ($row['post']['uri'] ?? ''));
-        return $id !== '' ? ['k' => 'bsky', 'id' => $id] : null;
+        return $id !== '' ? ['k' => 'bsky', 'id' => $id, 's' => 'bluesky'] : null;
     }
     if ($kind === 'rss') {
         $id = (string) (int) ($row['id'] ?? 0);
-        return $id !== '0' ? ['k' => 'rss', 'id' => $id] : null;
+        return $id !== '0' ? ['k' => 'rss', 'id' => $id, 's' => 'rss'] : null;
     }
     return null;
 }
 
 /**
  * @param list<array{kind?:string,row?:array<string,mixed>,from_tag?:bool}> $timeline
- * @return list<array{k:string,id:string,t?:int}>
+ * @return list<array{k:string,id:string,t?:int,s?:string}>
  */
 function admin_tl_rank_from_timeline(array $timeline): array
 {
@@ -6364,6 +6504,266 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
 }
 
 /**
+ * Add a small, bounded recommendation pool from older public posts already
+ * cached locally. This never fetches remotely and never bypasses visibility,
+ * block, mute, or muted-word checks. Recommendations are deliberately capped
+ * so a slow Fediverse stream cannot be replaced by a recommendation stream.
+ *
+ * @param list<array<string,mixed>> $timeline
+ * @return list<array<string,mixed>>
+ */
+function admin_home_cached_recommendation_items(array $timeline, int $ownerUserId): array
+{
+    if ($ownerUserId < 1 || !function_exists('admin_home_signal_actor_weights')) {
+        return $timeline;
+    }
+    try {
+        $actorWeights = admin_home_favourite_actor_weights($ownerUserId);
+        foreach (admin_home_signal_actor_weights($ownerUserId) as $actor => $weight) {
+            $actorWeights[$actor] = min(64, (float) ($actorWeights[$actor] ?? 0) + (float) $weight);
+        }
+        $tagWeights = function_exists('admin_home_favourite_tag_weights')
+            ? admin_home_favourite_tag_weights($ownerUserId)
+            : [];
+        if ($actorWeights === [] && $tagWeights === []) {
+            return $timeline;
+        }
+        $seen = [];
+        foreach ($timeline as $item) {
+            $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+            $id = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
+            if ($id !== '') $seen[$id] = true;
+        }
+        $since = gmdate('c', time() - 7 * 86400);
+        $st = ap_db()->prepare(
+            "SELECT * FROM events
+             WHERE type = 'Create' AND action_taken IN ('log','local_observe')
+               AND created_at >= ? AND visibility IN ('public','unlisted')
+             ORDER BY created_at DESC, id DESC LIMIT 240"
+        );
+        $st->execute([$since]);
+        $added = 0;
+        $maxAdded = 8;
+        foreach ($st->fetchAll() ?: [] as $row) {
+            if (!is_array($row) || $added >= $maxAdded) break;
+            $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
+            if ($object === '' || isset($seen[$object])) continue;
+            $item = ['kind' => 'event', 'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: 0, 'row' => $row, 'home_source' => 'recommendation'];
+            if (admin_timeline_row_hidden($row, $ownerUserId) || admin_timeline_item_muted_by_words($item)) continue;
+            $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            $score = (float) ($actorWeights[$actor] ?? 0);
+            foreach (admin_home_extract_hashtags((string) ($row['summary'] ?? $row['content'] ?? '')) as $tag) {
+                $score += (float) ($tagWeights[$tag] ?? 0) * 0.5;
+            }
+            if ($score < 1.5) continue;
+            // A bounded recency boost lets a relevant cached post surface while
+            // preventing old content from permanently outranking fresh posts.
+            $item['sort'] += min(12 * 3600, (int) round(1800 * log(1 + $score, 2)));
+            $item['recommendation_score'] = round($score, 3);
+            $timeline[] = $item;
+            $seen[$object] = true;
+            $added++;
+        }
+    } catch (Throwable $e) {
+        // Recommendations are optional; a cache/schema issue must not affect Home.
+    }
+    return $timeline;
+}
+
+function admin_home_phrase_matches_text(string $text, string $phrase): bool
+{
+    $phrase = trim(preg_replace('/\s+/u', ' ', strip_tags($phrase)));
+    if ($phrase === '') return false;
+    $pattern = '/(?<!\pL)' . preg_quote($phrase, '/') . '(?!\pL)/iu';
+    return preg_match($pattern, strip_tags($text)) === 1;
+}
+
+/** @return list<string> */
+function admin_home_toxicity_categories(string $text): array
+{
+    $text = strtolower(trim(strip_tags($text)));
+    if ($text === '') return [];
+    $patterns = [
+        'direct_abuse' => '/\b(?:fuck\s+you|suck\s+my\s+dick|go\s+fuck\s+yourself)\b/i',
+        'ai_slogan' => '/\b(?:slop|ai\s+trash|clanker)\b/i',
+        'misogyny' => '/\b(?:women\s+belong\s+in\s+the\s+kitchen|women\s+are\s+property|go\s+back\s+to\s+the\s+kitchen)\b/i',
+    ];
+    $matches = [];
+    foreach ($patterns as $category => $pattern) {
+        if (preg_match($pattern, $text)) $matches[] = $category;
+    }
+    // Admin-managed terms are exact phrase matches. They are read once per
+    // request and never alter visibility, federation, blocks, or mutes.
+    static $adminTerms = null;
+    if ($adminTerms === null) {
+        $adminTerms = [];
+        try {
+            $st = ap_db()->query('SELECT phrase, category FROM ap_home_downrank_terms WHERE enabled = 1 ORDER BY id ASC LIMIT 500');
+            foreach ($st->fetchAll() ?: [] as $term) {
+                $phrase = trim(preg_replace('/\s+/u', ' ', (string) ($term['phrase'] ?? '')));
+                if ($phrase === '' || mb_strlen($phrase) > 120) continue;
+                $category = preg_replace('/[^a-z0-9_-]/i', '', (string) ($term['category'] ?? 'custom')) ?: 'custom';
+                $adminTerms[] = [$phrase, $category];
+            }
+        } catch (Throwable $e) {
+            $adminTerms = [];
+        }
+    }
+    foreach ($adminTerms as [$phrase, $category]) {
+        if (admin_home_phrase_matches_text($text, $phrase)) $matches[] = $category;
+    }
+    return array_values(array_unique($matches));
+}
+
+/** @return array<string,array{score:int,until:int,categories:list<string>}> */
+function admin_home_suppression_map(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) return [];
+    try {
+        $st = ap_db()->prepare('SELECT actor_id, score, categories_json, suppressed_until FROM ap_home_suppression WHERE owner_user_id = ?');
+        $st->execute([$ownerUserId]);
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($actor === '') continue;
+            $cats = json_decode((string) ($row['categories_json'] ?? '[]'), true);
+            $out[$actor] = [
+                'score' => max(0, (int) ($row['score'] ?? 0)),
+                'until' => strtotime((string) ($row['suppressed_until'] ?? '')) ?: 0,
+                'categories' => is_array($cats) ? array_values(array_filter(array_map('strval', $cats))) : [],
+            ];
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/** @return list<array<string,mixed>> Aggregated private signals for admins. */
+function admin_home_downranked_actor_rows(): array
+{
+    try {
+        $rows = ap_db()->query('SELECT actor_id, owner_user_id, score, categories_json, suppressed_until, last_object_id, updated_at FROM ap_home_suppression ORDER BY suppressed_until DESC, score DESC')->fetchAll() ?: [];
+        $out = [];
+        foreach ($rows as $row) {
+            $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
+            if ($actor === '') continue;
+            if (!isset($out[$actor])) {
+                $out[$actor] = [
+                    'actor_id' => $actor,
+                    'score' => 0,
+                    'viewers' => 0,
+                    'until' => 0,
+                    'last_object_id' => '',
+                    'updated_at' => '',
+                    'categories' => [],
+                ];
+            }
+            $item =& $out[$actor];
+            $item['score'] = max((int) $item['score'], (int) ($row['score'] ?? 0));
+            $item['viewers']++;
+            $until = strtotime((string) ($row['suppressed_until'] ?? '')) ?: 0;
+            if ($until > (int) $item['until']) {
+                $item['until'] = $until;
+                $item['last_object_id'] = (string) ($row['last_object_id'] ?? '');
+            }
+            $item['updated_at'] = max((string) $item['updated_at'], (string) ($row['updated_at'] ?? ''));
+            $cats = json_decode((string) ($row['categories_json'] ?? '[]'), true);
+            if (is_array($cats)) $item['categories'] = array_values(array_unique(array_merge($item['categories'], array_map('strval', $cats))));
+            unset($item);
+        }
+        return array_values($out);
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+function admin_home_downrank_audit(string $action, string $actorId = '', int $termId = 0, string $phrase = '', array $details = []): void
+{
+    try {
+        $db = ap_db();
+        $db->prepare('INSERT INTO ap_home_downrank_audit (admin_user_id, admin_actor, action, actor_id, term_id, phrase, details_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            ->execute([
+                (int) ($GLOBALS['vaak_owner_id'] ?? 0),
+                (string) ($GLOBALS['vaak_actor_key'] ?? ''),
+                substr($action, 0, 80),
+                substr(rtrim($actorId, '/'), 0, 2048),
+                max(0, $termId),
+                substr($phrase, 0, 120),
+                json_encode($details, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                gmdate('c'),
+            ]);
+    } catch (Throwable $e) {
+        error_log('[vaak] downranking audit: ' . $e->getMessage());
+    }
+}
+
+function admin_home_downrank_audit_rows(int $limit = 50): array
+{
+    try {
+        $limit = max(1, min(200, $limit));
+        return ap_db()->query('SELECT admin_actor, action, actor_id, term_id, phrase, details_json, created_at FROM ap_home_downrank_audit ORDER BY created_at DESC, id DESC LIMIT ' . $limit)->fetchAll() ?: [];
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+function admin_home_record_suppression(int $ownerUserId, string $actorId, array $categories, string $objectId): void
+{
+    if ($ownerUserId < 1 || $actorId === '' || $categories === []) return;
+    try {
+        $db = ap_db();
+        $now = time();
+        $st = $db->prepare('SELECT score, suppressed_until, categories_json FROM ap_home_suppression WHERE owner_user_id = ? AND actor_id = ?');
+        $st->execute([$ownerUserId, $actorId]);
+        $old = $st->fetch() ?: [];
+        $score = max(0, (int) ($old['score'] ?? 0));
+        $previousUntil = strtotime((string) ($old['suppressed_until'] ?? '')) ?: 0;
+        $score = min(8, $score + 1);
+        $until = $now + min(7 * 86400, 3600 * max(1, $score));
+        if ($previousUntil > $until) $until = $previousUntil;
+        $oldCats = json_decode((string) ($old['categories_json'] ?? '[]'), true);
+        $allCats = array_values(array_unique(array_merge(is_array($oldCats) ? $oldCats : [], $categories)));
+        $values = [$score, json_encode($allCats, JSON_UNESCAPED_SLASHES), gmdate('c', $until), substr($objectId, 0, 2048), gmdate('c'), $ownerUserId, $actorId];
+        if ($old) {
+            $db->prepare('UPDATE ap_home_suppression SET score = ?, categories_json = ?, suppressed_until = ?, last_object_id = ?, updated_at = ? WHERE owner_user_id = ? AND actor_id = ?')->execute($values);
+        } else {
+            $db->prepare('INSERT INTO ap_home_suppression (owner_user_id, actor_id, score, categories_json, suppressed_until, last_object_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')->execute([$ownerUserId, $actorId, $score, $values[1], $values[2], $values[3], $values[4]]);
+        }
+    } catch (Throwable $e) {
+        // Optional ranking signal; never affect timeline availability.
+    }
+}
+
+/** @param list<array<string,mixed>> $timeline @return list<array<string,mixed>> */
+function admin_home_apply_temporary_toxicity_downrank(array $timeline, int $ownerUserId): array
+{
+    if ($ownerUserId < 1) return $timeline;
+    $states = admin_home_suppression_map($ownerUserId);
+    foreach ($timeline as &$item) {
+        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+        $visibility = strtolower((string) ($row['visibility'] ?? 'public'));
+        if ($visibility !== 'public' && $visibility !== 'unlisted') continue;
+        $actor = rtrim((string) ($row['actor_id'] ?? $row['attributedTo'] ?? ''), '/');
+        if ($actor === '') continue;
+        $text = implode("\n", array_map(static fn(string $key): string => (string) ($row[$key] ?? ''), ['summary', 'content', 'content_text', 'spoiler_text']));
+        $categories = admin_home_toxicity_categories($text);
+        $state = $states[$actor] ?? null;
+        if ($categories !== []) {
+            $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
+            admin_home_record_suppression($ownerUserId, $actor, $categories, $object);
+            $state = ['score' => min(8, (int) ($state['score'] ?? 0) + 1), 'until' => time() + 3600, 'categories' => $categories];
+        }
+        if (is_array($state) && (int) ($state['until'] ?? 0) > time()) {
+            $item['sort'] = (int) ($item['sort'] ?? 0) - min(12 * 3600, 1800 * max(1, (int) ($state['score'] ?? 1)));
+            $item['temporary_suppression'] = true;
+        }
+    }
+    unset($item);
+    return $timeline;
+}
+
+/**
  * Keep a thin but reliable followed-author baseline on the first Home page.
  * Recommendations are additive; they must not replace explicitly followed
  * content when that content is already in the local candidate set.
@@ -6570,7 +6970,7 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
     return $out;
 }
 
-/** @param list<array{k:string,id:string,t?:int}> $ranked */
+/** @param list<array{k:string,id:string,t?:int,s?:string}> $ranked */
 function admin_tl_cache_put(string $key, array $ranked): void
 {
     if ($key === '' || $ranked === []) {
@@ -6578,10 +6978,22 @@ function admin_tl_cache_put(string $key, array $ranked): void
     }
     $safe = preg_replace('/[^a-z0-9_]/', '', $key) ?: 'tl';
     $path = admin_tl_cache_dir() . '/tl_' . $safe . '.json';
+    $sourceCounts = [];
+    foreach ($ranked as $entry) {
+        if (!is_array($entry)) continue;
+        $source = trim((string) ($entry['s'] ?? $entry['k'] ?? 'unknown')) ?: 'unknown';
+        $sourceCounts[$source] = (int) ($sourceCounts[$source] ?? 0) + 1;
+    }
+    ksort($sourceCounts);
     $data = [
         'ts' => time(),
         'ranked' => $ranked,
+        'stage_meta' => [
+            'ranked_count' => count($ranked),
+            'source_counts' => $sourceCounts,
+        ],
     ];
+    $GLOBALS['admin_tl_cache_meta'] = $data['stage_meta'];
     // Redis is the shared hot path across PHP workers; the local file remains
     // a safe fallback when Redis is unavailable or being restarted.
     if (function_exists('ap_redis_json_set')) {
@@ -6879,6 +7291,11 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
     if ($view === 'home' && function_exists('admin_home_queue_bsky_after_first_page')) {
         $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
         if ($ownerUserId > 0) {
+            $homePartialProfile = function_exists('ap_profile_get')
+                ? ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))
+                : [];
+            $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homePartialProfile)
+                || !empty($homePartialProfile['algorithm_enabled']);
             $fediN = count($ranked);
             // Thin AP head (e.g. only own notes) → shorter head so Bluesky shows sooner.
             $head = $fediN > 0 && $fediN < 12 ? min(5, max(3, $fediN)) : 15;
@@ -6886,7 +7303,7 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 $head = 0;
             }
             $ranked = admin_home_queue_bsky_after_first_page($ranked, $ownerUserId, max(1, $head));
-            if (function_exists('admin_home_queue_rss_after_first_page')) {
+            if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
                 $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, max(1, $head));
             }
         }
@@ -7162,7 +7579,7 @@ function admin_timeline_row_hidden(array $row, int $ownerUserId): bool
 }
 
 /**
- * @return list<array{k:string,id:string,t?:int}>|null
+ * @return list<array{k:string,id:string,t?:int,s?:string}>|null
  */
 function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
 {
@@ -7176,14 +7593,16 @@ function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
         if (is_array($cached) && isset($cached['ranked']) && is_array($cached['ranked'])) {
             $ts = (int) ($cached['ts'] ?? 0);
             if ($ts > 0 && (time() - $ts) <= $ttlSec) {
-                /** @var list<array{k:string,id:string,t?:int}> $ranked */
+                /** @var list<array{k:string,id:string,t?:int,s?:string}> $ranked */
                 $ranked = [];
+                $GLOBALS['admin_tl_cache_meta'] = is_array($cached['stage_meta'] ?? null) ? $cached['stage_meta'] : null;
                 foreach ($cached['ranked'] as $row) {
                     if (!is_array($row) || empty($row['k']) || empty($row['id'])) continue;
                     $ranked[] = [
                         'k' => (string) $row['k'],
                         'id' => (string) $row['id'],
                         't' => !empty($row['t']) ? 1 : 0,
+                        's' => trim((string) ($row['s'] ?? '')),
                     ];
                 }
                 if ($ranked !== []) return $ranked;
@@ -7207,8 +7626,9 @@ function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
     if ($ts <= 0 || (time() - $ts) > $ttlSec) {
         return null;
     }
-    /** @var list<array{k:string,id:string,t?:int}> $ranked */
+    /** @var list<array{k:string,id:string,t?:int,s?:string}> $ranked */
     $ranked = [];
+    $GLOBALS['admin_tl_cache_meta'] = is_array($data['stage_meta'] ?? null) ? $data['stage_meta'] : null;
     foreach ($data['ranked'] as $row) {
         if (!is_array($row) || empty($row['k']) || empty($row['id'])) {
             continue;
@@ -7217,6 +7637,7 @@ function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
             'k' => (string) $row['k'],
             'id' => (string) $row['id'],
             't' => !empty($row['t']) ? 1 : 0,
+            's' => trim((string) ($row['s'] ?? '')),
         ];
     }
     return $ranked !== [] ? $ranked : null;
@@ -7926,6 +8347,13 @@ $homeTimeline = [];
 if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial && $view === 'home'))) {
     $homeSeenObject = [];
     $homeOwnerId = admin_owner_user_id();
+    $homeProfile = function_exists('ap_profile_get')
+        ? ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))
+        : [];
+    $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homeProfile)
+        || !empty($homeProfile['algorithm_enabled']);
+    $homeDownrankingEnabled = !array_key_exists('downranking_enabled', $homeProfile)
+        || !empty($homeProfile['downranking_enabled']);
     if ($followingIds) {
         // SQL filter by followed actors (avoid scanning 500 firehose rows in PHP)
         $homeActorIds = [];
@@ -8224,10 +8652,16 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     // Bluesky mix is queued into the ranked cache *after* the first page so
     // first paint stays fedi-only (no 80-post JSON decode / dual-publish walk).
     // Personalization only on ranked-cache rebuild (not on cache hits).
-    if (function_exists('admin_pending_timeline_items')) {
+    if ($homeAlgorithmEnabled && function_exists('admin_home_cached_recommendation_items')) {
+        $homeTimeline = admin_home_cached_recommendation_items($homeTimeline, $homeOwnerId);
+    }
+    if ($homeAlgorithmEnabled && $homeDownrankingEnabled && function_exists('admin_home_apply_temporary_toxicity_downrank')) {
+        $homeTimeline = admin_home_apply_temporary_toxicity_downrank($homeTimeline, $homeOwnerId);
+    }
+    if ($homeAlgorithmEnabled && function_exists('admin_pending_timeline_items')) {
         $homeTimeline = array_merge($homeTimeline, admin_pending_timeline_items($homeOwnerId));
     }
-    if (function_exists('admin_home_apply_favourite_rank')) {
+    if ($homeAlgorithmEnabled && function_exists('admin_home_apply_favourite_rank')) {
         $homeTimeline = admin_home_apply_favourite_rank($homeTimeline, $homeOwnerId);
     } else {
         usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
@@ -8340,7 +8774,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     // Recommendations are additive: keep a few followed-author cards on the
     // first page whenever the candidate set has enough follower content.
-    $homeTimeline = admin_home_apply_follower_fallback($homeTimeline, $tlLimit);
+    if ($homeAlgorithmEnabled) {
+        $homeTimeline = admin_home_apply_follower_fallback($homeTimeline, $tlLimit);
+    }
     // Seed ranked cache for subsequent infinite-scroll pages.
     // First page stays the fedi $homeTimeline slice; Bluesky ids start after it.
     if ($homeTimeline !== []) {
@@ -8353,7 +8789,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         ) {
             $ranked = admin_home_queue_bsky_after_first_page($ranked, $homeOwnerId, $tlLimit);
         }
-        if (function_exists('admin_home_queue_rss_after_first_page')) {
+        if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
             $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, $tlLimit);
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
@@ -12458,7 +12894,7 @@ function admin_render_masto_status_card(
         $boostWhen = (string) ($st['created_at'] ?? '');
         $boostSource = admin_object_url_is_bluesky((string) ($st['reblog']['uri'] ?? $st['reblog']['url'] ?? ''))
             ? 'Bluesky' : 'Fediverse';
-        $boostHeader = '<div class="meta" style="margin-bottom:.45rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> '
+        $boostHeader = '<div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> '
             . htmlspecialchars($boosterName !== '' ? $boosterName : 'Someone', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
             . ' boosted'
             . ($boostWhen !== '' ? ' · ' . htmlspecialchars(relative_time($boostWhen), ENT_QUOTES, 'UTF-8') : '')
@@ -13032,7 +13468,7 @@ function admin_render_remote_boost_card(
     }
     ?>
           <article class="tweet tweet-boost"<?= $hydrateAttrs ?>>
-            <div class="meta" style="margin-bottom:.45rem;color:var(--primary)">
+            <div class="meta meta-row" style="color:var(--primary)">
               <i class="ph ph-repeat" aria-hidden="true"></i>
               <?php if ($boosterProfile !== ''): ?>
                 <a href="<?= h($boosterProfile) ?>" style="color:inherit;text-decoration:none"><?= h($boosterName) ?></a>
@@ -13308,7 +13744,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $boosted = true;
     ?>
           <article class="tweet tweet-boost"<?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
-            <div class="meta" style="margin-bottom:.45rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
+            <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
             <div class="tweet-hd">
               <?= admin_avatar_img($targetActor !== '' ? $targetActor : null) ?>
               <div class="tweet-hd-main tweet-hd-main--fedi">
@@ -14095,7 +14531,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     ?>
     <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>">
       <?php if ($reasonLabel !== ''): ?>
-        <div class="meta" style="margin:0 0 .35rem;color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($reasonLabel) ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
+        <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($reasonLabel) ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
       <?php endif; ?>
       <?php if (!$isHome && $feedSource !== ''): ?>
         <div class="meta" style="margin:0 0 .35rem">☁ From saved feed</div>
@@ -14624,9 +15060,9 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     }
     if ($wantAncestors) {
         if ($stAncestors === []) {
-            echo '<div class="meta status-thread-empty" style="margin:0 0 1rem">No earlier posts in this thread on this instance.</div>';
+            echo '<div class="meta status-thread-empty">No earlier posts in this thread on this instance.</div>';
         } else {
-            echo '<div class="meta status-thread-count" style="margin:0 0 1rem">'
+            echo '<div class="meta status-thread-count meta-row">'
                 . count($stAncestors) . ' earlier in thread</div>';
             foreach ($stAncestors as $anc) {
                 if (is_array($anc)) {
@@ -14637,9 +15073,9 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     }
     if ($wantReplies) {
         if ($stDescendants === []) {
-            echo '<div class="meta">No replies found yet.</div>';
+            echo '<div class="meta status-thread-empty">No replies found yet.</div>';
         } else {
-            echo '<div class="meta status-thread-count" style="margin:1rem 0 .5rem">'
+            echo '<div class="meta status-thread-count meta-row">'
                 . count($stDescendants) . ' replies</div>';
             foreach ($stDescendants as $desc) {
                 if (is_array($desc)) {
@@ -14663,7 +15099,14 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
         return [];
     }
     $limit = max(1, min(40, $limit));
-    $sinceAt = gmdate('c', $sinceTs);
+    // The browser cursor is intentionally second-granularity. Overlap the
+    // previous second so posts sharing a timestamp with the current head are
+    // never lost; the client-side stable-key filter removes the overlap.
+    $sinceAt = gmdate('c', max(0, $sinceTs - 1));
+    // A short burst can contain more rows than the response limit. Fetch a
+    // wider candidate window before the final merge/sort so same-second rows
+    // do not crowd unseen posts out of the poll response.
+    $candidateLimit = min(200, max($limit * 4, $limit));
     $db = ap_db();
     $ownerId = admin_owner_user_id();
     $out = [];
@@ -14716,7 +15159,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                  ORDER BY published DESC
                  LIMIT ?"
             );
-            $st->execute([$sinceAt, $limit * 2]);
+            $st->execute([$sinceAt, $candidateLimit]);
             foreach ($st->fetchAll() ?: [] as $n) {
                 if (!is_array($n)) {
                     continue;
@@ -14749,7 +15192,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                      ORDER BY created_at DESC, id DESC
                      LIMIT ?"
                 );
-                $st->execute([$sinceAt, $limit * 2]);
+                $st->execute([$sinceAt, $candidateLimit]);
                 foreach ($st->fetchAll() ?: [] as $e) {
                     if (!is_array($e)) continue;
                     $pushEvent($e);
@@ -14765,7 +15208,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                  ORDER BY created_at DESC, id DESC
                  LIMIT ?"
             );
-            $st->execute([$sinceAt, $limit * 3]);
+            $st->execute([$sinceAt, $candidateLimit]);
             foreach ($st->fetchAll() ?: [] as $e) {
                 if (!is_array($e)) {
                     continue;
@@ -14799,7 +15242,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     );
                     $params = $chunk;
                     $params[] = $sinceAt;
-                    $params[] = $limit * 2;
+                    $params[] = $candidateLimit;
                     $st->execute($params);
                     foreach ($st->fetchAll() ?: [] as $e) {
                         if (!is_array($e)) {
@@ -14822,7 +15265,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                  ORDER BY created_at DESC, id DESC
                  LIMIT ?"
             );
-            $st->execute([$sinceAt, $limit]);
+            $st->execute([$sinceAt, $candidateLimit]);
             foreach ($st->fetchAll() ?: [] as $e) {
                 if (!is_array($e)) {
                     continue;
@@ -14842,7 +15285,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                      ORDER BY published DESC
                      LIMIT ?"
                 );
-                $st->execute([$prefix, $sinceAt, $limit]);
+                $st->execute([$prefix, $sinceAt, $candidateLimit]);
                 foreach ($st->fetchAll() ?: [] as $n) {
                     if (!is_array($n)) {
                         continue;
@@ -14872,7 +15315,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                 $ownDid = (string) (ap_bsky_session_row($ownerId)['did'] ?? '');
                 $newerBsky = ap_bsky_posts_for_home(
                     $ownerId,
-                    $limit,
+                    $candidateLimit,
                     $ownDid !== '' ? $ownDid : null,
                     null,
                     $sinceAt
@@ -15330,8 +15773,13 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         $rankedMiss = admin_tl_rank_from_timeline($timeline);
         if ($view === 'home') {
             $homeOwnerMiss = admin_owner_user_id();
+            $homeProfileMiss = function_exists('ap_profile_get')
+                ? ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))
+                : [];
+            $homeAlgorithmMiss = !array_key_exists('algorithm_enabled', $homeProfileMiss)
+                || !empty($homeProfileMiss['algorithm_enabled']);
             $rankedMiss = admin_home_queue_bsky_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
-            if (function_exists('admin_home_queue_rss_after_first_page')) {
+            if ($homeAlgorithmMiss && function_exists('admin_home_queue_rss_after_first_page')) {
                 $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
             }
         }
@@ -15406,6 +15854,12 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
     header('X-TL-Flags-Ms: ' . (string) (int) round($adminTlPerfFlagsMs));
     header('X-TL-Render-Ms: ' . (string) (int) round($adminTlPerfRenderMs));
     header('X-TL-Partial-Ms: ' . (string) (int) round($adminTlPerfTotalMs));
+    if ($view === 'home' && is_array($GLOBALS['admin_tl_cache_meta'] ?? null)) {
+        $stageHeader = json_encode($GLOBALS['admin_tl_cache_meta'], JSON_UNESCAPED_SLASHES);
+        if (is_string($stageHeader) && $stageHeader !== '') {
+            header('X-TL-Home-Stages: ' . $stageHeader);
+        }
+    }
     header('X-VAAK-View: ' . $view);
     // Soft-nav shells for home/local/feed exit earlier (fast cache/skeleton path).
     echo $body;
@@ -15837,11 +16291,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
           <?php endif; ?>
           <span class="meta"> · <?= h(relative_time($nCreated)) ?></span>
         </div>
-        <div class="meta" style="color:var(--primary);margin-top:.2rem"><?= h($typeLabel) ?></div>
+        <div class="meta meta-row" style="color:var(--primary)"><?= h($typeLabel) ?></div>
       </div>
     </div>
     <?php if ($nType === 'bite' && !$biteHasPost): ?>
-      <div class="meta" style="margin-top:.55rem;color:var(--muted)">No associated post</div>
+      <div class="meta meta-row" style="color:var(--muted)">No associated post</div>
     <?php else: ?>
       <?php
         // Parent context for replies/mentions — including GIF-only Bluesky replies
@@ -16050,9 +16504,9 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         }
       ?>
       <?php if ($notifOpenUri !== '' && vaak_is_own_url($notifOpenUri) && str_contains($notifOpenUri, '/notes/')): ?>
-        <a class="btn btn-ghost" href="?view=outbox&amp;focus=<?= urlencode($notifOpenUri) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open in Your posts</a>
+        <a class="btn btn-ghost btn-compact" href="?view=outbox&amp;focus=<?= urlencode($notifOpenUri) ?>">Open in Your posts</a>
       <?php elseif ($notifOpenUri !== '' && !str_contains($notifOpenUri, '/bites-received/')): ?>
-        <a class="btn btn-ghost" href="<?= h(admin_status_href($notifOpenUri, 'mentions')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
+        <a class="btn btn-ghost btn-compact" href="<?= h(admin_status_href($notifOpenUri, 'mentions')) ?>">Open</a>
         <a href="<?= h(admin_remote_object_href($notifOpenUri)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
       <?php endif; ?>
       <?php if ($nRel !== 'none'): ?>
@@ -16070,7 +16524,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
           <input type="hidden" name="action" value="follow_remote">
           <input type="hidden" name="return_view" value="mentions">
           <input type="hidden" name="actor_id" value="<?= h($nActorRef) ?>">
-          <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Follow</button>
+          <button class="btn btn-ghost btn-compact" type="submit">Follow</button>
         </form>
       <?php endif; ?>
     </div>
@@ -16078,7 +16532,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
     <?php
     } catch (Throwable $e) {
         error_log('[ap-admin] notif row: ' . $e->getMessage());
-        echo '<div class="meta" style="padding:.5rem 0;color:var(--muted)">Skipped a notification (temporary error).</div>';
+        echo '<div class="meta meta-row" style="color:var(--muted)">Skipped a notification (temporary error).</div>';
     }
 
 }
@@ -16298,7 +16752,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     :root[data-accent="pink"] { --primary:#ff70c7; --primary-dim:rgba(255,112,199,.15); --bg-glow:#201018; }
     :root[data-accent="bone"] { --primary:#d4cfc4; --primary-dim:rgba(212,207,196,.16); --bg-glow:#1a1916; }
     * { box-sizing: border-box; }
-    html { background: #101010; color-scheme: dark; }
+    html { background: var(--bg); color-scheme: dark; }
     body {
       margin: 0;
       font-family: "Segoe UI", system-ui, sans-serif;
@@ -16522,9 +16976,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       .topbar { padding: .85rem; }
       .tweet { padding: .85rem .15rem; }
       .tweet-hd-main { flex-direction: column; gap: .25rem; }
-      .tweet-actions { gap: .45rem; }
+      .tweet-actions,
+      .composer-actions { column-gap: .4rem; row-gap: .55rem; min-width: 0; }
       .tweet-actions .icon-btn,
       .tweet-actions .btn { min-height: 2.25rem; }
+      .tweet-actions > *,
+      .composer-actions > * { min-width: 0; }
+      .composer-actions > .meta { flex: 1 1 100%; overflow-wrap: anywhere; }
       .composer input, .composer textarea, .composer select { font-size: 16px; } /* avoid iOS zoom */
       .compose-fab {
         right: max(.85rem, env(safe-area-inset-right));
@@ -16673,7 +17131,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .cw-gate .cw-body .body { margin-top: .65rem; }
     /* Unopened DM threads on the conversation list */
     .tweet-dm-unread {
-      border-color: rgba(0, 255, 159, .35);
+      border-color: color-mix(in srgb, var(--primary) 35%, transparent);
       box-shadow: inset 3px 0 0 var(--primary);
     }
     .tweet-dm-unread .nav-badge { flex: 0 0 auto; }
@@ -16698,11 +17156,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .dm-bubble > :last-child { margin-bottom: 0; }
     .dm-bubble ul,.dm-bubble ol { margin: .4rem 0 .2rem 1.1rem; padding: 0; text-indent: 0; }
     .dm-bubble.dm-out {
-      background: rgba(0, 255, 159, .08);
-      border-color: rgba(0, 255, 159, .28);
+      background: color-mix(in srgb, var(--primary) 8%, transparent);
+      border-color: color-mix(in srgb, var(--primary) 28%, var(--border));
     }
     .dm-bubble.dm-in {
-      background: #141814;
+      background: var(--panel-2);
     }
     .dm-bubble a {
       color: var(--primary);
@@ -16941,7 +17399,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     select:hover { border-color: #4a4a4a; }
     select:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
-    select option { background: #101010; color: var(--text); }
+    select option { background: var(--bg); color: var(--text); }
     .composer-check {
       display: flex;
       align-items: center;
@@ -17207,13 +17665,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border: none; cursor: pointer;
       background: linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary) 78%, #000));
       color: #04140c; font-size: 1.75rem; font-weight: 700; line-height: 1;
-      box-shadow: 0 8px 28px rgba(0, 255, 159, 0.28);
+      box-shadow: 0 8px 28px color-mix(in srgb, var(--primary) 28%, transparent);
       display: inline-flex; align-items: center; justify-content: center;
       transition: transform .16s ease, box-shadow .16s ease, filter .16s ease;
     }
     .compose-fab:hover {
       filter: brightness(1.08); transform: translateY(-2px) scale(1.03);
-      box-shadow: 0 10px 32px rgba(0, 255, 159, 0.36);
+      box-shadow: 0 10px 32px color-mix(in srgb, var(--primary) 36%, transparent);
     }
     .compose-fab:active, .compose-fab.is-pressed { transform: translateY(0) scale(.94); }
     .compose-fab:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
@@ -17589,6 +18047,25 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: transparent; color: var(--muted);
       border: 1px solid var(--border);
     }
+    /* Shared compact control sizing for secondary actions across views. */
+    .btn-compact {
+      min-height: 2rem;
+      padding: .3rem .7rem;
+      font-size: .82rem;
+      line-height: 1.2;
+    }
+    /* Legacy inline-sized secondary controls use the same compact rhythm. */
+    .btn[style*="padding:.25rem .7rem"][style*="font-size:.8rem"],
+    .btn[style*="padding:.35rem .9rem"][style*="font-size:.85rem"] {
+      min-height: 2rem !important;
+      padding: .3rem .7rem !important;
+      font-size: .82rem !important;
+      line-height: 1.2 !important;
+    }
+    .meta-row {
+      margin: .35rem 0 .5rem;
+      line-height: 1.35;
+    }
 
     .tweet {
       padding: 1rem 1.1rem; margin-bottom: .75rem;
@@ -17640,6 +18117,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     #status-thread-ancestors > article.tweet:hover,
     #status-thread-descendants > article.tweet:hover,
     article.tweet#status-focus:hover { background: transparent; }
+    /* Keep an empty-replies state visually separated from the focused post. */
+    #status-thread-ancestors > .status-thread-empty,
+    #status-thread-descendants > .status-thread-empty,
+    #status-thread-descendants > .empty {
+      margin: 1.25rem .25rem 1.5rem;
+      padding: .85rem .25rem 1rem;
+      border-top: 1px solid var(--border);
+      text-align: center;
+    }
+    #status-thread-descendants > .status-thread-loading {
+      margin-top: 1.25rem !important;
+      padding: .5rem .25rem 1rem;
+      text-align: center;
+    }
     .relay-card .relay-meta { text-align: left; margin-left: 0; padding-left: 0; }
     .forum-post { display:flex; gap:.8rem; align-items:flex-start; }
     .forum-post-avatar { width:42px; height:42px; flex:0 0 42px; border-radius:50%; object-fit:cover; background:var(--panel-2); border:1px solid var(--border); }
@@ -17733,12 +18224,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tags { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .75rem; }
     .tag {
       font-size: .75rem; padding: .2rem .55rem; border-radius: 999px;
-      background: #182018; color: #9fd; border: 1px solid #243824;
+      background: color-mix(in srgb, var(--primary) 12%, var(--panel-2));
+      color: var(--primary);
+      border: 1px solid color-mix(in srgb, var(--primary) 24%, var(--border));
     }
-    .tweet-actions { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .8rem; align-items: center; overflow: visible; }
+    .tweet-actions { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .8rem; align-items: center; overflow: visible; min-width: 0; }
     .tweet-actions a, .tweet-actions button {
       font-size: .85rem; color: var(--muted);
       background: none; border: none; cursor: pointer; padding: .25rem .4rem;
+      min-width: 0; white-space: nowrap;
     }
     .tweet-actions a:hover, .tweet-actions button:hover { color: var(--primary); }
     .tweet-actions .icon-btn {
@@ -17965,7 +18459,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       from { opacity: 0; transform: translateY(10px); }
       to { opacity: 1; transform: translateY(0); }
     }
-    .empty { color: var(--muted); padding: 2rem 1rem; text-align: center; }
+    .empty,
+    .meta.empty-state {
+      color: var(--muted); padding: 1.5rem 1rem; text-align: center;
+      border: 1px dashed color-mix(in srgb, var(--border) 85%, transparent);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--panel-2) 42%, transparent);
+      line-height: 1.45;
+    }
+    .empty + .empty,
+    .meta.empty-state + .meta.empty-state { margin-top: .75rem; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; color: var(--muted); word-break: break-all; }
     .gb-item, .fin-row {
       background: var(--panel); border: 1px solid var(--border);
@@ -18512,6 +19015,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'relays' ? 'active' : '' ?>" href="?view=relays"><span class="ico">⇄</span><span class="label">Relays</span></a>
           <a class="<?= $view === 'stats' ? 'active' : '' ?>" href="?view=stats"><span class="ico">▤</span><span class="label">AP stats</span></a>
           <a class="<?= $view === 'queue_health' ? 'active' : '' ?>" href="?view=queue_health"><span class="ico">◌</span><span class="label">Queue health</span></a>
+          <a class="<?= $view === 'downranking' ? 'active' : '' ?>" href="?view=downranking"><span class="ico">≋</span><span class="label">Home downranking</span></a>
+          <a class="<?= $view === 'downranked' ? 'active' : '' ?>" href="?view=downranked"><span class="ico">⚠</span><span class="label">Downranked</span></a>
         </div>
       </details>
       <?php endif; ?>
@@ -18615,7 +19120,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 $refreshExtra .= '&amp;network=' . urlencode(strtolower((string) $_GET['network']));
             }
           ?>
-          <a class="btn btn-ghost" href="?view=<?= h($view) ?><?= $refreshExtra ?>&amp;_r=<?= time() ?>" title="Reload this view">↻ Refresh</a>
+          <?php $timelineRefresh = in_array($view, ['home', 'local', 'feed'], true); ?>
+          <a class="btn btn-ghost" href="?view=<?= h($view) ?><?= $refreshExtra ?><?= $timelineRefresh ? '' : '&amp;_r=' . time() ?>" title="Reload this view">↻ Refresh</a>
         <?php endif; ?>
       </div>
     </div>
@@ -20055,6 +20561,189 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endif; ?>
         <?php endif; ?>
 
+      <?php elseif ($view === 'downranked'): ?>
+        <?php if (empty($vaakIsAdmin)): ?>
+          <div class="empty">Admin only.</div>
+        <?php else: ?>
+          <?php
+            $downrankedQuery = trim((string) ($_GET['q'] ?? ''));
+            $downrankedPage = max(1, (int) ($_GET['page'] ?? 1));
+            $allDownrankedActors = admin_home_downranked_actor_rows();
+            if ($downrankedQuery !== '') {
+                $needle = strtolower($downrankedQuery);
+                $allDownrankedActors = array_values(array_filter($allDownrankedActors, static function (array $row) use ($needle): bool {
+                    $hay = strtolower((string) ($row['actor_id'] ?? '') . ' ' . implode(' ', (array) ($row['categories'] ?? [])));
+                    return str_contains($hay, $needle);
+                }));
+            }
+            $downrankedPerPage = 25;
+            $downrankedPages = max(1, (int) ceil(count($allDownrankedActors) / $downrankedPerPage));
+            $downrankedPage = min($downrankedPage, $downrankedPages);
+            $downrankedActors = array_slice($allDownrankedActors, ($downrankedPage - 1) * $downrankedPerPage, $downrankedPerPage);
+            $downrankedQueryParam = $downrankedQuery !== '' ? '&amp;q=' . rawurlencode($downrankedQuery) : '';
+            $downrankAuditRows = admin_home_downrank_audit_rows();
+          ?>
+          <div class="meta" style="margin-bottom:1rem">
+            Private, temporary Home-ranking signals grouped by actor. These are not public labels or moderation decisions.
+            Review the evidence categories and expiry before taking any server-wide action.
+          </div>
+          <form method="get" action="" style="display:flex;gap:.5rem;align-items:center;margin-bottom:1rem">
+            <input type="hidden" name="view" value="downranked">
+            <input type="search" name="q" value="<?= h($downrankedQuery) ?>" placeholder="Search actor URL or category" aria-label="Search downranked actors" style="flex:1;min-width:0">
+            <button class="btn btn-ghost" type="submit">Search</button>
+            <?php if ($downrankedQuery !== ''): ?><a class="btn btn-ghost" href="?view=downranked">Clear</a><?php endif; ?>
+          </form>
+          <?php if (!$allDownrankedActors): ?>
+            <div class="empty">No active temporary downranking signals.</div>
+          <?php else: ?>
+            <div style="display:flex;flex-direction:column;gap:.7rem">
+              <?php foreach ($downrankedActors as $dr): ?>
+                <?php
+                  $drActor = (string) ($dr['actor_id'] ?? '');
+                  $drName = function_exists('actor_display_name') ? actor_display_name($drActor, false) : $drActor;
+                  $drUntil = (int) ($dr['until'] ?? 0);
+                  $drExpired = $drUntil <= time();
+                  $drCats = implode(', ', array_map('strval', (array) ($dr['categories'] ?? [])));
+                ?>
+                <article class="tweet" style="padding:.85rem 1rem">
+                  <div class="tweet-hd">
+                    <div style="min-width:0">
+                      <div class="who" style="overflow-wrap:anywhere"><?= h($drName !== '' ? $drName : $drActor) ?></div>
+                      <div class="meta" style="overflow-wrap:anywhere"><?= h($drActor) ?></div>
+                    </div>
+                    <span class="tag"><?= $drExpired ? 'expired' : 'active' ?></span>
+                  </div>
+                  <div class="meta" style="margin-top:.55rem">
+                    Categories: <?= h($drCats !== '' ? $drCats : 'uncategorized') ?> · score <?= (int) ($dr['score'] ?? 0) ?> · <?= (int) ($dr['viewers'] ?? 0) ?> viewer<?= ((int) ($dr['viewers'] ?? 0) === 1 ? '' : 's') ?>
+                    <?php if ($drUntil > 0): ?> · <?= $drExpired ? 'expired' : 'expires ' . h(relative_time(gmdate('c', $drUntil))) ?><?php endif; ?>
+                  </div>
+                  <div class="tweet-actions" style="flex-wrap:wrap;margin-top:.55rem">
+                    <?php if (str_starts_with($drActor, 'https://')): ?><a href="<?= h(admin_remote_actor_href($drActor)) ?>" target="_blank" rel="noopener noreferrer">Open profile</a><?php endif; ?>
+                    <form method="post" action="?view=downranked" style="display:inline">
+                      <input type="hidden" name="action" value="downrank_signal_clear">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($drActor) ?>">
+                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Clear signal</button>
+                    </form>
+                    <form method="post" action="?view=downranked" style="display:inline">
+                      <input type="hidden" name="action" value="block_actor">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($drActor) ?>">
+                      <input type="hidden" name="kind" value="mute">
+                      <input type="hidden" name="reason" value="Admin review of temporary Home downranking signal">
+                      <input type="hidden" name="return_view" value="downranked">
+                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Server mute</button>
+                    </form>
+                    <form method="post" action="?view=downranked" style="display:inline" onsubmit="return confirm('Apply a server-wide block to this actor?');">
+                      <input type="hidden" name="action" value="block_actor">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($drActor) ?>">
+                      <input type="hidden" name="kind" value="block">
+                      <input type="hidden" name="reason" value="Admin review of temporary Home downranking signal">
+                      <input type="hidden" name="return_view" value="downranked">
+                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem;color:var(--danger)">Server block</button>
+                    </form>
+                  </div>
+                </article>
+              <?php endforeach; ?>
+            </div>
+            <?php if ($downrankedPages > 1): ?><nav class="composer-actions" aria-label="Downranked pages" style="margin-top:1rem;justify-content:center;gap:.5rem">
+              <?php if ($downrankedPage > 1): ?><a class="btn btn-ghost" href="?view=downranked&amp;page=<?= $downrankedPage - 1 ?><?= $downrankedQueryParam ?>">Previous</a><?php endif; ?>
+              <span class="meta">Page <?= $downrankedPage ?> of <?= $downrankedPages ?></span>
+              <?php if ($downrankedPage < $downrankedPages): ?><a class="btn btn-ghost" href="?view=downranked&amp;page=<?= $downrankedPage + 1 ?><?= $downrankedQueryParam ?>">Next</a><?php endif; ?>
+            </nav><?php endif; ?>
+          <?php endif; ?>
+          <details class="blocks-section" style="margin-top:1.5rem">
+            <summary><span class="who">Recent audit trail</span><span class="meta">admin vocabulary and escalation actions</span></summary>
+            <div class="blocks-section-body">
+              <?php if (!$downrankAuditRows): ?><div class="empty">No audit entries yet.</div><?php else: ?>
+                <?php foreach ($downrankAuditRows as $audit): ?>
+                  <div class="meta" style="padding:.45rem 0;border-bottom:1px solid var(--border)">
+                    <strong><?= h((string) ($audit['action'] ?? '')) ?></strong>
+                    · <?= h((string) ($audit['phrase'] ?? $audit['actor_id'] ?? '')) ?>
+                    · <?= h(relative_time((string) ($audit['created_at'] ?? ''))) ?>
+                    <?php if (!empty($audit['admin_actor'])): ?> · by <?= h((string) $audit['admin_actor']) ?><?php endif; ?>
+                  </div>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </div>
+          </details>
+        <?php endif; ?>
+
+      <?php elseif ($view === 'downranking'): ?>
+        <?php if (empty($vaakIsAdmin)): ?>
+          <div class="empty">Admin only.</div>
+        <?php else: ?>
+          <?php
+            $downrankTerms = [];
+            try {
+                $downrankTerms = ap_db()->query('SELECT id, phrase, category, enabled, created_at, updated_at FROM ap_home_downrank_terms ORDER BY category ASC, phrase ASC')->fetchAll() ?: [];
+            } catch (Throwable $e) {
+                $error = 'Downranking vocabulary is not available until its database migration is applied.';
+            }
+          ?>
+          <div class="meta" style="margin-bottom:1rem">
+            Add phrases that should receive a temporary, viewer-specific soft downrank on Home when recommendations are enabled.
+            This does not hide posts, affect federation, or create personal/server-wide mutes or blocks. Matching is case-insensitive and phrase-based;
+            entries are kept private to administrators.
+          </div>
+          <form class="composer" method="post" action="?view=downranking" style="margin-bottom:1.25rem">
+            <input type="hidden" name="action" value="downrank_term_add">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <label class="meta" for="downrank-phrase">Phrase or term</label>
+            <input id="downrank-phrase" name="phrase" type="text" maxlength="120" required placeholder="Enter a phrase to downrank temporarily">
+            <label class="meta" for="downrank-category" style="display:block;margin-top:.6rem">Category</label>
+            <select id="downrank-category" name="category">
+              <option value="protected_class">Protected-class harassment</option>
+              <option value="sexualized_harassment">Sexualized harassment</option>
+              <option value="custom" selected>Custom</option>
+            </select>
+            <div class="composer-actions">
+              <span class="meta">Max 120 characters · exact phrase matching</span>
+              <button class="btn btn-primary" type="submit">Save phrase</button>
+            </div>
+          </form>
+          <form method="post" action="?view=downranking" style="margin:-.7rem 0 1.25rem">
+            <input type="hidden" name="action" value="downrank_term_preview">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+            <label class="meta" for="downrank-preview-phrase">Preview against cached public posts before saving</label>
+            <div style="display:flex;gap:.5rem;margin-top:.35rem">
+              <input id="downrank-preview-phrase" name="preview_phrase" type="text" maxlength="120" required placeholder="Phrase to test" style="flex:1;min-width:0">
+              <button class="btn btn-ghost" type="submit">Preview matches</button>
+            </div>
+          </form>
+          <?php if (isset($downrankPreview) && is_array($downrankPreview)): ?>
+            <div class="tweet" style="margin-bottom:1.25rem">
+              <div class="who">Preview: “<?= h((string) ($downrankPreview['phrase'] ?? '')) ?>”</div>
+              <div class="meta" style="margin-top:.4rem">Matched <?= (int) ($downrankPreview['count'] ?? 0) ?> cached public/unlisted post<?= ((int) ($downrankPreview['count'] ?? 0) === 1 ? '' : 's') ?> from the last 30 days.</div>
+              <?php if (!empty($downrankPreview['samples'])): ?><div class="meta" style="margin-top:.35rem">Sample actors: <?= h(implode(', ', array_map(static fn(array $s): string => (string) ($s['actor_id'] ?? $s['host'] ?? ''), (array) $downrankPreview['samples']))) ?></div><?php endif; ?>
+            </div>
+          <?php endif; ?>
+          <?php if (!$downrankTerms): ?>
+            <div class="empty">No admin-managed phrases yet.</div>
+          <?php else: ?>
+            <div style="display:flex;flex-direction:column;gap:.6rem">
+              <?php foreach ($downrankTerms as $term): ?>
+                <article class="tweet" style="padding:.8rem 1rem">
+                  <div class="tweet-hd">
+                    <div class="who" style="overflow-wrap:anywhere"><?= h((string) ($term['phrase'] ?? '')) ?></div>
+                    <span class="tag"><?= h((string) ($term['category'] ?? 'custom')) ?></span>
+                  </div>
+                  <div class="tweet-actions" style="margin-top:.5rem">
+                    <span class="meta">Added <?= h(relative_time((string) ($term['created_at'] ?? ''))) ?></span>
+                    <form method="post" action="?view=downranking" style="display:inline;margin-left:auto" onsubmit="return confirm('Remove this downranking phrase?');">
+                      <input type="hidden" name="action" value="downrank_term_delete">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="term_id" value="<?= (int) ($term['id'] ?? 0) ?>">
+                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Remove</button>
+                    </form>
+                  </div>
+                </article>
+              <?php endforeach; ?>
+            </div>
+          <?php endif; ?>
+        <?php endif; ?>
+
       <?php elseif ($view === 'policies'): ?>
         <?php if (empty($vaakIsAdmin)): ?>
           <div class="empty">Admin only.</div>
@@ -20359,10 +21048,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
         <?php $twoFaEnabled = ap_auth_2fa_enabled($vaakOwnerId); ?>
         <?php if ($twoFaRecoveryCodes): ?>
-        <div class="tweet" style="margin-bottom:1.25rem;border-color:#00ff9f">
+        <div class="tweet" style="margin-bottom:1.25rem;border-color:var(--primary)">
           <div class="who">Save your recovery codes</div>
           <div class="body meta" style="margin-top:.5rem">Each code works once if you lose access to your authenticator. VAAK cannot show these again.</div>
-          <code style="display:block;white-space:pre-wrap;margin-top:.75rem;line-height:1.8;color:#9dffd0"><?= h(implode("\n", $twoFaRecoveryCodes)) ?></code>
+          <code style="display:block;white-space:pre-wrap;margin-top:.75rem;line-height:1.8;color:var(--primary)"><?= h(implode("\n", $twoFaRecoveryCodes)) ?></code>
         </div>
         <?php elseif (!$twoFaEnabled && is_array($twoFaSetup)): ?>
         <form class="composer" method="post" action="?view=security" style="margin-bottom:1.25rem" autocomplete="off">
@@ -20371,7 +21060,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta"><strong>Finish two-factor setup</strong></div>
           <div class="body meta" style="margin-top:.5rem">Scan the QR code with Google Authenticator or another TOTP app. If scanning is unavailable, enter the clean Base32 key below as a setup key.</div>
           <button type="button" class="btn btn-ghost" style="margin-top:.7rem" onclick="vaakShowTotpQr(<?= h(json_encode((string) ($twoFaSetup['otpauth'] ?? ''), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?: '\"\"') ?>)">Show QR code</button>
-          <code style="display:block;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem;color:#9dffd0">Base32 setup key: <?= h((string) ($twoFaSetup['secret'] ?? '')) ?></code>
+          <code style="display:block;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:.65rem;color:var(--primary)">Base32 setup key: <?= h((string) ($twoFaSetup['secret'] ?? '')) ?></code>
           <input name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit authenticator code" style="margin-top:.75rem">
           <div class="composer-actions"><span class="meta">The QR is generated in your browser.</span><button class="btn btn-primary" type="submit">Enable 2FA</button></div>
         </form>
@@ -20697,6 +21386,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
 
           <div class="checks">
+            <label><input type="checkbox" name="algorithm_enabled" value="1" <?= !empty($profile['algorithm_enabled']) ? 'checked' : '' ?>> Use Home recommendations and algorithmic ranking</label>
+            <label><input type="checkbox" name="downranking_enabled" value="1" <?= !empty($profile['downranking_enabled']) ? 'checked' : '' ?>> Temporarily downrank posts matching admin-managed harassment vocabulary</label>
             <label><input type="checkbox" name="discoverable" value="1" <?= !empty($profile['discoverable']) ? 'checked' : '' ?>> Show in profile directories / discovery</label>
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
@@ -20706,6 +21397,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <label><input type="checkbox" name="automated" value="1" <?= !empty($profile['automated']) ? 'checked' : '' ?>> Mark this account as automated</label>
             <label><input type="checkbox" name="collection_consent" value="1" <?= !empty($profile['collection_consent']) ? 'checked' : '' ?>> Allow featuring in Collections</label>
             <label><input type="checkbox" name="vanity_verified" value="1" <?= !empty($profile['vanity_verified']) ? 'checked' : '' ?>> Vanity verified checkmark <span class="vanity-verified" aria-hidden="true">✓</span></label>
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Home recommendations</b> — when enabled, Home may rank followed activity and add personalized recommendations, RSS, and connected Bluesky content. Turn it off for a simpler chronological Home made from followed Fediverse activity, followed hashtags, and followed Bluesky accounts. Privacy, mute, and block rules always apply.
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem">
+            <b style="color:var(--primary)">Temporary downranking</b> — when enabled, posts matching the administrator’s private vocabulary may be placed lower in Home for a limited time. This is only a soft ranking signal; it does not hide posts or affect your blocks, mutes, DMs, or federation.
           </div>
           <div class="meta" style="margin:.35rem 0 .75rem">
             <b style="color:var(--primary)">Follow back</b> —
@@ -23265,7 +23962,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           ?>
           <div id="status-thread-ancestors" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="<?= !empty($stMaybeMoreThread) ? '1' : '0' ?>">
             <?php if ($stAncestors): ?>
-              <div class="meta status-thread-count" style="margin:0 0 1rem"><?= count($stAncestors) ?> earlier in thread</div>
+              <div class="meta status-thread-count meta-row"><?= count($stAncestors) ?> earlier in thread</div>
               <?php foreach ($stAncestors as $anc): ?>
                 <?php if (is_array($anc)) {
                     admin_render_masto_status_card($anc, $followingIds, $stFrom, false, true);
@@ -23294,7 +23991,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
           <div id="status-thread-descendants" data-object="<?= h($stObject) ?>" data-from="<?= h($stFrom) ?>" data-need-more="<?= !empty($stMaybeMoreReplies) ? '1' : '0' ?>" data-seen-count="<?= (int) count($stDescendants) ?>">
             <?php if ($stDescendants): ?>
-              <div class="meta status-thread-count" style="margin:1rem 0 .5rem"><?= count($stDescendants) ?> replies we’ve seen</div>
+              <div class="meta status-thread-count meta-row"><?= count($stDescendants) ?> replies we’ve seen</div>
               <?php foreach ($stDescendants as $desc): ?>
                 <?php if (is_array($desc)) {
                     admin_render_masto_status_card($desc, $followingIds, $stFrom, false, true);
@@ -23306,7 +24003,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php elseif (!empty($stMaybeMoreReplies)): ?>
               <div class="meta status-thread-loading" style="margin-top:1rem">Loading replies…</div>
             <?php else: ?>
-              <div class="empty" style="margin-top:1rem">No replies cached on this instance yet.</div>
+              <div class="status-thread-empty meta">No replies found yet.</div>
             <?php endif; ?>
           </div>
         <?php endif; ?>
@@ -24583,6 +25280,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
         </div>
         <div class="side-card" style="margin-top:1rem">
+          <h3>Readiness checks</h3>
+          <div class="meta" style="margin-bottom:.6rem">Protected operational checks for this admin session. Correlation ID: <code><?= h($vaakCorrelationId) ?></code></div>
+          <div class="stat-grid">
+            <div class="stat"><div class="n" style="color:<?= !empty($healthDb['ok']) ? 'var(--primary)' : 'var(--danger)' ?>"><?= !empty($healthDb['ok']) ? 'OK' : 'FAIL' ?></div><div class="l">PostgreSQL<?= $healthDb['latency_ms'] !== null ? ' · ' . h(number_format((float) $healthDb['latency_ms'], 1)) . ' ms' : '' ?></div></div>
+            <div class="stat"><div class="n" style="color:<?= !empty($healthRedisCache['available']) ? 'var(--primary)' : 'var(--danger)' ?>"><?= !empty($healthRedisCache['available']) ? 'OK' : 'DOWN' ?></div><div class="l">Redis cache</div></div>
+            <div class="stat"><div class="n" style="color:<?= !empty($healthRedisQueue['available']) ? 'var(--primary)' : 'var(--danger)' ?>"><?= !empty($healthRedisQueue['available']) ? 'OK' : 'DOWN' ?></div><div class="l">Redis queue</div></div>
+          </div>
+          <?php $healthWarnings = array_merge((array) ($healthDb['error'] ?? ''), (array) ($healthRedisCache['warnings'] ?? []), (array) ($healthRedisQueue['warnings'] ?? [])); $healthWarnings = array_values(array_filter(array_map('strval', $healthWarnings))); ?>
+          <?php if ($healthWarnings): ?><div class="meta" style="margin-top:.65rem;color:var(--warning)"><?= h(implode(' · ', array_slice($healthWarnings, 0, 3))) ?></div><?php endif; ?>
+        </div>
+        <div class="side-card" style="margin-top:1rem">
           <h3>Queue classes</h3>
           <div style="overflow-x:auto">
             <table style="width:100%;border-collapse:collapse;font-size:.88rem">
@@ -24649,8 +25357,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <h3>Recent path timings</h3>
           <div class="meta" style="margin-bottom:.6rem">Aggregated Redis telemetry, retained for 24 hours; no request content is stored.</div>
           <div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.88rem">
-            <thead><tr class="meta" style="text-align:left"><th style="padding:.35rem;border-bottom:1px solid var(--border)">Path</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Calls</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Average</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Max</th></tr></thead>
-            <tbody><?php foreach ($timingMetrics as $tm => $tv): ?><tr><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h((string) $tm) ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= (int) $tv['count'] ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format($tv['count'] > 0 ? $tv['total_ms'] / $tv['count'] : 0, 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format($tv['max_ms'], 1)) ?> ms</td></tr><?php endforeach; ?></tbody>
+            <thead><tr class="meta" style="text-align:left"><th style="padding:.35rem;border-bottom:1px solid var(--border)">Path</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Calls</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Average</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">p50</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">p95</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">p99</th><th style="padding:.35rem;border-bottom:1px solid var(--border)">Max</th></tr></thead>
+            <tbody><?php foreach ($timingMetrics as $tm => $tv): ?><tr><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h((string) $tm) ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= (int) $tv['count'] ?></td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format($tv['count'] > 0 ? $tv['total_ms'] / $tv['count'] : 0, 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format((float) ($tv['p50_ms'] ?? 0), 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format((float) ($tv['p95_ms'] ?? 0), 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format((float) ($tv['p99_ms'] ?? 0), 1)) ?> ms</td><td style="padding:.35rem;border-bottom:1px solid var(--border)"><?= h(number_format($tv['max_ms'], 1)) ?> ms</td></tr><?php endforeach; ?></tbody>
           </table></div>
         </div>
         <?php endif; ?>
@@ -26417,7 +27125,7 @@ window.apAdminToast = function (msg, isErr) {
       loadThreadPart(
         document.getElementById('status-thread-descendants'),
         'replies',
-        'No replies found.',
+        'No replies found yet.',
         'Couldn’t load replies.'
       );
       return;
@@ -26454,7 +27162,7 @@ window.apAdminToast = function (msg, isErr) {
         // Now pull parents (source posts) + replies around the hydrated focus.
         const shells = ensureThreadShells(objectUrl, from);
         loadThreadPart(shells.anc, 'ancestors', 'No earlier posts found.', 'Couldn’t load earlier posts.');
-        loadThreadPart(shells.desc, 'replies', 'No replies found.', 'Couldn’t load replies.');
+        loadThreadPart(shells.desc, 'replies', 'No replies found yet.', 'Couldn’t load replies.');
       })
       .catch((err) => {
         box.dataset.loading = '0';
@@ -27595,7 +28303,7 @@ window.apAdminToast = function (msg, isErr) {
       if (h1) h1.textContent = TL_TITLES[nextView] || nextView;
       const refresh = document.querySelector('.topbar-actions a.btn[title="Reload this view"]');
       if (refresh) {
-        refresh.setAttribute('href', '?view=' + encodeURIComponent(nextView) + '&_r=' + Date.now());
+        refresh.setAttribute('href', '?view=' + encodeURIComponent(nextView));
       }
       if (typeof window.novaEnhanceTweetFolds === 'function') {
         window.novaEnhanceTweetFolds(items);

@@ -1457,6 +1457,15 @@ function ap_rss_http_get(string $url, string $etag = '', string $lastModified = 
             break;
         }
         $sleep = $retryAfter > 0 ? $retryAfter : (2 * $attempt);
+        if ($retryAfter <= 0) {
+            // Add bounded jitter to avoid synchronized feed retry bursts while
+            // preserving an explicit server-provided Retry-After interval.
+            try {
+                $sleep += random_int(-max(1, (int) floor($sleep * 0.20)), max(1, (int) ceil($sleep * 0.20)));
+            } catch (Throwable $e) {
+                // Keep the base delay if the system RNG is unavailable.
+            }
+        }
         $sleep = max(1, min(20, $sleep));
         ap_rss_host_backoff_set($url, $sleep + 5);
         if ($attempt >= $maxAttempts) {

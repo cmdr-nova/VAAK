@@ -418,7 +418,15 @@ function ap_bsky_crosspost_retry_backoff_sec(int $attempt): int
 {
     $table = [60, 120, 300, 600, 1200, 2400, 5400, 10800];
     $idx = max(0, min(count($table) - 1, $attempt - 1));
-    return $table[$idx];
+    $base = $table[$idx];
+    // Spread independent workers over a bounded window so a provider outage
+    // does not cause every queued post to retry at the same second.
+    try {
+        $jitter = random_int((int) floor($base * -0.20), (int) ceil($base * 0.20));
+    } catch (Throwable $e) {
+        $jitter = 0;
+    }
+    return max(1, $base + $jitter);
 }
 
 /**
