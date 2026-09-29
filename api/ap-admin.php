@@ -697,7 +697,12 @@ $vaakAdminOnlyActions = [
                 } elseif (!empty($askRow['answered'])) {
                     $error = 'This Ask has already been answered.';
                 } else {
-                    $queued = ap_queue_enqueue($answer, '', false, '', '', '', [], 'public');
+                    // Wafrn treats the answer as a normal ActivityPub reply to
+                    // the AskQuestion activity. Keeping the Ask IRI as
+                    // inReplyTo lets compatible servers/thread views associate
+                    // the answer without exposing the private question text.
+                    $askReplyTo = trim((string) ($askRow['ask_id'] ?? ''));
+                    $queued = ap_queue_enqueue($answer, '', false, $askReplyTo, '', '', [], 'public');
                     if (!empty($queued['ok'])) {
                         $now = ap_db_now();
                         ap_db()->prepare('UPDATE ap_asks SET answered = 1, updated_at = ? WHERE id = ? AND owner_user_id = ?')->execute([$now, $askId, $vaakOwnerId]);
