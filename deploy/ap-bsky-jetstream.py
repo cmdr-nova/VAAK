@@ -21,6 +21,8 @@ INCOMING = STATE_DIR / "incoming"
 MAX_EVENTS = 500
 MAX_BYTES = 8 * 1024 * 1024
 MAX_FILTER_DIDS_IN_URL = 25
+SHARD_INDEX = max(0, int(os.environ.get("VAAK_JETSTREAM_SHARD_INDEX", "0")))
+SHARD_COUNT = max(1, int(os.environ.get("VAAK_JETSTREAM_SHARD_COUNT", "1")))
 COLLECTIONS = [
     "app.bsky.feed.post",
     "app.bsky.feed.repost",
@@ -36,16 +38,23 @@ def wanted_dids():
 
 
 def cursor():
+    cursor_path = STATE_DIR / ("cursor-%d" % SHARD_INDEX)
     try:
-        return int(CURSOR_FILE.read_text().strip())
+        return int(cursor_path.read_text().strip())
     except (OSError, ValueError):
         return 0
 
 
 def persist_cursor(value):
-    tmp = CURSOR_FILE.with_suffix(".tmp")
+    cursor_path = STATE_DIR / ("cursor-%d" % SHARD_INDEX)
+    tmp = cursor_path.with_suffix(".tmp")
     tmp.write_text(str(int(value)))
-    os.replace(tmp, CURSOR_FILE)
+    os.replace(tmp, cursor_path)
+
+
+def selected_dids():
+    dids = wanted_dids()
+    return dids[SHARD_INDEX::SHARD_COUNT]
 
 
 def stream_url(dids, since):
@@ -61,7 +70,7 @@ def stream_url(dids, since):
 
 
 def spool(ws, wanted):
-    path = INCOMING / ("events-%d-%d.jsonl" % (int(time.time()), os.getpid()))
+    path = INCOMING / ("events-%d-%d-%d.jsonl" % (SHARD_INDEX, int(time.time()), os.getpid()))
     handle = path.open("a", encoding="utf-8")
     count = 0
     size = 0
@@ -85,7 +94,7 @@ def spool(ws, wanted):
                 persist_cursor(event["time_us"])
             if count >= MAX_EVENTS or size >= MAX_BYTES:
                 handle.close()
-                path = INCOMING / ("events-%d-%d.jsonl" % (int(time.time()), os.getpid()))
+                path = INCOMING / ("events-%d-%d-%d.jsonl" % (SHARD_INDEX, int(time.time()), os.getpid()))
                 handle = path.open("a", encoding="utf-8")
                 count = 0
                 size = 0
@@ -98,7 +107,7 @@ def main():
     INCOMING.mkdir(parents=True, exist_ok=True)
     backoff = 2
     while True:
-        dids = wanted_dids()
+        dids = selected_dids()
         if not dids:
             time.sleep(30)
             continue
