@@ -12278,7 +12278,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
                 . '<button class="menu-action danger" type="submit">Block this user (server)</button></form>';
         }
         $menu .= '<a class="menu-action" href="/vaak/?view=moderation&amp;actor=' . rawurlencode($actorId) . '&amp;from=' . rawurlencode($returnView) . '">Open in moderation panel</a>';
-    } elseif ($isAdmin && $isLocal && $actorId !== '') {
+    } elseif ($isAdmin && $isLocal && $actorId !== '' && !$isSelf) {
         if ($menu !== '') {
             $menu .= '<div class="menu-action-sep" role="separator" aria-hidden="true"></div>';
         }
