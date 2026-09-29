@@ -2746,7 +2746,12 @@ function ap_bsky_jetstream_ingest_event(array $event): array
             'record' => $record,
         ];
         ap_bsky_post_upsert_from_feed_item($post, null);
-        foreach ($owners as $owner) ap_bsky_post_observation_touch($uri, (int) $owner);
+        foreach ($owners as $owner) {
+            ap_bsky_post_observation_touch($uri, (int) $owner);
+            if (function_exists('ap_bsky_actor_refresh_enqueue')) {
+                ap_bsky_actor_refresh_enqueue((int) $owner, $did, true);
+            }
+        }
         return ['ok' => true, 'type' => 'post', 'owners' => count($owners)];
     }
     if ($action === 'delete' && ($collection === 'app.bsky.feed.post' || $collection === 'app.bsky.feed.repost')) {

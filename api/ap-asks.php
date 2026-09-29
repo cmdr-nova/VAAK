@@ -54,6 +54,11 @@ function ap_ask_store_inbound(array $activity, int $ownerUserId, string $ownerAc
     if ($target === null || $actor === null || $question === '' || strlen($question) > 10240) return false;
     $local = ap_local_user_by_actor_id($target);
     if (!is_array($local) || (int) ($local['id'] ?? 0) !== $ownerUserId) return false;
+    $key = (string) ($local['actor_key'] ?? '');
+    if ($key !== '' && function_exists('ap_profile_get')) {
+        $profile = ap_profile_get($key);
+        if (array_key_exists('asks_enabled', $profile) && empty($profile['asks_enabled'])) return false;
+    }
     if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($actor)) return false;
     $now = ap_db_now();
     $st = ap_db()->prepare('INSERT INTO ap_asks (ask_id,question,asker_actor,asked_actor,owner_user_id,ap_object,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(ask_id) DO NOTHING');

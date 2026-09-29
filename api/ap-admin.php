@@ -216,7 +216,7 @@ if ($view === 'gallery' || $view === 'vakktok') {
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
     'moderation', 'blocks', 'relays', 'stats', 'queue_health', 'invites', 'users', 'policies',
-    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers', 'asks',
+    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers',
 ];
 // Security is under You for every account (own OAuth tokens / password).
 if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
@@ -1825,6 +1825,7 @@ $vaakAdminOnlyActions = [
                 'hide_profile_boosts' => !empty($_POST['hide_profile_boosts']),
                 'algorithm_enabled' => !empty($_POST['algorithm_enabled']),
                 'downranking_enabled' => !empty($_POST['downranking_enabled']),
+                'asks_enabled' => !empty($_POST['asks_enabled']),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
                 'profile_badges' => is_array($_POST['profile_badges'] ?? null) ? $_POST['profile_badges'] : [],
             ], $vaakActorKey);
@@ -14328,6 +14329,15 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $author = is_array($post['author'] ?? null) ? $post['author'] : [];
     $display = trim((string) ($author['displayName'] ?? ''));
     $handle = (string) ($author['handle'] ?? '');
+    if (($display === '' || $handle === '' || (string) ($author['avatar'] ?? '') === '')
+        && function_exists('ap_bsky_actor_profile_cache_get')) {
+        $did = trim((string) ($author['did'] ?? ''));
+        $cachedActor = $did !== '' ? ap_bsky_actor_profile_cache_get($did, (int) ($GLOBALS['vaak_owner_id'] ?? 0)) : null;
+        $cp = is_array($cachedActor['profile'] ?? null) ? $cachedActor['profile'] : [];
+        if ($display === '') $display = trim((string) ($cp['displayName'] ?? ''));
+        if ($handle === '') $handle = trim((string) ($cp['handle'] ?? ''));
+        if ((string) ($author['avatar'] ?? '') === '') $author['avatar'] = (string) ($cp['avatar'] ?? '');
+    }
     if ($display === '') {
         $display = $handle !== '' ? $handle : 'Bluesky user';
     }
@@ -18951,6 +18961,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <span class="ico">＠</span><span class="label">Notifications</span>
         <span class="nav-badge" id="notif-badge"<?= $notifUnreadNav > 0 ? '' : ' hidden' ?>><?= h($notifBadgeLabel) ?></span>
       </a>
+      <?php
+        $asksUnreadNav = 0;
+        try { $ast = ap_db()->prepare('SELECT COUNT(*) FROM ap_asks WHERE owner_user_id = ? AND answered = 0'); $ast->execute([$vaakOwnerId]); $asksUnreadNav = (int) $ast->fetchColumn(); } catch (Throwable $e) {}
+      ?>
+      <a class="<?= $view === 'asks' ? 'active' : '' ?>" href="?view=asks" id="nav-asks">
+        <span class="ico">?</span><span class="label">Asks</span><span class="nav-badge"<?= $asksUnreadNav > 0 ? '' : ' hidden' ?>><?= $asksUnreadNav > 99 ? '99+' : (string) $asksUnreadNav ?></span>
+      </a>
       <a class="<?= $view === 'dms' ? 'active' : '' ?>" href="?view=dms" id="nav-dms">
         <span class="ico">✉</span><span class="label">DMs</span>
         <span class="nav-badge" id="dm-badge"<?= $dmUnreadNav > 0 ? '' : ' hidden' ?>><?= $dmUnreadNav > 99 ? '99+' : (string) (int) $dmUnreadNav ?></span>
@@ -19010,7 +19027,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>
           <a class="<?= $view === 'relays' ? 'active' : '' ?>" href="?view=relays"><span class="ico">⇄</span><span class="label">Relays</span></a>
           <a class="<?= $view === 'friend_servers' ? 'active' : '' ?>" href="?view=friend_servers"><span class="ico">✦</span><span class="label">Wafrn friends</span></a>
-          <a class="<?= $view === 'asks' ? 'active' : '' ?>" href="?view=asks"><span class="ico">?</span><span class="label">Asks</span></a>
           <a class="<?= $view === 'stats' ? 'active' : '' ?>" href="?view=stats"><span class="ico">▤</span><span class="label">AP stats</span></a>
           <a class="<?= $view === 'queue_health' ? 'active' : '' ?>" href="?view=queue_health"><span class="ico">◌</span><span class="label">Queue health</span></a>
           <a class="<?= $view === 'downranking' ? 'active' : '' ?>" href="?view=downranking"><span class="ico">≋</span><span class="label">Home downranking</span></a>
@@ -21410,6 +21426,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="checks">
             <label><input type="checkbox" name="algorithm_enabled" value="1" <?= !empty($profile['algorithm_enabled']) ? 'checked' : '' ?>> Use Home recommendations and algorithmic ranking</label>
             <label><input type="checkbox" name="downranking_enabled" value="1" <?= !empty($profile['downranking_enabled']) ? 'checked' : '' ?>> Temporarily downrank posts matching admin-managed harassment vocabulary</label>
+            <label><input type="checkbox" name="asks_enabled" value="1" <?= !array_key_exists('asks_enabled', $profile) || !empty($profile['asks_enabled']) ? 'checked' : '' ?>> Allow incoming Wafrn-compatible Asks</label>
             <label><input type="checkbox" name="discoverable" value="1" <?= !empty($profile['discoverable']) ? 'checked' : '' ?>> Show in profile directories / discovery</label>
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>

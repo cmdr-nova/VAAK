@@ -936,6 +936,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     hide_profile_boosts INTEGER NOT NULL DEFAULT 0,
     algorithm_enabled INTEGER NOT NULL DEFAULT 1,
     downranking_enabled INTEGER NOT NULL DEFAULT 1,
+    asks_enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ap_home_suppression (
@@ -1039,6 +1040,9 @@ SQL);
     }
     if (!in_array('downranking_enabled', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN downranking_enabled INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!in_array('asks_enabled', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN asks_enabled INTEGER NOT NULL DEFAULT 1');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -3011,10 +3015,13 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $downrankingEnabled = array_key_exists('downranking_enabled', $fields)
         ? (!empty($fields['downranking_enabled']) ? 1 : 0)
         : (!empty($existingProfile['downranking_enabled']) ? 1 : 0);
+    $asksEnabled = array_key_exists('asks_enabled', $fields)
+        ? (!empty($fields['asks_enabled']) ? 1 : 0)
+        : (!empty($existingProfile['asks_enabled']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, asks_enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -3039,6 +3046,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            hide_profile_boosts = excluded.hide_profile_boosts,
            algorithm_enabled = excluded.algorithm_enabled,
            downranking_enabled = excluded.downranking_enabled,
+           asks_enabled = excluded.asks_enabled,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -3066,6 +3074,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $hideProfileBoosts,
         $algorithmEnabled,
         $downrankingEnabled,
+        $asksEnabled,
         ap_db_now(),
     ]);
 
@@ -3888,7 +3897,7 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     if ($rich) {
         $actor['featured'] = $id . '/collections/featured';
         $actor['featuredCollections'] = $id . '/featuredCollections';
-        $actor['_wafrn_asks'] = '2';
+        if (!empty($p['asks_enabled'])) $actor['_wafrn_asks'] = '2';
     } else {
         $actor['featured'] = $id . '/collections/featured';
     }
