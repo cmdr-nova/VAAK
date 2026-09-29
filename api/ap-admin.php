@@ -3061,7 +3061,11 @@ $vaakAdminOnlyActions = [
                 }
             }
             if ($error === null) {
-                $result = ap_user_block_add($vaakOwnerId, 'actor', $input, $kind, $reason !== '' ? $reason : null);
+                if (function_exists('admin_is_local_admin_actor') && admin_is_local_admin_actor($input)) {
+                    $error = 'Local administrators cannot be blocked by personal accounts.';
+                } else {
+                    $result = ap_user_block_add($vaakOwnerId, 'actor', $input, $kind, $reason !== '' ? $reason : null);
+                }
             }
         } else {
             $result = ap_user_block_add($vaakOwnerId, 'domain', $input, $kind, $reason !== '' ? $reason : null);
@@ -12143,6 +12147,10 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isLocal = $actorId !== '' && function_exists('vaak_is_local_url') && vaak_is_local_url($actorId);
     $isSelf = $actorId !== '' && function_exists('vaak_actor_id')
         && rtrim(vaak_actor_id(), '/') === $actorId;
+    // Local admins must remain reachable for moderation. Personal blocks are
+    // therefore never offered (or accepted) against an admin actor.
+    $isLocalAdmin = $actorId !== '' && function_exists('admin_is_local_admin_actor')
+        && admin_is_local_admin_actor($actorId);
     if (!$isSelf && str_contains($host, 'bsky.app') && function_exists('ap_bsky_session_row')) {
         $bs = ap_bsky_session_row($ownerUserId);
         $pathHandle = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
@@ -12187,6 +12195,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     // Don't offer personal actions for the signed-in actor itself.
     if ($actorId !== '' && str_starts_with($actorId, 'https://') && !$isSelf) {
         $isBlocked = is_array($personalBlock);
+        if (!$isLocalAdmin) {
         $menu .= '<form method="post" action="?view=' . h($returnView) . '">'
             . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
             . '<input type="hidden" name="action" value="' . ($isBlocked ? 'user_block_remove' : 'user_block_add') . '">'
@@ -12199,6 +12208,9 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
             . '<button class="menu-action" type="submit" title="Hide from your timelines only">'
             . ($isBlocked ? 'Unblock for me' : 'Block for me') . '</button>'
             . '</form>';
+        } else {
+            $menu .= '<span class="menu-action" aria-disabled="true" title="Administrators cannot be blocked">Admin account — cannot be blocked</span>';
+        }
         $menu .= '<form method="post" action="?view=' . h($returnView) . '">'
             . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
             . '<input type="hidden" name="action" value="' . ($isMuted ? 'unmute_remote' : 'mute_remote') . '">'
@@ -15578,6 +15590,60 @@ if ($isPartial && $view === 'outbox') {
     }
     echo $outboxBody;
     exit;
+}
+
+// Local VAAK profile tabs use the same append-only pagination contract as
+// timelines.  Keep this endpoint deliberately local/SQL-only: it must never
+// turn a profile scroll into a synchronous remote fetch.
+if ($isPartial && $view === 'remote_profile') {
+    $profileActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
+    $profileTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
+    $profileOffset = max(0, (int) ($_GET['offset'] ?? 0));
+    $profileLimit = max(10, min(50, (int) ($_GET['limit'] ?? 40)));
+    if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $profileActor, $pm)) {
+        $profileRows = ['posts' => [], 'replies' => [], 'boosts' => [], 'media' => []];
+        try {
+            $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 500');
+            $st->execute(['https://mkultra.monster/users/' . strtolower($pm[1]) . '/%']);
+            foreach (($st->fetchAll() ?: []) as $row) {
+                $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+                $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
+                $bucket = !empty($obj['inReplyTo']) ? 'replies' : 'posts';
+                $profileRows[$bucket][] = $row;
+                if (!empty($obj['attachment']) || (!empty($row['media_urls']) && $row['media_urls'] !== '[]')) {
+                    $profileRows['media'][] = $row;
+                }
+            }
+            $st = ap_db()->prepare("SELECT * FROM events WHERE type IN ('Create','Announce') AND (actor_id = ? OR actor_id = ?) ORDER BY created_at DESC, id DESC LIMIT 500");
+            $st->execute([$profileActor, $profileActor . '/']);
+            foreach (($st->fetchAll() ?: []) as $row) {
+                $type = strtolower((string) ($row['type'] ?? 'create'));
+                $bucket = $type === 'announce' ? 'boosts' : (!empty($row['in_reply_to']) || !empty($row['in_reply_to_id']) ? 'replies' : 'posts');
+                $profileRows[$bucket][] = $row;
+                if (!empty($row['media_urls']) && $row['media_urls'] !== '[]') $profileRows['media'][] = $row;
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-admin] local profile partial: ' . $e->getMessage());
+        }
+        if (!isset($profileRows[$profileTab])) $profileTab = 'posts';
+        $all = $profileRows[$profileTab];
+        usort($all, static function ($a, $b): int {
+            $ta = strtotime((string) ($a['published'] ?? $a['created_at'] ?? '')) ?: 0;
+            $tb = strtotime((string) ($b['published'] ?? $b['created_at'] ?? '')) ?: 0;
+            return $tb <=> $ta;
+        });
+        $page = array_slice($all, $profileOffset, $profileLimit);
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store');
+        header('X-Has-More: ' . (($profileOffset + $profileLimit) < count($all) ? '1' : '0'));
+        header('X-Next-Offset: ' . ($profileOffset + count($page)));
+        header('X-VAAK-View: remote_profile');
+        foreach ($page as $row) {
+            if (strtolower((string) ($row['type'] ?? '')) === 'announce') admin_render_event_tweet($row, $followingIds, 'remote_profile');
+            else admin_render_outbox_card($row, 'remote_profile');
+        }
+        exit;
+    }
 }
 
 // AJAX fragment for Bluesky tab infinite scroll (cursor-based) + deferred merge samples
@@ -19148,7 +19214,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
   <section class="main">
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
-      <h1><?= h(view_title($view)) ?></h1>
+      <?php
+        $topTitle = view_title($view);
+        if ($view === 'remote_profile') {
+            $topActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
+            if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $topActor)) {
+                $topTitle = 'Local profile';
+            }
+        }
+      ?>
+      <h1><?= h($topTitle) ?></h1>
       <div class="topbar-actions">
         <?php if ($view === 'dms' || $view === 'blog'): ?>
           <a class="btn btn-ghost dm-back-top" href="?view=home">← Back to Home</a>
@@ -24573,6 +24648,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               }
           }
           $rpTabHref = '?view=remote_profile&actor=' . rawurlencode($rpActor) . '&from=' . rawurlencode($rpFrom) . '&tab=';
+          $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabItems[$rpTab], 0, 40) : $rpTabItems[$rpTab];
+          $rpLocalHasMore = $rpIsLocal && count($rpTabItems[$rpTab]) > count($rpLocalPageItems);
         ?>
         <?php if ($rpError): ?>
           <div class="empty" style="color:var(--danger)">Couldn’t load this profile (database busy). Retry shortly.</div>
@@ -24778,13 +24855,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           <?php elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts): ?>
             <?php if ($rpTabItems[$rpTab] === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
+            <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= count($rpLocalPageItems) ?>" data-limit="40" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0">
+            <?php endif; ?>
             <?php
-              $localProfileItems = $rpTabItems[$rpTab];
+              $localProfileItems = $rpIsLocal ? $rpLocalPageItems : $rpTabItems[$rpTab];
               usort($localProfileItems, static function ($a, $b): int {
                   $aPost = is_array($a['post'] ?? null) ? $a['post'] : [];
                   $bPost = is_array($b['post'] ?? null) ? $b['post'] : [];
-                  $aTime = (string) ($a['published'] ?? $aPost['record']['createdAt'] ?? $aPost['indexedAt'] ?? '');
-                  $bTime = (string) ($b['published'] ?? $bPost['record']['createdAt'] ?? $bPost['indexedAt'] ?? '');
+                  $aTime = (string) ($a['published'] ?? $a['created_at'] ?? $aPost['record']['createdAt'] ?? $aPost['indexedAt'] ?? '');
+                  $bTime = (string) ($b['published'] ?? $b['created_at'] ?? $bPost['record']['createdAt'] ?? $bPost['indexedAt'] ?? '');
                   return (strtotime($bTime) ?: 0) <=> (strtotime($aTime) ?: 0);
               });
             ?>
@@ -24797,6 +24876,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php admin_render_outbox_card($n, 'remote_profile'); ?>
               <?php endif; ?>
             <?php endforeach; ?>
+            <?php if ($rpIsLocal): ?></div><div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $rpLocalHasMore ? 'Scroll for more…' : 'End of profile' ?></div><div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div><button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
+            <?php endif; ?>
           <?php elseif ($rpTabItems[$rpTab] === []): ?>
             <div class="empty">No <?= h($rpTab) ?> available<?= $rpIsLocal ? ' in the local outbox' : ' in the activity seen by this instance' ?>.</div>
           <?php else: ?>
@@ -27837,6 +27918,10 @@ window.apAdminToast = function (msg, isErr) {
           const requestOffset = offset;
           url = '?view=' + encodeURIComponent(viewName)
             + '&partial=1&offset=' + requestOffset + '&limit=' + limit;
+          if (viewName === 'remote_profile') {
+            url += '&actor=' + encodeURIComponent(items.dataset.actor || '')
+              + '&tab=' + encodeURIComponent(items.dataset.tab || 'posts');
+          }
         }
         const res = await fetch(url, { credentials: 'same-origin', headers: { 'Accept': 'text/html' } });
         if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
