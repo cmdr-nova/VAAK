@@ -1184,6 +1184,12 @@ function ap_masto_status_from_as2_note(array $note, string $fallbackUrl): ?array
         $contentOut = $htag['html'];
         $tags = $htag['tags'];
     }
+    if (function_exists('ap_wafrn_remote_ask_html')) {
+        $askHtml = ap_wafrn_remote_ask_html($textPlain);
+        if ($askHtml !== null) {
+            $contentOut = $askHtml;
+        }
+    }
 
     return [
         'id' => ap_masto_synthetic_object_status_id($objectUrl),
