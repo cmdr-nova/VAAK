@@ -18191,8 +18191,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet:hover { border-color: #3a3a3a; }
 
     /* Mastodon-like flat timeline: the feed remains the scroll container, but
-       adjacent posts share one surface and are separated by rules. Cards in
-       Profile/Admin views and public HTML profiles are intentionally untouched. */
+       adjacent posts share one surface and are separated by rules. */
     .timeline-feed .compose-inline-panel > .composer {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
       border-radius: 0; box-shadow: none; padding: .85rem .25rem 1rem;
@@ -18221,11 +18220,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-feed > article.tweet:hover,
     .remote-profile-feed > .remote-profile-posts > article.tweet:hover { background: transparent; }
     .remote-profile-posts > article.tweet,
+    .remote-profile-posts #timeline-items > article.tweet,
     .asks-list > article.tweet {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
       border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
     }
     .remote-profile-posts > article.tweet:hover,
+    .remote-profile-posts #timeline-items > article.tweet:hover,
     .asks-list > article.tweet:hover { background: transparent; }
     .asks-list > article.tweet:last-child { border-bottom: 0; }
     .remote-profile-tabs { display:flex; gap:.35rem; flex-wrap:wrap; margin:1.2rem 0 .5rem; border-bottom:1px solid var(--border); }
