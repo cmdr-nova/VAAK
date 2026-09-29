@@ -18976,6 +18976,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <details class="nav-group" data-nav-key="you" <?= $navYouOpen ? 'open' : '' ?>>
         <summary><span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span></summary>
         <div class="nav-sub">
+          <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Settings</span></a>
           <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox" data-vaak-soft-nav="outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'rss' ? 'active' : '' ?>" href="?view=rss"><span class="ico">📰</span><span class="label">RSS</span></a>
@@ -18988,7 +18989,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <span class="nav-badge" id="nav-drafts-badge" hidden></span>
             <?php endif; ?>
           </a>
-          <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Profile</span></a>
           <a class="<?= $view === 'mod_lists' ? 'active' : '' ?>" href="?view=mod_lists"><span class="ico">⛨</span><span class="label">Mod Lists</span></a>
           <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
           <a class="<?= $view === 'atmosphere' ? 'active' : '' ?>" href="?view=atmosphere"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">ATmosphere</span></a>
