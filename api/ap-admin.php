@@ -689,8 +689,8 @@ $vaakAdminOnlyActions = [
             $error = 'Write an answer before posting.';
         } else {
             try {
-                $askSt = ap_db()->prepare('SELECT * FROM ap_asks WHERE id = ? AND owner_user_id = ? LIMIT 1');
-                $askSt->execute([$askId, $vaakOwnerId]);
+                $askSt = ap_db()->prepare('SELECT * FROM ap_asks WHERE id = ? AND owner_user_id = ? AND asked_actor = ? LIMIT 1');
+                $askSt->execute([$askId, $vaakOwnerId, $vaakActorId]);
                 $askRow = $askSt->fetch();
                 if (!is_array($askRow)) {
                     $error = 'Ask not found.';
@@ -19121,7 +19121,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </a>
       <?php
         $asksUnreadNav = 0;
-        try { $ast = ap_db()->prepare('SELECT COUNT(*) FROM ap_asks WHERE owner_user_id = ? AND answered = 0'); $ast->execute([$vaakOwnerId]); $asksUnreadNav = (int) $ast->fetchColumn(); } catch (Throwable $e) {}
+        try {
+            $ast = ap_db()->prepare('SELECT COUNT(*) FROM ap_asks WHERE owner_user_id = ? AND asked_actor = ? AND answered = 0');
+            $ast->execute([$vaakOwnerId, $vaakActorId]);
+            $asksUnreadNav = (int) $ast->fetchColumn();
+        } catch (Throwable $e) {}
       ?>
       <a class="<?= $view === 'asks' ? 'active' : '' ?>" href="?view=asks" id="nav-asks">
         <span class="ico">?</span><span class="label">Asks</span><span class="nav-badge"<?= $asksUnreadNav > 0 ? '' : ' hidden' ?>><?= $asksUnreadNav > 99 ? '99+' : (string) $asksUnreadNav ?></span>
@@ -20029,7 +20033,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php else: ?><div class="empty">No Ask target was provided.</div><?php endif; ?>
 
       <?php elseif ($view === 'asks'): ?>
-        <?php $askRows = []; try { $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 100'); $st->execute([$vaakOwnerId]); $askRows = $st->fetchAll() ?: []; } catch (Throwable $e) {} ?>
+        <?php $askRows = []; try {
+          $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE owner_user_id = ? AND asked_actor = ? ORDER BY created_at DESC LIMIT 100');
+          $st->execute([$vaakOwnerId, $vaakActorId]);
+          $askRows = $st->fetchAll() ?: [];
+        } catch (Throwable $e) {} ?>
         <h2 style="font-size:1.05rem;margin:0 0 .5rem">Asks</h2><p class="meta">Wafrn-compatible questions received by this account. They are private until you answer them in a post.</p>
         <?php if (!$askRows): ?><div class="empty">No Asks yet.</div><?php endif; ?>
         <div class="asks-list">
