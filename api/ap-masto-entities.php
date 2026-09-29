@@ -5,6 +5,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-link-preview.php';
+require_once __DIR__ . '/ap-asks.php';
 
 /**
  * Mastodon account id for the token/session-bound local user.
@@ -4059,6 +4060,15 @@ function ap_masto_status_from_mention(array $row): array
     // Session actor for "@you" mention parsing (not hard-coded cmdr_nova)
     $extraActors[] = ap_masto_session_actor_id();
     $pack = ap_masto_content_with_mentions($text, $extraActors);
+    // Wafrn serializes Asks as a compact Note string ("@user asked …")
+    // rather than VAAK's private Ask row. Give Mastodon-compatible clients the
+    // same visual Ask block used for local answers without changing storage.
+    if (function_exists('ap_wafrn_remote_ask_html')) {
+        $askHtml = ap_wafrn_remote_ask_html($text);
+        if ($askHtml !== null) {
+            $pack['content'] = $askHtml;
+        }
+    }
     if ($replyAccountId !== null && $replyParentActor !== null && ap_masto_is_local_actor_url($replyParentActor)) {
         $parentAcct = ap_masto_account_for_local_url($replyParentActor);
         $localMention = [

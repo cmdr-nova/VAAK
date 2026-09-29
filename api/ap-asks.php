@@ -153,6 +153,27 @@ function ap_ask_representation_html(string $answerNoteId, string $question, stri
         . htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote> ';
 }
 
+/**
+ * Render Wafrn's compact remote Ask representation for Mastodon-compatible
+ * clients. Wafrn intentionally sends this as ordinary Note text, so it needs
+ * a presentation hint at the VAAK status boundary rather than in storage.
+ */
+function ap_wafrn_remote_ask_html(string $text): ?string
+{
+    $text = trim(html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($text === '' || !preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $text, $m)) {
+        return null;
+    }
+    $asker = trim($m[1]);
+    $question = trim($m[2]);
+    if ($asker === '' || $question === '' || !str_contains($asker, '@')) return null;
+    return '<div class="ask-container" style="margin:.35rem 0 .55rem;padding:.65rem .75rem;border-left:3px solid #a45a91;background:rgba(164,90,145,.08)">'
+        . '<div class="ask-label" style="font-weight:600;margin-bottom:.35rem">'
+        . htmlspecialchars($asker, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' asked</div>'
+        . '<blockquote class="ask-text" style="margin:0;padding-left:.7rem;border-left:2px solid rgba(164,90,145,.5);white-space:pre-wrap">'
+        . nl2br(htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</blockquote></div>';
+}
+
 /** Format an answered Ask for the connected Bluesky mirror. */
 function ap_ask_bluesky_mirror_text(string $answer, array $ask): string
 {
