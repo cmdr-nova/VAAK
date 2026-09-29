@@ -974,6 +974,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     if ($bskyHandle !== null) {
         echo ' · <a href="https://bsky.app/profile/' . rawurlencode($bskyHandle) . '" rel="me noopener noreferrer" target="_blank">Bluesky</a>';
     }
+    // Open the authenticated VAAK Ask composer. The VAAK profile view checks
+    // the recipient's Wafrn capability before showing the actual form.
+    echo ' · <a href="/vaak/?view=remote_profile&amp;actor=' . rawurlencode('https://mkultra.monster/users/' . $safe) . '&amp;from=profile">Ask on VAAK</a>';
     echo '</p>';
 
     echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
