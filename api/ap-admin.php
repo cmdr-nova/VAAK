@@ -55,6 +55,8 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
 }
 require_once __DIR__ . '/ap-inbox.php';
+require_once __DIR__ . '/ap-asks.php';
+ap_asks_migrate();
 require_once __DIR__ . '/ap-visibility.php';
 
 const LOCAL_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
@@ -214,7 +216,7 @@ if ($view === 'gallery' || $view === 'vakktok') {
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
     'moderation', 'blocks', 'relays', 'stats', 'queue_health', 'invites', 'users', 'policies',
-    'guestbook', 'support', 'analytics', 'downranking', 'downranked',
+    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers',
 ];
 // Security is under You for every account (own OAuth tokens / password).
 if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
@@ -653,7 +655,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $action = '';
     }
     // Server-wide / operator-only mutations (UI views are gated; POSTs must be too)
-    $vaakAdminOnlyActions = [
+$vaakAdminOnlyActions = [
         'set_app_password', 'purge_oauth_tokens',
         'block_add', 'block_actor', 'block_domain', 'unblock',
         'relay_add', 'relay_enable', 'relay_disable', 'relay_remove',
@@ -662,6 +664,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         'user_ban', 'user_unban',
         'policies_save_privacy', 'policies_save_conduct', 'policies_save_rules',
         'downrank_term_add', 'downrank_term_delete', 'downrank_signal_clear', 'downrank_term_preview',
+        'wafrn_friend_add', 'wafrn_friend_remove',
     ];
     // revoke_oauth_token + change_password are per-user (scoped in handlers)
     if ($action !== '' && in_array($action, $vaakAdminOnlyActions, true) && empty($vaakIsAdmin)) {
@@ -669,7 +672,31 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         $action = '';
         $view = 'home';
     }
-    if ($action === 'switch_account_add') {
+    if ($action === 'ask_send') {
+        $target = trim((string) ($_POST['target_actor'] ?? ''));
+        $question = trim((string) ($_POST['question'] ?? ''));
+        $res = ap_ask_send($target, $question, $vaakOwnerId);
+        if (!empty($res['ok'])) $notice = 'Ask sent.';
+        else $error = (string) ($res['error'] ?? 'Could not send Ask.');
+        $view = 'remote_profile';
+        $_GET['actor'] = $target;
+        $_GET['from'] = (string) ($_POST['return_from'] ?? 'home');
+    } elseif ($action === 'wafrn_friend_add') {
+        $host = strtolower(trim((string) ($_POST['host'] ?? '')));
+        $host = preg_replace('~^https?://~', '', $host) ?? $host;
+        $host = trim(explode('/', $host, 2)[0]);
+        if ($host === '' || !filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)) $error = 'Enter a valid server hostname.';
+        else {
+            ap_db()->prepare('CREATE TABLE IF NOT EXISTS ap_wafrn_friend_servers (host TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT \'\', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)')->execute();
+            ap_db()->prepare('INSERT INTO ap_wafrn_friend_servers(host,enabled,note,created_at,updated_at) VALUES(?,1,?,?,?) ON CONFLICT(host) DO UPDATE SET enabled=1,updated_at=excluded.updated_at')->execute([$host, (string) ($_POST['note'] ?? ''), ap_db_now(), ap_db_now()]);
+            $notice = 'Friend server saved.';
+        }
+        $view = 'friend_servers';
+    } elseif ($action === 'wafrn_friend_remove') {
+        $host = strtolower(trim((string) ($_POST['host'] ?? '')));
+        ap_db()->prepare('DELETE FROM ap_wafrn_friend_servers WHERE host = ?')->execute([$host]);
+        $notice = 'Friend server removed.'; $view = 'friend_servers';
+    } elseif ($action === 'switch_account_add') {
         $login = trim((string) ($_POST['account_login'] ?? ''));
         $password = (string) ($_POST['account_password'] ?? '');
         $code = trim((string) ($_POST['account_2fa_code'] ?? ''));
@@ -18982,6 +19009,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'users' ? 'active' : '' ?>" href="?view=users"><span class="ico"><i class="ph ph-users-three" aria-hidden="true"></i></span><span class="label">Users</span></a>
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>
           <a class="<?= $view === 'relays' ? 'active' : '' ?>" href="?view=relays"><span class="ico">⇄</span><span class="label">Relays</span></a>
+          <a class="<?= $view === 'friend_servers' ? 'active' : '' ?>" href="?view=friend_servers"><span class="ico">✦</span><span class="label">Wafrn friends</span></a>
           <a class="<?= $view === 'stats' ? 'active' : '' ?>" href="?view=stats"><span class="ico">▤</span><span class="label">AP stats</span></a>
           <a class="<?= $view === 'queue_health' ? 'active' : '' ?>" href="?view=queue_health"><span class="ico">◌</span><span class="label">Queue health</span></a>
           <a class="<?= $view === 'downranking' ? 'active' : '' ?>" href="?view=downranking"><span class="ico">≋</span><span class="label">Home downranking</span></a>
@@ -19798,6 +19826,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $notifHasMore ? 'Scroll for more…' : 'End of notifications' ?></div>
           <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
         <?php endif; ?>
+
+      <?php elseif ($view === 'friend_servers'): ?>
+        <?php
+          $friendRows = [];
+          try { $friendRows = ap_db()->query('SELECT host,note,updated_at FROM ap_wafrn_friend_servers WHERE enabled=1 ORDER BY host')->fetchAll() ?: []; } catch (Throwable $e) {}
+        ?>
+        <h2 style="font-size:1.05rem;margin:0 0 .5rem">Wafrn friend servers</h2>
+        <p class="meta">Public posts are delivered to these Wafrn-compatible servers even without a local follower. Normal federation, blocks, and local-only privacy remain unchanged.</p>
+        <form class="composer" method="post" action="?view=friend_servers" style="margin:.8rem 0 1rem">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="wafrn_friend_add">
+          <label>Hostname</label><input name="host" required placeholder="wafrn.example">
+          <label style="margin-top:.5rem">Note (optional)</label><input name="note" maxlength="240" placeholder="Why this server is trusted">
+          <button class="btn btn-primary" type="submit" style="margin-top:.6rem">Add / enable friend server</button>
+        </form>
+        <?php if (!$friendRows): ?><div class="empty">No admin overrides. The official Wafrn directory is still used.</div><?php endif; ?>
+        <?php foreach ($friendRows as $friend): ?><div class="tweet" style="display:flex;align-items:center;gap:.75rem;justify-content:space-between"><div><b><?= h((string) $friend['host']) ?></b><div class="meta"><?= h((string) ($friend['note'] ?? '')) ?></div></div><form method="post" action="?view=friend_servers"><input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="wafrn_friend_remove"><input type="hidden" name="host" value="<?= h((string) $friend['host']) ?>"><button class="btn btn-ghost" type="submit">Remove</button></form></div><?php endforeach; ?>
 
       <?php elseif ($view === 'dms'): ?>
         <?php
@@ -24599,6 +24643,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endif; ?>
               <?php endif; ?>
               <?php if (!$rpIsBsky): ?>
+                <?php if (!$rpIsLocal && !$rpIsOwn && function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor)): ?>
+                  <details style="display:inline-block;vertical-align:middle"><summary class="btn btn-ghost" style="cursor:pointer;list-style:none">Ask</summary>
+                    <form class="composer" method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="position:absolute;z-index:5;width:min(22rem,90vw);margin-top:.35rem;padding:.65rem">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="ask_send"><input type="hidden" name="target_actor" value="<?= h($rpActor) ?>"><input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
+                      <label>Ask <?= h(actor_handle($rpActor)) ?></label><textarea name="question" maxlength="10240" required placeholder="Write your question…" style="min-height:5rem;margin-top:.35rem"></textarea><button class="btn btn-primary" type="submit" style="margin-top:.4rem">Send Ask</button>
+                    </form>
+                  </details>
+                <?php endif; ?>
                 <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Bite this account? (Wafrn-compatible 🦷)');">
                   <input type="hidden" name="action" value="bite_remote">
                   <input type="hidden" name="return_view" value="remote_profile">

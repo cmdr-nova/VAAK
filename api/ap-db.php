@@ -3816,6 +3816,9 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
         ];
         $ctxExtra['FeaturedCollection'] = 'https://w3id.org/fep/7aa9#FeaturedCollection';
         $ctxExtra['canFeature'] = 'https://w3id.org/fep/7aa9#canFeature';
+        // Wafrn-compatible Asks extension. Level 2 means authenticated users
+        // may ask this actor; Wafrn uses level 1 for anonymous asks.
+        $ctxExtra['AskQuestion'] = 'https://wafrn.net/ns#AskQuestion';
     }
     $actorAttachments = ap_cmdr_actor_attachments_with_policies(
         is_array($p['attachment'] ?? null) ? $p['attachment'] : []
@@ -3885,6 +3888,7 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
     if ($rich) {
         $actor['featured'] = $id . '/collections/featured';
         $actor['featuredCollections'] = $id . '/featuredCollections';
+        $actor['_wafrn_asks'] = '2';
     } else {
         $actor['featured'] = $id . '/collections/featured';
     }
@@ -4043,6 +4047,13 @@ function ap_wafrn_friend_inboxes(int $limit = 20): array
         $raw = is_file($catalog) ? (string) @file_get_contents($catalog) : 'waffles.baeddel.social';
     }
     $out = [];
+    // Admin-managed overrides are additive to the official Wafrn directory.
+    // This lets the operator keep a trusted instance in the bubble even if it
+    // is temporarily absent from join.wafrn.net.
+    try {
+        $rows = ap_db()->query("SELECT host FROM ap_wafrn_friend_servers WHERE enabled = 1 ORDER BY host ASC")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+        foreach ($rows as $rowHost) { $raw .= ' ' . (string) $rowHost; }
+    } catch (Throwable $e) { /* table is created lazily by ap_asks_migrate/admin */ }
     foreach (preg_split('/[,\s]+/', $raw) ?: [] as $value) {
         $value = trim((string) $value);
         if ($value === '') continue;

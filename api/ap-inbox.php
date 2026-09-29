@@ -33,6 +33,7 @@ const LOCAL_KEY_ID = CMDR_NOVA_KEY_ID;
 const LOCAL_FOLLOW_BACK_MAX_PER_HOUR = 30;
 
 require_once __DIR__ . '/ap-db.php';
+require_once __DIR__ . '/ap-asks.php';
 
 /** Outbound HTTP User-Agent for federation fingerprints (software name: vaak). */
 function ap_http_user_agent(?string $actorId = null): string
@@ -996,6 +997,18 @@ function ap_route_verified_activity(array $activity, int $bytes): string
             ap_log('blocked_reject_object type=' . $type . ' object=' . ap_short($objectId));
             ap_fail('Object instance blocked', 403);
         }
+    }
+
+    // Wafrn-compatible AskQuestion is a private, addressed interaction. It
+    // must be handled before public/private timeline observation so the
+    // question can never leak into the public events feed.
+    if ($type === 'AskQuestion' && $actorId) {
+        $recipient = ap_inbox_recipient_owner($activity);
+        $ok = function_exists('ap_ask_store_inbound')
+            ? ap_ask_store_inbound($activity, (int) ($recipient['owner_user_id'] ?? 0), (string) ($recipient['owner_actor_id'] ?? LOCAL_ACTOR))
+            : false;
+        ap_metrics_record($type, $actorId, $objectId, (string) ($recipient['owner_actor_id'] ?? LOCAL_ACTOR), $bytes, $ok ? 'local_ask' : 'local_ask_rejected', null);
+        return $ok ? 'local_ask' : 'local_ask_rejected';
     }
 
     // FEP-044f QuoteRequest — auto-approve public quotes of our notes.
