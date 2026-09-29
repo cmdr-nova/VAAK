@@ -698,11 +698,17 @@ $vaakAdminOnlyActions = [
                     $error = 'This Ask has already been answered.';
                 } else {
                     // Answers are conversational and should appear immediately,
-                    // unlike scheduled posts. Keep the Ask IRI as inReplyTo so
-                    // Wafrn-compatible servers can associate the response.
+                    // unlike scheduled posts. Reply to the Ask object itself so
+                    // Wafrn-compatible servers can associate the response, and
+                    // address the original asker for prompt delivery.
                     if (!defined('AP_INBOX_LIB_ONLY')) define('AP_INBOX_LIB_ONLY', true);
                     require_once __DIR__ . '/ap-inbox.php';
-                    $posted = ap_local_post_reply($answer, '', (string) ($askRow['asker_actor'] ?? ''), '', false, null, [], 'public', null);
+                    $posted = ap_local_post_reply(
+                        $answer,
+                        (string) ($askRow['ask_id'] ?? ''),
+                        (string) ($askRow['asker_actor'] ?? ''),
+                        '', false, null, [], 'public', null
+                    );
                     if (!empty($posted['ok'])) {
                         $now = ap_db_now();
                         ap_db()->prepare('UPDATE ap_asks SET answered = 1, answer_note_id = ?, updated_at = ? WHERE id = ? AND owner_user_id = ?')->execute([(string) ($posted['note_id'] ?? ''), $now, $askId, $vaakOwnerId]);

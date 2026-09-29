@@ -44,6 +44,18 @@ function ap_ask_answer_for_note(string $noteId): ?array
     } catch (Throwable $e) { return null; }
 }
 
+function ap_ask_by_id(string $askId): ?array
+{
+    $askId = rtrim(trim($askId), '/');
+    if ($askId === '') return null;
+    try {
+        $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE ask_id = ? OR ask_id = ? ORDER BY id DESC LIMIT 1');
+        $st->execute([$askId, $askId . '/']);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) { return null; }
+}
+
 /**
  * Resolve the cached identity shown alongside an answered Ask.
  * Never performs a synchronous remote actor fetch; the normal actor warmers
@@ -98,6 +110,22 @@ function ap_ask_actor_identity(string $actor): array
         'handle' => (string) ($label['handle'] ?? ''),
         'avatar' => $avatar,
     ];
+}
+
+/** Format an answered Ask for the connected Bluesky mirror. */
+function ap_ask_bluesky_mirror_text(string $answer, array $ask): string
+{
+    $identity = ap_ask_actor_identity((string) ($ask['asker_actor'] ?? ''));
+    $label = trim((string) (($identity['handle'] ?? '') ?: ($identity['display_name'] ?? 'User')));
+    if ($label === '') {
+        $label = 'User';
+    }
+    $question = trim((string) ($ask['question'] ?? ''));
+    $answer = trim($answer);
+    if ($question === '') {
+        return $answer;
+    }
+    return $label . ' asked: ' . $question . "\n\n" . $answer;
 }
 
 function ap_wafrn_ask_level_from_actor(array $doc): int

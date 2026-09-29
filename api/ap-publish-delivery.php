@@ -149,9 +149,21 @@ function ap_publish_delivery_execute(array $row, array $payload): array
             $bsky = ['ok' => true, 'skipped' => true, 'error' => 'Polls are Fediverse-only'];
             ap_log('publish_delivery skip_bsky note=' . $row['note_id']);
         } elseif ($visibility !== 'local' && !$pendingQuote && ap_bsky_session_row($owner) !== null) {
+            $bskyContent = (string) ($payload['content'] ?? '');
+            if (function_exists('ap_ask_answer_for_note')) {
+                $askContext = ap_ask_answer_for_note((string) $row['note_id']);
+                // The delivery worker can race the answer transaction's
+                // answer_note_id update; resolve the Ask by inReplyTo too.
+                if (!is_array($askContext) && function_exists('ap_ask_by_id')) {
+                    $askContext = ap_ask_by_id((string) ($payload['in_reply_to'] ?? ''));
+                }
+                if (is_array($askContext) && function_exists('ap_ask_bluesky_mirror_text')) {
+                    $bskyContent = ap_ask_bluesky_mirror_text($bskyContent, $askContext);
+                }
+            }
             $bsky = ap_bsky_crosspost_status(
                 $owner,
-                (string) ($payload['content'] ?? ''),
+                $bskyContent,
                 $visibility,
                 array_values(array_map('intval', $payload['media_local_ids'] ?? [])),
                 (string) ($payload['spoiler_text'] ?? ''),
