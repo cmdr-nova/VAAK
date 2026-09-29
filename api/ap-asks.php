@@ -7,8 +7,9 @@ function ap_asks_migrate(): void
 {
     static $done = false; if ($done) return; $done = true;
     try {
+        $idDef = ap_db_driver() === 'pgsql' ? 'BIGSERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT';
         ap_db()->exec("CREATE TABLE IF NOT EXISTS ap_asks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {$idDef},
             ask_id TEXT NOT NULL UNIQUE,
             question TEXT NOT NULL,
             asker_actor TEXT,
