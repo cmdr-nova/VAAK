@@ -56,6 +56,31 @@ function ap_ask_by_id(string $askId): ?array
     } catch (Throwable $e) { return null; }
 }
 
+/** Match a remote Wafrn answer to one of our outbound Asks. */
+function ap_ask_record_remote_answer(string $remoteActor, string $question, string $answerId, int $ownerUserId): ?array
+{
+    $remoteActor = rtrim(trim($remoteActor), '/');
+    $question = trim($question);
+    $answerId = rtrim(trim($answerId), '/');
+    if ($remoteActor === '' || $question === '' || $answerId === '' || $ownerUserId <= 0) return null;
+    try {
+        $st = ap_db()->prepare(
+            'SELECT * FROM ap_asks WHERE owner_user_id = ? AND asker_actor = ? AND asked_actor = ? AND question = ? ORDER BY id DESC LIMIT 1'
+        );
+        $st->execute([$ownerUserId, rtrim(ap_db_owner_actor_id_for_user_id($ownerUserId), '/'), $remoteActor, $question]);
+        $row = $st->fetch();
+        if (!is_array($row)) return null;
+        $now = ap_db_now();
+        ap_db()->prepare('UPDATE ap_asks SET answered = 1, answer_note_id = ?, updated_at = ? WHERE id = ?')
+            ->execute([$answerId, $now, (int) $row['id']]);
+        $row['answered'] = 1;
+        $row['answer_note_id'] = $answerId;
+        return $row;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
 /**
  * Resolve the cached identity shown alongside an answered Ask.
  * Never performs a synchronous remote actor fetch; the normal actor warmers

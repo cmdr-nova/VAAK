@@ -4018,6 +4018,7 @@ function ap_local_observe(array $activity): void
     $mediaUrls = [];
     $remoteDoc = null;
     $cw = ap_note_cw_from_doc(is_array($object) ? $object : null);
+    $askAnswerTag = null;
 
     if (is_array($object)) {
         $objType = is_string($object['type'] ?? null) ? $object['type'] : $type;
@@ -4025,6 +4026,20 @@ function ap_local_observe(array $activity): void
             $content = $object['content'];
         }
         $inReplyTo = ap_as_id($object['inReplyTo'] ?? null);
+        // Wafrn answers are public Creates with an AskQuestion tag rather than
+        // a normal inReplyTo. Preserve that relationship for notifications.
+        foreach ((array) ($object['tag'] ?? []) as $tag) {
+            if (is_array($tag) && ($tag['type'] ?? '') === 'AskQuestion') {
+                $tagActor = rtrim(trim((string) (ap_as_id($tag['actor'] ?? null) ?? '')), '/');
+                if ($tagActor !== '') {
+                    $askAnswerTag = [
+                        'actor' => $tagActor,
+                        'question' => trim((string) (($tag['name'] ?? '') ?: ($tag['question'] ?? ''))),
+                    ];
+                }
+                break;
+            }
+        }
         // Collect https image URLs for admin preview only — never download/store bytes.
         $mediaUrls = ap_extract_media_urls($object);
         // Announce may wrap a nested Note/object
@@ -4063,6 +4078,17 @@ function ap_local_observe(array $activity): void
         }
     }
     if (in_array($type, $storeTypes, true) || $content !== null || $mediaUrls) {
+        $askAnswerForLocal = is_array($askAnswerTag)
+            && rtrim((string) ($askAnswerTag['actor'] ?? ''), '/') === rtrim($localActor, '/')
+            && (string) ($askAnswerTag['question'] ?? '') !== '';
+        if ($askAnswerForLocal && $actorId !== null && $objectId !== null && function_exists('ap_ask_record_remote_answer')) {
+            ap_ask_record_remote_answer(
+                (string) $actorId,
+                (string) ($askAnswerTag['question'] ?? ''),
+                (string) $objectId,
+                (int) ($recipient['owner_user_id'] ?? 0)
+            );
+        }
         // Detect quote-boost of *our* notes (FEP-044f / Misskey quote fields).
         $storeActivityType = $type;
         $quoteSrc = is_array($object) ? $object : null;
@@ -4164,7 +4190,7 @@ function ap_local_observe(array $activity): void
             $replyToUs = is_string($inReplyTo)
                 && $inReplyTo !== ''
                 && str_starts_with(rtrim($inReplyTo, '/'), $localNotesPrefix);
-            $addressesUs = ap_activity_addresses_local_actor($activity, $localActor);
+            $addressesUs = ap_activity_addresses_local_actor($activity, $localActor) || $askAnswerForLocal;
             $ownerUid = (int) ($recipient['owner_user_id'] ?? 0);
             $subscribed = function_exists('ap_post_subscription_is')
                 && ap_post_subscription_is($actorId, $ownerUid > 0 ? $ownerUid : null);
