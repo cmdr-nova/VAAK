@@ -2469,12 +2469,17 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts',
                 continue;
             }
             $replyTo = rtrim(trim((string) ($row['in_reply_to'] ?? '')), '/');
+            // An answered Wafrn Ask may retain the Ask URI in in_reply_to for
+            // ActivityPub compatibility, but it is a standalone public answer
+            // rather than a reply to a post. Keep it on the Posts tab.
+            $isAskAnswer = function_exists('ap_ask_answer_for_note')
+                && is_array(ap_ask_answer_for_note((string) ($row['id'] ?? '')));
             $mediaItems = ap_cmdr_profile_media_items($row);
-            if ($mediaItems !== [] && !($hideProfileReplies && $replyTo !== '' && str_starts_with($replyTo, 'https://'))) {
+            if ($mediaItems !== [] && !($hideProfileReplies && !$isAskAnswer && $replyTo !== '' && str_starts_with($replyTo, 'https://'))) {
                 $row['_profile_media_items'] = $mediaItems;
                 $media[] = $row;
             }
-            if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+            if (!$isAskAnswer && $replyTo !== '' && str_starts_with($replyTo, 'https://')) {
                 $replies[] = $row;
             } else {
                 $posts[] = $row;
