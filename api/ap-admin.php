@@ -24406,11 +24406,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       $bind = [$rpActor, $rpActor . '/'];
                       $postsSql = "SELECT * FROM events WHERE type IN ('Create','Announce') AND ("
                            . implode(' OR ', $ors) . ")
-                           AND (type = 'Announce' OR
-                             (summary IS NOT NULL AND summary != '')
-                             OR (media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]')
-                             OR (spoiler_text IS NOT NULL AND spoiler_text != '')
-                             OR (sensitive IS NOT NULL AND sensitive != 0))
                            ORDER BY created_at DESC, id DESC LIMIT 500";
                       if (function_exists('ap_db_execute_retry')) {
                           $st = ap_db_execute_retry($postsSql, $bind);
