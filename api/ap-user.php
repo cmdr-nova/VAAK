@@ -21,6 +21,7 @@ require_once __DIR__ . '/ap-wow-link.php';
 require_once __DIR__ . '/ap-featured.php';
 require_once __DIR__ . '/ap-feeds.php';
 require_once __DIR__ . '/ap-masto-entities.php';
+require_once __DIR__ . '/ap-asks.php';
 // HTML profiles also surface cached Bluesky-native posts for accounts that
 // have a connected ATProto session. This remains cache-only: profile renders
 // never perform a live Bluesky fetch.
@@ -1260,6 +1261,15 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
     $id = htmlspecialchars((string) ($row['id'] ?? ''), ENT_QUOTES, 'UTF-8');
     $safeDate = htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8');
     $html = '<article class="post">';
+    $askContext = function_exists('ap_ask_answer_for_note')
+        ? ap_ask_answer_for_note((string) ($row['id'] ?? '')) : null;
+    if (is_array($askContext)) {
+        $asker = htmlspecialchars((string) (($askContext['asker_actor'] ?? '') ?: 'anonymous'), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $question = htmlspecialchars((string) ($askContext['question'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $html .= '<div class="ask-context" style="margin:0 0 .7rem;padding:.65rem .75rem;border-left:3px solid #777;background:rgba(255,255,255,.035)">'
+            . '<div class="muted"><strong>' . $asker . '</strong> asked:</div>'
+            . '<div style="margin-top:.3rem;white-space:pre-wrap">' . $question . '</div></div>';
+    }
     if (!empty($note['summary']) && is_string($note['summary'])) {
         $html .= '<p class="cw"><strong>CW</strong> · '
             . htmlspecialchars($note['summary'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
