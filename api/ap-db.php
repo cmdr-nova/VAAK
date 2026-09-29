@@ -4024,6 +4024,45 @@ function ap_known_shared_inboxes(int $limit = 40): array
 }
 
 /**
+ * Explicit Wafrn friend-server inboxes, mirroring Wafrn's friendServer flag.
+ *
+ * Keep this opt-in and bounded: public posts are sent to these hosts even
+ * without a local follower, but blocks and local-only privacy still win.
+ * Hosts may be supplied as a comma-separated VAAK_WAFRN_FRIEND_HOSTS value;
+ * the known Wafrn host is retained as the small default set.
+ *
+ * @return list<string>
+ */
+function ap_wafrn_friend_inboxes(int $limit = 20): array
+{
+    $limit = max(1, min(40, $limit));
+    $raw = getenv('VAAK_WAFRN_FRIEND_HOSTS');
+    $raw = is_string($raw) && trim($raw) !== ''
+        ? $raw
+        : 'waffles.baeddel.social';
+    $out = [];
+    foreach (preg_split('/[,\s]+/', $raw) ?: [] as $value) {
+        $value = trim((string) $value);
+        if ($value === '') continue;
+        if (!str_starts_with($value, 'https://')) {
+            $value = 'https://' . $value;
+        }
+        $parts = parse_url($value);
+        $host = strtolower(trim((string) ($parts['host'] ?? '')));
+        if ($host === '' || $host === 'mkultra.monster' || !filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)) {
+            continue;
+        }
+        $path = trim((string) ($parts['path'] ?? ''), '/');
+        $inbox = 'https://' . $host . ($path !== '' ? '/' . $path : '/inbox');
+        if (!ap_is_blocked_inbox($inbox)) {
+            $out[$inbox] = true;
+        }
+        if (count($out) >= $limit) break;
+    }
+    return array_keys($out);
+}
+
+/**
  * Pull https image/video URLs from an AS2 object for timeline preview — never downloads.
  * Accepts Image, Document, Video (Mastodon gifv is Document + video/mp4).
  *

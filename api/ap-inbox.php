@@ -4704,6 +4704,18 @@ function ap_deliver_public_activity(array $activity, array $priorityExtra = [], 
 
     $prioritySet = array_fill_keys(array_merge($bridgyInboxes, $otherPriority), true);
     $deferred = $bgFollowers;
+    // Wafrn's "friendServer" bubble: explicitly trusted Wafrn hosts receive
+    // public activity even without a local follower. This remains background
+    // delivery and never applies to local-only or direct messages.
+    if (function_exists('ap_wafrn_friend_inboxes')) {
+        foreach (ap_wafrn_friend_inboxes(20) as $friendInbox) {
+            if (isset($prioritySet[$friendInbox]) || ap_is_blocked_inbox($friendInbox)) {
+                continue;
+            }
+            $deferred[] = $friendInbox;
+            $prioritySet[$friendInbox] = true;
+        }
+    }
     foreach (ap_delivery_targets_filtered([], ap_known_shared_inboxes(40)) as $inbox) {
         if (isset($prioritySet[$inbox])) {
             continue;
