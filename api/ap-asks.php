@@ -160,18 +160,33 @@ function ap_ask_representation_html(string $answerNoteId, string $question, stri
  */
 function ap_wafrn_remote_ask_html(string $text): ?string
 {
-    $text = trim(html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    if ($text === '' || !preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $text, $m)) {
-        return null;
+    $raw = trim($text);
+    $answer = '';
+    $asker = '';
+    $question = '';
+    // Wafrn answers carry the question in a blockquote and the answer after
+    // it. Preserve those two parts instead of flattening them into one line.
+    if (preg_match('~^\s*<p>(.*?)\s+asked\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$~isu', $raw, $m)) {
+        $asker = trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $question = trim(html_entity_decode(strip_tags($m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $answer = trim(html_entity_decode(strip_tags($m[3]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    } else {
+        $plain = trim(html_entity_decode(strip_tags($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if ($plain === '' || !preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $plain, $m)) return null;
+        $asker = trim($m[1]);
+        $question = trim($m[2]);
     }
-    $asker = trim($m[1]);
-    $question = trim($m[2]);
     if ($asker === '' || $question === '' || !str_contains($asker, '@')) return null;
-    return '<div class="ask-container" style="margin:.35rem 0 .55rem;padding:.65rem .75rem;border-left:3px solid #a45a91;background:rgba(164,90,145,.08)">'
-        . '<div class="ask-label" style="font-weight:600;margin-bottom:.35rem">'
+    $html = '<div class="ask-container" style="margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid rgba(220,113,190,.55);border-radius:8px;background:rgba(164,90,145,.11)">'
+        . '<div class="ask-label" style="font-weight:700;margin-bottom:.4rem;color:#e5a8d2">'
         . htmlspecialchars($asker, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' asked</div>'
-        . '<blockquote class="ask-text" style="margin:0;padding-left:.7rem;border-left:2px solid rgba(164,90,145,.5);white-space:pre-wrap">'
-        . nl2br(htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</blockquote></div>';
+        . '<blockquote class="ask-text" style="margin:0;padding:.2rem 0 .2rem .8rem;border-left:3px solid rgba(220,113,190,.7);white-space:pre-wrap">'
+        . nl2br(htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</blockquote>';
+    if ($answer !== '') {
+        $html .= '<div class="ask-answer" style="margin-top:.65rem;padding-top:.55rem;border-top:1px solid rgba(220,113,190,.3);white-space:pre-wrap">'
+            . nl2br(htmlspecialchars($answer, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</div>';
+    }
+    return $html . '</div>';
 }
 
 /** Format an answered Ask for the connected Bluesky mirror. */

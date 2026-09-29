@@ -1185,7 +1185,7 @@ function ap_masto_status_from_as2_note(array $note, string $fallbackUrl): ?array
         $tags = $htag['tags'];
     }
     if (function_exists('ap_wafrn_remote_ask_html')) {
-        $askHtml = ap_wafrn_remote_ask_html($textPlain);
+        $askHtml = ap_wafrn_remote_ask_html($contentHtml !== '' ? $contentHtml : $textPlain);
         if ($askHtml !== null) {
             $contentOut = $askHtml;
         }
@@ -4070,7 +4070,7 @@ function ap_masto_status_from_mention(array $row): array
     // rather than VAAK's private Ask row. Give Mastodon-compatible clients the
     // same visual Ask block used for local answers without changing storage.
     if (function_exists('ap_wafrn_remote_ask_html')) {
-        $askHtml = ap_wafrn_remote_ask_html($text);
+        $askHtml = ap_wafrn_remote_ask_html((string) ($row['content'] ?? $text));
         if ($askHtml !== null) {
             $pack['content'] = $askHtml;
         }
