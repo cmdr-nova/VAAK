@@ -243,6 +243,9 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                         if ($likeSid !== '') {
                             ap_masto_favourite_add($likeSid, $likeOid !== '' ? $likeOid : $likeSid, null, null, $owner);
                         }
+                        if (function_exists('ap_bsky_favourite_cache_clear')) {
+                            ap_bsky_favourite_cache_clear($owner, (string) ($payload['uri'] ?? $target));
+                        }
                     }
                     return ['ok' => true, 'receipt' => ['record_uri' => (string) ($res['uri'] ?? $receipt['record_uri'] ?? ''), 'collection' => $collection]];
                 }
@@ -265,6 +268,9 @@ function ap_action_queue_execute(array $row, array $payload, array $receipt): ar
                     $unlikeSid = (string) ($payload['status_id'] ?? '');
                     $unlikeOid = (string) ($payload['object_id'] ?? $payload['uri'] ?? $target);
                     ap_masto_favourite_remove($unlikeSid, $owner, $unlikeOid !== '' ? $unlikeOid : null);
+                    if (function_exists('ap_bsky_favourite_cache_clear')) {
+                        ap_bsky_favourite_cache_clear($owner, (string) ($payload['uri'] ?? $target));
+                    }
                 }
                 return !empty($res['ok']) || $alreadyGone
                     ? ['ok' => true, 'receipt' => []] : ['ok' => false, 'error' => $err];

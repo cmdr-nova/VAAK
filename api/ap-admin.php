@@ -16579,11 +16579,25 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                     $bskyCid = (string) $cmap['bsky_cid'];
                 }
             }
+            // Cached AppView notifications can carry a stale viewer.like flag.
+            // Prefer VAAK's durable interaction projection for the initial
+            // state so a Like made from Notifications remains visible.
+            $bskyLikedLocal = false;
+            $bskyOwnerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+            if ($bskyAt !== '' && $bskyOwnerId > 0 && function_exists('admin_bsky_bookmark_keys')
+                && function_exists('ap_masto_status_is_favourited')) {
+                $bskyLikeKeys = admin_bsky_bookmark_keys($bskyAt, $bskyOwnerId);
+                $bskyLikedLocal = ap_masto_status_is_favourited(
+                    (string) ($bskyLikeKeys['status_id'] ?? ''),
+                    null,
+                    (string) ($bskyLikeKeys['object_id'] ?? $bskyAt)
+                );
+            }
             ?>
-        <button type="button" class="icon-btn bsky-action" data-bsky-action="like"
+        <button type="button" class="icon-btn bsky-action<?= $bskyLikedLocal ? ' on' : '' ?>" data-bsky-action="like"
           data-uri="<?= h($bskyAt) ?>" data-cid="<?= h($bskyCid) ?>" data-record-uri=""
           data-object-ref="<?= h($bskyObject) ?>" data-return-view="mentions"
-          title="Like on Bluesky" aria-label="Like on Bluesky" aria-pressed="false"><i class="ph ph-heart" aria-hidden="true"></i></button>
+          title="<?= $bskyLikedLocal ? 'Unlike' : 'Like on Bluesky' ?>" aria-label="<?= $bskyLikedLocal ? 'Unlike' : 'Like on Bluesky' ?>" aria-pressed="<?= $bskyLikedLocal ? 'true' : 'false' ?>"><i class="ph<?= $bskyLikedLocal ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
             <?php
         } elseif (in_array($nType, ['mention', 'quote'], true) && $nStatusId !== ''
             && preg_match('/^\d+$/', $nStatusId) && $nStatusUri !== ''
