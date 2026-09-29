@@ -9545,6 +9545,7 @@ function view_title(string $view): string
         'rss' => 'RSS',
         'compose' => 'Compose',
         'profile' => 'Profile',
+        'ask' => 'Ask',
         'remote_profile' => 'Remote profile',
         'status' => 'Post',
         'security' => 'Security',
@@ -12136,6 +12137,9 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         && !str_starts_with(strtolower($actorId), 'at://');
     if ($isFediverseActor && !$isSelf && !is_array($personalBlock)) {
         $menu .= '<a class="menu-action" href="?view=dms&amp;peer=' . h(rawurlencode($actorId)) . '">DM</a>';
+    }
+    if (!$isSelf && ($isLocal || (function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($actorId)))) {
+        $menu .= '<a class="menu-action" href="?view=ask&amp;target_actor=' . h(rawurlencode($actorId)) . '&amp;from=' . h(rawurlencode($returnFrom !== '' ? $returnFrom : $returnView)) . '">Ask</a>';
     }
     // Own-post Open/Edit/Pin/Note live in admin_own_post_action_bar()'s overflow.
     if (!$isSelf && $objectId !== '' && str_starts_with($objectId, 'https://')) {
@@ -18166,7 +18170,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: #1a1a1a; border: 1px solid var(--border);
     }
     .profile-hover-card {
-      position: fixed; z-index: 10050; width: min(340px, calc(100vw - 24px));
+      position: fixed; z-index: 10050; width: min(420px, calc(100vw - 24px));
       padding: 1rem; border: 1px solid var(--border); border-radius: 14px;
       background: var(--panel, #171717); color: var(--text, #eee);
       box-shadow: 0 12px 38px rgba(0,0,0,.48); pointer-events: auto;
@@ -19843,6 +19847,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $notifHasMore ? 'Scroll for more…' : 'End of notifications' ?></div>
           <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
         <?php endif; ?>
+
+      <?php elseif ($view === 'ask'): ?>
+        <?php
+          $askTarget = trim((string) ($_GET['target_actor'] ?? ''));
+          $askFrom = trim((string) ($_GET['from'] ?? 'home'));
+          if (!str_starts_with($askTarget, 'https://')) $askTarget = '';
+        ?>
+        <div class="page-back"><a class="btn btn-ghost" href="<?= h($askTarget !== '' ? ('?view=remote_profile&amp;actor=' . rawurlencode($askTarget) . '&amp;from=' . rawurlencode($askFrom)) : '?view=home') ?>">← Back to profile</a></div>
+        <h2 style="font-size:1.05rem;margin:.5rem 0">Ask <?= h($askTarget !== '' ? actor_handle($askTarget) : 'this account') ?></h2>
+        <p class="meta">Your question is sent privately as a Wafrn-compatible ActivityPub Ask.</p>
+        <?php if ($askTarget !== ''): ?>
+          <form class="composer" method="post" action="?view=ask">
+            <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="ask_send"><input type="hidden" name="target_actor" value="<?= h($askTarget) ?>"><input type="hidden" name="return_from" value="<?= h($askFrom) ?>">
+            <textarea name="question" maxlength="10240" required autofocus placeholder="Write your question…" style="min-height:10rem"></textarea>
+            <div class="composer-actions"><span class="meta">Up to 10,240 characters</span><button class="btn btn-primary" type="submit">Send Ask</button></div>
+          </form>
+        <?php else: ?><div class="empty">No Ask target was provided.</div><?php endif; ?>
 
       <?php elseif ($view === 'asks'): ?>
         <?php $askRows = []; try { $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 100'); $st->execute([$vaakOwnerId]); $askRows = $st->fetchAll() ?: []; } catch (Throwable $e) {} ?>
@@ -24667,14 +24688,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endif; ?>
               <?php endif; ?>
               <?php if (!$rpIsBsky): ?>
-                <?php if (!$rpIsOwn && ($rpIsLocal || (function_exists('ap_wafrn_actor_host_known') && ap_wafrn_actor_host_known($rpActor)))): ?>
-                  <details style="display:inline-block;vertical-align:middle"><summary class="btn btn-ghost" style="cursor:pointer;list-style:none">Ask</summary>
-                    <form class="composer" method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="position:absolute;z-index:5;width:min(22rem,90vw);margin-top:.35rem;padding:.65rem">
-                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="ask_send"><input type="hidden" name="target_actor" value="<?= h($rpActor) ?>"><input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
-                      <label>Ask <?= h(actor_handle($rpActor)) ?></label><textarea name="question" maxlength="10240" required placeholder="Write your question…" style="min-height:5rem;margin-top:.35rem"></textarea><button class="btn btn-primary" type="submit" style="margin-top:.4rem">Send Ask</button>
-                    </form>
-                  </details>
-                <?php endif; ?>
                 <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Bite this account? (Wafrn-compatible 🦷)');">
                   <input type="hidden" name="action" value="bite_remote">
                   <input type="hidden" name="return_view" value="remote_profile">
