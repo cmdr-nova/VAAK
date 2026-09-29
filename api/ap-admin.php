@@ -14194,7 +14194,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 ↩ reply to
                 <a href="<?= h(admin_status_href($replyTo, $returnView)) ?>">parent post</a>
               </div>
-            <?php elseif ($replyTo !== ''): ?>
+            <?php elseif (!is_array($askContext) && $replyTo !== ''): ?>
               <div class="meta" style="margin:.25rem 0 .35rem">↩ parent post</div>
             <?php endif; ?>
             <?php if (is_array($askContext)): ?>
