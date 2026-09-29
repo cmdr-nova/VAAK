@@ -26253,11 +26253,20 @@ window.apAdminToast = function (msg, isErr) {
     const viewportHeight = window.innerHeight;
     const spaceAbove = Math.max(0, rect.top - gap - pad);
     const spaceBelow = Math.max(0, viewportHeight - rect.bottom - gap - pad);
+    // Clear the previous constraint before measuring newly loaded folder
+    // content; otherwise scrollHeight can reflect the old loading height and
+    // leave the finished menu artificially compact until the user scrolls.
+    pop.style.maxHeight = 'none';
+    pop.style.overflowY = 'visible';
     const naturalHeight = Math.max(0, pop.scrollHeight || pop.offsetHeight || 200);
     const useAbove = spaceBelow < naturalHeight && spaceAbove > spaceBelow;
     const available = Math.max(120, Math.max(spaceAbove, spaceBelow));
-    pop.style.maxHeight = Math.min(naturalHeight, available) + 'px';
-    const height = Math.min(naturalHeight, available);
+    const constrained = naturalHeight > available;
+    if (constrained) {
+      pop.style.maxHeight = available + 'px';
+      pop.style.overflowY = 'auto';
+    }
+    const height = constrained ? available : naturalHeight;
     const left = Math.min(window.innerWidth - width - pad, Math.max(pad, rect.left));
     const below = rect.bottom + gap;
     const top = useAbove
