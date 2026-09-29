@@ -112,6 +112,22 @@ function ap_ask_actor_identity(string $actor): array
     ];
 }
 
+/** Build the exact Wafrn-compatible Ask context fragment for an answer Note. */
+function ap_ask_representation_html(string $answerNoteId, string $question, string $askerActor): string
+{
+    $identity = ap_ask_actor_identity($askerActor);
+    $display = trim((string) ($identity['display_name'] ?? ''));
+    $handle = trim((string) ($identity['handle'] ?? ''));
+    if ($display === '') $display = $handle !== '' ? $handle : 'Someone';
+    $label = htmlspecialchars($display, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $handleHtml = ($handle !== '' && strcasecmp($display, $handle) !== 0)
+        ? ' <span class="h-card">' . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</span>'
+        : '';
+    return '<p><a href="' . htmlspecialchars($askerActor, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">' . $label . '</a>' . $handleHtml
+        . ' <a href="' . htmlspecialchars($answerNoteId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">asked</a> </p> <blockquote>'
+        . htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote> ';
+}
+
 /** Format an answered Ask for the connected Bluesky mirror. */
 function ap_ask_bluesky_mirror_text(string $answer, array $ask): string
 {
@@ -171,6 +187,39 @@ function ap_wafrn_actor_host_known(string $actor): bool
     return false;
 }
 
+/**
+ * Add Wafrn's JSON-LD RsaSignature2017 envelope to an AskQuestion.  Wafrn
+ * verifies this embedded signature in addition to the normal HTTP signature.
+ * The small helper uses the same URDNA2015 normalization as Wafrn and keeps
+ * the optional Python dependency out of the PHP request process.
+ */
+function ap_wafrn_sign_ask_activity(array $activity, string $creator, string $privPath, string $targetActor): ?array
+{
+    $script = __DIR__ . '/ap-ask-jsonld-sign.py';
+    if (!is_file($script) || !is_readable($privPath)) return null;
+    $host = strtolower((string) (parse_url($targetActor, PHP_URL_HOST) ?: ''));
+    if ($host === '') return null;
+    $context = 'https://' . $host . '/contexts/identity-v1.jsonld';
+    $cmd = 'python3 ' . escapeshellarg($script)
+        . ' --key ' . escapeshellarg($privPath)
+        . ' --creator ' . escapeshellarg($creator)
+        . ' --context ' . escapeshellarg($context);
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = @proc_open($cmd, $descriptors, $pipes);
+    if (!is_resource($proc)) return null;
+    fwrite($pipes[0], json_encode($activity, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    fclose($pipes[0]);
+    $out = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $status = proc_close($proc);
+    if ($status !== 0 || trim($out) === '') {
+        error_log('[asks] JSON-LD signing failed: ' . trim($err));
+        return null;
+    }
+    $signed = json_decode($out, true);
+    return is_array($signed) && is_array($signed['signature'] ?? null) ? $signed : null;
+}
+
 function ap_ask_store_inbound(array $activity, int $ownerUserId, string $ownerActor): bool
 {
     ap_asks_migrate();
@@ -212,6 +261,8 @@ function ap_ask_send(string $targetActor, string $question, int $ownerUserId): a
     // VAAK never sends anonymous Asks: the authenticated local actor is always
     // included, regardless of the recipient's Wafrn level marker.
     $activity = ['@context'=>['https://www.w3.org/ns/activitystreams',['AskQuestion'=>'https://wafrn.net/ns#AskQuestion']], 'id'=>$id, 'type'=>'AskQuestion', 'actor'=>$actor, 'object'=>$targetActor, 'target'=>$targetActor, 'content'=>$question, 'to'=>[$targetActor]];
+    $activity = ap_wafrn_sign_ask_activity($activity, ap_local_key_id(), ap_local_priv_path(), $targetActor);
+    if (!is_array($activity)) return ['ok'=>false,'error'=>'The Wafrn-compatible JSON-LD signer is unavailable.'];
     $ok = ap_deliver_signed_json($inbox, $activity, ap_local_key_id(), ap_local_priv_path(), 8.0);
     if (!$ok) return ['ok'=>false,'error'=>'The Ask could not be delivered.'];
     $now = ap_db_now();

@@ -2721,6 +2721,32 @@ function ap_local_note_as2_doc(string $noteId): ?array
             if (is_array($decoded)) {
                 $obj = $decoded['object'] ?? $decoded;
                 if (is_array($obj) && (($obj['type'] ?? '') === 'Note' || isset($obj['content']))) {
+                    // Rebuild Ask context at read time so already-published
+                    // answers are corrected without rewriting outbox rows.
+                    $ask = function_exists('ap_ask_answer_for_note') ? ap_ask_answer_for_note($noteId) : null;
+                    if (is_array($ask)) {
+                        $rep = ap_ask_representation_html($noteId, (string) ($ask['question'] ?? ''), (string) ($ask['asker_actor'] ?? ''));
+                        if ($rep !== '' && trim((string) ($ask['question'] ?? '')) !== '') {
+                            $oldRep = '';
+                            foreach ((array) ($obj['tag'] ?? []) as $tag) {
+                                if (is_array($tag) && ($tag['type'] ?? '') === 'AskQuestion') {
+                                    $oldRep = (string) ($tag['representation'] ?? '');
+                                    break;
+                                }
+                            }
+                            $visible = (string) ($obj['content'] ?? '');
+                            if ($oldRep !== '') $visible = str_replace($oldRep, '', $visible);
+                            $obj['content'] = $rep . ltrim($visible);
+                            $tags = [];
+                            foreach ((array) ($obj['tag'] ?? []) as $tag) {
+                                if (is_array($tag) && ($tag['type'] ?? '') === 'AskQuestion') {
+                                    $tag['representation'] = $rep;
+                                }
+                                $tags[] = $tag;
+                            }
+                            $obj['tag'] = $tags;
+                        }
+                    }
                     return $obj;
                 }
             }
@@ -5561,8 +5587,14 @@ function ap_publish_status_text(
         $askQuestion = trim((string) ($askContext['question'] ?? ''));
         $askerActor = rtrim(trim((string) ($askContext['asker_actor'] ?? '')), '/');
         if ($askQuestion !== '' && $askerActor !== '') {
-            $askRepresentation = '<p><a href="' . htmlspecialchars((string) ($askContext['ask_id'] ?? $inReplyTo), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">asked</a></p><blockquote>'
-                . htmlspecialchars($askQuestion, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote>';
+            // Match Wafrn's representation so compatible clients can render
+            // the asker and question, then remove the exact fragment when
+            // they materialize the answer.  The old fragment linked to the
+            // private /fediverse/asks URL (which has no public GET route),
+            // omitted the asker entirely, and left remote clients with a
+            // dangling “asked” link.  Link that label to the public answer
+            // Note instead, as Wafrn does.
+            $askRepresentation = ap_ask_representation_html($noteId, $askQuestion, $askerActor);
             // Wafrn uses AskQuestion.representation as the exact fragment to
             // hide from the visible answer. Include that fragment in object
             // content, matching Wafrn's own ActivityPub producer; clients

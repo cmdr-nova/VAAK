@@ -463,6 +463,30 @@ if (preg_match('#^/users/cmdr_nova/(notes|creates)/([a-f0-9]+)$#', $path, $nm)) 
                 echo '{"error":"Not found"}';
                 exit;
             }
+            $askContext = function_exists('ap_ask_answer_for_note')
+                ? ap_ask_answer_for_note((string) ($row['id'] ?? $objectId)) : null;
+            if (is_array($askContext) && function_exists('ap_ask_representation_html')) {
+                $askQuestion = trim((string) ($askContext['question'] ?? ''));
+                $askerActor = rtrim(trim((string) ($askContext['asker_actor'] ?? '')), '/');
+                if ($askQuestion !== '' && $askerActor !== '') {
+                    $oldRep = '';
+                    foreach ((array) ($note['tag'] ?? []) as $tag) {
+                        if (is_array($tag) && ($tag['type'] ?? '') === 'AskQuestion') {
+                            $oldRep = (string) ($tag['representation'] ?? '');
+                            break;
+                        }
+                    }
+                    $rep = ap_ask_representation_html((string) ($row['id'] ?? $objectId), $askQuestion, $askerActor);
+                    $visible = (string) ($note['content'] ?? '');
+                    if ($oldRep !== '') $visible = str_replace($oldRep, '', $visible);
+                    $note['content'] = $rep . ltrim($visible);
+                    foreach ((array) ($note['tag'] ?? []) as $index => $tag) {
+                        if (is_array($tag) && ($tag['type'] ?? '') === 'AskQuestion') {
+                            $note['tag'][$index]['representation'] = $rep;
+                        }
+                    }
+                }
+            }
             // Standalone Note: quote policy + top-level @context only (no nested ctx)
             $note = ap_note_ensure_quote_policy($note);
             $note = ap_as2_ensure_top_context($note);
