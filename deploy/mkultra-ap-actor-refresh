@@ -1,0 +1,6 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Actor/profile refreshes can exceed one minute while hydrating remote Bluesky
+# actors. Serialize runs so cron never creates a CPU-consuming backlog.
+* * * * * www-data /usr/bin/flock -n /tmp/vaak-ap-actor-refresh.lock /usr/bin/env AP_DB_DSN=pgsql:dbname=novalandia VAAK_FEATURE_BLUESKY_TAB=1 /usr/bin/php /srv/mkultra/html/api/ap-actor-refresh-worker.php --limit=12 >> /var/log/mkultra/ap-actor-refresh.log 2>&1

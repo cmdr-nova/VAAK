@@ -8,7 +8,7 @@ Type=simple
 User=www-data
 WorkingDirectory=/srv/mkultra/html/api
 Environment=VAAK_JETSTREAM_STATE=/var/lib/mkultra/ap/jetstream
-Environment=VAAK_JETSTREAM_SHARD_COUNT=20
+Environment=VAAK_JETSTREAM_SHARD_COUNT=2
 Environment=VAAK_JETSTREAM_SHARD_INDEX=%i
 ExecStartPre=/usr/bin/install -d -o www-data -g www-data -m 0750 /var/lib/mkultra/ap/jetstream /var/lib/mkultra/ap/jetstream/incoming
 ExecStart=/opt/vaak-jetstream/bin/python /srv/mkultra/html/api/deploy/ap-bsky-jetstream.py
