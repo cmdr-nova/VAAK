@@ -681,6 +681,36 @@ $vaakAdminOnlyActions = [
         $view = 'remote_profile';
         $_GET['actor'] = $target;
         $_GET['from'] = (string) ($_POST['return_from'] ?? 'home');
+    } elseif ($action === 'ask_answer') {
+        $askId = (int) ($_POST['ask_id'] ?? 0);
+        $answer = trim((string) ($_POST['content'] ?? ''));
+        $view = 'asks';
+        if ($askId < 1 || $answer === '') {
+            $error = 'Write an answer before posting.';
+        } else {
+            try {
+                $askSt = ap_db()->prepare('SELECT * FROM ap_asks WHERE id = ? AND owner_user_id = ? LIMIT 1');
+                $askSt->execute([$askId, $vaakOwnerId]);
+                $askRow = $askSt->fetch();
+                if (!is_array($askRow)) {
+                    $error = 'Ask not found.';
+                } elseif (!empty($askRow['answered'])) {
+                    $error = 'This Ask has already been answered.';
+                } else {
+                    $queued = ap_queue_enqueue($answer, '', false, '', '', '', [], 'public');
+                    if (!empty($queued['ok'])) {
+                        $now = ap_db_now();
+                        ap_db()->prepare('UPDATE ap_asks SET answered = 1, updated_at = ? WHERE id = ? AND owner_user_id = ?')->execute([$now, $askId, $vaakOwnerId]);
+                        $notice = 'Answer queued for posting.';
+                    } else {
+                        $error = (string) ($queued['error'] ?? 'Could not queue answer.');
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log('[ap-admin] ask answer: ' . $e->getMessage());
+                $error = 'Could not answer this Ask right now.';
+            }
+        }
     } elseif ($action === 'wafrn_friend_add') {
         $host = strtolower(trim((string) ($_POST['host'] ?? '')));
         $host = preg_replace('~^https?://~', '', $host) ?? $host;
@@ -19869,7 +19899,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php $askRows = []; try { $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 100'); $st->execute([$vaakOwnerId]); $askRows = $st->fetchAll() ?: []; } catch (Throwable $e) {} ?>
         <h2 style="font-size:1.05rem;margin:0 0 .5rem">Asks</h2><p class="meta">Wafrn-compatible questions received by this account. They are private until you answer them in a post.</p>
         <?php if (!$askRows): ?><div class="empty">No Asks yet.</div><?php endif; ?>
-        <?php foreach ($askRows as $ask): ?><article class="tweet"><div class="meta">From <?= h((string) ($ask['asker_actor'] ?? 'anonymous')) ?> · <?= h((string) ($ask['created_at'] ?? '')) ?></div><div class="body" style="margin-top:.45rem;white-space:pre-wrap"><?= h((string) ($ask['question'] ?? '')) ?></div></article><?php endforeach; ?>
+        <?php foreach ($askRows as $ask): ?>
+          <article class="tweet">
+            <div class="meta">From <?= h((string) ($ask['asker_actor'] ?? 'anonymous')) ?> · <?= h((string) ($ask['created_at'] ?? '')) ?><?= !empty($ask['answered']) ? ' · answered' : '' ?></div>
+            <div class="body" style="margin-top:.45rem;white-space:pre-wrap"><?= h((string) ($ask['question'] ?? '')) ?></div>
+            <?php if (empty($ask['answered'])): ?>
+              <form class="composer" method="post" action="?view=asks" style="margin-top:.75rem">
+                <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                <input type="hidden" name="action" value="ask_answer">
+                <input type="hidden" name="ask_id" value="<?= (int) ($ask['id'] ?? 0) ?>">
+                <textarea name="content" maxlength="2000" required placeholder="Write your answer…" style="min-height:5rem"></textarea>
+                <div class="composer-actions"><span class="meta">Your answer will be posted publicly.</span><button class="btn btn-primary" type="submit">Answer &amp; post</button></div>
+              </form>
+            <?php endif; ?>
+          </article>
+        <?php endforeach; ?>
 
       <?php elseif ($view === 'friend_servers'): ?>
         <?php
@@ -24253,8 +24297,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   try {
                       $stOb = ap_db()->prepare(
                           "SELECT * FROM outbox_notes
-                           WHERE id LIKE ?
-                           ORDER BY published DESC LIMIT 30"
+                          WHERE id LIKE ?
+                           ORDER BY published DESC LIMIT 500"
                       );
                       $stOb->execute(['https://mkultra.monster/users/' . $rpLocalKey . '/%']);
                       $rpOutboxPosts = $stOb->fetchAll() ?: [];
@@ -24277,7 +24321,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           }
                       }
                   }
-                  if (!$rpOutboxPosts) {
+                  if ($rpIsLocal) {
                       $ors = ['actor_id = ? OR actor_id = ?'];
                       $bind = [$rpActor, $rpActor . '/'];
                       $postsSql = "SELECT * FROM events WHERE type IN ('Create','Announce') AND ("
@@ -24287,15 +24331,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                              OR (media_urls IS NOT NULL AND media_urls != '' AND media_urls != '[]')
                              OR (spoiler_text IS NOT NULL AND spoiler_text != '')
                              OR (sensitive IS NOT NULL AND sensitive != 0))
-                           ORDER BY created_at DESC, id DESC LIMIT 30";
+                           ORDER BY created_at DESC, id DESC LIMIT 500";
                       if (function_exists('ap_db_execute_retry')) {
                           $st = ap_db_execute_retry($postsSql, $bind);
-                          $rpPosts = $st ? $st->fetchAll() : [];
+                      $eventRows = $st ? ($st->fetchAll() ?: []) : [];
                       } else {
                           $st = $db->prepare($postsSql);
                           $st->execute($bind);
-                          $rpPosts = $st->fetchAll();
+                          $eventRows = $st->fetchAll() ?: [];
                       }
+                      // Keep the two storage representations separate: authored
+                      // Notes render from outbox_notes, while Announce/Create
+                      // activities render from the event ledger. Combining them
+                      // here would duplicate every local post in the profile.
+                      $rpPosts = $eventRows;
                   }
               } elseif (!$rpIsBsky) {
                   $rpMeta = $rpActor !== '' ? ap_remote_actor_get($rpActor) : null;
@@ -24449,17 +24498,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       }
                   }
               }
-              if ($rpIsLocal && $rpOutboxPosts && $rpActor !== '') {
-                  // The local outbox stores authored Notes; boost activities live
-                  // in the event ledger, so include them in the profile Boosts tab.
-                  try {
-                      $boostSt = ap_db()->prepare("SELECT * FROM events WHERE type = 'Announce' AND (actor_id = ? OR actor_id = ?) ORDER BY created_at DESC, id DESC LIMIT 30");
-                      $boostSt->execute([$rpActor, $rpActor . '/']);
-                      $rpPosts = $boostSt->fetchAll() ?: [];
-                  } catch (Throwable $e) {
-                      $rpPosts = [];
-                  }
-              }
               $rpFollowing = $rpActor !== '' && admin_is_following($followingIds, $rpActor);
           } catch (Throwable $e) {
               error_log('[ap-admin] remote_profile: ' . $e->getMessage());
@@ -24485,12 +24523,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if (str_contains($embedType, 'images') || str_contains($embedType, 'video')
                       || str_contains($embedType, 'recordWithMedia')) $rpTabItems['media'][] = $item;
               }
-          } elseif ($rpOutboxPosts || ($rpIsLocal && $rpBskyPosts)) {
+          } elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts) {
               foreach ($rpOutboxPosts as $item) {
                   $create = json_decode((string) ($item['raw_create_json'] ?? ''), true);
                   $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
                   if (!empty($obj['inReplyTo'])) $rpTabItems['replies'][] = $item;
                   else $rpTabItems['posts'][] = $item;
+                  // A local quote is still an authored post, not a repost.
+                  // The renderer reads the quote object from raw_create_json.
                   if (!empty($obj['attachment']) || !empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
               }
               foreach ($rpBskyPosts as $item) {
@@ -24510,7 +24550,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       || str_contains($embedType, 'recordWithMedia')) $rpTabItems['media'][] = $item;
               }
               foreach ($rpPosts as $boostItem) {
-                  if (strtolower((string) ($boostItem['type'] ?? '')) === 'announce') $rpTabItems['boosts'][] = $boostItem;
+                  $boostType = strtolower((string) ($boostItem['type'] ?? ''));
+                  if ($boostType === 'announce') $rpTabItems['boosts'][] = $boostItem;
+                  elseif ($boostType === 'create') {
+                      if (!empty($boostItem['in_reply_to']) || !empty($boostItem['in_reply_to_id'])) $rpTabItems['replies'][] = $boostItem;
+                      else $rpTabItems['posts'][] = $boostItem;
+                      if (!empty($boostItem['media_urls']) && $boostItem['media_urls'] !== '[]') $rpTabItems['media'][] = $boostItem;
+                  }
               }
           } else {
               foreach ($rpPosts as $item) {
@@ -24725,7 +24771,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php if (is_array($bItem)) admin_render_bsky_feed_item($bItem, 'following'); ?>
               <?php endforeach; ?>
             <?php endif; ?>
-          <?php elseif (($rpOutboxPosts || ($rpIsLocal && $rpBskyPosts)) && $rpTab !== 'boosts'): ?>
+          <?php elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts): ?>
             <?php if ($rpTabItems[$rpTab] === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
             <?php
               $localProfileItems = $rpTabItems[$rpTab];
@@ -24740,6 +24786,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php foreach ($localProfileItems as $n): ?>
               <?php if (isset($n['post']) && is_array($n['post'])): ?>
                 <?php admin_render_bsky_feed_item($n, 'following', 'remote_profile'); ?>
+              <?php elseif (isset($n['type']) && strtolower((string) $n['type']) === 'announce'): ?>
+                <?php admin_render_event_tweet($n, $followingIds, 'remote_profile'); ?>
               <?php else: ?>
                 <?php admin_render_outbox_card($n, 'remote_profile'); ?>
               <?php endif; ?>
