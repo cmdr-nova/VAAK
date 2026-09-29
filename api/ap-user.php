@@ -1735,5 +1735,8 @@ function ap_user_html_shell_end(): void
             . '</div>';
         echo '<script>(function(){var box=document.getElementById("ap-img-lightbox");var img=document.getElementById("ap-img-lightbox-img");var closeBtn=document.getElementById("ap-img-lightbox-close");if(!box||!img)return;function openLb(src,alt){if(!src)return;img.src=src;img.alt=alt||"";box.classList.add("open");box.setAttribute("aria-hidden","false");document.body.style.overflow="hidden";}function closeLb(){box.classList.remove("open");box.setAttribute("aria-hidden","true");img.removeAttribute("src");img.alt="";document.body.style.overflow="";}document.addEventListener("click",function(e){var t=e.target instanceof Element?e.target.closest(".note-media-trigger,[data-ap-lightbox]"):null;if(!t)return;e.preventDefault();var full=t.getAttribute("data-full")||(t.querySelector&&t.querySelector("img")&&t.querySelector("img").src)||"";var alt=(t.querySelector&&t.querySelector("img")&&t.querySelector("img").alt)||"";openLb(full,alt);});closeBtn&&closeBtn.addEventListener("click",closeLb);box.addEventListener("click",function(e){if(e.target===box)closeLb();});document.addEventListener("keydown",function(e){if(e.key==="Escape"&&box.classList.contains("open"))closeLb();});})();</script>';
     }
+    if (function_exists('ap_link_preview_youtube_script')) {
+        echo ap_link_preview_youtube_script();
+    }
     echo '</body></html>';
 }

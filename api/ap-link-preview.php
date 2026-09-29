@@ -144,6 +144,25 @@ function ap_link_preview_youtube_id(string $url): ?string
     return null;
 }
 
+/** Build a useful YouTube card without waiting on oEmbed. */
+function ap_link_preview_youtube_fallback(string $url): ?array
+{
+    $id = ap_link_preview_youtube_id($url);
+    if ($id === null) {
+        return null;
+    }
+    return [
+        'url' => 'https://www.youtube.com/watch?v=' . $id,
+        'title' => 'YouTube video',
+        'description' => null,
+        'image' => 'https://i.ytimg.com/vi/' . $id . '/hqdefault.jpg',
+        'provider_name' => 'YouTube',
+        'provider_url' => 'https://www.youtube.com/',
+        'type' => 'video',
+        'status' => 'ok',
+    ];
+}
+
 /**
  * SSRF-safe URL check (scheme + host resolution).
  */
@@ -441,6 +460,7 @@ function ap_link_preview_fetch_youtube(string $url): ?array
     if ($id === null) {
         return null;
     }
+    $fallback = ap_link_preview_youtube_fallback($url);
     $watch = 'https://www.youtube.com/watch?v=' . $id;
     $oembedUrl = 'https://www.youtube.com/oembed?format=json&url=' . rawurlencode($watch);
     $json = ap_link_preview_http_get($oembedUrl, 4, 65536);
@@ -453,16 +473,9 @@ function ap_link_preview_fetch_youtube(string $url): ?array
             $author = isset($data['author_name']) ? (string) $data['author_name'] : null;
         }
     }
-    return [
-        'url' => $watch,
-        'title' => $title ?: 'YouTube video',
-        'description' => $author !== null && $author !== '' ? $author : null,
-        'image' => 'https://i.ytimg.com/vi/' . $id . '/hqdefault.jpg',
-        'provider_name' => 'YouTube',
-        'provider_url' => 'https://www.youtube.com/',
-        'type' => 'video',
-        'status' => 'ok',
-    ];
+    $fallback['title'] = $title ?: $fallback['title'];
+    $fallback['description'] = $author !== null && $author !== '' ? $author : null;
+    return $fallback;
 }
 
 /**
@@ -549,7 +562,9 @@ function ap_link_preview_for_url(string $url, bool $allowFetch = true): ?array
         return ($cached['status'] ?? '') === 'ok' ? $cached : null;
     }
     if (!$allowFetch) {
-        return null;
+        // YouTube thumbnails are deterministic and do not require a network
+        // request; render the fallback while metadata warms asynchronously.
+        return ap_link_preview_youtube_fallback($url);
     }
 
     $card = null;
@@ -636,11 +651,39 @@ function ap_link_preview_html(?array $card, bool $interactive = true): string
     $image = isset($entity['image']) && is_string($entity['image']) && str_starts_with($entity['image'], 'https://')
         ? htmlspecialchars($entity['image'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
         : '';
+    $descHtml = $desc !== '' ? '<div class="link-card__desc">' . $desc . '</div>' : '';
+    $provHtml = $provider !== '' ? '<div class="link-card__provider">' . $provider . '</div>' : '';
+
+    // YouTube gets a click-to-play card. Keep this isolated from ordinary
+    // link cards and uploaded media so other preview/media handling is unchanged.
+    $youtubeId = ap_link_preview_youtube_id((string) $entity['url']);
+    if ($youtubeId !== null) {
+        $safeId = htmlspecialchars($youtubeId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $thumb = $image !== ''
+            ? $image
+            : htmlspecialchars('https://i.ytimg.com/vi/' . rawurlencode($youtubeId) . '/hqdefault.jpg', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $play = '<button type="button" data-youtube-play aria-label="Play YouTube video"'
+            . ' style="position:relative;display:block;flex:0 0 180px;width:180px;min-height:102px;padding:0;border:0;background:#080808;cursor:pointer;overflow:hidden">'
+            . '<img src="' . $thumb . '" alt="" loading="lazy" referrerpolicy="no-referrer"'
+            . ' style="display:block;width:100%;height:100%;min-height:102px;object-fit:cover">'
+            . '<span aria-hidden="true" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:grid;place-items:center;width:2.6rem;height:2.6rem;border-radius:50%;background:rgba(0,0,0,.78);color:#fff;font-size:1.2rem">▶</span>'
+            . '</button>';
+        $open = '<a href="' . $url . '" target="_blank" rel="nofollow noopener noreferrer"'
+            . ' style="display:inline-block;margin-top:.4rem;color:inherit;font-size:.76rem">Open on YouTube</a>';
+        $inner = $play
+            . '<div class="link-card__body">'
+            . $provHtml
+            . '<div class="link-card__title">' . ($title !== '' ? $title : 'YouTube video') . '</div>'
+            . $descHtml
+            . $open
+            . '</div>';
+        $static = $interactive ? '' : ' link-card--static';
+        return '<div class="link-card youtube-link-card' . $static . '" data-youtube-id="' . $safeId . '" data-youtube-url="' . $url . '">' . $inner . '</div>';
+    }
+
     $imgHtml = $image !== ''
         ? '<div class="link-card__media"><img src="' . $image . '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>'
         : '';
-    $descHtml = $desc !== '' ? '<div class="link-card__desc">' . $desc . '</div>' : '';
-    $provHtml = $provider !== '' ? '<div class="link-card__provider">' . $provider . '</div>' : '';
     $titleHtml = $title !== '' ? $title : $url;
     $inner = $imgHtml
         . '<div class="link-card__body">'
@@ -654,6 +697,42 @@ function ap_link_preview_html(?array $card, bool $interactive = true): string
     }
     // Non-interactive: profile outbox list wraps each post in <a class="post">
     return '<div class="link-card link-card--static" data-url="' . $url . '">' . $inner . '</div>';
+}
+
+/** Shared click-to-play behavior for YouTube preview cards. */
+function ap_link_preview_youtube_script(): string
+{
+    return <<<'HTML'
+<script>
+(function () {
+  if (window.__vaakYoutubeCardsBound) return;
+  window.__vaakYoutubeCardsBound = true;
+  document.addEventListener('click', function (event) {
+    var play = event.target && event.target.closest ? event.target.closest('[data-youtube-play]') : null;
+    if (!play) return;
+    var card = play.closest('[data-youtube-id]');
+    if (!card) return;
+    var id = card.getAttribute('data-youtube-id') || '';
+    if (!/^[A-Za-z0-9_-]{6,}$/.test(id) || card.getAttribute('data-youtube-loaded') === '1') return;
+    event.preventDefault();
+    event.stopPropagation();
+    var frame = document.createElement('iframe');
+    frame.src = 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(id) + '?autoplay=1&playsinline=1&rel=0';
+    frame.title = 'YouTube video';
+    frame.loading = 'lazy';
+    frame.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+    frame.allowFullscreen = true;
+    frame.style.cssText = 'display:block;width:100%;height:100%;min-height:220px;border:0;background:#000';
+    var shell = document.createElement('div');
+    shell.style.cssText = 'position:relative;width:100%;aspect-ratio:16/9;background:#000';
+    shell.appendChild(frame);
+    card.replaceChildren(shell);
+    card.setAttribute('data-youtube-loaded', '1');
+    card.classList.add('youtube-link-card--loaded');
+  });
+})();
+</script>
+HTML;
 }
 
 /**

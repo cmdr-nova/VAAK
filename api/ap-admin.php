@@ -30932,6 +30932,7 @@ if (VIEW === 'analytics') loadAnalytics();
   });
 })();
 </script>
+<?php if (function_exists('ap_link_preview_youtube_script')) echo ap_link_preview_youtube_script(); ?>
 </body>
 </html>
 <?php

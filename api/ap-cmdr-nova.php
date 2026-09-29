@@ -1239,6 +1239,9 @@ function ap_cmdr_shell_end(): void
             echo '<footer><p style="padding:1rem">Footer unavailable</p></footer>';
         }
         echo ap_cmdr_lightbox_markup_and_script();
+        if (function_exists('ap_link_preview_youtube_script')) {
+            echo ap_link_preview_youtube_script();
+        }
         echo '</body></html>';
         return;
     }
@@ -1259,6 +1262,9 @@ function ap_cmdr_shell_end(): void
     echo '</footer>';
     echo '</div></main>';
     echo ap_cmdr_lightbox_markup_and_script();
+    if (function_exists('ap_link_preview_youtube_script')) {
+        echo ap_link_preview_youtube_script();
+    }
     echo '</body></html>';
 }
 
