@@ -216,7 +216,7 @@ if ($view === 'gallery' || $view === 'vakktok') {
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
     'moderation', 'blocks', 'relays', 'stats', 'queue_health', 'invites', 'users', 'policies',
-    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers',
+    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers', 'asks',
 ];
 // Security is under You for every account (own OAuth tokens / password).
 if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
@@ -19010,6 +19010,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>
           <a class="<?= $view === 'relays' ? 'active' : '' ?>" href="?view=relays"><span class="ico">⇄</span><span class="label">Relays</span></a>
           <a class="<?= $view === 'friend_servers' ? 'active' : '' ?>" href="?view=friend_servers"><span class="ico">✦</span><span class="label">Wafrn friends</span></a>
+          <a class="<?= $view === 'asks' ? 'active' : '' ?>" href="?view=asks"><span class="ico">?</span><span class="label">Asks</span></a>
           <a class="<?= $view === 'stats' ? 'active' : '' ?>" href="?view=stats"><span class="ico">▤</span><span class="label">AP stats</span></a>
           <a class="<?= $view === 'queue_health' ? 'active' : '' ?>" href="?view=queue_health"><span class="ico">◌</span><span class="label">Queue health</span></a>
           <a class="<?= $view === 'downranking' ? 'active' : '' ?>" href="?view=downranking"><span class="ico">≋</span><span class="label">Home downranking</span></a>
@@ -19826,6 +19827,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $notifHasMore ? 'Scroll for more…' : 'End of notifications' ?></div>
           <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
         <?php endif; ?>
+
+      <?php elseif ($view === 'asks'): ?>
+        <?php $askRows = []; try { $st = ap_db()->prepare('SELECT * FROM ap_asks WHERE owner_user_id = ? ORDER BY created_at DESC LIMIT 100'); $st->execute([$vaakOwnerId]); $askRows = $st->fetchAll() ?: []; } catch (Throwable $e) {} ?>
+        <h2 style="font-size:1.05rem;margin:0 0 .5rem">Asks</h2><p class="meta">Wafrn-compatible questions received by this account. They are private until you answer them in a post.</p>
+        <?php if (!$askRows): ?><div class="empty">No Asks yet.</div><?php endif; ?>
+        <?php foreach ($askRows as $ask): ?><article class="tweet"><div class="meta">From <?= h((string) ($ask['asker_actor'] ?? 'anonymous')) ?> · <?= h((string) ($ask['created_at'] ?? '')) ?></div><div class="body" style="margin-top:.45rem;white-space:pre-wrap"><?= h((string) ($ask['question'] ?? '')) ?></div></article><?php endforeach; ?>
 
       <?php elseif ($view === 'friend_servers'): ?>
         <?php
