@@ -24222,6 +24222,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpActor = trim((string) ($_GET['actor'] ?? ''));
           $rpMeta = null;
           $rpBio = '';
+          $rpProfileBadges = [];
           $rpAvatar = null;
           $rpHeader = null;
           $rpFollowing = false;
@@ -24350,6 +24351,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               if ($rpIsLocal) {
                   // Local peers: actor_profile is authoritative (skip remote_actors / R2 / AS2).
                   $prof = function_exists('ap_profile_get') ? ap_profile_get($rpLocalKey) : [];
+                  $rpProfileBadges = function_exists('ap_profile_normalize_badges')
+                      ? ap_profile_normalize_badges($prof['profile_badges'] ?? []) : [];
                   $iconRaw = $prof['icon_url'] ?? null;
                   $imageRaw = $prof['image_url'] ?? null;
                   $rpAvatar = function_exists('ap_profile_sanitize_https_url')
@@ -24761,6 +24764,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="meta" style="margin-top:.75rem">No bio set.</div>
             <?php else: ?>
               <div class="meta" style="margin-top:.75rem">No bio is cached yet; profile details are being refreshed in the background.</div>
+            <?php endif; ?>
+            <?php if ($rpIsLocal && $rpProfileBadges !== [] && function_exists('ap_profile_badge_catalog')): ?>
+              <div class="profile-badges" aria-label="Profile badges" style="display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.65rem">
+                <?php foreach ($rpProfileBadges as $badgeKey): $badge = ap_profile_badge_catalog()[$badgeKey] ?? null; if (!is_array($badge)) continue; ?>
+                  <span class="tag" title="<?= h((string) ($badge['label'] ?? $badgeKey)) ?>"><?= h((string) ($badge['emoji'] ?? '')) ?> <?= h((string) ($badge['label'] ?? $badgeKey)) ?></span>
+                <?php endforeach; ?>
+              </div>
             <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
