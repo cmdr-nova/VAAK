@@ -2634,8 +2634,72 @@ CREATE TABLE IF NOT EXISTS bsky_posts (
 )
 SQL);
         }
+        ap_bsky_post_observations_migrate($db);
     } catch (Throwable $e) {
         // ops may provision
+    }
+}
+
+/**
+ * Track which connected VAAK accounts have observed a canonical Bluesky post.
+ *
+ * The post body is intentionally shared in bsky_posts.  This relation keeps
+ * owner-specific discovery semantics without copying the same post once per
+ * connected account.
+ */
+function ap_bsky_post_observations_migrate(?PDO $db = null): void
+{
+    static $doneByConnection = [];
+    $db ??= ap_db();
+    $connectionKey = spl_object_id($db);
+    if (isset($doneByConnection[$connectionKey])) {
+        return;
+    }
+    $doneByConnection[$connectionKey] = true;
+    try {
+        $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
+        $idType = $driver === 'pgsql' ? 'BIGINT' : 'INTEGER';
+        $db->exec("CREATE TABLE IF NOT EXISTS bsky_post_observations (
+            bsky_uri TEXT NOT NULL,
+            owner_user_id {$idType} NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            PRIMARY KEY (bsky_uri, owner_user_id)
+        )");
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_post_observations_owner_time ON bsky_post_observations (owner_user_id, last_seen_at DESC)');
+        if ($driver === 'pgsql') {
+            $db->exec("INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
+                SELECT bsky_uri, owner_user_id, COALESCE(seen_at, NOW()::text), COALESCE(seen_at, NOW()::text)
+                FROM bsky_posts WHERE owner_user_id IS NOT NULL
+                ON CONFLICT (bsky_uri, owner_user_id) DO NOTHING");
+        } else {
+            $db->exec("INSERT OR IGNORE INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
+                SELECT bsky_uri, owner_user_id, COALESCE(seen_at, datetime('now')), COALESCE(seen_at, datetime('now'))
+                FROM bsky_posts WHERE owner_user_id IS NOT NULL");
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] post observations migration failed: ' . $e->getMessage());
+    }
+}
+
+function ap_bsky_post_observation_touch(string $bskyUri, int $ownerUserId, ?PDO $db = null): void
+{
+    if ($ownerUserId < 1 || !str_starts_with($bskyUri, 'at://')) {
+        return;
+    }
+    $db ??= ap_db();
+    ap_bsky_post_observations_migrate($db);
+    $now = gmdate('c');
+    try {
+        $driver = function_exists('ap_db_driver') ? ap_db_driver($db) : 'sqlite';
+        if ($driver === 'pgsql') {
+            $st = $db->prepare('INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?) ON CONFLICT (bsky_uri, owner_user_id) DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at');
+        } else {
+            $st = $db->prepare('INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?) ON CONFLICT (bsky_uri, owner_user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at');
+        }
+        $st->execute([$bskyUri, $ownerUserId, $now, $now]);
+    } catch (Throwable $e) {
+        error_log('[ap-bsky] post observation touch failed: ' . $e->getMessage());
     }
 }
 
@@ -3058,6 +3122,9 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $now,
             $now,
         ]);
+        if ($ownerUserId !== null && $ownerUserId > 0) {
+            ap_bsky_post_observation_touch($uri, $ownerUserId);
+        }
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());
     }
@@ -3619,7 +3686,10 @@ function ap_bsky_posts_for_home(
                        l.fediverse_id
                 FROM bsky_posts p
                 LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-                WHERE p.owner_user_id = ?
+                WHERE EXISTS (
+                    SELECT 1 FROM bsky_post_observations o
+                    WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = ?
+                )
                   AND p.text IS NOT NULL';
         $bind = [$ownerUserId];
         if (is_string($excludeAuthorDid) && str_starts_with($excludeAuthorDid, 'did:')) {
@@ -3694,7 +3764,10 @@ function ap_bsky_home_rank_keys(
         $sql = 'SELECT p.bsky_uri, p.indexed_at, p.author_did, l.fediverse_id
                 FROM bsky_posts p
                 LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-                WHERE p.owner_user_id = ?
+                WHERE EXISTS (
+                    SELECT 1 FROM bsky_post_observations o
+                    WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = ?
+                )
                   AND p.text IS NOT NULL';
         $bind = [$ownerUserId];
         if (is_string($excludeAuthorDid) && str_starts_with($excludeAuthorDid, 'did:')) {

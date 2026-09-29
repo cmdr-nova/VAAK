@@ -536,7 +536,10 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             $profileLastModifiedTs = max($profileLastModifiedTs, strtotime($latestOutbox) ?: 0);
         }
         if ($profileOwnerId > 0) {
-            $st = $db->prepare('SELECT COALESCE(MAX(updated_at), \'\'), COALESCE(MAX(indexed_at), \'\') FROM bsky_posts WHERE owner_user_id = ?');
+            $st = $db->prepare("SELECT COALESCE(MAX(p.updated_at), ''), COALESCE(MAX(p.indexed_at), '')
+                FROM bsky_posts p
+                INNER JOIN bsky_post_observations o ON o.bsky_uri = p.bsky_uri
+                WHERE o.owner_user_id = ?");
             $st->execute([$profileOwnerId]);
             $bskyRevision = $st->fetch(PDO::FETCH_NUM) ?: [];
             foreach ($bskyRevision as $part) {
