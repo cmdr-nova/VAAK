@@ -19011,7 +19011,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <h3>Search</h3>
       <form method="get" action="" style="margin:0">
         <input type="hidden" name="view" value="search">
-        <input name="q" type="search" value="<?= h(trim((string) ($_GET['q'] ?? ''))) ?>" placeholder="@user@host · #tag" style="width:100%;background:#0c0c0c;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:.55rem .7rem;font:inherit">
+        <input name="q" type="search" value="<?= h(trim((string) ($_GET['q'] ?? ''))) ?>" placeholder="Search posts, accounts, tags, or URLs…" aria-label="Search posts, accounts, tags, or URLs" style="width:100%;background:#0c0c0c;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:.55rem .7rem;font:inherit">
         <button class="btn btn-primary" type="submit" style="width:100%;margin-top:.55rem">Search</button>
       </form>
     </div>
