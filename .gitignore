@@ -21,6 +21,7 @@ storage/
 var/
 vendor/
 node_modules/
+__pycache__/
 .DS_Store
 
 # Local agent instructions stay on the work machine and are never published.
