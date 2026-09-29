@@ -5563,6 +5563,12 @@ function ap_publish_status_text(
         if ($askQuestion !== '' && $askerActor !== '') {
             $askRepresentation = '<p><a href="' . htmlspecialchars((string) ($askContext['ask_id'] ?? $inReplyTo), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">asked</a></p><blockquote>'
                 . htmlspecialchars($askQuestion, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote>';
+            // Wafrn uses AskQuestion.representation as the exact fragment to
+            // hide from the visible answer. Include that fragment in object
+            // content, matching Wafrn's own ActivityPub producer; clients
+            // that understand the tag remove it while others still see the
+            // complete Ask + answer context.
+            $note['content'] = $askRepresentation . (string) ($note['content'] ?? '');
             $note['tag'][] = [
                 'type' => 'AskQuestion',
                 'name' => $askQuestion,
@@ -5579,7 +5585,8 @@ function ap_publish_status_text(
         $note['inReplyTo'] = $inReplyTo;
     }
     if ($as2MentionTags !== []) {
-        $note['tag'] = $as2MentionTags;
+        // Preserve Wafrn's AskQuestion tag alongside ordinary Mention tags.
+        $note['tag'] = array_merge(is_array($note['tag'] ?? null) ? $note['tag'] : [], $as2MentionTags);
     }
     if ($pollNorm !== null) {
         $endTime = (new DateTimeImmutable('now', new DateTimeZone('UTC')))

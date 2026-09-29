@@ -18478,6 +18478,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet-notif-boost .quote-block {
       margin-top: .55rem;
     }
+    /* Notification cards mix icon-only actions with text links. Keep their
+       controls on one visual baseline, including compact Profile/Open links. */
+    .tweet-notif .tweet-actions { align-items: center; gap: .55rem; }
+    .tweet-notif .tweet-actions > a,
+    .tweet-notif .tweet-actions > button {
+      display: inline-flex; align-items: center; line-height: 1.2;
+      min-height: 2rem;
+    }
+    .tweet-notif .tweet-actions > .btn {
+      font-size: .85rem !important;
+      padding: .35rem .6rem !important;
+    }
 
     .stat-grid {
       display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; margin-bottom: 1rem;
@@ -24450,9 +24462,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if ($rpIsLocal) {
                       $ors = ['actor_id = ? OR actor_id = ?'];
                       $bind = [$rpActor, $rpActor . '/'];
-                      $postsSql = "SELECT * FROM events WHERE type IN ('Create','Announce') AND ("
-                           . implode(' OR ', $ors) . ")
-                           ORDER BY created_at DESC, id DESC LIMIT 500";
+                      // Inbox delivery can log the same local Announce once as
+                      // local_observe and again as boost_ok. A profile should
+                      // show one boost per object, preferring the confirmed
+                      // boost record over the observation stub.
+                      $postsSql = "SELECT * FROM (
+                          SELECT DISTINCT ON (object_id) * FROM events
+                          WHERE type IN ('Create','Announce') AND (" . implode(' OR ', $ors) . ")
+                          ORDER BY object_id,
+                            CASE WHEN action_taken = 'boost_ok' THEN 0 ELSE 1 END,
+                            created_at DESC, id DESC
+                        ) AS profile_events
+                        ORDER BY created_at DESC, id DESC LIMIT 500";
                       if (function_exists('ap_db_execute_retry')) {
                           $st = ap_db_execute_retry($postsSql, $bind);
                       $eventRows = $st ? ($st->fetchAll() ?: []) : [];
