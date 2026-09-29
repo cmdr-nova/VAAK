@@ -6,6 +6,15 @@
  */
 declare(strict_types=1);
 
+// Baseline browser protections for both the logged-out login surface and the
+// authenticated app shell (protocol endpoints set their own policy headers).
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: SAMEORIGIN');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+}
+
 /** Keep bootstrap failures human-readable instead of returning a blank page. */
 function vaak_render_failure(?Throwable $error = null): void
 {
