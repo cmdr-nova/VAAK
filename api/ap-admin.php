@@ -681,6 +681,52 @@ if (isset($_GET['op']) && (string) $_GET['op'] === 'edit_draft') {
     exit;
 }
 
+// Low-volume passive Home learning. The client reports only a post key,
+// author/feed key, and a dwell bucket; server-side cooldowns deduplicate tabs
+// and reloads before anything reaches ap_user_signals.
+if (
+    ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+    && isset($_GET['ajax'])
+    && (string) $_GET['ajax'] === 'home_signal'
+) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $csrfSignal = (string) ($_POST['csrf'] ?? $_SERVER['HTTP_X_VAAK_CSRF'] ?? '');
+    if (!ap_auth_csrf_ok($csrfSignal)) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Session expired.']);
+        exit;
+    }
+    $platform = strtolower(trim((string) ($_POST['platform'] ?? '')));
+    $kind = strtolower(trim((string) ($_POST['kind'] ?? '')));
+    $targetKey = trim((string) ($_POST['target_key'] ?? ''));
+    $targetActor = trim((string) ($_POST['target_actor'] ?? ''));
+    $dwellSeconds = max(0, min(300, (int) ($_POST['dwell_seconds'] ?? 0)));
+    $validActor = ($platform === 'fedi' && str_starts_with($targetActor, 'https://'))
+        || ($platform === 'bsky' && (str_starts_with($targetActor, 'did:') || str_starts_with($targetActor, 'https://bsky.app/profile/')))
+        || ($platform === 'rss' && preg_match('/^rss:feed:[1-9][0-9]*$/', $targetActor));
+    if (!in_array($kind, ['impression', 'click', 'dwell'], true)
+        || $targetKey === '' || strlen($targetKey) > 2048 || strlen($targetActor) > 2048 || !$validActor
+    ) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'Invalid Home signal.']);
+        exit;
+    }
+    $signalProfile = function_exists('ap_profile_get') ? ap_profile_get($vaakActorKey) : [];
+    $algorithmEnabled = !array_key_exists('algorithm_enabled', $signalProfile)
+        || !empty($signalProfile['algorithm_enabled']);
+    $recorded = $algorithmEnabled && function_exists('ap_signal_record_passive')
+        ? ap_signal_record_passive($vaakOwnerId, $platform, $kind, $targetKey, $targetActor, $dwellSeconds)
+        : false;
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    echo json_encode(['ok' => true, 'recorded' => $recorded], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     $action = (string) ($_POST['action'] ?? '');
     // Hard guard: a compose POST that carries our own note_id is ALWAYS an edit.
@@ -6268,7 +6314,7 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v9_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v10_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -6534,6 +6580,10 @@ function admin_home_item_preference_actor(array $item): string
     if ($kind === 'bsky') {
         return rtrim((string) ($row['post']['author']['did'] ?? $row['author_did'] ?? ''), '/');
     }
+    if ($kind === 'rss') {
+        $feedId = (int) ($row['feed_id'] ?? 0);
+        return $feedId > 0 ? 'rss:feed:' . $feedId : '';
+    }
     // For boosts/Announce events, rank the original author rather than the
     // account that performed the boost.
     if ($kind === 'boost' || strtolower((string) ($row['type'] ?? '')) === 'announce') {
@@ -6574,6 +6624,12 @@ function admin_home_signal_actor_weights(int $ownerUserId): array
             'reply' => 1.0,
             'bookmark' => 1.1,
             'follow' => 0.6,
+            // Passive behavior stays intentionally weaker than an explicit
+            // action. Impressions add tiny fatigue; clicks and sustained dwell
+            // can recover and modestly strengthen an author/feed preference.
+            'impression' => -0.03,
+            'click' => 0.30,
+            'dwell' => 0.12,
         ];
         $now = time();
         foreach ($st->fetchAll() ?: [] as $row) {
@@ -6594,7 +6650,7 @@ function admin_home_signal_actor_weights(int $ownerUserId): array
             // Half-life of two weeks keeps recent intent useful without
             // making a single old interaction permanently dominate Home.
             $decay = exp(-$age / (14 * 86400));
-            $weights[$actor] = min(24.0, (float) ($weights[$actor] ?? 0) + ($base * $multiplier * $decay));
+            $weights[$actor] = max(-3.0, min(24.0, (float) ($weights[$actor] ?? 0) + ($base * $multiplier * $decay)));
         }
         if (function_exists('ap_redis_json_set')) {
             ap_redis_json_set($redisKey, $weights, 45);
@@ -6630,14 +6686,17 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
     $now = time();
     foreach ($timeline as &$item) {
         $actor = admin_home_item_preference_actor($item);
-        $count = $actor !== '' ? (int) ($weights[$actor] ?? 0) : 0;
+        $count = $actor !== '' ? (float) ($weights[$actor] ?? 0) : 0.0;
         // Native Bluesky favourites may record a bsky.app profile URL while
         // cached posts identify the author by DID. Check both cheap aliases.
-        if ($count < 1 && (($item['kind'] ?? '') === 'bsky')) {
+        if (($item['kind'] ?? '') === 'bsky') {
             $author = is_array($item['row']['post']['author'] ?? null) ? $item['row']['post']['author'] : [];
             foreach ([(string) ($author['handle'] ?? ''), (string) ($author['did'] ?? '')] as $ref) {
                 if ($ref === '') continue;
-                $count = max($count, (int) ($weights['https://bsky.app/profile/' . $ref] ?? 0));
+                $alias = 'https://bsky.app/profile/' . $ref;
+                if (array_key_exists($alias, $weights)) {
+                    $count = max($count, (float) $weights[$alias]);
+                }
             }
         }
         $tagCount = 0;
@@ -6646,13 +6705,15 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
         }
         $created = (int) ($item['sort'] ?? 0);
         // Only recent items receive a nudge; malformed/old timestamps stay put.
-        if (($count < 1 && $tagCount < 1) || $created < ($now - 172800) || $created > ($now + 300)) {
+        if (($count == 0.0 && $tagCount < 1) || $created < ($now - 172800) || $created > ($now + 300)) {
             continue;
         }
-        $authorBonus = $count > 0 ? (int) round(600 * log(1 + $count, 2)) : 0;
+        $authorBonus = $count > 0
+            ? (int) round(600 * log(1 + $count, 2))
+            : max(-300, (int) round(60 * $count));
         $tagBonus = $tagCount > 0 ? (int) round(300 * log(1 + $tagCount, 2)) : 0;
-        $bonus = min(1800, $authorBonus + $tagBonus);
-        if ($bonus > 0) {
+        $bonus = max(-300, min(1800, $authorBonus + $tagBonus));
+        if ($bonus !== 0) {
             $item['sort'] = $created + $bonus;
             $item['pref_nudge'] = true; // UI hint only; not persisted
         }
@@ -7142,6 +7203,18 @@ function admin_home_queue_rss_after_first_page(
     $keys = ap_rss_home_rank_keys($ownerUserId, $candidateLimit, $beforeTs);
     if ($keys === []) {
         return $ranked;
+    }
+    if (function_exists('admin_home_signal_actor_weights')) {
+        $signalWeights = admin_home_signal_actor_weights($ownerUserId);
+        foreach ($keys as $index => &$row) {
+            $row['_rank_order'] = $index;
+            $row['_passive_score'] = (float) ($signalWeights['rss:feed:' . (int) ($row['feed_id'] ?? 0)] ?? 0.0);
+        }
+        unset($row);
+        usort($keys, static function (array $a, array $b): int {
+            $score = ((float) ($b['_passive_score'] ?? 0.0)) <=> ((float) ($a['_passive_score'] ?? 0.0));
+            return $score !== 0 ? $score : ((int) ($a['_rank_order'] ?? 0) <=> (int) ($b['_rank_order'] ?? 0));
+        });
     }
     $seenRss = [];
     foreach ($ranked as $row) {
@@ -11851,6 +11924,19 @@ function admin_event_is_empty_private_stub(array $e): bool
     return true;
 }
 
+function admin_home_rank_tracking_attrs(string $platform, string $targetKey, string $targetActor): string
+{
+    $platform = strtolower(trim($platform));
+    $targetKey = trim($targetKey);
+    $targetActor = trim($targetActor);
+    if (!in_array($platform, ['fedi', 'bsky', 'rss'], true) || $targetKey === '' || $targetActor === '') {
+        return '';
+    }
+    return ' data-rank-platform="' . h($platform) . '"'
+        . ' data-rank-key="' . h(mb_substr($targetKey, 0, 2048)) . '"'
+        . ' data-rank-actor="' . h(mb_substr($targetActor, 0, 2048)) . '"';
+}
+
 function admin_render_event_tweet(array $e, array $followingIds, string $returnView, bool $fromFollowedTag = false): void
 {
     // Hide empty followers-only firehose stubs (no body to show).
@@ -12013,8 +12099,13 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     $profileHref = $aid !== ''
         ? ('?view=remote_profile&actor=' . rawurlencode($aid) . '&from=' . rawurlencode($returnView))
         : '';
+    $rankKey = $objectId !== '' ? $objectId : ($eventId > 0 ? 'event:' . $eventId : '');
+    $rankActor = function_exists('admin_home_item_preference_actor')
+        ? admin_home_item_preference_actor(['kind' => 'event', 'row' => $e])
+        : $aid;
+    $rankAttrs = admin_home_rank_tracking_attrs('fedi', $rankKey, $rankActor);
     ?>
-          <article class="tweet">
+          <article class="tweet"<?= $rankAttrs ?>>
             <div class="tweet-hd">
               <?php if ($profileHref !== ''): ?>
                 <a href="<?= h($profileHref) ?>" style="text-decoration:none"><?= admin_avatar_img($aid !== '' ? $aid : null) ?></a>
@@ -14064,8 +14155,10 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $bm = ($statusId !== '' || $objectId !== '')
         && ap_masto_status_is_bookmarked($statusId, null, $objectId !== '' ? $objectId : null);
     $boosted = true;
+    $rankKey = $objectId !== '' ? $objectId : ($statusId !== '' ? 'status:' . $statusId : '');
+    $rankAttrs = admin_home_rank_tracking_attrs('fedi', $rankKey, $targetActor);
     ?>
-          <article class="tweet tweet-boost"<?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
+          <article class="tweet tweet-boost"<?= $rankAttrs ?><?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
             <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
             <div class="tweet-hd">
               <?= admin_avatar_img($targetActor !== '' ? $targetActor : null) ?>
@@ -14407,8 +14500,11 @@ function admin_render_outbox_card(array $n, string $returnView): void
             0
         );
     }
+    $rankAttrs = !$isOwnNote
+        ? admin_home_rank_tracking_attrs('fedi', $noteId, $actor)
+        : '';
     ?>
-          <article class="tweet tweet-own"<?= $noteId !== '' ? ' id="note-' . h(md5($noteId)) . '" data-note-id="' . h($noteId) . '"' : '' ?>>
+          <article class="tweet tweet-own"<?= $rankAttrs ?><?= $noteId !== '' ? ' id="note-' . h(md5($noteId)) . '" data-note-id="' . h($noteId) . '"' : '' ?>>
             <div class="tweet-hd">
               <?= admin_avatar_img($actor) ?>
               <div class="tweet-hd-main tweet-hd-main--fedi">
@@ -14858,8 +14954,10 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
             ], $linkView);
         }
     }
+    $rankActor = $authorDid !== '' ? $authorDid : $authorProfileUrl;
+    $rankAttrs = admin_home_rank_tracking_attrs('bsky', $uri, $rankActor);
     ?>
-    <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>">
+    <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>"<?= $rankAttrs ?>>
       <?php if ($reasonLabel !== ''): ?>
         <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($reasonLabel) ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
       <?php endif; ?>
@@ -15114,8 +15212,11 @@ function admin_render_rss_item(array $row, string $returnView): void
             . '<button class="menu-action" type="submit" style="color:var(--danger)">Remove feed</button>'
             . '</form>';
     }
+    $rankAttrs = $feedId > 0
+        ? admin_home_rank_tracking_attrs('rss', 'rss:item:' . $itemId, 'rss:feed:' . $feedId)
+        : '';
     ?>
-    <article class="tweet" data-rss-item="<?= $itemId ?>">
+    <article class="tweet" data-rss-item="<?= $itemId ?>"<?= $rankAttrs ?>>
       <div class="tweet-hd">
         <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($feedTitle) ?>">
         <div class="tweet-hd-main">
@@ -27401,6 +27502,127 @@ window.apAdminToast = function (msg, isErr) {
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     }
   });
+})();
+</script>
+<script>
+// Weak, privacy-bounded Home feedback: sustained visibility, meaningful card
+// clicks, and bucketed dwell. Explicit actions remain much stronger signals.
+(function bindHomePassiveSignals() {
+  if (!('IntersectionObserver' in window) || document.documentElement.dataset.homeSignalsBound === '1') return;
+  document.documentElement.dataset.homeSignalsBound = '1';
+  const states = new WeakMap();
+  const active = new Set();
+  const onscreen = new Set();
+
+  function isHomeCard(card) {
+    const items = card && card.closest && card.closest('#timeline-items');
+    return !!(items && items.dataset.view === 'home' && card.dataset.rankKey && card.dataset.rankActor);
+  }
+  function send(kind, card, dwellSeconds) {
+    if (!isHomeCard(card) || !window.VAAK_CSRF) return;
+    const fd = new FormData();
+    fd.set('csrf', window.VAAK_CSRF);
+    fd.set('kind', kind);
+    fd.set('platform', card.dataset.rankPlatform || '');
+    fd.set('target_key', card.dataset.rankKey || '');
+    fd.set('target_actor', card.dataset.rankActor || '');
+    if (dwellSeconds) fd.set('dwell_seconds', String(Math.min(300, Math.max(0, dwellSeconds))));
+    const url = '/vaak/?view=home&ajax=home_signal';
+    if (navigator.sendBeacon && navigator.sendBeacon(url, fd)) return;
+    fetch(url, { method: 'POST', body: fd, credentials: 'same-origin', keepalive: true }).catch(() => {});
+  }
+  function stateFor(card) {
+    let state = states.get(card);
+    if (!state) {
+      state = { visible: false, started: 0, total: 0, impression: false, dwell: false, click: false, timer: 0 };
+      states.set(card, state);
+    }
+    return state;
+  }
+  function start(card) {
+    if (!isHomeCard(card) || document.hidden) return;
+    const state = stateFor(card);
+    if (state.visible) return;
+    state.visible = true;
+    state.started = performance.now();
+    active.add(card);
+    if (!state.impression) {
+      clearTimeout(state.timer);
+      state.timer = window.setTimeout(() => {
+        if (!state.visible || document.hidden || state.impression) return;
+        state.impression = true;
+        send('impression', card, 0);
+      }, 1200);
+    }
+  }
+  function stop(card, flushDwell) {
+    const state = states.get(card);
+    if (!state || !state.visible) return;
+    state.total += Math.max(0, performance.now() - state.started);
+    state.started = 0;
+    state.visible = false;
+    active.delete(card);
+    clearTimeout(state.timer);
+    if (flushDwell && !state.dwell && state.total >= 6000) {
+      state.dwell = true;
+      send('dwell', card, Math.round(state.total / 1000));
+    }
+  }
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      const enough = entry.isIntersecting
+        && entry.intersectionRect.height >= Math.min(240, entry.boundingClientRect.height * 0.5);
+      if (enough) {
+        onscreen.add(entry.target);
+        start(entry.target);
+      } else {
+        onscreen.delete(entry.target);
+        stop(entry.target, true);
+      }
+    });
+  }, { threshold: [0, 0.25, 0.5] });
+  function bind(root) {
+    const scope = root && root.querySelectorAll ? root : document;
+    if (scope.matches && scope.matches('article.tweet[data-rank-key]') && isHomeCard(scope)) observer.observe(scope);
+    scope.querySelectorAll('article.tweet[data-rank-key]').forEach((card) => {
+      if (isHomeCard(card) && !states.has(card)) {
+        stateFor(card);
+        observer.observe(card);
+      }
+    });
+  }
+  bind(document);
+  const mutations = new MutationObserver((records) => {
+    records.forEach((record) => {
+      record.addedNodes.forEach((node) => { if (node.nodeType === 1) bind(node); });
+      record.removedNodes.forEach((node) => {
+        if (node.nodeType !== 1) return;
+        if (states.has(node)) { onscreen.delete(node); stop(node, true); }
+        if (node.querySelectorAll) node.querySelectorAll('article.tweet[data-rank-key]').forEach((card) => {
+          onscreen.delete(card); stop(card, true);
+        });
+      });
+    });
+  });
+  if (document.body) mutations.observe(document.body, { childList: true, subtree: true });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) Array.from(active).forEach((card) => stop(card, false));
+    else Array.from(onscreen).forEach(start);
+  });
+  window.addEventListener('pagehide', () => {
+    Array.from(active).forEach((card) => stop(card, true));
+  });
+  document.addEventListener('click', (event) => {
+    const card = event.target && event.target.closest && event.target.closest('article.tweet[data-rank-key]');
+    if (!card || !isHomeCard(card) || event.target.closest('.tweet-actions, form, .post-action-menu')) return;
+    const meaningful = event.target.closest('a[href], .tweet-content-more, .media-thumb, video, audio');
+    if (!meaningful) return;
+    const state = stateFor(card);
+    if (!state.click) {
+      state.click = true;
+      send('click', card, 0);
+    }
+  }, true);
 })();
 </script>
 <script>
