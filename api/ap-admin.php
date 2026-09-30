@@ -1932,6 +1932,9 @@ $vaakAdminOnlyActions = [
                             . (string) ($bskySync['error'] ?? 'unknown') . ')';
                     }
                 }
+                // Keep the user-facing save toast concise; delivery and sync
+                // details remain server-side diagnostics.
+                $notice = 'Profile saved!';
             }
         }
     } elseif ($action === 'repush_profile') {
