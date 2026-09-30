@@ -29942,6 +29942,26 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     return '';
   }
   const COMPOSE_LS_KEY = 'vaak-compose-draft-v1';
+  const COMPOSE_VISIBILITY_KEY = 'vaak-compose-visibility-v1:' + <?= json_encode((string) $vaakActorKey) ?>;
+  const COMPOSE_HAS_CONTEXT = <?= json_encode($prefillReplyTo !== '' || $prefillQuoteObject !== '' || $prefillEditNote !== '' || $prefillDraftId > 0) ?>;
+  function bindComposeVisibilityPreference() {
+    if (!form) return;
+    const visibility = form.querySelector('select[name="visibility"]');
+    if (!visibility || visibility.dataset.preferenceBound === '1') return;
+    visibility.dataset.preferenceBound = '1';
+    if (!COMPOSE_HAS_CONTEXT) {
+      try {
+        const stored = localStorage.getItem(COMPOSE_VISIBILITY_KEY);
+        if (stored && Array.from(visibility.options).some((option) => option.value === stored && !option.disabled)) {
+          visibility.value = stored;
+        }
+      } catch (e) {}
+    }
+    visibility.addEventListener('change', () => {
+      try { localStorage.setItem(COMPOSE_VISIBILITY_KEY, visibility.value || 'public'); } catch (e) {}
+    });
+  }
+  bindComposeVisibilityPreference();
   const timelineFeed = document.querySelector('.feed');
   const timelineItems = document.getElementById('timeline-items');
   // Home / Local / Federated share one composer panel: inline at top of feed,
