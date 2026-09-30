@@ -8658,6 +8658,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             "SELECT * FROM outbox_notes
              WHERE id LIKE 'https://mkultra.monster/users/%'
                AND id NOT LIKE ?
+               AND COALESCE(kind, 'compose') <> 'blog'
                AND COALESCE(visibility, 'public') IN ('public', 'unlisted', 'local')
              ORDER BY published DESC LIMIT 40"
         );
