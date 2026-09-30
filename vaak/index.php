@@ -505,6 +505,7 @@ ASCII;
     .brand { position:relative; isolation:isolate; text-align: center; margin-bottom: 1.75rem; }
     .landing-mascot { position:absolute; z-index:0; inset:-4.3rem 0 auto; height:13rem; display:flex; justify-content:center; pointer-events:none; opacity:.82; }
     .landing-mascot img { display:block; width:min(15rem,70vw); height:100%; object-fit:contain; mask-image:linear-gradient(to bottom,transparent 0%,#000 12%,#000 72%,transparent 100%); -webkit-mask-image:linear-gradient(to bottom,transparent 0%,#000 12%,#000 72%,transparent 100%); }
+    .landing-mascot-mobile { display:none; }
     .brand pre {
       margin: 0 auto; display: inline-block; text-align: left;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -563,6 +564,9 @@ ASCII;
       .login-live-feed { width: 100vw; opacity: .1; padding: 1.5rem .75rem; transform: none; mask-image: linear-gradient(to bottom, transparent 0, #000 25%, #000 75%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 25%, #000 75%, transparent 100%); }
       .login-feed-scroll { transform: none; }
       main { max-width: 25rem; margin: 0 auto; }
+      .brand .landing-mascot { display:none; }
+      .landing-mascot-mobile { display:flex; position:relative; justify-content:center; height:13rem; margin:.35rem 0 -.35rem; pointer-events:none; opacity:.86; }
+      .landing-mascot-mobile img { display:block; width:min(16rem,78vw); height:100%; object-fit:contain; mask-image:linear-gradient(to bottom,#000 0%,#000 72%,transparent 100%); -webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 72%,transparent 100%); }
     }
   </style>
 </head>
@@ -680,6 +684,8 @@ ASCII;
       </form>
       <p class="switch">Have an invite? <a href="/vaak/?mode=register">Register</a><br><a href="/vaak/?mode=forgot">Forgot password?</a></p>
     <?php endif; ?>
+
+    <div class="landing-mascot-mobile" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.png" alt=""></div>
 
     <nav class="policies" aria-label="Policies">
       <a href="/vaak/privacy/">Privacy</a>
