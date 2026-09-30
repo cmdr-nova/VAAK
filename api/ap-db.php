@@ -2605,9 +2605,9 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
 }
 
 /** Local-only profile flair. Keys are stored so labels can be revised safely. */
-function ap_profile_badge_catalog(): array
+function ap_profile_badge_catalog(bool $includeAdmin = true): array
 {
-    return [
+    $catalog = [
         'admin' => ['label' => 'Admin', 'emoji' => '🛡️'],
         'rainbow' => ['label' => 'Rainbow pride', 'emoji' => '🏳️‍🌈'],
         'trans' => ['label' => 'Trans pride', 'emoji' => '🏳️‍⚧️'],
@@ -2656,12 +2656,16 @@ function ap_profile_badge_catalog(): array
         'dice' => ['label' => 'Dice goblin', 'emoji' => '🎲'],
         'minecraft' => ['label' => 'Minecraft builder', 'emoji' => '⛏️'],
     ];
+    if (!$includeAdmin) {
+        unset($catalog['admin']);
+    }
+    return $catalog;
 }
 
 /** @return list<string> */
-function ap_profile_normalize_badges(mixed $badges): array
+function ap_profile_normalize_badges(mixed $badges, bool $allowAdmin = true): array
 {
-    $allowed = ap_profile_badge_catalog();
+    $allowed = ap_profile_badge_catalog($allowAdmin);
     if (is_string($badges)) {
         $decoded = json_decode($badges, true);
         $badges = is_array($decoded) ? $decoded : [];
@@ -3010,8 +3014,8 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $quotePolicy = in_array((string) ($fields['quote_policy'] ?? ''), ['anyone', 'followers', 'nobody'], true)
         ? (string) $fields['quote_policy'] : (string) ($existingProfile['quote_policy'] ?? 'anyone');
     $profileBadges = array_key_exists('profile_badges', $fields)
-        ? ap_profile_normalize_badges($fields['profile_badges'])
-        : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []);
+        ? ap_profile_normalize_badges($fields['profile_badges'], $actorKey === 'cmdr_nova')
+        : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? [], $actorKey === 'cmdr_nova');
     $hideProfileReplies = array_key_exists('hide_profile_replies', $fields)
         ? (!empty($fields['hide_profile_replies']) ? 1 : 0)
         : (!empty($existingProfile['hide_profile_replies']) ? 1 : 0);

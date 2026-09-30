@@ -21721,7 +21721,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <textarea id="pf-forum-signature" name="forum_signature" maxlength="500" rows="3" placeholder="Shown below your Discuss posts…"><?= h((string) ($profile['forum_signature'] ?? '')) ?></textarea>
           <div class="meta" style="margin:.25rem 0 .75rem">Plain text only. HTML, scripts, and control characters are rejected.</div>
 
-          <?php $profileBadgeCatalog = ap_profile_badge_catalog(); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? []); ?>
+          <?php $profileBadgeCatalog = ap_profile_badge_catalog($vaakActorKey === 'cmdr_nova'); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? [], $vaakActorKey === 'cmdr_nova'); ?>
           <details style="border:1px solid var(--border);border-radius:10px;padding:.55rem .75rem;margin:0 0 1rem">
             <summary style="cursor:pointer;color:var(--text);font-weight:650">Profile badges <span class="meta">(up to 6 · <?= count($selectedProfileBadges) ?> selected)</span></summary>
             <fieldset style="border:0;padding:.55rem 0 0;margin:0">
