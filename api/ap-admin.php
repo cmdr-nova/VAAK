@@ -25011,31 +25011,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php else: ?>
             <?php foreach ($rpTabItems[$rpTab] as $p): ?>
               <?php
-                $pSum = (string) ($p['summary'] ?? '');
-                if (function_exists('ap_plain_unglue_mentions')) {
-                    $pSum = ap_plain_unglue_mentions($pSum);
-                }
-                $pObj = (string) ($p['object_id'] ?? '');
+                // Remote profile posts used to have a legacy, profile-only
+                // renderer that exposed raw ActivityPub types ("Create" /
+                // "Announce") and could not build structured quote cards.
+                // Use the same status/event card as the timelines so Wafrn
+                // and other remote profiles get current labels, media,
+                // boost headers, and quote-boost rendering.
+                $profileStatus = function_exists('ap_masto_status_from_event')
+                    ? ap_masto_status_from_event($p)
+                    : null;
               ?>
-              <article class="tweet">
-                <div class="tweet-hd">
-                  <div class="who"><?= h((string) ($p['type'] ?? 'Create')) ?></div>
-                  <div class="meta"><?= h(relative_time((string) $p['created_at'])) ?></div>
-                </div>
-                <div class="body" style="white-space:pre-wrap"><?= h($pSum) ?></div>
-                <?php
-                  $pMedia = mention_media_urls($p['media_urls'] ?? null);
-                  if ($pMedia) {
-                      echo admin_media_row_html($pMedia);
-                  }
-                ?>
-                <?php if ($pObj !== ''): ?>
-                  <div class="tweet-actions">
-                    <a href="<?= h(admin_status_href($pObj, 'remote_profile')) ?>">Open</a>
-                    <a href="<?= h(admin_remote_object_href($pObj)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
-                  </div>
-                <?php endif; ?>
-              </article>
+              <?php if (is_array($profileStatus)): ?>
+                <?php admin_render_masto_status_card($profileStatus, $followingIds, 'remote_profile', false, true); ?>
+              <?php else: ?>
+                <?php admin_render_event_tweet($p, $followingIds, 'remote_profile'); ?>
+              <?php endif; ?>
             <?php endforeach; ?>
           <?php endif; ?>
           </div>
