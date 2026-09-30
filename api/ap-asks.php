@@ -183,7 +183,9 @@ function ap_wafrn_remote_ask_html(string $text): ?string
         . '<blockquote class="ask-text" style="margin:0;padding:.2rem 0 .2rem .8rem;border-left:3px solid rgba(220,113,190,.7);white-space:pre-wrap">'
         . nl2br(htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</blockquote>';
     if ($answer !== '') {
-        $html .= '<hr class="ask-divider" style="margin:.7rem 0;border:0;border-top:1px solid rgba(220,113,190,.45)">'
+        // Keep a text fallback because some Mastodon-compatible clients strip
+        // HR elements and inline styles from status HTML.
+        $html .= '<hr class="ask-divider" style="margin:.7rem 0;border:0;border-top:1px solid rgba(220,113,190,.45)"><p class="ask-divider-fallback" aria-hidden="true">────────────</p>'
             . '<div class="ask-answer" style="white-space:pre-wrap">'
             . nl2br(htmlspecialchars($answer, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</div>';
     }
