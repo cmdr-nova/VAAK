@@ -11706,6 +11706,24 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     if (is_array($quoteParts)) {
         $quoted = (string) ($quoteParts['quoted'] ?? '');
         $commentary = (string) ($quoteParts['commentary'] ?? '');
+        // Wafrn quote activities commonly place the quoted author's full
+        // handle on its own line before the commentary, e.g.
+        // `@author@remote.example\nCommentary\n↪ QT @author@remote.example: ...`.
+        // The author is already represented by the quote card, so suppress
+        // that duplicated leading line while preserving real commentary that
+        // happens to begin with a mention.
+        $quotedHandle = '';
+        if (preg_match('/^↪\s*QT\s+(@[^\s:]+)\s*:/u', $quoted, $qhm)) {
+            $quotedHandle = trim((string) ($qhm[1] ?? ''));
+        }
+        if ($quotedHandle !== '' && $commentary !== '') {
+            $lines = preg_split('/\R/u', $commentary, 2);
+            $leading = is_array($lines) ? trim((string) ($lines[0] ?? '')) : '';
+            if ($leading !== '' && strcasecmp($leading, $quotedHandle) === 0) {
+                $commentary = is_array($lines) ? trim((string) ($lines[1] ?? '')) : '';
+                $quoteParts['commentary'] = $commentary;
+            }
+        }
         if (preg_match('#https://[^\s<>]+#u', $quoted, $qm)) {
             $quotedStatusUrl = rtrim((string) $qm[0], '.,);]');
         } elseif (preg_match('#(?:^|\n)RE:\s*(https://[^\s<>]+)#u', $commentary, $rm)) {
