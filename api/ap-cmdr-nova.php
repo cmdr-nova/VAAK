@@ -1688,12 +1688,17 @@ function ap_cmdr_html(): void
         $cacheKey = hash('sha256', (string) ($_SERVER['REQUEST_URI'] ?? '/users/cmdr_nova'));
         $profileCachePath = rtrim((string) sys_get_temp_dir(), DIRECTORY_SEPARATOR)
             . DIRECTORY_SEPARATOR . 'vaak-cmdr-profile-' . $cacheKey . '.html';
-        $cacheTtl = 20;
+        // The rich operator profile is expensive to assemble. Keep a fresh
+        // public snapshot for one minute and serve stale HTML for ten minutes
+        // while one request refreshes it in the background.
+        $cacheTtl = 60;
+        $cacheStaleWindow = 600;
+        $cacheHeader = 'public, max-age=' . $cacheTtl . ', stale-while-revalidate=' . $cacheStaleWindow;
         $cacheAge = is_readable($profileCachePath) ? (time() - (int) @filemtime($profileCachePath)) : -1;
         if (!$profileCacheBackground && $cacheAge >= 0 && $cacheAge < $cacheTtl) {
             header('Content-Type: text/html; charset=utf-8');
             header('Vary: Accept');
-            header('Cache-Control: public, max-age=20, stale-while-revalidate=120');
+            header('Cache-Control: ' . $cacheHeader);
             header('X-VAAK-Profile-Cache: HIT');
             if ($requestMethod !== 'HEAD') {
                 readfile($profileCachePath);
@@ -1702,7 +1707,7 @@ function ap_cmdr_html(): void
         }
         // Serve a bounded stale snapshot immediately, then refresh it after
         // the response. A Redis/file lock prevents a stampede of refreshes.
-        if (!$profileCacheBackground && $cacheAge >= $cacheTtl && $cacheAge < 140) {
+        if (!$profileCacheBackground && $cacheAge >= $cacheTtl && $cacheAge < ($cacheTtl + $cacheStaleWindow)) {
             $stale = @file_get_contents($profileCachePath);
             if (is_string($stale) && $stale !== '') {
                 $refreshLock = $profileCachePath . '.refresh.lock';
@@ -1726,7 +1731,7 @@ function ap_cmdr_html(): void
                 }
                 header('Content-Type: text/html; charset=utf-8');
                 header('Vary: Accept');
-                header('Cache-Control: public, max-age=20, stale-while-revalidate=120');
+                header('Cache-Control: ' . $cacheHeader);
                 header('X-VAAK-Profile-Cache: STALE');
                 if ($requestMethod !== 'HEAD') {
                     echo $stale;
@@ -2110,7 +2115,7 @@ function ap_cmdr_html(): void
             @file_put_contents($profileCachePath, $html, LOCK_EX);
         }
         if (!$profileCacheBackground) {
-            header('Cache-Control: public, max-age=20, stale-while-revalidate=120');
+            header('Cache-Control: public, max-age=60, stale-while-revalidate=600');
             header('X-VAAK-Profile-Cache: MISS');
             if ($requestMethod !== 'HEAD') {
                 echo $html;
