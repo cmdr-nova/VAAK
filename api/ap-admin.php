@@ -25013,19 +25013,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php
                 // Remote profile posts used to have a legacy, profile-only
                 // renderer that exposed raw ActivityPub types ("Create" /
-                // "Announce") and could not build structured quote cards.
-                // Use the same status/event card as the timelines so Wafrn
-                // and other remote profiles get current labels, media,
-                // boost headers, and quote-boost rendering.
-                $profileStatus = function_exists('ap_masto_status_from_event')
-                    ? ap_masto_status_from_event($p)
-                    : null;
+                // "Announce"). Use the timeline event renderer here: it
+                // understands Wafrn's compact `↪ QT` representation and
+                // turns it into the same structured quote card used on Home.
               ?>
-              <?php if (is_array($profileStatus)): ?>
-                <?php admin_render_masto_status_card($profileStatus, $followingIds, 'remote_profile', false, true); ?>
-              <?php else: ?>
-                <?php admin_render_event_tweet($p, $followingIds, 'remote_profile'); ?>
-              <?php endif; ?>
+              <?php admin_render_event_tweet($p, $followingIds, 'remote_profile'); ?>
             <?php endforeach; ?>
           <?php endif; ?>
           </div>
