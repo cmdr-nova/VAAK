@@ -12709,15 +12709,21 @@ function actor_handle(?string $actorId, ?string $username = null, bool $allowFet
  */
 function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null): string
 {
+    $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
     $hint = is_string($acctHint) ? ltrim(trim($acctHint), '@') : '';
     if ($hint !== '' && $hint !== '?') {
+        // Local mentions are resolved by VAAK from the username; keep the
+        // instance domain out of the user-facing composer text. Remote
+        // mentions retain their full acct so federation can resolve them.
+        if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#i', $actorId)) {
+            $hint = preg_replace('/@mkultra\.monster$/i', '', $hint) ?? $hint;
+        }
         // Bluesky-style handle already includes the domain.
         if (str_contains($hint, '.') && !str_contains($hint, '@')) {
             return '@' . $hint;
         }
         return '@' . $hint;
     }
-    $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
     if ($actorId === '') {
         return '';
     }
