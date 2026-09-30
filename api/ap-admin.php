@@ -14157,8 +14157,12 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $boosted = true;
     $rankKey = $objectId !== '' ? $objectId : ($statusId !== '' ? 'status:' . $statusId : '');
     $rankAttrs = admin_home_rank_tracking_attrs('fedi', $rankKey, $targetActor);
+    $timelineBoostKey = rtrim($boostId !== '' ? $boostId : $objectId, '/');
+    $timelineAttrs = $timelineBoostKey !== ''
+        ? ' data-timeline-key="' . h('boost:' . $timelineBoostKey) . '"'
+        : '';
     ?>
-          <article class="tweet tweet-boost"<?= $rankAttrs ?><?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
+          <article class="tweet tweet-boost"<?= $rankAttrs ?><?= $timelineAttrs ?><?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
             <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
             <div class="tweet-hd">
               <?= admin_avatar_img($targetActor !== '' ? $targetActor : null) ?>
@@ -15790,6 +15794,43 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     $out[] = $item;
                 }
             }
+        }
+
+        // Own boosts are stored in masto_reblogs rather than outbox_notes or
+        // the inbound events table. Include newly completed boosts in the same
+        // lightweight head poll so an AJAX boost can appear without a reload.
+        foreach (ap_masto_reblog_rows($candidateLimit, null, $ownerId) as $rb) {
+            if (!is_array($rb)) {
+                continue;
+            }
+            $boostSort = strtotime(admin_reblog_display_time($rb))
+                ?: (strtotime((string) ($rb['created_at'] ?? '')) ?: 0);
+            if ($boostSort <= $sinceTs) {
+                continue;
+            }
+            $boostItem = ['kind' => 'boost', 'sort' => $boostSort, 'row' => $rb];
+            if ($view === 'feed' && !admin_federated_timeline_item_allowed($boostItem)) {
+                continue;
+            }
+            if ($view === 'local' && !admin_local_timeline_item_allowed($boostItem)) {
+                continue;
+            }
+            if (admin_timeline_item_muted_by_words($boostItem)) {
+                continue;
+            }
+            $boostKey = rtrim((string) ($rb['boost_status_id'] ?? ''), '/');
+            if ($boostKey === '') {
+                $boostKey = rtrim((string) ($rb['object_id'] ?? ''), '/');
+            }
+            if ($boostKey === '') {
+                $boostKey = (string) ($rb['id'] ?? '');
+            }
+            $seenKey = 'boost:' . $boostKey;
+            if ($boostKey === '' || isset($seen[$seenKey])) {
+                continue;
+            }
+            $seen[$seenKey] = true;
+            $out[] = $boostItem;
         }
     } catch (Throwable $e) {
         error_log('[ap-admin] newer poll: ' . $e->getMessage());
@@ -27319,7 +27360,21 @@ window.apAdminToast = function (msg, isErr) {
   window.apQueueRepeatedClickReset = function (element) {
     queuedClickBursts.delete(element);
   };
-  async function watchInteractQueue(form, queueId, revision, snapshot) {
+  function refreshTimelineAfterPublish() {
+    if (typeof window.novaRefreshTimelinePreservingPosition === 'function') {
+      Promise.resolve(window.novaRefreshTimelinePreservingPosition()).catch(() => {});
+      return;
+    }
+    if (typeof window.novaPollTimeline === 'function') {
+      Promise.resolve(window.novaPollTimeline()).then(() => {
+        if (typeof window.novaInsertPendingTimeline === 'function') {
+          window.novaInsertPendingTimeline({ scrollToTop: false });
+        }
+      }).catch(() => {});
+    }
+  }
+
+  async function watchInteractQueue(form, queueId, revision, snapshot, refreshOnSuccess = false) {
     let tries = 0;
     while (tries++ < 90) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -27342,6 +27397,7 @@ window.apAdminToast = function (msg, isErr) {
             delete form.dataset.queueId;
             window.apQueueRepeatedClickReset(form);
           }
+          if (refreshOnSuccess) refreshTimelineAfterPublish();
           return;
         }
         if (q.status === 'failed') {
@@ -27416,7 +27472,15 @@ window.apAdminToast = function (msg, isErr) {
         form.dataset.queuePending = '1';
         form.dataset.queueId = String(data.queue_id);
         form.dataset.queueRevision = String(data.revision || '');
-        watchInteractQueue(form, data.queue_id, data.revision, before);
+        watchInteractQueue(
+          form,
+          data.queue_id,
+          data.revision,
+          before,
+          data.kind === 'reblog' && data.active === true
+        );
+      } else if (data.kind === 'reblog' && data.active === true) {
+        refreshTimelineAfterPublish();
       }
       // On Favourites / Bookmarks lists, drop the row when toggling off
       if ((data.kind === 'favourite' || data.kind === 'bookmark') && data.active === false) {
@@ -27667,6 +27731,10 @@ window.apAdminToast = function (msg, isErr) {
           if (actionKind === 'bsky_repost' && typeof window.apAdminToast === 'function') {
             window.apAdminToast('Boosted!');
           }
+          if (actionKind === 'bsky_repost'
+              && typeof window.novaRefreshTimelinePreservingPosition === 'function') {
+            Promise.resolve(window.novaRefreshTimelinePreservingPosition()).catch(() => {});
+          }
           return;
         }
         if (q.status === 'failed' && Number(q.revision) === Number(btn.dataset.queueRevision || revision)) {
@@ -27866,6 +27934,9 @@ window.apAdminToast = function (msg, isErr) {
         btn.setAttribute('aria-label', on ? 'Undo boost' : 'Boost');
         if (!on) btn.dataset.recordUri = '';
         else if (data.record_uri) btn.dataset.recordUri = data.record_uri;
+        if (on && !data.queued && typeof window.novaRefreshTimelinePreservingPosition === 'function') {
+          Promise.resolve(window.novaRefreshTimelinePreservingPosition()).catch(() => {});
+        }
       } else if (action === 'bookmark') {
         applyBskyBookmarkUi(btn, !!data.bookmarked, data);
         if (data.bookmarked && data.open_folder_picker && typeof window.novaOpenBookmarkFolderPicker === 'function') {
@@ -28443,6 +28514,10 @@ window.apAdminToast = function (msg, isErr) {
 
   function seenKeys() {
     const keys = {};
+    items.querySelectorAll('[data-timeline-key]').forEach((el) => {
+      const timelineKey = el.getAttribute('data-timeline-key') || '';
+      if (timelineKey) keys['timeline:' + timelineKey] = true;
+    });
     items.querySelectorAll('a[href*="object="]').forEach((a) => {
       const href = a.getAttribute('href') || '';
       const m = href.match(/[?&]object=([^&]+)/);
@@ -28471,7 +28546,11 @@ window.apAdminToast = function (msg, isErr) {
     const keep = [];
     Array.from(wrap.children).forEach((el) => {
       let key = '';
-      const link = el.querySelector && el.querySelector('a[href*="object="]');
+      if (el.getAttribute) {
+        const timelineKey = el.getAttribute('data-timeline-key') || '';
+        if (timelineKey) key = 'timeline:' + timelineKey;
+      }
+      const link = !key && el.querySelector && el.querySelector('a[href*="object="]');
       if (link) {
         const href = link.getAttribute('href') || '';
         const m = href.match(/[?&]object=([^&]+)/);
@@ -29154,6 +29233,12 @@ window.apAdminToast = function (msg, isErr) {
   setTimeout(() => { pollNewer(); syncTimelineStreamVisibility(); }, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
+  window.novaRefreshTimelinePreservingPosition = async function () {
+    await pollNewer();
+    // insertPending keeps the currently visible content anchored by the exact
+    // height added above it whenever the reader is away from the feed head.
+    insertPending({ scrollToTop: false });
+  };
 
   function loadDeferredSuggestions() {
     const slot = document.getElementById('home-suggestions-slot');
@@ -32284,12 +32369,6 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         }
       }
       if (mode === 'reply') playPostAudio();
-      // Capture before we clear fields — replies must not yank the feed to top.
-      const replyToBeforeClear = document.getElementById('compose-in-reply-to');
-      const wasFeedReply = !!(replyToBeforeClear && String(replyToBeforeClear.value || '').trim());
-      const wasQuotePost = data.kind === 'quote'
-        || !!(form.querySelector('input[name="quote_object"]')
-          && String(form.querySelector('input[name="quote_object"]').value || '').trim());
       // Posted/queued — don't re-save as draft on close
       skipDraftOnClose = true;
       // A completed post is no longer a recoverable composer draft. Remove the
@@ -32335,29 +32414,22 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
         // current timeline/media surface in place so browsing can continue.
         return;
       }
-      // Soft-insert own post into the live timeline (home newer-poll now includes
-      // outbox_notes). New roots/quotes jump to top so the card is visible;
-      // replies stay put so users can keep scrolling the feed.
+      // Soft-insert posts, replies, and quote-posts into the live timeline.
+      // When the reader is down-feed, preserve the same visible content while
+      // adding the new card above it instead of jumping back to the feed head.
       if (mode !== 'edit_status' && typeof window.novaPollTimeline === 'function') {
-        const feedEl = document.querySelector('.feed');
-        const savedWindowY = window.scrollY || document.documentElement.scrollTop || 0;
-        const savedFeedTop = feedEl ? feedEl.scrollTop : 0;
         // Reconcile the local card in the background. The post is already
         // committed locally and federation is durable-queued, so closing the
         // composer must not wait for a timeline rebuild.
-        Promise.resolve(window.novaPollTimeline()).then(() => {
-          if (typeof window.novaInsertPendingTimeline === 'function') {
-            window.novaInsertPendingTimeline({ scrollToTop: !wasFeedReply });
-          }
-          if (wasFeedReply) {
-            const restore = () => {
-              try { window.scrollTo(0, savedWindowY); } catch (e) {}
-              if (feedEl) feedEl.scrollTop = savedFeedTop;
-            };
-            restore();
-            requestAnimationFrame(restore);
-          }
-        }).catch(() => {});
+        if (typeof window.novaRefreshTimelinePreservingPosition === 'function') {
+          Promise.resolve(window.novaRefreshTimelinePreservingPosition()).catch(() => {});
+        } else {
+          Promise.resolve(window.novaPollTimeline()).then(() => {
+            if (typeof window.novaInsertPendingTimeline === 'function') {
+              window.novaInsertPendingTimeline({ scrollToTop: false });
+            }
+          }).catch(() => {});
+        }
       } else {
         window.location.reload();
       }
