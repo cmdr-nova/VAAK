@@ -182,9 +182,9 @@ function ap_db_migrate_postgres(PDO $db): void
     };
     $present = $loadPresentTables();
 
-    // Verified Webmentions are public responses to local profile/post URLs.
-    // Keep this table separate from ActivityPub notifications so external
-    // mentions cannot enter the authenticated timeline or notification feed.
+// Verified Webmentions are public responses to local profile/post URLs.
+// Keep source records separate from ActivityPub content; post targets may
+// additionally project a clipped, owner-scoped notification row.
     try {
         if (!isset($present['webmentions'])) {
             $db->exec(<<<'SQL'
@@ -653,6 +653,12 @@ SQL);
     } catch (Throwable $e) {
         error_log('[ap-db] downranking preference column not provisioned: ' . $e->getMessage());
     }
+    try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'webmentions_enabled'")->fetchColumn();
+        if (!$hasColumn) $db->exec('ALTER TABLE actor_profile ADD COLUMN webmentions_enabled INTEGER NOT NULL DEFAULT 1');
+    } catch (Throwable $e) {
+        error_log('[ap-db] webmention preference column not provisioned: ' . $e->getMessage());
+    }
     foreach (['reply_policy', 'quote_policy'] as $policyColumn) {
         try {
             $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = '{$policyColumn}'")->fetchColumn();
@@ -937,6 +943,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     algorithm_enabled INTEGER NOT NULL DEFAULT 1,
     downranking_enabled INTEGER NOT NULL DEFAULT 1,
     asks_enabled INTEGER NOT NULL DEFAULT 1,
+    webmentions_enabled INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ap_home_suppression (
@@ -1043,6 +1050,9 @@ SQL);
     }
     if (!in_array('asks_enabled', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN asks_enabled INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!in_array('webmentions_enabled', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN webmentions_enabled INTEGER NOT NULL DEFAULT 1');
     }
 
     // Persistent anti-AI actor marks from cached post heuristics (survives events prune)
@@ -2600,6 +2610,8 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'hide_profile_boosts' => false,
         'algorithm_enabled' => true,
         'downranking_enabled' => true,
+        'asks_enabled' => true,
+        'webmentions_enabled' => true,
         'updated_at' => null,
     ];
 }
@@ -2783,6 +2795,9 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'asks_enabled' => array_key_exists('asks_enabled', $row)
             ? !empty($row['asks_enabled'])
             : true,
+        'webmentions_enabled' => array_key_exists('webmentions_enabled', $row)
+            ? !empty($row['webmentions_enabled'])
+            : true,
         'updated_at' => $row['updated_at'] ?? null,
     ];
     if (function_exists('ap_redis_json_set')) ap_redis_json_set($profileCacheKey, $profile, 60);
@@ -2867,7 +2882,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool,algorithm_enabled?:bool,downranking_enabled?:bool} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool,algorithm_enabled?:bool,downranking_enabled?:bool,asks_enabled?:bool,webmentions_enabled?:bool} $fields
  */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
 {
@@ -3031,10 +3046,13 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $asksEnabled = array_key_exists('asks_enabled', $fields)
         ? (!empty($fields['asks_enabled']) ? 1 : 0)
         : (!empty($existingProfile['asks_enabled']) ? 1 : 0);
+    $webmentionsEnabled = array_key_exists('webmentions_enabled', $fields)
+        ? (!empty($fields['webmentions_enabled']) ? 1 : 0)
+        : (!empty($existingProfile['webmentions_enabled']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, asks_enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, asks_enabled, webmentions_enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -3060,6 +3078,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
            algorithm_enabled = excluded.algorithm_enabled,
            downranking_enabled = excluded.downranking_enabled,
            asks_enabled = excluded.asks_enabled,
+           webmentions_enabled = excluded.webmentions_enabled,
            updated_at = excluded.updated_at'
     );
     $stmt->execute([
@@ -3088,6 +3107,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
         $algorithmEnabled,
         $downrankingEnabled,
         $asksEnabled,
+        $webmentionsEnabled,
         ap_db_now(),
     ]);
 
@@ -8026,6 +8046,9 @@ function ap_webmention_rows_for_target(string $targetUrl, int $limit = 6): array
     if ($targetUrl === '' || !str_starts_with($targetUrl, 'https://mkultra.monster/users/')) {
         return [];
     }
+    if (!ap_webmention_target_enabled($targetUrl)) {
+        return [];
+    }
     $limit = max(1, min($limit, 20));
     try {
         $st = ap_db()->prepare(
@@ -8039,6 +8062,17 @@ function ap_webmention_rows_for_target(string $targetUrl, int $limit = 6): array
         error_log('[ap-db] webmention read failed: ' . $e->getMessage());
         return [];
     }
+}
+
+/** Resolve a local Webmention target to its profile key and preference. */
+function ap_webmention_target_enabled(string $targetUrl): bool
+{
+    $path = (string) parse_url($targetUrl, PHP_URL_PATH);
+    if (!preg_match('#^/users/([A-Za-z][A-Za-z0-9_]{1,29})(?:/(?:notes|creates)/[A-Fa-f0-9]+)?$#', $path, $m)) {
+        return false;
+    }
+    $profile = ap_profile_get(strtolower($m[1]));
+    return !array_key_exists('webmentions_enabled', $profile) || !empty($profile['webmentions_enabled']);
 }
 
 /** Small, safe HTML presentation for verified mentions on public pages. */
