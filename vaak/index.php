@@ -502,17 +502,17 @@ ASCII;
     .login-feed-actions a:hover { color:#eee; text-decoration:underline; }
     .login-feed-item.remote { border-color: #2a2a2a; }
     .login-feed-empty { color: #777; font-size: .85rem; padding: 1rem; }
-    .brand { text-align: center; margin-bottom: 1.75rem; }
-    .landing-mascot { display:flex; justify-content:center; margin:-.35rem 0 .25rem; pointer-events:none; }
-    .landing-mascot img { display:block; width:min(15rem,70vw); max-height:15rem; object-fit:contain; mask-image:linear-gradient(to bottom,#000 0%,#000 76%,transparent 100%); -webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 76%,transparent 100%); }
+    .brand { position:relative; isolation:isolate; text-align: center; margin-bottom: 1.75rem; }
+    .landing-mascot { position:absolute; z-index:0; inset:-4.3rem 0 auto; height:13rem; display:flex; justify-content:center; pointer-events:none; opacity:.82; }
+    .landing-mascot img { display:block; width:min(15rem,70vw); height:100%; object-fit:contain; mask-image:linear-gradient(to bottom,transparent 0%,#000 12%,#000 72%,transparent 100%); -webkit-mask-image:linear-gradient(to bottom,transparent 0%,#000 12%,#000 72%,transparent 100%); }
     .brand pre {
       margin: 0 auto; display: inline-block; text-align: left;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: clamp(.7rem, 2.8vw, .95rem); line-height: 1.05;
-      color: #00ff9f; text-shadow: 0 0 24px rgba(0,255,159,.25);
+      position:relative; z-index:1; color: rgba(0,255,159,.48); text-shadow: 0 0 24px rgba(0,255,159,.18);
     }
     .brand h1 {
-      margin: .85rem 0 0; font-size: .95rem; font-weight: 600; letter-spacing: .35em;
+      position:relative; z-index:1; margin: .85rem 0 0; font-size: .95rem; font-weight: 600; letter-spacing: .35em;
       color: #8a8a8a; text-indent: .35em;
     }
     .brand .vaak-version {
@@ -586,8 +586,8 @@ ASCII;
     </div>
   </aside>
   <main>
-    <div class="landing-mascot" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.png" alt=""></div>
     <div class="brand">
+      <div class="landing-mascot" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.png" alt=""></div>
       <pre><?= htmlspecialchars($asciiV, ENT_QUOTES, 'UTF-8') ?></pre>
       <h1>VAAK</h1>
       <p class="vaak-version"><?= htmlspecialchars(vaak_version_label(), ENT_QUOTES, 'UTF-8') ?></p>
