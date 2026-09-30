@@ -992,6 +992,22 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
             return ap_masto_status_from_row($local, false);
         }
 
+        // Ask answers need the mention projection's preserved question/answer
+        // fields. The firehose event row only retains a flattened summary and
+        // would otherwise erase that distinction in standalone status views.
+        $askMention = ap_db()->prepare(
+            'SELECT * FROM mentions WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL AND ask_question <> \'\' ORDER BY id DESC LIMIT 1'
+        );
+        $askMention->execute([$cand, $cand . '/']);
+        $askRow = $askMention->fetch();
+        if (is_array($askRow) && function_exists('ap_masto_status_from_mention')) {
+            $askStatus = ap_masto_status_from_mention($askRow);
+            if (is_array($askStatus)) {
+                unset($askStatus['quote']);
+                return $askStatus;
+            }
+        }
+
         // Inbound event (federated Create/etc.)
         $st = ap_db()->prepare(
             'SELECT * FROM events WHERE object_id = ? OR object_id = ? ORDER BY id DESC LIMIT 1'
