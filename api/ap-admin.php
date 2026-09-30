@@ -28892,6 +28892,7 @@ window.apAdminToast = function (msg, isErr) {
   };
   let busy = false;
   let leaving = false;
+  let queuedNavigation = null;
 
   function hardNav(view, filter, extra) {
     leaving = true;
@@ -29133,7 +29134,14 @@ window.apAdminToast = function (msg, isErr) {
     view = String(view || '');
     filter = filter == null ? '' : String(filter);
     extra = extra && typeof extra === 'object' ? extra : {};
-    if (!SOFT_VIEWS.has(view) || busy || leaving) return;
+    if (!SOFT_VIEWS.has(view) || leaving) return;
+    if (busy) {
+      // Preserve the latest user intent instead of silently dropping a click
+      // while the previous shell is still loading (which left Notifications'
+      // status text visible over the old page until a second click).
+      queuedNavigation = { view, push, filter, extra };
+      return;
+    }
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
 
     if (['home', 'local', 'feed'].includes(view) && typeof window.vaakSwapTimelineView === 'function') {
@@ -29198,6 +29206,10 @@ window.apAdminToast = function (msg, isErr) {
         }
       }
       main.innerHTML = html;
+      const loadedItems = main.querySelector('#timeline-items');
+      if (loadedItems && loadedItems.dataset.view && loadedItems.dataset.view !== view) {
+        throw new Error('shell-view-mismatch');
+      }
       if (typeof window.vaakAdoptComposerAfterSoftNav === 'function') {
         window.vaakAdoptComposerAfterSoftNav();
       }
@@ -29267,6 +29279,11 @@ window.apAdminToast = function (msg, isErr) {
       if (!leaving) {
         window.__vaakNavigationPending = false;
         if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+        if (queuedNavigation) {
+          const next = queuedNavigation;
+          queuedNavigation = null;
+          window.setTimeout(() => softNavTo(next.view, next.push, next.filter, next.extra), 0);
+        }
       }
     }
   }
