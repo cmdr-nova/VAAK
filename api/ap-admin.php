@@ -23870,6 +23870,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
           $stEvent = null;
           $stLocalStatus = null;
+          // Wafrn Ask answers are preserved in the mentions projection with
+          // separate question/answer fields.  The standalone status route
+          // historically resolved the same URL to the flattened firehose
+          // event, which made the question and answer indistinguishable.
+          // Keep an Ask-aware projection available for this renderer.
+          $stAskStatus = null;
           $stBskyItem = null;
           $isSyntheticBite = str_contains($stObject, '/bites-received/');
           if ($stObject !== '' && (str_starts_with($stObject, 'bsky:') || str_starts_with($stObject, 'at://'))) {
@@ -23897,6 +23903,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               // Strip like/reblog/bite interaction fragments so Open hits the real Note.
               if (function_exists('ap_masto_mention_target_object_id')) {
                   $stObject = ap_masto_mention_target_object_id($stObject);
+              }
+              try {
+                  $askLookup = ap_db()->prepare(
+                      'SELECT * FROM mentions WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL AND ask_question <> \'\' ORDER BY id DESC LIMIT 1'
+                  );
+                  $askLookup->execute([$stObject, rtrim($stObject, '/') . '/']);
+                  $askRow = $askLookup->fetch();
+                  if (is_array($askRow) && function_exists('ap_masto_status_from_mention')) {
+                      $candidateAskStatus = ap_masto_status_from_mention($askRow);
+                      if (is_array($candidateAskStatus)) {
+                          $stAskStatus = $candidateAskStatus;
+                      }
+                  }
+              } catch (Throwable $e) {
+                  error_log('[ap-admin] status Ask projection: ' . $e->getMessage());
               }
               // Web permalinks (https://host/@user/123) and Pleroma /posts/ forms
               // → try every lookup candidate against the local event store first.
@@ -23979,6 +24000,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $ctx = ap_masto_status_context((int) $stStatusId, $stCtxOpts);
               $stAncestors = is_array($ctx['ancestors'] ?? null) ? $ctx['ancestors'] : [];
               $stDescendants = is_array($ctx['descendants'] ?? null) ? $ctx['descendants'] : [];
+          }
+          // Ask status cards do not have a normal Create event context, but
+          // should still render as the focused status when opened directly.
+          if (is_array($stAskStatus)) {
+              $stLocalStatus = $stAskStatus;
+              $stEvent = null;
+              $stStatusId = (string) ($stAskStatus['id'] ?? '');
+              $stAncestors = [];
+              $stDescendants = [];
           }
           // Drop thread posts from blocked accounts (mute alone still shows in threads).
           if (function_exists('ap_actor_is_content_blocked')) {
