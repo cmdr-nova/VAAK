@@ -31750,12 +31750,20 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
   }
   if (draftBtn) {
     draftBtn.addEventListener('click', async () => {
+      const wasInline = isComposerInline();
       const res = await saveComposeDraft({ silent: false });
       if (res && res.ok) {
-        // Keep composer open with draft id set so further edits update the same draft
-        const title = document.getElementById('compose-modal-title');
-        if (title && draftIdField && draftIdField.value) {
-          title.textContent = 'Edit draft';
+        if (wasInline) {
+          // Inline Save draft is a handoff: keep the audience preference, but
+          // clear the composer so the user can immediately start another post.
+          clearComposeFieldsAfterClose();
+          try { localStorage.removeItem(COMPOSE_LS_KEY); } catch (e) {}
+        } else {
+          // Keep the modal open with draft id set so further edits update the same draft.
+          const title = document.getElementById('compose-modal-title');
+          if (title && draftIdField && draftIdField.value) {
+            title.textContent = 'Edit draft';
+          }
         }
       }
     });
