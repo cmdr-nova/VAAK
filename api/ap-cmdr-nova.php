@@ -1972,7 +1972,7 @@ function ap_cmdr_html(): void
 
     echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
     foreach (
-        array_filter([
+        ap_profile_order_tabs([
             'pinned' => ((int) ($counts['pinned'] ?? 0) > 0) ? 'Pinned' : null,
             'posts' => 'Posts',
             'replies' => $hideProfileReplies ? null : 'Replies',

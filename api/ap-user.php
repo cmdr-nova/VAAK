@@ -994,12 +994,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
 
     echo '<nav id="profile-tabs" class="profile-tabs" aria-label="Profile timeline">';
     foreach (
-        array_filter([
+        ap_profile_order_tabs([
             'pinned' => $pinnedCount > 0 ? ['Pinned', $pinnedCount] : null,
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
-            'media' => ['Media', count($mediaNotes)],
             'replies' => $hideProfileReplies ? null : ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
             'boosts' => $hideProfileBoosts ? null : ['Boosts', $profileBoostTotal],
+            'media' => ['Media', count($mediaNotes)],
             'featured' => ['Featured', $featuredCount],
             'blog' => ['Blog', $blogCount],
         ]) as $tKey => $tInfo
@@ -1526,6 +1526,7 @@ function ap_user_boost_preview_html(string $actorKey, array $boost, int $ownerUs
     }
 
     $raw = '';
+    $note = [];
     $event = null;
     $prefetchedEvents = $GLOBALS['ap_profile_boost_events'] ?? [];
     if (is_array($prefetchedEvents) && isset($prefetchedEvents[$object]) && is_array($prefetchedEvents[$object])) {
@@ -1535,6 +1536,11 @@ function ap_user_boost_preview_html(string $actorKey, array $boost, int $ownerUs
     }
     if (is_array($event)) {
         $raw = (string) (($event['content'] ?? '') ?: ($event['summary'] ?? ''));
+        $create = json_decode((string) ($event['raw_create_json'] ?? ''), true);
+        if (is_array($create) && is_array($create['object'] ?? null)) {
+            $note = $create['object'];
+            $raw = (string) (($note['content'] ?? '') ?: $raw);
+        }
     }
     if ($raw === '') {
         try {
@@ -1550,12 +1556,28 @@ function ap_user_boost_preview_html(string $actorKey, array $boost, int $ownerUs
     $body = $plain !== ''
         ? preg_replace_callback('~https?://[^\s<>]+~i', static fn(array $m): string => '<a href="' . htmlspecialchars($m[0], ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">' . htmlspecialchars($m[0], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>', htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
         : '<span class="muted">Unable to load the boosted post content.</span>';
+    $mediaHtml = $note !== [] ? ap_user_note_media_html($note, true) : '';
+    $linkHtml = '';
+    if ($mediaHtml === '' && function_exists('ap_link_preview_extract_url') && function_exists('ap_link_preview_for_url')) {
+        require_once __DIR__ . '/ap-link-preview.php';
+        $cardUrl = ap_link_preview_extract_url($raw);
+        if ($cardUrl !== null) {
+            $card = ap_link_preview_for_url($cardUrl, false);
+            if ($card === null && function_exists('ap_link_preview_warm_async')) {
+                ap_link_preview_warm_async($cardUrl);
+            }
+            if (is_array($card) && function_exists('ap_link_preview_html')) {
+                $linkHtml = ap_link_preview_html(array_merge($card, ['status' => 'ok']), true);
+            }
+        }
+    }
     $boostedAt = (string) ($boost['created_at'] ?? '');
     $boostDate = $boostedAt;
     try { $boostDate = (new DateTimeImmutable($boostedAt))->format('M j, Y · g:i A T'); } catch (Throwable $e) { /* keep */ }
     $date = $boostDate !== '' ? ' · ' . htmlspecialchars($boostDate, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') : '';
     return '<article class="post profile-boost"><p class="muted profile-boost-label">↻ boosted · Fediverse' . $date . '</p>'
         . '<div class="note-body">' . nl2br((string) $body) . '</div>'
+        . $mediaHtml . $linkHtml
         . '<p class="muted" style="font-size:.8rem;margin:.6rem 0 0"><a href="' . htmlspecialchars($object, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener noreferrer">Open original post</a></p></article>';
 }
 

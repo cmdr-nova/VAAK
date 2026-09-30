@@ -2,6 +2,26 @@
 /** Shared HTML-profile helpers used by every local account renderer. */
 declare(strict_types=1);
 
+if (!function_exists('ap_profile_order_tabs')) {
+    /**
+     * Keep every local HTML profile on the same baseline tab order. Renderers
+     * may omit a tab by passing null, but they cannot silently reorder it.
+     * @param array<string,array{0:string,1:int}|string|null> $tabs
+     * @return array<string,array{0:string,1:int}|string>
+     */
+    function ap_profile_order_tabs(array $tabs): array
+    {
+        $order = ['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog'];
+        $out = [];
+        foreach ($order as $key) {
+            if (array_key_exists($key, $tabs) && $tabs[$key] !== null) {
+                $out[$key] = $tabs[$key];
+            }
+        }
+        return $out;
+    }
+}
+
 if (!function_exists('ap_profile_html_share_meta')) {
     /** @return array<string,string> */
     function ap_profile_html_share_meta(string $actorKey, array $row, array $note, array $profile): array
