@@ -24454,6 +24454,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               'home' => '?view=home',
               'feed' => '?view=feed',
               'blocks' => '?view=blocks',
+              'about' => '?view=about',
               default => '?view=following',
           };
           $rpBackLabel = match ($rpFrom) {
@@ -24463,6 +24464,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               'home' => '← Home',
               'feed' => '← Federated',
               'blocks' => '← Blocks & mutes',
+              'about' => '← About VAAK',
               default => '← Following',
           };
           $rpActor = trim((string) ($_GET['actor'] ?? ''));
@@ -25082,6 +25084,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endif; ?>
               <?php endif; ?>
               <?php if (!$rpIsBsky): ?>
+                <?php if ($rpIsLocal && !$rpIsOwn): ?>
+                  <?php $rpMentionHandle = admin_reply_mention_handle($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null); ?>
+                  <?php if ($rpMentionHandle !== ''): ?><a class="btn btn-ghost" href="?view=outbox&amp;compose=1&amp;mention=<?= urlencode($rpMentionHandle) ?>&amp;return_view=remote_profile&amp;return_actor=<?= urlencode($rpActor) ?>" title="Start a post mentioning this account">Mention</a><?php endif; ?>
+                <?php endif; ?>
                 <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Bite this account? (Wafrn-compatible 🦷)');">
                   <input type="hidden" name="action" value="bite_remote">
                   <input type="hidden" name="return_view" value="remote_profile">
@@ -25919,7 +25925,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <li>Accessible, mobile-friendly software that remains pleasant to use.</li>
             </ul>
             <h2>Learn more</h2>
-            <p>Read the <a href="/vaak/conduct/">Code of Conduct</a> and <a href="/vaak/privacy/">Privacy Policy</a> for the current rules and data practices. Questions or accessibility feedback can go to <a href="mailto:cmdr-nova@mkultra.monster">cmdr-nova@mkultra.monster</a>.</p>
+            <p>Read the <a href="/vaak/conduct/">Code of Conduct</a> and <a href="/vaak/privacy/">Privacy Policy</a> for the current rules and data practices. Questions or accessibility feedback can go to <a href="mailto:cmdr-nova@mkultra.monster">cmdr-nova@mkultra.monster</a>, or mention <a href="?view=remote_profile&amp;actor=<?= rawurlencode('https://mkultra.monster/users/cmdr_nova') ?>&amp;from=about">@cmdr_nova@mkultra.monster</a> on VAAK.</p>
           </div>
         </article>
 
