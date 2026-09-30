@@ -1634,6 +1634,7 @@ function ap_cmdr_note_html(array $row, array $create): void
             echo '</article>';
         }
         echo '</section>';
+        echo ap_webmention_cards_html($noteUriRaw);
     }
 
     // Remote reply: open the visitor's home instance interact dialog for this Note.

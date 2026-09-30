@@ -1660,8 +1660,6 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
     echo ap_user_note_media_html($note, true);
     echo '<p class="muted" style="margin-top:1.25rem;font-size:.85rem">'
         . htmlspecialchars($dateLabel, ENT_QUOTES, 'UTF-8') . '</p>';
-    echo ap_webmention_cards_html((string) ($row['id'] ?? ''));
-
     $noteUriRaw = (string) ($row['id'] ?? '');
     if ($noteUriRaw !== '' && function_exists('ap_note_public_replies')) {
         $replies = ap_note_public_replies($noteUriRaw, 40);
@@ -1733,6 +1731,7 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
             echo '</article>';
         }
         echo '</section>';
+        echo ap_webmention_cards_html($noteUriRaw);
     }
 
     echo '<p class="back"><a href="/users/' . $safe . '">← profile</a></p>';
