@@ -18980,7 +18980,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .home-onboarding {
       margin: 0 0 .85rem; padding: .85rem .95rem;
       border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border));
-      border-radius: 12px; background: var(--panel-2);
+      border-radius: 12px; background: var(--panel-2); overflow:hidden; min-height:8rem;
     }
     .home-onboarding .who { margin-bottom: .25rem; }
     .home-onboarding__mascot { float:right; width:min(8rem,28%); max-height:10rem; object-fit:contain; object-position:bottom; margin:-.35rem -.25rem -.35rem .7rem; }
