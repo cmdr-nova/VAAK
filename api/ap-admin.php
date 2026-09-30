@@ -16457,12 +16457,34 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         } elseif (is_string($nSnippet) && strlen($nSnippet) > 280) {
             $snipShow = substr($nSnippet, 0, 280) . '…';
         }
-        // Strip API reply-context prefix when we render a separate "In reply to" block.
+        // Strip the API reply-context prefix when we render a separate
+        // "In reply to" block. The generated parent teaser may itself contain
+        // multiple paragraphs, so stopping at the first blank line leaves the
+        // tail of the quoted parent duplicated in the reply body. Prefer the
+        // final known mention (the actual reply text normally starts there),
+        // with a bounded 140-character fallback matching the API prefix size.
         if (is_string($snipShow) && preg_match('/^↩\s+/u', $snipShow)) {
-            // API reply status content may contain a multiline parent teaser;
-            // strip the whole teaser, not just its first line.
-            $snipShow = preg_replace('/^↩\s+.*?(?:\n\n|$)/su', '', $snipShow, 1) ?? $snipShow;
-            $snipShow = trim($snipShow);
+            $replyBodyStart = null;
+            foreach ($nStatusMentions as $knownMention) {
+                if (!is_array($knownMention)) continue;
+                $knownAcct = ltrim(trim((string) ($knownMention['acct'] ?? '')), '@');
+                if ($knownAcct === '') continue;
+                $pos = function_exists('mb_strripos')
+                    ? mb_strripos($snipShow, '@' . $knownAcct)
+                    : strripos($snipShow, '@' . $knownAcct);
+                if ($pos !== false && $pos > 0) {
+                    $replyBodyStart = $pos;
+                    break;
+                }
+            }
+            if ($replyBodyStart !== null) {
+                $snipShow = trim(function_exists('mb_substr')
+                    ? mb_substr($snipShow, $replyBodyStart)
+                    : substr($snipShow, $replyBodyStart));
+            } else {
+                $snipShow = preg_replace('/^↩\s+.{1,140}(?:\R{2,}|$)/su', '', $snipShow, 1) ?? $snipShow;
+                $snipShow = trim($snipShow);
+            }
             $nSnippet = $snipShow;
         }
         // Clickable @handles in mention/quote bodies (full @user@host when present).
