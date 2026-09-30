@@ -225,6 +225,61 @@ if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
     $view = 'home';
 }
 
+// The website guestbook and subscriber services retain their own direct
+// Basic-Auth-protected endpoints. VAAK admins should not need a second browser
+// password prompt, so proxy the small read/delete operations through the
+// already authenticated VAAK admin session instead. This route is never
+// available to non-admin sessions and does not expose upstream credentials.
+if (isset($_GET['site_api'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!$vaakIsAdmin) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Admin only.']);
+        exit;
+    }
+    $siteApi = strtolower(trim((string) $_GET['site_api']));
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    $target = null;
+    if ($siteApi === 'guestbook' && $method === 'GET') {
+        $target = 'http://127.0.0.1:8081/admin/guestbook';
+    } elseif ($siteApi === 'guestbook' && $method === 'DELETE') {
+        $entryId = (string) ($_GET['id'] ?? '');
+        if (!preg_match('/^[0-9]+$/', $entryId)) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'error' => 'Invalid guestbook entry.']);
+            exit;
+        }
+        $target = 'http://127.0.0.1:8081/admin/guestbook/' . $entryId;
+    } elseif ($siteApi === 'subscribers' && $method === 'GET') {
+        $target = 'http://127.0.0.1:5001/admin/stats';
+    }
+    if ($target === null || !function_exists('curl_init')) {
+        http_response_code(404);
+        echo json_encode(['ok' => false, 'error' => 'Unknown site operation.']);
+        exit;
+    }
+    $ch = curl_init($target);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_HTTPHEADER => ['X-Admin-Proxy-Auth: 1', 'Accept: application/json'],
+        CURLOPT_CONNECTTIMEOUT => 2,
+        CURLOPT_TIMEOUT => 8,
+    ]);
+    $body = curl_exec($ch);
+    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $errorText = curl_error($ch);
+    curl_close($ch);
+    if (!is_string($body) || $body === '') {
+        http_response_code($status >= 400 ? $status : 502);
+        echo json_encode(['ok' => false, 'error' => $errorText !== '' ? $errorText : 'Site service unavailable.']);
+        exit;
+    }
+    http_response_code($status > 0 ? $status : 200);
+    echo $body;
+    exit;
+}
+
 // CSV downloads (basicauth already protects /admin)
 if ($view === 'import_export' && isset($_GET['export'])) {
     ap_ie_handle_export(preg_replace('/[^a-z_]/', '', (string) $_GET['export']) ?: '');
@@ -32023,7 +32078,7 @@ function filterGuestbook() {
 }
 async function loadGuestbook() {
   try {
-    const data = await fetchJson('/admin/guestbook');
+    const data = await fetchJson('/vaak/?site_api=guestbook');
     allGuestbookEntries = data.entries || [];
     if (data.stats) {
       document.getElementById('gb-total').textContent = data.stats.total ?? '0';
@@ -32038,7 +32093,7 @@ async function loadGuestbook() {
 async function deleteGuestbook(id) {
   if (!confirm('Delete guestbook entry #' + id + '?')) return;
   try {
-    const data = await fetchJson('/admin/guestbook/' + id, { method: 'DELETE' });
+    const data = await fetchJson('/vaak/?site_api=guestbook&id=' + encodeURIComponent(id), { method: 'DELETE' });
     if (data.success) {
       allGuestbookEntries = allGuestbookEntries.filter(e => Number(e.id) !== Number(id));
       displayGuestbook(allGuestbookEntries);
@@ -32048,7 +32103,7 @@ async function deleteGuestbook(id) {
 
 async function loadSupport() {
   try {
-    const data = await fetchJson('/api/stripe/admin/stats');
+    const data = await fetchJson('/vaak/?site_api=subscribers');
     if (data.error) throw new Error(data.error);
     document.getElementById('sup-month').textContent = (data.total_month ?? 0).toFixed(2);
     document.getElementById('sup-subs').textContent = data.active_subscriptions ?? '0';
