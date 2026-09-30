@@ -28601,10 +28601,15 @@ window.apAdminToast = function (msg, isErr) {
       streamFallbackTimer = 0;
     }
   });
-  if (TIMELINE_SSE_ENABLED && window.EventSource && ['home', 'local', 'feed'].includes(viewName) && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
-    startTimelineStream();
-  } else if (['home', 'local', 'feed'].includes(viewName)) {
+  if (['home', 'local', 'feed'].includes(viewName)) {
+    // Keep a bounded timestamp poll even when SSE is enabled. Bluesky
+    // ingestion may not emit the same PostgreSQL wake-up notification as an
+    // ActivityPub event, and this guarantees the New N posts marker remains
+    // reliable without delaying the initial paint.
     streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+    if (TIMELINE_SSE_ENABLED && window.EventSource && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
+      startTimelineStream();
+    }
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
