@@ -16958,7 +16958,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <script>
     (function () {
       const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
-      const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink', 'bone'];
+      const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink', 'bone', 'cyan', 'teal', 'indigo', 'lime', 'sunset', 'rainbow'];
       const value = localStorage.getItem(key);
       if (allowed.includes(value)) document.documentElement.dataset.accent = value;
     }());
@@ -16978,6 +16978,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       --info: #7ee0ff;
       --radius: 14px;
       --shadow: 0 8px 30px rgba(0,0,0,.35);
+      --app-background: radial-gradient(1200px 600px at 10% -10%, var(--bg-glow) 0%, var(--bg) 45%);
     }
     :root[data-accent="yellow"] { --primary:#ffd400; --primary-dim:rgba(255,212,0,.15); --bg-glow:#201e10; }
     :root[data-accent="blue"] { --primary:#5aa9ff; --primary-dim:rgba(90,169,255,.15); --bg-glow:#101820; }
@@ -16986,12 +16987,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     :root[data-accent="orange"] { --primary:#ff9f43; --primary-dim:rgba(255,159,67,.15); --bg-glow:#201810; }
     :root[data-accent="pink"] { --primary:#ff70c7; --primary-dim:rgba(255,112,199,.15); --bg-glow:#201018; }
     :root[data-accent="bone"] { --primary:#d4cfc4; --primary-dim:rgba(212,207,196,.16); --bg-glow:#1a1916; }
+    :root[data-accent="cyan"] { --primary:#4de8ff; --primary-dim:rgba(77,232,255,.15); --bg-glow:#0e2024; }
+    :root[data-accent="teal"] { --primary:#2dd4bf; --primary-dim:rgba(45,212,191,.15); --bg-glow:#0d211f; }
+    :root[data-accent="indigo"] { --primary:#8b9cff; --primary-dim:rgba(139,156,255,.15); --bg-glow:#13152d; }
+    :root[data-accent="lime"] { --primary:#b8f34a; --primary-dim:rgba(184,243,74,.15); --bg-glow:#18210d; }
+    :root[data-accent="sunset"] { --primary:#ff9b71; --primary-dim:rgba(255,155,113,.16); --bg-glow:#291611; }
+    :root[data-accent="rainbow"] {
+      --primary:#ff82d1;
+      --primary-dim:rgba(255,130,209,.18);
+      --bg-glow:#28162b;
+      --app-background:
+        linear-gradient(135deg, rgba(255,72,122,.16), transparent 28%),
+        linear-gradient(225deg, rgba(255,196,76,.13), transparent 32%),
+        linear-gradient(315deg, rgba(72,224,190,.14), transparent 30%),
+        linear-gradient(45deg, rgba(91,139,255,.15), transparent 34%),
+        #101010;
+    }
     * { box-sizing: border-box; }
     html { background: var(--bg); color-scheme: dark; }
     body {
       margin: 0;
       font-family: "Segoe UI", system-ui, sans-serif;
-      background: radial-gradient(1200px 600px at 10% -10%, var(--bg-glow) 0%, var(--bg) 45%);
+      background: var(--app-background);
+      background-attachment: fixed;
       color: var(--text);
       min-height: 100vh;
     }
@@ -21672,13 +21690,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <option value="orange">Orange</option>
             <option value="pink">Pink</option>
             <option value="bone">Bone</option>
+            <option value="cyan">Cyan</option>
+            <option value="teal">Teal</option>
+            <option value="indigo">Indigo</option>
+            <option value="lime">Lime</option>
+            <option value="sunset">Sunset</option>
+            <option value="rainbow">Rainbow gradient</option>
           </select>
           <script>
             (function () {
               const select = document.getElementById('vaak-accent-select');
               if (!select) return;
               const key = 'vaak-accent-<?= h((string) $vaakActorKey) ?>';
-              const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink', 'bone'];
+              const allowed = ['green', 'yellow', 'blue', 'red', 'purple', 'orange', 'pink', 'bone', 'cyan', 'teal', 'indigo', 'lime', 'sunset', 'rainbow'];
               const current = localStorage.getItem(key);
               select.value = allowed.includes(current) ? current : 'green';
               select.addEventListener('change', function () {
@@ -21688,7 +21712,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               });
             }());
           </script>
-          <div class="meta" style="margin:.25rem 0 .75rem">Changes the accent used throughout Vaak. This is private to your account and browser.</div>
+          <div class="meta" style="margin:.25rem 0 .75rem">Changes the accent used throughout VAAK. Rainbow gradient also adds a subtle multicolor app background. This is private to your account and browser.</div>
 
           <label for="pf-summary">Bio (plain text or simple HTML: p, br, a, code, strong, em)</label>
           <textarea id="pf-summary" name="summary" maxlength="4000" required><?= h($summaryForForm) ?></textarea>
