@@ -100,6 +100,31 @@ function ap_bite_send(string $targetRef, string $kind = 'auto'): array
             $inboxes[] = $targetRef . '/inbox';
         } else {
             $doc = function_exists('ap_fetch_actor_doc') ? ap_fetch_actor_doc($targetRef) : null;
+            // A transient remote-fetch circuit (often caused by a brief Wafrn
+            // 5xx/timeout) must not make an explicit user action fail before
+            // the actor is tried again.  Bites are infrequent and user-driven,
+            // so retry the public actor document directly, bypassing the
+            // background fetch circuit, with signed then unsigned headers.
+            if (!is_array($doc)
+                && function_exists('ap_signed_get')
+                && function_exists('ap_decode_as2_body')) {
+                foreach ([
+                    static fn(string $url): ?string => ap_signed_get($url),
+                    static fn(string $url): ?string => function_exists('ap_unsigned_get') ? ap_unsigned_get($url, 8) : null,
+                ] as $fetchActor) {
+                    try {
+                        $rawActor = $fetchActor($targetRef);
+                        $retryDoc = ap_decode_as2_body($rawActor);
+                        if (is_array($retryDoc)
+                            && (($retryDoc['type'] ?? '') !== '' || isset($retryDoc['inbox']))) {
+                            $doc = $retryDoc;
+                            break;
+                        }
+                    } catch (Throwable $e) {
+                        // Try the next transport variant.
+                    }
+                }
+            }
             if (!is_array($doc)) {
                 return ['ok' => false, 'error' => 'Could not fetch target actor'];
             }
