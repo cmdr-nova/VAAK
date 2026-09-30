@@ -21695,7 +21695,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <option value="indigo">Indigo</option>
             <option value="lime">Lime</option>
             <option value="sunset">Sunset</option>
-            <option value="rainbow">Rainbow gradient</option>
+            <option value="rainbow">Night City</option>
           </select>
           <script>
             (function () {
@@ -21712,7 +21712,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               });
             }());
           </script>
-          <div class="meta" style="margin:.25rem 0 .75rem">Changes the accent used throughout VAAK. Rainbow gradient also adds a subtle multicolor app background. This is private to your account and browser.</div>
+          <div class="meta" style="margin:.25rem 0 .75rem">Changes the accent used throughout VAAK. Night City also adds a subtle multicolor app background. This is private to your account and browser.</div>
 
           <label for="pf-summary">Bio (plain text or simple HTML: p, br, a, code, strong, em)</label>
           <textarea id="pf-summary" name="summary" maxlength="4000" required><?= h($summaryForForm) ?></textarea>
