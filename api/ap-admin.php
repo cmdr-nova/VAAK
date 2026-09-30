@@ -10990,7 +10990,11 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
             [$hrefRaw, $ext] = $profileHref((string) $m['url']);
             $href = htmlspecialchars($hrefRaw, ENT_QUOTES, 'UTF-8');
             $needleFull = '@' . htmlspecialchars($acct, ENT_QUOTES, 'UTF-8');
-            $labelFull = '@' . htmlspecialchars($acct, ENT_QUOTES, 'UTF-8');
+            $isLocalMention = preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#i', (string) $m['url']) === 1;
+            $displayAcct = $isLocalMention
+                ? (string) ($m['username'] !== '' ? $m['username'] : explode('@', $acct, 2)[0])
+                : $acct;
+            $labelFull = '@' . htmlspecialchars($displayAcct, ENT_QUOTES, 'UTF-8');
             $extra = $ext ? ' target="_blank" rel="noopener noreferrer"' : '';
             $linkFull = '<a class="mention" href="' . $href . '"' . $extra . '>' . $labelFull . '</a>';
             $escaped = str_replace($needleFull, $linkFull, $escaped);
