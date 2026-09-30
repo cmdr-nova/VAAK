@@ -537,15 +537,11 @@ function ap_user_serve_collection_html(string $actorKey, string $actorId, string
 function ap_user_profile_html(string $actorKey, string $actorId): void
 {
     $p = ap_profile_get($actorKey);
-    // Do not start an anonymous PHP session for public profile reads. A
-    // session_start() on an unauthenticated request emits vaak_sess, which
-    // prevents shared HTTP caches from treating the profile as public. Only
-    // consult auth when the browser actually supplied our session cookie.
-    $authCookieName = defined('AP_AUTH_SESSION_NAME') ? AP_AUTH_SESSION_NAME : 'vaak_sess';
-    $hasAuthCookie = isset($_COOKIE[$authCookieName]) && trim((string) $_COOKIE[$authCookieName]) !== '';
-    $profileViewer = ($hasAuthCookie && function_exists('ap_auth_current_user'))
-        ? ap_auth_current_user() : null;
-    $profileIsPublicRequest = !is_array($profileViewer);
+    // HTML profiles are deliberately public and read-only. Do not inspect the
+    // VAAK session cookie here: doing so makes profile rendering vary by
+    // browser and adds session/auth work to an otherwise cacheable request.
+    $profileViewer = null;
+    $profileIsPublicRequest = true;
     $profileOwnerId = function_exists('ap_db_owner_user_id_for_actor')
         ? ap_db_owner_user_id_for_actor($actorId) : 0;
     $profileRevisionParts = [
@@ -591,7 +587,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     }
     $profileCacheSeed = implode('|', $profileRevisionParts);
     $profileEtag = '"' . sha1($profileCacheSeed) . '"';
-    header('Vary: Accept, Cookie');
+    header('Vary: Accept');
     header('ETag: ' . $profileEtag);
     if ($profileLastModifiedTs > 0) {
         header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $profileLastModifiedTs) . ' GMT');
@@ -661,14 +657,6 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
 
     ap_user_html_shell_start('@' . $actorKey . '@mkultra.monster');
     echo '<span id="profile-top" aria-hidden="true"></span>';
-    $viewer = $profileViewer;
-    $viewerActor = is_array($viewer) ? rtrim((string) ($viewer['actor_id'] ?? ''), '/') : '';
-    $isOwner = $viewerActor !== '' && $viewerActor === rtrim($actorId, '/');
-    if ($isOwner) {
-        echo '<div class="owner-bar" style="margin:0 0 .85rem;padding:.55rem .75rem;border:1px solid #2a4a3a;border-radius:10px;background:rgba(80,160,120,.1);font-size:.86rem;color:#bfe;text-align:center">'
-            . 'Signed in as <b>@' . htmlspecialchars($actorKey, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</b> — '
-            . '<a href="/vaak/?view=outbox" style="color:#7ee0ff">Open VAAK</a></div>';
-    }
     if (!empty($p['image_url'])) {
         $banner = htmlspecialchars((string) $p['image_url'], ENT_QUOTES, 'UTF-8');
         echo '<div class="banner" style="background-image:url(\'' . $banner . '\')"></div>';
