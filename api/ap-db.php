@@ -2924,13 +2924,18 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     if ($summary === '') {
         return ['ok' => false, 'error' => 'Bio / summary required.'];
     }
+    // Partial callers (maintenance/tests and future API clients) must not
+    // erase unrelated profile fields when changing one preference.
+    $existingProfile = ap_profile_get($actorKey);
     $forumSignature = trim(ap_fix_utf8((string) ($fields['forum_signature'] ?? '')));
     if (mb_strlen($forumSignature) > 500 || preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $forumSignature)) {
         return ['ok' => false, 'error' => 'Forum signature must be plain text with at most 500 characters.'];
     }
 
     $attachment = [];
-    $rawAtt = $fields['attachment'] ?? [];
+    $rawAtt = array_key_exists('attachment', $fields)
+        ? $fields['attachment']
+        : ($existingProfile['attachment'] ?? []);
     if (is_array($rawAtt)) {
         foreach (array_slice($rawAtt, 0, 8) as $item) {
             if (!is_array($item)) {
@@ -2983,8 +2988,12 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     // Verify HTTPS profile fields via rel=me backlink (sets verified_at)
     $attachment = ap_profile_verify_attachments($attachment, true);
 
-    $iconUrl = ap_profile_sanitize_https_url($fields['icon_url'] ?? null);
-    $imageUrl = ap_profile_sanitize_https_url($fields['image_url'] ?? null);
+    $iconUrl = array_key_exists('icon_url', $fields)
+        ? ap_profile_sanitize_https_url($fields['icon_url'])
+        : ap_profile_sanitize_https_url($existingProfile['icon_url'] ?? null);
+    $imageUrl = array_key_exists('image_url', $fields)
+        ? ap_profile_sanitize_https_url($fields['image_url'])
+        : ap_profile_sanitize_https_url($existingProfile['image_url'] ?? null);
     if (($fields['icon_url'] ?? '') !== '' && $fields['icon_url'] !== null && $iconUrl === null) {
         return ['ok' => false, 'error' => 'Avatar URL must be https://'];
     }
@@ -2998,7 +3007,6 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     $collectionConsent = array_key_exists('collection_consent', $fields)
         ? (!empty($fields['collection_consent']) ? 1 : 0)
         : 1;
-    $existingProfile = ap_profile_get($actorKey);
     if (array_key_exists('vanity_verified', $fields)) {
         $vanityVerified = !empty($fields['vanity_verified']) ? 1 : 0;
     } else {
