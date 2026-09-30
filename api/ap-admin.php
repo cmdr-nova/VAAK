@@ -140,7 +140,8 @@ $adminRenderHiccup = static function (string $msg = ''): void {
     }
     echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         . '<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#050505"><title>VAAK · Temporarily unavailable</title>'
-        . '<style>:root{color-scheme:dark}*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:2rem;display:grid;place-items:center;background:#050505;color:#e8e8e8;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(42rem,100%);text-align:center}.mark{margin:0 auto 2rem;color:#00ff9f;font:700 clamp(3.5rem,17vw,8rem)/.88 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 32px rgba(0,255,159,.28);white-space:pre;overflow:hidden}h1{margin:0;font-size:clamp(1.35rem,4vw,2rem);font-weight:650}p{margin:1rem auto 0;max-width:34rem;color:#999;font-size:1rem;line-height:1.55}</style></head><body><main>'
+        . '<style>:root{color-scheme:dark}*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:2rem;display:grid;place-items:center;background:#050505;color:#e8e8e8;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(42rem,100%);text-align:center}.error-mascot{display:block;width:min(180px,52vw);max-height:34vh;object-fit:contain;margin:0 auto 1.25rem}.mark{margin:0 auto 2rem;color:#00ff9f;font:700 clamp(3.5rem,17vw,8rem)/.88 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 32px rgba(0,255,159,.28);white-space:pre;overflow:hidden}h1{margin:0;font-size:clamp(1.35rem,4vw,2rem);font-weight:650}p{margin:1rem auto 0;max-width:34rem;color:#999;font-size:1rem;line-height:1.55}</style></head><body><main>'
+        . '<img class="error-mascot" src="/api/assets/mascot/vaak-error.png" alt="">'
         . '<pre class="mark" aria-label="VAAK">██╗   ██╗\n██║   ██║\n██║   ██║\n╚██╗ ██╔╝\n ╚████╔╝\n  ╚═══╝</pre>'
         . '<h1>Something&#039;s gone wrong, we&#039;re working on it.</h1>'
         . '<p>Questions, contact cmdr_nova@mkultra.monster</p>'
@@ -9282,6 +9283,12 @@ function h(mixed $s): string
     return htmlspecialchars($str, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function admin_mascot_empty(string $message, string $variant = 'neutral'): string
+{
+    $variant = in_array($variant, ['neutral', 'welcome', 'error'], true) ? $variant : 'neutral';
+    return '<div class="mascot-empty"><img src="/api/assets/mascot/vaak-' . $variant . '.png" alt=""><span>' . h($message) . '</span></div>';
+}
+
 function admin_blog_excerpt(string $markdown, int $limit = 420): string
 {
     $plain = trim(html_entity_decode(strip_tags($markdown), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -11192,7 +11199,7 @@ function admin_dm_html(?string $raw, ?array $dmRow = null): string
 function admin_dm_conversation_list_html(array $conversations, string $activePeer = ''): string
 {
     if ($conversations === []) {
-        return '<div class="empty">No direct messages yet.</div>';
+        return admin_mascot_empty('No direct messages yet.');
     }
     $html = '';
     foreach ($conversations as $conversation) {
@@ -11224,7 +11231,7 @@ function admin_dm_conversation_list_html(array $conversations, string $activePee
         }
         $html .= '</a>';
     }
-    return $html !== '' ? $html : '<div class="empty">No direct messages yet.</div>';
+    return $html !== '' ? $html : admin_mascot_empty('No direct messages yet.');
 }
 
 /** Render cached context for a DM that references another post. */
@@ -18976,6 +18983,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       border-radius: 12px; background: var(--panel-2);
     }
     .home-onboarding .who { margin-bottom: .25rem; }
+    .home-onboarding__mascot { float:right; width:min(8rem,28%); max-height:10rem; object-fit:contain; object-position:bottom; margin:-.35rem -.25rem -.35rem .7rem; }
+    @media (max-width:600px) { .home-onboarding__mascot { width:5.5rem; } }
+    .mascot-empty { display:flex; align-items:center; gap:.8rem; min-height:6rem; padding:.7rem 0; color:var(--muted); }
+    .mascot-empty img { width:4.5rem; height:6.2rem; object-fit:contain; object-position:bottom; flex:0 0 auto; }
     .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
     .home-suggestion .tweet-av { width: 40px; height: 40px; flex: 0 0 40px; }
     .home-suggestion-main { min-width: 0; min-height: 5.6rem; display: flex; flex: 1; flex-direction: column; overflow-wrap: anywhere; }
@@ -19687,6 +19698,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
         <?php if (!empty($homeOnboard['active'])): ?>
           <div class="home-onboarding" role="status">
+            <img class="home-onboarding__mascot" src="/api/assets/mascot/vaak-welcome.png" alt="">
             <div class="who">Welcome to your Home feed</div>
             <div class="meta" style="line-height:1.45">
               Home shows posts and boosts from people <b>you follow</b>
@@ -19703,7 +19715,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
         <?php endif; ?>
         <?php if (!$homeTimeline && empty($adminTlFullPageDefer)): ?>
-          <div class="empty">Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</div>
+          <div class="mascot-empty"><img src="/api/assets/mascot/vaak-neutral.png" alt=""><span>Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</span></div>
         <?php endif; ?>
         <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) count($homePage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($homePage[0]['sort']) ? $homePage[0]['sort'] : time()) ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?>>
           <?php foreach ($homePage as $homeIndex => $item): ?>
@@ -19741,7 +19753,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }
         ?>
         <?php if (!$localTimeline && empty($adminTlFullPageDefer)): ?>
-          <div class="empty">No local posts yet. When anyone on this instance posts, it shows up here.</div>
+          <?= admin_mascot_empty('No local posts yet. When anyone on this instance posts, it shows up here.') ?>
         <?php endif; ?>
         <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) count($localPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($localPage[0]['sort']) ? $localPage[0]['sort'] : time()) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?>>
           <?php foreach ($localPage as $item): ?>
@@ -19770,7 +19782,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($feedPage));
           }
         ?>
-        <?php if (!$feedTimeline && empty($adminTlFullPageDefer)): ?><div class="empty">No federation events yet.</div><?php endif; ?>
+        <?php if (!$feedTimeline && empty($adminTlFullPageDefer)): ?><?= admin_mascot_empty('No federation events yet.') ?><?php endif; ?>
         <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) count($feedPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($feedPage[0]['sort']) ? $feedPage[0]['sort'] : time()) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?>>
           <?php foreach ($feedPage as $item): ?>
             <?php
@@ -19826,7 +19838,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             $favList = array_slice($favRows, 0, 20);
           ?>
           <?php if (!$favList): ?>
-            <div class="empty">No Fediverse favourites yet.</div>
+            <?= admin_mascot_empty('No Fediverse favourites yet.') ?>
           <?php else: ?>
             <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
               <?php foreach ($favList as $st): admin_render_favourite_status_card($st); endforeach; ?>
@@ -19949,7 +19961,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </form>
         <?php endif; ?>
         <?php if (!$bmList && !$bskyBookmarksEnabled): ?>
-          <div class="empty"><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
+          <?= admin_mascot_empty($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') ?>
         <?php elseif (!$bmList && $bskyBookmarksEnabled): ?>
           <div class="empty" id="bookmarks-empty-fedi" hidden><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
         <?php endif; ?>
@@ -20076,7 +20088,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $notifHasMore = count($adminNotifs) >= $notifLimit && $notifNextMaxId !== '';
           if (!$adminNotifs):
         ?>
-          <div class="empty">No notifications yet.</div>
+          <?= admin_mascot_empty('No notifications yet.') ?>
         <?php else: ?>
           <div id="timeline-items" data-view="mentions" data-filter="<?= h($notifFilter) ?>" data-limit="<?= (int) $notifLimit ?>" data-max-id="<?= h($notifNextMaxId) ?>" data-has-more="<?= $notifHasMore ? '1' : '0' ?>" data-offset="0" data-newest="0">
             <?php admin_render_notification_stream($adminNotifs, $followingIds, $followerIds); ?>
@@ -20109,7 +20121,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $askRows = $st->fetchAll() ?: [];
         } catch (Throwable $e) {} ?>
         <h2 style="font-size:1.05rem;margin:0 0 .5rem">Asks</h2><p class="meta">Wafrn-compatible questions received by this account. They are private until you answer them in a post.</p>
-        <?php if (!$askRows): ?><div class="empty">No Asks yet.</div><?php endif; ?>
+        <?php if (!$askRows): ?><?= admin_mascot_empty('No Asks yet.') ?><?php endif; ?>
         <div class="asks-list">
         <?php foreach ($askRows as $ask): ?>
           <article class="tweet">

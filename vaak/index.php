@@ -31,8 +31,9 @@ function vaak_render_failure(?Throwable $error = null): void
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#050505"><title>VAAK · Temporarily unavailable</title>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:2rem;display:grid;place-items:center;background:#050505;color:#e8e8e8;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(42rem,100%);text-align:center}.mark{margin:0 auto 2rem;color:#00ff9f;font:700 clamp(3.5rem,17vw,8rem)/.88 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 32px rgba(0,255,159,.28);white-space:pre;overflow:hidden}h1{margin:0;font-size:clamp(1.35rem,4vw,2rem);font-weight:650}p{margin:1rem auto 0;max-width:34rem;color:#999;font-size:1rem;line-height:1.55}
+:root{color-scheme:dark}*{box-sizing:border-box}body{min-height:100vh;margin:0;padding:2rem;display:grid;place-items:center;background:#050505;color:#e8e8e8;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{width:min(42rem,100%);text-align:center}.mark{margin:0 auto 1rem;color:#00ff9f;font:700 clamp(3.5rem,17vw,8rem)/.88 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-shadow:0 0 32px rgba(0,255,159,.28);white-space:pre;overflow:hidden}.error-mascot{display:block;width:min(180px,52vw);max-height:34vh;object-fit:contain;margin:0 auto 1.25rem}h1{margin:0;font-size:clamp(1.35rem,4vw,2rem);font-weight:650}p{margin:1rem auto 0;max-width:34rem;color:#999;font-size:1rem;line-height:1.55}
 </style></head><body><main>
+<img class="error-mascot" src="/api/assets/mascot/vaak-error.png" alt="">
 <pre class="mark" aria-label="VAAK">██╗   ██╗
 ██║   ██║
 ██║   ██║
@@ -502,6 +503,8 @@ ASCII;
     .login-feed-item.remote { border-color: #2a2a2a; }
     .login-feed-empty { color: #777; font-size: .85rem; padding: 1rem; }
     .brand { text-align: center; margin-bottom: 1.75rem; }
+    .landing-mascot { display:flex; justify-content:center; margin:-.35rem 0 .25rem; pointer-events:none; }
+    .landing-mascot img { display:block; width:min(15rem,70vw); max-height:15rem; object-fit:contain; mask-image:linear-gradient(to bottom,#000 0%,#000 76%,transparent 100%); -webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 76%,transparent 100%); }
     .brand pre {
       margin: 0 auto; display: inline-block; text-align: left;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -583,6 +586,7 @@ ASCII;
     </div>
   </aside>
   <main>
+    <div class="landing-mascot" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.png" alt=""></div>
     <div class="brand">
       <pre><?= htmlspecialchars($asciiV, ENT_QUOTES, 'UTF-8') ?></pre>
       <h1>VAAK</h1>
