@@ -259,10 +259,21 @@ if (isset($_GET['site_api'])) {
         exit;
     }
     $ch = curl_init($target);
+    $proxyHeaders = [
+        'X-Admin-Proxy-Auth: 1',
+        'Accept: application/json',
+    ];
+    // The guestbook service requires an approved Origin for destructive
+    // requests. The browser-originated VAAK session is already admin-only;
+    // preserve that origin across the localhost proxy instead of weakening
+    // the service's CSRF guard.
+    if ($siteApi === 'guestbook' && $method === 'DELETE') {
+        $proxyHeaders[] = 'Origin: https://mkultra.monster';
+    }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST => $method,
-        CURLOPT_HTTPHEADER => ['X-Admin-Proxy-Auth: 1', 'Accept: application/json'],
+        CURLOPT_HTTPHEADER => $proxyHeaders,
         CURLOPT_CONNECTTIMEOUT => 2,
         CURLOPT_TIMEOUT => 8,
     ]);
