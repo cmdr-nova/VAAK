@@ -6662,8 +6662,15 @@ function admin_home_phrase_matches_text(string $text, string $phrase): bool
 {
     $phrase = trim(preg_replace('/\s+/u', ' ', strip_tags($phrase)));
     if ($phrase === '') return false;
+    // Hashtags are labels, not reliable evidence of harassment. Ignore the
+    // complete hashtag token so terms such as `slut` do not fire merely on a
+    // self-applied `#slut` tag.
+    $searchText = preg_replace('/(?<![\pL\pN_])#[\pL\pN_]+/u', ' ', strip_tags($text));
+    if (!is_string($searchText)) {
+        $searchText = strip_tags($text);
+    }
     $pattern = '/(?<!\pL)' . preg_quote($phrase, '/') . '(?!\pL)/iu';
-    return preg_match($pattern, strip_tags($text)) === 1;
+    return preg_match($pattern, $searchText) === 1;
 }
 
 /** @return list<string> */
