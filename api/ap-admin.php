@@ -9616,6 +9616,7 @@ function view_title(string $view): string
         'status' => 'Post',
         'security' => 'Security',
         'account_switcher' => 'Switch account',
+        'about' => 'About VAAK',
         'stats' => 'AP stats',
         'guestbook' => 'Guestbook',
         'support' => 'Support',
@@ -18988,6 +18989,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     @media (max-width:600px) { .home-onboarding__mascot { width:5.5rem; } }
     .mascot-empty { display:flex; align-items:center; gap:.8rem; min-height:6rem; padding:.7rem 0; color:var(--muted); }
     .mascot-empty img { width:4.5rem; height:6.2rem; object-fit:contain; object-position:bottom; flex:0 0 auto; }
+    .about-vaak { max-width: 52rem; margin: 0 auto; }
+    .about-vaak-hero { position:relative; min-height:18rem; overflow:hidden; border:1px solid var(--border); border-radius:14px; background:#080b12; }
+    .about-vaak-hero::after { content:""; position:absolute; inset:45% 0 0; background:linear-gradient(to bottom,transparent,rgba(8,8,8,.94)); pointer-events:none; }
+    .about-vaak-hero img { display:block; width:100%; height:18rem; object-fit:cover; object-position:center; opacity:.82; }
+    .about-vaak-hero-copy { position:absolute; z-index:1; left:1.1rem; right:1.1rem; bottom:1rem; }
+    .about-vaak-hero-copy h2 { margin:.2rem 0 0; color:#fff; font-size:clamp(1.8rem,5vw,3rem); letter-spacing:.12em; }
+    .about-vaak-hero-copy p { margin:.2rem 0 0; color:#d2d2d2; }
+    .about-vaak-copy { padding:1rem .2rem 2rem; }
+    .about-vaak-copy h2 { margin:1.2rem 0 .45rem; font-size:1.1rem; color:var(--primary); }
+    .about-vaak-copy p, .about-vaak-copy li { color:var(--muted); line-height:1.65; }
+    .about-vaak-copy a { color:var(--primary); }
     .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
     .home-suggestion .tweet-av { width: 40px; height: 40px; flex: 0 0 40px; }
     .home-suggestion-main { min-width: 0; min-height: 5.6rem; display: flex; flex: 1; flex-direction: column; overflow-wrap: anywhere; }
@@ -19251,10 +19263,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php if (function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
           <a class="<?= $view === 'atmosphere' ? 'active' : '' ?>" href="?view=atmosphere"><span class="ico"><i class="ph ph-butterfly" aria-hidden="true"></i></span><span class="label">ATmosphere</span></a>
           <?php endif; ?>
-          <a class="<?= $view === 'security' ? 'active' : '' ?>" href="?view=security"><span class="ico">⚿</span><span class="label">Security</span></a>
+      <a class="<?= $view === 'security' ? 'active' : '' ?>" href="?view=security"><span class="ico">⚿</span><span class="label">Security</span></a>
           <a class="<?= $view === 'import_export' ? 'active' : '' ?>" href="?view=import_export"><span class="ico">⇄</span><span class="label">Import / Export</span></a>
         </div>
       </details>
+      <hr class="nav-sep">
+      <a class="<?= $view === 'about' ? 'active' : '' ?>" href="?view=about"><span class="ico">ⓘ</span><span class="label">About VAAK</span></a>
       <?php if (!empty($vaakIsAdmin)): ?>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="admin" <?= $navAdminOpen ? 'open' : '' ?>>
@@ -25886,6 +25900,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <div class="bar-row"><span><?= h((string) $r['host']) ?></span><span><?= (int) $r['c'] ?></span></div>
           <?php endforeach; ?>
         </div>
+
+      <?php elseif ($view === 'about'): ?>
+        <article class="about-vaak">
+          <div class="about-vaak-hero">
+            <img src="/api/assets/mascot/vaak1.jpg" alt="Starry VAAK artwork">
+            <div class="about-vaak-hero-copy"><span class="meta">ABOUT THE INSTANCE</span><h2>VAAK</h2><p>Social software for reaching further.</p></div>
+          </div>
+          <div class="about-vaak-copy">
+            <h2>What VAAK is</h2>
+            <p>VAAK began with a simple want: social software capable of reaching more than ever before without forcing every conversation into one company’s silo. It brings together ActivityPub, Bluesky, RSS, local-only posts, and thoughtful recommendations in one place while keeping the familiar social actions people already expect.</p>
+            <p>It is an invite-only, small-scale project built to stay curious, interoperable, and humane. Public posts can travel across the Fediverse and compatible services; private conversations are kept scoped to their participants and the server rules that protect them.</p>
+            <h2>What VAAK values</h2>
+            <ul>
+              <li>Interoperability without giving up user choice.</li>
+              <li>Useful discovery that does not overwhelm the people you follow.</li>
+              <li>Clear moderation, privacy boundaries, and room for local-only speech.</li>
+              <li>Accessible, mobile-friendly software that remains pleasant to use.</li>
+            </ul>
+            <h2>Learn more</h2>
+            <p>Read the <a href="/vaak/conduct/">Code of Conduct</a> and <a href="/vaak/privacy/">Privacy Policy</a> for the current rules and data practices. Questions or accessibility feedback can go to <a href="mailto:cmdr-nova@mkultra.monster">cmdr-nova@mkultra.monster</a>.</p>
+          </div>
+        </article>
 
       <?php elseif ($view === 'guestbook'): ?>
         <div class="wide">
