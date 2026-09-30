@@ -19151,7 +19151,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </a>
       <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
-      <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>?public=1" rel="noopener noreferrer">View profile</a>
+      <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">View profile</a>
       <?php
         $switchAccountRows = function_exists('ap_auth_users_by_ids')
             ? ap_auth_users_by_ids(ap_auth_session_account_ids())
@@ -32333,7 +32333,7 @@ if (VIEW === 'analytics') loadAnalytics();
   document.addEventListener('click', function (ev) {
     if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
     const link = ev.target.closest && ev.target.closest('a[href]');
-    if (!link || link.target === '_blank' || link.hasAttribute('download')) return;
+    if (!link || link.hasAttribute('download')) return;
     // Soft-nav links manage their own loading state.
     if (link.getAttribute('data-vaak-soft-nav')) return;
     const href = link.getAttribute('href') || '';
@@ -32341,10 +32341,18 @@ if (VIEW === 'analytics') loadAnalytics();
     let destination;
     try { destination = new URL(href, window.location.href); } catch (e) { return; }
     if (isLocalHtmlProfile(destination)) {
-      window.__vaakNavigationPending = true;
-      showProfileLoading();
+      const loaderUrl = '/vaak/profile-loading.html?target=' + encodeURIComponent(destination.href);
+      if (link.target === '_blank') {
+        ev.preventDefault();
+        const popup = window.open(loaderUrl, '_blank', 'noopener,noreferrer');
+        if (!popup) window.location.assign(loaderUrl);
+      } else {
+        window.__vaakNavigationPending = true;
+        showProfileLoading();
+      }
       return;
     }
+    if (link.target === '_blank') return;
     if (destination.origin !== window.location.origin) return;
     // Show synchronously so the spinner is visible even when navigation starts
     // before the browser gets a chance to run a zero-delay timer.
