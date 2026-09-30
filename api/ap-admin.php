@@ -6197,7 +6197,7 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v6_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v7_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -6613,9 +6613,10 @@ function admin_home_cached_recommendation_items(array $timeline, int $ownerUserI
         $tagWeights = function_exists('admin_home_favourite_tag_weights')
             ? admin_home_favourite_tag_weights($ownerUserId)
             : [];
-        if ($actorWeights === [] && $tagWeights === []) {
-            return $timeline;
-        }
+        // Cold-start accounts still get a small, diverse discovery pool from
+        // posts already cached locally. Once signals exist, the same pool is
+        // scored against those signals as before.
+        $coldStart = $actorWeights === [] && $tagWeights === [];
         $seen = [];
         foreach ($timeline as $item) {
             $row = is_array($item['row'] ?? null) ? $item['row'] : [];
@@ -6631,7 +6632,8 @@ function admin_home_cached_recommendation_items(array $timeline, int $ownerUserI
         );
         $st->execute([$since]);
         $added = 0;
-        $maxAdded = 8;
+        $maxAdded = $coldStart ? 6 : 8;
+        $seenRecommendationActors = [];
         foreach ($st->fetchAll() ?: [] as $row) {
             if (!is_array($row) || $added >= $maxAdded) break;
             $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
@@ -6639,17 +6641,19 @@ function admin_home_cached_recommendation_items(array $timeline, int $ownerUserI
             $item = ['kind' => 'event', 'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: 0, 'row' => $row, 'home_source' => 'recommendation'];
             if (admin_timeline_row_hidden($row, $ownerUserId) || admin_timeline_item_muted_by_words($item)) continue;
             $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($coldStart && $actor !== '' && isset($seenRecommendationActors[$actor])) continue;
             $score = (float) ($actorWeights[$actor] ?? 0);
             foreach (admin_home_extract_hashtags((string) ($row['summary'] ?? $row['content'] ?? '')) as $tag) {
                 $score += (float) ($tagWeights[$tag] ?? 0) * 0.5;
             }
-            if ($score < 1.5) continue;
+            if (!$coldStart && $score < 1.5) continue;
             // A bounded recency boost lets a relevant cached post surface while
             // preventing old content from permanently outranking fresh posts.
             $item['sort'] += min(12 * 3600, (int) round(1800 * log(1 + $score, 2)));
             $item['recommendation_score'] = round($score, 3);
             $timeline[] = $item;
             $seen[$object] = true;
+            if ($actor !== '') $seenRecommendationActors[$actor] = true;
             $added++;
         }
     } catch (Throwable $e) {
