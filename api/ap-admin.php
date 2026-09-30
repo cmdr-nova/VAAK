@@ -20144,9 +20144,38 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php
           $friendRows = [];
           try { $friendRows = ap_db()->query('SELECT host,note,updated_at FROM ap_wafrn_friend_servers WHERE enabled=1 ORDER BY host')->fetchAll() ?: []; } catch (Throwable $e) {}
+          $defaultFriendHosts = [];
+          $friendHostRaw = getenv('VAAK_WAFRN_FRIEND_HOSTS');
+          if (!is_string($friendHostRaw) || trim($friendHostRaw) === '') {
+              $friendCatalog = '/var/lib/mkultra/ap/wafrn-friend-hosts.txt';
+              if (!is_file($friendCatalog)) $friendCatalog = __DIR__ . '/deploy/wafrn-friend-hosts.txt';
+              $friendHostRaw = is_file($friendCatalog) ? (string) @file_get_contents($friendCatalog) : 'waffles.baeddel.social';
+          }
+          foreach (preg_split('/[,\s]+/', (string) $friendHostRaw) ?: [] as $friendHost) {
+              $friendHost = trim((string) $friendHost);
+              if ($friendHost === '') continue;
+              if (!str_starts_with($friendHost, 'https://')) $friendHost = 'https://' . $friendHost;
+              $friendParts = parse_url($friendHost);
+              $friendHost = strtolower(trim((string) ($friendParts['host'] ?? '')));
+              if ($friendHost === '' || $friendHost === 'mkultra.monster' || !filter_var($friendHost, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)) continue;
+              $defaultFriendHosts[$friendHost] = true;
+          }
+          $defaultFriendHosts = array_keys($defaultFriendHosts);
+          sort($defaultFriendHosts, SORT_STRING);
         ?>
         <h2 style="font-size:1.05rem;margin:0 0 .5rem">Wafrn friend servers</h2>
         <p class="meta">Public posts are delivered to these Wafrn-compatible servers even without a local follower. Normal federation, blocks, and local-only privacy remain unchanged.</p>
+        <details style="margin:.8rem 0 1rem">
+          <summary style="cursor:pointer;font-weight:600">Default Wafrn instances (<?= count($defaultFriendHosts) ?>)</summary>
+          <?php if ($defaultFriendHosts): ?>
+            <div class="meta" style="margin-top:.55rem">These instances come from the refreshed Wafrn directory/catalog and are included automatically. They are not admin overrides.</div>
+            <ul style="margin:.5rem 0 0 1.2rem;padding:0;columns:2;column-gap:2rem">
+              <?php foreach ($defaultFriendHosts as $defaultFriendHost): ?><li style="overflow-wrap:anywhere;margin:.2rem 0"><?= h($defaultFriendHost) ?></li><?php endforeach; ?>
+            </ul>
+          <?php else: ?>
+            <div class="empty" style="margin-top:.55rem">No default Wafrn instances are currently available.</div>
+          <?php endif; ?>
+        </details>
         <form class="composer" method="post" action="?view=friend_servers" style="margin:.8rem 0 1rem">
           <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>"><input type="hidden" name="action" value="wafrn_friend_add">
           <label>Hostname</label><input name="host" required placeholder="wafrn.example">
