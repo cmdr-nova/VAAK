@@ -6773,6 +6773,42 @@ function admin_home_downranked_actor_rows(): array
     }
 }
 
+/** @return list<array{object_id:string,created_at:string,summary:string,categories:list<string>}> */
+function admin_home_downrank_evidence_rows(string $actorId, array $categories, int $limit = 5): array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    $wanted = array_values(array_filter(array_map('strval', $categories)));
+    if ($actorId === '' || $wanted === [] || $limit < 1) return [];
+    try {
+        // Keep this bounded: the page is an admin review surface and evidence
+        // should come from the recent cached events that can be opened in VAAK.
+        $st = ap_db()->prepare("SELECT object_id, created_at, summary
+            FROM events
+            WHERE actor_id = ? AND visibility IN ('public', 'unlisted')
+            ORDER BY created_at DESC
+            LIMIT 100");
+        $st->execute([$actorId]);
+        $out = [];
+        foreach ($st->fetchAll() ?: [] as $row) {
+            $objectId = rtrim(trim((string) ($row['object_id'] ?? '')), '/');
+            $summary = trim((string) ($row['summary'] ?? ''));
+            if ($objectId === '' || $summary === '') continue;
+            $matched = array_values(array_intersect($wanted, admin_home_toxicity_categories($summary)));
+            if ($matched === []) continue;
+            $out[] = [
+                'object_id' => $objectId,
+                'created_at' => (string) ($row['created_at'] ?? ''),
+                'summary' => $summary,
+                'categories' => $matched,
+            ];
+            if (count($out) >= $limit) break;
+        }
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
 function admin_home_downrank_audit(string $action, string $actorId = '', int $termId = 0, string $phrase = '', array $details = []): void
 {
     try {
@@ -20893,7 +20929,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $drName = function_exists('actor_display_name') ? actor_display_name($drActor, false) : $drActor;
                   $drUntil = (int) ($dr['until'] ?? 0);
                   $drExpired = $drUntil <= time();
-                  $drCats = implode(', ', array_map('strval', (array) ($dr['categories'] ?? [])));
+                  $drCategoryList = array_values(array_filter(array_map('strval', (array) ($dr['categories'] ?? []))));
+                  $drCats = implode(', ', $drCategoryList);
+                  $drEvidence = admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5);
                 ?>
                 <article class="tweet" style="padding:.85rem 1rem">
                   <div class="tweet-hd">
@@ -20907,6 +20945,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     Categories: <?= h($drCats !== '' ? $drCats : 'uncategorized') ?> · score <?= (int) ($dr['score'] ?? 0) ?> · <?= (int) ($dr['viewers'] ?? 0) ?> viewer<?= ((int) ($dr['viewers'] ?? 0) === 1 ? '' : 's') ?>
                     <?php if ($drUntil > 0): ?> · <?= $drExpired ? 'expired' : 'expires ' . h(relative_time(gmdate('c', $drUntil))) ?><?php endif; ?>
                   </div>
+                  <?php if ($drEvidence): ?>
+                    <div class="meta" style="margin-top:.55rem">Recent matching evidence:</div>
+                    <div style="display:flex;flex-direction:column;gap:.25rem;margin-top:.2rem">
+                      <?php foreach ($drEvidence as $evidence): ?>
+                        <?php
+                          $evidenceSummary = preg_replace('/\s+/u', ' ', (string) ($evidence['summary'] ?? ''));
+                          $evidenceSummary = is_string($evidenceSummary) ? trim($evidenceSummary) : '';
+                          $evidenceLabel = mb_substr($evidenceSummary, 0, 140);
+                          if ($evidenceLabel === '') $evidenceLabel = 'Open matching status';
+                          $evidenceHref = admin_status_href((string) ($evidence['object_id'] ?? ''), 'downranked');
+                        ?>
+                        <a class="meta" href="<?= h($evidenceHref) ?>" style="overflow-wrap:anywhere;text-decoration:underline" title="<?= h($evidenceSummary) ?>">
+                          <?= h($evidenceLabel) ?> · <?= h(implode(', ', (array) ($evidence['categories'] ?? []))) ?>
+                        </a>
+                      <?php endforeach; ?>
+                    </div>
+                  <?php endif; ?>
                   <div class="tweet-actions" style="flex-wrap:wrap;margin-top:.55rem">
                     <?php if (str_starts_with($drActor, 'https://')): ?><a href="<?= h(admin_remote_actor_href($drActor)) ?>" target="_blank" rel="noopener noreferrer">Open profile</a><?php endif; ?>
                     <form method="post" action="?view=downranked" style="display:inline">
