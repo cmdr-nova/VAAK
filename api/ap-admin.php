@@ -8862,14 +8862,13 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     }
     // Seed the ranked cache for the initial page and subsequent infinite
     // scroll. Bluesky is merged here rather than deferred to page two.
-    if ($homeTimeline !== []) {
+    $homeHasBskySession = function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
+        && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($homeOwnerId));
+    if ($homeTimeline !== [] || $homeHasBskySession) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('home', $following);
         $ranked = admin_tl_rank_from_timeline($homeTimeline);
         $beforeBsky = count($ranked);
-        if (
-            function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
-            && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($homeOwnerId))
-        ) {
+        if ($homeHasBskySession) {
             $ranked = admin_home_merge_bsky_ranked($ranked, $homeOwnerId);
         }
         if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
