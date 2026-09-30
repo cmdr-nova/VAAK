@@ -6940,18 +6940,17 @@ function admin_home_apply_follower_fallback(array $timeline, int $pageSize = 15)
 
 
 /**
- * Keep the first Home page fedi-only (fast paint). Queue Bluesky ids into later
- * pages at ~40% with ≥2 fedi cards between, skipping dual-published twins.
+ * Merge cached Bluesky Home candidates into the ranked Home set. Keep the
+ * share bounded at ~40% with spacing, but allow Bluesky cards on page one.
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
  */
-function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId, int $firstPage = 15): array
+function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
 {
     if ($ownerUserId < 1 || !function_exists('ap_bsky_home_rank_keys')) {
         return $ranked;
     }
-    $firstPage = max(0, $firstPage);
     $ownDid = '';
     if (function_exists('ap_bsky_session_row')) {
         $sess = ap_bsky_session_row($ownerUserId);
@@ -7005,9 +7004,8 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
     if ($ranked === []) {
         return array_slice($queued, 0, 60);
     }
-    $head = array_slice($ranked, 0, $firstPage);
-    $tail = array_slice($ranked, $firstPage);
-    $out = $head;
+    $tail = $ranked;
+    $out = [];
     $qi = 0;
     $bskyEmitted = 0;
     $sinceBsky = 2;
@@ -7025,41 +7023,13 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
             $sinceBsky = 0;
         }
     };
-    $flush(); // allow Bluesky right after a short fedi head
+    $flush(); // allow Bluesky in the initial Home page
     foreach ($tail as $item) {
         $out[] = $item;
         $sinceBsky++;
         $flush();
     }
     return $out;
-}
-
-/**
- * Decide how much recent Fediverse activity should remain ahead of the
- * algorithmic Bluesky mix on the Home timeline. A quiet/stale follow graph
- * should not hide fresh Bluesky recommendations behind an empty-looking AP
- * head, while genuinely recent followed AP posts should retain priority.
- */
-function admin_home_bsky_head_size(array $timeline, int $pageSize = 15): int
-{
-    $pageSize = max(0, $pageSize);
-    if ($pageSize === 0) {
-        return 0;
-    }
-    $recentCutoff = time() - (6 * 3600);
-    $recentFollowed = 0;
-    foreach ($timeline as $item) {
-        if (!is_array($item) || (string) ($item['home_source'] ?? '') !== 'following') {
-            continue;
-        }
-        if ((int) ($item['sort'] ?? 0) >= $recentCutoff) {
-            $recentFollowed++;
-        }
-    }
-    if ($recentFollowed < 1) {
-        return 0;
-    }
-    return min($pageSize, max(3, $recentFollowed));
 }
 
 /**
@@ -7450,8 +7420,9 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
         }
     }
     $ranked = $timeline !== [] ? admin_tl_rank_from_timeline($timeline) : [];
-    // Match full Home: keep a short fedi head, then mix Bluesky following posts + RSS.
-    if ($view === 'home' && function_exists('admin_home_queue_bsky_after_first_page')) {
+    // Match full Home: mix Bluesky into the ranked set immediately, while RSS
+    // remains a smaller later-page contribution.
+    if ($view === 'home' && function_exists('admin_home_merge_bsky_ranked')) {
         $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
         if ($ownerUserId > 0) {
             $homePartialProfile = function_exists('ap_profile_get')
@@ -7459,12 +7430,9 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 : [];
             $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homePartialProfile)
                 || !empty($homePartialProfile['algorithm_enabled']);
-            // Keep only genuinely recent followed AP activity ahead of the
-            // algorithmic Bluesky mix; stale/quiet AP heads must not hide it.
-            $head = admin_home_bsky_head_size($timeline, $tlLimit);
-            $ranked = admin_home_queue_bsky_after_first_page($ranked, $ownerUserId, $head);
+            $ranked = admin_home_merge_bsky_ranked($ranked, $ownerUserId);
             if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-                $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, $head);
+                $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, $tlLimit);
             }
         }
     }
@@ -8809,9 +8777,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         $homeTimeline[] = $boostItem;
         $homeBoostAdded++;
     }
-    // Bluesky mix is queued into the ranked cache *after* the first page so
-    // first paint stays fedi-only (no 80-post JSON decode / dual-publish walk).
-    // Personalization only on ranked-cache rebuild (not on cache hits).
+    // Personalization only runs while rebuilding the ranked cache (not on
+    // cache hits); Bluesky candidates are merged into that cache below.
     if ($homeAlgorithmEnabled && function_exists('admin_home_cached_recommendation_items')) {
         $homeTimeline = admin_home_cached_recommendation_items($homeTimeline, $homeOwnerId);
     }
@@ -8825,50 +8792,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         $homeTimeline = admin_home_apply_favourite_rank($homeTimeline, $homeOwnerId);
     } else {
         usort($homeTimeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
-    }
-    // Soft cap Bluesky share (~40%) so Home remains mixed when AP activity is slow.
-    // Defer surplus Bluesky (don't drop) so later pages / deeper scroll still get them.
-    if ($homeTimeline) {
-        $cappedBsky = [];
-        $deferredBsky = [];
-        $bskyEmitted = 0;
-        $sinceBsky = 0;
-        $flushDeferredBsky = static function () use (&$cappedBsky, &$deferredBsky, &$bskyEmitted, &$sinceBsky): void {
-            while ($deferredBsky !== []) {
-                if ($sinceBsky < 2 && $cappedBsky !== []) {
-                    break;
-                }
-                if (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.40) {
-                    break;
-                }
-                $cappedBsky[] = array_shift($deferredBsky);
-                $bskyEmitted++;
-                $sinceBsky = 0;
-            }
-        };
-        foreach ($homeTimeline as $item) {
-            $isBsky = ((string) ($item['kind'] ?? '')) === 'bsky';
-            if ($isBsky) {
-                if (($sinceBsky < 2 && $cappedBsky !== [])
-                    || (($bskyEmitted + 1) / max(1, count($cappedBsky) + 1) > 0.40)
-                ) {
-                    $deferredBsky[] = $item;
-                    continue;
-                }
-                $bskyEmitted++;
-                $sinceBsky = 0;
-                $cappedBsky[] = $item;
-            } else {
-                $sinceBsky++;
-                $cappedBsky[] = $item;
-                $flushDeferredBsky();
-            }
-        }
-        // Do NOT dump leftover Bluesky onto the tail — that created a
-        // Bluesky-only cliff after old local posts. Surplus stays out of this
-        // ranked head; deep scroll re-pulls older bsky_posts via extend, mixed
-        // chronologically with older following events still in the retention window.
-        $homeTimeline = $cappedBsky;
     }
     // Hard cap: tag-only posts ≤ ~25% of the ranked list (still keep some spice).
     $maxTagShare = 0.25;
@@ -8937,8 +8860,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     if ($homeAlgorithmEnabled) {
         $homeTimeline = admin_home_apply_follower_fallback($homeTimeline, $tlLimit);
     }
-    // Seed ranked cache for subsequent infinite-scroll pages. Keep a recent
-    // followed AP head, but let Bluesky lead when that head is stale/quiet.
+    // Seed the ranked cache for the initial page and subsequent infinite
+    // scroll. Bluesky is merged here rather than deferred to page two.
     if ($homeTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('home', $following);
         $ranked = admin_tl_rank_from_timeline($homeTimeline);
@@ -8947,18 +8870,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
             && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($homeOwnerId))
         ) {
-            $ranked = admin_home_queue_bsky_after_first_page(
-                $ranked,
-                $homeOwnerId,
-                admin_home_bsky_head_size($homeTimeline, $tlLimit)
-            );
+            $ranked = admin_home_merge_bsky_ranked($ranked, $homeOwnerId);
         }
         if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-            $ranked = admin_home_queue_rss_after_first_page(
-                $ranked,
-                $homeOwnerId,
-                admin_home_bsky_head_size($homeTimeline, $tlLimit)
-            );
+            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, $tlLimit);
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
@@ -16014,17 +15929,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 : [];
             $homeAlgorithmMiss = !array_key_exists('algorithm_enabled', $homeProfileMiss)
                 || !empty($homeProfileMiss['algorithm_enabled']);
-            $rankedMiss = admin_home_queue_bsky_after_first_page(
-                $rankedMiss,
-                $homeOwnerMiss,
-                admin_home_bsky_head_size($timeline, $tlLimit)
-            );
+            $rankedMiss = admin_home_merge_bsky_ranked($rankedMiss, $homeOwnerMiss);
             if ($homeAlgorithmMiss && function_exists('admin_home_queue_rss_after_first_page')) {
-                $rankedMiss = admin_home_queue_rss_after_first_page(
-                    $rankedMiss,
-                    $homeOwnerMiss,
-                    admin_home_bsky_head_size($timeline, $tlLimit)
-                );
+                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
             }
         }
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.
