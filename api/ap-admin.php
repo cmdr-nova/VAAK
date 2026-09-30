@@ -7031,6 +7031,34 @@ function admin_home_queue_bsky_after_first_page(array $ranked, int $ownerUserId,
 }
 
 /**
+ * Decide how much recent Fediverse activity should remain ahead of the
+ * algorithmic Bluesky mix on the Home timeline. A quiet/stale follow graph
+ * should not hide fresh Bluesky recommendations behind an empty-looking AP
+ * head, while genuinely recent followed AP posts should retain priority.
+ */
+function admin_home_bsky_head_size(array $timeline, int $pageSize = 15): int
+{
+    $pageSize = max(0, $pageSize);
+    if ($pageSize === 0) {
+        return 0;
+    }
+    $recentCutoff = time() - (6 * 3600);
+    $recentFollowed = 0;
+    foreach ($timeline as $item) {
+        if (!is_array($item) || (string) ($item['home_source'] ?? '') !== 'following') {
+            continue;
+        }
+        if ((int) ($item['sort'] ?? 0) >= $recentCutoff) {
+            $recentFollowed++;
+        }
+    }
+    if ($recentFollowed < 1) {
+        return 0;
+    }
+    return min($pageSize, max(3, $recentFollowed));
+}
+
+/**
  * Queue RSS item ids into later Home pages (~15%, ≥3 other cards between).
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
@@ -7427,15 +7455,12 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 : [];
             $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homePartialProfile)
                 || !empty($homePartialProfile['algorithm_enabled']);
-            $fediN = count($ranked);
-            // Thin AP head (e.g. only own notes) → shorter head so Bluesky shows sooner.
-            $head = $fediN > 0 && $fediN < 12 ? min(5, max(3, $fediN)) : 15;
-            if ($fediN === 0) {
-                $head = 0;
-            }
-            $ranked = admin_home_queue_bsky_after_first_page($ranked, $ownerUserId, max(1, $head));
+            // Keep only genuinely recent followed AP activity ahead of the
+            // algorithmic Bluesky mix; stale/quiet AP heads must not hide it.
+            $head = admin_home_bsky_head_size($timeline, $tlLimit);
+            $ranked = admin_home_queue_bsky_after_first_page($ranked, $ownerUserId, $head);
             if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-                $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, max(1, $head));
+                $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, $head);
             }
         }
     }
@@ -8908,8 +8933,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     if ($homeAlgorithmEnabled) {
         $homeTimeline = admin_home_apply_follower_fallback($homeTimeline, $tlLimit);
     }
-    // Seed ranked cache for subsequent infinite-scroll pages.
-    // First page stays the fedi $homeTimeline slice; Bluesky ids start after it.
+    // Seed ranked cache for subsequent infinite-scroll pages. Keep a recent
+    // followed AP head, but let Bluesky lead when that head is stale/quiet.
     if ($homeTimeline !== []) {
         $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key('home', $following);
         $ranked = admin_tl_rank_from_timeline($homeTimeline);
@@ -8918,10 +8943,18 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()
             && function_exists('ap_bsky_session_row') && is_array(ap_bsky_session_row($homeOwnerId))
         ) {
-            $ranked = admin_home_queue_bsky_after_first_page($ranked, $homeOwnerId, $tlLimit);
+            $ranked = admin_home_queue_bsky_after_first_page(
+                $ranked,
+                $homeOwnerId,
+                admin_home_bsky_head_size($homeTimeline, $tlLimit)
+            );
         }
         if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, $tlLimit);
+            $ranked = admin_home_queue_rss_after_first_page(
+                $ranked,
+                $homeOwnerId,
+                admin_home_bsky_head_size($homeTimeline, $tlLimit)
+            );
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
@@ -15977,9 +16010,17 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 : [];
             $homeAlgorithmMiss = !array_key_exists('algorithm_enabled', $homeProfileMiss)
                 || !empty($homeProfileMiss['algorithm_enabled']);
-            $rankedMiss = admin_home_queue_bsky_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
+            $rankedMiss = admin_home_queue_bsky_after_first_page(
+                $rankedMiss,
+                $homeOwnerMiss,
+                admin_home_bsky_head_size($timeline, $tlLimit)
+            );
             if ($homeAlgorithmMiss && function_exists('admin_home_queue_rss_after_first_page')) {
-                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
+                $rankedMiss = admin_home_queue_rss_after_first_page(
+                    $rankedMiss,
+                    $homeOwnerMiss,
+                    admin_home_bsky_head_size($timeline, $tlLimit)
+                );
             }
         }
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.
