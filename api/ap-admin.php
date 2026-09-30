@@ -19086,6 +19086,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       opacity: 1; visibility: visible; transform: translate(-50%, 0);
       transition: opacity .16s ease, transform .16s ease, visibility 0s;
     }
+    .vaak-profile-loading {
+      position: fixed; inset: 0; z-index: 10100; display: none;
+      align-items: center; justify-content: center; flex-direction: column;
+      gap: .8rem; background: #000; color: #aaa; text-align: center;
+    }
+    .vaak-profile-loading.is-visible { display: flex; }
+    .vaak-profile-loading img { width: min(240px, 58vw); height: auto; max-height: 62vh; object-fit: contain; image-rendering: auto; }
+    .vaak-profile-loading p { margin: 0; font-size: .9rem; letter-spacing: .02em; }
     .timeline-status-loading { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
     @media (prefers-reduced-motion: reduce) {
       .vaak-spinner { animation-duration: 1.4s; }
@@ -19118,6 +19126,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 <body class="<?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
   <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
+</div>
+<div id="vaak-profile-loading" class="vaak-profile-loading" role="status" aria-live="polite" aria-hidden="true">
+  <img src="https://mkultra.monster/api/assets/vaak-mascot-loading.gif" alt="">
+  <p>Loading profile…</p>
 </div>
 <div class="mobile-nav-backdrop" id="mobile-nav-backdrop" hidden></div>
 <header class="mobile-topbar" id="mobile-topbar">
@@ -32288,6 +32300,7 @@ if (VIEW === 'analytics') loadAnalytics();
 // Shared navigation feedback for full-page loads and form submissions.
 (function () {
   const indicator = document.getElementById('vaak-loading-indicator');
+  const profileLoading = document.getElementById('vaak-profile-loading');
   if (!indicator) return;
   const label = indicator.querySelector('[data-vaak-loading-label]');
   let hideTimer = 0;
@@ -32301,6 +32314,22 @@ if (VIEW === 'analytics') loadAnalytics();
     indicator.classList.remove('is-visible');
     indicator.setAttribute('aria-hidden', 'true');
   };
+  function isLocalHtmlProfile(destination) {
+    if (!destination) return false;
+    const host = destination.hostname.toLowerCase();
+    if (host !== 'mkultra.monster' && host !== 'vaak.monster') return false;
+    return /^\/(?:users\/[A-Za-z][A-Za-z0-9_]{1,29}(?:\/|$)|@[A-Za-z][A-Za-z0-9_]{1,29}(?:\/|$))/i.test(destination.pathname);
+  }
+  function showProfileLoading() {
+    if (!profileLoading) return;
+    profileLoading.classList.add('is-visible');
+    profileLoading.setAttribute('aria-hidden', 'false');
+  }
+  function hideProfileLoading() {
+    if (!profileLoading) return;
+    profileLoading.classList.remove('is-visible');
+    profileLoading.setAttribute('aria-hidden', 'true');
+  }
   document.addEventListener('click', function (ev) {
     if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
     const link = ev.target.closest && ev.target.closest('a[href]');
@@ -32311,6 +32340,11 @@ if (VIEW === 'analytics') loadAnalytics();
     if (!href || href[0] === '#' || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
     let destination;
     try { destination = new URL(href, window.location.href); } catch (e) { return; }
+    if (isLocalHtmlProfile(destination)) {
+      window.__vaakNavigationPending = true;
+      showProfileLoading();
+      return;
+    }
     if (destination.origin !== window.location.origin) return;
     // Show synchronously so the spinner is visible even when navigation starts
     // before the browser gets a chance to run a zero-delay timer.
@@ -32329,6 +32363,7 @@ if (VIEW === 'analytics') loadAnalytics();
   window.addEventListener('pageshow', function () {
     window.__vaakNavigationPending = false;
     window.vaakHideLoading();
+    hideProfileLoading();
   });
   document.addEventListener('click', function (event) {
     const button = event.target.closest('[data-copy-value]');
