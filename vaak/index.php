@@ -591,7 +591,7 @@ ASCII;
   </aside>
   <main>
     <div class="brand">
-      <div class="landing-mascot" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.png" alt=""></div>
+      <div class="landing-mascot" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.webp" alt=""></div>
       <pre><?= htmlspecialchars($asciiV, ENT_QUOTES, 'UTF-8') ?></pre>
       <h1>VAAK</h1>
       <p class="vaak-version"><?= htmlspecialchars(vaak_version_label(), ENT_QUOTES, 'UTF-8') ?></p>
@@ -685,7 +685,7 @@ ASCII;
       <p class="switch">Have an invite? <a href="/vaak/?mode=register">Register</a><br><a href="/vaak/?mode=forgot">Forgot password?</a></p>
     <?php endif; ?>
 
-    <div class="landing-mascot-mobile" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.png" alt=""></div>
+    <div class="landing-mascot-mobile" aria-hidden="true"><img src="/api/assets/mascot/vaak-landing.webp" alt=""></div>
 
     <nav class="policies" aria-label="Policies">
       <a href="/vaak/privacy/">Privacy</a>
