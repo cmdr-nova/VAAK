@@ -9226,6 +9226,33 @@ if (
         }
     }
 }
+// Standalone Mention actions use the same handle seed as replies, but do not
+// have a reply target to trigger the reply-specific branch above.
+if (
+    $prefillMention !== ''
+    && $prefillReplyTo === ''
+    && $prefillQuoteObject === ''
+    && $prefillEditNote === ''
+    && $prefillDraftId <= 0
+    && $prefillEditContent === ''
+) {
+    $seedHandles = [];
+    foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
+        $part = trim((string) $part);
+        if ($part === '') {
+            continue;
+        }
+        $h = function_exists('admin_reply_mention_handle')
+            ? admin_reply_mention_handle(null, $part)
+            : ('@' . ltrim($part, '@'));
+        if ($h !== '' && !(function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))) {
+            $seedHandles[] = $h;
+        }
+    }
+    if ($seedHandles !== []) {
+        $prefillEditContent = implode(' ', array_values(array_unique($seedHandles))) . ' ';
+    }
+}
 $autoOpenComposer = $composerForceOpen
     || isset($_GET['compose'])
     || $prefillReplyTo !== ''
