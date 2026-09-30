@@ -58,6 +58,9 @@ $targetCheck = ap_webmention_target_exists($target);
 if (!$targetCheck) {
     ap_webmention_error('target is not a public local profile or post', 404);
 }
+if (function_exists('ap_webmention_target_enabled') && !ap_webmention_target_enabled($target)) {
+    ap_webmention_error('Webmentions are disabled for this profile', 410);
+}
 
 $html = ap_webmention_fetch_source($source);
 if ($html === null) {
@@ -84,6 +87,45 @@ $sql = 'INSERT INTO webmentions
       source_author = excluded.source_author, source_published = excluded.source_published,
       source_host = excluded.source_host, verified_at = excluded.verified_at, updated_at = excluded.updated_at';
 $db->prepare($sql)->execute([$source, $target, $title, $content, $author, $published, $sourceHost, $now, $now, $now]);
+
+// Project post Webmentions into the target owner's private notification feed.
+// Profile-root mentions remain public cards only; notifications point to an
+// exact HTML-profile post so the target owner can open the relevant context.
+if (preg_match('#^https://mkultra\.monster/users/([A-Za-z][A-Za-z0-9_]{1,29})/(?:notes|creates)/[A-Fa-f0-9]+$#', $target, $tm)) {
+    $ownerActor = 'https://mkultra.monster/users/' . strtolower($tm[1]);
+    $ownerUserId = function_exists('ap_db_owner_user_id_for_actor')
+        ? ap_db_owner_user_id_for_actor($ownerActor) : 0;
+    if ($ownerUserId > 0 && function_exists('ap_mention_store')) {
+        $mentionIdSt = $db->prepare('SELECT id FROM webmentions WHERE source_url = ? AND target_url = ? LIMIT 1');
+        $mentionIdSt->execute([$source, $target]);
+        $mentionId = (int) ($mentionIdSt->fetchColumn() ?: 0);
+        if ($mentionId > 0) {
+            $clipParts = array_values(array_filter([
+                trim($title),
+                trim($content),
+            ], static fn($v): bool => $v !== ''));
+            $clip = mb_strimwidth(implode(" — ", $clipParts), 0, 900, '…', 'UTF-8');
+            if ($clip === '') {
+                $clip = 'Webmention from ' . $sourceHost;
+            }
+            $objectId = $target . '#webmention-' . $mentionId;
+            ap_mention_store([
+                'owner_user_id' => $ownerUserId,
+                'owner_actor_id' => $ownerActor,
+                'created_at' => $now,
+                'activity_id' => 'webmention:' . hash('sha256', $source . '|' . $target),
+                'object_id' => $objectId,
+                'actor_id' => $source,
+                'type' => 'mention',
+                'activity_type' => 'webmention',
+                'content' => $clip,
+            ]);
+            if (function_exists('ap_notification_projection_invalidate_owner')) {
+                ap_notification_projection_invalidate_owner($ownerUserId);
+            }
+        }
+    }
+}
 
 header('Content-Type: application/json; charset=utf-8');
 http_response_code($existingId !== false ? 200 : 201);

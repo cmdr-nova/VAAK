@@ -4186,7 +4186,7 @@ function ap_masto_status_from_mention(array $row): array
 function ap_masto_mention_target_object_id(string $objectId): string
 {
     $objectId = rtrim($objectId, '/');
-    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite)-[a-z0-9]+$/i', $objectId, $m)) {
+    if (preg_match('/^(https:\/\/.+?)#(like|reblog|update|quote|bite|webmention)-[a-z0-9]+$/i', $objectId, $m)) {
         return rtrim($m[1], '/');
     }
     return $objectId;
@@ -4417,6 +4417,9 @@ function ap_masto_mention_notif_type(array $row): ?string
 {
     $activity = strtolower((string) ($row['activity_type'] ?? ''));
     $objType = strtolower((string) ($row['type'] ?? ''));
+    if ($activity === 'webmention' || str_contains((string) ($row['object_id'] ?? ''), '#webmention-')) {
+        return 'mention';
+    }
     $objectId = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
     $ownerActor = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
     if ($ownerActor !== '') {

@@ -1882,6 +1882,7 @@ $vaakAdminOnlyActions = [
                 'algorithm_enabled' => !empty($_POST['algorithm_enabled']),
                 'downranking_enabled' => !empty($_POST['downranking_enabled']),
                 'asks_enabled' => !empty($_POST['asks_enabled']),
+                'webmentions_enabled' => !empty($_POST['webmentions_enabled']),
                 'forum_signature' => (string) ($_POST['forum_signature'] ?? ''),
                 'profile_badges' => is_array($_POST['profile_badges'] ?? null) ? $_POST['profile_badges'] : [],
             ], $vaakActorKey);
@@ -21764,6 +21765,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <label><input type="checkbox" name="algorithm_enabled" value="1" <?= !empty($profile['algorithm_enabled']) ? 'checked' : '' ?>> Use Home recommendations and algorithmic ranking</label>
             <label><input type="checkbox" name="downranking_enabled" value="1" <?= !empty($profile['downranking_enabled']) ? 'checked' : '' ?>> Temporarily downrank posts matching admin-managed harassment vocabulary</label>
             <label><input type="checkbox" name="asks_enabled" value="1" <?= !array_key_exists('asks_enabled', $profile) || !empty($profile['asks_enabled']) ? 'checked' : '' ?>> Allow incoming Wafrn-compatible Asks</label>
+            <label><input type="checkbox" name="webmentions_enabled" value="1" <?= !array_key_exists('webmentions_enabled', $profile) || !empty($profile['webmentions_enabled']) ? 'checked' : '' ?>> Receive Webmentions on public post notifications</label>
             <label><input type="checkbox" name="discoverable" value="1" <?= !empty($profile['discoverable']) ? 'checked' : '' ?>> Show in profile directories / discovery</label>
             <label><input type="checkbox" name="indexable" value="1" <?= !empty($profile['indexable']) ? 'checked' : '' ?>> Allow fediverse search indexing</label>
             <label><input type="checkbox" name="manually_approves" value="1" <?= !empty($profile['manually_approves']) ? 'checked' : '' ?>> Private account (manually approve followers)</label>
