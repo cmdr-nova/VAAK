@@ -814,26 +814,33 @@ function ap_rss_upsert_items(int $feedId, array $items): int
  * Recent RSS keys for Home ranking — even across feeds so many subscriptions
  * cannot crowd out Fediverse/Bluesky. At most one item per feed, then shuffled.
  *
- * @return list<array{uri:string,feed_id:int,published_at:?string}>
+ * @return list<array{uri:string,feed_id:int,published_at:?string,title:string,summary_text:string}>
  */
-function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 16): array
+function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 16, ?int $beforeTs = null): array
 {
     ap_rss_migrate();
     if ($ownerUserId < 1) {
         return [];
     }
     $limit = max(1, min(24, $limit));
+    $beforeTs = $beforeTs !== null ? max(1, $beforeTs) : null;
+    $beforeClause = $beforeTs !== null
+        ? ' AND COALESCE(i.published_at, i.ingested_at) < ?'
+        : '';
     // Pull a wider window, then keep the newest item per feed.
     $st = ap_db()->prepare(
-        "SELECT i.id, i.feed_id, i.published_at, i.url
+        "SELECT i.id, i.feed_id, i.published_at, i.url, i.title, i.summary_text
          FROM rss_items i
          JOIN rss_feeds f ON f.id = i.feed_id
          WHERE f.owner_user_id = ? AND f.enabled = TRUE
            AND (i.published_at IS NULL OR i.published_at >= NOW() - INTERVAL '14 days')
+           $beforeClause
          ORDER BY COALESCE(i.published_at, i.ingested_at) DESC, i.id DESC
          LIMIT 120"
     );
-    $st->execute([$ownerUserId]);
+    $params = [$ownerUserId];
+    if ($beforeTs !== null) $params[] = gmdate('c', $beforeTs);
+    $st->execute($params);
     $byFeed = [];
     $seenUrl = [];
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
@@ -852,6 +859,8 @@ function ap_rss_home_rank_keys(int $ownerUserId, int $limit = 16): array
             'uri' => (string) (int) ($row['id'] ?? 0),
             'feed_id' => $fid,
             'published_at' => isset($row['published_at']) ? (string) $row['published_at'] : null,
+            'title' => (string) ($row['title'] ?? ''),
+            'summary_text' => (string) ($row['summary_text'] ?? ''),
         ];
     }
     $out = array_values($byFeed);

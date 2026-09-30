@@ -6268,7 +6268,7 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v8_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v9_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -7127,13 +7127,19 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
  */
-function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, int $firstPage = 15): array
+function admin_home_queue_rss_after_first_page(
+    array $ranked,
+    int $ownerUserId,
+    int $firstPage = 15,
+    ?int $beforeTs = null,
+    int $candidateLimit = 16
+): array
 {
     if ($ownerUserId < 1 || !function_exists('ap_rss_home_rank_keys')) {
         return $ranked;
     }
     $firstPage = max(0, $firstPage);
-    $keys = ap_rss_home_rank_keys($ownerUserId, 16);
+    $keys = ap_rss_home_rank_keys($ownerUserId, $candidateLimit, $beforeTs);
     if ($keys === []) {
         return $ranked;
     }
@@ -7152,7 +7158,17 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
         if ($uri === '' || $uri === '0' || isset($seenRss[$uri])) {
             continue;
         }
-        $queued[] = ['k' => 'rss', 'id' => $uri];
+        $rssItem = [
+            'kind' => 'rss',
+            'row' => [
+                'title' => (string) ($row['title'] ?? ''),
+                'summary_text' => (string) ($row['summary_text'] ?? ''),
+            ],
+        ];
+        if (admin_timeline_item_muted_by_words($rssItem)) {
+            continue;
+        }
+        $queued[] = ['k' => 'rss', 'id' => $uri, 's' => 'rss'];
         $seenRss[$uri] = true;
     }
     if ($queued === []) {
@@ -7167,14 +7183,17 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
     $qi = 0;
     $rssEmitted = 0;
     $sinceRss = 2;
+    $tailEmitted = 0;
     // Space RSS like a peer network (~15% share, ≥3 non-RSS between inserts)
     // so many subscriptions cannot carpet Home.
-    $flush = static function () use (&$out, &$queued, &$qi, &$rssEmitted, &$sinceRss): void {
+    $flush = static function () use (&$out, &$queued, &$qi, &$rssEmitted, &$sinceRss, &$tailEmitted): void {
         while (isset($queued[$qi])) {
             if ($sinceRss < 3 && $out !== []) {
                 break;
             }
-            if ($out !== [] && ($rssEmitted + 1) / max(1, count($out) + 1) > 0.15) {
+            // Measure the ratio within the window being mixed, not against the
+            // already-rendered head. Otherwise deep pages drift toward 25% RSS.
+            if (($rssEmitted + 1) / max(1, $tailEmitted + $rssEmitted + 1) > 0.15) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -7186,7 +7205,13 @@ function admin_home_queue_rss_after_first_page(array $ranked, int $ownerUserId, 
     $flush();
     foreach ($tail as $item) {
         $out[] = $item;
-        $sinceRss++;
+        if ((string) ($item['k'] ?? '') === 'rss') {
+            $rssEmitted++;
+            $sinceRss = 0;
+        } else {
+            $tailEmitted++;
+            $sinceRss++;
+        }
         $flush();
     }
     return $out;
@@ -8420,6 +8445,23 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         }
         // Leave excess deferred Bluesky for a later extend window (keeps mix
         // chronological with fedi still available in the retention window).
+        if (
+            $homeAlgorithmEnabled
+            && $added !== []
+            && function_exists('admin_home_queue_rss_after_first_page')
+        ) {
+            $headCount = count($ranked);
+            $withRss = admin_home_queue_rss_after_first_page(
+                array_merge($ranked, $added),
+                $ownerId,
+                $headCount,
+                $beforeTs,
+                24
+            );
+            // The helper preserves the existing ranked head byte-for-byte and
+            // mixes cursor-matched RSS only into this newly appended window.
+            $added = array_slice($withRss, $headCount);
+        }
     }
 
     if ($added === []) {
