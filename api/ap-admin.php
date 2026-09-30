@@ -19697,7 +19697,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               while you’re getting started.
             </div>
           </div>
-          <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" data-onboarding="1" hidden></div>
         <?php endif; ?>
         <?php if (!$homeTimeline && empty($adminTlFullPageDefer)): ?>
           <div class="empty">Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</div>
@@ -19709,10 +19708,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   continue;
               }
               admin_render_timeline_item($item, $followingIds, 'home');
-              // Placeholder after a few posts; filled async so Home first paint stays light.
-              // Onboarding already places suggestions above the feed.
-              if (empty($homeOnboard['active']) && $homeIndex === 5) {
-                  echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
+              // Keep suggestions in the flow of Home rather than above the
+              // first post; the onboarding explanation remains at the top.
+              if ($homeIndex === 5) {
+                echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
               }
             ?>
           <?php endforeach; ?>
