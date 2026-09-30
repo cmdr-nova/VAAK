@@ -1118,6 +1118,11 @@ SQL);
     if (!in_array('sensitive', $mentionNames2, true)) {
         $db->exec('ALTER TABLE mentions ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0');
     }
+    foreach (['ask_actor', 'ask_question', 'ask_answer'] as $askCol) {
+        if (!in_array($askCol, $mentionNames2, true)) {
+            $db->exec('ALTER TABLE mentions ADD COLUMN ' . $askCol . " TEXT NOT NULL DEFAULT ''");
+        }
+    }
 
     // DMs: Bridgy Fed sends HTML with <a href> action links — keep them
     $dmCols = $db->query('PRAGMA table_info(direct_messages)')->fetchAll();
@@ -5317,8 +5322,8 @@ function ap_mention_store(array $row): void
     }
     $db = ap_db();
     $stmt = $db->prepare(
-        'INSERT INTO mentions (owner_user_id, owner_actor_id, created_at, activity_id, object_id, actor_id, type, content, in_reply_to, deleted_at, media_urls, activity_type, spoiler_text, sensitive)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        'INSERT INTO mentions (owner_user_id, owner_actor_id, created_at, activity_id, object_id, actor_id, type, content, in_reply_to, deleted_at, media_urls, activity_type, spoiler_text, sensitive, ask_actor, ask_question, ask_answer)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(owner_user_id, object_id) DO UPDATE SET
            owner_actor_id = COALESCE(excluded.owner_actor_id, mentions.owner_actor_id),
            created_at = CASE
@@ -5329,6 +5334,9 @@ function ap_mention_store(array $row): void
            content = excluded.content,
            media_urls = COALESCE(excluded.media_urls, mentions.media_urls),
            activity_type = COALESCE(excluded.activity_type, mentions.activity_type),
+           ask_actor = COALESCE(excluded.ask_actor, mentions.ask_actor),
+           ask_question = COALESCE(excluded.ask_question, mentions.ask_question),
+           ask_answer = COALESCE(excluded.ask_answer, mentions.ask_answer),
            spoiler_text = CASE
              WHEN excluded.spoiler_text != \'\' THEN excluded.spoiler_text
              ELSE mentions.spoiler_text END,
@@ -5357,6 +5365,9 @@ function ap_mention_store(array $row): void
         $activityType,
         $spoilerText,
         $sensitive ? 1 : 0,
+        (string) ($row['ask_actor'] ?? ''),
+        (string) ($row['ask_question'] ?? ''),
+        (string) ($row['ask_answer'] ?? ''),
     ]);
     if (function_exists('ap_search_fts_index_mention_row')) {
         $mid = 0;

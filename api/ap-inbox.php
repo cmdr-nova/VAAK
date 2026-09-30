@@ -4019,6 +4019,7 @@ function ap_local_observe(array $activity): void
     $remoteDoc = null;
     $cw = ap_note_cw_from_doc(is_array($object) ? $object : null);
     $askAnswerTag = null;
+    $askAnswerRepresentation = '';
 
     if (is_array($object)) {
         $objType = is_string($object['type'] ?? null) ? $object['type'] : $type;
@@ -4036,6 +4037,7 @@ function ap_local_observe(array $activity): void
                         'actor' => $tagActor,
                         'question' => trim((string) (($tag['name'] ?? '') ?: ($tag['question'] ?? ''))),
                     ];
+                    $askAnswerRepresentation = (string) ($tag['representation'] ?? '');
                 }
                 break;
             }
@@ -4088,6 +4090,10 @@ function ap_local_observe(array $activity): void
                 (string) $objectId,
                 (int) ($recipient['owner_user_id'] ?? 0)
             );
+        }
+        $askAnswerBody = '';
+        if (is_array($askAnswerTag) && $askAnswerRepresentation !== '' && is_string($content)) {
+            $askAnswerBody = trim(strip_tags(str_replace($askAnswerRepresentation, '', $content)));
         }
         // Detect quote-boost of *our* notes (FEP-044f / Misskey quote fields).
         $storeActivityType = $type;
@@ -4260,6 +4266,9 @@ function ap_local_observe(array $activity): void
                 'media_urls' => $mediaUrls,
                 'spoiler_text' => (string) ($cw['spoiler_text'] ?? ''),
                 'sensitive' => !empty($cw['sensitive']),
+                'ask_actor' => is_array($askAnswerTag) ? (string) ($askAnswerTag['actor'] ?? '') : '',
+                'ask_question' => is_array($askAnswerTag) ? (string) ($askAnswerTag['question'] ?? '') : '',
+                'ask_answer' => $askAnswerBody,
                 'owner_user_id' => (int) ($recipient['owner_user_id'] ?? 0),
                 'owner_actor_id' => (string) ($recipient['owner_actor_id'] ?? ''),
             ]);

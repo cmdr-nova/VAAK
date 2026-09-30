@@ -4070,7 +4070,16 @@ function ap_masto_status_from_mention(array $row): array
     // rather than VAAK's private Ask row. Give Mastodon-compatible clients the
     // same visual Ask block used for local answers without changing storage.
     if (function_exists('ap_wafrn_remote_ask_html')) {
-        $askHtml = ap_wafrn_remote_ask_html((string) ($row['content'] ?? $text));
+        $askSource = (string) ($row['content'] ?? $text);
+        if (trim((string) ($row['ask_question'] ?? '')) !== '') {
+            $askActor = trim((string) ($row['ask_actor'] ?? ''));
+            $askIdentity = $askActor !== '' && function_exists('ap_ask_actor_identity') ? ap_ask_actor_identity($askActor) : [];
+            $askLabel = (string) (($askIdentity['handle'] ?? '') ?: $askActor);
+            $askSource = '<p>' . htmlspecialchars($askLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' asked</p><blockquote>'
+                . htmlspecialchars((string) $row['ask_question'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote>'
+                . htmlspecialchars((string) ($row['ask_answer'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        }
+        $askHtml = ap_wafrn_remote_ask_html($askSource);
         if ($askHtml !== null) {
             $pack['content'] = $askHtml;
         }
