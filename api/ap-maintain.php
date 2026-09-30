@@ -7,12 +7,12 @@
  *                                        # expired oauth rows, tmp caches, stale remote
  *                                        # emoji/actors/link-previews; ANALYZE
  *   php ap-maintain.php --dry-run
- *   php ap-maintain.php --events-days=14
+ *   php ap-maintain.php --events-days=30
  *   php ap-maintain.php --vacuum         # also VACUUM (weekly; locks DB briefly)
  *   php ap-maintain.php --vacuum-only    # VACUUM + ANALYZE only
  *
  * Cron (recommended):
- *   45 4 * * * www-data php /srv/mkultra/html/api/ap-maintain.php --events-days=14 >> /var/log/mkultra/ap-maintain.log 2>&1
+ *   45 4 * * * www-data php /srv/mkultra/html/api/ap-maintain.php --events-days=30 >> /var/log/mkultra/ap-maintain.log 2>&1
  *   15 5 * * 0 www-data php /srv/mkultra/html/api/ap-maintain.php --vacuum-only >> /var/log/mkultra/ap-maintain.log 2>&1
  *
  * Related (separate cron): ap-media-cleanup.php purges unused R2 avatar/header blobs (30d).
@@ -30,7 +30,7 @@ require_once __DIR__ . '/ap-db.php';
 $dryRun = false;
 $vacuum = false;
 $vacuumOnly = false;
-$eventsDays = 14;
+$eventsDays = 30;
 $mentionGoneDays = 30;
 $oauthGoneDays = 7; // revoked / fully-expired OAuth tokens
 $tmpMaxAgeHours = 48;

@@ -1,0 +1,5 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Read-only health/integrity check; warnings and critical failures go to the
+# journal and this log for alert forwarding.
+*/15 * * * * root /usr/bin/flock -n /tmp/vaak-integrity-check.lock /usr/local/sbin/vaak-integrity-check.sh >> /var/log/mkultra/vaak-integrity.log 2>&1

@@ -1,0 +1,5 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Local encrypted-at-rest filesystem backup; copy this directory off-box as a
+# second step once VAAK_BACKUP_DIR is pointed at the operator's backup target.
+15 2 * * * root /usr/bin/flock -n /tmp/vaak-postgres-backup.lock /usr/local/sbin/vaak-postgres-backup.sh >> /var/log/mkultra/vaak-backup.log 2>&1
