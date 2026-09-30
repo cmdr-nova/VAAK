@@ -19267,8 +19267,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'import_export' ? 'active' : '' ?>" href="?view=import_export"><span class="ico">⇄</span><span class="label">Import / Export</span></a>
         </div>
       </details>
-      <hr class="nav-sep">
-      <a class="<?= $view === 'about' ? 'active' : '' ?>" href="?view=about"><span class="ico">ⓘ</span><span class="label">About VAAK</span></a>
       <?php if (!empty($vaakIsAdmin)): ?>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="admin" <?= $navAdminOpen ? 'open' : '' ?>>
@@ -19305,6 +19303,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a href="/"><span class="ico">←</span><span class="label">View site</span></a>
         </div>
       </details>
+      <hr class="nav-sep">
+      <a class="<?= $view === 'about' ? 'active' : '' ?>" href="?view=about"><span class="ico">ⓘ</span><span class="label">About VAAK</span></a>
       <a href="/vaak/?logout=1"><span class="ico">⎋</span><span class="label">Log out</span></a>
       <div class="nav-version" title="Release channel"><?= h(function_exists('vaak_version_label') ? vaak_version_label() : 'VAAK alpha') ?></div>
     </nav>
