@@ -15,3 +15,9 @@
   after confirming the remote host is healthy.
 - `vaak-integrity-check.sh` checks services, backup age, queue growth, and disk
   pressure every 15 minutes and logs warnings/critical failures to journald.
+
+The workstation pulls completed VPS backups to `/mnt/disc3/Backups/VAAK` with
+the user-level `vaak-disc3-backup.timer`. It runs daily at 03:15 (and on the
+next wake/boot when a scheduled run was missed), verifies the PostgreSQL
+checksum manifest, and retains 180 days. This is a local second tier, not a
+replacement for an independent off-box copy.
