@@ -6268,7 +6268,7 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v7_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    return 'v8_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -6669,9 +6669,15 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
  * so a slow Fediverse stream cannot be replaced by a recommendation stream.
  *
  * @param list<array<string,mixed>> $timeline
+ * @param list<int|string> $excludeEventIds already-ranked event ids for deep-page deduplication
  * @return list<array<string,mixed>>
  */
-function admin_home_cached_recommendation_items(array $timeline, int $ownerUserId): array
+function admin_home_cached_recommendation_items(
+    array $timeline,
+    int $ownerUserId,
+    array $excludeEventIds = [],
+    ?int $beforeTs = null
+): array
 {
     if ($ownerUserId < 1 || !function_exists('admin_home_signal_actor_weights')) {
         return $timeline;
@@ -6689,24 +6695,36 @@ function admin_home_cached_recommendation_items(array $timeline, int $ownerUserI
         // scored against those signals as before.
         $coldStart = $actorWeights === [] && $tagWeights === [];
         $seen = [];
+        $excludedEvents = [];
+        foreach ($excludeEventIds as $eventId) {
+            $eventId = (string) (int) $eventId;
+            if ($eventId !== '0') $excludedEvents[$eventId] = true;
+        }
         foreach ($timeline as $item) {
             $row = is_array($item['row'] ?? null) ? $item['row'] : [];
             $id = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
             if ($id !== '') $seen[$id] = true;
         }
         $since = gmdate('c', time() - 7 * 86400);
+        $beforeTs = $beforeTs !== null ? max(1, $beforeTs) : null;
+        $beforeClause = $beforeTs !== null ? ' AND created_at < ?' : '';
         $st = ap_db()->prepare(
             "SELECT * FROM events
              WHERE type = 'Create' AND action_taken IN ('log','local_observe')
                AND created_at >= ? AND visibility IN ('public','unlisted')
+               $beforeClause
              ORDER BY created_at DESC, id DESC LIMIT 240"
         );
-        $st->execute([$since]);
+        $params = [$since];
+        if ($beforeTs !== null) $params[] = gmdate('c', $beforeTs);
+        $st->execute($params);
         $added = 0;
         $maxAdded = $coldStart ? 6 : 8;
         $seenRecommendationActors = [];
         foreach ($st->fetchAll() ?: [] as $row) {
             if (!is_array($row) || $added >= $maxAdded) break;
+            $eventId = (string) (int) ($row['id'] ?? 0);
+            if ($eventId !== '0' && isset($excludedEvents[$eventId])) continue;
             $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
             if ($object === '' || isset($seen[$object])) continue;
             $item = ['kind' => 'event', 'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: 0, 'row' => $row, 'home_source' => 'recommendation'];
@@ -7313,8 +7331,8 @@ function admin_tl_schedule_ranked_warm(string $view, array $following, string $c
 
 /**
  * Lean ranked seed (events firehose / follow set) — enough for soft-nav fill.
- * Full Home ranking (Bluesky merge, favourite boost) still happens on a later
- * full rebuild when the user stays on the timeline.
+ * Home still applies the local recommendation stages here so a cold cache and
+ * every subsequent page have the same ranking semantics as a full rebuild.
  *
  * @param list<array<string,mixed>> $following
  */
@@ -7479,6 +7497,30 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
             }
         }
     }
+    $homeOwnerUserId = 0;
+    $homeAlgorithmEnabled = false;
+    $homeDownrankingEnabled = false;
+    if ($view === 'home') {
+        $homeOwnerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+        $homePartialProfile = function_exists('ap_profile_get')
+            ? ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))
+            : [];
+        $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homePartialProfile)
+            || !empty($homePartialProfile['algorithm_enabled']);
+        $homeDownrankingEnabled = !array_key_exists('downranking_enabled', $homePartialProfile)
+            || !empty($homePartialProfile['downranking_enabled']);
+        if ($homeAlgorithmEnabled && $homeOwnerUserId > 0) {
+            if (function_exists('admin_home_cached_recommendation_items')) {
+                $timeline = admin_home_cached_recommendation_items($timeline, $homeOwnerUserId);
+            }
+            if ($homeDownrankingEnabled && function_exists('admin_home_apply_temporary_toxicity_downrank')) {
+                $timeline = admin_home_apply_temporary_toxicity_downrank($timeline, $homeOwnerUserId);
+            }
+            if (function_exists('admin_home_apply_favourite_rank')) {
+                $timeline = admin_home_apply_favourite_rank($timeline, $homeOwnerUserId);
+            }
+        }
+    }
     if ($timeline === []) {
         // Home can still be Bluesky-only for accounts whose AP follows are muted/empty.
         if ($view !== 'home') {
@@ -7494,16 +7536,11 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
     // Match full Home: mix Bluesky into the ranked set immediately, while RSS
     // remains a smaller later-page contribution.
     if ($view === 'home' && function_exists('admin_home_merge_bsky_ranked')) {
-        $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
-        if ($ownerUserId > 0) {
-            $homePartialProfile = function_exists('ap_profile_get')
-                ? ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))
-                : [];
-            $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homePartialProfile)
-                || !empty($homePartialProfile['algorithm_enabled']);
-            $ranked = admin_home_merge_bsky_ranked($ranked, $ownerUserId);
+        if ($homeOwnerUserId > 0) {
+            $ranked = admin_home_merge_bsky_ranked($ranked, $homeOwnerUserId);
             if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-                $ranked = admin_home_queue_rss_after_first_page($ranked, $ownerUserId, $tlLimit);
+                $pageSize = max(8, min(40, (int) ($_GET['limit'] ?? 15)));
+                $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerUserId, $pageSize);
             }
         }
     }
@@ -8182,6 +8219,14 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             }
         }
     } else {
+        $ownerId = admin_owner_user_id();
+        $homeProfile = function_exists('ap_profile_get')
+            ? ap_profile_get((string) ($GLOBALS['vaak_actor_key'] ?? 'cmdr_nova'))
+            : [];
+        $homeAlgorithmEnabled = !array_key_exists('algorithm_enabled', $homeProfile)
+            || !empty($homeProfile['algorithm_enabled']);
+        $homeDownrankingEnabled = !array_key_exists('downranking_enabled', $homeProfile)
+            || !empty($homeProfile['downranking_enabled']);
         $actorIds = [];
         foreach ($following as $frow) {
             $fa = rtrim((string) ($frow['actor_id'] ?? ''), '/');
@@ -8189,9 +8234,6 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 $actorIds[$fa] = true;
                 $actorIds[$fa . '/'] = true;
             }
-        }
-        if ($actorIds === []) {
-            return null;
         }
         $homeRaw = [];
         foreach (array_chunk(array_keys($actorIds), 400) as $chunk) {
@@ -8228,10 +8270,10 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             }
             return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
         });
-        /** @var list<array{k:string,id:string,sort:int}> $homeCand */
+        /** @var list<array<string,mixed>> $homeCand */
         $homeCand = [];
         foreach ($homeRaw as $e) {
-            if (admin_timeline_row_hidden($e, admin_owner_user_id())) {
+            if (admin_timeline_row_hidden($e, $ownerId)) {
                 continue;
             }
             $e = admin_peertube_prefer_create($e);
@@ -8240,10 +8282,10 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 continue;
             }
             $aid = (string) ($e['actor_id'] ?? '');
-            if ($aid === '' || admin_timeline_row_hidden($e, admin_owner_user_id())) {
+            if ($aid === '' || admin_timeline_row_hidden($e, $ownerId)) {
                 continue;
             }
-            if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], admin_owner_user_id())) {
+            if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], $ownerId)) {
                 continue;
             }
             if (vaak_is_own_url($aid)) {
@@ -8256,10 +8298,20 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                 continue;
             }
             $seenIds[$eid] = true;
+            $sortTs = strtotime((string) ($e['created_at'] ?? '')) ?: 0;
+            $deprioritized = function_exists('ap_is_deprioritized_actor')
+                && ap_is_deprioritized_actor($aid, $ownerId);
+            if ($deprioritized) {
+                $sortTs -= function_exists('ap_deprioritize_penalty_seconds')
+                    ? ap_deprioritize_penalty_seconds()
+                    : (6 * 3600);
+            }
             $homeCand[] = [
-                'k' => 'event',
-                'id' => $eid,
-                'sort' => strtotime((string) ($e['created_at'] ?? '')) ?: 0,
+                'kind' => 'event',
+                'sort' => $sortTs,
+                'row' => $e,
+                'home_source' => 'following',
+                'deprioritized' => $deprioritized,
             ];
             if (count($homeCand) >= $want * 2) {
                 break;
@@ -8271,7 +8323,6 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             && function_exists('ap_bsky_posts_for_home')
             && function_exists('ap_bsky_session_row')
         ) {
-            $ownerId = admin_owner_user_id();
             $sess = $ownerId > 0 ? ap_bsky_session_row($ownerId) : null;
             if (is_array($sess)) {
                 $ownDid = (string) ($sess['did'] ?? '');
@@ -8302,11 +8353,36 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                         continue;
                     }
                     $seenBsky[$bUri] = true;
-                    $homeCand[] = ['k' => 'bsky', 'id' => $bUri, 'sort' => $sortTs];
+                    $homeCand[] = [
+                        'kind' => 'bsky',
+                        'sort' => $sortTs,
+                        'row' => $bItem,
+                        'home_source' => 'bluesky',
+                    ];
                 }
             }
         }
-        usort($homeCand, static fn($a, $b) => ($b['sort'] ?? 0) <=> ($a['sort'] ?? 0));
+        // Apply the same recommendation and preference stages to every older
+        // cursor window. Previously the ranked cache ended here and all later
+        // windows silently reverted to chronological followed posts.
+        if ($homeAlgorithmEnabled && function_exists('admin_home_cached_recommendation_items')) {
+            $homeCand = admin_home_cached_recommendation_items(
+                $homeCand,
+                $ownerId,
+                array_keys($seenIds),
+                $beforeTs
+            );
+        }
+        if ($homeAlgorithmEnabled && $homeDownrankingEnabled && function_exists('admin_home_apply_temporary_toxicity_downrank')) {
+            $homeCand = admin_home_apply_temporary_toxicity_downrank($homeCand, $ownerId);
+        }
+        if ($homeAlgorithmEnabled && function_exists('admin_home_apply_favourite_rank')) {
+            $homeCand = admin_home_apply_favourite_rank($homeCand, $ownerId);
+        }
+        // The scorer can be a no-op when an account has no learned signals;
+        // keep that case deterministic and chronological within this window.
+        usort($homeCand, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
+        $homeCand = admin_tl_rank_from_timeline($homeCand);
         // Soft-space Bluesky in the extend window (~40%, ≥2 fedi between).
         $bskyEmitted = 0;
         $sinceBsky = 2; // allow a Bluesky card first in the extend window
@@ -8332,12 +8408,12 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                         break;
                     }
                     $d = array_shift($deferred);
-                    $added[] = ['k' => (string) $d['k'], 'id' => (string) $d['id']];
+                    $added[] = $d;
                     $bskyEmitted++;
                     $sinceBsky = 0;
                 }
             }
-            $added[] = ['k' => (string) $cand['k'], 'id' => (string) $cand['id']];
+            $added[] = $cand;
             if (count($added) >= $want) {
                 break;
             }
