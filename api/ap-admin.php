@@ -15685,12 +15685,18 @@ if ($isPartial && $view === 'outbox') {
 // Local VAAK profile tabs use the same append-only pagination contract as
 // timelines.  Keep this endpoint deliberately local/SQL-only: it must never
 // turn a profile scroll into a synchronous remote fetch.
-if ($isPartial && $view === 'remote_profile') {
+    if ($isPartial && $view === 'remote_profile') {
     $profileActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
     $profileTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
     $profileOffset = max(0, (int) ($_GET['offset'] ?? 0));
     $profileLimit = max(10, min(50, (int) ($_GET['limit'] ?? 40)));
     if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $profileActor, $pm)) {
+        $profilePrefs = function_exists('ap_profile_get') ? ap_profile_get(strtolower($pm[1])) : [];
+        $hideProfileReplies = !empty($profilePrefs['hide_profile_replies']);
+        $hideProfileBoosts = !empty($profilePrefs['hide_profile_boosts']);
+        if (($profileTab === 'replies' && $hideProfileReplies) || ($profileTab === 'boosts' && $hideProfileBoosts)) {
+            $profileTab = 'posts';
+        }
         $profileRows = ['posts' => [], 'replies' => [], 'boosts' => [], 'media' => []];
         try {
             $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 500');
@@ -24515,6 +24521,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpOutboxPosts = [];
           $rpIsLocal = false;
           $rpLocalKey = null;
+          $rpHideProfileReplies = false;
+          $rpHideProfileBoosts = false;
           $rpError = null;
           $rpIsBsky = false;
           $rpBskyDid = '';
@@ -24552,6 +24560,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $rpLocalKey = strtolower($lm[1]);
               }
               $rpIsLocal = $rpLocalKey !== null;
+              if ($rpIsLocal && function_exists('ap_profile_get')) {
+                  $rpPrefs = ap_profile_get($rpLocalKey);
+                  $rpHideProfileReplies = !empty($rpPrefs['hide_profile_replies']);
+                  $rpHideProfileBoosts = !empty($rpPrefs['hide_profile_boosts']);
+              }
               $rpIsBsky = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($rpActor);
               $rpBskyDid = '';
               $rpBskyHandle = '';
@@ -24881,8 +24894,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               error_log('[ap-admin] remote_profile: ' . $e->getMessage());
               $rpError = $e->getMessage();
           }
-          $rpTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
-          if (!in_array($rpTab, ['posts', 'replies', 'boosts', 'media'], true)) $rpTab = 'posts';
+              $rpTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
+              if (!in_array($rpTab, ['posts', 'replies', 'boosts', 'media'], true)) $rpTab = 'posts';
+              if (($rpTab === 'replies' && $rpHideProfileReplies) || ($rpTab === 'boosts' && $rpHideProfileBoosts)) {
+                  $rpTab = 'posts';
+              }
           $rpTabItems = ['posts' => [], 'replies' => [], 'boosts' => [], 'media' => []];
           if ($rpIsBsky) {
               foreach ($rpBskyPosts as $item) {
@@ -25149,7 +25165,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </div>
           </article>
           <nav class="remote-profile-tabs" aria-label="Profile posts">
-            <?php foreach (['posts' => 'Posts', 'replies' => 'Replies', 'boosts' => 'Boosts', 'media' => 'Media'] as $tabKey => $tabLabel): ?>
+            <?php
+              $rpVisibleTabs = ['posts' => 'Posts', 'replies' => 'Replies', 'boosts' => 'Boosts', 'media' => 'Media'];
+              if ($rpIsLocal && $rpHideProfileReplies) unset($rpVisibleTabs['replies']);
+              if ($rpIsLocal && $rpHideProfileBoosts) unset($rpVisibleTabs['boosts']);
+            ?>
+            <?php foreach ($rpVisibleTabs as $tabKey => $tabLabel): ?>
               <a href="<?= h($rpTabHref . rawurlencode($tabKey)) ?>" class="<?= $rpTab === $tabKey ? 'is-active' : '' ?>" <?= $rpTab === $tabKey ? 'aria-current="page"' : '' ?>><?= h($tabLabel) ?><span class="tab-count"><?= count($rpTabItems[$tabKey]) ?></span></a>
             <?php endforeach; ?>
           </nav>
