@@ -1,0 +1,6 @@
+[Unit]
+Description=Pull completed VAAK backups to local disc3
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/vaak-disc3-backup.sh
