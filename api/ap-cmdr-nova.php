@@ -2504,12 +2504,15 @@ function ap_cmdr_posts_page(int $page, int $perPage = 20, string $tab = 'posts',
             // rather than a reply to a post. Keep it on the Posts tab.
             $isAskAnswer = function_exists('ap_ask_answer_for_note')
                 && is_array(ap_ask_answer_for_note((string) ($row['id'] ?? '')));
+            $isReplyOrMention = function_exists('ap_outbox_note_is_reply_or_mention')
+                ? ap_outbox_note_is_reply_or_mention($row)
+                : ($replyTo !== '' && str_starts_with($replyTo, 'https://'));
             $mediaItems = ap_cmdr_profile_media_items($row);
-            if ($mediaItems !== [] && !($hideProfileReplies && !$isAskAnswer && $replyTo !== '' && str_starts_with($replyTo, 'https://'))) {
+            if ($mediaItems !== [] && !($hideProfileReplies && !$isAskAnswer && $isReplyOrMention)) {
                 $row['_profile_media_items'] = $mediaItems;
                 $media[] = $row;
             }
-            if (!$isAskAnswer && $replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+            if (!$isAskAnswer && $isReplyOrMention) {
                 $replies[] = $row;
             } else {
                 $posts[] = $row;
