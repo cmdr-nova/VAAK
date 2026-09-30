@@ -741,16 +741,11 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $profileTotal = function_exists('ap_outbox_count_for_actor')
         ? ap_outbox_count_for_actor($actorKey)
         : 0;
-    if ($hideProfileReplies && $profileTotal > 0) {
-        try {
-            $replyCountStmt = ap_db()->prepare(
-                "SELECT COUNT(*) FROM outbox_notes WHERE actor_key = ? AND in_reply_to IS NOT NULL AND TRIM(in_reply_to) <> ''"
-            );
-            $replyCountStmt->execute([$actorKey]);
-            $profileTotal = max(0, $profileTotal - (int) $replyCountStmt->fetchColumn());
-        } catch (Throwable $e) {
-            // Keep the existing count if an older schema lacks in_reply_to.
-        }
+    // Replies and direct mentions belong exclusively in the Replies tab. The
+    // latter do not necessarily carry in_reply_to, so use the same durable
+    // ActivityPub tag-aware classifier used by the replies query.
+    if ($profileTotal > 0 && function_exists('ap_outbox_replies_count')) {
+        $profileTotal = max(0, $profileTotal - ap_outbox_replies_count($actorKey));
     }
     $notes = $tab === 'media' && function_exists('ap_outbox_media_list_page')
         ? ap_outbox_media_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage)
@@ -767,7 +762,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
         if (function_exists('ap_visibility_on_html_profile') && !ap_visibility_on_html_profile($vis)) {
             continue;
         }
-        if ($hideProfileReplies && trim((string) ($n['in_reply_to'] ?? '')) !== '') {
+        if (function_exists('ap_outbox_note_is_reply_or_mention') && ap_outbox_note_is_reply_or_mention($n)) {
             continue;
         }
         $publicNotes[] = $n;
@@ -903,7 +898,9 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             ? ap_outbox_replies_list_page($actorKey, $profilePerPage, ($profilePage - 1) * $profilePerPage)
             : array_values(array_filter(
                 ap_outbox_list($profilePerPage, $actorKey),
-                static fn(array $replyNote): bool => trim((string) ($replyNote['in_reply_to'] ?? '')) !== ''
+                static fn(array $replyNote): bool => function_exists('ap_outbox_note_is_reply_or_mention')
+                    ? ap_outbox_note_is_reply_or_mention($replyNote)
+                    : trim((string) ($replyNote['in_reply_to'] ?? '')) !== ''
             ));
     }
     $profileBskyReplies = array_values(array_filter($profileBskyPosts, static function (array $item): bool {
@@ -1266,6 +1263,7 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
         ? ap_html_sanitize_allowlist($content, '<p><br><a><strong><em><code><ul><ol><li>')
         : htmlspecialchars(strip_tags($content), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $content = function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline($content) : $content;
+    $content = ap_user_profile_linkify_local_mentions($content);
     $published = (string) ($note['published'] ?? $row['published'] ?? '');
     $dateLabel = $published;
     try {
@@ -1337,6 +1335,38 @@ function ap_user_post_preview_html(string $actorKey, array $row): string
     $html .= ap_webmention_cards_html((string) ($row['id'] ?? ''));
     $html .= '</article>';
     return $html;
+}
+
+/** Link bare local @handles in HTML profile bodies without touching existing anchors. */
+function ap_user_profile_linkify_local_mentions(string $html): string
+{
+    $parts = preg_split('/(<[^>]+>)/', $html, -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$html];
+    $inAnchor = false;
+    foreach ($parts as $i => $part) {
+        if ($part === '') {
+            continue;
+        }
+        if ($part[0] === '<') {
+            if (preg_match('/^<a\b/i', $part)) {
+                $inAnchor = true;
+            } elseif (preg_match('/^<\/a\s*>/i', $part)) {
+                $inAnchor = false;
+            }
+            continue;
+        }
+        if ($inAnchor) {
+            continue;
+        }
+        $parts[$i] = preg_replace_callback(
+            '/(?<![\w@])@([A-Za-z0-9_][A-Za-z0-9_.-]{0,63})(?!@)/u',
+            static function (array $m): string {
+                $handle = $m[1];
+                return '<a href="/users/' . rawurlencode(strtolower($handle)) . '">@' . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a>';
+            },
+            $part
+        ) ?? $part;
+    }
+    return implode('', $parts);
 }
 
 /** Render one cached Bluesky post on a local HTML profile. */
@@ -1619,6 +1649,7 @@ function ap_user_note_html(string $actorKey, array $row, array $create): void
         ? ap_html_sanitize_allowlist((string) ($note['content'] ?? $row['content'] ?? ''), '<p><br><a><strong><em><code><ul><ol><li>')
         : htmlspecialchars(strip_tags((string) ($note['content'] ?? $row['content'] ?? '')), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $content = function_exists('ap_profile_markdown_inline') ? ap_profile_markdown_inline($content) : $content;
+    $content = ap_user_profile_linkify_local_mentions($content);
     $p = ap_profile_get($actorKey);
     $name = htmlspecialchars((string) $p['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $safe = htmlspecialchars($actorKey, ENT_QUOTES, 'UTF-8');

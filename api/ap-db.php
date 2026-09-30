@@ -6321,6 +6321,30 @@ function ap_outbox_list_page(int $limit = 40, int $offset = 0, ?string $actorKey
 }
 
 /** @return list<array<string,mixed>> */
+function ap_outbox_note_is_reply_or_mention(array $row): bool
+{
+    if (trim((string) ($row['in_reply_to'] ?? '')) !== '') {
+        return true;
+    }
+    $raw = json_decode((string) ($row['raw_create_json'] ?? ''), true);
+    $object = is_array($raw) && is_array($raw['object'] ?? null) ? $raw['object'] : [];
+    $tags = is_array($object['tag'] ?? null) ? $object['tag'] : [];
+    foreach ($tags as $tag) {
+        if (!is_array($tag)) {
+            continue;
+        }
+        $type = strtolower((string) ($tag['type'] ?? $tag['$type'] ?? ''));
+        if ($type === 'mention' || str_ends_with($type, '#mention')) {
+            return true;
+        }
+    }
+    // Older rows may have lost the ActivityPub tag array but retain the
+    // mention anchor in their HTML body.
+    $content = (string) ($object['content'] ?? $row['content'] ?? '');
+    return (bool) preg_match('/<a\b[^>]*\bclass=["\'][^"\']*\bmention\b[^"\']*["\'][^>]*>/i', $content);
+}
+
+/** @return list<array<string,mixed>> */
 function ap_outbox_replies_list_page(string $actorKey, int $limit = 40, int $offset = 0): array
 {
     $actorKey = strtolower(trim($actorKey));
@@ -6331,13 +6355,10 @@ function ap_outbox_replies_list_page(string $actorKey, int $limit = 40, int $off
     }
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
-        $st = ap_db()->prepare(
-            'SELECT * FROM outbox_notes
-             WHERE id LIKE ? AND in_reply_to IS NOT NULL AND TRIM(in_reply_to) <> \'\'
-             ORDER BY published DESC LIMIT ? OFFSET ?'
-        );
-        $st->execute([$prefix . '%', $limit, $offset]);
-        return $st->fetchAll() ?: [];
+        $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 5000');
+        $st->execute([$prefix . '%']);
+        $rows = array_values(array_filter($st->fetchAll() ?: [], 'ap_outbox_note_is_reply_or_mention'));
+        return array_slice($rows, $offset, $limit);
     } catch (Throwable $e) {
         return [];
     }
@@ -6358,12 +6379,9 @@ function ap_outbox_replies_count(string $actorKey): int
     }
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
-        $st = ap_db()->prepare(
-            'SELECT COUNT(*) FROM outbox_notes
-             WHERE id LIKE ? AND in_reply_to IS NOT NULL AND TRIM(in_reply_to) <> \'\''
-        );
+        $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 5000');
         $st->execute([$prefix . '%']);
-        $count = max(0, (int) $st->fetchColumn());
+        $count = count(array_filter($st->fetchAll() ?: [], 'ap_outbox_note_is_reply_or_mention'));
         if (function_exists('ap_redis_json_set')) {
             ap_redis_json_set($key, ['count' => $count], 60);
         }
