@@ -5401,6 +5401,12 @@ function ap_mention_store(array $row): void
         (string) ($row['ask_question'] ?? ''),
         (string) ($row['ask_answer'] ?? ''),
     ]);
+    // A fresh mention must be visible to the web notification list immediately;
+    // otherwise the unread badge can advance while the cached first page still
+    // serves the previous projection (Ice Cubes bypasses that projection).
+    if (function_exists('ap_notification_projection_invalidate_owner')) {
+        ap_notification_projection_invalidate_owner($ownerUserId);
+    }
     if (function_exists('ap_search_fts_index_mention_row')) {
         $mid = 0;
         try {
