@@ -13730,7 +13730,43 @@ function admin_render_masto_status_card(
     $cwSpoiler = trim((string) ($st['spoiler_text'] ?? ''));
     $cwSensitive = !empty($st['sensitive']) || $cwSpoiler !== '';
 
+    // Local Ask answers: question lives in ap_asks, not in content_text.
+    // Always paint the canonical Ask card above the answer body (focus, Home, etc.).
+    $askCardHtml = '';
+    $askRow = null;
+    if (!empty($st['vaak_ask']) && is_array($st['vaak_ask'])) {
+        $askRow = $st['vaak_ask'];
+    } elseif ($uri !== '' && function_exists('ap_ask_answer_for_note')) {
+        $askRow = ap_ask_answer_for_note($uri);
+    }
+    if (is_array($askRow) && function_exists('ap_ask_card_html_from_row')) {
+        $askCardHtml = ap_ask_card_html_from_row($askRow, false);
+    } elseif (is_array($askRow) && function_exists('ap_ask_card_html')) {
+        $askCardHtml = ap_ask_card_html([
+            'question' => (string) ($askRow['question'] ?? ''),
+            'asker_actor' => (string) ($askRow['asker_actor'] ?? ''),
+        ]);
+    }
+    // If API content already prepended an ask-container, drop it from plain body
+    // so we do not duplicate the question under the card.
+    if ($askCardHtml !== '' && str_contains((string) ($st['content'] ?? ''), 'ask-container')) {
+        $stripped = preg_replace(
+            '~<div class="ask-container\b[^>]*>[\s\S]*?<div class="ask-body\b[^>]*>[\s\S]*?</div>\s*</div>~u',
+            '',
+            (string) $st['content']
+        );
+        if (is_string($stripped) && $stripped !== (string) $st['content']) {
+            $plainFromAsk = admin_html_to_plain($stripped);
+            if ($plainFromAsk !== '') {
+                $plain = $plainFromAsk;
+            }
+        }
+    }
+
     $bodyInner = '';
+    if ($askCardHtml !== '') {
+        $bodyInner .= $askCardHtml;
+    }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
     // If the status already carries a structured quote, never also show raw ↪ QT
     // lines in the commentary body.
@@ -24807,11 +24843,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
           $stEvent = null;
           $stLocalStatus = null;
-          // Wafrn Ask answers are preserved in the mentions projection with
-          // separate question/answer fields.  The standalone status route
-          // historically resolved the same URL to the flattened firehose
-          // event, which made the question and answer indistinguishable.
-          // Keep an Ask-aware projection available for this renderer.
+          // Ask answers: prefer local ap_asks via ap_normalize_status / vaak_ask
+          // on the local masto row. Mentions still carry Wafrn remote Ask fields.
           $stAskStatus = null;
           $stBskyItem = null;
           $isSyntheticBite = str_contains($stObject, '/bites-received/');
