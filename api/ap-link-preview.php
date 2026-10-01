@@ -662,14 +662,25 @@ function ap_link_preview_html(?array $card, bool $interactive = true): string
         $thumb = $image !== ''
             ? $image
             : htmlspecialchars('https://i.ytimg.com/vi/' . rawurlencode($youtubeId) . '/hqdefault.jpg', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $play = '<button type="button" data-youtube-play aria-label="Play YouTube video"'
-            . ' style="position:relative;display:block;flex:0 0 180px;width:180px;min-height:102px;padding:0;border:0;background:#080808;cursor:pointer;overflow:hidden">'
-            . '<img src="' . $thumb . '" alt="" loading="lazy" referrerpolicy="no-referrer"'
+        $thumbInner = '<img src="' . $thumb . '" alt="" loading="lazy" referrerpolicy="no-referrer"'
             . ' style="display:block;width:100%;height:100%;min-height:102px;object-fit:cover">'
-            . '<span aria-hidden="true" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:grid;place-items:center;width:2.6rem;height:2.6rem;border-radius:50%;background:rgba(0,0,0,.78);color:#fff;font-size:1.2rem">▶</span>'
-            . '</button>';
-        $open = '<a href="' . $url . '" target="_blank" rel="nofollow noopener noreferrer"'
-            . ' style="display:inline-block;margin-top:.4rem;color:inherit;font-size:.76rem">Open on YouTube</a>';
+            . '<span aria-hidden="true" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:grid;place-items:center;width:2.6rem;height:2.6rem;border-radius:50%;background:rgba(0,0,0,.78);color:#fff;font-size:1.2rem">▶</span>';
+        $thumbStyle = 'position:relative;display:block;flex:0 0 180px;width:180px;min-height:102px;padding:0;border:0;background:#080808;overflow:hidden';
+        if ($interactive) {
+            $play = '<button type="button" data-youtube-play aria-label="Play YouTube video" style="' . $thumbStyle . ';cursor:pointer">'
+                . $thumbInner
+                . '</button>';
+            $open = '<a href="' . $url . '" target="_blank" rel="nofollow noopener noreferrer"'
+                . ' style="display:inline-block;margin-top:.4rem;color:inherit;font-size:.76rem">Open on YouTube</a>';
+        } else {
+            // Profile outbox list wraps each post in <a class="post">. Nested
+            // <button>/<a> make browsers close that outer link early, so the
+            // card detaches and bleeds into the next post. Keep this static.
+            $play = '<span class="youtube-link-card__thumb" aria-hidden="true" style="' . $thumbStyle . '">'
+                . $thumbInner
+                . '</span>';
+            $open = '<span style="display:inline-block;margin-top:.4rem;color:inherit;font-size:.76rem">YouTube</span>';
+        }
         $inner = $play
             . '<div class="link-card__body">'
             . $provHtml
