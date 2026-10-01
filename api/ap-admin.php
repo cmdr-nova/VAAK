@@ -1190,10 +1190,12 @@ $vaakAdminOnlyActions = [
                         header('Content-Type: application/json; charset=utf-8');
                         header('Cache-Control: no-store');
                         http_response_code(202);
+                        // Optimistic UI already flipped the boost button; leave notice
+                        // empty so the client does not flash a "queued" toast.
                         echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
                             'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
                             'kind' => 'reblog', 'active' => $action === 'reblog_status', 'status_id' => $statusId,
-                            'notice' => $action === 'reblog_status' ? 'Boosted!' : 'Boost removed.'], JSON_UNESCAPED_SLASHES);
+                            'notice' => ''], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     $error = $queue['error'] ?? 'Could not queue boost.';
@@ -1244,6 +1246,31 @@ $vaakAdminOnlyActions = [
                     ]);
                     }
                     if (!empty($queue['ok'])) {
+                        // Apply local favourites/bookmarks immediately so the UI and
+                        // Favourites list stay correct while federation drains in the
+                        // background. Remote delivery remains the durable queue's job.
+                        if ($kind === 'favourite') {
+                            if ($desired) {
+                                ap_masto_favourite_add(
+                                    $statusId,
+                                    $targetKey !== '' ? $targetKey : $statusId,
+                                    $targetActor !== '' ? $targetActor : null,
+                                    null,
+                                    $vaakOwnerId
+                                );
+                            } else {
+                                ap_masto_favourite_remove($statusId, $vaakOwnerId, $targetKey !== '' ? $targetKey : null);
+                            }
+                        } elseif ($kind === 'bookmark') {
+                            if ($desired) {
+                                ap_masto_bookmark_add($statusId, $targetKey !== '' ? $targetKey : $statusId, $vaakOwnerId);
+                            } else {
+                                ap_masto_bookmark_remove($statusId, $vaakOwnerId, $targetKey !== '' ? $targetKey : null);
+                                if (function_exists('vaak_bookmark_folders_on_unbookmark')) {
+                                    vaak_bookmark_folders_on_unbookmark($statusId, $vaakOwnerId);
+                                }
+                            }
+                        }
                         $folderIds = [];
                         if ($kind === 'bookmark' && $desired && function_exists('vaak_bookmark_folders_for_status')) {
                             $folderIds = vaak_bookmark_folders_for_status($statusId, $vaakOwnerId);
@@ -1251,12 +1278,20 @@ $vaakAdminOnlyActions = [
                         header('Content-Type: application/json; charset=utf-8');
                         header('Cache-Control: no-store');
                         http_response_code(202);
-                        echo json_encode(['ok' => true, 'queued' => true, 'queue_id' => $queue['id'],
-                            'revision' => $queue['revision'], 'coalesced' => $queue['coalesced'] ?? false,
-                            'kind' => $kind, 'active' => $desired, 'status_id' => $statusId,
-                            'object_id' => $targetKey, 'folder_ids' => $folderIds,
+                        echo json_encode([
+                            'ok' => true,
+                            'queued' => true,
+                            'queue_id' => $queue['id'],
+                            'revision' => $queue['revision'],
+                            'coalesced' => $queue['coalesced'] ?? false,
+                            'kind' => $kind,
+                            'active' => $desired,
+                            'status_id' => $statusId,
+                            'object_id' => $targetKey,
+                            'folder_ids' => $folderIds,
                             'open_folder_picker' => $kind === 'bookmark' && $desired,
-                            'notice' => 'Action queued.'], JSON_UNESCAPED_SLASHES);
+                            'notice' => '',
+                        ], JSON_UNESCAPED_SLASHES);
                         exit;
                     }
                     header('Content-Type: application/json; charset=utf-8');
@@ -27550,6 +27585,8 @@ window.apAdminToast = function (msg, isErr) {
       || action === 'bookmark_status' || action === 'reblog_status';
     applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive });
     if (window.vaakHaptic) window.vaakHaptic(5);
+    // Clear any capture-phase Saving… pill immediately — this is background work.
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     form.dataset.busy = '1';
     // Keep the visual state immediate, but prevent duplicate requests in flight.
     if (btn) btn.disabled = false;
@@ -27602,10 +27639,11 @@ window.apAdminToast = function (msg, isErr) {
           String(data.object_id || ''),
           data.folder_ids || []
         );
-      } else if (data.kind === 'reblog' || (data.kind === 'bookmark' && !data.active)) {
-        window.apAdminToast(data.notice || (data.active ? 'Saved.' : 'Removed.'));
+      } else if (data.kind === 'bookmark' && !data.active && data.notice) {
+        // Unbookmark can stay silent; only toast when the server sends a notice.
+        // Likes/boosts: optimistic icon only — no "Saving…" / "queued" toasts.
       }
-      // favourite: icon fill only — no toast, no scroll jump
+      // favourite / reblog: icon fill only — no toast, no scroll jump
     } catch (err) {
       restoreInteractButton(before);
       window.apAdminToast('Network error — try again.', true);
@@ -28013,13 +28051,13 @@ window.apAdminToast = function (msg, isErr) {
       btn.setAttribute('aria-label', optimisticOn ? 'Undo boost' : 'Boost');
     } else if (action === 'bookmark') applyBskyBookmarkUi(btn, optimisticOn);
     if (window.vaakHaptic) window.vaakHaptic(5);
+    // Background queue — never flash the page-level Saving… / Loading… pill.
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     btn.dataset.busy = '1';
     btn.disabled = false;
     try {
       const data = await postBskyAction(btn, postAction, before);
-      if (action === 'repost' && data.queued && typeof window.apAdminToast === 'function') {
-        window.apAdminToast('Boost queued.');
-      }
+      // Optimistic icon is enough; only toast on failure (watchBskyQueue).
       if (action === 'like') {
         const on = !!data.liked;
         setBskyIcon(btn, 'heart', on, { on: 'Unlike', off: 'Like on Bluesky' });
@@ -32797,35 +32835,38 @@ if (VIEW === 'analytics') loadAnalytics();
     const button = form.querySelector('button[type="submit"]');
     if (!actionInput || !button || !['follow_remote', 'unfollow_remote'].includes(actionInput.value)) return;
     ev.preventDefault();
+    // Background queue — never leave the page-level Saving… pill up.
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     if (form.dataset.queueBusy === '1' || form.dataset.queuePending === '1') {
       if (window.apQueueRepeatedClick) window.apQueueRepeatedClick(form);
       return;
     }
     const before = { action: actionInput.value, label: button.innerHTML, title: button.title };
-      const want = actionInput.value === 'follow_remote';
-      form.dataset.queueBusy = '1'; button.disabled = false; button.textContent = want ? 'Following…' : 'Unfollowing…';
-      const relState = document.getElementById('remote-profile-rel-state');
-      const relBefore = relState ? { html: relState.innerHTML, following: relState.dataset.following } : null;
-      if (relState) {
-        const followedBy = relState.dataset.followedBy === '1';
-        relState.dataset.following = want ? '1' : '0';
-        relState.innerHTML = want
-          ? '<span class="tag" title="You follow them">' + (followedBy ? 'mutual' : 'following') + '</span>'
-          : (followedBy ? '<span class="tag" title="They follow you">follows you</span>' : '');
-      }
+    const want = actionInput.value === 'follow_remote';
+    form.dataset.queueBusy = '1';
+    button.disabled = false;
+    // Flip the button immediately (same idea as optimistic likes).
+    actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
+    button.innerHTML = want ? 'Unfollow' : 'Follow';
+    button.title = want ? 'Following' : 'Follow';
+    const relState = document.getElementById('remote-profile-rel-state');
+    const relBefore = relState ? { html: relState.innerHTML, following: relState.dataset.following } : null;
+    if (relState) {
+      const followedBy = relState.dataset.followedBy === '1';
+      relState.dataset.following = want ? '1' : '0';
+      relState.innerHTML = want
+        ? '<span class="tag" title="You follow them">' + (followedBy ? 'mutual' : 'following') + '</span>'
+        : (followedBy ? '<span class="tag" title="They follow you">follows you</span>' : '');
+    }
     const fd = new FormData(form); fd.set('ajax', '1');
+    // Queue still needs the original desired action.
+    fd.set('action', before.action);
     if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
     try {
       const res = await fetch(form.getAttribute('action') || window.location.href, { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
       const data = await res.json().catch(() => null);
       if (!data || !data.ok || !data.queued) throw new Error((data && data.error) || 'Could not queue follow action.');
-      // This was an AJAX durable-queue action; there is no full-page
-      // navigation to trigger pageshow, so dismiss the global Saving pill as
-      // soon as the queue has accepted the desired state.
-      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       form.dataset.queuePending = '1'; form.dataset.queueId = String(data.queue_id); form.dataset.queueRevision = String(data.revision || '');
-      actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
-      button.innerHTML = want ? 'Unfollow' : 'Follow'; button.title = want ? 'Following (action queued)' : 'Unfollowed (action queued)';
       (async () => {
         for (let n = 0; n < 90; n++) {
           await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -32850,7 +32891,11 @@ if (VIEW === 'analytics') loadAnalytics();
       actionInput.value = before.action; button.innerHTML = before.label; button.title = before.title;
       if (relState && relBefore) { relState.innerHTML = relBefore.html; relState.dataset.following = relBefore.following; }
       window.apAdminToast((e && e.message) || 'Follow action failed.', true);
-    } finally { form.dataset.queueBusy = '0'; button.disabled = false; }
+    } finally {
+      form.dataset.queueBusy = '0';
+      button.disabled = false;
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    }
   });
 })();
 </script>
@@ -33110,8 +33155,24 @@ if (VIEW === 'analytics') loadAnalytics();
   document.addEventListener('submit', function (ev) {
     if (ev.defaultPrevented) return;
     const form = ev.target;
-    if (form && form.id === 'compose-form') return;
-    if (form && form.getAttribute('data-ajax-submit') === '1') return;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (form.id === 'compose-form') return;
+    if (form.getAttribute('data-ajax-submit') === '1') return;
+    // Timeline interactions (like/boost/bookmark/follow) are optimistic AJAX +
+    // background queue work. Never show the page-level Saving… pill for them —
+    // that made users feel stuck waiting on the card.
+    const actionEl = form.querySelector('input[name="action"]');
+    const action = actionEl ? String(actionEl.value || '') : '';
+    if ([
+      'favourite_status', 'unfavourite_status',
+      'bookmark_status', 'unbookmark_status',
+      'reblog_status', 'unreblog_status',
+      'follow_remote', 'unfollow_remote',
+      'rss_favourite', 'rss_bookmark',
+      'poll_vote', 'action_queue_status',
+    ].includes(action)) {
+      return;
+    }
     window.vaakShowLoading('Saving…');
   }, true);
   window.addEventListener('pageshow', function () {
