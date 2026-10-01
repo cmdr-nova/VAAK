@@ -2716,9 +2716,16 @@ function ap_bsky_post_link_by_fedi(string $fediverseId): ?array
     }
     ap_bsky_post_links_migrate();
     try {
+        // Prefer the thread root when several long-post segments share one note id.
         $st = ap_db()->prepare(
-            'SELECT * FROM bsky_post_links
-             WHERE fediverse_id = ? OR fediverse_id = ? OR ap_object_id = ? OR ap_object_id = ?
+            'SELECT l.*
+             FROM bsky_post_links l
+             LEFT JOIN bsky_posts p ON p.bsky_uri = l.bsky_uri
+             WHERE l.fediverse_id = ? OR l.fediverse_id = ? OR l.ap_object_id = ? OR l.ap_object_id = ?
+             ORDER BY CASE
+               WHEN p.reply_root IS NULL OR p.reply_root = \'\' OR p.reply_root = p.bsky_uri THEN 0
+               ELSE 1
+             END ASC, l.seen_at ASC NULLS LAST
              LIMIT 1'
         );
         $st->execute([$fediverseId, $fediverseId . '/', $fediverseId, $fediverseId . '/']);
