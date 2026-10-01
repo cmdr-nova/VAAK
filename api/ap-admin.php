@@ -6367,7 +6367,8 @@ function admin_tl_cache_key(string $view, array $following): string
     }
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
-    return 'v10_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    // v11: cold-start FoF + diverse local/public mix.
+    return 'v11_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -6786,6 +6787,104 @@ function admin_home_apply_favourite_rank(array $timeline, int $ownerUserId): arr
  * @param list<int|string> $excludeEventIds already-ranked event ids for deep-page deduplication
  * @return list<array<string,mixed>>
  */
+/**
+ * Friends-of-follows from cached Announces: actors that people you follow have
+ * boosted recently. Redis-cached; DB/Redis only — never fetches remote graphs.
+ *
+ * @return array<string,float> actor_id => boost count (capped)
+ */
+function admin_home_foaf_actor_weights(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    $redisKey = 'vaak:recommend:v1:foaf:' . $ownerUserId;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($redisKey);
+        if (is_array($cached)) {
+            return $cached;
+        }
+    }
+    try {
+        $ownerActor = rtrim((string) ($GLOBALS['vaak_actor_id'] ?? ''), '/');
+        if ($ownerActor === '' || !str_starts_with($ownerActor, 'https://')) {
+            $stOwner = ap_db()->prepare('SELECT actor_id FROM ap_users WHERE id = ? LIMIT 1');
+            $stOwner->execute([$ownerUserId]);
+            $ownerActor = rtrim((string) ($stOwner->fetchColumn() ?: ''), '/');
+        }
+        if ($ownerActor === '' || !str_starts_with($ownerActor, 'https://')) {
+            return [];
+        }
+        $follows = [];
+        $stF = ap_db()->prepare(
+            'SELECT actor_id FROM following WHERE owner_actor_id = ? OR owner_actor_id = ?'
+        );
+        $stF->execute([$ownerActor, $ownerActor . '/']);
+        foreach ($stF->fetchAll(PDO::FETCH_COLUMN) ?: [] as $aid) {
+            $aid = rtrim(trim((string) $aid), '/');
+            if ($aid === '' || !str_starts_with($aid, 'https://') || str_contains($aid, 'bsky.app/')) {
+                continue;
+            }
+            $follows[$aid] = true;
+        }
+        if ($follows === []) {
+            if (function_exists('ap_redis_json_set')) {
+                ap_redis_json_set($redisKey, [], 300);
+            }
+            return [];
+        }
+        $since = gmdate('c', time() - 7 * 86400);
+        $counts = [];
+        foreach (array_chunk(array_keys($follows), 60) as $chunk) {
+            $ph = implode(',', array_fill(0, count($chunk), '?'));
+            $st = ap_db()->prepare(
+                "SELECT target_actor, COUNT(*) AS c
+                 FROM events
+                 WHERE type = 'Announce'
+                   AND action_taken IN ('log', 'local_observe')
+                   AND created_at >= ?
+                   AND actor_id IN ($ph)
+                   AND target_actor IS NOT NULL AND target_actor <> ''
+                 GROUP BY target_actor"
+            );
+            $st->execute(array_merge([$since], $chunk));
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $actor = rtrim(trim((string) ($row['target_actor'] ?? '')), '/');
+                $c = (int) ($row['c'] ?? 0);
+                if ($actor === '' || $c < 1 || !str_starts_with($actor, 'https://')) {
+                    continue;
+                }
+                if (isset($follows[$actor]) || $actor === $ownerActor) {
+                    continue;
+                }
+                if (str_contains($actor, 'bsky.app/') || str_contains($actor, 'relay.fedi.buzz/')) {
+                    continue;
+                }
+                $host = function_exists('ap_actor_host') ? (string) (ap_actor_host($actor) ?? '') : '';
+                if (function_exists('ap_row_is_hidden')
+                    && ap_row_is_hidden($actor, $host !== '' ? $host : null, $ownerUserId)) {
+                    continue;
+                }
+                $counts[$actor] = (float) ($counts[$actor] ?? 0) + $c;
+            }
+        }
+        arsort($counts, SORT_NUMERIC);
+        $weights = [];
+        foreach ($counts as $actor => $c) {
+            $weights[$actor] = min(64.0, (float) $c);
+            if (count($weights) >= 40) {
+                break;
+            }
+        }
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($redisKey, $weights, 300);
+        }
+        return $weights;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
 function admin_home_cached_recommendation_items(
     array $timeline,
     int $ownerUserId,
@@ -6804,60 +6903,189 @@ function admin_home_cached_recommendation_items(
         $tagWeights = function_exists('admin_home_favourite_tag_weights')
             ? admin_home_favourite_tag_weights($ownerUserId)
             : [];
-        // Cold-start accounts still get a small, diverse discovery pool from
-        // posts already cached locally. Once signals exist, the same pool is
-        // scored against those signals as before.
+        // Cold-start: no fav/tag/signal history yet. Prefer friends-of-follows
+        // from cached boosts, then a small diverse local/public fill.
         $coldStart = $actorWeights === [] && $tagWeights === [];
         $seen = [];
         $excludedEvents = [];
         foreach ($excludeEventIds as $eventId) {
             $eventId = (string) (int) $eventId;
-            if ($eventId !== '0') $excludedEvents[$eventId] = true;
+            if ($eventId !== '0') {
+                $excludedEvents[$eventId] = true;
+            }
         }
         foreach ($timeline as $item) {
             $row = is_array($item['row'] ?? null) ? $item['row'] : [];
             $id = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
-            if ($id !== '') $seen[$id] = true;
+            if ($id !== '') {
+                $seen[$id] = true;
+            }
         }
         $since = gmdate('c', time() - 7 * 86400);
         $beforeTs = $beforeTs !== null ? max(1, $beforeTs) : null;
         $beforeClause = $beforeTs !== null ? ' AND created_at < ?' : '';
-        $st = ap_db()->prepare(
-            "SELECT * FROM events
-             WHERE type = 'Create' AND action_taken IN ('log','local_observe')
-               AND created_at >= ? AND visibility IN ('public','unlisted')
-               $beforeClause
-             ORDER BY created_at DESC, id DESC LIMIT 240"
-        );
-        $params = [$since];
-        if ($beforeTs !== null) $params[] = gmdate('c', $beforeTs);
-        $st->execute($params);
+        $leanCols = 'id, type, actor_id, object_id, summary, media_urls, created_at,
+                     action_taken, spoiler_text, sensitive, visibility, host, in_reply_to';
         $added = 0;
-        $maxAdded = $coldStart ? 6 : 8;
+        $maxAdded = $coldStart ? 7 : 8;
         $seenRecommendationActors = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
-            if (!is_array($row) || $added >= $maxAdded) break;
-            $eventId = (string) (int) ($row['id'] ?? 0);
-            if ($eventId !== '0' && isset($excludedEvents[$eventId])) continue;
-            $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
-            if ($object === '' || isset($seen[$object])) continue;
-            $item = ['kind' => 'event', 'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: 0, 'row' => $row, 'home_source' => 'recommendation'];
-            if (admin_timeline_row_hidden($row, $ownerUserId) || admin_timeline_item_muted_by_words($item)) continue;
-            $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($coldStart && $actor !== '' && isset($seenRecommendationActors[$actor])) continue;
-            $score = (float) ($actorWeights[$actor] ?? 0);
-            foreach (admin_home_extract_hashtags((string) ($row['summary'] ?? $row['content'] ?? '')) as $tag) {
-                $score += (float) ($tagWeights[$tag] ?? 0) * 0.5;
+        $seenHosts = [];
+
+        $tryAdd = static function (array $row, float $score) use (
+            &$timeline,
+            &$seen,
+            &$seenRecommendationActors,
+            &$seenHosts,
+            &$added,
+            $maxAdded,
+            $excludedEvents,
+            $ownerUserId,
+            $coldStart
+        ): bool {
+            if ($added >= $maxAdded || !is_array($row)) {
+                return false;
             }
-            if (!$coldStart && $score < 1.5) continue;
-            // A bounded recency boost lets a relevant cached post surface while
-            // preventing old content from permanently outranking fresh posts.
-            $item['sort'] += min(12 * 3600, (int) round(1800 * log(1 + $score, 2)));
+            $eventId = (string) (int) ($row['id'] ?? 0);
+            if ($eventId !== '0' && isset($excludedEvents[$eventId])) {
+                return false;
+            }
+            $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
+            if ($object === '' || isset($seen[$object])) {
+                return false;
+            }
+            $item = [
+                'kind' => 'event',
+                'sort' => strtotime((string) ($row['created_at'] ?? '')) ?: 0,
+                'row' => $row,
+                'home_source' => 'recommendation',
+            ];
+            if (admin_timeline_row_hidden($row, $ownerUserId) || admin_timeline_item_muted_by_words($item)) {
+                return false;
+            }
+            $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($coldStart && $actor !== '' && isset($seenRecommendationActors[$actor])) {
+                return false;
+            }
+            $host = strtolower(trim((string) ($row['host'] ?? '')));
+            if ($host === '' && $actor !== '' && function_exists('ap_actor_host')) {
+                $host = strtolower((string) (ap_actor_host($actor) ?? ''));
+            }
+            // Cold-start fill: also diversify by host so one instance cannot
+            // dominate the small discovery budget.
+            if ($coldStart && $host !== '' && ($seenHosts[$host] ?? 0) >= 2) {
+                return false;
+            }
+            if (!$coldStart && $score < 1.5) {
+                return false;
+            }
+            $item['sort'] += min(12 * 3600, (int) round(1800 * log(1 + max(0.0, $score), 2)));
             $item['recommendation_score'] = round($score, 3);
             $timeline[] = $item;
             $seen[$object] = true;
-            if ($actor !== '') $seenRecommendationActors[$actor] = true;
+            if ($coldStart && $actor !== '') {
+                $seenRecommendationActors[$actor] = true;
+            }
+            if ($coldStart && $host !== '') {
+                $seenHosts[$host] = (int) ($seenHosts[$host] ?? 0) + 1;
+            }
             $added++;
+            return true;
+        };
+
+        if ($coldStart) {
+            $foaf = function_exists('admin_home_foaf_actor_weights')
+                ? admin_home_foaf_actor_weights($ownerUserId)
+                : [];
+            $foafBudget = min(4, $maxAdded);
+            if ($foaf !== []) {
+                $foafActors = array_slice(array_keys($foaf), 0, 24);
+                $foafLookup = [];
+                foreach ($foafActors as $fa) {
+                    $foafLookup[$fa] = true;
+                    $foafLookup[$fa . '/'] = true;
+                }
+                $chunk = array_keys($foafLookup);
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT $leanCols
+                     FROM events
+                     WHERE type = 'Create' AND action_taken IN ('log','local_observe')
+                       AND created_at >= ? AND visibility IN ('public','unlisted')
+                       AND actor_id IN ($ph)
+                       $beforeClause
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 80"
+                );
+                $params = array_merge([$since], $chunk);
+                if ($beforeTs !== null) {
+                    $params[] = gmdate('c', $beforeTs);
+                }
+                $st->execute($params);
+                foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                    if ($added >= $foafBudget) {
+                        break;
+                    }
+                    $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                    $score = 1.0 + (float) ($foaf[$actor] ?? 0);
+                    $tryAdd($row, $score);
+                }
+            }
+            // Diverse fill: prefer local-instance public Creates, then the
+            // broader public cache, with actor+host diversity.
+            $fillQueries = [
+                "SELECT $leanCols FROM events
+                 WHERE type = 'Create' AND action_taken IN ('log','local_observe')
+                   AND created_at >= ? AND visibility IN ('public','unlisted')
+                   AND actor_id LIKE 'https://mkultra.monster/users/%'
+                   $beforeClause
+                 ORDER BY created_at DESC, id DESC LIMIT 80",
+                "SELECT $leanCols FROM events
+                 WHERE type = 'Create' AND action_taken IN ('log','local_observe')
+                   AND created_at >= ? AND visibility IN ('public','unlisted')
+                   $beforeClause
+                 ORDER BY created_at DESC, id DESC LIMIT 120",
+            ];
+            foreach ($fillQueries as $sql) {
+                if ($added >= $maxAdded) {
+                    break;
+                }
+                $st = ap_db()->prepare($sql);
+                $params = [$since];
+                if ($beforeTs !== null) {
+                    $params[] = gmdate('c', $beforeTs);
+                }
+                $st->execute($params);
+                foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                    if ($added >= $maxAdded) {
+                        break;
+                    }
+                    $tryAdd($row, 1.0);
+                }
+            }
+        } else {
+            $st = ap_db()->prepare(
+                "SELECT $leanCols FROM events
+                 WHERE type = 'Create' AND action_taken IN ('log','local_observe')
+                   AND created_at >= ? AND visibility IN ('public','unlisted')
+                   $beforeClause
+                 ORDER BY created_at DESC, id DESC LIMIT 160"
+            );
+            $params = [$since];
+            if ($beforeTs !== null) {
+                $params[] = gmdate('c', $beforeTs);
+            }
+            $st->execute($params);
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                if ($added >= $maxAdded) {
+                    break;
+                }
+                $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                $score = (float) ($actorWeights[$actor] ?? 0);
+                foreach (admin_home_extract_hashtags((string) ($row['summary'] ?? '')) as $tag) {
+                    $score += (float) ($tagWeights[$tag] ?? 0) * 0.5;
+                }
+                $tryAdd($row, $score);
+            }
         }
     } catch (Throwable $e) {
         // Recommendations are optional; a cache/schema issue must not affect Home.
