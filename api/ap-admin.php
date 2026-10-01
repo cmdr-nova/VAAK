@@ -28598,9 +28598,20 @@ window.apAdminToast = function (msg, isErr) {
   const POLL_MS = 120000;
   const AT_TOP_PX = 120;
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
-  const isNotifTimeline = viewName === 'mentions';
-  const isBskyTimeline = viewName === 'bluesky';
-  const isOutboxTimeline = viewName === 'outbox';
+  // Must track soft-nav view changes — freezing these as const from the initial
+  // page load made Mentions→Home keep fetching notifications and paint
+  // "End of notifications" on the Home shell.
+  let isNotifTimeline = viewName === 'mentions';
+  let isBskyTimeline = viewName === 'bluesky';
+  let isOutboxTimeline = viewName === 'outbox';
+  function syncTimelineKindFlags() {
+    const liveView = (items && items.dataset && items.dataset.view)
+      ? String(items.dataset.view)
+      : String(viewName || '');
+    isNotifTimeline = liveView === 'mentions';
+    isBskyTimeline = liveView === 'bluesky';
+    isOutboxTimeline = liveView === 'outbox';
+  }
 
   let sc = scrollApi();
 
@@ -28799,6 +28810,14 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function loadMore() {
+    syncTimelineKindFlags();
+    // Soft-nav Mentions→Home can leave this boot script thinking it is still
+    // on notifications; refuse to page the wrong endpoint into Home.
+    if (items && items.dataset && items.dataset.view
+        && String(items.dataset.view) !== String(viewName)
+        && ['mentions', 'bluesky', 'outbox'].includes(String(items.dataset.view))) {
+      return;
+    }
     if (!hasMore || loading) return;
     // Don't keep paging while the user is explicitly going back to the top —
     // that was yanking the viewport back to the sentinel in a loop.
@@ -29403,6 +29422,7 @@ window.apAdminToast = function (msg, isErr) {
       const nextOff = parseInt(res.headers.get('X-Next-Offset') || String(limit), 10);
       offset = nextOff > 0 ? nextOff : limit;
       viewName = nextView;
+      syncTimelineKindFlags();
       pendingHtml = '';
       pendingCount = 0;
       updateNewBtn();
@@ -29498,11 +29518,16 @@ window.apAdminToast = function (msg, isErr) {
       window.clearInterval(streamFallbackTimer);
       streamFallbackTimer = 0;
     }
+    // Cancel any in-flight Mentions infinite-scroll work before rebinding.
+    if (typeof window.vaakAbortNotifScroll === 'function') {
+      try { window.vaakAbortNotifScroll(); } catch (e) {}
+    }
     items = document.getElementById('timeline-items');
     status = document.getElementById('timeline-status');
     sentinel = document.getElementById('timeline-sentinel');
     if (!items) return false;
     viewName = items.dataset.view || nextView;
+    syncTimelineKindFlags();
     offset = parseInt(items.dataset.offset || '0', 10) || 0;
     limit = parseInt(items.dataset.limit || '15', 10) || 15;
     hasMore = items.dataset.hasMore === '1';
@@ -29520,6 +29545,10 @@ window.apAdminToast = function (msg, isErr) {
     bskyCursor = items.dataset.cursor || '';
     bskyFeed = items.dataset.feed || 'following';
     bskySource = items.dataset.source || 'home';
+    if (status && !isNotifTimeline
+        && /end of notifications/i.test(String(status.textContent || ''))) {
+      status.textContent = hasMore ? 'Scroll for more…' : 'Loading…';
+    }
     if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(items);
     if (typeof window.novaEnqueueBoostHydrates === 'function') window.novaEnqueueBoostHydrates(items);
     // Critical: soft-nav replaces #timeline-sentinel. Re-observe the live node
@@ -29691,8 +29720,20 @@ window.apAdminToast = function (msg, isErr) {
     let initialPending = items.dataset.initialPending === '1';
     const filter = items.dataset.filter || 'all';
     const limit = parseInt(items.dataset.limit || '10', 10) || 10;
+    let aborted = false;
+    let fetchAbort = null;
+    const stillOnMentions = () => {
+      const live = document.getElementById('timeline-items');
+      return !aborted && live === items && live && live.dataset.view === 'mentions';
+    };
+    window.vaakAbortNotifScroll = function () {
+      aborted = true;
+      try { if (fetchAbort) fetchAbort.abort(); } catch (e) {}
+      fetchAbort = null;
+      try { io.disconnect(); } catch (e) {}
+    };
     async function loadInitial() {
-      if (!initialPending || loading) return;
+      if (!initialPending || loading || aborted) return;
       initialPending = false;
       loading = true;
       const skeleton = insertScrollSkeleton(status);
@@ -29701,13 +29742,17 @@ window.apAdminToast = function (msg, isErr) {
         const firstUrl = '?view=mentions&partial=1'
           + '&notification_filter=' + encodeURIComponent(filter)
           + '&limit=' + encodeURIComponent(String(limit));
+        fetchAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
         const firstRes = await fetch(firstUrl, {
           credentials: 'same-origin',
           headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
-          cache: 'no-store'
+          cache: 'no-store',
+          signal: fetchAbort ? fetchAbort.signal : undefined
         });
+        if (!stillOnMentions()) return;
         if (!firstRes.ok) throw new Error('HTTP ' + firstRes.status);
         const firstHtml = await firstRes.text();
+        if (!stillOnMentions()) return;
         if (firstHtml.trim()) {
           const tmp = document.createElement('div');
           tmp.innerHTML = firstHtml;
@@ -29725,16 +29770,20 @@ window.apAdminToast = function (msg, isErr) {
         }
         if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
       } catch (e) {
+        if (e && e.name === 'AbortError') return;
+        if (!stillOnMentions()) return;
         if (status) status.textContent = 'Could not load notifications — try Refresh';
         hasMore = false;
         items.dataset.hasMore = '0';
       } finally {
+        fetchAbort = null;
         if (skeleton && skeleton.parentNode) skeleton.parentNode.removeChild(skeleton);
         loading = false;
       }
     }
     loadInitial();
     const io = new IntersectionObserver(async (entries) => {
+      if (!stillOnMentions()) return;
       if (!entries.some((e) => e.isIntersecting) || loading || !hasMore || !maxId) return;
       loading = true;
       const skeleton = insertScrollSkeleton(status);
@@ -29744,13 +29793,17 @@ window.apAdminToast = function (msg, isErr) {
           + '&notification_filter=' + encodeURIComponent(filter)
           + '&notifications_max_id=' + encodeURIComponent(maxId)
           + '&limit=' + encodeURIComponent(String(limit));
+        fetchAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
         const moreRes = await fetch(moreUrl, {
           credentials: 'same-origin',
           headers: { 'Accept': 'text/html', 'X-Requested-With': 'XMLHttpRequest' },
-          cache: 'no-store'
+          cache: 'no-store',
+          signal: fetchAbort ? fetchAbort.signal : undefined
         });
+        if (!stillOnMentions()) return;
         if (!moreRes.ok) throw new Error('HTTP ' + moreRes.status);
         const moreHtml = await moreRes.text();
+        if (!stillOnMentions()) return;
         hasMore = moreRes.headers.get('X-Has-More') === '1';
         maxId = moreRes.headers.get('X-Next-Max-Id') || '';
         items.dataset.hasMore = hasMore ? '1' : '0';
@@ -29763,9 +29816,12 @@ window.apAdminToast = function (msg, isErr) {
         }
         if (status) status.textContent = hasMore ? 'Scroll for more…' : 'End of notifications';
       } catch (e) {
+        if (e && e.name === 'AbortError') return;
+        if (!stillOnMentions()) return;
         if (status) status.textContent = 'Could not load more';
         hasMore = false;
       } finally {
+        fetchAbort = null;
         if (skeleton && skeleton.parentNode) skeleton.parentNode.removeChild(skeleton);
         loading = false;
       }
@@ -29851,6 +29907,9 @@ window.apAdminToast = function (msg, isErr) {
 
     busy = true;
     window.__vaakNavigationPending = true;
+    if (view !== 'mentions' && typeof window.vaakAbortNotifScroll === 'function') {
+      try { window.vaakAbortNotifScroll(); } catch (e) {}
+    }
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     try {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
