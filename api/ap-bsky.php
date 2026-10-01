@@ -7717,7 +7717,14 @@ function ap_bsky_actor_refresh_worker_run(int $limit = 3): array
     $st->bindValue(1, $now);
     $st->bindValue(2, $limit, PDO::PARAM_INT);
     $st->execute();
+    // Hard wall clock so one stuck Bluesky sync cannot burn a CPU core for
+    // 15+ minutes and starve interactive VAAK PHP-FPM workers.
+    $refreshDeadline = microtime(true) + 45.0;
     foreach ($st->fetchAll() ?: [] as $job) {
+        if (microtime(true) >= $refreshDeadline) {
+            $stats['busy'] = 1;
+            break;
+        }
         $owner = (int) ($job['owner_user_id'] ?? 0);
         $actorRef = (string) ($job['actor_ref'] ?? '');
         $claim = $db->prepare("UPDATE bsky_actor_refresh_queue SET status = 'processing', locked_at = ? WHERE owner_user_id = ? AND actor_ref = ? AND status = 'pending'");
