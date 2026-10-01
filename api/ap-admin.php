@@ -17227,22 +17227,66 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
         echo '<div class="notification-avatar-stack" style="display:flex;align-items:center;min-width:3rem">';
         $shown = 0;
         foreach ($accounts as $acct) {
-            if (!is_array($acct)) continue;
+            if (!is_array($acct)) {
+                continue;
+            }
             $ref = function_exists('admin_account_actor_ref') ? admin_account_actor_ref($acct) : (string) ($acct['uri'] ?? $acct['url'] ?? '');
             $href = $ref !== '' ? '?view=remote_profile&actor=' . rawurlencode($ref) . '&from=mentions' : '';
             $avatar = admin_avatar_img($ref !== '' ? $ref : null);
             echo $href !== '' ? '<a href="' . h($href) . '" title="Open profile" style="margin-right:-.35rem">' . $avatar . '</a>' : $avatar;
-            if (++$shown >= 6) break;
+            if (++$shown >= 6) {
+                break;
+            }
         }
         echo '</div><div class="tweet-hd-main"><div class="meta" style="color:var(--primary)">'
             . h($count . ' people ' . $label) . '</div><div class="meta">'
             . h(relative_time((string) ($n['created_at'] ?? ''))) . '</div></div></div>';
+
         $snippet = trim(admin_html_to_plain((string) ($status['content'] ?? '')));
-        if ($snippet !== '') {
-            if (function_exists('mb_substr')) $snippet = mb_substr($snippet, 0, 280) . (mb_strlen($snippet) > 280 ? '…' : '');
-            else $snippet = substr($snippet, 0, 280) . (strlen($snippet) > 280 ? '…' : '');
-            echo '<div class="quote-block" style="margin-top:.55rem"><span class="qt-label">Your post</span><br>'
-                . '<span class="notification-snippet">' . h($snippet) . '</span></div>';
+        if (in_array($snippet, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+            $snippet = '';
+        }
+        $media = [];
+        foreach (($status['media_attachments'] ?? []) as $attachment) {
+            if (!is_array($attachment)) {
+                continue;
+            }
+            $url = (string) ($attachment['url'] ?? $attachment['preview_url'] ?? '');
+            if (!str_starts_with($url, 'https://')) {
+                continue;
+            }
+            $media[] = [
+                'url' => $url,
+                'mediaType' => in_array(strtolower((string) ($attachment['type'] ?? '')), ['video', 'gifv'], true) ? 'video/mp4' : null,
+                'preview_url' => (string) ($attachment['preview_url'] ?? ''),
+            ];
+            if (count($media) >= 4) {
+                break;
+            }
+        }
+        // Media-only posts have empty body — still show a Your-post preview card.
+        if ($snippet !== '' || $media !== [] || $statusUrl !== '') {
+            if ($snippet !== '') {
+                if (function_exists('mb_substr') && function_exists('mb_strlen')) {
+                    $snippet = mb_strlen($snippet) > 280 ? (mb_substr($snippet, 0, 280) . '…') : $snippet;
+                } else {
+                    $snippet = strlen($snippet) > 280 ? (substr($snippet, 0, 280) . '…') : $snippet;
+                }
+            }
+            $previewLabel = $snippet !== ''
+                ? $snippet
+                : ($media !== [] ? '📷 media post' : 'your post');
+            echo '<div class="quote-block" style="margin-top:.55rem"><span class="qt-label">Your post</span><br>';
+            if ($statusUrl !== '') {
+                echo '<a class="notification-snippet" href="' . h(admin_status_href($statusUrl, 'mentions')) . '">'
+                    . h($previewLabel) . '</a>';
+            } else {
+                echo '<span class="notification-snippet">' . h($previewLabel) . '</span>';
+            }
+            if ($media !== []) {
+                echo '<div class="notification-media">' . admin_media_row_html($media) . '</div>';
+            }
+            echo '</div>';
         }
         if ($statusUrl !== '') {
             echo '<div class="tweet-actions"><a class="btn btn-ghost" href="' . h(admin_status_href($statusUrl, 'mentions')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a></div>';
