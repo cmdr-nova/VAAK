@@ -3753,6 +3753,79 @@ function ap_instance_federate_actor_block(string $targetActorId, bool $blocking 
 }
 
 /**
+ * Queue instance Block/Undo fan-out so admin UI is not blocked on N× HTTP delivers.
+ * Local ap_blocks row + inbound 403 + graph side effects already apply before this runs.
+ *
+ * @return array{ok:bool,queued:bool,attempted:int,delivered:int}
+ */
+function ap_instance_federate_actor_block_background(string $targetActorId, bool $blocking = true): array
+{
+    $targetActorId = rtrim(trim($targetActorId), '/');
+    if ($targetActorId === '' || !str_starts_with($targetActorId, 'https://')) {
+        return ['ok' => false, 'queued' => false, 'attempted' => 0, 'delivered' => 0];
+    }
+    if (PHP_SAPI === 'cli' && defined('AP_INSTANCE_BLOCK_WORKER')) {
+        $fed = ap_instance_federate_actor_block($targetActorId, $blocking);
+        return [
+            'ok' => !empty($fed['ok']),
+            'queued' => false,
+            'attempted' => (int) ($fed['attempted'] ?? 0),
+            'delivered' => (int) ($fed['delivered'] ?? 0),
+        ];
+    }
+    $dir = '/tmp/ap-instance-block-jobs';
+    if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+        ap_log('instance_block_bg_mkdir_fail');
+        // Last resort: sync (admin waits, but block still federates).
+        $fed = ap_instance_federate_actor_block($targetActorId, $blocking);
+        return [
+            'ok' => !empty($fed['ok']),
+            'queued' => false,
+            'attempted' => (int) ($fed['attempted'] ?? 0),
+            'delivered' => (int) ($fed['delivered'] ?? 0),
+        ];
+    }
+    $job = [
+        'target' => $targetActorId,
+        'blocking' => $blocking ? 1 : 0,
+        'created_at' => gmdate('c'),
+    ];
+    $file = $dir . '/' . bin2hex(random_bytes(8)) . '.json';
+    if (@file_put_contents($file, json_encode($job, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) === false) {
+        ap_log('instance_block_bg_write_fail');
+        $fed = ap_instance_federate_actor_block($targetActorId, $blocking);
+        return [
+            'ok' => !empty($fed['ok']),
+            'queued' => false,
+            'attempted' => (int) ($fed['attempted'] ?? 0),
+            'delivered' => (int) ($fed['delivered'] ?? 0),
+        ];
+    }
+    @chmod($file, 0600);
+    $php = ap_php_cli_binary();
+    $worker = __DIR__ . '/ap-instance-block-worker.php';
+    if (!is_file($worker)) {
+        @unlink($file);
+        $fed = ap_instance_federate_actor_block($targetActorId, $blocking);
+        return [
+            'ok' => !empty($fed['ok']),
+            'queued' => false,
+            'attempted' => (int) ($fed['attempted'] ?? 0),
+            'delivered' => (int) ($fed['delivered'] ?? 0),
+        ];
+    }
+    $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($worker) . ' ' . escapeshellarg($file)
+        . ' >/dev/null 2>&1 </dev/null &';
+    exec($cmd);
+    ap_log(
+        'instance_block_bg_queued file=' . basename($file)
+        . ' target=' . ap_short($targetActorId)
+        . ' blocking=' . ($blocking ? '1' : '0')
+    );
+    return ['ok' => true, 'queued' => true, 'attempted' => 0, 'delivered' => 0];
+}
+
+/**
  * Federate a personal Block (Mastodon-compatible). Required for Bridgy Fed opt-out.
  *
  * @param array{id?:string,key_id?:string,priv?:string}|null $ident Override signing identity (instance fan-out).

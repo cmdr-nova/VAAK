@@ -2861,9 +2861,13 @@ $vaakAdminOnlyActions = [
                     $notice .= ' · inbound federation from them is now rejected (HTTP 403).';
                     if (($result['scope'] ?? '') === 'actor' && is_array($result['federated'] ?? null)) {
                         $fed = $result['federated'];
-                        $notice .= ' · Block notified '
-                            . (int) ($fed['delivered'] ?? 0) . '/'
-                            . (int) ($fed['attempted'] ?? 0) . ' local accounts.';
+                        if (!empty($fed['queued'])) {
+                            $notice .= ' · Block federation queued in the background.';
+                        } else {
+                            $notice .= ' · Block notified '
+                                . (int) ($fed['delivered'] ?? 0) . '/'
+                                . (int) ($fed['attempted'] ?? 0) . ' local accounts.';
+                        }
                     } elseif (($result['scope'] ?? '') === 'domain') {
                         $notice .= ' · Domain blocks are enforced locally (no per-user Block fan-out).';
                     }
@@ -2899,9 +2903,13 @@ $vaakAdminOnlyActions = [
                     . ' (follows are not auto-restored — re-follow if you want them back).';
                 if (($removed['scope'] ?? '') === 'actor' && is_array($removed['federated'] ?? null)) {
                     $fed = $removed['federated'];
-                    $notice .= ' · Undo(Block) notified '
-                        . (int) ($fed['delivered'] ?? 0) . '/'
-                        . (int) ($fed['attempted'] ?? 0) . ' local accounts.';
+                    if (!empty($fed['queued'])) {
+                        $notice .= ' · Undo(Block) federation queued in the background.';
+                    } else {
+                        $notice .= ' · Undo(Block) notified '
+                            . (int) ($fed['delivered'] ?? 0) . '/'
+                            . (int) ($fed['attempted'] ?? 0) . ' local accounts.';
+                    }
                 }
             } else {
                 $error = $removed['error'] ?? 'Block not found.';
