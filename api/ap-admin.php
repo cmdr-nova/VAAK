@@ -225,6 +225,22 @@ if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
     $view = 'home';
 }
 
+// Soft-nav shells, infinite-scroll fills, live newer polls, and ajax beacons
+// only need the session for auth. Release the file lock immediately so one
+// slow Home hydrate cannot queue the user's other tabs/polls for tens of seconds.
+$vaakReqMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+$vaakEarlyUnlock = $vaakReqMethod === 'GET' && (
+    (isset($_GET['partial']) && (string) $_GET['partial'] === '1')
+    || isset($_GET['ajax'])
+);
+if ($vaakEarlyUnlock) {
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+}
+
 // The website guestbook and subscriber services retain their own direct
 // Basic-Auth-protected endpoints. VAAK admins should not need a second browser
 // password prompt, so proxy the small read/delete operations through the
@@ -712,17 +728,19 @@ if (
         echo json_encode(['ok' => false, 'error' => 'Invalid Home signal.']);
         exit;
     }
+    // Release the session lock before DB/signal work so passive beacons cannot
+    // serialize behind (or block) Home soft-nav / timeline fills.
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     $signalProfile = function_exists('ap_profile_get') ? ap_profile_get($vaakActorKey) : [];
     $algorithmEnabled = !array_key_exists('algorithm_enabled', $signalProfile)
         || !empty($signalProfile['algorithm_enabled']);
     $recorded = $algorithmEnabled && function_exists('ap_signal_record_passive')
         ? ap_signal_record_passive($vaakOwnerId, $platform, $kind, $targetKey, $targetActor, $dwellSeconds)
         : false;
-    if (function_exists('ap_auth_session_write_close')) {
-        ap_auth_session_write_close();
-    } elseif (session_status() === PHP_SESSION_ACTIVE) {
-        session_write_close();
-    }
     echo json_encode(['ok' => true, 'recorded' => $recorded], JSON_UNESCAPED_SLASHES);
     exit;
 }
@@ -16194,12 +16212,13 @@ if ($isPartial && $view === 'bluesky') {
 
 // AJAX fragment for Home / Local / Federated infinite scroll
 if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
-    if (isset($_GET['shell']) && (string) $_GET['shell'] === '1') {
-        if (function_exists('ap_auth_session_write_close')) {
-            ap_auth_session_write_close();
-        } elseif (session_status() === PHP_SESSION_ACTIVE) {
-            session_write_close();
-        }
+    // Always drop the session lock for timeline partials (shell, fill, newer
+    // poll). Holding it through Bluesky/AP hydrate made concurrent badge /
+    // signal / soft-nav requests from the same browser queue for 40–70s.
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
     }
     // Live poll: items newer than the client's current head (no scroll jump on server).
     $wantNewer = isset($_GET['newer']) && (string) $_GET['newer'] === '1';
