@@ -6231,69 +6231,113 @@ function ap_note_public_replies(string $noteId, int $limit = 40): array
             }
         }
         if (is_string($bskyUri) && str_starts_with($bskyUri, 'at://') && function_exists('ap_bsky_xrpc')) {
+            // Prefer the thread root when post_links has several segments for one
+            // note (long-post splits). Depth 1 under a mid/tip URI misses siblings
+            // and can surface the next split chunk as a "reply".
+            try {
+                $stRoot = ap_db()->prepare(
+                    'SELECT reply_root FROM bsky_posts WHERE bsky_uri = ? LIMIT 1'
+                );
+                $stRoot->execute([$bskyUri]);
+                $rr = trim((string) ($stRoot->fetchColumn() ?: ''));
+                if ($rr !== '' && str_starts_with($rr, 'at://')) {
+                    $bskyUri = $rr;
+                }
+            } catch (Throwable $e) {
+                // keep $bskyUri
+            }
             $thread = ap_bsky_xrpc('https://public.api.bsky.app', 'app.bsky.feed.getPostThread', 'GET', [
                 'uri' => $bskyUri,
-                'depth' => '1',
+                'depth' => '2',
             ], null, null, 12);
-            $replies = [];
+            $replyNodes = [];
             if (!empty($thread['ok']) && is_array($thread['json']['thread'] ?? null)) {
-                $replies = $thread['json']['thread']['replies'] ?? [];
-            }
-            if (is_array($replies)) {
-                foreach ($replies as $node) {
-                    if (!is_array($node)) {
-                        continue;
+                $walk = static function ($nodes) use (&$walk, &$replyNodes): void {
+                    if (!is_array($nodes)) {
+                        return;
                     }
-                    $post = $node['post'] ?? null;
-                    if (!is_array($post)) {
-                        continue;
-                    }
-                    $uri = rtrim((string) ($post['uri'] ?? ''), '/');
-                    if ($uri === '' || !str_starts_with($uri, 'at://')) {
-                        continue;
-                    }
-                    // Skip if we already have this reply via a dual-publish fedi twin.
-                    $fediTwin = '';
-                    if (function_exists('ap_bsky_post_link_by_uri')) {
-                        $plink = ap_bsky_post_link_by_uri($uri);
-                        if (is_array($plink)) {
-                            $fediTwin = rtrim((string) ($plink['fediverse_id'] ?? $plink['ap_object_id'] ?? ''), '/');
+                    foreach ($nodes as $node) {
+                        if (!is_array($node)) {
+                            continue;
+                        }
+                        $replyNodes[] = $node;
+                        if (!empty($node['replies']) && is_array($node['replies'])) {
+                            $walk($node['replies']);
                         }
                     }
-                    if ($fediTwin !== '' && isset($byKey[$fediTwin])) {
+                };
+                $walk($thread['json']['thread']['replies'] ?? []);
+            }
+            foreach ($replyNodes as $node) {
+                if (!is_array($node)) {
+                    continue;
+                }
+                $post = $node['post'] ?? null;
+                if (!is_array($post)) {
+                    continue;
+                }
+                $uri = rtrim((string) ($post['uri'] ?? ''), '/');
+                if ($uri === '' || !str_starts_with($uri, 'at://')) {
+                    continue;
+                }
+                // Long-post split tails are Bluesky "replies" to the root twin.
+                // They map back to THIS note — never list them as public replies.
+                if (function_exists('ap_bsky_vaak_mirror_note_id_for_uri')) {
+                    $mirrorOf = ap_bsky_vaak_mirror_note_id_for_uri($uri);
+                    if (is_string($mirrorOf) && rtrim($mirrorOf, '/') === $noteId) {
                         continue;
                     }
-                    $author = is_array($post['author'] ?? null) ? $post['author'] : [];
-                    $handle = (string) ($author['handle'] ?? '');
-                    $did = (string) ($author['did'] ?? '');
-                    $actorId = $handle !== ''
-                        ? ('https://bsky.app/profile/' . rawurlencode($handle))
-                        : ($did !== '' ? ('https://bsky.app/profile/' . rawurlencode($did)) : '');
-                    $rec = is_array($post['record'] ?? null) ? $post['record'] : [];
-                    $text = trim((string) ($rec['text'] ?? ''));
-                    $published = (string) ($rec['createdAt'] ?? $post['indexedAt'] ?? '');
-                    $rkey = '';
-                    if (preg_match('~^at://[^/]+/[^/]+/([^/]+)$~', $uri, $rm)) {
-                        $rkey = $rm[1];
-                    }
-                    $url = $handle !== '' && $rkey !== ''
-                        ? ('https://bsky.app/profile/' . rawurlencode($handle) . '/post/' . rawurlencode($rkey))
-                        : $uri;
-                    // Prefer fedi twin URL when we know it (click stays on the open web).
-                    if ($fediTwin !== '' && str_starts_with($fediTwin, 'https://')) {
-                        $url = $fediTwin;
-                    }
-                    $push(
-                        'bluesky',
-                        $fediTwin !== '' ? $fediTwin : $uri,
-                        $url,
-                        $actorId,
-                        $text,
-                        $published,
-                        '',
-                        false
-                    );
+                } elseif (function_exists('ap_bsky_is_vaak_mirror_segment')
+                    && ap_bsky_is_vaak_mirror_segment($uri)) {
+                    continue;
                 }
+                // Skip if we already have this reply via a dual-publish fedi twin.
+                $fediTwin = '';
+                if (function_exists('ap_bsky_post_link_by_uri')) {
+                    $plink = ap_bsky_post_link_by_uri($uri);
+                    if (is_array($plink)) {
+                        $fediTwin = rtrim((string) ($plink['fediverse_id'] ?? $plink['ap_object_id'] ?? ''), '/');
+                    }
+                }
+                // Segment links for this note all share the parent fediverseId —
+                // that is not a separate reply.
+                if ($fediTwin !== '' && $fediTwin === $noteId) {
+                    continue;
+                }
+                if ($fediTwin !== '' && isset($byKey[$fediTwin])) {
+                    continue;
+                }
+                $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+                $handle = (string) ($author['handle'] ?? '');
+                $did = (string) ($author['did'] ?? '');
+                $actorId = $handle !== ''
+                    ? ('https://bsky.app/profile/' . rawurlencode($handle))
+                    : ($did !== '' ? ('https://bsky.app/profile/' . rawurlencode($did)) : '');
+                $rec = is_array($post['record'] ?? null) ? $post['record'] : [];
+                $text = trim((string) ($rec['text'] ?? ''));
+                $published = (string) ($rec['createdAt'] ?? $post['indexedAt'] ?? '');
+                $rkey = '';
+                if (preg_match('~^at://[^/]+/[^/]+/([^/]+)$~', $uri, $rm)) {
+                    $rkey = $rm[1];
+                }
+                $url = $handle !== '' && $rkey !== ''
+                    ? ('https://bsky.app/profile/' . rawurlencode($handle) . '/post/' . rawurlencode($rkey))
+                    : $uri;
+                // Prefer fedi twin URL when we know it (click stays on the open web).
+                // Never point a Bluesky reply at the parent note itself.
+                if ($fediTwin !== '' && str_starts_with($fediTwin, 'https://') && $fediTwin !== $noteId) {
+                    $url = $fediTwin;
+                }
+                $push(
+                    'bluesky',
+                    ($fediTwin !== '' && $fediTwin !== $noteId) ? $fediTwin : $uri,
+                    $url,
+                    $actorId,
+                    $text,
+                    $published,
+                    '',
+                    false
+                );
             }
         }
     } catch (Throwable $e) {
