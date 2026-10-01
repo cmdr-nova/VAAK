@@ -6,6 +6,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/ap-link-preview.php';
 require_once __DIR__ . '/ap-asks.php';
+require_once __DIR__ . '/ap-normalize.php';
 
 /**
  * Mastodon account id for the token/session-bound local user.
@@ -4099,20 +4100,16 @@ function ap_masto_status_from_mention(array $row): array
     // Session actor for "@you" mention parsing (not hard-coded cmdr_nova)
     $extraActors[] = ap_masto_session_actor_id();
     $pack = ap_masto_content_with_mentions($text, $extraActors);
-    // Wafrn serializes Asks as a compact Note string ("@user asked …")
-    // rather than VAAK's private Ask row. Give Mastodon-compatible clients the
-    // same visual Ask block used for local answers without changing storage.
-    if (function_exists('ap_wafrn_remote_ask_html')) {
-        $askSource = (string) ($row['content'] ?? $text);
-        if (trim((string) ($row['ask_question'] ?? '')) !== '') {
-            $askActor = trim((string) ($row['ask_actor'] ?? ''));
-            $askIdentity = $askActor !== '' && function_exists('ap_ask_actor_identity') ? ap_ask_actor_identity($askActor) : [];
-            $askLabel = (string) (($askIdentity['handle'] ?? '') ?: $askActor);
-            $askSource = '<p>' . htmlspecialchars($askLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' asked</p><blockquote>'
-                . htmlspecialchars((string) $row['ask_question'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</blockquote>'
-                . htmlspecialchars((string) ($row['ask_answer'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        }
-        $askHtml = ap_wafrn_remote_ask_html($askSource);
+    // Asks: prefer structured mention columns, else parse Wafrn compact Note text.
+    // Both paths use ap_ask_card_html so VAAK + Mastodon clients share one card.
+    if (trim((string) ($row['ask_question'] ?? '')) !== '' && function_exists('ap_ask_card_html')) {
+        $pack['content'] = ap_ask_card_html([
+            'question' => (string) $row['ask_question'],
+            'asker_actor' => (string) ($row['ask_actor'] ?? ''),
+            'answer' => (string) ($row['ask_answer'] ?? ''),
+        ]);
+    } elseif (function_exists('ap_wafrn_remote_ask_html')) {
+        $askHtml = ap_wafrn_remote_ask_html((string) ($row['content'] ?? $text));
         if ($askHtml !== null) {
             $pack['content'] = $askHtml;
         }

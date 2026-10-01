@@ -14898,11 +14898,8 @@ function admin_render_outbox_card(array $n, string $returnView): void
             <?php elseif (!is_array($askContext) && $replyTo !== ''): ?>
               <div class="meta" style="margin:.25rem 0 .35rem">↩ parent post</div>
             <?php endif; ?>
-            <?php if (is_array($askContext)): ?>
-              <div class="ask-container" style="display:flex;gap:.65rem;align-items:flex-start;margin:.5rem 0 .75rem;padding:.65rem 0;border-bottom:1px solid var(--border)">
-                <?= admin_avatar_img((string) ($askContext['asker_actor'] ?? '')) ?>
-                <div><div class="meta"><b><?= h(actor_handle((string) ($askContext['asker_actor'] ?? 'anonymous'))) ?></b> asked:</div><div class="body" style="margin-top:.25rem;white-space:pre-wrap"><?= h((string) ($askContext['question'] ?? '')) ?></div></div>
-              </div>
+            <?php if (is_array($askContext) && function_exists('ap_ask_card_html_from_row')): ?>
+              <?= ap_ask_card_html_from_row($askContext, false) ?>
             <?php endif; ?>
             <?php
               $ownInner = '';
@@ -19199,6 +19196,26 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .body, .feed-body {
       white-space: pre-wrap; word-break: break-word; line-height: 1.45;
     }
+    /* Canonical Ask card — colors follow user accent (--primary / --primary-dim) */
+    .ask-container {
+      display: flex;
+      gap: .65rem;
+      align-items: flex-start;
+      margin: .35rem 0 .65rem;
+      padding: .7rem .8rem;
+      border: 1px solid var(--primary);
+      border-radius: 8px;
+      background: var(--primary-dim);
+    }
+    .ask-container .ask-label { color: var(--primary); font-weight: 700; }
+    .ask-container a.ask-label:hover { text-decoration: underline; text-underline-offset: 2px; }
+    .ask-container .ask-text {
+      margin: 0;
+      padding: .15rem 0 .15rem .75rem;
+      border-left: 3px solid var(--primary);
+      white-space: pre-wrap;
+    }
+    .ask-container .ask-divider-fallback { display: none; }
     /* Modest gap between paragraphs (HTML from compose / remotes) */
     .body p, .feed-body p {
       margin: 0 0 0.75em;

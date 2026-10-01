@@ -154,6 +154,117 @@ function ap_ask_representation_html(string $answerNoteId, string $question, stri
 }
 
 /**
+ * Canonical VAAK Ask card (accent box).
+ *
+ * Theme-aware: uses --primary / --primary-dim when the surface defines them
+ * (VAAK accent settings). Fallbacks keep public profiles and Mastodon-compatible
+ * status HTML readable when those vars are absent.
+ *
+ * Wire format for federation stays ap_ask_representation_html(); this is
+ * presentation only (timeline, note pages, profiles, status.content HTML).
+ *
+ * @param array{
+ *   question:string,
+ *   asker_actor?:string,
+ *   asker_label?:string,
+ *   answer?:string|null,
+ *   show_avatar?:bool
+ * } $opts
+ */
+function ap_ask_card_html(array $opts): string
+{
+    $question = trim((string) ($opts['question'] ?? ''));
+    if ($question === '') {
+        return '';
+    }
+    $askerActor = rtrim(trim((string) ($opts['asker_actor'] ?? '')), '/');
+    $answer = isset($opts['answer']) ? trim((string) $opts['answer']) : '';
+    $showAvatar = !array_key_exists('show_avatar', $opts) || !empty($opts['show_avatar']);
+
+    $display = '';
+    $handle = '';
+    $avatar = '';
+    if ($askerActor !== '' && function_exists('ap_ask_actor_identity')) {
+        $identity = ap_ask_actor_identity($askerActor);
+        $display = trim((string) ($identity['display_name'] ?? ''));
+        $handle = trim((string) ($identity['handle'] ?? ''));
+        $avatar = trim((string) ($identity['avatar'] ?? ''));
+    }
+    $labelOpt = trim((string) ($opts['asker_label'] ?? ''));
+    if ($display === '') {
+        $display = $labelOpt !== '' ? $labelOpt : ($handle !== '' ? $handle : 'Someone');
+    }
+
+    $border = 'var(--primary, #ff70c7)';
+    $bg = 'var(--primary-dim, rgba(255,112,199,.12))';
+    $labelColor = 'var(--primary, #ff70c7)';
+
+    $nameEsc = htmlspecialchars($display, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $labelInner = $nameEsc . ' asked';
+    if ($handle !== '' && strcasecmp($display, $handle) !== 0) {
+        $labelInner = $nameEsc
+            . ' <span class="ask-handle" style="font-weight:500;opacity:.85">'
+            . htmlspecialchars($handle, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . '</span> asked';
+    }
+
+    $avatarHtml = '';
+    if ($showAvatar && str_starts_with($avatar, 'https://')) {
+        $avatarHtml = '<img class="ask-avatar" src="'
+            . htmlspecialchars($avatar, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . '" alt="" width="32" height="32" loading="lazy" referrerpolicy="no-referrer"'
+            . ' style="border-radius:50%;object-fit:cover;flex:0 0 auto">';
+    }
+
+    $askerUrl = ($askerActor !== '' && str_starts_with($askerActor, 'https://')) ? $askerActor : '';
+    if ($askerUrl !== '') {
+        $labelBlock = '<a class="ask-label" href="'
+            . htmlspecialchars($askerUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . '" style="display:inline-block;font-weight:700;margin-bottom:.4rem;color:'
+            . $labelColor . ';text-decoration:none">' . $labelInner . '</a>';
+    } else {
+        $labelBlock = '<div class="ask-label" style="font-weight:700;margin-bottom:.4rem;color:'
+            . $labelColor . '">' . $labelInner . '</div>';
+    }
+
+    $html = '<div class="ask-container" style="display:flex;gap:.65rem;align-items:flex-start;margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid '
+        . $border . ';border-radius:8px;background:' . $bg . '">'
+        . $avatarHtml
+        . '<div class="ask-body" style="min-width:0;flex:1 1 auto">'
+        . $labelBlock
+        . '<blockquote class="ask-text" style="margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid '
+        . $border . ';white-space:pre-wrap">'
+        . nl2br(htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+        . '</blockquote>';
+
+    if ($answer !== '') {
+        // Text fallback: some Mastodon-compatible clients strip HR / styles.
+        $html .= '<hr class="ask-divider" style="margin:.7rem 0;border:0;border-top:1px solid '
+            . $border . '">'
+            . '<p class="ask-divider-fallback" aria-hidden="true">────────────</p>'
+            . '<div class="ask-answer" style="white-space:pre-wrap">'
+            . nl2br(htmlspecialchars($answer, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'))
+            . '</div>';
+    }
+
+    return $html . '</div></div>';
+}
+
+/** Ask card from an ap_asks / mention ask row (question only unless $includeAnswer). */
+function ap_ask_card_html_from_row(array $askRow, bool $includeAnswer = false): string
+{
+    $answer = '';
+    if ($includeAnswer) {
+        $answer = (string) ($askRow['ask_answer'] ?? $askRow['answer'] ?? '');
+    }
+    return ap_ask_card_html([
+        'question' => (string) ($askRow['question'] ?? $askRow['ask_question'] ?? ''),
+        'asker_actor' => (string) ($askRow['asker_actor'] ?? $askRow['ask_actor'] ?? ''),
+        'answer' => $answer,
+    ]);
+}
+
+/**
  * Render Wafrn's compact remote Ask representation for Mastodon-compatible
  * clients. Wafrn intentionally sends this as ordinary Note text, so it needs
  * a presentation hint at the VAAK status boundary rather than in storage.
@@ -172,24 +283,21 @@ function ap_wafrn_remote_ask_html(string $text): ?string
         $answer = trim(html_entity_decode(strip_tags($m[3]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
     } else {
         $plain = trim(html_entity_decode(strip_tags($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        if ($plain === '' || !preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $plain, $m)) return null;
+        if ($plain === '' || !preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $plain, $m)) {
+            return null;
+        }
         $asker = trim($m[1]);
         $question = trim($m[2]);
     }
-    if ($asker === '' || $question === '' || !str_contains($asker, '@')) return null;
-    $html = '<div class="ask-container" style="margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid rgba(220,113,190,.55);border-radius:8px;background:rgba(164,90,145,.11)">'
-        . '<div class="ask-label" style="font-weight:700;margin-bottom:.4rem;color:#e5a8d2">'
-        . htmlspecialchars($asker, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . ' asked</div>'
-        . '<blockquote class="ask-text" style="margin:0;padding:.2rem 0 .2rem .8rem;border-left:3px solid rgba(220,113,190,.7);white-space:pre-wrap">'
-        . nl2br(htmlspecialchars($question, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</blockquote>';
-    if ($answer !== '') {
-        // Keep a text fallback because some Mastodon-compatible clients strip
-        // HR elements and inline styles from status HTML.
-        $html .= '<hr class="ask-divider" style="margin:.7rem 0;border:0;border-top:1px solid rgba(220,113,190,.45)"><p class="ask-divider-fallback" aria-hidden="true">────────────</p>'
-            . '<div class="ask-answer" style="white-space:pre-wrap">'
-            . nl2br(htmlspecialchars($answer, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</div>';
+    if ($asker === '' || $question === '' || !str_contains($asker, '@')) {
+        return null;
     }
-    return $html . '</div>';
+    return ap_ask_card_html([
+        'question' => $question,
+        'asker_label' => $asker,
+        'answer' => $answer,
+        'show_avatar' => false,
+    ]);
 }
 
 /** Format an answered Ask for the connected Bluesky mirror. */
