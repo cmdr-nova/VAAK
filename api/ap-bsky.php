@@ -900,6 +900,203 @@ function ap_bsky_uri_is_thread_root_of(string $maybeRoot, string $tipUri): bool
 }
 
 /**
+ * True when $noteId is a local VAAK outbox note URL.
+ */
+function ap_bsky_is_local_note_id(string $noteId): bool
+{
+    $noteId = rtrim(trim($noteId), '/');
+    return $noteId !== ''
+        && str_starts_with($noteId, 'https://mkultra.monster/users/')
+        && str_contains($noteId, '/notes/');
+}
+
+/**
+ * Cache/DB-only: local VAAK note id if this Bluesky URI is (part of) a
+ * VAAK→Bluesky mirror thread — including long-post split tails whose root or
+ * tip is mapped but the segment itself has no fediverseId.
+ */
+function ap_bsky_vaak_mirror_note_id_for_uri(string $bskyUri): ?string
+{
+    $bskyUri = trim($bskyUri);
+    if (!str_starts_with($bskyUri, 'at://')) {
+        return null;
+    }
+    static $memo = [];
+    if (array_key_exists($bskyUri, $memo)) {
+        return $memo[$bskyUri];
+    }
+    $flags = ap_bsky_mirror_segment_flags([$bskyUri]);
+    if (!empty($flags[$bskyUri]['mirror']) && !empty($flags[$bskyUri]['note_id'])) {
+        return $memo[$bskyUri] = (string) $flags[$bskyUri]['note_id'];
+    }
+    return $memo[$bskyUri] = null;
+}
+
+function ap_bsky_is_vaak_mirror_segment(string $bskyUri): bool
+{
+    return ap_bsky_vaak_mirror_note_id_for_uri($bskyUri) !== null;
+}
+
+/**
+ * Batch classify Bluesky URIs as VAAK mirror-thread segments (root or split
+ * tail). One or two SQL round-trips; never calls XRPC.
+ *
+ * @param list<string> $uris
+ * @return array<string,array{mirror:bool,note_id:?string}>
+ */
+function ap_bsky_mirror_segment_flags(array $uris): array
+{
+    $out = [];
+    $clean = [];
+    foreach ($uris as $uri) {
+        $uri = trim((string) $uri);
+        if ($uri === '' || !str_starts_with($uri, 'at://')) {
+            continue;
+        }
+        if (!isset($out[$uri])) {
+            $out[$uri] = ['mirror' => false, 'note_id' => null];
+            $clean[] = $uri;
+        }
+    }
+    if ($clean === []) {
+        return $out;
+    }
+
+    $rootByUri = [];
+    foreach ($clean as $uri) {
+        $rootByUri[$uri] = $uri;
+    }
+    try {
+        $ph = implode(',', array_fill(0, count($clean), '?'));
+        $st = ap_db()->prepare(
+            "SELECT bsky_uri, reply_root FROM bsky_posts WHERE bsky_uri IN ($ph)"
+        );
+        $st->execute($clean);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $uri = trim((string) ($row['bsky_uri'] ?? ''));
+            $root = trim((string) ($row['reply_root'] ?? ''));
+            if ($uri !== '' && $root !== '' && str_starts_with($root, 'at://')) {
+                $rootByUri[$uri] = $root;
+            }
+        }
+    } catch (Throwable $e) {
+        // Fall through with root=self.
+    }
+
+    $candidates = array_values(array_unique(array_merge($clean, array_values($rootByUri))));
+    /** @var array<string,string> $uriToNote */
+    $uriToNote = [];
+
+    // Direct crosspost map (may store tip, not root).
+    try {
+        $ph = implode(',', array_fill(0, count($candidates), '?'));
+        $st = ap_db()->prepare(
+            "SELECT bsky_uri, note_id FROM bsky_crossposts WHERE bsky_uri IN ($ph)"
+        );
+        $st->execute($candidates);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $uri = trim((string) ($row['bsky_uri'] ?? ''));
+            $note = rtrim(trim((string) ($row['note_id'] ?? '')), '/');
+            if ($uri !== '' && ap_bsky_is_local_note_id($note)) {
+                $uriToNote[$uri] = $note;
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+
+    // post_links.fediverse_id (root segment usually has this).
+    try {
+        $ph = implode(',', array_fill(0, count($candidates), '?'));
+        $st = ap_db()->prepare(
+            "SELECT bsky_uri, fediverse_id, ap_object_id FROM bsky_post_links WHERE bsky_uri IN ($ph)"
+        );
+        $st->execute($candidates);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $uri = trim((string) ($row['bsky_uri'] ?? ''));
+            $note = rtrim(trim((string) ($row['fediverse_id'] ?? $row['ap_object_id'] ?? '')), '/');
+            if ($uri !== '' && ap_bsky_is_local_note_id($note) && !isset($uriToNote[$uri])) {
+                $uriToNote[$uri] = $note;
+            }
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+
+    // Tip-stored maps: any crosspost whose cached post shares a candidate root.
+    $roots = array_values(array_unique(array_values($rootByUri)));
+    if ($roots !== []) {
+        try {
+            $ph = implode(',', array_fill(0, count($roots), '?'));
+            $st = ap_db()->prepare(
+                "SELECT p.bsky_uri, p.reply_root, c.note_id
+                 FROM bsky_crossposts c
+                 INNER JOIN bsky_posts p ON p.bsky_uri = c.bsky_uri
+                 WHERE p.reply_root IN ($ph) OR p.bsky_uri IN ($ph)"
+            );
+            $st->execute(array_merge($roots, $roots));
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $note = rtrim(trim((string) ($row['note_id'] ?? '')), '/');
+                if (!ap_bsky_is_local_note_id($note)) {
+                    continue;
+                }
+                $tip = trim((string) ($row['bsky_uri'] ?? ''));
+                $tipRoot = trim((string) ($row['reply_root'] ?? ''));
+                if ($tip !== '') {
+                    $uriToNote[$tip] = $note;
+                }
+                if ($tipRoot !== '' && str_starts_with($tipRoot, 'at://')) {
+                    $uriToNote[$tipRoot] = $note;
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+
+        // Same for post_links on any segment under these roots.
+        try {
+            $ph = implode(',', array_fill(0, count($roots), '?'));
+            $st = ap_db()->prepare(
+                "SELECT p.bsky_uri, p.reply_root, COALESCE(NULLIF(l.fediverse_id, ''), l.ap_object_id) AS note_id
+                 FROM bsky_posts p
+                 INNER JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
+                 WHERE (p.reply_root IN ($ph) OR p.bsky_uri IN ($ph))
+                   AND (
+                     l.fediverse_id LIKE 'https://mkultra.monster/users/%/notes/%'
+                     OR l.ap_object_id LIKE 'https://mkultra.monster/users/%/notes/%'
+                   )"
+            );
+            $st->execute(array_merge($roots, $roots));
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $note = rtrim(trim((string) ($row['note_id'] ?? '')), '/');
+                if (!ap_bsky_is_local_note_id($note)) {
+                    continue;
+                }
+                $seg = trim((string) ($row['bsky_uri'] ?? ''));
+                $segRoot = trim((string) ($row['reply_root'] ?? ''));
+                if ($seg !== '') {
+                    $uriToNote[$seg] = $note;
+                }
+                if ($segRoot !== '' && str_starts_with($segRoot, 'at://')) {
+                    $uriToNote[$segRoot] = $note;
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
+    }
+
+    foreach ($clean as $uri) {
+        $root = $rootByUri[$uri] ?? $uri;
+        $note = $uriToNote[$uri] ?? $uriToNote[$root] ?? null;
+        if (is_string($note) && ap_bsky_is_local_note_id($note)) {
+            $out[$uri] = ['mirror' => true, 'note_id' => $note];
+        }
+    }
+    return $out;
+}
+
+/**
  * @return array{note_id:string,bsky_uri:string,bsky_cid:?string,owner_user_id:?int}|null
  */
 function ap_bsky_crosspost_by_note_id(string $noteId): ?array
@@ -3426,6 +3623,18 @@ function ap_bsky_import_own_post_as_local(int $ownerUserId, array $post, int $de
         // VAAK→Bluesky mirror — never create a second local twin.
         ap_bsky_crosspost_save(rtrim($record['fediverseId'], '/'), $uri, $cid !== '' ? $cid : null, $ownerUserId);
         return ['ok' => true, 'skipped' => true, 'note_id' => rtrim($record['fediverseId'], '/'), 'created' => false];
+    }
+    // Long-post split tails: no per-segment fediverseId, but the thread root
+    // (or tip map) already points at the VAAK note. Never mint reply twins.
+    if (function_exists('ap_bsky_vaak_mirror_note_id_for_uri')) {
+        $mirrorNote = ap_bsky_vaak_mirror_note_id_for_uri($uri);
+        if (is_string($mirrorNote) && $mirrorNote !== '') {
+            ap_bsky_crosspost_save($mirrorNote, $uri, $cid !== '' ? $cid : null, $ownerUserId);
+            if (function_exists('ap_bsky_post_link_upsert')) {
+                ap_bsky_post_link_upsert($uri, $cid !== '' ? $cid : null, $mirrorNote, $mirrorNote);
+            }
+            return ['ok' => true, 'skipped' => true, 'note_id' => $mirrorNote, 'created' => false, 'mirror_segment' => true];
+        }
     }
 
     $actorId = ap_db_owner_actor_id_for_user_id($ownerUserId);
@@ -10579,7 +10788,8 @@ function ap_bsky_crosspost_status_inner(
         // Bidirectional map:
         // - Note.blueskyUri (caller) + record.fediverseId on segment 0 = FEP/Wafrn pair
         // - bsky_crossposts stores the *tip* so replies attach under the last chunk
-        // - bsky_post_links indexes the *root* AT-URI back to the AP Note
+        // - bsky_post_links indexes EVERY segment back to the AP Note so Your Posts
+        //   / HTML profiles can hide long-post split tails without XRPC.
         $tip = count($uris) - 1;
         ap_bsky_crosspost_save(
             $fediverseId,
@@ -10587,11 +10797,10 @@ function ap_bsky_crosspost_status_inner(
             $cids[$tip] ?? null,
             $ownerUserId
         );
-        ap_bsky_post_link_upsert((string) $uris[0], $cids[0] ?? null, $fediverseId, $fediverseId);
-        if ($tip > 0) {
+        foreach ($uris as $segIdx => $segUri) {
             ap_bsky_post_link_upsert(
-                (string) $uris[$tip],
-                $cids[$tip] ?? null,
+                (string) $segUri,
+                isset($cids[$segIdx]) ? (string) $cids[$segIdx] : null,
                 $fediverseId,
                 $fediverseId
             );

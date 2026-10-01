@@ -863,9 +863,25 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             $localNoteIds[$localId] = true;
         }
     }
-    $profileBskyPosts = array_values(array_filter($profileBskyPosts, static function (array $item) use ($localNoteIds): bool {
+    // Hide VAAK→Bluesky mirror threads (including long-post split tails) so
+    // they do not reappear as Bluesky cards or fake profile replies.
+    $profileMirrorFlags = [];
+    if ($profileBskyPosts !== [] && function_exists('ap_bsky_mirror_segment_flags')) {
+        $profileUris = [];
+        foreach ($profileBskyPosts as $bItem) {
+            $uri = trim((string) (($bItem['post']['uri'] ?? '') ?: ''));
+            if ($uri !== '') {
+                $profileUris[] = $uri;
+            }
+        }
+        $profileMirrorFlags = ap_bsky_mirror_segment_flags($profileUris);
+    }
+    $profileBskyPosts = array_values(array_filter($profileBskyPosts, static function (array $item) use ($localNoteIds, $profileMirrorFlags): bool {
         $post = is_array($item['post'] ?? null) ? $item['post'] : [];
         $uri = trim((string) ($post['uri'] ?? ''));
+        if ($uri !== '' && !empty($profileMirrorFlags[$uri]['mirror'])) {
+            return false;
+        }
         $record = is_array($post['record'] ?? null) ? $post['record'] : [];
         $fediId = rtrim((string) (($record['fediverseId'] ?? '') ?: ($record['fediverse_id'] ?? '')), '/');
         if ($fediId === '' && $uri !== '' && function_exists('ap_bsky_post_link_by_uri')) {

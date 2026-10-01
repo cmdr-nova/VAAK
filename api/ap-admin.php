@@ -16010,6 +16010,19 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
             'row' => $row,
         ];
     }
+    // Pre-classify Bluesky URIs so long-post mirror splits (root + tails) are
+    // hidden even when the VAAK twin is on another page offset.
+    $bskyMirrorFlags = [];
+    if (function_exists('ap_bsky_mirror_segment_flags')) {
+        $bskyUris = [];
+        foreach ($bsky as $bItem) {
+            $uri = trim((string) (($bItem['post']['uri'] ?? '') ?: ''));
+            if ($uri !== '') {
+                $bskyUris[] = $uri;
+            }
+        }
+        $bskyMirrorFlags = ap_bsky_mirror_segment_flags($bskyUris);
+    }
     foreach ($bsky as $bItem) {
         $post = is_array($bItem['post'] ?? null) ? $bItem['post'] : [];
         $author = is_array($post['author'] ?? null) ? $post['author'] : [];
@@ -16017,6 +16030,9 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
             continue;
         }
         $uri = (string) ($post['uri'] ?? '');
+        if ($uri !== '' && !empty($bskyMirrorFlags[$uri]['mirror'])) {
+            continue;
+        }
         $link = ($uri !== '' && function_exists('ap_bsky_post_link_by_uri'))
             ? ap_bsky_post_link_by_uri($uri) : null;
         $fediId = (string) (($link['fediverse_id'] ?? '') ?: ($post['record']['fediverseId'] ?? ''));
