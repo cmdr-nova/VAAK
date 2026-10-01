@@ -5555,8 +5555,13 @@ function ap_publish_status_text(
     if (!function_exists('ap_masto_content_with_mentions')) {
         require_once __DIR__ . '/ap-masto-entities.php';
     }
+    // Collapse accidental duplicate reply seeds: "@alice.bsky.social @alice.bsky.social@bsky.app …"
+    if ($content !== '' && function_exists('ap_collapse_duplicate_leading_mentions')) {
+        $content = ap_collapse_duplicate_leading_mentions($content);
+    }
     $mentionPack = null;
     $as2MentionTags = [];
+    $as2MentionSeen = [];
     if ($content !== '' && function_exists('ap_masto_content_with_mentions')) {
         $mentionPack = ap_masto_content_with_mentions($content, $extraMentionActors);
         foreach ($mentionPack['mentions'] ?? [] as $m) {
@@ -5567,6 +5572,10 @@ function ap_publish_status_text(
             if (rtrim($mUrl, '/') === rtrim($actor, '/')) {
                 continue;
             }
+            if (isset($as2MentionSeen[$mUrl])) {
+                continue;
+            }
+            $as2MentionSeen[$mUrl] = true;
             $as2MentionTags[] = [
                 'type' => 'Mention',
                 'href' => $mUrl,

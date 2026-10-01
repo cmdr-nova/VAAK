@@ -10044,6 +10044,9 @@ function ap_bsky_create_post(
     ?array $quoteRef = null,
     ?array $video = null
 ): array {
+    if ($text !== '' && function_exists('ap_collapse_duplicate_leading_mentions')) {
+        $text = ap_collapse_duplicate_leading_mentions($text);
+    }
     $record = [
         '$type' => 'app.bsky.feed.post',
         'text' => $text,
