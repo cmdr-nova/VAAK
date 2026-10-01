@@ -6835,8 +6835,13 @@ function admin_home_foaf_actor_weights(int $ownerUserId): array
         }
         $since = gmdate('c', time() - 7 * 86400);
         $counts = [];
-        foreach (array_chunk(array_keys($follows), 60) as $chunk) {
-            $ph = implode(',', array_fill(0, count($chunk), '?'));
+        foreach (array_chunk(array_keys($follows), 40) as $chunk) {
+            $actors = [];
+            foreach ($chunk as $aid) {
+                $actors[] = $aid;
+                $actors[] = $aid . '/';
+            }
+            $ph = implode(',', array_fill(0, count($actors), '?'));
             $st = ap_db()->prepare(
                 "SELECT target_actor, COUNT(*) AS c
                  FROM events
@@ -6847,7 +6852,7 @@ function admin_home_foaf_actor_weights(int $ownerUserId): array
                    AND target_actor IS NOT NULL AND target_actor <> ''
                  GROUP BY target_actor"
             );
-            $st->execute(array_merge([$since], $chunk));
+            $st->execute(array_merge([$since], $actors));
             foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
                 $actor = rtrim(trim((string) ($row['target_actor'] ?? '')), '/');
                 $c = (int) ($row['c'] ?? 0);
