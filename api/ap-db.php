@@ -3509,6 +3509,50 @@ function ap_profile_export_public_cache(string $actorKey = 'cmdr_nova'): void
  * Do NOT insert &lt;br&gt; between &lt;p&gt; tags — Mastodon/Ice Cubes already
  * margin paragraphs, so &lt;/p&gt;&lt;br&gt;&lt;p&gt; renders as a huge gap.
  */
+/**
+ * Collapse duplicate leading @handles in reply text.
+ * Fixes composer seeds that mixed @alice.bsky.social with @alice.bsky.social@bsky.app.
+ */
+function ap_collapse_duplicate_leading_mentions(string $text): string
+{
+    $text = str_replace(["\r\n", "\r"], "\n", ap_fix_utf8($text));
+    if ($text === '' || !str_contains($text, '@')) {
+        return $text;
+    }
+    if (!preg_match('/^((?:@[^\s]+)(?:\s+@[^\s]+)*)(\s+|$)/u', $text, $m)) {
+        return $text;
+    }
+    $prefix = trim($m[1]);
+    $rest = substr($text, strlen($m[0]));
+    $tokens = preg_split('/\s+/u', $prefix) ?: [];
+    $kept = [];
+    $seen = [];
+    foreach ($tokens as $tok) {
+        if ($tok === '' || $tok[0] !== '@') {
+            $kept[] = $tok;
+            continue;
+        }
+        $bare = strtolower(ltrim($tok, '@'));
+        if (preg_match('/^(.+\.[a-z0-9.-]+)@bsky\.app$/i', $bare, $bm)) {
+            $bare = strtolower($bm[1]);
+            $tok = '@' . $bare;
+        }
+        if ($bare === '' || isset($seen[$bare])) {
+            continue;
+        }
+        $seen[$bare] = true;
+        $kept[] = $tok;
+    }
+    $head = implode(' ', $kept);
+    if ($head === '') {
+        return ltrim($rest);
+    }
+    if ($rest === '') {
+        return $head;
+    }
+    return $head . (str_starts_with($rest, "\n") ? $rest : (' ' . ltrim($rest)));
+}
+
 function ap_plain_text_to_html(string $text): string
 {
     $text = str_replace(["\r\n", "\r"], "\n", ap_fix_utf8($text));

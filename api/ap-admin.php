@@ -9467,11 +9467,16 @@ if (
                 $seedHandles[] = $h;
             }
         }
-        // Dedupe while preserving order
+        // Dedupe while preserving order (collapse @handle vs @handle@bsky.app).
         $seenSeed = [];
         $uniq = [];
         foreach ($seedHandles as $h) {
-            $k = strtolower(ltrim($h, '@'));
+            $h = function_exists('admin_reply_mention_normalize')
+                ? admin_reply_mention_normalize($h)
+                : $h;
+            $k = function_exists('admin_reply_mention_dedupe_key')
+                ? admin_reply_mention_dedupe_key($h)
+                : strtolower(ltrim($h, '@'));
             if ($k === '' || isset($seenSeed[$k])) {
                 continue;
             }
@@ -9494,6 +9499,7 @@ if (
     && $prefillEditContent === ''
 ) {
     $seedHandles = [];
+    $seenSeed = [];
     foreach (preg_split('/\s*,\s*/', $prefillMention) ?: [] as $part) {
         $part = trim((string) $part);
         if ($part === '') {
@@ -9502,12 +9508,20 @@ if (
         $h = function_exists('admin_reply_mention_handle')
             ? admin_reply_mention_handle(null, $part)
             : ('@' . ltrim($part, '@'));
-        if ($h !== '' && !(function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))) {
-            $seedHandles[] = $h;
+        if ($h === '' || (function_exists('admin_reply_mention_is_self') && admin_reply_mention_is_self($h))) {
+            continue;
         }
+        $k = function_exists('admin_reply_mention_dedupe_key')
+            ? admin_reply_mention_dedupe_key($h)
+            : strtolower(ltrim($h, '@'));
+        if ($k === '' || isset($seenSeed[$k])) {
+            continue;
+        }
+        $seenSeed[$k] = true;
+        $seedHandles[] = $h;
     }
     if ($seedHandles !== []) {
-        $prefillEditContent = implode(' ', array_values(array_unique($seedHandles))) . ' ';
+        $prefillEditContent = implode(' ', $seedHandles) . ' ';
     }
 }
 $autoOpenComposer = $composerForceOpen
@@ -12986,6 +13000,38 @@ function actor_handle(?string $actorId, ?string $username = null, bool $allowFet
  * Handle to prefill in the reply composer (@user@host), or '' for self / unknown.
  * Optional $acctHint is a Mastodon acct / Bluesky handle without requiring a leading @.
  */
+/** Normalize a reply-seed handle for display + dedupe (Bluesky aliases collapse). */
+function admin_reply_mention_normalize(string $handle): string
+{
+    $handle = trim($handle);
+    if ($handle === '' || $handle === '@') {
+        return '';
+    }
+    if ($handle[0] !== '@') {
+        $handle = '@' . $handle;
+    }
+    // Prefer @alice.bsky.social over @alice.bsky.social@bsky.app
+    if (preg_match('/^@(.+)@bsky\.app$/i', $handle, $m) && str_contains($m[1], '.')) {
+        return '@' . strtolower($m[1]);
+    }
+    return $handle;
+}
+
+/** Stable dedupe key so @alice.bsky.social and @alice.bsky.social@bsky.app collide. */
+function admin_reply_mention_dedupe_key(string $handle): string
+{
+    $norm = admin_reply_mention_normalize($handle);
+    $key = strtolower(ltrim($norm, '@'));
+    if ($key === '') {
+        return '';
+    }
+    // Also collapse accidental trailing instance on already-normalized Bluesky handles.
+    if (preg_match('/^(.+\.[a-z0-9.-]+)@bsky\.app$/i', $key, $m)) {
+        return strtolower($m[1]);
+    }
+    return $key;
+}
+
 function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null): string
 {
     $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
@@ -12997,11 +13043,7 @@ function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null):
         if (preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#i', $actorId)) {
             $hint = preg_replace('/@mkultra\.monster$/i', '', $hint) ?? $hint;
         }
-        // Bluesky-style handle already includes the domain.
-        if (str_contains($hint, '.') && !str_contains($hint, '@')) {
-            return '@' . $hint;
-        }
-        return '@' . $hint;
+        return admin_reply_mention_normalize('@' . $hint);
     }
     if ($actorId === '') {
         return '';
@@ -13013,18 +13055,19 @@ function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null):
     if (preg_match('#^https://mkultra\.monster/users/#i', $actorId)) {
         return '';
     }
+    // Bluesky profile URLs: prefer the handle path segment over actor_handle()'s
+    // @handle@bsky.app form so seeds stay consistent with facet extracts.
+    if (preg_match('#^https://bsky\.app/profile/([^/?#]+)#i', $actorId, $pm)) {
+        $seg = rawurldecode($pm[1]);
+        if ($seg !== '' && !str_starts_with($seg, 'did:')) {
+            return admin_reply_mention_normalize('@' . $seg);
+        }
+    }
     $handle = trim(actor_handle($actorId));
     if ($handle === '' || $handle === '@') {
         return '';
     }
-    if ($handle[0] !== '@') {
-        $handle = '@' . $handle;
-    }
-    // Prefer @alice.bsky.social over @alice.bsky.social@bsky.app
-    if (preg_match('/^@(.+)@bsky\.app$/i', $handle, $m) && str_contains($m[1], '.')) {
-        return '@' . $m[1];
-    }
-    return $handle;
+    return admin_reply_mention_normalize($handle);
 }
 
 /** @return list<string> lowercased self acct keys to skip when seeding a reply */
@@ -13069,17 +13112,14 @@ function admin_reply_mention_seed(?string $authorActorId, ?string $authorAcct = 
     $out = [];
     $seen = [];
     $push = static function (string $handle) use (&$out, &$seen): void {
-        $handle = trim($handle);
-        if ($handle === '' || $handle === '@') {
+        $handle = admin_reply_mention_normalize($handle);
+        if ($handle === '') {
             return;
-        }
-        if ($handle[0] !== '@') {
-            $handle = '@' . $handle;
         }
         if (admin_reply_mention_is_self($handle)) {
             return;
         }
-        $key = strtolower(ltrim($handle, '@'));
+        $key = admin_reply_mention_dedupe_key($handle);
         if ($key === '' || isset($seen[$key])) {
             return;
         }
@@ -31124,6 +31164,7 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       }
     }
     // mention may be "a@host" or "a@host,b@host" (from reply links).
+    // Collapse Bluesky aliases: @alice.bsky.social vs @alice.bsky.social@bsky.app.
     const mentionRaw = String(opts.mention || '').trim();
     const mentionParts = [];
     const mentionSeen = {};
@@ -31131,7 +31172,12 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
       let p = String(part || '').trim();
       if (!p) return;
       if (p.charAt(0) !== '@') p = '@' + p;
-      const key = p.slice(1).toLowerCase();
+      let key = p.slice(1).toLowerCase();
+      const bskyAlias = key.match(/^(.+\.[a-z0-9.-]+)@bsky\.app$/i);
+      if (bskyAlias) {
+        key = bskyAlias[1].toLowerCase();
+        p = '@' + key;
+      }
       if (!key || mentionSeen[key]) return;
       mentionSeen[key] = true;
       mentionParts.push(p);
