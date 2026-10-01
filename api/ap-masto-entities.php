@@ -729,7 +729,10 @@ function ap_masto_status_from_row(array $row, bool $attachQuote = true, bool $al
             $status['quote'] = $quote;
         }
     }
-    return ap_masto_apply_interaction_flags($status);
+    $status = ap_masto_apply_interaction_flags($status);
+    return function_exists('ap_normalize_status')
+        ? ap_normalize_status($status)
+        : $status;
 }
 
 /**
