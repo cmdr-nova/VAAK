@@ -1259,16 +1259,33 @@ function ap_masto_synthetic_object_status_id(string $objectUrl): string
 
 function ap_masto_status_media_attachments(int $statusLocalId): array
 {
-    if ($statusLocalId <= 0 || !function_exists('ap_masto_media_entity')) {
+    if ($statusLocalId <= 0) {
+        return [];
+    }
+    // Media entity helper lives in ap-r2.php; notifications/timeline paths may
+    // not have loaded it yet. Without this, media-only posts render as empty.
+    if (!function_exists('ap_masto_media_entity')) {
+        $r2 = __DIR__ . '/ap-r2.php';
+        if (is_file($r2)) {
+            require_once $r2;
+        }
+    }
+    if (!function_exists('ap_masto_media_entity')) {
         return [];
     }
     if (isset($GLOBALS['ap_notification_media_rows'][$statusLocalId])
         && is_array($GLOBALS['ap_notification_media_rows'][$statusLocalId])) {
         $out = [];
         foreach ($GLOBALS['ap_notification_media_rows'][$statusLocalId] as $row) {
-            if (is_array($row)) $out[] = ap_masto_media_entity($row);
+            if (is_array($row)) {
+                $out[] = ap_masto_media_entity($row);
+            }
         }
-        return $out;
+        // Prefetch can be empty while masto_media already has rows (race / partial
+        // warm). Fall through to SQL when the cache produced nothing.
+        if ($out !== []) {
+            return $out;
+        }
     }
     $st = ap_db()->prepare('SELECT * FROM masto_media WHERE status_local_id = ? ORDER BY local_id ASC');
     $st->execute([$statusLocalId]);
