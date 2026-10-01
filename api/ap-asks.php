@@ -257,11 +257,123 @@ function ap_ask_card_html_from_row(array $askRow, bool $includeAnswer = false): 
     if ($includeAnswer) {
         $answer = (string) ($askRow['ask_answer'] ?? $askRow['answer'] ?? '');
     }
+    $label = trim((string) ($askRow['asker_label'] ?? ''));
     return ap_ask_card_html([
         'question' => (string) ($askRow['question'] ?? $askRow['ask_question'] ?? ''),
         'asker_actor' => (string) ($askRow['asker_actor'] ?? $askRow['ask_actor'] ?? ''),
+        'asker_label' => $label,
         'answer' => $answer,
+        'show_avatar' => (($askRow['asker_actor'] ?? $askRow['ask_actor'] ?? '') !== ''),
     ]);
+}
+
+/**
+ * Parse Wafrn/VAAK compact Ask text into structured parts.
+ *
+ * @return array{asker_label:string,question:string,answer:string}|null
+ */
+function ap_ask_parse_compact_text(string $text): ?array
+{
+    $raw = trim($text);
+    if ($raw === '') {
+        return null;
+    }
+    $asker = '';
+    $question = '';
+    $answer = '';
+    // HTML form: <p>@user asked</p><blockquote>q</blockquote>answer
+    if (preg_match('~^\s*<p>(.*?)\s+asked\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$~isu', $raw, $m)) {
+        $asker = trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $question = trim(html_entity_decode(strip_tags($m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $answer = trim(html_entity_decode(strip_tags($m[3]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    } else {
+        $plain = trim(html_entity_decode(strip_tags($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        // Multiline Wafrn firehose summary: "@user@host asked\n\nquestion\n\nanswer"
+        if (preg_match('/^(@[^\s]+)\s+asked\s*\n+(.+)$/isu', $plain, $m)) {
+            $asker = trim($m[1]);
+            $rest = trim($m[2]);
+            if (preg_match('/^(.*?)\n\s*\n+(.+)$/su', $rest, $parts)) {
+                $question = trim($parts[1]);
+                $answer = trim($parts[2]);
+            } else {
+                $question = $rest;
+            }
+        } elseif (preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $plain, $m)) {
+            $asker = trim($m[1]);
+            $rest = trim($m[2]);
+            if (preg_match('/^(.*?)\n\s*\n+(.+)$/su', $rest, $parts)) {
+                $question = trim($parts[1]);
+                $answer = trim($parts[2]);
+            } else {
+                $question = $rest;
+            }
+        } else {
+            return null;
+        }
+    }
+    if ($asker === '' || $question === '' || !str_contains($asker, '@')) {
+        return null;
+    }
+    return [
+        'asker_label' => $asker,
+        'question' => $question,
+        'answer' => $answer,
+    ];
+}
+
+/**
+ * Resolve Ask context for any object URL (local answer, outbound→remote answer,
+ * federated Wafrn answer via mentions, or compact text parse).
+ *
+ * @return array{question:string,asker_actor:string,asker_label:string,answer:string}|null
+ */
+function ap_ask_context_for_object(string $objectId, ?string $fallbackText = null): ?array
+{
+    $objectId = rtrim(trim($objectId), '/');
+    if ($objectId !== '' && function_exists('ap_ask_answer_for_note')) {
+        $local = ap_ask_answer_for_note($objectId);
+        if (is_array($local) && trim((string) ($local['question'] ?? '')) !== '') {
+            return [
+                'question' => trim((string) $local['question']),
+                'asker_actor' => (string) ($local['asker_actor'] ?? ''),
+                'asker_label' => '',
+                'answer' => '',
+            ];
+        }
+    }
+    if ($objectId !== '' && str_starts_with($objectId, 'https://')) {
+        try {
+            $st = ap_db()->prepare(
+                'SELECT ask_actor, ask_question, ask_answer FROM mentions
+                 WHERE (object_id = ? OR object_id = ?) AND deleted_at IS NULL AND ask_question <> \'\'
+                 ORDER BY id DESC LIMIT 1'
+            );
+            $st->execute([$objectId, $objectId . '/']);
+            $row = $st->fetch();
+            if (is_array($row) && trim((string) ($row['ask_question'] ?? '')) !== '') {
+                return [
+                    'question' => trim((string) $row['ask_question']),
+                    'asker_actor' => (string) ($row['ask_actor'] ?? ''),
+                    'asker_label' => '',
+                    'answer' => trim((string) ($row['ask_answer'] ?? '')),
+                ];
+            }
+        } catch (Throwable $e) {
+            // table/columns may be mid-migrate
+        }
+    }
+    if (is_string($fallbackText) && trim($fallbackText) !== '') {
+        $parsed = ap_ask_parse_compact_text($fallbackText);
+        if (is_array($parsed)) {
+            return [
+                'question' => $parsed['question'],
+                'asker_actor' => '',
+                'asker_label' => $parsed['asker_label'],
+                'answer' => $parsed['answer'],
+            ];
+        }
+    }
+    return null;
 }
 
 /**
@@ -271,31 +383,14 @@ function ap_ask_card_html_from_row(array $askRow, bool $includeAnswer = false): 
  */
 function ap_wafrn_remote_ask_html(string $text): ?string
 {
-    $raw = trim($text);
-    $answer = '';
-    $asker = '';
-    $question = '';
-    // Wafrn answers carry the question in a blockquote and the answer after
-    // it. Preserve those two parts instead of flattening them into one line.
-    if (preg_match('~^\s*<p>(.*?)\s+asked\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$~isu', $raw, $m)) {
-        $asker = trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        $question = trim(html_entity_decode(strip_tags($m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        $answer = trim(html_entity_decode(strip_tags($m[3]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-    } else {
-        $plain = trim(html_entity_decode(strip_tags($raw), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-        if ($plain === '' || !preg_match('/^(.{1,240}?)\s+asked\s+(.{1,20000})$/isu', $plain, $m)) {
-            return null;
-        }
-        $asker = trim($m[1]);
-        $question = trim($m[2]);
-    }
-    if ($asker === '' || $question === '' || !str_contains($asker, '@')) {
+    $parsed = ap_ask_parse_compact_text($text);
+    if ($parsed === null) {
         return null;
     }
     return ap_ask_card_html([
-        'question' => $question,
-        'asker_label' => $asker,
-        'answer' => $answer,
+        'question' => $parsed['question'],
+        'asker_label' => $parsed['asker_label'],
+        'answer' => $parsed['answer'],
         'show_avatar' => false,
     ]);
 }

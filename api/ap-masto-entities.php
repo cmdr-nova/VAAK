@@ -6298,7 +6298,14 @@ function ap_masto_status_from_event(array $row): ?array
         ];
     }
 
-    return ap_masto_apply_interaction_flags($status);
+    $status = ap_masto_apply_interaction_flags($status);
+    // Normalize inner of boosts too when present.
+    if (isset($status['reblog']) && is_array($status['reblog']) && function_exists('ap_normalize_status')) {
+        $status['reblog'] = ap_normalize_status($status['reblog']);
+    }
+    return function_exists('ap_normalize_status')
+        ? ap_normalize_status($status)
+        : $status;
 }
 
 /**
