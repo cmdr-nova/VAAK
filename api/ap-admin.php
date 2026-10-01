@@ -16755,6 +16755,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                 $nSnippet = preg_replace('#^RE:\s*https://\S+#u', '', $nSnippet) ?? $nSnippet;
                 $nSnippet = trim($nSnippet);
             }
+            // Media-only local notes often use empty HTML with a "(media)" sentinel
+            // in content_text; treat that as no text so the media preview can lead.
+            if (in_array($nSnippet, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+                $nSnippet = '';
+            }
             // Wafrn may glue the first commentary word onto our local domain
             // (@cmdr_nova@mkultra.monsteraudio / @…monsterone). Shared unglue
             // restores the real handle before we linkify the snippet.
@@ -16949,10 +16954,23 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php endif; ?>
       <?php if ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
         <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
-      <?php elseif (($nSnippet !== '' || $nMedia !== []) && in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?>
+      <?php elseif (in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)
+          && ($nSnippet !== '' || $nMedia !== [] || $nStatusUri !== '')): ?>
+        <?php
+          // Media-only posts often store empty HTML / "(media)" sentinel. Still show
+          // a "Your post" preview card so likes/boosts are identifiable.
+          $nPreviewLabel = $snipShow;
+          if ($nPreviewLabel === '' || in_array($nPreviewLabel, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
+              $nPreviewLabel = $nMedia !== [] ? '📷 media post' : 'your post';
+          }
+        ?>
         <div class="quote-block" style="margin-top:.55rem">
           <span class="qt-label"><?= in_array($nType, ['quote', 'status'], true) ? 'Post' : 'Your post' ?></span><br>
-          <?php if ($snipShow !== ''): ?><span class="notification-snippet"><?= h($snipShow) ?></span><?php endif; ?>
+          <?php if ($nStatusUri !== ''): ?>
+            <a class="notification-snippet" href="<?= h(admin_status_href($nStatusUri, 'mentions')) ?>"><?= h($nPreviewLabel) ?></a>
+          <?php else: ?>
+            <span class="notification-snippet"><?= h($nPreviewLabel) ?></span>
+          <?php endif; ?>
           <?php if ($nMedia !== []): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
         </div>
       <?php endif; ?>
