@@ -12496,6 +12496,33 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
               $eMedia = mention_media_urls($e['media_urls'] ?? null);
               $summaryRaw = admin_media_placeholder_summary($summaryRaw, $eMedia);
               $bodyChunk = '';
+              // Federated / remote-profile Asks (Wafrn compact summary or mentions columns).
+              $eventAsk = null;
+              if ($objectId !== '' && function_exists('ap_ask_context_for_object')) {
+                  $eventAsk = ap_ask_context_for_object($objectId, $summaryRaw);
+              } elseif ($summaryRaw !== '' && function_exists('ap_ask_parse_compact_text')) {
+                  $parsedAsk = ap_ask_parse_compact_text($summaryRaw);
+                  if (is_array($parsedAsk)) {
+                      $eventAsk = [
+                          'question' => $parsedAsk['question'],
+                          'asker_actor' => '',
+                          'asker_label' => $parsedAsk['asker_label'],
+                          'answer' => $parsedAsk['answer'],
+                      ];
+                  }
+              }
+              if (is_array($eventAsk) && function_exists('ap_ask_card_html_from_row')) {
+                  $bodyChunk .= ap_ask_card_html_from_row($eventAsk, false);
+                  $askAnswer = trim((string) ($eventAsk['answer'] ?? ''));
+                  if ($askAnswer !== '') {
+                      $summaryRaw = $askAnswer;
+                      $quoteParts = null;
+                  } else {
+                      // Question-only card; do not also dump "X asked …" as body.
+                      $summaryRaw = '';
+                      $quoteParts = null;
+                  }
+              }
               // Resolve bare @user → full acct via cache (same path Ice Cubes uses), so
               // timeline summaries that lost @host still get clickable profile links.
               $eventMentions = [];
@@ -13730,21 +13757,31 @@ function admin_render_masto_status_card(
     $cwSpoiler = trim((string) ($st['spoiler_text'] ?? ''));
     $cwSensitive = !empty($st['sensitive']) || $cwSpoiler !== '';
 
-    // Local Ask answers: question lives in ap_asks, not in content_text.
-    // Always paint the canonical Ask card above the answer body (focus, Home, etc.).
+    // Ask answers (local + remote Wafrn): question via vaak_ask / ap_asks / mentions.
+    // Always paint the canonical Ask card above the answer body.
     $askCardHtml = '';
     $askRow = null;
     if (!empty($st['vaak_ask']) && is_array($st['vaak_ask'])) {
         $askRow = $st['vaak_ask'];
+    } elseif ($uri !== '' && function_exists('ap_ask_context_for_object')) {
+        $askRow = ap_ask_context_for_object($uri, $plain);
     } elseif ($uri !== '' && function_exists('ap_ask_answer_for_note')) {
         $askRow = ap_ask_answer_for_note($uri);
     }
     if (is_array($askRow) && function_exists('ap_ask_card_html_from_row')) {
         $askCardHtml = ap_ask_card_html_from_row($askRow, false);
+        $askAnswerPlain = trim((string) ($askRow['answer'] ?? $askRow['ask_answer'] ?? ''));
+        if ($askAnswerPlain !== '') {
+            $plain = $askAnswerPlain;
+        } elseif ($askCardHtml !== '' && preg_match('/\basked\b/iu', $plain)) {
+            // Compact "X asked …" was the whole body — card carries the question.
+            $plain = '';
+        }
     } elseif (is_array($askRow) && function_exists('ap_ask_card_html')) {
         $askCardHtml = ap_ask_card_html([
             'question' => (string) ($askRow['question'] ?? ''),
             'asker_actor' => (string) ($askRow['asker_actor'] ?? ''),
+            'asker_label' => (string) ($askRow['asker_label'] ?? ''),
         ]);
     }
     // If API content already prepended an ask-container, drop it from plain body
