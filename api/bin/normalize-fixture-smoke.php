@@ -110,6 +110,8 @@ function vaak_fixture_project(array $status): array
                 && is_array(($st['quote']['quoted_status'] ?? null)),
             'has_reblog' => is_array($st['reblog'] ?? null),
             'vaak_rss_feed_id' => isset($st['vaak_rss_feed_id']) ? (int) $st['vaak_rss_feed_id'] : null,
+            'vaak_degraded' => !empty($st['vaak_degraded']),
+            'vaak_degraded_reason' => (string) ($st['vaak_degraded_reason'] ?? ''),
         ];
         if ($out['has_quote']) {
             $out['quote_plain'] = trim(html_entity_decode(
@@ -182,6 +184,7 @@ function vaak_fixture_run(array $meta, array $input): ?array
         'rss' => ap_normalize_from_rss_item($input),
         'event' => ap_normalize_from_activitypub_event($input),
         'status' => ap_normalize_status($input),
+        'degraded' => ap_normalize_degraded_status($input),
         default => null,
     };
 }

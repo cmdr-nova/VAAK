@@ -15,5 +15,7 @@
     "ask_question": "",
     "has_quote": false,
     "has_reblog": false,
-    "vaak_rss_feed_id": 42
+    "vaak_rss_feed_id": 42,
+    "vaak_degraded": false,
+    "vaak_degraded_reason": ""
 }

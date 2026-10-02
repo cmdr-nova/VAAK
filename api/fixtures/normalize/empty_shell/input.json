@@ -12,6 +12,5 @@
   "action_taken": "local_observe",
   "created_at": "2026-07-01T12:00:00Z",
   "in_reply_to": "",
-  "_allow_hidden_actor": true,
-  "_allow_empty_for_context": true
+  "_allow_hidden_actor": true
 }
