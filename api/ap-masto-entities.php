@@ -9101,6 +9101,14 @@ function ap_masto_bsky_trend_status(array $post): ?array
     }
     $uri = trim((string) ($post['uri'] ?? ''));
     $author = is_array($post['author'] ?? null) ? $post['author'] : [];
+    // Fill thin authors from bsky_actor_profiles / prior posts (Home first paint).
+    if ($author !== [] && function_exists('ap_bsky_enrich_author_view')) {
+        $author = ap_bsky_enrich_author_view(
+            $author,
+            (int) ($GLOBALS['vaak_owner_id'] ?? 0)
+        );
+        $post['author'] = $author;
+    }
     $did = trim((string) ($author['did'] ?? ''));
     if ($uri === '' || $did === '') {
         return null;
