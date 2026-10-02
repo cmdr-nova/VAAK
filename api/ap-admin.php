@@ -5867,19 +5867,9 @@ if ($hydrateBoost || $hydrateCreate) {
             exit;
         }
         ob_start();
-        if (
-            function_exists('ap_normalize_from_activitypub_event')
-            && function_exists('admin_render_masto_status_card')
-        ) {
-            // Budget already spent in ensure above; card must not re-fetch.
-            $GLOBALS['admin_boost_fetch_budget'] = 0;
-            $st = ap_normalize_from_activitypub_event($row);
-            if (is_array($st)) {
-                admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
-            } else {
-                echo '<div class="meta">Could not render post.</div>';
-            }
-        } else {
+        // Budget already spent in ensure above; card must not re-fetch.
+        $GLOBALS['admin_boost_fetch_budget'] = 0;
+        if (!admin_try_render_event_shared_card($row, $followingIds, $returnView)) {
             echo '<div class="meta">Could not render post.</div>';
         }
         echo ob_get_clean();
@@ -12314,6 +12304,14 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
         admin_try_render_announce_shared_card($e, $followingIds, $returnView, true);
         return;
     }
+    // Create/Update → shared Mastodon status card first.
+    // Legacy event_tweet HTML below is last-resort when normalize refuses.
+    if ($fromFollowedTag) {
+        $e['_from_followed_tag'] = true;
+    }
+    if (admin_try_render_event_shared_card($e, $followingIds, $returnView)) {
+        return;
+    }
     $canReply = feed_event_can_reply($e);
     $replyObjectId = feed_event_reply_object_id($e);
     $summaryRaw = html_entity_decode((string) ($e['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
@@ -14170,6 +14168,7 @@ function admin_render_masto_status_card(
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
                     <?php if ($isBsky): ?><span class="tag" title="From Bluesky">Bluesky</span><?php endif; ?>
+                    <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
                     <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php else: ?>
@@ -14181,6 +14180,7 @@ function admin_render_masto_status_card(
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
                     <?php if ($isBsky): ?><span class="tag" title="From Bluesky">Bluesky</span><?php endif; ?>
+                    <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
                     <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php endif; ?>
@@ -14451,6 +14451,35 @@ function admin_render_masto_status_card(
             </div>
           </article>
     <?php
+}
+
+/**
+ * Prefer shared Mastodon status card for a Create/Update (or other non-Announce) event.
+ * Returns false when normalize refuses — callers may fall through to legacy dialect.
+ *
+ * @param array<string,mixed> $e
+ * @param array<int|string,mixed> $followingIds
+ */
+function admin_try_render_event_shared_card(
+    array $e,
+    array $followingIds,
+    string $returnView,
+    bool $focused = false,
+    bool $showOpen = true
+): bool {
+    if (!function_exists('ap_normalize_from_activitypub_event')
+        || !function_exists('admin_render_masto_status_card')) {
+        return false;
+    }
+    $st = ap_normalize_from_activitypub_event($e);
+    if (!is_array($st)) {
+        return false;
+    }
+    if (!empty($e['_from_followed_tag'])) {
+        $st['vaak_from_followed_tag'] = true;
+    }
+    admin_render_masto_status_card($st, $followingIds, $returnView, $focused, $showOpen);
+    return true;
 }
 
 /**
@@ -15972,23 +16001,19 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     // Thin Announces paint as reblog + vaak_degraded announce_only (AJAX hydrate_boost).
     // Fav/bookmark/boost use the inner status id + object URL (same as Ice Cubes).
     $evType = strtolower((string) ($row['type'] ?? 'create'));
-    if (
-        $row !== []
-        && in_array($evType, ['create', 'update', 'announce'], true)
-        && function_exists('ap_normalize_from_activitypub_event')
-        && function_exists('admin_render_masto_status_card')
-    ) {
+    if ($row !== [] && in_array($evType, ['create', 'update', 'announce'], true)) {
         if ($evType === 'announce') {
             // Do not sync-fetch on the timeline path (stalls Home); AJAX hydrate instead.
-            $row['_skip_announce_hydrate'] = true;
-        }
-        $st = ap_normalize_from_activitypub_event($row);
-        if (is_array($st)) {
-            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            if (admin_try_render_announce_shared_card($row, $followingIds, $returnView, true)) {
+                return;
+            }
+            // Hidden/session/empty — skip. Do not resurrect remote_boost_card dialect.
             return;
         }
-        if ($evType === 'announce') {
-            // Hidden/session/empty — skip. Do not resurrect remote_boost_card dialect.
+        if ($fromTag) {
+            $row['_from_followed_tag'] = true;
+        }
+        if (admin_try_render_event_shared_card($row, $followingIds, $returnView)) {
             return;
         }
     }
@@ -16221,17 +16246,10 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
             exit;
         }
         if (is_array($focusEvent)) {
-            $focusStatus = function_exists('ap_masto_status_from_event')
-                ? ap_masto_status_from_event($focusEvent)
-                : null;
-            if (is_array($focusStatus)) {
-                if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusStatus['id'])) {
-                    ap_masto_status_flags_prefetch([(string) $focusStatus['id']]);
-                }
-                admin_render_masto_status_card($focusStatus, $followingIds, $stFrom, true, false);
-            } else {
-                admin_render_event_tweet($focusEvent, $followingIds, $stFrom);
+            if (admin_try_render_event_shared_card($focusEvent, $followingIds, $stFrom, true, false)) {
+                exit;
             }
+            admin_render_event_tweet($focusEvent, $followingIds, $stFrom);
             exit;
         }
         echo '<div class="meta">Couldn’t load this post yet. '
@@ -24489,6 +24507,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     $evRow = ap_event_by_object_id($oid);
                 }
                 if (is_array($evRow)) {
+                    // event_tweet prefers shared Create/Announce cards; legacy last.
                     admin_render_event_tweet($evRow, $followingIdsForLists, 'lists');
                 } else {
                     $acct = is_array($st['account'] ?? null) ? $st['account'] : [];
@@ -25633,15 +25652,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php if (is_array($stEvent)): ?>
               <div id="status-focus">
                 <?php
-                  $focusStatus = function_exists('ap_masto_status_from_event')
-                      ? ap_masto_status_from_event($stEvent)
-                      : null;
-                  if (is_array($focusStatus)) {
-                      if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusStatus['id'])) {
-                          ap_masto_status_flags_prefetch([(string) $focusStatus['id']]);
-                      }
-                      admin_render_masto_status_card($focusStatus, $followingIds, $stFrom, true, false);
-                  } else {
+                  if (!admin_try_render_event_shared_card($stEvent, $followingIds, $stFrom, true, false)) {
                       admin_render_event_tweet($stEvent, $followingIds, $stFrom);
                   }
                 ?>
@@ -25706,16 +25717,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php
             if (is_array($stLocalStatus)) {
                 admin_render_masto_status_card($stLocalStatus, $followingIds, $stFrom, true, false);
-            } else {
-                $focusStatus = ap_masto_status_from_event($stEvent);
-                if (is_array($focusStatus)) {
-                    if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusStatus['id'])) {
-                        ap_masto_status_flags_prefetch([(string) $focusStatus['id']]);
-                    }
-                    admin_render_masto_status_card($focusStatus, $followingIds, $stFrom, true, false);
-                } else {
-                    admin_render_event_tweet($stEvent, $followingIds, $stFrom);
-                }
+            } elseif (!admin_try_render_event_shared_card($stEvent, $followingIds, $stFrom, true, false)) {
+                admin_render_event_tweet($stEvent, $followingIds, $stFrom);
             }
           ?>
 
