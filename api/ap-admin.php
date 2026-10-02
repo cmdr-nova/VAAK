@@ -14057,6 +14057,11 @@ function admin_render_masto_status_card(
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
             . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef !== '' ? $actorRef : null) . '</div>';
     }
+    // Quote-boosts: commentary media belongs with the outer text, above the
+    // nested quoted post (text+media or media-only). Same order for fedi + Bluesky.
+    if ($media) {
+        $bodyInner .= admin_media_row_html($media);
+    }
 
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
         $qst = $quote['quoted_status'];
@@ -14130,9 +14135,6 @@ function admin_render_masto_status_card(
                 'open_label' => 'Quoted post (not cached yet) — open',
             ], $returnView);
         }
-    }
-    if ($media) {
-        $bodyInner .= admin_media_row_html($media);
     }
     // Status Open / masto cards: attach poll UI (timeline outbox path already does).
     $pollHtml = '';
