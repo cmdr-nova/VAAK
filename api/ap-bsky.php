@@ -6219,8 +6219,99 @@ function ap_bsky_feed_item_from_any_url(string $url, int $ownerUserId = 0, bool 
  * @param array<string,mixed> $item
  * @return array{uri:?string,handle:string,display:string,text:string,url:string}|null
  */
+/**
+ * Fill handle/display/text for a reply-parent preview when AppView only left an at:// ref.
+ *
+ * @param array{uri:?string,handle:string,display:string,text:string,url:string} $prev
+ * @return array{uri:?string,handle:string,display:string,text:string,url:string}
+ */
+function ap_bsky_reply_parent_preview_enrich(array $prev, int $ownerUserId = 0): array
+{
+    $uri = trim((string) ($prev['uri'] ?? ''));
+    $handle = trim((string) ($prev['handle'] ?? ''));
+    $display = trim((string) ($prev['display'] ?? ''));
+    $text = trim((string) ($prev['text'] ?? ''));
+    $handleThin = $handle === '' || str_starts_with($handle, 'did:');
+    $displayThin = $display === '' || $display === 'parent post' || $display === 'Bluesky user';
+
+    // DID from at://did:…/app.bsky.feed.post/…
+    $did = '';
+    if (preg_match('#^at://(did:[^/]+)/#', $uri, $m)) {
+        $did = (string) $m[1];
+    }
+
+    // 1) Cached parent post row (handle + snippet).
+    if ($uri !== '' && str_starts_with($uri, 'at://') && ($handleThin || $displayThin || $text === '')) {
+        try {
+            if (function_exists('ap_bsky_posts_migrate')) {
+                ap_bsky_posts_migrate();
+            }
+            $st = ap_db()->prepare(
+                'SELECT author_did, author_handle, author_display, text
+                 FROM bsky_posts WHERE bsky_uri = ? LIMIT 1'
+            );
+            $st->execute([$uri]);
+            $row = $st->fetch();
+            if (is_array($row)) {
+                if ($did === '') {
+                    $did = trim((string) ($row['author_did'] ?? ''));
+                }
+                $ph = trim((string) ($row['author_handle'] ?? ''));
+                $pd = trim((string) ($row['author_display'] ?? ''));
+                $pt = trim((string) ($row['text'] ?? ''));
+                if ($handleThin && $ph !== '' && !str_starts_with($ph, 'did:')) {
+                    $handle = $ph;
+                    $handleThin = false;
+                }
+                if ($displayThin && $pd !== '') {
+                    $display = $pd;
+                    $displayThin = false;
+                }
+                if ($text === '' && $pt !== '') {
+                    $text = mb_substr($pt, 0, 120);
+                }
+            }
+        } catch (Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    // 2) Author enrich from profile cache / prior posts by DID.
+    if ($did !== '' && str_starts_with($did, 'did:') && ($handleThin || $displayThin)
+        && function_exists('ap_bsky_enrich_author_view')) {
+        $author = ap_bsky_enrich_author_view([
+            'did' => $did,
+            'handle' => $handleThin ? '' : $handle,
+            'displayName' => $displayThin ? '' : $display,
+            'avatar' => '',
+        ], $ownerUserId);
+        $eh = trim((string) ($author['handle'] ?? ''));
+        $ed = trim((string) ($author['displayName'] ?? ''));
+        if ($handleThin && $eh !== '' && !str_starts_with($eh, 'did:')) {
+            $handle = $eh;
+            $handleThin = false;
+        }
+        if ($displayThin && $ed !== '') {
+            $display = $ed;
+            $displayThin = false;
+        }
+    }
+
+    if ($displayThin) {
+        $display = $handle !== '' ? $handle : 'parent post';
+    }
+    $prev['handle'] = $handle;
+    $prev['display'] = $display;
+    $prev['text'] = $text;
+    if ($uri !== '' && function_exists('ap_bsky_https_url_from_at_uri')) {
+        $prev['url'] = ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null);
+    }
+    return $prev;
+}
+
 function ap_bsky_reply_parent_preview(array $item): ?array
 {
+    $ownerUserId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
     $parent = $item['reply']['parent'] ?? null;
     if (!is_array($parent)) {
         $post = is_array($item['post'] ?? null) ? $item['post'] : [];
@@ -6230,13 +6321,13 @@ function ap_bsky_reply_parent_preview(array $item): ?array
             return null;
         }
         $uri = (string) $ref['uri'];
-        return [
+        return ap_bsky_reply_parent_preview_enrich([
             'uri' => $uri,
             'handle' => '',
             'display' => 'parent post',
             'text' => '',
             'url' => ap_bsky_https_url_from_at_uri($uri, null),
-        ];
+        ], $ownerUserId);
     }
     $vType = (string) ($parent['$type'] ?? '');
     if ($vType !== '' && (str_contains($vType, 'NotFound') || str_contains($vType, 'Blocked'))) {
@@ -6257,13 +6348,13 @@ function ap_bsky_reply_parent_preview(array $item): ?array
     $rec = is_array($parent['record'] ?? null) ? $parent['record'] : [];
     $text = trim((string) ($rec['text'] ?? ''));
     $uri = (string) ($parent['uri'] ?? '');
-    return [
+    return ap_bsky_reply_parent_preview_enrich([
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
         'display' => $display,
         'text' => $text,
         'url' => $uri !== '' ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null) : 'https://bsky.app/',
-    ];
+    ], $ownerUserId);
 }
 
 /**
