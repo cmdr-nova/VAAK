@@ -943,7 +943,7 @@ function ap_rss_item_to_masto_status(array $row): array
     if ($feedTitle === '') {
         $feedTitle = 'RSS';
     }
-    $favicon = trim((string) ($row['feed_favicon'] ?? ''));
+    $feedFavicon = trim((string) ($row['feed_favicon'] ?? ''));
     $published = (string) ($row['published_at'] ?? ($row['ingested_at'] ?? gmdate('c')));
     $created = function_exists('ap_masto_format_time')
         ? ap_masto_format_time($published)
@@ -999,11 +999,20 @@ function ap_rss_item_to_masto_status(array $row): array
         ];
     }
 
-    $avatar = ($favicon !== '' && preg_match('#^https?://#i', $favicon))
-        ? $favicon
-        : (defined('AP_REMOTE_AVATAR_FALLBACK')
+    // Timeline avatar: item link host favicon first, then stored feed icon, then default.
+    $linkFavicon = ($url !== '' && function_exists('ap_rss_favicon_for_url'))
+        ? ap_rss_favicon_for_url($url)
+        : '';
+    $avatar = '';
+    if ($linkFavicon !== '' && preg_match('#^https?://#i', $linkFavicon)) {
+        $avatar = $linkFavicon;
+    } elseif ($feedFavicon !== '' && preg_match('#^https?://#i', $feedFavicon)) {
+        $avatar = $feedFavicon;
+    } else {
+        $avatar = defined('AP_REMOTE_AVATAR_FALLBACK')
             ? AP_REMOTE_AVATAR_FALLBACK
-            : 'https://mkultra.monster/img/avatar/default.jpg');
+            : 'https://mkultra.monster/img/avatar/default.jpg';
+    }
 
     $acct = preg_replace('/\s+/', '', strtolower($feedTitle)) ?: 'rss';
     $acct = substr(preg_replace('/[^a-z0-9._-]/', '', $acct) ?? 'rss', 0, 30) ?: 'rss';
@@ -1587,12 +1596,35 @@ function ap_rss_guess_favicon(string $siteOrFeedUrl, string $feedImage = ''): st
     if ($feedImage !== '' && preg_match('#^https://#i', $feedImage)) {
         return $feedImage;
     }
+    // Prefer a resolvable host icon over bare /favicon.ico (Tumblr blogs 404).
+    $fromLink = ap_rss_favicon_for_url($siteOrFeedUrl);
+    if ($fromLink !== '') {
+        return $fromLink;
+    }
     $parts = parse_url($siteOrFeedUrl);
     if (!is_array($parts) || empty($parts['host'])) {
         return '';
     }
     $origin = 'https://' . $parts['host'];
     return $origin . '/favicon.ico';
+}
+
+/**
+ * Favicon URL for a page/article link — used as the RSS timeline avatar.
+ * DuckDuckGo's icon CDN is cache-friendly and survives hosts that 404 /favicon.ico.
+ */
+function ap_rss_favicon_for_url(string $pageUrl): string
+{
+    $pageUrl = trim($pageUrl);
+    if ($pageUrl === '' || !preg_match('#^https?://#i', $pageUrl)) {
+        return '';
+    }
+    $host = strtolower((string) (parse_url($pageUrl, PHP_URL_HOST) ?: ''));
+    $host = preg_replace('/^www\./', '', $host) ?? $host;
+    if ($host === '' || !preg_match('/^[a-z0-9.-]+$/i', $host)) {
+        return '';
+    }
+    return 'https://icons.duckduckgo.com/ip3/' . $host . '.ico';
 }
 
 /**
