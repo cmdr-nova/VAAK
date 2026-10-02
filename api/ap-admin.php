@@ -5546,6 +5546,8 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_following_i
 } else {
     $followingIds = $adminIndexActorMap($following, $relsetRich);
 }
+// Bluesky shared-card helper reads this when callers omit an explicit following set.
+$GLOBALS['vaak_following_ids'] = $followingIds;
 // Phase 4: warm moderation sets for every authenticated page so later
 // Home/search/DMs hit Redis instead of cold-building after idle.
 if (!$accountSwitcherView && $vaakOwnerId > 0 && !$isPartial) {
@@ -14874,6 +14876,9 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
                     ];
                 }
             }
+            if (admin_try_render_bsky_shared_card($item, $followingIds, $returnView === 'home' ? 'home' : 'bluesky')) {
+                return;
+            }
             admin_render_bsky_feed_item($item, 'following', $returnView === 'home' ? 'home' : 'bluesky');
             return;
         }
@@ -15525,13 +15530,64 @@ function admin_bsky_bookmark_keys(string $atUri, int $ownerUserId = 0): array
 }
 
 /**
+ * Map Bluesky renderer context → admin return_view for the shared card.
+ */
+function admin_bsky_context_return_view(string $context): string
+{
+    $context = trim($context);
+    if ($context === 'home' || str_starts_with($context, 'list-')) {
+        return 'home';
+    }
+    if (in_array($context, ['bookmarks', 'favourites', 'outbox', 'remote_profile', 'bluesky', 'search', 'mentions', 'status'], true)) {
+        return $context;
+    }
+    return 'bluesky';
+}
+
+/**
+ * Prefer shared Mastodon status card for a Bluesky feed item.
+ *
+ * @param array<string,mixed> $item FeedViewPost-shaped ({post, reason?}) or bare PostView
+ * @param array<int|string,mixed> $followingIds
+ */
+function admin_try_render_bsky_shared_card(array $item, array $followingIds, string $returnView): bool
+{
+    if (!function_exists('ap_normalize_from_bsky_post')
+        || !function_exists('admin_render_masto_status_card')) {
+        return false;
+    }
+    $st = ap_normalize_from_bsky_post($item);
+    if (!is_array($st)) {
+        return false;
+    }
+    if (
+        function_exists('ap_normalize_status_has_visible_body')
+        && !ap_normalize_status_has_visible_body($st)
+        && empty($st['reblog'])
+    ) {
+        return false;
+    }
+    admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+    return true;
+}
+
+/**
  * Render one Bluesky feed item (Bluesky tab or Home mix).
+ * Prefers normalize → shared status card; legacy HTML is last-resort only.
  *
  * @param array<string,mixed> $item
  * @param string $context 'bluesky' (tab) or 'home' (mixed Home feed — federated card chrome)
  */
 function admin_render_bsky_feed_item(array $item, string $feedKey = 'following', string $context = 'bluesky'): void
 {
+    $returnView = admin_bsky_context_return_view($context);
+    $followingIds = is_array($GLOBALS['vaak_following_ids'] ?? null)
+        ? $GLOBALS['vaak_following_ids']
+        : [];
+    if (admin_try_render_bsky_shared_card($item, $followingIds, $returnView)) {
+        return;
+    }
+
     $post = is_array($item['post'] ?? null) ? $item['post'] : null;
     if ($post === null) {
         return;
@@ -15885,22 +15941,10 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     if ($kind === 'bsky') {
         $row = is_array($item['row'] ?? null) ? $item['row'] : [];
         if ($row !== []) {
-            // 10.2: Bluesky Home/feed → normalize → shared status card (ATProto actions).
-            if (
-                function_exists('ap_normalize_from_bsky_post')
-                && function_exists('admin_render_masto_status_card')
-            ) {
-                $st = ap_normalize_from_bsky_post($row);
-                if (is_array($st) && (
-                    !function_exists('ap_normalize_status_has_visible_body')
-                    || ap_normalize_status_has_visible_body($st)
-                    || !empty($st['reblog'])
-                )) {
-                    admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
-                    return;
-                }
+            // Shared card first; specialized Bluesky HTML only if normalize refuses.
+            if (!admin_try_render_bsky_shared_card($row, $followingIds, $returnView)) {
+                admin_render_bsky_feed_item($row, 'following', $returnView === 'home' ? 'home' : 'bluesky');
             }
-            admin_render_bsky_feed_item($row, 'following', $returnView === 'home' ? 'home' : 'bluesky');
         }
         return;
     }
