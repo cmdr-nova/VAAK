@@ -5821,9 +5821,11 @@ if (isset($_GET['partial'], $_GET['shell'])
     exit;
 }
 
-// AJAX: hydrate one thin boost card in place (no full timeline rebuild / no scroll reset)
+// AJAX: hydrate one thin boost card OR empty Create shell in place
+// (no full timeline rebuild / no scroll reset). Signed fetch via ensure.
 $hydrateBoost = $isPartial && (string) ($_GET['hydrate_boost'] ?? '') === '1';
-if ($hydrateBoost) {
+$hydrateCreate = $isPartial && (string) ($_GET['hydrate_create'] ?? '') === '1';
+if ($hydrateBoost || $hydrateCreate) {
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     $eventId = (int) ($_GET['event_id'] ?? 0);
@@ -5837,6 +5839,50 @@ if ($hydrateBoost) {
     }
     require_once __DIR__ . '/ap-inbox.php';
     require_once __DIR__ . '/ap-masto-entities.php';
+    if ($hydrateCreate) {
+        if ($objectId === '' || !str_starts_with($objectId, 'https://')) {
+            http_response_code(400);
+            echo '<div class="meta">Missing object.</div>';
+            exit;
+        }
+        // One signed remote fetch for this empty Create/Update shell.
+        $GLOBALS['admin_boost_fetch_budget'] = 1;
+        if ($followingIds === [] || count($followingIds) < 3) {
+            $followingIds = ($vaakOwnerId > 0 && function_exists('ap_following_id_set'))
+                ? ap_following_id_set($vaakActorId, $vaakOwnerId, true)
+                : $adminIndexActorMap($following, true);
+        }
+        $row = null;
+        if (function_exists('ap_masto_ensure_remote_note_event')) {
+            $row = ap_masto_ensure_remote_note_event($objectId);
+        }
+        if (!is_array($row) && function_exists('ap_event_by_object_id')) {
+            $row = ap_event_by_object_id($objectId);
+        }
+        if (!is_array($row)) {
+            http_response_code(404);
+            echo '<div class="meta">Post not found.</div>';
+            exit;
+        }
+        ob_start();
+        if (
+            function_exists('ap_normalize_from_activitypub_event')
+            && function_exists('admin_render_masto_status_card')
+        ) {
+            // Budget already spent in ensure above; card must not re-fetch.
+            $GLOBALS['admin_boost_fetch_budget'] = 0;
+            $st = ap_normalize_from_activitypub_event($row);
+            if (is_array($st)) {
+                admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            } else {
+                echo '<div class="meta">Could not render post.</div>';
+            }
+        } else {
+            echo '<div class="meta">Could not render post.</div>';
+        }
+        echo ob_get_clean();
+        exit;
+    }
     $hydrateLocalBoost = (string) ($_GET['hydrate_local_boost'] ?? '') === '1';
     if ($hydrateLocalBoost) {
         $ownerId = admin_owner_user_id();
@@ -13977,15 +14023,43 @@ function admin_render_masto_status_card(
     }
     // Empty remote shells (Announce-only cache, authorized-fetch peers, deleted notes):
     // show a clear placeholder instead of a blank who/when card in threads.
+    // Timeline paints a hydrate stub (AJAX signed fetch) so Home does not stall;
+    // hydrate_create / hydrate_boost partials set admin_boost_fetch_budget=1.
+    $createHydrate = false;
     if (trim(strip_tags($bodyInner)) === ''
         && $uri !== ''
         && str_starts_with($uri, 'https://')
         && !$isLocal
         && !$isRss
+        && !$isBsky
     ) {
+        $fetchBudget = &$GLOBALS['admin_boost_fetch_budget'];
+        if (!is_int($fetchBudget)) {
+            $fetchBudget = 0;
+        }
+        if ($fetchBudget > 0 && function_exists('ap_masto_ensure_remote_note_event')) {
+            $fetchBudget--;
+            $fetched = ap_masto_ensure_remote_note_event($uri);
+            if (is_array($fetched)
+                && function_exists('ap_normalize_from_activitypub_event')
+                && function_exists('ap_normalize_status_has_visible_body')
+            ) {
+                $refreshed = ap_normalize_from_activitypub_event($fetched);
+                if (is_array($refreshed) && ap_normalize_status_has_visible_body($refreshed)) {
+                    // Re-enter with filled status (budget already consumed).
+                    admin_render_masto_status_card($refreshed, $followingIds, $returnView, $focused, $showOpen);
+                    return;
+                }
+            }
+        }
+        $createHydrate = !$focused;
         $bodyInner = '<div class="body feed-body meta">'
-            . 'This post isn’t cached with text or media on VAAK yet '
-            . '(often we only saw a boost, or the remote requires authorized fetch). '
+            . '<span class="create-hydrate-status">'
+            . ($createHydrate
+                ? 'Loading post…'
+                : ('This post isn’t cached with text or media on VAAK yet '
+                    . '(often we only saw a boost, or the remote requires authorized fetch). '))
+            . '</span>'
             . '<a href="' . h(admin_remote_object_href($uri)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
             . '</div>';
     }
@@ -13994,8 +14068,14 @@ function admin_render_masto_status_card(
     if ($returnView === 'status' && $uri !== '') {
         $actionBase = '?view=status&object=' . rawurlencode($uri) . '&from=search';
     }
+    $createHydrateAttrs = '';
+    if ($createHydrate) {
+        $createHydrateAttrs = ' data-create-hydrate="1"'
+            . ' data-object-id="' . h($uri) . '"'
+            . ' data-return-view="' . h($returnView) . '"';
+    }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $rankAttrs ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
             <div class="tweet-hd">
               <?php if ($isRss || ($isBsky && $directAvatar !== '')): ?>
@@ -28948,8 +29028,8 @@ window.apAdminToast = function (msg, isErr) {
     return neu;
   }
 
-  // Progressive boost hydration: fetch missing boosted posts while you scroll,
-  // swapping each card in place (never reloads the timeline / never jumps to top).
+  // Progressive boost / empty-Create hydration: signed remote fetch while you
+  // scroll, swapping each card in place (never reloads / never jumps to top).
   const boostQueue = [];
   let boostActive = 0;
   const BOOST_CONCURRENCY = 2;
@@ -28957,8 +29037,10 @@ window.apAdminToast = function (msg, isErr) {
   function pumpBoostHydrate() {
     while (boostActive < BOOST_CONCURRENCY && boostQueue.length) {
       const card = boostQueue.shift();
-      if (!card || !card.isConnected
-        || (card.dataset.boostHydrate !== '1' && card.dataset.boostHydrateLocal !== '1')) continue;
+      if (!card || !card.isConnected) continue;
+      const isCreate = card.dataset.createHydrate === '1';
+      const isBoost = card.dataset.boostHydrate === '1' || card.dataset.boostHydrateLocal === '1';
+      if (!isCreate && !isBoost) continue;
       if (card.dataset.boostHydrating === '1') continue;
       card.dataset.boostHydrating = '1';
       boostActive++;
@@ -28966,11 +29048,12 @@ window.apAdminToast = function (msg, isErr) {
       const objectId = card.dataset.objectId || '';
       const isLocal = card.dataset.boostHydrateLocal === '1';
       const from = card.dataset.returnView || 'home';
-      const statusEl = card.querySelector('.boost-hydrate-status');
-      if (statusEl) statusEl.textContent = 'Loading boosted post…';
+      const statusEl = card.querySelector(isCreate ? '.create-hydrate-status' : '.boost-hydrate-status');
+      if (statusEl) statusEl.textContent = isCreate ? 'Loading post…' : 'Loading boosted post…';
       const url = '?view=' + encodeURIComponent(from)
-        + '&partial=1&hydrate_boost=1'
-        + (isLocal ? '&hydrate_local_boost=1' : '')
+        + '&partial=1'
+        + (isCreate ? '&hydrate_create=1' : '&hydrate_boost=1')
+        + (!isCreate && isLocal ? '&hydrate_local_boost=1' : '')
         + '&event_id=' + encodeURIComponent(eventId)
         + '&object_id=' + encodeURIComponent(objectId)
         + '&from=' + encodeURIComponent(from);
@@ -28983,7 +29066,7 @@ window.apAdminToast = function (msg, isErr) {
           const neu = replaceCardInPlace(card, html);
           // If the server still cannot resolve the target, do not leave a
           // misleading perpetual loading message. The card remains usable as
-          // a thin boost/link stub and reports the terminal state clearly.
+          // a thin stub and reports the terminal state clearly.
           if (neu && (neu.dataset.boostHydrate === '1' || neu.dataset.boostHydrateLocal === '1')) {
             const st = neu.querySelector('.boost-hydrate-status');
             if (st) {
@@ -28992,11 +29075,24 @@ window.apAdminToast = function (msg, isErr) {
             neu.dataset.boostHydrate = '0';
             neu.dataset.boostHydrateLocal = '0';
           }
+          if (neu && neu.dataset.createHydrate === '1') {
+            const st = neu.querySelector('.create-hydrate-status');
+            if (st) {
+              st.textContent = 'This post isn’t cached with text or media on VAAK yet. ';
+            }
+            neu.dataset.createHydrate = '0';
+          }
         })
         .catch(() => {
-          const st = card.querySelector('.boost-hydrate-status');
-          if (st) st.textContent = 'Couldn’t load boosted post';
-          card.dataset.boostHydrate = '0';
+          if (isCreate) {
+            const st = card.querySelector('.create-hydrate-status');
+            if (st) st.textContent = 'Couldn’t load post. ';
+            card.dataset.createHydrate = '0';
+          } else {
+            const st = card.querySelector('.boost-hydrate-status');
+            if (st) st.textContent = 'Couldn’t load boosted post';
+            card.dataset.boostHydrate = '0';
+          }
           card.dataset.boostHydrating = '0';
         })
         .finally(() => {
@@ -29008,7 +29104,9 @@ window.apAdminToast = function (msg, isErr) {
 
   function enqueueBoostHydrates(root) {
     const scope = root || document;
-    scope.querySelectorAll('article.tweet-boost[data-boost-hydrate="1"], article.tweet-boost[data-boost-hydrate-local="1"]').forEach((card) => {
+    scope.querySelectorAll(
+      'article.tweet-boost[data-boost-hydrate="1"], article.tweet-boost[data-boost-hydrate-local="1"], article.tweet[data-create-hydrate="1"]'
+    ).forEach((card) => {
       if (card.dataset.boostQueued === '1') return;
       card.dataset.boostQueued = '1';
       boostQueue.push(card);
