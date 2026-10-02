@@ -3965,6 +3965,7 @@ function ap_bsky_posts_for_home(
     $limit = max(1, min(120, $limit));
     try {
         $sql = 'SELECT p.bsky_uri, p.raw_json, p.reason_json, p.indexed_at, p.author_did,
+                       p.author_handle, p.author_display, p.author_avatar,
                        l.fediverse_id
                 FROM bsky_posts p
                 LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
@@ -4004,6 +4005,25 @@ function ap_bsky_posts_for_home(
             if ($text === '' && !$hasEmbed) {
                 continue;
             }
+            // Patch denormalized author columns onto thin raw blobs.
+            if (is_array($raw['author'] ?? null)) {
+                $ah = trim((string) ($row['author_handle'] ?? ''));
+                $ad = trim((string) ($row['author_display'] ?? ''));
+                $aa = trim((string) ($row['author_avatar'] ?? ''));
+                if ($ah !== '' && trim((string) ($raw['author']['handle'] ?? '')) === '') {
+                    $raw['author']['handle'] = $ah;
+                }
+                if ($ad !== '' && trim((string) ($raw['author']['displayName'] ?? '')) === '') {
+                    $raw['author']['displayName'] = $ad;
+                }
+                if ($aa !== '' && trim((string) ($raw['author']['avatar'] ?? '')) === '') {
+                    $raw['author']['avatar'] = $aa;
+                }
+                if (trim((string) ($raw['author']['did'] ?? '')) === ''
+                    && trim((string) ($row['author_did'] ?? '')) !== '') {
+                    $raw['author']['did'] = (string) $row['author_did'];
+                }
+            }
             $item = [
                 'post' => $raw,
                 'bsky_uri' => (string) ($row['bsky_uri'] ?? $raw['uri'] ?? ''),
@@ -4018,7 +4038,7 @@ function ap_bsky_posts_for_home(
                     $item['reason'] = $reason;
                 }
             }
-            $out[] = $item;
+            $out[] = ap_bsky_enrich_feed_item_authors($item, $ownerUserId);
         }
         return $out;
     } catch (Throwable $e) {
@@ -4081,6 +4101,130 @@ function ap_bsky_home_rank_keys(
 }
 
 /**
+ * Fill thin AppView/Jetstream author blobs (empty handle/avatar/displayName) from
+ * local caches — same idea as Wafrn's users-row join before Home paint.
+ *
+ * Order: bsky_actor_profiles → other bsky_posts columns for this DID.
+ * Never blocks on XRPC; optionally enqueues actor refresh when still thin.
+ *
+ * @param array<string,mixed> $author
+ * @return array<string,mixed>
+ */
+function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
+{
+    $did = trim((string) ($author['did'] ?? ''));
+    $handle = trim((string) ($author['handle'] ?? ''));
+    $display = trim((string) ($author['displayName'] ?? ''));
+    $avatar = trim((string) ($author['avatar'] ?? ''));
+    $handleThin = $handle === '' || str_starts_with($handle, 'did:');
+    $needs = $handleThin || $display === '' || $avatar === '';
+    if (!$needs || $did === '' || !str_starts_with($did, 'did:')) {
+        return $author;
+    }
+
+    // 1) Durable profile cache (filled by actor-refresh / prior AppView profiles).
+    if (function_exists('ap_bsky_actor_profile_cache_get')) {
+        $cached = ap_bsky_actor_profile_cache_get($did, $ownerUserId > 0 ? $ownerUserId : 0);
+        $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
+        if ($profile !== []) {
+            $ch = trim((string) ($profile['handle'] ?? ''));
+            $cdn = trim((string) ($profile['displayName'] ?? ''));
+            $cav = trim((string) ($profile['avatar'] ?? ''));
+            if ($handleThin && $ch !== '' && !str_starts_with($ch, 'did:')) {
+                $author['handle'] = $ch;
+                $handle = $ch;
+                $handleThin = false;
+            }
+            if ($display === '' && $cdn !== '') {
+                $author['displayName'] = $cdn;
+                $display = $cdn;
+            }
+            if ($avatar === '' && $cav !== '' && preg_match('#^https?://#i', $cav)) {
+                $author['avatar'] = $cav;
+                $avatar = $cav;
+            }
+        }
+    }
+
+    // 2) Denormalized columns on any prior post by this DID.
+    if ($handleThin || $display === '' || $avatar === '') {
+        try {
+            ap_bsky_posts_migrate();
+            $st = ap_db()->prepare(
+                "SELECT author_handle, author_display, author_avatar
+                 FROM bsky_posts
+                 WHERE author_did = ?
+                   AND author_handle IS NOT NULL AND author_handle <> ''
+                   AND author_handle NOT LIKE 'did:%'
+                 ORDER BY seen_at DESC
+                 LIMIT 1"
+            );
+            $st->execute([$did]);
+            $row = $st->fetch();
+            if (is_array($row)) {
+                $ph = trim((string) ($row['author_handle'] ?? ''));
+                $pd = trim((string) ($row['author_display'] ?? ''));
+                $pa = trim((string) ($row['author_avatar'] ?? ''));
+                if ($handleThin && $ph !== '') {
+                    $author['handle'] = $ph;
+                    $handle = $ph;
+                    $handleThin = false;
+                }
+                if ($display === '' && $pd !== '') {
+                    $author['displayName'] = $pd;
+                    $display = $pd;
+                }
+                if ($avatar === '' && $pa !== '' && preg_match('#^https?://#i', $pa)) {
+                    $author['avatar'] = $pa;
+                    $avatar = $pa;
+                }
+            }
+        } catch (Throwable $e) {
+            // non-fatal
+        }
+    }
+
+    // Still thin → queue background refresh (Wafrn would block; we stay paint-first).
+    if (
+        ($handleThin || $avatar === '')
+        && $ownerUserId > 0
+        && function_exists('ap_bsky_actor_refresh_enqueue')
+        && function_exists('ap_bsky_actor_profile_url')
+    ) {
+        ap_bsky_actor_refresh_enqueue($ownerUserId, ap_bsky_actor_profile_url($did));
+    }
+
+    return $author;
+}
+
+/**
+ * Enrich post.author (+ reason.by for reposts) from local profile caches.
+ *
+ * @param array<string,mixed> $postOrItem PostView or FeedViewPost
+ * @return array<string,mixed>
+ */
+function ap_bsky_enrich_feed_item_authors(array $postOrItem, int $ownerUserId = 0): array
+{
+    if (isset($postOrItem['post']) && is_array($postOrItem['post'])) {
+        $post = $postOrItem['post'];
+        if (is_array($post['author'] ?? null)) {
+            $post['author'] = ap_bsky_enrich_author_view($post['author'], $ownerUserId);
+        }
+        $postOrItem['post'] = $post;
+    } elseif (is_array($postOrItem['author'] ?? null)) {
+        $postOrItem['author'] = ap_bsky_enrich_author_view($postOrItem['author'], $ownerUserId);
+    }
+    if (isset($postOrItem['reason']) && is_array($postOrItem['reason'])) {
+        $reason = $postOrItem['reason'];
+        if (is_array($reason['by'] ?? null)) {
+            $reason['by'] = ap_bsky_enrich_author_view($reason['by'], $ownerUserId);
+            $postOrItem['reason'] = $reason;
+        }
+    }
+    return $postOrItem;
+}
+
+/**
  * Load one cached Bluesky post as a FeedViewPost-shaped item.
  *
  * @return array{post:array,reason?:array,bsky_uri:string}|null
@@ -4094,7 +4238,8 @@ function ap_bsky_post_item_by_uri(string $bskyUri): ?array
     ap_bsky_posts_migrate();
     try {
         $st = ap_db()->prepare(
-            'SELECT bsky_uri, raw_json, reason_json FROM bsky_posts WHERE bsky_uri = ? LIMIT 1'
+            'SELECT bsky_uri, raw_json, reason_json, author_did, author_handle, author_display, author_avatar
+             FROM bsky_posts WHERE bsky_uri = ? LIMIT 1'
         );
         $st->execute([$bskyUri]);
         $row = $st->fetch();
@@ -4105,6 +4250,24 @@ function ap_bsky_post_item_by_uri(string $bskyUri): ?array
         if (!is_array($raw)) {
             return null;
         }
+        // Patch denormalized columns onto thin raw author before profile-cache enrich.
+        if (is_array($raw['author'] ?? null)) {
+            $ah = trim((string) ($row['author_handle'] ?? ''));
+            $ad = trim((string) ($row['author_display'] ?? ''));
+            $aa = trim((string) ($row['author_avatar'] ?? ''));
+            if ($ah !== '' && trim((string) ($raw['author']['handle'] ?? '')) === '') {
+                $raw['author']['handle'] = $ah;
+            }
+            if ($ad !== '' && trim((string) ($raw['author']['displayName'] ?? '')) === '') {
+                $raw['author']['displayName'] = $ad;
+            }
+            if ($aa !== '' && trim((string) ($raw['author']['avatar'] ?? '')) === '') {
+                $raw['author']['avatar'] = $aa;
+            }
+            if (trim((string) ($raw['author']['did'] ?? '')) === '' && trim((string) ($row['author_did'] ?? '')) !== '') {
+                $raw['author']['did'] = (string) $row['author_did'];
+            }
+        }
         $item = ['post' => $raw, 'bsky_uri' => (string) ($row['bsky_uri'] ?? $bskyUri)];
         if (!empty($row['reason_json'])) {
             $reason = json_decode((string) $row['reason_json'], true);
@@ -4112,7 +4275,8 @@ function ap_bsky_post_item_by_uri(string $bskyUri): ?array
                 $item['reason'] = $reason;
             }
         }
-        return $item;
+        $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        return ap_bsky_enrich_feed_item_authors($item, $ownerId);
     } catch (Throwable $e) {
         return null;
     }

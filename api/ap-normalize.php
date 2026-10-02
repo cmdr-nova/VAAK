@@ -249,6 +249,15 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
  */
 function ap_normalize_from_bsky_post(array $postOrItem): ?array
 {
+    // Wafrn-style: fill handle/avatar/display from local profile cache before paint
+    // so Home never shows raw did:plc… for authors we have already seen.
+    if (!function_exists('ap_bsky_enrich_feed_item_authors') && is_file(__DIR__ . '/ap-bsky.php')) {
+        require_once __DIR__ . '/ap-bsky.php';
+    }
+    if (function_exists('ap_bsky_enrich_feed_item_authors')) {
+        $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        $postOrItem = ap_bsky_enrich_feed_item_authors($postOrItem, $ownerId);
+    }
     $post = is_array($postOrItem['post'] ?? null) ? $postOrItem['post'] : $postOrItem;
     $reason = is_array($postOrItem['reason'] ?? null) ? $postOrItem['reason'] : null;
     if (!function_exists('ap_masto_bsky_trend_status')) {
