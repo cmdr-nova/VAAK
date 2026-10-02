@@ -1,0 +1,4 @@
+{
+  "entry": "event",
+  "description": "Thin Announce with no Create body — reblog wrapper + inner vaak_degraded announce_only"
+}

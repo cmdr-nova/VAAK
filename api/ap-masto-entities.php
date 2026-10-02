@@ -6293,6 +6293,21 @@ function ap_masto_status_from_event(array $row): ?array
         $inner['url'] = $inner['uri'];
         unset($inner['reblog']);
         $inner['reblog'] = null;
+        // Thin Announce (no Create body/media yet): mark the INNER status degraded
+        // so web + Ice Cubes share one Mastodon reblog model. Fav/bookmark/boost
+        // keys stay on the inner id + object URL (same as API apply_interaction_flags).
+        $innerPlain = trim(html_entity_decode(strip_tags((string) ($inner['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $innerMedia = is_array($inner['media_attachments'] ?? null) ? $inner['media_attachments'] : [];
+        if (
+            ($innerPlain === '' || preg_match('/^\(boost\)$/i', $innerPlain))
+            && $innerMedia === []
+            && empty($inner['vaak_ask'])
+            && empty($inner['quote'])
+        ) {
+            $inner['vaak_degraded'] = true;
+            $inner['vaak_degraded_reason'] = 'announce_only';
+            $inner['content'] = '';
+        }
 
         $status = [
             'id' => $status['id'], // announce / event snowflake
@@ -6325,6 +6340,8 @@ function ap_masto_status_from_event(array $row): ?array
             'emojis' => [],
             'card' => null,
             'poll' => null,
+            // Web AJAX hydrate for thin boosts (event id of the Announce row).
+            'vaak_announce_event_id' => $eventId > 0 ? $eventId : null,
         ];
     }
 

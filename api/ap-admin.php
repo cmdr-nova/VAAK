@@ -5946,7 +5946,7 @@ if ($hydrateBoost || $hydrateCreate) {
         echo '<div class="meta">Boost not found.</div>';
         exit;
     }
-    // Allow one sync remote fetch for this card
+    // Allow one sync remote fetch for this card (from_event hydrate path).
     $GLOBALS['admin_boost_fetch_budget'] = 1;
     // Rich following aliases help Follow button state on the hydrated card
     if ($followingIds === [] || count($followingIds) < 3) {
@@ -5955,6 +5955,21 @@ if ($hydrateBoost || $hydrateCreate) {
             : $adminIndexActorMap($following, true);
     }
     ob_start();
+    // Prefer shared Mastodon reblog card so fav/boost/bookmark ids match the API.
+    if (
+        function_exists('ap_normalize_from_activitypub_event')
+        && function_exists('admin_render_masto_status_card')
+    ) {
+        // Leave _skip_announce_hydrate unset so ensure can fill the Create once.
+        $st = ap_normalize_from_activitypub_event($e);
+        if (is_array($st)) {
+            // Budget already spent inside ensure; card must not re-fetch.
+            $GLOBALS['admin_boost_fetch_budget'] = 0;
+            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            echo ob_get_clean();
+            exit;
+        }
+    }
     admin_render_remote_boost_card($e, $followingIds, $returnView, false);
     echo ob_get_clean();
     exit;
@@ -12297,8 +12312,20 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     if (admin_event_is_empty_private_stub($e)) {
         return;
     }
-    // Inbound Announce → Mastodon-style "X boosted" card with original author visible
+    // Inbound Announce → shared Mastodon reblog card (thin → degraded + hydrate).
     if (strtolower((string) ($e['type'] ?? '')) === 'announce') {
+        if (
+            function_exists('ap_normalize_from_activitypub_event')
+            && function_exists('admin_render_masto_status_card')
+        ) {
+            $ann = $e;
+            $ann['_skip_announce_hydrate'] = true;
+            $stAnn = ap_normalize_from_activitypub_event($ann);
+            if (is_array($stAnn)) {
+                admin_render_masto_status_card($stAnn, $followingIds, $returnView, false, true);
+                return;
+            }
+        }
         admin_render_remote_boost_card($e, $followingIds, $returnView, $fromFollowedTag);
         return;
     }
@@ -13718,7 +13745,11 @@ function admin_render_masto_status_card(
     bool $hideHeader = false
 ): void {
     $boostHeader = '';
+    // Preserve Announce event id across reblog unwrap for thin-boost AJAX hydrate.
+    $announceEventId = (int) ($st['vaak_announce_event_id'] ?? 0);
     // Keep Mastodon reblog wrapper: show "X boosted" then the original author card.
+    // Fav/bookmark/boost buttons below use the INNER status id + object URL — the
+    // same keys Ice Cubes / Mastodon API clients see on status.reblog.
     if (
         isset($st['reblog']) && is_array($st['reblog'])
         && (
@@ -13737,6 +13768,9 @@ function admin_render_masto_status_card(
             . ($boostWhen !== '' ? ' · ' . htmlspecialchars(relative_time($boostWhen), ENT_QUOTES, 'UTF-8') : '')
             . ' <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">' . h($boostSource) . '</span>'
             . '</div>';
+        if ($announceEventId < 1) {
+            $announceEventId = (int) ($st['reblog']['vaak_announce_event_id'] ?? 0);
+        }
         $st = $st['reblog'];
     }
     $acct = (string) ($st['account']['acct'] ?? '?');
@@ -14026,6 +14060,7 @@ function admin_render_masto_status_card(
     // half-parsed objects): one chrome via vaak_degraded, with AJAX hydrate on
     // timelines. hydrate_create / hydrate_boost set admin_boost_fetch_budget=1.
     $createHydrate = false;
+    $boostHydrate = false;
     $isDegraded = !empty($st['vaak_degraded']);
     $degradedReason = (string) ($st['vaak_degraded_reason'] ?? 'empty_shell');
     if ((trim(strip_tags($bodyInner)) === '' || $isDegraded)
@@ -14050,21 +14085,48 @@ function admin_render_masto_status_card(
                 $refreshed = ap_normalize_from_activitypub_event($fetched);
                 if (is_array($refreshed) && ap_normalize_status_has_visible_body($refreshed)) {
                     // Re-enter with filled status (budget already consumed).
+                    // Prefer re-wrapping as the original Announce when we have its id
+                    // so boost header + interaction ids stay stable after hydrate.
+                    if ($announceEventId > 0 && function_exists('ap_db')) {
+                        try {
+                            $ast = ap_db()->prepare("SELECT * FROM events WHERE id = ? AND type = 'Announce' LIMIT 1");
+                            $ast->execute([$announceEventId]);
+                            $annRow = $ast->fetch();
+                            if (is_array($annRow)) {
+                                $annRow['_skip_announce_hydrate'] = true;
+                                $wrapped = ap_normalize_from_activitypub_event($annRow);
+                                if (is_array($wrapped)) {
+                                    admin_render_masto_status_card($wrapped, $followingIds, $returnView, $focused, $showOpen, $hideHeader);
+                                    return;
+                                }
+                            }
+                        } catch (Throwable $e) {
+                            // fall through to bare refreshed Create
+                        }
+                    }
                     admin_render_masto_status_card($refreshed, $followingIds, $returnView, $focused, $showOpen, $hideHeader);
                     return;
                 }
             }
         }
-        $createHydrate = !$focused;
+        // Thin boosts hydrate via Announce event id so the returned card keeps
+        // the Mastodon reblog wrapper (same status ids as the API / Ice Cubes).
+        if ($degradedReason === 'announce_only' && $announceEventId > 0) {
+            $boostHydrate = !$focused;
+        } else {
+            $createHydrate = !$focused;
+        }
         $degradedMsg = match ($degradedReason) {
             'fetch_failed' => 'Couldn’t load this post from the remote.',
             'announce_only' => 'We only saw a boost of this post so far.',
             'half_parsed' => 'This post only partially parsed on VAAK.',
             default => 'This post isn’t cached with text or media on VAAK yet.',
         };
+        $hydrateStatusClass = $boostHydrate ? 'boost-hydrate-status' : 'create-hydrate-status';
+        $hydrateLoading = $boostHydrate ? 'Loading boosted post…' : 'Loading post…';
         $bodyInner = '<div class="body feed-body meta vaak-degraded">'
-            . '<span class="create-hydrate-status">'
-            . ($createHydrate ? 'Loading post…' : (h($degradedMsg) . ' '))
+            . '<span class="' . $hydrateStatusClass . '">'
+            . (($createHydrate || $boostHydrate) ? $hydrateLoading : (h($degradedMsg) . ' '))
             . '</span>'
             . '<a href="' . h(admin_remote_object_href($uri)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
             . '</div>';
@@ -14075,13 +14137,18 @@ function admin_render_masto_status_card(
         $actionBase = '?view=status&object=' . rawurlencode($uri) . '&from=search';
     }
     $createHydrateAttrs = '';
-    if ($createHydrate) {
+    if ($boostHydrate && $announceEventId > 0) {
+        $createHydrateAttrs = ' data-boost-hydrate="1"'
+            . ' data-event-id="' . (int) $announceEventId . '"'
+            . ' data-object-id="' . h($uri) . '"'
+            . ' data-return-view="' . h($returnView) . '"';
+    } elseif ($createHydrate) {
         $createHydrateAttrs = ' data-create-hydrate="1"'
             . ' data-object-id="' . h($uri) . '"'
             . ' data-return-view="' . h($returnView) . '"';
     }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
             <?php if (!$hideHeader): ?>
             <div class="tweet-hd">
@@ -15835,7 +15902,8 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     $fromTag = !empty($item['from_tag']) || !empty($item['row']['_from_followed_tag']);
     // 10.2: Create/Update/Announce → normalized Mastodon status → shared card.
-    // Thin Announces (no Create yet) keep remote_boost_card for AJAX hydrate.
+    // Thin Announces paint as reblog + vaak_degraded announce_only (AJAX hydrate_boost).
+    // Fav/bookmark/boost use the inner status id + object URL (same as Ice Cubes).
     $evType = strtolower((string) ($row['type'] ?? 'create'));
     if (
         $row !== []
@@ -15849,15 +15917,11 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
         }
         $st = ap_normalize_from_activitypub_event($row);
         if (is_array($st)) {
-            $usable = $evType !== 'announce'
-                || (function_exists('ap_normalize_status_has_visible_body')
-                    && ap_normalize_status_has_visible_body($st));
-            if ($usable) {
-                admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
-                return;
-            }
+            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            return;
         }
         if ($evType === 'announce') {
+            // Fallback only when normalize could not build a status at all.
             admin_render_remote_boost_card($row, $followingIds, $returnView, $fromTag);
             return;
         }
