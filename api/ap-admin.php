@@ -10806,8 +10806,15 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
         $html .= '<div style="margin-top:.25rem;white-space:pre-wrap">'
             . admin_linkify_body_html($text, $returnView, $mentions) . '</div>';
     }
+    $qSpoiler = trim((string) ($opts['spoiler_text'] ?? ''));
+    $qSensitive = !empty($opts['sensitive']) || $qSpoiler !== '';
     if ($media !== [] && function_exists('admin_quote_media_html')) {
-        $html .= admin_quote_media_html($media);
+        $mediaHtml = admin_quote_media_html($media);
+        if ($qSensitive && $mediaHtml !== '' && function_exists('admin_cw_gate_html')) {
+            // Nested quoted NSFW media gets its own CW (outer post may be clean commentary).
+            $mediaHtml = admin_cw_gate_html($qSpoiler !== '' ? $qSpoiler : 'Sensitive content', true, $mediaHtml);
+        }
+        $html .= $mediaHtml;
     }
     // Link preview for URL-only / article quotes (Guardian, YouTube, etc.).
     if ($media === [] && function_exists('ap_link_preview_html')) {
@@ -10960,6 +10967,8 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
             }
         }
     }
+    $spoiler = trim((string) ($st['spoiler_text'] ?? ''));
+    $sensitive = !empty($st['sensitive']) || $spoiler !== '';
     return [
         'acct' => $acct !== '' ? ('@' . ltrim($acct, '@')) : '',
         'text' => $text,
@@ -10969,6 +10978,8 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
         'mentions' => $mentions,
         'open_label' => 'Open quoted',
         'open_external' => false,
+        'sensitive' => $sensitive,
+        'spoiler_text' => $spoiler !== '' ? $spoiler : ($sensitive ? 'Sensitive content' : ''),
     ];
 }
 
@@ -10998,6 +11009,16 @@ function admin_quote_opts_from_bsky(array $prev, string $fallbackUrl = ''): arra
             'provider_name' => '',
         ];
     }
+    $sensitive = false;
+    $spoiler = '';
+    if (is_array($prev['post'] ?? null) && function_exists('ap_bsky_post_is_sensitive')
+        && ap_bsky_post_is_sensitive($prev['post'])) {
+        $sensitive = true;
+        $spoiler = 'Sensitive content';
+    } elseif (!empty($prev['sensitive'])) {
+        $sensitive = true;
+        $spoiler = trim((string) ($prev['spoiler_text'] ?? '')) ?: 'Sensitive content';
+    }
     return [
         'acct' => $handle !== '' ? ('@' . $handle) : '',
         'text' => $text,
@@ -11006,6 +11027,8 @@ function admin_quote_opts_from_bsky(array $prev, string $fallbackUrl = ''): arra
         'card' => $card,
         'open_label' => 'Open original',
         'open_external' => true,
+        'sensitive' => $sensitive,
+        'spoiler_text' => $spoiler,
     ];
 }
 

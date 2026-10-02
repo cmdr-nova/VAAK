@@ -3356,8 +3356,55 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     if (isset($record['reply']) && is_array($record['reply'])) {
         $raw['record']['reply'] = $record['reply'];
     }
+    // Keep record.embed (blob refs) so Jetstream-only rows can still signal
+    // images/video/recordWithMedia and trigger AppView media repair.
+    if (isset($record['embed']) && is_array($record['embed'])) {
+        $raw['record']['embed'] = $record['embed'];
+    }
     if (!empty($record['fediverseId'])) {
         $raw['record']['fediverseId'] = (string) $record['fediverseId'];
+    }
+    // Never clobber a hydrated AppView embed with a later Jetstream/thin upsert.
+    if ($embedCompact === null) {
+        try {
+            $prev = ap_db()->prepare('SELECT embed_json, raw_json FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+            $prev->execute([$uri]);
+            $prevRow = $prev->fetch(PDO::FETCH_ASSOC);
+            if (is_array($prevRow)) {
+                $prevEmbed = json_decode((string) ($prevRow['embed_json'] ?? ''), true);
+                if (!is_array($prevEmbed)) {
+                    $prevRaw = json_decode((string) ($prevRow['raw_json'] ?? ''), true);
+                    $prevEmbed = is_array($prevRaw['embed'] ?? null) ? $prevRaw['embed'] : null;
+                }
+                if (is_array($prevEmbed) && $prevEmbed !== []) {
+                    $embedCompact = $prevEmbed;
+                    $raw['embed'] = $prevEmbed;
+                }
+                // Union moderation labels so a thin re-upsert cannot wipe them.
+                $prevRaw = json_decode((string) ($prevRow['raw_json'] ?? ''), true);
+                if (is_array($prevRaw) && is_array($prevRaw['labels'] ?? null)) {
+                    $seenVals = [];
+                    foreach ($raw['labels'] as $lab) {
+                        if (is_array($lab) && isset($lab['val'])) {
+                            $seenVals[strtolower((string) $lab['val'])] = true;
+                        }
+                    }
+                    foreach ($prevRaw['labels'] as $lab) {
+                        if (!is_array($lab)) {
+                            continue;
+                        }
+                        $val = strtolower(trim((string) ($lab['val'] ?? '')));
+                        if ($val === '' || isset($seenVals[$val])) {
+                            continue;
+                        }
+                        $raw['labels'][] = $lab;
+                        $seenVals[$val] = true;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // ignore
+        }
     }
     // Self-labels live on the record (composer shield); also fold into top-level labels.
     $selfLabels = ap_bsky_compact_label_list($record['labels'] ?? ($record['selfLabels'] ?? null));
@@ -6214,6 +6261,17 @@ function ap_bsky_feed_item_from_any_url(string $url, int $ownerUserId = 0, bool 
     }
     $cached = ap_bsky_post_item_by_uri($atUri);
     if (is_array($cached) && is_array($cached['post'] ?? null) && trim((string) ($cached['post']['uri'] ?? '')) !== '') {
+        // Status/focus allowFetch: refresh missing/thin embeds + labels so NSFW
+        // media is kept behind a CW instead of dropped from a Jetstream-only row.
+        if ($allowFetch && function_exists('ap_bsky_repair_thin_media_embed')) {
+            $GLOBALS['vaak_bsky_force_media_repair'] = true;
+            $budget = &$GLOBALS['admin_bsky_gallery_repair_budget'];
+            if (!isset($budget) || !is_int($budget) || $budget < 1) {
+                $budget = 2;
+            }
+            $cached['post'] = ap_bsky_repair_thin_media_embed($cached['post'], $ownerUserId);
+            unset($GLOBALS['vaak_bsky_force_media_repair']);
+        }
         return $cached;
     }
     if (!$allowFetch) {
@@ -9233,27 +9291,66 @@ function ap_bsky_post_image_urls(array $post): array
  *
  * @param array<string,mixed> $post
  */
-function ap_bsky_post_embed_media_thin(array $post): bool
+function ap_bsky_record_embed_looks_media(?array $recEmbed): bool
 {
-    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : null;
-    if (!is_array($embed)) {
+    if (!is_array($recEmbed)) {
         return false;
     }
-    $type = strtolower((string) ($embed['$type'] ?? ''));
+    $type = strtolower((string) ($recEmbed['$type'] ?? ''));
     if ($type === '') {
         return false;
     }
-    $looksMedia = str_contains($type, 'gallery')
+    return str_contains($type, 'gallery')
         || str_contains($type, 'images')
         || str_contains($type, 'video')
-        || (str_contains($type, 'recordwithmedia') && is_array($embed['media'] ?? null));
-    if (!$looksMedia) {
+        || str_contains($type, 'recordwithmedia');
+}
+
+/**
+ * True when AppView gallery/images/video embed is missing or lost CDN URLs.
+ * Jetstream ingest stores record.embed blobs without a view embed — those need repair.
+ */
+function ap_bsky_post_embed_media_thin(array $post): bool
+{
+    $uri = (string) ($post['uri'] ?? 'x');
+    $hasUrls = false;
+    if (function_exists('ap_masto_bsky_media_attachments')) {
+        $hasUrls = ap_masto_bsky_media_attachments($post, $uri) !== [];
+    } else {
+        $hasUrls = ap_bsky_post_image_urls($post) !== []
+            || ap_bsky_embed_video_view(is_array($post['embed'] ?? null) ? $post['embed'] : null) !== null;
+    }
+    if ($hasUrls) {
         return false;
     }
-    if (function_exists('ap_masto_bsky_media_attachments')) {
-        return ap_masto_bsky_media_attachments($post, (string) ($post['uri'] ?? 'x')) === [];
+
+    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : null;
+    if (is_array($embed)) {
+        $type = strtolower((string) ($embed['$type'] ?? ''));
+        if ($type !== '') {
+            $looksMedia = str_contains($type, 'gallery')
+                || str_contains($type, 'images')
+                || str_contains($type, 'video')
+                || (str_contains($type, 'recordwithmedia') && is_array($embed['media'] ?? null));
+            if ($looksMedia) {
+                return true;
+            }
+        }
     }
-    return ap_bsky_post_image_urls($post) === [] && ap_bsky_embed_video_view($embed) === null;
+
+    // Missing view embed: repair when record promised media, labels say adult,
+    // or the caller forced a focus/status refresh.
+    $recEmbed = is_array($post['record']['embed'] ?? null) ? $post['record']['embed'] : null;
+    if (ap_bsky_record_embed_looks_media($recEmbed)) {
+        return true;
+    }
+    if (ap_bsky_post_is_sensitive($post)) {
+        return true;
+    }
+    if (!empty($GLOBALS['vaak_bsky_force_media_repair'])) {
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -9297,7 +9394,41 @@ function ap_bsky_repair_thin_media_embed(array $post, int $ownerUserId = 0): arr
     }
     $posts = is_array($got['json']['posts'] ?? null) ? $got['json']['posts'] : [];
     $live = is_array($posts[0] ?? null) ? $posts[0] : null;
-    if (!is_array($live) || !is_array($live['embed'] ?? null)) {
+    if (!is_array($live)) {
+        return $post;
+    }
+    // Always fold live moderation labels (porn/nudity/…) onto the cached post
+    // so CW gates work even when media was already present.
+    $liveLabels = ap_bsky_compact_label_list($live['labels'] ?? null);
+    if ($liveLabels !== []) {
+        $post['labels'] = $liveLabels;
+    }
+    if (is_array($live['record'] ?? null)) {
+        if (!is_array($post['record'] ?? null)) {
+            $post['record'] = $live['record'];
+        } else {
+            if (isset($live['record']['embed']) && is_array($live['record']['embed'])) {
+                $post['record']['embed'] = $live['record']['embed'];
+            }
+            $selfLabs = ap_bsky_compact_label_list($live['record']['labels'] ?? ($live['record']['selfLabels'] ?? null));
+            if ($selfLabs !== []) {
+                $post['record']['labels'] = [
+                    '$type' => 'com.atproto.label.defs#selfLabels',
+                    'values' => $selfLabs,
+                ];
+            }
+        }
+    }
+    if (!is_array($live['embed'] ?? null)) {
+        // Labels-only refresh still worth persisting.
+        try {
+            ap_bsky_post_upsert_from_feed_item(['post' => array_merge($post, [
+                'labels' => $live['labels'] ?? ($post['labels'] ?? []),
+                'record' => $post['record'] ?? ($live['record'] ?? []),
+            ])], $ownerUserId > 0 ? $ownerUserId : null);
+        } catch (Throwable $e) {
+            // ignore
+        }
         return $post;
     }
     $compact = ap_bsky_post_embed_compact($live['embed']);
@@ -9305,7 +9436,7 @@ function ap_bsky_repair_thin_media_embed(array $post, int $ownerUserId = 0): arr
         return $post;
     }
     $post['embed'] = $compact;
-    // Persist repaired embed so the next Home paint is cache-hit.
+    // Persist repaired embed + labels so the next Home/status paint is cache-hit.
     try {
         ap_bsky_post_upsert_from_feed_item(['post' => array_merge($live, ['embed' => $live['embed']])], $ownerUserId > 0 ? $ownerUserId : null);
     } catch (Throwable $e) {

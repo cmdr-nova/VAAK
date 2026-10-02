@@ -153,6 +153,10 @@ function ap_normalize_apply_bsky_sensitivity(array $status): array
     if (isset($status['reblog']) && is_array($status['reblog'])) {
         $status['reblog'] = $applyOne($status['reblog']);
     }
+    // Quote nests: NSFW labels on the quoted Bluesky post → CW on that nest.
+    if (isset($status['quote']['quoted_status']) && is_array($status['quote']['quoted_status'])) {
+        $status['quote']['quoted_status'] = $applyOne($status['quote']['quoted_status']);
+    }
     return $status;
 }
 
@@ -265,10 +269,23 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
     }
     $post = is_array($postOrItem['post'] ?? null) ? $postOrItem['post'] : $postOrItem;
     $reason = is_array($postOrItem['reason'] ?? null) ? $postOrItem['reason'] : null;
-    // Repair gallery/images embeds that compact previously stripped to $type-only.
+    // Repair missing/thin AppView embeds (Jetstream rows often lack view embeds;
+    // NSFW-labeled posts must keep images/gifs/videos behind a CW, not drop them).
     if (function_exists('ap_bsky_repair_thin_media_embed')) {
         $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        $recEmbed = is_array($post['record']['embed'] ?? null) ? $post['record']['embed'] : null;
+        $expectMedia = (function_exists('ap_bsky_record_embed_looks_media') && ap_bsky_record_embed_looks_media($recEmbed))
+            || (function_exists('ap_bsky_post_is_sensitive') && ap_bsky_post_is_sensitive($post))
+            || !empty($GLOBALS['vaak_bsky_force_media_repair']);
+        // Status focus sets vaak_bsky_force_media_repair for already-broken cache rows
+        // that lost both view embed and record.embed.
+        if ($expectMedia && !is_array($post['embed'] ?? null)) {
+            $GLOBALS['vaak_bsky_force_media_repair'] = true;
+        }
         $post = ap_bsky_repair_thin_media_embed($post, $ownerId);
+        if ($expectMedia) {
+            unset($GLOBALS['vaak_bsky_force_media_repair']);
+        }
         if (is_array($postOrItem['post'] ?? null)) {
             $postOrItem['post'] = $post;
         }
@@ -364,6 +381,22 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
         $qPrev = ap_bsky_quote_preview($post);
         if (is_array($qPrev)) {
             $qPost = is_array($qPrev['post'] ?? null) ? $qPrev['post'] : null;
+            if (is_array($qPost) && function_exists('ap_bsky_repair_thin_media_embed')) {
+                $qRec = is_array($qPost['record']['embed'] ?? null) ? $qPost['record']['embed'] : null;
+                $qExpect = (function_exists('ap_bsky_record_embed_looks_media') && ap_bsky_record_embed_looks_media($qRec))
+                    || (function_exists('ap_bsky_post_is_sensitive') && ap_bsky_post_is_sensitive($qPost))
+                    || !empty($GLOBALS['vaak_bsky_force_media_repair']);
+                if ($qExpect && !is_array($qPost['embed'] ?? null)) {
+                    $GLOBALS['vaak_bsky_force_media_repair'] = true;
+                }
+                $qPost = ap_bsky_repair_thin_media_embed(
+                    $qPost,
+                    (int) ($GLOBALS['vaak_owner_id'] ?? 0)
+                );
+                if ($qExpect) {
+                    unset($GLOBALS['vaak_bsky_force_media_repair']);
+                }
+            }
             $qSt = is_array($qPost) ? ap_masto_bsky_trend_status($qPost) : null;
             $prevMedia = is_array($qPrev['media'] ?? null) ? $qPrev['media'] : [];
             if (!is_array($qSt)) {
