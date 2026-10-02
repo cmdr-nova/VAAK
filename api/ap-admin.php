@@ -13702,6 +13702,14 @@ function admin_render_masto_status_card(
     $isRss = !empty($st['vaak_rss_item_id'])
         || (!empty($st['source']) && (string) $st['source'] === 'rss')
         || str_starts_with($sidEarly, 'rss:');
+    $isBsky = !$isRss && (
+        (!empty($st['source']) && (string) $st['source'] === 'bluesky')
+        || !empty($st['bsky_post'])
+        || str_starts_with($uri, 'at://')
+        || str_contains($uri, 'bsky.app/')
+        || str_starts_with($sidEarly, 'bsky:')
+        || str_ends_with(strtolower($acct), '@bsky.app')
+    );
     $rssItemId = $isRss
         ? (int) ($st['vaak_rss_item_id'] ?? 0)
         : 0;
@@ -13715,15 +13723,20 @@ function admin_render_masto_status_card(
             $rssFeedId = (int) $mRssFeed[1];
         }
     }
-    $rssAvatar = '';
-    if ($isRss) {
+    $directAvatar = '';
+    if ($isRss || $isBsky) {
         $avCand = trim((string) ($st['account']['avatar'] ?? $st['account']['avatar_static'] ?? ''));
         if ($avCand !== '' && preg_match('#^https?://#i', $avCand)) {
-            $rssAvatar = $avCand;
+            $directAvatar = $avCand;
         }
     }
+    $bskyPostBlob = is_array($st['bsky_post'] ?? null) ? $st['bsky_post'] : null;
+    $bskyCid = trim((string) ($st['bsky_cid'] ?? ''));
+    if ($bskyCid === '' && is_array($bskyPostBlob)) {
+        $bskyCid = trim((string) ($bskyPostBlob['cid'] ?? ''));
+    }
     $plain = admin_html_to_plain((string) ($st['content'] ?? ''));
-    $isLocalEarly = !$isRss && $uri !== '' && vaak_is_own_url($uri);
+    $isLocalEarly = !$isRss && !$isBsky && $uri !== '' && vaak_is_own_url($uri);
     // Local posts: prefer stored plain text so blank lines match compose / remotes
     if ($isLocalEarly) {
         try {
@@ -13770,7 +13783,7 @@ function admin_render_masto_status_card(
             'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
         ];
     }
-    $following = !$isRss && $actorRef !== '' && admin_is_following($followingIds, $actorRef);
+    $following = !$isRss && !$isBsky && $actorRef !== '' && admin_is_following($followingIds, $actorRef);
     $sid = (string) ($st['id'] ?? '');
     $favObject = $isRss ? ($sid !== '' ? $sid : null) : ($uri !== '' ? $uri : null);
     $fav = ($sid !== '' || $favObject !== null) && function_exists('ap_masto_status_is_favourited')
@@ -13778,12 +13791,18 @@ function admin_render_masto_status_card(
     $boosted = !$isRss && $sid !== '' && function_exists('ap_masto_status_is_reblogged') && ap_masto_status_is_reblogged($sid);
     $bm = ($sid !== '' || $favObject !== null) && function_exists('ap_masto_status_is_bookmarked')
         && ap_masto_status_is_bookmarked($sid, null, $favObject);
-    $isLocal = !$isRss && $uri !== '' && vaak_is_own_url($uri);
+    $isLocal = !$isRss && !$isBsky && $uri !== '' && vaak_is_own_url($uri);
     $cwSpoiler = trim((string) ($st['spoiler_text'] ?? ''));
     $cwSensitive = !empty($st['sensitive']) || $cwSpoiler !== '';
-    $rssRankAttrs = '';
+    $rankAttrs = '';
     if ($isRss && $rssItemId > 0 && $rssFeedId > 0) {
-        $rssRankAttrs = admin_home_rank_tracking_attrs('rss', 'rss:item:' . $rssItemId, 'rss:feed:' . $rssFeedId);
+        $rankAttrs = admin_home_rank_tracking_attrs('rss', 'rss:item:' . $rssItemId, 'rss:feed:' . $rssFeedId);
+    } elseif ($isBsky) {
+        $bskyRankActor = trim((string) ($st['author_did'] ?? ($st['account']['id'] ?? $actorRef)));
+        $bskyRankKey = str_starts_with($uri, 'at://') ? $uri : (string) ($st['uri'] ?? $uri);
+        if ($bskyRankKey !== '' && $bskyRankActor !== '') {
+            $rankAttrs = admin_home_rank_tracking_attrs('bsky', $bskyRankKey, $bskyRankActor);
+        }
     }
     $rssHost = '';
     if ($isRss && $uri !== '' && preg_match('#^https?://#i', $uri)) {
@@ -13976,17 +13995,23 @@ function admin_render_masto_status_card(
         $actionBase = '?view=status&object=' . rawurlencode($uri) . '&from=search';
     }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $rssRankAttrs ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
             <div class="tweet-hd">
-              <?php if ($isRss): ?>
+              <?php if ($isRss || ($isBsky && $directAvatar !== '')): ?>
                 <?php
-                  $rssFallbackAv = defined('AP_REMOTE_AVATAR_FALLBACK')
+                  $fallbackAv = defined('AP_REMOTE_AVATAR_FALLBACK')
                       ? AP_REMOTE_AVATAR_FALLBACK
                       : 'https://mkultra.monster/img/avatar/default.jpg';
-                  $rssAvSrc = $rssAvatar !== '' ? $rssAvatar : $rssFallbackAv;
+                  $avSrc = $directAvatar !== '' ? $directAvatar : $fallbackAv;
                 ?>
-                <img class="tweet-av" src="<?= h($rssAvSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($rssFallbackAv) ?>'" title="<?= h($display) ?>">
+                <?php if ($isBsky && $actorRef !== ''): ?>
+                  <a href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="text-decoration:none">
+                    <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($display) ?>"<?= admin_profile_hover_attr($actorRef) ?>>
+                  </a>
+                <?php else: ?>
+                  <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($display) ?>">
+                <?php endif; ?>
               <?php elseif ($actorRef !== '' && !$isLocal): ?>
                 <a href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="text-decoration:none"><?= admin_avatar_img($actorRef) ?></a>
               <?php else: ?>
@@ -14005,6 +14030,7 @@ function admin_render_masto_status_card(
                     <?php if (!empty($st['edited_at'])): ?>
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
+                    <?php if ($isBsky): ?><span class="tag" title="From Bluesky">Bluesky</span><?php endif; ?>
                     <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php else: ?>
@@ -14015,6 +14041,7 @@ function admin_render_masto_status_card(
                     <?php if (!empty($st['edited_at'])): ?>
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
+                    <?php if ($isBsky): ?><span class="tag" title="From Bluesky">Bluesky</span><?php endif; ?>
                     <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php endif; ?>
@@ -14104,6 +14131,23 @@ function admin_render_masto_status_card(
                     'from' => $focused ? $returnView : '',
                 ]) ?>
               <?php else: ?>
+              <?php
+                $stIsBsky = $isBsky
+                    || admin_object_is_bluesky_post($uri)
+                    || str_starts_with($actorRef, 'https://bsky.app/')
+                    || str_ends_with(strtolower($acct), '@bsky.app');
+                $stReplyTarget = $uri;
+                if ($stIsBsky) {
+                    if (function_exists('ap_bsky_https_url_from_at_uri') && str_starts_with($uri, 'at://')) {
+                        $httpsReply = ap_bsky_https_url_from_at_uri($uri, null);
+                        if (is_string($httpsReply) && str_starts_with($httpsReply, 'https://')) {
+                            $stReplyTarget = $httpsReply;
+                        }
+                    } elseif (str_starts_with($uri, 'https://bsky.app/') && function_exists('ap_bsky_normalize_web_url')) {
+                        $stReplyTarget = ap_bsky_normalize_web_url($uri);
+                    }
+                }
+              ?>
               <?php if ($showOpen && $uri !== ''): ?>
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($uri, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
               <?php endif; ?>
@@ -14113,18 +14157,15 @@ function admin_render_masto_status_card(
                       ? admin_reply_mention_seed($actorRef, $acct !== '?' ? $acct : null, $stMentions)
                       : [];
                 ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($uri) ?><?= $actorRef !== '' && !$isLocal ? '&amp;to=' . urlencode($actorRef) : '' ?><?= admin_reply_mention_query($stMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($stReplyTarget) ?><?= $actorRef !== '' && !$isLocal ? '&amp;to=' . urlencode($actorRef) : '' ?><?= admin_reply_mention_query($stMentionSeed) ?><?= admin_reply_cw_query($cwSpoiler, $cwSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
               <?php endif; ?>
-              <?php
-                $stIsBsky = admin_object_is_bluesky_post($uri)
-                    || str_starts_with($actorRef, 'https://bsky.app/')
-                    || str_ends_with(strtolower($acct), '@bsky.app');
-              ?>
               <?php if ($stIsBsky && $uri !== '' && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()): ?>
                 <?php
                   $stBskyAt = '';
-                  $stBskyCid = '';
+                  $stBskyCid = $bskyCid;
                   $stBskyLikeRecord = '';
+                  $stBskyRepostRecord = '';
+                  $stBskyReposted = false;
                   if (str_starts_with($uri, 'at://')) {
                       $stBskyAt = $uri;
                   } elseif (function_exists('ap_bsky_at_uri_from_any_url')) {
@@ -14133,14 +14174,33 @@ function admin_render_masto_status_card(
                           $stBskyAt = $converted;
                       }
                   }
-                  if ($stBskyAt !== '' && function_exists('ap_bsky_post_item_by_uri')) {
+                  $stBskyViewer = is_array($bskyPostBlob['viewer'] ?? null) ? $bskyPostBlob['viewer'] : [];
+                  if ($stBskyViewer !== []) {
+                      $stBskyLikeRecord = is_string($stBskyViewer['like'] ?? null) ? (string) $stBskyViewer['like'] : '';
+                      $stBskyRepostRecord = is_string($stBskyViewer['repost'] ?? null) ? (string) $stBskyViewer['repost'] : '';
+                      $stBskyReposted = $stBskyRepostRecord !== '';
+                      if ($stBskyLikeRecord !== '') {
+                          $fav = true;
+                      }
+                      if (!empty($stBskyViewer['bookmarked']) || !empty($stBskyViewer['bookmark'])) {
+                          $bm = true;
+                      }
+                  }
+                  if ($stBskyAt !== '' && function_exists('ap_bsky_post_item_by_uri')
+                      && ($stBskyCid === '' || $stBskyViewer === [])
+                  ) {
                       $stBskyItem = ap_bsky_post_item_by_uri($stBskyAt);
                       if (is_array($stBskyItem) && is_array($stBskyItem['post'] ?? null)) {
-                          $stBskyCid = (string) ($stBskyItem['post']['cid'] ?? '');
+                          if ($stBskyCid === '') {
+                              $stBskyCid = (string) ($stBskyItem['post']['cid'] ?? '');
+                          }
                           $stBskyViewer = is_array($stBskyItem['post']['viewer'] ?? null)
                               ? $stBskyItem['post']['viewer'] : [];
                           $stBskyLikeRecord = is_string($stBskyViewer['like'] ?? null)
-                              ? (string) $stBskyViewer['like'] : '';
+                              ? (string) $stBskyViewer['like'] : $stBskyLikeRecord;
+                          $stBskyRepostRecord = is_string($stBskyViewer['repost'] ?? null)
+                              ? (string) $stBskyViewer['repost'] : $stBskyRepostRecord;
+                          $stBskyReposted = $stBskyRepostRecord !== '';
                           if ($stBskyLikeRecord !== '') {
                               $fav = true;
                           }
@@ -14166,7 +14226,17 @@ function admin_render_masto_status_card(
                           $stBskyObjectRef = $httpsRef;
                       }
                   }
+                  if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($stBskyObjectRef, 'https://bsky.app/')) {
+                      $stBskyObjectRef = ap_bsky_normalize_web_url($stBskyObjectRef);
+                  }
                 ?>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($stBskyObjectRef) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+                <?php if ($stBskyAt !== ''): ?>
+                  <button type="button" class="icon-btn bsky-action<?= $stBskyReposted ? ' on' : '' ?>" data-bsky-action="repost"
+                    data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>" data-record-uri="<?= h($stBskyRepostRecord) ?>"
+                    data-object-ref="<?= h($stBskyObjectRef) ?>" data-return-view="<?= h($returnView) ?>"
+                    title="<?= $stBskyReposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $stBskyReposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $stBskyReposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                <?php endif; ?>
                 <button type="button" class="icon-btn bsky-action<?= $fav ? ' on' : '' ?>" data-bsky-action="like"
                   data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>" data-record-uri="<?= h($stBskyLikeRecord) ?>"
                   data-object-ref="<?= h($stBskyObjectRef) ?>" data-return-view="<?= h($returnView) ?>"
@@ -15617,6 +15687,21 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     if ($kind === 'bsky') {
         $row = is_array($item['row'] ?? null) ? $item['row'] : [];
         if ($row !== []) {
+            // 10.2: Bluesky Home/feed → normalize → shared status card (ATProto actions).
+            if (
+                function_exists('ap_normalize_from_bsky_post')
+                && function_exists('admin_render_masto_status_card')
+            ) {
+                $st = ap_normalize_from_bsky_post($row);
+                if (is_array($st) && (
+                    !function_exists('ap_normalize_status_has_visible_body')
+                    || ap_normalize_status_has_visible_body($st)
+                    || !empty($st['reblog'])
+                )) {
+                    admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+                    return;
+                }
+            }
             admin_render_bsky_feed_item($row, 'following', $returnView === 'home' ? 'home' : 'bluesky');
         }
         return;
@@ -15641,18 +15726,31 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     }
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     $fromTag = !empty($item['from_tag']) || !empty($item['row']['_from_followed_tag']);
-    // 10.2: Create/Update firehose → normalized Mastodon status → shared card.
-    // Announce keeps remote_boost_card (thin-boost hydrate AJAX).
+    // 10.2: Create/Update/Announce → normalized Mastodon status → shared card.
+    // Thin Announces (no Create yet) keep remote_boost_card for AJAX hydrate.
     $evType = strtolower((string) ($row['type'] ?? 'create'));
     if (
         $row !== []
-        && in_array($evType, ['create', 'update'], true)
+        && in_array($evType, ['create', 'update', 'announce'], true)
         && function_exists('ap_normalize_from_activitypub_event')
         && function_exists('admin_render_masto_status_card')
     ) {
+        if ($evType === 'announce') {
+            // Do not sync-fetch on the timeline path (stalls Home); AJAX hydrate instead.
+            $row['_skip_announce_hydrate'] = true;
+        }
         $st = ap_normalize_from_activitypub_event($row);
         if (is_array($st)) {
-            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            $usable = $evType !== 'announce'
+                || (function_exists('ap_normalize_status_has_visible_body')
+                    && ap_normalize_status_has_visible_body($st));
+            if ($usable) {
+                admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+                return;
+            }
+        }
+        if ($evType === 'announce') {
+            admin_render_remote_boost_card($row, $followingIds, $returnView, $fromTag);
             return;
         }
     }
@@ -19757,6 +19855,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .img-lightbox img {
       max-width: min(96vw, 1200px); max-height: 92vh; object-fit: contain;
       border-radius: 8px; box-shadow: 0 12px 48px rgba(0,0,0,.5);
+      cursor: pointer;
     }
     .img-lightbox__close {
       position: absolute; top: .75rem; right: .9rem; width: 2.4rem; height: 2.4rem;
@@ -30845,7 +30944,8 @@ $showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'securi
     openLb(t.getAttribute('data-full') || (t.querySelector('img') && t.querySelector('img').src) || '');
   });
   closeBtn && closeBtn.addEventListener('click', closeLb);
-  box.addEventListener('click', (e) => { if (e.target === box) closeLb(); });
+  // Backdrop or the enlarged image itself closes the lightbox.
+  box.addEventListener('click', (e) => { if (e.target === box || e.target === img) closeLb(); });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && box.classList.contains('open')) closeLb();
   });
