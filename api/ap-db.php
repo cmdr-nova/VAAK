@@ -4791,7 +4791,7 @@ function ap_metrics_record(
             && in_array($actionTaken, ['log', 'local_observe'], true)
         ) {
             $dup = ap_db()->prepare(
-                'SELECT id, spoiler_text, sensitive, visibility FROM events WHERE type = ? AND object_id = ? LIMIT 1'
+                'SELECT id, summary, media_urls, spoiler_text, sensitive, visibility, action_taken FROM events WHERE type = ? AND object_id = ? LIMIT 1'
             );
             $dup->execute([$type, $objectId]);
             $existing = $dup->fetch();
@@ -4818,6 +4818,36 @@ function ap_metrics_record(
                             ->execute([$visibility, (int) $existing['id']]);
                     } catch (Throwable $e) {
                         // column may be mid-migrate
+                    }
+                }
+                // Empty Create/Update shells (boost-only cache, authorized-fetch
+                // peers): write summary/media once a later signed fetch succeeds.
+                // Without this, ap_masto_ensure_remote_note_event can GET content
+                // and still leave Home on the "isn't cached" placeholder.
+                $oldSum = trim((string) ($existing['summary'] ?? ''));
+                $oldMedia = trim((string) ($existing['media_urls'] ?? ''));
+                $oldMediaEmpty = ($oldMedia === '' || $oldMedia === '[]' || $oldMedia === 'null');
+                $oldAction = (string) ($existing['action_taken'] ?? '');
+                if ($oldSum === '' && $summary !== null && $summary !== '') {
+                    try {
+                        if ($oldAction === 'private_firehose_skipped') {
+                            ap_db()->prepare(
+                                "UPDATE events SET summary = ?, action_taken = 'local_observe' WHERE id = ?"
+                            )->execute([$summary, (int) $existing['id']]);
+                        } else {
+                            ap_db()->prepare('UPDATE events SET summary = ? WHERE id = ?')
+                                ->execute([$summary, (int) $existing['id']]);
+                        }
+                    } catch (Throwable $e) {
+                        // non-fatal
+                    }
+                }
+                if ($oldMediaEmpty && $mediaJson !== null && $mediaJson !== '') {
+                    try {
+                        ap_db()->prepare('UPDATE events SET media_urls = ? WHERE id = ?')
+                            ->execute([$mediaJson, (int) $existing['id']]);
+                    } catch (Throwable $e) {
+                        // non-fatal
                     }
                 }
                 return;
@@ -5049,19 +5079,34 @@ function ap_events_refresh_create_from_update(
         }
     }
     try {
-        // Prefer live Create that is still on the timeline (incl. local compose rows)
+        // Prefer live Create that is still on the timeline (incl. local compose
+        // rows). Also refresh empty shells recorded as private_firehose_skipped
+        // when a later signed fetch recovers public content.
         $st = ap_db()->prepare(
-            "SELECT id FROM events
+            "SELECT id, action_taken, summary, media_urls FROM events
              WHERE (object_id = ? OR object_id = ?)
                AND type = 'Create'
-               AND action_taken IN ('log', 'local_observe', 'compose')
-             ORDER BY id DESC LIMIT 1"
+               AND action_taken IN ('log', 'local_observe', 'compose', 'private_firehose_skipped')
+               AND COALESCE(action_taken, '') != 'deleted'
+             ORDER BY CASE action_taken
+               WHEN 'local_observe' THEN 0
+               WHEN 'log' THEN 1
+               WHEN 'compose' THEN 2
+               ELSE 3
+             END, id DESC
+             LIMIT 1"
         );
         $st->execute([$objectId, $objectId . '/']);
-        $id = (int) ($st->fetchColumn() ?: 0);
+        $row = $st->fetch();
+        $id = is_array($row) ? (int) ($row['id'] ?? 0) : 0;
         if ($id <= 0) {
             return false;
         }
+        $oldAction = is_array($row) ? (string) ($row['action_taken'] ?? '') : '';
+        $oldSum = is_array($row) ? trim((string) ($row['summary'] ?? '')) : '';
+        // Promote empty private_firehose_skipped stubs to local_observe once we
+        // have recoverable public body (authorized-fetch / thin-Announce path).
+        $promoteAction = ($oldAction === 'private_firehose_skipped' && $oldSum === '' && $plain !== null && $plain !== '');
         ap_db()->prepare(
             "UPDATE events SET
                 summary = COALESCE(?, summary),
@@ -5069,7 +5114,8 @@ function ap_events_refresh_create_from_update(
                 in_reply_to = COALESCE(?, in_reply_to),
                 spoiler_text = CASE WHEN ? != '' THEN ? ELSE spoiler_text END,
                 sensitive = CASE WHEN ? THEN 1 ELSE sensitive END,
-                visibility = ?
+                visibility = ?,
+                action_taken = CASE WHEN ? THEN 'local_observe' ELSE action_taken END
              WHERE id = ?"
         )->execute([
             $plain,
@@ -5079,6 +5125,7 @@ function ap_events_refresh_create_from_update(
             $spoilerText,
             $sensitive ? 1 : 0,
             $visibility,
+            $promoteAction ? 1 : 0,
             $id,
         ]);
         if (function_exists('ap_search_fts_index_event_row')) {

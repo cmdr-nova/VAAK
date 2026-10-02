@@ -2728,8 +2728,14 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
     $needsPeerTubeMediaBackfill = $isNoteRow
         && $isPeerTubeObject
         && ($existingMedia === '' || str_contains($existingMedia, '/static/web-videos/'));
+    // Empty Create/Update shells (Announce-only cache, authorized-fetch peers that
+    // arrived without content): signed GET can fill summary/media even when
+    // in_reply_to is already set. Without this, ensure early-returns forever.
+    $existingSummary = is_array($existing) ? trim((string) ($existing['summary'] ?? '')) : '';
+    $mediaEmpty = ($existingMedia === '' || $existingMedia === '[]' || $existingMedia === 'null');
+    $needsContentBackfill = $isNoteRow && $existingSummary === '' && $mediaEmpty;
     // Announce/Like stubs are not enough — fetch the real Note when missing.
-    if ($isNoteRow && !$needsReplyBackfill && !$needsPeerTubeMediaBackfill) {
+    if ($isNoteRow && !$needsReplyBackfill && !$needsPeerTubeMediaBackfill && !$needsContentBackfill) {
         return $existing;
     }
 
@@ -2884,27 +2890,45 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
     $oid = function_exists('ap_as_id') ? (ap_as_id($doc['id'] ?? null) ?: $objectUrl) : $objectUrl;
     $oid = rtrim((string) $oid, '/');
 
-    // Repair older PeerTube rows that cached the first advertised web-video
-    // MP4, which may be explicitly audio-only. The extractor now selects an
-    // audio+video rendition nested under the HLS master link.
-    if ($needsPeerTubeMediaBackfill && function_exists('ap_events_refresh_create_from_update')) {
-        ap_events_refresh_create_from_update(
-            $oid,
-            is_string($summary) ? $summary : null,
-            is_array($media) ? $media : null,
-            $inReplyTo,
-            '',
-            !empty($doc['sensitive']),
-            'public'
-        );
-        return function_exists('ap_event_by_object_id') ? ap_event_by_object_id($oid) : $existing;
-    }
-
     $spoilerText = is_string($doc['summary'] ?? null) ? (string) $doc['summary'] : '';
     $sensitive = !empty($doc['sensitive']);
     $visibility = isset($restVisibility) && is_string($restVisibility)
         ? $restVisibility
         : 'public';
+
+    // Repair older PeerTube rows that cached the first advertised web-video
+    // MP4, which may be explicitly audio-only. The extractor now selects an
+    // audio+video rendition nested under the HLS master link.
+    // Also refresh empty Create/Update shells once signed fetch returned body.
+    if (
+        ($needsPeerTubeMediaBackfill || $needsContentBackfill)
+        && function_exists('ap_events_refresh_create_from_update')
+    ) {
+        ap_events_refresh_create_from_update(
+            $oid,
+            is_string($summary) ? $summary : null,
+            is_array($media) ? $media : null,
+            $inReplyTo,
+            $spoilerText,
+            $sensitive,
+            $visibility
+        );
+        $refreshed = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($oid) : $existing;
+        if ($needsPeerTubeMediaBackfill && is_array($refreshed)) {
+            return $refreshed;
+        }
+        if ($needsContentBackfill && is_array($refreshed)) {
+            $filledSum = trim((string) ($refreshed['summary'] ?? ''));
+            $filledMedia = trim((string) ($refreshed['media_urls'] ?? ''));
+            $filledMediaEmpty = ($filledMedia === '' || $filledMedia === '[]' || $filledMedia === 'null');
+            if ($filledSum !== '' || !$filledMediaEmpty) {
+                return $refreshed;
+            }
+            // Fall through to ap_metrics_record — refresh may miss rows with
+            // action_taken like private_firehose_skipped.
+        }
+    }
+
     ap_metrics_record(
         'Create',
         $actorId,
