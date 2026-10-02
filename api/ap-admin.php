@@ -6317,7 +6317,8 @@ function admin_tl_cache_dir(): string
 /** Redis key for the short-lived ranked timeline index (IDs only, no card HTML). */
 function admin_tl_redis_key(string $key): string
 {
-    return 'vaak:timeline:ranked:v1:' . hash('sha256', $key);
+    // v2: RSS surfaces after ~8 posts (was v1 ~15).
+    return 'vaak:timeline:ranked:v2:' . hash('sha256', $key);
 }
 
 function admin_tl_owner_index_key(int $ownerUserId): string
@@ -7532,7 +7533,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
 function admin_home_queue_rss_after_first_page(
     array $ranked,
     int $ownerUserId,
-    int $firstPage = 15,
+    int $firstPage = 8,
     ?int $beforeTs = null,
     int $candidateLimit = 16
 ): array
@@ -7673,6 +7674,7 @@ function admin_tl_cache_clear(): void
 {
     if (function_exists('ap_redis_delete_pattern')) {
         ap_redis_delete_pattern('vaak:timeline:ranked:v1:*');
+        ap_redis_delete_pattern('vaak:timeline:ranked:v2:*');
         ap_redis_delete_pattern('vaak:timeline:owner-index:v1:*');
     }
     $dir = admin_tl_cache_dir();
@@ -7978,8 +7980,8 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
         if ($homeOwnerUserId > 0) {
             $ranked = admin_home_merge_bsky_ranked($ranked, $homeOwnerUserId);
             if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-                $pageSize = max(8, min(40, (int) ($_GET['limit'] ?? 15)));
-                $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerUserId, $pageSize);
+                // Surface first RSS after ~8 posts (was full pageSize ~15).
+                $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerUserId, 8);
             }
         }
     }
@@ -9482,7 +9484,8 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             $ranked = admin_home_merge_bsky_ranked($ranked, $homeOwnerId);
         }
         if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
-            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, $tlLimit);
+            // Surface first RSS after ~8 posts so feeds are visible without a long scroll.
+            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, 8);
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
@@ -14147,12 +14150,60 @@ function admin_render_masto_status_card(
         if (is_array($st['card'] ?? null)) {
             $cardHtml = ap_link_preview_html(array_merge($st['card'], ['status' => 'ok']), true);
         }
+        // Bluesky external embed (when card was not attached upstream).
+        if (
+            $cardHtml === ''
+            && $isBsky
+            && is_array($bskyPostBlob)
+            && function_exists('ap_bsky_external_link_card_html')
+        ) {
+            $emb = is_array($bskyPostBlob['embed'] ?? null) ? $bskyPostBlob['embed'] : null;
+            $ext = null;
+            if (is_array($emb)) {
+                $embType = (string) ($emb['$type'] ?? '');
+                if (str_contains($embType, 'external') && is_array($emb['external'] ?? null)) {
+                    $ext = $emb['external'];
+                } elseif (
+                    str_contains($embType, 'recordWithMedia')
+                    && is_array($emb['media']['external'] ?? null)
+                ) {
+                    $ext = $emb['media']['external'];
+                }
+            }
+            if (is_array($ext)) {
+                $cardHtml = ap_bsky_external_link_card_html($ext);
+            }
+        }
         if ($cardHtml === '' && $plain !== '' && function_exists('ap_link_preview_card_for_status_text')) {
+            // Cache-first, then a small per-request fetch budget (Home/Federated),
+            // same pattern as quote cards — so link posts get a preview without
+            // waiting for Search-only allowFetch.
             $pcard = ap_link_preview_card_for_status_text(
                 (string) ($st['content'] ?? $plain),
                 false,
-                $returnView === 'search'
+                false
             );
+            if ($pcard === null) {
+                $lpBudget = &$GLOBALS['admin_status_link_preview_budget'];
+                if (!isset($lpBudget) || !is_int($lpBudget)) {
+                    $lpBudget = 3;
+                }
+                if ($lpBudget > 0) {
+                    $lpBudget--;
+                    $pcard = ap_link_preview_card_for_status_text(
+                        (string) ($st['content'] ?? $plain),
+                        false,
+                        true
+                    );
+                }
+            }
+            if ($pcard === null && function_exists('ap_link_preview_extract_url')
+                && function_exists('ap_link_preview_warm_async')) {
+                $warmUrl = ap_link_preview_extract_url((string) ($st['content'] ?? $plain));
+                if (is_string($warmUrl) && $warmUrl !== '') {
+                    ap_link_preview_warm_async($warmUrl);
+                }
+            }
             if (is_array($pcard)) {
                 $cardHtml = ap_link_preview_html(array_merge($pcard, ['status' => 'ok']), true);
             }
@@ -17245,7 +17296,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 || !empty($homeProfileMiss['algorithm_enabled']);
             $rankedMiss = admin_home_merge_bsky_ranked($rankedMiss, $homeOwnerMiss);
             if ($homeAlgorithmMiss && function_exists('admin_home_queue_rss_after_first_page')) {
-                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, $tlLimit);
+                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, 8);
             }
         }
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.

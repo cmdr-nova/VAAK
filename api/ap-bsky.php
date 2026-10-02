@@ -3134,6 +3134,48 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
             $out['images'] = $imgs;
         }
     }
+    // AppView gallery#view uses items[] (viewImage), not images[].
+    // Older compact only kept $type and dropped media on Home.
+    if (str_contains($type, 'gallery') && is_array($embed['items'] ?? null)) {
+        $imgs = [];
+        $items = [];
+        foreach (array_slice($embed['items'], 0, 4) as $img) {
+            if (!is_array($img)) {
+                continue;
+            }
+            $thumb = (string) ($img['thumbnail'] ?? $img['thumb'] ?? $img['fullsize'] ?? '');
+            $full = (string) ($img['fullsize'] ?? $img['thumbnail'] ?? $img['thumb'] ?? '');
+            if (!str_starts_with($thumb, 'https://') && !str_starts_with($full, 'https://')) {
+                continue;
+            }
+            $norm = [
+                'thumb' => str_starts_with($thumb, 'https://') ? $thumb : $full,
+                'fullsize' => str_starts_with($full, 'https://') ? $full : $thumb,
+                'thumbnail' => str_starts_with($thumb, 'https://') ? $thumb : $full,
+                'alt' => (string) ($img['alt'] ?? ''),
+                '$type' => 'app.bsky.embed.gallery#viewImage',
+            ];
+            if (is_array($img['aspectRatio'] ?? null)) {
+                $norm['aspectRatio'] = [
+                    'width' => (int) ($img['aspectRatio']['width'] ?? 0),
+                    'height' => (int) ($img['aspectRatio']['height'] ?? 0),
+                ];
+            }
+            $imgs[] = [
+                'thumb' => $norm['thumb'],
+                'fullsize' => $norm['fullsize'],
+                'alt' => $norm['alt'],
+            ];
+            $items[] = $norm;
+        }
+        if ($items !== []) {
+            $out['items'] = $items;
+            // Also mirror as images so older media helpers keep working.
+            if (empty($out['images'])) {
+                $out['images'] = $imgs;
+            }
+        }
+    }
     if (str_contains($type, 'external') && is_array($embed['external'] ?? null)) {
         $ext = $embed['external'];
         $out['external'] = [
@@ -9005,14 +9047,18 @@ function ap_bsky_post_image_urls(array $post): array
     $images = [];
     if (str_contains($type, 'images') && is_array($embed['images'] ?? null)) {
         $images = $embed['images'];
+    } elseif (str_contains($type, 'gallery') && is_array($embed['items'] ?? null)) {
+        $images = $embed['items'];
     } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['images'] ?? null)) {
         $images = $embed['media']['images'];
+    } elseif (str_contains($type, 'recordWithMedia') && is_array($embed['media']['items'] ?? null)) {
+        $images = $embed['media']['items'];
     }
     foreach ($images as $img) {
         if (!is_array($img)) {
             continue;
         }
-        $u = (string) ($img['thumb'] ?? $img['fullsize'] ?? '');
+        $u = (string) ($img['thumb'] ?? $img['thumbnail'] ?? $img['fullsize'] ?? '');
         if ($u === '' && is_array($img['image'] ?? null)) {
             // raw blob — skip without CDN resolve in Phase A
             continue;
@@ -9022,6 +9068,92 @@ function ap_bsky_post_image_urls(array $post): array
         }
     }
     return $out;
+}
+
+/**
+ * True when AppView gallery/images embed lost CDN URLs (compact bug / thin cache).
+ *
+ * @param array<string,mixed> $post
+ */
+function ap_bsky_post_embed_media_thin(array $post): bool
+{
+    $embed = is_array($post['embed'] ?? null) ? $post['embed'] : null;
+    if (!is_array($embed)) {
+        return false;
+    }
+    $type = strtolower((string) ($embed['$type'] ?? ''));
+    if ($type === '') {
+        return false;
+    }
+    $looksMedia = str_contains($type, 'gallery')
+        || str_contains($type, 'images')
+        || str_contains($type, 'video')
+        || (str_contains($type, 'recordwithmedia') && is_array($embed['media'] ?? null));
+    if (!$looksMedia) {
+        return false;
+    }
+    if (function_exists('ap_masto_bsky_media_attachments')) {
+        return ap_masto_bsky_media_attachments($post, (string) ($post['uri'] ?? 'x')) === [];
+    }
+    return ap_bsky_post_image_urls($post) === [] && ap_bsky_embed_video_view($embed) === null;
+}
+
+/**
+ * Re-fetch AppView embed when gallery/images cache was stripped to $type only.
+ * Budgeted for timeline paint; always enqueues warm on miss/exhaustion.
+ *
+ * @param array<string,mixed> $post
+ * @return array<string,mixed>
+ */
+function ap_bsky_repair_thin_media_embed(array $post, int $ownerUserId = 0): array
+{
+    if (!ap_bsky_post_embed_media_thin($post)) {
+        return $post;
+    }
+    $uri = trim((string) ($post['uri'] ?? ''));
+    if (!str_starts_with($uri, 'at://')) {
+        return $post;
+    }
+    $budget = &$GLOBALS['admin_bsky_gallery_repair_budget'];
+    if (!isset($budget) || !is_int($budget)) {
+        $budget = 2;
+    }
+    if ($budget < 1) {
+        if (function_exists('ap_bsky_post_preview_warm_enqueue')) {
+            ap_bsky_post_preview_warm_enqueue($uri, $ownerUserId);
+        }
+        return $post;
+    }
+    $budget--;
+    if (!defined('AP_BSKY_PUBLIC_API') || !function_exists('ap_bsky_xrpc')) {
+        return $post;
+    }
+    $got = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.feed.getPosts', 'GET', [
+        'uris' => $uri,
+    ], null, null, 6);
+    if (empty($got['ok']) || !is_array($got['json'] ?? null)) {
+        if (function_exists('ap_bsky_post_preview_warm_enqueue')) {
+            ap_bsky_post_preview_warm_enqueue($uri, $ownerUserId);
+        }
+        return $post;
+    }
+    $posts = is_array($got['json']['posts'] ?? null) ? $got['json']['posts'] : [];
+    $live = is_array($posts[0] ?? null) ? $posts[0] : null;
+    if (!is_array($live) || !is_array($live['embed'] ?? null)) {
+        return $post;
+    }
+    $compact = ap_bsky_post_embed_compact($live['embed']);
+    if (!is_array($compact)) {
+        return $post;
+    }
+    $post['embed'] = $compact;
+    // Persist repaired embed so the next Home paint is cache-hit.
+    try {
+        ap_bsky_post_upsert_from_feed_item(['post' => array_merge($live, ['embed' => $live['embed']])], $ownerUserId > 0 ? $ownerUserId : null);
+    } catch (Throwable $e) {
+        // ignore
+    }
+    return $post;
 }
 
 /**

@@ -9050,38 +9050,53 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
     }
     $out = [];
     $n = 0;
+    $pushImage = static function (array $image) use (&$out, &$n, $statusId): void {
+        $url = trim((string) (
+            $image['fullsize']
+            ?? $image['url']
+            ?? $image['thumb']
+            ?? $image['thumbnail']
+            ?? ''
+        ));
+        if (!str_starts_with($url, 'https://')) {
+            return;
+        }
+        $displayUrl = function_exists('ap_remote_post_media_resolve')
+            ? ap_remote_post_media_resolve($url)
+            : $url;
+        $preview = trim((string) ($image['thumb'] ?? $image['thumbnail'] ?? $url));
+        $previewUrl = function_exists('ap_remote_post_media_resolve')
+            ? ap_remote_post_media_resolve($preview)
+            : $preview;
+        $out[] = [
+            'id' => $statusId . '#media-' . (++$n),
+            'type' => 'image',
+            'url' => $displayUrl,
+            'preview_url' => str_starts_with($previewUrl, 'https://') ? $previewUrl : $displayUrl,
+            'remote_url' => $url,
+            'text_url' => $url,
+            'description' => (string) ($image['alt'] ?? ''),
+            'meta' => [],
+            'blurhash' => null,
+        ];
+    };
     foreach ($sources as $source) {
         foreach ((is_array($source['images'] ?? null) ? $source['images'] : []) as $image) {
-            if (!is_array($image)) {
-                continue;
+            if (is_array($image)) {
+                $pushImage($image);
             }
-            $url = trim((string) ($image['fullsize'] ?? $image['url'] ?? $image['thumb'] ?? ''));
-            if (!str_starts_with($url, 'https://')) {
-                continue;
+        }
+        // gallery#view → items[] of viewImage (thumbnail/fullsize).
+        foreach ((is_array($source['items'] ?? null) ? $source['items'] : []) as $image) {
+            if (is_array($image)) {
+                $pushImage($image);
             }
-            $displayUrl = function_exists('ap_remote_post_media_resolve')
-                ? ap_remote_post_media_resolve($url)
-                : $url;
-            $preview = trim((string) ($image['thumb'] ?? $url));
-            $previewUrl = function_exists('ap_remote_post_media_resolve')
-                ? ap_remote_post_media_resolve($preview)
-                : $preview;
-            $out[] = [
-                'id' => $statusId . '#media-' . (++$n),
-                'type' => 'image',
-                'url' => $displayUrl,
-                'preview_url' => str_starts_with($previewUrl, 'https://') ? $previewUrl : $displayUrl,
-                'remote_url' => $url,
-                'text_url' => $url,
-                'description' => (string) ($image['alt'] ?? ''),
-                'meta' => [],
-                'blurhash' => null,
-            ];
         }
         $video = is_array($source['video'] ?? null) ? $source['video'] : $source;
         $playlist = trim((string) ($video['playlist'] ?? $video['url'] ?? ''));
+        $srcType = strtolower((string) ($source['$type'] ?? $type));
         if ($playlist !== '' && str_starts_with($playlist, 'https://')
-            && (str_contains($type, 'video') || isset($source['playlist']) || isset($source['video']))) {
+            && (str_contains($srcType, 'video') || isset($source['playlist']) || isset($source['video']))) {
             $preview = trim((string) ($video['thumbnail'] ?? $video['thumb'] ?? ''));
             $out[] = [
                 'id' => $statusId . '#media-' . (++$n),
