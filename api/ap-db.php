@@ -9873,10 +9873,11 @@ function ap_user_block_add(
                 }
             }
             if (function_exists('ap_bsky_sync_moderation_from_vaak')) {
-                ap_bsky_sync_moderation_from_vaak($ownerUserId, $value, 'block');
+                $sync = ap_bsky_sync_moderation_from_vaak($ownerUserId, $value, 'block');
+                $out['bsky_sync'] = $sync;
             }
         } catch (Throwable $e) {
-            // ignore
+            $out['bsky_sync'] = ['ok' => false, 'error' => $e->getMessage()];
         }
     }
     return $out;

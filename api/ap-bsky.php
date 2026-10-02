@@ -8625,7 +8625,9 @@ function ap_bsky_unfollow_actor(int $ownerUserId, string $didOrRef): array
  */
 function ap_bsky_mute_actor(int $ownerUserId, string $did): array
 {
-    if (!ap_bsky_tab_enabled() || ap_bsky_session_row($ownerUserId) === null) {
+    // Connected sessions write moderation even when the UI tab env flag is unset
+    // (CLI/backfill often omit VAAK_FEATURE_BLUESKY_TAB that FPM sets).
+    if (ap_bsky_session_row($ownerUserId) === null) {
         return ['ok' => true, 'skipped' => true];
     }
     if (!str_starts_with($did, 'did:')) {
@@ -8666,7 +8668,7 @@ function ap_bsky_mute_actor(int $ownerUserId, string $did): array
  */
 function ap_bsky_unmute_actor(int $ownerUserId, string $did): array
 {
-    if (!ap_bsky_tab_enabled() || ap_bsky_session_row($ownerUserId) === null) {
+    if (ap_bsky_session_row($ownerUserId) === null) {
         return ['ok' => true, 'skipped' => true];
     }
     if (!str_starts_with($did, 'did:')) {
@@ -8707,7 +8709,7 @@ function ap_bsky_unmute_actor(int $ownerUserId, string $did): array
  */
 function ap_bsky_block_actor(int $ownerUserId, string $did): array
 {
-    if (!ap_bsky_tab_enabled() || ap_bsky_session_row($ownerUserId) === null) {
+    if (ap_bsky_session_row($ownerUserId) === null) {
         return ['ok' => true, 'skipped' => true];
     }
     if (!str_starts_with($did, 'did:')) {
@@ -8759,7 +8761,7 @@ function ap_bsky_block_actor(int $ownerUserId, string $did): array
  */
 function ap_bsky_unblock_actor(int $ownerUserId, string $did): array
 {
-    if (!ap_bsky_tab_enabled() || ap_bsky_session_row($ownerUserId) === null) {
+    if (ap_bsky_session_row($ownerUserId) === null) {
         return ['ok' => true, 'skipped' => true];
     }
     if (!str_starts_with($did, 'did:')) {
@@ -8804,19 +8806,24 @@ function ap_bsky_unblock_actor(int $ownerUserId, string $did): array
     return ['ok' => true];
 }
 
-/** Best-effort push after VAAK mute/block mutations. */
-function ap_bsky_sync_moderation_from_vaak(int $ownerUserId, string $actorUrl, string $op): void
+/**
+ * Best-effort push after VAAK mute/block mutations.
+ *
+ * @return array{ok:bool,skipped?:bool,error?:string,did?:string,uri?:string}
+ */
+function ap_bsky_sync_moderation_from_vaak(int $ownerUserId, string $actorUrl, string $op): array
 {
-    if ($ownerUserId < 1 || !ap_bsky_tab_enabled()) {
-        return;
+    if ($ownerUserId < 1) {
+        return ['ok' => true, 'skipped' => true, 'error' => 'no owner'];
     }
     if (ap_bsky_session_row($ownerUserId) === null) {
-        return;
+        return ['ok' => true, 'skipped' => true, 'error' => 'no bluesky session'];
     }
     try {
         $did = ap_bsky_resolve_target_did($actorUrl, $ownerUserId);
         if ($did === null) {
-            return;
+            error_log('[ap-bsky] sync_moderation ' . $op . ' unresolved: ' . $actorUrl);
+            return ['ok' => false, 'error' => 'unresolved did'];
         }
         $res = match ($op) {
             'mute' => ap_bsky_mute_actor($ownerUserId, $did),
@@ -8828,8 +8835,12 @@ function ap_bsky_sync_moderation_from_vaak(int $ownerUserId, string $actorUrl, s
         if (empty($res['ok']) && empty($res['skipped'])) {
             error_log('[ap-bsky] sync_moderation ' . $op . ' ' . $did . ': ' . (string) ($res['error'] ?? 'fail'));
         }
+        $out = $res;
+        $out['did'] = $did;
+        return $out;
     } catch (Throwable $e) {
         error_log('[ap-bsky] sync_moderation: ' . $e->getMessage());
+        return ['ok' => false, 'error' => $e->getMessage()];
     }
 }
 

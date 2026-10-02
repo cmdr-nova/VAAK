@@ -2873,6 +2873,7 @@ $vaakAdminOnlyActions = [
                     );
                     if (!empty($personal['ok'])) {
                         $result['personal_dual'] = true;
+                        $result['personal_bsky_sync'] = $personal['bsky_sync'] ?? null;
                     }
                 }
                 $notice = $verb . ' ' . ($result['scope'] ?? '') . ' ' . $blockedValue
@@ -2886,7 +2887,22 @@ $vaakAdminOnlyActions = [
                 if ($isBskyServerTarget) {
                     $notice .= ' · hidden for everyone on VAAK.';
                     if (!empty($result['personal_dual'])) {
-                        $notice .= ' · also blocked for you personally (Bluesky sync when connected).';
+                        $bskySync = is_array($result['personal_bsky_sync'] ?? null)
+                            ? $result['personal_bsky_sync']
+                            : null;
+                        if (is_array($bskySync) && !empty($bskySync['ok']) && empty($bskySync['skipped'])) {
+                            $notice .= ' · also blocked for you on Bluesky.';
+                        } elseif (is_array($bskySync) && !empty($bskySync['skipped'])) {
+                            $notice .= ' · also blocked for you personally (Bluesky sync skipped'
+                                . (!empty($bskySync['error']) ? ': ' . (string) $bskySync['error'] : '')
+                                . ').';
+                        } elseif (is_array($bskySync) && empty($bskySync['ok'])) {
+                            $notice .= ' · also blocked for you personally (Bluesky sync failed'
+                                . (!empty($bskySync['error']) ? ': ' . (string) $bskySync['error'] : '')
+                                . ').';
+                        } else {
+                            $notice .= ' · also blocked for you personally (Bluesky sync when connected).';
+                        }
                     }
                 } elseif ($kind === 'block' || $kind === 'suspend') {
                     $notice .= ' · inbound federation from them is now rejected (HTTP 403).';
