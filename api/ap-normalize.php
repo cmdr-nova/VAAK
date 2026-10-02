@@ -225,7 +225,7 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
     if ($sum !== '' && !in_array($sum, ['(media)', '(attachment)', '(poll)', '(quote)', '(boost)'], true)) {
         $reason = 'half_parsed';
     }
-    return ap_normalize_degraded_status([
+    $bits = [
         'id' => ap_masto_event_status_id(
             (int) ($eventRow['id'] ?? 0),
             isset($eventRow['created_at']) ? (string) $eventRow['created_at'] : null
@@ -238,7 +238,12 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
         'sensitive' => !empty($eventRow['sensitive']),
         'visibility' => (string) ($eventRow['visibility'] ?? 'public'),
         'reason' => $reason,
-    ]);
+    ];
+    $replyTo = rtrim((string) ($eventRow['in_reply_to'] ?? ''), '/');
+    if ($replyTo !== '' && str_starts_with($replyTo, 'https://')) {
+        $bits['vaak_in_reply_to_url'] = $replyTo;
+    }
+    return ap_normalize_degraded_status($bits);
 }
 
 /**
@@ -277,6 +282,31 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
     $st['bsky_cid'] = (string) ($post['cid'] ?? ($st['bsky_cid'] ?? ''));
     if (isset($postOrItem['_vaak_feed_source'])) {
         $st['vaak_feed_source'] = (string) $postOrItem['_vaak_feed_source'];
+    }
+    // Structured reply parent for shared-card ↩ reply to chrome (handle + snippet).
+    if (
+        empty($st['vaak_reply_parent'])
+        && function_exists('ap_bsky_reply_parent_preview')
+    ) {
+        $replyPrev = ap_bsky_reply_parent_preview($postOrItem);
+        if (is_array($replyPrev)) {
+            $st['vaak_reply_parent'] = $replyPrev;
+            if (empty($st['vaak_in_reply_to_url'])) {
+                $pUrl = trim((string) ($replyPrev['url'] ?? ''));
+                $pUri = trim((string) ($replyPrev['uri'] ?? ''));
+                if ($pUrl !== '' && $pUrl !== 'https://bsky.app/') {
+                    $st['vaak_in_reply_to_url'] = $pUrl;
+                } elseif (str_starts_with($pUri, 'at://')) {
+                    $st['vaak_in_reply_to_url'] = $pUri;
+                }
+            }
+            if (($st['in_reply_to_id'] ?? null) === null || $st['in_reply_to_id'] === '') {
+                $pUri = trim((string) ($replyPrev['uri'] ?? ''));
+                if ($pUri !== '') {
+                    $st['in_reply_to_id'] = $pUri;
+                }
+            }
+        }
     }
 
     // Structured quote embed → Mastodon-ish quote for the shared card.
@@ -501,6 +531,10 @@ function ap_normalize_degraded_status(array $bits): array
     ];
     if (isset($bits['source']) && is_string($bits['source']) && $bits['source'] !== '') {
         $status['source'] = $bits['source'];
+    }
+    $replyUrl = rtrim((string) ($bits['vaak_in_reply_to_url'] ?? $bits['in_reply_to'] ?? ''), '/');
+    if ($replyUrl !== '' && (str_starts_with($replyUrl, 'https://') || str_starts_with($replyUrl, 'at://'))) {
+        $status['vaak_in_reply_to_url'] = $replyUrl;
     }
     return function_exists('ap_normalize_status') ? ap_normalize_status($status) : $status;
 }

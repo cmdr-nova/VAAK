@@ -12287,6 +12287,116 @@ function admin_event_is_empty_private_stub(array $e): bool
     return true;
 }
 
+/**
+ * Shared-card ↩ reply to chrome (Fediverse + Bluesky).
+ * Uses vaak_reply_parent (Bluesky preview), vaak_in_reply_to_url, or in_reply_to_id.
+ *
+ * @param array<string,mixed> $st Mastodon-shaped status
+ */
+function admin_status_reply_to_meta_html(array $st, string $returnView): string
+{
+    if (!empty($st['vaak_ask']) && is_array($st['vaak_ask'])) {
+        return '';
+    }
+
+    $parent = is_array($st['vaak_reply_parent'] ?? null) ? $st['vaak_reply_parent'] : null;
+    if ($parent === null && !empty($st['bsky_post']) && is_array($st['bsky_post'])
+        && function_exists('ap_bsky_reply_parent_preview')) {
+        $item = ['post' => $st['bsky_post']];
+        if (is_array($st['bsky_reply'] ?? null)) {
+            $item['reply'] = $st['bsky_reply'];
+        }
+        $parent = ap_bsky_reply_parent_preview($item);
+    }
+
+    if (is_array($parent)) {
+        $parentLabel = trim((string) ($parent['handle'] ?? ''));
+        if ($parentLabel !== '') {
+            $parentLabel = '@' . ltrim($parentLabel, '@');
+        } else {
+            $parentLabel = trim((string) ($parent['display'] ?? 'parent post'));
+        }
+        $snip = trim((string) ($parent['text'] ?? ''));
+        if ($snip !== '') {
+            $snip = mb_substr($snip, 0, 120);
+        }
+        $parentUrl = trim((string) ($parent['url'] ?? ''));
+        $parentAt = trim((string) ($parent['uri'] ?? ''));
+        $href = '';
+        if ($parentUrl !== '' && $parentUrl !== 'https://bsky.app/') {
+            $href = function_exists('admin_status_href')
+                ? admin_status_href($parentUrl, $returnView)
+                : $parentUrl;
+        } elseif (str_starts_with($parentAt, 'at://') && function_exists('admin_status_href')) {
+            $href = admin_status_href($parentAt, $returnView);
+        }
+        $linkText = $snip !== '' ? $snip : ($parentLabel !== '' ? $parentLabel : 'parent post');
+        $html = '<div class="meta" style="margin:.35rem 0 .5rem">↩ reply to ';
+        if ($parentLabel !== '' && $snip !== '' && $parentLabel !== $linkText) {
+            $html .= '<span>' . h($parentLabel) . '</span> ';
+        }
+        $html .= '<span class="tag" style="margin-left:.15rem" title="Reply source">Bluesky</span> ';
+        if ($href !== '' && $href !== '#') {
+            $html .= '<a href="' . h($href) . '">' . h($linkText) . '</a>';
+        } else {
+            $html .= h($linkText);
+        }
+        $html .= '</div>';
+        return $html;
+    }
+
+    $replyUrl = rtrim((string) ($st['vaak_in_reply_to_url'] ?? ''), '/');
+    if ($replyUrl === '' && !empty($st['in_reply_to']) && is_string($st['in_reply_to'])) {
+        $replyUrl = rtrim((string) $st['in_reply_to'], '/');
+    }
+    if ($replyUrl === '' && !empty($st['in_reply_to_id']) && is_string($st['in_reply_to_id'])) {
+        $cand = trim((string) $st['in_reply_to_id']);
+        if (str_starts_with($cand, 'https://') || str_starts_with($cand, 'at://')) {
+            $replyUrl = rtrim($cand, '/');
+        }
+    }
+    if ($replyUrl === '') {
+        return '';
+    }
+    if (str_starts_with($replyUrl, 'at://') && function_exists('ap_bsky_https_url_from_at_uri')) {
+        $https = ap_bsky_https_url_from_at_uri($replyUrl, null);
+        if (is_string($https) && str_starts_with($https, 'https://')) {
+            $replyUrl = $https;
+        }
+    }
+    if (!str_starts_with($replyUrl, 'https://') && !str_starts_with($replyUrl, 'at://')) {
+        return '';
+    }
+
+    $parentSnippet = '';
+    $parentHandle = '';
+    if (str_starts_with($replyUrl, 'https://') && function_exists('ap_event_by_object_id')) {
+        $parentEvent = ap_event_by_object_id($replyUrl);
+        if (is_array($parentEvent) && !empty($parentEvent['summary'])) {
+            $parentSnippet = mb_substr(trim((string) $parentEvent['summary']), 0, 120);
+        }
+        if (is_array($parentEvent) && !empty($parentEvent['actor_id']) && function_exists('actor_handle')) {
+            $parentHandle = actor_handle((string) $parentEvent['actor_id']);
+        }
+    }
+    $parentIsBsky = str_contains(strtolower($replyUrl), 'bsky.app')
+        || str_starts_with(strtolower($replyUrl), 'at://');
+    $parentSource = $parentIsBsky ? 'Bluesky' : 'fediverse';
+    $href = function_exists('admin_status_href')
+        ? admin_status_href($replyUrl, $returnView)
+        : ('?view=status&object=' . rawurlencode($replyUrl));
+    $linkText = $parentSnippet !== '' ? $parentSnippet : 'parent post';
+
+    $html = '<div class="meta" style="margin:.35rem 0 .5rem">↩ reply to ';
+    if ($parentHandle !== '') {
+        $html .= '<span>@' . h(ltrim($parentHandle, '@')) . '</span> ';
+    }
+    $html .= '<span class="tag" style="margin-left:.15rem" title="Reply source">' . h($parentSource) . '</span> ';
+    $html .= '<a href="' . h($href) . '">' . h($linkText) . '</a>';
+    $html .= '</div>';
+    return $html;
+}
+
 function admin_home_rank_tracking_attrs(string $platform, string $targetKey, string $targetActor): string
 {
     $platform = strtolower(trim($platform));
@@ -14226,6 +14336,8 @@ function admin_render_masto_status_card(
               ?>
             <?php endif; ?>
             <?php
+              // ↩ reply to (Fediverse + Bluesky) — ported from event_tweet / bsky_feed_item.
+              echo admin_status_reply_to_meta_html($st, $returnView);
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyInner);
             ?>
             <div class="tweet-actions">
@@ -14483,12 +14595,32 @@ function admin_try_render_event_shared_card(
         || !function_exists('admin_render_masto_status_card')) {
         return false;
     }
+    // Same skip as event_tweet — Home/Federated call this path before legacy HTML.
+    if (!$focused && function_exists('admin_event_is_empty_private_stub')
+        && admin_event_is_empty_private_stub($e)) {
+        return true;
+    }
     $st = ap_normalize_from_activitypub_event($e);
     if (!is_array($st)) {
         return false;
     }
     if (!empty($e['_from_followed_tag'])) {
         $st['vaak_from_followed_tag'] = true;
+    }
+    // Timeline: hide private/direct empty shells (Create-fold degraded path was
+    // painting stubs event_tweet used to drop). Public empty_shell keeps
+    // create-hydrate so authorized-fetch peers can fill in via AJAX.
+    if (
+        !$focused
+        && !empty($st['vaak_degraded'])
+        && (string) ($st['vaak_degraded_reason'] ?? '') === 'empty_shell'
+        && function_exists('ap_normalize_status_has_visible_body')
+        && !ap_normalize_status_has_visible_body($st)
+    ) {
+        $vis = strtolower((string) ($st['visibility'] ?? ($e['visibility'] ?? 'public')));
+        if ($vis === 'private' || $vis === 'direct') {
+            return true;
+        }
     }
     admin_render_masto_status_card($st, $followingIds, $returnView, $focused, $showOpen);
     return true;
