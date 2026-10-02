@@ -271,14 +271,16 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
     $reason = is_array($postOrItem['reason'] ?? null) ? $postOrItem['reason'] : null;
     // Repair missing/thin AppView embeds (Jetstream rows often lack view embeds;
     // NSFW-labeled posts must keep images/gifs/videos behind a CW, not drop them).
+    // Sync AppView only when admin_bsky_gallery_repair_budget > 0 (status focus);
+    // timeline/soft-nav leave budget at 0 and warm asynchronously.
     if (function_exists('ap_bsky_repair_thin_media_embed')) {
         $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
         $recEmbed = is_array($post['record']['embed'] ?? null) ? $post['record']['embed'] : null;
         $expectMedia = (function_exists('ap_bsky_record_embed_looks_media') && ap_bsky_record_embed_looks_media($recEmbed))
             || (function_exists('ap_bsky_post_is_sensitive') && ap_bsky_post_is_sensitive($post))
             || !empty($GLOBALS['vaak_bsky_force_media_repair']);
-        // Status focus sets vaak_bsky_force_media_repair for already-broken cache rows
-        // that lost both view embed and record.embed.
+        // Mark thin for the media-thin check; budget still gates sync getPosts.
+        // Status focus raises admin_bsky_gallery_repair_budget before paint.
         if ($expectMedia && !is_array($post['embed'] ?? null)) {
             $GLOBALS['vaak_bsky_force_media_repair'] = true;
         }

@@ -4653,6 +4653,7 @@ if (isset($_GET['partial'], $_GET['shell'])
     && (string) $_GET['shell'] === '1'
     && in_array($view, ['favourites', 'bookmarks'], true)
 ) {
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
@@ -6112,6 +6113,9 @@ if (
     && (int) ($_GET['offset'] ?? 0) === 0
     && in_array($view, ['home', 'local', 'feed'], true)
 ) {
+    // Soft-nav must not sync-hit AppView for thin Bluesky media (0.5.61 CW path).
+    // Warm enqueues repair; status focus raises the budget for sync getPosts.
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
@@ -17097,6 +17101,7 @@ function admin_outbox_page(int $ownerId, string $actorKey, int $offset, int $lim
 // AJAX fragment for Your Posts infinite scroll. Keep this before the broader
 // timeline fragment so outbox requests never trigger a timeline rebuild.
 if ($isPartial && $view === 'outbox') {
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
@@ -17260,6 +17265,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
     // Always drop the session lock for timeline partials (shell, fill, newer
     // poll). Holding it through Bluesky/AP hydrate made concurrent badge /
     // signal / soft-nav requests from the same browser queue for 40–70s.
+    // Also keep Bluesky media repair async on these paints (warm only).
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
@@ -25749,6 +25756,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               && admin_object_is_bluesky_post($stObject);
           if ($stIsBskyObject && function_exists('ap_bsky_feed_item_from_any_url')) {
               try {
+                  // Status focus: allow a small sync AppView repair so NSFW/thin
+                  // media paints behind a CW instead of waiting on warm.
+                  $GLOBALS['admin_bsky_gallery_repair_budget'] = 2;
                   $stBskyItem = ap_bsky_feed_item_from_any_url($stObject, admin_owner_user_id(), true);
               } catch (Throwable $e) {
                   error_log('[ap-admin] status bsky hydrate: ' . $e->getMessage());
