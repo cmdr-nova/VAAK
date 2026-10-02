@@ -13714,7 +13714,8 @@ function admin_render_masto_status_card(
     array $followingIds,
     string $returnView,
     bool $focused = false,
-    bool $showOpen = true
+    bool $showOpen = true,
+    bool $hideHeader = false
 ): void {
     $boostHeader = '';
     // Keep Mastodon reblog wrapper: show "X boosted" then the original author card.
@@ -14049,7 +14050,7 @@ function admin_render_masto_status_card(
                 $refreshed = ap_normalize_from_activitypub_event($fetched);
                 if (is_array($refreshed) && ap_normalize_status_has_visible_body($refreshed)) {
                     // Re-enter with filled status (budget already consumed).
-                    admin_render_masto_status_card($refreshed, $followingIds, $returnView, $focused, $showOpen);
+                    admin_render_masto_status_card($refreshed, $followingIds, $returnView, $focused, $showOpen, $hideHeader);
                     return;
                 }
             }
@@ -14080,8 +14081,9 @@ function admin_render_masto_status_card(
             . ' data-return-view="' . h($returnView) . '"';
     }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
+            <?php if (!$hideHeader): ?>
             <div class="tweet-hd">
               <?php if ($isRss || ($isBsky && $directAvatar !== '')): ?>
                 <?php
@@ -14138,6 +14140,27 @@ function admin_render_masto_status_card(
                 <?php endif; ?>
               </div>
             </div>
+            <?php else: ?>
+              <?php
+                // Mentions nest: author lives on the notif header. Keep network /
+                // visibility chips so Bluesky/followers-only posts stay labeled.
+                $stVis = admin_visibility_meta($st['visibility'] ?? 'public');
+                $embedChips = '';
+                if ($isBsky) {
+                    $embedChips .= '<span class="tag" title="From Bluesky">Bluesky</span>';
+                }
+                if ($isRss) {
+                    $embedChips .= '<span class="tag" title="From an RSS/Atom feed you added">RSS</span>';
+                }
+                if (($stVis['key'] ?? 'public') !== 'public') {
+                    $embedChips .= '<span class="tag" title="Audience">' . h($stVis['label']) . '</span>';
+                }
+                $embedChips .= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null);
+                if (trim(strip_tags($embedChips)) !== '') {
+                    echo '<div class="meta meta-row tweet-embed-chips" style="margin:.15rem 0 .35rem">' . $embedChips . '</div>';
+                }
+              ?>
+            <?php endif; ?>
             <?php
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyInner);
             ?>
@@ -17322,6 +17345,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         $nCreated = (string) ($n['created_at'] ?? '');
         $nStatus = (isset($n['status']) && is_array($n['status'])) ? $n['status'] : null;
         $nStatusUri = is_array($nStatus) ? (string) ($nStatus['uri'] ?? $nStatus['url'] ?? '') : '';
+        $nEmbedded = false;
         $nSnippet = '';
         $nMedia = [];
         $nStatusMentions = [];
@@ -17521,7 +17545,15 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
             }
         }
       ?>
-      <?php if ($nParentUrl !== '' && $nParentSnippet !== ''): ?>
+      <?php
+        // Structured quote on the status is painted inside the nested shared card;
+        // skip the thin "Quoted" parent teaser to avoid a duplicate preview.
+        $nHasStructuredQuote = is_array($nStatus)
+            && is_array($nStatus['quote']['quoted_status'] ?? null);
+        $nShowParentTeaser = $nParentUrl !== '' && $nParentSnippet !== ''
+            && !($nType === 'quote' && $nHasStructuredQuote);
+      ?>
+      <?php if ($nShowParentTeaser): ?>
         <div class="quote-block" style="margin-top:.55rem">
           <span class="qt-label"><?= $nType === 'quote' ? 'Quoted' : 'In reply to' ?></span><br>
           <?php if ($nParentHref !== ''): ?>
@@ -17531,7 +17563,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
           <?php endif; ?>
         </div>
       <?php endif; ?>
-      <?php if ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
+      <?php if (in_array($nType, ['mention', 'quote'], true)
+          && is_array($nStatus)
+          && ($nEmbedded = admin_notif_try_embed_status_card($nStatus, $followingIds, true))): ?>
+        <?php /* Shared status card under notif chrome; nested author header hidden. */ ?>
+      <?php elseif ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
         <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
       <?php elseif (in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)
           && is_array($nStatus)
@@ -17557,12 +17593,12 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         </div>
       <?php endif; ?>
     <?php endif; ?>
-    <?php if ($nMedia !== [] && !in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
+    <?php if ($nMedia !== [] && !$nEmbedded && !in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)): ?><div class="notification-media"><?= admin_media_row_html($nMedia) ?></div><?php endif; ?>
     <div class="tweet-actions">
       <?php if ($profileHref !== ''): ?>
         <a class="btn btn-ghost" href="<?= h($profileHref) ?>" style="padding:.25rem .7rem;font-size:.8rem">Profile</a>
       <?php endif; ?>
-      <?php if (in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== ''): ?>
+      <?php if (!$nEmbedded && in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== ''): ?>
         <?php
           $nMentionSeed = admin_reply_mention_seed(
               $nActorRef,
@@ -17578,12 +17614,13 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php endif; ?>
       <?php
         // Favourite / Bluesky like on mention + quote cards (the remote post body).
+        // Skipped when the nested shared card already owns Reply/Like/Open.
         $nStatusId = is_array($nStatus) ? trim((string) ($nStatus['id'] ?? '')) : '';
         $nAcctHost = (string) ($n['account']['acct'] ?? '');
         $bskyAt = '';
         $bskyCid = '';
         $bskyObject = $nStatusUri;
-        $nIsBsky = in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== '' && (
+        $nIsBsky = !$nEmbedded && in_array($nType, ['mention', 'quote'], true) && $nStatusUri !== '' && (
             str_starts_with($nStatusUri, 'https://bsky.app/')
             || str_starts_with($nStatusUri, 'at://')
             || str_starts_with($nStatusUri, 'bsky:')
@@ -17670,7 +17707,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
           data-object-ref="<?= h($bskyObject) ?>" data-return-view="mentions"
           title="<?= $bskyLikedLocal ? 'Unlike' : 'Like on Bluesky' ?>" aria-label="<?= $bskyLikedLocal ? 'Unlike' : 'Like on Bluesky' ?>" aria-pressed="<?= $bskyLikedLocal ? 'true' : 'false' ?>"><i class="ph<?= $bskyLikedLocal ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
             <?php
-        } elseif (in_array($nType, ['mention', 'quote'], true) && $nStatusId !== ''
+        } elseif (!$nEmbedded && in_array($nType, ['mention', 'quote'], true) && $nStatusId !== ''
             && preg_match('/^\d+$/', $nStatusId) && $nStatusUri !== ''
             && !str_contains($nStatusUri, '/bites-received/')) {
             $nObjectId = function_exists('ap_masto_mention_target_object_id')
@@ -17711,9 +17748,9 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
             }
         }
       ?>
-      <?php if ($notifOpenUri !== '' && vaak_is_own_url($notifOpenUri) && str_contains($notifOpenUri, '/notes/')): ?>
+      <?php if (!$nEmbedded && $notifOpenUri !== '' && vaak_is_own_url($notifOpenUri) && str_contains($notifOpenUri, '/notes/')): ?>
         <a class="btn btn-ghost btn-compact" href="?view=outbox&amp;focus=<?= urlencode($notifOpenUri) ?>">Open in Your posts</a>
-      <?php elseif ($notifOpenUri !== '' && !str_contains($notifOpenUri, '/bites-received/')): ?>
+      <?php elseif (!$nEmbedded && $notifOpenUri !== '' && !str_contains($notifOpenUri, '/bites-received/')): ?>
         <a class="btn btn-ghost btn-compact" href="<?= h(admin_status_href($notifOpenUri, 'mentions')) ?>">Open</a>
         <a href="<?= h(admin_remote_object_href($notifOpenUri)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
       <?php endif; ?>
@@ -17748,12 +17785,14 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
 /**
  * Nest the shared Mastodon status card under a Mentions header when the
  * underlying status has a visible body/media. Falls back to the legacy
- * quote-block preview when the status is empty or converters failed.
+ * quote-block / snippet preview when the status is empty or converters failed.
  *
  * @param array<string,mixed>|null $status
  * @param array<int|string,mixed> $followingIds
+ * @param bool $hideHeader When true (mention/quote nest), skip the nested
+ *                         author row — the notif chrome already shows them.
  */
-function admin_notif_try_embed_status_card(?array $status, array $followingIds): bool
+function admin_notif_try_embed_status_card(?array $status, array $followingIds, bool $hideHeader = false): bool
 {
     if (!is_array($status) || $status === []) {
         return false;
@@ -17770,8 +17809,8 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds):
     ) {
         return false;
     }
-    echo '<div class="notif-status-embed">';
-    admin_render_masto_status_card($status, $followingIds, 'mentions', false, true);
+    echo '<div class="notif-status-embed' . ($hideHeader ? ' notif-status-embed--nohd' : '') . '">';
+    admin_render_masto_status_card($status, $followingIds, 'mentions', false, true, $hideHeader);
     echo '</div>';
     return true;
 }
@@ -19663,7 +19702,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet-notif-boost .quote-block {
       margin-top: .55rem;
     }
-    /* Nested shared status card under Mentions like/boost headers. */
+    /* Nested shared status card under Mentions like/boost/mention/quote headers. */
     .tweet-notif .notif-status-embed {
       margin: .55rem 0 .15rem;
       padding: .15rem 0 0;
@@ -19678,6 +19717,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .tweet-notif .notif-status-embed > article.tweet:hover {
       background: transparent;
+    }
+    .tweet-notif .notif-status-embed--nohd > article.tweet {
+      padding-top: .35rem;
+    }
+    .tweet-notif .notif-status-embed--nohd .tweet-actions {
+      margin-top: .45rem;
     }
     /* Notification cards mix icon-only actions with text links. Keep their
        controls on one visual baseline, including compact Profile/Open links. */
