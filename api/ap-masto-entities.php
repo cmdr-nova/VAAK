@@ -9081,15 +9081,21 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
         ];
     };
     foreach ($sources as $source) {
-        foreach ((is_array($source['images'] ?? null) ? $source['images'] : []) as $image) {
-            if (is_array($image)) {
-                $pushImage($image);
-            }
+        // Prefer one image list: gallery items[] OR images[] (compact may mirror
+        // both; counting both doubled 4-image galleries to 8 attachments).
+        $imageList = [];
+        if (is_array($source['items'] ?? null) && $source['items'] !== []) {
+            $imageList = $source['items'];
+        } elseif (is_array($source['images'] ?? null)) {
+            $imageList = $source['images'];
         }
-        // gallery#view → items[] of viewImage (thumbnail/fullsize).
-        foreach ((is_array($source['items'] ?? null) ? $source['items'] : []) as $image) {
-            if (is_array($image)) {
-                $pushImage($image);
+        foreach ($imageList as $image) {
+            if (!is_array($image)) {
+                continue;
+            }
+            $pushImage($image);
+            if (count($out) >= 4) {
+                return $out;
             }
         }
         $video = is_array($source['video'] ?? null) ? $source['video'] : $source;
@@ -9109,6 +9115,9 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
                 'meta' => [],
                 'blurhash' => null,
             ];
+            if (count($out) >= 4) {
+                return $out;
+            }
         }
     }
     return $out;
