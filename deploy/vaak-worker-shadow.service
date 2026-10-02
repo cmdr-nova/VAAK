@@ -1,0 +1,29 @@
+# Optional soak-test unit for wave-1 Rust shadows.
+# Does NOT replace PHP/Python. Install manually when ready:
+#   cp deploy/vaak-worker-shadow.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now vaak-worker-shadow.service
+#
+# Requires release binary at /usr/local/bin/vaak-worker (or adjust ExecStart).
+
+[Unit]
+Description=VAAK Rust shadow workers (notif badge loop)
+After=network.target postgresql.service redis-server.service
+# Keep disabled by default until soak-tested.
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker notif-badge --loop --interval-secs 30 --owner-id 1
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

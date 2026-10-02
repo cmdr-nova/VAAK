@@ -1,0 +1,26 @@
+[package]
+name = "vaak-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Shadow-mode Rust workers for VAAK (notif, ranked/newer, action-queue, jetstream hydrate)"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[[bin]]
+name = "vaak-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "time", "net"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
