@@ -6215,6 +6215,10 @@ function ap_masto_status_from_event(array $row): ?array
             'current_user' => 'automatic',
         ],
     ];
+    // Web shared card paints ↩ reply to from this URL (Ice Cubes uses in_reply_to_id).
+    if ($inReplyToUrl !== '') {
+        $status['vaak_in_reply_to_url'] = $inReplyToUrl;
+    }
 
     // Announce → Mastodon reblog wrapper: outer = booster, inner = original author
     if ($type === 'announce') {
@@ -9184,7 +9188,27 @@ function ap_masto_bsky_trend_status(array $post): ?array
         'bsky_cid' => (string) ($post['cid'] ?? ''),
         'sensitive' => false,
         'spoiler_text' => '',
+        'in_reply_to_id' => null,
+        'in_reply_to_account_id' => null,
     ];
+    // Reply parent from AppView record (shared card ↩ reply to chrome).
+    $replyParentRef = is_array($post['record']['reply']['parent'] ?? null)
+        ? $post['record']['reply']['parent']
+        : null;
+    if (is_array($replyParentRef) && !empty($replyParentRef['uri'])) {
+        $parentAt = trim((string) $replyParentRef['uri']);
+        if (str_starts_with($parentAt, 'at://')) {
+            $status['in_reply_to_id'] = $parentAt;
+            $parentHttps = function_exists('ap_bsky_https_url_from_at_uri')
+                ? ap_bsky_https_url_from_at_uri($parentAt, null)
+                : '';
+            if (is_string($parentHttps) && str_starts_with($parentHttps, 'https://')) {
+                $status['vaak_in_reply_to_url'] = $parentHttps;
+            } else {
+                $status['vaak_in_reply_to_url'] = $parentAt;
+            }
+        }
+    }
     return function_exists('ap_normalize_status')
         ? ap_normalize_status($status)
         : $status;
