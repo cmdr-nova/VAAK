@@ -9085,7 +9085,7 @@ function ap_masto_bsky_trend_status(array $post): ?array
     if ($displayName === '') {
         $displayName = $handle !== '' ? $handle : $did;
     }
-    return [
+    $status = [
         'id' => $uri,
         'url' => $url,
         'uri' => $uri,
@@ -9104,15 +9104,22 @@ function ap_masto_bsky_trend_status(array $post): ?array
             'acct' => $handle !== '' ? $handle : $did,
             'display_name' => $displayName,
             'avatar' => (string) ($author['avatar'] ?? ''),
+            'avatar_static' => (string) ($author['avatar'] ?? ''),
+            'uri' => function_exists('ap_bsky_actor_profile_url')
+                ? ap_bsky_actor_profile_url($did !== '' ? $did : $handle)
+                : ('https://bsky.app/profile/' . ($did !== '' ? $did : rawurlencode($handle))),
         ],
         'reblogs_count' => (int) ($post['repostCount'] ?? 0),
         'favourites_count' => (int) ($post['likeCount'] ?? 0),
         'replies_count' => (int) ($post['replyCount'] ?? 0),
         'media_attachments' => $media,
+        'reblog' => null,
+        'quote' => null,
         'source' => 'bluesky',
         'author_did' => $did,
         'trend_actors' => [$did],
         'bsky_post' => $post,
+        'bsky_cid' => (string) ($post['cid'] ?? ''),
         'sensitive' => false,
         'spoiler_text' => '',
     ];

@@ -11,9 +11,9 @@
  *   ap_rss_item_to_masto_status
  *   ap_normalize_from_bsky_post (thin wrapper)
  *
- * Web render target: admin_render_masto_status_card (Home Create/Update + RSS
- * via admin_render_timeline_item). Announce boost shells and Bluesky-native
- * feed cards still use specialized renderers until folded in.
+ * Web render target: admin_render_masto_status_card (Home Create/Update/Announce,
+ * RSS, and Bluesky feed items via admin_render_timeline_item). Thin Announces
+ * without a cached Create still use remote_boost_card for AJAX hydrate.
  *
  * @see Documents/cmdr-nova/Projects/NovaLandia/Additional Fixes/10.2 Features and Fixes.md
  */
@@ -195,6 +195,7 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
 function ap_normalize_from_bsky_post(array $postOrItem): ?array
 {
     $post = is_array($postOrItem['post'] ?? null) ? $postOrItem['post'] : $postOrItem;
+    $reason = is_array($postOrItem['reason'] ?? null) ? $postOrItem['reason'] : null;
     if (!function_exists('ap_masto_bsky_trend_status')) {
         require_once __DIR__ . '/ap-masto-entities.php';
     }
@@ -205,12 +206,141 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
     if (!is_array($st)) {
         return null;
     }
-    // Ensure labels blob survives even if the converter omitted it.
     if (!isset($st['bsky_post'])) {
         $st['bsky_post'] = $post;
     }
     $st['source'] = 'bluesky';
-    return ap_normalize_status($st);
+    $st['bsky_cid'] = (string) ($post['cid'] ?? ($st['bsky_cid'] ?? ''));
+    if (isset($postOrItem['_vaak_feed_source'])) {
+        $st['vaak_feed_source'] = (string) $postOrItem['_vaak_feed_source'];
+    }
+
+    // Structured quote embed → Mastodon-ish quote for the shared card.
+    if (
+        empty($st['quote'])
+        && function_exists('ap_bsky_quote_preview')
+        && function_exists('ap_masto_bsky_trend_status')
+    ) {
+        $qPrev = ap_bsky_quote_preview($post);
+        if (is_array($qPrev)) {
+            $qPost = is_array($qPrev['post'] ?? null) ? $qPrev['post'] : null;
+            $qSt = is_array($qPost) ? ap_masto_bsky_trend_status($qPost) : null;
+            if (!is_array($qSt)) {
+                // Thin preview without full PostView — synthesize a minimal status.
+                $qHandle = trim((string) ($qPrev['handle'] ?? ''));
+                $qText = trim((string) ($qPrev['text'] ?? ''));
+                $qUrl = trim((string) ($qPrev['url'] ?? ''));
+                $qSt = [
+                    'id' => $qUrl !== '' ? $qUrl : ('bsky-quote:' . substr(hash('sha256', $qText . $qHandle), 0, 16)),
+                    'uri' => $qUrl,
+                    'url' => $qUrl,
+                    'content' => $qText !== ''
+                        ? ('<p>' . nl2br(htmlspecialchars($qText, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>')
+                        : '',
+                    'created_at' => gmdate('c'),
+                    'account' => [
+                        'acct' => $qHandle,
+                        'username' => $qHandle,
+                        'display_name' => trim((string) ($qPrev['display'] ?? $qHandle)),
+                        'url' => $qHandle !== '' ? ('https://bsky.app/profile/' . rawurlencode($qHandle)) : '',
+                        'avatar' => '',
+                    ],
+                    'media_attachments' => is_array($qPrev['media'] ?? null) ? $qPrev['media'] : [],
+                    'source' => 'bluesky',
+                ];
+            }
+            $st['quote'] = [
+                'quoted_status' => $qSt,
+                'state' => 'accepted',
+            ];
+        }
+    }
+
+    $st = ap_normalize_status($st);
+
+    // reasonRepost → Mastodon reblog wrapper (outer booster, empty body).
+    if (is_array($reason)) {
+        $rt = (string) ($reason['$type'] ?? '');
+        if (str_contains($rt, 'reasonRepost')) {
+            $by = is_array($reason['by'] ?? null) ? $reason['by'] : [];
+            $byDid = trim((string) ($by['did'] ?? ''));
+            $byHandle = trim((string) ($by['handle'] ?? ''));
+            $byName = trim((string) ($by['displayName'] ?? ''));
+            if ($byName === '') {
+                $byName = $byHandle !== '' ? $byHandle : 'someone';
+            }
+            $byAvatar = (string) ($by['avatar'] ?? '');
+            $byUrl = $byDid !== ''
+                ? (function_exists('ap_bsky_actor_profile_url')
+                    ? ap_bsky_actor_profile_url($byDid)
+                    : ('https://bsky.app/profile/' . $byDid))
+                : ($byHandle !== ''
+                    ? (function_exists('ap_bsky_actor_profile_url')
+                        ? ap_bsky_actor_profile_url($byHandle)
+                        : ('https://bsky.app/profile/' . rawurlencode($byHandle)))
+                    : '');
+            $outerCreated = trim((string) ($reason['indexedAt'] ?? ''));
+            if ($outerCreated === '') {
+                $outerCreated = (string) ($st['created_at'] ?? gmdate('c'));
+            }
+            $outer = [
+                'id' => 'bsky-repost:' . substr(hash('sha256', $byDid . '|' . (string) ($st['uri'] ?? '')), 0, 24),
+                'created_at' => $outerCreated,
+                'content' => '',
+                'sensitive' => false,
+                'spoiler_text' => '',
+                'visibility' => 'public',
+                'uri' => (string) ($st['uri'] ?? ''),
+                'url' => (string) ($st['url'] ?? ''),
+                'reblog' => $st,
+                'account' => [
+                    'id' => $byDid !== '' ? $byDid : ('bsky:' . $byHandle),
+                    'acct' => $byHandle !== '' ? $byHandle : $byDid,
+                    'username' => $byHandle !== '' ? $byHandle : $byDid,
+                    'display_name' => $byName,
+                    'url' => $byUrl,
+                    'uri' => $byUrl,
+                    'avatar' => $byAvatar,
+                    'avatar_static' => $byAvatar,
+                ],
+                'media_attachments' => [],
+                'source' => 'bluesky',
+                'bsky_repost' => true,
+            ];
+            return ap_normalize_status($outer);
+        }
+    }
+
+    return $st;
+}
+
+/**
+ * Whether a Mastodon-shaped status (or its reblog) has body/media worth painting
+ * without AJAX hydrate.
+ *
+ * @param array<string,mixed> $status
+ */
+function ap_normalize_status_has_visible_body(array $status): bool
+{
+    $inner = (isset($status['reblog']) && is_array($status['reblog'])) ? $status['reblog'] : $status;
+    $plain = trim(html_entity_decode(strip_tags((string) ($inner['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if ($plain !== '' && !preg_match('/^\(boost\)$/i', $plain)) {
+        return true;
+    }
+    $media = is_array($inner['media_attachments'] ?? null) ? $inner['media_attachments'] : [];
+    if ($media !== []) {
+        return true;
+    }
+    if (!empty($inner['vaak_ask']) && is_array($inner['vaak_ask'])) {
+        return true;
+    }
+    if (is_array($inner['quote'] ?? null)) {
+        return true;
+    }
+    if (is_array($inner['card'] ?? null) && trim((string) (($inner['card']['url'] ?? ''))) !== '') {
+        return true;
+    }
+    return false;
 }
 
 /**

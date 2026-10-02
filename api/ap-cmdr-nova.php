@@ -1096,7 +1096,7 @@ function ap_cmdr_shell_start(string $title, array $meta = []): void
       p.media{margin:.55rem 0 0}
       .ap-img-lightbox{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;padding:1rem;background:rgba(0,0,0,.88);backdrop-filter:blur(3px)}
       .ap-img-lightbox.open{display:flex}
-      .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.55)}
+      .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px;box-shadow:0 12px 40px rgba(0,0,0,.55);cursor:pointer}
       .ap-img-lightbox__close{position:absolute;top:max(.75rem,env(safe-area-inset-top));right:max(.75rem,env(safe-area-inset-right));appearance:none;border:0;border-radius:999px;width:2.4rem;height:2.4rem;background:rgba(255,255,255,.14);color:#fff;font-size:1.4rem;line-height:1;cursor:pointer}
       .ap-img-lightbox__close:hover{background:rgba(255,255,255,.24)}
       @media (max-width:640px){
@@ -1124,7 +1124,8 @@ function ap_cmdr_lightbox_markup_and_script(): string
     $html .= 'function closeLb(){box.classList.remove("open");box.setAttribute("aria-hidden","true");img.removeAttribute("src");img.alt="";document.body.style.overflow="";}';
     $html .= 'document.addEventListener("click",function(e){var t=e.target instanceof Element?e.target.closest(".note-media-trigger,[data-ap-lightbox]"):null;if(!t)return;e.preventDefault();var full=t.getAttribute("data-full")||(t.querySelector&&t.querySelector("img")&&t.querySelector("img").src)||"";var alt=(t.querySelector&&t.querySelector("img")&&t.querySelector("img").alt)||"";openLb(full,alt);});';
     $html .= 'closeBtn&&closeBtn.addEventListener("click",closeLb);';
-    $html .= 'box.addEventListener("click",function(e){if(e.target===box)closeLb();});';
+    // Backdrop or the enlarged image itself closes the lightbox.
+    $html .= 'box.addEventListener("click",function(e){if(e.target===box||e.target===img)closeLb();});';
     $html .= 'document.addEventListener("keydown",function(e){if(e.key==="Escape"&&box.classList.contains("open"))closeLb();});';
     $html .= '})();</script>';
     return $html;
@@ -1226,7 +1227,7 @@ function ap_cmdr_site_shell_start(string $title, array $meta = []): void
       body.ap-site-shell .ap-site-main .media-row.media-count-1 img,body.ap-site-shell .ap-site-main .media-row.media-count-1 .thumb{height:auto;min-height:0;background:transparent}
       .ap-img-lightbox{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;padding:1rem;background:rgba(0,0,0,.88)}
       .ap-img-lightbox.open{display:flex}
-      .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px}
+      .ap-img-lightbox img{max-width:min(96vw,1200px);max-height:92vh;object-fit:contain;border-radius:8px;cursor:pointer}
       .ap-img-lightbox__close{position:absolute;top:.75rem;right:.75rem;appearance:none;border:0;border-radius:999px;width:2.4rem;height:2.4rem;background:rgba(255,255,255,.14);color:#fff;font-size:1.4rem;cursor:pointer}
       @media (max-width:900px){
         body.ap-site-shell{display:block!important}
