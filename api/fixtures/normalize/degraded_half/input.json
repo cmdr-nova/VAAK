@@ -1,0 +1,7 @@
+{
+  "uri": "https://mastodon.social/users/fixture_d/statuses/42",
+  "actor_id": "https://mastodon.social/users/fixture_d",
+  "created_at": "2026-08-15T12:00:00Z",
+  "content_plain": "Only a fragment survived.",
+  "reason": "half_parsed"
+}

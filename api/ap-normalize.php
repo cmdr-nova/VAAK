@@ -183,7 +183,48 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
         return null;
     }
     $st = ap_masto_status_from_event($eventRow);
-    return is_array($st) ? $st : null;
+    if (is_array($st)) {
+        if (
+            function_exists('ap_normalize_status_has_visible_body')
+            && !ap_normalize_status_has_visible_body($st)
+        ) {
+            $st['vaak_degraded'] = true;
+            $st['vaak_degraded_reason'] = (string) ($st['vaak_degraded_reason'] ?? 'empty_shell');
+        }
+        return $st;
+    }
+
+    // Empty Create/Update stubs (from_event returns null without allow-empty):
+    // still emit a degraded status so Home paints one card + hydrate instead of
+    // falling through to a parallel event_tweet dialect.
+    $type = strtolower((string) ($eventRow['type'] ?? 'create'));
+    if (!in_array($type, ['create', 'update'], true)) {
+        return null;
+    }
+    $actorId = rtrim((string) ($eventRow['actor_id'] ?? ''), '/');
+    $objectId = rtrim((string) ($eventRow['object_id'] ?? ''), '/');
+    if ($actorId === '' || $objectId === '' || !str_starts_with($objectId, 'https://')) {
+        return null;
+    }
+    $reason = 'empty_shell';
+    $sum = trim((string) ($eventRow['summary'] ?? ''));
+    if ($sum !== '' && !in_array($sum, ['(media)', '(attachment)', '(poll)', '(quote)', '(boost)'], true)) {
+        $reason = 'half_parsed';
+    }
+    return ap_normalize_degraded_status([
+        'id' => ap_masto_event_status_id(
+            (int) ($eventRow['id'] ?? 0),
+            isset($eventRow['created_at']) ? (string) $eventRow['created_at'] : null
+        ),
+        'uri' => $objectId,
+        'actor_id' => $actorId,
+        'created_at' => (string) ($eventRow['created_at'] ?? gmdate('c')),
+        'content_plain' => $sum,
+        'spoiler_text' => (string) ($eventRow['spoiler_text'] ?? ''),
+        'sensitive' => !empty($eventRow['sensitive']),
+        'visibility' => (string) ($eventRow['visibility'] ?? 'public'),
+        'reason' => $reason,
+    ]);
 }
 
 /**
@@ -341,6 +382,96 @@ function ap_normalize_status_has_visible_body(array $status): bool
         return true;
     }
     return false;
+}
+
+/**
+ * Half-parsed / empty-shell → Mastodon-shaped status that the shared card can
+ * always paint (author, time, optional plain text, Open remote). Never drop the
+ * item because one field was weird.
+ *
+ * Reasons: empty_shell | half_parsed | fetch_failed | announce_only
+ *
+ * @param array<string,mixed> $bits
+ * @return array<string,mixed>
+ */
+function ap_normalize_degraded_status(array $bits): array
+{
+    $uri = rtrim(trim((string) ($bits['uri'] ?? $bits['url'] ?? $bits['object_id'] ?? '')), '/');
+    $actorId = rtrim(trim((string) ($bits['actor_id'] ?? $bits['attributedTo'] ?? '')), '/');
+    $reason = trim((string) ($bits['reason'] ?? 'half_parsed'));
+    if ($reason === '') {
+        $reason = 'half_parsed';
+    }
+    $created = trim((string) ($bits['created_at'] ?? $bits['published'] ?? ''));
+    if ($created === '') {
+        $created = gmdate('c');
+    }
+    $plain = trim((string) ($bits['content_plain'] ?? $bits['summary'] ?? $bits['text'] ?? ''));
+    if ($plain !== '') {
+        $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
+        $plain = mb_substr($plain, 0, 2000);
+    }
+    $content = $plain !== ''
+        ? ('<p>' . htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>')
+        : '';
+
+    $account = is_array($bits['account'] ?? null) ? $bits['account'] : null;
+    if ($account === null && $actorId !== '' && str_starts_with($actorId, 'https://')) {
+        if (function_exists('ap_masto_remote_account')) {
+            $account = ap_masto_remote_account($actorId);
+        } else {
+            $host = strtolower((string) (parse_url($actorId, PHP_URL_HOST) ?: 'unknown'));
+            $user = basename(parse_url($actorId, PHP_URL_PATH) ?: 'user');
+            $user = ltrim((string) $user, '@');
+            $account = [
+                'id' => $actorId,
+                'acct' => $user . '@' . $host,
+                'username' => $user,
+                'display_name' => $user,
+                'url' => $actorId,
+                'uri' => $actorId,
+                'avatar' => '',
+            ];
+        }
+    }
+    if (!is_array($account)) {
+        $account = [
+            'id' => $actorId !== '' ? $actorId : 'unknown',
+            'acct' => 'unknown',
+            'username' => 'unknown',
+            'display_name' => 'Unknown',
+            'url' => $uri !== '' ? $uri : '',
+            'uri' => $actorId,
+            'avatar' => '',
+        ];
+    }
+
+    $media = is_array($bits['media_attachments'] ?? null) ? $bits['media_attachments'] : [];
+    $id = (string) ($bits['id'] ?? '');
+    if ($id === '') {
+        $id = $uri !== '' ? $uri : ('degraded:' . substr(hash('sha256', $actorId . '|' . $reason . '|' . $created), 0, 20));
+    }
+
+    $status = [
+        'id' => $id,
+        'uri' => $uri,
+        'url' => $uri !== '' ? $uri : (string) ($account['url'] ?? ''),
+        'content' => $content,
+        'created_at' => $created,
+        'sensitive' => !empty($bits['sensitive']),
+        'spoiler_text' => (string) ($bits['spoiler_text'] ?? ''),
+        'visibility' => (string) ($bits['visibility'] ?? 'public'),
+        'account' => $account,
+        'media_attachments' => $media,
+        'reblog' => null,
+        'quote' => null,
+        'vaak_degraded' => true,
+        'vaak_degraded_reason' => $reason,
+    ];
+    if (isset($bits['source']) && is_string($bits['source']) && $bits['source'] !== '') {
+        $status['source'] = $bits['source'];
+    }
+    return function_exists('ap_normalize_status') ? ap_normalize_status($status) : $status;
 }
 
 /**

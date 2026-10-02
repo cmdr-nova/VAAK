@@ -14021,17 +14021,19 @@ function admin_render_masto_status_card(
     if ($cardHtml !== '') {
         $bodyInner .= $cardHtml;
     }
-    // Empty remote shells (Announce-only cache, authorized-fetch peers, deleted notes):
-    // show a clear placeholder instead of a blank who/when card in threads.
-    // Timeline paints a hydrate stub (AJAX signed fetch) so Home does not stall;
-    // hydrate_create / hydrate_boost partials set admin_boost_fetch_budget=1.
+    // Degraded / empty remote shells (Announce-only cache, authorized-fetch peers,
+    // half-parsed objects): one chrome via vaak_degraded, with AJAX hydrate on
+    // timelines. hydrate_create / hydrate_boost set admin_boost_fetch_budget=1.
     $createHydrate = false;
-    if (trim(strip_tags($bodyInner)) === ''
+    $isDegraded = !empty($st['vaak_degraded']);
+    $degradedReason = (string) ($st['vaak_degraded_reason'] ?? 'empty_shell');
+    if ((trim(strip_tags($bodyInner)) === '' || $isDegraded)
         && $uri !== ''
         && str_starts_with($uri, 'https://')
         && !$isLocal
         && !$isRss
         && !$isBsky
+        && trim(strip_tags($bodyInner)) === ''
     ) {
         $fetchBudget = &$GLOBALS['admin_boost_fetch_budget'];
         if (!is_int($fetchBudget)) {
@@ -14053,12 +14055,15 @@ function admin_render_masto_status_card(
             }
         }
         $createHydrate = !$focused;
-        $bodyInner = '<div class="body feed-body meta">'
+        $degradedMsg = match ($degradedReason) {
+            'fetch_failed' => 'Couldn’t load this post from the remote.',
+            'announce_only' => 'We only saw a boost of this post so far.',
+            'half_parsed' => 'This post only partially parsed on VAAK.',
+            default => 'This post isn’t cached with text or media on VAAK yet.',
+        };
+        $bodyInner = '<div class="body feed-body meta vaak-degraded">'
             . '<span class="create-hydrate-status">'
-            . ($createHydrate
-                ? 'Loading post…'
-                : ('This post isn’t cached with text or media on VAAK yet '
-                    . '(often we only saw a boost, or the remote requires authorized fetch). '))
+            . ($createHydrate ? 'Loading post…' : (h($degradedMsg) . ' '))
             . '</span>'
             . '<a href="' . h(admin_remote_object_href($uri)) . '" target="_blank" rel="noopener noreferrer">Open on remote</a>'
             . '</div>';

@@ -1,0 +1,21 @@
+{
+    "uri": "https://mastodon.social/users/fixture_d/statuses/42",
+    "content_plain": "Only a fragment survived.",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "",
+    "account": {
+        "acct": "fixture_d@mastodon.social",
+        "username": "fixture_d",
+        "display_name": "fixture_d"
+    },
+    "media": [],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null,
+    "vaak_degraded": true,
+    "vaak_degraded_reason": "half_parsed"
+}
