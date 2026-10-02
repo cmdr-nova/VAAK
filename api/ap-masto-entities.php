@@ -11156,17 +11156,22 @@ function ap_masto_interaction_row_to_status(array $row, string $flag): ?array
     $statusIdRaw = trim((string) ($row['status_id'] ?? ''));
     $sid = (int) $statusIdRaw; // numeric Mastodon/snowflake ids only; "rss:123" → 0
     $status = null;
+    // Favourites/bookmarks store the Note URL, sometimes with a leftover
+    // #announce-{eventId} fragment from boost-card interaction ids.
+    $objectIdRaw = rtrim(trim((string) ($row['object_id'] ?? '')), '/');
+    $objectId = preg_replace('/#announce-\d+$/', '', $objectIdRaw) ?? $objectIdRaw;
+    $objectId = rtrim($objectId, '/');
 
     // Local-only RSS bookmarks/favourites (status_id = rss:{item_id}).
     if ($status === null && (str_starts_with($statusIdRaw, 'rss:')
-        || str_starts_with(trim((string) ($row['object_id'] ?? '')), 'rss:'))
+        || str_starts_with($objectIdRaw, 'rss:'))
     ) {
         if (!function_exists('ap_rss_status_by_local_id')) {
             @require_once __DIR__ . '/ap-rss.php';
         }
         $rssKey = str_starts_with($statusIdRaw, 'rss:')
             ? $statusIdRaw
-            : trim((string) ($row['object_id'] ?? ''));
+            : $objectIdRaw;
         if (function_exists('ap_rss_status_by_local_id')) {
             $owner = (int) ($row['owner_user_id'] ?? 0);
             $status = ap_rss_status_by_local_id($rssKey, $owner > 0 ? $owner : null);
@@ -11179,50 +11184,82 @@ function ap_masto_interaction_row_to_status(array $row, string $flag): ?array
             $status = $resolved['status'];
         }
     }
-    if ($status === null) {
-        $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
-        if ($oid !== '' && str_starts_with($oid, 'https://')) {
-            $status = ap_masto_lookup_status_by_object_url($oid, 0, false);
-            if ($status === null && function_exists('ap_masto_status_from_as2_note')) {
-                // Minimal stub so the bookmark/favourite still appears in VAAK
-                $actor = (string) ($row['target_actor'] ?? '');
-                $status = [
-                    'id' => (string) ($row['status_id'] ?? '0'),
-                    'created_at' => ap_masto_format_time((string) ($row['created_at'] ?? gmdate('c'))),
-                    'in_reply_to_id' => null,
-                    'in_reply_to_account_id' => null,
-                    'sensitive' => false,
-                    'spoiler_text' => '',
-                    'visibility' => 'public',
-                    'language' => null,
-                    'uri' => $oid,
-                    'url' => $oid,
-                    'replies_count' => 0,
-                    'reblogs_count' => 0,
-                    'favourites_count' => 0,
-                    'edited_at' => null,
-                    'favourited' => false,
-                    'reblogged' => false,
-                    'muted' => false,
-                    'bookmarked' => false,
-                    'pinned' => false,
-                    'content' => '<p><a href="' . htmlspecialchars($oid, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">'
-                        . htmlspecialchars($oid, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></p>',
-                    'reblog' => null,
-                    'application' => null,
-                    'account' => $actor !== ''
-                        ? (ap_masto_local_actor_key_from_url($actor) !== null
-                            ? ap_masto_account_for_local_url($actor)
-                            : ap_masto_remote_account($actor))
-                        : ap_masto_remote_account($oid),
-                    'media_attachments' => [],
-                    'mentions' => [],
-                    'tags' => [],
-                    'emojis' => [],
-                    'card' => null,
-                    'poll' => null,
-                ];
+    // Mastodon /api/v1/favourites|bookmarks return the original Note, never a
+    // boost wrapper. Announce snowflakes resolve to an empty outer + filled
+    // reblog — unwrap so web cards and Ice Cubes see author/media/body.
+    // Keep the interaction-row status_id so unfav/unbookmark keys stay stable.
+    $interactionStatusId = $statusIdRaw !== '' ? $statusIdRaw : '';
+    if (is_array($status) && isset($status['reblog']) && is_array($status['reblog'])) {
+        $status = $status['reblog'];
+        if ($interactionStatusId !== '' && $interactionStatusId !== '0') {
+            $status['id'] = $interactionStatusId;
+        }
+    }
+    // Cache-first retry on the stripped object URL when resolve was empty or
+    // still has no visible body (Announce-only / Like-only event rows).
+    $needsObjectLookup = !is_array($status);
+    if (!$needsObjectLookup && is_array($status)) {
+        if (function_exists('ap_normalize_status_has_visible_body')) {
+            $needsObjectLookup = !ap_normalize_status_has_visible_body($status);
+        } else {
+            $plain = trim(html_entity_decode(strip_tags((string) ($status['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            $media = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
+            $needsObjectLookup = ($plain === '' && $media === []);
+        }
+    }
+    if ($needsObjectLookup && $objectId !== '' && str_starts_with($objectId, 'https://')) {
+        $byUrl = ap_masto_lookup_status_by_object_url($objectId, 0, false);
+        if (is_array($byUrl)) {
+            if (isset($byUrl['reblog']) && is_array($byUrl['reblog'])) {
+                $byUrl = $byUrl['reblog'];
             }
+            if ($interactionStatusId !== '' && $interactionStatusId !== '0') {
+                $byUrl['id'] = $interactionStatusId;
+            }
+            $status = $byUrl;
+        }
+    }
+    if ($status === null && $objectId !== '' && str_starts_with($objectId, 'https://')) {
+        if (function_exists('ap_masto_status_from_as2_note')) {
+            // Minimal stub so the bookmark/favourite still appears in VAAK
+            $actor = (string) ($row['target_actor'] ?? '');
+            $status = [
+                'id' => (string) ($row['status_id'] ?? '0'),
+                'created_at' => ap_masto_format_time((string) ($row['created_at'] ?? gmdate('c'))),
+                'in_reply_to_id' => null,
+                'in_reply_to_account_id' => null,
+                'sensitive' => false,
+                'spoiler_text' => '',
+                'visibility' => 'public',
+                'language' => null,
+                'uri' => $objectId,
+                'url' => $objectId,
+                'replies_count' => 0,
+                'reblogs_count' => 0,
+                'favourites_count' => 0,
+                'edited_at' => null,
+                'favourited' => false,
+                'reblogged' => false,
+                'muted' => false,
+                'bookmarked' => false,
+                'pinned' => false,
+                'content' => '<p><a href="' . htmlspecialchars($objectId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">'
+                    . htmlspecialchars($objectId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></p>',
+                'reblog' => null,
+                'application' => null,
+                'account' => $actor !== ''
+                    ? (ap_masto_local_actor_key_from_url($actor) !== null
+                        ? ap_masto_account_for_local_url($actor)
+                        : ap_masto_remote_account($actor))
+                    : ap_masto_remote_account($objectId),
+                'media_attachments' => [],
+                'mentions' => [],
+                'tags' => [],
+                'emojis' => [],
+                'card' => null,
+                'poll' => null,
+                'vaak_library_stub' => true,
+            ];
         }
     }
     if (!is_array($status)) {
