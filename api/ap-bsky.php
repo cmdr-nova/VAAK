@@ -9045,23 +9045,63 @@ function ap_bsky_refresh_hide_set(int $ownerUserId, bool $force = false): array
  */
 function ap_bsky_filter_hidden_authors(int $ownerUserId, array $feed): array
 {
-    $hide = ap_bsky_hide_did_set($ownerUserId);
-    if ($hide === []) {
-        return $feed;
-    }
+    $hide = $ownerUserId > 0 ? ap_bsky_hide_did_set($ownerUserId) : [];
     $out = [];
     foreach ($feed as $item) {
         if (!is_array($item) || !is_array($item['post'] ?? null)) {
             continue;
         }
         $authorDid = (string) ($item['post']['author']['did'] ?? '');
+        $authorHandle = strtolower(trim((string) ($item['post']['author']['handle'] ?? '')));
+        $refs = [];
+        if ($authorDid !== '') {
+            $refs[] = $authorDid;
+            $refs[] = 'https://bsky.app/profile/' . $authorDid;
+        }
+        if ($authorHandle !== '') {
+            $refs[] = 'https://bsky.app/profile/' . $authorHandle;
+        }
+        $hidden = false;
         if ($authorDid !== '' && isset($hide[$authorDid])) {
+            $hidden = true;
+        }
+        // Instance-wide server block/mute (ap_blocks) — hide for every VAAK user.
+        if (!$hidden) {
+            foreach ($refs as $ref) {
+                if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($ref)) {
+                    $hidden = true;
+                    break;
+                }
+                if (function_exists('ap_is_globally_muted_actor') && ap_is_globally_muted_actor($ref)) {
+                    $hidden = true;
+                    break;
+                }
+            }
+        }
+        // Personal VAAK mute/block when owner is known (also covers non-synced rows).
+        if (!$hidden && $ownerUserId > 0) {
+            foreach ($refs as $ref) {
+                if (function_exists('ap_user_is_blocked') && ap_user_is_blocked($ref, 'bsky.app', $ownerUserId)) {
+                    $hidden = true;
+                    break;
+                }
+                if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($ref, $ownerUserId)) {
+                    $hidden = true;
+                    break;
+                }
+            }
+        }
+        if ($hidden) {
             continue;
         }
         $reason = is_array($item['reason'] ?? null) ? $item['reason'] : null;
         if (is_array($reason)) {
             $byDid = (string) ($reason['by']['did'] ?? '');
-            if ($byDid !== '' && isset($hide[$byDid])) {
+            if ($byDid !== '' && (
+                isset($hide[$byDid])
+                || (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($byDid))
+                || (function_exists('ap_is_globally_muted_actor') && ap_is_globally_muted_actor($byDid))
+            )) {
                 continue;
             }
         }

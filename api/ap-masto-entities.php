@@ -8700,10 +8700,19 @@ const AP_MASTO_TRENDS_CACHE_TTL = 7200; // 2 hours
  */
 function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId): bool
 {
-    if ($ownerUserId < 1 || $actor === '') {
+    if ($actor === '') {
         return false;
     }
     $actor = rtrim(trim($actor), '/');
+    if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($actor)) {
+        return true;
+    }
+    if (function_exists('ap_is_globally_muted_actor') && ap_is_globally_muted_actor($actor)) {
+        return true;
+    }
+    if ($ownerUserId < 1) {
+        return false;
+    }
     if (str_starts_with($actor, 'did:')) {
         static $bskyHidden = [];
         $cacheKey = $ownerUserId . ':' . $actor;
@@ -8718,6 +8727,12 @@ function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId): bool
             }
         }
         if ($bskyHidden[$cacheKey]) {
+            return true;
+        }
+        if (function_exists('ap_user_is_blocked') && ap_user_is_blocked($actor, 'bsky.app', $ownerUserId)) {
+            return true;
+        }
+        if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, $ownerUserId)) {
             return true;
         }
         return false;

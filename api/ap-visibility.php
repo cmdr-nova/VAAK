@@ -6,16 +6,35 @@ declare(strict_types=1);
 function ap_visibility_actor_hidden(string $actor, int $ownerUserId): bool
 {
     $actor = rtrim(trim($actor), '/');
-    if ($actor === '' || $ownerUserId < 1) {
+    if ($actor === '') {
+        return false;
+    }
+    // Server-wide blocks/mutes apply even without a bound owner (shared cards).
+    if (function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($actor)) {
+        return true;
+    }
+    if (function_exists('ap_is_globally_muted_actor') && ap_is_globally_muted_actor($actor)) {
+        return true;
+    }
+    if ($ownerUserId < 1) {
         return false;
     }
     if (str_starts_with(strtolower($actor), 'did:')) {
-        if (function_exists('ap_bsky_hide_did_reasons')) {
-            return ap_bsky_hide_did_reasons($ownerUserId, $actor) !== [];
+        if (function_exists('ap_bsky_hide_did_reasons') && ap_bsky_hide_did_reasons($ownerUserId, $actor) !== []) {
+            return true;
         }
         if (function_exists('ap_bsky_hide_did_set')) {
             $set = ap_bsky_hide_did_set($ownerUserId);
-            return isset($set[$actor]) || isset($set[strtolower($actor)]);
+            if (isset($set[$actor]) || isset($set[strtolower($actor)])) {
+                return true;
+            }
+        }
+        // Personal VAAK mute/block against DID / profile aliases.
+        if (function_exists('ap_user_is_blocked') && ap_user_is_blocked($actor, 'bsky.app', $ownerUserId)) {
+            return true;
+        }
+        if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, $ownerUserId)) {
+            return true;
         }
         return false;
     }

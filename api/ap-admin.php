@@ -2853,11 +2853,38 @@ $vaakAdminOnlyActions = [
             if (!empty($result['ok'])) {
                 $side = $result['side_effects'] ?? [];
                 $verb = $kind === 'mute' ? 'Muted' : ucfirst($kind) . 'ed';
-                $notice = $verb . ' ' . ($result['scope'] ?? '') . ' ' . ($result['value'] ?? '')
+                $blockedValue = (string) ($result['value'] ?? '');
+                $isBskyServerTarget = ($result['scope'] ?? '') === 'actor'
+                    && (
+                        str_contains(strtolower($blockedValue), 'bsky.app/profile/')
+                        || str_starts_with($blockedValue, 'did:')
+                    );
+                // Admin server-block of a Bluesky user = dual: VAAK-wide hide for
+                // everyone + personal block for the acting admin (syncs to their
+                // Bluesky). Other local users' Bluesky blocklists are untouched.
+                if ($isBskyServerTarget && in_array($kind, ['block', 'suspend'], true)
+                    && $vaakOwnerId > 0 && function_exists('ap_user_block_add')) {
+                    $personal = ap_user_block_add(
+                        $vaakOwnerId,
+                        'actor',
+                        $blockedValue,
+                        'block',
+                        $reason !== '' ? $reason : 'server block dual'
+                    );
+                    if (!empty($personal['ok'])) {
+                        $result['personal_dual'] = true;
+                    }
+                }
+                $notice = $verb . ' ' . ($result['scope'] ?? '') . ' ' . $blockedValue
                     . ' · removed followers ' . (int) ($side['followers_removed'] ?? 0)
                     . ', following ' . (int) ($side['following_removed'] ?? 0)
                     . ', hid mentions ' . (int) ($side['mentions_hidden'] ?? 0);
-                if ($kind === 'block' || $kind === 'suspend') {
+                if ($isBskyServerTarget) {
+                    $notice .= ' · hidden for everyone on VAAK.';
+                    if (!empty($result['personal_dual'])) {
+                        $notice .= ' · also blocked for you personally (Bluesky sync when connected).';
+                    }
+                } elseif ($kind === 'block' || $kind === 'suspend') {
                     $notice .= ' · inbound federation from them is now rejected (HTTP 403).';
                     if (($result['scope'] ?? '') === 'actor' && is_array($result['federated'] ?? null)) {
                         $fed = $result['federated'];
@@ -12972,14 +12999,33 @@ function admin_global_actor_control(string $actorId): ?array
         $controls = [];
         foreach (function_exists('ap_block_list') ? ap_block_list() : [] as $row) {
             if (($row['scope'] ?? '') === 'actor') {
-                $controls[rtrim((string) ($row['value'] ?? ''), '/')] = $row;
+                $val = rtrim((string) ($row['value'] ?? ''), '/');
+                if ($val === '') {
+                    continue;
+                }
+                $controls[$val] = $row;
+                if (function_exists('ap_actor_moderation_aliases')) {
+                    foreach (ap_actor_moderation_aliases($val) as $alias) {
+                        if (!isset($controls[$alias])) {
+                            $controls[$alias] = $row;
+                        }
+                    }
+                }
             }
         }
     }
     $key = rtrim($actorId, '/');
-    return $key !== '' && isset($controls[$key]) && is_array($controls[$key])
-        ? $controls[$key]
-        : null;
+    if ($key !== '' && isset($controls[$key]) && is_array($controls[$key])) {
+        return $controls[$key];
+    }
+    if ($key !== '' && function_exists('ap_actor_moderation_aliases')) {
+        foreach (ap_actor_moderation_aliases($key) as $alias) {
+            if (isset($controls[$alias]) && is_array($controls[$alias])) {
+                return $controls[$alias];
+            }
+        }
+    }
+    return null;
 }
 
 /** Protect every local account currently marked as an admin from server-wide moderation. */
@@ -13168,7 +13214,12 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
                 . '<input type="hidden" name="id" value="' . (int) ($globalControl['id'] ?? 0) . '">'
                 . '<button class="menu-action" type="submit">Remove user block (server)</button></form>';
         } else {
-            $menu .= '<form method="post" action="?view=blocks" onsubmit="return confirm(\'Block this user server-wide? VAAK will reject their federation (HTTP 403) and stop delivering to them.\');">'
+            $isBskyMenu = str_contains(strtolower($actorId), 'bsky.app/profile/')
+                || str_starts_with(strtolower($actorId), 'did:');
+            $serverBlockConfirm = $isBskyMenu
+                ? 'Block this Bluesky user server-wide on VAAK? Everyone on this instance will stop seeing them. This also blocks them for you personally (and syncs that personal block to your Bluesky account if connected). Other VAAK users’ Bluesky blocklists are left alone.'
+                : 'Block this user server-wide? VAAK will reject their federation (HTTP 403) and stop delivering to them.';
+            $menu .= '<form method="post" action="?view=blocks" onsubmit="return confirm(' . h(json_encode($serverBlockConfirm, JSON_UNESCAPED_UNICODE)) . ');">'
                 . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
                 . '<input type="hidden" name="action" value="block_actor">'
                 . '<input type="hidden" name="kind" value="block">'
@@ -26576,12 +26627,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 ? $rpBskyFollowsYou
                 : ($rpRel === 'mutual' || $rpRel === 'follows_you');
             $rpOwnerId = admin_owner_user_id();
-            $rpMuted = !$rpIsBsky && function_exists('ap_is_muted_actor') && ap_is_muted_actor($rpActor, $rpOwnerId);
-            $rpBlockedPersonal = !$rpIsBsky && function_exists('ap_user_is_blocked')
-                && ap_user_is_blocked($rpActor, short_host($rpActor), $rpOwnerId);
-            $rpBlockedServer = !$rpIsBsky && function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($rpActor);
-            $rpContentBlocked = !$rpIsBsky && function_exists('ap_actor_is_content_blocked')
-                && ap_actor_is_content_blocked($rpActor, short_host($rpActor), $rpOwnerId);
+            $rpMuted = function_exists('ap_is_muted_actor') && ap_is_muted_actor($rpActor, $rpOwnerId);
+            $rpBlockedPersonal = function_exists('ap_user_is_blocked')
+                && ap_user_is_blocked($rpActor, $rpIsBsky ? 'bsky.app' : short_host($rpActor), $rpOwnerId);
+            $rpBlockedServer = function_exists('ap_is_blocked_actor') && ap_is_blocked_actor($rpActor);
+            $rpContentBlocked = function_exists('ap_actor_is_content_blocked')
+                && ap_actor_is_content_blocked($rpActor, $rpIsBsky ? 'bsky.app' : short_host($rpActor), $rpOwnerId);
             $rpIsOwn = $rpIsBsky
                 ? (function_exists('ap_bsky_session_row') && is_array($sess = ap_bsky_session_row($vaakOwnerId))
                     && (($sess['did'] ?? '') === $rpBskyDid || ($sess['handle'] ?? '') === $rpBskyHandle))
@@ -26731,7 +26782,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <input type="hidden" name="target" value="<?= h($rpActor) ?>">
                   <button class="btn btn-ghost" type="submit" title="Wafrn-compatible bite"><i class="ph ph-tooth" aria-hidden="true"></i> Bite</button>
                 </form>
-                <?= block_quick_actions($rpActor, short_host($rpActor), 'remote_profile', $vaakOwnerId, !empty($vaakIsAdmin), $rpFrom) ?>
+              <?php endif; ?>
+              <?php if (!$rpIsOwn): ?>
+                <?= block_quick_actions(
+                    $rpActor,
+                    $rpIsBsky ? 'bsky.app' : short_host($rpActor),
+                    'remote_profile',
+                    $vaakOwnerId,
+                    !empty($vaakIsAdmin),
+                    $rpFrom
+                ) ?>
               <?php endif; ?>
               <a href="<?= h($rpIsBsky ? $rpActor : admin_remote_actor_href($rpActor)) ?>" target="_blank" rel="noopener noreferrer"><?= $rpIsBsky ? 'Open on Bluesky' : h(admin_open_profile_label($rpActor)) ?></a>
               <?php if (!$rpIsBsky && !$rpIsLocal && !$rpIsOwn): ?>
