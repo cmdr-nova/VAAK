@@ -5658,13 +5658,19 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     }
 
     try {
+        // Keep in sync with ap_masto_notifications_fetch follow scan: Bluesky
+        // follows use action_taken=bsky_follow and are NOT in AP followers[].
+        // The badge used to only count local_accept_followback, so a new Bluesky
+        // follow showed in Mentions with no nav badge.
+        $bskyFollowAction = defined('AP_BSKY_FOLLOW_ACTION') ? AP_BSKY_FOLLOW_ACTION : 'bsky_follow';
         $st = ap_db()->prepare(
-            "SELECT id, created_at, actor_id FROM events
-             WHERE type = 'Follow' AND action_taken = 'local_accept_followback'
+            "SELECT id, created_at, actor_id, action_taken FROM events
+             WHERE type = 'Follow'
+               AND action_taken IN ('local_accept_followback', ?)
                AND (target_actor = ? OR target_actor = ?)
              ORDER BY id DESC LIMIT 100"
         );
-        $st->execute([$ownerActorId, $ownerActorId . '/']);
+        $st->execute([$bskyFollowAction, $ownerActorId, $ownerActorId . '/']);
         $followerSet = [];
         try {
             foreach (ap_followers_list($ownerActorId) as $fr) {
@@ -5681,7 +5687,11 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
                 continue;
             }
             $fa = rtrim((string) ($row['actor_id'] ?? ''), '/');
-            if ($fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
+            $action = (string) ($row['action_taken'] ?? '');
+            // Drop AP follow notifs once the actor has unfollowed (Undo Follow).
+            // Bluesky follows are not in AP followers[] — never require that set.
+            if ($action === 'local_accept_followback'
+                && $fa !== '' && $followerSet !== [] && empty($followerSet[$fa])) {
                 continue;
             }
             if ($fa !== '' && function_exists('ap_row_is_hidden')
