@@ -6465,7 +6465,8 @@ function admin_tl_cache_key(string $view, array $following): string
     // Bump when the ranked-entry eligibility rules change so old cache files
     // cannot reintroduce cards that a fresh timeline build would exclude.
     // v11: cold-start FoF + diverse local/public mix.
-    return 'v11_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    // v12: denser Home mix (Bluesky/RSS/local/recommendation caps).
+    return 'v12_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -7029,7 +7030,7 @@ function admin_home_cached_recommendation_items(
         $leanCols = 'id, type, actor_id, object_id, summary, media_urls, created_at,
                      action_taken, spoiler_text, sensitive, visibility, host, in_reply_to';
         $added = 0;
-        $maxAdded = $coldStart ? 7 : 8;
+        $maxAdded = $coldStart ? 10 : 12;
         $seenRecommendationActors = [];
         $seenHosts = [];
 
@@ -7474,7 +7475,7 @@ function admin_home_apply_follower_fallback(array $timeline, int $pageSize = 15)
 
 /**
  * Merge cached Bluesky Home candidates into the ranked Home set. Keep the
- * share bounded at ~40% with spacing, but allow Bluesky cards on page one.
+ * share bounded at ~50% with light spacing, but allow Bluesky cards on page one.
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
@@ -7541,13 +7542,13 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
     $out = [];
     $qi = 0;
     $bskyEmitted = 0;
-    $sinceBsky = 2;
+    $sinceBsky = 1;
     $flush = static function () use (&$out, &$queued, &$qi, &$bskyEmitted, &$sinceBsky): void {
         while (isset($queued[$qi])) {
-            if ($sinceBsky < 2 && $out !== []) {
+            if ($sinceBsky < 1 && $out !== []) {
                 break;
             }
-            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.40) {
+            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.50) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -7566,7 +7567,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
 }
 
 /**
- * Queue RSS item ids into later Home pages (~15%, ≥3 other cards between).
+ * Queue RSS item ids into later Home pages (~22%, ≥2 other cards between).
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
@@ -7574,9 +7575,9 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
 function admin_home_queue_rss_after_first_page(
     array $ranked,
     int $ownerUserId,
-    int $firstPage = 8,
+    int $firstPage = 5,
     ?int $beforeTs = null,
-    int $candidateLimit = 16
+    int $candidateLimit = 24
 ): array
 {
     if ($ownerUserId < 1 || !function_exists('ap_rss_home_rank_keys')) {
@@ -7640,16 +7641,16 @@ function admin_home_queue_rss_after_first_page(
     $rssEmitted = 0;
     $sinceRss = 2;
     $tailEmitted = 0;
-    // Space RSS like a peer network (~15% share, ≥3 non-RSS between inserts)
-    // so many subscriptions cannot carpet Home.
+    // Space RSS like a peer network (~22% share, ≥2 non-RSS between inserts)
+    // so many subscriptions cannot carpet Home, but the feed stays busier.
     $flush = static function () use (&$out, &$queued, &$qi, &$rssEmitted, &$sinceRss, &$tailEmitted): void {
         while (isset($queued[$qi])) {
-            if ($sinceRss < 3 && $out !== []) {
+            if ($sinceRss < 2 && $out !== []) {
                 break;
             }
             // Measure the ratio within the window being mixed, not against the
             // already-rendered head. Otherwise deep pages drift toward 25% RSS.
-            if (($rssEmitted + 1) / max(1, $tailEmitted + $rssEmitted + 1) > 0.15) {
+            if (($rssEmitted + 1) / max(1, $tailEmitted + $rssEmitted + 1) > 0.22) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -8022,7 +8023,7 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
             $ranked = admin_home_merge_bsky_ranked($ranked, $homeOwnerUserId);
             if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
                 // Surface first RSS after ~8 posts (was full pageSize ~15).
-                $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerUserId, 8);
+                $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerUserId, 5);
             }
         }
     }
@@ -8865,15 +8866,15 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         // keep that case deterministic and chronological within this window.
         usort($homeCand, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
         $homeCand = admin_tl_rank_from_timeline($homeCand);
-        // Soft-space Bluesky in the extend window (~40%, ≥2 fedi between).
+        // Soft-space Bluesky in the extend window (~50%, ≥1 fedi between).
         $bskyEmitted = 0;
-        $sinceBsky = 2; // allow a Bluesky card first in the extend window
+        $sinceBsky = 1; // allow a Bluesky card first in the extend window
         $deferred = [];
         foreach ($homeCand as $cand) {
             $isBsky = ((string) ($cand['k'] ?? '')) === 'bsky';
             if ($isBsky) {
-                if (($sinceBsky < 2 && $added !== [])
-                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.40)
+                if (($sinceBsky < 1 && $added !== [])
+                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.50)
                 ) {
                     $deferred[] = $cand;
                     continue;
@@ -8883,10 +8884,10 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             } else {
                 $sinceBsky++;
                 while ($deferred !== []) {
-                    if ($sinceBsky < 2) {
+                    if ($sinceBsky < 1) {
                         break;
                     }
-                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.40) {
+                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.50) {
                         break;
                     }
                     $d = array_shift($deferred);
@@ -9245,11 +9246,11 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                AND (action_taken = 'log' OR action_taken = 'local_observe')
                AND actor_id LIKE 'https://mkultra.monster/users/%'
              ORDER BY created_at DESC, id DESC
-             LIMIT 80"
+             LIMIT 120"
         );
         $stLocal->execute();
         foreach ($stLocal->fetchAll() ?: [] as $e) {
-            if ($localAdded >= 40) {
+            if ($localAdded >= 55) {
                 break;
             }
             $aid = rtrim((string) ($e['actor_id'] ?? ''), '/');
@@ -9263,7 +9264,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 continue;
             }
             $actorCount = (int) ($localPerActor[$aid] ?? 0);
-            if ($actorCount >= 3) {
+            if ($actorCount >= 5) {
                 continue;
             }
             $sum = trim(html_entity_decode((string) ($e['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -9526,7 +9527,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         }
         if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
             // Surface first RSS after ~8 posts so feeds are visible without a long scroll.
-            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, 8);
+            $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, 5);
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
@@ -16664,10 +16665,11 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     // previous second so posts sharing a timestamp with the current head are
     // never lost; the client-side stable-key filter removes the overlap.
     $sinceAt = gmdate('c', max(0, $sinceTs - 1));
-    // A short burst can contain more rows than the response limit. Fetch a
-    // wider candidate window before the final merge/sort so same-second rows
-    // do not crowd unseen posts out of the poll response.
-    $candidateLimit = min(200, max($limit * 4, $limit));
+    // Keep the candidate window tight — live polls run often and used to pull
+    // 60 Bluesky JSON rows (~1s) plus SELECT * event blobs on every tick.
+    $candidateLimit = min(48, max($limit * 2, $limit));
+    $leanEventCols = 'id, type, actor_id, object_id, summary, media_urls, created_at,
+                     action_taken, spoiler_text, sensitive, visibility, host, in_reply_to';
     $db = ap_db();
     $ownerId = admin_owner_user_id();
     $out = [];
@@ -16745,7 +16747,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             }
             if (count($out) < $limit) {
                 $st = $db->prepare(
-                    "SELECT * FROM events
+                    "SELECT {$leanEventCols} FROM events
                      WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
                        AND action_taken IN ('log', 'local_observe')
                        AND actor_id LIKE 'https://mkultra.monster/users/%'
@@ -16762,7 +16764,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             }
         } elseif ($view === 'feed') {
             $st = $db->prepare(
-                "SELECT * FROM events
+                "SELECT {$leanEventCols} FROM events
                  WHERE type IN ('Create', 'Quote', 'QuotePost', 'Announce')
                    AND action_taken IN ('log', 'local_observe')
                    AND created_at > ?
@@ -16793,7 +16795,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                 foreach (array_chunk($ids, 80) as $chunk) {
                     $ph = implode(',', array_fill(0, count($chunk), '?'));
                     $st = $db->prepare(
-                        "SELECT * FROM events
+                        "SELECT {$leanEventCols} FROM events
                          WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
                            AND action_taken IN ('log', 'local_observe')
                            AND actor_id IN ($ph)
@@ -16818,7 +16820,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             }
             // Local peers' Creates always belong on Home
             $st = $db->prepare(
-                "SELECT * FROM events
+                "SELECT {$leanEventCols} FROM events
                  WHERE type IN ('Create', 'Quote', 'QuotePost')
                    AND action_taken IN ('log', 'local_observe')
                    AND actor_id LIKE 'https://mkultra.monster/users/%'
@@ -16874,9 +16876,11 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                 && function_exists('ap_bsky_posts_for_home')
             ) {
                 $ownDid = (string) (ap_bsky_session_row($ownerId)['did'] ?? '');
+                // Match the response limit — decoding 60 raw_json rows per poll
+                // was ~1s alone and stacked with render under FPM pressure.
                 $newerBsky = ap_bsky_posts_for_home(
                     $ownerId,
-                    $candidateLimit,
+                    min(24, max($limit, $limit * 2)),
                     $ownDid !== '' ? $ownDid : null,
                     null,
                     $sinceAt
@@ -17342,6 +17346,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         exit;
     }
     if ($wantNewer) {
+        // Live polls must never occupy a worker for tens of seconds — that was
+        // starving soft-nav and badge requests (Caddy p50 ~45s on newer=1).
+        @set_time_limit(12);
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
         if ($sinceTs <= 0) {
@@ -17349,7 +17356,9 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             header('X-Newest: 0');
             exit;
         }
+        $newerT0 = microtime(true);
         $slice = admin_tl_fetch_newer($view, $following, $sinceTs, max(8, min(30, $tlLimit)));
+        $newerFetchMs = (int) round((microtime(true) - $newerT0) * 1000);
         $newest = $sinceTs;
         foreach ($slice as $it) {
             $newest = max($newest, (int) ($it['sort'] ?? 0));
@@ -17357,14 +17366,21 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         if (function_exists('ap_masto_status_flags_prefetch')) {
             ap_masto_status_flags_prefetch(admin_timeline_status_ids($slice));
         }
-        header('X-New-Count: ' . count($slice));
-        header('X-Newest: ' . $newest);
+        $newerRenderT0 = microtime(true);
+        ob_start();
         foreach ($slice as $item) {
             if (admin_timeline_item_muted_by_words($item)) {
                 continue;
             }
             admin_render_timeline_item($item, $followingIds, $view);
         }
+        $newerHtml = (string) ob_get_clean();
+        header('X-New-Count: ' . count($slice));
+        header('X-Newest: ' . $newest);
+        header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
+        header('X-TL-Newer-Render-Ms: ' . (string) (int) round((microtime(true) - $newerRenderT0) * 1000));
+        header('X-TL-Newer-Total-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
+        echo $newerHtml;
         exit;
     }
     $adminTlPerfT0 = microtime(true);
@@ -17458,7 +17474,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 || !empty($homeProfileMiss['algorithm_enabled']);
             $rankedMiss = admin_home_merge_bsky_ranked($rankedMiss, $homeOwnerMiss);
             if ($homeAlgorithmMiss && function_exists('admin_home_queue_rss_after_first_page')) {
-                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, 8);
+                $rankedMiss = admin_home_queue_rss_after_first_page($rankedMiss, $homeOwnerMiss, 5);
             }
         }
         // Cache miss on a deep offset: extend remotes instead of serving an empty tail.

@@ -5730,61 +5730,73 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     $ownerUserId = function_exists('ap_db_masto_owner_user_id')
         ? ap_db_masto_owner_user_id()
         : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
-    // Keep page-load badge snappy, but ajax polling must not sit on a long lie.
-    $cacheTtl = $bypassCache ? 0 : 20;
+    // Badge polls every ~12s; keep Redis/file hot longer so rebuilds stay rare.
+    $cacheTtl = $bypassCache ? 0 : 45;
     $redisKey = 'vaak:notifications:v1:unread:' . $ownerUserId . ':' . $scan . ':' . hash('sha256', $lastRead);
     $unreadStampedeLock = '';
     $holdUnreadLock = false;
-    if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
-        $redisCached = ap_redis_json_get($redisKey);
-        if (is_array($redisCached) && isset($redisCached['c'])) {
-            return [
-                'count' => max(0, min($scan, (int) $redisCached['c'])),
-                'last_read_id' => $lastRead,
-                'latest_unread_id' => (string) ($redisCached['u'] ?? ''),
-                'latest_id' => (string) ($redisCached['l'] ?? ''),
-            ];
-        }
-        $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
-        $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
-        if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
-            $peer = ap_redis_stampede_wait(
-                static function () use ($redisKey) {
-                    $row = ap_redis_json_get($redisKey);
-                    return (is_array($row) && isset($row['c'])) ? $row : null;
-                },
-                150
-            );
-            if (is_array($peer) && isset($peer['c'])) {
-                return [
-                    'count' => max(0, min($scan, (int) $peer['c'])),
-                    'last_read_id' => $lastRead,
-                    'latest_unread_id' => (string) ($peer['u'] ?? ''),
-                    'latest_id' => (string) ($peer['l'] ?? ''),
-                ];
-            }
-        }
-    }
     $cacheDir = '/var/lib/mkultra/ap';
     if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
         $cacheDir = sys_get_temp_dir();
     }
     $cachePath = $cacheDir . '/notif_unread_' . (int) $ownerUserId . '_' . substr(sha1($lastRead), 0, 12) . '.json';
-    if ($cacheTtl > 0 && is_file($cachePath)) {
+    $readUnreadCache = static function (array $row) use ($scan, $lastRead): array {
+        return [
+            'count' => max(0, min($scan, (int) ($row['c'] ?? 0))),
+            'last_read_id' => $lastRead,
+            'latest_unread_id' => (string) ($row['u'] ?? ''),
+            'latest_id' => (string) ($row['l'] ?? ''),
+        ];
+    };
+    $readFileUnread = static function (int $maxAge) use ($cachePath, $readUnreadCache): ?array {
+        if (!is_file($cachePath)) {
+            return null;
+        }
         $age = time() - (int) @filemtime($cachePath);
-        if ($age >= 0 && $age < $cacheTtl) {
-            $raw = @file_get_contents($cachePath);
-            if (is_string($raw) && $raw !== '') {
-                $decoded = json_decode($raw, true);
-                if (is_array($decoded) && isset($decoded['c'])) {
-                    return [
-                        'count' => max(0, min($scan, (int) $decoded['c'])),
-                        'last_read_id' => $lastRead,
-                        'latest_unread_id' => (string) ($decoded['u'] ?? ''),
-                        'latest_id' => (string) ($decoded['l'] ?? ''),
-                    ];
-                }
+        if ($age < 0 || $age >= $maxAge) {
+            return null;
+        }
+        $raw = @file_get_contents($cachePath);
+        if (!is_string($raw) || $raw === '') {
+            return null;
+        }
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded) || !isset($decoded['c'])) {
+            return null;
+        }
+        return $readUnreadCache($decoded);
+    };
+    if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
+        $redisCached = ap_redis_json_get($redisKey);
+        if (is_array($redisCached) && isset($redisCached['c'])) {
+            return $readUnreadCache($redisCached);
+        }
+        $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
+        $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
+        if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
+            // Wait long enough for a peer rebuild (~100–200ms) instead of
+            // stampeding another full scan (was 150ms → duplicate 9–12s work).
+            $peer = ap_redis_stampede_wait(
+                static function () use ($redisKey) {
+                    $row = ap_redis_json_get($redisKey);
+                    return (is_array($row) && isset($row['c'])) ? $row : null;
+                },
+                2500
+            );
+            if (is_array($peer) && isset($peer['c'])) {
+                return $readUnreadCache($peer);
             }
+            // Prefer slightly stale badge over a second rebuild under load.
+            $stale = $readFileUnread(180);
+            if (is_array($stale)) {
+                return $stale;
+            }
+        }
+    }
+    if ($cacheTtl > 0) {
+        $freshFile = $readFileUnread($cacheTtl);
+        if (is_array($freshFile)) {
+            return $freshFile;
         }
     }
 
