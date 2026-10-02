@@ -5769,7 +5769,8 @@ function ap_bsky_media_items_from_embeds(mixed $embeds): array
     if (!is_array($embeds)) {
         return [];
     }
-    $list = isset($embeds['$type']) || isset($embeds['images']) || isset($embeds['video']) || isset($embeds['playlist'])
+    $list = isset($embeds['$type']) || isset($embeds['images']) || isset($embeds['items'])
+        || isset($embeds['video']) || isset($embeds['playlist'])
         ? [$embeds]
         : $embeds;
     $items = [];
@@ -5777,22 +5778,40 @@ function ap_bsky_media_items_from_embeds(mixed $embeds): array
         if (!is_array($em)) {
             continue;
         }
-        // Compact or view images
-        $images = is_array($em['images'] ?? null) ? $em['images'] : [];
+        // recordWithMedia → walk the media side too (outer images live there).
+        $et = strtolower((string) ($em['$type'] ?? ''));
+        if (str_contains($et, 'recordwithmedia') && is_array($em['media'] ?? null)) {
+            foreach (ap_bsky_media_items_from_embeds($em['media']) as $nested) {
+                $items[] = $nested;
+                if (count($items) >= 4) {
+                    return $items;
+                }
+            }
+        }
+        // Prefer gallery items[] OR images[] (same rule as ap_masto_bsky_media_attachments).
+        $images = [];
+        if (is_array($em['items'] ?? null) && $em['items'] !== []) {
+            $images = $em['items'];
+        } elseif (is_array($em['images'] ?? null)) {
+            $images = $em['images'];
+        }
         foreach ($images as $img) {
             if (!is_array($img)) {
                 continue;
             }
-            $url = (string) ($img['fullsize'] ?? $img['thumb'] ?? $img['url'] ?? '');
+            $url = (string) ($img['fullsize'] ?? $img['thumb'] ?? $img['url'] ?? $img['thumbnail'] ?? '');
             if (!str_starts_with($url, 'https://')) {
                 continue;
             }
-            $thumb = (string) ($img['thumb'] ?? $img['preview_url'] ?? '');
+            $thumb = (string) ($img['thumb'] ?? $img['thumbnail'] ?? $img['preview_url'] ?? '');
             $items[] = [
                 'url' => $url,
                 'mediaType' => 'image/jpeg',
                 'preview_url' => str_starts_with($thumb, 'https://') ? $thumb : '',
             ];
+            if (count($items) >= 4) {
+                return $items;
+            }
         }
         $video = function_exists('ap_bsky_embed_video_view')
             ? ap_bsky_embed_video_view($em)
@@ -5806,6 +5825,9 @@ function ap_bsky_media_items_from_embeds(mixed $embeds): array
                     'mediaType' => 'application/x-mpegURL',
                     'preview_url' => str_starts_with($thumbnail, 'https://') ? $thumbnail : '',
                 ];
+                if (count($items) >= 4) {
+                    return $items;
+                }
             }
         }
     }
@@ -5904,7 +5926,8 @@ function ap_bsky_quote_preview(array $post): ?array
                 continue;
             }
             $et = (string) ($em['$type'] ?? '');
-            if (str_contains($et, 'images') || !empty($em['images'])) {
+            if (str_contains($et, 'images') || str_contains($et, 'gallery')
+                || !empty($em['images']) || !empty($em['items'])) {
                 $text = '📷 Image';
                 break;
             }

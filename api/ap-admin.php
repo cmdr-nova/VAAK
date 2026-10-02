@@ -14083,6 +14083,24 @@ function admin_render_masto_status_card(
         if ($qMentions !== []) {
             $qOpts['mentions'] = $qMentions;
         }
+        // Nested quoted media: if the status entity lacked attachments, try a
+        // Bluesky preview (synth quotes / thin cache) before painting the nest.
+        if (($qOpts['media'] ?? []) === [] && $quri !== ''
+            && function_exists('ap_quote_target_is_bluesky')
+            && ap_quote_target_is_bluesky($quri)
+            && function_exists('ap_bsky_post_preview_from_url')) {
+            $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+            $bskyQ = ap_bsky_post_preview_from_url($quri, $ownerForBsky, false);
+            if (is_array($bskyQ) && !empty($bskyQ['media']) && is_array($bskyQ['media'])) {
+                $qOpts['media'] = $bskyQ['media'];
+            }
+            if (($qOpts['text'] ?? '') === '' && is_array($bskyQ) && trim((string) ($bskyQ['text'] ?? '')) !== '') {
+                $qOpts['text'] = trim((string) $bskyQ['text']);
+            }
+            if (($qOpts['acct'] ?? '') === '' && is_array($bskyQ) && trim((string) ($bskyQ['handle'] ?? '')) !== '') {
+                $qOpts['acct'] = '@' . ltrim((string) $bskyQ['handle'], '@');
+            }
+        }
         $bodyInner .= admin_quote_card_html($qOpts, $returnView);
     } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
         // Recover quote URL from status fields / local outbox AS2 when pending.
