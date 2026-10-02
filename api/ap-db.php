@@ -7268,9 +7268,12 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
             continue;
         }
         $v = rtrim((string) ($b['value'] ?? ''), '/');
-        if ($v !== '') {
-            $map[$v] = true;
-            $map[$v . '/'] = true;
+        if ($v === '') {
+            continue;
+        }
+        foreach (ap_actor_moderation_aliases($v) as $alias) {
+            $map[$alias] = true;
+            $map[$alias . '/'] = true;
         }
     }
     if ($redisKey !== '' && function_exists('ap_redis_json_set')) {
@@ -7394,6 +7397,10 @@ function ap_block_normalize_actor(string $raw): ?string
     if ($raw === '') {
         return null;
     }
+    // Accept bare Bluesky DIDs from admin forms / dual-block helpers.
+    if (str_starts_with($raw, 'did:')) {
+        return 'https://bsky.app/profile/' . $raw;
+    }
     if (str_starts_with($raw, 'https://')) {
         $url = ap_profile_sanitize_https_url($raw);
         if ($url === null) {
@@ -7407,9 +7414,157 @@ function ap_block_normalize_actor(string $raw): ?string
         if ($host === 'mkultra.monster' || str_ends_with($host, '.mkultra.monster')) {
             return null;
         }
-        return rtrim($url, '/');
+        $url = rtrim($url, '/');
+        // Prefer canonical DID profile URL when the cache already knows the handle.
+        if ($host === 'bsky.app' && function_exists('ap_actor_moderation_aliases')) {
+            foreach (ap_actor_moderation_aliases($url) as $alias) {
+                if (preg_match('~^https://bsky\.app/profile/(did:[^/?#]+)$~i', $alias, $m)) {
+                    return 'https://bsky.app/profile/' . $m[1];
+                }
+            }
+        }
+        return $url;
     }
     return null;
+}
+
+/**
+ * Alias set for moderation matching (Bluesky DID ↔ handle ↔ profile URLs).
+ * Cache-only — no network. Used so server/personal blocks apply across refs.
+ *
+ * @return list<string>
+ */
+function ap_actor_moderation_aliases(?string $actorId): array
+{
+    $actorId = rtrim(trim((string) $actorId), '/');
+    if ($actorId === '') {
+        return [];
+    }
+    static $memo = [];
+    if (isset($memo[$actorId])) {
+        return $memo[$actorId];
+    }
+    $out = [$actorId];
+    $did = null;
+    $handle = null;
+    if (str_starts_with($actorId, 'did:')) {
+        $did = $actorId;
+    } elseif (preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $actorId, $m)) {
+        $part = rawurldecode((string) $m[1]);
+        if (str_starts_with($part, 'did:')) {
+            $did = $part;
+        } elseif ($part !== '') {
+            $handle = strtolower(ltrim($part, '@'));
+        }
+    } elseif (preg_match('~/(?:ap/)?(did:plc:[a-z0-9]+)~i', $actorId, $m)) {
+        $did = $m[1];
+    }
+    // Resolve missing DID/handle from local Bluesky caches only.
+    if (($did === null || $handle === null) && ($did !== null || $handle !== null)) {
+        try {
+            if ($did !== null && $handle === null) {
+                $st = ap_db()->prepare(
+                    "SELECT lower(author_handle) AS h FROM bsky_posts
+                     WHERE author_did = ? AND author_handle IS NOT NULL AND author_handle <> ''
+                     LIMIT 1"
+                );
+                $st->execute([$did]);
+                $h = strtolower(trim((string) ($st->fetchColumn() ?: '')));
+                if ($h !== '') {
+                    $handle = $h;
+                } else {
+                    $pst = ap_db()->prepare(
+                        'SELECT profile_json FROM bsky_actor_profiles WHERE did = ? OR actor_ref = ? LIMIT 1'
+                    );
+                    $pst->execute([$did, $did]);
+                    $pj = json_decode((string) ($pst->fetchColumn() ?: ''), true);
+                    if (is_array($pj)) {
+                        $h = strtolower(trim((string) ($pj['handle'] ?? '')));
+                        if ($h !== '') {
+                            $handle = $h;
+                        }
+                    }
+                }
+            } elseif ($handle !== null && $did === null) {
+                $st = ap_db()->prepare(
+                    "SELECT author_did FROM bsky_posts
+                     WHERE lower(author_handle) = ? AND author_did IS NOT NULL AND author_did <> ''
+                     LIMIT 1"
+                );
+                $st->execute([$handle]);
+                $d = trim((string) ($st->fetchColumn() ?: ''));
+                if (str_starts_with($d, 'did:')) {
+                    $did = $d;
+                } else {
+                    $pst = ap_db()->prepare(
+                        'SELECT did, actor_ref, profile_json FROM bsky_actor_profiles
+                         WHERE lower(actor_ref) IN (?, ?) OR did = ?
+                         LIMIT 8'
+                    );
+                    $pst->execute([
+                        $handle,
+                        'https://bsky.app/profile/' . $handle,
+                        $handle,
+                    ]);
+                    foreach ($pst->fetchAll() ?: [] as $row) {
+                        $d = trim((string) ($row['did'] ?? ''));
+                        if (!str_starts_with($d, 'did:')) {
+                            $pj = json_decode((string) ($row['profile_json'] ?? ''), true);
+                            $d = is_array($pj) ? trim((string) ($pj['did'] ?? '')) : '';
+                            $ph = is_array($pj) ? strtolower(trim((string) ($pj['handle'] ?? ''))) : '';
+                            if ($ph !== '' && $ph !== $handle) {
+                                continue;
+                            }
+                        }
+                        if (str_starts_with($d, 'did:')) {
+                            $did = $d;
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // keep what we have
+        }
+    }
+    if (is_string($did) && str_starts_with($did, 'did:')) {
+        $out[] = $did;
+        $out[] = 'https://bsky.app/profile/' . $did;
+        $out[] = 'https://bsky.app/profile/' . rawurlencode($did);
+    }
+    if (is_string($handle) && $handle !== '') {
+        $out[] = $handle;
+        $out[] = 'https://bsky.app/profile/' . $handle;
+        $out[] = 'https://bsky.app/profile/' . rawurlencode($handle);
+    }
+    $uniq = [];
+    foreach ($out as $v) {
+        $v = rtrim(trim((string) $v), '/');
+        if ($v !== '') {
+            $uniq[$v] = true;
+        }
+    }
+    return $memo[$actorId] = array_keys($uniq);
+}
+
+/** True when two actor refs collide after Bluesky DID/handle alias expansion. */
+function ap_actor_moderation_refs_match(?string $a, ?string $b): bool
+{
+    $a = rtrim(trim((string) $a), '/');
+    $b = rtrim(trim((string) $b), '/');
+    if ($a === '' || $b === '') {
+        return false;
+    }
+    if ($a === $b) {
+        return true;
+    }
+    $aSet = array_fill_keys(ap_actor_moderation_aliases($a), true);
+    foreach (ap_actor_moderation_aliases($b) as $alias) {
+        if (isset($aSet[$alias])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -7457,7 +7612,12 @@ function ap_block_upsert(string $scope, string $value, string $kind = 'block', ?
     // fan-out from local accounts (background so admin UI is not stuck on N× HTTP).
     // Domain blocks stay local reject (no mass Block fan-out).
     // Server-wide mute stays local-only (no ActivityPub Mute).
-    if ($scope === 'actor' && in_array($kind, ['block', 'suspend'], true)) {
+    // Bluesky targets: VAAK-wide hide only — do not fan AP Block or push into
+    // every local user's Bluesky blocklist. Admin dual personal+server block
+    // is applied by the moderation UI for the acting admin.
+    $isBskyTarget = str_contains(strtolower($value), 'bsky.app/profile/')
+        || str_starts_with($value, 'did:');
+    if ($scope === 'actor' && in_array($kind, ['block', 'suspend'], true) && !$isBskyTarget) {
         if (!function_exists('ap_instance_federate_actor_block_background')) {
             if (!defined('AP_INBOX_LIB_ONLY')) {
                 define('AP_INBOX_LIB_ONLY', true);
@@ -7507,7 +7667,9 @@ function ap_block_remove(int $id): array
         'mentions_restored' => (int) ($restored['mentions_restored'] ?? 0),
     ];
     $prevKind = (string) ($row['kind'] ?? 'block');
-    if ($scope === 'actor' && in_array($prevKind, ['block', 'suspend'], true) && $value !== '') {
+    $isBskyTarget = str_contains(strtolower($value), 'bsky.app/profile/')
+        || str_starts_with($value, 'did:');
+    if ($scope === 'actor' && in_array($prevKind, ['block', 'suspend'], true) && $value !== '' && !$isBskyTarget) {
         if (!function_exists('ap_instance_federate_actor_block_background')) {
             if (!defined('AP_INBOX_LIB_ONLY')) {
                 define('AP_INBOX_LIB_ONLY', true);
@@ -7554,17 +7716,36 @@ function ap_is_blocked_actor(?string $actorId): bool
         return false;
     }
     $actorId = rtrim($actorId, '/');
-    $host = parse_url($actorId, PHP_URL_HOST);
+    // Bare DIDs have no host — still match Bluesky actor blocks via aliases.
+    $host = str_starts_with($actorId, 'did:')
+        ? null
+        : parse_url($actorId, PHP_URL_HOST);
     $host = is_string($host) ? strtolower($host) : null;
-    if ($host && ap_is_blocked_host($host)) {
+    // Domain blocks apply to AP hosts. Never treat bsky.app host alone as a
+    // blanket block of every Bluesky profile — actor blocks use DID aliases.
+    if ($host && $host !== 'bsky.app' && ap_is_blocked_host($host)) {
         return true;
     }
+    if ($host === 'bsky.app' && ap_is_blocked_host('bsky.app')) {
+        // Explicit domain block of bsky.app (rare) still means all Bluesky.
+        return true;
+    }
+    $aliasSet = array_fill_keys(ap_actor_moderation_aliases($actorId), true);
     foreach (ap_block_list_cached() as $b) {
         if (($b['scope'] ?? '') !== 'actor' || ($b['kind'] ?? 'block') === 'mute') {
             continue;
         }
-        if (rtrim((string) $b['value'], '/') === $actorId) {
+        $val = rtrim((string) ($b['value'] ?? ''), '/');
+        if ($val === '') {
+            continue;
+        }
+        if (isset($aliasSet[$val])) {
             return true;
+        }
+        foreach (ap_actor_moderation_aliases($val) as $alias) {
+            if (isset($aliasSet[$alias])) {
+                return true;
+            }
         }
     }
     return false;
@@ -7575,17 +7756,22 @@ function ap_is_globally_muted_actor(?string $actorId, ?string $host = null): boo
 {
     $actorId = $actorId !== null ? rtrim(trim($actorId), '/') : '';
     $host = $host !== null ? strtolower(trim($host)) : '';
-    if ($host === '' && $actorId !== '') {
+    if ($host === '' && $actorId !== '' && !str_starts_with($actorId, 'did:')) {
         $parsed = parse_url($actorId, PHP_URL_HOST);
         $host = is_string($parsed) ? strtolower($parsed) : '';
     }
+    $aliasSet = $actorId !== ''
+        ? array_fill_keys(ap_actor_moderation_aliases($actorId), true)
+        : [];
     foreach (ap_block_list_cached() as $b) {
         if (($b['kind'] ?? '') !== 'mute') {
             continue;
         }
-        if (($b['scope'] ?? '') === 'actor' && $actorId !== ''
-            && rtrim((string) ($b['value'] ?? ''), '/') === $actorId) {
-            return true;
+        if (($b['scope'] ?? '') === 'actor' && $actorId !== '') {
+            $val = rtrim((string) ($b['value'] ?? ''), '/');
+            if ($val !== '' && (isset($aliasSet[$val]) || ap_actor_moderation_refs_match($actorId, $val))) {
+                return true;
+            }
         }
         if (($b['scope'] ?? '') === 'domain' && $host !== '') {
             $domain = strtolower((string) ($b['value'] ?? ''));
@@ -8471,7 +8657,12 @@ function ap_is_muted_actor(?string $actorId, int $ownerUserId): bool
     }
     $actorId = rtrim($actorId, '/');
     $set = ap_mutes_set_cached($ownerUserId);
-    return !empty($set[$actorId]) || !empty($set[$actorId . '/']);
+    foreach (ap_actor_moderation_aliases($actorId) as $alias) {
+        if (!empty($set[$alias]) || !empty($set[$alias . '/'])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -9353,14 +9544,16 @@ function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): 
     }
     $actorId = $actorId !== null ? rtrim($actorId, '/') : null;
     $host = $host !== null && $host !== '' ? strtolower($host) : null;
-    if (($host === null || $host === '') && is_string($actorId) && $actorId !== '') {
+    if (($host === null || $host === '') && is_string($actorId) && $actorId !== '' && !str_starts_with($actorId, 'did:')) {
         $h = parse_url($actorId, PHP_URL_HOST);
         $host = is_string($h) ? strtolower($h) : null;
     }
     if ($actorId !== null && $actorId !== '' && function_exists('ap_blocks_actor_id_set')) {
         $actorSet = ap_blocks_actor_id_set($ownerUserId);
-        if (!empty($actorSet[$actorId]) || !empty($actorSet[$actorId . '/'])) {
-            return true;
+        foreach (ap_actor_moderation_aliases($actorId) as $alias) {
+            if (!empty($actorSet[$alias]) || !empty($actorSet[$alias . '/'])) {
+                return true;
+            }
         }
     }
     foreach (ap_user_blocks_list_cached($ownerUserId) as $b) {
@@ -9372,7 +9565,7 @@ function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): 
                 continue;
             }
             $v = rtrim($value, '/');
-            if ($v !== '' && ($actorId === $v || $actorId . '/' === $v || $actorId === $v . '/')) {
+            if ($v !== '' && ap_actor_moderation_refs_match($actorId, $v)) {
                 return true;
             }
         } elseif ($scope === 'domain' && $host !== null && $host !== '') {
@@ -9393,7 +9586,7 @@ function ap_user_block_find(?string $actorId, ?string $host, int $ownerUserId): 
     }
     $actorId = $actorId !== null ? rtrim($actorId, '/') : null;
     $host = $host !== null && $host !== '' ? strtolower($host) : null;
-    if (($host === null || $host === '') && is_string($actorId) && $actorId !== '') {
+    if (($host === null || $host === '') && is_string($actorId) && $actorId !== '' && !str_starts_with($actorId, 'did:')) {
         $h = parse_url($actorId, PHP_URL_HOST);
         $host = is_string($h) ? strtolower($h) : null;
     }
@@ -9402,7 +9595,7 @@ function ap_user_block_find(?string $actorId, ?string $host, int $ownerUserId): 
         $value = (string) ($row['value'] ?? '');
         if ($scope === 'actor' && $actorId !== null && $actorId !== '') {
             $value = rtrim($value, '/');
-            if ($value !== '' && $actorId === $value) {
+            if ($value !== '' && ap_actor_moderation_refs_match($actorId, $value)) {
                 return $row;
             }
         } elseif ($scope === 'domain' && $host !== null && $host !== '') {
@@ -9487,18 +9680,23 @@ function ap_user_block_add(
     }
 
     // Actor blocks federate Block + sever follows (Bridgy Fed / Mastodon-compatible).
+    // Bluesky targets skip ActivityPub Block and sync app.bsky.graph.block instead.
     if ($scope === 'actor' && $kind === 'block') {
-        if (!function_exists('ap_block_remote_actor')) {
-            if (!defined('AP_INBOX_LIB_ONLY')) {
-                define('AP_INBOX_LIB_ONLY', true);
+        $isBskyTarget = str_contains(strtolower($value), 'bsky.app/profile/')
+            || str_starts_with($value, 'did:');
+        if (!$isBskyTarget) {
+            if (!function_exists('ap_block_remote_actor')) {
+                if (!defined('AP_INBOX_LIB_ONLY')) {
+                    define('AP_INBOX_LIB_ONLY', true);
+                }
+                require_once __DIR__ . '/ap-inbox.php';
             }
-            require_once __DIR__ . '/ap-inbox.php';
-        }
-        if (function_exists('ap_block_remote_actor')) {
-            $fed = ap_block_remote_actor($value);
-            $out['delivered'] = !empty($fed['delivered']);
-            if (!empty($fed['error']) && empty($fed['delivered'])) {
-                $out['error'] = (string) $fed['error'];
+            if (function_exists('ap_block_remote_actor')) {
+                $fed = ap_block_remote_actor($value);
+                $out['delivered'] = !empty($fed['delivered']);
+                if (!empty($fed['error']) && empty($fed['delivered'])) {
+                    $out['error'] = (string) $fed['error'];
+                }
             }
         }
         // Best-effort: also create app.bsky.graph.block when target has a DID.
@@ -9543,15 +9741,19 @@ function ap_user_block_remove(int $ownerUserId, int $id): array
         'value' => (string) ($row['value'] ?? ''),
     ];
     if ($out['scope'] === 'actor' && ($row['kind'] ?? 'block') === 'block' && $out['value'] !== '') {
-        if (!function_exists('ap_unblock_remote_actor')) {
-            if (!defined('AP_INBOX_LIB_ONLY')) {
-                define('AP_INBOX_LIB_ONLY', true);
+        $isBskyTarget = str_contains(strtolower($out['value']), 'bsky.app/profile/')
+            || str_starts_with($out['value'], 'did:');
+        if (!$isBskyTarget) {
+            if (!function_exists('ap_unblock_remote_actor')) {
+                if (!defined('AP_INBOX_LIB_ONLY')) {
+                    define('AP_INBOX_LIB_ONLY', true);
+                }
+                require_once __DIR__ . '/ap-inbox.php';
             }
-            require_once __DIR__ . '/ap-inbox.php';
-        }
-        if (function_exists('ap_unblock_remote_actor')) {
-            $fed = ap_unblock_remote_actor($out['value']);
-            $out['delivered'] = !empty($fed['delivered']);
+            if (function_exists('ap_unblock_remote_actor')) {
+                $fed = ap_unblock_remote_actor($out['value']);
+                $out['delivered'] = !empty($fed['delivered']);
+            }
         }
         try {
             if (!function_exists('ap_bsky_sync_moderation_from_vaak')) {
