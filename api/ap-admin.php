@@ -5945,9 +5945,24 @@ if ($hydrateBoost || $hydrateCreate) {
         echo ob_get_clean();
         exit;
     }
-    // Normalize refused (hidden/gone) — terminal stub, no legacy dialect.
-    echo '<article class="tweet tweet-boost"><div class="meta meta-row">'
-        . '<span class="boost-hydrate-status">Boost details unavailable</span></div></article>';
+    // Normalize refused (hidden/gone/deleted) — terminal stub, no legacy dialect.
+    $boostGoneMsg = 'Boost details unavailable';
+    $boostOid = rtrim((string) ($e['object_id'] ?? $objectId), '/');
+    $boostDeleted = false;
+    if ($boostOid !== '' && function_exists('ap_object_target_unavailable_reason')) {
+        $why = ap_object_target_unavailable_reason($boostOid);
+        if ($why === 'deleted' || $why === 'tombstone') {
+            $boostGoneMsg = 'Boosted post unavailable';
+            $boostDeleted = true;
+        }
+    }
+    if ($boostOid !== '' && function_exists('ap_object_target_mark_warm_miss')) {
+        ap_object_target_mark_warm_miss($boostOid, $boostDeleted ? 'deleted' : 'miss');
+    }
+    echo '<article class="tweet tweet-boost"'
+        . ($boostDeleted ? ' data-boost-gone="1"' : '')
+        . '><div class="meta meta-row">'
+        . '<span class="boost-hydrate-status">' . h($boostGoneMsg) . '</span></div></article>';
     echo ob_get_clean();
     exit;
 }
@@ -12518,10 +12533,26 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 $quoteParts['commentary'] = $commentary;
             }
         }
-        if (preg_match('#https://[^\s<>]+#u', $quoted, $qm)) {
-            $quotedStatusUrl = rtrim((string) $qm[0], '.,);]');
-        } elseif (preg_match('#(?:^|\n)RE:\s*(https://[^\s<>]+)#u', $commentary, $rm)) {
-            $quotedStatusUrl = rtrim((string) $rm[1], '.,);]');
+        // Prefer RE:/permalink status URLs over ordinary links inside QT text
+        // (YouTube, blog columns, Wikipedia) — those caused endless "not cached yet".
+        if (function_exists('ap_masto_quote_url_from_event_summary')) {
+            $quotedStatusUrl = (string) (ap_masto_quote_url_from_event_summary($summaryRaw) ?? '');
+        }
+        if ($quotedStatusUrl === '') {
+            if (preg_match('#(?:^|\n)RE:\s*(https://[^\s<>]+)#u', $commentary, $rm)) {
+                $cand = rtrim((string) $rm[1], '.,);]');
+                if ($cand !== '' && (!function_exists('ap_url_looks_like_status_object')
+                    || ap_url_looks_like_status_object($cand))) {
+                    $quotedStatusUrl = $cand;
+                }
+            }
+        }
+        if ($quotedStatusUrl === '' && preg_match('#https://[^\s<>]+#u', $quoted, $qm)) {
+            $cand = rtrim((string) $qm[0], '.,);]');
+            if ($cand !== '' && function_exists('ap_url_looks_like_status_object')
+                && ap_url_looks_like_status_object($cand)) {
+                $quotedStatusUrl = $cand;
+            }
         }
         if ($quotedStatusUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
             $quotedStatus = ap_masto_lookup_status_by_object_url($quotedStatusUrl, 0, false);
@@ -12730,8 +12761,11 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                           $qFallbackText = '';
                       }
                       if (str_starts_with($qFallbackText, 'https://') && !str_contains($qFallbackText, ' ')) {
-                          if ($quotedStatusUrl === '') {
-                              $quotedStatusUrl = rtrim($qFallbackText, '.,);]');
+                          $cand = rtrim($qFallbackText, '.,);]');
+                          if ($quotedStatusUrl === '' && $cand !== ''
+                              && (!function_exists('ap_url_looks_like_status_object')
+                                  || ap_url_looks_like_status_object($cand))) {
+                              $quotedStatusUrl = $cand;
                           }
                           $qFallbackText = '';
                       }
@@ -12755,14 +12789,19 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                           || !empty($quotedBsky['media']))) {
                       $quoteOpts = admin_quote_opts_from_bsky($quotedBsky, $quotedStatusUrl);
                   } elseif ($qFallbackText !== '' || $qFallbackAcct !== '' || $quotedStatusUrl !== '') {
+                      $qUnavail = ($quotedStatusUrl !== '' && function_exists('ap_object_target_unavailable_reason'))
+                          ? ap_object_target_unavailable_reason($quotedStatusUrl)
+                          : null;
                       $quoteOpts = [
                           'acct' => $qFallbackAcct !== '' ? ('@' . ltrim($qFallbackAcct, '@')) : '',
-                          'text' => $qFallbackText,
+                          'text' => ($qUnavail !== null && $qFallbackText === '')
+                              ? 'Quoted post unavailable'
+                              : $qFallbackText,
                           'url' => $quotedStatusUrl,
                           'media' => [],
                           'mentions' => $qMentions,
-                          'open_label' => 'Open quoted',
-                          'open_external' => false,
+                          'open_label' => ($qUnavail !== null) ? 'Open original' : 'Open quoted',
+                          'open_external' => $qUnavail !== null,
                       ];
                   }
                   // Several ActivityPub bridges expose the quoted attachment
@@ -14147,14 +14186,29 @@ function admin_render_masto_status_card(
             || !empty($bskyPending['media']))) {
             $bodyInner .= admin_quote_card_html(admin_quote_opts_from_bsky($bskyPending, $pendingUrl), $returnView);
         } elseif ($pendingUrl !== '') {
-            if (function_exists('ap_quote_target_warm_async')) {
-                ap_quote_target_warm_async($pendingUrl);
+            $unavail = function_exists('ap_object_target_unavailable_reason')
+                ? ap_object_target_unavailable_reason($pendingUrl)
+                : null;
+            $looksStatus = !function_exists('ap_url_looks_like_status_object')
+                || ap_url_looks_like_status_object($pendingUrl);
+            if ($unavail !== null || !$looksStatus) {
+                // Deleted, prior warm miss, or ordinary web link — stop saying "not cached yet".
+                $bodyInner .= admin_quote_card_html([
+                    'text' => 'Quoted post unavailable',
+                    'url' => $pendingUrl,
+                    'open_external' => true,
+                    'open_label' => 'Open original',
+                ], $returnView);
+            } else {
+                if (function_exists('ap_quote_target_warm_async')) {
+                    ap_quote_target_warm_async($pendingUrl);
+                }
+                $bodyInner .= admin_quote_card_html([
+                    'url' => $pendingUrl,
+                    'text' => '',
+                    'open_label' => 'Quoted post (not cached yet) — open',
+                ], $returnView);
             }
-            $bodyInner .= admin_quote_card_html([
-                'url' => $pendingUrl,
-                'text' => '',
-                'open_label' => 'Quoted post (not cached yet) — open',
-            ], $returnView);
         }
     }
     // Status Open / masto cards: attach poll UI (timeline outbox path already does).
@@ -29574,6 +29628,12 @@ window.apAdminToast = function (msg, isErr) {
           // If the server still cannot resolve the target, do not leave a
           // misleading perpetual loading message. The card remains usable as
           // a thin stub and reports the terminal state clearly.
+          if (neu && neu.dataset.boostGone === '1') {
+            // Deleted / permanently unavailable boost target — drop from Home
+            // the same way empty Create shells are removed after a failed fill.
+            try { neu.remove(); } catch (e) {}
+            return;
+          }
           if (neu && (neu.dataset.boostHydrate === '1' || neu.dataset.boostHydrateLocal === '1')) {
             const st = neu.querySelector('.boost-hydrate-status');
             if (st) {

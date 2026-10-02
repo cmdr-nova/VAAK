@@ -42,12 +42,39 @@ require_once __DIR__ . '/ap-masto-entities.php';
 
 try {
     if (function_exists('ap_masto_ensure_remote_note_event')) {
+        // Refuse non-status URLs early (YouTube/blog links misread as quote targets).
+        if (function_exists('ap_url_looks_like_status_object')
+            && !ap_url_looks_like_status_object($url)) {
+            if (function_exists('ap_object_target_mark_warm_miss')) {
+                ap_object_target_mark_warm_miss($url, 'miss');
+            }
+            fwrite(STDOUT, 'skip-nonstatus ' . $url . "\n");
+            exit(3);
+        }
         $before = function_exists('ap_event_by_object_id') ? ap_event_by_object_id($url) : null;
         $beforeSum = is_array($before) ? trim((string) ($before['summary'] ?? '')) : '';
         $row = ap_masto_ensure_remote_note_event($url);
         $ok = is_array($row);
         $afterSum = $ok ? trim((string) ($row['summary'] ?? '')) : '';
         $filled = $ok && $beforeSum === '' && $afterSum !== '';
+        if (!$ok && function_exists('ap_object_target_mark_warm_miss')) {
+            $reason = 'miss';
+            try {
+                $stDel = ap_db()->prepare(
+                    "SELECT 1 FROM events
+                     WHERE type = 'Delete'
+                       AND (object_id = ? OR object_id = ?)
+                     LIMIT 1"
+                );
+                $stDel->execute([$url, $url . '/']);
+                if ($stDel->fetchColumn()) {
+                    $reason = 'deleted';
+                }
+            } catch (Throwable $e) {
+                // keep miss
+            }
+            ap_object_target_mark_warm_miss($url, $reason);
+        }
         fwrite(STDOUT, ($ok ? ($filled ? 'ok-filled' : 'ok') : 'miss') . ' ' . $url . "\n");
         exit($ok ? 0 : 3);
     }

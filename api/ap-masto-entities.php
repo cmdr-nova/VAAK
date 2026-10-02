@@ -850,7 +850,132 @@ function ap_masto_bsky_preview_media_as_attachments(array $items, string $status
 }
 
 /**
+ * True when a URL looks like a cacheable ActivityPub / Bluesky status object.
+ * Rejects ordinary web links that often appear inside quoted text (YouTube,
+ * Wikipedia, blog columns) so quote cards do not warm forever as "not cached".
+ */
+function ap_url_looks_like_status_object(string $url): bool
+{
+    $url = rtrim(trim($url), '/');
+    if ($url === '' || !str_starts_with($url, 'https://')) {
+        return false;
+    }
+    if (function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($url)) {
+        return true;
+    }
+    if (str_starts_with($url, 'at://')) {
+        return true;
+    }
+    $host = strtolower((string) (parse_url($url, PHP_URL_HOST) ?: ''));
+    $path = (string) (parse_url($url, PHP_URL_PATH) ?: '');
+    if ($host === '' || $path === '' || $path === '/') {
+        return false;
+    }
+    // Common non-status destinations that show up in QT bodies / link posts.
+    if (preg_match(
+        '#(?:^|\.)(youtu\.be|youtube\.com|wikipedia\.org|bloomberg\.com|twitter\.com|x\.com|tiktok\.com|instagram\.com|facebook\.com|reddit\.com|twitch\.tv)$#',
+        $host
+    )) {
+        return false;
+    }
+    if (preg_match('#\.(?:jpe?g|png|gif|webp|mp4|webm|mp3|pdf|svg)(?:$|\?)#i', $path)) {
+        return false;
+    }
+    if (preg_match('#/(?:statuses|posts|notes|objects|notice|activity|videos/watch|w)/[A-Za-z0-9_-]+#i', $path)) {
+        return true;
+    }
+    // Mastodon / Pixelfed web: /@user/123456789
+    if (preg_match('#/@[^/]+/[0-9A-Za-z_-]+$#', $path)) {
+        return true;
+    }
+    // Lemmy / PieFed style
+    if (preg_match('#/post/[0-9]+#', $path)) {
+        return true;
+    }
+    // Threads AP posts
+    if (str_contains($host, 'threads.net') && str_contains($path, '/post/')) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Recent warm miss / Delete marker for a quote or boost target.
+ * Used to show "unavailable" instead of perpetual "not cached yet".
+ */
+function ap_object_target_unavailable_reason(string $objectUrl): ?string
+{
+    $objectUrl = rtrim(trim($objectUrl), '/');
+    if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return null;
+    }
+    $missPath = sys_get_temp_dir() . '/vaak-quote-warm-miss-' . hash('sha256', $objectUrl);
+    if (is_file($missPath)) {
+        $age = time() - (int) @filemtime($missPath);
+        if ($age >= 0 && $age < 1800) {
+            $raw = trim((string) @file_get_contents($missPath));
+            if ($raw === 'deleted' || $raw === 'tombstone') {
+                return 'deleted';
+            }
+            return 'miss';
+        }
+    }
+    try {
+        $cands = function_exists('ap_object_url_lookup_candidates')
+            ? ap_object_url_lookup_candidates($objectUrl)
+            : [$objectUrl, $objectUrl . '/'];
+        if ($cands === []) {
+            $cands = [$objectUrl];
+        }
+        $ors = [];
+        $params = [];
+        foreach ($cands as $c) {
+            $ors[] = 'object_id = ? OR object_id = ?';
+            $params[] = $c;
+            $params[] = rtrim((string) $c, '/') . '/';
+        }
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM events
+             WHERE type = 'Delete'
+               AND (" . implode(' OR ', $ors) . ")
+             LIMIT 1"
+        );
+        $st->execute($params);
+        if ($st->fetchColumn()) {
+            return 'deleted';
+        }
+        $st2 = ap_db()->prepare(
+            "SELECT 1 FROM events
+             WHERE type IN ('Create', 'Update')
+               AND COALESCE(action_taken, '') = 'deleted'
+               AND (" . implode(' OR ', $ors) . ")
+             LIMIT 1"
+        );
+        $st2->execute($params);
+        if ($st2->fetchColumn()) {
+            return 'deleted';
+        }
+    } catch (Throwable $e) {
+        // ignore
+    }
+    return null;
+}
+
+/** Record a quote/boost target warm miss so the UI can stop saying "not cached yet". */
+function ap_object_target_mark_warm_miss(string $objectUrl, string $reason = 'miss'): void
+{
+    $objectUrl = rtrim(trim($objectUrl), '/');
+    if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return;
+    }
+    $reason = in_array($reason, ['miss', 'deleted', 'tombstone'], true) ? $reason : 'miss';
+    $path = sys_get_temp_dir() . '/vaak-quote-warm-miss-' . hash('sha256', $objectUrl);
+    @file_put_contents($path, $reason, LOCK_EX);
+}
+
+/**
  * Extract a quote-target URL from an inbound event summary (↪ QT / RE: forms).
+ * Prefers ActivityPub/Bluesky status URLs over ordinary links inside quoted text.
  */
 function ap_masto_quote_url_from_event_summary(string $summary): ?string
 {
@@ -858,17 +983,61 @@ function ap_masto_quote_url_from_event_summary(string $summary): ?string
     if ($summary === '') {
         return null;
     }
-    // Prefer URL on the ↪ QT line (quoted post), then RE: prefix, then first https.
-    if (preg_match('/↪\s*QT[^\n]*?(https:\/\/[^\s<>]+)/u', $summary, $m)) {
-        return rtrim((string) $m[1], '.,);]');
+    /** @var list<array{url:string,pri:int}> $candidates */
+    $candidates = [];
+    $push = static function (string $url, int $pri) use (&$candidates): void {
+        $url = rtrim(trim($url), '.,);]');
+        $url = rtrim($url, '/');
+        if ($url === '' || !str_starts_with($url, 'https://')) {
+            return;
+        }
+        $candidates[] = ['url' => $url, 'pri' => $pri];
+    };
+    // RE: prefix — usually the real object id for quote-boosts / boosts.
+    if (preg_match_all('/(?:^|\n)RE:\s*(https:\/\/[^\s<>]+)/u', $summary, $mm)) {
+        foreach ($mm[1] as $u) {
+            $push((string) $u, 40);
+        }
     }
-    if (preg_match('/(?:^|\n)RE:\s*(https:\/\/[^\s<>]+)/u', $summary, $m)) {
-        return rtrim((string) $m[1], '.,);]');
+    // Leading permalink line before the QT block (common Mastodon/Wafrn enrich).
+    if (preg_match('/^(https:\/\/[^\s<>]+)\s*(?:\n|$)/u', $summary, $m)) {
+        $push((string) $m[1], 35);
     }
-    // Misskey-style block without an inline URL — leave to object-id warm elsewhere.
-    if (str_contains($summary, '↪ QT') || str_contains($summary, '↪QT')) {
+    // Explicit "↪ QT: https://…" (URL is the target).
+    if (preg_match_all('/↪\s*QT:\s*(https:\/\/[^\s<>]+)/u', $summary, $mm)) {
+        foreach ($mm[1] as $u) {
+            $push((string) $u, 30);
+        }
+    }
+    // Other URLs on the QT line / block — often blog/YouTube links inside text.
+    if (preg_match_all('/↪\s*QT[^\n]*?(https:\/\/[^\s<>]+)/u', $summary, $mm)) {
+        foreach ($mm[1] as $u) {
+            $push((string) $u, 10);
+        }
+    }
+    if ($candidates === []) {
+        if (str_contains($summary, '↪ QT') || str_contains($summary, '↪QT')) {
+            return null;
+        }
         return null;
     }
+    $best = null;
+    $bestScore = -1;
+    foreach ($candidates as $c) {
+        $looks = function_exists('ap_url_looks_like_status_object')
+            ? ap_url_looks_like_status_object($c['url'])
+            : true;
+        $score = $c['pri'] + ($looks ? 100 : 0);
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $best = $c['url'];
+        }
+    }
+    if ($best !== null && function_exists('ap_url_looks_like_status_object')
+        && ap_url_looks_like_status_object($best)) {
+        return $best;
+    }
+    // Never return a non-status web link as a quote target (causes endless warm misses).
     return null;
 }
 
@@ -2733,6 +2902,16 @@ function ap_quote_target_warm_async(string $objectUrl): void
 {
     $objectUrl = rtrim(trim($objectUrl), '/');
     if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return;
+    }
+    // Skip ordinary web links that were mis-extracted from QT bodies.
+    if (function_exists('ap_url_looks_like_status_object')
+        && !ap_url_looks_like_status_object($objectUrl)) {
+        return;
+    }
+    // Already known missing/deleted — don't respawn warm workers.
+    if (function_exists('ap_object_target_unavailable_reason')
+        && ap_object_target_unavailable_reason($objectUrl) !== null) {
         return;
     }
     if (function_exists('ap_bsky_at_uri_from_any_url') && ap_bsky_at_uri_from_any_url($objectUrl) !== null) {
