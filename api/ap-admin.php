@@ -2879,6 +2879,10 @@ $vaakAdminOnlyActions = [
                     . ' · removed followers ' . (int) ($side['followers_removed'] ?? 0)
                     . ', following ' . (int) ($side['following_removed'] ?? 0)
                     . ', hid mentions ' . (int) ($side['mentions_hidden'] ?? 0);
+                if ((int) ($side['unfollow_queued'] ?? 0) > 0 || (int) ($side['unfollow_pairs'] ?? 0) > 0) {
+                    $notice .= ', unfollow Undo queued '
+                        . (int) ($side['unfollow_queued'] ?? $side['unfollow_pairs'] ?? 0);
+                }
                 if ($isBskyServerTarget) {
                     $notice .= ' · hidden for everyone on VAAK.';
                     if (!empty($result['personal_dual'])) {
