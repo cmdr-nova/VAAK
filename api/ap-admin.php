@@ -12313,11 +12313,20 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
     }
 
     if (is_array($parent)) {
-        $parentLabel = trim((string) ($parent['handle'] ?? ''));
-        if ($parentLabel !== '') {
-            $parentLabel = '@' . ltrim($parentLabel, '@');
-        } else {
-            $parentLabel = trim((string) ($parent['display'] ?? 'parent post'));
+        // Prefer handle (like fedi @user@host); fall back to display name.
+        $rawHandle = trim((string) ($parent['handle'] ?? ''));
+        if ($rawHandle !== '' && str_starts_with($rawHandle, 'did:')) {
+            $rawHandle = '';
+        }
+        $rawDisplay = trim((string) ($parent['display'] ?? ''));
+        if (in_array($rawDisplay, ['parent post', 'Bluesky user', 'Unavailable'], true)) {
+            $rawDisplay = '';
+        }
+        $parentLabel = '';
+        if ($rawHandle !== '') {
+            $parentLabel = '@' . ltrim($rawHandle, '@');
+        } elseif ($rawDisplay !== '') {
+            $parentLabel = $rawDisplay;
         }
         $snip = trim((string) ($parent['text'] ?? ''));
         if ($snip !== '') {
@@ -12333,9 +12342,10 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
         } elseif (str_starts_with($parentAt, 'at://') && function_exists('admin_status_href')) {
             $href = admin_status_href($parentAt, $returnView);
         }
-        $linkText = $snip !== '' ? $snip : ($parentLabel !== '' ? $parentLabel : 'parent post');
+        // Match fedi chrome: ↩ reply to @handle [tag] snippet|parent post
+        $linkText = $snip !== '' ? $snip : 'parent post';
         $html = '<div class="meta" style="margin:.35rem 0 .5rem">↩ reply to ';
-        if ($parentLabel !== '' && $snip !== '' && $parentLabel !== $linkText) {
+        if ($parentLabel !== '') {
             $html .= '<span>' . h($parentLabel) . '</span> ';
         }
         $html .= '<span class="tag" style="margin-left:.15rem" title="Reply source">Bluesky</span> ';
@@ -14658,9 +14668,9 @@ function admin_try_render_event_shared_card(
     if (!empty($e['_from_followed_tag'])) {
         $st['vaak_from_followed_tag'] = true;
     }
-    // Timeline: hide private/direct empty shells (Create-fold degraded path was
-    // painting stubs event_tweet used to drop). Public empty_shell keeps
-    // create-hydrate so authorized-fetch peers can fill in via AJAX.
+    // Timeline: hide empty_shell Creates with no body until cached. Background
+    // warm fills the object so a later Home load can paint a real card.
+    // Focused status view still shows Open on remote. announce_only keeps AJAX hydrate.
     if (
         !$focused
         && !empty($st['vaak_degraded'])
@@ -14668,10 +14678,12 @@ function admin_try_render_event_shared_card(
         && function_exists('ap_normalize_status_has_visible_body')
         && !ap_normalize_status_has_visible_body($st)
     ) {
-        $vis = strtolower((string) ($st['visibility'] ?? ($e['visibility'] ?? 'public')));
-        if ($vis === 'private' || $vis === 'direct') {
-            return true;
+        $oid = rtrim((string) ($e['object_id'] ?? $st['uri'] ?? ''), '/');
+        if ($oid !== '' && str_starts_with($oid, 'https://')
+            && function_exists('ap_quote_target_warm_async')) {
+            ap_quote_target_warm_async($oid);
         }
+        return true;
     }
     admin_render_masto_status_card($st, $followingIds, $returnView, $focused, $showOpen);
     return true;
@@ -29503,19 +29515,18 @@ window.apAdminToast = function (msg, isErr) {
             neu.dataset.boostHydrate = '0';
             neu.dataset.boostHydrateLocal = '0';
           }
+          // Empty Create still unresolved — drop the stub from the timeline
+          // instead of leaving “isn’t cached yet” chrome on Home.
           if (neu && neu.dataset.createHydrate === '1') {
-            const st = neu.querySelector('.create-hydrate-status');
-            if (st) {
-              st.textContent = 'This post isn’t cached with text or media on VAAK yet. ';
-            }
-            neu.dataset.createHydrate = '0';
+            neu.remove();
+            return;
           }
         })
         .catch(() => {
           if (isCreate) {
-            const st = card.querySelector('.create-hydrate-status');
-            if (st) st.textContent = 'Couldn’t load post. ';
-            card.dataset.createHydrate = '0';
+            // Failed create-hydrate: remove the empty shell from the feed.
+            try { card.remove(); } catch (e) {}
+            return;
           } else {
             const st = card.querySelector('.boost-hydrate-status');
             if (st) st.textContent = 'Couldn’t load boosted post';
