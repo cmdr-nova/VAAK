@@ -430,9 +430,17 @@ function ap_normalize_degraded_status(array $bits): array
         $created = gmdate('c');
     }
     $plain = trim((string) ($bits['content_plain'] ?? $bits['summary'] ?? $bits['text'] ?? ''));
+    if ($plain !== '' && str_contains($plain, '<')) {
+        $plain = function_exists('ap_html_to_plain_text')
+            ? ap_html_to_plain_text($plain)
+            : trim(html_entity_decode(strip_tags($plain), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    }
     if ($plain !== '') {
         $plain = preg_replace('/\s+/u', ' ', $plain) ?? $plain;
         $plain = mb_substr($plain, 0, 2000);
+    }
+    if (in_array($plain, ['(attachment)', '(media)', '(poll)', '(quote)', '(boost)'], true)) {
+        $plain = '';
     }
     $content = $plain !== ''
         ? ('<p>' . htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>')

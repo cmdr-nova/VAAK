@@ -5974,6 +5974,19 @@ function ap_masto_status_from_event(array $row): ?array
 
     $account = ap_masto_remote_account($actorId);
     $text = html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    // Defense: some callers stuffed raw HTML into events.summary. Escaping that
+    // as plain text paints literal <p>/<a> tags in the shared card.
+    if ($text !== '' && str_contains($text, '<')) {
+        $text = function_exists('ap_html_to_plain_text')
+            ? ap_html_to_plain_text($text)
+            : trim(html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    }
+    if (in_array(trim($text), ['(attachment)', '(media)', '(poll)', '(quote)', '(boost)'], true)) {
+        // Keep empty body when the row has media; placeholder is not user text.
+        if (!empty($row['media_urls']) && (string) $row['media_urls'] !== '[]') {
+            $text = '';
+        }
+    }
     $spoilerText = trim((string) ($row['spoiler_text'] ?? ''));
     $isSensitive = !empty($row['sensitive']) || $spoilerText !== '';
     // Strip RE:<url> prefixes from quote commentary (keep ↪ QT block intact)
