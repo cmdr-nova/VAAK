@@ -6212,6 +6212,25 @@ function ap_bsky_post_preview_warm_enqueue(string $url, int $ownerUserId = 0): b
     if (function_exists('ap_redis_lock') && !ap_redis_lock($lockKey, 45)) {
         return false;
     }
+
+    // Rust-primary warm queue (vaak-worker thin-media-warm --loop). PHP nohup is fallback.
+    $rustPrimary = getenv('VAAK_THIN_MEDIA_RUST_PRIMARY');
+    $rustPrimary = $rustPrimary === false
+        ? true
+        : !in_array(strtolower(trim((string) $rustPrimary)), ['0', 'false', 'off', 'no'], true);
+    if ($rustPrimary && function_exists('ap_redis_queue_push')) {
+        $payload = json_encode([
+            'uri' => $atUri,
+            'owner' => max(0, $ownerUserId),
+            'ts' => time(),
+            'source' => 'php-enqueue',
+        ], JSON_UNESCAPED_SLASHES);
+        if (is_string($payload) && ap_redis_queue_push('bsky_post_warm', $payload)) {
+            return true;
+        }
+        // Queue push failed — fall through to PHP worker.
+    }
+
     $worker = __DIR__ . '/ap-bsky-post-warm.php';
     $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
     if ($php === '' || str_contains($php, 'php-fpm')) {

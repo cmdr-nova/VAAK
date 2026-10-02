@@ -1,0 +1,24 @@
+# Live notif-badge owner (Rust-primary). PHP reads Redis and falls back on miss.
+#   systemctl enable --now vaak-worker-notif.service
+
+[Unit]
+Description=VAAK Rust notif badge (live Redis writer)
+After=network.target postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker notif-badge --live --loop --interval-secs 20 --owner-id 1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

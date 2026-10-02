@@ -1,80 +1,44 @@
-# VAAK Rust workers (wave 1–3 — shadow mode)
+# VAAK Rust workers (shadow + live cutover)
 
-Side-by-side Rust binaries that **mirror** hot worker paths without replacing PHP/Python.
-
-| Command | Live owner today | Rust shadow does |
+| Command | Mode | Role |
 |---|---|---|
-| `notif-badge` | PHP `ajax=notif_unread` | Unread badge with PHP snowflake + mention types + mute/block + Update-of-favourite |
-| `ranked-newer` | PHP `partial=1&newer=1` | Newer Home candidate dump |
-| `action-queue` | PHP `ap-action-queue-worker.php` | List pending jobs only (never claims) |
-| `jetstream-hydrate` | Python spooler + PHP ingest | Spool scan + cursors + wanted-dids + thin-media DB |
-| `thin-media-repair` | PHP `ap_bsky_repair_thin_media_embed` | Dry-run candidates; optional AppView `--fetch` (never writes) |
-| `timeline-home` | PHP Home ranked cache / hydrate | Read ranked Redis IDs + light enrich; DB fallback if cache cold |
-| `serve` | — | Localhost Axum: `/healthz` + `/shadow/*` + `/api/v1/timelines/home` alias |
+| `notif-badge --live --loop` | **LIVE** | Owns production notif Redis + file cache |
+| `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
+| `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
+| `serve` | shadow HTTP | Localhost `/shadow/*` only |
 
-Shared freeze-contract crate: **`vaak-types`** (deserializes `api/fixtures/normalize/*/expected.json`).
+PHP remains fallback: notif rebuilds on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails.
 
-## Build
+## Live systemd units
 
 ```bash
-cd rust
-cargo test -p vaak-types --tests
-cargo test -p vaak-worker --bins
-cargo build --release -p vaak-worker
+systemctl enable --now vaak-worker-notif.service
+systemctl enable --now vaak-worker-thin-warm.service
 ```
 
-Binary: `target/release/vaak-worker`
+Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-thin-warm.service`
 
-## Config
-
-Reads `/etc/mkultra/vaak.env` when present (override with `VAAK_ENV_FILE`).
+## Env
 
 | Variable | Default | Notes |
 |---|---|---|
-| `VAAK_DATABASE_URL` | `postgresql:///novalandia?host=/var/run/postgresql` | Peer auth as `www-data` on prod |
-| `VAAK_REDIS_URL` | `redis://127.0.0.1/` | Cache DB |
-| `VAAK_JETSTREAM_STATE` | `/var/lib/mkultra/ap/jetstream` | Spool directory |
-| `VAAK_SHADOW_OWNER_ID` | `1` | Owner used by CLI shadows |
-| `VAAK_BSKY_PUBLIC_API` | `https://public.api.bsky.app` | AppView for thin-media `--fetch` |
+| `VAAK_DATABASE_URL` | peer `novalandia` | www-data |
+| `VAAK_REDIS_URL` | `redis://127.0.0.1/0` | cache DB |
+| `VAAK_REDIS_QUEUE_URL` | `redis://127.0.0.1/1` | queue DB (PHP `ap_redis_client('queue')`) |
+| `VAAK_NOTIF_RUST_PRIMARY` | `1` (PHP) | longer stampede wait + stale file preference |
+| `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
+| `VAAK_BSKY_PUBLIC_API` | `https://public.api.bsky.app` | warm fetch |
 
-## Prod install (shadow only)
+## Build / install
 
 ```bash
+cd rust && cargo build --release -p vaak-worker
 scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
-# Optional units (leave disabled):
-#   deploy/vaak-worker-shadow.service
-#   deploy/vaak-worker-shadow-http.service
+# stop units before replacing a running binary
 ```
 
-Run as `www-data`:
+## Cutover notes (0.5.64)
 
-```bash
-sudo -u www-data env RUST_LOG=error /usr/local/bin/vaak-worker <command> …
-```
-
-## Soak examples
-
-```bash
-sudo -u www-data env RUST_LOG=error /usr/local/bin/vaak-worker notif-badge --once --owner-id 1 --compare
-sudo -u www-data env RUST_LOG=error /usr/local/bin/vaak-worker thin-media-repair --dry-run --limit 10
-sudo -u www-data env RUST_LOG=error /usr/local/bin/vaak-worker thin-media-repair --dry-run --fetch --limit 3
-sudo -u www-data env RUST_LOG=error /usr/local/bin/vaak-worker timeline-home --owner-id 1 --limit 10
-
-sudo -u www-data /usr/local/bin/vaak-worker serve --bind 127.0.0.1:8787
-curl -s 'http://127.0.0.1:8787/shadow/timelines/home?owner_id=1&limit=10'
-curl -s 'http://127.0.0.1:8787/api/v1/timelines/home?owner_id=1&limit=5'   # alias, still shadow JSON
-curl -s 'http://127.0.0.1:8787/shadow/thin-media?limit=5&fetch=1'
-```
-
-## Cutover rule
-
-No Rust command writes production timeline/action/Jetstream/`bsky_posts` state.
-Shadow Redis keys use the `vaak:shadow:` prefix only.
-`serve` refuses non-loopback binds.
-`/api/v1/timelines/home` on this port is a **shadow alias**, not a PHP replacement.
-
-## Wave notes
-
-- **W1**: four CLI shadows + disabled systemd unit
-- **W2**: notif snowflake parity, jetstream depth, Axum stub, `vaak-types`
-- **W3**: mute/block + Update-of-favourite notif edges; thin-media dry-run/`--fetch`; Home timeline shadow from ranked cache (DB cold fallback)
+- Notif live key: `vaak:notifications:v1:unread:{owner}:{scan}:{sha256(last_read)}` TTL 45s; source `vaak-worker-live`
+- Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
+- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-thin-warm` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` in `/etc/mkultra/vaak.env`
