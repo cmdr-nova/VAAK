@@ -801,6 +801,77 @@ function ap_masto_poll_entity(array $row): array
     ];
 }
 
+/**
+ * Convert Bluesky quote-preview media items ({url,mediaType,preview_url}) into
+ * Mastodon media_attachments so shared cards / Ice Cubes paint nested media.
+ *
+ * @param list<array<string,mixed>> $items
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_bsky_preview_media_as_attachments(array $items, string $statusId): array
+{
+    $out = [];
+    $n = 0;
+    foreach ($items as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $url = trim((string) ($item['url'] ?? $item['preview_url'] ?? ''));
+        if (!str_starts_with($url, 'https://')) {
+            continue;
+        }
+        $preview = trim((string) ($item['preview_url'] ?? ''));
+        $mt = strtolower(trim((string) ($item['mediaType'] ?? $item['type'] ?? '')));
+        $type = 'image';
+        if (str_contains($mt, 'video') || str_contains($mt, 'mpegurl') || preg_match('/\.m3u8(?:$|[?#])/i', $url)) {
+            $type = 'video';
+        } elseif (str_contains($mt, 'audio')) {
+            $type = 'audio';
+        } elseif (in_array($mt, ['video', 'gifv', 'audio'], true)) {
+            $type = $mt === 'gifv' ? 'gifv' : $mt;
+        }
+        $out[] = [
+            'id' => $statusId . '#media-' . (++$n),
+            'type' => $type,
+            'url' => $url,
+            'preview_url' => str_starts_with($preview, 'https://') ? $preview : $url,
+            'remote_url' => $url,
+            'text_url' => $url,
+            'description' => (string) ($item['alt'] ?? $item['description'] ?? ''),
+            'meta' => [],
+            'blurhash' => null,
+            'mediaType' => $mt !== '' ? $mt : null,
+        ];
+        if (count($out) >= 4) {
+            break;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Extract a quote-target URL from an inbound event summary (↪ QT / RE: forms).
+ */
+function ap_masto_quote_url_from_event_summary(string $summary): ?string
+{
+    $summary = trim($summary);
+    if ($summary === '') {
+        return null;
+    }
+    // Prefer URL on the ↪ QT line (quoted post), then RE: prefix, then first https.
+    if (preg_match('/↪\s*QT[^\n]*?(https:\/\/[^\s<>]+)/u', $summary, $m)) {
+        return rtrim((string) $m[1], '.,);]');
+    }
+    if (preg_match('/(?:^|\n)RE:\s*(https:\/\/[^\s<>]+)/u', $summary, $m)) {
+        return rtrim((string) $m[1], '.,);]');
+    }
+    // Misskey-style block without an inline URL — leave to object-id warm elsewhere.
+    if (str_contains($summary, '↪ QT') || str_contains($summary, '↪QT')) {
+        return null;
+    }
+    return null;
+}
+
 /** Pull FEP-044f / Misskey quote target URL from a stored Create activity JSON. */
 function ap_masto_quote_url_from_create_json(?string $rawCreateJson): ?string
 {
@@ -895,8 +966,9 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
                     : ('<p>' . htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>'))
                 : '';
             $acct = $handle !== '' ? $handle : 'bsky.app';
+            $synthId = 'bsky:' . md5((string) ($prev['uri'] ?? $webUrl));
             $quoted = [
-                'id' => 'bsky:' . md5((string) ($prev['uri'] ?? $webUrl)),
+                'id' => $synthId,
                 'uri' => $webUrl,
                 'url' => $webUrl,
                 'content' => $html,
@@ -911,7 +983,18 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
                             : ('https://bsky.app/profile/' . rawurlencode($handle)))
                         : 'https://bsky.app/',
                 ],
+                // Quote cards + Ice Cubes need nested media (images/video on the quoted post).
+                'media_attachments' => function_exists('ap_masto_bsky_preview_media_as_attachments')
+                    ? ap_masto_bsky_preview_media_as_attachments(
+                        is_array($prev['media'] ?? null) ? $prev['media'] : [],
+                        $synthId
+                    )
+                    : [],
+                'source' => 'bluesky',
             ];
+            if (is_array($prev['card'] ?? null)) {
+                $quoted['card'] = $prev['card'];
+            }
         }
     }
     if ($quoted === null) {
@@ -6218,6 +6301,89 @@ function ap_masto_status_from_event(array $row): ?array
     // Web shared card paints ↩ reply to from this URL (Ice Cubes uses in_reply_to_id).
     if ($inReplyToUrl !== '') {
         $status['vaak_in_reply_to_url'] = $inReplyToUrl;
+    }
+
+    // Fediverse quote posts (↪ QT / RE: / FEP-044f): attach structured quote so the
+    // shared card paints nested media instead of leaving raw QT text in the body.
+    if (($status['quote'] ?? null) === null && function_exists('ap_masto_quote_entity')) {
+        $quoteObjectUrl = ap_masto_quote_url_from_event_summary(
+            html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8')
+        );
+        if ($quoteObjectUrl === null || $quoteObjectUrl === '') {
+            // Some enriched rows stash the target on object fields via metrics/json.
+            foreach (['quote_object_id', 'quote_url'] as $qk) {
+                $qv = trim((string) ($row[$qk] ?? ''));
+                if (str_starts_with($qv, 'https://')) {
+                    $quoteObjectUrl = rtrim($qv, '/');
+                    break;
+                }
+            }
+        }
+        if (is_string($quoteObjectUrl) && str_starts_with($quoteObjectUrl, 'https://')) {
+            // Firehose display: treat as authorized so we don't stick on "pending"
+            // for remote quotes we already have locally (or Bluesky previews).
+            $quoteEnt = ap_masto_quote_entity($quoteObjectUrl, 0, false, true);
+            if (is_array($quoteEnt)) {
+                $status['quote'] = $quoteEnt;
+                $status['quote_url'] = $quoteObjectUrl;
+                // Drop the raw ↪ QT block from body now that the nest carries it.
+                $plainBody = trim(html_entity_decode(strip_tags((string) ($status['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                if ($plainBody !== '' && (str_contains($plainBody, '↪ QT') || str_contains($plainBody, '↪QT'))) {
+                    $commentary = $plainBody;
+                    if (preg_match('/^(.*?)(?:\n\n|\n)↪\s*QT.*$/us', $plainBody, $cm)) {
+                        $commentary = trim((string) ($cm[1] ?? ''));
+                    } elseif (preg_match('/^↪\s*QT/u', $plainBody)) {
+                        $commentary = '';
+                    }
+                    // Also strip a leading RE:<url> left in commentary.
+                    $commentary = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $commentary) ?? $commentary;
+                    $commentary = trim($commentary);
+                    if ($commentary === '') {
+                        $status['content'] = '';
+                    } else {
+                        $escaped = htmlspecialchars($commentary, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                        $status['content'] = '<p>' . nl2br($escaped) . '</p>';
+                    }
+                }
+                // Bridge pattern: some AP bridges only put the quoted attachment on
+                // the outer event's media_urls. Move into the nest when the quoted
+                // status itself has no media (keep intentional outer+quote media when
+                // both sides already have attachments).
+                $qSt = is_array($status['quote']['quoted_status'] ?? null)
+                    ? $status['quote']['quoted_status']
+                    : null;
+                $qMedia = is_array($qSt['media_attachments'] ?? null) ? $qSt['media_attachments'] : [];
+                $outerMedia = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
+                if ($qSt !== null && $qMedia === [] && $outerMedia !== []) {
+                    $status['quote']['quoted_status']['media_attachments'] = $outerMedia;
+                    $status['media_attachments'] = [];
+                } elseif ($qSt !== null && $qMedia !== [] && $outerMedia !== []) {
+                    // Same asset on both sides → keep it inside the nest only.
+                    $qUrls = [];
+                    foreach ($qMedia as $qm) {
+                        if (!is_array($qm)) {
+                            continue;
+                        }
+                        $u = rtrim((string) ($qm['url'] ?? $qm['preview_url'] ?? ''), '/');
+                        if ($u !== '') {
+                            $qUrls[$u] = true;
+                        }
+                    }
+                    if ($qUrls !== []) {
+                        $status['media_attachments'] = array_values(array_filter(
+                            $outerMedia,
+                            static function ($om) use ($qUrls): bool {
+                                if (!is_array($om)) {
+                                    return false;
+                                }
+                                $u = rtrim((string) ($om['url'] ?? $om['preview_url'] ?? ''), '/');
+                                return $u === '' || !isset($qUrls[$u]);
+                            }
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     // Announce → Mastodon reblog wrapper: outer = booster, inner = original author

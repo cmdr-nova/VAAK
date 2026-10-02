@@ -365,13 +365,15 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
         if (is_array($qPrev)) {
             $qPost = is_array($qPrev['post'] ?? null) ? $qPrev['post'] : null;
             $qSt = is_array($qPost) ? ap_masto_bsky_trend_status($qPost) : null;
+            $prevMedia = is_array($qPrev['media'] ?? null) ? $qPrev['media'] : [];
             if (!is_array($qSt)) {
                 // Thin preview without full PostView — synthesize a minimal status.
                 $qHandle = trim((string) ($qPrev['handle'] ?? ''));
                 $qText = trim((string) ($qPrev['text'] ?? ''));
                 $qUrl = trim((string) ($qPrev['url'] ?? ''));
+                $synthId = $qUrl !== '' ? $qUrl : ('bsky-quote:' . substr(hash('sha256', $qText . $qHandle), 0, 16));
                 $qSt = [
-                    'id' => $qUrl !== '' ? $qUrl : ('bsky-quote:' . substr(hash('sha256', $qText . $qHandle), 0, 16)),
+                    'id' => $synthId,
                     'uri' => $qUrl,
                     'url' => $qUrl,
                     'content' => $qText !== ''
@@ -385,9 +387,23 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
                         'url' => $qHandle !== '' ? ('https://bsky.app/profile/' . rawurlencode($qHandle)) : '',
                         'avatar' => '',
                     ],
-                    'media_attachments' => is_array($qPrev['media'] ?? null) ? $qPrev['media'] : [],
+                    'media_attachments' => function_exists('ap_masto_bsky_preview_media_as_attachments')
+                        ? ap_masto_bsky_preview_media_as_attachments($prevMedia, $synthId)
+                        : $prevMedia,
                     'source' => 'bluesky',
                 ];
+                if (is_array($qPrev['card'] ?? null)) {
+                    $qSt['card'] = $qPrev['card'];
+                }
+            } else {
+                // trend_status succeeded but may lack media while the quote preview
+                // still has images/video from the embedded record — merge them in.
+                $qMedia = is_array($qSt['media_attachments'] ?? null) ? $qSt['media_attachments'] : [];
+                if ($qMedia === [] && $prevMedia !== []) {
+                    $qSt['media_attachments'] = function_exists('ap_masto_bsky_preview_media_as_attachments')
+                        ? ap_masto_bsky_preview_media_as_attachments($prevMedia, (string) ($qSt['id'] ?? 'bsky-quote'))
+                        : $prevMedia;
+                }
             }
             $st['quote'] = [
                 'quoted_status' => $qSt,
