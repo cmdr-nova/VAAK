@@ -410,14 +410,18 @@ fn shadow_redis_key(owner_user_id: i64, scan: i64, last_read: &str) -> String {
     format!("vaak:shadow:notifications:v1:unread:{owner_user_id}:{scan}:{hash}")
 }
 
-/// Compute + write shadow Redis; optionally include live compare payload.
+/// Compute + write Redis. When `live`, also writes the production notif key + file cache.
 pub async fn compute_and_cache(
     cfg: &Config,
     owner_user_id: i64,
     compare: bool,
+    live: bool,
 ) -> Result<serde_json::Value> {
     let db = crate::db::connect(&cfg.database_url).await?;
-    let state = compute_unread(&db, owner_user_id, 80).await?;
+    let mut state = compute_unread(&db, owner_user_id, 80).await?;
+    if live {
+        state.source = "vaak-worker-live".into();
+    }
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let payload = serde_json::json!({
@@ -429,47 +433,101 @@ pub async fn compute_and_cache(
         "mention_kept": state.mention_kept,
         "mention_skipped": state.mention_skipped,
         "follow_kept": state.follow_kept,
+        "hidden_skipped": state.hidden_skipped,
+        "update_kept": state.update_kept,
     });
     let shadow_key = shadow_redis_key(owner_user_id, state.scan, &state.last_read_id);
     redis_util::json_set(&mut redis, &shadow_key, &payload, 120).await?;
 
+    let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
+    if live {
+        // Match PHP cache TTL (45s) so badge polls stay hot under Rust ownership.
+        redis_util::json_set(&mut redis, &live_key, &payload, 45).await?;
+        write_file_cache(cfg, owner_user_id, &state.last_read_id, &payload)?;
+        tracing::info!(%live_key, count = state.count, "notif live cache written");
+    }
+
     if compare {
-        let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
-        let live = redis_util::json_get(&mut redis, &live_key).await?;
-        tracing::info!(%shadow_key, live = ?live, "notif shadow compare");
+        let live_cache = redis_util::json_get(&mut redis, &live_key).await?;
+        tracing::info!(%shadow_key, live = ?live_cache, "notif compare");
         Ok(serde_json::json!({
             "shadow": state,
+            "live_mode": live,
             "shadow_redis_key": shadow_key,
             "live_redis_key": live_key,
-            "live_cache": live,
+            "live_cache": live_cache,
         }))
     } else {
-        Ok(serde_json::to_value(state)?)
+        let mut v = serde_json::to_value(&state)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("live_mode".into(), serde_json::json!(live));
+            obj.insert("live_redis_key".into(), serde_json::json!(live_key));
+        }
+        Ok(v)
     }
 }
 
-pub async fn run_once(cfg: &Config, owner_user_id: i64, compare: bool) -> Result<UnreadState> {
-    let body = compute_and_cache(cfg, owner_user_id, compare).await?;
+fn write_file_cache(
+    cfg: &Config,
+    owner_user_id: i64,
+    last_read: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(last_read.as_bytes());
+    let hash12 = hex::encode(hasher.finalize());
+    let hash12 = &hash12[..12.min(hash12.len())];
+    let dir = &cfg.notif_cache_dir;
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let path = dir.join(format!("notif_unread_{owner_user_id}_{hash12}.json"));
+    let lean = serde_json::json!({
+        "c": payload.get("c").cloned().unwrap_or(serde_json::json!(0)),
+        "u": payload.get("u").cloned().unwrap_or(serde_json::json!("")),
+        "l": payload.get("l").cloned().unwrap_or(serde_json::json!("")),
+        "ts": payload.get("ts").cloned().unwrap_or(serde_json::json!(0)),
+    });
+    std::fs::write(&path, serde_json::to_vec(&lean)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+pub async fn run_once(
+    cfg: &Config,
+    owner_user_id: i64,
+    compare: bool,
+    live: bool,
+) -> Result<UnreadState> {
+    let body = compute_and_cache(cfg, owner_user_id, compare, live).await?;
     println!("{}", serde_json::to_string_pretty(&body)?);
     if let Ok(state) = serde_json::from_value::<UnreadState>(body.clone()) {
         Ok(state)
     } else if let Some(shadow) = body.get("shadow") {
         Ok(serde_json::from_value(shadow.clone())?)
     } else {
-        anyhow::bail!("unexpected notif shadow payload shape");
+        anyhow::bail!("unexpected notif payload shape");
     }
 }
 
-pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, compare: bool) -> Result<()> {
+pub async fn run_loop(
+    cfg: &Config,
+    owner_user_id: i64,
+    interval_secs: u64,
+    compare: bool,
+    live: bool,
+) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(5));
     loop {
-        match run_once(cfg, owner_user_id, compare).await {
+        match run_once(cfg, owner_user_id, compare, live).await {
             Ok(state) => tracing::info!(
                 count = state.count,
                 latest = %state.latest_id,
-                "notif shadow ok"
+                live,
+                "notif ok"
             ),
-            Err(e) => tracing::error!(error = %e, "notif shadow failed"),
+            Err(e) => tracing::error!(error = %e, "notif failed"),
         }
         tokio::time::sleep(interval).await;
     }

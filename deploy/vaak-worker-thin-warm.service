@@ -1,0 +1,27 @@
+# Live thin-media warm queue worker (Rust-primary).
+# Drains vaak:queue:bsky_post_warm on Redis DB1; periodic thin-post scan enqueue.
+# PHP ap_bsky_post_preview_warm_enqueue LPUSHes here; nohup PHP is fallback.
+#   systemctl enable --now vaak-worker-thin-warm.service
+
+[Unit]
+Description=VAAK Rust thin-media warm worker
+After=network.target postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
+Environment=VAAK_REDIS_QUEUE_URL=redis://127.0.0.1/1
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker thin-media-warm --loop --scan-interval-secs 180 --owner-id 1
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

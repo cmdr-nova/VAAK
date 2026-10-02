@@ -26,6 +26,7 @@ pub struct OwnerQuery {
     /// Accepts true/false/1/0/yes/no (string form in query).
     pub compare: Option<String>,
     pub fetch: Option<String>,
+    pub live: Option<String>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -109,7 +110,8 @@ async fn shadow_notif(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let compare = truthy(q.compare.as_deref());
-    match crate::notif::compute_and_cache(&state.cfg, owner, compare).await {
+    let live = truthy(q.live.as_deref());
+    match crate::notif::compute_and_cache(&state.cfg, owner, compare, live).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

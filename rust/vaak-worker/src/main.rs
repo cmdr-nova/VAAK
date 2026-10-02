@@ -1,6 +1,4 @@
-//! VAAK wave-1–3 Rust workers — shadow mode only.
-//!
-//! Live owners remain PHP/Python. These commands mirror hot paths for soak/parity.
+//! VAAK Rust workers — shadow + live cutover (notif badge, thin-media warm).
 
 mod action_queue;
 mod config;
@@ -12,6 +10,7 @@ mod notif;
 mod ranked;
 mod redis_util;
 mod thin_media;
+mod thin_media_warm;
 mod timeline;
 
 use std::net::SocketAddr;
@@ -21,7 +20,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "vaak-worker", about = "VAAK shadow-mode Rust workers (wave 1–3)")]
+#[command(name = "vaak-worker", about = "VAAK Rust workers (shadow + live cutover)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -29,12 +28,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Recompute notification unread badge into vaak:shadow:* Redis keys.
+    /// Notification unread badge (shadow and/or live Redis).
     NotifBadge {
         #[arg(long, default_value_t = false)]
         once: bool,
         #[arg(long, default_value_t = false)]
         compare: bool,
+        /// Write production Redis key + file cache (Rust-primary cutover).
+        #[arg(long, default_value_t = false)]
+        live: bool,
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
         #[arg(long, default_value_t = 30)]
@@ -42,7 +44,6 @@ enum Command {
         #[arg(long, default_value_t = false)]
         r#loop: bool,
     },
-    /// Dump Home newer-poll candidates (JSON) for parity with PHP newer=1.
     RankedNewer {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
@@ -51,14 +52,12 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
-    /// List pending/processing action-queue rows (never claims).
     ActionQueue {
         #[arg(long, default_value_t = true)]
         list: bool,
         #[arg(long, default_value_t = 25)]
         limit: i64,
     },
-    /// Read-only Jetstream spool scan + thin-media candidate list.
     JetstreamHydrate {
         #[arg(long, default_value_t = true)]
         scan_once: bool,
@@ -67,7 +66,7 @@ enum Command {
         #[arg(long, default_value_t = 25)]
         max_thin: usize,
     },
-    /// Thin-media repair dry-run (optional AppView fetch; never writes).
+    /// Dry-run thin-media candidates (never writes).
     ThinMediaRepair {
         #[arg(long, default_value_t = true)]
         dry_run: bool,
@@ -76,14 +75,27 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Shadow Home from PHP ranked Redis cache (IDs + light enrich).
+    /// Live thin-media warm: enqueue scan and/or drain queue (writes bsky_posts).
+    ThinMediaWarm {
+        /// Enqueue a thin-post scan once, then exit.
+        #[arg(long, default_value_t = false)]
+        enqueue_once: bool,
+        /// Drain Redis warm queue forever (also periodic scan).
+        #[arg(long, default_value_t = false)]
+        r#loop: bool,
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+        #[arg(long, default_value_t = 180)]
+        scan_interval_secs: u64,
+    },
     TimelineHome {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Localhost Axum shadow HTTP (/healthz + /shadow/*).
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
@@ -99,12 +111,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::Config::load()?;
-    tracing::info!(env = ?config::env_snapshot(), "vaak-worker shadow starting");
+    tracing::info!(env = ?config::env_snapshot(), "vaak-worker starting");
 
     match cli.cmd {
         Command::NotifBadge {
             once,
             compare,
+            live,
             owner_id,
             interval_secs,
             r#loop,
@@ -115,9 +128,9 @@ async fn main() -> Result<()> {
                 cfg.default_owner_id
             };
             if r#loop && !once {
-                notif::run_loop(&cfg, owner, interval_secs, compare).await?;
+                notif::run_loop(&cfg, owner, interval_secs, compare, live).await?;
             } else {
-                notif::run_once(&cfg, owner, compare).await?;
+                notif::run_once(&cfg, owner, compare, live).await?;
             }
         }
         Command::RankedNewer {
@@ -148,6 +161,26 @@ async fn main() -> Result<()> {
             limit,
         } => {
             thin_media::run(&cfg, limit, fetch).await?;
+        }
+        Command::ThinMediaWarm {
+            enqueue_once,
+            r#loop,
+            owner_id,
+            limit,
+            scan_interval_secs,
+        } => {
+            let owner = if owner_id > 0 {
+                owner_id
+            } else {
+                cfg.default_owner_id
+            };
+            if r#loop {
+                thin_media_warm::run_worker_loop(&cfg, scan_interval_secs).await?;
+            } else if enqueue_once {
+                thin_media_warm::run_enqueue_cli(&cfg, owner, limit).await?;
+            } else {
+                anyhow::bail!("thin-media-warm requires --enqueue-once or --loop");
+            }
         }
         Command::TimelineHome { owner_id, limit } => {
             let owner = if owner_id > 0 {

@@ -5766,6 +5766,12 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         }
         return $readUnreadCache($decoded);
     };
+    // Rust-primary notif badge (vaak-worker notif-badge --live --loop). PHP rebuilds on miss.
+    $notifRustPrimary = getenv('VAAK_NOTIF_RUST_PRIMARY');
+    $notifRustPrimary = $notifRustPrimary === false
+        ? true
+        : !in_array(strtolower(trim((string) $notifRustPrimary)), ['0', 'false', 'off', 'no'], true);
+
     if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
         if (is_array($redisCached) && isset($redisCached['c'])) {
@@ -5774,20 +5780,21 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
         $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
         if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
-            // Wait long enough for a peer rebuild (~100–200ms) instead of
-            // stampeding another full scan (was 150ms → duplicate 9–12s work).
+            // Wait for Rust live writer (or a peer PHP rebuild) before scanning.
+            $peerWaitMs = $notifRustPrimary ? 4500 : 2500;
             $peer = ap_redis_stampede_wait(
                 static function () use ($redisKey) {
                     $row = ap_redis_json_get($redisKey);
                     return (is_array($row) && isset($row['c'])) ? $row : null;
                 },
-                2500
+                $peerWaitMs
             );
             if (is_array($peer) && isset($peer['c'])) {
                 return $readUnreadCache($peer);
             }
             // Prefer slightly stale badge over a second rebuild under load.
-            $stale = $readFileUnread(180);
+            $staleAge = $notifRustPrimary ? 300 : 180;
+            $stale = $readFileUnread($staleAge);
             if (is_array($stale)) {
                 return $stale;
             }
@@ -5797,6 +5804,13 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         $freshFile = $readFileUnread($cacheTtl);
         if (is_array($freshFile)) {
             return $freshFile;
+        }
+    }
+    // Last resort under Rust ownership: accept older file before expensive rebuild.
+    if ($notifRustPrimary && $cacheTtl > 0) {
+        $stale = $readFileUnread(600);
+        if (is_array($stale)) {
+            return $stale;
         }
     }
 
