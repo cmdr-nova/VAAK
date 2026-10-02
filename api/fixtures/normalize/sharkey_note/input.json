@@ -1,0 +1,13 @@
+{
+  "id": "https://eepy.moe/notes/fixtureSharkey01",
+  "type": "Note",
+  "attributedTo": "https://eepy.moe/users/fixture_s",
+  "content": "<p>Sharkey says hi — quoting something.</p>",
+  "contentMap": {
+    "en": "<p>Sharkey says hi — quoting something.</p>"
+  },
+  "_misskey_quote": "https://eepy.moe/notes/quotedTarget01",
+  "published": "2026-02-01T08:30:00Z",
+  "sensitive": false,
+  "to": ["https://www.w3.org/ns/activitystreams#Public"]
+}

@@ -1,0 +1,46 @@
+{
+  "uri": "at://did:plc:fixturebsky02/app.bsky.feed.post/fixtureQuote01",
+  "cid": "bafyfixturecid02",
+  "author": {
+    "did": "did:plc:fixturebsky02",
+    "handle": "quoter.bsky.social",
+    "displayName": "Quoter",
+    "avatar": ""
+  },
+  "record": {
+    "$type": "app.bsky.feed.post",
+    "text": "Quoting this",
+    "createdAt": "2026-04-02T11:00:00.000Z",
+    "embed": {
+      "$type": "app.bsky.embed.record",
+      "record": {
+        "uri": "at://did:plc:fixturebsky01/app.bsky.feed.post/fixtureSkeet01",
+        "cid": "bafyfixturecid01"
+      }
+    }
+  },
+  "embed": {
+    "$type": "app.bsky.embed.record#view",
+    "record": {
+      "$type": "app.bsky.embed.record#viewRecord",
+      "uri": "at://did:plc:fixturebsky01/app.bsky.feed.post/fixtureSkeet01",
+      "cid": "bafyfixturecid01",
+      "author": {
+        "did": "did:plc:fixturebsky01",
+        "handle": "fixture.bsky.social",
+        "displayName": "Fixture Bsky"
+      },
+      "value": {
+        "$type": "app.bsky.feed.post",
+        "text": "Skeet with an image fixture",
+        "createdAt": "2026-04-01T10:00:00.000Z"
+      },
+      "indexedAt": "2026-04-01T10:00:01.000Z"
+    }
+  },
+  "indexedAt": "2026-04-02T11:00:01.000Z",
+  "likeCount": 0,
+  "repostCount": 0,
+  "replyCount": 0,
+  "labels": []
+}

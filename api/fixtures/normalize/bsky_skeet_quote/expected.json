@@ -1,0 +1,20 @@
+{
+    "uri": "at://did:plc:fixturebsky02/app.bsky.feed.post/fixtureQuote01",
+    "content_plain": "Quoting this",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "bluesky",
+    "account": {
+        "acct": "quoter.bsky.social",
+        "username": "quoter.bsky.social",
+        "display_name": "Quoter"
+    },
+    "media": [],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": true,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null,
+    "quote_plain": "Skeet with an image fixture"
+}

@@ -1,0 +1,19 @@
+{
+    "uri": "https://pleroma.example/objects/fixture-akkoma-01",
+    "content_plain": "Akkoma body behind a content warning.",
+    "sensitive": true,
+    "spoiler_text": "mild spoilers",
+    "source": "",
+    "account": {
+        "acct": "fixture_a@pleroma.example",
+        "username": "fixture_a",
+        "display_name": "fixture_a"
+    },
+    "media": [],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null
+}

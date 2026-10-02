@@ -1,0 +1,19 @@
+{
+    "uri": "https://example.org/posts/fixture-rss-01",
+    "content_plain": "Fixture RSS headline A short RSS summary for the normalizer fixture.",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "rss",
+    "account": {
+        "acct": "Fixture",
+        "username": "fixture",
+        "display_name": "Fixture"
+    },
+    "media": [],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": 42
+}

@@ -1,0 +1,24 @@
+{
+    "uri": "https://mastodon.social/users/fixture_m/statuses/1001",
+    "content_plain": "Hello from Mastodon fixture.",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "",
+    "account": {
+        "acct": "fixture_m@mastodon.social",
+        "username": "fixture_m",
+        "display_name": "fixture_m"
+    },
+    "media": [
+        {
+            "type": "image",
+            "url": "https://files.mastodon.social/media_attachments/files/fixture/original/m.jpg"
+        }
+    ],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "https://pleroma.example/objects/fixture-akkoma-01",
+  "type": "Note",
+  "attributedTo": "https://pleroma.example/users/fixture_a",
+  "content": "<p>Akkoma body behind a content warning.</p>",
+  "summary": "mild spoilers",
+  "sensitive": true,
+  "published": "2026-03-01T18:00:00Z",
+  "to": ["https://www.w3.org/ns/activitystreams#Public"]
+}

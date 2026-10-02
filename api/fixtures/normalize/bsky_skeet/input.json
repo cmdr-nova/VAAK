@@ -1,0 +1,43 @@
+{
+  "uri": "at://did:plc:fixturebsky01/app.bsky.feed.post/fixtureSkeet01",
+  "cid": "bafyfixturecid01",
+  "author": {
+    "did": "did:plc:fixturebsky01",
+    "handle": "fixture.bsky.social",
+    "displayName": "Fixture Bsky",
+    "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:fixturebsky01/fixture@jpeg"
+  },
+  "record": {
+    "$type": "app.bsky.feed.post",
+    "text": "Skeet with an image fixture",
+    "createdAt": "2026-04-01T10:00:00.000Z",
+    "embed": {
+      "$type": "app.bsky.embed.images",
+      "images": [
+        {
+          "alt": "sky",
+          "image": {
+            "ref": { "$link": "bafyfixtureblob01" },
+            "mimeType": "image/jpeg",
+            "size": 12345
+          }
+        }
+      ]
+    }
+  },
+  "embed": {
+    "$type": "app.bsky.embed.images#view",
+    "images": [
+      {
+        "thumb": "https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:fixturebsky01/bafyfixtureblob01@jpeg",
+        "fullsize": "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:fixturebsky01/bafyfixtureblob01@jpeg",
+        "alt": "sky"
+      }
+    ]
+  },
+  "indexedAt": "2026-04-01T10:00:01.000Z",
+  "likeCount": 2,
+  "repostCount": 1,
+  "replyCount": 0,
+  "labels": [{ "val": "porn" }]
+}

@@ -1,0 +1,4 @@
+{
+  "entry": "bsky",
+  "description": "Bluesky PostView quoting another post via recordWithMedia / record embed"
+}

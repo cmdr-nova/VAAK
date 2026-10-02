@@ -1,0 +1,18 @@
+{
+  "id": "https://mastodon.social/users/fixture_m/statuses/1001",
+  "type": "Note",
+  "attributedTo": "https://mastodon.social/users/fixture_m",
+  "content": "<p>Hello from <strong>Mastodon</strong> fixture.</p>",
+  "published": "2026-01-15T12:00:00Z",
+  "sensitive": false,
+  "summary": null,
+  "attachment": [
+    {
+      "type": "Document",
+      "mediaType": "image/jpeg",
+      "url": "https://files.mastodon.social/media_attachments/files/fixture/original/m.jpg",
+      "name": "A test image"
+    }
+  ],
+  "to": ["https://www.w3.org/ns/activitystreams#Public"]
+}
