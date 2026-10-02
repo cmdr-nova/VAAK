@@ -5955,22 +5955,16 @@ if ($hydrateBoost || $hydrateCreate) {
             : $adminIndexActorMap($following, true);
     }
     ob_start();
-    // Prefer shared Mastodon reblog card so fav/boost/bookmark ids match the API.
-    if (
-        function_exists('ap_normalize_from_activitypub_event')
-        && function_exists('admin_render_masto_status_card')
-    ) {
-        // Leave _skip_announce_hydrate unset so ensure can fill the Create once.
-        $st = ap_normalize_from_activitypub_event($e);
-        if (is_array($st)) {
-            // Budget already spent inside ensure; card must not re-fetch.
-            $GLOBALS['admin_boost_fetch_budget'] = 0;
-            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
-            echo ob_get_clean();
-            exit;
-        }
+    // Leave _skip_announce_hydrate unset so ensure can fill the Create once.
+    if (admin_try_render_announce_shared_card($e, $followingIds, $returnView, false)) {
+        // Budget already spent inside ensure; card must not re-fetch.
+        $GLOBALS['admin_boost_fetch_budget'] = 0;
+        echo ob_get_clean();
+        exit;
     }
-    admin_render_remote_boost_card($e, $followingIds, $returnView, false);
+    // Normalize refused (hidden/gone) — terminal stub, no legacy dialect.
+    echo '<article class="tweet tweet-boost"><div class="meta meta-row">'
+        . '<span class="boost-hydrate-status">Boost details unavailable</span></div></article>';
     echo ob_get_clean();
     exit;
 }
@@ -12312,21 +12306,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     if (admin_event_is_empty_private_stub($e)) {
         return;
     }
-    // Inbound Announce → shared Mastodon reblog card (thin → degraded + hydrate).
+    // Inbound Announce → shared Mastodon reblog card only.
+    // Normalize null usually means hidden/blocked booster — do not paint legacy dialect.
     if (strtolower((string) ($e['type'] ?? '')) === 'announce') {
-        if (
-            function_exists('ap_normalize_from_activitypub_event')
-            && function_exists('admin_render_masto_status_card')
-        ) {
-            $ann = $e;
-            $ann['_skip_announce_hydrate'] = true;
-            $stAnn = ap_normalize_from_activitypub_event($ann);
-            if (is_array($stAnn)) {
-                admin_render_masto_status_card($stAnn, $followingIds, $returnView, false, true);
-                return;
-            }
-        }
-        admin_render_remote_boost_card($e, $followingIds, $returnView, $fromFollowedTag);
+        admin_try_render_announce_shared_card($e, $followingIds, $returnView, true);
         return;
     }
     $canReply = feed_event_can_reply($e);
@@ -14469,7 +14452,39 @@ function admin_render_masto_status_card(
 }
 
 /**
- * Render an inbound remote Announce as "X boosted" with the original author card.
+ * Prefer shared Mastodon reblog card for an Announce event.
+ * Returns false when normalize refuses the row (hidden/session/empty) — callers
+ * should skip painting rather than fall through to the legacy dialect.
+ *
+ * @param array<string,mixed> $e
+ * @param array<int|string,mixed> $followingIds
+ */
+function admin_try_render_announce_shared_card(
+    array $e,
+    array $followingIds,
+    string $returnView,
+    bool $skipSyncHydrate = true
+): bool {
+    if (!function_exists('ap_normalize_from_activitypub_event')
+        || !function_exists('admin_render_masto_status_card')) {
+        return false;
+    }
+    $ann = $e;
+    if ($skipSyncHydrate) {
+        $ann['_skip_announce_hydrate'] = true;
+    }
+    $st = ap_normalize_from_activitypub_event($ann);
+    if (!is_array($st)) {
+        return false;
+    }
+    admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+    return true;
+}
+
+/**
+ * Legacy inbound Announce card ("X boosted" + original author).
+ * Prefer admin_try_render_announce_shared_card / shared Mastodon reblog path.
+ * Kept as last-resort HTML when normalize cannot build a status at all.
  *
  * @param array<string,mixed> $e events row (type=Announce)
  * @param array<string,bool> $followingIds
@@ -14480,6 +14495,14 @@ function admin_render_remote_boost_card(
     string $returnView,
     bool $fromFollowedTag = false
 ): void {
+    // Shared card first (same ids as Ice Cubes). Skip sync-fetch here — callers
+    // that need hydrate set admin_boost_fetch_budget and leave skip unset upstream.
+    $skip = !empty($e['_skip_announce_hydrate'])
+        || (int) ($GLOBALS['admin_boost_fetch_budget'] ?? 0) < 1;
+    if (admin_try_render_announce_shared_card($e, $followingIds, $returnView, $skip)) {
+        return;
+    }
+
     $boosterId = rtrim((string) ($e['actor_id'] ?? ''), '/');
     $objectId = rtrim((string) ($e['object_id'] ?? ''), '/');
     $created = (string) ($e['created_at'] ?? '');
@@ -15921,8 +15944,7 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
             return;
         }
         if ($evType === 'announce') {
-            // Fallback only when normalize could not build a status at all.
-            admin_render_remote_boost_card($row, $followingIds, $returnView, $fromTag);
+            // Hidden/session/empty — skip. Do not resurrect remote_boost_card dialect.
             return;
         }
     }
