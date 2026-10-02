@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
 use crate::config::Config;
+use crate::hidden::{self, HiddenSets};
 use crate::redis_util;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,8 @@ pub struct UnreadState {
     pub mention_kept: i64,
     pub mention_skipped: i64,
     pub follow_kept: i64,
+    pub hidden_skipped: i64,
+    pub update_kept: i64,
     pub source: String,
 }
 
@@ -27,11 +30,22 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
     let last_read = load_last_read_id(db, owner_user_id).await?;
     let owner_actor = load_owner_actor_id(db, owner_user_id).await?;
     let owner_actor_trim = owner_actor.trim_end_matches('/').to_string();
+    let hidden = hidden::load_hidden_sets(db, owner_user_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "hidden sets load failed; continuing without");
+            HiddenSets::default()
+        });
+    let subscriptions = hidden::load_post_subscriptions(db, owner_user_id)
+        .await
+        .unwrap_or_default();
 
     let mut ids: Vec<String> = Vec::new();
     let mut mention_kept = 0_i64;
     let mut mention_skipped = 0_i64;
     let mut follow_kept = 0_i64;
+    let mut hidden_skipped = 0_i64;
+    let mut update_kept = 0_i64;
 
     let mention_rows = db
         .query(
@@ -76,7 +90,14 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
             }
         };
 
-        if mention_notif_type(
+        let actor_trim = actor_id.trim_end_matches('/');
+        if !actor_trim.is_empty() && hidden.is_hidden(actor_trim) {
+            hidden_skipped += 1;
+            mention_skipped += 1;
+            continue;
+        }
+
+        let kind = mention_notif_type(
             &activity_type,
             &obj_type,
             &object_id,
@@ -85,14 +106,47 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
             &in_reply_to,
             our_prefix,
             &activity_id,
-        )
-        .is_none()
-        {
-            mention_skipped += 1;
-            continue;
-        }
+            &subscriptions,
+        );
 
-        // Snowflake type 5 = mention/fav/boost/quote row in mentions table.
+        let kind = match kind {
+            Some(k) => k,
+            None if activity_type.eq_ignore_ascii_case("update") => {
+                // Update of a post we favourited (Note-like only).
+                let obj = obj_type.to_ascii_lowercase();
+                if !matches!(obj.as_str(), "note" | "article" | "page" | "question" | "") {
+                    mention_skipped += 1;
+                    continue;
+                }
+                if object_id.contains("/videos/") || object_id.contains("/w/") {
+                    mention_skipped += 1;
+                    continue;
+                }
+                let our_note = object_id.starts_with(&format!("{our_prefix}/notes/"))
+                    || object_id.starts_with(&format!("{our_prefix}/statuses/"));
+                if our_note {
+                    mention_skipped += 1;
+                    continue;
+                }
+                match hidden::is_favourited(db, owner_user_id, &object_id).await {
+                    Ok(true) => {
+                        update_kept += 1;
+                        "update"
+                    }
+                    _ => {
+                        mention_skipped += 1;
+                        continue;
+                    }
+                }
+            }
+            None => {
+                mention_skipped += 1;
+                continue;
+            }
+        };
+        let _ = kind;
+
+        // Snowflake type 5 = mention/fav/boost/quote/update row in mentions table.
         ids.push(snowflake_id(created.as_deref(), id, 5));
         mention_kept += 1;
     }
@@ -119,6 +173,10 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
             .to_string();
         // Skip self.
         if !actor_id.is_empty() && actor_id == owner_actor_trim {
+            continue;
+        }
+        if !actor_id.is_empty() && hidden.is_hidden(&actor_id) {
+            hidden_skipped += 1;
             continue;
         }
         // Snowflake type 6 = follow event.
@@ -166,13 +224,15 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         mention_kept,
         mention_skipped,
         follow_kept,
+        hidden_skipped,
+        update_kept,
         source: "vaak-worker-shadow".into(),
     })
 }
 
 /// Thin port of PHP `ap_masto_mention_notif_type` — returns Some(kind) when the
-/// row should count toward the badge. Update/favourite-of-ours edge cases that
-/// need extra DB lookups are skipped (return None) for now.
+/// row should count toward the badge. `update` returns None so the caller can
+/// run the favourites lookup.
 fn mention_notif_type(
     activity_type: &str,
     obj_type: &str,
@@ -182,6 +242,7 @@ fn mention_notif_type(
     in_reply_to: &str,
     our_prefix: &str,
     activity_id: &str,
+    subscriptions: &std::collections::HashSet<String>,
 ) -> Option<&'static str> {
     let activity = activity_type.to_ascii_lowercase();
     let obj = obj_type.to_ascii_lowercase();
@@ -241,7 +302,7 @@ fn mention_notif_type(
     {
         return Some("quote");
     }
-    // Update-of-favourited needs a favourites lookup — skip in shadow for now.
+    // Caller handles Update + favourite lookup.
     if activity == "update" {
         return None;
     }
@@ -257,10 +318,11 @@ fn mention_notif_type(
         if !reply.is_empty() && reply.starts_with(&format!("{our}/notes/")) {
             return Some("mention");
         }
-        // Content @-address / post-subscription checks need more helpers; keep
-        // rows with non-empty content as mentions for badge soak.
-        if !content.is_empty() {
+        if hidden::content_addresses_local(content, our) {
             return Some("mention");
+        }
+        if !actor.is_empty() && subscriptions.contains(actor) {
+            return Some("status");
         }
         return None;
     }

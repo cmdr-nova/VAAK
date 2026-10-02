@@ -12,6 +12,7 @@ pub struct Config {
     pub redis_url: String,
     pub jetstream_state: PathBuf,
     pub default_owner_id: i64,
+    pub bsky_public_api: String,
 }
 
 impl Config {
@@ -33,12 +34,16 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
+        let bsky_public_api = env::var("VAAK_BSKY_PUBLIC_API")
+            .or_else(|_| env::var("AP_BSKY_PUBLIC_API"))
+            .unwrap_or_else(|_| "https://public.api.bsky.app".to_string());
 
         Ok(Self {
             database_url,
             redis_url,
             jetstream_state,
             default_owner_id,
+            bsky_public_api,
         })
     }
 }
@@ -73,6 +78,8 @@ pub fn env_snapshot() -> HashMap<String, String> {
         "VAAK_JETSTREAM_STATE",
         "VAAK_SHADOW_OWNER_ID",
         "VAAK_JETSTREAM_URL",
+        "VAAK_BSKY_PUBLIC_API",
+        "AP_BSKY_PUBLIC_API",
         "AP_DB_DSN",
     ] {
         if let Ok(v) = env::var(key) {

@@ -1,15 +1,18 @@
-//! VAAK wave-1/2 Rust workers — shadow mode only.
+//! VAAK wave-1–3 Rust workers — shadow mode only.
 //!
 //! Live owners remain PHP/Python. These commands mirror hot paths for soak/parity.
 
 mod action_queue;
 mod config;
 mod db;
+mod hidden;
 mod http;
 mod jetstream;
 mod notif;
 mod ranked;
 mod redis_util;
+mod thin_media;
+mod timeline;
 
 use std::net::SocketAddr;
 
@@ -18,7 +21,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "vaak-worker", about = "VAAK shadow-mode Rust workers (wave 1–2)")]
+#[command(name = "vaak-worker", about = "VAAK shadow-mode Rust workers (wave 1–3)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -63,6 +66,22 @@ enum Command {
         max_files: usize,
         #[arg(long, default_value_t = 25)]
         max_thin: usize,
+    },
+    /// Thin-media repair dry-run (optional AppView fetch; never writes).
+    ThinMediaRepair {
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        fetch: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Shadow Home from PHP ranked Redis cache (IDs + light enrich).
+    TimelineHome {
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Localhost Axum shadow HTTP (/healthz + /shadow/*).
     Serve {
@@ -122,6 +141,21 @@ async fn main() -> Result<()> {
             max_thin,
         } => {
             jetstream::scan_once(&cfg, max_files, max_thin).await?;
+        }
+        Command::ThinMediaRepair {
+            dry_run: _,
+            fetch,
+            limit,
+        } => {
+            thin_media::run(&cfg, limit, fetch).await?;
+        }
+        Command::TimelineHome { owner_id, limit } => {
+            let owner = if owner_id > 0 {
+                owner_id
+            } else {
+                cfg.default_owner_id
+            };
+            timeline::run(&cfg, owner, limit).await?;
         }
         Command::Serve { bind } => {
             let addr: SocketAddr = bind.parse()?;
