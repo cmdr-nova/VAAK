@@ -1,0 +1,24 @@
+{
+    "uri": "at://did:plc:fixturebsky01/app.bsky.feed.post/fixtureSkeet01",
+    "content_plain": "Skeet with an image fixture",
+    "sensitive": true,
+    "spoiler_text": "Sensitive content",
+    "source": "bluesky",
+    "account": {
+        "acct": "fixture.bsky.social",
+        "username": "fixture.bsky.social",
+        "display_name": "Fixture Bsky"
+    },
+    "media": [
+        {
+            "type": "image",
+            "url": "https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:fixturebsky01/bafyfixtureblob01@jpeg"
+        }
+    ],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null
+}

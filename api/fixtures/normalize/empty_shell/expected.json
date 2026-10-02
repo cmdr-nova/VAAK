@@ -1,0 +1,19 @@
+{
+    "uri": "https://mastodon.social/users/fixture_empty/statuses/900001",
+    "content_plain": "",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "",
+    "account": {
+        "acct": "fixture_empty@mastodon.social",
+        "username": "fixture_empty",
+        "display_name": "fixture_empty"
+    },
+    "media": [],
+    "has_visible_body": false,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null
+}

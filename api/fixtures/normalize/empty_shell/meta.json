@@ -1,0 +1,4 @@
+{
+  "entry": "event",
+  "description": "Empty Create event shell — has_visible_body must be false (hydrate path)"
+}

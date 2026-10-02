@@ -1,0 +1,19 @@
+{
+    "uri": "https://mkultra.monster/users/cmdr_nova/notes/fixture-ask-01",
+    "content_plain": "Here is my answer to the ask.",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "",
+    "account": {
+        "acct": "cmdr_nova",
+        "username": "cmdr_nova",
+        "display_name": "cmdr_nova"
+    },
+    "media": [],
+    "has_visible_body": true,
+    "has_ask": true,
+    "ask_question": "What is your favourite synth?",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null
+}

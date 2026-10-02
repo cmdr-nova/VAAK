@@ -1,0 +1,12 @@
+{
+  "id": 90001,
+  "feed_id": 42,
+  "title": "Fixture RSS headline",
+  "summary_text": "A short RSS summary for the normalizer fixture.",
+  "url": "https://example.org/posts/fixture-rss-01",
+  "image_url": "",
+  "feed_title": "Fixture Feed",
+  "feed_favicon": "https://example.org/favicon.ico",
+  "published_at": "2026-06-01T14:00:00Z",
+  "ingested_at": "2026-06-01T14:05:00Z"
+}

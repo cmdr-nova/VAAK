@@ -1,0 +1,17 @@
+{
+  "id": 900001,
+  "type": "Create",
+  "actor_id": "https://mastodon.social/users/fixture_empty",
+  "object_id": "https://mastodon.social/users/fixture_empty/statuses/900001",
+  "host": "mastodon.social",
+  "summary": "",
+  "media_urls": null,
+  "spoiler_text": "",
+  "sensitive": 0,
+  "visibility": "public",
+  "action_taken": "local_observe",
+  "created_at": "2026-07-01T12:00:00Z",
+  "in_reply_to": "",
+  "_allow_hidden_actor": true,
+  "_allow_empty_for_context": true
+}

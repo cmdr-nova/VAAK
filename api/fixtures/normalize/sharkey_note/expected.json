@@ -1,0 +1,19 @@
+{
+    "uri": "https://eepy.moe/notes/fixtureSharkey01",
+    "content_plain": "Sharkey says hi — quoting something.",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "",
+    "account": {
+        "acct": "fixture_s@eepy.moe",
+        "username": "fixture_s",
+        "display_name": "fixture_s"
+    },
+    "media": [],
+    "has_visible_body": true,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null
+}

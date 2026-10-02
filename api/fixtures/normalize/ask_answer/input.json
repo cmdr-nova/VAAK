@@ -1,0 +1,26 @@
+{
+  "id": "109001",
+  "uri": "https://mkultra.monster/users/cmdr_nova/notes/fixture-ask-01",
+  "url": "https://mkultra.monster/users/cmdr_nova/notes/fixture-ask-01",
+  "content": "<p>Here is my answer to the ask.</p>",
+  "created_at": "2026-05-01T09:00:00Z",
+  "sensitive": false,
+  "spoiler_text": "",
+  "visibility": "public",
+  "account": {
+    "id": "1",
+    "acct": "cmdr_nova",
+    "username": "cmdr_nova",
+    "display_name": "cmdr_nova",
+    "url": "https://mkultra.monster/users/cmdr_nova",
+    "uri": "https://mkultra.monster/users/cmdr_nova",
+    "avatar": "https://mkultra.monster/img/avatar/default.jpg"
+  },
+  "media_attachments": [],
+  "vaak_ask": {
+    "question": "What is your favourite synth?",
+    "asker_actor": "https://app.wafrn.net/fediverse/blog/fixture_ask",
+    "asker_label": "fixture_ask",
+    "answer": "Here is my answer to the ask."
+  }
+}
