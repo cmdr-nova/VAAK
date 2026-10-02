@@ -14,7 +14,7 @@
  * Web render target: admin_render_masto_status_card (Home Create/Update/Announce,
  * RSS, and Bluesky feed items via admin_render_timeline_item). Thin Announces
  * without a cached Create paint as Mastodon reblog + vaak_degraded announce_only
- * (AJAX hydrate_boost); remote_boost_card remains a fallback dialect only.
+ * (AJAX hydrate_boost). Legacy remote_boost_card HTML is last-resort only.
  *
  * @see Documents/cmdr-nova/Projects/NovaLandia/Additional Fixes/10.2 Features and Fixes.md
  */
