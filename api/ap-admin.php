@@ -4264,7 +4264,10 @@ $vaakAdminOnlyActions = [
         );
         if (!empty($res['ok'])) {
             $worker = __DIR__ . '/ap-account-delete-worker.php';
-            $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : PHP_BINARY;
+            $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+            if ($php === '' || str_contains($php, 'php-fpm')) {
+                $php = is_executable('/usr/bin/php8.3') ? '/usr/bin/php8.3' : '/usr/bin/php';
+            }
             if (is_file($worker) && is_string($php) && $php !== '') {
                 $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($worker) . ' '
                     . escapeshellarg((string) $vaakOwnerId) . ' >/dev/null 2>&1 </dev/null &';

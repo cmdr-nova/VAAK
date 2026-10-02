@@ -2747,8 +2747,30 @@ function ap_quote_target_warm_async(string $objectUrl): void
     if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
         return;
     }
-    @fwrite($lock, (string) time());
-    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : PHP_BINARY;
+    // Cooldown: skip re-spawn if we already kicked a warm in the last 90s
+    // (worker may still be fetching; Home paints this URL on every scroll).
+    $prev = 0;
+    $lockStat = @fstat($lock);
+    if (is_array($lockStat) && isset($lockStat['size']) && (int) $lockStat['size'] > 0) {
+        rewind($lock);
+        $prev = (int) trim((string) @stream_get_contents($lock));
+    }
+    $now = time();
+    if ($prev > 0 && ($now - $prev) < 90) {
+        flock($lock, LOCK_UN);
+        fclose($lock);
+        return;
+    }
+    ftruncate($lock, 0);
+    rewind($lock);
+    @fwrite($lock, (string) $now);
+    fflush($lock);
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    // Belt-and-suspenders: never hand a worker to php-fpm (prints Usage, no work).
+    if ($php === '' || str_contains($php, 'php-fpm')) {
+        $php = is_executable('/usr/bin/php8.3') ? '/usr/bin/php8.3'
+            : (is_executable('/usr/bin/php') ? '/usr/bin/php' : 'php');
+    }
     $worker = __DIR__ . '/ap-quote-target-warm.php';
     if (!is_file($worker) || !is_string($php) || $php === '') {
         flock($lock, LOCK_UN);
@@ -2757,7 +2779,7 @@ function ap_quote_target_warm_async(string $objectUrl): void
     }
     $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($worker)
         . ' ' . escapeshellarg($objectUrl)
-        . ' >>/tmp/vaak-quote-warm.log 2>&1 &';
+        . ' >>/tmp/vaak-quote-warm.log 2>&1 </dev/null &';
     @exec($cmd);
     flock($lock, LOCK_UN);
     fclose($lock);

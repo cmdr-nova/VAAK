@@ -27,7 +27,10 @@ while (true) {
         if ($once) break;
         continue;
     }
-    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : PHP_BINARY;
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    if ($php === '' || str_contains($php, 'php-fpm')) {
+        $php = is_executable('/usr/bin/php8.3') ? '/usr/bin/php8.3' : '/usr/bin/php';
+    }
     $script = __DIR__ . '/' . $scripts[$queue];
     $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script) . ' --limit=20';
     @exec('nohup ' . $cmd . ' >/dev/null 2>&1 </dev/null &');

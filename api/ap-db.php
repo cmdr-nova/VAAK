@@ -22,6 +22,26 @@ function ap_feature_enabled(string $name, bool $default = true): bool
     return !in_array(strtolower(trim((string) $raw)), ['0', 'false', 'off', 'no'], true);
 }
 
+/**
+ * Absolute path to a CLI php binary for background nohup workers.
+ * Never returns php-fpm — under FPM, PHP_BINARY is the pool binary and
+ * spawning it as a worker just prints Usage: and does no work (empty-shell
+ * quote/create warm was stuck this way).
+ */
+function ap_php_cli_binary(): string
+{
+    foreach (['/usr/bin/php8.3', '/usr/bin/php', '/usr/local/bin/php'] as $cand) {
+        if (is_executable($cand)) {
+            return $cand;
+        }
+    }
+    if (defined('PHP_BINARY') && is_string(PHP_BINARY) && PHP_BINARY !== ''
+        && !str_contains(PHP_BINARY, 'php-fpm') && is_executable(PHP_BINARY)) {
+        return PHP_BINARY;
+    }
+    return 'php';
+}
+
 const AP_DB_PATH = '/var/lib/mkultra/ap/ap.sqlite';
 
 /**

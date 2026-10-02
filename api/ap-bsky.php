@@ -6166,7 +6166,11 @@ function ap_bsky_post_preview_warm_enqueue(string $url, int $ownerUserId = 0): b
         return false;
     }
     $worker = __DIR__ . '/ap-bsky-post-warm.php';
-    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : PHP_BINARY;
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    if ($php === '' || str_contains($php, 'php-fpm')) {
+        $php = is_executable('/usr/bin/php8.3') ? '/usr/bin/php8.3'
+            : (is_executable('/usr/bin/php') ? '/usr/bin/php' : 'php');
+    }
     if (!is_file($worker) || !is_string($php) || $php === '') {
         return false;
     }
