@@ -1,14 +1,14 @@
 //! Shadow notification unread badge (parity with PHP ap_masto_notifications_unread_state).
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
 use crate::config::Config;
 use crate::redis_util;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnreadState {
     pub count: i64,
     pub last_read_id: String,
@@ -16,19 +16,27 @@ pub struct UnreadState {
     pub latest_id: String,
     pub scan: i64,
     pub owner_user_id: i64,
-    pub source: &'static str,
+    pub mention_kept: i64,
+    pub mention_skipped: i64,
+    pub follow_kept: i64,
+    pub source: String,
 }
 
 pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Result<UnreadState> {
     let scan = scan.clamp(1, 80);
     let last_read = load_last_read_id(db, owner_user_id).await?;
     let owner_actor = load_owner_actor_id(db, owner_user_id).await?;
+    let owner_actor_trim = owner_actor.trim_end_matches('/').to_string();
 
     let mut ids: Vec<String> = Vec::new();
+    let mut mention_kept = 0_i64;
+    let mut mention_skipped = 0_i64;
+    let mut follow_kept = 0_i64;
 
     let mention_rows = db
         .query(
-            "SELECT id, created_at, activity_id
+            "SELECT id, created_at, activity_id, activity_type, type,
+                    object_id, owner_actor_id, actor_id, content, in_reply_to
              FROM mentions
              WHERE owner_user_id = $1 AND deleted_at IS NULL
              ORDER BY id DESC
@@ -44,30 +52,78 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
             .unwrap_or_default()
             .trim()
             .to_string();
-        if !activity_id.is_empty() && !seen_activity.insert(activity_id) {
+        if !activity_id.is_empty() && !seen_activity.insert(activity_id.clone()) {
+            mention_skipped += 1;
             continue;
         }
+
         let id: i64 = row.get(0);
         let created: Option<String> = row.try_get(1).ok().flatten();
-        ids.push(notif_id_for_row(id, created.as_deref()));
+        let activity_type: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        let obj_type: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+        let object_id: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+        let owner_actor_id: String = row.try_get::<_, Option<String>>(6)?.unwrap_or_default();
+        let actor_id: String = row.try_get::<_, Option<String>>(7)?.unwrap_or_default();
+        let content: String = row.try_get::<_, Option<String>>(8)?.unwrap_or_default();
+        let in_reply_to: String = row.try_get::<_, Option<String>>(9)?.unwrap_or_default();
+
+        let our_prefix = {
+            let o = owner_actor_id.trim_end_matches('/');
+            if o.is_empty() {
+                owner_actor_trim.as_str()
+            } else {
+                o
+            }
+        };
+
+        if mention_notif_type(
+            &activity_type,
+            &obj_type,
+            &object_id,
+            &actor_id,
+            &content,
+            &in_reply_to,
+            our_prefix,
+            &activity_id,
+        )
+        .is_none()
+        {
+            mention_skipped += 1;
+            continue;
+        }
+
+        // Snowflake type 5 = mention/fav/boost/quote row in mentions table.
+        ids.push(snowflake_id(created.as_deref(), id, 5));
+        mention_kept += 1;
     }
 
     let follow_rows = db
         .query(
-            "SELECT id, created_at FROM events
+            "SELECT id, created_at, actor_id, action_taken FROM events
              WHERE type = 'Follow'
                AND action_taken IN ('local_accept_followback', 'bsky_follow')
                AND (target_actor = $1 OR target_actor = $2)
              ORDER BY id DESC
              LIMIT 100",
-            &[&owner_actor, &format!("{owner_actor}/")],
+            &[&owner_actor_trim, &format!("{owner_actor_trim}/")],
         )
         .await
         .context("select follow events")?;
     for row in follow_rows {
         let id: i64 = row.get(0);
         let created: Option<String> = row.try_get(1).ok().flatten();
-        ids.push(notif_id_for_row(id, created.as_deref()));
+        let actor_id: String = row
+            .try_get::<_, Option<String>>(2)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        // Skip self.
+        if !actor_id.is_empty() && actor_id == owner_actor_trim {
+            continue;
+        }
+        // Snowflake type 6 = follow event.
+        ids.push(snowflake_id(created.as_deref(), id, 6));
+        follow_kept += 1;
     }
 
     // Newest-first by snowflake length then lexicographic (matches PHP).
@@ -107,8 +163,117 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         latest_id,
         scan,
         owner_user_id,
-        source: "vaak-worker-shadow",
+        mention_kept,
+        mention_skipped,
+        follow_kept,
+        source: "vaak-worker-shadow".into(),
     })
+}
+
+/// Thin port of PHP `ap_masto_mention_notif_type` — returns Some(kind) when the
+/// row should count toward the badge. Update/favourite-of-ours edge cases that
+/// need extra DB lookups are skipped (return None) for now.
+fn mention_notif_type(
+    activity_type: &str,
+    obj_type: &str,
+    object_id: &str,
+    actor_id: &str,
+    content: &str,
+    in_reply_to: &str,
+    our_prefix: &str,
+    activity_id: &str,
+) -> Option<&'static str> {
+    let activity = activity_type.to_ascii_lowercase();
+    let obj = obj_type.to_ascii_lowercase();
+    let actor = actor_id.trim_end_matches('/');
+    let our = our_prefix.trim_end_matches('/');
+
+    if object_id.contains("#webmention-") || activity == "webmention" {
+        return Some("mention");
+    }
+    if !actor.is_empty() && actor == our {
+        return None;
+    }
+
+    let is_bsky = activity_id.starts_with("at://")
+        || actor.starts_with("https://bsky.app/")
+        || object_id.starts_with("https://bsky.app/")
+        || object_id.starts_with("bsky:");
+
+    if is_bsky {
+        if activity == "like" || obj == "like" {
+            return Some("favourite");
+        }
+        if activity == "announce" || obj == "announce" {
+            return Some("reblog");
+        }
+        if activity == "quote"
+            || activity == "quotepost"
+            || obj == "quote"
+            || obj == "quotepost"
+            || object_id.contains("#quote-")
+            || content.contains('↪')
+        {
+            return Some("quote");
+        }
+        if activity == "create" || activity == "mention" || obj == "note" || !content.is_empty() {
+            return Some("mention");
+        }
+        return None;
+    }
+
+    if activity == "like" || obj == "like" || activity == "emojireact" {
+        return Some("favourite");
+    }
+    if activity == "bite" || obj == "bite" {
+        return Some("bite");
+    }
+    if activity == "announce" || obj == "announce" {
+        let our_note = object_id.starts_with(&format!("{our}/notes/"))
+            || object_id.starts_with(&format!("{our}/statuses/"));
+        return Some(if our_note { "reblog" } else { "mention" });
+    }
+    if activity == "quote"
+        || activity == "quotepost"
+        || obj == "quote"
+        || obj == "quotepost"
+        || object_id.contains("#quote-")
+    {
+        return Some("quote");
+    }
+    // Update-of-favourited needs a favourites lookup — skip in shadow for now.
+    if activity == "update" {
+        return None;
+    }
+    if matches!(
+        obj.as_str(),
+        "person" | "application" | "service" | "group"
+    ) {
+        return None;
+    }
+    if matches!(obj.as_str(), "note" | "article" | "page" | "question" | "") || !content.is_empty()
+    {
+        let reply = in_reply_to.trim_end_matches('/');
+        if !reply.is_empty() && reply.starts_with(&format!("{our}/notes/")) {
+            return Some("mention");
+        }
+        // Content @-address / post-subscription checks need more helpers; keep
+        // rows with non-empty content as mentions for badge soak.
+        if !content.is_empty() {
+            return Some("mention");
+        }
+        return None;
+    }
+    None
+}
+
+/// PHP `ap_masto_snowflake_id`: seconds * 1e9 + (type%10)*1e8 + (dbId%1e8).
+pub fn snowflake_id(created_at: Option<&str>, db_id: i64, type_num: i64) -> String {
+    let secs = created_at
+        .and_then(parse_epoch_secs)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let v = secs * 1_000_000_000 + (type_num.rem_euclid(10) * 100_000_000) + db_id.rem_euclid(100_000_000);
+    v.to_string()
 }
 
 async fn load_last_read_id(db: &Client, owner_user_id: i64) -> Result<String> {
@@ -152,23 +317,19 @@ async fn load_owner_actor_id(db: &Client, owner_user_id: i64) -> Result<String> 
     Ok("https://mkultra.monster/users/cmdr_nova".to_string())
 }
 
-fn notif_id_for_row(id: i64, created_at: Option<&str>) -> String {
-    if let Some(ts) = created_at.and_then(parse_epoch_millis) {
-        format!("{ts}{id:06}")
-    } else {
-        format!("{id}")
+fn parse_epoch_secs(s: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp());
     }
-}
-
-fn parse_epoch_millis(s: &str) -> Option<i64> {
-    if let Ok(secs) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Some(secs.timestamp_millis());
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%z") {
+        return Some(dt.timestamp());
     }
-    if let Ok(secs) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%z") {
-        return Some(secs.timestamp_millis());
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
+        return Some(dt.timestamp());
     }
-    if let Ok(secs) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
-        return Some(secs.timestamp_millis());
+    // PHP strtotime-friendly: "2026-10-02 18:52:59+00"
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%z") {
+        return Some(dt.timestamp());
     }
     None
 }
@@ -187,7 +348,12 @@ fn shadow_redis_key(owner_user_id: i64, scan: i64, last_read: &str) -> String {
     format!("vaak:shadow:notifications:v1:unread:{owner_user_id}:{scan}:{hash}")
 }
 
-pub async fn run_once(cfg: &Config, owner_user_id: i64, compare: bool) -> Result<UnreadState> {
+/// Compute + write shadow Redis; optionally include live compare payload.
+pub async fn compute_and_cache(
+    cfg: &Config,
+    owner_user_id: i64,
+    compare: bool,
+) -> Result<serde_json::Value> {
     let db = crate::db::connect(&cfg.database_url).await?;
     let state = compute_unread(&db, owner_user_id, 80).await?;
 
@@ -198,6 +364,9 @@ pub async fn run_once(cfg: &Config, owner_user_id: i64, compare: bool) -> Result
         "l": state.latest_id,
         "ts": chrono::Utc::now().timestamp(),
         "source": state.source,
+        "mention_kept": state.mention_kept,
+        "mention_skipped": state.mention_skipped,
+        "follow_kept": state.follow_kept,
     });
     let shadow_key = shadow_redis_key(owner_user_id, state.scan, &state.last_read_id);
     redis_util::json_set(&mut redis, &shadow_key, &payload, 120).await?;
@@ -206,28 +375,56 @@ pub async fn run_once(cfg: &Config, owner_user_id: i64, compare: bool) -> Result
         let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
         let live = redis_util::json_get(&mut redis, &live_key).await?;
         tracing::info!(%shadow_key, live = ?live, "notif shadow compare");
-        println!(
-            "{}",
-            serde_json::json!({
-                "shadow": state,
-                "shadow_redis_key": shadow_key,
-                "live_redis_key": live_key,
-                "live_cache": live,
-            })
-        );
+        Ok(serde_json::json!({
+            "shadow": state,
+            "shadow_redis_key": shadow_key,
+            "live_redis_key": live_key,
+            "live_cache": live,
+        }))
     } else {
-        println!("{}", serde_json::to_string_pretty(&state)?);
+        Ok(serde_json::to_value(state)?)
     }
-    Ok(state)
+}
+
+pub async fn run_once(cfg: &Config, owner_user_id: i64, compare: bool) -> Result<UnreadState> {
+    let body = compute_and_cache(cfg, owner_user_id, compare).await?;
+    println!("{}", serde_json::to_string_pretty(&body)?);
+    if let Ok(state) = serde_json::from_value::<UnreadState>(body.clone()) {
+        Ok(state)
+    } else if let Some(shadow) = body.get("shadow") {
+        Ok(serde_json::from_value(shadow.clone())?)
+    } else {
+        anyhow::bail!("unexpected notif shadow payload shape");
+    }
 }
 
 pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, compare: bool) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(5));
     loop {
         match run_once(cfg, owner_user_id, compare).await {
-            Ok(state) => tracing::info!(count = state.count, "notif shadow ok"),
+            Ok(state) => tracing::info!(
+                count = state.count,
+                latest = %state.latest_id,
+                "notif shadow ok"
+            ),
             Err(e) => tracing::error!(error = %e, "notif shadow failed"),
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snowflake_id;
+
+    #[test]
+    fn snowflake_matches_php_shape() {
+        // seconds * 1e9 + type*1e8 + dbId
+        // 2026-10-02T18:52:59Z ≈ use fixed: 1790967179 if that is the unix — we
+        // just assert structure from a known seconds value via RFC3339 parse.
+        let id = snowflake_id(Some("2026-10-02T18:52:59Z"), 1018, 5);
+        let n: i64 = id.parse().unwrap();
+        assert_eq!(n % 100_000_000, 1018);
+        assert_eq!((n % 1_000_000_000) / 100_000_000, 5);
     }
 }

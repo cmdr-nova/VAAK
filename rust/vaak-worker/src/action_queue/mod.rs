@@ -29,7 +29,7 @@ pub struct ActionQueueReport {
     pub note: &'static str,
 }
 
-pub async fn list_pending(cfg: &Config, limit: i64) -> Result<()> {
+pub async fn report(cfg: &Config, limit: i64) -> Result<ActionQueueReport> {
     let db = crate::db::connect(&cfg.database_url).await?;
     let limit = limit.clamp(1, 100);
 
@@ -74,19 +74,23 @@ pub async fn list_pending(cfg: &Config, limit: i64) -> Result<()> {
             desired_state: row.get(5),
             status: row.get(6),
             attempts: row.get(7),
-            next_attempt_at: row.try_get(8).ok(),
-            last_error: row.try_get(9).ok(),
-            updated_at: row.try_get(10).ok(),
+            next_attempt_at: row.try_get::<_, Option<String>>(8).ok().flatten(),
+            last_error: row.try_get::<_, Option<String>>(9).ok().flatten(),
+            updated_at: row.try_get::<_, Option<String>>(10).ok().flatten(),
         });
     }
 
-    let report = ActionQueueReport {
+    Ok(ActionQueueReport {
         pending: pending as usize,
         processing: processing as usize,
         sample,
         source: "vaak-worker-shadow",
         note: "Shadow mode lists only; PHP remains the claim/execute owner.",
-    };
+    })
+}
+
+pub async fn list_pending(cfg: &Config, limit: i64) -> Result<()> {
+    let report = report(cfg, limit).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
