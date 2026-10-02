@@ -9355,7 +9355,10 @@ function ap_bsky_post_embed_media_thin(array $post): bool
 
 /**
  * Re-fetch AppView embed when gallery/images cache was stripped to $type only.
- * Budgeted for timeline paint; always enqueues warm on miss/exhaustion.
+ *
+ * Default budget is 0 (enqueue warm only) so Home/soft-nav/timeline paints stay
+ * snappy. Status focus / allowFetch paths raise admin_bsky_gallery_repair_budget
+ * for a small sync getPosts burst. Exhausted budget always enqueues warm.
  *
  * @param array<string,mixed> $post
  * @return array<string,mixed>
@@ -9370,8 +9373,10 @@ function ap_bsky_repair_thin_media_embed(array $post, int $ownerUserId = 0): arr
         return $post;
     }
     $budget = &$GLOBALS['admin_bsky_gallery_repair_budget'];
+    // Timeline/soft-nav default: never block paint on AppView. Callers that need
+    // sync repair (status focus, allowFetch) must raise the budget first.
     if (!isset($budget) || !is_int($budget)) {
-        $budget = 2;
+        $budget = 0;
     }
     if ($budget < 1) {
         if (function_exists('ap_bsky_post_preview_warm_enqueue')) {
