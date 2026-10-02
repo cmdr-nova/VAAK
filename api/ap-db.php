@@ -7794,8 +7794,11 @@ function ap_is_blocked_inbox(?string $inboxUrl): bool
 
 /**
  * Remove local follow relationships and hide mentions for a new block.
+ * For block/suspend (not mute): collect following pairs first, delete locally for
+ * everyone on VAAK, then queue Undo(Follow) fan-out for Fediverse targets.
+ * Bluesky server blocks skip AP Undo (admin dual personal path unfollows on Bluesky).
  *
- * @return array{followers_removed:int,following_removed:int,mentions_hidden:int}
+ * @return array{followers_removed:int,following_removed:int,mentions_hidden:int,unfollow_queued:int,unfollow_pairs:int}
  */
 function ap_block_apply_side_effects(string $scope, string $value, string $kind = 'block'): array
 {
@@ -7803,10 +7806,34 @@ function ap_block_apply_side_effects(string $scope, string $value, string $kind 
     $followers = 0;
     $following = 0;
     $mentions = 0;
+    $unfollowQueued = 0;
+    $unfollowPairs = 0;
     $now = ap_db_now();
+    $pairs = [];
+
+    $isBskyTarget = $scope === 'actor' && (
+        str_contains(strtolower($value), 'bsky.app/profile/')
+        || str_starts_with($value, 'did:')
+    );
 
     if ($scope === 'domain') {
         if ($kind !== 'mute') {
+            try {
+                $st = $db->prepare(
+                    'SELECT owner_actor_id, actor_id FROM following
+                     WHERE host = ? OR host LIKE ?'
+                );
+                $st->execute([$value, '%.' . $value]);
+                foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                    $local = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+                    $target = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                    if ($local !== '' && $target !== '') {
+                        $pairs[] = ['local' => $local, 'target' => $target];
+                    }
+                }
+            } catch (Throwable $e) {
+                // fall through to deletes
+            }
             $st = $db->prepare('DELETE FROM followers WHERE host = ? OR host LIKE ?');
             $st->execute([$value, '%.' . $value]);
             $followers = $st->rowCount();
@@ -7822,28 +7849,91 @@ function ap_block_apply_side_effects(string $scope, string $value, string $kind 
         $st->execute([$now, 'https://' . $value . '/%', 'https://%.' . $value . '/%']);
         $mentions = $st->rowCount();
     } else {
-        $alt = str_ends_with($value, '/') ? rtrim($value, '/') : ($value . '/');
-        if ($kind !== 'mute') {
-            $st = $db->prepare('DELETE FROM followers WHERE actor_id = ?');
-            $st->execute([$value]);
+        $aliases = [$value => true];
+        $canon = rtrim($value, '/');
+        $aliases[$canon] = true;
+        $aliases[$canon . '/'] = true;
+        if (function_exists('ap_masto_actor_id_aliases')) {
+            foreach (ap_masto_actor_id_aliases($canon) as $al) {
+                $al = rtrim((string) $al, '/');
+                if ($al !== '') {
+                    $aliases[$al] = true;
+                    $aliases[$al . '/'] = true;
+                }
+            }
+        }
+        if (function_exists('ap_actor_moderation_aliases')) {
+            foreach (ap_actor_moderation_aliases($canon) as $al) {
+                $al = rtrim((string) $al, '/');
+                if ($al !== '' && str_starts_with($al, 'https://')) {
+                    $aliases[$al] = true;
+                    $aliases[$al . '/'] = true;
+                }
+            }
+        }
+        $aliasList = array_keys($aliases);
+        if ($kind !== 'mute' && $aliasList !== []) {
+            try {
+                $ph = implode(',', array_fill(0, count($aliasList), '?'));
+                $st = $db->prepare(
+                    "SELECT owner_actor_id, actor_id FROM following WHERE actor_id IN ($ph)"
+                );
+                $st->execute($aliasList);
+                foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                    $local = rtrim((string) ($row['owner_actor_id'] ?? ''), '/');
+                    $target = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                    if ($local !== '' && $target !== '') {
+                        $pairs[] = ['local' => $local, 'target' => $target];
+                    }
+                }
+            } catch (Throwable $e) {
+                // fall through
+            }
+            $ph = implode(',', array_fill(0, count($aliasList), '?'));
+            $st = $db->prepare("DELETE FROM followers WHERE actor_id IN ($ph)");
+            $st->execute($aliasList);
             $followers = $st->rowCount();
-            // also try with/without trailing slash variance
-            $db->prepare('DELETE FROM followers WHERE actor_id = ?')->execute([$alt]);
-            $st = $db->prepare('DELETE FROM following WHERE actor_id = ? OR actor_id = ?');
-            $st->execute([$value, $alt]);
+            $st = $db->prepare("DELETE FROM following WHERE actor_id IN ($ph)");
+            $st->execute($aliasList);
             $following = $st->rowCount();
         }
-        $st = $db->prepare(
-            'UPDATE mentions SET deleted_at = ? WHERE deleted_at IS NULL AND (actor_id = ? OR actor_id = ?)'
-        );
-        $st->execute([$now, $value, $alt]);
-        $mentions = $st->rowCount();
+        if ($aliasList !== []) {
+            $ph = implode(',', array_fill(0, count($aliasList), '?'));
+            $st = $db->prepare(
+                "UPDATE mentions SET deleted_at = ? WHERE deleted_at IS NULL AND actor_id IN ($ph)"
+            );
+            $st->execute(array_merge([$now], $aliasList));
+            $mentions = $st->rowCount();
+        }
+    }
+
+    $unfollowPairs = count($pairs);
+    // Fediverse Undo fan-out for everyone; skip Bluesky (no AP Undo) and mutes.
+    if ($kind !== 'mute' && !$isBskyTarget && $pairs !== []) {
+        if (!function_exists('ap_instance_unfollow_pairs_background')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            $inboxLib = __DIR__ . '/ap-inbox.php';
+            if (is_file($inboxLib)) {
+                require_once $inboxLib;
+            }
+        }
+        if (function_exists('ap_instance_unfollow_pairs_background')) {
+            $fed = ap_instance_unfollow_pairs_background($pairs);
+            $unfollowQueued = (int) ($fed['attempted'] ?? count($pairs));
+        } elseif (function_exists('ap_instance_unfollow_pairs')) {
+            $fed = ap_instance_unfollow_pairs($pairs);
+            $unfollowQueued = (int) ($fed['attempted'] ?? 0);
+        }
     }
 
     return [
         'followers_removed' => $followers,
         'following_removed' => $following,
         'mentions_hidden' => $mentions,
+        'unfollow_queued' => $unfollowQueued,
+        'unfollow_pairs' => $unfollowPairs,
     ];
 }
 
@@ -9679,24 +9769,99 @@ function ap_user_block_add(
         return ['ok' => false, 'error' => 'Could not save personal block.'];
     }
 
-    // Actor blocks federate Block + sever follows (Bridgy Fed / Mastodon-compatible).
-    // Bluesky targets skip ActivityPub Block and sync app.bsky.graph.block instead.
-    if ($scope === 'actor' && $kind === 'block') {
-        $isBskyTarget = str_contains(strtolower($value), 'bsky.app/profile/')
-            || str_starts_with($value, 'did:');
-        if (!$isBskyTarget) {
-            if (!function_exists('ap_block_remote_actor')) {
+    // Unfollow then federate Block (Bridgy Fed / Mastodon-compatible).
+    // Bluesky: unfollow + graph.block for this owner only (no fan-out to others).
+    // Domain: unfollow everyone on that host for this owner only.
+    $ownerActorId = '';
+    if (function_exists('ap_db_owner_actor_id_for_user_id')) {
+        $ownerActorId = ap_db_owner_actor_id_for_user_id($ownerUserId);
+    }
+    if ($ownerActorId === '') {
+        try {
+            $st = ap_db()->prepare('SELECT actor_id FROM ap_users WHERE id = ? LIMIT 1');
+            $st->execute([$ownerUserId]);
+            $ownerActorId = rtrim((string) ($st->fetchColumn() ?: ''), '/');
+        } catch (Throwable $e) {
+            $ownerActorId = '';
+        }
+    }
+
+    if ($kind === 'block' && $scope === 'domain' && $ownerActorId !== '') {
+        $pairs = [];
+        try {
+            $st = ap_db()->prepare(
+                'SELECT actor_id FROM following
+                 WHERE owner_actor_id = ? AND (host = ? OR host LIKE ?)'
+            );
+            $st->execute([$ownerActorId, $value, '%.' . $value]);
+            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $target) {
+                $target = rtrim((string) $target, '/');
+                if ($target !== '') {
+                    $pairs[] = ['local' => $ownerActorId, 'target' => $target];
+                }
+            }
+            ap_db()->prepare(
+                'DELETE FROM following
+                 WHERE owner_actor_id = ? AND (host = ? OR host LIKE ?)'
+            )->execute([$ownerActorId, $value, '%.' . $value]);
+            ap_db()->prepare(
+                'DELETE FROM followers
+                 WHERE owner_actor_id = ? AND (host = ? OR host LIKE ?)'
+            )->execute([$ownerActorId, $value, '%.' . $value]);
+        } catch (Throwable $e) {
+            error_log('[ap-db] user_block_add domain unfollow: ' . $e->getMessage());
+        }
+        if ($pairs !== []) {
+            if (!function_exists('ap_instance_unfollow_pairs_background')) {
                 if (!defined('AP_INBOX_LIB_ONLY')) {
                     define('AP_INBOX_LIB_ONLY', true);
                 }
                 require_once __DIR__ . '/ap-inbox.php';
             }
-            if (function_exists('ap_block_remote_actor')) {
-                $fed = ap_block_remote_actor($value);
-                $out['delivered'] = !empty($fed['delivered']);
-                if (!empty($fed['error']) && empty($fed['delivered'])) {
-                    $out['error'] = (string) $fed['error'];
+            if (function_exists('ap_instance_unfollow_pairs_background')) {
+                $out['unfollowed'] = ap_instance_unfollow_pairs_background($pairs);
+            }
+        }
+    }
+
+    if ($scope === 'actor' && $kind === 'block') {
+        $isBskyTarget = str_contains(strtolower($value), 'bsky.app/profile/')
+            || str_starts_with($value, 'did:');
+        if (!function_exists('ap_unfollow_remote_actor') || !function_exists('ap_block_remote_actor')) {
+            if (!defined('AP_INBOX_LIB_ONLY')) {
+                define('AP_INBOX_LIB_ONLY', true);
+            }
+            require_once __DIR__ . '/ap-inbox.php';
+        }
+        $ident = null;
+        if ($ownerActorId !== '' && function_exists('ap_identity_for_local_actor')) {
+            $ident = ap_identity_for_local_actor($ownerActorId);
+        }
+        if ($isBskyTarget) {
+            try {
+                if (!function_exists('ap_bsky_unfollow_actor')) {
+                    $bskyLib = __DIR__ . '/ap-bsky.php';
+                    if (is_file($bskyLib)) {
+                        require_once $bskyLib;
+                    }
                 }
+                if (function_exists('ap_bsky_unfollow_actor')) {
+                    $uf = ap_bsky_unfollow_actor($ownerUserId, $value);
+                    $out['unfollowed'] = !empty($uf['ok']);
+                }
+            } catch (Throwable $e) {
+                // ignore
+            }
+        } elseif (function_exists('ap_unfollow_remote_actor')) {
+            // Undo Follow first (while local following row may still exist).
+            $uf = ap_unfollow_remote_actor($value, null, null, $ident, false);
+            $out['unfollowed'] = !empty($uf['ok']);
+        }
+        if (!$isBskyTarget && function_exists('ap_block_remote_actor')) {
+            $fed = ap_block_remote_actor($value, $ident);
+            $out['delivered'] = !empty($fed['delivered']);
+            if (!empty($fed['error']) && empty($fed['delivered'])) {
+                $out['error'] = (string) $fed['error'];
             }
         }
         // Best-effort: also create app.bsky.graph.block when target has a DID.

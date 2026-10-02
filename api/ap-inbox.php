@@ -3543,10 +3543,16 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true, 
 /**
  * Unfollow a remote actor: send Undo(Follow) and drop local following row.
  *
+ * @param array{id?:string,key_id?:string,priv?:string}|null $ident Optional local signing identity (multi-user / fan-out).
  * @return array{ok:bool,error?:string,already?:bool}
  */
-function ap_unfollow_remote_actor(string $actorId, ?string $followActivityId = null, ?string $stableUndoId = null): array
-{
+function ap_unfollow_remote_actor(
+    string $actorId,
+    ?string $followActivityId = null,
+    ?string $stableUndoId = null,
+    ?array $ident = null,
+    bool $forceDeliver = false
+): array {
     $rawInput = trim($actorId);
     $resolved = ap_resolve_actor_ref($rawInput);
     if ($resolved === null && str_starts_with($rawInput, 'https://')) {
@@ -3556,14 +3562,27 @@ function ap_unfollow_remote_actor(string $actorId, ?string $followActivityId = n
         return ['ok' => false, 'error' => 'Could not resolve actor to unfollow'];
     }
     $targetId = rtrim($resolved, '/');
-    $ident = ap_outbound_identity();
-    $localId = $ident['id'];
+    $ident = is_array($ident) && !empty($ident['id']) && !empty($ident['key_id']) && !empty($ident['priv'])
+        ? $ident
+        : ap_outbound_identity();
+    $localId = rtrim((string) ($ident['id'] ?? ''), '/');
+    if ($localId === '' || !str_starts_with($localId, 'https://')) {
+        return ['ok' => false, 'error' => 'Not signed in as a local account'];
+    }
 
     $wantAliases = [$targetId => true];
     if (function_exists('ap_masto_actor_id_aliases')) {
         foreach (ap_masto_actor_id_aliases($targetId) as $al) {
             $al = rtrim((string) $al, '/');
             if ($al !== '') {
+                $wantAliases[$al] = true;
+            }
+        }
+    }
+    if (function_exists('ap_actor_moderation_aliases')) {
+        foreach (ap_actor_moderation_aliases($targetId) as $al) {
+            $al = rtrim((string) $al, '/');
+            if ($al !== '' && str_starts_with($al, 'https://')) {
                 $wantAliases[$al] = true;
             }
         }
@@ -3577,11 +3596,15 @@ function ap_unfollow_remote_actor(string $actorId, ?string $followActivityId = n
             break;
         }
     }
-    if (!$isFollowing) {
+    if (!$isFollowing && !$forceDeliver) {
         foreach (array_keys($wantAliases) as $a) {
             ap_following_remove($a, $localId);
         }
         return ['ok' => true, 'already' => true];
+    }
+    if (!$isFollowing && $forceDeliver) {
+        // Local row already gone (e.g. server-block side effects); still notify remote.
+        $targetId = array_key_first($wantAliases) ?: $targetId;
     }
 
     // Same-instance: drop both following + follower rows; skip remote Undo.
@@ -3600,7 +3623,18 @@ function ap_unfollow_remote_actor(string $actorId, ?string $followActivityId = n
 
     // The durable interaction worker must not mark an unfollow complete until
     // the remote Undo has been accepted. Keep local graph state for retry.
-    if (!$inbox || !str_starts_with($inbox, 'https://') || ap_is_blocked_inbox($inbox)) {
+    // forceDeliver (server-block fan-out) may target a freshly domain-blocked host.
+    if (!$inbox || !str_starts_with($inbox, 'https://')) {
+        // Still clear local following when we cannot deliver.
+        foreach (array_keys($wantAliases) as $a) {
+            ap_following_remove($a, $localId);
+        }
+        return ['ok' => false, 'error' => 'Remote inbox unavailable for Follow undo'];
+    }
+    if (!$forceDeliver && ap_is_blocked_inbox($inbox)) {
+        foreach (array_keys($wantAliases) as $a) {
+            ap_following_remove($a, $localId);
+        }
         return ['ok' => false, 'error' => 'Remote inbox unavailable for Follow undo'];
     }
     {
@@ -3715,6 +3749,98 @@ function ap_local_actors_for_instance_block_fanout(string $targetActorId): array
         // keep session actor at least
     }
     return array_keys($out);
+}
+
+/**
+ * Background Undo(Follow) fan-out for pairs collected before a server block.
+ * Job shape: { pairs: list<{local:string,target:string}>, created_at: string }
+ *
+ * @param list<array{local:string,target:string}> $pairs
+ * @return array{ok:bool,queued:bool,attempted:int,delivered:int}
+ */
+function ap_instance_unfollow_pairs_background(array $pairs): array
+{
+    $clean = [];
+    foreach ($pairs as $pair) {
+        if (!is_array($pair)) {
+            continue;
+        }
+        $local = rtrim(trim((string) ($pair['local'] ?? '')), '/');
+        $target = rtrim(trim((string) ($pair['target'] ?? '')), '/');
+        if ($local === '' || $target === ''
+            || !str_starts_with($local, 'https://mkultra.monster/users/')
+            || !str_starts_with($target, 'https://')) {
+            continue;
+        }
+        // Bluesky follows are severed via ap_bsky_unfollow_actor, not AP Undo.
+        if (str_contains(strtolower($target), 'bsky.app/profile/') || str_starts_with($target, 'did:')) {
+            continue;
+        }
+        $clean[] = ['local' => $local, 'target' => $target];
+    }
+    if ($clean === []) {
+        return ['ok' => true, 'queued' => false, 'attempted' => 0, 'delivered' => 0];
+    }
+    if (PHP_SAPI === 'cli' && defined('AP_INSTANCE_BLOCK_WORKER')) {
+        return ap_instance_unfollow_pairs($clean);
+    }
+    $dir = '/tmp/ap-instance-unfollow-jobs';
+    if (!is_dir($dir) && !@mkdir($dir, 0700, true) && !is_dir($dir)) {
+        return ap_instance_unfollow_pairs($clean);
+    }
+    $file = $dir . '/' . bin2hex(random_bytes(8)) . '.json';
+    $job = ['pairs' => $clean, 'created_at' => gmdate('c')];
+    if (@file_put_contents($file, json_encode($job, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) === false) {
+        return ap_instance_unfollow_pairs($clean);
+    }
+    @chmod($file, 0600);
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : 'php';
+    $worker = __DIR__ . '/ap-instance-unfollow-worker.php';
+    if (!is_file($worker)) {
+        @unlink($file);
+        return ap_instance_unfollow_pairs($clean);
+    }
+    $cmd = escapeshellarg($php) . ' ' . escapeshellarg($worker) . ' ' . escapeshellarg($file)
+        . ' >>/tmp/vaak-instance-unfollow.log 2>&1 &';
+    @exec($cmd);
+    return ['ok' => true, 'queued' => true, 'attempted' => count($clean), 'delivered' => 0];
+}
+
+/**
+ * @param list<array{local:string,target:string}> $pairs
+ * @return array{ok:bool,queued:bool,attempted:int,delivered:int}
+ */
+function ap_instance_unfollow_pairs(array $pairs): array
+{
+    $attempted = 0;
+    $delivered = 0;
+    foreach ($pairs as $pair) {
+        if (!is_array($pair)) {
+            continue;
+        }
+        $local = rtrim(trim((string) ($pair['local'] ?? '')), '/');
+        $target = rtrim(trim((string) ($pair['target'] ?? '')), '/');
+        if ($local === '' || $target === '') {
+            continue;
+        }
+        $ident = ap_identity_for_local_actor($local);
+        if ($ident === null) {
+            // Still drop local row if keys are missing.
+            if (function_exists('ap_following_remove')) {
+                ap_following_remove($target, $local);
+            }
+            continue;
+        }
+        $attempted++;
+        $res = ap_unfollow_remote_actor($target, null, null, $ident, true);
+        if (!empty($res['ok'])) {
+            $delivered++;
+        } elseif (function_exists('ap_following_remove')) {
+            // Ensure VAAK following list is clean even if Undo delivery failed.
+            ap_following_remove($target, $local);
+        }
+    }
+    return ['ok' => true, 'queued' => false, 'attempted' => $attempted, 'delivered' => $delivered];
 }
 
 /**
