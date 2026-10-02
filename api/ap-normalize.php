@@ -13,7 +13,8 @@
  *
  * Web render target: admin_render_masto_status_card (Home Create/Update/Announce,
  * RSS, and Bluesky feed items via admin_render_timeline_item). Thin Announces
- * without a cached Create still use remote_boost_card for AJAX hydrate.
+ * without a cached Create paint as Mastodon reblog + vaak_degraded announce_only
+ * (AJAX hydrate_boost); remote_boost_card remains a fallback dialect only.
  *
  * @see Documents/cmdr-nova/Projects/NovaLandia/Additional Fixes/10.2 Features and Fixes.md
  */
@@ -184,12 +185,25 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
     }
     $st = ap_masto_status_from_event($eventRow);
     if (is_array($st)) {
+        $evType = strtolower((string) ($eventRow['type'] ?? ''));
         if (
             function_exists('ap_normalize_status_has_visible_body')
             && !ap_normalize_status_has_visible_body($st)
         ) {
-            $st['vaak_degraded'] = true;
-            $st['vaak_degraded_reason'] = (string) ($st['vaak_degraded_reason'] ?? 'empty_shell');
+            // Announce → mark the INNER (original) status announce_only so fav /
+            // bookmark / boost keys stay on the reblog target Ice Cubes uses.
+            if ($evType === 'announce' && is_array($st['reblog'] ?? null)) {
+                $st['reblog']['vaak_degraded'] = true;
+                $st['reblog']['vaak_degraded_reason'] = (string) (
+                    $st['reblog']['vaak_degraded_reason'] ?? 'announce_only'
+                );
+                if (empty($st['vaak_announce_event_id'])) {
+                    $st['vaak_announce_event_id'] = (int) ($eventRow['id'] ?? 0) ?: null;
+                }
+            } else {
+                $st['vaak_degraded'] = true;
+                $st['vaak_degraded_reason'] = (string) ($st['vaak_degraded_reason'] ?? 'empty_shell');
+            }
         }
         return $st;
     }

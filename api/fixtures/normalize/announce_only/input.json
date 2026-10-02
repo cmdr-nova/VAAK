@@ -1,0 +1,17 @@
+{
+  "id": 900010,
+  "type": "Announce",
+  "actor_id": "https://mastodon.social/users/fixture_booster",
+  "object_id": "https://example.social/users/orig/statuses/900010",
+  "host": "mastodon.social",
+  "summary": "",
+  "media_urls": null,
+  "spoiler_text": "",
+  "sensitive": 0,
+  "visibility": "public",
+  "action_taken": "local_observe",
+  "created_at": "2026-07-01T12:30:00Z",
+  "target_actor": "https://example.social/users/orig",
+  "_allow_hidden_actor": true,
+  "_skip_announce_hydrate": true
+}

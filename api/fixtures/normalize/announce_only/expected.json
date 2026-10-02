@@ -1,0 +1,42 @@
+{
+  "uri": "https://example.social/users/orig/statuses/900010#announce-900010",
+  "content_plain": "",
+  "sensitive": false,
+  "spoiler_text": "",
+  "source": "",
+  "account": {
+    "acct": "fixture_booster@mastodon.social",
+    "username": "fixture_booster",
+    "display_name": "fixture_booster"
+  },
+  "media": [],
+  "has_visible_body": false,
+  "has_ask": false,
+  "ask_question": "",
+  "has_quote": false,
+  "has_reblog": true,
+  "vaak_rss_feed_id": null,
+  "vaak_degraded": false,
+  "vaak_degraded_reason": "",
+  "reblog": {
+    "uri": "https://example.social/users/orig/statuses/900010",
+    "content_plain": "",
+    "sensitive": false,
+    "spoiler_text": "",
+    "source": "",
+    "account": {
+      "acct": "orig@example.social",
+      "username": "orig",
+      "display_name": "orig"
+    },
+    "media": [],
+    "has_visible_body": false,
+    "has_ask": false,
+    "ask_question": "",
+    "has_quote": false,
+    "has_reblog": false,
+    "vaak_rss_feed_id": null,
+    "vaak_degraded": true,
+    "vaak_degraded_reason": "announce_only"
+  }
+}
