@@ -1,18 +1,22 @@
-# VAAK Rust workers (wave 1 — shadow mode)
+# VAAK Rust workers (wave 1–2 — shadow mode)
 
 Side-by-side Rust binaries that **mirror** hot worker paths without replacing PHP/Python.
 
 | Command | Live owner today | Rust shadow does |
 |---|---|---|
-| `notif-badge` | PHP `ajax=notif_unread` | Recompute unread state; write `vaak:shadow:notifications:…`; optional compare |
+| `notif-badge` | PHP `ajax=notif_unread` | Recompute unread (snowflake + mention type filter); write `vaak:shadow:notifications:…`; optional compare |
 | `ranked-newer` | PHP `partial=1&newer=1` | Query newer Home candidates; emit JSON for soak/parity |
 | `action-queue` | PHP `ap-action-queue-worker.php` | List pending jobs only (never claims) |
-| `jetstream-hydrate` | Python spooler + PHP ingest worker | Read-only scan of Jetstream JSONL; thin-embed repair candidates |
+| `jetstream-hydrate` | Python spooler + PHP ingest worker | Spool scan + cursors + wanted-dids + thin-media DB candidates |
+| `serve` | — | Localhost Axum: `/healthz` + `/shadow/*` |
+
+Shared freeze-contract crate: **`vaak-types`** (deserializes `api/fixtures/normalize/*/expected.json`).
 
 ## Build
 
 ```bash
 cd rust
+cargo test -p vaak-types --tests
 cargo build --release -p vaak-worker
 ```
 
@@ -34,9 +38,9 @@ Reads `/etc/mkultra/vaak.env` when present (override with `VAAK_ENV_FILE`).
 ```bash
 scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 ssh root@144.91.124.35 'chmod 755 /usr/local/bin/vaak-worker'
-# Optional unit (leave disabled until soak is deliberate):
-# scp deploy/vaak-worker-shadow.service root@…:/etc/systemd/system/
-# systemctl daemon-reload   # do NOT enable yet
+# Optional units (leave disabled until soak is deliberate):
+#   deploy/vaak-worker-shadow.service       — notif loop
+#   deploy/vaak-worker-shadow-http.service  — localhost :8787
 ```
 
 Run as `www-data` so Postgres peer auth matches PHP:
@@ -48,43 +52,28 @@ sudo -u www-data /usr/local/bin/vaak-worker <command> …
 ## Soak-test examples (safe)
 
 ```bash
-# Notification badge shadow once
-sudo -u www-data /usr/local/bin/vaak-worker notif-badge --once --owner-id 1
-
-# Compare against live Redis cache if present
 sudo -u www-data /usr/local/bin/vaak-worker notif-badge --once --owner-id 1 --compare
-
-# Home newer-poll candidate dump (last N seconds)
 sudo -u www-data /usr/local/bin/vaak-worker ranked-newer --owner-id 1 --since-secs 900
-
-# Pending action-queue rows (no claim)
 sudo -u www-data /usr/local/bin/vaak-worker action-queue --list
-
-# Jetstream spool scan (read-only; empty when spool is drained)
 sudo -u www-data /usr/local/bin/vaak-worker jetstream-hydrate --scan-once
-```
 
-Optional loop (systemd template in `deploy/vaak-worker-shadow.service` — **disabled by default**):
-
-```bash
-sudo -u www-data /usr/local/bin/vaak-worker notif-badge --loop --interval-secs 30 --owner-id 1
+# Localhost HTTP (foreground)
+sudo -u www-data /usr/local/bin/vaak-worker serve --bind 127.0.0.1:8787
+curl -s http://127.0.0.1:8787/healthz
+curl -s 'http://127.0.0.1:8787/shadow/notif?owner_id=1&compare=1'
+curl -s 'http://127.0.0.1:8787/shadow/ranked-newer?owner_id=1&since_secs=900'
+curl -s http://127.0.0.1:8787/shadow/jetstream
 ```
 
 ## Cutover rule
 
 No Rust command in this wave writes production timeline/action/Jetstream state.
 Shadow Redis keys use the `vaak:shadow:` prefix only.
+`serve` refuses non-loopback binds.
 
-## Known wave-1 gaps (expected)
+## Wave-2 notes
 
-- **notif-badge**: unread `count` should match live; `latest_id` may differ because PHP also folds likes/reblogs/quotes into the scan. Mentions + follow accepts are the shadow sources for now.
-- **ranked-newer**: candidate IDs only (no HTML/card hydrate). Useful for latency + mix parity, not a drop-in for `newer=1` HTML.
-- **jetstream-hydrate**: reports empty when `incoming/` + `processing/` are drained (normal under healthy shards). Does not rewrite cursors or spool files.
-- **action-queue**: inspect-only. Claiming stays in PHP.
-
-## First prod smoke (2026-10-02)
-
-- `notif-badge --compare`: count matched live Redis (`c=0`); wrote `vaak:shadow:notifications:…`
-- `ranked-newer --since-secs 900`: ~150ms, returned follow-event candidates
-- `action-queue --list`: pending/processing counts OK
-- `jetstream-hydrate --scan-once`: OK against empty drained spool; wrote `vaak:shadow:jetstream:last_scan`
+- **notif-badge**: PHP snowflake (`sec*1e9 + type*1e8 + dbId`) + thin `mention_notif_type` port (likes/reblogs/quotes/bites/mentions; skips Update-of-favourite and hidden-actor lookups). Prod smoke: `latest_id` matched live Redis.
+- **jetstream-hydrate**: reports shard cursors, wanted-dids count, spool depths, and `bsky_posts` thin-media DB candidates even when the JSONL spool is drained.
+- **serve**: Axum on `127.0.0.1:8787` only.
+- **vaak-types**: freeze projection for normalize fixtures; `cargo test -p vaak-types --tests` round-trips all `expected.json` cases.

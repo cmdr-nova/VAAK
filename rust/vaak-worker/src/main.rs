@@ -1,21 +1,24 @@
-//! VAAK wave-1 Rust workers — shadow mode only.
+//! VAAK wave-1/2 Rust workers — shadow mode only.
 //!
 //! Live owners remain PHP/Python. These commands mirror hot paths for soak/parity.
 
 mod action_queue;
 mod config;
 mod db;
+mod http;
 mod jetstream;
 mod notif;
 mod ranked;
 mod redis_util;
+
+use std::net::SocketAddr;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "vaak-worker", about = "VAAK shadow-mode Rust workers (wave 1)")]
+#[command(name = "vaak-worker", about = "VAAK shadow-mode Rust workers (wave 1–2)")]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -60,6 +63,11 @@ enum Command {
         max_files: usize,
         #[arg(long, default_value_t = 25)]
         max_thin: usize,
+    },
+    /// Localhost Axum shadow HTTP (/healthz + /shadow/*).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
     },
 }
 
@@ -114,6 +122,10 @@ async fn main() -> Result<()> {
             max_thin,
         } => {
             jetstream::scan_once(&cfg, max_files, max_thin).await?;
+        }
+        Command::Serve { bind } => {
+            let addr: SocketAddr = bind.parse()?;
+            http::serve(cfg, addr).await?;
         }
     }
     Ok(())

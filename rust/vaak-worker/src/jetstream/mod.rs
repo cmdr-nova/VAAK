@@ -1,4 +1,4 @@
-//! Read-only Jetstream spool scanner + thin-embed repair candidate finder.
+//! Read-only Jetstream spool scanner + cursor/wanted-dids + thin-media DB check.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -19,16 +19,24 @@ pub struct SpoolReport {
     pub lines_bad: usize,
     pub by_collection: HashMap<String, usize>,
     pub thin_media_candidates: Vec<String>,
+    pub thin_media_db: Vec<String>,
     pub sample_dids: Vec<String>,
+    pub cursors: HashMap<String, String>,
+    pub wanted_dids_count: usize,
+    pub incoming_count: usize,
+    pub processing_count: usize,
     pub source: &'static str,
     pub note: &'static str,
 }
 
-pub async fn scan_once(cfg: &Config, max_files: usize, max_thin: usize) -> Result<()> {
+pub async fn report_once(cfg: &Config, max_files: usize, max_thin: usize) -> Result<SpoolReport> {
     let incoming = cfg.jetstream_state.join("incoming");
     let processing = cfg.jetstream_state.join("processing");
     let mut files = list_jsonl(&incoming).await?;
-    files.extend(list_jsonl(&processing).await?);
+    let incoming_count = files.len();
+    let mut processing_files = list_jsonl(&processing).await?;
+    let processing_count = processing_files.len();
+    files.append(&mut processing_files);
     files.sort();
     if files.len() > max_files {
         files.truncate(max_files);
@@ -36,10 +44,16 @@ pub async fn scan_once(cfg: &Config, max_files: usize, max_thin: usize) -> Resul
 
     let mut report = SpoolReport {
         state_dir: cfg.jetstream_state.display().to_string(),
+        incoming_count,
+        processing_count,
         source: "vaak-worker-shadow",
         note: "Read-only scan. Python spooler + PHP ingest remain live owners.",
         ..SpoolReport::default()
     };
+
+    report.cursors = read_cursors(&cfg.jetstream_state).await?;
+    report.wanted_dids_count =
+        count_wanted_dids(&cfg.jetstream_state.join("wanted-dids.json")).await?;
 
     let mut did_set = std::collections::BTreeSet::new();
 
@@ -88,15 +102,98 @@ pub async fn scan_once(cfg: &Config, max_files: usize, max_thin: usize) -> Resul
 
     report.sample_dids = did_set.into_iter().collect();
 
-    // Publish a short shadow summary for soak dashboards.
+    if let Ok(db) = crate::db::connect(&cfg.database_url).await {
+        match find_thin_media_db(&db, max_thin).await {
+            Ok(uris) => report.thin_media_db = uris,
+            Err(e) => tracing::warn!(error = %e, "thin media DB scan skipped"),
+        }
+    }
+
     if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
         let key = "vaak:shadow:jetstream:last_scan";
         let payload = serde_json::to_value(&report)?;
         let _ = redis_util::json_set(&mut redis, key, &payload, 600).await;
     }
 
+    Ok(report)
+}
+
+pub async fn scan_once(cfg: &Config, max_files: usize, max_thin: usize) -> Result<()> {
+    let report = report_once(cfg, max_files, max_thin).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+async fn read_cursors(state_dir: &Path) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    if !state_dir.is_dir() {
+        return Ok(out);
+    }
+    let mut rd = fs::read_dir(state_dir).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cursor") {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(&path).await.unwrap_or_default();
+        out.insert(name.to_string(), raw.trim().to_string());
+    }
+    Ok(out)
+}
+
+async fn count_wanted_dids(path: &Path) -> Result<usize> {
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let raw = fs::read_to_string(path).await?;
+    let v: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    Ok(match v {
+        Value::Array(a) => a.len(),
+        Value::Object(o) => o
+            .get("dids")
+            .and_then(|x| x.as_array())
+            .map(|a| a.len())
+            .unwrap_or(o.len()),
+        _ => 0,
+    })
+}
+
+async fn find_thin_media_db(db: &tokio_postgres::Client, limit: usize) -> Result<Vec<String>> {
+    let limit = limit.clamp(1, 50) as i64;
+    // embed_json media-ish, raw_json missing fullsize/playlist (AppView view URLs).
+    let rows = db
+        .query(
+            "SELECT bsky_uri FROM bsky_posts
+             WHERE embed_json IS NOT NULL
+               AND (
+                 embed_json ILIKE '%images%'
+                 OR embed_json ILIKE '%video%'
+                 OR embed_json ILIKE '%recordWithMedia%'
+               )
+               AND (
+                 raw_json IS NULL
+                 OR (
+                   raw_json NOT ILIKE '%fullsize%'
+                   AND raw_json NOT ILIKE '%playlist%'
+                 )
+               )
+             ORDER BY indexed_at DESC NULLS LAST
+             LIMIT $1",
+            &[&limit],
+        )
+        .await
+        .context("thin media db")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let uri: String = row.get(0);
+        out.push(uri);
+    }
+    Ok(out)
 }
 
 async fn list_jsonl(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -129,7 +226,6 @@ fn thin_media_uri(event: &Value) -> Option<String> {
     if !looks_media {
         return None;
     }
-    // Jetstream commit records usually have blobs, not AppView view URLs.
     let did = event.get("did")?.as_str()?;
     let rkey = event.pointer("/commit/rkey")?.as_str()?;
     Some(format!("at://{did}/app.bsky.feed.post/{rkey}"))

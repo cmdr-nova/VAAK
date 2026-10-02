@@ -211,10 +211,19 @@ fn parse_ts(s: &str) -> Option<i64> {
     None
 }
 
-pub async fn run(cfg: &Config, owner_user_id: i64, since_secs: i64, limit: i64) -> Result<()> {
+pub async fn fetch_report(
+    cfg: &Config,
+    owner_user_id: i64,
+    since_secs: i64,
+    limit: i64,
+) -> Result<NewerReport> {
     let db = crate::db::connect(&cfg.database_url).await?;
     let since_ts = (Utc::now() - Duration::seconds(since_secs.max(60))).timestamp();
-    let report = fetch_newer_home(&db, owner_user_id, since_ts, limit).await?;
+    fetch_newer_home(&db, owner_user_id, since_ts, limit).await
+}
+
+pub async fn run(cfg: &Config, owner_user_id: i64, since_secs: i64, limit: i64) -> Result<()> {
+    let report = fetch_report(cfg, owner_user_id, since_secs, limit).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

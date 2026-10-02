@@ -1,0 +1,33 @@
+# Optional localhost Axum shadow HTTP for wave-2 soak.
+# Does NOT replace PHP. Install manually when ready:
+#   cp deploy/vaak-worker-shadow-http.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now vaak-worker-shadow-http.service
+#
+# Binds 127.0.0.1:8787 only. Endpoints:
+#   GET /healthz
+#   GET /shadow/notif?owner_id=1&compare=1
+#   GET /shadow/ranked-newer?owner_id=1&since_secs=900
+#   GET /shadow/action-queue
+#   GET /shadow/jetstream
+
+[Unit]
+Description=VAAK Rust shadow HTTP (localhost Axum)
+After=network.target postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker serve --bind 127.0.0.1:8787
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
