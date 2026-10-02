@@ -265,6 +265,14 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
     }
     $post = is_array($postOrItem['post'] ?? null) ? $postOrItem['post'] : $postOrItem;
     $reason = is_array($postOrItem['reason'] ?? null) ? $postOrItem['reason'] : null;
+    // Repair gallery/images embeds that compact previously stripped to $type-only.
+    if (function_exists('ap_bsky_repair_thin_media_embed')) {
+        $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        $post = ap_bsky_repair_thin_media_embed($post, $ownerId);
+        if (is_array($postOrItem['post'] ?? null)) {
+            $postOrItem['post'] = $post;
+        }
+    }
     if (!function_exists('ap_masto_bsky_trend_status')) {
         require_once __DIR__ . '/ap-masto-entities.php';
     }
@@ -277,11 +285,49 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
     }
     if (!isset($st['bsky_post'])) {
         $st['bsky_post'] = $post;
+    } else {
+        $st['bsky_post'] = $post;
     }
     $st['source'] = 'bluesky';
     $st['bsky_cid'] = (string) ($post['cid'] ?? ($st['bsky_cid'] ?? ''));
     if (isset($postOrItem['_vaak_feed_source'])) {
         $st['vaak_feed_source'] = (string) $postOrItem['_vaak_feed_source'];
+    }
+    // Bluesky external link embeds → Mastodon preview card for shared paint.
+    if (
+        empty($st['card'])
+        && empty($st['media_attachments'])
+        && is_array($post['embed'] ?? null)
+    ) {
+        $emb = $post['embed'];
+        $embType = (string) ($emb['$type'] ?? '');
+        $ext = null;
+        if (str_contains($embType, 'external') && is_array($emb['external'] ?? null)) {
+            $ext = $emb['external'];
+        } elseif (
+            str_contains($embType, 'recordWithMedia')
+            && is_array($emb['media']['external'] ?? null)
+        ) {
+            $ext = $emb['media']['external'];
+        }
+        if (is_array($ext)) {
+            $extUri = trim((string) ($ext['uri'] ?? ''));
+            if ($extUri !== '' && preg_match('#^https?://#i', $extUri)) {
+                $host = parse_url($extUri, PHP_URL_HOST);
+                $st['card'] = [
+                    'url' => $extUri,
+                    'title' => trim((string) ($ext['title'] ?? '')) !== ''
+                        ? trim((string) $ext['title'])
+                        : (is_string($host) ? $host : $extUri),
+                    'description' => mb_substr(trim((string) ($ext['description'] ?? '')), 0, 280),
+                    'image' => trim((string) ($ext['thumb'] ?? '')) !== ''
+                        ? trim((string) $ext['thumb'])
+                        : null,
+                    'type' => 'link',
+                    'provider_name' => is_string($host) ? strtolower($host) : '',
+                ];
+            }
+        }
     }
     // Structured reply parent for shared-card ↩ reply to chrome (handle + snippet).
     if (
