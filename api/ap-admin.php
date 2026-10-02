@@ -17529,10 +17529,13 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php if ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
         <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
       <?php elseif (in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)
+          && is_array($nStatus)
+          && admin_notif_try_embed_status_card($nStatus, $followingIds)): ?>
+        <?php /* Shared status card nested under the notif header. */ ?>
+      <?php elseif (in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)
           && ($nSnippet !== '' || $nMedia !== [] || $nStatusUri !== '')): ?>
         <?php
-          // Media-only posts often store empty HTML / "(media)" sentinel. Still show
-          // a "Your post" preview card so likes/boosts are identifiable.
+          // Media-only / empty-shell fallback when normalize has no visible body.
           $nPreviewLabel = $snipShow;
           if ($nPreviewLabel === '' || in_array($nPreviewLabel, ['(media)', '(attachment)', '(poll)', '(quote)'], true)) {
               $nPreviewLabel = $nMedia !== [] ? '📷 media post' : 'your post';
@@ -17738,6 +17741,37 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
 }
 
 /**
+ * Nest the shared Mastodon status card under a Mentions header when the
+ * underlying status has a visible body/media. Falls back to the legacy
+ * quote-block preview when the status is empty or converters failed.
+ *
+ * @param array<string,mixed>|null $status
+ * @param array<int|string,mixed> $followingIds
+ */
+function admin_notif_try_embed_status_card(?array $status, array $followingIds): bool
+{
+    if (!is_array($status) || $status === []) {
+        return false;
+    }
+    if (!function_exists('admin_render_masto_status_card')) {
+        return false;
+    }
+    if (function_exists('ap_normalize_status')) {
+        $status = ap_normalize_status($status);
+    }
+    if (
+        function_exists('ap_normalize_status_has_visible_body')
+        && !ap_normalize_status_has_visible_body($status)
+    ) {
+        return false;
+    }
+    echo '<div class="notif-status-embed">';
+    admin_render_masto_status_card($status, $followingIds, 'mentions', false, true);
+    echo '</div>';
+    return true;
+}
+
+/**
  * Group repeated like/boost notifications for the VAAK Notifications view.
  * The underlying notification rows remain unchanged; this is presentation
  * only and therefore cannot affect unread IDs, moderation, or pagination.
@@ -17838,8 +17872,9 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
                 break;
             }
         }
-        // Media-only posts have empty body — still show a Your-post preview card.
-        if ($snippet !== '' || $media !== [] || $statusUrl !== '') {
+        // Prefer nested shared status card; fall back to thin Your-post preview.
+        $embedded = admin_notif_try_embed_status_card($status !== [] ? $status : null, $followingIds);
+        if (!$embedded && ($snippet !== '' || $media !== [] || $statusUrl !== '')) {
             if ($snippet !== '') {
                 if (function_exists('mb_substr') && function_exists('mb_strlen')) {
                     $snippet = mb_strlen($snippet) > 280 ? (mb_substr($snippet, 0, 280) . '…') : $snippet;
@@ -17862,7 +17897,7 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
             }
             echo '</div>';
         }
-        if ($statusUrl !== '') {
+        if ($statusUrl !== '' && !$embedded) {
             echo '<div class="tweet-actions"><a class="btn btn-ghost" href="' . h(admin_status_href($statusUrl, 'mentions')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a></div>';
         }
         echo '</article>';
@@ -19622,6 +19657,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .tweet-notif-like .quote-block,
     .tweet-notif-boost .quote-block {
       margin-top: .55rem;
+    }
+    /* Nested shared status card under Mentions like/boost headers. */
+    .tweet-notif .notif-status-embed {
+      margin: .55rem 0 .15rem;
+      padding: .15rem 0 0;
+      border-top: 1px solid var(--border);
+    }
+    .tweet-notif .notif-status-embed > article.tweet {
+      border: 0;
+      background: transparent;
+      padding: .55rem 0 0;
+      margin: 0;
+      content-visibility: visible;
+    }
+    .tweet-notif .notif-status-embed > article.tweet:hover {
+      background: transparent;
     }
     /* Notification cards mix icon-only actions with text links. Keep their
        controls on one visual baseline, including compact Profile/Open links. */
