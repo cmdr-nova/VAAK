@@ -1251,6 +1251,9 @@ function ap_masto_status_from_as2_note(array $note, string $fallbackUrl): ?array
             'current_user' => 'automatic',
         ],
     ];
+    return function_exists('ap_normalize_status')
+        ? ap_normalize_status($status)
+        : $status;
 }
 
 /** Stable public status id for a remote/local object URL (quote embeds). */
@@ -4193,7 +4196,10 @@ function ap_masto_status_from_mention(array $row): array
             'current_user' => 'automatic',
         ],
     ];
-    return ap_masto_apply_interaction_flags($status);
+    $status = ap_masto_apply_interaction_flags($status);
+    return function_exists('ap_normalize_status')
+        ? ap_normalize_status($status)
+        : $status;
 }
 
 /**
@@ -9106,7 +9112,13 @@ function ap_masto_bsky_trend_status(array $post): ?array
         'source' => 'bluesky',
         'author_did' => $did,
         'trend_actors' => [$did],
+        'bsky_post' => $post,
+        'sensitive' => false,
+        'spoiler_text' => '',
     ];
+    return function_exists('ap_normalize_status')
+        ? ap_normalize_status($status)
+        : $status;
 }
 
 /**

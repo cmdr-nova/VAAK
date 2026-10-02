@@ -13698,8 +13698,32 @@ function admin_render_masto_status_card(
         ? admin_account_actor_ref(is_array($st['account'] ?? null) ? $st['account'] : [])
         : (string) ($st['account']['uri'] ?? $st['account']['url'] ?? '');
     $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
+    $sidEarly = (string) ($st['id'] ?? '');
+    $isRss = !empty($st['vaak_rss_item_id'])
+        || (!empty($st['source']) && (string) $st['source'] === 'rss')
+        || str_starts_with($sidEarly, 'rss:');
+    $rssItemId = $isRss
+        ? (int) ($st['vaak_rss_item_id'] ?? 0)
+        : 0;
+    if ($isRss && $rssItemId < 1 && function_exists('ap_rss_parse_local_status_id')) {
+        $rssItemId = ap_rss_parse_local_status_id($sidEarly);
+    }
+    $rssFeedId = $isRss ? (int) ($st['vaak_rss_feed_id'] ?? 0) : 0;
+    if ($isRss && $rssFeedId < 1) {
+        $acctId = (string) ($st['account']['id'] ?? '');
+        if (preg_match('/^rss-feed:([1-9][0-9]*)$/', $acctId, $mRssFeed)) {
+            $rssFeedId = (int) $mRssFeed[1];
+        }
+    }
+    $rssAvatar = '';
+    if ($isRss) {
+        $avCand = trim((string) ($st['account']['avatar'] ?? $st['account']['avatar_static'] ?? ''));
+        if ($avCand !== '' && preg_match('#^https?://#i', $avCand)) {
+            $rssAvatar = $avCand;
+        }
+    }
     $plain = admin_html_to_plain((string) ($st['content'] ?? ''));
-    $isLocalEarly = $uri !== '' && vaak_is_own_url($uri);
+    $isLocalEarly = !$isRss && $uri !== '' && vaak_is_own_url($uri);
     // Local posts: prefer stored plain text so blank lines match compose / remotes
     if ($isLocalEarly) {
         try {
@@ -13746,16 +13770,26 @@ function admin_render_masto_status_card(
             'preview_url' => str_starts_with($preview, 'https://') ? $preview : null,
         ];
     }
-    $following = $actorRef !== '' && admin_is_following($followingIds, $actorRef);
+    $following = !$isRss && $actorRef !== '' && admin_is_following($followingIds, $actorRef);
     $sid = (string) ($st['id'] ?? '');
-    $fav = ($sid !== '' || $uri !== '') && function_exists('ap_masto_status_is_favourited')
-        && ap_masto_status_is_favourited($sid, null, $uri !== '' ? $uri : null);
-    $boosted = $sid !== '' && function_exists('ap_masto_status_is_reblogged') && ap_masto_status_is_reblogged($sid);
-    $bm = ($sid !== '' || $uri !== '') && function_exists('ap_masto_status_is_bookmarked')
-        && ap_masto_status_is_bookmarked($sid, null, $uri !== '' ? $uri : null);
-    $isLocal = $uri !== '' && vaak_is_own_url($uri);
+    $favObject = $isRss ? ($sid !== '' ? $sid : null) : ($uri !== '' ? $uri : null);
+    $fav = ($sid !== '' || $favObject !== null) && function_exists('ap_masto_status_is_favourited')
+        && ap_masto_status_is_favourited($sid, null, $favObject);
+    $boosted = !$isRss && $sid !== '' && function_exists('ap_masto_status_is_reblogged') && ap_masto_status_is_reblogged($sid);
+    $bm = ($sid !== '' || $favObject !== null) && function_exists('ap_masto_status_is_bookmarked')
+        && ap_masto_status_is_bookmarked($sid, null, $favObject);
+    $isLocal = !$isRss && $uri !== '' && vaak_is_own_url($uri);
     $cwSpoiler = trim((string) ($st['spoiler_text'] ?? ''));
     $cwSensitive = !empty($st['sensitive']) || $cwSpoiler !== '';
+    $rssRankAttrs = '';
+    if ($isRss && $rssItemId > 0 && $rssFeedId > 0) {
+        $rssRankAttrs = admin_home_rank_tracking_attrs('rss', 'rss:item:' . $rssItemId, 'rss:feed:' . $rssFeedId);
+    }
+    $rssHost = '';
+    if ($isRss && $uri !== '' && preg_match('#^https?://#i', $uri)) {
+        $hRss = parse_url($uri, PHP_URL_HOST);
+        $rssHost = is_string($hRss) ? strtolower($hRss) : '';
+    }
 
     // Ask answers (local + remote Wafrn): question via vaak_ask / ap_asks / mentions.
     // Always paint the canonical Ask card above the answer body.
@@ -13928,6 +13962,7 @@ function admin_render_masto_status_card(
         && $uri !== ''
         && str_starts_with($uri, 'https://')
         && !$isLocal
+        && !$isRss
     ) {
         $bodyInner = '<div class="body feed-body meta">'
             . 'This post isn’t cached with text or media on VAAK yet '
@@ -13941,32 +13976,52 @@ function admin_render_masto_status_card(
         $actionBase = '?view=status&object=' . rawurlencode($uri) . '&from=search';
     }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= $boostHeader !== '' ? ' tweet-boost' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $rssRankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
             <div class="tweet-hd">
-              <?php if ($actorRef !== '' && !$isLocal): ?>
+              <?php if ($isRss): ?>
+                <?php
+                  $rssFallbackAv = defined('AP_REMOTE_AVATAR_FALLBACK')
+                      ? AP_REMOTE_AVATAR_FALLBACK
+                      : 'https://mkultra.monster/img/avatar/default.jpg';
+                  $rssAvSrc = $rssAvatar !== '' ? $rssAvatar : $rssFallbackAv;
+                ?>
+                <img class="tweet-av" src="<?= h($rssAvSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($rssFallbackAv) ?>'" title="<?= h($display) ?>">
+              <?php elseif ($actorRef !== '' && !$isLocal): ?>
                 <a href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="text-decoration:none"><?= admin_avatar_img($actorRef) ?></a>
               <?php else: ?>
                 <?= admin_avatar_img($isLocal ? vaak_actor_id() : ($actorRef !== '' ? $actorRef : null)) ?>
               <?php endif; ?>
-              <div class="tweet-hd-main tweet-hd-main--fedi">
+              <div class="tweet-hd-main<?= $isRss ? '' : ' tweet-hd-main--fedi' ?>">
                 <div>
-                  <?php if ($actorRef !== '' && !$isLocal): ?>
+                  <?php if ($isRss): ?>
+                    <span class="who"><?= h($display !== '' ? $display : 'RSS') ?></span>
+                    <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
+                    <span class="tag" title="From an RSS/Atom feed you added">RSS</span>
+                  <?php elseif ($actorRef !== '' && !$isLocal): ?>
                     <a class="who" href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?></a>
                     <a class="meta" href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($acct) ?></a>
+                    <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
+                    <?php if (!empty($st['edited_at'])): ?>
+                      <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
+                    <?php endif; ?>
+                    <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
+                    <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php else: ?>
                     <span class="who"><?= admin_emoji_html($display, $actorRef !== '' ? $actorRef : null) ?></span>
                     <?php if ($acct !== ''): ?><span class="meta"> @<?= h($acct) ?></span><?php endif; ?>
+                    <?php if ($isLocal): ?><span class="tag" style="margin-left:.35rem">you</span><?php endif; ?>
+                    <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
+                    <?php if (!empty($st['edited_at'])): ?>
+                      <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
+                    <?php endif; ?>
+                    <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
+                    <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                   <?php endif; ?>
-                  <?php if ($isLocal): ?><span class="tag" style="margin-left:.35rem">you</span><?php endif; ?>
-                  <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
-                  <?php if (!empty($st['edited_at'])): ?>
-                    <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
-                  <?php endif; ?>
-                  <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
-                  <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
                 </div>
-                <?php if ($stVis['key'] !== 'public'): ?>
+                <?php if ($isRss && $rssHost !== ''): ?>
+                  <div class="meta"><?= h($rssHost) ?></div>
+                <?php elseif (!$isRss && (($stVis['key'] ?? 'public') !== 'public')): ?>
                   <div class="meta"><span class="tag" title="Audience"><?= h($stVis['label']) ?></span></div>
                 <?php endif; ?>
               </div>
@@ -13975,7 +14030,45 @@ function admin_render_masto_status_card(
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($isLocal && $uri !== ''): ?>
+              <?php if ($isRss): ?>
+                <?php
+                  $rssOverflow = '';
+                  if ($uri !== '' && preg_match('#^https?://#i', $uri)) {
+                      $rssOverflow .= '<a class="menu-action" href="' . h($uri) . '" target="_blank" rel="noopener noreferrer">Open</a>';
+                  }
+                  if ($rssFeedId > 0) {
+                      $rssOverflow .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Remove this RSS feed from your Home mix?\');">'
+                          . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
+                          . '<input type="hidden" name="action" value="rss_remove_feed">'
+                          . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+                          . '<input type="hidden" name="feed_id" value="' . (int) $rssFeedId . '">'
+                          . '<button class="menu-action" type="submit" style="color:var(--danger)">Remove feed</button>'
+                          . '</form>';
+                  }
+                ?>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($sid) ?>">
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                </form>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($sid) ?>">
+                  <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                </form>
+                <?php if ($rssOverflow !== ''): ?>
+                  <details class="post-action-menu">
+                    <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
+                    <div class="post-action-menu__body"><?= $rssOverflow ?></div>
+                  </details>
+                <?php endif; ?>
+              <?php elseif ($isLocal && $uri !== ''): ?>
                 <?php
                   $editPlain = $plain;
                   $editSpoiler = $cwSpoiler;
@@ -14367,6 +14460,26 @@ function admin_render_remote_boost_card(
               } else {
                   $boostSpoiler = trim((string) ($e['spoiler_text'] ?? ''));
                   $boostSensitive = !empty($e['sensitive']) || $boostSpoiler !== '';
+              }
+              // Bluesky labels often never land on Bridgy Create.sensitive — match focus CW.
+              if (
+                  !$boostSensitive
+                  && $objectId !== ''
+                  && function_exists('ap_bsky_at_uri_from_any_url')
+                  && function_exists('ap_bsky_post_item_by_uri')
+                  && function_exists('ap_bsky_post_is_sensitive')
+              ) {
+                  $boostAt = ap_bsky_at_uri_from_any_url($objectId);
+                  if (is_string($boostAt) && $boostAt !== '') {
+                      $boostBskyItem = ap_bsky_post_item_by_uri($boostAt);
+                      $boostBskyPost = is_array($boostBskyItem['post'] ?? null) ? $boostBskyItem['post'] : null;
+                      if (is_array($boostBskyPost) && ap_bsky_post_is_sensitive($boostBskyPost)) {
+                          $boostSensitive = true;
+                          if ($boostSpoiler === '') {
+                              $boostSpoiler = 'Sensitive content';
+                          }
+                      }
+                  }
               }
               echo admin_cw_gate_html($boostSpoiler, $boostSensitive, $boostInner);
             ?>
@@ -15511,17 +15624,48 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
     if ($kind === 'rss') {
         $row = is_array($item['row'] ?? null) ? $item['row'] : [];
         if ($row !== []) {
+            // 10.2: RSS Home → normalized Mastodon status → shared card.
+            if (
+                function_exists('ap_normalize_from_rss_item')
+                && function_exists('admin_render_masto_status_card')
+            ) {
+                $st = ap_normalize_from_rss_item($row);
+                if (is_array($st)) {
+                    admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+                    return;
+                }
+            }
             admin_render_rss_item($row, $returnView);
         }
         return;
     }
+    $row = is_array($item['row'] ?? null) ? $item['row'] : [];
     $fromTag = !empty($item['from_tag']) || !empty($item['row']['_from_followed_tag']);
-    admin_render_event_tweet($item['row'], $followingIds, $returnView, $fromTag);
+    // 10.2: Create/Update firehose → normalized Mastodon status → shared card.
+    // Announce keeps remote_boost_card (thin-boost hydrate AJAX).
+    $evType = strtolower((string) ($row['type'] ?? 'create'));
+    if (
+        $row !== []
+        && in_array($evType, ['create', 'update'], true)
+        && function_exists('ap_normalize_from_activitypub_event')
+        && function_exists('admin_render_masto_status_card')
+    ) {
+        $st = ap_normalize_from_activitypub_event($row);
+        if (is_array($st)) {
+            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            return;
+        }
+    }
+    if ($row !== []) {
+        admin_render_event_tweet($row, $followingIds, $returnView, $fromTag);
+        return;
+    }
+    admin_render_event_tweet($item['row'] ?? [], $followingIds, $returnView, $fromTag);
 }
 
 /**
- * Home/RSS card: feed title as display name (no @handle), favicon avatar,
- * favourite/bookmark/boost/quote via materialize — no reply.
+ * RSS Home / library card via normalizer → shared Mastodon status card.
+ * Keeps the old entry point for bookmarks/favourites callers.
  *
  * @param array<string,mixed> $row
  */
@@ -15531,152 +15675,23 @@ function admin_render_rss_item(array $row, string $returnView): void
     if ($itemId < 1) {
         return;
     }
-    $feedId = (int) ($row['feed_id'] ?? 0);
-    $feedTitle = function_exists('ap_rss_display_title')
-        ? ap_rss_display_title((string) ($row['feed_title'] ?? ''))
-        : trim((string) ($row['feed_title'] ?? ''));
-    if ($feedTitle === '') {
-        $feedTitle = 'RSS';
+    if (function_exists('ap_normalize_from_rss_item') && function_exists('admin_render_masto_status_card')) {
+        $st = ap_normalize_from_rss_item($row);
+        if (is_array($st)) {
+            admin_render_masto_status_card($st, [], $returnView, false, true);
+            return;
+        }
     }
-    $favicon = trim((string) ($row['feed_favicon'] ?? ''));
-    $title = trim((string) ($row['title'] ?? ''));
-    $summaryRaw = trim((string) ($row['summary_text'] ?? ''));
-    $summary = function_exists('ap_rss_display_summary')
-        ? ap_rss_display_summary($summaryRaw)
-        : $summaryRaw;
-    if ($summary !== '') {
-        $summary = mb_strimwidth($summary, 0, 360, '…', 'UTF-8');
-    }
+    // Fallback if normalize/card unavailable: open article link only.
     $url = trim((string) ($row['url'] ?? ''));
-    $image = trim((string) ($row['image_url'] ?? ''));
-    if ($image !== '' && function_exists('ap_rss_upgrade_image_url')) {
-        $image = ap_rss_upgrade_image_url($image);
+    $title = trim((string) ($row['title'] ?? ''));
+    echo '<article class="tweet" data-rss-item="' . $itemId . '">';
+    echo '<div class="body feed-body">' . htmlspecialchars($title !== '' ? $title : 'RSS item', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';
+    if ($url !== '' && preg_match('#^https?://#i', $url)) {
+        echo '<div class="meta"><a href="' . htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . '" target="_blank" rel="noopener noreferrer">Open</a></div>';
     }
-    $published = (string) ($row['published_at'] ?? ($row['ingested_at'] ?? ''));
-    $host = '';
-    if ($url !== '') {
-        $h = parse_url($url, PHP_URL_HOST);
-        $host = is_string($h) ? strtolower($h) : '';
-    }
-    $fallbackAv = defined('AP_REMOTE_AVATAR_FALLBACK')
-        ? AP_REMOTE_AVATAR_FALLBACK
-        : 'https://mkultra.monster/img/avatar/default.jpg';
-    $avSrc = ($favicon !== '' && preg_match('#^https?://#i', $favicon)) ? $favicon : $fallbackAv;
-
-    $statusId = function_exists('ap_rss_local_status_id') ? ap_rss_local_status_id($itemId) : ('rss:' . $itemId);
-    $fav = function_exists('ap_masto_status_is_favourited')
-        && ap_masto_status_is_favourited($statusId, null, $statusId);
-    $bm = function_exists('ap_masto_status_is_bookmarked')
-        && ap_masto_status_is_bookmarked($statusId, null, $statusId);
-
-    // Image-heavy items (Reddit photo posts, short-caption feeds) use the same
-    // media-row/lightbox as Fediverse/Bluesky attachments instead of a link card.
-    // Text-heavy Reddit selfposts keep a body summary instead.
-    $mediaForward = function_exists('ap_rss_item_is_media_forward')
-        ? ap_rss_item_is_media_forward($summaryRaw, $image, $url)
-        : ($image !== '' && preg_match('#^https://#i', $image) && $summary === '');
-    $mediaHtml = '';
-    if ($mediaForward && $image !== '' && preg_match('#^https://#i', $image) && function_exists('admin_media_row_html')) {
-        $mediaHtml = admin_media_row_html([['url' => $image, 'mediaType' => 'image/*']]);
-    }
-
-    $linkCardHtml = '';
-    // When we already show a real text summary, skip a bulky link-card that repeats the title;
-    // Open remains in the overflow menu.
-    $showLinkCard = $url !== '' && preg_match('#^https?://#i', $url) && $mediaHtml === '' && $summary === '';
-    if ($showLinkCard) {
-        $card = null;
-        if (function_exists('ap_link_preview_cache_get')) {
-            if (!function_exists('ap_link_preview_for_url')) {
-                @require_once __DIR__ . '/ap-link-preview.php';
-            }
-            $card = ap_link_preview_cache_get($url);
-        }
-        if (is_array($card) && function_exists('ap_link_preview_html')) {
-            $linkCardHtml = ap_link_preview_html($card, true);
-        } else {
-            $titleH = h($title !== '' ? $title : ($host !== '' ? $host : $url));
-            $provH = $host !== '' ? '<div class="link-card__provider">' . h($host) . '</div>' : '';
-            $imgH = ($image !== '' && preg_match('#^https?://#i', $image))
-                ? '<div class="link-card__media"><img src="' . h($image) . '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>'
-                : '';
-            $linkCardHtml = '<a class="link-card" href="' . h($url) . '" target="_blank" rel="nofollow noopener noreferrer">'
-                . $imgH
-                . '<div class="link-card__body">' . $provH . '<div class="link-card__title">' . $titleH . '</div></div>'
-                . '</a>';
-        }
-    }
-
-    $overflow = '';
-    if ($url !== '') {
-        $overflow .= '<a class="menu-action" href="' . h($url) . '" target="_blank" rel="noopener noreferrer">Open</a>';
-    }
-    if ($feedId > 0) {
-        $overflow .= '<form method="post" action="?view=' . h($returnView) . '" onsubmit="return confirm(\'Remove this RSS feed from your Home mix?\');">'
-            . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
-            . '<input type="hidden" name="action" value="rss_remove_feed">'
-            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
-            . '<input type="hidden" name="feed_id" value="' . $feedId . '">'
-            . '<button class="menu-action" type="submit" style="color:var(--danger)">Remove feed</button>'
-            . '</form>';
-    }
-    $rankAttrs = $feedId > 0
-        ? admin_home_rank_tracking_attrs('rss', 'rss:item:' . $itemId, 'rss:feed:' . $feedId)
-        : '';
-    ?>
-    <article class="tweet" data-rss-item="<?= $itemId ?>"<?= $rankAttrs ?>>
-      <div class="tweet-hd">
-        <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($feedTitle) ?>">
-        <div class="tweet-hd-main">
-          <div>
-            <span class="who"><?= h($feedTitle) ?></span>
-            <span class="meta"> · <?= h(relative_time($published)) ?></span>
-            <span class="tag" title="From an RSS/Atom feed you added">RSS</span>
-          </div>
-          <?php if ($host !== ''): ?>
-            <div class="meta"><?= h($host) ?></div>
-          <?php endif; ?>
-        </div>
-      </div>
-      <?php if ($title !== ''): ?>
-        <div class="body feed-body" style="font-weight:600"><?= h($title) ?></div>
-      <?php endif; ?>
-      <?php if ($summary !== ''): ?>
-        <div class="body feed-body" style="margin-top:.35rem;white-space:pre-wrap;overflow-wrap:anywhere"><?= h($summary) ?></div>
-      <?php endif; ?>
-      <?php if ($summary !== '' && $url !== '' && $mediaHtml === '' && $linkCardHtml === ''): ?>
-        <div class="meta" style="margin-top:.45rem">
-          <a href="<?= h($url) ?>" target="_blank" rel="nofollow noopener noreferrer">Open original</a>
-        </div>
-      <?php endif; ?>
-      <?= $mediaHtml ?>
-      <?= $linkCardHtml ?>
-      <div class="tweet-actions">
-        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
-          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-          <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
-          <input type="hidden" name="object_id" value="<?= h($statusId) ?>">
-          <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-        </form>
-        <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
-          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-          <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
-          <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-          <input type="hidden" name="status_id" value="<?= h($statusId) ?>">
-          <input type="hidden" name="object_id" value="<?= h($statusId) ?>">
-          <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
-        </form>
-        <?php if ($overflow !== ''): ?>
-          <details class="post-action-menu">
-            <summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>
-            <div class="post-action-menu__body"><?= $overflow ?></div>
-          </details>
-        <?php endif; ?>
-      </div>
-    </article>
-    <?php
+    echo '</article>';
 }
 
 /**

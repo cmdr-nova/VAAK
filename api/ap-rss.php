@@ -1008,7 +1008,7 @@ function ap_rss_item_to_masto_status(array $row): array
     $acct = preg_replace('/\s+/', '', strtolower($feedTitle)) ?: 'rss';
     $acct = substr(preg_replace('/[^a-z0-9._-]/', '', $acct) ?? 'rss', 0, 30) ?: 'rss';
 
-    return [
+    $status = [
         'id' => $statusId,
         'created_at' => $created,
         'in_reply_to_id' => null,
@@ -1062,7 +1062,13 @@ function ap_rss_item_to_masto_status(array $row): array
         'card' => $card,
         'poll' => null,
         'vaak_rss_item_id' => $itemId,
+        'vaak_rss_feed_id' => (int) ($row['feed_id'] ?? 0),
+        'source' => 'rss',
     ];
+    if (function_exists('ap_normalize_status')) {
+        return ap_normalize_status($status);
+    }
+    return $status;
 }
 
 /** Load an RSS item as a Mastodon status by synthetic id `rss:123`. */
