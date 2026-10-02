@@ -1,6 +1,6 @@
 # VAAK
 
-**Current release:** alpha **0.5.57** · 2026-10-02
+**Current release:** alpha **0.6.0** · 2026-10-02
 
 VAAK (pronounced “vaak”) is a multi-user social web client for the Fediverse, with optional Bluesky / AT Protocol connection. One interface for reading, posting, following, moderating, and carrying identity across both networks.
 
@@ -47,9 +47,10 @@ Live instances and public profiles are host-specific. This repository is the pub
 - **PostgreSQL** holds durable state (accounts, posts, queues, moderation)
 - **Redis** accelerates caches and wake-ups; the app still works if Redis is down
 - Remote AppView / PDS work is pushed to workers so page loads enqueue and return quickly
+- From **0.6.0**, selected background workers (notification badge, thin-media warm) run as Rust primary with PHP fallback; an Axum stub sits beside PHP while federation and the admin UI remain PHP-owned
 
 ## Status
 
-Active alpha. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
+Active alpha. **0.6.0** opens an incremental Rust + Axum backend rebuild track (workers first). Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
 
 Version labels in the app come from `api/ap-version.php` (channel, semver, date).
