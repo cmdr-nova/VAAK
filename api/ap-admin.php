@@ -9192,7 +9192,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         }
     }
     // Local instance Creates (other mkultra.monster accounts) so Home isn't empty with no follows.
+    // Cap per actor so a busy local bot (e.g. luna_naloc) cannot fill a scroll window alone.
     $localAdded = 0;
+    $localPerActor = [];
     try {
         $stLocal = $db->prepare(
             "SELECT * FROM events
@@ -9217,6 +9219,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
             if (function_exists('ap_row_matches_muted_words') && ap_row_matches_muted_words($e, 'event', [], $homeOwnerId)) {
                 continue;
             }
+            $actorCount = (int) ($localPerActor[$aid] ?? 0);
+            if ($actorCount >= 3) {
+                continue;
+            }
             $sum = trim(html_entity_decode((string) ($e['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
             $med = (string) ($e['media_urls'] ?? '');
             if ($sum === '' && ($med === '' || $med === '[]')) {
@@ -9238,10 +9244,12 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                     ? ap_deprioritize_penalty_seconds()
                     : (6 * 3600);
             }
+            $localPerActor[$aid] = $actorCount + 1;
             $homeTimeline[] = [
                 'kind' => 'event',
                 'sort' => $sortTs,
                 'row' => $e,
+                'home_source' => 'local',
                 'deprioritized' => function_exists('ap_is_deprioritized_actor')
                     && ap_is_deprioritized_actor($aid, $homeOwnerId),
             ];
@@ -9250,7 +9258,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     } catch (Throwable $e) {
         error_log('[ap-admin] home local posts: ' . $e->getMessage());
     }
-    // Public outbox notes from other local users (as synthetic events — not outbox cards).
+    // Public outbox notes from other local users — paint as outbox cards (plain
+    // content_text path). Synthetic events previously stuffed raw HTML into
+    // summary with id "outbox:…", so normalize degraded + htmlspecialchars
+    // showed literal <p>/<a> tags on Home.
     try {
         $stOb = $db->prepare(
             "SELECT * FROM outbox_notes
@@ -9281,30 +9292,25 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 : false) {
                 continue;
             }
-            $plain = trim(html_entity_decode(strip_tags((string) ($n['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-            if ($plain === '') {
+            $actorCount = (int) ($localPerActor[$nActor] ?? 0);
+            if ($actorCount >= 3) {
                 continue;
             }
+            $plain = trim(html_entity_decode(strip_tags((string) ($n['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            if ($plain === '' || in_array($plain, ['(attachment)', '(media)', '(poll)', '(quote)'], true)) {
+                // Still allow media-only notes through outbox_card (attachments in raw JSON).
+                $rawProbe = (string) ($n['raw_create_json'] ?? '');
+                if ($rawProbe === '' || (!str_contains($rawProbe, '"attachment"') && !str_contains($rawProbe, '"Image"'))) {
+                    continue;
+                }
+            }
             admin_mark_dual_publish_seen($homeSeenObject, $nid);
-            $synth = [
-                'id' => 'outbox:' . $nid,
-                'type' => 'Create',
-                'actor_id' => $nActor,
-                'object_id' => $nid,
-                'created_at' => (string) ($n['published'] ?? ''),
-                'summary' => (string) ($n['content'] ?? ''),
-                'host' => 'mkultra.monster',
-                'action_taken' => 'local_observe',
-                'media_urls' => null,
-                'in_reply_to' => $n['in_reply_to'] ?? null,
-                'spoiler_text' => '',
-                'sensitive' => 0,
-                'visibility' => (string) ($n['visibility'] ?? 'public'),
-            ];
+            $localPerActor[$nActor] = $actorCount + 1;
             $homeTimeline[] = [
-                'kind' => 'event',
+                'kind' => 'outbox',
                 'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
-                'row' => $synth,
+                'row' => $n,
+                'home_source' => 'local',
             ];
             $localAdded++;
         }
@@ -11380,6 +11386,8 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
     if ($plain === '') {
         return '';
     }
+    // Bluesky (and some remotes) truncate URLs as www.host/... without a scheme.
+    $plain = preg_replace('#(?<![\w./:@])(www\.[^\s<]+)#iu', 'https://$1', $plain) ?? $plain;
     $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
 
     if (function_exists('ap_normalize_bridgy_plain_mentions')) {
@@ -13930,6 +13938,10 @@ function admin_render_masto_status_card(
             $plain = (string) ($splitPlain['commentary'] ?? '');
         }
     }
+    // Media-only placeholders left in summary/content_text — never paint as body text.
+    if ($plain !== '' && preg_match('/^\((?:attachment|media|poll|quote|boost)\)$/i', trim($plain))) {
+        $plain = '';
+    }
     if ($plain !== '') {
         $bodyInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
             . admin_linkify_body_html($plain, $returnView, $stMentions, $actorRef !== '' ? $actorRef : null) . '</div>';
@@ -15341,7 +15353,6 @@ function admin_render_outbox_card(array $n, string $returnView): void
                       $ownName = $actorKey;
                   }
                   $ownHandle = '@' . $actorKey . '@mkultra.monster';
-                  $ownType = (!empty($n['kind']) && $n['kind'] === 'quote') ? 'Quote' : 'Create';
                   $ownVisRaw = (string) ($n['visibility'] ?? 'public');
                   if (($ownVisRaw === '' || $ownVisRaw === 'public') && is_array($srow)) {
                       $vrow = (string) ($srow['visibility'] ?? '');
@@ -15366,7 +15377,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
                 <div>
                   <span class="who"><?= admin_emoji_html($ownName, $actor) ?></span>
                   <span class="meta"> <?= h($ownHandle) ?></span>
-                  <span class="meta"> · <?= h($ownType) ?> · <?= h(relative_time($published)) ?></span>
+                  <span class="meta"> · <?= h(relative_time($published)) ?></span>
                   <?php if (is_array($srow) && !empty($srow['edited_at'])): ?>
                     <span class="meta" title="<?= h((string) $srow['edited_at']) ?>"> · edited</span>
                   <?php endif; ?>
@@ -15391,7 +15402,7 @@ function admin_render_outbox_card(array $n, string $returnView): void
             <?php endif; ?>
             <?php
               $ownInner = '';
-              if ($bodyPlain !== '' && !in_array($bodyPlain, ['(quote)', '(media)', '(poll)'], true)) {
+              if ($bodyPlain !== '' && !in_array($bodyPlain, ['(quote)', '(media)', '(poll)', '(attachment)', '(boost)'], true)) {
                   $ownInner .= '<div class="body feed-body" style="white-space:pre-wrap">'
                       . admin_linkify_body_html($bodyPlain, $returnView, [], $actor !== '' ? $actor : null) . '</div>';
               }
