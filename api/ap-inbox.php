@@ -4662,19 +4662,8 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
  * CLI PHP binary for background workers. Never return php-fpm — FPM cannot
  * run worker scripts, which left media/poll deliver jobs stuck in /tmp forever.
  */
-function ap_php_cli_binary(): string
-{
-    foreach (['/usr/bin/php8.3', '/usr/bin/php', '/usr/local/bin/php'] as $cand) {
-        if (is_executable($cand)) {
-            return $cand;
-        }
-    }
-    if (defined('PHP_BINARY') && is_string(PHP_BINARY) && PHP_BINARY !== ''
-        && !str_contains(PHP_BINARY, 'php-fpm') && is_executable(PHP_BINARY)) {
-        return PHP_BINARY;
-    }
-    return 'php';
-}
+// ap_php_cli_binary() lives in ap-db.php (always loaded). Kept as a no-op
+// comment so older call sites / docs that pointed here stay discoverable.
 
 /**
  * Queue remaining inbox deliveries in a background PHP worker so admin compose

@@ -25,9 +25,10 @@ function ap_publish_delivery_wake_async(): void
     if (!function_exists('exec') || !function_exists('shell_exec')) return;
     $script = __DIR__ . '/ap-publish-delivery-worker.php';
     if (!is_file($script)) return;
-    $php = function_exists('ap_php_cli_binary')
-        ? ap_php_cli_binary()
-        : (defined('PHP_BINARY') && PHP_BINARY !== '' ? PHP_BINARY : '/usr/bin/php');
+    $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+    if ($php === '' || str_contains($php, 'php-fpm')) {
+        $php = is_executable('/usr/bin/php8.3') ? '/usr/bin/php8.3' : '/usr/bin/php';
+    }
     $running = trim((string) @shell_exec("pgrep -fc 'ap-publish-delivery-worker.php' 2>/dev/null"));
     if ((int) $running > 0) return;
     $cmd = 'nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script)
