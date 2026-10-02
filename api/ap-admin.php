@@ -4459,8 +4459,9 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     $hasMore = count($rows) > ($offset + $limit);
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
     echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
+    $GLOBALS['admin_library_fetch_budget'] = 3;
     foreach ($items as $item) {
-        admin_render_favourite_status_card($item);
+        admin_render_library_status_card($item, 'favourites');
     }
     echo '</div>';
     exit;
@@ -4667,10 +4668,11 @@ if (isset($_GET['partial'], $_GET['shell'])
             if ($favList === []) {
                 echo '<div class="empty">No Fediverse favourites yet.</div>';
             } else {
+                $GLOBALS['admin_library_fetch_budget'] = 3;
                 echo '<div data-fedi-favourites-fragment data-offset="' . (int) count($favList)
                     . '" data-limit="20" data-has-more="' . ($favHasMore ? '1' : '0') . '">';
                 foreach ($favList as $st) {
-                    admin_render_favourite_status_card($st);
+                    admin_render_library_status_card($st, 'favourites');
                 }
                 echo '<div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
                     . ($favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites') . '</div></div>';
@@ -4730,23 +4732,9 @@ if (isset($_GET['partial'], $_GET['shell'])
     if ($bmList === []) {
         echo '<div class="empty">' . ($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') . '</div>';
     } else {
+        $GLOBALS['admin_library_fetch_budget'] = 3;
         foreach ($bmList as $st) {
-            $bmSid = (string) ($st['id'] ?? '');
-            if (str_starts_with($bmSid, 'rss:')
-                && function_exists('ap_rss_parse_local_status_id')
-                && function_exists('ap_rss_item_by_id')
-                && function_exists('admin_render_rss_item')
-            ) {
-                $rssId = ap_rss_parse_local_status_id($bmSid);
-                $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $vaakOwnerId) : null;
-                if (is_array($rssRow)) {
-                    admin_render_rss_item($rssRow, 'bookmarks');
-                    continue;
-                }
-            }
-            if (function_exists('admin_render_masto_status_card')) {
-                admin_render_masto_status_card($st, [], 'bookmarks', false, true);
-            }
+            admin_render_library_status_card($st, 'bookmarks');
         }
     }
     if ($bskyOn) {
@@ -17636,7 +17624,130 @@ header('Content-Type: text/html; charset=utf-8');
  * @param array<string,bool> $followingIds
  * @param array<string,bool> $followerIds
  */
-function admin_render_favourite_status_card(array $st): void
+/**
+ * True when a library (favourites/bookmarks) status is a URL-only stub or has
+ * no author/body/media worth painting — needs enrich before the shared card.
+ *
+ * @param array<string,mixed> $st
+ */
+function admin_library_status_is_thin(array $st): bool
+{
+    if (!empty($st['vaak_library_stub'])) {
+        return true;
+    }
+    if (function_exists('ap_normalize_status_has_visible_body')
+        && ap_normalize_status_has_visible_body($st)
+    ) {
+        $acct = trim((string) ($st['account']['acct'] ?? ''));
+        // Visible body but unknown/default author still looks broken on library.
+        if ($acct === '' || $acct === '?') {
+            return true;
+        }
+        return false;
+    }
+    $plain = trim(html_entity_decode(strip_tags((string) ($st['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $media = is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [];
+    if ($media !== []) {
+        return false;
+    }
+    if ($plain === '') {
+        return true;
+    }
+    $uri = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
+    // URL-only stub: content is just the object link.
+    if ($uri !== '' && ($plain === $uri || $plain === $uri . '/' || str_starts_with($plain, 'http'))) {
+        if ($plain === $uri || $plain === $uri . '/' || preg_match('#^https?://\S+$#u', $plain)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Budgeted hydrate for thin library statuses: strip announce fragments, cache
+ * lookup, then optional signed ensure_remote → normalize.
+ *
+ * @param array<string,mixed> $st
+ * @return array<string,mixed>
+ */
+function admin_library_status_enrich(array $st): array
+{
+    if (!admin_library_status_is_thin($st)) {
+        return $st;
+    }
+    $uri = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
+    $uri = preg_replace('/#announce-\d+$/', '', $uri) ?? $uri;
+    $uri = rtrim($uri, '/');
+    if ($uri === '' || !str_starts_with($uri, 'https://')) {
+        return $st;
+    }
+    $flags = [
+        'favourited' => !empty($st['favourited']),
+        'bookmarked' => !empty($st['bookmarked']),
+    ];
+    $keepId = (string) ($st['id'] ?? '');
+
+    $apply = static function (array $fresh) use ($flags, $keepId): array {
+        if (isset($fresh['reblog']) && is_array($fresh['reblog'])) {
+            $fresh = $fresh['reblog'];
+        }
+        if ($flags['favourited']) {
+            $fresh['favourited'] = true;
+        }
+        if ($flags['bookmarked']) {
+            $fresh['bookmarked'] = true;
+        }
+        // Keep the interaction snowflake id so unfav/unbookmark forms stay stable.
+        if ($keepId !== '' && $keepId !== '0') {
+            $fresh['id'] = $keepId;
+        }
+        unset($fresh['vaak_library_stub']);
+        return $fresh;
+    };
+
+    if (function_exists('ap_masto_lookup_status_by_object_url')) {
+        $cached = ap_masto_lookup_status_by_object_url($uri, 0, false);
+        if (is_array($cached)) {
+            $cached = $apply($cached);
+            if (!admin_library_status_is_thin($cached)) {
+                return $cached;
+            }
+            $st = $cached;
+        }
+    }
+
+    $budget = &$GLOBALS['admin_library_fetch_budget'];
+    if (!is_int($budget)) {
+        $budget = 3;
+    }
+    if ($budget < 1 || !function_exists('ap_masto_ensure_remote_note_event')) {
+        return $st;
+    }
+    $budget--;
+    $fetched = ap_masto_ensure_remote_note_event($uri);
+    if (!is_array($fetched)) {
+        return $st;
+    }
+    $fresh = null;
+    if (function_exists('ap_normalize_from_activitypub_event')) {
+        $fresh = ap_normalize_from_activitypub_event($fetched);
+    } elseif (function_exists('ap_masto_status_from_event')) {
+        $fresh = ap_masto_status_from_event($fetched);
+    }
+    if (!is_array($fresh)) {
+        return $st;
+    }
+    return $apply($fresh);
+}
+
+/**
+ * Shared-card paint path for Favourites / Bookmarks (and folder soft-nav).
+ * RSS keeps its dedicated card; everything else enriches then uses the
+ * Mastodon-canonical status card.
+ *
+ * @param array<string,mixed> $st
+ */
+function admin_render_library_status_card(array $st, string $returnView = 'favourites'): void
 {
     $sid = (string) ($st['id'] ?? '');
     if (str_starts_with($sid, 'rss:')
@@ -17648,31 +17759,21 @@ function admin_render_favourite_status_card(array $st): void
         $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
         $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $owner > 0 ? $owner : null) : null;
         if (is_array($rssRow)) {
-            admin_render_rss_item($rssRow, 'favourites');
+            admin_render_rss_item($rssRow, $returnView);
             return;
         }
     }
-    $acct = (string) ($st['account']['acct'] ?? '?');
-    $oid = (string) ($st['uri'] ?? '');
-    $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
-    echo '<article class="tweet relay-card"><div class="tweet-hd">';
-    echo admin_avatar_img($actorUrl !== '' ? $actorUrl : null);
-    echo '<div class="tweet-hd-main"><div><span class="who">' . h($acct) . '</span><span class="meta"> · ' . h((string) ($st['created_at'] ?? '')) . '</span></div></div></div>';
-    $favPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
-    $favMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
-    $favMedia = is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [];
-    $favBody = $favPlain !== '' ? '<div class="body feed-body">' . admin_linkify_body_html($favPlain, 'favourites', $favMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>' : '';
-    $favMediaHtml = $favMedia !== [] ? admin_media_row_html($favMedia) : '';
-    echo admin_cw_gate_html((string) ($st['spoiler_text'] ?? ''), !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '', $favBody . $favMediaHtml);
-    echo '<div class="tweet-actions">';
-    if ($oid !== '') {
-        echo '<a class="btn btn-ghost" href="' . h(admin_status_href($oid, 'favourites')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a>';
-        echo '<a href="' . h(admin_remote_object_href($oid)) . '" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>';
+    $st = admin_library_status_enrich($st);
+    if (function_exists('admin_render_masto_status_card')) {
+        admin_render_masto_status_card($st, [], $returnView, false, true);
+        return;
     }
-    if ($sid !== '') {
-        echo '<form method="post" action="?view=favourites" style="display:inline"><input type="hidden" name="action" value="unfavourite_status"><input type="hidden" name="return_view" value="favourites"><input type="hidden" name="status_id" value="' . h($sid) . '"><input type="hidden" name="object_id" value="' . h($oid) . '"><input type="hidden" name="target_actor" value="' . h($actorUrl) . '"><button class="icon-btn on" type="submit" title="Unlike" aria-label="Unlike"><i class="ph-fill ph-heart" aria-hidden="true"></i></button></form>';
-    }
-    echo '</div></article>';
+}
+
+/** @deprecated Prefer admin_render_library_status_card — kept as a thin alias. */
+function admin_render_favourite_status_card(array $st): void
+{
+    admin_render_library_status_card($st, 'favourites');
 }
 
 /**
@@ -21377,8 +21478,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php if (!$favList): ?>
             <?= admin_mascot_empty('No Fediverse favourites yet.') ?>
           <?php else: ?>
+            <?php $GLOBALS['admin_library_fetch_budget'] = 3; ?>
             <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
-              <?php foreach ($favList as $st): admin_render_favourite_status_card($st); endforeach; ?>
+              <?php foreach ($favList as $st): admin_render_library_status_card($st, 'favourites'); endforeach; ?>
               <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
             </div>
           <?php endif; ?>
@@ -21511,66 +21613,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
         <?php endif; ?>
         <?php if ($bmList): ?>
-          <?php foreach ($bmList as $st): ?>
-            <?php
-              $sid = (string) ($st['id'] ?? '');
-              if (str_starts_with($sid, 'rss:')
-                  && function_exists('ap_rss_parse_local_status_id')
-                  && function_exists('ap_rss_item_by_id')
-                  && function_exists('admin_render_rss_item')
-              ) {
-                  $rssId = ap_rss_parse_local_status_id($sid);
-                  $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $vaakOwnerId) : null;
-                  if (is_array($rssRow)) {
-                      admin_render_rss_item($rssRow, 'bookmarks');
-                      continue;
-                  }
-              }
-              $acct = (string) ($st['account']['acct'] ?? '?');
-              $oid = (string) ($st['uri'] ?? '');
-              $actorUrl = (string) ($st['account']['url'] ?? $st['account']['uri'] ?? '');
-            ?>
-            <article class="tweet">
-              <div class="tweet-hd">
-                <?= admin_avatar_img($actorUrl !== '' ? $actorUrl : null) ?>
-                <div class="tweet-hd-main">
-                  <div>
-                    <span class="who"><?= h($acct) ?></span>
-                    <span class="meta"> · <?= h((string) ($st['created_at'] ?? '')) ?></span>
-                  </div>
-                </div>
-              </div>
-              <?php
-                $bmPlain = admin_html_to_plain((string) ($st['content'] ?? ''));
-                $bmMentions = is_array($st['mentions'] ?? null) ? $st['mentions'] : [];
-                $bmMedia = is_array($st['media_attachments'] ?? null) ? $st['media_attachments'] : [];
-                $bmBody = $bmPlain !== ''
-                    ? '<div class="body feed-body">' . admin_linkify_body_html($bmPlain, 'bookmarks', $bmMentions, $actorUrl !== '' ? $actorUrl : null) . '</div>'
-                    : '';
-                $bmMediaHtml = $bmMedia !== [] ? admin_media_row_html($bmMedia) : '';
-                echo admin_cw_gate_html(
-                    (string) ($st['spoiler_text'] ?? ''),
-                    !empty($st['sensitive']) || trim((string) ($st['spoiler_text'] ?? '')) !== '',
-                    $bmBody . $bmMediaHtml
-                );
-              ?>
-              <div class="tweet-actions">
-                <?php if ($oid !== ''): ?>
-                  <a class="btn btn-ghost" href="<?= h(admin_status_href($oid, 'bookmarks')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                  <a href="<?= h(admin_remote_object_href($oid)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
-                <?php endif; ?>
-                <?php if ($sid !== ''): ?>
-                  <form method="post" action="?view=bookmarks" style="display:inline" class="bm-folder-trigger">
-                    <input type="hidden" name="action" value="unbookmark_status">
-                    <input type="hidden" name="return_view" value="bookmarks">
-                    <input type="hidden" name="status_id" value="<?= h($sid) ?>">
-                    <input type="hidden" name="object_id" value="<?= h($oid) ?>">
-                    <button class="icon-btn on" type="submit" title="Bookmark folders" aria-label="Bookmark folders" data-bm-picker="1"><i class="ph-fill ph-bookmark-simple" aria-hidden="true"></i></button>
-                  </form>
-                <?php endif; ?>
-              </div>
-            </article>
-          <?php endforeach; ?>
+          <?php $GLOBALS['admin_library_fetch_budget'] = 3; ?>
+          <?php foreach ($bmList as $st): admin_render_library_status_card($st, 'bookmarks'); endforeach; ?>
         <?php endif; ?>
         <?php if ($bookmarkLimit < 80 && count($bmList) >= $bookmarkLimit): ?>
           <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
