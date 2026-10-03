@@ -303,13 +303,15 @@ if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
     $view = 'home';
 }
 
-// Soft-nav shells, infinite-scroll fills, live newer polls, and ajax beacons
-// only need the session for auth. Release the file lock immediately so one
-// slow Home hydrate cannot queue the user's other tabs/polls for tens of seconds.
+// Soft-nav shells, infinite-scroll fills, live newer polls, ajax beacons, and
+// read-only profile paints only need the session for auth. Release the file
+// lock immediately so one slow hydrate cannot queue the user's other tabs/polls.
 $vaakReqMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 $vaakEarlyUnlock = $vaakReqMethod === 'GET' && (
     (isset($_GET['partial']) && (string) $_GET['partial'] === '1')
     || isset($_GET['ajax'])
+    || $view === 'remote_profile'
+    || !empty($GLOBALS['vaak_guest_profile'])
 );
 if ($vaakEarlyUnlock) {
     if (function_exists('ap_auth_session_write_close')) {
@@ -17891,6 +17893,7 @@ $notifUnreadNav = 0;
 $notifLatestUnreadIdNav = '';
 $notifLatestIdNav = '';
 $notifLastReadIdNav = '0';
+if (empty($GLOBALS['vaak_guest_profile'])) {
 try {
     if ($view === 'mentions' && function_exists('ap_masto_notifications_mark_read')) {
         // Light scan only — never hydrate a full notification entity just to clear the badge.
@@ -17914,6 +17917,7 @@ try {
     error_log('[ap-admin] notif badge: ' . $e->getMessage());
     $notifUnreadNav = 0;
 }
+}
 $notifBadgeLabel = $notifUnreadNav > 99 ? '99+' : (string) (int) $notifUnreadNav;
 // Chime seed prefers the newest unread tip; fall back to overall latest when caught up.
 if ($notifLatestUnreadIdNav === '') {
@@ -17923,7 +17927,9 @@ $notifLastReadIdNav = preg_replace('/\D+/', '', $notifLastReadIdNav) ?: '0';
 // Seed unread DM tip so the first poll cannot chime for already-open DMs.
 $dmLatestIdNav = '';
 try {
-    $ownerForDmSeed = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
+    $ownerForDmSeed = empty($GLOBALS['vaak_guest_profile'])
+        ? (function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0))
+        : 0;
     if ($ownerForDmSeed > 0 && $view !== 'account_switcher') {
         $dmSeedSt = ap_db()->prepare(
             "SELECT id FROM direct_messages
@@ -21217,7 +21223,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php else: ?>
       <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
-      <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">View profile</a>
+      <a class="btn btn-ghost brand-profile-link" href="<?= h(function_exists('ap_vaak_pretty_profile_path') ? ap_vaak_pretty_profile_path((string) $vaakActorKey) : ('/users/' . rawurlencode((string) $vaakActorKey))) ?>">View profile</a>
       <?php
         $switchAccountRows = function_exists('ap_auth_users_by_ids')
             ? ap_auth_users_by_ids(ap_auth_session_account_ids())
@@ -26685,8 +26691,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $rpOutboxTotal = function_exists('ap_outbox_count_for_actor')
                       ? ap_outbox_count_for_actor((string) $rpLocalKey)
                       : 0;
+                  $rpOutboxRepliesTotal = 0;
                   if ($rpOutboxTotal > 0 && function_exists('ap_outbox_replies_count')) {
-                      $rpOutboxTotal = max(0, $rpOutboxTotal - ap_outbox_replies_count((string) $rpLocalKey));
+                      $rpOutboxRepliesTotal = ap_outbox_replies_count((string) $rpLocalKey);
+                      $rpOutboxTotal = max(0, $rpOutboxTotal - $rpOutboxRepliesTotal);
                   }
                   $rpBskyPostCount = 0;
                   if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_count_for_author')) {
@@ -26742,10 +26750,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       'image_source_url' => $rpHeader,
                   ];
                   try {
+                      // First paint only needs a page + a little headroom for tabs /
+                      // has-more. Deep history continues via infinite-scroll partials.
                       $stOb = ap_db()->prepare(
                           "SELECT * FROM outbox_notes
                           WHERE id LIKE ?
-                           ORDER BY published DESC LIMIT 500"
+                           ORDER BY published DESC LIMIT 80"
                       );
                       $stOb->execute(['https://mkultra.monster/users/' . $rpLocalKey . '/%']);
                       $rpOutboxPosts = $stOb->fetchAll() ?: [];
@@ -26782,7 +26792,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                             CASE WHEN action_taken = 'boost_ok' THEN 0 ELSE 1 END,
                             created_at DESC, id DESC
                         ) AS profile_events
-                        ORDER BY created_at DESC, id DESC LIMIT 500";
+                        ORDER BY created_at DESC, id DESC LIMIT 80";
                       if (function_exists('ap_db_execute_retry')) {
                           $st = ap_db_execute_retry($postsSql, $bind);
                       $eventRows = $st ? ($st->fetchAll() ?: []) : [];
@@ -27060,7 +27070,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpTimelineTabs = ['posts', 'replies', 'boosts', 'media'];
           if (in_array($rpTab, $rpTimelineTabs, true)) {
               $rpTabBucket = $rpTabItems[$rpTab] ?? [];
-              $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabBucket, 0, 40) : $rpTabBucket;
+              // First paint: 20 cards; infinite-scroll partials load the rest.
+              $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabBucket, 0, 20) : $rpTabBucket;
               $rpLocalHasMore = $rpIsLocal && count($rpTabBucket) > count($rpLocalPageItems);
           } else {
               $rpLocalPageItems = [];
@@ -27459,12 +27470,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </article>
           <nav class="remote-profile-tabs" aria-label="Profile posts">
             <?php
+              // Prefer authoritative counts for local tabs (first-page fetch is capped).
+              $rpTabCountPosts = count($rpTabItems['posts'] ?? []);
+              $rpTabCountReplies = count($rpTabItems['replies'] ?? []);
+              $rpTabCountBoosts = count($rpTabItems['boosts'] ?? []);
+              $rpTabCountMedia = count($rpTabItems['media'] ?? []);
+              if ($rpIsLocal) {
+                  if (!empty($rpOutboxTotal)) {
+                      $rpTabCountPosts = max($rpTabCountPosts, (int) $rpOutboxTotal);
+                  }
+                  if (!empty($rpOutboxRepliesTotal) && !$rpHideProfileReplies) {
+                      $rpTabCountReplies = max($rpTabCountReplies, (int) $rpOutboxRepliesTotal);
+                  }
+                  if (isset($rpBoostTotal) && !$rpHideProfileBoosts) {
+                      $rpTabCountBoosts = max($rpTabCountBoosts, (int) $rpBoostTotal);
+                  }
+              }
               $rpTabDefs = [
                   'pinned' => $rpIsLocal && $rpPinnedStatuses !== [] ? ['Pinned', count($rpPinnedStatuses)] : null,
-                  'posts' => ['Posts', count($rpTabItems['posts'] ?? [])],
-                  'replies' => ($rpIsLocal && $rpHideProfileReplies) ? null : ['Replies', count($rpTabItems['replies'] ?? [])],
-                  'boosts' => ($rpIsLocal && $rpHideProfileBoosts) ? null : ['Boosts', count($rpTabItems['boosts'] ?? [])],
-                  'media' => ['Media', count($rpTabItems['media'] ?? [])],
+                  'posts' => ['Posts', $rpTabCountPosts],
+                  'replies' => ($rpIsLocal && $rpHideProfileReplies) ? null : ['Replies', $rpTabCountReplies],
+                  'boosts' => ($rpIsLocal && $rpHideProfileBoosts) ? null : ['Boosts', $rpTabCountBoosts],
+                  'media' => ['Media', $rpTabCountMedia],
                   'featured' => $rpIsLocal && $rpFeaturedCards !== [] ? ['Featured', count($rpFeaturedCards)] : null,
                   'blog' => $rpIsLocal && ($rpBlogPosts !== [] || $rpBlogPost !== null)
                       ? ['Blog', function_exists('ap_blog_posts_count') ? ap_blog_posts_count((string) $rpLocalKey, true) : count($rpBlogPosts)]

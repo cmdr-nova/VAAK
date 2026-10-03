@@ -5730,6 +5730,16 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     $ownerUserId = function_exists('ap_db_masto_owner_user_id')
         ? ap_db_masto_owner_user_id()
         : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+    // Guests / unbound sessions have no badge — never stampede-wait on a key
+    // the Rust live writer will not populate.
+    if ($ownerUserId < 1 || !empty($GLOBALS['vaak_guest_profile'])) {
+        return [
+            'count' => 0,
+            'last_read_id' => $lastRead,
+            'latest_unread_id' => '',
+            'latest_id' => '',
+        ];
+    }
     // Badge polls every ~12s; keep Redis/file hot longer so rebuilds stay rare.
     $cacheTtl = $bypassCache ? 0 : 45;
     $redisKey = 'vaak:notifications:v1:unread:' . $ownerUserId . ':' . $scan . ':' . hash('sha256', $lastRead);
@@ -5777,11 +5787,18 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         if (is_array($redisCached) && isset($redisCached['c'])) {
             return $readUnreadCache($redisCached);
         }
+        // Prefer a slightly stale file badge before any stampede wait — page
+        // paints (profiles/Home) must not block ~4.5s when Rust/peer is busy.
+        $staleAge = $notifRustPrimary ? 300 : 180;
+        $staleBeforeWait = $readFileUnread($staleAge);
+        if (is_array($staleBeforeWait)) {
+            return $staleBeforeWait;
+        }
         $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
         $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
         if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
-            // Wait for Rust live writer (or a peer PHP rebuild) before scanning.
-            $peerWaitMs = $notifRustPrimary ? 4500 : 2500;
+            // Brief wait only — never park a PHP worker for multi-second badge sync.
+            $peerWaitMs = $notifRustPrimary ? 250 : 200;
             $peer = ap_redis_stampede_wait(
                 static function () use ($redisKey) {
                     $row = ap_redis_json_get($redisKey);
@@ -5792,8 +5809,6 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             if (is_array($peer) && isset($peer['c'])) {
                 return $readUnreadCache($peer);
             }
-            // Prefer slightly stale badge over a second rebuild under load.
-            $staleAge = $notifRustPrimary ? 300 : 180;
             $stale = $readFileUnread($staleAge);
             if (is_array($stale)) {
                 return $stale;
