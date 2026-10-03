@@ -14389,11 +14389,20 @@ function admin_render_masto_status_card(
     // Degraded / empty remote shells (Announce-only cache, authorized-fetch peers,
     // half-parsed objects): one chrome via vaak_degraded, with AJAX hydrate on
     // timelines. hydrate_create / hydrate_boost set admin_boost_fetch_budget=1.
+    //
+    // Media-row / ask / quote / card HTML is often tags-only, so strip_tags(bodyInner)
+    // is empty even when the post is fully paint-able. Using strip_tags alone made
+    // media-only Creates (e.g. hellyeahbot) look like empty shells: the media was
+    // replaced with “Loading post…”, then create-hydrate JS removed the card.
     $createHydrate = false;
     $boostHydrate = false;
     $isDegraded = !empty($st['vaak_degraded']);
     $degradedReason = (string) ($st['vaak_degraded_reason'] ?? 'empty_shell');
-    if ((trim(strip_tags($bodyInner)) === '' || $isDegraded)
+    $hasVisibleBody = function_exists('ap_normalize_status_has_visible_body')
+        ? ap_normalize_status_has_visible_body($st)
+        : ($media !== [] || $plain !== '' || $askCardHtml !== '' || is_array($quote));
+    if (!$hasVisibleBody
+        && (trim(strip_tags($bodyInner)) === '' || $isDegraded)
         && $uri !== ''
         && str_starts_with($uri, 'https://')
         && !$isLocal
