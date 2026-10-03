@@ -32102,7 +32102,9 @@ window.apAdminToast = function (msg, isErr) {
     if (view !== 'mentions' && typeof window.vaakAbortNotifScroll === 'function') {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
     }
-    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
+    if (typeof window.vaakShowLoading === 'function') {
+      window.vaakShowLoading(view === 'search' ? 'Searching…' : 'Loading…');
+    }
     try {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
         + encodeURIComponent(view === 'mentions' ? '10' : (view === 'outbox' ? '20' : '15'));
@@ -35334,7 +35336,12 @@ if (VIEW === 'analytics') loadAnalytics();
     ].includes(action)) {
       return;
     }
-    window.vaakShowLoading('Saving…');
+    let formAction = '';
+    try { formAction = String(form.getAttribute('action') || form.action || ''); } catch (e) {}
+    const isSearch = /[?&]view=search(?:&|$)/.test(formAction)
+      || (String(form.method || 'get').toLowerCase() === 'get'
+          && !!form.querySelector('input[name="q"][type="search"]'));
+    window.vaakShowLoading(isSearch ? 'Searching…' : 'Saving…');
   }, true);
   window.addEventListener('pageshow', function () {
     window.__vaakNavigationPending = false;
