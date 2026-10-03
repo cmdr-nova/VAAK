@@ -20118,6 +20118,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-fields { display:grid; grid-template-columns:1fr 1fr; gap:.55rem .75rem; margin:.75rem 0 0; font-size:.88rem; }
     .remote-profile-field { min-width:0; overflow:hidden; }
     .remote-profile-field a { overflow:hidden; text-overflow:ellipsis; }
+    .remote-profile-field .field-verified { display:inline-flex; align-items:center; justify-content:center; width:1em; height:1em; margin-left:.35rem; border-radius:50%; background:rgba(0,255,159,.2); color:#00ff9f; font-size:.75em; font-weight:800; line-height:1; vertical-align:middle; position:relative; top:-.05em; }
     @media (max-width:520px) { .remote-profile-fields { grid-template-columns:1fr; } }
     .profile-world-links img { display:block; }
     /* Focused status threads use the same flat card treatment as timelines. */
@@ -26861,14 +26862,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if ($rpFieldValue === '') {
                       continue;
                   }
-                  $rpFieldRows[] = [$rpFieldName, $rpFieldValue];
+                  $rpFieldVerifiedAt = (!empty($rpAtt['verified_at']) && is_string($rpAtt['verified_at']))
+                      ? (string) $rpAtt['verified_at']
+                      : '';
+                  $rpFieldRows[] = [$rpFieldName, $rpFieldValue, $rpFieldVerifiedAt];
               }
             ?>
             <?php if ($rpFieldRows !== []): ?>
               <div class="remote-profile-fields" aria-label="Profile fields">
-                <?php foreach ($rpFieldRows as [$rpFieldName, $rpFieldValue]): ?>
+                <?php foreach ($rpFieldRows as [$rpFieldName, $rpFieldValue, $rpFieldVerifiedAt]): ?>
                   <div class="remote-profile-field">
-                    <span class="meta" style="display:block;font-size:.75rem;margin:0 0 .15rem"><?= h($rpFieldName) ?></span>
+                    <span class="meta" style="display:block;font-size:.75rem;margin:0 0 .15rem"><?= h($rpFieldName) ?><?php if ($rpFieldVerifiedAt !== ''): ?> <span class="field-verified" title="Verified via rel=me · <?= h($rpFieldVerifiedAt) ?>" aria-label="Verified">✓</span><?php endif; ?></span>
                     <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $rpFieldValue ?></div>
                   </div>
                 <?php endforeach; ?>
