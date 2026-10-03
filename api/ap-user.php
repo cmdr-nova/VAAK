@@ -50,6 +50,33 @@ if ($username === '') {
     exit;
 }
 
+// On vaak.monster, logged-in visits to /users/{key} open the on-VAAK profile
+// (pretty URL). mkultra.monster keeps public HTML + ActivityPub negotiation.
+$hostHeader = strtolower((string) ($_SERVER['HTTP_HOST'] ?? ''));
+$onVaakHost = $hostHeader === 'vaak.monster' || $hostHeader === 'www.vaak.monster';
+$acceptEarly = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
+$wantsApEarly = function_exists('ap_user_wants_activitypub')
+    ? ap_user_wants_activitypub($acceptEarly)
+    : (str_contains($acceptEarly, 'application/activity+json') || str_contains($acceptEarly, 'application/ld+json'));
+if ($onVaakHost && $sub === '' && !$wantsApEarly) {
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        ap_auth_bootstrap();
+        if (function_exists('ap_auth_start_session')) {
+            ap_auth_start_session();
+        }
+    }
+    $vaakSessionUser = ap_auth_current_user();
+    if (is_array($vaakSessionUser)) {
+        $_GET['view'] = 'remote_profile';
+        $_GET['actor'] = 'https://mkultra.monster/users/' . $username;
+        if (!isset($_GET['from']) || trim((string) $_GET['from']) === '') {
+            $_GET['from'] = 'home';
+        }
+        require __DIR__ . '/ap-admin.php';
+        exit;
+    }
+}
+
 // Preserve rich cmdr_nova behavior
 if ($username === 'cmdr_nova') {
     $_SERVER['REQUEST_URI'] = '/users/cmdr_nova' . ($sub !== '' ? '/' . $sub : '')
