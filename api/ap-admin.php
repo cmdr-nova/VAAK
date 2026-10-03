@@ -29816,20 +29816,24 @@ window.apAdminToast = function (msg, isErr) {
   let items = document.getElementById('timeline-items');
   let sentinel = document.getElementById('timeline-sentinel');
   let status = document.getElementById('timeline-status');
-  const topBtn = document.getElementById('feed-top-btn');
-  const newBtn = document.getElementById('feed-new-btn');
+  let topBtn = document.getElementById('feed-top-btn');
+  let newBtn = document.getElementById('feed-new-btn');
   const feedRoot = document.querySelector('.feed');
   // Read the timeline identity before constructing the scroll API so later
   // helpers do not hit JavaScript's temporal dead zone.
   let viewName = items ? (items.dataset.view || 'home') : 'home';
   let hasMore = items ? items.dataset.hasMore === '1' : false;
-  if (newBtn && feedRoot) {
+  function placeNewPostsBtn() {
+    const liveFeed = document.querySelector('.feed');
+    newBtn = document.getElementById('feed-new-btn');
+    if (!newBtn || !liveFeed) return;
     // Keep the new-post row in normal feed flow; it must never cover the
     // sticky timeline tabs above it.
-    const composeSlot = feedRoot.querySelector('#compose-inline-slot');
-    if (composeSlot) feedRoot.insertBefore(newBtn, composeSlot.nextSibling);
-    else feedRoot.insertBefore(newBtn, feedRoot.firstChild);
+    const composeSlot = liveFeed.querySelector('#compose-inline-slot');
+    if (composeSlot) liveFeed.insertBefore(newBtn, composeSlot.nextSibling);
+    else if (newBtn.parentElement !== liveFeed) liveFeed.insertBefore(newBtn, liveFeed.firstChild);
   }
+  placeNewPostsBtn();
   if (!root || !items || !sentinel) {
     // Search pages are intentionally not timeline-paginated, but they still
     // use the feed scroll container. Keep the same unobtrusive back-to-top
@@ -29903,7 +29907,9 @@ window.apAdminToast = function (msg, isErr) {
   // ↑ button: ignore infinite-scroll fights until the user leaves the top (or pin expires).
   let stickToTop = false;
   let stickToTopTimer = 0;
-  const POLL_MS = 120000;
+  // Soft-nav used to clear this interval and never restart it (Mentions→Home
+  // left the tab silent until a hard refresh). Keep a modest cadence.
+  const POLL_MS = 45000;
   const AT_TOP_PX = 120;
   const TL_TITLES = { home: 'Home', local: 'Local', feed: 'Federation feed' };
   // Must track soft-nav view changes — freezing these as const from the initial
@@ -30051,7 +30057,10 @@ window.apAdminToast = function (msg, isErr) {
     if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
     if (pollBusy || document.hidden) return;
+    if (!items || !items.isConnected) return;
     pollBusy = true;
+    const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    const abortTimer = ac ? window.setTimeout(() => { try { ac.abort(); } catch (e) {} }, 20000) : 0;
     try {
       const url = '?view=' + encodeURIComponent(viewName)
         + '&partial=1&newer=1&since=' + encodeURIComponent(String(newestTs))
@@ -30059,7 +30068,8 @@ window.apAdminToast = function (msg, isErr) {
       const res = await fetch(url, {
         credentials: 'same-origin',
         headers: { 'Accept': 'text/html' },
-        cache: 'no-store'
+        cache: 'no-store',
+        signal: ac ? ac.signal : undefined
       });
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('poll');
@@ -30081,8 +30091,9 @@ window.apAdminToast = function (msg, isErr) {
       pendingCount += filtered.count;
       updateNewBtn();
     } catch (e) {
-      // quiet — Refresh still works
+      // quiet — Refresh still works; abort/timeout must not stick pollBusy
     } finally {
+      if (abortTimer) window.clearTimeout(abortTimer);
       pollBusy = false;
     }
   }
@@ -30325,7 +30336,10 @@ window.apAdminToast = function (msg, isErr) {
   }
   sc.onScroll(updateTopBtn);
   updateTopBtn();
-  if (topBtn) {
+  function bindTopBtn() {
+    topBtn = document.getElementById('feed-top-btn');
+    if (!topBtn || topBtn.dataset.vaakBound === '1') return;
+    topBtn.dataset.vaakBound = '1';
     topBtn.addEventListener('click', () => {
       armStickToTop();
       insertPending({ scrollToTop: true });
@@ -30336,12 +30350,17 @@ window.apAdminToast = function (msg, isErr) {
       });
     });
   }
-  if (newBtn) {
+  function bindNewPostsBtn() {
+    placeNewPostsBtn();
+    if (!newBtn || newBtn.dataset.vaakBound === '1') return;
+    newBtn.dataset.vaakBound = '1';
     newBtn.addEventListener('click', () => {
       armStickToTop();
       insertPending({ scrollToTop: true });
     });
   }
+  bindTopBtn();
+  bindNewPostsBtn();
 
   // Bluesky: first paint is Following-only; saved-feed samples load after paint
   // (mirrors Home deferred boost hydrate — keep TTFB / first paint snappy).
@@ -30571,6 +30590,28 @@ window.apAdminToast = function (msg, isErr) {
       streamReconnectTimer = 0;
     }
   }
+  function stopTimelinePollTimer() {
+    if (streamFallbackTimer) {
+      window.clearInterval(streamFallbackTimer);
+      streamFallbackTimer = 0;
+    }
+  }
+  // Soft-nav Mentions→Home / tab swaps clear the interval; always re-arm for
+  // standard timelines so live head polls do not die until a hard refresh.
+  function ensureTimelinePollTimer() {
+    syncTimelineKindFlags();
+    if (!['home', 'local', 'feed'].includes(viewName)) {
+      stopTimelinePollTimer();
+      return;
+    }
+    if (isNotifTimeline || isOutboxTimeline || isBskyTimeline) {
+      stopTimelinePollTimer();
+      return;
+    }
+    if (!streamFallbackTimer) {
+      streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+    }
+  }
   function scheduleStreamReconnect() {
     if (streamReconnectTimer || document.hidden || window.__vaakNavigationPending) return;
     streamReconnectTimer = window.setTimeout(() => {
@@ -30610,16 +30651,15 @@ window.apAdminToast = function (msg, isErr) {
       source.onerror = () => {
         if (timelineStream !== source) return;
         stopTimelineStream();
-        if (!streamFallbackTimer) streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+        ensureTimelinePollTimer();
         scheduleStreamReconnect();
       };
-      if (streamFallbackTimer) {
-        window.clearInterval(streamFallbackTimer);
-        streamFallbackTimer = 0;
-      }
+      // SSE is optional near-real-time; keep the timestamp poll armed so Bluesky
+      // ingest (no PG wake-up) and soft-nav rebinds cannot leave the tab silent.
+      ensureTimelinePollTimer();
     } catch (e) {
       timelineStream = null;
-      if (!streamFallbackTimer) streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+      ensureTimelinePollTimer();
     }
   }
   // Full-page navigation must release the SSE connection immediately.  The
@@ -30628,23 +30668,21 @@ window.apAdminToast = function (msg, isErr) {
   window.addEventListener('pagehide', () => {
     window.__vaakNavigationPending = true;
     stopTimelineStream();
-    if (streamFallbackTimer) {
-      window.clearInterval(streamFallbackTimer);
-      streamFallbackTimer = 0;
-    }
+    stopTimelinePollTimer();
   });
   if (['home', 'local', 'feed'].includes(viewName)) {
     // Keep a bounded timestamp poll even when SSE is enabled. Bluesky
     // ingestion may not emit the same PostgreSQL wake-up notification as an
     // ActivityPub event, and this guarantees the New N posts marker remains
     // reliable without delaying the initial paint.
-    streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+    ensureTimelinePollTimer();
     if (TIMELINE_SSE_ENABLED && window.EventSource && !isNotifTimeline && !isOutboxTimeline && !isBskyTimeline) {
       startTimelineStream();
     }
   }
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
+      ensureTimelinePollTimer();
       pollNewer();
       syncTimelineStreamVisibility();
     } else {
@@ -30701,10 +30739,7 @@ window.apAdminToast = function (msg, isErr) {
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
-    if (streamFallbackTimer) {
-      window.clearInterval(streamFallbackTimer);
-      streamFallbackTimer = 0;
-    }
+    stopTimelinePollTimer();
     tabSwapBusy = true;
     if (status) status.textContent = 'Loading…';
     items.classList.add('timeline-swapping');
@@ -30807,8 +30842,13 @@ window.apAdminToast = function (msg, isErr) {
       items.classList.remove('timeline-swapping');
       tabSwapBusy = false;
       loading = false;
+      pollBusy = false;
       window.__vaakNavigationPending = false;
+      bindTopBtn();
+      bindNewPostsBtn();
+      ensureTimelinePollTimer();
       syncTimelineStreamVisibility();
+      try { pollNewer(); } catch (e) {}
       // Timeline tabs are swapped in-place, so the shared capture-phase
       // navigation handler has no full-page `pageshow` event to clear its
       // indicator.  Hide it when the partial swap (or its error path) ends.
@@ -30822,10 +30862,7 @@ window.apAdminToast = function (msg, isErr) {
     // Rebind to the new DOM nodes from the shell response.
     nextView = String(nextView || viewName || 'home');
     try { stopTimelineStream(); } catch (e) {}
-    if (streamFallbackTimer) {
-      window.clearInterval(streamFallbackTimer);
-      streamFallbackTimer = 0;
-    }
+    stopTimelinePollTimer();
     // Cancel any in-flight Mentions infinite-scroll work before rebinding.
     if (typeof window.vaakAbortNotifScroll === 'function') {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
@@ -30841,6 +30878,7 @@ window.apAdminToast = function (msg, isErr) {
     hasMore = items.dataset.hasMore === '1';
     newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
     loading = false;
+    pollBusy = false;
     stickToTop = false;
     if (stickToTopTimer) {
       window.clearTimeout(stickToTopTimer);
@@ -30872,7 +30910,11 @@ window.apAdminToast = function (msg, isErr) {
       items.dataset.hasMore = '1';
       setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
     }
+    try { bindTopBtn(); } catch (e) {}
+    try { bindNewPostsBtn(); } catch (e) {}
+    try { ensureTimelinePollTimer(); } catch (e) {}
     try { syncTimelineStreamVisibility(); } catch (e) {}
+    try { pollNewer(); } catch (e) {}
     if (typeof window.vaakBindFeedTopBtn === 'function') {
       window.vaakBindFeedTopBtn(document.querySelector('section.main'));
     }
