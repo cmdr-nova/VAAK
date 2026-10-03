@@ -45,6 +45,7 @@ require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
 require_once __DIR__ . '/ap-wow-link.php'; // Profile → Link World of Warcraft character
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
 require_once __DIR__ . '/ap-profile-html.php'; // Shared profile tab order / HTML helpers
+require_once __DIR__ . '/ap-vaak-profile-route.php'; // Pretty /vaak/users/{key} + vaak.monster/users/{key}
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
@@ -66,11 +67,21 @@ const LOCAL_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
 // Never auto-login from HTTP Basic — that ignored the password and bound cmdr_nova.
 ap_auth_bootstrap();
 $vaakUser = ap_auth_current_user();
-if ($vaakUser === null) {
+$vaakGuestMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+$vaakGuestProfile = !empty($GLOBALS['vaak_guest_profile'])
+    && strtolower(trim((string) ($_GET['view'] ?? ''))) === 'remote_profile'
+    && ($vaakGuestMethod === 'GET' || $vaakGuestMethod === 'HEAD');
+if ($vaakUser === null && !$vaakGuestProfile) {
     $loginQs = '/vaak/?mode=login';
     $returnView = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? ''));
     if ($returnView !== '' && $returnView !== 'home') {
         $loginQs .= '&next=' . rawurlencode($returnView);
+    }
+    $prettyReturn = function_exists('ap_vaak_pretty_profile_key_from_request')
+        ? ap_vaak_pretty_profile_key_from_request()
+        : null;
+    if ($prettyReturn !== null && function_exists('ap_vaak_pretty_profile_path')) {
+        $loginQs .= '&next_path=' . rawurlencode(ap_vaak_pretty_profile_path($prettyReturn));
     }
     // AJAX / partial fetches must NOT follow a 302 into login HTML and paint it
     // inside the feed. Return 401 so the client can do a full-page redirect.
@@ -103,22 +114,43 @@ if ($vaakUser === null) {
     header('Location: ' . $loginQs, true, 302);
     exit;
 }
-$vaakIsAdmin = ap_auth_is_admin($vaakUser);
-$vaakOwnerId = (int) ($vaakUser['id'] ?? 0);
+if ($vaakGuestProfile && $vaakUser === null) {
+    // Read-only public profile: same paint as logged-in remote_profile, no write actions.
+    $vaakUser = [
+        'id' => 0,
+        'username' => 'guest',
+        'actor_key' => '',
+        'display_name' => 'Guest',
+        'is_guest' => true,
+    ];
+    $vaakIsAdmin = false;
+    $vaakOwnerId = 0;
+} else {
+    $vaakIsAdmin = ap_auth_is_admin($vaakUser);
+    $vaakOwnerId = (int) ($vaakUser['id'] ?? 0);
+}
 $GLOBALS['vaak_user'] = $vaakUser;
 $GLOBALS['vaak_is_admin'] = $vaakIsAdmin;
 $GLOBALS['vaak_owner_id'] = $vaakOwnerId;
+$GLOBALS['vaak_guest_profile'] = $vaakGuestProfile;
 if ($vaakOwnerId > 0 && function_exists('ap_rss_migrate')) {
     ap_rss_migrate();
 }
 
-$vaakActorKey = (string) ($vaakUser['actor_key'] ?? 'cmdr_nova');
-$vaakActorId = rtrim((string) ($vaakUser['actor_id'] ?? ('https://mkultra.monster/users/' . $vaakActorKey)), '/');
-$vaakUsername = (string) ($vaakUser['username'] ?? $vaakActorKey);
-$vaakHandle = '@' . $vaakUsername . '@mkultra.monster';
+if ($vaakGuestProfile) {
+    $vaakActorKey = '__guest__';
+    $vaakActorId = '';
+    $vaakUsername = 'guest';
+    $vaakHandle = '';
+} else {
+    $vaakActorKey = (string) ($vaakUser['actor_key'] ?? 'cmdr_nova');
+    $vaakActorId = rtrim((string) ($vaakUser['actor_id'] ?? ('https://mkultra.monster/users/' . $vaakActorKey)), '/');
+    $vaakUsername = (string) ($vaakUser['username'] ?? $vaakActorKey);
+    $vaakHandle = '@' . $vaakUsername . '@mkultra.monster';
+}
 $GLOBALS['vaak_actor_key'] = $vaakActorKey;
 $GLOBALS['vaak_actor_id'] = $vaakActorId;
-if (function_exists('ap_request_actor_set')) {
+if (!$vaakGuestProfile && function_exists('ap_request_actor_set')) {
     ap_request_actor_set($vaakActorKey);
 }
 
@@ -196,6 +228,51 @@ $error = null;
 $twoFaSetup = null;
 $twoFaRecoveryCodes = [];
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
+if (!empty($GLOBALS['vaak_guest_profile'])) {
+    // Guests may only see public local profiles — never the rest of the app.
+    $view = 'remote_profile';
+    $_GET['view'] = 'remote_profile';
+}
+// Canonicalize local on-VAAK profile URLs before any HTML is emitted.
+// vaak.monster → /users/{key}; mkultra.monster → /vaak/users/{key}.
+if (
+    $view === 'remote_profile'
+    && !isset($_GET['partial']) && !isset($_GET['ajax'])
+    && strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'GET'
+    && function_exists('ap_vaak_pretty_profile_path')
+) {
+    $earlyActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
+    $earlyLocalKey = null;
+    if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $earlyActor, $earlyLm)) {
+        $earlyLocalKey = strtolower($earlyLm[1]);
+    } elseif (function_exists('ap_vaak_pretty_profile_key_from_request')) {
+        $earlyLocalKey = ap_vaak_pretty_profile_key_from_request();
+    }
+    if (is_string($earlyLocalKey) && $earlyLocalKey !== '') {
+        $earlyReqPath = rtrim((string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: ''), '/') ?: '/';
+        $earlyCanonQ = [];
+        foreach (['tab', 'post', 'from'] as $earlyCanonKey) {
+            $earlyCanonVal = trim((string) ($_GET[$earlyCanonKey] ?? ''));
+            if ($earlyCanonVal !== '') {
+                $earlyCanonQ[$earlyCanonKey] = $earlyCanonVal;
+            }
+        }
+        $earlyCanon = ap_vaak_pretty_profile_path($earlyLocalKey, $earlyCanonQ);
+        $earlyCanonPath = rtrim((string) (parse_url($earlyCanon, PHP_URL_PATH) ?: $earlyCanon), '/') ?: '/';
+        if (
+            $earlyReqPath !== $earlyCanonPath
+            && (
+                $earlyReqPath === '/vaak'
+                || str_starts_with($earlyReqPath, '/vaak/index')
+                || (function_exists('ap_vaak_is_vaak_host') && ap_vaak_is_vaak_host()
+                    && preg_match('#^/vaak/users/[A-Za-z0-9_]+$#', $earlyReqPath))
+            )
+        ) {
+            header('Location: ' . $earlyCanon, true, 302);
+            exit;
+        }
+    }
+}
 // Account switcher lands with ?switched=1&as=actor_key (303 after switch_account).
 if (isset($_GET['switched']) && (string) $_GET['switched'] === '1') {
     $as = strtolower(preg_replace('/[^a-z0-9_]/', '', (string) ($_GET['as'] ?? '')) ?? '');
@@ -747,6 +824,19 @@ if (
 }
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    if (!empty($GLOBALS['vaak_guest_profile'])) {
+        $wantJsonGuest = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
+        if ($wantJsonGuest) {
+            header('Content-Type: application/json; charset=utf-8');
+            http_response_code(401);
+            echo json_encode(['ok' => false, 'error' => 'login_required', 'login' => '/vaak/?mode=login'], JSON_UNESCAPED_SLASHES);
+            exit;
+        }
+        header('Location: /vaak/?mode=login', true, 302);
+        exit;
+    }
     $action = (string) ($_POST['action'] ?? '');
     // Hard guard: a compose POST that carries our own note_id is ALWAYS an edit.
     // Stale client mode (reply) + duplicate compose forms have repeatedly created
@@ -11405,7 +11495,8 @@ function admin_local_actor_key_from_id(?string $actorId): ?string
 }
 
 /**
- * In-app profile href. Local accounts use pretty /users/{key} on vaak.monster;
+ * In-app profile href. Local accounts use host-aware pretty paths
+ * (vaak.monster/users/{key} or mkultra.monster/vaak/users/{key});
  * remotes and Bluesky keep ?view=remote_profile&actor=…
  *
  * @param array<string,scalar|null> $extra Extra query params (tab, post, …)
@@ -11428,7 +11519,16 @@ function admin_profile_app_href(?string $actorId, string $from = 'home', array $
         if ($from !== '' && $from !== 'home') {
             $q['from'] = $from;
         }
-        $path = '/users/' . rawurlencode($localKey);
+        if (function_exists('ap_vaak_pretty_profile_path')) {
+            return ap_vaak_pretty_profile_path($localKey, $q);
+        }
+        if (!function_exists('ap_vaak_pretty_profile_path') && is_file(__DIR__ . '/ap-vaak-profile-route.php')) {
+            require_once __DIR__ . '/ap-vaak-profile-route.php';
+            if (function_exists('ap_vaak_pretty_profile_path')) {
+                return ap_vaak_pretty_profile_path($localKey, $q);
+            }
+        }
+        $path = '/vaak/users/' . rawurlencode($localKey);
         return $q === [] ? $path : ($path . '?' . http_build_query($q));
     }
     $q = array_merge(['view' => 'remote_profile', 'actor' => $actorId], $q);
@@ -18743,7 +18843,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <meta name="csrf-token" content="<?= h(ap_auth_csrf_token()) ?>">
   <?php
     $vaakPrettyProfilePath = parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
-    $vaakPrettyProfile = (bool) preg_match('#^/users/[A-Za-z0-9_]+/?$#', $vaakPrettyProfilePath);
+    $vaakPrettyProfile = (bool) preg_match('#^(/vaak)?/users/[A-Za-z0-9_]+/?$#', $vaakPrettyProfilePath);
   ?>
   <?php if ($vaakPrettyProfile): ?>
   <base href="/vaak/">
@@ -21050,7 +21150,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .brand-avatar { width: 52px; height: 52px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border); display: block; margin: .4rem auto .45rem; }
   </style>
 </head>
-<body class="<?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
+<body class="<?= !empty($GLOBALS['vaak_guest_profile']) ? 'vaak-guest-profile ' : '' ?><?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
   <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
 </div>
@@ -21058,12 +21158,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 <header class="mobile-topbar" id="mobile-topbar">
   <button type="button" class="mobile-topbar__menu" id="mobile-menu-btn" aria-label="Open menu" aria-controls="admin-rail-left" aria-expanded="false">☰</button>
   <div class="mobile-topbar__title"><span>VAAK</span> · <?= h(view_title($view)) ?></div>
+  <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
   <a class="mobile-topbar__search" href="?view=search" data-vaak-soft-nav="search" aria-label="Search">⌕</a>
+  <?php else: ?>
+  <a class="mobile-topbar__search" href="/vaak/?mode=login" aria-label="Log in">⇢</a>
+  <?php endif; ?>
 </header>
+<?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
+<div class="notice" style="margin:0;border-radius:0;border-left:0;border-right:0;text-align:center">
+  Public profile · <a href="/vaak/?mode=login&amp;next_path=<?= rawurlencode((string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>">Log in</a>
+  · <a href="/vaak/?mode=register">Join VAAK</a>
+</div>
+<?php endif; ?>
 <div class="shell">
   <aside class="rail-left" id="admin-rail-left">
     <div class="brand">
-      <a class="brand-link" href="?view=home" title="VAAK Home">
+      <a class="brand-link" href="<?= !empty($GLOBALS['vaak_guest_profile']) ? '/vaak/' : '?view=home' ?>" title="VAAK Home">
         <pre class="brand-ascii" aria-hidden="true">██╗   ██╗
 ██║   ██║
 ██║   ██║
@@ -21072,6 +21182,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   ╚═══╝</pre>
         <strong>VAAK</strong>
       </a>
+      <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
+      <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">browsing as guest</div>
+      <a class="btn btn-primary brand-profile-link" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode((string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>">Log in</a>
+      <a class="btn btn-ghost brand-profile-link" href="/vaak/?mode=register">Join VAAK</a>
+      <?php else: ?>
       <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
       <a class="btn btn-ghost brand-profile-link" href="/users/<?= h(rawurlencode($vaakActorKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">View profile</a>
@@ -21105,7 +21220,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="account-switcher__manage" href="?view=account_switcher">Manage accounts</a>
         </div>
       </details>
+      <?php endif; ?>
     </div>
+    <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
+    <nav class="nav" aria-label="Guest">
+      <a href="/vaak/?mode=login&amp;next_path=<?= rawurlencode((string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>"><span class="ico">⇢</span><span class="label">Log in</span></a>
+      <a href="/vaak/?mode=register"><span class="ico">✦</span><span class="label">Join VAAK</span></a>
+      <hr class="nav-sep">
+      <a href="https://mkultra.monster/"><span class="ico">←</span><span class="label">mkultra.monster</span></a>
+      <a href="/vaak/privacy/"><span class="ico">§</span><span class="label">Privacy</span></a>
+      <div class="nav-version" title="Release channel"><?= h(function_exists('vaak_version_label') ? vaak_version_label() : 'VAAK alpha') ?></div>
+    </nav>
+    <?php else: ?>
     <?php
       $dmUnreadNav = ap_dm_unread_count();
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
@@ -21219,8 +21345,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <a href="/vaak/?logout=1"><span class="ico">⎋</span><span class="label">Log out</span></a>
       <div class="nav-version" title="Release channel"><?= h(function_exists('vaak_version_label') ? vaak_version_label() : 'VAAK alpha') ?></div>
     </nav>
+    <?php endif; ?>
   </aside>
 
+  <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
   <aside class="rail-right">
     <div class="side-card">
       <h3>Search</h3>
@@ -21276,6 +21404,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php endif; ?>
     </div>
   </aside>
+  <?php endif; ?>
 
   <section class="main">
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
@@ -26373,24 +26502,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $rpLocalKey = strtolower($lm[1]);
               }
               $rpIsLocal = $rpLocalKey !== null;
-              // Pretty local URL: /users/{key} instead of ?view=remote_profile&actor=…
+              // Pretty local URL instead of ?view=remote_profile&actor=…
+              // vaak.monster → /users/{key}; mkultra → /vaak/users/{key}
               if ($rpIsLocal && $rpLocalKey !== null
                   && !isset($_GET['partial']) && !isset($_GET['ajax'])
-                  && strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'GET') {
-                  $rpReqPath = parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
-                  $rpPrettyPath = '/users/' . $rpLocalKey;
-                  if ($rpReqPath === '/vaak' || $rpReqPath === '/vaak/' || str_starts_with($rpReqPath, '/vaak/index')) {
-                      $rpCanonQ = [];
-                      foreach (['tab', 'post', 'from'] as $rpCanonKey) {
-                          $rpCanonVal = trim((string) ($_GET[$rpCanonKey] ?? ''));
-                          if ($rpCanonVal !== '') {
-                              $rpCanonQ[$rpCanonKey] = $rpCanonVal;
-                          }
+                  && strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'GET'
+                  && function_exists('ap_vaak_pretty_profile_path')) {
+                  $rpReqPath = rtrim((string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: ''), '/') ?: '/';
+                  $rpCanonQ = [];
+                  foreach (['tab', 'post', 'from'] as $rpCanonKey) {
+                      $rpCanonVal = trim((string) ($_GET[$rpCanonKey] ?? ''));
+                      if ($rpCanonVal !== '') {
+                          $rpCanonQ[$rpCanonKey] = $rpCanonVal;
                       }
-                      $rpCanon = $rpPrettyPath . ($rpCanonQ !== [] ? ('?' . http_build_query($rpCanonQ)) : '');
-                      header('Location: ' . $rpCanon, true, 302);
-                      exit;
                   }
+                  // Canonical redirects run earlier (before HTML); keep path vars for links below.
+                  $rpCanon = ap_vaak_pretty_profile_path((string) $rpLocalKey, $rpCanonQ);
+                  $rpCanonPath = rtrim((string) (parse_url($rpCanon, PHP_URL_PATH) ?: $rpCanon), '/') ?: '/';
               }
               if ($rpIsLocal && function_exists('ap_profile_get')) {
                   $rpPrefs = ap_profile_get($rpLocalKey);
@@ -26991,7 +27119,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <?php endif; ?>
                 </div>
               </div>
-              <?php if (!$rpIsOwn): ?>
+              <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
+                <div class="remote-profile-follow" style="flex:0 0 auto;align-self:center;display:flex;gap:.45rem;flex-wrap:wrap">
+                  <a class="btn btn-primary" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode(function_exists('ap_vaak_pretty_profile_path') && $rpLocalKey ? ap_vaak_pretty_profile_path((string) $rpLocalKey) : (string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>">Log in</a>
+                  <a class="btn btn-ghost" href="/vaak/?mode=register">Join VAAK</a>
+                  <?php if ($rpIsLocal && $rpLocalKey): ?>
+                    <a class="btn btn-ghost" href="/authorize_interaction?uri=<?= rawurlencode('https://mkultra.monster/users/' . $rpLocalKey) ?>" title="Follow from your Fediverse account">Follow from fedi</a>
+                  <?php endif; ?>
+                </div>
+              <?php elseif (!$rpIsOwn): ?>
                 <div class="remote-profile-follow" style="flex:0 0 auto;align-self:center">
                   <?php if ($rpFollowing): ?>
                     <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Unfollow this account?');">
@@ -27000,7 +27136,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
                       <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
                       <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                      <button class="btn btn-following" type="submit" title="<?= $rpIsBsky ? 'Following on Bluesky' : 'Following' ?>"><?= $rpIsBsky ? 'Following' : 'Following' ?></button>
+                      <button class="btn btn-following" type="submit" title="Following — click to unfollow">Following</button>
                     </form>
                   <?php else: ?>
                     <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
@@ -27009,9 +27145,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
                       <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
                       <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                      <button class="btn btn-primary" type="submit"><?= $rpIsBsky
-                          ? ($rpRel === 'follows_you' ? 'Follow back' : 'Follow')
-                          : ($rpRel === 'follows_you' ? 'Follow back' : 'Follow') ?></button>
+                      <button class="btn btn-primary" type="submit"><?= $rpRel === 'follows_you' ? 'Follow back' : 'Follow' ?></button>
                     </form>
                   <?php endif; ?>
                 </div>
@@ -32231,7 +32365,8 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 
 <?php
-$showComposeFab = !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
+$showComposeFab = empty($GLOBALS['vaak_guest_profile'])
+    && !in_array($view, ['guestbook', 'support', 'analytics', 'security'], true);
 ?>
 <?php if ($showComposeFab): ?>
 <button type="button" class="compose-fab" id="compose-fab" title="Compose" aria-label="Compose"><i class="ph ph-pencil-simple" aria-hidden="true"></i></button>

@@ -51,6 +51,19 @@ $accept = strtolower($_SERVER['HTTP_ACCEPT'] ?? '');
 // a "Pretty-print" JSON view instead of the public profile HTML.
 $wantsAp = ap_cmdr_wants_activitypub($accept);
 
+// vaak.monster bare /users/cmdr_nova → on-VAAK profile (Caddy used to send this
+// file directly, bypassing ap-user.php). Notes/inbox/feeds stay here.
+require_once __DIR__ . '/ap-vaak-profile-route.php';
+if (
+    !$wantsAp
+    && ($method === 'GET' || $method === 'HEAD')
+    && ($path === '/users/cmdr_nova' || $path === '/users/cmdr_nova/')
+    && function_exists('ap_vaak_pretty_profile_key_from_request')
+    && ap_vaak_pretty_profile_key_from_request() === 'cmdr_nova'
+) {
+    ap_vaak_boot_pretty_profile('cmdr_nova');
+}
+
 if (preg_match('#^/users/cmdr_nova/inbox$#', $path)) {
     if ($method !== 'POST') {
         header('Allow: POST');

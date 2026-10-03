@@ -57,6 +57,7 @@ register_shutdown_function(static function (): void {
 
 require_once dirname(__DIR__) . '/api/ap-auth.php';
 require_once dirname(__DIR__) . '/api/ap-version.php';
+require_once dirname(__DIR__) . '/api/ap-vaak-profile-route.php';
 
 ap_auth_bootstrap();
 ap_auth_start_session();
@@ -264,6 +265,15 @@ $mode = preg_replace('/[^a-z]/', '', (string) ($_GET['mode'] ?? '')) ?: '';
 if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !== 'reset' && $mode !== '2fa') {
     $mode = '';
 }
+
+// Pretty local profiles: /vaak/users/{key} (and Caddy ?local_key= rewrites).
+$vaakPrettyKey = function_exists('ap_vaak_pretty_profile_key_from_request')
+    ? ap_vaak_pretty_profile_key_from_request()
+    : null;
+if ($vaakPrettyKey !== null && $mode === '') {
+    ap_vaak_boot_pretty_profile($vaakPrettyKey);
+}
+
 // Flash messages from PRG redirects (forgot / reset password).
 ap_auth_start_session();
 if (!empty($_SESSION['vaak_flash_ok']) && is_string($_SESSION['vaak_flash_ok'])) {
@@ -298,6 +308,13 @@ if ($isAuthPost) {
             (string) ($_POST['password'] ?? '')
         );
         if (!empty($res['ok'])) {
+            $nextPath = function_exists('ap_vaak_safe_next_path')
+                ? ap_vaak_safe_next_path((string) ($_POST['next_path'] ?? $_GET['next_path'] ?? ''))
+                : null;
+            if ($nextPath !== null) {
+                header('Location: ' . $nextPath, true, 302);
+                exit;
+            }
             $next = preg_replace('/[^a-z_]/', '', (string) ($_GET['next'] ?? $_POST['next'] ?? '')) ?: 'home';
             // Resume /authorize_interaction after login (stashed actor URI).
             if ($next === 'remote_profile') {
@@ -318,6 +335,12 @@ if ($isAuthPost) {
         }
         if (!empty($res['requires_2fa'])) {
             ap_auth_start_session();
+            $pendingNextPath = function_exists('ap_vaak_safe_next_path')
+                ? ap_vaak_safe_next_path((string) ($_POST['next_path'] ?? $_GET['next_path'] ?? ''))
+                : null;
+            if ($pendingNextPath !== null) {
+                $_SESSION['vaak_2fa_pending_next_path'] = $pendingNextPath;
+            }
             $_SESSION['vaak_2fa_pending_next'] = preg_replace('/[^a-z_]/', '', (string) ($_GET['next'] ?? $_POST['next'] ?? '')) ?: 'home';
             $mode = '2fa';
         } else {
@@ -339,9 +362,17 @@ if ($isAuthPost) {
         $mode = 'register';
     } elseif ($postAction === 'verify_2fa' || $mode === '2fa') {
         ap_auth_start_session();
+        $nextPath = function_exists('ap_vaak_safe_next_path')
+            ? ap_vaak_safe_next_path((string) ($_SESSION['vaak_2fa_pending_next_path'] ?? $_POST['next_path'] ?? ''))
+            : null;
+        unset($_SESSION['vaak_2fa_pending_next_path']);
         $next = preg_replace('/[^a-z_]/', '', (string) ($_SESSION['vaak_2fa_pending_next'] ?? $_POST['next'] ?? '')) ?: 'home';
         $res = ap_auth_complete_2fa_login((string) ($_POST['code'] ?? ''));
         if (!empty($res['ok'])) {
+            if ($nextPath !== null) {
+                header('Location: ' . $nextPath, true, 302);
+                exit;
+            }
             header('Location: /vaak/?view=' . rawurlencode($next), true, 302);
             exit;
         }
@@ -673,6 +704,14 @@ ASCII;
       <form method="post" action="/vaak/?mode=login" autocomplete="on">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
         <input type="hidden" name="action" value="login">
+        <?php
+          $loginNextPath = function_exists('ap_vaak_safe_next_path')
+              ? ap_vaak_safe_next_path((string) ($_GET['next_path'] ?? $_POST['next_path'] ?? ''))
+              : null;
+        ?>
+        <?php if ($loginNextPath !== null): ?>
+          <input type="hidden" name="next_path" value="<?= htmlspecialchars($loginNextPath, ENT_QUOTES, 'UTF-8') ?>">
+        <?php endif; ?>
         <label for="login">Username or email</label>
         <input id="login" name="login" required autocomplete="username"
                placeholder="username"

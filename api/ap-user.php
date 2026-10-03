@@ -50,30 +50,17 @@ if ($username === '') {
     exit;
 }
 
-// On vaak.monster, logged-in visits to /users/{key} open the on-VAAK profile
-// (pretty URL). mkultra.monster keeps public HTML + ActivityPub negotiation.
-$hostHeader = strtolower((string) ($_SERVER['HTTP_HOST'] ?? ''));
-$onVaakHost = $hostHeader === 'vaak.monster' || $hostHeader === 'www.vaak.monster';
+// On vaak.monster, bare /users/{key} is the on-VAAK profile (logged-in or guest).
+// mkultra.monster /users/{key} stays public HTML + ActivityPub negotiation.
+require_once __DIR__ . '/ap-vaak-profile-route.php';
 $acceptEarly = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
 $wantsApEarly = function_exists('ap_user_wants_activitypub')
     ? ap_user_wants_activitypub($acceptEarly)
     : (str_contains($acceptEarly, 'application/activity+json') || str_contains($acceptEarly, 'application/ld+json'));
-if ($onVaakHost && $sub === '' && !$wantsApEarly) {
-    if (session_status() !== PHP_SESSION_ACTIVE) {
-        ap_auth_bootstrap();
-        if (function_exists('ap_auth_start_session')) {
-            ap_auth_start_session();
-        }
-    }
-    $vaakSessionUser = ap_auth_current_user();
-    if (is_array($vaakSessionUser)) {
-        $_GET['view'] = 'remote_profile';
-        $_GET['actor'] = 'https://mkultra.monster/users/' . $username;
-        if (!isset($_GET['from']) || trim((string) $_GET['from']) === '') {
-            $_GET['from'] = 'home';
-        }
-        require __DIR__ . '/ap-admin.php';
-        exit;
+if ($sub === '' && !$wantsApEarly && function_exists('ap_vaak_pretty_profile_key_from_request')) {
+    $prettyKey = ap_vaak_pretty_profile_key_from_request();
+    if ($prettyKey !== null && $prettyKey === strtolower($username)) {
+        ap_vaak_boot_pretty_profile($prettyKey);
     }
 }
 
