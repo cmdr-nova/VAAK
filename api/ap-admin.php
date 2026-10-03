@@ -2470,8 +2470,17 @@ $vaakAdminOnlyActions = [
     } elseif ($action === 'suggestion_follow' || $action === 'suggestion_dismiss') {
         $view = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'home')) ?: 'home';
         $actor = trim((string) ($_POST['actor_id'] ?? ''));
+        $wantSuggestionJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
         if ($action === 'suggestion_dismiss') {
             ap_masto_suggestion_dismiss($actor);
+            if ($wantSuggestionJson) {
+                header('Content-Type: application/json; charset=utf-8');
+                header('Cache-Control: no-store');
+                echo json_encode(['ok' => true, 'dismissed' => true]);
+                exit;
+            }
             $notice = 'Suggestion dismissed.';
         } else {
             $isBskySuggestion = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actor);
@@ -2480,6 +2489,8 @@ $vaakAdminOnlyActions = [
                 && is_array(ap_bsky_session_row($vaakOwnerId));
             if ($isBskySuggestion && !$hasBskySession) {
                 $error = 'Connect Bluesky in Profile settings before following Bluesky suggestions.';
+            } elseif ($actor === '') {
+                $error = 'Missing suggestion account.';
             } else {
                 $queue = ap_action_queue_enqueue(
                     $vaakOwnerId,
@@ -2490,11 +2501,33 @@ $vaakAdminOnlyActions = [
                     ['actor' => $actor]
                 );
                 if (!empty($queue['ok'])) {
-                    $notice = 'Follow queued — it will finish in the background.';
                     ap_masto_suggestion_dismiss($actor); // drop from For You once queued
+                    if ($wantSuggestionJson) {
+                        header('Content-Type: application/json; charset=utf-8');
+                        header('Cache-Control: no-store');
+                        http_response_code(202);
+                        echo json_encode([
+                            'ok' => true,
+                            'queued' => true,
+                            'queue_id' => $queue['id'] ?? null,
+                            'revision' => $queue['revision'] ?? null,
+                            'coalesced' => $queue['coalesced'] ?? false,
+                            'kind' => 'follow',
+                            'active' => true,
+                        ]);
+                        exit;
+                    }
+                    // Non-AJAX fallback (no JS): stay quiet — no flash notice.
                 } else {
                     $error = $queue['error'] ?? 'Could not queue follow.';
                 }
+            }
+            if ($wantSuggestionJson && is_string($error) && $error !== '') {
+                header('Content-Type: application/json; charset=utf-8');
+                header('Cache-Control: no-store');
+                http_response_code(503);
+                echo json_encode(['ok' => false, 'error' => $error]);
+                exit;
             }
         }
     } elseif (str_starts_with($action, 'starter_pack_')) {
@@ -19140,7 +19173,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             $at = admin_at_acct($acct);
             echo '<div class="meta home-suggestion-handle" title="' . h($at) . '">' . h($at) . '</div>';
         }
-        echo '<form method="post" action="?view=home" class="home-suggestion-form">'
+        echo '<form method="post" action="?view=home" class="home-suggestion-form" data-ajax-submit="1">'
+            . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
             . '<input type="hidden" name="action" value="suggestion_follow">'
             . '<input type="hidden" name="return_view" value="home">'
             . '<input type="hidden" name="actor_id" value="' . h($actorUrl) . '">'
@@ -25874,13 +25908,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="tweet-actions">
                 <?php if ($actorUrl !== ''): ?>
                   <a href="?view=remote_profile&amp;actor=<?= urlencode($actorUrl) ?>">Profile</a>
-                  <form method="post" action="?view=foryou" style="display:inline">
+                  <form method="post" action="?view=foryou" style="display:inline" data-ajax-submit="1">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                     <input type="hidden" name="action" value="suggestion_follow">
+                    <input type="hidden" name="return_view" value="foryou">
                     <input type="hidden" name="actor_id" value="<?= h($actorUrl) ?>">
                     <button class="btn btn-primary" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Follow</button>
                   </form>
-                  <form method="post" action="?view=foryou" style="display:inline">
+                  <form method="post" action="?view=foryou" style="display:inline" data-ajax-submit="1">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                     <input type="hidden" name="action" value="suggestion_dismiss">
+                    <input type="hidden" name="return_view" value="foryou">
                     <input type="hidden" name="actor_id" value="<?= h($actorUrl) ?>">
                     <button class="btn btn-ghost" type="submit" style="padding:.35rem .9rem;font-size:.85rem">Dismiss</button>
                   </form>
@@ -35254,6 +35292,82 @@ if (VIEW === 'analytics') loadAnalytics();
 })();
 </script>
 <script>
+// Suggested-account Follow: optimistic Following + silent background queue.
+// No Saving… toast, no “queued in the background” confirmation.
+(function () {
+  document.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const actionInput = form.querySelector('input[name="action"]');
+    const button = form.querySelector('button[type="submit"]');
+    if (!actionInput || !button) return;
+    const action = String(actionInput.value || '');
+    if (action !== 'suggestion_follow' && action !== 'suggestion_dismiss') return;
+    ev.preventDefault();
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    if (form.dataset.busy === '1') return;
+    form.dataset.busy = '1';
+    const card = form.closest('article.home-suggestion, article.tweet');
+    const beforeLabel = button.innerHTML;
+    const beforeDisabled = button.disabled;
+    const beforeClass = button.className;
+    if (action === 'suggestion_follow') {
+      button.textContent = 'Following';
+      button.disabled = true;
+      button.classList.remove('btn-primary');
+      button.classList.add('btn-following');
+      button.title = 'Following';
+    } else {
+      button.disabled = true;
+    }
+    if (window.vaakHaptic) window.vaakHaptic(5);
+    const fd = new FormData(form);
+    fd.set('ajax', '1');
+    if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    const fadeCard = () => {
+      if (!card || !card.isConnected) return;
+      card.style.transition = 'opacity .2s ease, transform .2s ease';
+      card.style.opacity = '0';
+      card.style.transform = 'scale(0.98)';
+      setTimeout(() => {
+        if (!card.isConnected) return;
+        const grid = card.parentElement;
+        card.remove();
+        // Drop empty Home suggestions section once the last card is gone.
+        if (grid && grid.classList.contains('home-suggestions-grid') && !grid.querySelector('article.home-suggestion')) {
+          const section = grid.closest('section.home-suggestions');
+          if (section) section.remove();
+        }
+      }, 220);
+    };
+    try {
+      const res = await fetch(form.getAttribute('action') || window.location.href, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }
+      });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok) {
+        throw new Error((data && data.error) || (action === 'suggestion_follow' ? 'Could not follow.' : 'Could not dismiss.'));
+      }
+      fadeCard();
+    } catch (err) {
+      button.innerHTML = beforeLabel;
+      button.disabled = beforeDisabled;
+      button.className = beforeClass;
+      button.title = '';
+      form.dataset.busy = '0';
+      if (typeof window.apAdminToast === 'function') {
+        window.apAdminToast((err && err.message) || 'Could not follow.', true);
+      }
+    } finally {
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    }
+  });
+})();
+</script>
+<script>
 // Follow/unfollow forms use the same durable queue as timeline reactions.
 (function () {
   document.addEventListener('submit', async (ev) => {
@@ -35599,6 +35713,7 @@ if (VIEW === 'analytics') loadAnalytics();
       'bookmark_status', 'unbookmark_status',
       'reblog_status', 'unreblog_status',
       'follow_remote', 'unfollow_remote',
+      'suggestion_follow', 'suggestion_dismiss',
       'rss_favourite', 'rss_bookmark',
       'poll_vote', 'action_queue_status',
     ].includes(action)) {
