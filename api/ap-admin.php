@@ -6575,7 +6575,8 @@ function admin_tl_cache_key(string $view, array $following): string
     // cannot reintroduce cards that a fresh timeline build would exclude.
     // v11: cold-start FoF + diverse local/public mix.
     // v12: denser Home mix (Bluesky/RSS/local/recommendation caps).
-    return 'v12_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
+    // v13: Local lean warm uses outbox_notes (compose), not log/local_observe events.
+    return 'v13_' . $view . '_u' . $owner . '_a' . $algorithmMode . '_' . substr(hash('sha256', implode('|', $parts)), 0, 24);
 }
 
 /**
@@ -7933,33 +7934,52 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
     $db = ap_db();
     $timeline = [];
     if ($view === 'local') {
+        // Match the full Local rebuild: outbox_notes (compose/public posts) plus
+        // local masto_reblogs. Filtering events to log/local_observe skipped
+        // action_taken=compose and seeded a days-old Announce-only cache.
         try {
             $st = $db->query(
-                "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
-                        action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
-                 FROM events
-                 WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
-                   AND (action_taken = 'log' OR action_taken = 'local_observe')
-                   AND actor_id LIKE 'https://mkultra.monster/users/%'
-                 ORDER BY created_at DESC, id DESC
+                "SELECT * FROM outbox_notes
+                 WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
+                 ORDER BY published DESC
                  LIMIT 160"
             );
-            $ownerUserId = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
-            foreach ($st->fetchAll() ?: [] as $erow) {
-                if (!is_array($erow)) {
-                    continue;
-                }
-                if ($ownerUserId > 0 && admin_timeline_row_hidden($erow, $ownerUserId)) {
+            foreach ($st->fetchAll() ?: [] as $nrow) {
+                if (!is_array($nrow) || admin_outbox_is_bsky_import($nrow)) {
                     continue;
                 }
                 $timeline[] = [
-                    'kind' => 'event',
-                    'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
-                    'row' => $erow,
+                    'kind' => 'outbox',
+                    'sort' => strtotime((string) ($nrow['published'] ?? '')) ?: 0,
+                    'row' => $nrow,
                 ];
             }
         } catch (Throwable $e) {
             return;
+        }
+        try {
+            $stRb = $db->query(
+                "SELECT * FROM masto_reblogs
+                 WHERE owner_actor_id LIKE 'https://mkultra.monster/users/%'
+                 ORDER BY created_at DESC
+                 LIMIT 80"
+            );
+            foreach ($stRb->fetchAll() ?: [] as $rb) {
+                if (!is_array($rb) || admin_reblog_is_bsky($rb)) {
+                    continue;
+                }
+                $timeline[] = [
+                    'kind' => 'boost',
+                    'sort' => strtotime((string) ($rb['created_at'] ?? '')) ?: 0,
+                    'row' => $rb,
+                ];
+            }
+        } catch (Throwable $e) {
+            // optional
+        }
+        usort($timeline, static fn($a, $b) => ($b['sort'] ?? 0) <=> ($a['sort'] ?? 0));
+        if ($timeline !== []) {
+            $timeline = array_slice($timeline, 0, 160);
         }
     } elseif ($view === 'feed') {
         try {
@@ -31529,9 +31549,17 @@ window.apAdminToast = function (msg, isErr) {
       if (status) {
         status.textContent = hasMore ? 'Scroll for more…' : (html.trim() ? 'End of timeline' : '');
       }
-      // Empty-state hint when the partial returns nothing.
-      // Soft-nav skeleton with needs-fill: wait for loadMore — do not flash empty state.
-      if (!html.trim() && items.dataset.needsFill !== '1') {
+      // Empty first page with more ranked rows: fill via loadMore (stale/filtered
+      // cache head) instead of flashing the permanent empty-state copy.
+      if (!html.trim() && hasMore && typeof loadMore === 'function') {
+        items.dataset.needsFill = '0';
+        offset = 0;
+        items.dataset.offset = '0';
+        items.dataset.hasMore = '1';
+        if (status) status.textContent = 'Loading timeline…';
+        setTimeout(function () { try { loadMore(); } catch (e) {} }, 0);
+      } else if (!html.trim() && items.dataset.needsFill !== '1') {
+        // Empty-state hint when the partial returns nothing.
         const empty = document.createElement('div');
         empty.className = 'empty';
         if (nextView === 'local') {
@@ -32058,7 +32086,11 @@ window.apAdminToast = function (msg, isErr) {
           bindFeedTopBtn(document.querySelector('section.main'));
           return;
         }
-        // Fall through to full shell soft-nav when swap cannot bind a live node.
+        // In-place was the right mode; swap failed (busy / mid-flight detach).
+        // Prefer hardNav over racing a shell replace against an in-flight swap,
+        // which previously left Local clicks bouncing back to Home.
+        hardNav(view, filter, extra);
+        return;
       }
     }
 
