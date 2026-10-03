@@ -37,6 +37,7 @@ enum Command {
         /// Write production Redis key + file cache (Rust-primary cutover).
         #[arg(long, default_value_t = false)]
         live: bool,
+        /// Local ap_users.id. `0` (default in loop) refreshes every non-disabled account.
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
         #[arg(long, default_value_t = 30)]
@@ -122,14 +123,16 @@ async fn main() -> Result<()> {
             interval_secs,
             r#loop,
         } => {
-            let owner = if owner_id > 0 {
-                owner_id
-            } else {
-                cfg.default_owner_id
-            };
+            // Loop with owner_id=0 → all local accounts. One-shot with 0 still
+            // falls back to VAAK_SHADOW_OWNER_ID for quick single-user smoke.
             if r#loop && !once {
-                notif::run_loop(&cfg, owner, interval_secs, compare, live).await?;
+                notif::run_loop(&cfg, owner_id, interval_secs, compare, live).await?;
             } else {
+                let owner = if owner_id > 0 {
+                    owner_id
+                } else {
+                    cfg.default_owner_id
+                };
                 notif::run_once(&cfg, owner, compare, live).await?;
             }
         }
