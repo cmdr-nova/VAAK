@@ -11583,6 +11583,134 @@ function ap_masto_status_flags_prefetch(array $statusIds, array $objectIds = [])
     }
 }
 
+/**
+ * Engagement totals for a local VAAK note (own posts on Home / Your Posts / profile).
+ * Fediverse likes/boosts come from the events ledger; local VAAK favourites /
+ * bookmarks / boosts from masto_*; quotes from quote_object + quote_authorizations;
+ * Bluesky crosspost counts from bsky_posts when a mirror exists (added, not maxed,
+ * because AP and ATProto audiences do not overlap).
+ *
+ * @return array{favourites:int,reblogs:int,quotes:int,bookmarks:int}
+ */
+function ap_local_note_engagement_counts(string $noteId, ?string $statusId = null): array
+{
+    $empty = ['favourites' => 0, 'reblogs' => 0, 'quotes' => 0, 'bookmarks' => 0];
+    $noteId = rtrim(trim($noteId), '/');
+    if ($noteId === '' || !str_contains($noteId, '/notes/')) {
+        return $empty;
+    }
+    $statusId = trim((string) $statusId);
+    $noteSlash = $noteId . '/';
+    try {
+        $db = ap_db();
+        $likeSt = $db->prepare(
+            "SELECT COUNT(DISTINCT rtrim(actor_id, '/')) FROM events
+             WHERE type = 'Like' AND (object_id = ? OR object_id = ?)"
+        );
+        $likeSt->execute([$noteId, $noteSlash]);
+        $fav = (int) $likeSt->fetchColumn();
+
+        $annSt = $db->prepare(
+            "SELECT COUNT(DISTINCT rtrim(actor_id, '/')) FROM events
+             WHERE type = 'Announce' AND (object_id = ? OR object_id = ?)"
+        );
+        $annSt->execute([$noteId, $noteSlash]);
+        $reblogs = (int) $annSt->fetchColumn();
+
+        $quotes = 0;
+        try {
+            $qtSt = $db->prepare(
+                "SELECT COUNT(*) FROM events
+                 WHERE quote_object IS NOT NULL AND quote_object != ''
+                   AND (quote_object = ? OR quote_object = ? OR rtrim(quote_object, '/') = ?)"
+            );
+            $qtSt->execute([$noteId, $noteSlash, $noteId]);
+            $quotes = (int) $qtSt->fetchColumn();
+        } catch (Throwable $e) {
+            // events.quote_object is not present on every deploy yet
+        }
+        try {
+            $qa = $db->prepare(
+                "SELECT COUNT(*) FROM quote_authorizations
+                 WHERE deleted_at IS NULL AND (quoted_note_id = ? OR quoted_note_id = ?)"
+            );
+            $qa->execute([$noteId, $noteSlash]);
+            $quotes = max($quotes, (int) $qa->fetchColumn());
+        } catch (Throwable $e) {
+            // quote_authorizations may be absent on older DBs
+        }
+
+        // Fallback: Creates whose summary embeds this note as a QT target.
+        if ($quotes < 1) {
+            try {
+                $qtSum = $db->prepare(
+                    "SELECT COUNT(*) FROM events
+                     WHERE type = 'Create'
+                       AND summary IS NOT NULL AND summary LIKE ?
+                       AND object_id IS DISTINCT FROM ? AND object_id IS DISTINCT FROM ?"
+                );
+                $qtSum->execute(['%' . $noteId . '%', $noteId, $noteSlash]);
+                $quotes = max($quotes, (int) $qtSum->fetchColumn());
+            } catch (Throwable $e) {
+                // ignore
+            }
+        }
+
+        // Local VAAK account actions (including self-like / self-bookmark / self-boost).
+        if ($statusId !== '' || $noteId !== '') {
+            $localFav = $db->prepare(
+                'SELECT COUNT(*) FROM masto_favourites WHERE status_id = ? OR object_id = ? OR object_id = ?'
+            );
+            $localFav->execute([$statusId !== '' ? $statusId : $noteId, $noteId, $noteSlash]);
+            $fav += (int) $localFav->fetchColumn();
+
+            $localRb = $db->prepare(
+                'SELECT COUNT(*) FROM masto_reblogs WHERE status_id = ? OR object_id = ? OR object_id = ?'
+            );
+            $localRb->execute([$statusId !== '' ? $statusId : $noteId, $noteId, $noteSlash]);
+            $reblogs += (int) $localRb->fetchColumn();
+
+            $localBm = $db->prepare(
+                'SELECT COUNT(*) FROM masto_bookmarks WHERE status_id = ? OR object_id = ? OR object_id = ?'
+            );
+            $localBm->execute([$statusId !== '' ? $statusId : $noteId, $noteId, $noteSlash]);
+            $bookmarks = (int) $localBm->fetchColumn();
+        } else {
+            $bookmarks = 0;
+        }
+
+        // Bluesky mirror engagement (separate network).
+        try {
+            $bx = $db->prepare(
+                'SELECT p.like_count, p.repost_count, p.quote_count
+                 FROM bsky_crossposts c
+                 JOIN bsky_posts p ON p.bsky_uri = c.bsky_uri
+                 WHERE c.note_id = ? OR c.note_id = ?
+                 ORDER BY c.created_at DESC NULLS LAST
+                 LIMIT 1'
+            );
+            $bx->execute([$noteId, $noteSlash]);
+            $brow = $bx->fetch(PDO::FETCH_ASSOC);
+            if (is_array($brow)) {
+                $fav += max(0, (int) ($brow['like_count'] ?? 0));
+                $reblogs += max(0, (int) ($brow['repost_count'] ?? 0));
+                $quotes += max(0, (int) ($brow['quote_count'] ?? 0));
+            }
+        } catch (Throwable $e) {
+            // crosspost tables optional
+        }
+
+        return [
+            'favourites' => max(0, $fav),
+            'reblogs' => max(0, $reblogs),
+            'quotes' => max(0, $quotes),
+            'bookmarks' => max(0, $bookmarks),
+        ];
+    } catch (Throwable $e) {
+        return $empty;
+    }
+}
+
 function ap_masto_status_is_favourited(string $statusId, ?int $ownerUserId = null, ?string $objectId = null): bool
 {
     $statusId = trim($statusId);
