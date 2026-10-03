@@ -15589,11 +15589,33 @@ function admin_render_outbox_card(array $n, string $returnView): void
 {
     $actor = vaak_actor_id();
     $actorKey = vaak_actor_key();
+    // Guest / unbound sessions have no real actor — never paint @__guest__.
+    if ($actorKey === '' || $actorKey === '__guest__' || $actor === '') {
+        $actor = '';
+        $actorKey = '';
+    }
     $noteId = (string) ($n['id'] ?? '');
     // Prefer actor from note id so peer local profiles render correctly
     if ($noteId !== '' && preg_match('#^(https://mkultra\.monster/users/([A-Za-z0-9_]+))/#', $noteId, $nm)) {
         $actor = $nm[1];
         $actorKey = strtolower($nm[2]);
+    } elseif ($noteId !== '' && preg_match('#^(https://mkultra\.monster/users/([A-Za-z0-9_]+))$#', $noteId, $nm)) {
+        $actor = $nm[1];
+        $actorKey = strtolower($nm[2]);
+    }
+    // Event-ledger rows sometimes land here with object_id instead of note id.
+    if (($actorKey === '' || $actor === '') && !empty($n['object_id']) && is_string($n['object_id'])
+        && preg_match('#^(https://mkultra\.monster/users/([A-Za-z0-9_]+))/#', (string) $n['object_id'], $om)) {
+        $actor = $om[1];
+        $actorKey = strtolower($om[2]);
+        if ($noteId === '' || ctype_digit($noteId)) {
+            $noteId = (string) $n['object_id'];
+        }
+    }
+    if (($actorKey === '' || $actor === '') && !empty($n['actor_id']) && is_string($n['actor_id'])
+        && preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', rtrim((string) $n['actor_id'], '/'), $am)) {
+        $actor = 'https://mkultra.monster/users/' . strtolower($am[1]);
+        $actorKey = strtolower($am[1]);
     }
     $isOwnNote = function_exists('vaak_is_own_url') ? vaak_is_own_url($noteId !== '' ? $noteId : $actor) : ($actor === vaak_actor_id());
     $content = (string) ($n['content'] ?? '');
@@ -17360,13 +17382,13 @@ if ($isPartial && $view === 'outbox') {
                     $profileRows['media'][] = $row;
                 }
             }
-            $st = ap_db()->prepare("SELECT * FROM events WHERE type IN ('Create','Announce') AND (actor_id = ? OR actor_id = ?) ORDER BY created_at DESC, id DESC LIMIT 500");
+            // Outbox owns authored Notes; event ledger only contributes Announces
+            // (boosts). Mixing Create events in here duplicated cards and made
+            // guest renders fall back to @__guest__ (numeric event id ≠ note URL).
+            $st = ap_db()->prepare("SELECT * FROM events WHERE type = 'Announce' AND (actor_id = ? OR actor_id = ?) ORDER BY created_at DESC, id DESC LIMIT 500");
             $st->execute([$profileActor, $profileActor . '/']);
             foreach (($st->fetchAll() ?: []) as $row) {
-                $type = strtolower((string) ($row['type'] ?? 'create'));
-                $bucket = $type === 'announce' ? 'boosts' : (!empty($row['in_reply_to']) || !empty($row['in_reply_to_id']) ? 'replies' : 'posts');
-                $profileRows[$bucket][] = $row;
-                if (!empty($row['media_urls']) && $row['media_urls'] !== '[]') $profileRows['media'][] = $row;
+                $profileRows['boosts'][] = $row;
             }
         } catch (Throwable $e) {
             error_log('[ap-admin] local profile partial: ' . $e->getMessage());
@@ -21384,7 +21406,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <aside class="rail-right">
     <div class="side-card">
       <h3>Search</h3>
-      <form method="get" action="" style="margin:0">
+      <?php /* action must be under /vaak/ — empty action on /users/{key} pretty URLs reloads the profile instead of search. */ ?>
+      <form method="get" action="?view=search" style="margin:0">
         <input type="hidden" name="view" value="search">
         <input name="q" type="search" value="<?= h(trim((string) ($_GET['q'] ?? ''))) ?>" placeholder="Search anything…" aria-label="Search posts, accounts, tags, or URLs" style="width:100%;background:#0c0c0c;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:.55rem .7rem;font:inherit">
         <button class="btn btn-primary" type="submit" style="width:100%;margin-top:.55rem">Search</button>
@@ -26777,9 +26800,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       // local_observe and again as boost_ok. A profile should
                       // show one boost per object, preferring the confirmed
                       // boost record over the observation stub.
+                      // Authored Notes come from outbox_notes; only Announces
+                      // (boosts) are read from the event ledger here.
                       $postsSql = "SELECT * FROM (
                           SELECT DISTINCT ON (object_id) * FROM events
-                          WHERE type IN ('Create','Announce') AND (" . implode(' OR ', $ors) . ")
+                          WHERE type = 'Announce' AND (" . implode(' OR ', $ors) . ")
                           ORDER BY object_id,
                             CASE WHEN action_taken = 'boost_ok' THEN 0 ELSE 1 END,
                             created_at DESC, id DESC
@@ -26793,10 +26818,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           $st->execute($bind);
                           $eventRows = $st->fetchAll() ?: [];
                       }
-                      // Keep the two storage representations separate: authored
-                      // Notes render from outbox_notes, while Announce/Create
-                      // activities render from the event ledger. Combining them
-                      // here would duplicate every local post in the profile.
                       $rpPosts = $eventRows;
                   }
               } elseif (!$rpIsBsky) {
@@ -27024,13 +27045,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if (str_contains($embedType, 'images') || str_contains($embedType, 'video')
                       || str_contains($embedType, 'recordWithMedia')) $rpTabItems['media'][] = $item;
               }
+              // Local authored Notes already come from outbox_notes above.
+              // Event Creates here are the same posts under a different schema
+              // (numeric id, no note URL) — rendering them via outbox_card made
+              // guest profiles show @__guest__ and duplicated media cards.
+              // Only Announces belong in the Boosts tab from the event ledger.
               foreach ($rpPosts as $boostItem) {
                   $boostType = strtolower((string) ($boostItem['type'] ?? ''));
-                  if ($boostType === 'announce') $rpTabItems['boosts'][] = $boostItem;
-                  elseif ($boostType === 'create') {
-                      if (!empty($boostItem['in_reply_to']) || !empty($boostItem['in_reply_to_id'])) $rpTabItems['replies'][] = $boostItem;
-                      else $rpTabItems['posts'][] = $boostItem;
-                      if (!empty($boostItem['media_urls']) && $boostItem['media_urls'] !== '[]') $rpTabItems['media'][] = $boostItem;
+                  if ($boostType === 'announce') {
+                      $rpTabItems['boosts'][] = $boostItem;
                   }
               }
           } else {
