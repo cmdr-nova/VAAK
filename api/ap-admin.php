@@ -10253,10 +10253,10 @@ function admin_render_compose_panel(bool $inline = false): void
       <input type="hidden" name="compose_return_view" value="<?= h($composerReturnView) ?>">
       <?php if ($prefillQuoteObject !== '' && !$composeIsEdit): ?>
         <input type="hidden" name="quote_object" value="<?= h($prefillQuoteObject) ?>">
-        <div class="meta" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($vaakHandle) ?></b></div>
+        <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($vaakHandle) ?></b></div>
         <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Quoting</span><br><span class="mono"><?= h($prefillQuoteObject) ?></span></div>
       <?php else: ?>
-        <div class="meta" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h('@' . $vaakUsername) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
+        <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h('@' . $vaakUsername) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
         <?php if ($composeIsSelfReply): ?>
           <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Replying to your post</span><br><span class="mono"><?= h($prefillReplyTo) ?></span></div>
         <?php endif; ?>
@@ -20126,11 +20126,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       position: absolute; top: .25rem; right: .75rem;
       margin: 0; color: var(--muted); font-size: .82rem;
     }
-    .compose-inline-panel .composer > .meta[style*="margin-bottom"] {
+    .compose-inline-panel .composer > .compose-as-line {
       display: flex !important; align-items: center; width: 100%;
       column-gap: .3rem;
     }
-    .compose-inline-panel .composer > .meta[style*="margin-bottom"] > b { margin-left: .2rem; }
+    .compose-inline-panel .composer > .compose-as-line > b { margin-left: .2rem; }
     .compose-inline-panel .composer > input[name="spoiler_text"] { margin-top: 1rem !important; }
     .compose-inline-panel .compose-inline-visibility select {
       width: auto; max-width: 10rem; margin: 0; padding: .25rem .45rem;
@@ -28975,11 +28975,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 (function () {
   // CSRF: inject into every POST form (capture) + expose for hand-built FormData
   window.VAAK_CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+  window.VAAK_USERNAME = <?= json_encode((string) ($vaakUsername ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
+  window.VAAK_HANDLE = <?= json_encode((string) ($vaakHandle ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
   window.vaakCsrfApply = function (fd) {
     if (fd && typeof fd.set === 'function' && window.VAAK_CSRF) {
       fd.set('csrf', window.VAAK_CSRF);
     }
     return fd;
+  };
+  // Soft-nav from pretty /users/{key} must not keep that pathname in history —
+  // refresh would boot remote_profile again (ignoring ?view=home).
+  window.vaakIsPrettyProfilePath = function (pathname) {
+    return /^(\/vaak)?\/users\/[A-Za-z0-9_]+\/?$/.test(String(pathname || ''));
+  };
+  window.vaakAppHistoryUrl = function (mutate) {
+    const u = new URL(window.location.href);
+    if (window.vaakIsPrettyProfilePath(u.pathname)) {
+      u.pathname = '/vaak/';
+      u.search = '';
+      u.hash = '';
+    }
+    if (typeof mutate === 'function') mutate(u);
+    return u.pathname + u.search + (u.hash || '');
   };
 
   // Session expired mid-use: never paint /vaak login HTML into the feed.
@@ -32102,10 +32119,18 @@ window.apAdminToast = function (msg, isErr) {
       }
       sc.setTop(0, false);
       if (push !== false) {
-        const u = new URL(window.location.href);
-        u.searchParams.set('view', nextView);
-        u.searchParams.delete('_r');
-        history.pushState({ vaakTl: nextView }, '', u.pathname + u.search);
+        const href = (typeof window.vaakAppHistoryUrl === 'function')
+          ? window.vaakAppHistoryUrl((u) => {
+              u.searchParams.set('view', nextView);
+              u.searchParams.delete('_r');
+            })
+          : (() => {
+              const u = new URL(window.location.href);
+              u.searchParams.set('view', nextView);
+              u.searchParams.delete('_r');
+              return u.pathname + u.search;
+            })();
+        history.pushState({ vaakTl: nextView }, '', href);
       }
       document.title = (TL_TITLES[nextView] || nextView) + ' · VAAK';
       return true;
@@ -32207,6 +32232,11 @@ window.apAdminToast = function (msg, isErr) {
   });
   window.addEventListener('popstate', () => {
     const u = new URL(window.location.href);
+    // Back onto a pretty profile URL needs a full load (shell is remote_profile).
+    if (typeof window.vaakIsPrettyProfilePath === 'function' && window.vaakIsPrettyProfilePath(u.pathname)) {
+      window.location.reload();
+      return;
+    }
     const next = u.searchParams.get('view') || 'home';
     if (['home', 'local', 'feed'].includes(next) && next !== viewName) {
       swapTimelineView(next, false);
@@ -32253,7 +32283,9 @@ window.apAdminToast = function (msg, isErr) {
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
-    let url = '?view=' + encodeURIComponent(view);
+    // Absolute /vaak/ path: relative ?view= on /users/{key} would reload the profile
+    // when <base> is missing; with <base href="/vaak/"> it works, but stay explicit.
+    let url = '/vaak/?view=' + encodeURIComponent(view);
     if (view === 'mentions' && filter && filter !== 'all') {
       url += '&notification_filter=' + encodeURIComponent(filter);
     }
@@ -32266,8 +32298,10 @@ window.apAdminToast = function (msg, isErr) {
     // stale home URL, or hardNav retry) must force a real load.
     try {
       const cur = new URL(window.location.href);
-      const curView = cur.searchParams.get('view') || 'home';
-      if (curView === view) {
+      const onPretty = typeof window.vaakIsPrettyProfilePath === 'function'
+        && window.vaakIsPrettyProfilePath(cur.pathname);
+      const curView = cur.searchParams.get('view') || (onPretty ? '' : 'home');
+      if (curView === view || onPretty) {
         url += '&_r=' + String(Date.now());
       }
     } catch (e) {}
@@ -32657,36 +32691,43 @@ window.apAdminToast = function (msg, isErr) {
       if (feedEl) { try { feedEl.scrollTop = 0; } catch (e) {} }
       updateChrome(view);
       if (push !== false) {
-        const u = new URL(window.location.href);
-        u.searchParams.set('view', view);
-        u.searchParams.delete('_r');
-        if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
-        else u.searchParams.delete('notification_filter');
-        if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
-          u.searchParams.set('network', extra.network);
-        } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
-          u.searchParams.delete('network');
-        }
-        if ((view === 'following' || view === 'followers') && extra.limit) {
-          u.searchParams.set('limit', String(extra.limit));
-        } else if (view !== 'following' && view !== 'followers') {
-          u.searchParams.delete('limit');
-        }
-        if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
-        else if (view !== 'bookmarks') u.searchParams.delete('folder');
-        if (view === 'search') {
-          if (extra.q) u.searchParams.set('q', String(extra.q));
-          else u.searchParams.delete('q');
-          if (extra.type) u.searchParams.set('type', String(extra.type));
-          else u.searchParams.delete('type');
-          if (extra.resolve) u.searchParams.set('resolve', '1');
-          else u.searchParams.delete('resolve');
-        } else {
-          u.searchParams.delete('q');
-          u.searchParams.delete('type');
-          u.searchParams.delete('resolve');
-        }
-        history.pushState({ vaakSoft: view, filter: filter || '', extra }, '', u.pathname + u.search);
+        const href = (typeof window.vaakAppHistoryUrl === 'function')
+          ? window.vaakAppHistoryUrl((u) => {
+              u.searchParams.set('view', view);
+              u.searchParams.delete('_r');
+              if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
+              else u.searchParams.delete('notification_filter');
+              if ((view === 'favourites' || view === 'following' || view === 'followers') && extra.network) {
+                u.searchParams.set('network', extra.network);
+              } else if (view !== 'favourites' && view !== 'following' && view !== 'followers') {
+                u.searchParams.delete('network');
+              }
+              if ((view === 'following' || view === 'followers') && extra.limit) {
+                u.searchParams.set('limit', String(extra.limit));
+              } else if (view !== 'following' && view !== 'followers') {
+                u.searchParams.delete('limit');
+              }
+              if (view === 'bookmarks' && extra.folder) u.searchParams.set('folder', String(extra.folder));
+              else if (view !== 'bookmarks') u.searchParams.delete('folder');
+              if (view === 'search') {
+                if (extra.q) u.searchParams.set('q', String(extra.q));
+                else u.searchParams.delete('q');
+                if (extra.type) u.searchParams.set('type', String(extra.type));
+                else u.searchParams.delete('type');
+                if (extra.resolve) u.searchParams.set('resolve', '1');
+                else u.searchParams.delete('resolve');
+              } else {
+                u.searchParams.delete('q');
+                u.searchParams.delete('type');
+                u.searchParams.delete('resolve');
+              }
+            })
+          : (() => {
+              const u = new URL(window.location.href);
+              u.searchParams.set('view', view);
+              return u.pathname + u.search;
+            })();
+        history.pushState({ vaakSoft: view, filter: filter || '', extra }, '', href);
       }
       if (typeof window.novaEnhanceTweetFolds === 'function') {
         const foldRoot = document.getElementById('timeline-items') || main.querySelector('.feed');
@@ -32768,6 +32809,10 @@ window.apAdminToast = function (msg, isErr) {
 
   window.addEventListener('popstate', () => {
     const u = new URL(window.location.href);
+    if (typeof window.vaakIsPrettyProfilePath === 'function' && window.vaakIsPrettyProfilePath(u.pathname)) {
+      window.location.reload();
+      return;
+    }
     const view = u.searchParams.get('view') || 'home';
     if (!SOFT_VIEWS.has(view)) return;
     const extra = {};
@@ -33349,6 +33394,34 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const panel = getComposePanel();
     return !!(panel && panel.classList.contains('compose-inline-panel'));
   }
+  function ensureComposeAsLine(composeForm) {
+    if (!composeForm) return null;
+    let asMeta = composeForm.querySelector('.compose-as-line');
+    const label = (window.VAAK_USERNAME && String(window.VAAK_USERNAME).trim() !== '')
+      ? ('@' + String(window.VAAK_USERNAME).replace(/^@+/, ''))
+      : (window.VAAK_HANDLE ? String(window.VAAK_HANDLE) : '');
+    if (!asMeta) {
+      asMeta = document.createElement('div');
+      asMeta.className = 'meta compose-as-line';
+      asMeta.style.marginBottom = '.5rem';
+      const firstField = composeForm.querySelector('input[name="spoiler_text"], .compose-textarea-wrap, textarea[name="content"]');
+      if (firstField) composeForm.insertBefore(asMeta, firstField);
+      else composeForm.insertBefore(asMeta, composeForm.firstChild);
+    }
+    let bold = asMeta.querySelector('b');
+    if (!bold) {
+      asMeta.textContent = 'As ';
+      bold = document.createElement('b');
+      bold.style.color = 'var(--primary)';
+      asMeta.appendChild(bold);
+    }
+    if (label !== '') {
+      bold.textContent = label;
+    } else if (!(bold.textContent || '').trim()) {
+      bold.textContent = '@';
+    }
+    return asMeta;
+  }
   function applyComposerToolbarChrome(panel) {
     if (!panel) return;
     const composeForm = panel.querySelector('#compose-form');
@@ -33358,7 +33431,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
 
     // Audience select rides next to "As @handle" on the inline feed composer.
     if (panel.classList.contains('compose-inline-panel')) {
-      const asMeta = composeForm.querySelector('.meta[style*="margin-bottom"]');
+      const asMeta = ensureComposeAsLine(composeForm);
       const visibility = composeForm.querySelector('#compose-visibility');
       const visibilityWrap = visibility && visibility.closest('label');
       if (asMeta && visibilityWrap && !visibilityWrap.classList.contains('compose-inline-visibility')) {
@@ -33494,6 +33567,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const view = items ? (items.dataset.view || '') : '';
     if (slot && ['home', 'local', 'feed'].includes(view)) {
       placeComposerInline();
+      const form = panel.querySelector('#compose-form');
+      if (form) ensureComposeAsLine(form);
       return true;
     }
     if (panel.classList.contains('compose-inline-panel')) {
