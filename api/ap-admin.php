@@ -27432,7 +27432,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 </form>
                 <?php endif; ?>
               <?php endif; ?>
-              <?php if (!$rpIsOwn): ?>
+              <?php if (!$rpIsOwn && empty($GLOBALS['vaak_guest_profile'])): ?>
                 <?= block_quick_actions(
                     $rpActor,
                     $rpIsBsky ? 'bsky.app' : short_host($rpActor),
@@ -27442,18 +27442,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     $rpFrom
                 ) ?>
               <?php endif; ?>
-              <?php if ($rpIsBsky): ?>
-                <a href="<?= h($rpActor) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
-              <?php elseif (!$rpIsLocal): ?>
-                <a href="<?= h(admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
-                <?php if (!$rpIsOwn): ?>
-                  <?php
-                    $rpRemoteFollowHref = admin_remote_actor_href(
-                        $rpActor,
-                        is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null
-                    );
-                  ?>
-                  <a href="<?= h($rpRemoteFollowHref) ?>" target="_blank" rel="noopener noreferrer" title="Opens their instance’s profile — use Follow Remotely there with your @user@mkultra.monster address">Follow on their instance</a>
+              <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
+                <?php if ($rpIsBsky): ?>
+                  <a href="<?= h($rpActor) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
+                <?php elseif (!$rpIsLocal): ?>
+                  <a href="<?= h(admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
+                  <?php if (!$rpIsOwn): ?>
+                    <?php
+                      $rpRemoteFollowHref = admin_remote_actor_href(
+                          $rpActor,
+                          is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null
+                      );
+                    ?>
+                    <a href="<?= h($rpRemoteFollowHref) ?>" target="_blank" rel="noopener noreferrer" title="Opens their instance’s profile — use Follow Remotely there with your @user@mkultra.monster address">Follow on their instance</a>
+                  <?php endif; ?>
                 <?php endif; ?>
               <?php endif; ?>
             </div>
