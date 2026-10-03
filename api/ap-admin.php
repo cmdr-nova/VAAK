@@ -23590,9 +23590,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <label>Verified creator links / profile fields (up to 8)</label>
           <div class="meta" style="margin:0 0 .55rem">
             Add a website or post URL you control. For a verified creator check,
-            the linked page must include
-            <code>&lt;a rel="me" href="<?= h($vaakActorId) ?>"&gt;</code>
-            (or a <code>&lt;link rel="me"&gt;</code>). Ice Cubes / Mastodon show a green check when <code>verified_at</code> is set.
+            the linked page must include a <code>rel="me"</code> link back to either
+            <code><?= h($vaakActorId) ?></code>
+            (ActivityPub) or
+            <code>https://vaak.monster/users/<?= h(rawurlencode((string) $vaakActorKey)) ?></code>
+            (on-VAAK profile). Ice Cubes / Mastodon show a green check when <code>verified_at</code> is set.
           </div>
           <?php for ($i = 0; $i < 8; $i++):
               $an = (string) ($atts[$i]['name'] ?? '');
@@ -23931,7 +23933,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="meta" style="margin-bottom:.75rem">
             <b style="color:var(--primary)">Re-check verified links</b><br>
             Fetches each https profile field and looks for a <code>rel=me</code> link back to
-            <code><?= h($vaakActorId) ?></code>. Other sites need the same backlink.
+            <code><?= h($vaakActorId) ?></code>
+            or
+            <code>https://vaak.monster/users/<?= h(rawurlencode((string) $vaakActorKey)) ?></code>.
           </div>
           <div class="composer-actions">
             <span class="meta">Updates <code>verified_at</code> for Ice Cubes / Mastodon clients.</span>
