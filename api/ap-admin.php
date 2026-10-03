@@ -14172,8 +14172,27 @@ function admin_render_masto_status_card(
         $boostWhen = (string) ($st['created_at'] ?? '');
         $boostSource = admin_object_url_is_bluesky((string) ($st['reblog']['uri'] ?? $st['reblog']['url'] ?? ''))
             ? 'Bluesky' : 'Fediverse';
+        $boosterAccount = is_array($st['account'] ?? null) ? $st['account'] : [];
+        $boosterRef = function_exists('admin_account_actor_ref')
+            ? admin_account_actor_ref($boosterAccount)
+            : rtrim((string) ($boosterAccount['uri'] ?? $boosterAccount['url'] ?? ''), '/');
+        $boosterHref = '';
+        if ($boosterRef !== '') {
+            $boosterHref = function_exists('admin_profile_app_href')
+                ? admin_profile_app_href($boosterRef, $returnView)
+                : ('?view=remote_profile&actor=' . rawurlencode($boosterRef) . '&from=' . rawurlencode($returnView));
+        }
+        $boosterLabel = htmlspecialchars(
+            $boosterName !== '' ? $boosterName : ($boosterAcct !== '' ? $boosterAcct : 'Someone'),
+            ENT_QUOTES | ENT_SUBSTITUTE,
+            'UTF-8'
+        );
+        if ($boosterHref !== '') {
+            $boosterLabel = '<a href="' . h($boosterHref) . '" style="color:inherit;text-decoration:none">'
+                . $boosterLabel . '</a>';
+        }
         $boostHeader = '<div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> '
-            . htmlspecialchars($boosterName !== '' ? $boosterName : 'Someone', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            . $boosterLabel
             . ' boosted'
             . ($boostWhen !== '' ? ' · ' . htmlspecialchars(relative_time($boostWhen), ENT_QUOTES, 'UTF-8') : '')
             . ' <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">' . h($boostSource) . '</span>'
@@ -15200,12 +15219,16 @@ function admin_render_remote_boost_card(
     $boosterName = $boosterId !== '' ? actor_display_name($boosterId) : 'someone';
     $boosterHandle = $boosterId !== '' ? actor_handle($boosterId) : '';
     $boosterProfile = $boosterId !== ''
-        ? ('?view=remote_profile&actor=' . rawurlencode($boosterId) . '&from=' . rawurlencode($returnView))
+        ? (function_exists('admin_profile_app_href')
+            ? admin_profile_app_href($boosterId, $returnView)
+            : ('?view=remote_profile&actor=' . rawurlencode($boosterId) . '&from=' . rawurlencode($returnView)))
         : '';
     $origName = $origActor !== '' ? actor_display_name($origActor) : 'unknown';
     $origHandle = $origActor !== '' ? actor_handle($origActor) : '';
     $origProfile = $origActor !== ''
-        ? ('?view=remote_profile&actor=' . rawurlencode($origActor) . '&from=' . rawurlencode($returnView))
+        ? (function_exists('admin_profile_app_href')
+            ? admin_profile_app_href($origActor, $returnView)
+            : ('?view=remote_profile&actor=' . rawurlencode($origActor) . '&from=' . rawurlencode($returnView)))
         : '';
     $summaryRaw = '';
     if (is_array($innerEvent) && trim((string) ($innerEvent['summary'] ?? '')) !== '') {
@@ -15481,7 +15504,11 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     if ($boosterActor !== '' && $boosterActor === $sessionActor) {
         $boostWho = 'You boosted';
     } elseif ($boosterActor !== '') {
-        $boostWho = actor_display_name($boosterActor) . ' boosted';
+        $boosterHref = function_exists('admin_profile_app_href')
+            ? admin_profile_app_href($boosterActor, $returnView)
+            : ('?view=remote_profile&actor=' . rawurlencode($boosterActor) . '&from=' . rawurlencode($returnView));
+        $boostWho = '<a href="' . h($boosterHref) . '" style="color:inherit;text-decoration:none">'
+            . h(actor_display_name($boosterActor)) . '</a> boosted';
     } else {
         $boostWho = 'Boosted';
     }
@@ -15546,7 +15573,7 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
         : '';
     ?>
           <article class="tweet tweet-boost"<?= $rankAttrs ?><?= $timelineAttrs ?><?= ($innerSummary === '' && $objectId !== '' && str_starts_with($objectId, 'https://')) ? ' data-boost-hydrate-local="1" data-object-id="' . h($objectId) . '" data-return-view="' . h($returnView) . '"' : '' ?>>
-            <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($boostWho) ?> · <?= h(relative_time($created)) ?></div>
+            <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= $boostWho ?> · <?= h(relative_time($created)) ?></div>
             <div class="tweet-hd">
               <?= admin_avatar_img($targetActor !== '' ? $targetActor : null) ?>
               <div class="tweet-hd-main tweet-hd-main--fedi">
@@ -16399,7 +16426,28 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
                 $reasonLabel = 'You boosted';
             } else {
                 $rdn = trim((string) ($by['displayName'] ?? ''));
-                $reasonLabel = ($rdn !== '' ? $rdn . ' · ' : '') . '@' . ltrim($rh, '@') . ' boosted';
+                $boosterText = ($rdn !== '' ? $rdn . ' · ' : '') . '@' . ltrim($rh, '@');
+                $byProfileRef = $byDid !== ''
+                    ? (function_exists('ap_bsky_actor_profile_url')
+                        ? ap_bsky_actor_profile_url($byDid)
+                        : ('https://bsky.app/profile/' . $byDid))
+                    : ($rh !== ''
+                        ? (function_exists('ap_bsky_actor_profile_url')
+                            ? ap_bsky_actor_profile_url($rh)
+                            : ('https://bsky.app/profile/' . rawurlencode(ltrim($rh, '@'))))
+                        : '');
+                $byHref = '';
+                if ($byProfileRef !== '') {
+                    $byHref = function_exists('admin_profile_app_href')
+                        ? admin_profile_app_href($byProfileRef, $returnView)
+                        : ('?view=remote_profile&actor=' . rawurlencode($byProfileRef) . '&from=' . rawurlencode($returnView));
+                }
+                if ($byHref !== '') {
+                    $reasonLabel = '<a href="' . h($byHref) . '" style="color:inherit;text-decoration:none">'
+                        . h($boosterText) . '</a> boosted';
+                } else {
+                    $reasonLabel = h($boosterText) . ' boosted';
+                }
             }
         }
     }
@@ -16533,7 +16581,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     ?>
     <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>"<?= $rankAttrs ?>>
       <?php if ($reasonLabel !== ''): ?>
-        <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= h($reasonLabel) ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
+        <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= $reasonLabel ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
       <?php endif; ?>
       <?php if (!$isHome && $feedSource !== ''): ?>
         <div class="meta" style="margin:0 0 .35rem">☁ From saved feed</div>
