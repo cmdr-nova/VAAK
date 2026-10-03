@@ -21198,12 +21198,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <a class="mobile-topbar__search" href="/vaak/?mode=login" aria-label="Log in">⇢</a>
   <?php endif; ?>
 </header>
-<?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
-<div class="notice" style="margin:0;border-radius:0;border-left:0;border-right:0;text-align:center">
-  Public profile · <a href="/vaak/?mode=login&amp;next_path=<?= rawurlencode((string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>">Log in</a>
-  · <a href="/vaak/?mode=register">Join VAAK</a>
-</div>
-<?php endif; ?>
 <div class="shell">
   <aside class="rail-left" id="admin-rail-left">
     <div class="brand">
@@ -21218,8 +21212,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </a>
       <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">browsing as guest</div>
-      <a class="btn btn-primary brand-profile-link" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode((string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>">Log in</a>
-      <a class="btn btn-ghost brand-profile-link" href="/vaak/?mode=register">Join VAAK</a>
       <?php else: ?>
       <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       <div class="meta" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
@@ -27080,7 +27072,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
         <?php if ($rpError): ?>
           <div class="empty" style="color:var(--danger)">Couldn’t load this profile (database busy). Retry shortly.</div>
-          <?php if ($rpActor !== '' && str_starts_with($rpActor, 'https://')): ?>
+          <?php if (empty($GLOBALS['vaak_guest_profile']) && $rpActor !== '' && str_starts_with($rpActor, 'https://')): ?>
             <div class="page-back">
               <a class="btn btn-ghost" href="<?= h($rpBackHref) ?>"><?= h($rpBackLabel) ?></a>
               <a class="btn btn-ghost" href="<?= h(admin_remote_actor_href($rpActor)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
@@ -27089,6 +27081,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php elseif ($rpActor === '' || !str_starts_with($rpActor, 'https://')): ?>
           <div class="empty">No actor URL.</div>
         <?php else: ?>
+          <?php if (empty($GLOBALS['vaak_guest_profile'])): ?>
           <div class="page-back">
             <a class="btn btn-ghost" href="<?= h($rpBackHref) ?>"><?= h($rpBackLabel) ?></a>
             <?php if ($rpIsLocal): ?>
@@ -27097,6 +27090,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <a class="btn btn-ghost" href="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>&amp;refresh=1" title="Queue a background profile and post refresh">↻ Refresh profile</a>
             <?php endif; ?>
           </div>
+          <?php endif; ?>
           <?php
             $rpRel = $rpIsBsky
                 ? ($rpBskyFollowing
@@ -27183,8 +27177,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 </div>
               </div>
               <?php
-                // Guest auth CTAs live in the sidebar / top banner — keep the
-                // profile header for identity only. Seed follow-panel vars here.
+                // Guest auth CTAs live in the left nav only — keep the profile
+                // header for identity + Follow. Seed follow-panel vars here.
                 $rpGuestActorIri = '';
                 $rpGuestBsky = '';
                 if (!empty($GLOBALS['vaak_guest_profile'])) {
