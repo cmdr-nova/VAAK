@@ -20282,6 +20282,28 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-follow .btn { min-width:7.5rem; padding:.65rem 1.35rem; font-size:.95rem; font-weight:700; border-radius:999px; }
     .remote-profile-follow .btn-following { background:transparent; border:1px solid var(--border); color:var(--text); }
     .remote-profile-follow .btn-following:hover { border-color:var(--danger); color:var(--danger); }
+    body.vaak-guest-profile .remote-profile-hd { flex-direction:column; align-items:stretch; }
+    body.vaak-guest-profile .remote-profile-follow { width:100%; margin-top:.15rem; }
+    body.vaak-guest-profile .remote-profile-follow .btn { min-width:0; }
+    .remote-profile-guest-actions { display:flex; flex-wrap:wrap; gap:.45rem; align-items:center; }
+    .remote-profile-guest-follow { width:100%; margin-top:.55rem; }
+    .remote-profile-guest-follow .guest-follow-panel {
+      margin-top:.65rem; padding:.85rem; border:1px solid var(--border); border-radius:12px; background:var(--panel-2);
+    }
+    .remote-profile-guest-follow .guest-follow-panel[hidden] { display:none !important; }
+    .remote-profile-guest-follow label { display:block; font-size:.88rem; color:var(--muted); margin-bottom:.4rem; }
+    .remote-profile-guest-follow .guest-follow-row { display:flex; gap:.5rem; flex-wrap:wrap; }
+    .remote-profile-guest-follow .guest-follow-row input {
+      flex:1; min-width:12rem; padding:.55rem .7rem; border-radius:10px; border:1px solid var(--border);
+      background:#0c0c0c; color:var(--text); font:inherit; font-size:16px;
+    }
+    .remote-profile-guest-follow .guest-follow-row button {
+      padding:.55rem .9rem; border-radius:10px; border:0; background:#2a2e37; color:var(--text); font:inherit; cursor:pointer;
+    }
+    .remote-profile-guest-follow .guest-follow-row button:hover { background:#3a404c; }
+    .remote-profile-guest-follow .guest-follow-hint { margin:.55rem 0 0; font-size:.8rem; color:var(--muted); }
+    .remote-profile-guest-follow .guest-follow-hint.is-error { color:var(--danger); }
+    .remote-profile-guest-follow .guest-follow-bsky { margin-top:.85rem; padding-top:.85rem; border-top:1px solid var(--border); }
     .remote-profile-stats { display:flex; gap:1.25rem; margin:.85rem 0 0; padding-top:.85rem; border-top:1px solid var(--border); flex-wrap:wrap; }
     .remote-profile-stats a, .remote-profile-stats > div { color:inherit; text-decoration:none; display:flex; flex-direction:column; gap:.15rem; min-width:4.5rem; }
     .remote-profile-stats a:hover .n { color:var(--primary); }
@@ -21222,6 +21244,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </details>
       <?php endif; ?>
     </div>
+    <?php
+      // Badge seed for footer JS — guests never load inbox counts.
+      if (!isset($dmUnreadNav)) {
+          $dmUnreadNav = 0;
+      }
+    ?>
     <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
     <nav class="nav" aria-label="Guest">
       <a href="/vaak/?mode=login&amp;next_path=<?= rawurlencode((string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>"><span class="ico">⇢</span><span class="label">Log in</span></a>
@@ -27006,14 +27034,32 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if (!empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
               }
           }
-          $rpTabHref = ($rpIsLocal && $rpLocalKey)
-              ? ('/users/' . rawurlencode((string) $rpLocalKey) . '?tab=')
-              : ('?view=remote_profile&actor=' . rawurlencode($rpActor) . '&from=' . rawurlencode($rpFrom) . '&tab=');
-          if ($rpIsLocal && $rpLocalKey && $rpFrom !== '') {
-              $rpTabHref = '/users/' . rawurlencode((string) $rpLocalKey) . '?from=' . rawurlencode($rpFrom) . '&tab=';
+          $rpTabHrefQ = [];
+          if ($rpFrom !== '') {
+              $rpTabHrefQ['from'] = $rpFrom;
           }
-          $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabItems[$rpTab], 0, 40) : $rpTabItems[$rpTab];
-          $rpLocalHasMore = $rpIsLocal && count($rpTabItems[$rpTab]) > count($rpLocalPageItems);
+          $rpTabHrefQ['tab'] = ''; // placeholder; appended per-tab below
+          if ($rpIsLocal && $rpLocalKey && function_exists('ap_vaak_pretty_profile_path')) {
+              // Build "...?from=&tab=" prefix so each tab can append its key.
+              $rpTabHrefBase = ap_vaak_pretty_profile_path((string) $rpLocalKey, $rpFrom !== '' ? ['from' => $rpFrom] : []);
+              $rpTabHref = $rpTabHrefBase . (str_contains($rpTabHrefBase, '?') ? '&' : '?') . 'tab=';
+          } elseif ($rpIsLocal && $rpLocalKey) {
+              $rpTabHref = '/users/' . rawurlencode((string) $rpLocalKey)
+                  . ($rpFrom !== '' ? ('?from=' . rawurlencode($rpFrom) . '&tab=') : '?tab=');
+          } else {
+              $rpTabHref = '?view=remote_profile&actor=' . rawurlencode($rpActor)
+                  . '&from=' . rawurlencode($rpFrom) . '&tab=';
+          }
+          // Pinned / Featured / Blog render from dedicated lists — not $rpTabItems.
+          $rpTimelineTabs = ['posts', 'replies', 'boosts', 'media'];
+          if (in_array($rpTab, $rpTimelineTabs, true)) {
+              $rpTabBucket = $rpTabItems[$rpTab] ?? [];
+              $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabBucket, 0, 40) : $rpTabBucket;
+              $rpLocalHasMore = $rpIsLocal && count($rpTabBucket) > count($rpLocalPageItems);
+          } else {
+              $rpLocalPageItems = [];
+              $rpLocalHasMore = false;
+          }
         ?>
         <?php if ($rpError): ?>
           <div class="empty" style="color:var(--danger)">Couldn’t load this profile (database busy). Retry shortly.</div>
@@ -27120,12 +27166,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 </div>
               </div>
               <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
-                <div class="remote-profile-follow" style="flex:0 0 auto;align-self:center;display:flex;gap:.45rem;flex-wrap:wrap">
-                  <a class="btn btn-primary" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode(function_exists('ap_vaak_pretty_profile_path') && $rpLocalKey ? ap_vaak_pretty_profile_path((string) $rpLocalKey) : (string) ($_SERVER['REQUEST_URI'] ?? '/vaak/')) ?>">Log in</a>
+                <?php
+                  $rpGuestNext = function_exists('ap_vaak_pretty_profile_path') && $rpLocalKey
+                      ? ap_vaak_pretty_profile_path((string) $rpLocalKey)
+                      : (string) ($_SERVER['REQUEST_URI'] ?? '/vaak/');
+                  $rpGuestActorIri = $rpIsLocal && $rpLocalKey
+                      ? ('https://mkultra.monster/users/' . $rpLocalKey)
+                      : $rpActor;
+                  $rpGuestBsky = '';
+                  if (!empty($rpBskyStatsHandle)) {
+                      $rpGuestBsky = (string) $rpBskyStatsHandle;
+                  } elseif ($rpBskyHandle !== '') {
+                      $rpGuestBsky = (string) $rpBskyHandle;
+                  }
+                ?>
+                <div class="remote-profile-follow remote-profile-guest-actions">
+                  <a class="btn btn-primary" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode($rpGuestNext) ?>">Log in</a>
                   <a class="btn btn-ghost" href="/vaak/?mode=register">Join VAAK</a>
-                  <?php if ($rpIsLocal && $rpLocalKey): ?>
-                    <a class="btn btn-ghost" href="/authorize_interaction?uri=<?= rawurlencode('https://mkultra.monster/users/' . $rpLocalKey) ?>" title="Follow from your Fediverse account">Follow from fedi</a>
-                  <?php endif; ?>
                 </div>
               <?php elseif (!$rpIsOwn): ?>
                 <div class="remote-profile-follow" style="flex:0 0 auto;align-self:center">
@@ -27151,6 +27208,73 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 </div>
               <?php endif; ?>
             </div>
+            <?php if (!empty($GLOBALS['vaak_guest_profile']) && $rpGuestActorIri !== '' && str_starts_with($rpGuestActorIri, 'https://')): ?>
+              <div class="remote-profile-guest-follow">
+                <button type="button" class="btn btn-primary" id="rp-guest-follow-toggle" aria-expanded="false" aria-controls="rp-guest-follow-panel">Follow</button>
+                <div class="guest-follow-panel" id="rp-guest-follow-panel" hidden>
+                  <form id="rp-guest-follow-form" action="#" method="get">
+                    <label for="rp-guest-follow-handle">Follow from your fediverse account</label>
+                    <div class="guest-follow-row">
+                      <input id="rp-guest-follow-handle" name="handle" type="text" inputmode="email" autocomplete="username" spellcheck="false" placeholder="@you@your.instance" required>
+                      <button type="submit">Go</button>
+                    </div>
+                    <p class="guest-follow-hint" id="rp-guest-follow-hint">Opens your instance’s follow dialog (Mastodon, Akkoma, GoToSocial, etc.).</p>
+                  </form>
+                  <?php if ($rpGuestBsky !== ''): ?>
+                    <form class="guest-follow-bsky" action="https://bsky.app/profile/<?= rawurlencode($rpGuestBsky) ?>" method="get" target="_blank" rel="noopener noreferrer">
+                      <label for="rp-guest-bsky-handle">Follow on Bluesky</label>
+                      <div class="guest-follow-row">
+                        <input id="rp-guest-bsky-handle" type="text" value="@<?= h($rpGuestBsky) ?>" readonly>
+                        <button type="submit">Open</button>
+                      </div>
+                      <p class="guest-follow-hint">Opens this profile in Bluesky so you can follow it there.</p>
+                    </form>
+                  <?php endif; ?>
+                </div>
+              </div>
+              <script>
+              (function () {
+                var ACTOR = <?= json_encode($rpGuestActorIri, JSON_UNESCAPED_SLASHES) ?>;
+                var toggle = document.getElementById('rp-guest-follow-toggle');
+                var panel = document.getElementById('rp-guest-follow-panel');
+                var form = document.getElementById('rp-guest-follow-form');
+                var input = document.getElementById('rp-guest-follow-handle');
+                var hint = document.getElementById('rp-guest-follow-hint');
+                if (!toggle || !panel || !form || !input) return;
+                function setErr(m) {
+                  if (!hint) return;
+                  if (m) { hint.textContent = m; hint.classList.add('is-error'); }
+                  else { hint.textContent = 'Opens your instance’s follow dialog (Mastodon, Akkoma, GoToSocial, etc.).'; hint.classList.remove('is-error'); }
+                }
+                function parseHandle(raw) {
+                  var s = String(raw || '').trim();
+                  if (s.indexOf('acct:') === 0) s = s.slice(5);
+                  if (s.charAt(0) !== '@') s = '@' + s;
+                  var m = s.match(/^@([A-Za-z0-9_.\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})$/);
+                  return m ? { user: m[1], host: m[2].toLowerCase() } : null;
+                }
+                toggle.addEventListener('click', function () {
+                  var open = panel.hasAttribute('hidden');
+                  if (open) {
+                    panel.removeAttribute('hidden');
+                    toggle.setAttribute('aria-expanded', 'true');
+                    setErr('');
+                    setTimeout(function () { input.focus(); }, 0);
+                  } else {
+                    panel.setAttribute('hidden', '');
+                    toggle.setAttribute('aria-expanded', 'false');
+                  }
+                });
+                form.addEventListener('submit', function (ev) {
+                  ev.preventDefault();
+                  var p = parseHandle(input.value);
+                  if (!p) { setErr('Use a full address like @you@mastodon.social'); input.focus(); return; }
+                  setErr('');
+                  window.open('https://' + p.host + '/authorize_interaction?uri=' + encodeURIComponent(ACTOR), '_blank', 'noopener,noreferrer');
+                });
+              })();
+              </script>
+            <?php endif; ?>
             <?php if ($rpBio !== ''): ?>
               <div class="body" style="margin-top:.75rem;white-space:pre-wrap"><?= h($rpBio) ?></div>
             <?php elseif ($rpIsLocal): ?>
