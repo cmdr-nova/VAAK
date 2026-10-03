@@ -7771,7 +7771,20 @@ function ap_is_blocked_actor(?string $actorId): bool
         // Explicit domain block of bsky.app (rare) still means all Bluesky.
         return true;
     }
+    // Bluesky DID/handle aliases plus Fediverse /users/ ↔ /@user forms.
+    // Side-effect unfollow already used masto aliases; block checks must too.
+    if (!function_exists('ap_masto_actor_id_aliases') && is_file(__DIR__ . '/ap-masto-entities.php')) {
+        require_once __DIR__ . '/ap-masto-entities.php';
+    }
     $aliasSet = array_fill_keys(ap_actor_moderation_aliases($actorId), true);
+    if (function_exists('ap_masto_actor_id_aliases') && str_starts_with($actorId, 'https://')) {
+        foreach (ap_masto_actor_id_aliases($actorId) as $al) {
+            $al = rtrim((string) $al, '/');
+            if ($al !== '') {
+                $aliasSet[$al] = true;
+            }
+        }
+    }
     foreach (ap_block_list_cached() as $b) {
         if (($b['scope'] ?? '') !== 'actor' || ($b['kind'] ?? 'block') === 'mute') {
             continue;
@@ -7783,8 +7796,15 @@ function ap_is_blocked_actor(?string $actorId): bool
         if (isset($aliasSet[$val])) {
             return true;
         }
-        foreach (ap_actor_moderation_aliases($val) as $alias) {
-            if (isset($aliasSet[$alias])) {
+        $blockAliases = ap_actor_moderation_aliases($val);
+        if (function_exists('ap_masto_actor_id_aliases') && str_starts_with($val, 'https://')) {
+            foreach (ap_masto_actor_id_aliases($val) as $al) {
+                $blockAliases[] = $al;
+            }
+        }
+        foreach ($blockAliases as $alias) {
+            $alias = rtrim((string) $alias, '/');
+            if ($alias !== '' && isset($aliasSet[$alias])) {
                 return true;
             }
         }
