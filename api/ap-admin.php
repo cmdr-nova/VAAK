@@ -20292,10 +20292,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-actions .remote-profile-follow-inline .btn-following:hover {
       border-color:var(--danger); color:var(--danger);
     }
-    body.vaak-guest-profile .remote-profile-hd { flex-direction:column; align-items:stretch; }
-    body.vaak-guest-profile .remote-profile-follow { width:100%; margin-top:.15rem; }
-    body.vaak-guest-profile .remote-profile-follow .btn { min-width:0; }
-    .remote-profile-guest-actions { display:flex; flex-wrap:wrap; gap:.45rem; align-items:center; }
     .remote-profile-guest-follow { width:100%; margin-top:.55rem; }
     .remote-profile-guest-follow .guest-follow-panel {
       margin-top:.65rem; padding:.85rem; border:1px solid var(--border); border-radius:12px; background:var(--panel-2);
@@ -27175,26 +27171,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <?php endif; ?>
                 </div>
               </div>
-              <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
-                <?php
-                  $rpGuestNext = function_exists('ap_vaak_pretty_profile_path') && $rpLocalKey
-                      ? ap_vaak_pretty_profile_path((string) $rpLocalKey)
-                      : (string) ($_SERVER['REQUEST_URI'] ?? '/vaak/');
-                  $rpGuestActorIri = $rpIsLocal && $rpLocalKey
-                      ? ('https://mkultra.monster/users/' . $rpLocalKey)
-                      : $rpActor;
-                  $rpGuestBsky = '';
-                  if (!empty($rpBskyStatsHandle)) {
-                      $rpGuestBsky = (string) $rpBskyStatsHandle;
-                  } elseif ($rpBskyHandle !== '') {
-                      $rpGuestBsky = (string) $rpBskyHandle;
-                  }
-                ?>
-                <div class="remote-profile-follow remote-profile-guest-actions">
-                  <a class="btn btn-primary" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode($rpGuestNext) ?>">Log in</a>
-                  <a class="btn btn-ghost" href="/vaak/?mode=register">Join VAAK</a>
-                </div>
-              <?php endif; ?>
+              <?php
+                // Guest auth CTAs live in the sidebar / top banner — keep the
+                // profile header for identity only. Seed follow-panel vars here.
+                $rpGuestActorIri = '';
+                $rpGuestBsky = '';
+                if (!empty($GLOBALS['vaak_guest_profile'])) {
+                    $rpGuestActorIri = $rpIsLocal && $rpLocalKey
+                        ? ('https://mkultra.monster/users/' . $rpLocalKey)
+                        : $rpActor;
+                    if (!empty($rpBskyStatsHandle)) {
+                        $rpGuestBsky = (string) $rpBskyStatsHandle;
+                    } elseif ($rpBskyHandle !== '') {
+                        $rpGuestBsky = (string) $rpBskyHandle;
+                    }
+                }
+              ?>
             </div>
             <?php if (!empty($GLOBALS['vaak_guest_profile']) && $rpGuestActorIri !== '' && str_starts_with($rpGuestActorIri, 'https://')): ?>
               <div class="remote-profile-guest-follow">
