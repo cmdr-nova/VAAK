@@ -30737,13 +30737,26 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function swapTimelineView(nextView, push) {
-    if (tabSwapBusy) return;
+    if (tabSwapBusy) return false;
     nextView = String(nextView || '');
     if (!['home', 'local', 'feed'].includes(nextView)) {
       window.location.href = '?view=' + encodeURIComponent(nextView);
-      return;
+      return false;
     }
-    if (nextView === viewName && !push) return;
+    // Soft-nav to Mentions/Favourites/etc replaces section.main and leaves this
+    // closure holding a detached #timeline-items. Writing there looks like the
+    // Home drawer link "does nothing" — especially on mobile after Notifications.
+    items = document.getElementById('timeline-items');
+    status = document.getElementById('timeline-status');
+    sentinel = document.getElementById('timeline-sentinel');
+    newBtn = document.getElementById('feed-new-btn');
+    topBtn = document.getElementById('feed-top-btn');
+    if (!items || !items.isConnected) return false;
+    const liveView = String(items.dataset.view || '');
+    if (!['home', 'local', 'feed'].includes(liveView)) return false;
+    viewName = liveView;
+    syncTimelineKindFlags();
+    if (nextView === viewName && !push) return true;
     window.__vaakNavigationPending = true;
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
@@ -30762,13 +30775,13 @@ window.apAdminToast = function (msg, isErr) {
       });
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('tabSwap');
-        return;
+        return false;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const html = await res.text();
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
         window.vaakRedirectToLogin('tabSwap-html');
-        return;
+        return false;
       }
       hasMore = res.headers.get('X-Has-More') === '1';
       const nextOff = parseInt(res.headers.get('X-Next-Offset') || String(limit), 10);
@@ -30844,11 +30857,12 @@ window.apAdminToast = function (msg, isErr) {
         history.pushState({ vaakTl: nextView }, '', u.pathname + u.search);
       }
       document.title = (TL_TITLES[nextView] || nextView) + ' · VAAK';
+      return true;
     } catch (e) {
       window.location.href = '?view=' + encodeURIComponent(nextView);
-      return;
+      return false;
     } finally {
-      items.classList.remove('timeline-swapping');
+      if (items && items.classList) items.classList.remove('timeline-swapping');
       tabSwapBusy = false;
       loading = false;
       pollBusy = false;
@@ -30972,6 +30986,16 @@ window.apAdminToast = function (msg, isErr) {
   let busy = false;
   let leaving = false;
   let queuedNavigation = null;
+  // Mobile drawer: pointerup starts soft-nav; ignore the synthetic click that
+  // often lands on Mentions content after the rail slides away.
+  let softNavTouchGuard = 0;
+
+  // hardNav sets leaving=true before assign; if the browser ignores a same-URL
+  // navigation, soft-nav would permanently no-op. Clear on resume / pageshow.
+  window.addEventListener('pageshow', () => { leaving = false; });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') leaving = false;
+  });
 
   function hardNav(view, filter, extra) {
     leaving = true;
@@ -30987,6 +31011,15 @@ window.apAdminToast = function (msg, isErr) {
         if (extra[k] != null && extra[k] !== '') url += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(String(extra[k]));
       });
     }
+    // Same view in the address bar (common after Mentions soft-nav left a
+    // stale home URL, or hardNav retry) must force a real load.
+    try {
+      const cur = new URL(window.location.href);
+      const curView = cur.searchParams.get('view') || 'home';
+      if (curView === view) {
+        url += '&_r=' + String(Date.now());
+      }
+    } catch (e) {}
     window.location.assign(url);
   }
 
@@ -31236,11 +31269,44 @@ window.apAdminToast = function (msg, isErr) {
     io.observe(sentinel);
   }
 
+  function softNavExtrasFromLink(link) {
+    const extra = {};
+    if (!link) return extra;
+    const linkUrl = new URL(link.href, window.location.href);
+    const view = link.getAttribute('data-vaak-soft-nav') || '';
+    if (view === 'favourites') {
+      extra.network = link.getAttribute('data-fav-network')
+        || linkUrl.searchParams.get('network')
+        || 'fedi';
+    }
+    if (view === 'following' || view === 'followers') {
+      extra.network = link.getAttribute('data-follow-network')
+        || linkUrl.searchParams.get('network')
+        || 'all';
+      const lim = linkUrl.searchParams.get('limit');
+      if (lim) extra.limit = lim;
+    }
+    if (view === 'bookmarks') {
+      const folder = link.getAttribute('data-bm-folder')
+        || linkUrl.searchParams.get('folder');
+      if (folder) extra.folder = folder;
+    }
+    if (view === 'search') {
+      extra.q = link.getAttribute('data-search-q') || linkUrl.searchParams.get('q') || '';
+      extra.type = link.getAttribute('data-search-type') || linkUrl.searchParams.get('type') || '';
+      if (linkUrl.searchParams.get('resolve') || !extra.q) extra.resolve = '1';
+    }
+    return extra;
+  }
+
   async function softNavTo(view, push, filter, extra) {
     view = String(view || '');
     filter = filter == null ? '' : String(filter);
     extra = extra && typeof extra === 'object' ? extra : {};
-    if (!SOFT_VIEWS.has(view) || leaving) return;
+    if (!SOFT_VIEWS.has(view)) return;
+    // Stuck leaving (hardNav same-URL no-op) used to make every later Home tap
+    // a silent preventDefault with no navigation — bad on the mobile drawer.
+    if (leaving) leaving = false;
     if (busy) {
       // Preserve the latest user intent instead of silently dropping a click
       // while the previous shell is still loading (which left Notifications'
@@ -31252,12 +31318,20 @@ window.apAdminToast = function (msg, isErr) {
 
     if (['home', 'local', 'feed'].includes(view) && typeof window.vaakSwapTimelineView === 'function') {
       const cur = new URL(window.location.href).searchParams.get('view') || '';
-      if (['home', 'local', 'feed'].includes(cur)) {
+      const live = document.getElementById('timeline-items');
+      const liveView = (live && live.isConnected) ? String(live.dataset.view || '') : '';
+      // Require BOTH the URL and the live DOM to already be a timeline view.
+      // After Mentions soft-nav the URL can still say home while #timeline-items
+      // is Mentions (or a detached Home node) — in-place swap then no-ops.
+      if (['home', 'local', 'feed'].includes(cur) && ['home', 'local', 'feed'].includes(liveView)) {
         if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
-        await window.vaakSwapTimelineView(view, push !== false);
-        updateChrome(view);
-        bindFeedTopBtn(document.querySelector('section.main'));
-        return;
+        const swapped = await window.vaakSwapTimelineView(view, push !== false);
+        if (swapped !== false) {
+          updateChrome(view);
+          bindFeedTopBtn(document.querySelector('section.main'));
+          return;
+        }
+        // Fall through to full shell soft-nav when swap cannot bind a live node.
       }
     }
 
@@ -31403,34 +31477,36 @@ window.apAdminToast = function (msg, isErr) {
     if (!link || link.target === '_blank') return;
     const view = link.getAttribute('data-vaak-soft-nav') || '';
     if (!SOFT_VIEWS.has(view)) return;
+    // Mobile drawer already started soft-nav on pointerup — swallow the click
+    // that would otherwise hit Mentions content behind the closing rail.
+    if (Date.now() < softNavTouchGuard) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+      return;
+    }
     ev.preventDefault();
     ev.stopPropagation();
     if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
-    const extra = {};
-    const linkUrl = new URL(link.href, window.location.href);
-    if (view === 'favourites') {
-      extra.network = link.getAttribute('data-fav-network')
-        || linkUrl.searchParams.get('network')
-        || 'fedi';
-    }
-    if (view === 'following' || view === 'followers') {
-      extra.network = link.getAttribute('data-follow-network')
-        || linkUrl.searchParams.get('network')
-        || 'all';
-      const lim = linkUrl.searchParams.get('limit');
-      if (lim) extra.limit = lim;
-    }
-    if (view === 'bookmarks') {
-      const folder = link.getAttribute('data-bm-folder')
-        || linkUrl.searchParams.get('folder');
-      if (folder) extra.folder = folder;
-    }
-    if (view === 'search') {
-      extra.q = link.getAttribute('data-search-q') || linkUrl.searchParams.get('q') || '';
-      extra.type = link.getAttribute('data-search-type') || linkUrl.searchParams.get('type') || '';
-      if (linkUrl.searchParams.get('resolve') || !extra.q) extra.resolve = '1';
-    }
-    softNavTo(view, true, link.getAttribute('data-notif-filter') || '', extra);
+    softNavTo(view, true, link.getAttribute('data-notif-filter') || '', softNavExtrasFromLink(link));
+  }, true);
+
+  // Mobile drawer: kick soft-nav on pointerup while the rail is still open.
+  // Waiting for click lets the drawer close first; the synthetic click then
+  // lands on the Mentions feed and Home appears to do nothing.
+  document.addEventListener('pointerup', (ev) => {
+    if (ev.pointerType === 'mouse' || ev.button !== 0) return;
+    const rail = document.getElementById('admin-rail-left');
+    if (!rail || !rail.classList.contains('mobile-open')) return;
+    const link = ev.target && ev.target.closest ? ev.target.closest('a[data-vaak-soft-nav]') : null;
+    if (!link || link.target === '_blank' || !rail.contains(link)) return;
+    const view = link.getAttribute('data-vaak-soft-nav') || '';
+    if (!SOFT_VIEWS.has(view)) return;
+    softNavTouchGuard = Date.now() + 800;
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
+    softNavTo(view, true, link.getAttribute('data-notif-filter') || '', softNavExtrasFromLink(link));
   }, true);
 
   window.addEventListener('popstate', () => {
