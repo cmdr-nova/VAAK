@@ -27380,12 +27380,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     </form>
                   <?php endif; ?>
                   <span id="remote-profile-rel-state" data-following="<?= $rpFollowing ? '1' : '0' ?>" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>">
-                    <?php if ($rpFollowsYou && !$rpFollowing): ?>
-                      <span class="tag" title="This account follows you">follows you</span>
-                    <?php elseif ($rpRel === 'mutuals'): ?>
+                    <?php if ($rpRel === 'mutuals' || ($rpFollowing && $rpFollowsYou)): ?>
                       <span class="tag" title="You follow each other">mutuals</span>
-                    <?php elseif ($rpFollowing): ?>
-                      <span class="tag" title="You follow them">following</span>
+                    <?php elseif ($rpFollowsYou && !$rpFollowing): ?>
+                      <span class="tag" title="This account follows you">follows you</span>
                     <?php endif; ?>
                   </span>
                 </span>
@@ -34940,8 +34938,9 @@ if (VIEW === 'analytics') loadAnalytics();
     if (relState) {
       const followedBy = relState.dataset.followedBy === '1';
       relState.dataset.following = want ? '1' : '0';
+      // Button already says Follow/Following — only keep mutuals / follows-you tags.
       relState.innerHTML = want
-        ? '<span class="tag" title="You follow them">' + (followedBy ? 'mutual' : 'following') + '</span>'
+        ? (followedBy ? '<span class="tag" title="You follow each other">mutuals</span>' : '')
         : (followedBy ? '<span class="tag" title="They follow you">follows you</span>' : '');
     }
     const fd = new FormData(form); fd.set('ajax', '1');
