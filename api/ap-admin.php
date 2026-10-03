@@ -3338,11 +3338,11 @@ $vaakAdminOnlyActions = [
             if (!empty($result['ok'])) {
                 $notice = $wantOn
                     ? (!empty($result['already'])
-                        ? 'Already notified of posts from ' . $target
-                        : 'You will be notified when they post.')
+                        ? 'Already subscribed to their posts.'
+                        : 'Subscribed — you will be notified when they post.')
                     : (!empty($result['already'])
-                        ? 'Were not subscribed to posts from ' . $target
-                        : 'Stopped notifying for their posts.');
+                        ? 'Were not subscribed to their posts.'
+                        : 'Unsubscribed from their posts.');
             } else {
                 $error = $result['error'] ?? 'Could not update post notifications.';
             }
@@ -27921,7 +27921,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
                     <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
                     <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                    <button class="btn btn-ghost" type="submit" title="Stop notifications for their posts">Stop notifying</button>
+                    <button class="btn btn-ghost" type="submit" title="Stop notifications for their posts">Unsubscribe</button>
                   </form>
                 <?php else: ?>
                   <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
@@ -27930,7 +27930,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
                     <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
                     <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                    <button class="btn btn-ghost" type="submit" title="Get a notification when they post">Notify me of posts</button>
+                    <button class="btn btn-ghost" type="submit" title="Get a notification when they post">Subscribe</button>
                   </form>
                 <?php endif; ?>
               <?php endif; ?>
