@@ -27441,12 +27441,53 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   // The renderer reads the quote object from raw_create_json.
                   if (!empty($obj['attachment']) || !empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
               }
+              // Same twin dedupe as Your Posts: skip Bluesky rows that already
+              // have a local outbox note (fediverseId / crosspost map / mirror).
+              $rpLocalNoteIds = [];
+              foreach ($rpOutboxPosts as $obRow) {
+                  if (!is_array($obRow)) {
+                      continue;
+                  }
+                  $oid = rtrim((string) ($obRow['id'] ?? ''), '/');
+                  if ($oid !== '') {
+                      $rpLocalNoteIds[$oid] = true;
+                  }
+              }
+              $rpBskyUris = [];
+              foreach ($rpBskyPosts as $bProbe) {
+                  if (!is_array($bProbe)) {
+                      continue;
+                  }
+                  $u = trim((string) (($bProbe['post']['uri'] ?? '') ?: ''));
+                  if ($u !== '') {
+                      $rpBskyUris[] = $u;
+                  }
+              }
+              $rpBskyMirrorFlags = (function_exists('ap_bsky_mirror_segment_flags') && $rpBskyUris !== [])
+                  ? ap_bsky_mirror_segment_flags($rpBskyUris)
+                  : [];
               foreach ($rpBskyPosts as $item) {
                   if (!is_array($item)) continue;
                   $post = is_array($item['post'] ?? null) ? $item['post'] : [];
                   $record = is_array($post['record'] ?? null) ? $post['record'] : [];
                   $embed = is_array($post['embed'] ?? null) ? $post['embed'] : [];
                   $reason = is_array($item['reason'] ?? null) ? $item['reason'] : [];
+                  $bUri = trim((string) ($post['uri'] ?? ''));
+                  if ($bUri !== '' && !empty($rpBskyMirrorFlags[$bUri]['mirror'])) {
+                      continue;
+                  }
+                  $link = ($bUri !== '' && function_exists('ap_bsky_post_link_by_uri'))
+                      ? ap_bsky_post_link_by_uri($bUri) : null;
+                  $fediId = rtrim((string) (($link['fediverse_id'] ?? '') ?: ($record['fediverseId'] ?? '')), '/');
+                  if ($fediId === '' && $bUri !== '' && function_exists('ap_bsky_crosspost_by_uri')) {
+                      $xp = ap_bsky_crosspost_by_uri($bUri);
+                      if (is_array($xp)) {
+                          $fediId = rtrim((string) ($xp['note_id'] ?? ''), '/');
+                      }
+                  }
+                  if ($fediId !== '' && isset($rpLocalNoteIds[$fediId])) {
+                      continue;
+                  }
                   if (!empty($reason['$type']) && str_ends_with((string) $reason['$type'], '.reasonRepost')) {
                       $rpTabItems['boosts'][] = $item;
                       continue;
@@ -27512,27 +27553,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $rpLocalPageItems = is_array($rpPage['items'] ?? null) ? $rpPage['items'] : [];
                   $rpLocalHasMore = !empty($rpPage['has_more']);
                   $rpLocalNextOffset = (int) ($rpPage['next_offset'] ?? count($rpLocalPageItems));
-                  // Own-profile Bluesky-only rows still surface on first paint
-                  // (merged + time-sorted); deep scroll continues via outbox SQL.
-                  // Cursor stays on the SQL page size so later offsets stay aligned.
+                  // Own-profile Bluesky-only rows (no local twin) still surface on
+                  // first paint. Crossposts / mirror segments are already skipped
+                  // when building $rpTabItems (fediverseId + crosspost map).
                   if ($rpBskyPosts !== [] && $rpLocalPageItems !== []) {
-                      $seenIds = [];
-                      foreach ($rpLocalPageItems as $localRow) {
-                          if (!is_array($localRow)) {
-                              continue;
-                          }
-                          $lid = rtrim((string) ($localRow['id'] ?? ''), '/');
-                          if ($lid !== '') {
-                              $seenIds[$lid] = true;
-                          }
-                      }
                       $bskyExtra = [];
                       foreach (($rpTabItems[$rpTab] ?? []) as $bItem) {
                           if (!is_array($bItem) || !isset($bItem['post'])) {
-                              continue;
-                          }
-                          $bUri = rtrim((string) ($bItem['post']['uri'] ?? $bItem['uri'] ?? ''), '/');
-                          if ($bUri !== '' && isset($seenIds[$bUri])) {
                               continue;
                           }
                           $bskyExtra[] = $bItem;
