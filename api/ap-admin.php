@@ -27442,15 +27442,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     $rpFrom
                 ) ?>
               <?php endif; ?>
-              <a href="<?= h($rpIsBsky ? $rpActor : admin_remote_actor_href($rpActor)) ?>" target="_blank" rel="noopener noreferrer"><?= $rpIsBsky ? 'Open on Bluesky' : h(admin_open_profile_label($rpActor)) ?></a>
-              <?php if (!$rpIsBsky && !$rpIsLocal && !$rpIsOwn): ?>
-                <?php
-                  $rpRemoteFollowHref = admin_remote_actor_href(
-                      $rpActor,
-                      is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null
-                  );
-                ?>
-                <a href="<?= h($rpRemoteFollowHref) ?>" target="_blank" rel="noopener noreferrer" title="Opens their instance’s profile — use Follow Remotely there with your @user@mkultra.monster address">Follow on their instance</a>
+              <?php if ($rpIsBsky): ?>
+                <a href="<?= h($rpActor) ?>" target="_blank" rel="noopener noreferrer">Open on Bluesky</a>
+              <?php elseif (!$rpIsLocal): ?>
+                <a href="<?= h(admin_remote_actor_href($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null)) ?>" target="_blank" rel="noopener noreferrer"><?= h(admin_open_profile_label($rpActor)) ?></a>
+                <?php if (!$rpIsOwn): ?>
+                  <?php
+                    $rpRemoteFollowHref = admin_remote_actor_href(
+                        $rpActor,
+                        is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null
+                    );
+                  ?>
+                  <a href="<?= h($rpRemoteFollowHref) ?>" target="_blank" rel="noopener noreferrer" title="Opens their instance’s profile — use Follow Remotely there with your @user@mkultra.monster address">Follow on their instance</a>
+                <?php endif; ?>
               <?php endif; ?>
             </div>
           </article>
