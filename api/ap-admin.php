@@ -14646,6 +14646,15 @@ function admin_render_masto_status_card(
     $actionBase = '?view=' . rawurlencode($returnView);
     if ($returnView === 'status' && $uri !== '') {
         $actionBase = '?view=status&object=' . rawurlencode($uri) . '&from=search';
+    } elseif ($returnView === 'remote_profile') {
+        // Stay on the profile after non-AJAX interact fallbacks.
+        $profileReturnActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
+        if ($profileReturnActor === '' && $actorRef !== '' && str_starts_with($actorRef, 'https://')) {
+            $profileReturnActor = $actorRef;
+        }
+        if ($profileReturnActor !== '') {
+            $actionBase .= '&actor=' . rawurlencode($profileReturnActor);
+        }
     }
     $createHydrateAttrs = '';
     if ($boostHydrate && $announceEventId > 0) {
@@ -15601,6 +15610,56 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
 }
 
 /**
+ * Prefer the shared Mastodon status card for a local outbox note so profile /
+ * Local timeline posts get the same reply/boost/quote/like/bookmark/⋯ actions
+ * as Home. Falls through for guests, Bluesky imports, and notes without a
+ * masto_statuses row.
+ *
+ * @param array<string,mixed> $n outbox_notes row
+ * @param array<int|string,mixed> $followingIds
+ */
+function admin_try_render_outbox_shared_card(array $n, array $followingIds, string $returnView): bool
+{
+    if (!empty($GLOBALS['vaak_guest_profile'])) {
+        return false;
+    }
+    if (!function_exists('ap_masto_status_by_note_id')
+        || !function_exists('ap_masto_status_from_row')
+        || !function_exists('admin_render_masto_status_card')) {
+        return false;
+    }
+    if (function_exists('admin_outbox_is_bsky_import') && admin_outbox_is_bsky_import($n)) {
+        return false;
+    }
+    $noteId = rtrim((string) ($n['id'] ?? ''), '/');
+    if (($noteId === '' || ctype_digit($noteId)) && !empty($n['object_id']) && is_string($n['object_id'])) {
+        $oid = rtrim((string) $n['object_id'], '/');
+        if ($oid !== '' && str_contains($oid, '/notes/')) {
+            $noteId = $oid;
+        }
+    }
+    if ($noteId === '' || !str_starts_with($noteId, 'https://')
+        || (function_exists('vaak_is_local_url') && !vaak_is_local_url($noteId))) {
+        return false;
+    }
+    try {
+        $row = ap_masto_status_by_note_id($noteId);
+        if (!is_array($row)) {
+            return false;
+        }
+        $st = ap_masto_status_from_row($row, true, false);
+        if (!is_array($st) || trim((string) ($st['id'] ?? '')) === '') {
+            return false;
+        }
+        admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+        return true;
+    } catch (Throwable $e) {
+        error_log('[ap-admin] outbox shared card: ' . $e->getMessage());
+        return false;
+    }
+}
+
+/**
  * Render a local outbox note as a timeline card (for Home/Federated mix-in).
  *
  * @param array<string,mixed> $n outbox_notes row
@@ -16018,10 +16077,78 @@ function admin_render_outbox_card(array $n, string $returnView): void
                     'boosted' => $ownBoosted,
                     'actor' => $actor,
                 ]) ?>
+              <?php elseif ($noteId !== '' && empty($GLOBALS['vaak_guest_profile'])): ?>
+                <?php
+                  // Peer local notes (other VAAK accounts): same action set as
+                  // timeline shared cards when the shared-card path could not run.
+                  $peerSid = $ownQuoteStatusId;
+                  $peerBoosted = false;
+                  $peerFav = false;
+                  $peerBm = false;
+                  if ($peerSid !== '' && function_exists('ap_masto_status_is_reblogged')) {
+                      $peerBoosted = ap_masto_status_is_reblogged($peerSid);
+                  }
+                  if ($peerSid !== '' && function_exists('ap_masto_status_is_favourited')) {
+                      $peerFav = ap_masto_status_is_favourited($peerSid, null, $noteId);
+                  }
+                  if ($peerSid !== '' && function_exists('ap_masto_status_is_bookmarked')) {
+                      $peerBm = ap_masto_status_is_bookmarked($peerSid, null, $noteId);
+                  }
+                  $peerCanBoostQuote = !in_array(strtolower((string) ($ownVisRaw ?? 'public')), ['private', 'direct', 'followers'], true);
+                  $peerActionBase = '?view=' . rawurlencode($returnView);
+                  if ($returnView === 'remote_profile' && $actor !== '') {
+                      $peerActionBase .= '&actor=' . rawurlencode($actor);
+                  }
+                ?>
+                <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
+                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= $actor !== '' ? '&amp;to=' . urlencode($actor) : '' ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
+                <?php if ($peerCanBoostQuote): ?>
+                  <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($noteId) ?><?= $peerSid !== '' ? '&amp;quote_status_id=' . urlencode($peerSid) : '' ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+                <?php endif; ?>
+                <?php if ($peerCanBoostQuote && $peerSid !== '' && preg_match('/^\d+$/', $peerSid)): ?>
+                  <form method="post" action="<?= h($peerActionBase) ?>" style="display:inline">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                    <input type="hidden" name="action" value="<?= $peerBoosted ? 'unreblog_status' : 'reblog_status' ?>">
+                    <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                    <?php if ($returnView === 'remote_profile' && $actor !== ''): ?>
+                      <input type="hidden" name="return_actor" value="<?= h($actor) ?>">
+                    <?php endif; ?>
+                    <input type="hidden" name="status_id" value="<?= h($peerSid) ?>">
+                    <input type="hidden" name="object_id" value="<?= h($noteId) ?>">
+                    <input type="hidden" name="target_actor" value="<?= h($actor) ?>">
+                    <button class="icon-btn<?= $peerBoosted ? ' on' : '' ?>" type="submit" title="<?= $peerBoosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $peerBoosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                  </form>
+                <?php endif; ?>
+                <?php if ($peerSid !== '' && preg_match('/^\d+$/', $peerSid)): ?>
+                  <form method="post" action="<?= h($peerActionBase) ?>" style="display:inline">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                    <input type="hidden" name="action" value="<?= $peerFav ? 'unfavourite_status' : 'favourite_status' ?>">
+                    <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                    <?php if ($returnView === 'remote_profile' && $actor !== ''): ?>
+                      <input type="hidden" name="return_actor" value="<?= h($actor) ?>">
+                    <?php endif; ?>
+                    <input type="hidden" name="status_id" value="<?= h($peerSid) ?>">
+                    <input type="hidden" name="object_id" value="<?= h($noteId) ?>">
+                    <input type="hidden" name="target_actor" value="<?= h($actor) ?>">
+                    <button class="icon-btn<?= $peerFav ? ' on' : '' ?>" type="submit" title="<?= $peerFav ? 'Unlike' : 'Like' ?>" aria-label="<?= $peerFav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $peerFav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                  </form>
+                  <form method="post" action="<?= h($peerActionBase) ?>" style="display:inline">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                    <input type="hidden" name="action" value="<?= $peerBm ? 'unbookmark_status' : 'bookmark_status' ?>">
+                    <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                    <?php if ($returnView === 'remote_profile' && $actor !== ''): ?>
+                      <input type="hidden" name="return_actor" value="<?= h($actor) ?>">
+                    <?php endif; ?>
+                    <input type="hidden" name="status_id" value="<?= h($peerSid) ?>">
+                    <input type="hidden" name="object_id" value="<?= h($noteId) ?>">
+                    <button class="icon-btn<?= $peerBm ? ' on' : '' ?>" type="submit" title="<?= $peerBm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $peerBm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $peerBm ? '1' : '0' ?>"><i class="ph<?= $peerBm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+                  </form>
+                <?php endif; ?>
+                <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL (<?= h($ownVisLabel ?? 'Public') ?>)">Note</a>
+                <?= block_quick_actions($actor, short_host($actor), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $noteId) ?>
               <?php elseif ($noteId !== ''): ?>
                 <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply / continue thread" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
-                <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL (<?= h($ownVisLabel ?? 'Public') ?>)">Note</a>
+                <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL">Note</a>
               <?php endif; ?>
             </div>
           </article>
@@ -16533,7 +16660,10 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
 {
     $kind = (string) ($item['kind'] ?? '');
     if ($kind === 'outbox') {
-        admin_render_outbox_card($item['row'], $returnView);
+        $outboxRow = is_array($item['row'] ?? null) ? $item['row'] : [];
+        if ($outboxRow === [] || !admin_try_render_outbox_shared_card($outboxRow, $followingIds, $returnView)) {
+            admin_render_outbox_card($outboxRow, $returnView);
+        }
         return;
     }
     if ($kind === 'boost') {
@@ -17427,8 +17557,14 @@ if ($isPartial && $view === 'outbox') {
         header('X-Next-Offset: ' . ($profileOffset + count($page)));
         header('X-VAAK-View: remote_profile');
         foreach ($page as $row) {
-            if (strtolower((string) ($row['type'] ?? '')) === 'announce') admin_render_event_tweet($row, $followingIds, 'remote_profile');
-            else admin_render_outbox_card($row, 'remote_profile');
+            if (!is_array($row)) {
+                continue;
+            }
+            if (strtolower((string) ($row['type'] ?? '')) === 'announce') {
+                admin_render_event_tweet($row, $followingIds, 'remote_profile');
+            } elseif (!admin_try_render_outbox_shared_card($row, $followingIds, 'remote_profile')) {
+                admin_render_outbox_card($row, 'remote_profile');
+            }
         }
         exit;
     }
@@ -27653,8 +27789,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php admin_render_bsky_feed_item($n, 'following', 'remote_profile'); ?>
               <?php elseif (isset($n['type']) && strtolower((string) $n['type']) === 'announce'): ?>
                 <?php admin_render_event_tweet($n, $followingIds, 'remote_profile'); ?>
+              <?php elseif (is_array($n) && admin_try_render_outbox_shared_card($n, $followingIds, 'remote_profile')): ?>
               <?php else: ?>
-                <?php admin_render_outbox_card($n, 'remote_profile'); ?>
+                <?php if (is_array($n)) admin_render_outbox_card($n, 'remote_profile'); ?>
               <?php endif; ?>
             <?php endforeach; ?>
             <?php if ($rpIsLocal): ?></div><div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $rpLocalHasMore ? 'Scroll for more…' : 'End of profile' ?></div><div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div><button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
