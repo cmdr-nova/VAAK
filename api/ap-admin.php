@@ -10806,6 +10806,12 @@ function admin_own_post_action_bar(string $noteId, string $returnView, array $op
     $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
     $from = preg_replace('/[^a-z_]/', '', (string) ($opts['from'] ?? '')) ?: '';
     $statusId = trim((string) ($opts['status_id'] ?? ''));
+    if (($statusId === '' || !preg_match('/^\d+$/', $statusId)) && function_exists('ap_masto_canonical_interaction_keys')) {
+        $keys = ap_masto_canonical_interaction_keys('', $noteId);
+        if (preg_match('/^\d+$/', (string) ($keys['status_id'] ?? ''))) {
+            $statusId = (string) $keys['status_id'];
+        }
+    }
     $spoiler = (string) ($opts['spoiler'] ?? '');
     $sensitive = !empty($opts['sensitive']);
     $vis = strtolower(trim((string) ($opts['visibility'] ?? 'public')));
@@ -10813,6 +10819,9 @@ function admin_own_post_action_bar(string $noteId, string $returnView, array $op
         $vis = 'public';
     }
     $boosted = !empty($opts['boosted']);
+    if (!array_key_exists('boosted', $opts) && $statusId !== '' && function_exists('ap_masto_status_is_reblogged')) {
+        $boosted = ap_masto_status_is_reblogged($statusId);
+    }
     $actor = trim((string) ($opts['actor'] ?? ''));
     $canBoostQuote = !in_array($vis, ['private', 'direct', 'followers'], true);
     $actionUrl = '?view=' . rawurlencode($returnView);
@@ -10822,27 +10831,94 @@ function admin_own_post_action_bar(string $noteId, string $returnView, array $op
             $actionUrl .= '&from=' . rawurlencode($from);
         }
     }
+
+    $fav = array_key_exists('favourited', $opts) ? !empty($opts['favourited']) : false;
+    $bm = array_key_exists('bookmarked', $opts) ? !empty($opts['bookmarked']) : false;
+    if ($statusId !== '' && preg_match('/^\d+$/', $statusId)) {
+        if (!array_key_exists('favourited', $opts) && function_exists('ap_masto_status_is_favourited')) {
+            $fav = ap_masto_status_is_favourited($statusId, null, $noteId);
+        }
+        if (!array_key_exists('bookmarked', $opts) && function_exists('ap_masto_status_is_bookmarked')) {
+            $bm = ap_masto_status_is_bookmarked($statusId, null, $noteId);
+        }
+    }
+    $counts = is_array($opts['counts'] ?? null) ? $opts['counts'] : null;
+    if ($counts === null && function_exists('ap_local_note_engagement_counts')) {
+        $counts = ap_local_note_engagement_counts($noteId, $statusId !== '' ? $statusId : null);
+    }
+    if (!is_array($counts)) {
+        $counts = ['favourites' => 0, 'reblogs' => 0, 'quotes' => 0, 'bookmarks' => 0];
+    }
+    $countSpan = static function (int $n): string {
+        return $n > 0
+            ? '<span class="action-count" aria-hidden="true">' . h((string) $n) . '</span>'
+            : '';
+    };
+    $csrf = function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : '';
+
     $html = '<a class="icon-btn" href="?view=' . h($returnView) . '&amp;compose=1&amp;reply_to='
         . rawurlencode($noteId)
         . (function_exists('admin_reply_cw_query') ? admin_reply_cw_query($spoiler, $sensitive) : '')
         . '" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>';
     if ($canBoostQuote && $statusId !== '' && preg_match('/^\d+$/', $statusId)) {
+        $rbN = (int) ($counts['reblogs'] ?? 0);
         $html .= '<form method="post" action="' . h($actionUrl) . '" style="display:inline">'
+            . ($csrf !== '' ? '<input type="hidden" name="csrf" value="' . h($csrf) . '">' : '')
             . '<input type="hidden" name="action" value="' . ($boosted ? 'unreblog_status' : 'reblog_status') . '">'
             . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
             . '<input type="hidden" name="status_id" value="' . h($statusId) . '">'
             . '<input type="hidden" name="object_id" value="' . h($noteId) . '">'
             . ($actor !== '' ? '<input type="hidden" name="target_actor" value="' . h($actor) . '">' : '')
-            . '<button class="icon-btn' . ($boosted ? ' on' : '') . '" type="submit" title="'
+            . '<button class="icon-btn' . ($boosted ? ' on' : '') . '" type="submit" data-own-eng="1" data-eng-count="'
+            . (int) $rbN . '" title="'
             . ($boosted ? 'Undo boost' : 'Boost') . '" aria-label="'
-            . ($boosted ? 'Undo boost' : 'Boost') . '"><i class="ph ph-repeat" aria-hidden="true"></i></button>'
+            . ($boosted ? 'Undo boost' : 'Boost')
+            . ($rbN > 0 ? ' (' . $rbN . ')' : '')
+            . '"><i class="ph ph-repeat" aria-hidden="true"></i>'
+            . $countSpan($rbN) . '</button>'
             . '</form>';
     }
     if ($canBoostQuote) {
+        $qtN = (int) ($counts['quotes'] ?? 0);
         $html .= '<a class="icon-btn" href="?view=' . h($returnView) . '&amp;compose=1&amp;quote_object='
             . rawurlencode($noteId)
             . ($statusId !== '' ? '&amp;quote_status_id=' . rawurlencode($statusId) : '')
-            . '" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>';
+            . '" data-own-eng="1" data-eng-count="' . (int) $qtN . '" title="Quote" aria-label="Quote'
+            . ($qtN > 0 ? ' (' . $qtN . ')' : '')
+            . '"><i class="ph ph-quotes" aria-hidden="true"></i>'
+            . $countSpan($qtN) . '</a>';
+    }
+    if ($statusId !== '' && preg_match('/^\d+$/', $statusId)) {
+        $favN = (int) ($counts['favourites'] ?? 0);
+        $bmN = (int) ($counts['bookmarks'] ?? 0);
+        $html .= '<form method="post" action="' . h($actionUrl) . '" style="display:inline">'
+            . ($csrf !== '' ? '<input type="hidden" name="csrf" value="' . h($csrf) . '">' : '')
+            . '<input type="hidden" name="action" value="' . ($fav ? 'unfavourite_status' : 'favourite_status') . '">'
+            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+            . '<input type="hidden" name="status_id" value="' . h($statusId) . '">'
+            . '<input type="hidden" name="object_id" value="' . h($noteId) . '">'
+            . ($actor !== '' ? '<input type="hidden" name="target_actor" value="' . h($actor) . '">' : '')
+            . '<button class="icon-btn' . ($fav ? ' on' : '') . '" type="submit" data-own-eng="1" data-eng-count="'
+            . (int) $favN . '" title="' . ($fav ? 'Unlike' : 'Like') . '" aria-label="'
+            . ($fav ? 'Unlike' : 'Like')
+            . ($favN > 0 ? ' (' . $favN . ')' : '')
+            . '"><i class="ph' . ($fav ? '-fill' : '') . ' ph-heart" aria-hidden="true"></i>'
+            . $countSpan($favN) . '</button>'
+            . '</form>';
+        $html .= '<form method="post" action="' . h($actionUrl) . '" style="display:inline">'
+            . ($csrf !== '' ? '<input type="hidden" name="csrf" value="' . h($csrf) . '">' : '')
+            . '<input type="hidden" name="action" value="' . ($bm ? 'unbookmark_status' : 'bookmark_status') . '">'
+            . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
+            . '<input type="hidden" name="status_id" value="' . h($statusId) . '">'
+            . '<input type="hidden" name="object_id" value="' . h($noteId) . '">'
+            . '<button class="icon-btn' . ($bm ? ' on' : '') . '" type="submit" data-own-eng="1" data-eng-count="'
+            . (int) $bmN . '" data-bm-picker="' . ($bm ? '1' : '0') . '" title="'
+            . ($bm ? 'Bookmark folders' : 'Bookmark') . '" aria-label="'
+            . ($bm ? 'Bookmark folders' : 'Bookmark')
+            . ($bmN > 0 ? ' (' . $bmN . ')' : '')
+            . '"><i class="ph' . ($bm ? '-fill' : '') . ' ph-bookmark-simple" aria-hidden="true"></i>'
+            . $countSpan($bmN) . '</button>'
+            . '</form>';
     }
     $html .= admin_delete_post_button($noteId, $returnView, $from);
     $html .= admin_own_post_overflow($noteId, $returnView, $from, [
@@ -16690,10 +16766,29 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
         ?>
         <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?><?= admin_reply_mention_query($bskyMentionSeed) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
         <?php if ($isOwnBsky): ?>
+          <?php
+            $ownBskyLikes = max(0, (int) ($post['likeCount'] ?? $post['like_count'] ?? 0));
+            $ownBskyReposts = max(0, (int) ($post['repostCount'] ?? $post['repost_count'] ?? 0));
+            $ownBskyQuotes = max(0, (int) ($post['quoteCount'] ?? $post['quote_count'] ?? 0));
+            // Prefer federated twin counts when this Bluesky post is a VAAK crosspost.
+            if ($fediId !== '' && function_exists('ap_local_note_engagement_counts') && str_contains($fediId, '/notes/')) {
+                $ownTwin = ap_local_note_engagement_counts($fediId, null);
+                $ownBskyLikes = max($ownBskyLikes, (int) ($ownTwin['favourites'] ?? 0));
+                $ownBskyReposts = max($ownBskyReposts, (int) ($ownTwin['reblogs'] ?? 0));
+                $ownBskyQuotes = max($ownBskyQuotes, (int) ($ownTwin['quotes'] ?? 0));
+            }
+            $ownBskyCount = static function (int $n): string {
+                return $n > 0 ? '<span class="action-count" aria-hidden="true">' . h((string) $n) . '</span>' : '';
+            };
+          ?>
           <?php if ($uri !== ''): ?>
-            <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+            <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyReposts ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?><?= $ownBskyReposts > 0 ? ' (' . (int) $ownBskyReposts . ')' : '' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i><?= $ownBskyCount($ownBskyReposts) ?></button>
           <?php endif; ?>
-          <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+          <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyQuotes ?>" title="Quote" aria-label="Quote<?= $ownBskyQuotes > 0 ? ' (' . (int) $ownBskyQuotes . ')' : '' ?>"><i class="ph ph-quotes" aria-hidden="true"></i><?= $ownBskyCount($ownBskyQuotes) ?></a>
+          <?php if ($uri !== ''): ?>
+            <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyLikes ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?><?= $ownBskyLikes > 0 ? ' (' . (int) $ownBskyLikes . ')' : '' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i><?= $ownBskyCount($ownBskyLikes) ?></button>
+            <button type="button" class="icon-btn bsky-action<?= $bookmarked ? ' on' : '' ?>" data-bsky-action="bookmark" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-bm-picker="<?= $bookmarked ? '1' : '0' ?>" data-own-eng="1" title="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bookmarked ? 'true' : 'false' ?>"><i class="ph<?= $bookmarked ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
+          <?php endif; ?>
           <?php if ($fediId !== '' && function_exists('admin_delete_post_button') && str_contains($fediId, '/notes/')): ?>
             <?= admin_delete_post_button($fediId, $composeView) ?>
             <?= admin_own_post_overflow($fediId, $composeView) ?>
@@ -20837,6 +20932,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       font-size: 1rem; line-height: 1;
       transition: color .15s ease, background-color .15s ease, border-color .15s ease, transform .12s ease, box-shadow .15s ease;
     }
+    /* Own-post engagement: grow the hit target when a compact count is present. */
+    .tweet-actions .icon-btn[data-own-eng="1"] {
+      width: auto; min-width: 2rem; padding: 0 .45rem; gap: .28rem;
+    }
+    .tweet-actions .action-count {
+      font-size: .72rem; font-variant-numeric: tabular-nums; line-height: 1;
+      color: var(--muted); font-weight: 600;
+    }
+    .tweet-actions .icon-btn.on .action-count,
+    .tweet-actions .icon-btn[data-own-eng="1"]:hover .action-count { color: var(--primary); }
     .tweet-actions .icon-btn:hover {
       border-color: color-mix(in srgb, var(--primary) 42%, transparent);
       background: color-mix(in srgb, var(--primary) 12%, transparent);
@@ -29734,29 +29839,43 @@ window.apAdminToast = function (msg, isErr) {
     if (ev.key === 'Escape') closeFolderPopover();
   });
 
-  function applyInteractButton(form, data) {
+  function applyInteractButton(form, data, beforeActive) {
     const btn = form.querySelector('button[type="submit"]');
     const actionInput = form.querySelector('input[name="action"]');
     if (!btn || !actionInput || !data || !data.ok) return;
     const kind = data.kind;
     const active = !!data.active;
+    const ownEng = btn.getAttribute('data-own-eng') === '1';
+    let countN = parseInt(btn.getAttribute('data-eng-count') || '0', 10);
+    if (!Number.isFinite(countN) || countN < 0) countN = 0;
+    if (ownEng && (kind === 'favourite' || kind === 'bookmark' || kind === 'reblog')
+        && typeof beforeActive === 'boolean' && beforeActive !== active) {
+      countN = Math.max(0, countN + (active ? 1 : -1));
+      btn.setAttribute('data-eng-count', String(countN));
+    }
+    const countHtml = (ownEng && countN > 0)
+      ? '<span class="action-count" aria-hidden="true">' + String(countN) + '</span>'
+      : '';
+    const countSuffix = (ownEng && countN > 0) ? (' (' + countN + ')') : '';
     if (kind === 'favourite') {
-      btn.innerHTML = '<i class="ph' + (active ? '-fill' : '') + ' ph-heart" aria-hidden="true"></i>';
+      btn.innerHTML = '<i class="ph' + (active ? '-fill' : '') + ' ph-heart" aria-hidden="true"></i>' + countHtml;
       btn.classList.toggle('on', active);
       btn.title = active ? 'Unlike' : 'Like';
-      btn.setAttribute('aria-label', active ? 'Unlike' : 'Like');
+      btn.setAttribute('aria-label', (active ? 'Unlike' : 'Like') + countSuffix);
       actionInput.value = active ? 'unfavourite_status' : 'favourite_status';
     } else if (kind === 'bookmark') {
-      btn.innerHTML = '<i class="ph' + (active ? '-fill' : '') + ' ph-bookmark-simple" aria-hidden="true"></i>';
+      btn.innerHTML = '<i class="ph' + (active ? '-fill' : '') + ' ph-bookmark-simple" aria-hidden="true"></i>' + countHtml;
       btn.classList.toggle('on', active);
       btn.title = active ? 'Bookmark folders' : 'Bookmark';
-      btn.setAttribute('aria-label', active ? 'Bookmark folders' : 'Bookmark');
+      btn.setAttribute('aria-label', (active ? 'Bookmark folders' : 'Bookmark') + countSuffix);
       btn.setAttribute('data-bm-picker', active ? '1' : '0');
       actionInput.value = active ? 'unbookmark_status' : 'bookmark_status';
     } else if (kind === 'reblog') {
+      const icon = btn.querySelector('i.ph-repeat') ? btn.querySelector('i.ph-repeat').outerHTML : '<i class="ph ph-repeat" aria-hidden="true"></i>';
+      btn.innerHTML = icon + countHtml;
       btn.classList.toggle('on', active);
       btn.title = active ? 'Undo boost' : 'Boost';
-      btn.setAttribute('aria-label', active ? 'Undo boost' : 'Boost');
+      btn.setAttribute('aria-label', (active ? 'Undo boost' : 'Boost') + countSuffix);
       actionInput.value = active ? 'unreblog_status' : 'reblog_status';
     }
   }
@@ -29773,6 +29892,7 @@ window.apAdminToast = function (msg, isErr) {
       title: btn.title,
       ariaLabel: btn.getAttribute('aria-label'),
       bmPicker: btn.getAttribute('data-bm-picker'),
+      engCount: btn.getAttribute('data-eng-count'),
       action: actionInput.value,
     };
   }
@@ -29786,6 +29906,8 @@ window.apAdminToast = function (msg, isErr) {
     else snapshot.btn.setAttribute('aria-label', snapshot.ariaLabel);
     if (snapshot.bmPicker === null) snapshot.btn.removeAttribute('data-bm-picker');
     else snapshot.btn.setAttribute('data-bm-picker', snapshot.bmPicker);
+    if (snapshot.engCount === null || snapshot.engCount === undefined) snapshot.btn.removeAttribute('data-eng-count');
+    else snapshot.btn.setAttribute('data-eng-count', snapshot.engCount);
     snapshot.actionInput.value = snapshot.action;
   }
 
@@ -29892,7 +30014,7 @@ window.apAdminToast = function (msg, isErr) {
       : (action === 'bookmark_status' || action === 'unbookmark_status') ? 'bookmark' : 'reblog';
     const optimisticActive = action === 'favourite_status'
       || action === 'bookmark_status' || action === 'reblog_status';
-    applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive });
+    applyInteractButton(form, { ok: true, kind: optimisticKind, active: optimisticActive }, !optimisticActive);
     if (window.vaakHaptic) window.vaakHaptic(5);
     // Clear any capture-phase Saving… pill immediately — this is background work.
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
@@ -29915,7 +30037,8 @@ window.apAdminToast = function (msg, isErr) {
         window.apAdminToast((data && (data.error || data.notice)) || 'Action failed.', true);
         return;
       }
-      applyInteractButton(form, data);
+      // beforeActive = current (optimistic) state so counts do not double-bump.
+      applyInteractButton(form, data, btn ? btn.classList.contains('on') : !!data.active);
       if (data.queued && data.queue_id) {
         form.dataset.queuePending = '1';
         form.dataset.queueId = String(data.queue_id);
