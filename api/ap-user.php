@@ -730,7 +730,13 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             if ($ln === '' || $lv === '') {
                 continue;
             }
-            echo '<div class="field"><span class="field-label">' . $ln . '</span>'
+            $fieldVerified = !empty($att['verified_at']) && is_string($att['verified_at']);
+            $verMark = $fieldVerified
+                ? ' <span class="field-verified" title="Verified via rel=me · '
+                    . htmlspecialchars((string) $att['verified_at'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    . '" aria-label="Verified">✓</span>'
+                : '';
+            echo '<div class="field"><span class="field-label">' . $ln . $verMark . '</span>'
                 . '<div class="field-value">' . $lv . '</div></div>';
         }
         echo '</div>';
@@ -1817,6 +1823,7 @@ function ap_user_html_shell_start(string $title, array $meta = []): void
       .fields .field-label{display:block;color:#999;font-size:.75rem;margin:0 0 .2rem}
       .fields .field-value{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .fields .field-value a{overflow:hidden;text-overflow:ellipsis}
+      .field-verified{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;margin-left:.35rem;border-radius:50%;background:rgba(0,255,159,.2);color:#00ff9f;font-size:.75em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.05em}
       @media (max-width:520px){.fields{grid-template-columns:1fr}}
       .stats{display:flex;gap:1.25rem;margin:1.1rem 0 0;padding-top:1rem;border-top:1px solid #2a2a2a}
       .stats a{text-decoration:none;color:inherit}
