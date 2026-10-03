@@ -17681,69 +17681,51 @@ if ($isPartial && $view === 'outbox') {
 }
 
 // Local VAAK profile tabs use the same append-only pagination contract as
-// timelines.  Keep this endpoint deliberately local/SQL-only: it must never
+// timelines. Keep this endpoint deliberately local/SQL-only: it must never
 // turn a profile scroll into a synchronous remote fetch.
-    if ($isPartial && $view === 'remote_profile') {
+if ($isPartial && $view === 'remote_profile') {
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
+    if (function_exists('ap_auth_session_write_close')) {
+        ap_auth_session_write_close();
+    } elseif (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     $profileActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
     $profileTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
     $profileOffset = max(0, (int) ($_GET['offset'] ?? 0));
-    $profileLimit = max(10, min(50, (int) ($_GET['limit'] ?? 40)));
-    if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $profileActor, $pm)) {
-        $profilePrefs = function_exists('ap_profile_get') ? ap_profile_get(strtolower($pm[1])) : [];
-        $hideProfileReplies = !empty($profilePrefs['hide_profile_replies']);
-        $hideProfileBoosts = !empty($profilePrefs['hide_profile_boosts']);
-        if (($profileTab === 'replies' && $hideProfileReplies) || ($profileTab === 'boosts' && $hideProfileBoosts)) {
-            $profileTab = 'posts';
-        }
-        $profileRows = ['posts' => [], 'replies' => [], 'boosts' => [], 'media' => []];
-        try {
-            $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 500');
-            $st->execute(['https://mkultra.monster/users/' . strtolower($pm[1]) . '/%']);
-            foreach (($st->fetchAll() ?: []) as $row) {
-                $create = json_decode((string) ($row['raw_create_json'] ?? ''), true);
-                $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
-                $bucket = !empty($obj['inReplyTo']) ? 'replies' : 'posts';
-                $profileRows[$bucket][] = $row;
-                if (!empty($obj['attachment']) || (!empty($row['media_urls']) && $row['media_urls'] !== '[]')) {
-                    $profileRows['media'][] = $row;
-                }
-            }
-            // Outbox owns authored Notes; event ledger only contributes Announces
-            // (boosts). Mixing Create events in here duplicated cards and made
-            // guest renders fall back to @__guest__ (numeric event id ≠ note URL).
-            $st = ap_db()->prepare("SELECT * FROM events WHERE type = 'Announce' AND (actor_id = ? OR actor_id = ?) ORDER BY created_at DESC, id DESC LIMIT 500");
-            $st->execute([$profileActor, $profileActor . '/']);
-            foreach (($st->fetchAll() ?: []) as $row) {
-                $profileRows['boosts'][] = $row;
-            }
-        } catch (Throwable $e) {
-            error_log('[ap-admin] local profile partial: ' . $e->getMessage());
-        }
-        if (!isset($profileRows[$profileTab])) $profileTab = 'posts';
-        $all = $profileRows[$profileTab];
-        usort($all, static function ($a, $b): int {
-            $ta = strtotime((string) ($a['published'] ?? $a['created_at'] ?? '')) ?: 0;
-            $tb = strtotime((string) ($b['published'] ?? $b['created_at'] ?? '')) ?: 0;
-            return $tb <=> $ta;
-        });
-        $page = array_slice($all, $profileOffset, $profileLimit);
-        header('Content-Type: text/html; charset=utf-8');
-        header('Cache-Control: no-store');
-        header('X-Has-More: ' . (($profileOffset + $profileLimit) < count($all) ? '1' : '0'));
-        header('X-Next-Offset: ' . ($profileOffset + count($page)));
-        header('X-VAAK-View: remote_profile');
-        foreach ($page as $row) {
-            if (!is_array($row)) {
-                continue;
-            }
-            if (strtolower((string) ($row['type'] ?? '')) === 'announce') {
-                admin_render_event_tweet($row, $followingIds, 'remote_profile');
-            } elseif (!admin_try_render_outbox_shared_card($row, $followingIds, 'remote_profile')) {
-                admin_render_outbox_card($row, 'remote_profile');
-            }
-        }
+    $profileLimit = max(10, min(50, (int) ($_GET['limit'] ?? 20)));
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-VAAK-View: remote_profile');
+    if (!preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $profileActor, $pm)) {
+        header('X-Has-More: 0');
+        header('X-Next-Offset: ' . $profileOffset);
         exit;
     }
+    $profileKey = strtolower($pm[1]);
+    $profilePrefs = function_exists('ap_profile_get') ? ap_profile_get($profileKey) : [];
+    $hideProfileReplies = !empty($profilePrefs['hide_profile_replies']);
+    $hideProfileBoosts = !empty($profilePrefs['hide_profile_boosts']);
+    if (($profileTab === 'replies' && $hideProfileReplies) || ($profileTab === 'boosts' && $hideProfileBoosts)) {
+        $profileTab = 'posts';
+    }
+    $page = function_exists('ap_local_profile_tab_page')
+        ? ap_local_profile_tab_page($profileKey, $profileActor, $profileTab, $profileLimit, $profileOffset)
+        : ['items' => [], 'has_more' => false, 'next_offset' => $profileOffset];
+    $rows = is_array($page['items'] ?? null) ? $page['items'] : [];
+    header('X-Has-More: ' . (!empty($page['has_more']) ? '1' : '0'));
+    header('X-Next-Offset: ' . (int) ($page['next_offset'] ?? ($profileOffset + count($rows))));
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        if (strtolower((string) ($row['type'] ?? '')) === 'announce') {
+            admin_render_event_tweet($row, $followingIds, 'remote_profile');
+        } elseif (!admin_try_render_outbox_shared_card($row, $followingIds, 'remote_profile')) {
+            admin_render_outbox_card($row, 'remote_profile');
+        }
+    }
+    exit;
 }
 
 // AJAX fragment for Bluesky tab infinite scroll (cursor-based) + deferred merge samples
@@ -27513,14 +27495,69 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }
           // Pinned / Featured / Blog render from dedicated lists — not $rpTabItems.
           $rpTimelineTabs = ['posts', 'replies', 'boosts', 'media'];
+          $rpLocalPageLimit = 20;
+          $rpLocalNextOffset = 0;
           if (in_array($rpTab, $rpTimelineTabs, true)) {
               $rpTabBucket = $rpTabItems[$rpTab] ?? [];
-              // First paint: 20 cards; infinite-scroll partials load the rest.
-              $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabBucket, 0, 20) : $rpTabBucket;
-              $rpLocalHasMore = $rpIsLocal && count($rpTabBucket) > count($rpLocalPageItems);
+              if ($rpIsLocal && $rpLocalKey && function_exists('ap_local_profile_tab_page')) {
+                  // Same SQL OFFSET contract as the infinite-scroll partial so
+                  // the first page and later pages share one cursor.
+                  $rpPage = ap_local_profile_tab_page(
+                      (string) $rpLocalKey,
+                      $rpActor,
+                      $rpTab,
+                      $rpLocalPageLimit,
+                      0
+                  );
+                  $rpLocalPageItems = is_array($rpPage['items'] ?? null) ? $rpPage['items'] : [];
+                  $rpLocalHasMore = !empty($rpPage['has_more']);
+                  $rpLocalNextOffset = (int) ($rpPage['next_offset'] ?? count($rpLocalPageItems));
+                  // Own-profile Bluesky-only rows still surface on first paint
+                  // (merged + time-sorted); deep scroll continues via outbox SQL.
+                  // Cursor stays on the SQL page size so later offsets stay aligned.
+                  if ($rpBskyPosts !== [] && $rpLocalPageItems !== []) {
+                      $seenIds = [];
+                      foreach ($rpLocalPageItems as $localRow) {
+                          if (!is_array($localRow)) {
+                              continue;
+                          }
+                          $lid = rtrim((string) ($localRow['id'] ?? ''), '/');
+                          if ($lid !== '') {
+                              $seenIds[$lid] = true;
+                          }
+                      }
+                      $bskyExtra = [];
+                      foreach (($rpTabItems[$rpTab] ?? []) as $bItem) {
+                          if (!is_array($bItem) || !isset($bItem['post'])) {
+                              continue;
+                          }
+                          $bUri = rtrim((string) ($bItem['post']['uri'] ?? $bItem['uri'] ?? ''), '/');
+                          if ($bUri !== '' && isset($seenIds[$bUri])) {
+                              continue;
+                          }
+                          $bskyExtra[] = $bItem;
+                      }
+                      if ($bskyExtra !== []) {
+                          $merged = array_merge($rpLocalPageItems, $bskyExtra);
+                          usort($merged, static function ($a, $b): int {
+                              $aPost = is_array($a['post'] ?? null) ? $a['post'] : [];
+                              $bPost = is_array($b['post'] ?? null) ? $b['post'] : [];
+                              $aTime = (string) ($a['published'] ?? $a['created_at'] ?? $aPost['record']['createdAt'] ?? $aPost['indexedAt'] ?? '');
+                              $bTime = (string) ($b['published'] ?? $b['created_at'] ?? $bPost['record']['createdAt'] ?? $bPost['indexedAt'] ?? '');
+                              return (strtotime($bTime) ?: 0) <=> (strtotime($aTime) ?: 0);
+                          });
+                          $rpLocalPageItems = array_slice($merged, 0, $rpLocalPageLimit);
+                      }
+                  }
+              } else {
+                  $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabBucket, 0, $rpLocalPageLimit) : $rpTabBucket;
+                  $rpLocalHasMore = $rpIsLocal && count($rpTabBucket) > count($rpLocalPageItems);
+                  $rpLocalNextOffset = count($rpLocalPageItems);
+              }
           } else {
               $rpLocalPageItems = [];
               $rpLocalHasMore = false;
+              $rpLocalNextOffset = 0;
           }
         ?>
         <?php if ($rpError): ?>
@@ -28046,17 +28083,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           <?php elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts): ?>
             <?php if ($rpTabItems[$rpTab] === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
-            <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= count($rpLocalPageItems) ?>" data-limit="40" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0">
+            <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= (int) $rpLocalNextOffset ?>" data-limit="<?= (int) $rpLocalPageLimit ?>" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0">
             <?php endif; ?>
             <?php
               $localProfileItems = $rpIsLocal ? $rpLocalPageItems : $rpTabItems[$rpTab];
-              usort($localProfileItems, static function ($a, $b): int {
-                  $aPost = is_array($a['post'] ?? null) ? $a['post'] : [];
-                  $bPost = is_array($b['post'] ?? null) ? $b['post'] : [];
-                  $aTime = (string) ($a['published'] ?? $a['created_at'] ?? $aPost['record']['createdAt'] ?? $aPost['indexedAt'] ?? '');
-                  $bTime = (string) ($b['published'] ?? $b['created_at'] ?? $bPost['record']['createdAt'] ?? $bPost['indexedAt'] ?? '');
-                  return (strtotime($bTime) ?: 0) <=> (strtotime($aTime) ?: 0);
-              });
+              if (!$rpIsLocal) {
+                  usort($localProfileItems, static function ($a, $b): int {
+                      $aPost = is_array($a['post'] ?? null) ? $a['post'] : [];
+                      $bPost = is_array($b['post'] ?? null) ? $b['post'] : [];
+                      $aTime = (string) ($a['published'] ?? $a['created_at'] ?? $aPost['record']['createdAt'] ?? $aPost['indexedAt'] ?? '');
+                      $bTime = (string) ($b['published'] ?? $b['created_at'] ?? $bPost['record']['createdAt'] ?? $bPost['indexedAt'] ?? '');
+                      return (strtotime($bTime) ?: 0) <=> (strtotime($aTime) ?: 0);
+                  });
+              }
             ?>
             <?php foreach ($localProfileItems as $n): ?>
               <?php if (isset($n['post']) && is_array($n['post'])): ?>
@@ -30881,7 +30920,7 @@ window.apAdminToast = function (msg, isErr) {
 </script>
 <?php endif; ?>
 
-<?php if (in_array($view, ['home', 'feed', 'local', 'mentions', 'bluesky', 'outbox'], true)): ?>
+<?php if (in_array($view, ['home', 'feed', 'local', 'mentions', 'bluesky', 'outbox', 'remote_profile'], true)): ?>
 <script>
 (function () {
   /** Replace a timeline card in place without jumping scroll to the top. */
@@ -31443,6 +31482,7 @@ window.apAdminToast = function (msg, isErr) {
         else if (isNotifTimeline) status.textContent = 'End of notifications';
         else if (isBskyTimeline) status.textContent = 'End of Bluesky feed';
         else if (isOutboxTimeline) status.textContent = 'End of Your Posts';
+        else if (viewName === 'remote_profile') status.textContent = 'End of profile';
         else status.textContent = 'End of timeline';
       }
     } catch (e) {
