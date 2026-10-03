@@ -20115,6 +20115,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-tabs a { color:var(--muted); text-decoration:none; padding:.65rem .8rem; border-bottom:2px solid transparent; }
     .remote-profile-tabs a.is-active { color:var(--text); border-color:var(--primary); }
     .remote-profile-tabs .tab-count { opacity:.7; font-size:.8em; margin-left:.3rem; }
+    .remote-profile-fields { display:grid; grid-template-columns:1fr 1fr; gap:.55rem .75rem; margin:.75rem 0 0; font-size:.88rem; }
+    .remote-profile-field { min-width:0; overflow:hidden; }
+    .remote-profile-field a { overflow:hidden; text-overflow:ellipsis; }
+    @media (max-width:520px) { .remote-profile-fields { grid-template-columns:1fr; } }
+    .profile-world-links img { display:block; }
     /* Focused status threads use the same flat card treatment as timelines. */
     #status-thread-ancestors > article.tweet,
     #status-thread-descendants > article.tweet,
@@ -26233,6 +26238,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpLocalKey = null;
           $rpHideProfileReplies = false;
           $rpHideProfileBoosts = false;
+          $rpProfileFields = [];
+          $rpSlLink = null;
+          $rpWowLink = null;
           $rpError = null;
           $rpIsBsky = false;
           $rpBskyDid = '';
@@ -26361,6 +26369,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $prof = function_exists('ap_profile_get') ? ap_profile_get($rpLocalKey) : [];
                   $rpProfileBadges = function_exists('ap_profile_normalize_badges')
                       ? ap_profile_normalize_badges($prof['profile_badges'] ?? []) : [];
+                  // Same extras as HTML /users/{key} profiles: SL/WoW world links + PropertyValue fields.
+                  $rpProfileFields = (!empty($prof['attachment']) && is_array($prof['attachment']))
+                      ? $prof['attachment']
+                      : [];
+                  $rpSlLink = function_exists('ap_sl_link_for_actor_key')
+                      ? ap_sl_link_for_actor_key((string) $rpLocalKey)
+                      : null;
+                  $rpWowLink = function_exists('ap_wow_link_for_actor_key')
+                      ? ap_wow_link_for_actor_key((string) $rpLocalKey)
+                      : null;
                   $iconRaw = $prof['icon_url'] ?? null;
                   $imageRaw = $prof['image_url'] ?? null;
                   $rpAvatar = function_exists('ap_profile_sanitize_https_url')
@@ -26524,6 +26542,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                               $rpBio = function_exists('ap_html_to_plain_text')
                                   ? ap_html_to_plain_text($rpDoc['summary'])
                                   : trim(html_entity_decode(strip_tags($rpDoc['summary']), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                          }
+                          // Mastodon-style profile fields (PropertyValue attachments).
+                          if (!empty($rpDoc['attachment']) && is_array($rpDoc['attachment'])) {
+                              $rpProfileFields = $rpDoc['attachment'];
                           }
                       }
                   }
@@ -26785,12 +26807,82 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php else: ?>
               <div class="meta" style="margin-top:.75rem">No bio is cached yet; profile details are being refreshed in the background.</div>
             <?php endif; ?>
+            <?php
+              $rpHasSl = is_array($rpSlLink) && !empty($rpSlLink['sl_username']);
+              $rpHasWow = is_array($rpWowLink) && !empty($rpWowLink['armory_url']);
+            ?>
+            <?php if ($rpHasSl || $rpHasWow): ?>
+              <div class="profile-world-links" style="display:flex;gap:.5rem;align-items:center;margin:.65rem 0 0;flex-wrap:wrap">
+                <?php if ($rpHasSl): ?>
+                  <?php
+                    $rpSlName = (string) $rpSlLink['sl_username'];
+                    $rpSlHref = function_exists('ap_sl_viewer_profile_url')
+                        ? ap_sl_viewer_profile_url((string) ($rpSlLink['sl_agent_id'] ?? ''))
+                        : 'https://secondlife.com/';
+                  ?>
+                  <a href="<?= h($rpSlHref) ?>" rel="noopener noreferrer me" title="Open <?= h($rpSlName) ?> in Second Life" aria-label="Open <?= h($rpSlName) ?> in Second Life">
+                    <img src="/vaak/second-life.jpg" alt="Second Life" width="43" height="34" loading="lazy">
+                  </a>
+                  <span class="meta"><?= h($rpSlName) ?></span>
+                <?php endif; ?>
+                <?php if ($rpHasWow): ?>
+                  <?php
+                    $rpWowName = (string) ($rpWowLink['character_name'] ?? 'World of Warcraft character');
+                    $rpWowRealm = trim((string) ($rpWowLink['realm'] ?? ''));
+                    $rpWowLabel = $rpWowRealm !== '' ? ($rpWowName . ' · ' . $rpWowRealm) : $rpWowName;
+                    $rpWowHref = (string) $rpWowLink['armory_url'];
+                    $rpWowPortrait = trim((string) ($rpWowLink['portrait_url'] ?? ''));
+                  ?>
+                  <?php if ($rpWowPortrait !== ''): ?>
+                    <a href="<?= h($rpWowHref) ?>" target="_blank" rel="noopener noreferrer" title="Open <?= h($rpWowLabel) ?> Armory profile" aria-label="Open <?= h($rpWowLabel) ?> Armory profile">
+                      <img src="<?= h($rpWowPortrait) ?>" alt="World of Warcraft" width="43" height="34" loading="lazy" referrerpolicy="no-referrer" style="object-fit:cover;border-radius:8px">
+                    </a>
+                  <?php else: ?>
+                    <a class="btn btn-ghost" href="<?= h($rpWowHref) ?>" target="_blank" rel="noopener noreferrer">WoW Armory</a>
+                  <?php endif; ?>
+                  <span class="meta"><?= h($rpWowLabel) ?></span>
+                <?php endif; ?>
+              </div>
+            <?php endif; ?>
+            <?php
+              $rpFieldRows = [];
+              foreach ($rpProfileFields as $rpAtt) {
+                  if (!is_array($rpAtt)) {
+                      continue;
+                  }
+                  $rpFieldName = trim((string) ($rpAtt['name'] ?? ''));
+                  $rpFieldRaw = (string) ($rpAtt['value'] ?? '');
+                  if ($rpFieldName === '' || trim(strip_tags($rpFieldRaw)) === '') {
+                      continue;
+                  }
+                  $rpFieldValue = function_exists('ap_html_sanitize_allowlist')
+                      ? ap_html_sanitize_allowlist($rpFieldRaw, '<a>')
+                      : htmlspecialchars(strip_tags($rpFieldRaw), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                  if ($rpFieldValue === '') {
+                      continue;
+                  }
+                  $rpFieldRows[] = [$rpFieldName, $rpFieldValue];
+              }
+            ?>
+            <?php if ($rpFieldRows !== []): ?>
+              <div class="remote-profile-fields" aria-label="Profile fields">
+                <?php foreach ($rpFieldRows as [$rpFieldName, $rpFieldValue]): ?>
+                  <div class="remote-profile-field">
+                    <span class="meta" style="display:block;font-size:.75rem;margin:0 0 .15rem"><?= h($rpFieldName) ?></span>
+                    <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= $rpFieldValue ?></div>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            <?php endif; ?>
             <?php if ($rpIsLocal && $rpProfileBadges !== [] && function_exists('ap_profile_badge_catalog')): ?>
               <div class="profile-badges" aria-label="Profile badges" style="display:flex;flex-wrap:wrap;gap:.35rem;margin-top:.65rem">
                 <?php foreach ($rpProfileBadges as $badgeKey): $badge = ap_profile_badge_catalog()[$badgeKey] ?? null; if (!is_array($badge)) continue; ?>
                   <span class="tag" title="<?= h((string) ($badge['label'] ?? $badgeKey)) ?>"><?= h((string) ($badge['emoji'] ?? '')) ?> <?= h((string) ($badge['label'] ?? $badgeKey)) ?></span>
                 <?php endforeach; ?>
               </div>
+            <?php endif; ?>
+            <?php if ($rpIsLocal): ?>
+              <div class="meta" style="margin-top:.55rem"><a href="/users/<?= h(rawurlencode((string) $rpLocalKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">Open public HTML profile</a></div>
             <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
