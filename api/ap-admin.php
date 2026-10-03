@@ -27355,7 +27355,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <a href="<?= h($rpFollowersHref) ?>"<?= $rpIsOwn ? '' : ' target="_blank" rel="noopener noreferrer"' ?><?= $rpStatsTitle ?>><span class="n"><?= (int) $rpFollowersStat ?></span><span class="l">Followers</span></a>
               </div>
             <?php endif; ?>
-            <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions remote-profile-actions" style="flex-wrap:wrap;align-items:center;gap:.45rem">
               <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
                 <?php /* Guest Follow panel lives above; no in-row follow control. */ ?>
