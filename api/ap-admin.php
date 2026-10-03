@@ -44,6 +44,7 @@ require_once __DIR__ . '/ap-queue.php'; // posting queue / scheduler
 require_once __DIR__ . '/ap-sl-link.php'; // Profile → Link Second Life avatar
 require_once __DIR__ . '/ap-wow-link.php'; // Profile → Link World of Warcraft character
 require_once __DIR__ . '/ap-featured.php'; // Profile → Featured accounts (endorsements)
+require_once __DIR__ . '/ap-profile-html.php'; // Shared profile tab order / HTML helpers
 require_once __DIR__ . '/ap-notices.php'; // Local-only operator notices
 require_once __DIR__ . '/ap-discuss.php'; // Local-only discussion forums
 require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
@@ -11393,6 +11394,50 @@ function admin_open_profile_label(?string $actorIdOrUrl): string
     return 'Open remote';
 }
 
+/** Local actor_key from an mkultra actor IRI, or null. */
+function admin_local_actor_key_from_id(?string $actorId): ?string
+{
+    $u = rtrim(trim((string) $actorId), '/');
+    if ($u !== '' && preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $u, $m)) {
+        return strtolower($m[1]);
+    }
+    return null;
+}
+
+/**
+ * In-app profile href. Local accounts use pretty /users/{key} on vaak.monster;
+ * remotes and Bluesky keep ?view=remote_profile&actor=…
+ *
+ * @param array<string,scalar|null> $extra Extra query params (tab, post, …)
+ */
+function admin_profile_app_href(?string $actorId, string $from = 'home', array $extra = []): string
+{
+    $actorId = rtrim(trim((string) $actorId), '/');
+    if ($actorId === '') {
+        return '/vaak/?view=home';
+    }
+    $localKey = admin_local_actor_key_from_id($actorId);
+    $q = [];
+    foreach ($extra as $ek => $ev) {
+        if ($ev === null || $ev === '') {
+            continue;
+        }
+        $q[(string) $ek] = $ev;
+    }
+    if ($localKey !== null) {
+        if ($from !== '' && $from !== 'home') {
+            $q['from'] = $from;
+        }
+        $path = '/users/' . rawurlencode($localKey);
+        return $q === [] ? $path : ($path . '?' . http_build_query($q));
+    }
+    $q = array_merge(['view' => 'remote_profile', 'actor' => $actorId], $q);
+    if ($from !== '') {
+        $q['from'] = $from;
+    }
+    return '/vaak/?' . http_build_query($q);
+}
+
 /**
  * Prefer ActivityPub actor id (uri) over web profile url for follows / remote_profile.
  *
@@ -11669,14 +11714,12 @@ function admin_linkify_body_html(string $plain, string $returnView = 'home', arr
             $q = substr($actorUrl, strlen('search://'));
             return ['?view=search&q=' . rawurlencode('@' . $q) . '&type=accounts&resolve=1', false];
         }
-        if (str_starts_with($actorUrl, 'https://bsky.app/')) {
-            // Keep Bluesky profiles inside VAAK so Follow uses AT Protocol, not AP.
-            return ['?view=remote_profile&actor=' . rawurlencode($actorUrl) . '&from=' . rawurlencode($returnView), false];
-        }
         if (vaak_is_own_url($actorUrl)) {
             return ['?view=outbox', false];
         }
-        // Always use AP actor IRI for remote_profile (not bsky.app web URL)
+        if (function_exists('admin_profile_app_href')) {
+            return [admin_profile_app_href($actorUrl, $returnView), false];
+        }
         return ['?view=remote_profile&actor=' . rawurlencode($actorUrl) . '&from=' . rawurlencode($returnView), false];
     };
 
@@ -13426,7 +13469,9 @@ function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $
     if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
         return ['ok' => false, 'error' => 'Invalid profile'];
     }
-    $profileUrl = '?view=remote_profile&actor=' . rawurlencode($actorId) . '&from=home';
+    $profileUrl = function_exists('admin_profile_app_href')
+        ? admin_profile_app_href($actorId, 'home')
+        : ('?view=remote_profile&actor=' . rawurlencode($actorId) . '&from=home');
     $own = function_exists('vaak_is_own_url') && vaak_is_own_url($actorId);
     $platform = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actorId) ? 'bluesky' : 'fediverse';
     $display = '';
@@ -14021,6 +14066,11 @@ function admin_render_masto_status_card(
     $actorRef = function_exists('admin_account_actor_ref')
         ? admin_account_actor_ref(is_array($st['account'] ?? null) ? $st['account'] : [])
         : (string) ($st['account']['uri'] ?? $st['account']['url'] ?? '');
+    $profileAppHref = ($actorRef !== '' && function_exists('admin_profile_app_href'))
+        ? admin_profile_app_href($actorRef, $returnView)
+        : ($actorRef !== ''
+            ? ('?view=remote_profile&actor=' . rawurlencode($actorRef) . '&from=' . rawurlencode($returnView))
+            : '');
     $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
     $sidEarly = (string) ($st['id'] ?? '');
     $isRss = !empty($st['vaak_rss_item_id'])
@@ -14498,15 +14548,15 @@ function admin_render_masto_status_card(
                       : 'https://mkultra.monster/img/avatar/default.jpg';
                   $avSrc = $directAvatar !== '' ? $directAvatar : $fallbackAv;
                 ?>
-                <?php if ($isBsky && $actorRef !== ''): ?>
-                  <a href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="text-decoration:none">
+                <?php if ($isBsky && $actorRef !== '' && $profileAppHref !== ''): ?>
+                  <a href="<?= h($profileAppHref) ?>" style="text-decoration:none">
                     <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($display) ?>"<?= admin_profile_hover_attr($actorRef) ?>>
                   </a>
                 <?php else: ?>
                   <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($display) ?>">
                 <?php endif; ?>
-              <?php elseif ($actorRef !== '' && !$isLocal): ?>
-                <a href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="text-decoration:none"><?= admin_avatar_img($actorRef) ?></a>
+              <?php elseif ($actorRef !== '' && !$isLocal && $profileAppHref !== ''): ?>
+                <a href="<?= h($profileAppHref) ?>" style="text-decoration:none"><?= admin_avatar_img($actorRef) ?></a>
               <?php else: ?>
                 <?= admin_avatar_img($isLocal ? vaak_actor_id() : ($actorRef !== '' ? $actorRef : null)) ?>
               <?php endif; ?>
@@ -14516,9 +14566,9 @@ function admin_render_masto_status_card(
                     <span class="who"><?= h($display !== '' ? $display : 'RSS') ?></span>
                     <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
                     <span class="tag" title="From an RSS/Atom feed you added">RSS</span>
-                  <?php elseif ($actorRef !== '' && !$isLocal): ?>
-                    <a class="who" href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?></a>
-                    <a class="meta" href="?view=remote_profile&amp;actor=<?= urlencode($actorRef) ?>&amp;from=<?= urlencode($returnView) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($acct) ?></a>
+                  <?php elseif ($actorRef !== '' && !$isLocal && $profileAppHref !== ''): ?>
+                    <a class="who" href="<?= h($profileAppHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?></a>
+                    <a class="meta" href="<?= h($profileAppHref) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($acct) ?></a>
                     <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
                     <?php if (!empty($st['edited_at'])): ?>
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
@@ -18691,6 +18741,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   <meta name="apple-mobile-web-app-title" content="VAAK">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="csrf-token" content="<?= h(ap_auth_csrf_token()) ?>">
+  <?php
+    $vaakPrettyProfilePath = parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
+    $vaakPrettyProfile = (bool) preg_match('#^/users/[A-Za-z0-9_]+/?$#', $vaakPrettyProfilePath);
+  ?>
+  <?php if ($vaakPrettyProfile): ?>
+  <base href="/vaak/">
+  <?php endif; ?>
   <title><?= $notifUnreadNav > 0 ? '(' . h($notifBadgeLabel) . ') ' : '' ?>VAAK · <?= h(view_title($view)) ?></title>
   <!-- Versioned, path-specific icons keep Safari from reusing the root site's favicon. -->
   <link rel="manifest" href="/vaak/manifest.webmanifest?v=20260909">
@@ -20120,6 +20177,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-field a { overflow:hidden; text-overflow:ellipsis; }
     .remote-profile-field .field-verified { display:inline-flex; align-items:center; justify-content:center; width:1em; height:1em; margin-left:.35rem; border-radius:50%; background:rgba(0,255,159,.2); color:#00ff9f; font-size:.75em; font-weight:800; line-height:1; vertical-align:middle; position:relative; top:-.05em; }
     @media (max-width:520px) { .remote-profile-fields { grid-template-columns:1fr; } }
+    .remote-profile-hd { display:flex; align-items:flex-start; justify-content:space-between; gap:.85rem; flex-wrap:wrap; }
+    .remote-profile-hd-main { display:flex; align-items:center; gap:.75rem; min-width:0; flex:1 1 14rem; }
+    .remote-profile-follow .btn { min-width:7.5rem; padding:.65rem 1.35rem; font-size:.95rem; font-weight:700; border-radius:999px; }
+    .remote-profile-follow .btn-following { background:transparent; border:1px solid var(--border); color:var(--text); }
+    .remote-profile-follow .btn-following:hover { border-color:var(--danger); color:var(--danger); }
+    .remote-profile-stats { display:flex; gap:1.25rem; margin:.85rem 0 0; padding-top:.85rem; border-top:1px solid var(--border); flex-wrap:wrap; }
+    .remote-profile-stats a, .remote-profile-stats > div { color:inherit; text-decoration:none; display:flex; flex-direction:column; gap:.15rem; min-width:4.5rem; }
+    .remote-profile-stats a:hover .n { color:var(--primary); }
+    .remote-profile-stats .n { font-size:1.2rem; font-weight:700; color:var(--primary); line-height:1.1; }
+    .remote-profile-stats .l { font-size:.75rem; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+    .remote-profile-blog-post { border:1px solid var(--border); border-radius:12px; background:var(--card, #141414); padding:1.1rem 1.2rem; margin:.85rem 0; overflow-wrap:anywhere; }
+    .remote-profile-blog-post h2 { margin:.15rem 0 .4rem; line-height:1.25; font-size:1.15rem; }
+    .remote-profile-blog-post .note-body { font-size:1.02rem; line-height:1.7; }
+    .remote-profile-blog-post .note-body p { margin:.75rem 0; }
+    .featured-accounts { list-style:none; margin:0; padding:0; }
+    .featured-account { border-bottom:1px solid var(--border); }
+    .featured-account:last-child { border-bottom:none; }
+    .featured-account-link { display:flex; align-items:center; gap:.85rem; padding:.85rem 0; color:inherit; text-decoration:none; }
+    .featured-account-link:hover { background:rgba(126,224,255,.04); margin:0 -.5rem; padding-left:.5rem; padding-right:.5rem; border-radius:8px; }
+    .featured-av { width:48px; height:48px; border-radius:50%; object-fit:cover; border:2px solid var(--border); background:#222; flex:0 0 auto; }
+    .featured-meta { display:flex; flex-direction:column; gap:.15rem; min-width:0; }
+    .featured-name { font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .featured-acct { font-size:.85rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .profile-world-links img { display:block; }
     /* Focused status threads use the same flat card treatment as timelines. */
     #status-thread-ancestors > article.tweet,
@@ -26242,6 +26322,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpProfileFields = [];
           $rpSlLink = null;
           $rpWowLink = null;
+          $rpPinnedStatuses = [];
+          $rpFeaturedCards = [];
+          $rpBlogPosts = [];
+          $rpBlogPost = null;
+          $rpBlogSlug = '';
+          $rpPostsStat = 0;
+          $rpFollowingStat = 0;
+          $rpFollowersStat = 0;
+          $rpHasCombinedStats = false;
+          $rpBskyStatsHandle = null;
           $rpError = null;
           $rpIsBsky = false;
           $rpBskyDid = '';
@@ -26279,6 +26369,25 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $rpLocalKey = strtolower($lm[1]);
               }
               $rpIsLocal = $rpLocalKey !== null;
+              // Pretty local URL: /users/{key} instead of ?view=remote_profile&actor=…
+              if ($rpIsLocal && $rpLocalKey !== null
+                  && !isset($_GET['partial']) && !isset($_GET['ajax'])
+                  && strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) === 'GET') {
+                  $rpReqPath = parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: '';
+                  $rpPrettyPath = '/users/' . $rpLocalKey;
+                  if ($rpReqPath === '/vaak' || $rpReqPath === '/vaak/' || str_starts_with($rpReqPath, '/vaak/index')) {
+                      $rpCanonQ = [];
+                      foreach (['tab', 'post', 'from'] as $rpCanonKey) {
+                          $rpCanonVal = trim((string) ($_GET[$rpCanonKey] ?? ''));
+                          if ($rpCanonVal !== '') {
+                              $rpCanonQ[$rpCanonKey] = $rpCanonVal;
+                          }
+                      }
+                      $rpCanon = $rpPrettyPath . ($rpCanonQ !== [] ? ('?' . http_build_query($rpCanonQ)) : '');
+                      header('Location: ' . $rpCanon, true, 302);
+                      exit;
+                  }
+              }
               if ($rpIsLocal && function_exists('ap_profile_get')) {
                   $rpPrefs = ap_profile_get($rpLocalKey);
                   $rpHideProfileReplies = !empty($rpPrefs['hide_profile_replies']);
@@ -26380,6 +26489,62 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $rpWowLink = function_exists('ap_wow_link_for_actor_key')
                       ? ap_wow_link_for_actor_key((string) $rpLocalKey)
                       : null;
+                  // Pinned / Featured / Blog (local-only parity with HTML profiles).
+                  if (function_exists('ap_masto_pinned_statuses') && function_exists('ap_masto_status_from_row')) {
+                      try {
+                          foreach (ap_masto_pinned_statuses(5, (string) $rpLocalKey) as $prow) {
+                              if (!is_array($prow)) {
+                                  continue;
+                              }
+                              $rpPinnedStatuses[] = ap_masto_status_from_row($prow, true, false);
+                          }
+                      } catch (Throwable $e) {
+                          $rpPinnedStatuses = [];
+                      }
+                  }
+                  if (function_exists('ap_featured_cards_for_actor_key')) {
+                      $rpFeaturedCards = ap_featured_cards_for_actor_key((string) $rpLocalKey);
+                  }
+                  $rpBlogSlug = preg_replace('/[^a-z0-9_-]/', '', strtolower(trim((string) ($_GET['post'] ?? '')))) ?: '';
+                  if ($rpBlogSlug !== '' && function_exists('ap_blog_post_get')) {
+                      $rpBlogPost = ap_blog_post_get((string) $rpLocalKey, $rpBlogSlug, true);
+                  }
+                  if (function_exists('ap_blog_posts_list')) {
+                      $rpBlogPosts = ap_blog_posts_list((string) $rpLocalKey, true, 40);
+                  }
+                  // Unified Posts / Following / Followers (Fedi + connected Bluesky).
+                  $rpActorIri = 'https://mkultra.monster/users/' . $rpLocalKey;
+                  $rpApFollowers = function_exists('ap_followers_count') ? ap_followers_count($rpActorIri) : 0;
+                  $rpApFollowing = function_exists('ap_following_count') ? ap_following_count($rpActorIri) : 0;
+                  $rpOutboxTotal = function_exists('ap_outbox_count_for_actor')
+                      ? ap_outbox_count_for_actor((string) $rpLocalKey)
+                      : 0;
+                  if ($rpOutboxTotal > 0 && function_exists('ap_outbox_replies_count')) {
+                      $rpOutboxTotal = max(0, $rpOutboxTotal - ap_outbox_replies_count((string) $rpLocalKey));
+                  }
+                  $rpBskyPostCount = 0;
+                  if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_count_for_author')) {
+                      $rpBskyPostCount = ap_bsky_posts_count_for_author($rpBskyDid);
+                  }
+                  $rpBoostTotal = 0;
+                  if (!$rpHideProfileBoosts && function_exists('ap_db_owner_user_id_for_actor') && function_exists('ap_masto_reblog_count_for_html_profile')) {
+                      $rpOwnerForBoosts = ap_db_owner_user_id_for_actor((string) $rpLocalKey);
+                      if ($rpOwnerForBoosts > 0) {
+                          $rpBoostTotal = ap_masto_reblog_count_for_html_profile($rpOwnerForBoosts);
+                      }
+                  }
+                  $rpPostsStat = $rpOutboxTotal + $rpBskyPostCount + $rpBoostTotal;
+                  $rpCombined = function_exists('ap_profile_combined_follow_counts')
+                      ? ap_profile_combined_follow_counts((string) $rpLocalKey, (int) $rpApFollowers, (int) $rpApFollowing, false)
+                      : ['followers' => (int) $rpApFollowers, 'following' => (int) $rpApFollowing];
+                  $rpFollowingStat = (int) ($rpCombined['following'] ?? $rpApFollowing);
+                  $rpFollowersStat = (int) ($rpCombined['followers'] ?? $rpApFollowers);
+                  $rpHasCombinedStats = true;
+                  if (!empty($rpCombined['bsky_handle'])) {
+                      $rpBskyStatsHandle = (string) $rpCombined['bsky_handle'];
+                  } elseif (function_exists('ap_profile_bsky_handle')) {
+                      $rpBskyStatsHandle = ap_profile_bsky_handle((string) $rpLocalKey);
+                  }
                   $iconRaw = $prof['icon_url'] ?? null;
                   $imageRaw = $prof['image_url'] ?? null;
                   $rpAvatar = function_exists('ap_profile_sanitize_https_url')
@@ -26628,8 +26793,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $rpError = $e->getMessage();
           }
               $rpTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
-              if (!in_array($rpTab, ['posts', 'replies', 'boosts', 'media'], true)) $rpTab = 'posts';
+              $rpAllowedTabs = ['posts', 'replies', 'boosts', 'media'];
+              if ($rpIsLocal) {
+                  $rpAllowedTabs = ['pinned', 'posts', 'replies', 'boosts', 'media', 'featured', 'blog'];
+              }
+              if (!in_array($rpTab, $rpAllowedTabs, true)) {
+                  $rpTab = 'posts';
+              }
               if (($rpTab === 'replies' && $rpHideProfileReplies) || ($rpTab === 'boosts' && $rpHideProfileBoosts)) {
+                  $rpTab = 'posts';
+              }
+              if ($rpTab === 'pinned' && $rpPinnedStatuses === []) {
+                  $rpTab = 'posts';
+              }
+              if ($rpTab === 'featured' && $rpFeaturedCards === []) {
+                  $rpTab = 'posts';
+              }
+              if ($rpTab === 'blog' && $rpBlogPosts === [] && $rpBlogPost === null) {
                   $rpTab = 'posts';
               }
           $rpTabItems = ['posts' => [], 'replies' => [], 'boosts' => [], 'media' => []];
@@ -26694,7 +26874,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if (!empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
               }
           }
-          $rpTabHref = '?view=remote_profile&actor=' . rawurlencode($rpActor) . '&from=' . rawurlencode($rpFrom) . '&tab=';
+          $rpTabHref = ($rpIsLocal && $rpLocalKey)
+              ? ('/users/' . rawurlencode((string) $rpLocalKey) . '?tab=')
+              : ('?view=remote_profile&actor=' . rawurlencode($rpActor) . '&from=' . rawurlencode($rpFrom) . '&tab=');
+          if ($rpIsLocal && $rpLocalKey && $rpFrom !== '') {
+              $rpTabHref = '/users/' . rawurlencode((string) $rpLocalKey) . '?from=' . rawurlencode($rpFrom) . '&tab=';
+          }
           $rpLocalPageItems = $rpIsLocal ? array_slice($rpTabItems[$rpTab], 0, 40) : $rpTabItems[$rpTab];
           $rpLocalHasMore = $rpIsLocal && count($rpTabItems[$rpTab]) > count($rpLocalPageItems);
         ?>
@@ -26777,29 +26962,56 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </div>
           <?php endif; ?>
           <article class="tweet">
-            <div class="tweet-hd" style="align-items:center;gap:.75rem">
-              <?php if ($rpAvatar): ?>
-                <?php
-                  $rpAvFallback = defined('AP_REMOTE_AVATAR_FALLBACK')
-                      ? AP_REMOTE_AVATAR_FALLBACK
-                      : 'https://mkultra.monster/img/avatar/default.jpg';
-                ?>
-                <img src="<?= h((string) $rpAvatar) ?>" alt="" width="64" height="64" style="border-radius:50%;object-fit:cover" loading="lazy" referrerpolicy="no-referrer"
-                     onerror="this.onerror=null;this.src='<?= h($rpAvFallback) ?>'">
-              <?php else: ?>
-                <?= admin_avatar_img($rpActor) ?>
-              <?php endif; ?>
-              <div>
-                <div class="who"><?= admin_emoji_html((string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor)), $rpActor) ?></div>
-                <div class="meta"><?= h($rpIsBsky && $rpBskyHandle !== '' ? ('@' . $rpBskyHandle) : actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null)) ?>
-                  <?php if ($rpIsLocal): ?><span class="tag" style="margin-left:.35rem" title="Account on this instance">local</span><?php endif; ?>
-                  <?php if ($rpIsBsky): ?><span class="tag" style="margin-left:.35rem" title="Bluesky / AT Protocol">Bluesky</span><?php endif; ?>
-                  <?php if ($rpIsOwn): ?><span class="tag" style="margin-left:.35rem" title="Signed-in account">you</span><?php endif; ?>
-                </div>
-                <?php if ($rpIsOwn): ?>
-                  <div class="meta" style="margin-top:.25rem">This is you · <a href="?view=profile">Edit profile</a></div>
+            <div class="tweet-hd remote-profile-hd">
+              <div class="remote-profile-hd-main">
+                <?php if ($rpAvatar): ?>
+                  <?php
+                    $rpAvFallback = defined('AP_REMOTE_AVATAR_FALLBACK')
+                        ? AP_REMOTE_AVATAR_FALLBACK
+                        : 'https://mkultra.monster/img/avatar/default.jpg';
+                  ?>
+                  <img src="<?= h((string) $rpAvatar) ?>" alt="" width="64" height="64" style="border-radius:50%;object-fit:cover" loading="lazy" referrerpolicy="no-referrer"
+                       onerror="this.onerror=null;this.src='<?= h($rpAvFallback) ?>'">
+                <?php else: ?>
+                  <?= admin_avatar_img($rpActor) ?>
                 <?php endif; ?>
+                <div style="min-width:0">
+                  <div class="who"><?= admin_emoji_html((string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor)), $rpActor) ?></div>
+                  <div class="meta"><?= h($rpIsBsky && $rpBskyHandle !== '' ? ('@' . $rpBskyHandle) : actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null)) ?>
+                    <?php if ($rpIsLocal): ?><span class="tag" style="margin-left:.35rem" title="Account on this instance">local</span><?php endif; ?>
+                    <?php if ($rpIsBsky): ?><span class="tag" style="margin-left:.35rem" title="Bluesky / AT Protocol">Bluesky</span><?php endif; ?>
+                    <?php if ($rpIsOwn): ?><span class="tag" style="margin-left:.35rem" title="Signed-in account">you</span><?php endif; ?>
+                  </div>
+                  <?php if ($rpIsOwn): ?>
+                    <div class="meta" style="margin-top:.25rem">This is you · <a href="?view=profile">Edit profile</a></div>
+                  <?php endif; ?>
+                </div>
               </div>
+              <?php if (!$rpIsOwn): ?>
+                <div class="remote-profile-follow" style="flex:0 0 auto;align-self:center">
+                  <?php if ($rpFollowing): ?>
+                    <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Unfollow this account?');">
+                      <input type="hidden" name="action" value="unfollow_remote">
+                      <input type="hidden" name="return_view" value="remote_profile">
+                      <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
+                      <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
+                      <button class="btn btn-following" type="submit" title="<?= $rpIsBsky ? 'Following on Bluesky' : 'Following' ?>"><?= $rpIsBsky ? 'Following' : 'Following' ?></button>
+                    </form>
+                  <?php else: ?>
+                    <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
+                      <input type="hidden" name="action" value="follow_remote">
+                      <input type="hidden" name="return_view" value="remote_profile">
+                      <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
+                      <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
+                      <button class="btn btn-primary" type="submit"><?= $rpIsBsky
+                          ? ($rpRel === 'follows_you' ? 'Follow back' : 'Follow')
+                          : ($rpRel === 'follows_you' ? 'Follow back' : 'Follow') ?></button>
+                    </form>
+                  <?php endif; ?>
+                </div>
+              <?php endif; ?>
             </div>
             <?php if ($rpBio !== ''): ?>
               <div class="body" style="margin-top:.75rem;white-space:pre-wrap"><?= h($rpBio) ?></div>
@@ -26885,6 +27097,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endforeach; ?>
               </div>
             <?php endif; ?>
+            <?php if ($rpHasCombinedStats): ?>
+              <?php
+                $rpStatsTitle = $rpBskyStatsHandle ? ' title="Includes ActivityPub and connected Bluesky counts"' : '';
+                $rpFollowingHref = $rpIsOwn
+                    ? '?view=following'
+                    : ('/users/' . rawurlencode((string) $rpLocalKey) . '/following');
+                $rpFollowersHref = $rpIsOwn
+                    ? '?view=followers'
+                    : ('/users/' . rawurlencode((string) $rpLocalKey) . '/followers');
+              ?>
+              <div class="remote-profile-stats" aria-label="Profile stats">
+                <div><span class="n"><?= (int) $rpPostsStat ?></span><span class="l">Posts</span></div>
+                <a href="<?= h($rpFollowingHref) ?>"<?= $rpIsOwn ? '' : ' target="_blank" rel="noopener noreferrer"' ?><?= $rpStatsTitle ?>><span class="n"><?= (int) $rpFollowingStat ?></span><span class="l">Following</span></a>
+                <a href="<?= h($rpFollowersHref) ?>"<?= $rpIsOwn ? '' : ' target="_blank" rel="noopener noreferrer"' ?><?= $rpStatsTitle ?>><span class="n"><?= (int) $rpFollowersStat ?></span><span class="l">Followers</span></a>
+              </div>
+            <?php endif; ?>
             <?php if ($rpIsLocal): ?>
               <div class="meta" style="margin-top:.55rem"><a href="/users/<?= h(rawurlencode((string) $rpLocalKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">Open public HTML profile</a></div>
             <?php endif; ?>
@@ -26893,34 +27121,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php if ($rpRel !== 'none'): ?>
                 <span id="remote-profile-rel-state" data-following="<?= $rpFollowing ? '1' : '0' ?>" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>"><?= admin_rel_badge($rpRel) ?></span>
               <?php else: ?>
-                <span class="meta">not following</span>
+                <span id="remote-profile-rel-state" class="meta" data-following="0" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>">not following</span>
               <?php endif; ?>
               <?php if ($rpMuted): ?><span class="tag" title="Hidden from your timelines &amp; notifications">muted for me</span><?php endif; ?>
               <?php if ($rpBlockedPersonal): ?><span class="tag" style="color:var(--danger)" title="Personal block — hidden from your timelines only">blocked for me</span><?php endif; ?>
               <?php if ($rpBlockedServer): ?><span class="tag" style="color:var(--danger)" title="Server-wide block">blocked server-wide</span><?php endif; ?>
-              <?php if (!$rpIsOwn): ?>
-                <?php if ($rpFollowing): ?>
-                  <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Unfollow this account?');">
-                    <input type="hidden" name="action" value="unfollow_remote">
-                    <input type="hidden" name="return_view" value="remote_profile">
-                    <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
-                    <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
-                    <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                    <button class="btn btn-ghost" type="submit"><?= $rpIsBsky ? 'Unfollow on Bluesky' : 'Unfollow' ?></button>
-                  </form>
-                <?php else: ?>
-                  <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
-                    <input type="hidden" name="action" value="follow_remote">
-                    <input type="hidden" name="return_view" value="remote_profile">
-                    <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
-                    <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
-                    <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                    <button class="btn btn-primary" type="submit"><?= $rpIsBsky
-                        ? ($rpRel === 'follows_you' ? 'Follow back on Bluesky' : 'Follow on Bluesky')
-                        : ($rpRel === 'follows_you' ? 'Follow back' : 'Follow') ?></button>
-                  </form>
-                <?php endif; ?>
-              <?php endif; ?>
               <?php if ($rpIsLocal && !$rpIsOwn): ?>
                 <?php if ($rpPostSub): ?>
                   <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
@@ -26981,16 +27186,110 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </article>
           <nav class="remote-profile-tabs" aria-label="Profile posts">
             <?php
-              $rpVisibleTabs = ['posts' => 'Posts', 'replies' => 'Replies', 'boosts' => 'Boosts', 'media' => 'Media'];
-              if ($rpIsLocal && $rpHideProfileReplies) unset($rpVisibleTabs['replies']);
-              if ($rpIsLocal && $rpHideProfileBoosts) unset($rpVisibleTabs['boosts']);
+              $rpTabDefs = [
+                  'pinned' => $rpIsLocal && $rpPinnedStatuses !== [] ? ['Pinned', count($rpPinnedStatuses)] : null,
+                  'posts' => ['Posts', count($rpTabItems['posts'] ?? [])],
+                  'replies' => ($rpIsLocal && $rpHideProfileReplies) ? null : ['Replies', count($rpTabItems['replies'] ?? [])],
+                  'boosts' => ($rpIsLocal && $rpHideProfileBoosts) ? null : ['Boosts', count($rpTabItems['boosts'] ?? [])],
+                  'media' => ['Media', count($rpTabItems['media'] ?? [])],
+                  'featured' => $rpIsLocal && $rpFeaturedCards !== [] ? ['Featured', count($rpFeaturedCards)] : null,
+                  'blog' => $rpIsLocal && ($rpBlogPosts !== [] || $rpBlogPost !== null)
+                      ? ['Blog', function_exists('ap_blog_posts_count') ? ap_blog_posts_count((string) $rpLocalKey, true) : count($rpBlogPosts)]
+                      : null,
+              ];
+              $rpVisibleTabs = function_exists('ap_profile_order_tabs')
+                  ? ap_profile_order_tabs($rpTabDefs)
+                  : array_filter($rpTabDefs, static fn($v) => $v !== null);
             ?>
-            <?php foreach ($rpVisibleTabs as $tabKey => $tabLabel): ?>
-              <a href="<?= h($rpTabHref . rawurlencode($tabKey)) ?>" class="<?= $rpTab === $tabKey ? 'is-active' : '' ?>" <?= $rpTab === $tabKey ? 'aria-current="page"' : '' ?>><?= h($tabLabel) ?><span class="tab-count"><?= count($rpTabItems[$tabKey]) ?></span></a>
+            <?php foreach ($rpVisibleTabs as $tabKey => $tabInfo): ?>
+              <?php
+                $tabLabel = is_array($tabInfo) ? (string) ($tabInfo[0] ?? $tabKey) : (string) $tabInfo;
+                $tabCount = is_array($tabInfo) ? (int) ($tabInfo[1] ?? 0) : 0;
+              ?>
+              <a href="<?= h($rpTabHref . rawurlencode((string) $tabKey)) ?>" class="<?= $rpTab === $tabKey ? 'is-active' : '' ?>" <?= $rpTab === $tabKey ? 'aria-current="page"' : '' ?>><?= h($tabLabel) ?><span class="tab-count"><?= $tabCount ?></span></a>
             <?php endforeach; ?>
           </nav>
           <div class="remote-profile-posts">
-          <?php if ($rpIsBsky): ?>
+          <?php if ($rpTab === 'pinned'): ?>
+            <?php if ($rpPinnedStatuses === []): ?>
+              <div class="empty">No pinned posts.</div>
+            <?php else: ?>
+              <?php foreach ($rpPinnedStatuses as $pinSt): ?>
+                <?php if (is_array($pinSt)) {
+                    admin_render_masto_status_card($pinSt, $followingIds, 'remote_profile', false, true);
+                } ?>
+              <?php endforeach; ?>
+            <?php endif; ?>
+          <?php elseif ($rpTab === 'featured'): ?>
+            <?php
+              $rpFeatFallback = defined('AP_REMOTE_AVATAR_FALLBACK')
+                  ? AP_REMOTE_AVATAR_FALLBACK
+                  : 'https://mkultra.monster/img/avatar/default.webp';
+            ?>
+            <?php if ($rpFeaturedCards === []): ?>
+              <div class="empty">No featured accounts.</div>
+            <?php else: ?>
+              <ul class="featured-accounts" aria-label="Featured accounts">
+                <?php foreach ($rpFeaturedCards as $fc): ?>
+                  <?php
+                    if (!is_array($fc)) {
+                        continue;
+                    }
+                    $fcActor = rtrim((string) ($fc['actor_id'] ?? ''), '/');
+                    if ($fcActor === '' || !str_starts_with($fcActor, 'https://')) {
+                        continue;
+                    }
+                    $fcAcct = (string) ($fc['acct'] ?? '');
+                    $fcName = (string) ($fc['display_name'] ?? $fcAcct);
+                    $fcAvatar = (string) ($fc['avatar'] ?? $rpFeatFallback);
+                    if ($fcAvatar === '') {
+                        $fcAvatar = $rpFeatFallback;
+                    }
+                    $fcHref = function_exists('admin_profile_app_href')
+                        ? admin_profile_app_href($fcActor, $rpFrom !== '' ? $rpFrom : 'home')
+                        : ('?view=remote_profile&actor=' . rawurlencode($fcActor));
+                  ?>
+                  <li class="featured-account">
+                    <a class="featured-account-link" href="<?= h($fcHref) ?>">
+                      <img class="featured-av" src="<?= h($fcAvatar) ?>" alt="" width="48" height="48" loading="lazy" referrerpolicy="no-referrer"
+                           onerror="this.onerror=null;this.src='<?= h($rpFeatFallback) ?>'">
+                      <span class="featured-meta">
+                        <span class="featured-name"><?= h($fcName) ?></span>
+                        <?php if ($fcAcct !== ''): ?><span class="featured-acct">@<?= h($fcAcct) ?></span><?php endif; ?>
+                      </span>
+                    </a>
+                  </li>
+                <?php endforeach; ?>
+              </ul>
+            <?php endif; ?>
+          <?php elseif ($rpTab === 'blog'): ?>
+            <?php if (is_array($rpBlogPost)): ?>
+              <article class="remote-profile-blog-post">
+                <div class="meta">Blog<?= ($rpBlogPost['category'] ?? '') !== '' ? ' · ' . h((string) $rpBlogPost['category']) : '' ?></div>
+                <h2><?= h((string) ($rpBlogPost['title'] ?? 'Untitled')) ?></h2>
+                <div class="meta"><?= h((string) ($rpBlogPost['published_at'] ?? $rpBlogPost['created_at'] ?? '')) ?></div>
+                <?php if (!empty($rpBlogPost['tags'])): ?><p class="meta">#<?= h(implode(' #', (array) $rpBlogPost['tags'])) ?></p><?php endif; ?>
+                <div class="note-body"><?= function_exists('admin_blog_markdown_html') ? admin_blog_markdown_html((string) ($rpBlogPost['body_markdown'] ?? '')) : h((string) ($rpBlogPost['body_markdown'] ?? '')) ?></div>
+                <p class="composer-actions"><a class="btn btn-ghost" href="<?= h($rpTabHref . 'blog') ?>">← All blog posts</a></p>
+              </article>
+            <?php elseif ($rpBlogPosts === []): ?>
+              <div class="empty">No blog posts yet.</div>
+            <?php else: ?>
+              <?php foreach ($rpBlogPosts as $bp): ?>
+                <?php if (!is_array($bp)) {
+                    continue;
+                } ?>
+                <article class="remote-profile-blog-post">
+                  <div class="meta">Blog<?= ($bp['category'] ?? '') !== '' ? ' · ' . h((string) $bp['category']) : '' ?> · <?= h((string) ($bp['published_at'] ?? $bp['created_at'] ?? '')) ?></div>
+                  <h2><a href="<?= h($rpTabHref . 'blog&post=' . rawurlencode((string) ($bp['slug'] ?? ''))) ?>" style="color:inherit;text-decoration:none"><?= h((string) ($bp['title'] ?? 'Untitled')) ?></a></h2>
+                  <?php if (!empty($bp['excerpt'])): ?>
+                    <p class="meta" style="white-space:pre-wrap"><?= h((string) $bp['excerpt']) ?></p>
+                  <?php endif; ?>
+                  <p><a class="btn btn-ghost" href="<?= h($rpTabHref . 'blog&post=' . rawurlencode((string) ($bp['slug'] ?? ''))) ?>">Read</a></p>
+                </article>
+              <?php endforeach; ?>
+            <?php endif; ?>
+          <?php elseif ($rpIsBsky): ?>
             <?php if ($rpTabItems[$rpTab] === []): ?>
               <div class="empty">No <?= h($rpTab) ?> loaded from Bluesky yet.</div>
             <?php else: ?>
@@ -34341,8 +34640,10 @@ if (VIEW === 'analytics') loadAnalytics();
     button.disabled = false;
     // Flip the button immediately (same idea as optimistic likes).
     actionInput.value = want ? 'unfollow_remote' : 'follow_remote';
-    button.innerHTML = want ? 'Unfollow' : 'Follow';
-    button.title = want ? 'Following' : 'Follow';
+    button.innerHTML = want ? 'Following' : 'Follow';
+    button.title = want ? 'Following — click to unfollow' : 'Follow';
+    button.classList.toggle('btn-primary', !want);
+    button.classList.toggle('btn-following', want);
     const relState = document.getElementById('remote-profile-rel-state');
     const relBefore = relState ? { html: relState.innerHTML, following: relState.dataset.following } : null;
     if (relState) {
