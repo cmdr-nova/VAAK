@@ -28308,20 +28308,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
   // Session expired mid-use: never paint /vaak login HTML into the feed.
   // Server returns 401 + X-VAAK-Auth for partial/ajax; also catch legacy login HTML.
+  // Guest public profiles keep <base href="/vaak/"> so relative ?ajax= hits /vaak/
+  // without a session — those 401s must NOT bounce the visitor to login.
+  window.vaakGuestProfile = <?= !empty($GLOBALS['vaak_guest_profile']) ? 'true' : 'false' ?>;
   window.vaakLoginUrl = '/vaak/?mode=login';
   window.vaakRedirectToLogin = function (reason) {
     try {
+      if (window.vaakGuestProfile) return;
       if (window.__vaakLoginRedirecting) return;
       window.__vaakLoginRedirecting = true;
       var next = '';
+      var nextPath = '';
       try {
         var sp = new URLSearchParams(window.location.search || '');
         var view = (sp.get('view') || '').replace(/[^a-z_]/g, '');
         if (view && view !== 'home') next = '&next=' + encodeURIComponent(view);
+        var path = window.location.pathname || '';
+        if (/^(\/vaak)?\/users\/[A-Za-z0-9_]+\/?$/.test(path)) {
+          nextPath = '&next_path=' + encodeURIComponent(path);
+        }
       } catch (e) {}
-      window.location.replace(window.vaakLoginUrl + next);
+      window.location.replace(window.vaakLoginUrl + next + nextPath);
     } catch (e2) {
-      window.location.href = '/vaak/?mode=login';
+      if (!window.vaakGuestProfile) window.location.href = '/vaak/?mode=login';
     }
   };
   window.vaakLooksLikeLoginHtml = function (html) {
@@ -28339,6 +28348,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     window.fetch = function (input, init) {
       return orig(input, init).then(function (res) {
         try {
+          if (window.vaakGuestProfile) return res;
           var url = '';
           if (typeof input === 'string') url = input;
           else if (input && typeof input.url === 'string') url = input.url;
@@ -28780,6 +28790,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     dmId: <?= json_encode($dmLatestIdNav) ?>,
   });
   const pollNotif = async () => {
+    if (window.vaakGuestProfile) return;
     try {
       const res = await fetch('?ajax=notif_unread', {
         credentials: 'same-origin',
@@ -28804,21 +28815,24 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   };
   const notifPollMs = () => (document.visibilityState === 'visible' ? 12000 : 45000);
   const scheduleNotifPoll = () => {
+    if (window.vaakGuestProfile) return;
     if (notifPollTimer) clearTimeout(notifPollTimer);
     notifPollTimer = setTimeout(async () => {
       await pollNotif();
       scheduleNotifPoll();
     }, notifPollMs());
   };
-  scheduleNotifPoll();
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      pollNotif();
-      scheduleNotifPoll();
-    }
-  });
-  // Mobile Safari often throttles timers; refresh badges when the hamburger opens.
-  window.addEventListener('vaak:mobile-nav-open', () => { pollNotif(); });
+  if (!window.vaakGuestProfile) {
+    scheduleNotifPoll();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        pollNotif();
+        scheduleNotifPoll();
+      }
+    });
+    // Mobile Safari often throttles timers; refresh badges when the hamburger opens.
+    window.addEventListener('vaak:mobile-nav-open', () => { pollNotif(); });
+  }
   window.vaakPollNotif = pollNotif;
 })();
 
@@ -28971,6 +28985,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
   }
 
+  if (window.vaakGuestProfile) return;
   if (enableBtn) enableBtn.addEventListener('click', () => { enablePush(); });
   if (disableBtn) disableBtn.addEventListener('click', () => { disablePush(); });
   if (statusEl || enableBtn) refreshStatus();
