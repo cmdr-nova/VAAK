@@ -27375,9 +27375,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <a href="<?= h($rpFollowersHref) ?>"<?= $rpIsOwn ? '' : ' target="_blank" rel="noopener noreferrer"' ?><?= $rpStatsTitle ?>><span class="n"><?= (int) $rpFollowersStat ?></span><span class="l">Followers</span></a>
               </div>
             <?php endif; ?>
-            <?php if ($rpIsLocal): ?>
-              <div class="meta" style="margin-top:.55rem"><a href="/users/<?= h(rawurlencode((string) $rpLocalKey)) ?>?public=1" target="_blank" rel="noopener noreferrer">Open public HTML profile</a></div>
-            <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
             <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
               <?php if ($rpRel !== 'none'): ?>
