@@ -5781,6 +5781,13 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     $notifRustPrimary = $notifRustPrimary === false
         ? true
         : !in_array(strtolower(trim((string) $notifRustPrimary)), ['0', 'false', 'off', 'no'], true);
+    // Long stale-file shortcuts are only safe when a live Rust writer refreshes
+    // this owner. A single --owner-id 1 loop used to leave every other account
+    // on a 5–10 minute zero badge while Mentions still showed new rows.
+    $rustLiveOwnerEnv = getenv('VAAK_NOTIF_RUST_OWNER_ID');
+    $rustLiveOwner = $rustLiveOwnerEnv === false ? 0 : (int) $rustLiveOwnerEnv;
+    // owner 0 / unset = Rust loops all local users (preferred). Positive = pinned.
+    $rustCoversOwner = $notifRustPrimary && ($rustLiveOwner <= 0 || $rustLiveOwner === $ownerUserId);
 
     if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
@@ -5789,7 +5796,8 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         }
         // Prefer a slightly stale file badge before any stampede wait — page
         // paints (profiles/Home) must not block ~4.5s when Rust/peer is busy.
-        $staleAge = $notifRustPrimary ? 300 : 180;
+        // Uncovered owners rebuild after the normal 45s TTL instead of 300–600s.
+        $staleAge = $rustCoversOwner ? 300 : $cacheTtl;
         $staleBeforeWait = $readFileUnread($staleAge);
         if (is_array($staleBeforeWait)) {
             return $staleBeforeWait;
@@ -5821,8 +5829,8 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             return $freshFile;
         }
     }
-    // Last resort under Rust ownership: accept older file before expensive rebuild.
-    if ($notifRustPrimary && $cacheTtl > 0) {
+    // Last resort under Rust ownership for covered owners only.
+    if ($rustCoversOwner && $cacheTtl > 0) {
         $stale = $readFileUnread(600);
         if (is_array($stale)) {
             return $stale;
@@ -6069,22 +6077,8 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
     }
     ap_masto_markers_set(['notifications' => ['last_read_id' => $best]]);
     // Drop short-lived unread badge cache so the nav clears immediately.
-    try {
-        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
-            ? ap_db_masto_owner_user_id()
-            : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
-        if (function_exists('ap_redis_delete_pattern')) {
-            ap_redis_delete_pattern('vaak:notifications:v1:unread:' . (int) $ownerUserId . ':*');
-        }
-        $cacheDir = '/var/lib/mkultra/ap';
-        if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
-            $cacheDir = sys_get_temp_dir();
-        }
-        foreach (glob($cacheDir . '/notif_unread_' . (int) $ownerUserId . '_*.json') ?: [] as $path) {
-            @unlink($path);
-        }
-    } catch (Throwable $e) {
-        // non-fatal
+    if (function_exists('ap_masto_notifications_unread_invalidate')) {
+        ap_masto_notifications_unread_invalidate();
     }
     return $best;
 }

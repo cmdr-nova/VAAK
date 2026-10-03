@@ -5440,6 +5440,36 @@ function ap_actor_is_followed(string $actorId, ?string $ownerActorId = null): bo
     return false;
 }
 
+/**
+ * Drop Redis + file unread-badge caches for an owner so the next poll rebuilds.
+ * Lives in ap-db so inbox/mention paths can invalidate without loading Mastodon entities.
+ */
+function ap_masto_notifications_unread_invalidate(?int $ownerUserId = null): void
+{
+    $ownerUserId = $ownerUserId ?? (function_exists('ap_db_masto_owner_user_id')
+        ? ap_db_masto_owner_user_id()
+        : (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0));
+    $ownerUserId = (int) $ownerUserId;
+    if ($ownerUserId < 1) {
+        return;
+    }
+    try {
+        if (function_exists('ap_redis_delete_pattern')) {
+            ap_redis_delete_pattern('vaak:notifications:v1:unread:' . $ownerUserId . ':*');
+            ap_redis_delete_pattern('vaak:shadow:notifications:v1:unread:' . $ownerUserId . ':*');
+        }
+        $cacheDir = '/var/lib/mkultra/ap';
+        if (!is_dir($cacheDir) || !is_writable($cacheDir)) {
+            $cacheDir = sys_get_temp_dir();
+        }
+        foreach (glob($cacheDir . '/notif_unread_' . $ownerUserId . '_*.json') ?: [] as $path) {
+            @unlink($path);
+        }
+    } catch (Throwable $e) {
+        // non-fatal
+    }
+}
+
 function ap_mention_store(array $row): void
 {
     // Text + optional remote media URLs (https only). Never stores media bytes.
@@ -5558,6 +5588,11 @@ function ap_mention_store(array $row): void
     // serves the previous projection (Ice Cubes bypasses that projection).
     if (function_exists('ap_notification_projection_invalidate_owner')) {
         ap_notification_projection_invalidate_owner($ownerUserId);
+    }
+    // Drop stale unread badge cache so nav polls rebuild (multi-user; Rust may
+    // only cover a subset of owners until the all-owners loop is live).
+    if (function_exists('ap_masto_notifications_unread_invalidate')) {
+        ap_masto_notifications_unread_invalidate($ownerUserId);
     }
     if (function_exists('ap_search_fts_index_mention_row')) {
         $mid = 0;

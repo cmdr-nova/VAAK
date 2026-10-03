@@ -511,6 +511,20 @@ pub async fn run_once(
     }
 }
 
+/// Local account ids for multi-user badge refresh (`disabled_at IS NULL`).
+pub async fn list_local_owner_ids(db: &Client) -> Result<Vec<i64>> {
+    let rows = db
+        .query(
+            "SELECT id FROM ap_users
+             WHERE disabled_at IS NULL
+             ORDER BY id ASC",
+            &[],
+        )
+        .await
+        .context("select ap_users for notif badge")?;
+    Ok(rows.iter().map(|r| r.get::<_, i64>(0)).collect())
+}
+
 pub async fn run_loop(
     cfg: &Config,
     owner_user_id: i64,
@@ -519,15 +533,41 @@ pub async fn run_loop(
     live: bool,
 ) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(5));
+    // owner_user_id <= 0 → refresh every non-disabled local account each tick
+    // (multi-user cutover). Positive id keeps the single-owner soak path.
     loop {
-        match run_once(cfg, owner_user_id, compare, live).await {
-            Ok(state) => tracing::info!(
-                count = state.count,
-                latest = %state.latest_id,
-                live,
-                "notif ok"
-            ),
-            Err(e) => tracing::error!(error = %e, "notif failed"),
+        let owners: Vec<i64> = if owner_user_id > 0 {
+            vec![owner_user_id]
+        } else {
+            match crate::db::connect(&cfg.database_url).await {
+                Ok(db) => match list_local_owner_ids(&db).await {
+                    Ok(ids) if !ids.is_empty() => ids,
+                    Ok(_) => {
+                        tracing::warn!("notif loop: no local ap_users; sleeping");
+                        vec![]
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "notif loop: list owners failed");
+                        vec![]
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "notif loop: db connect failed");
+                    vec![]
+                }
+            }
+        };
+        for owner in owners {
+            match run_once(cfg, owner, compare, live).await {
+                Ok(state) => tracing::info!(
+                    owner,
+                    count = state.count,
+                    latest = %state.latest_id,
+                    live,
+                    "notif ok"
+                ),
+                Err(e) => tracing::error!(owner, error = %e, "notif failed"),
+            }
         }
         tokio::time::sleep(interval).await;
     }

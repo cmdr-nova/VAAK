@@ -2,7 +2,7 @@
 
 | Command | Mode | Role |
 |---|---|---|
-| `notif-badge --live --loop` | **LIVE** | Owns production notif Redis + file cache |
+| `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` only |
@@ -25,7 +25,8 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-thin-warm.service
 | `VAAK_DATABASE_URL` | peer `novalandia` | www-data |
 | `VAAK_REDIS_URL` | `redis://127.0.0.1/0` | cache DB |
 | `VAAK_REDIS_QUEUE_URL` | `redis://127.0.0.1/1` | queue DB (PHP `ap_redis_client('queue')`) |
-| `VAAK_NOTIF_RUST_PRIMARY` | `1` (PHP) | longer stampede wait + stale file preference |
+| `VAAK_NOTIF_RUST_PRIMARY` | `1` (PHP) | longer stampede wait + stale file preference for Rust-covered owners |
+| `VAAK_NOTIF_RUST_OWNER_ID` | `0` (PHP) | `0` = all local users covered by Rust loop; positive = single-owner long-stale shortcut only |
 | `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
 | `VAAK_BSKY_PUBLIC_API` | `https://public.api.bsky.app` | warm fetch |
 

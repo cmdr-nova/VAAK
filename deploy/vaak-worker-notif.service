@@ -12,9 +12,11 @@ User=www-data
 Group=www-data
 Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
 Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=VAAK_NOTIF_RUST_OWNER_ID=0
 Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
 Environment=RUST_LOG=info
-ExecStart=/usr/local/bin/vaak-worker notif-badge --live --loop --interval-secs 20 --owner-id 1
+# owner-id 0 = every non-disabled ap_users row each tick (multi-user badges).
+ExecStart=/usr/local/bin/vaak-worker notif-badge --live --loop --interval-secs 20 --owner-id 0
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
