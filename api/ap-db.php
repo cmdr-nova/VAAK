@@ -6652,6 +6652,92 @@ function ap_outbox_count_for_actor(string $actorKey): int
     }
 }
 
+/**
+ * Paged local on-VAAK profile tab (posts / replies / media / boosts).
+ * SQL OFFSET so infinite scroll can walk the full outbox, not a 500-row window.
+ *
+ * @return array{items:list<array<string,mixed>>,has_more:bool,next_offset:int}
+ */
+function ap_local_profile_tab_page(
+    string $actorKey,
+    string $actorId,
+    string $tab,
+    int $limit = 20,
+    int $offset = 0
+): array {
+    $empty = ['items' => [], 'has_more' => false, 'next_offset' => max(0, $offset)];
+    $actorKey = strtolower(trim($actorKey));
+    $actorId = rtrim(trim($actorId), '/');
+    $tab = strtolower(trim($tab));
+    if (!in_array($tab, ['posts', 'replies', 'boosts', 'media'], true)) {
+        $tab = 'posts';
+    }
+    $limit = max(1, min(50, $limit));
+    $offset = max(0, $offset);
+    if ($actorKey === '') {
+        return $empty;
+    }
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
+    if ($actorId === '') {
+        $actorId = rtrim($prefix, '/');
+    }
+    try {
+        $db = ap_db();
+        if ($tab === 'boosts') {
+            $sql = "SELECT * FROM (
+                      SELECT DISTINCT ON (object_id) * FROM events
+                      WHERE type = 'Announce' AND (actor_id = ? OR actor_id = ?)
+                      ORDER BY object_id,
+                        CASE WHEN action_taken = 'boost_ok' THEN 0 ELSE 1 END,
+                        created_at DESC, id DESC
+                    ) AS profile_events
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?";
+            $st = $db->prepare($sql);
+            $st->execute([$actorId, $actorId . '/', $limit + 1, $offset]);
+            $rows = $st->fetchAll() ?: [];
+        } elseif ($tab === 'media') {
+            $st = $db->prepare(
+                "SELECT * FROM outbox_notes
+                 WHERE id LIKE ? AND raw_create_json LIKE '%\"attachment\"%'
+                 ORDER BY published DESC LIMIT ? OFFSET ?"
+            );
+            $st->execute([$prefix . '%', $limit + 1, $offset]);
+            $rows = $st->fetchAll() ?: [];
+        } elseif ($tab === 'replies') {
+            $st = $db->prepare(
+                "SELECT * FROM outbox_notes
+                 WHERE id LIKE ?
+                   AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
+                 ORDER BY published DESC LIMIT ? OFFSET ?"
+            );
+            $st->execute([$prefix . '%', $limit + 1, $offset]);
+            $rows = $st->fetchAll() ?: [];
+        } else {
+            $st = $db->prepare(
+                "SELECT * FROM outbox_notes
+                 WHERE id LIKE ?
+                   AND (in_reply_to IS NULL OR btrim(in_reply_to) = '')
+                 ORDER BY published DESC LIMIT ? OFFSET ?"
+            );
+            $st->execute([$prefix . '%', $limit + 1, $offset]);
+            $rows = $st->fetchAll() ?: [];
+        }
+        $hasMore = count($rows) > $limit;
+        if ($hasMore) {
+            $rows = array_slice($rows, 0, $limit);
+        }
+        return [
+            'items' => $rows,
+            'has_more' => $hasMore,
+            'next_offset' => $offset + count($rows),
+        ];
+    } catch (Throwable $e) {
+        error_log('[ap-db] local_profile_tab_page: ' . $e->getMessage());
+        return $empty;
+    }
+}
+
 function ap_follow_lists_cache_gen(bool $bump = false): int
 {
     static $gen = 0;

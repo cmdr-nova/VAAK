@@ -432,6 +432,19 @@ if ($user === null) {
     $secMode = strtolower((string) ($_SERVER['HTTP_SEC_FETCH_MODE'] ?? ''));
     $isFetch = ($secDest === 'empty' && in_array($secMode, ['cors', 'same-origin', 'no-cors'], true))
         || $xrw === 'xmlhttprequest';
+    // Guest on-VAAK local profiles need the same infinite-scroll partial as the
+    // timeline. Pretty /users/{key} sets vaak_guest_profile for the first paint,
+    // but scroll fetches ?view=remote_profile&partial=1&actor=… without that flag.
+    if ($isPartial && strtolower(trim((string) ($_GET['view'] ?? ''))) === 'remote_profile') {
+        $guestActor = rtrim(trim((string) ($_GET['actor'] ?? '')), '/');
+        if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $guestActor, $guestPm)) {
+            $GLOBALS['vaak_guest_profile'] = true;
+            $_GET['view'] = 'remote_profile';
+            $_GET['actor'] = $guestActor;
+            require dirname(__DIR__) . '/api/ap-admin.php';
+            exit;
+        }
+    }
     if ($isPartial || $isAjaxGet || $isFetch) {
         $loginQs = '/vaak/?mode=login';
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? ''));
