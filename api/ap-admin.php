@@ -17984,10 +17984,10 @@ if ($isPartial && $view === 'mentions') {
     }
     $notifTypes = $notifFilterOptions[$notifFilter]['types'];
     $notifShell = isset($_GET['shell']) && (string) $_GET['shell'] === '1';
-    // Keep the first notification response small enough to stay responsive on a
-    // cold cache. Older cards continue through the existing infinite-scroll
-    // endpoint, so this does not reduce the available notification history.
-    $notifLimit = isset($_GET['limit']) ? max(1, min(20, (int) $_GET['limit'])) : 10;
+    // Soft-nav paints an empty shell first; the async partial can afford a
+    // wider window so like/boost groups form. Look-ahead inside
+    // admin_notifications_page completes groups that would split at the edge.
+    $notifLimit = isset($_GET['limit']) ? max(1, min(60, (int) $_GET['limit'])) : 30;
     $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
     // Soft-nav first page has no max_id; infinite scroll passes one.
     if ($notifShell) {
@@ -18013,20 +18013,18 @@ if ($isPartial && $view === 'mentions') {
     // can involve remote account/status cache misses, so load the first page
     // asynchronously after the shell is visible instead of blocking navigation.
     $adminNotifs = [];
+    $nextMaxId = '';
+    $hasMore = false;
     if (!$notifShell) {
         try {
-            $adminNotifs = function_exists('ap_masto_notifications_fetch')
-                ? ap_masto_notifications_fetch($notifLimit, $notifMaxId, null, $notifTypes)
-                : [];
+            $notifPage = admin_notifications_page($notifLimit, $notifMaxId, $notifTypes);
+            $adminNotifs = $notifPage['items'];
+            $nextMaxId = $notifPage['next_max_id'];
+            $hasMore = $notifPage['has_more'];
         } catch (Throwable $e) {
             error_log('[ap-admin] notifications partial: ' . $e->getMessage());
         }
     }
-    $nextMaxId = '';
-    if ($adminNotifs !== []) {
-        $nextMaxId = preg_replace('/\D+/', '', (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? '')) ?: '';
-    }
-    $hasMore = count($adminNotifs) >= $notifLimit && $nextMaxId !== '';
     header('Content-Type: text/html; charset=utf-8');
     header('Cache-Control: no-store');
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
@@ -18856,6 +18854,23 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
 }
 
 /**
+ * Group key for Mentions like/boost collapse, or null when the row must stay alone.
+ */
+function admin_notification_group_key(array $row): ?string
+{
+    $type = (string) ($row['type'] ?? 'mention');
+    if (!in_array($type, ['favourite', 'reblog'], true)) {
+        return null;
+    }
+    $status = is_array($row['status'] ?? null) ? $row['status'] : [];
+    $statusKey = rtrim((string) ($status['uri'] ?? $status['url'] ?? ''), '/');
+    if ($statusKey === '') {
+        return null;
+    }
+    return $type . ':' . $statusKey;
+}
+
+/**
  * Group repeated like/boost notifications for the VAAK Notifications view.
  * The underlying notification rows remain unchanged; this is presentation
  * only and therefore cannot affect unread IDs, moderation, or pagination.
@@ -18871,11 +18886,9 @@ function admin_group_notification_rows(array $rows): array
         if (!is_array($row)) {
             continue;
         }
-        $type = (string) ($row['type'] ?? 'mention');
-        $status = is_array($row['status'] ?? null) ? $row['status'] : [];
-        $statusKey = rtrim((string) ($status['uri'] ?? $status['url'] ?? ''), '/');
-        $canGroup = in_array($type, ['favourite', 'reblog'], true) && $statusKey !== '';
-        $key = $canGroup ? $type . ':' . $statusKey : 'single:' . (string) ($row['id'] ?? count($out));
+        $groupKey = admin_notification_group_key($row);
+        $canGroup = $groupKey !== null;
+        $key = $canGroup ? $groupKey : ('single:' . (string) ($row['id'] ?? count($out)));
         if (!$canGroup || !isset($index[$key])) {
             $row['_group_count'] = 1;
             $row['_group_accounts'] = [is_array($row['account'] ?? null) ? $row['account'] : []];
@@ -18898,6 +18911,80 @@ function admin_group_notification_rows(array $rows): array
         }
     }
     return $out;
+}
+
+/**
+ * Fetch one Mentions page and complete like/boost groups that would otherwise
+ * split across the infinite-scroll boundary.
+ *
+ * Soft-nav still paints an empty shell first; this runs on the async partial
+ * (and full-page Mentions), so a larger window does not block tab switches.
+ *
+ * @param list<string> $types
+ * @return array{items:list<array<string,mixed>>, next_max_id:string, has_more:bool}
+ */
+function admin_notifications_page(int $limit, ?string $maxId, array $types = []): array
+{
+    $limit = max(1, min(60, $limit));
+    $empty = ['items' => [], 'next_max_id' => '', 'has_more' => false];
+    if (!function_exists('ap_masto_notifications_fetch')) {
+        return $empty;
+    }
+    $primary = ap_masto_notifications_fetch($limit, $maxId, null, $types);
+    if (!is_array($primary) || $primary === []) {
+        return $empty;
+    }
+
+    $primaryKeys = [];
+    foreach ($primary as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $gk = admin_notification_group_key($row);
+        if ($gk !== null) {
+            $primaryKeys[$gk] = true;
+        }
+    }
+
+    $merged = $primary;
+    if ($primaryKeys !== []) {
+        $lastPrimaryId = preg_replace('/\D+/', '', (string) ($primary[count($primary) - 1]['id'] ?? '')) ?: '';
+        if ($lastPrimaryId !== '') {
+            // Pull a short older window so same-post likes/boosts that sit just
+            // past the page edge fold into this page. Include interstitial rows
+            // through the last matching item so pagination cannot skip them.
+            $lookahead = ap_masto_notifications_fetch(min(30, max(15, $limit)), $lastPrimaryId, null, $types);
+            if (is_array($lookahead) && $lookahead !== []) {
+                $lastMatch = -1;
+                foreach ($lookahead as $i => $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $gk = admin_notification_group_key($row);
+                    if ($gk !== null && isset($primaryKeys[$gk])) {
+                        $lastMatch = (int) $i;
+                    }
+                }
+                if ($lastMatch >= 0) {
+                    foreach (array_slice($lookahead, 0, $lastMatch + 1) as $extra) {
+                        if (is_array($extra)) {
+                            $merged[] = $extra;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    $nextMaxId = preg_replace('/\D+/', '', (string) ($merged[count($merged) - 1]['id'] ?? '')) ?: '';
+    // has_more: primary was a full page (more history exists), even when
+    // look-ahead only completed groups without adding a new "page".
+    $hasMore = count($primary) >= $limit && $nextMaxId !== '';
+    return [
+        'items' => $merged,
+        'next_max_id' => $nextMaxId,
+        'has_more' => $hasMore,
+    ];
 }
 
 /** Render grouped notification rows with Mastodon-style avatar tiles. */
@@ -22326,24 +22413,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   . h((string) $filterOption['label']) . '</a>';
           }
           echo '</nav>';
-          // A cold notification render can hydrate remote account/status data;
-          // paint a small first page quickly and let infinite scroll fetch older
-          // cards in subsequent requests.
-          $notifLimit = 10;
+          // Wider first page + look-ahead so like/boost groups form; infinite
+          // scroll still appends older cards via ?partial=1.
+          $notifLimit = 30;
           $adminNotifs = [];
-          // First page only — older pages append via ?partial=1 (keeps scroll place).
+          $notifNextMaxId = '';
+          $notifHasMore = false;
           try {
-              $adminNotifs = function_exists('ap_masto_notifications_fetch')
-                  ? ap_masto_notifications_fetch($notifLimit, null, null, $notifTypes)
-                  : [];
+              $notifPage = admin_notifications_page($notifLimit, null, $notifTypes);
+              $adminNotifs = $notifPage['items'];
+              $notifNextMaxId = $notifPage['next_max_id'];
+              $notifHasMore = $notifPage['has_more'];
           } catch (Throwable $e) {
               error_log('[ap-admin] notifications fetch: ' . $e->getMessage());
           }
-          $notifNextMaxId = '';
-          if ($adminNotifs !== []) {
-              $notifNextMaxId = preg_replace('/\D+/', '', (string) ($adminNotifs[count($adminNotifs) - 1]['id'] ?? '')) ?: '';
-          }
-          $notifHasMore = count($adminNotifs) >= $notifLimit && $notifNextMaxId !== '';
           if (!$adminNotifs):
         ?>
           <?= admin_mascot_empty('No notifications yet.') ?>
