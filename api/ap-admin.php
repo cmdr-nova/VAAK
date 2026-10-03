@@ -20282,6 +20282,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .remote-profile-follow .btn { min-width:7.5rem; padding:.65rem 1.35rem; font-size:.95rem; font-weight:700; border-radius:999px; }
     .remote-profile-follow .btn-following { background:transparent; border:1px solid var(--border); color:var(--text); }
     .remote-profile-follow .btn-following:hover { border-color:var(--danger); color:var(--danger); }
+    .remote-profile-actions .remote-profile-follow-inline { display:inline-flex; align-items:center; gap:.4rem; flex-wrap:wrap; }
+    .remote-profile-actions .remote-profile-follow-inline .btn {
+      min-width:6.5rem; padding:.55rem 1.15rem; font-size:.92rem; font-weight:700; border-radius:999px;
+    }
+    .remote-profile-actions .remote-profile-follow-inline .btn-following {
+      background:transparent; border:1px solid var(--border); color:var(--text);
+    }
+    .remote-profile-actions .remote-profile-follow-inline .btn-following:hover {
+      border-color:var(--danger); color:var(--danger);
+    }
     body.vaak-guest-profile .remote-profile-hd { flex-direction:column; align-items:stretch; }
     body.vaak-guest-profile .remote-profile-follow { width:100%; margin-top:.15rem; }
     body.vaak-guest-profile .remote-profile-follow .btn { min-width:0; }
@@ -27184,28 +27194,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <a class="btn btn-primary" href="/vaak/?mode=login&amp;next_path=<?= rawurlencode($rpGuestNext) ?>">Log in</a>
                   <a class="btn btn-ghost" href="/vaak/?mode=register">Join VAAK</a>
                 </div>
-              <?php elseif (!$rpIsOwn): ?>
-                <div class="remote-profile-follow" style="flex:0 0 auto;align-self:center">
-                  <?php if ($rpFollowing): ?>
-                    <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Unfollow this account?');">
-                      <input type="hidden" name="action" value="unfollow_remote">
-                      <input type="hidden" name="return_view" value="remote_profile">
-                      <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
-                      <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
-                      <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                      <button class="btn btn-following" type="submit" title="Following — click to unfollow">Following</button>
-                    </form>
-                  <?php else: ?>
-                    <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
-                      <input type="hidden" name="action" value="follow_remote">
-                      <input type="hidden" name="return_view" value="remote_profile">
-                      <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
-                      <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
-                      <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
-                      <button class="btn btn-primary" type="submit"><?= $rpRel === 'follows_you' ? 'Follow back' : 'Follow' ?></button>
-                    </form>
-                  <?php endif; ?>
-                </div>
               <?php endif; ?>
             </div>
             <?php if (!empty($GLOBALS['vaak_guest_profile']) && $rpGuestActorIri !== '' && str_starts_with($rpGuestActorIri, 'https://')): ?>
@@ -27376,16 +27364,45 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               </div>
             <?php endif; ?>
             <div class="mono" style="margin-top:.5rem"><?= h($rpActor) ?></div>
-            <div class="tweet-actions" style="flex-wrap:wrap;align-items:center">
-              <?php if ($rpRel !== 'none'): ?>
-                <span id="remote-profile-rel-state" data-following="<?= $rpFollowing ? '1' : '0' ?>" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>"><?= admin_rel_badge($rpRel) ?></span>
-              <?php else: ?>
-                <span id="remote-profile-rel-state" class="meta" data-following="0" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>">not following</span>
+            <div class="tweet-actions remote-profile-actions" style="flex-wrap:wrap;align-items:center;gap:.45rem">
+              <?php if (!empty($GLOBALS['vaak_guest_profile'])): ?>
+                <?php /* Guest Follow panel lives above; no in-row follow control. */ ?>
+              <?php elseif (!$rpIsOwn): ?>
+                <span class="remote-profile-follow-inline">
+                  <?php if ($rpFollowing): ?>
+                    <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Unfollow this account?');">
+                      <input type="hidden" name="action" value="unfollow_remote">
+                      <input type="hidden" name="return_view" value="remote_profile">
+                      <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
+                      <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
+                      <button class="btn btn-following" type="submit" title="Following — click to unfollow">Following</button>
+                    </form>
+                  <?php else: ?>
+                    <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
+                      <input type="hidden" name="action" value="follow_remote">
+                      <input type="hidden" name="return_view" value="remote_profile">
+                      <input type="hidden" name="return_actor" value="<?= h($rpActor) ?>">
+                      <input type="hidden" name="return_from" value="<?= h($rpFrom) ?>">
+                      <input type="hidden" name="actor_id" value="<?= h($rpActor) ?>">
+                      <button class="btn btn-primary" type="submit"><?= $rpRel === 'follows_you' ? 'Follow back' : 'Follow' ?></button>
+                    </form>
+                  <?php endif; ?>
+                  <span id="remote-profile-rel-state" data-following="<?= $rpFollowing ? '1' : '0' ?>" data-followed-by="<?= $rpFollowsYou ? '1' : '0' ?>">
+                    <?php if ($rpFollowsYou && !$rpFollowing): ?>
+                      <span class="tag" title="This account follows you">follows you</span>
+                    <?php elseif ($rpRel === 'mutuals'): ?>
+                      <span class="tag" title="You follow each other">mutuals</span>
+                    <?php elseif ($rpFollowing): ?>
+                      <span class="tag" title="You follow them">following</span>
+                    <?php endif; ?>
+                  </span>
+                </span>
               <?php endif; ?>
               <?php if ($rpMuted): ?><span class="tag" title="Hidden from your timelines &amp; notifications">muted for me</span><?php endif; ?>
               <?php if ($rpBlockedPersonal): ?><span class="tag" style="color:var(--danger)" title="Personal block — hidden from your timelines only">blocked for me</span><?php endif; ?>
               <?php if ($rpBlockedServer): ?><span class="tag" style="color:var(--danger)" title="Server-wide block">blocked server-wide</span><?php endif; ?>
-              <?php if ($rpIsLocal && !$rpIsOwn): ?>
+              <?php if ($rpIsLocal && !$rpIsOwn && empty($GLOBALS['vaak_guest_profile'])): ?>
                 <?php if ($rpPostSub): ?>
                   <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline">
                     <input type="hidden" name="action" value="unsubscribe_posts">
@@ -27406,11 +27423,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </form>
                 <?php endif; ?>
               <?php endif; ?>
-              <?php if (!$rpIsBsky): ?>
+              <?php if (!$rpIsBsky && empty($GLOBALS['vaak_guest_profile'])): ?>
                 <?php if ($rpIsLocal && !$rpIsOwn): ?>
                   <?php $rpMentionHandle = admin_reply_mention_handle($rpActor, is_array($rpMeta) ? (string) ($rpMeta['username'] ?? '') : null); ?>
                   <?php if ($rpMentionHandle !== ''): ?><a class="btn btn-ghost" href="?view=outbox&amp;compose=1&amp;mention=<?= urlencode($rpMentionHandle) ?>&amp;return_view=remote_profile&amp;return_actor=<?= urlencode($rpActor) ?>" title="Start a post mentioning this account">Mention</a><?php endif; ?>
                 <?php endif; ?>
+                <?php if (!$rpIsOwn): ?>
                 <form method="post" action="?view=remote_profile&amp;actor=<?= urlencode($rpActor) ?>&amp;from=<?= urlencode($rpFrom) ?>" style="display:inline" onsubmit="return confirm('Bite this account? (Wafrn-compatible 🦷)');">
                   <input type="hidden" name="action" value="bite_remote">
                   <input type="hidden" name="return_view" value="remote_profile">
@@ -27420,6 +27438,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <input type="hidden" name="target" value="<?= h($rpActor) ?>">
                   <button class="btn btn-ghost" type="submit" title="Wafrn-compatible bite"><i class="ph ph-tooth" aria-hidden="true"></i> Bite</button>
                 </form>
+                <?php endif; ?>
               <?php endif; ?>
               <?php if (!$rpIsOwn): ?>
                 <?= block_quick_actions(
