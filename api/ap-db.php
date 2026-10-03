@@ -3006,7 +3006,7 @@ function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
     }
 
     // Verify HTTPS profile fields via rel=me backlink (sets verified_at)
-    $attachment = ap_profile_verify_attachments($attachment, true);
+    $attachment = ap_profile_verify_attachments($attachment, true, $actorKey);
 
     $iconUrl = array_key_exists('icon_url', $fields)
         ? ap_profile_sanitize_https_url($fields['icon_url'])
@@ -3155,6 +3155,27 @@ function ap_profile_actor_url(string $actorKey = 'cmdr_nova'): string
 }
 
 /**
+ * Public identity URLs that count for rel=me verification.
+ * ActivityPub actor IRI on mkultra plus the on-VAAK pretty profile on vaak.monster.
+ *
+ * @return list<string>
+ */
+function ap_profile_identity_urls(string $actorKey = 'cmdr_nova'): array
+{
+    $actorKey = strtolower(preg_replace('/[^a-z0-9_]/', '', $actorKey) ?? '');
+    if ($actorKey === '') {
+        return [];
+    }
+    $enc = rawurlencode($actorKey);
+    return [
+        'https://mkultra.monster/users/' . $enc,
+        'https://vaak.monster/users/' . $enc,
+        'https://www.vaak.monster/users/' . $enc,
+        'https://mkultra.monster/@' . $enc,
+    ];
+}
+
+/**
  * Turn a profile field value into an https URL, or null if it isn't link-like.
  * Accepts bare domains (mkultra.monster), paths, HTML anchors, or full https URLs.
  */
@@ -3233,11 +3254,18 @@ function ap_profile_urls_match(string $a, string $b): bool
 }
 
 /**
- * Does HTML contain an <a> or <link> with rel including "me" pointing at $profileUrl?
+ * Does HTML contain an <a> or <link> with rel including "me" pointing at any identity URL?
+ *
+ * @param string|list<string> $profileUrls
  */
-function ap_profile_html_has_rel_me(string $html, string $profileUrl): bool
+function ap_profile_html_has_rel_me(string $html, string|array $profileUrls): bool
 {
-    if ($html === '' || $profileUrl === '') {
+    $targets = is_array($profileUrls) ? $profileUrls : [$profileUrls];
+    $targets = array_values(array_filter(array_map(
+        static fn($u): string => trim((string) $u),
+        $targets
+    ), static fn(string $u): bool => $u !== ''));
+    if ($html === '' || $targets === []) {
         return false;
     }
     if (!preg_match_all('/<(a|link)\b([^>]*)>/i', $html, $matches, PREG_SET_ORDER)) {
@@ -3263,12 +3291,14 @@ function ap_profile_html_has_rel_me(string $html, string $profileUrl): bool
         if (!str_starts_with(strtolower($href), 'https://')) {
             continue;
         }
-        if (ap_profile_urls_match($href, $profileUrl)) {
-            return true;
-        }
-        // Mastodon also accepts rel=me that redirects to the profile URL
-        if (ap_profile_url_redirects_to($href, $profileUrl)) {
-            return true;
+        foreach ($targets as $profileUrl) {
+            if (ap_profile_urls_match($href, $profileUrl)) {
+                return true;
+            }
+            // Mastodon also accepts rel=me that redirects to the profile URL
+            if (ap_profile_url_redirects_to($href, $profileUrl)) {
+                return true;
+            }
         }
     }
     return false;
@@ -3314,16 +3344,24 @@ function ap_profile_url_redirects_to(string $url, string $target): bool
 }
 
 /**
- * Fetch a page and verify it links back to our actor with rel=me.
+ * Fetch a page and verify it links back to one of our identity URLs with rel=me.
+ *
+ * @param string|list<string>|null $profileUrl Single URL, list, or null to use ap_profile_identity_urls($actorKey)
  * @return string|null ISO8601 verified_at on success
  */
-function ap_profile_verify_rel_me_url(string $pageUrl, ?string $profileUrl = null): ?string
+function ap_profile_verify_rel_me_url(string $pageUrl, string|array|null $profileUrl = null, string $actorKey = 'cmdr_nova'): ?string
 {
     $pageUrl = ap_profile_coerce_https_url($pageUrl) ?? '';
     if ($pageUrl === '') {
         return null;
     }
-    $profileUrl = $profileUrl ?: ap_profile_actor_url();
+    if ($profileUrl === null) {
+        $profileUrl = function_exists('ap_profile_identity_urls')
+            ? ap_profile_identity_urls($actorKey)
+            : [ap_profile_actor_url($actorKey)];
+    } elseif (is_string($profileUrl)) {
+        $profileUrl = [$profileUrl];
+    }
     if (!function_exists('ap_link_preview_http_get')) {
         require_once __DIR__ . '/ap-link-preview.php';
     }
@@ -3346,9 +3384,12 @@ function ap_profile_verify_rel_me_url(string $pageUrl, ?string $profileUrl = nul
  * @param list<array<string,mixed>> $attachments
  * @return list<array<string,mixed>>
  */
-function ap_profile_verify_attachments(array $attachments, bool $doFetch = true): array
+function ap_profile_verify_attachments(array $attachments, bool $doFetch = true, string $actorKey = 'cmdr_nova'): array
 {
     $out = [];
+    $identityUrls = function_exists('ap_profile_identity_urls')
+        ? ap_profile_identity_urls($actorKey)
+        : [ap_profile_actor_url($actorKey)];
     foreach (array_slice($attachments, 0, 8) as $item) {
         if (!is_array($item)) {
             continue;
@@ -3361,7 +3402,7 @@ function ap_profile_verify_attachments(array $attachments, bool $doFetch = true)
             $out[] = $item;
             continue;
         }
-        $verifiedAt = ap_profile_verify_rel_me_url($url);
+        $verifiedAt = ap_profile_verify_rel_me_url($url, $identityUrls, $actorKey);
         if ($verifiedAt !== null) {
             $item['verified_at'] = $verifiedAt;
         } else {
@@ -3405,7 +3446,7 @@ function ap_profile_reverify_fields(string $actorKey = 'cmdr_nova'): array
             'value' => $value,
         ];
     }
-    $verifiedAtts = ap_profile_verify_attachments($normalized, true);
+    $verifiedAtts = ap_profile_verify_attachments($normalized, true, $actorKey);
     $verified = 0;
     foreach ($verifiedAtts as $item) {
         if (!empty($item['verified_at'])) {
