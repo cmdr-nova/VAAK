@@ -8610,10 +8610,14 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
                 $bskyHandleCand = $cand;
             }
         }
-        if ($bskyHandleCand !== '' && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()) {
-            if (!function_exists('ap_bsky_resolve_handle_did') && is_file(__DIR__ . '/ap-bsky.php')) {
+        if ($bskyHandleCand !== '') {
+            // Load Bluesky helpers before the feature gate (tab_enabled lives in ap-bsky.php).
+            if ((!function_exists('ap_bsky_tab_enabled') || !function_exists('ap_bsky_get_profile'))
+                && is_file(__DIR__ . '/ap-bsky.php')) {
                 require_once __DIR__ . '/ap-bsky.php';
             }
+        }
+        if ($bskyHandleCand !== '' && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()) {
             $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
             if ($ownerForBsky < 1) {
                 $ownerForBsky = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
