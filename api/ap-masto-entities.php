@@ -8944,7 +8944,11 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         if (function_exists('ap_resolve_actor_ref')) {
             $resolved = ap_resolve_actor_ref('@' . $handle);
             if (is_string($resolved) && $resolved !== '') {
-                if (function_exists('ap_fetch_actor_doc')) {
+                // Skip sync AS2 when flat/PG already has a fresh non-placeholder row
+                // (acct Redis + PG resolve above already avoided a second WebFinger).
+                $fresh = function_exists('ap_remote_actor_profile_fresh_for_resolve')
+                    && ap_remote_actor_profile_fresh_for_resolve($resolved);
+                if (!$fresh && function_exists('ap_fetch_actor_doc')) {
                     $doc = ap_fetch_actor_doc($resolved);
                     if (is_array($doc)) {
                         $canon = function_exists('ap_as_id') ? ap_as_id($doc['id'] ?? null) : null;
@@ -8973,6 +8977,9 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
                             ]);
                         }
                     }
+                } elseif ($fresh && function_exists('ap_remote_actor_acct_put')) {
+                    // Keep acct map warm even when we skipped the network fetch.
+                    ap_remote_actor_acct_put($handle, $resolved);
                 }
                 $addActor($resolved);
             }

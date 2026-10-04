@@ -13592,6 +13592,113 @@ function ap_remote_actor_flat_ttl_secs(): int
     return 2700;
 }
 
+/** Acct → actor_id map TTL (search resolve / WebFinger coalesce). */
+function ap_remote_actor_acct_ttl_secs(): int
+{
+    return 3600;
+}
+
+/** Normalize `user@host` (no leading @) for Redis / PG lookups. */
+function ap_remote_actor_acct_norm(string $acct): string
+{
+    $acct = strtolower(trim($acct));
+    if (str_starts_with($acct, 'acct:')) {
+        $acct = substr($acct, 5);
+    }
+    $acct = ltrim($acct, '@');
+    return $acct;
+}
+
+/** Redis key for `user@host` → ActivityPub actor id. */
+function ap_remote_actor_acct_redis_key(string $acct): string
+{
+    return 'vaak:acct:v1:ap:' . hash('sha256', ap_remote_actor_acct_norm($acct));
+}
+
+/** Cached actor id for an acct, or null on miss. */
+function ap_remote_actor_acct_get(string $acct): ?string
+{
+    $acct = ap_remote_actor_acct_norm($acct);
+    if ($acct === '' || !str_contains($acct, '@') || !function_exists('ap_redis_json_get')) {
+        return null;
+    }
+    $got = ap_redis_json_get(ap_remote_actor_acct_redis_key($acct));
+    if (!is_array($got)) {
+        return null;
+    }
+    $actorId = rtrim((string) ($got['actor_id'] ?? ''), '/');
+    return ($actorId !== '' && str_starts_with($actorId, 'https://')) ? $actorId : null;
+}
+
+/** Remember WebFinger / PG acct → actor_id for search resolve. */
+function ap_remote_actor_acct_put(string $acct, string $actorId): void
+{
+    $acct = ap_remote_actor_acct_norm($acct);
+    $actorId = rtrim(trim($actorId), '/');
+    if ($acct === '' || !str_contains($acct, '@')
+        || $actorId === '' || !str_starts_with($actorId, 'https://')
+        || !function_exists('ap_redis_json_set')) {
+        return;
+    }
+    ap_redis_json_set(
+        ap_remote_actor_acct_redis_key($acct),
+        ['acct' => $acct, 'actor_id' => $actorId, 'cached_at' => gmdate('c')],
+        ap_remote_actor_acct_ttl_secs()
+    );
+}
+
+/**
+ * Local PG lookup of actor_id by preferredUsername + host (no network).
+ */
+function ap_remote_actor_id_by_acct(string $username, string $host): ?string
+{
+    $username = strtolower(ltrim(trim($username), '@'));
+    $host = strtolower(trim($host));
+    if ($username === '' || $host === '') {
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT actor_id FROM remote_actors
+             WHERE lower(COALESCE(host,'')) = ?
+               AND lower(COALESCE(username,'')) = ?
+             ORDER BY updated_at DESC NULLS LAST
+             LIMIT 1"
+        );
+        $st->execute([$host, $username]);
+        $id = rtrim((string) ($st->fetchColumn() ?: ''), '/');
+        return ($id !== '' && str_starts_with($id, 'https://')) ? $id : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * True when flat/PG already has a usable profile for search resolve
+ * (non-placeholder username, updated within 12h) — skip sync AS2 fetch.
+ */
+function ap_remote_actor_profile_fresh_for_resolve(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return false;
+    }
+    $row = function_exists('ap_remote_actor_get') ? ap_remote_actor_get($actorId) : null;
+    if (!is_array($row)) {
+        return false;
+    }
+    $uname = isset($row['username']) ? (string) $row['username'] : '';
+    if (function_exists('ap_remote_actor_username_is_placeholder')
+        && ap_remote_actor_username_is_placeholder($uname)) {
+        return false;
+    }
+    if (trim($uname) === '') {
+        return false;
+    }
+    $updatedAt = strtotime((string) ($row['updated_at'] ?? '')) ?: 0;
+    return $updatedAt >= (time() - 12 * 3600);
+}
+
 /** Write / refresh flat Redis after a durable remote_actors upsert. */
 function ap_remote_actor_flat_put(string $actorId, ?array $row = null): void
 {
@@ -13944,6 +14051,12 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     }
     $GLOBALS['ap_remote_actor_memo'][$actorId] = $row;
     ap_remote_actor_flat_put($actorId, $row);
+    // Keep search resolve acct→actor hot when we know username@host.
+    if (is_string($username) && $username !== '' && is_string($host) && $host !== ''
+        && function_exists('ap_remote_actor_acct_put')
+        && !ap_remote_actor_username_is_placeholder($username)) {
+        ap_remote_actor_acct_put($username . '@' . strtolower((string) $host), $actorId);
+    }
 }
 
 /**

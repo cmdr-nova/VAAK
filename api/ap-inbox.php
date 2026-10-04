@@ -3299,6 +3299,27 @@ function ap_resolve_actor_ref(string $input): ?string
         if (!ap_host_resolves_public($host)) {
             return null;
         }
+        $acct = strtolower($user) . '@' . $host;
+
+        // 1) Acct → actor_id Redis (search / WebFinger coalesce).
+        if (function_exists('ap_remote_actor_acct_get')) {
+            $cachedId = ap_remote_actor_acct_get($acct);
+            if (is_string($cachedId) && $cachedId !== '') {
+                return $cachedId;
+            }
+        }
+
+        // 2) Local PG by username+host (no network).
+        if (function_exists('ap_remote_actor_id_by_acct')) {
+            $fromPg = ap_remote_actor_id_by_acct($user, $host);
+            if (is_string($fromPg) && $fromPg !== '') {
+                if (function_exists('ap_remote_actor_acct_put')) {
+                    ap_remote_actor_acct_put($acct, $fromPg);
+                }
+                return $fromPg;
+            }
+        }
+
         $resource = 'acct:' . $user . '@' . $host;
         $wfUrl = 'https://' . $host . '/.well-known/webfinger?resource=' . rawurlencode($resource);
 
@@ -3329,35 +3350,74 @@ function ap_resolve_actor_ref(string $input): ?string
             return null;
         };
 
-        // Prefer curl/IPv4 — file_get_contents often hangs on broken AAAA (5s empty body).
-        $wfHeaders = [
-            'Accept: application/jrd+json, application/json',
-            'User-Agent: ' . ap_http_user_agent(),
-        ];
-        $href = null;
-        if (function_exists('ap_http_curl_get_ex')) {
-            $curlRes = ap_http_curl_get_ex($wfUrl, $wfHeaders, 8);
-            $href = $parseWf(is_string($curlRes['body'] ?? null) ? $curlRes['body'] : null);
-        }
-        if ($href === null) {
-            $ctx = stream_context_create([
-                'http' => [
-                    'method' => 'GET',
-                    'timeout' => 5,
-                    'header' => "Accept: application/jrd+json, application/json\r\nUser-Agent: " . ap_http_user_agent() . "\r\n",
-                    'ignore_errors' => true,
-                ],
-                'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
-            ]);
-            $body = @file_get_contents($wfUrl, false, $ctx);
-            $href = $parseWf(is_string($body) ? $body : null);
-        }
-        if ($href !== null) {
+        $doWebFinger = static function () use ($wfUrl, $parseWf, $acct): ?string {
+            // Prefer curl/IPv4 — file_get_contents often hangs on broken AAAA (5s empty body).
+            $wfHeaders = [
+                'Accept: application/jrd+json, application/json',
+                'User-Agent: ' . ap_http_user_agent(),
+            ];
+            $href = null;
+            if (function_exists('ap_http_curl_get_ex')) {
+                $curlRes = ap_http_curl_get_ex($wfUrl, $wfHeaders, 8);
+                $href = $parseWf(is_string($curlRes['body'] ?? null) ? $curlRes['body'] : null);
+            }
+            if ($href === null) {
+                $ctx = stream_context_create([
+                    'http' => [
+                        'method' => 'GET',
+                        'timeout' => 5,
+                        'header' => "Accept: application/jrd+json, application/json\r\nUser-Agent: " . ap_http_user_agent() . "\r\n",
+                        'ignore_errors' => true,
+                    ],
+                    'ssl' => ['verify_peer' => true, 'verify_peer_name' => true],
+                ]);
+                $body = @file_get_contents($wfUrl, false, $ctx);
+                $href = $parseWf(is_string($body) ? $body : null);
+            }
+            if ($href === null) {
+                // Last resort: signed GET (some locked-down hosts)
+                $href = $parseWf(ap_signed_get($wfUrl));
+            }
+            if (is_string($href) && $href !== '' && function_exists('ap_remote_actor_acct_put')) {
+                ap_remote_actor_acct_put($acct, $href);
+            }
             return $href;
+        };
+
+        // 3) Stampede-locked WebFinger — one peer fetches; others wait on acct Redis.
+        $lockKey = 'webfinger:' . hash('sha256', $acct);
+        $gotLock = function_exists('ap_redis_lock') && ap_redis_lock($lockKey, 15);
+        if ($gotLock) {
+            try {
+                // Re-check after lock (peer may have filled while we contended).
+                if (function_exists('ap_remote_actor_acct_get')) {
+                    $again = ap_remote_actor_acct_get($acct);
+                    if (is_string($again) && $again !== '') {
+                        return $again;
+                    }
+                }
+                return $doWebFinger();
+            } finally {
+                if (function_exists('ap_redis_unlock')) {
+                    ap_redis_unlock($lockKey);
+                }
+            }
         }
-        // Last resort: signed GET (some locked-down hosts)
-        $href = $parseWf(ap_signed_get($wfUrl));
-        return $href;
+
+        if (function_exists('ap_redis_stampede_wait') && function_exists('ap_remote_actor_acct_get')) {
+            $peer = ap_redis_stampede_wait(
+                static function () use ($acct) {
+                    return ap_remote_actor_acct_get($acct);
+                },
+                2500
+            );
+            if (is_string($peer) && $peer !== '') {
+                return $peer;
+            }
+        }
+
+        // Lock unavailable / wait timed out — fetch ourselves.
+        return $doWebFinger();
     }
 
     if (!str_starts_with($input, 'https://')) {
