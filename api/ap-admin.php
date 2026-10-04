@@ -21999,29 +21999,31 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     /* Phyrian Strains — web HUD chrome (Phase 1) */
     .phyrian { max-width: 42rem; margin: 0 auto 1.5rem; }
     .phyrian-hero {
-      position: relative; overflow: hidden;
+      position: relative; min-height: 11.5rem; overflow: hidden;
       border: 1px solid color-mix(in srgb, #c45a8c 35%, var(--border));
-      border-radius: 14px; background: #050308; margin-bottom: .55rem;
+      border-radius: 14px; background: #050308; margin-bottom: .85rem;
     }
     .phyrian-hero img {
-      display: block; width: 100%; height: auto; max-height: 14rem;
-      object-fit: contain; object-position: center;
-      /* 20% dim so HUD chrome below stays readable */
+      display: block; width: 100%; height: 11.5rem;
+      object-fit: cover; object-position: center 40%;
+      /* 20% dim so overlaid copy stays readable */
       opacity: .8;
     }
-    .phyrian-lede {
-      margin: 0 0 .85rem; color: var(--muted); line-height: 1.45; font-size: .88rem;
+    .phyrian-hero::after {
+      content: ""; position: absolute; inset: 0;
+      background: linear-gradient(115deg, rgba(8,6,14,.92) 0%, rgba(8,6,14,.55) 42%, rgba(8,6,14,.2) 70%, rgba(8,6,14,.65) 100%),
+                  linear-gradient(to top, rgba(8,6,14,.95), transparent 55%);
+      pointer-events: none;
     }
-    .phyrian-lede .meta {
-      display: block; margin: 0 0 .2rem; color: #b8a0c8;
-      letter-spacing: .06em; text-transform: uppercase; font-size: .72rem;
+    .phyrian-hero-copy {
+      position: absolute; z-index: 1; left: 1rem; right: 1rem; bottom: .85rem;
     }
-    .phyrian-note {
-      margin: 0 0 .85rem; padding: .65rem .8rem; border-radius: 10px;
-      border: 1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));
-      background: color-mix(in srgb, #1a1024 70%, var(--panel));
-      color: var(--muted); line-height: 1.45; font-size: .88rem;
+    .phyrian-hero-copy .meta { margin: 0; color: #b8a0c8; letter-spacing: .06em; text-transform: uppercase; font-size: .72rem; }
+    .phyrian-hero-copy h2 {
+      margin: .15rem 0 0; color: #fff; font-size: clamp(1.35rem, 4vw, 1.85rem);
+      letter-spacing: .08em; text-shadow: 0 0 18px rgba(196,90,140,.45);
     }
+    .phyrian-hero-copy p { margin: .25rem 0 0; color: #d8c8e0; line-height: 1.45; max-width: 34rem; font-size: .9rem; }
     .phyrian-hud {
       display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: .85rem;
       align-items: stretch; margin-bottom: .85rem; padding: .85rem;
@@ -22084,15 +22086,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .phyrian-hud-copy { margin: 0 0 .7rem; color: var(--muted); line-height: 1.5; font-size: .9rem; }
     .phyrian-hud-copy b { color: var(--text); }
     .phyrian-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
-    .phyrian-banner {
-      position: relative; height: 3.4rem; margin: 0 0 .95rem; overflow: hidden;
-      border-radius: 10px; border: 1px solid color-mix(in srgb, #c45a8c 28%, var(--border));
-      background: #0a0610;
-    }
-    .phyrian-banner img {
-      display: block; width: 100%; height: 100%; object-fit: cover; object-position: center;
-      opacity: .75; filter: saturate(1.05);
-    }
     .phyrian-section-title {
       display: flex; align-items: center; gap: .55rem;
       margin: 1.05rem 0 .55rem; color: var(--muted);
@@ -22150,7 +22143,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       .phyrian-hud-art { flex-direction: row; justify-content: flex-start; gap: .65rem; }
       .phyrian-hud-art img { width: 4.2rem; }
       .phyrian-hud-art .meta { text-align: left; }
-      .phyrian-hero img { max-height: 10.5rem; }
+      .phyrian-hero { min-height: 9.5rem; }
+      .phyrian-hero img { height: 9.5rem; }
       .phyrian-dir { grid-template-columns: 1fr; }
     }
     .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
@@ -29208,12 +29202,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         ?>
         <section class="phyrian">
           <header class="phyrian-hero">
-            <img src="<?= h($phyAsset('title-header.jpg')) ?>" alt="Phyrian Strains" width="900" height="583" decoding="async">
+            <img src="<?= h($phyAsset('title-header.jpg')) ?>" alt="" width="900" height="583" decoding="async">
+            <div class="phyrian-hero-copy">
+              <p class="meta">Phase 1 · web-only</p>
+              <h2>Phyrian Strains</h2>
+              <p>Consent-based imprint and resonance on this instance. OpenSim link / Resonant badge come later — nothing here federates.</p>
+            </div>
           </header>
-          <p class="phyrian-lede">
-            <span class="meta">Phase 1 · web-only</span>
-            Consent-based imprint and resonance on this instance. OpenSim link / Resonant badge come later — nothing here federates.
-          </p>
 
           <div class="phyrian-hud">
             <div class="phyrian-hud-art">
@@ -29270,10 +29265,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php endif; ?>
               </div>
             </div>
-          </div>
-
-          <div class="phyrian-banner" aria-hidden="true">
-            <img src="<?= h($phyAsset('banner-exchange.jpg')) ?>" alt="" width="1000" height="283" loading="lazy" decoding="async">
           </div>
 
           <?php if ($phyPending): ?>
