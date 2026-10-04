@@ -18965,6 +18965,8 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
 
 /**
  * Group key for Mentions like/boost collapse, or null when the row must stay alone.
+ * Status URIs are canonicalized across Fedi/Bluesky twins so dual-network
+ * likes on the same post share one card.
  */
 function admin_notification_group_key(array $row): ?string
 {
@@ -18977,13 +18979,45 @@ function admin_notification_group_key(array $row): ?string
     if ($statusKey === '') {
         return null;
     }
+    if (function_exists('ap_masto_notif_canonical_status_key')) {
+        $ownerHint = 0;
+        $acct = is_array($row['account'] ?? null) ? $row['account'] : [];
+        // Owner of the liked post is the Mentions viewer; status.account is fine as fallback.
+        if (isset($status['account']['uri']) && is_string($status['account']['uri'])
+            && function_exists('ap_db_owner_user_id_for_actor')) {
+            $ownerHint = ap_db_owner_user_id_for_actor((string) $status['account']['uri']);
+        }
+        $statusKey = ap_masto_notif_canonical_status_key($statusKey, $ownerHint);
+    }
+    if ($statusKey === '') {
+        return null;
+    }
     return $type . ':' . $statusKey;
+}
+
+/** Identity key for an account payload (linked Fedi/Bluesky share one key). */
+function admin_notification_account_identity_key(array $acct): string
+{
+    $ref = rtrim((string) ($acct['uri'] ?? $acct['url'] ?? ''), '/');
+    if ($ref !== '' && function_exists('ap_masto_notif_actor_identity_key')) {
+        return ap_masto_notif_actor_identity_key($ref);
+    }
+    return (string) ($acct['id'] ?? $ref);
+}
+
+/** Prefer a local VAAK account payload over its Bluesky twin when merging. */
+function admin_notification_account_is_local(array $acct): bool
+{
+    $ref = rtrim((string) ($acct['uri'] ?? $acct['url'] ?? ''), '/');
+    return str_starts_with($ref, 'https://mkultra.monster/users/')
+        || str_starts_with($ref, 'https://mkultra.monster/@');
 }
 
 /**
  * Group repeated like/boost notifications for the VAAK Notifications view.
  * The underlying notification rows remain unchanged; this is presentation
  * only and therefore cannot affect unread IDs, moderation, or pagination.
+ * Linked Fedi+Bluesky identities count as one person.
  *
  * @param list<array<string,mixed>> $rows
  * @return list<array<string,mixed>>
@@ -18999,25 +19033,48 @@ function admin_group_notification_rows(array $rows): array
         $groupKey = admin_notification_group_key($row);
         $canGroup = $groupKey !== null;
         $key = $canGroup ? $groupKey : ('single:' . (string) ($row['id'] ?? count($out)));
+        $acct = is_array($row['account'] ?? null) ? $row['account'] : [];
+        $ident = $acct !== [] ? admin_notification_account_identity_key($acct) : ('anon:' . count($out));
         if (!$canGroup || !isset($index[$key])) {
             $row['_group_count'] = 1;
-            $row['_group_accounts'] = [is_array($row['account'] ?? null) ? $row['account'] : []];
+            $row['_group_accounts'] = $acct !== [] ? [$acct] : [];
+            $row['_group_identity_keys'] = [$ident => true];
+            // Prefer local AP actor as the card face when a Bluesky twin arrives first.
+            if ($acct !== [] && !admin_notification_account_is_local($acct)) {
+                // keep as-is until a local twin merges in
+            }
             $index[$key] = count($out);
             $out[] = $row;
             continue;
         }
         $idx = $index[$key];
-        $out[$idx]['_group_count'] = (int) ($out[$idx]['_group_count'] ?? 1) + 1;
-        $acct = is_array($row['account'] ?? null) ? $row['account'] : [];
-        $acctId = (string) ($acct['id'] ?? $acct['uri'] ?? $acct['url'] ?? '');
-        $seen = [];
-        foreach (($out[$idx]['_group_accounts'] ?? []) as $existing) {
-            if (is_array($existing)) {
-                $seen[(string) ($existing['id'] ?? $existing['uri'] ?? $existing['url'] ?? '')] = true;
+        $seenIdent = is_array($out[$idx]['_group_identity_keys'] ?? null)
+            ? $out[$idx]['_group_identity_keys']
+            : [];
+        if (!isset($seenIdent[$ident])) {
+            $out[$idx]['_group_count'] = (int) ($out[$idx]['_group_count'] ?? 1) + 1;
+            $seenIdent[$ident] = true;
+            $out[$idx]['_group_identity_keys'] = $seenIdent;
+            if ($acct !== [] && count($out[$idx]['_group_accounts'] ?? []) < 6) {
+                $out[$idx]['_group_accounts'][] = $acct;
             }
-        }
-        if ($acct !== [] && !isset($seen[$acctId]) && count($out[$idx]['_group_accounts']) < 6) {
-            $out[$idx]['_group_accounts'][] = $acct;
+        } elseif ($acct !== [] && admin_notification_account_is_local($acct)) {
+            // Same linked identity: swap Bluesky face for local VAAK account.
+            $accounts = is_array($out[$idx]['_group_accounts'] ?? null)
+                ? $out[$idx]['_group_accounts']
+                : [];
+            foreach ($accounts as $ai => $existing) {
+                if (!is_array($existing)) {
+                    continue;
+                }
+                if (admin_notification_account_identity_key($existing) === $ident
+                    && !admin_notification_account_is_local($existing)) {
+                    $accounts[$ai] = $acct;
+                    $out[$idx]['_group_accounts'] = $accounts;
+                    $out[$idx]['account'] = $acct;
+                    break;
+                }
+            }
         }
     }
     return $out;
@@ -32396,7 +32453,7 @@ window.apAdminToast = function (msg, isErr) {
     let maxId = items.dataset.maxId || '';
     let initialPending = items.dataset.initialPending === '1';
     const filter = items.dataset.filter || 'all';
-    const limit = parseInt(items.dataset.limit || '10', 10) || 10;
+    const limit = parseInt(items.dataset.limit || '30', 10) || 30;
     let aborted = false;
     let fetchAbort = null;
     const stillOnMentions = () => {
@@ -32412,6 +32469,7 @@ window.apAdminToast = function (msg, isErr) {
     async function loadInitial() {
       if (!initialPending || loading || aborted) return;
       initialPending = false;
+      try { items.dataset.initialPending = '0'; } catch (e) {}
       loading = true;
       const skeleton = insertScrollSkeleton(status);
       setStatusLoading(status);
@@ -32629,7 +32687,9 @@ window.apAdminToast = function (msg, isErr) {
 
     busy = true;
     window.__vaakNavigationPending = true;
-    if (view !== 'mentions' && typeof window.vaakAbortNotifScroll === 'function') {
+    // Always abort prior Mentions scroll work — including Mentions→Mentions
+    // filter swaps — so loadInitial cannot append twice onto a live shell.
+    if (typeof window.vaakAbortNotifScroll === 'function') {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
     }
     if (typeof window.vaakShowLoading === 'function') {
@@ -32637,7 +32697,7 @@ window.apAdminToast = function (msg, isErr) {
     }
     try {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
-        + encodeURIComponent(view === 'mentions' ? '10' : (view === 'outbox' ? '20' : '15'));
+        + encodeURIComponent(view === 'mentions' ? '30' : (view === 'outbox' ? '20' : '15'));
       if (view === 'mentions' && filter) url += '&notification_filter=' + encodeURIComponent(filter);
       if (view === 'favourites' && extra.network) url += '&network=' + encodeURIComponent(extra.network);
       if ((view === 'following' || view === 'followers') && extra.network) {

@@ -5583,6 +5583,24 @@ function ap_mention_store(array $row): void
         (string) ($row['ask_question'] ?? ''),
         (string) ($row['ask_answer'] ?? ''),
     ]);
+    // Local AP like/boost won the race: drop the Bluesky twin echo from the
+    // same linked identity so Mentions does not show both faces for one action.
+    $storeActor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+    $storeAct = strtolower((string) ($activityType ?? ''));
+    if (
+        $storeActor !== ''
+        && str_starts_with($storeActor, 'https://mkultra.monster/users/')
+        && in_array($storeAct, ['like', 'announce', 'emojireact'], true)
+        && function_exists('ap_mention_soft_delete_linked_bsky_twin_echo')
+    ) {
+        $targetNote = function_exists('ap_masto_mention_target_object_id')
+            ? ap_masto_mention_target_object_id((string) $objectId)
+            : (string) preg_replace('/#(like|reblog|emojireact)-[a-z0-9]+$/i', '', (string) $objectId);
+        $echoKind = ($storeAct === 'announce') ? 'reblog' : 'like';
+        if (is_string($targetNote) && $targetNote !== '') {
+            ap_mention_soft_delete_linked_bsky_twin_echo($ownerUserId, $targetNote, $echoKind, $storeActor);
+        }
+    }
     // A fresh mention must be visible to the web notification list immediately;
     // otherwise the unread badge can advance while the cached first page still
     // serves the previous projection (Ice Cubes bypasses that projection).
@@ -5732,6 +5750,96 @@ function ap_mention_soft_delete_interaction(string $actorId, string $targetObjec
         ap_notification_projection_invalidate_all();
     }
 
+    return $touched;
+}
+
+/**
+ * Soft-delete Bluesky like/boost Mentions rows that are twin echoes of a local
+ * VAAK user's Fediverse interaction on the same note.
+ *
+ * @return int rows touched
+ */
+function ap_mention_soft_delete_linked_bsky_twin_echo(
+    int $ownerUserId,
+    string $localNoteId,
+    string $kind,
+    string $localActorId
+): int {
+    $ownerUserId = (int) $ownerUserId;
+    $localNoteId = rtrim(trim($localNoteId), '/');
+    $localActorId = rtrim(trim($localActorId), '/');
+    $kind = strtolower(trim($kind));
+    if ($ownerUserId < 1 || $localNoteId === '' || $localActorId === ''
+        || !in_array($kind, ['like', 'reblog'], true)) {
+        return 0;
+    }
+    $likerUid = function_exists('ap_db_owner_user_id_for_actor')
+        ? ap_db_owner_user_id_for_actor($localActorId)
+        : 0;
+    if ($likerUid < 1) {
+        return 0;
+    }
+    $session = null;
+    if (function_exists('ap_bsky_session_row')) {
+        $session = ap_bsky_session_row($likerUid);
+    } else {
+        try {
+            $st = ap_db()->prepare('SELECT handle, did FROM bsky_sessions WHERE owner_user_id = ? LIMIT 1');
+            $st->execute([$likerUid]);
+            $row = $st->fetch();
+            $session = is_array($row) ? $row : null;
+        } catch (Throwable $e) {
+            $session = null;
+        }
+    }
+    if (!is_array($session)) {
+        return 0;
+    }
+    $actors = [];
+    $handle = ltrim(trim((string) ($session['handle'] ?? '')), '@');
+    $did = trim((string) ($session['did'] ?? ''));
+    $toProfile = static function (string $ident): string {
+        if (function_exists('ap_bsky_actor_profile_url')) {
+            return ap_bsky_actor_profile_url($ident);
+        }
+        $path = str_starts_with($ident, 'did:') ? $ident : rawurlencode($ident);
+        return 'https://bsky.app/profile/' . $path;
+    };
+    if ($handle !== '') {
+        $actors[] = $toProfile($handle);
+    }
+    if ($did !== '') {
+        $actors[] = $toProfile($did);
+    }
+    $actors = array_values(array_unique(array_filter($actors)));
+    if ($actors === []) {
+        return 0;
+    }
+    $now = ap_db_now();
+    $touched = 0;
+    try {
+        $db = ap_db();
+        foreach ($actors as $bskyActor) {
+            $bskyActor = rtrim($bskyActor, '/');
+            if ($bskyActor === '') {
+                continue;
+            }
+            $st = $db->prepare(
+                'UPDATE mentions SET deleted_at = ?
+                 WHERE owner_user_id = ?
+                   AND deleted_at IS NULL
+                   AND (actor_id = ? OR actor_id = ?)
+                   AND object_id LIKE ?'
+            );
+            $st->execute([$now, $ownerUserId, $bskyActor, $bskyActor . '/', $localNoteId . '#' . $kind . '-%']);
+            $touched += $st->rowCount();
+        }
+    } catch (Throwable $e) {
+        return $touched;
+    }
+    if ($touched > 0 && function_exists('ap_notification_projection_invalidate_owner')) {
+        ap_notification_projection_invalidate_owner($ownerUserId);
+    }
     return $touched;
 }
 

@@ -12188,6 +12188,83 @@ function ap_bsky_notification_media_urls(array $notif, int $ownerUserId = 0, boo
     return array_slice($urls, 0, 4);
 }
 
+/**
+ * True when a Bluesky like/repost is an echo of an already-stored local AP
+ * interaction from the same linked VAAK user on the twin note.
+ */
+function ap_bsky_interaction_is_twin_echo(
+    int $ownerUserId,
+    string $localNoteId,
+    string $kind,
+    string $authorDid,
+    string $authorHandle
+): bool {
+    $ownerUserId = (int) $ownerUserId;
+    $localNoteId = rtrim(trim($localNoteId), '/');
+    $kind = strtolower(trim($kind));
+    if ($ownerUserId < 1 || $localNoteId === '' || !in_array($kind, ['like', 'reblog'], true)) {
+        return false;
+    }
+    $linkedUid = 0;
+    if ($authorDid !== '' && function_exists('ap_masto_notif_bsky_owner_user_id')) {
+        $linkedUid = ap_masto_notif_bsky_owner_user_id($authorDid);
+    }
+    if ($linkedUid < 1 && $authorHandle !== '' && function_exists('ap_masto_notif_bsky_owner_user_id')) {
+        $linkedUid = ap_masto_notif_bsky_owner_user_id($authorHandle);
+    }
+    if ($linkedUid < 1) {
+        // Fallback direct session lookup when masto helpers are unavailable.
+        try {
+            if ($authorDid !== '') {
+                $st = ap_db()->prepare('SELECT owner_user_id FROM bsky_sessions WHERE did = ? LIMIT 1');
+                $st->execute([$authorDid]);
+                $linkedUid = (int) ($st->fetchColumn() ?: 0);
+            }
+            if ($linkedUid < 1 && $authorHandle !== '') {
+                $st = ap_db()->prepare(
+                    'SELECT owner_user_id FROM bsky_sessions WHERE lower(handle) = lower(?) LIMIT 1'
+                );
+                $st->execute([ltrim($authorHandle, '@')]);
+                $linkedUid = (int) ($st->fetchColumn() ?: 0);
+            }
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+    if ($linkedUid < 1) {
+        return false;
+    }
+    $localActor = function_exists('ap_db_owner_actor_id_for_user_id')
+        ? rtrim(ap_db_owner_actor_id_for_user_id($linkedUid), '/')
+        : '';
+    if ($localActor === '') {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM mentions
+             WHERE owner_user_id = ?
+               AND deleted_at IS NULL
+               AND (actor_id = ? OR actor_id = ?)
+               AND object_id LIKE ?
+               AND (
+                 lower(coalesce(activity_type, '')) IN ('like', 'announce', 'emojireact')
+                 OR lower(coalesce(type, '')) IN ('like', 'announce', 'emojireact')
+               )
+             LIMIT 1"
+        );
+        $st->execute([
+            $ownerUserId,
+            $localActor,
+            $localActor . '/',
+            $localNoteId . '#' . $kind . '-%',
+        ]);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActorId, array $notif): ?array
 {
     $reason = strtolower(trim((string) ($notif['reason'] ?? '')));
@@ -12298,6 +12375,13 @@ function ap_bsky_notification_to_mention_row(int $ownerUserId, string $ownerActo
             $activityType = 'Create';
             $objType = 'Note';
             break;
+    }
+
+    // Twin-identity dedupe: skip Bluesky like/repost echoes when the author's
+    // linked VAAK Fediverse account already notified on the local twin note.
+    if ($kind !== null && is_string($localNoteId) && $localNoteId !== ''
+        && ap_bsky_interaction_is_twin_echo($ownerUserId, $localNoteId, $kind, $did, $handle)) {
+        return null;
     }
 
     // Interaction object_id: prefer local note id when mapped so resolve_our_liked_status works.
