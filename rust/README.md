@@ -4,14 +4,14 @@
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
 | `notif-list --loop --owner-id 0` | **LIVE** | Mentions list warm — **native projection→Redis** first (`ap_notification_projection`); PHP `notif-list-warm.php` only when projection cannot fill (10.5) |
-| `ranked-warm --loop --owner-id 0` | **LIVE** | Home / Local / Federated ranked ID-cache warm — orchestrates PHP `bin/ranked-warm.php` into `vaak:timeline:ranked:v2:{sha256}` |
+| `ranked-warm --loop --owner-id 0` | **LIVE** | Home ranked rebuild **native** (`source=vaak-worker-native`); Local/Federated still spawn PHP `bin/ranked-warm.php` → `vaak:timeline:ranked:v2:{sha256}` |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home` (hydrate Redis), `/api/v1/notifications` (Redis-read) |
 
-PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm and ranked-warm keep entity/lean hydrate in PHP (freeze contract) while Rust owns the multi-owner loop — interim bridges until native Rust + Axum cutover, then those PHP parts drop.
+PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm keeps PHP hydrate as cold fallback; ranked Home is native (Local/Federated + Home-on-fail still PHP). Interim bridges drop as each surface moves fully to Rust + Axum.
 
 ## Live systemd units
 
@@ -41,7 +41,8 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_NOTIF_NATIVE_PROJECTION` | `1` | notif-list writes Redis from `ap_notification_projection` before PHP spawn; empty thin windows fall through to PHP (0.6.43) |
 | `VAAK_NOTIF_LIST_REFRESH_SECS` | `90` | skip-if-fresh window for list keys |
 | `VAAK_SHADOW_HTTP` | `http://127.0.0.1:8787` | Axum shadow base for Mentions M5 proxy (loopback only) |
-| `VAAK_RANKED_RUST_PRIMARY` | `1` (default in materializer) | ranked-warm tags Redis `source=vaak-worker-live` with longer TTL trust |
+| `VAAK_RANKED_RUST_PRIMARY` | `1` (default in materializer) | PHP ranked-warm tags Redis `source=vaak-worker-live` with longer TTL trust |
+| `VAAK_RANKED_NATIVE_HOME` | `1` (default) | Home ranked rebuild in Rust; `0` forces PHP spawn for Home |
 | `VAAK_API_ROOT` | `/srv/mkultra/html/api` | notif-list / ranked-warm PHP materializer path |
 | `VAAK_PHP_BIN` | `/usr/bin/php` | materializer spawn |
 | `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
@@ -61,7 +62,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 
 - Notif live key: `vaak:notifications:v1:unread:{owner}:{scan}:{sha256(last_read)}` TTL 45s; source `vaak-worker-live`
 - Notif list key: `vaak:notifications:v1:{owner}:{sha256(limit,max,since,types,exclude)}` envelope `{ts,items,source}` TTL 600s when list-warm primary; source `vaak-worker-live` from `notif-list-warm.php` (hash JSON key order must match PHP: `limit,max,since,types,exclude`)
-- Ranked key: `vaak:timeline:ranked:v2:{sha256(logical)}` + owner index `vaak:timeline:owner-index:v1:{owner}`; source `vaak-worker-live` from `ranked-warm.php`
+- Ranked key: `vaak:timeline:ranked:v2:{sha256(logical)}` + owner index `vaak:timeline:owner-index:v1:{owner}`; Home source `vaak-worker-native` (0.6.48); Local/Federated / Home-fallback `vaak-worker-live` from `ranked-warm.php`
 - Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss). Prime with `bin/home-timeline-warm.php` or Ice Cubes head polls.
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
 - Actor warm queue: `vaak:queue:bsky_actor_warm` JSON `{did,owner,ts,source}`; flat key `vaak:actor:v1:bsky:{did}` TTL ~2700s
