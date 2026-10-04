@@ -1,10 +1,10 @@
 # Live Home/Local/Federated ranked ID-cache warm.
 #   systemctl enable --now vaak-worker-ranked-warm.service
 #
-# Native (default): Home + Local + Federated rebuild vaak:timeline:ranked:v2:*
-# with source=vaak-worker-native. PHP ranked-warm.php only on native miss/flag-off
-# (Home empty/thin still falls back to PHP for recommendations).
-# Flags: VAAK_RANKED_NATIVE_HOME=1, VAAK_RANKED_NATIVE_LOCAL_FEED=1 (set 0 to force PHP).
+# Native-only: rebuilds vaak:timeline:ranked:v2:* with source=vaak-worker-native
+# (Home FoF/recommendations + favourite/toxicity when algorithm on).
+# Flags: VAAK_RANKED_NATIVE_HOME=1, VAAK_RANKED_NATIVE_LOCAL_FEED=1
+# (set 0 to skip that view; PHP bin/ranked-warm.php is retired).
 
 [Unit]
 Description=VAAK Rust ranked timeline warm (Home/Local/Federated native)
@@ -17,11 +17,8 @@ User=www-data
 Group=www-data
 Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
 Environment=VAAK_SHADOW_OWNER_ID=1
-Environment=VAAK_API_ROOT=/srv/mkultra/html/api
-Environment=VAAK_PHP_BIN=/usr/bin/php
 Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
 Environment=AP_DB_DSN=pgsql:dbname=novalandia
-Environment=VAAK_RANKED_WARM=1
 Environment=VAAK_RANKED_NATIVE_HOME=1
 Environment=VAAK_RANKED_NATIVE_LOCAL_FEED=1
 Environment=VAAK_FEATURE_BLUESKY_TAB=1

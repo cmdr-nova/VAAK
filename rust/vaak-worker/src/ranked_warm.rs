@@ -1,26 +1,23 @@
 //! Home / Local / Federated **ranked** warm (loading-plan slice 2 → native).
 //!
-//! - **Home (native):** rebuilds `vaak:timeline:ranked:v2:{sha256(logical)}` +
-//!   owner index from Postgres (follow events, own outbox, FoF/cold-start
+//! - **Home:** rebuilds `vaak:timeline:ranked:v2:{sha256(logical)}` + owner
+//!   index from Postgres (follow events, own outbox, FoF/cold-start
 //!   recommendations, favourite/toxicity nudges when algorithm on, Bluesky
 //!   merge, RSS spacing). Source `vaak-worker-native`. Flag
-//!   `VAAK_RANKED_NATIVE_HOME=1`.
-//! - **Local / Federated (native):** outbox+local boosts / firehose events with
-//!   v13 key parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on).
-//! - PHP `api/bin/ranked-warm.php` remains only when a native flag is off or
-//!   native Home rebuild fails (last-resort empty fallback).
+//!   `VAAK_RANKED_NATIVE_HOME=1` (default on; `0` skips Home warm).
+//! - **Local / Federated:** outbox+local boosts / firehose events with v13 key
+//!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
+//! - Empty timelines soft-skip (no Redis write). PHP `bin/ranked-warm.php` is
+//!   retired; HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`.
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio_postgres::Client;
 
 use crate::config::Config;
@@ -32,25 +29,6 @@ const CACHE_VERSION: &str = "v13";
 const HOME_TTL_SECS: u64 = 600;
 const MAX_TIMELINE: usize = 160;
 const PER_ACTOR_CAP: usize = 25;
-
-#[derive(Debug, Clone)]
-struct WarmPaths {
-    php_bin: PathBuf,
-    script: PathBuf,
-}
-
-fn warm_paths() -> WarmPaths {
-    let php_bin = PathBuf::from(
-        std::env::var("VAAK_PHP_BIN").unwrap_or_else(|_| "/usr/bin/php".to_string()),
-    );
-    let api_root = PathBuf::from(
-        std::env::var("VAAK_API_ROOT").unwrap_or_else(|_| "/srv/mkultra/html/api".to_string()),
-    );
-    WarmPaths {
-        php_bin,
-        script: api_root.join("bin/ranked-warm.php"),
-    }
-}
 
 fn env_flag_default_true(name: &str) -> bool {
     match std::env::var(name) {
@@ -2140,7 +2118,13 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     }
 
     if ranked.is_empty() {
-        bail!("native home ranked empty for owner={owner_user_id}");
+        // Parity with Local/Federated: empty accounts skip without PHP fallback.
+        let ms = started.elapsed().as_millis();
+        return Ok(format!(
+            "owner={owner_user_id} view=home key={logical} ranked=0 ms={ms} source=vaak-worker-native skipped=empty algo={} downrank={}",
+            if algorithm_on { "on" } else { "off" },
+            if downranking_on { "on" } else { "off" },
+        ));
     }
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
@@ -2229,102 +2213,32 @@ pub async fn warm_feed_native(cfg: &Config, owner_user_id: i64) -> Result<String
     ))
 }
 
-async fn warm_php_views(owner_user_id: i64, views: &str) -> Result<String> {
-    let paths = warm_paths();
-    if !paths.script.is_file() {
-        bail!("ranked-warm script missing: {}", paths.script.display());
-    }
-    let views = if views.trim().is_empty() {
-        "local,feed"
-    } else {
-        views
-    };
-    let started = Instant::now();
-    let mut cmd = Command::new(&paths.php_bin);
-    cmd.arg(&paths.script)
-        .arg(format!("--owner-id={owner_user_id}"))
-        .arg(format!("--views={views}"))
-        .env("VAAK_RANKED_WARM", "1")
-        .env("VAAK_FEATURE_BLUESKY_TAB", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if std::env::var_os("AP_DB_DSN").is_none() {
-        cmd.env("AP_DB_DSN", "pgsql:dbname=novalandia");
-    }
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("spawn {} {}", paths.php_bin.display(), paths.script.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let ms = started.elapsed().as_millis();
-    if !output.status.success() {
-        bail!(
-            "ranked-warm php owner={owner_user_id} exit={} ms={ms} stderr={stderr} stdout={stdout}",
-            output.status.code().unwrap_or(-1)
-        );
-    }
-    if !stderr.is_empty() {
-        tracing::warn!(owner = owner_user_id, %stderr, "ranked-warm php stderr");
-    }
-    Ok(format!("owner={owner_user_id} php_ms={ms}\n{stdout}"))
-}
-
 pub async fn warm_owner(cfg: &Config, owner_user_id: i64, views: &str) -> Result<String> {
     let wanted = parse_views(views);
     let mut lines = Vec::new();
-    let mut php_views = Vec::new();
 
     for view in &wanted {
         match *view {
-            "home" if native_home_enabled() => match warm_home_native(cfg, owner_user_id).await {
-                Ok(line) => lines.push(line),
-                Err(e) => {
-                    tracing::warn!(
-                        owner = owner_user_id,
-                        error = %e,
-                        "native home ranked failed; falling back to PHP"
-                    );
-                    php_views.push("home");
-                }
-            },
-            "home" => php_views.push("home"),
+            "home" if native_home_enabled() => {
+                lines.push(warm_home_native(cfg, owner_user_id).await?)
+            }
+            "home" => lines.push(format!(
+                "owner={owner_user_id} view=home skipped=flag-off flag=VAAK_RANKED_NATIVE_HOME"
+            )),
             "local" if native_local_feed_enabled() => {
-                match warm_local_native(cfg, owner_user_id).await {
-                    Ok(line) => lines.push(line),
-                    Err(e) => {
-                        tracing::warn!(
-                            owner = owner_user_id,
-                            error = %e,
-                            "native local ranked failed; falling back to PHP"
-                        );
-                        php_views.push("local");
-                    }
-                }
+                lines.push(warm_local_native(cfg, owner_user_id).await?)
             }
-            "local" => php_views.push("local"),
+            "local" => lines.push(format!(
+                "owner={owner_user_id} view=local skipped=flag-off flag=VAAK_RANKED_NATIVE_LOCAL_FEED"
+            )),
             "feed" if native_local_feed_enabled() => {
-                match warm_feed_native(cfg, owner_user_id).await {
-                    Ok(line) => lines.push(line),
-                    Err(e) => {
-                        tracing::warn!(
-                            owner = owner_user_id,
-                            error = %e,
-                            "native feed ranked failed; falling back to PHP"
-                        );
-                        php_views.push("feed");
-                    }
-                }
+                lines.push(warm_feed_native(cfg, owner_user_id).await?)
             }
-            "feed" => php_views.push("feed"),
+            "feed" => lines.push(format!(
+                "owner={owner_user_id} view=feed skipped=flag-off flag=VAAK_RANKED_NATIVE_LOCAL_FEED"
+            )),
             _ => {}
         }
-    }
-
-    if !php_views.is_empty() {
-        let joined = php_views.join(",");
-        lines.push(warm_php_views(owner_user_id, &joined).await?);
     }
 
     Ok(lines.join("\n"))
