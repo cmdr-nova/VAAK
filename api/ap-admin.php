@@ -4715,11 +4715,20 @@ $vaakAdminOnlyActions = [
             }
         }
     } elseif (in_array($action, [
-        'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin',
+        'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
     ], true)) {
         $view = 'phyrian';
         if (!function_exists('ap_phyrian_ensure_player')) {
             $error = 'Phyrian Strains is unavailable.';
+        } elseif ($action === 'phyrian_self_seed') {
+            $res = function_exists('ap_phyrian_origin_self_seed')
+                ? ap_phyrian_origin_self_seed($ownerId)
+                : ['ok' => false, 'error' => 'Self-seed unavailable'];
+            if (!empty($res['ok'])) {
+                $notice = 'Origin seeded: ' . (string) ($res['strain'] ?? 'strain') . '.';
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not seed origin');
+            }
         } elseif ($action === 'phyrian_checkin') {
             $res = ap_phyrian_checkin($ownerId);
             if (!empty($res['ok'])) {
@@ -22201,6 +22210,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .phyrian-stats b { color: var(--text); font-variant-numeric: tabular-nums; }
     .phyrian-hud-copy { margin: 0 0 .7rem; color: var(--muted); line-height: 1.5; font-size: .9rem; }
     .phyrian-hud-copy b { color: var(--text); }
+    .phyrian-lineage { margin: 0 0 .65rem; line-height: 1.45; font-size: .85rem; }
+    .phyrian-lineage b { color: var(--text); }
     .phyrian-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
     .phyrian-section-title {
       display: flex; align-items: center; gap: .55rem;
@@ -29306,6 +29317,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $phyImprinted = ($phyStatus === 'imprinted' && $phyStrain !== '');
           $phyIsOrigin = function_exists('ap_phyrian_is_origin_owner')
               && ap_phyrian_is_origin_owner((int) $vaakOwnerId);
+          $phyStability = function_exists('ap_phyrian_stability')
+              ? ap_phyrian_stability(is_array($phyPlayer) ? $phyPlayer : [])
+              : ($phyImprinted ? 'Stable' : 'Unmarked');
+          $phyLineage = ($vaakOwnerId > 0 && $phyImprinted && function_exists('ap_phyrian_lineage'))
+              ? ap_phyrian_lineage((int) $vaakOwnerId, 4)
+              : [];
+          $phyParentId = (int) ($phyPlayer['imprinted_by_owner_id'] ?? 0);
+          $phyParentName = ($phyParentId > 0 && function_exists('ap_phyrian_username_for_owner'))
+              ? ap_phyrian_username_for_owner($phyParentId)
+              : '';
           $phyPending = ($vaakOwnerId > 0 && function_exists('ap_phyrian_pending_for'))
               ? ap_phyrian_pending_for((int) $vaakOwnerId)
               : [];
@@ -29318,6 +29339,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $phyCheckedInToday = true;
           }
           $phyCanOfferImprint = $phyImprinted || $phyIsOrigin;
+          $phyDecayDaily = defined('AP_PHYRIAN_DAILY_DECAY') ? (int) AP_PHYRIAN_DAILY_DECAY : 5;
           $phyAsset = static function (string $file): string {
               return '/api/assets/phyrian/' . ltrim($file, '/');
           };
@@ -29335,7 +29357,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="phyrian-hud">
             <div class="phyrian-hud-art">
               <img src="<?= h($phyAsset($phyImprinted ? 'icon-status.png' : 'icon-register.png')) ?>" alt="" width="160" height="160" decoding="async">
-              <span class="meta"><?= $phyImprinted ? 'Status' : 'Unmarked' ?></span>
+              <span class="meta"><?= h($phyStability) ?></span>
             </div>
             <div class="phyrian-hud-body">
               <div class="phyrian-status-row">
@@ -29360,19 +29382,61 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="phyrian-stats">
                 <span>Gen <b><?= (int) $phyGen ?></b></span>
                 <span>Level <b><?= (int) $phyLevel ?></b></span>
+                <?php if ($phyImprinted): ?>
+                  <span>Decay <b>−<?= (int) $phyDecayDaily ?>/day</b></span>
+                <?php endif; ?>
               </div>
+              <?php if ($phyImprinted && ($phyParentName !== '' || count($phyLineage) > 1)): ?>
+                <p class="phyrian-lineage meta">
+                  <?php if ($phyParentName !== ''): ?>
+                    Imprinted by <b>@<?= h($phyParentName) ?></b>
+                  <?php else: ?>
+                    Origin seed
+                  <?php endif; ?>
+                  <?php if (count($phyLineage) > 1): ?>
+                    ·
+                    <?php
+                      $phyChain = [];
+                      foreach ($phyLineage as $hop) {
+                          $hopName = trim((string) ($hop['username'] ?? ''));
+                          if ($hopName === '') {
+                              $hopName = 'user' . (int) ($hop['owner_user_id'] ?? 0);
+                          }
+                          $phyChain[] = (!empty($hop['is_self']) ? 'You' : '@' . $hopName)
+                              . ' <span class="meta">(' . h((string) ($hop['strain'] ?? '')) . ')</span>';
+                      }
+                      echo implode(' <span class="meta">←</span> ', $phyChain);
+                    ?>
+                  <?php endif; ?>
+                </p>
+              <?php endif; ?>
               <?php if (!$phyImprinted): ?>
                 <p class="phyrian-hud-copy">
-                  Accept an imprint offer from the origin (or another imprinted local) to receive a strain.
-                  Until then there is no daily check-in and you cannot offer imprint or exchange resonance.
+                  <?php if ($phyIsOrigin): ?>
+                    You are the <b>origin</b>. Seed your own strain, or offer imprint to an Unknown Entity —
+                    accepting will seed you first and transmit that same strain so lineage stays coherent.
+                  <?php else: ?>
+                    Accept an imprint offer from the origin (or another imprinted local) to receive a strain.
+                    Until then there is no daily check-in and you cannot offer imprint or exchange resonance.
+                  <?php endif; ?>
                 </p>
               <?php else: ?>
                 <p class="phyrian-hud-copy">
-                  Your lineage is <b><?= h($phyStrain) ?></b>. Check in once per UTC day, offer imprint
-                  to Unknown Entities, and exchange resonance with other imprinted locals.
+                  Your lineage is <b><?= h($phyStrain) ?></b>
+                  (<?= h($phyStability) ?>).
+                  Check in once per UTC day, exchange resonance, or imprint Unknown Entities to fight decay
+                  (−<?= (int) $phyDecayDaily ?> resonance/day after a one-day grace).
                 </p>
               <?php endif; ?>
               <div class="phyrian-actions">
+                <?php if ($phyIsOrigin && !$phyImprinted): ?>
+                  <form method="post" action="?view=phyrian" style="display:inline">
+                    <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                    <input type="hidden" name="action" value="phyrian_self_seed">
+                    <input type="hidden" name="return_view" value="phyrian">
+                    <button class="btn btn-primary" type="submit">Seed origin strain</button>
+                  </form>
+                <?php endif; ?>
                 <?php if ($phyImprinted): ?>
                   <?php if ($phyCheckedInToday): ?>
                     <span class="meta">Checked in today</span>
@@ -29414,9 +29478,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                   <div class="meta">
                     <?php if ($preqKind === 'imprint'): ?>
-                      Accepting assigns you a strain (origin rolls random; peers transmit their own).
+                      Accepting assigns you their strain (origin seeds first if unmarked, then transmits; peers transmit their own). Gen = parent + 1.
                     <?php else: ?>
-                      Accepting gives both of you +5 resonance (capped at 100).
+                      Accepting gives both of you +5 resonance (capped at 100) and refreshes decay.
                     <?php endif; ?>
                   </div>
                   <div class="tweet-actions">
@@ -29455,6 +29519,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $pdStatus = (string) ($pd['status'] ?? 'unknown');
                   $pdStrain = trim((string) ($pd['strain'] ?? ''));
                   $pdRes = (int) ($pd['resonance'] ?? 0);
+                  $pdGen = (int) ($pd['generation'] ?? 1);
+                  $pdStab = trim((string) ($pd['stability'] ?? ''));
                   $pdImprinted = ($pdStatus === 'imprinted' && $pdStrain !== '');
                   $pdCanImprint = $phyCanOfferImprint && !$pdImprinted;
                   $pdCanResonate = $phyImprinted && $pdImprinted;
@@ -29466,7 +29532,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <div style="min-width:0">
                       <span class="who">@<?= h($pdHandle) ?></span>
                       <?php if ($pdImprinted): ?>
-                        <div class="meta"><?= h($pdStrain) ?> · <?= (int) $pdRes ?> resonance</div>
+                        <div class="meta"><?= h($pdStrain) ?> · gen <?= (int) $pdGen ?> · <?= (int) $pdRes ?> resonance<?= $pdStab !== '' ? ' · ' . h($pdStab) : '' ?></div>
                       <?php else: ?>
                         <div class="meta">Unknown Entity</div>
                       <?php endif; ?>
