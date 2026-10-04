@@ -103,23 +103,9 @@ foreach ($jobs as $job) {
     $types = $job['types'];
     $t0 = microtime(true);
     try {
-        $meta = $inspectJob($ownerId, $jobLimit, $types);
-        if ($meta['fresh']) {
-            $ms = (int) round((microtime(true) - $t0) * 1000);
-            fwrite(STDOUT, sprintf(
-                "owner=%d job=%s skip_fresh age=%d refresh=%d ms=%d\n",
-                $ownerId,
-                $label,
-                (int) $meta['age'],
-                $refreshSecs,
-                $ms
-            ));
-            $skipped++;
-            $ok++;
-            continue;
-        }
-
         $deriveFrom = isset($job['derive_from']) ? (string) $job['derive_from'] : '';
+        // If the parent job rebuilt this tick, always re-derive (don't skip_fresh
+        // a stale sibling while all40 is newer).
         if ($deriveFrom !== '' && isset($built[$deriveFrom]) && is_array($built[$deriveFrom])) {
             $items = array_slice($built[$deriveFrom], 0, $jobLimit);
             ap_masto_notifications_list_cache_put($ownerId, $jobLimit, $items, $types, [], 'vaak-worker-live');
@@ -136,6 +122,22 @@ foreach ($jobs as $job) {
             $derived++;
             $ok++;
             $built[$label] = $items;
+            continue;
+        }
+
+        $meta = $inspectJob($ownerId, $jobLimit, $types);
+        if ($meta['fresh']) {
+            $ms = (int) round((microtime(true) - $t0) * 1000);
+            fwrite(STDOUT, sprintf(
+                "owner=%d job=%s skip_fresh age=%d refresh=%d ms=%d\n",
+                $ownerId,
+                $label,
+                (int) $meta['age'],
+                $refreshSecs,
+                $ms
+            ));
+            $skipped++;
+            $ok++;
             continue;
         }
 

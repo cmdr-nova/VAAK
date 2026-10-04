@@ -35,6 +35,8 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_NOTIF_RUST_PRIMARY` | `1` (PHP) | longer stampede wait + stale file preference for Rust-covered owners |
 | `VAAK_NOTIF_RUST_OWNER_ID` | `0` (PHP) | `0` = all local users covered by Rust loop; positive = single-owner long-stale shortcut only |
 | `VAAK_NOTIF_LIST_RUST_PRIMARY` | `1` (PHP) | Mentions list Redis fresh 120s / stale 600s; skip request-path stale rebuild + look-ahead on cache hit |
+| `VAAK_NOTIF_AXUM_PRIMARY` | `1` (PHP) | Mentions M5: `admin_notifications_page` reads localhost Axum `/api/v1/notifications` first; PHP Redis/hydrate fallback on miss |
+| `VAAK_SHADOW_HTTP` | `http://127.0.0.1:8787` | Axum shadow base for Mentions M5 proxy (loopback only) |
 | `VAAK_RANKED_RUST_PRIMARY` | `1` (default in materializer) | ranked-warm tags Redis `source=vaak-worker-live` with longer TTL trust |
 | `VAAK_API_ROOT` | `/srv/mkultra/html/api` | notif-list / ranked-warm PHP materializer path |
 | `VAAK_PHP_BIN` | `/usr/bin/php` | materializer spawn |
