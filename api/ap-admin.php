@@ -1242,9 +1242,7 @@ $vaakAdminOnlyActions = [
             $rssItem = ($rssItemId > 0 && function_exists('ap_rss_item_by_id'))
                 ? ap_rss_item_by_id($rssItemId, $vaakOwnerId)
                 : null;
-            if ($action === 'reblog_status' || $action === 'unreblog_status') {
-                $error = 'RSS items cannot be boosted.';
-            } elseif (!is_array($rssItem)) {
+            if (!is_array($rssItem)) {
                 $error = 'RSS item not found.';
             } else {
                 $statusId = function_exists('ap_rss_local_status_id')
@@ -1256,7 +1254,7 @@ $vaakAdminOnlyActions = [
                     ap_masto_favourite_add($statusId, $objectId, null, null, $vaakOwnerId);
                     $interactOk = true;
                     $interactActive = true;
-                    $notice = 'Favourited.';
+                    $notice = 'Favourited (VAAK only — not federated).';
                 } elseif ($action === 'unfavourite_status') {
                     $interactKind = 'favourite';
                     ap_masto_favourite_remove($statusId, $vaakOwnerId, $objectId);
@@ -1268,7 +1266,36 @@ $vaakAdminOnlyActions = [
                     ap_masto_bookmark_add($statusId, $objectId, $vaakOwnerId);
                     $interactOk = true;
                     $interactActive = true;
-                    $notice = 'Bookmarked.';
+                    $notice = 'Bookmarked (VAAK only — not federated).';
+                } elseif ($action === 'reblog_status' || $action === 'unreblog_status') {
+                    // Local-only boost — never Announce / never invent an RSS actor.
+                    $interactKind = 'reblog';
+                    if ($action === 'reblog_status') {
+                        $boostId = 'rss-boost:' . $rssItemId;
+                        $announceId = 'local:rss-boost:' . $rssItemId . ':' . (int) $vaakOwnerId;
+                        $rb = ap_masto_reblog_add(
+                            $statusId,
+                            $boostId,
+                            $objectId,
+                            null,
+                            $announceId,
+                            $vaakOwnerId
+                        );
+                        $interactOk = !empty($rb['ok']);
+                        $interactActive = $interactOk;
+                        $notice = $interactOk
+                            ? 'Boosted (VAAK only — not federated).'
+                            : (string) ($rb['error'] ?? 'Could not boost RSS item.');
+                        if (!$interactOk) {
+                            $error = $notice;
+                            $notice = null;
+                        }
+                    } else {
+                        ap_masto_reblog_remove($statusId, $vaakOwnerId);
+                        $interactOk = true;
+                        $interactActive = false;
+                        $notice = 'Removed boost.';
+                    }
                 } else { // unbookmark_status
                     $interactKind = 'bookmark';
                     ap_masto_bookmark_remove($statusId, $vaakOwnerId, $objectId);
@@ -4581,7 +4608,58 @@ $vaakAdminOnlyActions = [
                 }
             }
         } elseif ($action === 'rss_boost' || $action === 'rss_quote') {
-            $error = 'Boost and quote are not available on RSS items (they would publish as you).';
+            // Local-only — same synthetic rss:{id} keys as fav/bookmark; never federate.
+            $itemId = (int) ($_POST['item_id'] ?? 0);
+            $item = function_exists('ap_rss_item_by_id') ? ap_rss_item_by_id($itemId, $ownerId) : null;
+            if (!is_array($item)) {
+                $error = 'RSS item not found.';
+            } else {
+                $statusId = ap_rss_local_status_id($itemId);
+                if ($action === 'rss_boost') {
+                    $isBoosted = function_exists('ap_masto_status_is_reblogged')
+                        && ap_masto_status_is_reblogged($statusId, $ownerId);
+                    if ($isBoosted) {
+                        ap_masto_reblog_remove($statusId, $ownerId);
+                        $notice = 'Removed boost.';
+                    } else {
+                        $rb = ap_masto_reblog_add(
+                            $statusId,
+                            'rss-boost:' . $itemId,
+                            $statusId,
+                            null,
+                            'local:rss-boost:' . $itemId . ':' . $ownerId,
+                            $ownerId
+                        );
+                        if (!empty($rb['ok'])) {
+                            $notice = 'Boosted (VAAK only — not federated).';
+                        } else {
+                            $error = (string) ($rb['error'] ?? 'Could not boost RSS item.');
+                        }
+                    }
+                } else { // rss_quote — local marker (rss-quote:{id}), never federates.
+                    $quoteStatusId = 'rss-quote:' . $itemId;
+                    $isQuoted = function_exists('ap_masto_status_is_reblogged')
+                        && ap_masto_status_is_reblogged($quoteStatusId, $ownerId);
+                    if ($isQuoted) {
+                        ap_masto_reblog_remove($quoteStatusId, $ownerId);
+                        $notice = 'Removed quote boost.';
+                    } else {
+                        $rb = ap_masto_reblog_add(
+                            $quoteStatusId,
+                            'rss-quote-boost:' . $itemId,
+                            $statusId,
+                            null,
+                            'local:rss-quote:' . $itemId . ':' . $ownerId,
+                            $ownerId
+                        );
+                        if (!empty($rb['ok'])) {
+                            $notice = 'Quote boosted (VAAK only — not federated).';
+                        } else {
+                            $error = (string) ($rb['error'] ?? 'Could not quote-boost RSS item.');
+                        }
+                    }
+                }
+            }
         } elseif ($action === 'rss_cleanup_mirrors') {
             $view = 'rss';
             $res = ap_rss_cleanup_mirror_notes($ownerId);
@@ -5201,6 +5279,22 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
             if ($viewerId > 0 && function_exists('ap_masto_trend_item_hidden')
                 && ap_masto_trend_item_hidden($candidate, $viewerId)) {
                 continue;
+            }
+            // Skip bare-domain link cards (host only, no title/path context).
+            if ($kind === 'links') {
+                $candUrl = trim((string) ($candidate['url'] ?? ''));
+                $candTitle = trim((string) ($candidate['title'] ?? ''));
+                $candPath = $candUrl !== '' ? (string) (parse_url($candUrl, PHP_URL_PATH) ?: '') : '';
+                $candHost = $candUrl !== '' ? strtolower((string) (parse_url($candUrl, PHP_URL_HOST) ?: '')) : '';
+                $titleUseful = $candTitle !== ''
+                    && $candTitle !== $candUrl
+                    && !str_starts_with($candTitle, 'http://')
+                    && !str_starts_with($candTitle, 'https://')
+                    && strcasecmp($candTitle, $candHost) !== 0;
+                $pathUseful = $candPath !== '' && $candPath !== '/';
+                if (!$titleUseful && !$pathUseful) {
+                    continue;
+                }
             }
             $items[] = $candidate;
             if (count($items) >= $limit) {
@@ -14582,7 +14676,11 @@ function admin_render_masto_status_card(
     $favObject = $isRss ? ($sid !== '' ? $sid : null) : ($uri !== '' ? $uri : null);
     $fav = ($sid !== '' || $favObject !== null) && function_exists('ap_masto_status_is_favourited')
         && ap_masto_status_is_favourited($sid, null, $favObject);
-    $boosted = !$isRss && $sid !== '' && function_exists('ap_masto_status_is_reblogged') && ap_masto_status_is_reblogged($sid);
+    $boosted = $sid !== '' && function_exists('ap_masto_status_is_reblogged') && ap_masto_status_is_reblogged($sid);
+    $rssQuoted = false;
+    if ($isRss && $rssItemId > 0 && function_exists('ap_masto_status_is_reblogged')) {
+        $rssQuoted = ap_masto_status_is_reblogged('rss-quote:' . $rssItemId);
+    }
     $bm = ($sid !== '' || $favObject !== null) && function_exists('ap_masto_status_is_bookmarked')
         && ap_masto_status_is_bookmarked($sid, null, $favObject);
     $isLocal = !$isRss && !$isBsky && $uri !== '' && vaak_is_own_url($uri);
@@ -15076,7 +15174,22 @@ function admin_render_masto_status_card(
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                   <input type="hidden" name="object_id" value="<?= h($sid) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like (VAAK only)' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                </form>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="rss_quote">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="item_id" value="<?= (int) $rssItemId ?>">
+                  <button class="icon-btn<?= !empty($rssQuoted) ? ' on' : '' ?>" type="submit" title="<?= !empty($rssQuoted) ? 'Remove quote boost (VAAK only)' : 'Quote boost (VAAK only)' ?>" aria-label="<?= !empty($rssQuoted) ? 'Remove quote boost' : 'Quote boost' ?>" aria-pressed="<?= !empty($rssQuoted) ? 'true' : 'false' ?>"><i class="ph ph-quotes" aria-hidden="true"></i></button>
+                </form>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="<?= $boosted ? 'unreblog_status' : 'reblog_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($sid) ?>">
+                  <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost (VAAK only)' : 'Boost (VAAK only)' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $boosted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
                 </form>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
