@@ -4744,6 +4744,217 @@ function ap_masto_mention_is_bluesky(array $row): bool
     return false;
 }
 
+/**
+ * Resolve a Bluesky handle/DID/profile URL to a linked VAAK owner_user_id (0 if none).
+ */
+function ap_masto_notif_bsky_owner_user_id(string $handleOrDidOrUrl): int
+{
+    $ref = trim($handleOrDidOrUrl);
+    if ($ref === '') {
+        return 0;
+    }
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $ref, $m)) {
+        $ref = rawurldecode($m[1]);
+    }
+    $ref = ltrim($ref, '@');
+    if ($ref === '') {
+        return 0;
+    }
+    static $cache = [];
+    $cacheKey = strtolower($ref);
+    if (array_key_exists($cacheKey, $cache)) {
+        return $cache[$cacheKey];
+    }
+    try {
+        if (str_starts_with($ref, 'did:')) {
+            $st = ap_db()->prepare('SELECT owner_user_id FROM bsky_sessions WHERE did = ? LIMIT 1');
+            $st->execute([$ref]);
+        } else {
+            $st = ap_db()->prepare(
+                'SELECT owner_user_id FROM bsky_sessions
+                 WHERE lower(handle) = lower(?) OR lower(handle) = lower(?)
+                 LIMIT 1'
+            );
+            $st->execute([$ref, ltrim($ref, '@')]);
+        }
+        $uid = (int) ($st->fetchColumn() ?: 0);
+        $cache[$cacheKey] = $uid;
+        return $uid;
+    } catch (Throwable $e) {
+        $cache[$cacheKey] = 0;
+        return 0;
+    }
+}
+
+/**
+ * Stable identity key for Mentions twin-identity dedupe.
+ * Linked Fedi + Bluesky accounts for the same VAAK user share one key.
+ */
+function ap_masto_notif_actor_identity_key(string $actorId): string
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return 'unknown';
+    }
+    if (preg_match('~^https://mkultra\.monster/users/([^/?#]+)$~i', $actorId, $m)) {
+        $uid = function_exists('ap_db_owner_user_id_for_actor')
+            ? ap_db_owner_user_id_for_actor($actorId)
+            : 0;
+        if ($uid > 0) {
+            return 'vaak:' . $uid;
+        }
+        return 'vaak:' . strtolower((string) $m[1]);
+    }
+    if (str_starts_with($actorId, 'https://bsky.app/') || str_starts_with($actorId, 'did:')) {
+        $uid = ap_masto_notif_bsky_owner_user_id($actorId);
+        if ($uid > 0) {
+            return 'vaak:' . $uid;
+        }
+        if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorId, $m)) {
+            return 'bsky:' . strtolower(rawurldecode($m[1]));
+        }
+        if (str_starts_with($actorId, 'did:')) {
+            return 'bsky:' . strtolower($actorId);
+        }
+    }
+    return 'actor:' . strtolower($actorId);
+}
+
+/**
+ * Canonical status URI for Mentions like/boost grouping across Fedi/Bluesky twins.
+ */
+function ap_masto_notif_canonical_status_key(string $statusUri, int $ownerUserId = 0): string
+{
+    $statusUri = rtrim(trim($statusUri), '/');
+    if ($statusUri === '') {
+        return '';
+    }
+    if (str_starts_with($statusUri, 'https://mkultra.monster/users/')
+        && str_contains($statusUri, '/notes/')) {
+        return $statusUri;
+    }
+    $probe = $statusUri;
+    if (str_starts_with($statusUri, 'https://bsky.app/')
+        && function_exists('ap_bsky_at_uri_from_any_url')) {
+        $at = ap_bsky_at_uri_from_any_url($statusUri);
+        if (is_string($at) && str_starts_with($at, 'at://')) {
+            $probe = $at;
+        }
+    }
+    if ((str_starts_with($probe, 'at://') || str_starts_with($statusUri, 'https://bsky.app/'))
+        && function_exists('ap_bsky_local_note_id_for_at_uri')) {
+        $twin = ap_bsky_local_note_id_for_at_uri($probe, $ownerUserId, false);
+        if (is_string($twin) && str_starts_with($twin, 'https://')) {
+            return rtrim($twin, '/');
+        }
+    }
+    if (str_starts_with($probe, 'at://') && function_exists('ap_bsky_crosspost_by_uri')) {
+        $xp = ap_bsky_crosspost_by_uri($probe);
+        if (is_array($xp)) {
+            $note = rtrim((string) ($xp['note_id'] ?? ''), '/');
+            if ($note !== '' && str_starts_with($note, 'https://')) {
+                return $note;
+            }
+        }
+    }
+    return $statusUri;
+}
+
+/**
+ * Drop Bluesky like/boost mention rows that duplicate a linked local VAAK
+ * identity's action on the same (twin) status. Presentation + API fetch share
+ * this so Mentions and Ice Cubes stay consistent.
+ *
+ * @param list<array{sort:int|float,kind:string,row:array}> $items
+ * @return list<array{sort:int|float,kind:string,row:array}>
+ */
+function ap_masto_notifications_dedupe_twin_actions(array $items): array
+{
+    $best = [];
+    $drop = [];
+    foreach ($items as $i => $item) {
+        if (!is_array($item) || (string) ($item['kind'] ?? '') !== 'mention') {
+            continue;
+        }
+        $row = is_array($item['row'] ?? null) ? $item['row'] : null;
+        if ($row === null) {
+            continue;
+        }
+        $type = ap_masto_mention_notif_type($row);
+        if (!in_array($type, ['favourite', 'reblog'], true)) {
+            continue;
+        }
+        $actorId = (string) ($row['actor_id'] ?? '');
+        $ident = ap_masto_notif_actor_identity_key($actorId);
+        // Only collapse when the actor maps to a linked VAAK user.
+        if (!str_starts_with($ident, 'vaak:')) {
+            continue;
+        }
+        $target = ap_masto_mention_target_object_id((string) ($row['object_id'] ?? ''));
+        $canon = ap_masto_notif_canonical_status_key(
+            $target,
+            (int) ($row['owner_user_id'] ?? 0)
+        );
+        if ($canon === '') {
+            continue;
+        }
+        $key = $type . ':' . $canon . ':' . $ident;
+        $isBsky = ap_masto_mention_is_bluesky($row);
+        if (!isset($best[$key])) {
+            $best[$key] = ['i' => $i, 'bsky' => $isBsky];
+            continue;
+        }
+        $prev = $best[$key];
+        if ($isBsky && !$prev['bsky']) {
+            $drop[$i] = true;
+            continue;
+        }
+        if (!$isBsky && $prev['bsky']) {
+            $drop[$prev['i']] = true;
+            $best[$key] = ['i' => $i, 'bsky' => false];
+            continue;
+        }
+        // Same class (both local or both Bluesky): keep the first (newer in DESC scan).
+        $drop[$i] = true;
+    }
+    if ($drop === []) {
+        return $items;
+    }
+    // Self-heal: soft-delete dropped Bluesky twin echoes so later Mentions
+    // pages cannot resurrect them once the local row ages out of the window.
+    if (function_exists('ap_mention_soft_delete_interaction')) {
+        foreach ($drop as $di => $_) {
+            $drow = is_array($items[$di]['row'] ?? null) ? $items[$di]['row'] : null;
+            if ($drow === null || !ap_masto_mention_is_bluesky($drow)) {
+                continue;
+            }
+            $dtype = ap_masto_mention_notif_type($drow);
+            $dkind = $dtype === 'reblog' ? 'reblog' : 'like';
+            $dtarget = ap_masto_mention_target_object_id((string) ($drow['object_id'] ?? ''));
+            $dactor = (string) ($drow['actor_id'] ?? '');
+            if ($dtarget !== '' && $dactor !== '') {
+                try {
+                    ap_mention_soft_delete_interaction(
+                        $dactor,
+                        $dtarget,
+                        $dkind,
+                        trim((string) ($drow['activity_id'] ?? '')) ?: null
+                    );
+                } catch (Throwable $e) {
+                    // best-effort
+                }
+            }
+        }
+    }
+    $out = [];
+    foreach ($items as $i => $item) {
+        if (!isset($drop[$i])) {
+            $out[] = $item;
+        }
+    }
+    return $out;
+}
+
 function ap_masto_mention_notif_type(array $row): ?string
 {
     $activity = strtolower((string) ($row['activity_type'] ?? ''));
@@ -5523,6 +5734,10 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             // polls table may be absent on older installs
         }
     }
+
+    // Twin-identity dedupe: one like/boost from a linked Fedi+Bluesky user
+    // collapses to a single notification (prefer the local AP row).
+    $items = ap_masto_notifications_dedupe_twin_actions($items);
 
     // Batch-load known remote actor rows before entity hydration. This keeps
     // Ice Cubes notification requests from repeating one DB lookup per card;
