@@ -18540,9 +18540,21 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
                 if (!str_starts_with($nUrl, 'https://')) {
                     continue;
                 }
+                $nAttType = strtolower((string) ($nAttachment['type'] ?? ''));
+                $nMt = isset($nAttachment['mediaType']) && is_string($nAttachment['mediaType'])
+                    ? (string) $nAttachment['mediaType']
+                    : null;
+                if ($nMt === null || $nMt === '') {
+                    if ($nAttType === 'video' || preg_match('/\.(mp4|webm|m3u8)(\?|#|$)/i', $nUrl)) {
+                        $nMt = 'video/mp4';
+                    } elseif ($nAttType === 'gifv') {
+                        // MP4 gifv → <video loop>; plain .gif → <img> (browser-animated).
+                        $nMt = preg_match('/\.(mp4|webm|m3u8)(\?|#|$)/i', $nUrl) ? 'video/mp4' : 'image/gif';
+                    }
+                }
                 $nMedia[] = [
                     'url' => $nUrl,
-                    'mediaType' => in_array(strtolower((string) ($nAttachment['type'] ?? '')), ['video', 'gifv'], true) ? 'video/mp4' : null,
+                    'mediaType' => $nMt,
                     'preview_url' => (string) ($nAttachment['preview_url'] ?? ''),
                 ];
                 if (count($nMedia) >= 4) {

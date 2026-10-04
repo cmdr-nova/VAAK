@@ -871,6 +871,11 @@ function ap_url_looks_like_status_object(string $url): bool
     if ($host === '' || $path === '' || $path === '/') {
         return false;
     }
+    // Bluesky web permalinks (works even when ap-inbox helpers are not loaded).
+    if (($host === 'bsky.app' || str_ends_with($host, '.bsky.app'))
+        && preg_match('#/profile/[^/]+/post/[A-Za-z0-9_-]+#', $path)) {
+        return true;
+    }
     // Common non-status destinations that show up in QT bodies / link posts.
     if (preg_match(
         '#(?:^|\.)(youtu\.be|youtube\.com|wikipedia\.org|bloomberg\.com|twitter\.com|x\.com|tiktok\.com|instagram\.com|facebook\.com|reddit\.com|twitch\.tv)$#',
@@ -1009,6 +1014,12 @@ function ap_masto_quote_url_from_event_summary(string $summary): ?string
             $push((string) $u, 30);
         }
     }
+    // Bluesky Mentions store "↪ QT https://…" (no colon after QT).
+    if (preg_match_all('/↪\s*QT\s+(https:\/\/[^\s<>]+)/u', $summary, $mm)) {
+        foreach ($mm[1] as $u) {
+            $push((string) $u, 28);
+        }
+    }
     // Other URLs on the QT line / block — often blog/YouTube links inside text.
     if (preg_match_all('/↪\s*QT[^\n]*?(https:\/\/[^\s<>]+)/u', $summary, $mm)) {
         foreach ($mm[1] as $u) {
@@ -1106,13 +1117,25 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
     // allowHiddenActor: quote embeds of people you've blocked/hidden should still
     // resolve when *you* quoted them (otherwise VAAK shows endless "pending").
     $quoted = ap_masto_lookup_status_by_object_url($quoteObjectUrl, $depth + 1, $allowFetch, true);
+    $isBskyQuote = (function_exists('ap_quote_target_is_bluesky') && ap_quote_target_is_bluesky($quoteObjectUrl))
+        || str_starts_with($quoteObjectUrl, 'https://bsky.app/')
+        || str_starts_with($quoteObjectUrl, 'at://')
+        || str_contains($quoteObjectUrl, 'bsky.brid.gy');
+    if ($quoted === null && $isBskyQuote) {
+        // Mentions / thin API paths may not have loaded ap-bsky yet.
+        if (!function_exists('ap_bsky_post_preview_from_url') && is_file(__DIR__ . '/ap-bsky.php')) {
+            require_once __DIR__ . '/ap-bsky.php';
+        }
+    }
     if ($quoted === null
-        && function_exists('ap_quote_target_is_bluesky')
-        && ap_quote_target_is_bluesky($quoteObjectUrl)
+        && $isBskyQuote
         && function_exists('ap_bsky_post_preview_from_url')) {
         // Bluesky quotes are not AS2 — synthesize a minimal status from AppView/cache
         // so Status/Home masto cards aren't stuck on "pending".
         $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+        if ($ownerForBsky < 1) {
+            $ownerForBsky = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        }
         // Timeline/list paints pass allowFetch=false; status detail may fetch.
         $prev = ap_bsky_post_preview_from_url($quoteObjectUrl, $ownerForBsky, $allowFetch);
         if ($prev === null && !$allowFetch && function_exists('ap_bsky_post_preview_warm_enqueue')) {
@@ -4292,21 +4315,27 @@ function ap_masto_status_from_mention(array $row): array
     $i = 0;
     foreach (array_slice($mediaUrlList, 0, 4) as $clean) {
         $i++;
-        $isGif = (bool) preg_match('/\.gif(\?|#|$)/i', $clean)
+        $anim = function_exists('ap_masto_animated_media_from_url')
+            ? ap_masto_animated_media_from_url($clean, $clean)
+            : ['url' => $clean, 'preview_url' => $clean, 'type' => 'image', 'mediaType' => null];
+        $isGif = ($anim['type'] ?? '') === 'gifv'
+            || (bool) preg_match('/\.gif(\?|#|$)/i', $clean)
             || str_contains(strtolower($clean), 'tenor.com')
             || str_contains(strtolower($clean), 'giphy.com')
             || str_contains(strtolower($clean), 'klipy.com');
+        $attType = ($anim['type'] ?? 'image') === 'gifv' || $isGif ? 'gifv' : (string) ($anim['type'] ?? 'image');
         $media[] = [
             'id' => (string) (2000000 + $mentionId) . $i,
-            'type' => 'image',
-            'url' => $clean,
-            'preview_url' => $clean,
+            'type' => $attType,
+            'url' => (string) ($anim['url'] ?? $clean),
+            'preview_url' => (string) ($anim['preview_url'] ?? $clean),
             'remote_url' => $clean,
             'preview_remote_url' => null,
             'text_url' => null,
             'meta' => null,
-            'description' => $isGif ? 'GIF' : null,
+            'description' => $isGif || $attType === 'gifv' ? 'GIF' : null,
             'blurhash' => null,
+            'mediaType' => $anim['mediaType'] ?? ($attType === 'gifv' ? 'image/gif' : null),
         ];
     }
     $inReplyTo = (string) ($row['in_reply_to'] ?? '');
@@ -4464,6 +4493,47 @@ function ap_masto_status_from_mention(array $row): array
     }
     $spoilerText = trim((string) ($row['spoiler_text'] ?? ''));
     $isSensitive = !empty($row['sensitive']) || $spoilerText !== '';
+    // Quote Mentions (Bluesky + Fedi) often only carry the target as "↪ QT …"
+    // in content. Attach a structured quote so Mentions paint the same nested
+    // card as timelines, then strip the raw QT block from the body.
+    $quoteEnt = null;
+    $quoteObjectUrl = null;
+    $rawContentForQuote = (string) ($row['content'] ?? '');
+    if (function_exists('ap_masto_quote_entity')
+        && (str_contains($rawContentForQuote, '↪ QT') || str_contains($rawContentForQuote, '↪QT')
+            || str_contains($text, '↪ QT') || str_contains($text, '↪QT'))) {
+        $quoteObjectUrl = ap_masto_quote_url_from_event_summary($rawContentForQuote);
+        if (($quoteObjectUrl === null || $quoteObjectUrl === '') && $text !== $rawContentForQuote) {
+            $quoteObjectUrl = ap_masto_quote_url_from_event_summary($text);
+        }
+        if (is_string($quoteObjectUrl) && str_starts_with($quoteObjectUrl, 'https://')) {
+            // Mentions paint: treat as authorized so Bluesky/local twins resolve.
+            $quoteEnt = ap_masto_quote_entity($quoteObjectUrl, 0, false, true);
+        }
+    }
+    $bodyContent = $pack['content'];
+    if (is_array($quoteEnt)) {
+        $plainBody = trim(html_entity_decode(strip_tags((string) $bodyContent), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if ($plainBody !== '' && (str_contains($plainBody, '↪ QT') || str_contains($plainBody, '↪QT'))) {
+            $commentary = $plainBody;
+            if (preg_match('/^(.*?)(?:\n\n|\n)↪\s*QT.*$/us', $plainBody, $cm)) {
+                $commentary = trim((string) ($cm[1] ?? ''));
+            } elseif (preg_match('/^↪\s*QT/u', $plainBody)) {
+                $commentary = '';
+            }
+            $commentary = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $commentary) ?? $commentary;
+            $commentary = trim($commentary);
+            if ($commentary === '') {
+                $bodyContent = '';
+            } else {
+                $escaped = htmlspecialchars($commentary, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                $bodyContent = '<p>' . nl2br($escaped) . '</p>';
+            }
+        }
+    }
+    // Skip link-preview cards when a structured quote owns the QT URL, or when
+    // outer media (incl. animated GIF) already fills the attachment slot.
+    $cardSource = is_array($quoteEnt) ? $bodyContent : (string) ($row['content'] ?? '');
     $status = [
         'id' => ap_masto_mention_status_id($mentionId, isset($row['created_at']) ? (string) $row['created_at'] : null),
         'created_at' => ap_masto_format_time(isset($row['created_at']) ? (string) $row['created_at'] : null),
@@ -4485,7 +4555,7 @@ function ap_masto_status_from_mention(array $row): array
         'muted' => false,
         'bookmarked' => false,
         'pinned' => false,
-        'content' => $pack['content'],
+        'content' => $bodyContent,
         'reblog' => null,
         'application' => null,
         'account' => $account,
@@ -4493,17 +4563,20 @@ function ap_masto_status_from_mention(array $row): array
         'mentions' => $pack['mentions'],
         'tags' => $pack['tags'] ?? [],
         'emojis' => [],
-        'card' => ap_masto_remote_link_card((string) ($row['content'] ?? ''), count($media) > 0),
+        'card' => ap_masto_remote_link_card($cardSource, count($media) > 0 || is_array($quoteEnt)),
         'poll' => null,
         // Explicit null prevents clients from carrying a stale native quote
         // card across status updates when this remote post has no quote.
-        'quote' => null,
+        'quote' => is_array($quoteEnt) ? $quoteEnt : null,
         'quote_approval' => [
             'automatic' => ['public'],
             'manual' => [],
             'current_user' => 'automatic',
         ],
     ];
+    if (is_array($quoteEnt) && is_string($quoteObjectUrl) && $quoteObjectUrl !== '') {
+        $status['quote_url'] = $quoteObjectUrl;
+    }
     $status = ap_masto_apply_interaction_flags($status);
     return function_exists('ap_normalize_status')
         ? ap_normalize_status($status)
@@ -9677,6 +9750,72 @@ function ap_masto_trends_is_status_object_url(string $objectId): bool
  *
  * @return list<array<string,mixed>>
  */
+/**
+ * Prefer a playable animated URL for Bluesky/Tenor/Klipy/Giphy GIF embeds.
+ *
+ * @return array{url:string,preview_url:string,type:string,mediaType:?string}
+ */
+function ap_masto_animated_media_from_url(string $url, string $preview = ''): array
+{
+    $url = trim($url);
+    $preview = trim($preview);
+    $lower = strtolower($url);
+    $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?? ''));
+    $query = (string) (parse_url($url, PHP_URL_QUERY) ?? '');
+    $playUrl = $url;
+    $type = 'image';
+    $mediaType = null;
+
+    // Klipy: .gif?mp4=ID → sibling /ID.mp4 is the looping video.
+    if (str_contains($lower, 'klipy.com') && $query !== ''
+        && preg_match('/(?:^|&)mp4=([^&]+)/i', $query, $m)) {
+        $dir = preg_replace('~/[^/]+$~', '/', (string) (parse_url($url, PHP_URL_PATH) ?? '')) ?: '/';
+        $host = (string) (parse_url($url, PHP_URL_SCHEME) ?? 'https') . '://'
+            . (string) (parse_url($url, PHP_URL_HOST) ?? 'static.klipy.com');
+        $mp4Id = rawurldecode($m[1]);
+        if ($mp4Id !== '') {
+            $playUrl = $host . $dir . rawurlencode($mp4Id) . '.mp4';
+            $type = 'gifv';
+            $mediaType = 'video/mp4';
+            if ($preview === '' || !str_starts_with($preview, 'https://')) {
+                $preview = $url;
+            }
+            return [
+                'url' => $playUrl,
+                'preview_url' => $preview,
+                'type' => $type,
+                'mediaType' => $mediaType,
+            ];
+        }
+    }
+
+    if (str_ends_with($path, '.gif')
+        || str_contains($lower, 'tenor.com')
+        || str_contains($lower, 'giphy.com')
+        || str_contains($lower, 'klipy.com')) {
+        $type = 'gifv';
+        $mediaType = str_ends_with($path, '.gif') ? 'image/gif' : 'image/gif';
+        // Prefer a same-path .mp4 sibling when the host serves one (Klipy/Tenor-ish).
+        if (str_ends_with($path, '.gif')) {
+            $mp4Sibling = preg_replace('/\.gif$/i', '.mp4', $url);
+            if (is_string($mp4Sibling) && $mp4Sibling !== $url && str_contains($lower, 'klipy.com')) {
+                $playUrl = preg_replace('/\?.*$/', '', $mp4Sibling) ?? $mp4Sibling;
+                $mediaType = 'video/mp4';
+                if ($preview === '') {
+                    $preview = $url;
+                }
+            }
+        }
+    }
+
+    return [
+        'url' => $playUrl,
+        'preview_url' => str_starts_with($preview, 'https://') ? $preview : $url,
+        'type' => $type,
+        'mediaType' => $mediaType,
+    ];
+}
+
 function ap_masto_bsky_media_attachments(array $post, string $statusId): array
 {
     $embed = is_array($post['embed'] ?? null)
@@ -9710,19 +9849,57 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
         $previewUrl = function_exists('ap_remote_post_media_resolve')
             ? ap_remote_post_media_resolve($preview)
             : $preview;
+        $anim = ap_masto_animated_media_from_url($displayUrl, $previewUrl);
         $out[] = [
             'id' => $statusId . '#media-' . (++$n),
-            'type' => 'image',
-            'url' => $displayUrl,
-            'preview_url' => str_starts_with($previewUrl, 'https://') ? $previewUrl : $displayUrl,
+            'type' => $anim['type'],
+            'url' => $anim['url'],
+            'preview_url' => $anim['preview_url'],
             'remote_url' => $url,
             'text_url' => $url,
-            'description' => (string) ($image['alt'] ?? ''),
+            'description' => (string) ($image['alt'] ?? ($anim['type'] === 'gifv' ? 'GIF' : '')),
             'meta' => [],
             'blurhash' => null,
+            'mediaType' => $anim['mediaType'],
+        ];
+    };
+    $pushExternalGif = static function (array $source) use (&$out, &$n, $statusId): void {
+        $ext = is_array($source['external'] ?? null) ? $source['external'] : null;
+        if ($ext === null) {
+            return;
+        }
+        $uri = trim((string) ($ext['uri'] ?? ''));
+        if ($uri === '' || !str_starts_with($uri, 'https://')) {
+            return;
+        }
+        $looksMedia = function_exists('ap_bsky_url_looks_like_media')
+            ? ap_bsky_url_looks_like_media($uri)
+            : (bool) preg_match('/\.(gif|png|jpe?g|webp|mp4|webm)(\?|#|$)/i', $uri);
+        if (!$looksMedia) {
+            return;
+        }
+        $thumb = trim((string) ($ext['thumb'] ?? ''));
+        if (is_array($ext['thumb'] ?? null)) {
+            $thumb = '';
+        }
+        $anim = ap_masto_animated_media_from_url($uri, $thumb);
+        $out[] = [
+            'id' => $statusId . '#media-' . (++$n),
+            'type' => $anim['type'] === 'image' ? 'gifv' : $anim['type'],
+            'url' => $anim['url'],
+            'preview_url' => $anim['preview_url'],
+            'remote_url' => $uri,
+            'text_url' => $uri,
+            'description' => trim((string) ($ext['title'] ?? $ext['description'] ?? 'GIF')) ?: 'GIF',
+            'meta' => [],
+            'blurhash' => null,
+            'mediaType' => $anim['mediaType'] ?? 'image/gif',
         ];
     };
     foreach ($sources as $source) {
+        if (!is_array($source)) {
+            continue;
+        }
         // Prefer one image list: gallery items[] OR images[] (compact may mirror
         // both; counting both doubled 4-image galleries to 8 attachments).
         $imageList = [];
@@ -9758,6 +9935,15 @@ function ap_masto_bsky_media_attachments(array $post, string $statusId): array
                 'blurhash' => null,
             ];
             if (count($out) >= 4) {
+                return $out;
+            }
+        }
+        // Bluesky GIFs are often external embeds (Tenor/Klipy/Giphy), including
+        // as the media side of recordWithMedia quote-boosts.
+        if ($out === [] || str_contains($srcType, 'external') || isset($source['external'])) {
+            $before = count($out);
+            $pushExternalGif($source);
+            if (count($out) > $before && count($out) >= 4) {
                 return $out;
             }
         }
