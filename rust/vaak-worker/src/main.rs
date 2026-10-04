@@ -1,6 +1,7 @@
 //! VAAK Rust workers — shadow + live cutover (notif badge/list, ranked warm, thin-media, actor warm).
 
 mod action_queue;
+mod ap_actor_warm;
 mod config;
 mod db;
 mod hidden;
@@ -139,6 +140,22 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
         #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 180)]
+        scan_interval_secs: u64,
+    },
+    /// Fediverse (AP) actor warm: drain Redis queue + PG flat backfill (signed fetch via PHP).
+    ApActorWarm {
+        /// Backfill flat Redis from `remote_actors` once (also enqueues thin actors).
+        #[arg(long, default_value_t = false)]
+        backfill_once: bool,
+        /// Drain `vaak:queue:ap_actor_warm` forever (periodic PG flat backfill).
+        #[arg(long, default_value_t = false)]
+        r#loop: bool,
+        /// Warm specific actor URLs once (spawns PHP ap-actor-warm.php), then exit.
+        #[arg(long)]
+        actor: Vec<String>,
+        #[arg(long, default_value_t = 40)]
         limit: usize,
         #[arg(long, default_value_t = 180)]
         scan_interval_secs: u64,
@@ -294,6 +311,23 @@ async fn main() -> Result<()> {
                 actor_warm::run_enqueue_cli(&cfg, limit).await?;
             } else {
                 anyhow::bail!("actor-warm requires --loop, --enqueue-once, or --actor");
+            }
+        }
+        Command::ApActorWarm {
+            backfill_once,
+            r#loop,
+            actor,
+            limit,
+            scan_interval_secs,
+        } => {
+            if r#loop {
+                ap_actor_warm::run_worker_loop(&cfg, scan_interval_secs).await?;
+            } else if !actor.is_empty() {
+                ap_actor_warm::run_once_cli(&cfg, &actor).await?;
+            } else if backfill_once {
+                ap_actor_warm::run_backfill_cli(&cfg, limit).await?;
+            } else {
+                anyhow::bail!("ap-actor-warm requires --loop, --backfill-once, or --actor");
             }
         }
         Command::TimelineHome { owner_id, limit } => {
