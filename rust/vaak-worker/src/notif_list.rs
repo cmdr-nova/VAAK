@@ -2,8 +2,11 @@
 //!
 //! Warm path (10.5): prefer native Rust materialize from
 //! `ap_notification_projection` → Redis `vaak:notifications:v1:{owner}:{hash}`.
-//! PHP `notif-list-warm.php` remains fallback when projection cannot fill a
-//! full page. Axum `:8787` reads the same Redis keys (M3/M5).
+//! PHP `notif-list-warm.php` remains rare cold-start fallback when projection
+//! cannot fill and no confirmed warm envelope exists. Quiet accounts that
+//! already have an empty `vaak-worker-projection` / `vaak-worker-live`
+//! envelope skip-fresh (0.6.52) so PHP is not respawned every tick.
+//! Axum `:8787` reads the same Redis keys (M3/M5).
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -102,15 +105,23 @@ async fn redis_list_age(
     let Some(payload) = cached else {
         return Ok(None);
     };
-    // Empty envelopes are never "fresh" — a prior projection poison or cold
-    // account must rebuild (PHP fallback when projection is thin).
     let items_empty = payload
         .get("items")
         .and_then(|v| v.as_array())
         .map(|a| a.is_empty())
         .unwrap_or(true);
     if items_empty {
-        return Ok(None);
+        // 0.6.43: never treat *unknown* empty as fresh (thin-projection poison).
+        // 0.6.52: empty envelopes from a confirmed warm (`vaak-worker-projection`
+        // or `vaak-worker-live`) are authoritative quiet-account pages — skip
+        // so we do not respawn PHP every tick.
+        let source = payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if source != "vaak-worker-projection" && source != "vaak-worker-live" {
+            return Ok(None);
+        }
     }
     let ts = payload.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
     if ts < 1 {
@@ -301,6 +312,35 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
                 ));
             }
             None => {
+                // Quiet account: prior warm already confirmed empty. Re-stamp as
+                // projection instead of spawning PHP every refresh window.
+                if let Some(prior) = redis_util::json_get(&mut redis, &key).await? {
+                    let prior_empty = prior
+                        .get("items")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true);
+                    let prior_source = prior
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if prior_empty
+                        && (prior_source == "vaak-worker-projection"
+                            || prior_source == "vaak-worker-live")
+                    {
+                        if job.label == "all40" {
+                            all40_items = Some(Vec::new());
+                        }
+                        write_list_envelope(&mut redis, &key, Vec::new()).await?;
+                        native_ok += 1;
+                        lines.push(format!(
+                            "owner={owner_user_id} job={} quiet_restamp ms={}",
+                            job.label,
+                            t0.elapsed().as_millis()
+                        ));
+                        continue;
+                    }
+                }
                 need_php = true;
                 lines.push(format!(
                     "owner={owner_user_id} job={} projection_incomplete ms={}",
@@ -514,10 +554,23 @@ pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limi
         for owner in owners {
             match warm_owner(cfg, owner, limit).await {
                 Ok(body) => {
+                    // Prefer the Rust summary (`native=` / `php=`) over the PHP
+                    // materializer trailer (`warm_fail=`), which is appended after
+                    // fallback and used to mask php=1 in logs.
                     let summary = body
                         .lines()
                         .rev()
-                        .find(|l| l.starts_with("owner=") && l.contains("total_ms="))
+                        .find(|l| {
+                            l.starts_with("owner=")
+                                && l.contains("total_ms=")
+                                && l.contains("native=")
+                                && l.contains("php=")
+                        })
+                        .or_else(|| {
+                            body.lines().rev().find(|l| {
+                                l.starts_with("owner=") && l.contains("total_ms=")
+                            })
+                        })
                         .or_else(|| body.lines().last())
                         .unwrap_or("ok");
                     tracing::info!(owner, %summary, "notif-list warm ok");

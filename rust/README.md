@@ -3,7 +3,7 @@
 | Command | Mode | Role |
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
-| `notif-list --loop --owner-id 0` | **LIVE** | Mentions list warm — **native projection→Redis** first (`ap_notification_projection`); PHP `notif-list-warm.php` only when projection cannot fill (10.5) |
+| `notif-list --loop --owner-id 0` | **LIVE** | Mentions list warm — **native projection→Redis** first; quiet confirmed-empty envelopes skip/restamp (0.6.52); PHP `notif-list-warm.php` only on true cold-start / incomplete projection |
 | `ranked-warm --loop --owner-id 0` | **LIVE** | Home ranked rebuild **native** (`source=vaak-worker-native`); Local/Federated still spawn PHP `bin/ranked-warm.php` → `vaak:timeline:ranked:v2:{sha256}` |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
