@@ -168,8 +168,14 @@ if ($vaakGuestProfile) {
 } else {
     $vaakActorKey = (string) ($vaakUser['actor_key'] ?? 'cmdr_nova');
     $vaakActorId = rtrim((string) ($vaakUser['actor_id'] ?? ('https://mkultra.monster/users/' . $vaakActorKey)), '/');
-    $vaakUsername = (string) ($vaakUser['username'] ?? $vaakActorKey);
-    $vaakHandle = '@' . $vaakUsername . '@mkultra.monster';
+    // Empty-string username must not win over actor_key (?? only skips null).
+    $vaakUsername = trim((string) ($vaakUser['username'] ?? ''));
+    if ($vaakUsername === '') {
+        $vaakUsername = trim($vaakActorKey);
+    }
+    $vaakHandle = $vaakUsername !== ''
+        ? ('@' . $vaakUsername . '@mkultra.monster')
+        : '';
 }
 $GLOBALS['vaak_actor_key'] = $vaakActorKey;
 $GLOBALS['vaak_actor_id'] = $vaakActorId;
@@ -10421,7 +10427,16 @@ function admin_render_compose_panel(bool $inline = false): void
     $prefillDraftMediaIds = is_array($prefillDraftMediaIds ?? null) ? $prefillDraftMediaIds : [];
     $prefillActor = (string) ($prefillActor ?? '');
     $vaakHandle = (string) ($vaakHandle ?? '');
-    $vaakUsername = (string) ($vaakUsername ?? '');
+    $vaakUsername = trim((string) ($vaakUsername ?? ''));
+    if ($vaakUsername === '') {
+        $vaakUsername = trim((string) ($GLOBALS['vaak_actor_key'] ?? ''));
+        if ($vaakUsername === '__guest__') {
+            $vaakUsername = '';
+        }
+    }
+    $composeAsLabel = $vaakUsername !== ''
+        ? ('@' . ltrim($vaakUsername, '@'))
+        : ($vaakHandle !== '' ? $vaakHandle : '@');
     $composerReturnView = (string) ($composerReturnView ?? 'home');
     $prefillReplyPrivacyAuthor = strtolower((string) ($prefillReplyPrivacyAuthor ?? ''));
     $prefillReplyPrivacyParticipants = (int) ($prefillReplyPrivacyParticipants ?? 0);
@@ -10459,7 +10474,7 @@ function admin_render_compose_panel(bool $inline = false): void
       <h2 id="compose-modal-title"><?= h($composeTitle) ?></h2>
       <button type="button" class="compose-modal__close" id="compose-modal-close" aria-label="Close">×</button>
     </div>
-    <form class="composer" method="post" action="?view=outbox" enctype="multipart/form-data" id="compose-form">
+    <form class="composer" method="post" action="/vaak/?view=outbox" enctype="multipart/form-data" id="compose-form">
       <input type="hidden" name="action" id="compose-action" value="<?= $composeIsEdit ? 'edit_status' : 'reply' ?>">
       <input type="hidden" name="note_id" id="compose-note-id" value="<?= h($composeIsEdit ? $prefillEditNote : '') ?>">
       <input type="hidden" name="draft_id" id="compose-draft-id" value="<?= $prefillDraftId > 0 ? (string) (int) $prefillDraftId : '' ?>">
@@ -10468,10 +10483,10 @@ function admin_render_compose_panel(bool $inline = false): void
       <input type="hidden" name="compose_return_view" value="<?= h($composerReturnView) ?>">
       <?php if ($prefillQuoteObject !== '' && !$composeIsEdit): ?>
         <input type="hidden" name="quote_object" value="<?= h($prefillQuoteObject) ?>">
-        <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($vaakHandle) ?></b></div>
+        <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($vaakHandle !== '' ? $vaakHandle : $composeAsLabel) ?></b></div>
         <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Quoting</span><br><span class="mono"><?= h($prefillQuoteObject) ?></span></div>
       <?php else: ?>
-        <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h('@' . $vaakUsername) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
+        <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($composeAsLabel) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
         <?php if ($composeIsSelfReply): ?>
           <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Replying to your post</span><br><span class="mono"><?= h($prefillReplyTo) ?></span></div>
         <?php endif; ?>
@@ -29896,11 +29911,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   window.VAAK_CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
   window.VAAK_USERNAME = <?= json_encode((string) ($vaakUsername ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
   window.VAAK_HANDLE = <?= json_encode((string) ($vaakHandle ?? ''), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
+  window.VAAK_ACTOR_KEY = <?= json_encode((string) (($vaakGuestProfile ?? false) ? '' : ($vaakActorKey ?? '')), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;
   window.vaakCsrfApply = function (fd) {
     if (fd && typeof fd.set === 'function' && window.VAAK_CSRF) {
       fd.set('csrf', window.VAAK_CSRF);
     }
     return fd;
+  };
+  // Absolute compose endpoint — relative ?view=outbox from /users/{key} hits the
+  // AP profile handler (403 pins text) even when <base href="/vaak/"> is present
+  // for some XHR/fetch resolvers. Always post to /vaak/.
+  window.vaakComposeActionUrl = function () {
+    return '/vaak/?view=outbox';
   };
   // Soft-nav from pretty /users/{key} must not keep that pathname in history —
   // refresh would boot remote_profile again (ignoring ?view=home).
@@ -34351,12 +34373,19 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const panel = getComposePanel();
     return !!(panel && panel.classList.contains('compose-inline-panel'));
   }
+  function composeIdentityLabel() {
+    const user = String(window.VAAK_USERNAME || '').trim().replace(/^@+/, '');
+    if (user && user.toLowerCase() !== 'guest') return '@' + user;
+    const handle = String(window.VAAK_HANDLE || '').trim();
+    if (handle) return handle.charAt(0) === '@' ? handle : ('@' + handle);
+    const key = String(window.VAAK_ACTOR_KEY || '').trim().replace(/^@+/, '');
+    if (key && key !== '__guest__') return '@' + key;
+    return '';
+  }
   function ensureComposeAsLine(composeForm) {
     if (!composeForm) return null;
     let asMeta = composeForm.querySelector('.compose-as-line');
-    const label = (window.VAAK_USERNAME && String(window.VAAK_USERNAME).trim() !== '')
-      ? ('@' + String(window.VAAK_USERNAME).replace(/^@+/, ''))
-      : (window.VAAK_HANDLE ? String(window.VAAK_HANDLE) : '');
+    const label = composeIdentityLabel();
     if (!asMeta) {
       asMeta = document.createElement('div');
       asMeta.className = 'meta compose-as-line';
@@ -34365,16 +34394,28 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (firstField) composeForm.insertBefore(asMeta, firstField);
       else composeForm.insertBefore(asMeta, composeForm.firstChild);
     }
-    let bold = asMeta.querySelector('b');
+    // Keep non-bold siblings (inline Audience select) when repairing the label.
+    let bold = asMeta.querySelector(':scope > b');
+    if (!bold) bold = asMeta.querySelector('b');
     if (!bold) {
-      asMeta.textContent = 'As ';
+      const keep = Array.prototype.slice.call(asMeta.childNodes).filter((n) => {
+        return !(n.nodeType === 1 && String(n.tagName || '').toLowerCase() === 'b');
+      });
+      asMeta.textContent = '';
+      asMeta.appendChild(document.createTextNode('As '));
       bold = document.createElement('b');
       bold.style.color = 'var(--primary)';
       asMeta.appendChild(bold);
+      keep.forEach((n) => {
+        if (n.nodeType === 3 && !String(n.textContent || '').trim()) return;
+        if (n.nodeType === 3 && /^As\s*$/.test(String(n.textContent || ''))) return;
+        asMeta.appendChild(n);
+      });
     }
+    const cur = (bold.textContent || '').trim();
     if (label !== '') {
       bold.textContent = label;
-    } else if (!(bold.textContent || '').trim()) {
+    } else if (cur === '' || cur === '@') {
       bold.textContent = '@';
     }
     return asMeta;
@@ -34547,6 +34588,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     // Same icon toolbar as the top-of-feed composer (CSS is no longer
     // scoped only to .compose-inline-panel).
     applyComposerToolbarChrome(panel);
+    const composeForm = panel.querySelector('#compose-form');
+    if (composeForm) ensureComposeAsLine(composeForm);
     modal.hidden = false;
     if (fab) fab.removeAttribute('aria-hidden');
   }
@@ -34908,6 +34951,14 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     // Reply/quote/edit pop-out needs the panel back inside the modal shell.
     if (supportsInlineComposerNow() && isComposerInline()) {
       placeComposerInModal();
+    } else if (!supportsInlineComposerNow() && isComposerInline()) {
+      // Profile / Mentions / etc.: panel may still be parked inline after soft-nav.
+      placeComposerInModal();
+    }
+    const liveForm = document.getElementById('compose-form');
+    if (liveForm) {
+      try { liveForm.setAttribute('action', window.vaakComposeActionUrl()); } catch (e) {}
+      ensureComposeAsLine(liveForm);
     }
     const transitionToken = ++composeModalTransitionToken;
     modal.hidden = false;
@@ -35270,7 +35321,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (draftMediaField) {
         fd.set('draft_media_ids', draftMediaField.value || '');
       }
-      const res = await fetch(form.getAttribute('action') || '?view=outbox', {
+      const res = await fetch((typeof window.vaakComposeActionUrl === 'function' ? window.vaakComposeActionUrl() : '/vaak/?view=outbox'), {
         method: 'POST',
         body: fd,
         credentials: 'same-origin',
@@ -35339,9 +35390,16 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const qb = form.querySelector('.quote-block');
     if (qb) qb.remove();
     try {
-      const u = new URL(window.location.href);
-      ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
-      window.history.replaceState({}, '', u.pathname + u.search + u.hash);
+      const href = (typeof window.vaakAppHistoryUrl === 'function')
+        ? window.vaakAppHistoryUrl((u) => {
+            ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+          })
+        : (() => {
+            const u = new URL(window.location.href);
+            ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+            return u.pathname + u.search + u.hash;
+          })();
+      window.history.replaceState({}, '', href);
     } catch (e) {}
   }
   async function closeModal() {
@@ -35842,7 +35900,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     if (altText) fd.set('description', altText);
     if (window.vaakCsrfApply) window.vaakCsrfApply(fd);
     else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
-    return submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, onProgress);
+    const postUrl = (typeof window.vaakComposeActionUrl === 'function')
+      ? window.vaakComposeActionUrl()
+      : '/vaak/?view=outbox';
+    return submitComposeRequest(postUrl, fd, onProgress);
   }
   async function preUploadPendingComposeFiles() {
     if (!files.length) return { ok: true };
@@ -35878,7 +35939,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
   function submitComposeRequest(url, fd, onProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', url, true);
+      const postUrl = url || (typeof window.vaakComposeActionUrl === 'function'
+        ? window.vaakComposeActionUrl()
+        : '/vaak/?view=outbox');
+      xhr.open('POST', postUrl, true);
       xhr.withCredentials = true;
       xhr.setRequestHeader('Accept', 'application/json');
       xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
@@ -35890,8 +35954,14 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       xhr.addEventListener('load', () => {
         let data = null;
         try { data = JSON.parse(xhr.responseText || ''); } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
-        else resolve(data || { ok: false, error: 'Upload failed (HTTP ' + xhr.status + ').' });
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(data || { ok: false, error: 'Empty upload response.' });
+          return;
+        }
+        const fallback = (data && data.error)
+          ? data
+          : { ok: false, error: 'Upload failed (HTTP ' + xhr.status + ').' };
+        resolve(fallback);
       });
       xhr.addEventListener('error', () => reject(new Error('network')));
       xhr.addEventListener('timeout', () => reject(new Error('timeout')));
@@ -36235,7 +36305,10 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (draftMediaField) fd.set('draft_media_ids', draftMediaField.value || '');
       const hadMedia = !!(((draftMediaField && draftMediaField.value) || '').trim());
       setSubmitProgress(hadMedia ? 'finalizing' : 'posting', hadMedia ? 100 : 0);
-      const data = await submitComposeRequest(form.getAttribute('action') || '?view=outbox', fd, null);
+      const postUrl = (typeof window.vaakComposeActionUrl === 'function')
+        ? window.vaakComposeActionUrl()
+        : '/vaak/?view=outbox';
+      const data = await submitComposeRequest(postUrl, fd, null);
       setSubmitProgress(hadMedia ? 'finalizing' : 'posting', 100);
       if (!data || !data.ok) {
         const failMsg = actionName === 'queue_post' ? 'Queue failed.' : (actionName === 'edit_status' ? 'Edit failed.' : 'Post failed.');
@@ -36298,9 +36371,16 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (toActor) { toActor.value = ''; if (toActor.type !== 'hidden') toActor.style.display = ''; }
       // Drop compose/quote/reply query flags so refresh doesn't reopen the modal
       try {
-        const u = new URL(window.location.href);
-        ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
-        window.history.replaceState({}, '', u.pathname + u.search + u.hash);
+        const href = (typeof window.vaakAppHistoryUrl === 'function')
+          ? window.vaakAppHistoryUrl((u) => {
+              ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+            })
+          : (() => {
+              const u = new URL(window.location.href);
+              ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
+              return u.pathname + u.search + u.hash;
+            })();
+        window.history.replaceState({}, '', href);
       } catch (e) {}
       if (mode === 'queue_post') {
         // The queue is durable and the item is already accepted. Leave the
