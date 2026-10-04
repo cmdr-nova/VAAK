@@ -7,9 +7,13 @@
 # Binds 127.0.0.1:8787 only. Endpoints:
 #   GET /healthz
 #   GET /shadow/notif?owner_id=1&compare=1
+#   GET /shadow/notifications?owner_id=1&limit=30   (Mentions M3 Redis-read)
+#   GET /api/v1/notifications?owner_id=1&limit=30  (Mastodon-shaped alias)
+#   GET /shadow/timelines/home + /api/v1/timelines/home
 #   GET /shadow/ranked-newer?owner_id=1&since_secs=900
 #   GET /shadow/action-queue
 #   GET /shadow/jetstream
+# Shadow only — PHP remains live until Axum cutover; then PHP drops.
 
 [Unit]
 Description=VAAK Rust shadow HTTP (localhost Axum)

@@ -27,6 +27,10 @@ pub struct OwnerQuery {
     pub compare: Option<String>,
     pub fetch: Option<String>,
     pub live: Option<String>,
+    /// Comma-separated Mastodon notification types (empty = all).
+    pub types: Option<String>,
+    pub max_id: Option<String>,
+    pub since_id: Option<String>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -66,13 +70,15 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/shadow/notif", get(shadow_notif))
+        .route("/shadow/notifications", get(shadow_notifications))
         .route("/shadow/ranked-newer", get(shadow_ranked))
         .route("/shadow/action-queue", get(shadow_action_queue))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
-        // Mastodon-shaped path alias (still shadow JSON, not a live cutover).
+        // Mastodon-shaped path aliases (still shadow JSON, not a live cutover).
         .route("/api/v1/timelines/home", get(shadow_home))
+        .route("/api/v1/notifications", get(shadow_notifications_masto))
         .with_state(state);
 
     tracing::info!(%bind, "vaak-worker shadow HTTP listening");
@@ -94,12 +100,14 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         "routes": [
             "/healthz",
             "/shadow/notif",
+            "/shadow/notifications",
             "/shadow/ranked-newer",
             "/shadow/action-queue",
             "/shadow/jetstream",
             "/shadow/thin-media",
             "/shadow/timelines/home",
-            "/api/v1/timelines/home"
+            "/api/v1/timelines/home",
+            "/api/v1/notifications"
         ],
     }))
 }
@@ -159,4 +167,72 @@ async fn shadow_home(
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let limit = q.limit.unwrap_or(20).clamp(1, 40) as usize;
     json_result(crate::timeline::home_shadow(&state.cfg, owner, limit).await)
+}
+
+fn parse_types(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return vec![];
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+async fn shadow_notifications(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(30);
+    let types = parse_types(q.types.as_deref());
+    json_result(
+        crate::notif_list::notifications_shadow(
+            &state.cfg,
+            owner,
+            limit,
+            &types,
+            q.max_id.as_deref(),
+            q.since_id.as_deref(),
+        )
+        .await,
+    )
+}
+
+/// Mastodon-shaped body: bare notification array when cache hits (Ice Cubes-friendly).
+async fn shadow_notifications_masto(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(30);
+    let types = parse_types(q.types.as_deref());
+    match crate::notif_list::notifications_shadow(
+        &state.cfg,
+        owner,
+        limit,
+        &types,
+        q.max_id.as_deref(),
+        q.since_id.as_deref(),
+    )
+    .await
+    {
+        Ok(report) if report.cache_hit => (StatusCode::OK, Json(report.items)).into_response(),
+        Ok(report) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "notif list cache miss",
+                "redis_key": report.redis_key,
+                "note": report.note,
+                "mode": "shadow",
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
