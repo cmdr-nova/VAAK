@@ -296,6 +296,125 @@ function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?
 }
 
 /**
+ * Home Axum-primary (Mentions M5 twin): try localhost shadow `/api/v1/timelines/home`
+ * before PHP Redis/file hydrate. Head polls only (no max_id). On 200, echo body +
+ * Link and exit. Miss/error → false so caller falls through.
+ *
+ * Flag: VAAK_HOME_AXUM_PRIMARY (default on). Rollback: set 0.
+ * Base: VAAK_SHADOW_HTTP (loopback only; default http://127.0.0.1:8787).
+ */
+function ap_masto_timeline_home_axum_try(int $limit, ?string $maxId, ?string $sinceId, int $ownerUserId = 0): bool
+{
+    $enabled = getenv('VAAK_HOME_AXUM_PRIMARY');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return false;
+    }
+    // Head-only — scroll pages are not in hydrate Redis (same as cache_try / Axum).
+    if ($maxId !== null && $maxId !== '') {
+        return false;
+    }
+    if ($ownerUserId < 1) {
+        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+            ? (int) ap_db_masto_owner_user_id()
+            : (int) (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+    }
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    $limit = max(1, min(80, $limit));
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return false;
+    }
+    $query = [
+        'owner_id' => $ownerUserId,
+        'limit' => $limit,
+    ];
+    if ($sinceId !== null && $sinceId !== '') {
+        $query['since_id'] = $sinceId;
+    }
+    $url = $base . '/api/v1/timelines/home?' . http_build_query($query);
+    $body = null;
+    $code = 0;
+    $link = '';
+    $started = microtime(true);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return false;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => 120,
+            CURLOPT_TIMEOUT_MS => 350,
+            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HEADERFUNCTION => static function ($ch, string $headerLine) use (&$link): int {
+                if (stripos($headerLine, 'Link:') === 0) {
+                    $link = trim(substr($headerLine, 5));
+                }
+                return strlen($headerLine);
+            },
+        ]);
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 0.35,
+                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'ignore_errors' => true,
+            ],
+        ]);
+        $raw = @file_get_contents($url, false, $ctx);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $hline) {
+                $hline = (string) $hline;
+                if (preg_match('#^HTTP/\S+\s+(\d+)#', $hline, $m)) {
+                    $code = (int) $m[1];
+                } elseif (stripos($hline, 'Link:') === 0) {
+                    $link = trim(substr($hline, 5));
+                }
+            }
+        }
+    }
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timelines.home.axum_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($body) || $body === '') {
+        return false;
+    }
+    // Must be a JSON array (Mastodon timeline shape); refuse error objects.
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded) || !array_is_list($decoded)) {
+        return false;
+    }
+    http_response_code(200);
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-VAAK-TL-Cache: axum-shadow');
+    if ($link !== '') {
+        header('Link: ' . $link);
+    }
+    echo $body;
+    exit;
+}
+
+/**
  * @param list<array<string,mixed>> $statuses
  * @param array<string,scalar|null> $extraQuery
  */
@@ -1498,6 +1617,11 @@ function ap_masto_api(string $method, string $path): void
         // Ice Cubes pull-to-refresh often uses min_id (same exclusive lower bound as since_id)
         if (($sinceId === null || $sinceId === '') && isset($_GET['min_id'])) {
             $sinceId = (string) $_GET['min_id'];
+        }
+        // Home Axum-primary: localhost shadow hydrate first (Mentions M5 twin).
+        // Miss / max_id / flag-off → PHP Redis/file cache, then cold merge.
+        if (ap_masto_timeline_home_axum_try($limit, $maxId, $sinceId)) {
+            return;
         }
         if (ap_masto_timeline_cache_try('/api/v1/timelines/home', $limit, $maxId, $sinceId)) {
             return;
