@@ -1033,7 +1033,9 @@ function ap_rss_item_to_masto_status(array $row): array
         'favourites_count' => 0,
         'edited_at' => null,
         'favourited' => false,
-        'reblogged' => false,
+        'reblogged' => (function_exists('ap_masto_status_is_reblogged')
+            && $statusId !== ''
+            && ap_masto_status_is_reblogged($statusId)),
         'muted' => false,
         'bookmarked' => false,
         'pinned' => false,
