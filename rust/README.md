@@ -3,22 +3,24 @@
 | Command | Mode | Role |
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
+| `notif-list --loop --owner-id 0` | **LIVE** | Mentions / Ice Cubes **list** warm — orchestrates PHP `bin/notif-list-warm.php` into `vaak:notifications:v1:{owner}:{hash}` |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` only |
 
-PHP remains fallback: notif rebuilds on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs.
+PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm keeps entity hydrate in PHP (freeze contract) while Rust owns the multi-owner loop.
 
 ## Live systemd units
 
 ```bash
 systemctl enable --now vaak-worker-notif.service
+systemctl enable --now vaak-worker-notif-list.service
 systemctl enable --now vaak-worker-thin-warm.service
 systemctl enable --now vaak-worker-actor-warm.service
 ```
 
-Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-thin-warm.service`, `deploy/vaak-worker-actor-warm.service`
+Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.service`, `deploy/vaak-worker-thin-warm.service`, `deploy/vaak-worker-actor-warm.service`
 
 ## Env
 
@@ -29,6 +31,9 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-thin-warm.service
 | `VAAK_REDIS_QUEUE_URL` | `redis://127.0.0.1/1` | queue DB (PHP `ap_redis_client('queue')`) |
 | `VAAK_NOTIF_RUST_PRIMARY` | `1` (PHP) | longer stampede wait + stale file preference for Rust-covered owners |
 | `VAAK_NOTIF_RUST_OWNER_ID` | `0` (PHP) | `0` = all local users covered by Rust loop; positive = single-owner long-stale shortcut only |
+| `VAAK_NOTIF_LIST_RUST_PRIMARY` | `1` (PHP) | Mentions list Redis fresh 120s / stale 600s; skip request-path stale rebuild + look-ahead on cache hit |
+| `VAAK_API_ROOT` | `/srv/mkultra/html/api` | notif-list PHP materializer path |
+| `VAAK_PHP_BIN` | `/usr/bin/php` | notif-list spawn |
 | `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
 | `VAAK_ACTOR_WARM_RUST_PRIMARY` | `1` (PHP) | thin-author LPUSH to `bsky_actor_warm` |
 | `VAAK_BSKY_PUBLIC_API` | `https://public.api.bsky.app` | warm fetch |
@@ -44,6 +49,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 ## Cutover notes (0.5.64)
 
 - Notif live key: `vaak:notifications:v1:unread:{owner}:{scan}:{sha256(last_read)}` TTL 45s; source `vaak-worker-live`
+- Notif list key: `vaak:notifications:v1:{owner}:{sha256(limit,max,since,types,exclude)}` envelope `{ts,items,source}` TTL 600s when list-warm primary; source `vaak-worker-live` from `notif-list-warm.php`
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
 - Actor warm queue: `vaak:queue:bsky_actor_warm` JSON `{did,owner,ts,source}`; flat key `vaak:actor:v1:bsky:{did}` TTL ~2700s
-- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-thin-warm vaak-worker-actor-warm` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` / `VAAK_ACTOR_WARM_RUST_PRIMARY=0` in `/etc/mkultra/vaak.env`
+- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-notif-list vaak-worker-thin-warm vaak-worker-actor-warm` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_NOTIF_LIST_RUST_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` / `VAAK_ACTOR_WARM_RUST_PRIMARY=0` in `/etc/mkultra/vaak.env`
