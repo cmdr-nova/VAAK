@@ -302,10 +302,21 @@ if (isset($_GET['switched']) && (string) $_GET['switched'] === '1') {
     $notice = $as !== '' ? ('Switched to @' . $as . '.') : 'Account switched.';
 }
 $composerForceOpen = false;
-// Legacy ?view=compose → Your posts + open floating composer
+// Legacy ?view=compose → Home + open floating composer
 if ($view === 'compose') {
     $composerForceOpen = true;
-    $view = 'outbox';
+    $view = 'home';
+}
+// Your Posts removed — own profile (/users/{key}) already shows posts + more.
+if ($view === 'outbox') {
+    $ownProfilePath = function_exists('ap_vaak_pretty_profile_path')
+        ? ap_vaak_pretty_profile_path((string) ($vaakActorKey ?? ''), [])
+        : '';
+    if ($ownProfilePath === '' || $ownProfilePath === '/') {
+        $ownProfilePath = '?view=remote_profile&actor=' . rawurlencode((string) ($vaakActorId ?? ''));
+    }
+    header('Location: ' . $ownProfilePath, true, 302);
+    exit;
 }
 // Legacy muted_words admin view → Profile (per-user mutes / words / personal blocks)
 if ($view === 'muted_words') {
@@ -1677,7 +1688,7 @@ $vaakAdminOnlyActions = [
                 }
                 $delivered = (int) ($result['delivered'] ?? 0);
                 $queued = (int) ($result['queued'] ?? 0);
-                $notice = $isQuote ? 'Quote posted.' : 'Posted to Your posts.';
+                $notice = $isQuote ? 'Quote posted.' : 'Posted.';
                 if ($poll !== null) {
                     $notice .= ' · poll';
                 }
@@ -21872,6 +21883,170 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .about-vaak-copy h2 { margin:1.2rem 0 .45rem; font-size:1.1rem; color:var(--primary); }
     .about-vaak-copy p, .about-vaak-copy li { color:var(--muted); line-height:1.65; }
     .about-vaak-copy a { color:var(--primary); }
+    /* Phyrian Strains — web HUD chrome (Phase 1) */
+    .phyrian { max-width: 42rem; margin: 0 auto 1.5rem; }
+    .phyrian-hero {
+      position: relative; min-height: 11.5rem; overflow: hidden;
+      border: 1px solid color-mix(in srgb, #c45a8c 35%, var(--border));
+      border-radius: 14px; background: #0a0610; margin-bottom: .85rem;
+    }
+    .phyrian-hero img {
+      display: block; width: 100%; height: 11.5rem; object-fit: cover;
+      object-position: center 35%; opacity: .88;
+    }
+    .phyrian-hero::after {
+      content: ""; position: absolute; inset: 0;
+      background: linear-gradient(115deg, rgba(8,6,14,.92) 0%, rgba(8,6,14,.55) 42%, rgba(8,6,14,.2) 70%, rgba(8,6,14,.65) 100%),
+                  linear-gradient(to top, rgba(8,6,14,.95), transparent 55%);
+      pointer-events: none;
+    }
+    .phyrian-hero-copy {
+      position: absolute; z-index: 1; left: 1rem; right: 1rem; bottom: .85rem;
+    }
+    .phyrian-hero-copy .meta { margin: 0; color: #b8a0c8; letter-spacing: .06em; text-transform: uppercase; font-size: .72rem; }
+    .phyrian-hero-copy h2 {
+      margin: .15rem 0 0; color: #fff; font-size: clamp(1.35rem, 4vw, 1.85rem);
+      letter-spacing: .08em; text-shadow: 0 0 18px rgba(196,90,140,.45);
+    }
+    .phyrian-hero-copy p { margin: .25rem 0 0; color: #d8c8e0; line-height: 1.45; max-width: 34rem; font-size: .9rem; }
+    .phyrian-note {
+      margin: 0 0 .85rem; padding: .65rem .8rem; border-radius: 10px;
+      border: 1px solid color-mix(in srgb, #5ee7ff 28%, var(--border));
+      background: color-mix(in srgb, #1a1024 70%, var(--panel));
+      color: var(--muted); line-height: 1.45; font-size: .88rem;
+    }
+    .phyrian-hud {
+      display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: .85rem;
+      align-items: stretch; margin-bottom: .85rem; padding: .85rem;
+      border-radius: 14px;
+      border: 1px solid color-mix(in srgb, #5ee7ff 30%, var(--border));
+      background:
+        linear-gradient(160deg, rgba(94,231,255,.06), transparent 45%),
+        linear-gradient(20deg, rgba(196,90,140,.08), transparent 40%),
+        var(--panel);
+      box-shadow: inset 0 0 0 1px rgba(94,231,255,.06);
+    }
+    .phyrian-hud-art {
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .35rem;
+    }
+    .phyrian-hud-art img { width: 5.1rem; height: auto; object-fit: contain; filter: drop-shadow(0 0 10px rgba(94,231,255,.25)); }
+    .phyrian-hud-art .meta { text-align: center; font-size: .68rem; letter-spacing: .05em; text-transform: uppercase; }
+    .phyrian-hud-body { min-width: 0; }
+    .phyrian-status-row {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem .65rem; margin-bottom: .45rem;
+    }
+    .phyrian-status-row .who { font-size: 1.15rem; text-transform: none; letter-spacing: 0; }
+    .phyrian-badge {
+      display: inline-flex; align-items: center; padding: .12rem .45rem; border-radius: 999px;
+      font-size: .68rem; letter-spacing: .04em; text-transform: uppercase;
+      border: 1px solid color-mix(in srgb, #5ee7ff 40%, var(--border));
+      color: #9fefff; background: rgba(94,231,255,.08);
+    }
+    .phyrian-badge--origin {
+      border-color: color-mix(in srgb, #c45a8c 50%, var(--border));
+      color: #f0b0d0; background: rgba(196,90,140,.12);
+    }
+    .phyrian-badge--unknown {
+      border-color: var(--border); color: var(--muted); background: transparent;
+    }
+    .phyrian-res {
+      margin: .35rem 0 .65rem;
+    }
+    .phyrian-res-label {
+      display: flex; justify-content: space-between; gap: .5rem; margin-bottom: .3rem;
+      font-size: .8rem; color: var(--muted);
+    }
+    .phyrian-res-label b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .phyrian-resbar {
+      height: .72rem; border-radius: 999px; overflow: hidden;
+      background: rgba(0,0,0,.35);
+      border: 1px solid color-mix(in srgb, #5ee7ff 35%, var(--border));
+      box-shadow: inset 0 1px 2px rgba(0,0,0,.35);
+    }
+    .phyrian-resbar > span {
+      display: block; height: 100%; width: var(--phy-res, 0%);
+      background: linear-gradient(90deg, #7a2f55, #c45a8c 40%, #5ee7ff);
+      box-shadow: 0 0 12px rgba(94,231,255,.35);
+      transition: width .35s ease;
+    }
+    .phyrian-stats {
+      display: flex; flex-wrap: wrap; gap: .55rem .9rem; margin: 0 0 .65rem;
+      font-size: .85rem; color: var(--muted);
+    }
+    .phyrian-stats b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .phyrian-hud-copy { margin: 0 0 .7rem; color: var(--muted); line-height: 1.5; font-size: .9rem; }
+    .phyrian-hud-copy b { color: var(--text); }
+    .phyrian-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
+    .phyrian-banner {
+      position: relative; height: 3.4rem; margin: 0 0 .95rem; overflow: hidden;
+      border-radius: 10px; border: 1px solid color-mix(in srgb, #c45a8c 28%, var(--border));
+      background: #0a0610;
+    }
+    .phyrian-banner img {
+      display: block; width: 100%; height: 100%; object-fit: cover; object-position: center;
+      opacity: .75; filter: saturate(1.05);
+    }
+    .phyrian-section-title {
+      display: flex; align-items: center; gap: .55rem;
+      margin: 1.05rem 0 .55rem; color: var(--muted);
+      font-size: .78rem; letter-spacing: .06em; text-transform: uppercase;
+    }
+    .phyrian-section-title img { width: 1.7rem; height: 1.7rem; object-fit: contain; }
+    .phyrian-req {
+      display: grid; grid-template-columns: 3.4rem minmax(0, 1fr); gap: .7rem;
+      align-items: start; margin-bottom: .65rem; padding: .75rem;
+      border-radius: 12px; border: 1px solid var(--border); background: var(--panel);
+    }
+    .phyrian-req img { width: 3.4rem; height: auto; object-fit: contain; }
+    .phyrian-req .who { text-transform: none; letter-spacing: 0; }
+    .phyrian-req .meta { margin: .2rem 0 .55rem; line-height: 1.4; }
+    .phyrian-dir {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(15.5rem, 1fr)); gap: .65rem;
+    }
+    .phyrian-card {
+      display: flex; flex-direction: column; gap: .45rem;
+      padding: .75rem; border-radius: 12px;
+      border: 1px solid var(--border); background: var(--panel); min-width: 0;
+    }
+    .phyrian-card-hd { display: flex; gap: .55rem; align-items: flex-start; min-width: 0; }
+    .phyrian-card-hd img { width: 2.4rem; height: 2.4rem; object-fit: contain; flex: 0 0 auto; }
+    .phyrian-card-hd .who {
+      display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      text-transform: none; letter-spacing: 0; font-size: .95rem;
+    }
+    .phyrian-card .tweet-actions { margin: 0; gap: .35rem; }
+    .phyrian-act {
+      position: relative; display: inline-flex; align-items: center; justify-content: center;
+      min-height: 2.35rem; padding: .35rem .85rem .35rem .4rem; border: 0; border-radius: 8px;
+      cursor: pointer; overflow: hidden; color: #fff; font-size: .8rem; font-weight: 600;
+      letter-spacing: .02em; background: #1a1020;
+      box-shadow: inset 0 0 0 1px rgba(94,231,255,.25);
+    }
+    .phyrian-act img {
+      position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center;
+      opacity: .72; pointer-events: none;
+    }
+    .phyrian-act span {
+      position: relative; z-index: 1; padding: .15rem .55rem; border-radius: 999px;
+      background: rgba(8,6,14,.72); text-shadow: 0 1px 2px rgba(0,0,0,.55);
+    }
+    .phyrian-act:hover img { opacity: .9; }
+    .phyrian-act:hover { filter: brightness(1.06); }
+    .phyrian-act:focus-visible { outline: 2px solid #5ee7ff; outline-offset: 2px; }
+    .phyrian-act--ghost {
+      background: transparent; color: var(--text);
+      box-shadow: inset 0 0 0 1px var(--border);
+    }
+    .phyrian-act--ghost img { opacity: .55; }
+    @media (max-width: 600px) {
+      .phyrian-hud { grid-template-columns: 1fr; }
+      .phyrian-hud-art { flex-direction: row; justify-content: flex-start; gap: .65rem; }
+      .phyrian-hud-art img { width: 4.2rem; }
+      .phyrian-hud-art .meta { text-align: left; }
+      .phyrian-hero { min-height: 9.5rem; }
+      .phyrian-hero img { height: 9.5rem; }
+      .phyrian-dir { grid-template-columns: 1fr; }
+    }
     .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
     .home-suggestion .tweet-av { width: 40px; height: 40px; flex: 0 0 40px; }
     .home-suggestion-main { min-width: 0; min-height: 5.6rem; display: flex; flex: 1; flex-direction: column; overflow-wrap: anywhere; }
@@ -22096,7 +22271,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = false;
-      $navYouOpen = ($view === 'rss' || $view === 'phyrian');
+      $navYouOpen = ($view === 'rss' || $view === 'phyrian' || $view === 'profile' || $view === 'blog' || $view === 'queue' || $view === 'drafts');
       $navAdminOpen = false;
       $navSiteOpen = false;
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
@@ -22143,7 +22318,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <summary><span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span></summary>
         <div class="nav-sub">
           <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Settings</span></a>
-          <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox" data-vaak-soft-nav="outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'rss' ? 'active' : '' ?>" href="?view=rss"><span class="ico">📰</span><span class="label">RSS</span></a>
           <a class="<?= $view === 'phyrian' ? 'active' : '' ?>" href="?view=phyrian"><span class="ico">◈</span><span class="label">Phyrian Strains</span></a>
@@ -28748,7 +28922,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="tweet-actions">
                 <?php if ($noteId !== ''): ?>
                   <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, 'queue')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                  <a href="?view=outbox" class="meta">Your posts</a>
+                  <?php
+                    $queueOwnProfile = function_exists('ap_vaak_pretty_profile_path')
+                        ? ap_vaak_pretty_profile_path((string) ($vaakActorKey ?? ''), [])
+                        : ('?view=remote_profile&actor=' . rawurlencode((string) ($vaakActorId ?? '')));
+                  ?>
+                  <a href="<?= h($queueOwnProfile) ?>" class="meta">Your profile</a>
                 <?php endif; ?>
               </div>
             </article>
@@ -28899,6 +29078,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $phyStatus = (string) ($phyPlayer['status'] ?? 'unknown');
           $phyStrain = trim((string) ($phyPlayer['strain'] ?? ''));
           $phyResonance = (int) ($phyPlayer['resonance'] ?? 0);
+          $phyResPct = max(0, min(100, $phyResonance));
           $phyGen = (int) ($phyPlayer['generation'] ?? 1);
           $phyLevel = (int) ($phyPlayer['level'] ?? 1);
           $phyImprinted = ($phyStatus === 'imprinted' && $phyStrain !== '');
@@ -28916,165 +29096,201 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $phyCheckedInToday = true;
           }
           $phyCanOfferImprint = $phyImprinted || $phyIsOrigin;
+          $phyAsset = static function (string $file): string {
+              return '/api/assets/phyrian/' . ltrim($file, '/');
+          };
         ?>
-        <div class="side-card" style="border-color:color-mix(in srgb, var(--primary) 40%, var(--border));margin-bottom:1rem">
-          <div class="meta" style="margin:0;line-height:1.45">
-            <b>Phyrian Strains</b> is in progress (Phase 1 — web-only). Local imprint offers and resonance
-            requests land here for accept/deny. OpenSim link / Resonant badge come later. Nothing here
-            federates.
-          </div>
-        </div>
+        <section class="phyrian">
+          <header class="phyrian-hero">
+            <img src="<?= h($phyAsset('hero-imprint.jpg')) ?>" alt="" width="800" height="525" decoding="async">
+            <div class="phyrian-hero-copy">
+              <p class="meta">Phase 1 · web-only</p>
+              <h2>Phyrian Strains</h2>
+              <p>Consent-based imprint and resonance on this instance. OpenSim link / Resonant badge come later — nothing here federates.</p>
+            </div>
+          </header>
 
-        <article class="tweet" style="margin-bottom:1rem">
-          <div class="tweet-hd">
-            <div>
-              <?php if ($phyImprinted): ?>
-                <span class="who" style="text-transform:none;letter-spacing:0"><?= h($phyStrain) ?></span>
-                <span class="meta"> · imprinted</span>
-              <?php else: ?>
-                <span class="who" style="text-transform:none;letter-spacing:0">Unknown Entity</span>
-                <span class="meta"> · unmarked</span>
-              <?php endif; ?>
-              <?php if ($phyIsOrigin): ?>
-                <span class="meta"> · origin</span>
-              <?php endif; ?>
+          <div class="phyrian-hud">
+            <div class="phyrian-hud-art">
+              <img src="<?= h($phyAsset($phyImprinted ? 'icon-status.png' : 'icon-register.png')) ?>" alt="" width="160" height="160" decoding="async">
+              <span class="meta"><?= $phyImprinted ? 'Status' : 'Unmarked' ?></span>
             </div>
-          </div>
-          <div class="meta" style="margin:.35rem 0 .75rem;display:flex;flex-wrap:wrap;gap:.75rem 1.25rem">
-            <span>Resonance <b style="color:var(--text)"><?= (int) $phyResonance ?></b><span class="meta"> / 100</span></span>
-            <span>Gen <b style="color:var(--text)"><?= (int) $phyGen ?></b></span>
-            <span>Level <b style="color:var(--text)"><?= (int) $phyLevel ?></b></span>
-          </div>
-          <?php if (!$phyImprinted): ?>
-            <div class="body feed-body" style="margin-bottom:.75rem">
-              You are an <b>Unknown Entity</b>. Accept an imprint offer from the origin (or another
-              imprinted local) to receive a strain. Until then there is no daily check-in and you
-              cannot offer imprint or exchange resonance.
-            </div>
-          <?php else: ?>
-            <div class="body feed-body" style="margin-bottom:.75rem">
-              Your lineage is <b><?= h($phyStrain) ?></b>. Check in once per UTC day, offer imprint
-              to Unknown Entities, and exchange resonance with other imprinted locals.
-            </div>
-          <?php endif; ?>
-          <div class="tweet-actions">
-            <?php if ($phyImprinted): ?>
-              <?php if ($phyCheckedInToday): ?>
-                <span class="meta">Checked in today</span>
-              <?php else: ?>
-                <form method="post" action="?view=phyrian" style="display:inline">
-                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                  <input type="hidden" name="action" value="phyrian_checkin">
-                  <input type="hidden" name="return_view" value="phyrian">
-                  <button class="btn btn-primary" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Daily check-in</button>
-                </form>
-              <?php endif; ?>
-            <?php endif; ?>
-          </div>
-        </article>
-
-        <?php if ($phyPending): ?>
-          <h3 class="meta" style="margin:0 0 .55rem;text-transform:uppercase;letter-spacing:.04em">Incoming requests</h3>
-          <?php foreach ($phyPending as $preq): ?>
-            <?php
-              $preqId = (int) ($preq['id'] ?? 0);
-              $preqKind = (string) ($preq['kind'] ?? '');
-              $preqFrom = trim((string) ($preq['from_username'] ?? $preq['from_actor_key'] ?? 'someone'));
-              $preqLabel = $preqKind === 'imprint' ? 'Imprint offer' : 'Resonance exchange';
-            ?>
-            <article class="tweet" style="margin-bottom:.65rem">
-              <div class="tweet-hd">
-                <div>
-                  <span class="who" style="text-transform:none;letter-spacing:0"><?= h($preqLabel) ?></span>
-                  <span class="meta"> · from @<?= h($preqFrom) ?></span>
-                  <?php if (!empty($preq['created_at'])): ?>
-                    <span class="meta"> · <?= h(relative_time((string) $preq['created_at'])) ?></span>
-                  <?php endif; ?>
-                </div>
-              </div>
-              <div class="meta" style="margin:.25rem 0 .65rem">
-                <?php if ($preqKind === 'imprint'): ?>
-                  Accepting assigns you a strain (origin rolls random; peers transmit their own).
+            <div class="phyrian-hud-body">
+              <div class="phyrian-status-row">
+                <?php if ($phyImprinted): ?>
+                  <span class="who"><?= h($phyStrain) ?></span>
+                  <span class="phyrian-badge">Imprinted</span>
                 <?php else: ?>
-                  Accepting gives both of you +5 resonance (capped at 100).
+                  <span class="who">Unknown Entity</span>
+                  <span class="phyrian-badge phyrian-badge--unknown">Unmarked</span>
+                <?php endif; ?>
+                <?php if ($phyIsOrigin): ?>
+                  <span class="phyrian-badge phyrian-badge--origin">Origin</span>
                 <?php endif; ?>
               </div>
-              <div class="tweet-actions">
-                <form method="post" action="?view=phyrian" style="display:inline">
-                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                  <input type="hidden" name="action" value="phyrian_accept">
-                  <input type="hidden" name="request_id" value="<?= $preqId ?>">
-                  <input type="hidden" name="return_view" value="phyrian">
-                  <button class="btn btn-primary" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Accept</button>
-                </form>
-                <form method="post" action="?view=phyrian" style="display:inline">
-                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                  <input type="hidden" name="action" value="phyrian_deny">
-                  <input type="hidden" name="request_id" value="<?= $preqId ?>">
-                  <input type="hidden" name="return_view" value="phyrian">
-                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Deny</button>
-                </form>
-              </div>
-            </article>
-          <?php endforeach; ?>
-        <?php endif; ?>
-
-        <h3 class="meta" style="margin:1.1rem 0 .55rem;text-transform:uppercase;letter-spacing:.04em">Local players</h3>
-        <?php if (!$phyDirectory): ?>
-          <div class="empty">No other local accounts yet. Imprint and resonance stay on this instance for Phase 1.</div>
-        <?php else: ?>
-          <?php foreach ($phyDirectory as $pd): ?>
-            <?php
-              $pdId = (int) ($pd['id'] ?? 0);
-              $pdName = trim((string) ($pd['username'] ?? $pd['actor_key'] ?? ''));
-              $pdStatus = (string) ($pd['status'] ?? 'unknown');
-              $pdStrain = trim((string) ($pd['strain'] ?? ''));
-              $pdRes = (int) ($pd['resonance'] ?? 0);
-              $pdImprinted = ($pdStatus === 'imprinted' && $pdStrain !== '');
-              $pdCanImprint = $phyCanOfferImprint && !$pdImprinted;
-              $pdCanResonate = $phyImprinted && $pdImprinted;
-            ?>
-            <article class="tweet" style="margin-bottom:.55rem">
-              <div class="tweet-hd">
-                <div>
-                  <span class="who" style="text-transform:none;letter-spacing:0">@<?= h($pdName !== '' ? $pdName : ('user' . $pdId)) ?></span>
-                  <?php if ($pdImprinted): ?>
-                    <span class="meta"> · <?= h($pdStrain) ?></span>
-                    <span class="meta"> · <?= (int) $pdRes ?> resonance</span>
-                  <?php else: ?>
-                    <span class="meta"> · Unknown Entity</span>
-                  <?php endif; ?>
+              <div class="phyrian-res">
+                <div class="phyrian-res-label">
+                  <span>Resonance</span>
+                  <b><?= (int) $phyResonance ?> / 100</b>
                 </div>
+                <div class="phyrian-resbar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="<?= (int) $phyResPct ?>" style="--phy-res:<?= (int) $phyResPct ?>%"><span></span></div>
               </div>
-              <?php if ($pdCanImprint || $pdCanResonate): ?>
-                <div class="tweet-actions" style="margin-top:.45rem">
-                  <?php if ($pdCanImprint): ?>
-                    <form method="post" action="?view=phyrian" style="display:inline">
-                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                      <input type="hidden" name="action" value="phyrian_request">
-                      <input type="hidden" name="kind" value="imprint">
-                      <input type="hidden" name="to_owner_id" value="<?= $pdId ?>">
-                      <input type="hidden" name="return_view" value="phyrian">
-                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Offer imprint</button>
-                    </form>
-                  <?php endif; ?>
-                  <?php if ($pdCanResonate): ?>
-                    <form method="post" action="?view=phyrian" style="display:inline">
-                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                      <input type="hidden" name="action" value="phyrian_request">
-                      <input type="hidden" name="kind" value="resonance">
-                      <input type="hidden" name="to_owner_id" value="<?= $pdId ?>">
-                      <input type="hidden" name="return_view" value="phyrian">
-                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Request resonance</button>
-                    </form>
-                  <?php endif; ?>
-                </div>
-              <?php elseif (!$phyImprinted && !$phyIsOrigin): ?>
-                <div class="meta" style="margin-top:.35rem">Imprint first to interact.</div>
+              <div class="phyrian-stats">
+                <span>Gen <b><?= (int) $phyGen ?></b></span>
+                <span>Level <b><?= (int) $phyLevel ?></b></span>
+              </div>
+              <?php if (!$phyImprinted): ?>
+                <p class="phyrian-hud-copy">
+                  Accept an imprint offer from the origin (or another imprinted local) to receive a strain.
+                  Until then there is no daily check-in and you cannot offer imprint or exchange resonance.
+                </p>
+              <?php else: ?>
+                <p class="phyrian-hud-copy">
+                  Your lineage is <b><?= h($phyStrain) ?></b>. Check in once per UTC day, offer imprint
+                  to Unknown Entities, and exchange resonance with other imprinted locals.
+                </p>
               <?php endif; ?>
-            </article>
-          <?php endforeach; ?>
-        <?php endif; ?>
+              <div class="phyrian-actions">
+                <?php if ($phyImprinted): ?>
+                  <?php if ($phyCheckedInToday): ?>
+                    <span class="meta">Checked in today</span>
+                  <?php else: ?>
+                    <form method="post" action="?view=phyrian" style="display:inline">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="action" value="phyrian_checkin">
+                      <input type="hidden" name="return_view" value="phyrian">
+                      <button class="btn btn-primary" type="submit">Daily check-in</button>
+                    </form>
+                  <?php endif; ?>
+                <?php endif; ?>
+              </div>
+            </div>
+          </div>
+
+          <div class="phyrian-banner" aria-hidden="true">
+            <img src="<?= h($phyAsset('banner-exchange.jpg')) ?>" alt="" width="1000" height="283" loading="lazy" decoding="async">
+          </div>
+
+          <?php if ($phyPending): ?>
+            <h3 class="phyrian-section-title">
+              <img src="<?= h($phyAsset('icon-scan.png')) ?>" alt="" width="40" height="40" decoding="async">
+              Incoming requests
+            </h3>
+            <?php foreach ($phyPending as $preq): ?>
+              <?php
+                $preqId = (int) ($preq['id'] ?? 0);
+                $preqKind = (string) ($preq['kind'] ?? '');
+                $preqFrom = trim((string) ($preq['from_username'] ?? $preq['from_actor_key'] ?? 'someone'));
+                $preqLabel = $preqKind === 'imprint' ? 'Imprint offer' : 'Resonance exchange';
+                $preqArt = $preqKind === 'imprint' ? 'btn-imprint.png' : 'btn-exchange.png';
+              ?>
+              <article class="phyrian-req">
+                <img src="<?= h($phyAsset($preqArt)) ?>" alt="" width="420" height="96" loading="lazy" decoding="async">
+                <div>
+                  <div>
+                    <span class="who"><?= h($preqLabel) ?></span>
+                    <span class="meta"> · from @<?= h($preqFrom) ?></span>
+                    <?php if (!empty($preq['created_at'])): ?>
+                      <span class="meta"> · <?= h(relative_time((string) $preq['created_at'])) ?></span>
+                    <?php endif; ?>
+                  </div>
+                  <div class="meta">
+                    <?php if ($preqKind === 'imprint'): ?>
+                      Accepting assigns you a strain (origin rolls random; peers transmit their own).
+                    <?php else: ?>
+                      Accepting gives both of you +5 resonance (capped at 100).
+                    <?php endif; ?>
+                  </div>
+                  <div class="tweet-actions">
+                    <form method="post" action="?view=phyrian" style="display:inline">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="action" value="phyrian_accept">
+                      <input type="hidden" name="request_id" value="<?= $preqId ?>">
+                      <input type="hidden" name="return_view" value="phyrian">
+                      <button class="btn btn-primary" type="submit">Accept</button>
+                    </form>
+                    <form method="post" action="?view=phyrian" style="display:inline">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="action" value="phyrian_deny">
+                      <input type="hidden" name="request_id" value="<?= $preqId ?>">
+                      <input type="hidden" name="return_view" value="phyrian">
+                      <button class="btn btn-ghost" type="submit">Deny</button>
+                    </form>
+                  </div>
+                </div>
+              </article>
+            <?php endforeach; ?>
+          <?php endif; ?>
+
+          <h3 class="phyrian-section-title">
+            <img src="<?= h($phyAsset('icon-profile.png')) ?>" alt="" width="40" height="40" decoding="async">
+            Local players
+          </h3>
+          <?php if (!$phyDirectory): ?>
+            <div class="empty">No other local accounts yet. Imprint and resonance stay on this instance for Phase 1.</div>
+          <?php else: ?>
+            <div class="phyrian-dir">
+              <?php foreach ($phyDirectory as $pd): ?>
+                <?php
+                  $pdId = (int) ($pd['id'] ?? 0);
+                  $pdName = trim((string) ($pd['username'] ?? $pd['actor_key'] ?? ''));
+                  $pdStatus = (string) ($pd['status'] ?? 'unknown');
+                  $pdStrain = trim((string) ($pd['strain'] ?? ''));
+                  $pdRes = (int) ($pd['resonance'] ?? 0);
+                  $pdImprinted = ($pdStatus === 'imprinted' && $pdStrain !== '');
+                  $pdCanImprint = $phyCanOfferImprint && !$pdImprinted;
+                  $pdCanResonate = $phyImprinted && $pdImprinted;
+                  $pdHandle = $pdName !== '' ? $pdName : ('user' . $pdId);
+                ?>
+                <article class="phyrian-card">
+                  <div class="phyrian-card-hd">
+                    <img src="<?= h($phyAsset($pdImprinted ? 'icon-status.png' : 'icon-register.png')) ?>" alt="" width="48" height="48" loading="lazy" decoding="async">
+                    <div style="min-width:0">
+                      <span class="who">@<?= h($pdHandle) ?></span>
+                      <?php if ($pdImprinted): ?>
+                        <div class="meta"><?= h($pdStrain) ?> · <?= (int) $pdRes ?> resonance</div>
+                      <?php else: ?>
+                        <div class="meta">Unknown Entity</div>
+                      <?php endif; ?>
+                    </div>
+                  </div>
+                  <?php if ($pdCanImprint || $pdCanResonate): ?>
+                    <div class="tweet-actions">
+                      <?php if ($pdCanImprint): ?>
+                        <form method="post" action="?view=phyrian" style="display:inline">
+                          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                          <input type="hidden" name="action" value="phyrian_request">
+                          <input type="hidden" name="kind" value="imprint">
+                          <input type="hidden" name="to_owner_id" value="<?= $pdId ?>">
+                          <input type="hidden" name="return_view" value="phyrian">
+                          <button class="phyrian-act" type="submit">
+                            <img src="<?= h($phyAsset('btn-imprint.png')) ?>" alt="" loading="lazy" decoding="async">
+                            <span>Offer imprint</span>
+                          </button>
+                        </form>
+                      <?php endif; ?>
+                      <?php if ($pdCanResonate): ?>
+                        <form method="post" action="?view=phyrian" style="display:inline">
+                          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                          <input type="hidden" name="action" value="phyrian_request">
+                          <input type="hidden" name="kind" value="resonance">
+                          <input type="hidden" name="to_owner_id" value="<?= $pdId ?>">
+                          <input type="hidden" name="return_view" value="phyrian">
+                          <button class="phyrian-act" type="submit">
+                            <img src="<?= h($phyAsset('btn-exchange.png')) ?>" alt="" loading="lazy" decoding="async">
+                            <span>Request resonance</span>
+                          </button>
+                        </form>
+                      <?php endif; ?>
+                    </div>
+                  <?php elseif (!$phyImprinted && !$phyIsOrigin): ?>
+                    <div class="meta">Imprint first to interact.</div>
+                  <?php endif; ?>
+                </article>
+              <?php endforeach; ?>
+            </div>
+          <?php endif; ?>
+        </section>
 
       <?php elseif ($view === 'drafts'): ?>
         <?php $draftRows = function_exists('ap_drafts_list') ? ap_drafts_list(100) : []; ?>
