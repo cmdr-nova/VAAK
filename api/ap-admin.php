@@ -18316,6 +18316,12 @@ if ($isPartial && $view === 'mentions') {
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
     header('X-Next-Max-Id: ' . $nextMaxId);
     header('X-VAAK-View: mentions');
+    $notifSource = (string) ($GLOBALS['ap_notif_list_source'] ?? '');
+    if ($notifSource !== '') {
+        header('X-VAAK-Notif-Source: ' . preg_replace('/[^a-z0-9._-]+/i', '', $notifSource));
+    } elseif (!empty($GLOBALS['ap_notif_list_cache_hit'])) {
+        header('X-VAAK-Notif-Source: redis');
+    }
     if ($notifShell) {
         $notifFilterHref = static function (string $filter): string {
             return '?view=mentions&notification_filter=' . rawurlencode($filter);
@@ -19398,9 +19404,26 @@ function admin_notifications_page(int $limit, ?string $maxId, array $types = [])
     if (!function_exists('ap_masto_notifications_fetch')) {
         return $empty;
     }
-    $primary = ap_masto_notifications_fetch($limit, $maxId, null, $types);
+    // M5: Mentions partial prefers localhost Axum JSON (same Redis envelope as
+    // list-warm). On miss/error, fall through to PHP Redis/hydrate.
+    $primary = null;
+    $fromAxum = false;
+    if (function_exists('ap_masto_notifications_axum_fetch')) {
+        $axum = ap_masto_notifications_axum_fetch($limit, $maxId, null, $types);
+        if (is_array($axum) && $axum !== []) {
+            $primary = $axum;
+            $fromAxum = true;
+        }
+    }
+    if (!is_array($primary)) {
+        $primary = ap_masto_notifications_fetch($limit, $maxId, null, $types);
+    }
     if (!is_array($primary) || $primary === []) {
         return $empty;
+    }
+    if ($fromAxum) {
+        $GLOBALS['ap_notif_list_cache_hit'] = true;
+        $GLOBALS['ap_notif_list_source'] = 'axum-shadow';
     }
 
     $primaryKeys = [];

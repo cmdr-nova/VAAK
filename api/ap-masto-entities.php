@@ -5694,6 +5694,127 @@ function ap_masto_notifications_list_cache_put(
 }
 
 /**
+ * Mentions M5: read Mastodon notification JSON from localhost Axum shadow.
+ * Returns a list on 200 cache hit; null on miss/error so callers fall back to PHP.
+ *
+ * @param list<string> $types
+ * @return list<array<string,mixed>>|null
+ */
+function ap_masto_notifications_axum_fetch(
+    int $limit = 30,
+    ?string $maxId = null,
+    ?string $sinceId = null,
+    array $types = [],
+    int $ownerUserId = 0
+): ?array {
+    $enabled = getenv('VAAK_NOTIF_AXUM_PRIMARY');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return null;
+    }
+    if ($ownerUserId < 1) {
+        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+            ? (int) ap_db_masto_owner_user_id()
+            : (int) ap_db_default_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $limit = max(1, min(80, $limit));
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    // Localhost-only cutover; refuse non-loopback bases.
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $query = [
+        'owner_id' => $ownerUserId,
+        'limit' => $limit,
+    ];
+    if ($maxId !== null && $maxId !== '') {
+        $query['max_id'] = $maxId;
+    }
+    if ($sinceId !== null && $sinceId !== '') {
+        $query['since_id'] = $sinceId;
+    }
+    if ($types !== []) {
+        $query['types'] = implode(',', array_values(array_filter(array_map(
+            static fn($t) => strtolower(trim((string) $t)),
+            $types
+        ), static fn($t) => $t !== '')));
+    }
+    $url = $base . '/api/v1/notifications?' . http_build_query($query);
+    $body = null;
+    $code = 0;
+    $started = microtime(true);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return null;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => 120,
+            CURLOPT_TIMEOUT_MS => 350,
+            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        ]);
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 0.35,
+                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'ignore_errors' => true,
+            ],
+        ]);
+        $raw = @file_get_contents($url, false, $ctx);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $hline) {
+                if (preg_match('#^HTTP/\S+\s+(\d+)#', (string) $hline, $m)) {
+                    $code = (int) $m[1];
+                    break;
+                }
+            }
+        }
+    }
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('notifications.axum_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($body) || $body === '') {
+        return null;
+    }
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded) || !array_is_list($decoded)) {
+        return null;
+    }
+    /** @var list<array<string,mixed>> $items */
+    $items = [];
+    foreach ($decoded as $row) {
+        if (is_array($row)) {
+            $items[] = $row;
+        }
+    }
+    $GLOBALS['ap_notif_list_cache_hit'] = true;
+    $GLOBALS['ap_notif_list_source'] = 'axum-shadow';
+    return $items;
+}
+
+/**
  * @param list<string> $types empty = all supported
  * @param list<string> $exclude
  * @return list<array<string,mixed>>
@@ -5761,12 +5882,14 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             $items = $wrapped['items'];
             if ($age >= 0 && $age <= $notifFreshSec) {
                 $GLOBALS['ap_notif_list_cache_hit'] = true;
+                $GLOBALS['ap_notif_list_source'] = 'redis';
                 $recordNotifTiming('cache_fresh', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
                 return $items;
             }
             if ($age >= 0 && $age <= $notifStaleSec) {
                 $GLOBALS['ap_notif_list_cache_hit'] = true;
+                $GLOBALS['ap_notif_list_source'] = 'redis';
                 // Stale-while-revalidate: answer immediately. When list-warm is
                 // primary, skip request-path rebuild — the worker refreshes keys.
                 if (!$listRustPrimary) {
