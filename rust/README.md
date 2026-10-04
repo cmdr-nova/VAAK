@@ -9,7 +9,7 @@
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
-| `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home`, `/api/v1/notifications` (Redis-read only) |
+| `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home` (hydrate Redis), `/api/v1/notifications` (Redis-read) |
 
 PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm and ranked-warm keep entity/lean hydrate in PHP (freeze contract) while Rust owns the multi-owner loop — interim bridges until native Rust + Axum cutover, then those PHP parts drop.
 
@@ -62,7 +62,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Notif live key: `vaak:notifications:v1:unread:{owner}:{scan}:{sha256(last_read)}` TTL 45s; source `vaak-worker-live`
 - Notif list key: `vaak:notifications:v1:{owner}:{sha256(limit,max,since,types,exclude)}` envelope `{ts,items,source}` TTL 600s when list-warm primary; source `vaak-worker-live` from `notif-list-warm.php` (hash JSON key order must match PHP: `limit,max,since,types,exclude`)
 - Ranked key: `vaak:timeline:ranked:v2:{sha256(logical)}` + owner index `vaak:timeline:owner-index:v1:{owner}`; source `vaak-worker-live` from `ranked-warm.php`
-- Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home`, `/api/v1/timelines/home`
+- Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss). Prime with `bin/home-timeline-warm.php` or Ice Cubes head polls.
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
 - Actor warm queue: `vaak:queue:bsky_actor_warm` JSON `{did,owner,ts,source}`; flat key `vaak:actor:v1:bsky:{did}` TTL ~2700s
 - AP actor warm queue: `vaak:queue:ap_actor_warm` JSON `{actor_id,ts,source}`; flat key `vaak:actor:v1:ap:{sha256}` TTL ~2700s; PHP `ap-actor-warm.php` does signed fetch
