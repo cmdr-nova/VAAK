@@ -2,11 +2,16 @@
 /**
  * Mastodon-compatible API shim for Ice Cubes / Tusky (multi-user; token-bound actor).
  * Routes: /api/v1/*, /api/v2/*, /oauth/*
+ *
+ * Define AP_MASTO_LIB_ONLY before require to load helpers without HTTP dispatch
+ * (used by bin/home-timeline-warm.php and similar CLI warmers).
  */
 declare(strict_types=1);
 
-header('X-Content-Type-Options: nosniff');
-header('X-Robots-Tag: noindex, nofollow');
+if (!defined('AP_MASTO_LIB_ONLY')) {
+    header('X-Content-Type-Options: nosniff');
+    header('X-Robots-Tag: noindex, nofollow');
+}
 
 require_once __DIR__ . '/ap-db.php';
 require_once __DIR__ . '/ap-auth.php';
@@ -20,26 +25,29 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
 }
 require_once __DIR__ . '/ap-inbox.php';
 
-$method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
-$uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
-$path = parse_url($uri, PHP_URL_PATH) ?: '/';
-$path = rtrim($path, '/') ?: '/';
+// CLI / worker includes can load helpers without dispatching HTTP.
+if (!defined('AP_MASTO_LIB_ONLY')) {
+    $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+    $uri = (string) ($_SERVER['REQUEST_URI'] ?? '/');
+    $path = parse_url($uri, PHP_URL_PATH) ?: '/';
+    $path = rtrim($path, '/') ?: '/';
 
-// CORS for mobile apps (preflight)
-if ($method === 'OPTIONS') {
+    // CORS for mobile apps (preflight)
+    if ($method === 'OPTIONS') {
+        header('Access-Control-Allow-Origin: *');
+        header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
+        header('Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key');
+        http_response_code(204);
+        exit;
+    }
     header('Access-Control-Allow-Origin: *');
-    header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key');
-    http_response_code(204);
-    exit;
-}
-header('Access-Control-Allow-Origin: *');
 
-try {
-    ap_masto_dispatch($method, $path);
-} catch (Throwable $e) {
-    error_log('[ap-mastodon] ' . $e->getMessage());
-    ap_masto_json(['error' => 'Internal server error'], 500);
+    try {
+        ap_masto_dispatch($method, $path);
+    } catch (Throwable $e) {
+        error_log('[ap-mastodon] ' . $e->getMessage());
+        ap_masto_json(['error' => 'Internal server error'], 500);
+    }
 }
 
 function ap_masto_dispatch(string $method, string $path): void

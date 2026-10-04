@@ -31,6 +31,8 @@ pub struct OwnerQuery {
     pub types: Option<String>,
     pub max_id: Option<String>,
     pub since_id: Option<String>,
+    /// Ice Cubes pull-to-refresh uses min_id (same exclusive lower bound as since_id).
+    pub min_id: Option<String>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -76,8 +78,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
-        // Mastodon-shaped path aliases (still shadow JSON, not a live cutover).
-        .route("/api/v1/timelines/home", get(shadow_home))
+        // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
+        .route("/api/v1/timelines/home", get(shadow_home_masto))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
         .with_state(state);
 
@@ -167,6 +169,67 @@ async fn shadow_home(
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let limit = q.limit.unwrap_or(20).clamp(1, 40) as usize;
     json_result(crate::timeline::home_shadow(&state.cfg, owner, limit).await)
+}
+
+/// Mastodon-shaped Home statuses from PHP hydrate Redis (404 on miss).
+async fn shadow_home_masto(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(40).clamp(1, 80) as usize;
+    // Head polls only (Ice Cubes cache); scroll pages are not cached by PHP.
+    if q.max_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "home hydrate cache is head-only (no max_id)",
+                "mode": "shadow",
+            })),
+        )
+            .into_response();
+    }
+    let since = q
+        .since_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            q.min_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+    match crate::timeline::home_hydrate(&state.cfg, owner, limit, since).await {
+        Ok(report) if report.cache_hit => {
+            let mut resp = (StatusCode::OK, Json(report.items)).into_response();
+            if let Some(link) = report.link {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&link) {
+                    resp.headers_mut().insert(axum::http::header::LINK, val);
+                }
+            }
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-vaak-tl-cache"),
+                axum::http::HeaderValue::from_static("axum-shadow"),
+            );
+            resp
+        }
+        Ok(report) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "home hydrate cache miss",
+                "redis_key": report.redis_key,
+                "note": report.note,
+                "mode": "shadow",
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 fn parse_types(raw: Option<&str>) -> Vec<String> {
