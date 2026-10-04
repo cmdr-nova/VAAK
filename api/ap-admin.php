@@ -18759,34 +18759,14 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         } elseif (is_string($nSnippet) && strlen($nSnippet) > 280) {
             $snipShow = substr($nSnippet, 0, 280) . '…';
         }
-        // Strip the API reply-context prefix when we render a separate
-        // "In reply to" block. The generated parent teaser may itself contain
-        // multiple paragraphs, so stopping at the first blank line leaves the
-        // tail of the quoted parent duplicated in the reply body. Prefer the
-        // final known mention (the actual reply text normally starts there),
-        // with a bounded 140-character fallback matching the API prefix size.
+        // Strip the API reply-context prefix when Mentions paints parent context
+        // separately (shared-card ↩ chrome or parent teaser). Shared helper also
+        // cleans status.content before the nested embed so the bake is not shown twice.
         if (is_string($snipShow) && preg_match('/^↩\s+/u', $snipShow)) {
-            $replyBodyStart = null;
-            foreach ($nStatusMentions as $knownMention) {
-                if (!is_array($knownMention)) continue;
-                $knownAcct = ltrim(trim((string) ($knownMention['acct'] ?? '')), '@');
-                if ($knownAcct === '') continue;
-                $pos = function_exists('mb_strripos')
-                    ? mb_strripos($snipShow, '@' . $knownAcct)
-                    : strripos($snipShow, '@' . $knownAcct);
-                if ($pos !== false && $pos > 0) {
-                    $replyBodyStart = $pos;
-                    break;
-                }
-            }
-            if ($replyBodyStart !== null) {
-                $snipShow = trim(function_exists('mb_substr')
-                    ? mb_substr($snipShow, $replyBodyStart)
-                    : substr($snipShow, $replyBodyStart));
-            } else {
-                $snipShow = preg_replace('/^↩\s+.{1,140}(?:\R{2,}|$)/su', '', $snipShow, 1) ?? $snipShow;
-                $snipShow = trim($snipShow);
-            }
+            $snipShow = admin_notif_strip_reply_context_plain(
+                $snipShow,
+                is_array($nStatusMentions ?? null) ? $nStatusMentions : []
+            );
             $nSnippet = $snipShow;
         }
         // Clickable @handles in mention/quote bodies (full @user@host when present).
@@ -18869,27 +18849,32 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
       <?php
         // Structured quote on the status is painted inside the nested shared card;
         // skip the thin "Quoted" parent teaser to avoid a duplicate preview.
+        // Reply Mentions: shared-card ↩ chrome covers parent context — only show
+        // the thin teaser when the embed path fails (snippet fallback below).
         $nHasStructuredQuote = is_array($nStatus)
             && is_array($nStatus['quote']['quoted_status'] ?? null);
         $nShowParentTeaser = $nParentUrl !== '' && $nParentSnippet !== ''
             && !($nType === 'quote' && $nHasStructuredQuote);
       ?>
-      <?php if ($nShowParentTeaser): ?>
-        <div class="quote-block" style="margin-top:.55rem">
-          <span class="qt-label"><?= $nType === 'quote' ? 'Quoted' : 'In reply to' ?></span><br>
-          <?php if ($nParentHref !== ''): ?>
-            <a class="notification-snippet" href="<?= h($nParentHref) ?>"><?= h($nParentSnippet) ?></a>
-          <?php else: ?>
-            <span class="notification-snippet"><?= h($nParentSnippet) ?></span>
-          <?php endif; ?>
-        </div>
-      <?php endif; ?>
       <?php if (in_array($nType, ['mention', 'quote'], true)
           && is_array($nStatus)
           && ($nEmbedded = admin_notif_try_embed_status_card($nStatus, $followingIds, true))): ?>
-        <?php /* Shared status card under notif chrome; nested author header hidden. */ ?>
-      <?php elseif ($nSnippetHtml !== '' && in_array($nType, ['mention', 'quote'], true)): ?>
-        <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
+        <?php /* Shared status card under notif chrome; nested author header hidden.
+                 Reply bake stripped inside embed; ↩ chrome is the sole parent context. */ ?>
+      <?php elseif (in_array($nType, ['mention', 'quote'], true)): ?>
+        <?php if ($nShowParentTeaser): ?>
+          <div class="quote-block" style="margin-top:.55rem">
+            <span class="qt-label"><?= $nType === 'quote' ? 'Quoted' : 'In reply to' ?></span><br>
+            <?php if ($nParentHref !== ''): ?>
+              <a class="notification-snippet" href="<?= h($nParentHref) ?>"><?= h($nParentSnippet) ?></a>
+            <?php else: ?>
+              <span class="notification-snippet"><?= h($nParentSnippet) ?></span>
+            <?php endif; ?>
+          </div>
+        <?php endif; ?>
+        <?php if ($nSnippetHtml !== ''): ?>
+          <div class="body feed-body notification-post"><?= $nSnippetHtml ?></div>
+        <?php endif; ?>
       <?php elseif (in_array($nType, ['favourite', 'reblog', 'update', 'poll', 'status'], true)
           && is_array($nStatus)
           && admin_notif_try_embed_status_card($nStatus, $followingIds)): ?>
@@ -19104,6 +19089,128 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
 }
 
 /**
+ * Strip the Ice Cubes reply-context prefix ("↩ parent preview") from plain text.
+ * Mentions paints parent context via shared-card ↩ chrome / parent teaser, so the
+ * baked prefix must not also appear in the reply body.
+ *
+ * Prefer the blank-line split the API bake uses ("↩ preview\n\nreply"). Mention
+ * heuristics are a fallback for older single-block rows where the reply itself
+ * starts with @handle.
+ *
+ * @param list<array<string,mixed>> $knownMentions
+ */
+function admin_notif_strip_reply_context_plain(string $text, array $knownMentions = []): string
+{
+    $text = trim($text);
+    if ($text === '' || !preg_match('/^↩\s+/u', $text)) {
+        return $text;
+    }
+    // API bake: "↩ " + up to 140 chars of parent + "\n\n" + reply.
+    if (preg_match('/^↩\s+.+\R{2,}([\s\S]+)$/u', $text, $m)) {
+        return trim((string) $m[1]);
+    }
+    $replyBodyStart = null;
+    foreach ($knownMentions as $knownMention) {
+        if (!is_array($knownMention)) {
+            continue;
+        }
+        $knownAcct = ltrim(trim((string) ($knownMention['acct'] ?? '')), '@');
+        if ($knownAcct === '') {
+            continue;
+        }
+        // Skip a leading "@handle" that belongs to the parent preview itself.
+        $searchFrom = 1;
+        $hay = function_exists('mb_substr') ? mb_substr($text, $searchFrom) : substr($text, $searchFrom);
+        $rel = function_exists('mb_strripos')
+            ? mb_strripos($hay, '@' . $knownAcct)
+            : strripos($hay, '@' . $knownAcct);
+        if ($rel === false) {
+            continue;
+        }
+        $pos = $searchFrom + (int) $rel;
+        // Reply-starting mention is past the ~140-char bake window.
+        if ($pos >= 8) {
+            $replyBodyStart = $pos;
+            break;
+        }
+    }
+    if ($replyBodyStart !== null) {
+        return trim(function_exists('mb_substr')
+            ? mb_substr($text, $replyBodyStart)
+            : substr($text, $replyBodyStart));
+    }
+    $stripped = preg_replace('/^↩\s+.{1,140}(?:\R{2,}|$)/su', '', $text, 1);
+    return trim(is_string($stripped) ? $stripped : $text);
+}
+
+/**
+ * Drop the API-baked "↩ parent preview" paragraph from a Mentions status so the
+ * nested shared card shows only the reply/quote body (chrome still has ↩ reply to).
+ *
+ * @param array<string,mixed> $status
+ * @param list<array<string,mixed>> $knownMentions
+ * @return array<string,mixed>
+ */
+function admin_notif_status_strip_reply_bake(array $status, array $knownMentions = []): array
+{
+    $content = (string) ($status['content'] ?? '');
+    if ($content === '') {
+        return $status;
+    }
+    $plain = function_exists('admin_html_to_plain')
+        ? admin_html_to_plain($content)
+        : trim(html_entity_decode(strip_tags($content), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    if (!preg_match('/^↩\s+/u', $plain)) {
+        return $status;
+    }
+    // HTML path: drop the first <p> when it is the bake line.
+    if (preg_match('/^\s*<p\b[^>]*>[\s\S]*?<\/p>\s*/u', $content, $m)) {
+        $firstPlain = function_exists('admin_html_to_plain')
+            ? admin_html_to_plain($m[0])
+            : trim(html_entity_decode(strip_tags($m[0]), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if (preg_match('/^↩\s+/u', $firstPlain)) {
+            $rest = ltrim(substr($content, strlen($m[0])));
+            if ($rest !== '') {
+                $status['content'] = $rest;
+                return $status;
+            }
+        }
+    }
+    $mentions = $knownMentions !== []
+        ? $knownMentions
+        : (is_array($status['mentions'] ?? null) ? $status['mentions'] : []);
+    $cleaned = admin_notif_strip_reply_context_plain($plain, $mentions);
+    if ($cleaned === '' || $cleaned === $plain) {
+        return $status;
+    }
+    if (function_exists('ap_masto_content_with_mentions')) {
+        $extra = [];
+        foreach ($mentions as $m) {
+            if (is_array($m) && !empty($m['url']) && is_string($m['url'])) {
+                $extra[] = (string) $m['url'];
+            }
+        }
+        $pack = ap_masto_content_with_mentions($cleaned, $extra);
+        $status['content'] = (string) ($pack['content'] ?? $cleaned);
+        if (!empty($pack['mentions']) && is_array($pack['mentions'])) {
+            $status['mentions'] = $pack['mentions'];
+        }
+    } else {
+        $parts = preg_split('/\n{2,}/u', $cleaned) ?: [$cleaned];
+        $html = '';
+        foreach ($parts as $p) {
+            $p = trim((string) $p);
+            if ($p === '') {
+                continue;
+            }
+            $html .= '<p>' . h($p) . '</p>';
+        }
+        $status['content'] = $html !== '' ? $html : h($cleaned);
+    }
+    return $status;
+}
+
+/**
  * Nest the shared Mastodon status card under a Mentions header when the
  * underlying status has a visible body/media. Falls back to the legacy
  * quote-block / snippet preview when the status is empty or converters failed.
@@ -19120,6 +19227,12 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     }
     if (!function_exists('admin_render_masto_status_card')) {
         return false;
+    }
+    // Mentions reply rows bake "↩ parent\n\nreply" into content for Ice Cubes.
+    // Shared-card ↩ chrome already shows the parent — strip the bake so the nest
+    // body is only the reply (Open/status view never had the bake).
+    if ($hideHeader) {
+        $status = admin_notif_status_strip_reply_bake($status);
     }
     if (function_exists('ap_normalize_status')) {
         $status = ap_normalize_status($status);
