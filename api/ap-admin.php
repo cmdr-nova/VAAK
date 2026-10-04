@@ -313,8 +313,13 @@ if ($view === 'compose') {
     $composerForceOpen = true;
     $view = 'home';
 }
-// Your Posts removed — own profile (/users/{key}) already shows posts + more.
-if ($view === 'outbox') {
+// Your Posts removed — GET navigations go to own profile (/users/{key}).
+// Compose still POSTs to ?view=outbox (upload_media / reply / draft / queue);
+// do not redirect those or the XHR follows to HTML and shows "Empty upload response."
+if (
+    $view === 'outbox'
+    && strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'POST'
+) {
     $ownProfilePath = function_exists('ap_vaak_pretty_profile_path')
         ? ap_vaak_pretty_profile_path((string) ($vaakActorKey ?? ''), [])
         : '';
@@ -36031,9 +36036,21 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       });
       xhr.addEventListener('load', () => {
         let data = null;
-        try { data = JSON.parse(xhr.responseText || ''); } catch (_) {}
+        const raw = String(xhr.responseText || '');
+        try { data = JSON.parse(raw); } catch (_) {}
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(data || { ok: false, error: 'Empty upload response.' });
+          if (data && typeof data === 'object') {
+            resolve(data);
+            return;
+          }
+          // Non-JSON 2xx is usually an HTML redirect/shell (e.g. legacy outbox GET).
+          const looksHtml = /^\s*</.test(raw);
+          resolve({
+            ok: false,
+            error: looksHtml
+              ? 'Compose hit a page instead of the API — refresh and try again.'
+              : (raw.trim() === '' ? 'Empty compose response.' : 'Invalid compose response.'),
+          });
           return;
         }
         const fallback = (data && data.error)
