@@ -5100,23 +5100,32 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     }
     $dmCount = function_exists('ap_dm_unread_count') ? ap_dm_unread_count() : 0;
     $latestDmId = '';
+    $ownerForBadge = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
     try {
-        $ownerForDm = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
         $dmLatest = ap_db()->prepare(
             "SELECT id FROM direct_messages
              WHERE owner_user_id = ? AND direction = 'in' AND read_at IS NULL AND deleted_at IS NULL
              ORDER BY id DESC LIMIT 1"
         );
-        $dmLatest->execute([$ownerForDm]);
+        $dmLatest->execute([$ownerForBadge]);
         $latestDmId = (string) ($dmLatest->fetchColumn() ?: '');
     } catch (Throwable $e) {
         // Keep the badge endpoint usable if DM metadata is temporarily busy.
+    }
+    $phyrianPending = 0;
+    try {
+        if ($ownerForBadge > 0 && function_exists('ap_phyrian_pending_count')) {
+            $phyrianPending = ap_phyrian_pending_count($ownerForBadge);
+        }
+    } catch (Throwable $e) {
+        $phyrianPending = 0;
     }
     $latestUnread = preg_replace('/\D+/', '', (string) ($state['latest_unread_id'] ?? '')) ?: '';
     $latestAny = preg_replace('/\D+/', '', (string) ($state['latest_id'] ?? '')) ?: '';
     echo json_encode([
         'count' => (int) ($state['count'] ?? 0),
         'dm_count' => (int) $dmCount,
+        'phyrian_pending' => (int) $phyrianPending,
         'latest_unread_id' => $latestUnread,
         // Keep latest_id as an alias of the unread tip for older cached JS.
         'latest_id' => $latestUnread !== '' ? $latestUnread : $latestAny,
@@ -10312,6 +10321,15 @@ if ($prefillReplyTo !== '' && $prefillQuoteObject === '' && $prefillEditNote ===
 }
 $composerReturnView = $view;
 $draftsCountNav = function_exists('ap_drafts_count') ? ap_drafts_count() : 0;
+$phyrianPendingNav = 0;
+if (empty($GLOBALS['vaak_guest_profile']) && (int) ($vaakOwnerId ?? 0) > 0
+    && function_exists('ap_phyrian_pending_count')) {
+    try {
+        $phyrianPendingNav = ap_phyrian_pending_count((int) $vaakOwnerId);
+    } catch (Throwable $e) {
+        $phyrianPendingNav = 0;
+    }
+}
 if (function_exists('ap_blog_posts_list')) {
     $draftsCountNav += count(array_filter(ap_blog_posts_list($vaakActorKey, false, 200), static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft'));
 }
@@ -22415,12 +22433,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       </details>
       <hr class="nav-sep">
       <details class="nav-group" data-nav-key="you" <?= $navYouOpen ? 'open' : '' ?>>
-        <summary><span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span></summary>
+        <summary>
+          <span class="ico"><i class="ph ph-user" aria-hidden="true"></i></span><span class="label">You</span>
+          <span class="nav-badge" id="nav-you-phyrian-badge" style="position:static"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?> aria-label="<?= (int) $phyrianPendingNav ?> Phyrian requests"><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
+        </summary>
         <div class="nav-sub">
           <a class="<?= $view === 'profile' ? 'active' : '' ?>" href="?view=profile"><span class="ico">◇</span><span class="label">Settings</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'rss' ? 'active' : '' ?>" href="?view=rss"><span class="ico">📰</span><span class="label">RSS</span></a>
-          <a class="<?= $view === 'phyrian' ? 'active' : '' ?>" href="?view=phyrian"><span class="ico">◈</span><span class="label">Phyrian Strains</span></a>
+          <a class="<?= $view === 'phyrian' ? 'active' : '' ?>" href="?view=phyrian" id="nav-phyrian">
+            <span class="ico">◈</span><span class="label">Phyrian Strains</span>
+            <span class="nav-badge" id="nav-phyrian-badge"<?= $phyrianPendingNav > 0 ? '' : ' hidden' ?>><?= $phyrianPendingNav > 99 ? '99+' : (string) (int) $phyrianPendingNav ?></span>
+          </a>
           <a class="<?= $view === 'queue' ? 'active' : '' ?>" href="?view=queue"><span class="ico">⏱</span><span class="label">Queue</span></a>
           <a class="<?= $view === 'drafts' ? 'active' : '' ?>" href="?view=drafts" id="nav-drafts">
             <span class="ico">📄</span><span class="label">Drafts</span>
@@ -30304,6 +30328,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
   const notifBaseTitle = <?= json_encode('VAAK · ' . view_title($view)) ?>;
   const notifBadge = document.getElementById('notif-badge');
   const dmBadge = document.getElementById('dm-badge');
+  const phyrianBadge = document.getElementById('nav-phyrian-badge');
+  const youPhyrianBadge = document.getElementById('nav-you-phyrian-badge');
   // Digit-only snowflake comparison keeps unread-tip tracking stable across polls.
   const snowflakeDigits = (v) => String(v || '').replace(/\D+/g, '') || '0';
   const snowflakeNewer = (a, b) => {
@@ -30331,10 +30357,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     if (n > 0) {
       el.textContent = label;
       el.hidden = false;
+      if (el.hasAttribute('aria-label') || el.id === 'nav-you-phyrian-badge') {
+        el.setAttribute('aria-label', label + ' Phyrian requests');
+      }
     } else {
       el.hidden = true;
       el.textContent = '0';
     }
+  }
+
+  function applyPhyrianPending(count) {
+    const p = Math.max(0, parseInt(count, 10) || 0);
+    setBadge(phyrianBadge, p);
+    setBadge(youPhyrianBadge, p);
   }
 
   function applyInboxUnread(notifCount, dmCount, opts) {
@@ -30350,6 +30385,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     setBadge(notifBadge, n);
     setBadge(dmBadge, d);
+    if (opts && Object.prototype.hasOwnProperty.call(opts, 'phyrianPending')) {
+      applyPhyrianPending(opts.phyrianPending);
+    }
     const titleBits = [];
     if (n > 0 && !notifView) titleBits.push(n > 99 ? '99+' : String(n));
     if (d > 0 && !dmView) titleBits.push('✉' + (d > 99 ? '99+' : String(d)));
@@ -30376,6 +30414,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     notifId: <?= json_encode($notifLatestUnreadIdNav !== '' ? $notifLatestUnreadIdNav : $notifLatestIdNav) ?>,
     lastReadId: <?= json_encode($notifLastReadIdNav) ?>,
     dmId: <?= json_encode($dmLatestIdNav) ?>,
+    phyrianPending: <?= (int) $phyrianPendingNav ?>,
   });
   const pollNotif = async () => {
     if (window.vaakGuestProfile) return;
@@ -30397,6 +30436,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         notifId: unreadTip,
         lastReadId: data && data.last_read_id,
         dmId: data && data.latest_dm_id,
+        phyrianPending: data && data.phyrian_pending,
       });
     } catch (e) {
     }

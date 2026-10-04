@@ -129,6 +129,25 @@ function ap_phyrian_pending_for(int $ownerUserId): array
     }
 }
 
+/** Incoming imprint/resonance offers waiting on this owner (nav badge). */
+function ap_phyrian_pending_count(int $ownerUserId): int
+{
+    if ($ownerUserId < 1) {
+        return 0;
+    }
+    ap_phyrian_migrate();
+    try {
+        $st = ap_db()->prepare(
+            "SELECT COUNT(*) FROM phyrian_requests
+             WHERE to_owner_id = ? AND status = 'pending'"
+        );
+        $st->execute([$ownerUserId]);
+        return max(0, (int) $st->fetchColumn());
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
 /**
  * @return array{ok:bool,error?:string,id?:int}
  */
