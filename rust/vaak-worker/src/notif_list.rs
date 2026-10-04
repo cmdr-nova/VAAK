@@ -102,6 +102,16 @@ async fn redis_list_age(
     let Some(payload) = cached else {
         return Ok(None);
     };
+    // Empty envelopes are never "fresh" — a prior projection poison or cold
+    // account must rebuild (PHP fallback when projection is thin).
+    let items_empty = payload
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(true);
+    if items_empty {
+        return Ok(None);
+    }
     let ts = payload.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
     if ts < 1 {
         return Ok(None);
@@ -110,8 +120,13 @@ async fn redis_list_age(
 }
 
 /// Read recent projection rows and filter to a Mentions page.
-/// Full pages always win. Partial pages win only when the 80-row recent window
-/// is exhausted (sparse filters like mentions/boosts skip PHP hydrate).
+///
+/// - Full pages (>= limit) always win.
+/// - Partial/empty pages win only when the 80-row recent window is exhausted
+///   (sparse filters like mentions/boosts can skip PHP hydrate).
+/// - Thin windows (`scanned < 80`) may accept **non-empty** partials, but must
+///   never return an empty `Some([])` — that poisons Redis and Mentions shows
+///   "No notifications yet" while PHP hydrate is skipped.
 async fn projection_page(
     db: &Client,
     owner_user_id: i64,
@@ -153,9 +168,15 @@ async fn projection_page(
         out.truncate(limit as usize);
         return Ok(Some(out));
     }
-    if scanned < 80 {
+    if scanned >= 80 {
+        // Recent window exhausted — partial/empty is authoritative for this filter.
         return Ok(Some(out));
     }
+    if !out.is_empty() {
+        // Thin window with real hits: accept partial rather than waiting on PHP.
+        return Ok(Some(out));
+    }
+    // Thin/empty window (incl. scanned=0): fall through to PHP hydrate.
     Ok(None)
 }
 
