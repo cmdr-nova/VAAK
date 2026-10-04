@@ -1,13 +1,14 @@
 //! Home / Local / Federated **ranked** warm (loading-plan slice 2 → native).
 //!
 //! - **Home (native):** rebuilds `vaak:timeline:ranked:v2:{sha256(logical)}` +
-//!   owner index from Postgres (follow events, own outbox, favourite/toxicity
-//!   nudges when algorithm on, Bluesky merge, RSS spacing). Source
-//!   `vaak-worker-native`. Flag `VAAK_RANKED_NATIVE_HOME=1`.
+//!   owner index from Postgres (follow events, own outbox, FoF/cold-start
+//!   recommendations, favourite/toxicity nudges when algorithm on, Bluesky
+//!   merge, RSS spacing). Source `vaak-worker-native`. Flag
+//!   `VAAK_RANKED_NATIVE_HOME=1`.
 //! - **Local / Federated (native):** outbox+local boosts / firehose events with
 //!   v13 key parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on).
-//! - PHP `api/bin/ranked-warm.php` remains for Home empty/thin fallback
-//!   (recommendations still PHP-only) and when a native flag is off.
+//! - PHP `api/bin/ranked-warm.php` remains only when a native flag is off or
+//!   native Home rebuild fails (last-resort empty fallback).
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
@@ -1620,6 +1621,405 @@ async fn load_favourite_tag_weights(db: &Client, owner: i64) -> HashMap<String, 
     pairs.into_iter().collect()
 }
 
+fn host_of_actor(actor: &str) -> String {
+    actor
+        .strip_prefix("https://")
+        .or_else(|| actor.strip_prefix("http://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+async fn load_muted_phrases(db: &Client, owner: i64) -> Vec<String> {
+    if owner < 1 {
+        return Vec::new();
+    }
+    let rows = db
+        .query(
+            "SELECT phrase FROM ap_muted_words WHERE owner_user_id = $1 LIMIT 200",
+            &[&owner],
+        )
+        .await
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for row in rows {
+        let phrase: String = row
+            .try_get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let phrase = phrase.trim().to_ascii_lowercase();
+        if !phrase.is_empty() {
+            out.push(phrase);
+        }
+    }
+    out
+}
+
+fn text_matches_muted(text: &str, phrases: &[String]) -> bool {
+    if phrases.is_empty() {
+        return false;
+    }
+    let lower = strip_tags_lower(text);
+    if lower.trim().is_empty() {
+        return false;
+    }
+    phrases.iter().any(|p| !p.is_empty() && lower.contains(p))
+}
+
+/// Friends-of-follows from cached Announces (PHP `admin_home_foaf_actor_weights`).
+async fn load_foaf_actor_weights(
+    db: &Client,
+    owner: i64,
+    owner_actor: &str,
+    following: &[String],
+    hidden: &hidden::HiddenSets,
+) -> HashMap<String, f64> {
+    if owner < 1 || following.is_empty() {
+        return HashMap::new();
+    }
+    let owner_actor = owner_actor.trim_end_matches('/');
+    let follows: HashSet<String> = following
+        .iter()
+        .filter(|a| a.starts_with("https://") && !a.contains("bsky.app/"))
+        .map(|a| a.trim_end_matches('/').to_string())
+        .collect();
+    if follows.is_empty() {
+        return HashMap::new();
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let mut counts: HashMap<String, f64> = HashMap::new();
+    let follow_list: Vec<String> = follows.iter().cloned().collect();
+    for chunk in follow_list.chunks(40) {
+        let mut actors = Vec::with_capacity(chunk.len() * 2);
+        for aid in chunk {
+            actors.push(aid.clone());
+            actors.push(format!("{aid}/"));
+        }
+        let rows = match db
+            .query(
+                "SELECT target_actor, COUNT(*)::bigint AS c
+                 FROM events
+                 WHERE type = 'Announce'
+                   AND action_taken = ANY(ARRAY['log','local_observe'])
+                   AND created_at >= $1
+                   AND actor_id = ANY($2)
+                   AND target_actor IS NOT NULL AND target_actor <> ''
+                 GROUP BY target_actor",
+                &[&since, &actors],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        for row in rows {
+            let actor: String = row
+                .try_get::<_, Option<String>>(0)
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string();
+            let c: i64 = row.try_get::<_, Option<i64>>(1).ok().flatten().unwrap_or(0);
+            if c < 1
+                || actor.is_empty()
+                || !actor.starts_with("https://")
+                || follows.contains(&actor)
+                || actor == owner_actor
+                || actor.contains("bsky.app/")
+                || actor.contains("relay.fedi.buzz/")
+                || hidden.is_hidden(&actor)
+            {
+                continue;
+            }
+            *counts.entry(actor).or_insert(0.0) += c as f64;
+        }
+    }
+    let mut pairs: Vec<_> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pairs.truncate(40);
+    pairs
+        .into_iter()
+        .map(|(a, c)| (a, c.min(64.0)))
+        .collect()
+}
+
+struct RecoState<'a> {
+    timeline: &'a mut Vec<TimelineItem>,
+    hidden: &'a hidden::HiddenSets,
+    muted: &'a [String],
+    seen_objects: HashSet<String>,
+    seen_rec_actors: HashSet<String>,
+    seen_hosts: HashMap<String, usize>,
+    cold_start: bool,
+    max_added: usize,
+    added: usize,
+}
+
+impl RecoState<'_> {
+    fn try_add(
+        &mut self,
+        row_id: i64,
+        actor: String,
+        object_id: String,
+        summary: String,
+        created: String,
+        visibility: String,
+        host: String,
+        score: f64,
+        budget: usize,
+    ) -> bool {
+        if self.added >= budget.min(self.max_added) {
+            return false;
+        }
+        let object = {
+            let o = object_id.trim_end_matches('/');
+            if o.is_empty() {
+                row_id.to_string()
+            } else {
+                o.to_string()
+            }
+        };
+        if object.is_empty() || self.seen_objects.contains(&object) {
+            return false;
+        }
+        if actor.is_empty() || self.hidden.is_hidden(&actor) {
+            return false;
+        }
+        if text_matches_muted(&summary, self.muted) {
+            return false;
+        }
+        if self.cold_start && self.seen_rec_actors.contains(&actor) {
+            return false;
+        }
+        let host = if host.is_empty() {
+            host_of_actor(&actor)
+        } else {
+            host.to_ascii_lowercase()
+        };
+        if self.cold_start && !host.is_empty() && *self.seen_hosts.get(&host).unwrap_or(&0) >= 2 {
+            return false;
+        }
+        if !self.cold_start && score < 1.5 {
+            return false;
+        }
+        let mut sort = parse_ts(&created);
+        let bump = ((1800.0 * (1.0 + score.max(0.0)).log2()).round() as i64).min(12 * 3600);
+        sort += bump;
+        self.timeline.push(TimelineItem::event(
+            row_id.to_string(),
+            sort,
+            actor.clone(),
+            actor.clone(),
+            summary,
+            visibility,
+            object.clone(),
+            "Create".into(),
+            "recommendation",
+        ));
+        self.seen_objects.insert(object);
+        if self.cold_start {
+            self.seen_rec_actors.insert(actor);
+            if !host.is_empty() {
+                *self.seen_hosts.entry(host).or_insert(0) += 1;
+            }
+        }
+        self.added += 1;
+        true
+    }
+}
+
+fn parse_reco_row(row: &tokio_postgres::Row) -> Result<(i64, String, String, String, String, String, String)> {
+    let id: i64 = row.get(0);
+    let actor: String = row
+        .try_get::<_, Option<String>>(1)?
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    let object_id: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+    let summary: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+    let created: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+    let visibility: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+    let host: String = row.try_get::<_, Option<String>>(6)?.unwrap_or_default();
+    Ok((id, actor, object_id, summary, created, visibility, host))
+}
+
+/// PHP `admin_home_cached_recommendation_items` — bounded FoF / preference fill.
+async fn apply_cached_recommendations(
+    db: &Client,
+    owner: i64,
+    owner_actor: &str,
+    following: &[String],
+    hidden: &hidden::HiddenSets,
+    timeline: &mut Vec<TimelineItem>,
+    actor_weights: &HashMap<String, f64>,
+    tag_weights: &HashMap<String, i32>,
+) -> Result<()> {
+    if owner < 1 {
+        return Ok(());
+    }
+    let cold_start = actor_weights.is_empty() && tag_weights.is_empty();
+    let max_added: usize = if cold_start { 10 } else { 12 };
+    let muted = load_muted_phrases(db, owner).await;
+    let mut seen_objects: HashSet<String> = HashSet::new();
+    for item in timeline.iter() {
+        let oid = if !item.object_id.is_empty() {
+            item.object_id.clone()
+        } else {
+            item.id.clone()
+        };
+        if !oid.is_empty() {
+            seen_objects.insert(oid.trim_end_matches('/').to_string());
+        }
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+    let mut state = RecoState {
+        timeline,
+        hidden,
+        muted: &muted,
+        seen_objects,
+        seen_rec_actors: HashSet::new(),
+        seen_hosts: HashMap::new(),
+        cold_start,
+        max_added,
+        added: 0,
+    };
+
+    if cold_start {
+        let foaf = load_foaf_actor_weights(db, owner, owner_actor, following, hidden).await;
+        let foaf_budget = max_added.min(4);
+        if !foaf.is_empty() {
+            let mut foaf_actors: Vec<_> = foaf.keys().cloned().collect();
+            foaf_actors.sort_by(|a, b| {
+                foaf.get(b)
+                    .unwrap_or(&0.0)
+                    .partial_cmp(foaf.get(a).unwrap_or(&0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            foaf_actors.truncate(24);
+            let mut lookup = Vec::new();
+            for fa in &foaf_actors {
+                lookup.push(fa.clone());
+                lookup.push(format!("{fa}/"));
+            }
+            if let Ok(rows) = db
+                .query(
+                    "SELECT id, actor_id, COALESCE(object_id,''), COALESCE(summary,''),
+                            created_at, COALESCE(visibility,'public'), COALESCE(host,'')
+                     FROM events
+                     WHERE type = 'Create'
+                       AND action_taken = ANY(ARRAY['log','local_observe'])
+                       AND created_at >= $1
+                       AND visibility = ANY(ARRAY['public','unlisted'])
+                       AND actor_id = ANY($2)
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 80",
+                    &[&since, &lookup],
+                )
+                .await
+            {
+                for row in rows {
+                    if state.added >= foaf_budget {
+                        break;
+                    }
+                    let (id, actor, object_id, summary, created, visibility, host) =
+                        parse_reco_row(&row)?;
+                    let score = 1.0 + foaf.get(&actor).copied().unwrap_or(0.0);
+                    state.try_add(
+                        id, actor, object_id, summary, created, visibility, host, score, foaf_budget,
+                    );
+                }
+            }
+        }
+        for (local_only, limit) in [(true, 80i64), (false, 120i64)] {
+            if state.added >= max_added {
+                break;
+            }
+            let rows = if local_only {
+                db.query(
+                    "SELECT id, actor_id, COALESCE(object_id,''), COALESCE(summary,''),
+                            created_at, COALESCE(visibility,'public'), COALESCE(host,'')
+                     FROM events
+                     WHERE type = 'Create'
+                       AND action_taken = ANY(ARRAY['log','local_observe'])
+                       AND created_at >= $1
+                       AND visibility = ANY(ARRAY['public','unlisted'])
+                       AND actor_id LIKE 'https://mkultra.monster/users/%'
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT $2",
+                    &[&since, &limit],
+                )
+                .await
+            } else {
+                db.query(
+                    "SELECT id, actor_id, COALESCE(object_id,''), COALESCE(summary,''),
+                            created_at, COALESCE(visibility,'public'), COALESCE(host,'')
+                     FROM events
+                     WHERE type = 'Create'
+                       AND action_taken = ANY(ARRAY['log','local_observe'])
+                       AND created_at >= $1
+                       AND visibility = ANY(ARRAY['public','unlisted'])
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT $2",
+                    &[&since, &limit],
+                )
+                .await
+            };
+            if let Ok(rows) = rows {
+                for row in rows {
+                    if state.added >= max_added {
+                        break;
+                    }
+                    let (id, actor, object_id, summary, created, visibility, host) =
+                        parse_reco_row(&row)?;
+                    state.try_add(
+                        id, actor, object_id, summary, created, visibility, host, 1.0, max_added,
+                    );
+                }
+            }
+        }
+    } else if let Ok(rows) = db
+        .query(
+            "SELECT id, actor_id, COALESCE(object_id,''), COALESCE(summary,''),
+                    created_at, COALESCE(visibility,'public'), COALESCE(host,'')
+             FROM events
+             WHERE type = 'Create'
+               AND action_taken = ANY(ARRAY['log','local_observe'])
+               AND created_at >= $1
+               AND visibility = ANY(ARRAY['public','unlisted'])
+             ORDER BY created_at DESC, id DESC
+             LIMIT 160",
+            &[&since],
+        )
+        .await
+    {
+        for row in rows {
+            if state.added >= max_added {
+                break;
+            }
+            let (id, actor, object_id, summary, created, visibility, host) = parse_reco_row(&row)?;
+            let mut score = actor_weights.get(&actor).copied().unwrap_or(0.0);
+            for tag in extract_hashtags(&summary) {
+                score += tag_weights.get(&tag).copied().unwrap_or(0) as f64 * 0.5;
+            }
+            state.try_add(
+                id, actor, object_id, summary, created, visibility, host, score, max_added,
+            );
+        }
+    }
+
+    if state.added > 0 {
+        tracing::debug!(
+            owner,
+            added = state.added,
+            cold_start,
+            "native home recommendations added"
+        );
+    }
+    Ok(())
+}
+
 fn apply_favourite_rank(
     timeline: &mut Vec<TimelineItem>,
     actor_weights: &HashMap<String, f64>,
@@ -1685,6 +2085,31 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     timeline.extend(fetch_own_outbox(&db, &actor_id).await?);
 
     if algorithm_on {
+        // Match PHP order: recommendations → toxicity → favourite.
+        let mut actor_weights = load_favourite_actor_weights(&db, owner_user_id).await;
+        for (actor, weight) in load_signal_actor_weights(&db, owner_user_id).await {
+            let entry = actor_weights.entry(actor).or_insert(0.0);
+            *entry = (*entry + weight).min(64.0);
+        }
+        let tag_weights = load_favourite_tag_weights(&db, owner_user_id).await;
+        if let Err(e) = apply_cached_recommendations(
+            &db,
+            owner_user_id,
+            &actor_id,
+            &following,
+            &hidden,
+            &mut timeline,
+            &actor_weights,
+            &tag_weights,
+        )
+        .await
+        {
+            tracing::warn!(
+                owner = owner_user_id,
+                error = %format!("{e:#}"),
+                "native home recommendations skipped"
+            );
+        }
         if downranking_on {
             if let Err(e) = apply_toxicity_downrank(&db, owner_user_id, &mut timeline).await {
                 tracing::warn!(
@@ -1694,12 +2119,6 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
                 );
             }
         }
-        let mut actor_weights = load_favourite_actor_weights(&db, owner_user_id).await;
-        for (actor, weight) in load_signal_actor_weights(&db, owner_user_id).await {
-            let entry = actor_weights.entry(actor).or_insert(0.0);
-            *entry = (*entry + weight).min(64.0);
-        }
-        let tag_weights = load_favourite_tag_weights(&db, owner_user_id).await;
         apply_favourite_rank(&mut timeline, &actor_weights, &tag_weights);
     }
 
