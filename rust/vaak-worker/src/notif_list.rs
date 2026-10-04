@@ -1,21 +1,21 @@
-//! Mentions / Ice Cubes notification **list** warm (M1) + Axum shadow read (M3).
+//! Mentions / Ice Cubes notification **list** warm + Axum shadow read.
 //!
-//! Orchestrates PHP `api/bin/notif-list-warm.php`, which materializes full
-//! Mastodon notification JSON into existing Redis keys
-//! `vaak:notifications:v1:{owner}:{hash}`. Entity hydrate stays in PHP for now
-//! so the freeze contract matches Mentions paint + Ice Cubes; Rust owns the
-//! loop, multi-owner cadence, and (M3) localhost Axum JSON read of warm Redis.
-//! End state: native hydrate + Axum live route, then drop PHP materializer.
+//! Warm path (10.5): prefer native Rust materialize from
+//! `ap_notification_projection` → Redis `vaak:notifications:v1:{owner}:{hash}`.
+//! PHP `notif-list-warm.php` remains fallback when projection cannot fill a
+//! full page. Axum `:8787` reads the same Redis keys (M3/M5).
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
+use tokio_postgres::Client;
 
 use crate::config::Config;
 use crate::notif;
@@ -40,8 +40,140 @@ fn warm_paths() -> WarmPaths {
     }
 }
 
-/// Warm one owner's common Mentions / Ice Cubes list cache keys via PHP.
-pub async fn warm_owner(owner_user_id: i64, limit: i64) -> Result<String> {
+fn env_flag_default_true(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => {
+            !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+        }
+        _ => true,
+    }
+}
+
+fn refresh_secs() -> i64 {
+    std::env::var("VAAK_NOTIF_LIST_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(90)
+        .clamp(15, 600)
+}
+
+struct WarmJob {
+    label: &'static str,
+    limit: i64,
+    types: Vec<String>,
+}
+
+fn warm_jobs(limit: i64) -> Vec<WarmJob> {
+    let limit = limit.clamp(1, 80);
+    vec![
+        WarmJob {
+            label: "all40",
+            limit: 40,
+            types: vec![],
+        },
+        WarmJob {
+            label: "all30",
+            limit,
+            types: vec![],
+        },
+        WarmJob {
+            label: "mentions",
+            limit,
+            types: vec!["mention".into()],
+        },
+        WarmJob {
+            label: "favourites",
+            limit,
+            types: vec!["favourite".into()],
+        },
+        WarmJob {
+            label: "boosts_quotes",
+            limit,
+            types: vec!["reblog".into(), "quote".into()],
+        },
+    ]
+}
+
+async fn redis_list_age(
+    redis: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+) -> Result<Option<i64>> {
+    let cached = redis_util::json_get(redis, key).await?;
+    let Some(payload) = cached else {
+        return Ok(None);
+    };
+    let ts = payload.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ts < 1 {
+        return Ok(None);
+    }
+    Ok(Some((Utc::now().timestamp() - ts).max(0)))
+}
+
+/// Read recent projection rows and filter to a Mentions page.
+/// Full pages always win. Partial pages win only when the 80-row recent window
+/// is exhausted (sparse filters like mentions/boosts skip PHP hydrate).
+async fn projection_page(
+    db: &Client,
+    owner_user_id: i64,
+    want: &[String],
+    limit: i64,
+) -> Result<Option<Vec<Value>>> {
+    // Match PHP gmdate('c') / stored updated_at (`…+00:00`), not `…Z` — text compare.
+    let cutoff = (Utc::now() - ChronoDuration::seconds(900))
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string();
+    let rows = db
+        .query(
+            "SELECT payload_json FROM ap_notification_projection
+             WHERE owner_user_id = $1 AND updated_at >= $2
+             ORDER BY created_at DESC, notification_id DESC
+             LIMIT 80",
+            &[&owner_user_id, &cutoff],
+        )
+        .await
+        .context("projection select")?;
+    let scanned = rows.len();
+    let want_set: std::collections::HashSet<&str> = want.iter().map(|s| s.as_str()).collect();
+    let mut out: Vec<Value> = Vec::new();
+    for row in rows {
+        let raw: String = row.get(0);
+        let Ok(item) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let typ = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if typ.is_empty() || !want_set.contains(typ) {
+            continue;
+        }
+        out.push(item);
+        if out.len() as i64 >= limit {
+            break;
+        }
+    }
+    if (out.len() as i64) >= limit {
+        out.truncate(limit as usize);
+        return Ok(Some(out));
+    }
+    if scanned < 80 {
+        return Ok(Some(out));
+    }
+    Ok(None)
+}
+
+async fn write_list_envelope(
+    redis: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+    items: Vec<Value>,
+) -> Result<()> {
+    let payload = json!({
+        "ts": Utc::now().timestamp(),
+        "items": items,
+        "source": "vaak-worker-projection",
+    });
+    redis_util::json_set(redis, key, &payload, 600).await
+}
+
+/// PHP materializer fallback (full hydrate) when projection cannot fill pages.
+async fn warm_owner_php(owner_user_id: i64, limit: i64) -> Result<String> {
     let paths = warm_paths();
     if !paths.script.is_file() {
         bail!("notif-list warm script missing: {}", paths.script.display());
@@ -57,7 +189,6 @@ pub async fn warm_owner(owner_user_id: i64, limit: i64) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Peer-auth DSN when unset (matches other CLI smokes).
     if std::env::var_os("AP_DB_DSN").is_none() {
         cmd.env("AP_DB_DSN", "pgsql:dbname=novalandia");
     }
@@ -77,12 +208,122 @@ pub async fn warm_owner(owner_user_id: i64, limit: i64) -> Result<String> {
     if !stderr.is_empty() {
         tracing::warn!(owner = owner_user_id, %stderr, "notif-list-warm stderr");
     }
-    Ok(format!("owner={owner_user_id} ms={ms}\n{stdout}"))
+    Ok(format!("php_fallback ms={ms}\n{stdout}"))
+}
+
+/// Warm one owner: projection→Redis first; PHP spawn if any Mentions page is incomplete.
+pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<String> {
+    let limit = limit.clamp(1, 80);
+    let started = Instant::now();
+    let native = env_flag_default_true("VAAK_NOTIF_NATIVE_PROJECTION");
+    let refresh = refresh_secs();
+
+    if !native {
+        let body = warm_owner_php(owner_user_id, limit).await?;
+        return Ok(format!(
+            "owner={owner_user_id} ms={} mode=php_only\n{body}",
+            started.elapsed().as_millis()
+        ));
+    }
+
+    let db = crate::db::connect(&cfg.database_url).await?;
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    let jobs = warm_jobs(limit);
+    let mut lines: Vec<String> = Vec::new();
+    let mut skip_fresh = 0u32;
+    let mut native_ok = 0u32;
+    let mut need_php = false;
+    let mut all40_items: Option<Vec<Value>> = None;
+
+    for job in &jobs {
+        let want = expand_types(&job.types);
+        let key = notifications_list_redis_key(owner_user_id, job.limit, None, None, &want);
+
+        // Derive all30 from a just-built all40 before skip-fresh.
+        if job.label == "all30" {
+            if let Some(ref items40) = all40_items {
+                let items30: Vec<Value> = items40.iter().take(job.limit as usize).cloned().collect();
+                let n = items30.len();
+                write_list_envelope(&mut redis, &key, items30).await?;
+                native_ok += 1;
+                lines.push(format!(
+                    "owner={owner_user_id} job=all30 derive=all40 items={n} ms=0"
+                ));
+                continue;
+            }
+        }
+
+        if let Some(age) = redis_list_age(&mut redis, &key).await? {
+            if age <= refresh {
+                skip_fresh += 1;
+                lines.push(format!(
+                    "owner={owner_user_id} job={} skip_fresh age={age} refresh={refresh} ms=0",
+                    job.label
+                ));
+                continue;
+            }
+        }
+
+        let t0 = Instant::now();
+        match projection_page(&db, owner_user_id, &want, job.limit).await? {
+            Some(items) => {
+                let n = items.len();
+                if job.label == "all40" {
+                    all40_items = Some(items.clone());
+                }
+                write_list_envelope(&mut redis, &key, items).await?;
+                native_ok += 1;
+                lines.push(format!(
+                    "owner={owner_user_id} job={} projection items={n} ms={}",
+                    job.label,
+                    t0.elapsed().as_millis()
+                ));
+            }
+            None => {
+                need_php = true;
+                lines.push(format!(
+                    "owner={owner_user_id} job={} projection_incomplete ms={}",
+                    job.label,
+                    t0.elapsed().as_millis()
+                ));
+            }
+        }
+    }
+
+    let mut php_note = String::new();
+    if need_php {
+        match warm_owner_php(owner_user_id, limit).await {
+            Ok(body) => {
+                php_note = body;
+                lines.push("php_fallback=1".into());
+            }
+            Err(e) => {
+                tracing::error!(owner = owner_user_id, error = %e, "notif-list php fallback failed");
+                lines.push(format!("php_fallback_error={e}"));
+            }
+        }
+    }
+
+    let total_ms = started.elapsed().as_millis();
+    let summary = format!(
+        "owner={owner_user_id} warm_ok={} skip_fresh={skip_fresh} native={native_ok} php={} total_ms={total_ms} refresh_secs={refresh}",
+        skip_fresh + native_ok,
+        if need_php { 1 } else { 0 },
+    );
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&summary);
+    if !php_note.is_empty() {
+        out.push('\n');
+        out.push_str(&php_note);
+    }
+    Ok(out)
 }
 
 pub async fn run_once(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<()> {
-    let _ = cfg; // reserved for future native hydrate
-    let body = warm_owner(owner_user_id, limit).await?;
+    let body = warm_owner(cfg, owner_user_id, limit).await?;
     println!("{body}");
     Ok(())
 }
@@ -250,9 +491,14 @@ pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limi
             }
         };
         for owner in owners {
-            match warm_owner(owner, limit).await {
+            match warm_owner(cfg, owner, limit).await {
                 Ok(body) => {
-                    let summary = body.lines().last().unwrap_or("ok");
+                    let summary = body
+                        .lines()
+                        .rev()
+                        .find(|l| l.starts_with("owner=") && l.contains("total_ms="))
+                        .or_else(|| body.lines().last())
+                        .unwrap_or("ok");
                     tracing::info!(owner, %summary, "notif-list warm ok");
                 }
                 Err(e) => tracing::error!(owner, error = %e, "notif-list warm failed"),
