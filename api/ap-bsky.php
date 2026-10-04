@@ -4189,11 +4189,104 @@ function ap_bsky_home_rank_keys(
     }
 }
 
+/** Flat DID Redis key written by `vaak-worker actor-warm` (cache DB0). */
+function ap_bsky_actor_flat_redis_key(string $did): string
+{
+    return 'vaak:actor:v1:bsky:' . trim($did);
+}
+
+/**
+ * MGET flat actor keys into request-local memo `$GLOBALS['vaak_bsky_actor_memo']`.
+ * Shape per DID: `{did,handle,displayName,avatar,updated_at}` or null on miss.
+ *
+ * @param list<string> $dids
+ */
+function ap_bsky_actors_prefetch(array $dids): void
+{
+    if (!isset($GLOBALS['vaak_bsky_actor_memo']) || !is_array($GLOBALS['vaak_bsky_actor_memo'])) {
+        $GLOBALS['vaak_bsky_actor_memo'] = [];
+    }
+    /** @var array<string,array<string,mixed>|null> $memo */
+    $memo = &$GLOBALS['vaak_bsky_actor_memo'];
+    $want = [];
+    foreach ($dids as $did) {
+        $did = trim((string) $did);
+        if ($did === '' || !str_starts_with($did, 'did:')) {
+            continue;
+        }
+        if (!array_key_exists($did, $memo)) {
+            $want[$did] = true;
+        }
+    }
+    if ($want === []) {
+        return;
+    }
+    $redis = function_exists('ap_redis_client') ? ap_redis_client('cache') : null;
+    if (!$redis) {
+        foreach (array_keys($want) as $did) {
+            $memo[$did] = null;
+        }
+        return;
+    }
+    try {
+        foreach (array_chunk(array_keys($want), 200) as $chunk) {
+            $keys = [];
+            foreach ($chunk as $did) {
+                $keys[] = ap_bsky_actor_flat_redis_key($did);
+            }
+            $vals = $redis->mGet($keys);
+            if (!is_array($vals)) {
+                $vals = array_fill(0, count($chunk), false);
+            }
+            foreach ($chunk as $i => $did) {
+                $raw = $vals[$i] ?? false;
+                $decoded = is_string($raw) ? json_decode($raw, true) : null;
+                $memo[$did] = is_array($decoded) ? $decoded : null;
+            }
+        }
+    } catch (Throwable $e) {
+        foreach (array_keys($want) as $did) {
+            if (!array_key_exists($did, $memo)) {
+                $memo[$did] = null;
+            }
+        }
+    }
+}
+
+/**
+ * Apply a flat actor memo/Redis blob onto a thin author view.
+ *
+ * @param array<string,mixed> $author
+ * @param array<string,mixed> $flat
+ * @return array{0:array<string,mixed>,1:string,2:string,3:string,4:bool}
+ */
+function ap_bsky_author_apply_flat(array $author, array $flat, string $handle, string $display, string $avatar, bool $handleThin): array
+{
+    $ch = trim((string) ($flat['handle'] ?? ''));
+    $cdn = trim((string) ($flat['displayName'] ?? ''));
+    $cav = trim((string) ($flat['avatar'] ?? ''));
+    if ($handleThin && $ch !== '' && !str_starts_with($ch, 'did:')) {
+        $author['handle'] = $ch;
+        $handle = $ch;
+        $handleThin = false;
+    }
+    if ($display === '' && $cdn !== '') {
+        $author['displayName'] = $cdn;
+        $display = $cdn;
+    }
+    if ($avatar === '' && $cav !== '' && preg_match('#^https?://#i', $cav)) {
+        $author['avatar'] = $cav;
+        $avatar = $cav;
+    }
+    return [$author, $handle, $display, $avatar, $handleThin];
+}
+
 /**
  * Fill thin AppView/Jetstream author blobs (empty handle/avatar/displayName) from
  * local caches — same idea as Wafrn's users-row join before Home paint.
  *
- * Order: bsky_actor_profiles → other bsky_posts columns for this DID.
+ * Order: flat DID Redis / request memo → hashed profile cache / bsky_actor_profiles
+ * → other bsky_posts columns for this DID.
  * Never blocks on XRPC; optionally enqueues actor refresh when still thin.
  *
  * @param array<string,mixed> $author
@@ -4209,6 +4302,33 @@ function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
     $needs = $handleThin || $display === '' || $avatar === '';
     if (!$needs || $did === '' || !str_starts_with($did, 'did:')) {
         return $author;
+    }
+
+    // 0) Request-local flat memo / flat DID Redis (Rust actor-warm).
+    $flat = null;
+    if (isset($GLOBALS['vaak_bsky_actor_memo']) && is_array($GLOBALS['vaak_bsky_actor_memo'])
+        && array_key_exists($did, $GLOBALS['vaak_bsky_actor_memo'])) {
+        $flat = $GLOBALS['vaak_bsky_actor_memo'][$did];
+    } elseif (function_exists('ap_redis_json_get')) {
+        $flat = ap_redis_json_get(ap_bsky_actor_flat_redis_key($did));
+        if (!isset($GLOBALS['vaak_bsky_actor_memo']) || !is_array($GLOBALS['vaak_bsky_actor_memo'])) {
+            $GLOBALS['vaak_bsky_actor_memo'] = [];
+        }
+        $GLOBALS['vaak_bsky_actor_memo'][$did] = is_array($flat) ? $flat : null;
+    }
+    if (is_array($flat) && $flat !== []) {
+        [$author, $handle, $display, $avatar, $handleThin] = ap_bsky_author_apply_flat(
+            $author,
+            $flat,
+            $handle,
+            $display,
+            $avatar,
+            $handleThin
+        );
+        $needs = $handleThin || $display === '' || $avatar === '';
+        if (!$needs) {
+            return $author;
+        }
     }
 
     // 1) Durable profile cache (filled by actor-refresh / prior AppView profiles).
@@ -4281,6 +4401,29 @@ function ap_bsky_enrich_author_view(array $author, int $ownerUserId = 0): array
         && function_exists('ap_bsky_actor_profile_url')
     ) {
         ap_bsky_actor_refresh_enqueue($ownerUserId, ap_bsky_actor_profile_url($did));
+    }
+
+    // Rust actor-warm Redis queue (best-effort; mirrors thin-media enqueue).
+    if ($handleThin || $avatar === '') {
+        $rustPrimary = getenv('VAAK_ACTOR_WARM_RUST_PRIMARY');
+        $rustPrimary = $rustPrimary === false
+            ? true
+            : !in_array(strtolower(trim((string) $rustPrimary)), ['0', 'false', 'off', 'no'], true);
+        if ($rustPrimary && function_exists('ap_redis_queue_push')) {
+            $lockKey = 'bsky-actor-warm:' . hash('sha256', $did);
+            $locked = !function_exists('ap_redis_lock') || ap_redis_lock($lockKey, 45);
+            if ($locked) {
+                $payload = json_encode([
+                    'did' => $did,
+                    'owner' => max(0, $ownerUserId),
+                    'ts' => time(),
+                    'source' => 'thin-author',
+                ], JSON_UNESCAPED_SLASHES);
+                if (is_string($payload)) {
+                    ap_redis_queue_push('bsky_actor_warm', $payload);
+                }
+            }
+        }
     }
 
     return $author;
