@@ -12613,6 +12613,46 @@ function admin_reblog_is_bsky(array $row): bool
         || str_contains($objectId, 'bsky.mkultra.monster/');
 }
 
+/** True for a local-only RSS boost/quote stored in masto_reblogs. */
+function admin_reblog_is_rss(array $row): bool
+{
+    $statusId = strtolower(trim((string) ($row['status_id'] ?? '')));
+    $objectId = strtolower(trim((string) ($row['object_id'] ?? '')));
+    $boostId = strtolower(trim((string) ($row['boost_status_id'] ?? '')));
+    return str_starts_with($statusId, 'rss:')
+        || str_starts_with($statusId, 'rss-quote:')
+        || str_starts_with($objectId, 'rss:')
+        || str_starts_with($boostId, 'rss-boost:')
+        || str_starts_with($boostId, 'rss-quote-boost:');
+}
+
+/** Parse rss_items.id from a local RSS reblog row (0 if unknown). */
+function admin_reblog_rss_item_id(array $row): int
+{
+    $candidates = [
+        (string) ($row['object_id'] ?? ''),
+        (string) ($row['status_id'] ?? ''),
+        (string) ($row['boost_status_id'] ?? ''),
+        (string) ($row['announce_activity_id'] ?? ''),
+    ];
+    foreach ($candidates as $v) {
+        $v = trim($v);
+        if ($v === '') {
+            continue;
+        }
+        if (function_exists('ap_rss_parse_local_status_id')) {
+            $id = ap_rss_parse_local_status_id($v);
+            if ($id > 0) {
+                return $id;
+            }
+        }
+        if (preg_match('/(?:^|:)(?:rss-boost|rss-quote-boost|rss-quote|rss):(\d+)(?:$|:)/', $v, $m)) {
+            return (int) $m[1];
+        }
+    }
+    return 0;
+}
+
 /** Local timeline cards must originate from a local actor/action. */
 function admin_local_timeline_item_allowed(array $item): bool
 {
@@ -12655,8 +12695,10 @@ function admin_federated_timeline_item_allowed(array $item): bool
             && !admin_outbox_is_bsky_import($row);
     }
     if ($kind === 'boost') {
+        // RSS boosts are local-only (never Announced) — keep them off Federated.
         return vaak_is_local_url((string) ($row['owner_actor_id'] ?? ''))
-            && !admin_reblog_is_bsky($row);
+            && !admin_reblog_is_bsky($row)
+            && !admin_reblog_is_rss($row);
     }
     if ($kind !== 'event') {
         return false;
@@ -14576,8 +14618,18 @@ function admin_render_masto_status_card(
         $boosterAcct = (string) ($st['account']['acct'] ?? '');
         $boosterName = (string) ($st['account']['display_name'] ?? $boosterAcct);
         $boostWhen = (string) ($st['created_at'] ?? '');
-        $boostSource = admin_object_url_is_bluesky((string) ($st['reblog']['uri'] ?? $st['reblog']['url'] ?? ''))
-            ? 'Bluesky' : 'Fediverse';
+        $innerReblog = is_array($st['reblog'] ?? null) ? $st['reblog'] : [];
+        $innerSid = (string) ($innerReblog['id'] ?? '');
+        $innerIsRss = !empty($innerReblog['vaak_rss_item_id'])
+            || (!empty($innerReblog['source']) && (string) $innerReblog['source'] === 'rss')
+            || str_starts_with($innerSid, 'rss:');
+        if ($innerIsRss) {
+            $boostSource = 'RSS';
+        } elseif (admin_object_url_is_bluesky((string) ($innerReblog['uri'] ?? $innerReblog['url'] ?? ''))) {
+            $boostSource = 'Bluesky';
+        } else {
+            $boostSource = 'Fediverse';
+        }
         $boosterAccount = is_array($st['account'] ?? null) ? $st['account'] : [];
         $boosterRef = function_exists('admin_account_actor_ref')
             ? admin_account_actor_ref($boosterAccount)
@@ -15900,6 +15952,32 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
     $targetActor = (string) ($rb['target_actor'] ?? '');
     $boosterActor = rtrim((string) ($rb['owner_actor_id'] ?? ''), '/');
     $sessionActor = rtrim(vaak_actor_id(), '/');
+
+    // RSS local-only boosts: paint the feed item via shared card (feed title +
+    // article body), not an empty Fedi shell with "unknown" / unavailable.
+    if (admin_reblog_is_rss($rb)
+        && function_exists('ap_rss_item_by_id')
+        && function_exists('ap_normalize_from_rss_item')
+        && function_exists('ap_masto_status_from_reblog')
+        && function_exists('admin_render_masto_status_card')) {
+        $rssItemId = admin_reblog_rss_item_id($rb);
+        $rssOwner = (int) ($rb['owner_user_id'] ?? 0);
+        $rssItem = $rssItemId > 0
+            ? ap_rss_item_by_id($rssItemId, $rssOwner > 0 ? $rssOwner : null)
+            : null;
+        if (!is_array($rssItem) && $rssItemId > 0) {
+            $rssItem = ap_rss_item_by_id($rssItemId, null);
+        }
+        if (is_array($rssItem)) {
+            $inner = ap_normalize_from_rss_item($rssItem);
+            if (is_array($inner)) {
+                $wrapped = ap_masto_status_from_reblog($rb, $inner);
+                admin_render_masto_status_card($wrapped, $followingIds, $returnView, false, true);
+                return;
+            }
+        }
+        // Deleted/missing item: fall through to the unavailable stub below.
+    }
 
     // Bluesky-native reposts: render the real post from ATProto cache with the
     // reasonRepost header (original author + text/media), not an empty Fedi shell.
