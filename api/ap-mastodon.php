@@ -414,6 +414,10 @@ function ap_masto_timeline_home_axum_try(int $limit, ?string $maxId, ?string $si
     exit;
 }
 
+// HTML Home Axum assist helpers live in ap-masto-entities.php
+// (ap_masto_timeline_home_axum_fetch / ap_masto_timeline_home_hydrate_warm_async)
+// so ap-admin soft-nav can call them without AP_MASTO_LIB_ONLY.
+
 /**
  * @param list<array<string,mixed>> $statuses
  * @param array<string,scalar|null> $extraQuery

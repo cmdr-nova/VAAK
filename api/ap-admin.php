@@ -6473,7 +6473,58 @@ if (
             exit;
         }
     }
-    if ($adminTlFromCache && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
+    // Home: prefer Axum hydrate statuses (Mentions M5 twin) before PG hydrate.
+    $shellAxumHit = false;
+    if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_fetch')) {
+        $axumStatuses = ap_masto_timeline_home_axum_fetch($shellLimit, (int) $vaakOwnerId);
+        if (is_array($axumStatuses) && $axumStatuses !== [] && function_exists('admin_render_masto_status_card')) {
+            $flagIds = [];
+            foreach ($axumStatuses as $st) {
+                if (!is_array($st)) {
+                    continue;
+                }
+                $sid = (string) ($st['id'] ?? '');
+                if ($sid !== '') {
+                    $flagIds[] = $sid;
+                }
+                if (isset($st['reblog']) && is_array($st['reblog'])) {
+                    $rid = (string) ($st['reblog']['id'] ?? '');
+                    if ($rid !== '') {
+                        $flagIds[] = $rid;
+                    }
+                }
+            }
+            if (function_exists('ap_masto_status_flags_prefetch') && $flagIds !== []) {
+                ap_masto_status_flags_prefetch($flagIds);
+            }
+            ob_start();
+            foreach ($axumStatuses as $st) {
+                if (!is_array($st)) {
+                    continue;
+                }
+                if (function_exists('ap_row_matches_muted_words')) {
+                    $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
+                    if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) $vaakOwnerId)) {
+                        continue;
+                    }
+                }
+                admin_render_masto_status_card($st, $followingIds, $view, false, true);
+            }
+            $shellBody = (string) ob_get_clean();
+            if ($shellBody !== '') {
+                $shellAxumHit = true;
+                $shellHasMore = true;
+                if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+                    $shellHasMore = count($adminTlRankedCached) > $shellLimit;
+                }
+                $shellNext = $shellLimit;
+                $shellCache = 'axum-shadow';
+            }
+        } elseif (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+            ap_masto_timeline_home_hydrate_warm_async((int) $vaakOwnerId, $shellLimit);
+        }
+    }
+    if (!$shellAxumHit && $adminTlFromCache && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
         $shellKeys = array_slice($adminTlRankedCached, 0, $shellLimit);
         $shellSlice = admin_tl_hydrate($shellKeys);
         if ($view === 'local') {
@@ -6501,7 +6552,7 @@ if (
         }
         $shellNext = $shellLimit;
         $shellCache = 'hit';
-    } else {
+    } elseif (!$shellAxumHit) {
         // Cache miss: free the stampede lock for fill, and warm a lean ranked
         // index after the response so a closed tab cannot leave TL cold.
         $warmLock = $adminTlStampedeLock;
@@ -10045,13 +10096,40 @@ if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
     $adminTlStampedeLock = '';
 }
 
+// Full-page Home: prefer Axum hydrate statuses (Mentions M5 twin) before PG hydrate.
+$adminHomeAxumStatuses = null;
+if (
+    !$isPartial
+    && $view === 'home'
+    && (int) ($_GET['offset'] ?? 0) === 0
+    && function_exists('ap_masto_timeline_home_axum_fetch')
+) {
+    $axumHome = ap_masto_timeline_home_axum_fetch($tlLimit, (int) $vaakOwnerId);
+    if (is_array($axumHome) && $axumHome !== []) {
+        $adminHomeAxumStatuses = $axumHome;
+        if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+            $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
+        } else {
+            $adminTlCachedHasMore = true;
+        }
+    } elseif (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+        ap_masto_timeline_home_hydrate_warm_async((int) $vaakOwnerId, $tlLimit);
+    }
+}
+
 // Full-page first paint: when ranked cache hits, hydrate only the visible window
 // (builders above were skipped via $adminTlFromCache). Partials hydrate later.
+// Home skips PG hydrate when Axum already supplied first-paint statuses.
 if (
     !$isPartial
     && $adminTlFromCache
     && is_array($adminTlRankedCached)
     && in_array($view, ['home', 'feed', 'local'], true)
+    && !(
+        $view === 'home'
+        && is_array($adminHomeAxumStatuses)
+        && $adminHomeAxumStatuses !== []
+    )
 ) {
     $adminTlCachedTotal = count($adminTlRankedCached);
     $sliceKeys = array_slice($adminTlRankedCached, 0, $tlLimit);
@@ -23002,11 +23080,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'home'): ?>
         <?php
-          $homePage = array_slice($homeTimeline, 0, $tlLimit);
+          $homeFromAxum = is_array($adminHomeAxumStatuses ?? null) && $adminHomeAxumStatuses !== [];
+          $homePage = $homeFromAxum ? [] : array_slice($homeTimeline, 0, $tlLimit);
           $homeHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($homeTimeline) > $tlLimit || !empty($GLOBALS['admin_home_queued_bsky']));
-          $homeNeedsFill = !empty($adminTlFullPageDefer) || ($homePage === [] && $homeHasMore);
+          if ($homeFromAxum) {
+              $homeHasMore = !empty($adminTlCachedHasMore) || count($adminHomeAxumStatuses) >= $tlLimit;
+          }
+          $homeNeedsFill = !$homeFromAxum && (
+              !empty($adminTlFullPageDefer) || ($homePage === [] && $homeHasMore)
+          );
           if ($homeNeedsFill) {
               $homeHasMore = true;
           }
@@ -23015,8 +23099,41 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               (string) $vaakActorId
           );
           // Suggestions are deferred after first paint (see ajax=home_suggestions).
-          if (function_exists('ap_masto_status_flags_prefetch')) {
+          if ($homeFromAxum) {
+              $flagIds = [];
+              foreach ($adminHomeAxumStatuses as $st) {
+                  if (!is_array($st)) {
+                      continue;
+                  }
+                  $sid = (string) ($st['id'] ?? '');
+                  if ($sid !== '') {
+                      $flagIds[] = $sid;
+                  }
+                  if (isset($st['reblog']) && is_array($st['reblog'])) {
+                      $rid = (string) ($st['reblog']['id'] ?? '');
+                      if ($rid !== '') {
+                          $flagIds[] = $rid;
+                      }
+                  }
+              }
+              if (function_exists('ap_masto_status_flags_prefetch') && $flagIds !== []) {
+                  ap_masto_status_flags_prefetch($flagIds);
+              }
+          } elseif (function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($homePage));
+          }
+          $homePaintCount = $homeFromAxum ? count($adminHomeAxumStatuses) : count($homePage);
+          $homeNewest = time();
+          if ($homeFromAxum) {
+              $ca = (string) ($adminHomeAxumStatuses[0]['created_at'] ?? '');
+              if ($ca !== '') {
+                  $ts = strtotime($ca);
+                  if ($ts !== false) {
+                      $homeNewest = (int) $ts;
+                  }
+              }
+          } elseif (!empty($homePage[0]['sort'])) {
+              $homeNewest = (int) $homePage[0]['sort'];
           }
         ?>
         <?php if (!empty($homeOnboard['active'])): ?>
@@ -23038,28 +23155,51 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
           <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
         <?php endif; ?>
-        <?php if (!$homeTimeline && empty($adminTlFullPageDefer)): ?>
+        <?php if (!$homeFromAxum && !$homeTimeline && empty($adminTlFullPageDefer)): ?>
           <div class="mascot-empty"><img src="/api/assets/mascot/vaak-neutral.png" alt=""><span>Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</span></div>
         <?php endif; ?>
-        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) count($homePage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($homePage[0]['sort']) ? $homePage[0]['sort'] : time()) ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?>>
-          <?php foreach ($homePage as $homeIndex => $item): ?>
-            <?php
-              if (admin_timeline_item_muted_by_words($item)) {
-                  continue;
-              }
-              admin_render_timeline_item($item, $followingIds, 'home');
-              // Keep suggestions in the flow of Home rather than above the
-              // first post; the onboarding explanation remains at the top.
-              if (empty($homeOnboard['active']) && $homeIndex === 5) {
-                echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
-              }
-            ?>
-          <?php endforeach; ?>
-          <?php if (empty($homeOnboard['active']) && count($homePage) < 6): ?>
-            <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
+        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) $homePaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) $homeNewest ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $homeFromAxum ? ' data-tl-cache="axum-shadow"' : '' ?>>
+          <?php if ($homeFromAxum): ?>
+            <?php foreach ($adminHomeAxumStatuses as $homeIndex => $st): ?>
+              <?php
+                if (!is_array($st) || !function_exists('admin_render_masto_status_card')) {
+                    continue;
+                }
+                if (function_exists('ap_row_matches_muted_words')) {
+                    $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
+                    if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) $vaakOwnerId)) {
+                        continue;
+                    }
+                }
+                admin_render_masto_status_card($st, $followingIds, 'home', false, true);
+                if (empty($homeOnboard['active']) && $homeIndex === 5) {
+                  echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
+                }
+              ?>
+            <?php endforeach; ?>
+            <?php if (empty($homeOnboard['active']) && $homePaintCount < 6): ?>
+              <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
+            <?php endif; ?>
+          <?php else: ?>
+            <?php foreach ($homePage as $homeIndex => $item): ?>
+              <?php
+                if (admin_timeline_item_muted_by_words($item)) {
+                    continue;
+                }
+                admin_render_timeline_item($item, $followingIds, 'home');
+                // Keep suggestions in the flow of Home rather than above the
+                // first post; the onboarding explanation remains at the top.
+                if (empty($homeOnboard['active']) && $homeIndex === 5) {
+                  echo '<div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>';
+                }
+              ?>
+            <?php endforeach; ?>
+            <?php if (empty($homeOnboard['active']) && count($homePage) < 6): ?>
+              <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
+            <?php endif; ?>
           <?php endif; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeNeedsFill ? 'Loading timeline…' : ($homeHasMore ? 'Scroll for more…' : ($homeTimeline ? 'End of timeline' : '')) ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeNeedsFill ? 'Loading timeline…' : ($homeHasMore ? 'Scroll for more…' : (($homeFromAxum || $homeTimeline) ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'local'): ?>

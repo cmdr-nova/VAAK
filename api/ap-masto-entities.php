@@ -5815,6 +5815,150 @@ function ap_masto_notifications_axum_fetch(
 }
 
 /**
+ * HTML Home / soft-nav assist (Mentions M5 twin): fetch hydrated Mastodon
+ * statuses from localhost Axum (same Redis envelope as Ice Cubes).
+ * Returns a list on 200 cache hit; null on miss/error so callers fall back.
+ *
+ * Flag: VAAK_HOME_AXUM_PRIMARY (default on). Rollback: set 0.
+ *
+ * @return list<array<string,mixed>>|null
+ */
+function ap_masto_timeline_home_axum_fetch(int $limit = 15, int $ownerUserId = 0): ?array
+{
+    $enabled = getenv('VAAK_HOME_AXUM_PRIMARY');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return null;
+    }
+    if ($ownerUserId < 1) {
+        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+            ? (int) ap_db_masto_owner_user_id()
+            : (int) (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id')) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $limit = max(1, min(80, $limit));
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/api/v1/timelines/home?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'limit' => $limit,
+    ]);
+    $body = null;
+    $code = 0;
+    $started = microtime(true);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return null;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => 120,
+            CURLOPT_TIMEOUT_MS => 350,
+            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+        ]);
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 0.35,
+                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'ignore_errors' => true,
+            ],
+        ]);
+        $raw = @file_get_contents($url, false, $ctx);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $hline) {
+                if (preg_match('#^HTTP/\S+\s+(\d+)#', (string) $hline, $m)) {
+                    $code = (int) $m[1];
+                }
+            }
+        }
+    }
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timelines.home.axum_html_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($body) || $body === '') {
+        return null;
+    }
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded) || !array_is_list($decoded) || $decoded === []) {
+        return null;
+    }
+    /** @var list<array<string,mixed>> $out */
+    $out = [];
+    foreach ($decoded as $row) {
+        if (is_array($row)) {
+            $out[] = $row;
+        }
+    }
+    return $out !== [] ? $out : null;
+}
+
+/**
+ * Best-effort prime of Home hydrate Redis so HTML Axum assist can hit next time.
+ */
+function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit = 15): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    static $scheduled = [];
+    if (isset($scheduled[$ownerUserId])) {
+        return;
+    }
+    $scheduled[$ownerUserId] = true;
+    $limit = max(1, min(40, $limit));
+    $script = __DIR__ . '/bin/home-timeline-warm.php';
+    if (!is_file($script)) {
+        return;
+    }
+    register_shutdown_function(static function () use ($ownerUserId, $limit, $script): void {
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            $php = getenv('VAAK_PHP_BIN') ?: PHP_BINARY ?: '/usr/bin/php';
+            $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
+                . ' --owner-id=' . (int) $ownerUserId
+                . ' --limit=' . (int) $limit
+                . ' >/dev/null 2>&1 &';
+            if (function_exists('exec')) {
+                @exec($cmd);
+            }
+        } catch (Throwable $e) {
+            // optional
+        }
+    });
+}
+
+/**
  * @param list<string> $types empty = all supported
  * @param list<string> $exclude
  * @return list<array<string,mixed>>
