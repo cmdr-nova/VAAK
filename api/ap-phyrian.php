@@ -2,11 +2,18 @@
 declare(strict_types=1);
 
 /**
- * Phyrian Strains — VAAK web game (Phase 1 scaffold).
+ * Phyrian Strains — VAAK web game (Phase 1).
  *
- * Consent-based imprint + local resonance exchange. OpenSim bridge is Phase 3.
- * See Projects/NovaLandia/Phyrian Strains/Plan.md.
+ * Consent-based imprint + local resonance exchange + daily decay.
+ * OpenSim bridge is Phase 3. See Projects/NovaLandia/Phyrian Strains/Plan.md.
  */
+
+/** Web daily decay (OpenSim uses 8; Phase-1 web is slightly gentler). */
+const AP_PHYRIAN_DAILY_DECAY = 5;
+const AP_PHYRIAN_MAX_RESONANCE = 100;
+const AP_PHYRIAN_IMPRINT_START_RESONANCE = 50;
+/** One UTC day of grace after imprint before decay starts. */
+const AP_PHYRIAN_DECAY_GRACE_SECONDS = 86400;
 
 function ap_phyrian_migrate(?PDO $db = null): void
 {
@@ -73,6 +80,40 @@ function ap_phyrian_is_origin_owner(int $ownerUserId): bool
     return $ownerUserId === 1;
 }
 
+function ap_phyrian_player_is_imprinted(array $player): bool
+{
+    return (string) ($player['status'] ?? '') === 'imprinted'
+        && trim((string) ($player['strain'] ?? '')) !== '';
+}
+
+/** Stability label for HUD (DB status stays unknown/imprinted). */
+function ap_phyrian_stability(array $player): string
+{
+    if (!ap_phyrian_player_is_imprinted($player)) {
+        return 'Unmarked';
+    }
+    $r = (int) ($player['resonance'] ?? 0);
+    if ($r <= 0) {
+        return 'Dormant';
+    }
+    if ($r < 25) {
+        return 'Critical';
+    }
+    if ($r < 50) {
+        return 'Fading';
+    }
+    return 'Stable';
+}
+
+function ap_phyrian_pick_strain(): string
+{
+    $catalog = ap_phyrian_strain_catalog();
+    if ($catalog === []) {
+        return 'Phyrian';
+    }
+    return $catalog[random_int(0, count($catalog) - 1)] ?? 'Phyrian';
+}
+
 /**
  * @return array<string,mixed>
  */
@@ -89,7 +130,7 @@ function ap_phyrian_ensure_player(int $ownerUserId, string $actorId): array
     $st->execute([$ownerUserId]);
     $row = $st->fetch(PDO::FETCH_ASSOC);
     if (is_array($row)) {
-        return $row;
+        return ap_phyrian_apply_decay_row($row);
     }
     $ins = $db->prepare(
         "INSERT INTO phyrian_players (owner_user_id, actor_id, status, resonance, generation, level)
@@ -104,7 +145,203 @@ function ap_phyrian_ensure_player(int $ownerUserId, string $actorId): array
     }
     $st->execute([$ownerUserId]);
     $row = $st->fetch(PDO::FETCH_ASSOC);
-    return is_array($row) ? $row : [];
+    return is_array($row) ? ap_phyrian_apply_decay_row($row) : [];
+}
+
+/**
+ * Lazy daily resonance decay (OpenSim-shaped: grace after imprint, then −N/day).
+ * Keeps DB status as imprinted; UI uses {@see ap_phyrian_stability()}.
+ *
+ * @param array<string,mixed> $row
+ * @return array<string,mixed>
+ */
+function ap_phyrian_apply_decay_row(array $row): array
+{
+    if (!ap_phyrian_player_is_imprinted($row)) {
+        return $row;
+    }
+    $imprintedAt = (string) ($row['imprinted_at'] ?? '');
+    $anchor = $imprintedAt !== '' ? strtotime($imprintedAt) : false;
+    if ($anchor === false) {
+        $created = (string) ($row['created_at'] ?? '');
+        $anchor = $created !== '' ? strtotime($created) : false;
+    }
+    if ($anchor === false) {
+        return $row;
+    }
+    $now = time();
+    $graceEnds = $anchor + AP_PHYRIAN_DECAY_GRACE_SECONDS;
+    if ($now < $graceEnds) {
+        return $row;
+    }
+    $lastDecayRaw = (string) ($row['last_decay_at'] ?? '');
+    $lastDecay = $lastDecayRaw !== '' ? strtotime($lastDecayRaw) : false;
+    if ($lastDecay === false) {
+        $lastDecay = $graceEnds;
+    }
+    $lastDecay = max($lastDecay, $graceEnds);
+    $days = (int) floor(($now - $lastDecay) / 86400);
+    if ($days < 1) {
+        return $row;
+    }
+    $old = (int) ($row['resonance'] ?? 0);
+    $new = max(0, $old - ($days * AP_PHYRIAN_DAILY_DECAY));
+    $newLast = gmdate('c', $lastDecay + ($days * 86400));
+    try {
+        ap_db()->prepare(
+            'UPDATE phyrian_players
+             SET resonance = ?, last_decay_at = ?, updated_at = NOW()
+             WHERE owner_user_id = ?'
+        )->execute([$new, $newLast, (int) ($row['owner_user_id'] ?? 0)]);
+    } catch (Throwable $e) {
+        return $row;
+    }
+    $row['resonance'] = $new;
+    $row['last_decay_at'] = $newLast;
+    return $row;
+}
+
+/**
+ * Batch decay for cron. Returns counts.
+ *
+ * @return array{scanned:int,changed:int}
+ */
+function ap_phyrian_decay_all(int $limit = 500): array
+{
+    ap_phyrian_migrate();
+    $limit = max(1, min(2000, $limit));
+    $scanned = 0;
+    $changed = 0;
+    try {
+        $st = ap_db()->query(
+            "SELECT * FROM phyrian_players
+             WHERE status = 'imprinted' AND strain IS NOT NULL AND strain <> ''
+             ORDER BY owner_user_id ASC
+             LIMIT " . (int) $limit
+        );
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $scanned++;
+            $before = (int) ($row['resonance'] ?? 0);
+            $after = ap_phyrian_apply_decay_row($row);
+            if ((int) ($after['resonance'] ?? 0) !== $before) {
+                $changed++;
+            }
+        }
+    } catch (Throwable $e) {
+        // cron should not throw
+    }
+    return ['scanned' => $scanned, 'changed' => $changed];
+}
+
+function ap_phyrian_username_for_owner(int $ownerUserId): string
+{
+    if ($ownerUserId < 1) {
+        return '';
+    }
+    try {
+        $st = ap_db()->prepare(
+            'SELECT COALESCE(NULLIF(username, \'\'), NULLIF(actor_key, \'\'), \'\')
+             FROM ap_users WHERE id = ? LIMIT 1'
+        );
+        $st->execute([$ownerUserId]);
+        return trim((string) ($st->fetchColumn() ?: ''));
+    } catch (Throwable $e) {
+        return '';
+    }
+}
+
+/**
+ * Walk imprinted_by chain (child → parent → …).
+ *
+ * @return list<array{owner_user_id:int,username:string,strain:string,generation:int,is_self:bool}>
+ */
+function ap_phyrian_lineage(int $ownerUserId, int $maxHops = 4): array
+{
+    ap_phyrian_migrate();
+    $maxHops = max(1, min(8, $maxHops));
+    $out = [];
+    $seen = [];
+    $current = $ownerUserId;
+    for ($i = 0; $i < $maxHops && $current > 0; $i++) {
+        if (isset($seen[$current])) {
+            break;
+        }
+        $seen[$current] = true;
+        try {
+            $st = ap_db()->prepare(
+                'SELECT owner_user_id, strain, generation, imprinted_by_owner_id, status
+                 FROM phyrian_players WHERE owner_user_id = ? LIMIT 1'
+            );
+            $st->execute([$current]);
+            $row = $st->fetch(PDO::FETCH_ASSOC);
+        } catch (Throwable $e) {
+            break;
+        }
+        if (!is_array($row) || !ap_phyrian_player_is_imprinted($row)) {
+            break;
+        }
+        $out[] = [
+            'owner_user_id' => (int) ($row['owner_user_id'] ?? 0),
+            'username' => ap_phyrian_username_for_owner((int) ($row['owner_user_id'] ?? 0)),
+            'strain' => trim((string) ($row['strain'] ?? '')),
+            'generation' => (int) ($row['generation'] ?? 1),
+            'is_self' => $i === 0,
+        ];
+        $parent = (int) ($row['imprinted_by_owner_id'] ?? 0);
+        if ($parent < 1 || $parent === $current) {
+            break;
+        }
+        $current = $parent;
+    }
+    return $out;
+}
+
+/**
+ * Origin-only: imprint yourself with a random catalog strain (no peer required).
+ *
+ * @return array{ok:bool,error?:string,strain?:string,resonance?:int}
+ */
+function ap_phyrian_origin_self_seed(int $ownerUserId): array
+{
+    ap_phyrian_migrate();
+    if (!ap_phyrian_is_origin_owner($ownerUserId)) {
+        return ['ok' => false, 'error' => 'Only the origin can self-seed'];
+    }
+    $player = ap_phyrian_ensure_player($ownerUserId, ap_phyrian_actor_id_for_owner($ownerUserId));
+    if ($player === []) {
+        return ['ok' => false, 'error' => 'Player unavailable'];
+    }
+    if (ap_phyrian_player_is_imprinted($player)) {
+        return [
+            'ok' => true,
+            'strain' => trim((string) ($player['strain'] ?? '')),
+            'resonance' => (int) ($player['resonance'] ?? 0),
+        ];
+    }
+    $strain = ap_phyrian_pick_strain();
+    try {
+        ap_db()->prepare(
+            "UPDATE phyrian_players
+             SET status = 'imprinted', strain = ?,
+                 resonance = GREATEST(resonance, ?),
+                 generation = 1,
+                 imprinted_by_owner_id = NULL,
+                 imprinted_at = NOW(),
+                 last_decay_at = NOW(),
+                 updated_at = NOW()
+             WHERE owner_user_id = ?"
+        )->execute([$strain, AP_PHYRIAN_IMPRINT_START_RESONANCE, $ownerUserId]);
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Could not seed origin'];
+    }
+    return [
+        'ok' => true,
+        'strain' => $strain,
+        'resonance' => AP_PHYRIAN_IMPRINT_START_RESONANCE,
+    ];
 }
 
 /**
@@ -167,18 +404,16 @@ function ap_phyrian_request_create(int $fromOwnerId, int $toOwnerId, string $kin
         return ['ok' => false, 'error' => 'Players unavailable'];
     }
     if ($kind === 'imprint') {
-        $fromImprinted = (string) ($from['status'] ?? '') === 'imprinted'
-            || trim((string) ($from['strain'] ?? '')) !== '';
+        $fromImprinted = ap_phyrian_player_is_imprinted($from);
         if (!$fromImprinted && !ap_phyrian_is_origin_owner($fromOwnerId)) {
             return ['ok' => false, 'error' => 'Only imprinted players (or the origin) can offer imprint'];
         }
-        if ((string) ($to['status'] ?? '') === 'imprinted' && trim((string) ($to['strain'] ?? '')) !== '') {
+        if (ap_phyrian_player_is_imprinted($to)) {
             return ['ok' => false, 'error' => 'They already have a strain'];
         }
     } else {
-        // Resonance: both must be imprinted.
         foreach ([$from, $to] as $p) {
-            if ((string) ($p['status'] ?? '') !== 'imprinted' || trim((string) ($p['strain'] ?? '')) === '') {
+            if (!ap_phyrian_player_is_imprinted($p)) {
                 return ['ok' => false, 'error' => 'Both players must be imprinted to exchange resonance'];
             }
         }
@@ -246,36 +481,49 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
     if ($kind === 'imprint') {
         $from = ap_phyrian_ensure_player($fromId, ap_phyrian_actor_id_for_owner($fromId));
         $to = ap_phyrian_ensure_player($ownerUserId, ap_phyrian_actor_id_for_owner($ownerUserId));
-        $catalog = ap_phyrian_strain_catalog();
-        $strain = trim((string) ($from['strain'] ?? ''));
-        if ($strain === '' && ap_phyrian_is_origin_owner($fromId)) {
-            $strain = $catalog[random_int(0, max(0, count($catalog) - 1))] ?? 'Phyrian';
+        if ($from === [] || $to === []) {
+            return ['ok' => false, 'error' => 'Players unavailable'];
         }
+        // Origin unmarked → seed first so the recipient inherits the same strain.
+        if (ap_phyrian_is_origin_owner($fromId) && !ap_phyrian_player_is_imprinted($from)) {
+            $seed = ap_phyrian_origin_self_seed($fromId);
+            if (empty($seed['ok'])) {
+                return ['ok' => false, 'error' => (string) ($seed['error'] ?? 'Origin seed failed')];
+            }
+            $from = ap_phyrian_ensure_player($fromId, ap_phyrian_actor_id_for_owner($fromId));
+        }
+        $strain = trim((string) ($from['strain'] ?? ''));
         if ($strain === '') {
             return ['ok' => false, 'error' => 'Imprinter has no strain'];
         }
+        $parentGen = max(1, (int) ($from['generation'] ?? 1));
+        $childGen = min(99, $parentGen + 1);
         $db->prepare(
             "UPDATE phyrian_players
-             SET status = 'imprinted', strain = ?, resonance = GREATEST(resonance, 50),
-                 imprinted_by_owner_id = ?, imprinted_at = NOW(), updated_at = NOW()
+             SET status = 'imprinted', strain = ?,
+                 resonance = GREATEST(resonance, ?),
+                 generation = ?,
+                 imprinted_by_owner_id = ?,
+                 imprinted_at = NOW(),
+                 last_decay_at = NOW(),
+                 updated_at = NOW()
              WHERE owner_user_id = ?"
-        )->execute([$strain, $fromId, $ownerUserId]);
-        // Origin self-seed: if origin was still Unknown, imprint them with a random strain too.
-        if (ap_phyrian_is_origin_owner($fromId)
-            && ((string) ($from['status'] ?? '') !== 'imprinted' || trim((string) ($from['strain'] ?? '')) === '')) {
-            $originStrain = $catalog[random_int(0, max(0, count($catalog) - 1))] ?? 'Phyrian';
-            $db->prepare(
-                "UPDATE phyrian_players
-                 SET status = 'imprinted', strain = ?, resonance = GREATEST(resonance, 50),
-                     imprinted_at = COALESCE(imprinted_at, NOW()), updated_at = NOW()
-                 WHERE owner_user_id = ?"
-            )->execute([$originStrain, $fromId]);
-        }
+        )->execute([
+            $strain,
+            AP_PHYRIAN_IMPRINT_START_RESONANCE,
+            $childGen,
+            $fromId,
+            $ownerUserId,
+        ]);
     } elseif ($kind === 'resonance') {
+        // Exchange fights decay: bump resonance and refresh last_decay_at.
         $db->prepare(
-            'UPDATE phyrian_players SET resonance = LEAST(100, resonance + 5), updated_at = NOW()
+            'UPDATE phyrian_players
+             SET resonance = LEAST(?, resonance + 5),
+                 last_decay_at = NOW(),
+                 updated_at = NOW()
              WHERE owner_user_id IN (?, ?)'
-        )->execute([$fromId, $ownerUserId]);
+        )->execute([AP_PHYRIAN_MAX_RESONANCE, $fromId, $ownerUserId]);
     } else {
         return ['ok' => false, 'error' => 'Unknown kind'];
     }
@@ -287,7 +535,7 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
 }
 
 /**
- * @return list<array{id:int,username:string,actor_key:string,status:string,strain:?string,resonance:int}>
+ * @return list<array{id:int,username:string,actor_key:string,status:string,strain:?string,resonance:int,generation:int,stability:string}>
  */
 function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
 {
@@ -298,7 +546,9 @@ function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
             "SELECT u.id, u.username, u.actor_key, u.actor_id,
                     COALESCE(p.status, 'unknown') AS status,
                     p.strain,
-                    COALESCE(p.resonance, 0) AS resonance
+                    COALESCE(p.resonance, 0) AS resonance,
+                    COALESCE(p.generation, 1) AS generation,
+                    p.imprinted_at, p.last_decay_at, p.created_at
              FROM ap_users u
              LEFT JOIN phyrian_players p ON p.owner_user_id = u.id
              WHERE u.disabled_at IS NULL AND u.id <> ?
@@ -308,6 +558,14 @@ function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
         $st->execute([$viewerOwnerId, $limit]);
         $out = [];
         foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            // Lazy decay so directory resonance stays honest.
+            if (ap_phyrian_player_is_imprinted($row)) {
+                $row['owner_user_id'] = (int) ($row['id'] ?? 0);
+                $row = ap_phyrian_apply_decay_row($row);
+            }
             $out[] = [
                 'id' => (int) ($row['id'] ?? 0),
                 'username' => (string) ($row['username'] ?? $row['actor_key'] ?? ''),
@@ -315,6 +573,8 @@ function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
                 'status' => (string) ($row['status'] ?? 'unknown'),
                 'strain' => isset($row['strain']) ? (string) $row['strain'] : null,
                 'resonance' => (int) ($row['resonance'] ?? 0),
+                'generation' => (int) ($row['generation'] ?? 1),
+                'stability' => ap_phyrian_stability($row),
             ];
         }
         return $out;
@@ -332,7 +592,7 @@ function ap_phyrian_checkin(int $ownerUserId): array
 {
     ap_phyrian_migrate();
     $player = ap_phyrian_ensure_player($ownerUserId, ap_phyrian_actor_id_for_owner($ownerUserId));
-    if ($player === [] || (string) ($player['status'] ?? '') !== 'imprinted') {
+    if ($player === [] || !ap_phyrian_player_is_imprinted($player)) {
         return ['ok' => false, 'error' => 'Imprint first'];
     }
     $last = (string) ($player['last_checkin_at'] ?? '');
@@ -346,9 +606,12 @@ function ap_phyrian_checkin(int $ownerUserId): array
     }
     ap_db()->prepare(
         'UPDATE phyrian_players
-         SET resonance = LEAST(100, resonance + ?), last_checkin_at = NOW(), updated_at = NOW()
+         SET resonance = LEAST(?, resonance + ?),
+             last_checkin_at = NOW(),
+             last_decay_at = NOW(),
+             updated_at = NOW()
          WHERE owner_user_id = ?'
-    )->execute([$bonus, $ownerUserId]);
+    )->execute([AP_PHYRIAN_MAX_RESONANCE, $bonus, $ownerUserId]);
     $st = ap_db()->prepare('SELECT resonance FROM phyrian_players WHERE owner_user_id = ?');
     $st->execute([$ownerUserId]);
     return ['ok' => true, 'resonance' => (int) $st->fetchColumn()];

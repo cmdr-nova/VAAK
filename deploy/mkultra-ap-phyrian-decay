@@ -1,0 +1,6 @@
+AP_DB_DSN=pgsql:dbname=novalandia
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Daily Phyrian resonance decay (lazy page-load also applies; cron covers offline).
+20 4 * * * www-data /usr/bin/flock -n /tmp/vaak-phyrian-decay.lock /usr/bin/env AP_DB_DSN=pgsql:dbname=novalandia /usr/bin/php /srv/mkultra/html/api/bin/phyrian-decay.php --limit=500 >> /var/log/mkultra/ap-phyrian-decay.log 2>&1
