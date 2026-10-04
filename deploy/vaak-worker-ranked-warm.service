@@ -1,12 +1,13 @@
 # Live Home/Local/Federated ranked ID-cache warm.
 #   systemctl enable --now vaak-worker-ranked-warm.service
 #
-# Home (native): rebuilds vaak:timeline:ranked:v2:* in Rust (source=vaak-worker-native).
-# Local/Federated: still spawn api/bin/ranked-warm.php until those views are ported.
-# Flag: VAAK_RANKED_NATIVE_HOME=1 (default on). Set 0 to force PHP for Home too.
+# Native (default): Home + Local + Federated rebuild vaak:timeline:ranked:v2:*
+# with source=vaak-worker-native. PHP ranked-warm.php only on native miss/flag-off
+# (Home empty/thin still falls back to PHP for recommendations).
+# Flags: VAAK_RANKED_NATIVE_HOME=1, VAAK_RANKED_NATIVE_LOCAL_FEED=1 (set 0 to force PHP).
 
 [Unit]
-Description=VAAK Rust ranked timeline warm (Home native + PHP Local/Federated)
+Description=VAAK Rust ranked timeline warm (Home/Local/Federated native)
 After=network.target postgresql.service redis-server.service
 ConditionPathExists=/usr/local/bin/vaak-worker
 
@@ -22,6 +23,7 @@ Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
 Environment=AP_DB_DSN=pgsql:dbname=novalandia
 Environment=VAAK_RANKED_WARM=1
 Environment=VAAK_RANKED_NATIVE_HOME=1
+Environment=VAAK_RANKED_NATIVE_LOCAL_FEED=1
 Environment=VAAK_FEATURE_BLUESKY_TAB=1
 Environment=RUST_LOG=info
 # owner-id 0 = every non-disabled ap_users row each tick.

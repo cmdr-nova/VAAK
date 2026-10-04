@@ -66,7 +66,7 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         limit: i64,
     },
-    /// Home / Local / Federated ranked ID-cache warm (Redis via PHP lean warm).
+    /// Home / Local / Federated ranked ID-cache warm (native Redis; PHP fallback).
     RankedWarm {
         #[arg(long, default_value_t = false)]
         once: bool,

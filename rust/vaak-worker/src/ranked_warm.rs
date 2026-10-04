@@ -1,10 +1,12 @@
-//! Home / Local / Federated **ranked** warm (loading-plan slice 2 → native Home).
+//! Home / Local / Federated **ranked** warm (loading-plan slice 2 → native).
 //!
 //! - **Home (native):** rebuilds `vaak:timeline:ranked:v2:{sha256(logical)}` +
 //!   owner index from Postgres (follow events, own outbox, Bluesky merge, RSS
 //!   spacing). Source `vaak-worker-native`. Flag `VAAK_RANKED_NATIVE_HOME=1`.
-//! - **Local / Federated:** still orchestrates PHP `api/bin/ranked-warm.php`
-//!   until those views are ported.
+//! - **Local / Federated (native):** outbox+local boosts / firehose events with
+//!   v13 key parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on).
+//! - PHP `api/bin/ranked-warm.php` remains for Home empty/thin fallback and when
+//!   a native flag is off.
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
@@ -61,6 +63,10 @@ fn native_home_enabled() -> bool {
     env_flag_default_true("VAAK_RANKED_NATIVE_HOME")
 }
 
+fn native_local_feed_enabled() -> bool {
+    env_flag_default_true("VAAK_RANKED_NATIVE_LOCAL_FEED")
+}
+
 fn parse_views(views: &str) -> Vec<&'static str> {
     let mut out = Vec::new();
     let raw = if views.trim().is_empty() {
@@ -95,7 +101,7 @@ fn owner_index_key(owner: i64) -> String {
     format!("vaak:timeline:owner-index:v1:{}", owner.max(0))
 }
 
-/// PHP `admin_tl_cache_key` for Home / Local / Federated.
+/// PHP `admin_tl_cache_key` for Home.
 fn cache_key_home(owner: i64, algorithm_on: bool, following_actor_ids: &[String]) -> String {
     let mut parts = following_actor_ids.to_vec();
     parts.sort();
@@ -108,6 +114,55 @@ fn cache_key_home(owner: i64, algorithm_on: bool, following_actor_ids: &[String]
         "{CACHE_VERSION}_home_u{owner}_a{algo}_{}",
         &fp[..24.min(fp.len())]
     )
+}
+
+/// PHP `admin_tl_cache_key('local')` — follow-set independent; algo mode `na`.
+fn cache_key_local(owner: i64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"");
+    let fp = hex::encode(hasher.finalize());
+    format!(
+        "{CACHE_VERSION}_local_u{owner}_ana_{}",
+        &fp[..24.min(fp.len())]
+    )
+}
+
+/// PHP `admin_tl_cache_key('feed')` — following fingerprint; algo mode `na`.
+fn cache_key_feed(owner: i64, following_actor_ids: &[String]) -> String {
+    let mut parts = following_actor_ids.to_vec();
+    parts.sort();
+    let joined = parts.join("|");
+    let mut hasher = Sha256::new();
+    hasher.update(joined.as_bytes());
+    let fp = hex::encode(hasher.finalize());
+    format!(
+        "{CACHE_VERSION}_feed_u{owner}_ana_{}",
+        &fp[..24.min(fp.len())]
+    )
+}
+
+fn outbox_is_bsky_import(raw_create_json: &str) -> bool {
+    let raw = raw_create_json.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    // Match PHP admin_outbox_is_bsky_import: object.vaakOrigin === 'bluesky'
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        return v
+            .get("object")
+            .and_then(|o| o.get("vaakOrigin"))
+            .and_then(|x| x.as_str())
+            == Some("bluesky");
+    }
+    false
+}
+
+fn reblog_is_bsky(status_id: &str, object_id: &str) -> bool {
+    let status = status_id.trim().to_ascii_lowercase();
+    let object = object_id.trim().to_ascii_lowercase();
+    status.starts_with("bsky-repost-")
+        || object.starts_with("https://bsky.app/")
+        || object.contains("bsky.mkultra.monster/")
 }
 
 fn parse_ts(s: &str) -> i64 {
@@ -790,6 +845,127 @@ async fn write_ranked_cache(
     Ok(())
 }
 
+/// Instance Local: public outbox notes + local masto_reblogs (skip Bluesky imports).
+async fn fetch_local_timeline(db: &Client) -> Result<Vec<TimelineItem>> {
+    let mut items = Vec::new();
+    let note_rows = db
+        .query(
+            "SELECT id, published, COALESCE(raw_create_json, '')
+             FROM outbox_notes
+             WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
+             ORDER BY published DESC
+             LIMIT 160",
+            &[],
+        )
+        .await
+        .context("select local outbox_notes")?;
+    for row in note_rows {
+        let id: String = row
+            .try_get::<_, Option<String>>(0)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let published: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let raw: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        if outbox_is_bsky_import(&raw) {
+            continue;
+        }
+        let actor = id
+            .rsplit_once("/notes/")
+            .map(|(prefix, _)| prefix.to_string())
+            .unwrap_or_default();
+        items.push(TimelineItem {
+            kind: "outbox".into(),
+            sort: parse_ts(&published),
+            id,
+            source: "local".into(),
+            actor_id: actor,
+        });
+    }
+
+    let rb_rows = db
+        .query(
+            "SELECT status_id, COALESCE(object_id, ''), created_at, COALESCE(owner_actor_id, '')
+             FROM masto_reblogs
+             WHERE owner_actor_id LIKE 'https://mkultra.monster/users/%'
+             ORDER BY created_at DESC
+             LIMIT 80",
+            &[],
+        )
+        .await
+        .context("select local masto_reblogs")?;
+    for row in rb_rows {
+        let status_id: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+        let object_id: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        if status_id.trim().is_empty() || reblog_is_bsky(&status_id, &object_id) {
+            continue;
+        }
+        let created: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        let owner: String = row
+            .try_get::<_, Option<String>>(3)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        items.push(TimelineItem {
+            kind: "boost".into(),
+            sort: parse_ts(&created),
+            id: status_id,
+            source: "boost".into(),
+            actor_id: owner,
+        });
+    }
+    Ok(items)
+}
+
+/// Federated firehose events (Create/Announce/Quote), owner mute/block filtered.
+async fn fetch_federated_events(
+    db: &Client,
+    hidden: &hidden::HiddenSets,
+) -> Result<Vec<TimelineItem>> {
+    let rows = db
+        .query(
+            "SELECT id, actor_id, summary, media_urls, created_at, visibility
+             FROM events
+             WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
+               AND action_taken = ANY(ARRAY['log','local_observe'])
+             ORDER BY created_at DESC, id DESC
+             LIMIT 160",
+            &[],
+        )
+        .await
+        .context("select federated events")?;
+    let mut items = Vec::new();
+    for row in rows {
+        let id: i64 = row.get(0);
+        let actor: String = row
+            .try_get::<_, Option<String>>(1)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if actor.is_empty() || hidden.is_hidden(&actor) {
+            continue;
+        }
+        let summary: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        let media: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        let created: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+        let visibility: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+        if is_empty_private_stub(&visibility, &summary, &media) {
+            continue;
+        }
+        items.push(TimelineItem {
+            kind: "event".into(),
+            sort: parse_ts(&created),
+            id: id.to_string(),
+            source: "fediverse".into(),
+            actor_id: actor,
+        });
+    }
+    Ok(items)
+}
+
 /// Native Home ranked rebuild (no PHP).
 pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String> {
     let started = Instant::now();
@@ -838,6 +1014,72 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let counts = source_counts(&ranked);
     Ok(format!(
         "owner={owner_user_id} view=home key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts}",
+        ranked.len()
+    ))
+}
+
+/// Native Local ranked rebuild (instance outbox + boosts).
+pub async fn warm_local_native(cfg: &Config, owner_user_id: i64) -> Result<String> {
+    let started = Instant::now();
+    let db = crate::db::connect(&cfg.database_url).await?;
+    // Touch owner so we fail fast on missing users (parity with PHP bind).
+    let _ = load_owner(&db, owner_user_id).await?;
+    let logical = cache_key_local(owner_user_id);
+    let timeline = fetch_local_timeline(&db).await?;
+    let ranked = rank_from_timeline(timeline);
+    if ranked.is_empty() {
+        // PHP lean warm returns without writing — do not fall back to PHP.
+        let ms = started.elapsed().as_millis();
+        return Ok(format!(
+            "owner={owner_user_id} view=local key={logical} ranked=0 ms={ms} source=vaak-worker-native skipped=empty"
+        ));
+    }
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    write_ranked_cache(
+        &mut redis,
+        owner_user_id,
+        &logical,
+        &ranked,
+        "vaak-worker-native",
+    )
+    .await?;
+    let ms = started.elapsed().as_millis();
+    let counts = source_counts(&ranked);
+    Ok(format!(
+        "owner={owner_user_id} view=local key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts}",
+        ranked.len()
+    ))
+}
+
+/// Native Federated ranked rebuild (firehose events + mute/block filter).
+pub async fn warm_feed_native(cfg: &Config, owner_user_id: i64) -> Result<String> {
+    let started = Instant::now();
+    let db = crate::db::connect(&cfg.database_url).await?;
+    let (actor_id, _) = load_owner(&db, owner_user_id).await?;
+    let following = load_following_actor_ids(&db, &actor_id).await?;
+    let logical = cache_key_feed(owner_user_id, &following);
+    let hidden = hidden::load_hidden_sets(&db, owner_user_id).await?;
+    let timeline = fetch_federated_events(&db, &hidden).await?;
+    let ranked = rank_from_timeline(timeline);
+    if ranked.is_empty() {
+        let ms = started.elapsed().as_millis();
+        return Ok(format!(
+            "owner={owner_user_id} view=feed key={logical} ranked=0 ms={ms} source=vaak-worker-native skipped=empty"
+        ));
+    }
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    write_ranked_cache(
+        &mut redis,
+        owner_user_id,
+        &logical,
+        &ranked,
+        "vaak-worker-native",
+    )
+    .await?;
+    let ms = started.elapsed().as_millis();
+    let counts = source_counts(&ranked);
+    Ok(format!(
+        "owner={owner_user_id} view=feed key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts}",
         ranked.len()
     ))
 }
@@ -903,7 +1145,33 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, views: &str) -> Result
                 }
             },
             "home" => php_views.push("home"),
+            "local" if native_local_feed_enabled() => {
+                match warm_local_native(cfg, owner_user_id).await {
+                    Ok(line) => lines.push(line),
+                    Err(e) => {
+                        tracing::warn!(
+                            owner = owner_user_id,
+                            error = %e,
+                            "native local ranked failed; falling back to PHP"
+                        );
+                        php_views.push("local");
+                    }
+                }
+            }
             "local" => php_views.push("local"),
+            "feed" if native_local_feed_enabled() => {
+                match warm_feed_native(cfg, owner_user_id).await {
+                    Ok(line) => lines.push(line),
+                    Err(e) => {
+                        tracing::warn!(
+                            owner = owner_user_id,
+                            error = %e,
+                            "native feed ranked failed; falling back to PHP"
+                        );
+                        php_views.push("feed");
+                    }
+                }
+            }
             "feed" => php_views.push("feed"),
             _ => {}
         }
@@ -986,6 +1254,32 @@ mod tests {
         hasher.update(b"https://example.com/users/a");
         let fp = hex::encode(hasher.finalize());
         assert_eq!(key, format!("v13_home_u1_aon_{}", &fp[..24]));
+    }
+
+    #[test]
+    fn local_cache_key_empty_follow_set() {
+        let key = cache_key_local(1);
+        assert_eq!(key, "v13_local_u1_ana_e3b0c44298fc1c149afbf4c8");
+    }
+
+    #[test]
+    fn feed_cache_key_includes_following_fingerprint() {
+        let key = cache_key_feed(1, &["https://example.com/users/a".into()]);
+        let mut hasher = Sha256::new();
+        hasher.update(b"https://example.com/users/a");
+        let fp = hex::encode(hasher.finalize());
+        assert_eq!(key, format!("v13_feed_u1_ana_{}", &fp[..24]));
+    }
+
+    #[test]
+    fn bsky_reblog_and_import_filters() {
+        assert!(reblog_is_bsky("bsky-repost-abc", ""));
+        assert!(reblog_is_bsky("x", "https://bsky.app/profile/x/post/1"));
+        assert!(!reblog_is_bsky("123", "https://mastodon.social/users/a/statuses/1"));
+        assert!(outbox_is_bsky_import(
+            r#"{"object":{"vaakOrigin":"bluesky","content":"hi"}}"#
+        ));
+        assert!(!outbox_is_bsky_import(r#"{"object":{"content":"hi"}}"#));
     }
 
     #[test]
