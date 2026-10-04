@@ -8593,6 +8593,79 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         $remoteRefs = [];
     };
 
+    // Bluesky handle resolve (resolve checkbox): @dame.is / alice.bsky.social.
+    // Must run before the host-only short-circuit — domain-like Bluesky handles
+    // are classified as is_host by ap_masto_search_query_parts.
+    if ($resolve) {
+        $bskyHandleCand = '';
+        if (is_string($parts['handle'] ?? null) && str_contains((string) $parts['handle'], '@')) {
+            // Full @user@host is Fediverse — skip Bluesky here.
+            $bskyHandleCand = '';
+        } elseif (!empty($parts['is_host']) && is_string($parts['host'] ?? null)) {
+            $bskyHandleCand = strtolower(ltrim((string) $parts['host'], '@'));
+        } else {
+            $cand = strtolower(ltrim(trim($q), '@'));
+            if ($cand !== '' && !str_contains($cand, '@')
+                && preg_match('/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/', $cand)) {
+                $bskyHandleCand = $cand;
+            }
+        }
+        if ($bskyHandleCand !== '' && function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled()) {
+            if (!function_exists('ap_bsky_resolve_handle_did') && is_file(__DIR__ . '/ap-bsky.php')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            $ownerForBsky = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+            if ($ownerForBsky < 1) {
+                $ownerForBsky = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+            }
+            $did = null;
+            $profile = null;
+            if (function_exists('ap_bsky_get_profile') && $ownerForBsky > 0) {
+                $got = ap_bsky_get_profile($ownerForBsky, $bskyHandleCand);
+                if (!empty($got['ok']) && is_array($got['profile'] ?? null)) {
+                    $profile = $got['profile'];
+                }
+            }
+            if ($profile === null && function_exists('ap_bsky_resolve_handle_did')) {
+                $did = ap_bsky_resolve_handle_did($bskyHandleCand, $ownerForBsky);
+                if (is_string($did) && $did !== '' && function_exists('ap_bsky_get_profile') && $ownerForBsky > 0) {
+                    $got = ap_bsky_get_profile($ownerForBsky, $did);
+                    if (!empty($got['ok']) && is_array($got['profile'] ?? null)) {
+                        $profile = $got['profile'];
+                    }
+                }
+            }
+            // Public AppView fallback when no session owner (guest) or getProfile failed.
+            if ($profile === null && function_exists('ap_bsky_xrpc') && defined('AP_BSKY_PUBLIC_API')) {
+                $actorQ = is_string($did) && $did !== '' ? $did : $bskyHandleCand;
+                $pub = ap_bsky_xrpc(AP_BSKY_PUBLIC_API, 'app.bsky.actor.getProfile', 'GET', ['actor' => $actorQ], null, null, 8);
+                if (!empty($pub['ok']) && is_array($pub['json'] ?? null)) {
+                    $profile = $pub['json'];
+                }
+            }
+            if (is_array($profile)) {
+                $did = trim((string) ($profile['did'] ?? $did ?? ''));
+                $handleOut = strtolower(ltrim(trim((string) ($profile['handle'] ?? $bskyHandleCand)), '@'));
+                if ($handleOut === '') {
+                    $handleOut = $bskyHandleCand;
+                }
+                $profileUrl = 'https://bsky.app/profile/' . rawurlencode($handleOut !== '' ? $handleOut : $did);
+                if (function_exists('ap_remote_actor_upsert')) {
+                    ap_remote_actor_upsert($profileUrl, [
+                        'username' => $handleOut !== '' ? $handleOut : $did,
+                        'display_name' => trim((string) ($profile['displayName'] ?? '')) !== ''
+                            ? (string) $profile['displayName']
+                            : ($handleOut !== '' ? $handleOut : $did),
+                        'host' => 'bsky.app',
+                        'icon_source_url' => isset($profile['avatar']) && is_string($profile['avatar'])
+                            ? $profile['avatar'] : null,
+                    ]);
+                }
+                $addActor($profileUrl);
+            }
+        }
+    }
+
     // Exact / handle resolve first when asked (Ice Cubes “add account”).
     // Only @user@host — never raw URLs/IPs (SSRF surface stays in ap_resolve_actor_ref + public-DNS checks).
     $handle = $parts['handle'] ?? ltrim($q, '@');

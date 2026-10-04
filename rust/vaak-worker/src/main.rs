@@ -1,4 +1,4 @@
-//! VAAK Rust workers — shadow + live cutover (notif badge, thin-media warm).
+//! VAAK Rust workers — shadow + live cutover (notif badge, thin-media warm, actor warm).
 
 mod action_queue;
 mod config;
@@ -9,6 +9,7 @@ mod jetstream;
 mod notif;
 mod ranked;
 mod redis_util;
+mod actor_warm;
 mod thin_media;
 mod thin_media_warm;
 mod timeline;
@@ -87,6 +88,24 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
         #[arg(long, default_value_t = 15)]
+        limit: usize,
+        #[arg(long, default_value_t = 180)]
+        scan_interval_secs: u64,
+    },
+    /// Live actor warm: drain Redis queue + optional PG refresh enqueue (flat DID Redis).
+    ActorWarm {
+        /// Pull pending actors from bsky_actor_refresh_queue onto Redis once.
+        #[arg(long, default_value_t = false)]
+        enqueue_once: bool,
+        /// Drain `vaak:queue:bsky_actor_warm` forever (periodic PG scan).
+        #[arg(long, default_value_t = false)]
+        r#loop: bool,
+        /// Warm specific actors once (DID / handle / profile URL), then exit.
+        #[arg(long)]
+        actor: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = 180)]
         scan_interval_secs: u64,
@@ -183,6 +202,29 @@ async fn main() -> Result<()> {
                 thin_media_warm::run_enqueue_cli(&cfg, owner, limit).await?;
             } else {
                 anyhow::bail!("thin-media-warm requires --enqueue-once or --loop");
+            }
+        }
+        Command::ActorWarm {
+            enqueue_once,
+            r#loop,
+            actor,
+            owner_id,
+            limit,
+            scan_interval_secs,
+        } => {
+            let owner = if owner_id > 0 {
+                owner_id
+            } else {
+                cfg.default_owner_id
+            };
+            if r#loop {
+                actor_warm::run_worker_loop(&cfg, scan_interval_secs).await?;
+            } else if !actor.is_empty() {
+                actor_warm::run_once_cli(&cfg, &actor, owner).await?;
+            } else if enqueue_once {
+                actor_warm::run_enqueue_cli(&cfg, limit).await?;
+            } else {
+                anyhow::bail!("actor-warm requires --loop, --enqueue-once, or --actor");
             }
         }
         Command::TimelineHome { owner_id, limit } => {

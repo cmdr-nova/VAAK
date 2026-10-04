@@ -97,6 +97,16 @@ pub async fn queue_brpop(
     Ok(row.map(|(_, item)| item))
 }
 
+/// Non-blocking RPOP from `vaak:queue:{queue}`.
+pub async fn queue_rpop(
+    conn: &mut redis::aio::MultiplexedConnection,
+    queue: &str,
+) -> Result<Option<String>> {
+    let key = format!("vaak:queue:{queue}");
+    let item: Option<String> = conn.rpop(&key, None).await.with_context(|| format!("RPOP {key}"))?;
+    Ok(item)
+}
+
 pub async fn queue_llen(conn: &mut redis::aio::MultiplexedConnection, queue: &str) -> Result<i64> {
     let key = format!("vaak:queue:{queue}");
     let n: i64 = conn.llen(&key).await.unwrap_or(0);

@@ -52,6 +52,7 @@ require_once __DIR__ . '/ap-webpush.php'; // Browser + Ice Cubes Web Push
 require_once __DIR__ . '/ap-bsky.php'; // Phase A Bluesky tab (opt-in, feature-flagged)
 require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline actions
 require_once __DIR__ . '/ap-rss.php'; // You → RSS → Home mix
+require_once __DIR__ . '/ap-phyrian.php'; // Phyrian Strains web game (Phase 1)
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -59,6 +60,13 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
 require_once __DIR__ . '/ap-inbox.php';
 require_once __DIR__ . '/ap-asks.php';
 ap_asks_migrate();
+if (function_exists('ap_phyrian_migrate')) {
+    try {
+        ap_phyrian_migrate();
+    } catch (Throwable $e) {
+        // table create may need postgres ownership on first deploy
+    }
+}
 require_once __DIR__ . '/ap-visibility.php';
 
 const LOCAL_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
@@ -4591,6 +4599,39 @@ $vaakAdminOnlyActions = [
                 }
             }
         }
+    } elseif (in_array($action, [
+        'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin',
+    ], true)) {
+        $view = 'phyrian';
+        if (!function_exists('ap_phyrian_ensure_player')) {
+            $error = 'Phyrian Strains is unavailable.';
+        } elseif ($action === 'phyrian_checkin') {
+            $res = ap_phyrian_checkin($ownerId);
+            if (!empty($res['ok'])) {
+                $notice = 'Checked in. Resonance is now ' . (int) ($res['resonance'] ?? 0) . '.';
+            } else {
+                $error = (string) ($res['error'] ?? 'Check-in failed.');
+            }
+        } elseif ($action === 'phyrian_request') {
+            $toId = (int) ($_POST['to_owner_id'] ?? 0);
+            $kind = (string) ($_POST['kind'] ?? 'resonance');
+            $res = ap_phyrian_request_create($ownerId, $toId, $kind);
+            if (!empty($res['ok'])) {
+                $notice = $kind === 'imprint'
+                    ? 'Imprint offer sent. They can accept it on their Phyrian Strains page.'
+                    : 'Resonance request sent. Waiting for them to accept.';
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not send request.');
+            }
+        } elseif ($action === 'phyrian_accept' || $action === 'phyrian_deny') {
+            $reqId = (int) ($_POST['request_id'] ?? 0);
+            $res = ap_phyrian_request_resolve($ownerId, $reqId, $action === 'phyrian_accept');
+            if (!empty($res['ok'])) {
+                $notice = $action === 'phyrian_accept' ? 'Accepted.' : 'Denied.';
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not update request.');
+            }
+        }
     }
 }
 
@@ -8652,6 +8693,42 @@ function admin_tl_hydrate(array $slice): array
             ap_remote_media_prefetch($actorIds, 'avatar');
         }
     }
+    // Bluesky authors: prefetch flat DID Redis before enrich/paint in post_item_by_uri.
+    if ($bskyUris !== [] && function_exists('ap_bsky_actors_prefetch')) {
+        $bskyDids = [];
+        try {
+            foreach (array_chunk(array_values(array_unique($bskyUris)), 200) as $chunk) {
+                $ph = implode(',', array_fill(0, count($chunk), '?'));
+                $st = ap_db()->prepare(
+                    "SELECT author_did, reason_json FROM bsky_posts WHERE bsky_uri IN ($ph)"
+                );
+                $st->execute($chunk);
+                foreach ($st->fetchAll() ?: [] as $brow) {
+                    if (!is_array($brow)) {
+                        continue;
+                    }
+                    $ad = trim((string) ($brow['author_did'] ?? ''));
+                    if ($ad !== '' && str_starts_with($ad, 'did:')) {
+                        $bskyDids[$ad] = true;
+                    }
+                    if (!empty($brow['reason_json'])) {
+                        $reason = json_decode((string) $brow['reason_json'], true);
+                        $byDid = is_array($reason) && is_array($reason['by'] ?? null)
+                            ? trim((string) ($reason['by']['did'] ?? ''))
+                            : '';
+                        if ($byDid !== '' && str_starts_with($byDid, 'did:')) {
+                            $bskyDids[$byDid] = true;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            $bskyDids = [];
+        }
+        if ($bskyDids !== []) {
+            ap_bsky_actors_prefetch(array_keys($bskyDids));
+        }
+    }
     foreach ($slice as $entry) {
         $k = (string) ($entry['k'] ?? '');
         $id = (string) ($entry['id'] ?? '');
@@ -10461,6 +10538,7 @@ function view_title(string $view): string
         'queue' => 'Queue',
         'drafts' => 'Drafts',
         'rss' => 'RSS',
+        'phyrian' => 'Phyrian Strains',
         'compose' => 'Compose',
         'profile' => 'Profile',
         'ask' => 'Ask',
@@ -10798,6 +10876,74 @@ function admin_own_post_overflow(
  *
  * @param array{status_id?:string,spoiler?:string,sensitive?:bool,plain?:string,visibility?:string,boosted?:bool,actor?:string,from?:string} $opts
  */
+/** Compact engagement label: 999 → "999", 1000 → "1k", 1200 → "1.2k", 12000 → "12k". */
+function admin_format_compact_count(int $n): string
+{
+    if ($n < 1) {
+        return '';
+    }
+    if ($n < 1000) {
+        return (string) $n;
+    }
+    if ($n < 10000) {
+        $tenths = (int) floor($n / 100);
+        $whole = intdiv($tenths, 10);
+        $frac = $tenths % 10;
+        return $frac > 0 ? ($whole . '.' . $frac . 'k') : ($whole . 'k');
+    }
+    if ($n < 1000000) {
+        return (string) intdiv($n, 1000) . 'k';
+    }
+    $tenths = (int) floor($n / 100000);
+    $whole = intdiv($tenths, 10);
+    $frac = $tenths % 10;
+    return $frac > 0 ? ($whole . '.' . $frac . 'M') : ($whole . 'M');
+}
+
+/** @return string empty when $n < 1 */
+function admin_action_count_html(int $n): string
+{
+    $label = admin_format_compact_count($n);
+    return $label !== ''
+        ? '<span class="action-count" aria-hidden="true">' . h($label) . '</span>'
+        : '';
+}
+
+/**
+ * Engagement totals for a painted status card (Bluesky AppView + status JSON + local notes).
+ *
+ * @param array<string,mixed> $st
+ * @param array<string,mixed>|null $bskyPostBlob
+ * @return array{favourites:int,reblogs:int,quotes:int,bookmarks:int}
+ */
+function admin_status_action_counts(array $st, ?array $bskyPostBlob = null, string $uri = '', string $statusId = ''): array
+{
+    $fav = max(0, (int) ($st['favourites_count'] ?? 0));
+    $rb = max(0, (int) ($st['reblogs_count'] ?? 0));
+    $qt = max(0, (int) ($st['quotes_count'] ?? 0));
+    $bm = max(0, (int) ($st['bookmarks_count'] ?? 0));
+    if (is_array($bskyPostBlob)) {
+        $fav = max($fav, (int) ($bskyPostBlob['likeCount'] ?? 0));
+        $rb = max($rb, (int) ($bskyPostBlob['repostCount'] ?? 0));
+        $qt = max($qt, (int) ($bskyPostBlob['quoteCount'] ?? 0));
+    }
+    $uri = rtrim(trim($uri !== '' ? $uri : (string) ($st['uri'] ?? $st['url'] ?? '')), '/');
+    $statusId = trim($statusId !== '' ? $statusId : (string) ($st['id'] ?? ''));
+    if ($uri !== '' && str_contains($uri, '/notes/') && function_exists('ap_local_note_engagement_counts')) {
+        $local = ap_local_note_engagement_counts($uri, preg_match('/^\d+$/', $statusId) ? $statusId : null);
+        $fav = max($fav, (int) ($local['favourites'] ?? 0));
+        $rb = max($rb, (int) ($local['reblogs'] ?? 0));
+        $qt = max($qt, (int) ($local['quotes'] ?? 0));
+        $bm = max($bm, (int) ($local['bookmarks'] ?? 0));
+    }
+    return [
+        'favourites' => $fav,
+        'reblogs' => $rb,
+        'quotes' => $qt,
+        'bookmarks' => $bm,
+    ];
+}
+
 function admin_own_post_action_bar(string $noteId, string $returnView, array $opts = []): string
 {
     if ($noteId === '' || !function_exists('vaak_is_own_url') || !vaak_is_own_url($noteId)) {
@@ -10850,9 +10996,7 @@ function admin_own_post_action_bar(string $noteId, string $returnView, array $op
         $counts = ['favourites' => 0, 'reblogs' => 0, 'quotes' => 0, 'bookmarks' => 0];
     }
     $countSpan = static function (int $n): string {
-        return $n > 0
-            ? '<span class="action-count" aria-hidden="true">' . h((string) $n) . '</span>'
-            : '';
+        return admin_action_count_html($n);
     };
     $csrf = function_exists('ap_auth_csrf_token') ? ap_auth_csrf_token() : '';
 
@@ -15056,18 +15200,24 @@ function admin_render_masto_status_card(
                   if (function_exists('ap_bsky_normalize_web_url') && str_starts_with($stBskyObjectRef, 'https://bsky.app/')) {
                       $stBskyObjectRef = ap_bsky_normalize_web_url($stBskyObjectRef);
                   }
+                  $stEng = admin_status_action_counts($st, is_array($bskyPostBlob) ? $bskyPostBlob : null, $uri, $sid);
+                  $stFavN = (int) ($stEng['favourites'] ?? 0);
+                  $stRbN = (int) ($stEng['reblogs'] ?? 0);
+                  $stQtN = (int) ($stEng['quotes'] ?? 0);
                 ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($stBskyObjectRef) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+                <a class="icon-btn<?= $stQtN > 0 ? ' has-count' : '' ?>" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($stBskyObjectRef) ?>" data-eng="1" data-eng-count="<?= (int) $stQtN ?>" title="Quote" aria-label="Quote<?= $stQtN > 0 ? ' (' . h(admin_format_compact_count($stQtN)) . ')' : '' ?>"><i class="ph ph-quotes" aria-hidden="true"></i><?= admin_action_count_html($stQtN) ?></a>
                 <?php if ($stBskyAt !== ''): ?>
-                  <button type="button" class="icon-btn bsky-action<?= $stBskyReposted ? ' on' : '' ?>" data-bsky-action="repost"
+                  <button type="button" class="icon-btn bsky-action<?= $stBskyReposted ? ' on' : '' ?><?= $stRbN > 0 ? ' has-count' : '' ?>" data-bsky-action="repost"
                     data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>" data-record-uri="<?= h($stBskyRepostRecord) ?>"
                     data-object-ref="<?= h($stBskyObjectRef) ?>" data-return-view="<?= h($returnView) ?>"
-                    title="<?= $stBskyReposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $stBskyReposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $stBskyReposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                    data-eng="1" data-eng-count="<?= (int) $stRbN ?>"
+                    title="<?= $stBskyReposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $stBskyReposted ? 'Undo boost' : 'Boost' ?><?= $stRbN > 0 ? ' (' . h(admin_format_compact_count($stRbN)) . ')' : '' ?>" aria-pressed="<?= $stBskyReposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i><?= admin_action_count_html($stRbN) ?></button>
                 <?php endif; ?>
-                <button type="button" class="icon-btn bsky-action<?= $fav ? ' on' : '' ?>" data-bsky-action="like"
+                <button type="button" class="icon-btn bsky-action<?= $fav ? ' on' : '' ?><?= $stFavN > 0 ? ' has-count' : '' ?>" data-bsky-action="like"
                   data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>" data-record-uri="<?= h($stBskyLikeRecord) ?>"
                   data-object-ref="<?= h($stBskyObjectRef) ?>" data-return-view="<?= h($returnView) ?>"
-                  title="<?= $fav ? 'Unlike' : 'Like on Bluesky' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like on Bluesky' ?>" aria-pressed="<?= $fav ? 'true' : 'false' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                  data-eng="1" data-eng-count="<?= (int) $stFavN ?>"
+                  title="<?= $fav ? 'Unlike' : 'Like on Bluesky' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like on Bluesky' ?><?= $stFavN > 0 ? ' (' . h(admin_format_compact_count($stFavN)) . ')' : '' ?>" aria-pressed="<?= $fav ? 'true' : 'false' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i><?= admin_action_count_html($stFavN) ?></button>
                 <button type="button" class="icon-btn bsky-action<?= $bm ? ' on' : '' ?>" data-bsky-action="bookmark"
                   data-uri="<?= h($stBskyAt) ?>" data-cid="<?= h($stBskyCid) ?>"
                   data-status-id="<?= h((string) ($stBskyBmKeys['status_id'] ?? '')) ?>"
@@ -15076,14 +15226,20 @@ function admin_render_masto_status_card(
                   data-bm-picker="<?= $bm ? '1' : '0' ?>"
                   title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bm ? 'true' : 'false' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
               <?php elseif ($sid !== '' && $uri !== ''): ?>
-                <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($uri) ?>&amp;quote_status_id=<?= urlencode($sid) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+                <?php
+                  $stEng = admin_status_action_counts($st, null, $uri, $sid);
+                  $stFavN = (int) ($stEng['favourites'] ?? 0);
+                  $stRbN = (int) ($stEng['reblogs'] ?? 0);
+                  $stQtN = (int) ($stEng['quotes'] ?? 0);
+                ?>
+                <a class="icon-btn<?= $stQtN > 0 ? ' has-count' : '' ?>" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($uri) ?>&amp;quote_status_id=<?= urlencode($sid) ?>" data-eng="1" data-eng-count="<?= (int) $stQtN ?>" title="Quote" aria-label="Quote<?= $stQtN > 0 ? ' (' . h(admin_format_compact_count($stQtN)) . ')' : '' ?>"><i class="ph ph-quotes" aria-hidden="true"></i><?= admin_action_count_html($stQtN) ?></a>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $boosted ? 'unreblog_status' : 'reblog_status' ?>">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                   <input type="hidden" name="object_id" value="<?= h($uri) ?>">
                   <input type="hidden" name="target_actor" value="<?= h($actorRef) ?>">
-                  <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $boosted ? ' on' : '' ?><?= $stRbN > 0 ? ' has-count' : '' ?>" type="submit" data-eng="1" data-eng-count="<?= (int) $stRbN ?>" title="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?><?= $stRbN > 0 ? ' (' . h(admin_format_compact_count($stRbN)) . ')' : '' ?>"><i class="ph ph-repeat" aria-hidden="true"></i><?= admin_action_count_html($stRbN) ?></button>
                 </form>
                 <?php if (!$isLocal): ?>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline" onsubmit="return confirm('Bite this post?');">
@@ -15100,7 +15256,7 @@ function admin_render_masto_status_card(
                   <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                   <input type="hidden" name="object_id" value="<?= h($uri) ?>">
                   <input type="hidden" name="target_actor" value="<?= h($actorRef) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?><?= $stFavN > 0 ? ' has-count' : '' ?>" type="submit" data-eng="1" data-eng-count="<?= (int) $stFavN ?>" title="<?= $fav ? 'Unlike' : 'Like' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?><?= $stFavN > 0 ? ' (' . h(admin_format_compact_count($stFavN)) . ')' : '' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i><?= admin_action_count_html($stFavN) ?></button>
                 </form>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="action" value="<?= $bm ? 'unbookmark_status' : 'bookmark_status' ?>">
@@ -16778,15 +16934,15 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
                 $ownBskyQuotes = max($ownBskyQuotes, (int) ($ownTwin['quotes'] ?? 0));
             }
             $ownBskyCount = static function (int $n): string {
-                return $n > 0 ? '<span class="action-count" aria-hidden="true">' . h((string) $n) . '</span>' : '';
+                return admin_action_count_html($n);
             };
           ?>
           <?php if ($uri !== ''): ?>
-            <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyReposts ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?><?= $ownBskyReposts > 0 ? ' (' . (int) $ownBskyReposts . ')' : '' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i><?= $ownBskyCount($ownBskyReposts) ?></button>
+            <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?><?= $ownBskyReposts > 0 ? ' has-count' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyReposts ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?><?= $ownBskyReposts > 0 ? ' (' . h(admin_format_compact_count($ownBskyReposts)) . ')' : '' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i><?= $ownBskyCount($ownBskyReposts) ?></button>
           <?php endif; ?>
-          <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyQuotes ?>" title="Quote" aria-label="Quote<?= $ownBskyQuotes > 0 ? ' (' . (int) $ownBskyQuotes . ')' : '' ?>"><i class="ph ph-quotes" aria-hidden="true"></i><?= $ownBskyCount($ownBskyQuotes) ?></a>
+          <a class="icon-btn<?= $ownBskyQuotes > 0 ? ' has-count' : '' ?>" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyQuotes ?>" title="Quote" aria-label="Quote<?= $ownBskyQuotes > 0 ? ' (' . h(admin_format_compact_count($ownBskyQuotes)) . ')' : '' ?>"><i class="ph ph-quotes" aria-hidden="true"></i><?= $ownBskyCount($ownBskyQuotes) ?></a>
           <?php if ($uri !== ''): ?>
-            <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyLikes ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?><?= $ownBskyLikes > 0 ? ' (' . (int) $ownBskyLikes . ')' : '' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i><?= $ownBskyCount($ownBskyLikes) ?></button>
+            <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?><?= $ownBskyLikes > 0 ? ' has-count' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-own-eng="1" data-eng-count="<?= (int) $ownBskyLikes ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?><?= $ownBskyLikes > 0 ? ' (' . h(admin_format_compact_count($ownBskyLikes)) . ')' : '' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i><?= $ownBskyCount($ownBskyLikes) ?></button>
             <button type="button" class="icon-btn bsky-action<?= $bookmarked ? ' on' : '' ?>" data-bsky-action="bookmark" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-bm-picker="<?= $bookmarked ? '1' : '0' ?>" data-own-eng="1" title="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bookmarked ? 'true' : 'false' ?>"><i class="ph<?= $bookmarked ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
           <?php endif; ?>
           <?php if ($fediId !== '' && function_exists('admin_delete_post_button') && str_contains($fediId, '/notes/')): ?>
@@ -16812,10 +16968,15 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
             ?>
           <?php endif; ?>
         <?php else: ?>
-        <a class="icon-btn" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
+        <?php
+          $feedFavN = max(0, (int) ($post['likeCount'] ?? $post['like_count'] ?? 0));
+          $feedRbN = max(0, (int) ($post['repostCount'] ?? $post['repost_count'] ?? 0));
+          $feedQtN = max(0, (int) ($post['quoteCount'] ?? $post['quote_count'] ?? 0));
+        ?>
+        <a class="icon-btn<?= $feedQtN > 0 ? ' has-count' : '' ?>" href="?view=<?= h($composeView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($replyTarget) ?>&amp;feed=<?= urlencode($feedKey) ?>" data-eng="1" data-eng-count="<?= (int) $feedQtN ?>" title="Quote" aria-label="Quote<?= $feedQtN > 0 ? ' (' . h(admin_format_compact_count($feedQtN)) . ')' : '' ?>"><i class="ph ph-quotes" aria-hidden="true"></i><?= admin_action_count_html($feedQtN) ?></a>
         <?php if ($uri !== ''): ?>
-          <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
-          <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
+          <button type="button" class="icon-btn bsky-action<?= $reposted ? ' on' : '' ?><?= $feedRbN > 0 ? ' has-count' : '' ?>" data-bsky-action="repost" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($repostRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-eng="1" data-eng-count="<?= (int) $feedRbN ?>" title="<?= $reposted ? 'Undo boost' : 'Boost' ?>" aria-label="<?= $reposted ? 'Undo boost' : 'Boost' ?><?= $feedRbN > 0 ? ' (' . h(admin_format_compact_count($feedRbN)) . ')' : '' ?>" aria-pressed="<?= $reposted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i><?= admin_action_count_html($feedRbN) ?></button>
+          <button type="button" class="icon-btn bsky-action<?= $liked ? ' on' : '' ?><?= $feedFavN > 0 ? ' has-count' : '' ?>" data-bsky-action="like" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-record-uri="<?= h($likeRecord) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-eng="1" data-eng-count="<?= (int) $feedFavN ?>" title="<?= $liked ? 'Unlike' : 'Like' ?>" aria-label="<?= $liked ? 'Unlike' : 'Like' ?><?= $feedFavN > 0 ? ' (' . h(admin_format_compact_count($feedFavN)) . ')' : '' ?>" aria-pressed="<?= $liked ? 'true' : 'false' ?>"><i class="ph<?= $liked ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i><?= admin_action_count_html($feedFavN) ?></button>
           <button type="button" class="icon-btn bsky-action<?= $bookmarked ? ' on' : '' ?>" data-bsky-action="bookmark" data-uri="<?= h($uri) ?>" data-cid="<?= h($cid) ?>" data-status-id="<?= h($bmKeys['status_id']) ?>" data-object-id="<?= h($bmKeys['object_id']) ?>" data-object-ref="<?= h($bskyObjectRef) ?>" data-return-view="<?= h($composeView) ?>" data-bm-picker="<?= $bookmarked ? '1' : '0' ?>" title="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bookmarked ? 'Bookmark folders' : 'Bookmark' ?>" aria-pressed="<?= $bookmarked ? 'true' : 'false' ?>"><i class="ph<?= $bookmarked ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
         <?php endif; ?>
         <?php if (!$isHome && $fediId !== ''): ?>
@@ -20983,16 +21144,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       font-size: 1rem; line-height: 1;
       transition: color .15s ease, background-color .15s ease, border-color .15s ease, transform .12s ease, box-shadow .15s ease;
     }
-    /* Own-post engagement: grow the hit target when a compact count is present. */
-    .tweet-actions .icon-btn[data-own-eng="1"] {
-      width: auto; min-width: 2rem; padding: 0 .45rem; gap: .28rem;
+    /* Engagement counts: room for icon + 3 digits / compact 1.2k. */
+    .tweet-actions .icon-btn[data-own-eng="1"],
+    .tweet-actions .icon-btn[data-eng="1"],
+    .tweet-actions .icon-btn.has-count {
+      width: auto; min-width: 2.75rem; padding: 0 .55rem; gap: .28rem;
     }
     .tweet-actions .action-count {
       font-size: .72rem; font-variant-numeric: tabular-nums; line-height: 1;
-      color: var(--muted); font-weight: 600;
+      color: var(--muted); font-weight: 600; min-width: 1.35em; text-align: left;
     }
     .tweet-actions .icon-btn.on .action-count,
-    .tweet-actions .icon-btn[data-own-eng="1"]:hover .action-count { color: var(--primary); }
+    .tweet-actions .icon-btn[data-own-eng="1"]:hover .action-count,
+    .tweet-actions .icon-btn[data-eng="1"]:hover .action-count,
+    .tweet-actions .icon-btn.has-count:hover .action-count { color: var(--primary); }
     .tweet-actions .icon-btn:hover {
       border-color: color-mix(in srgb, var(--primary) 42%, transparent);
       background: color-mix(in srgb, var(--primary) 12%, transparent);
@@ -21772,7 +21937,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       $discussUnreadNav = function_exists('ap_discuss_unread_topic_count') ? ap_discuss_unread_topic_count($vaakOwnerId) : 0;
       $noticesUnreadNav = isset($noticesUnreadNav) ? (int) $noticesUnreadNav : 0;
       $navLibraryOpen = false;
-      $navYouOpen = ($view === 'rss');
+      $navYouOpen = ($view === 'rss' || $view === 'phyrian');
       $navAdminOpen = false;
       $navSiteOpen = false;
       $reportsOpenCount = function_exists('ap_reports_open_count') ? ap_reports_open_count() : 0;
@@ -21822,6 +21987,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <a class="<?= $view === 'outbox' ? 'active' : '' ?>" href="?view=outbox" data-vaak-soft-nav="outbox"><span class="ico">✎</span><span class="label">Your posts</span></a>
           <a class="<?= $view === 'blog' ? 'active' : '' ?>" href="?view=blog"><span class="ico"><i class="ph ph-article" aria-hidden="true"></i></span><span class="label">Blog</span></a>
           <a class="<?= $view === 'rss' ? 'active' : '' ?>" href="?view=rss"><span class="ico">📰</span><span class="label">RSS</span></a>
+          <a class="<?= $view === 'phyrian' ? 'active' : '' ?>" href="?view=phyrian"><span class="ico">◈</span><span class="label">Phyrian Strains</span></a>
           <a class="<?= $view === 'queue' ? 'active' : '' ?>" href="?view=queue"><span class="ico">⏱</span><span class="label">Queue</span></a>
           <a class="<?= $view === 'drafts' ? 'active' : '' ?>" href="?view=drafts" id="nav-drafts">
             <span class="ico">📄</span><span class="label">Drafts</span>
@@ -28562,6 +28728,195 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php endforeach; ?>
         <?php endif; ?>
 
+      <?php elseif ($view === 'phyrian'): ?>
+        <?php
+          $phyActorId = rtrim((string) ($vaakActorId ?? ''), '/');
+          if ($phyActorId === '' && function_exists('ap_phyrian_actor_id_for_owner')) {
+              $phyActorId = ap_phyrian_actor_id_for_owner((int) $vaakOwnerId);
+          }
+          $phyPlayer = ($vaakOwnerId > 0 && function_exists('ap_phyrian_ensure_player'))
+              ? ap_phyrian_ensure_player((int) $vaakOwnerId, $phyActorId)
+              : [];
+          $phyStatus = (string) ($phyPlayer['status'] ?? 'unknown');
+          $phyStrain = trim((string) ($phyPlayer['strain'] ?? ''));
+          $phyResonance = (int) ($phyPlayer['resonance'] ?? 0);
+          $phyGen = (int) ($phyPlayer['generation'] ?? 1);
+          $phyLevel = (int) ($phyPlayer['level'] ?? 1);
+          $phyImprinted = ($phyStatus === 'imprinted' && $phyStrain !== '');
+          $phyIsOrigin = function_exists('ap_phyrian_is_origin_owner')
+              && ap_phyrian_is_origin_owner((int) $vaakOwnerId);
+          $phyPending = ($vaakOwnerId > 0 && function_exists('ap_phyrian_pending_for'))
+              ? ap_phyrian_pending_for((int) $vaakOwnerId)
+              : [];
+          $phyDirectory = ($vaakOwnerId > 0 && function_exists('ap_phyrian_local_directory'))
+              ? ap_phyrian_local_directory((int) $vaakOwnerId, 40)
+              : [];
+          $phyCheckedInToday = false;
+          $phyLastCheckin = (string) ($phyPlayer['last_checkin_at'] ?? '');
+          if ($phyLastCheckin !== '' && substr($phyLastCheckin, 0, 10) === gmdate('Y-m-d')) {
+              $phyCheckedInToday = true;
+          }
+          $phyCanOfferImprint = $phyImprinted || $phyIsOrigin;
+        ?>
+        <div class="side-card" style="border-color:color-mix(in srgb, var(--primary) 40%, var(--border));margin-bottom:1rem">
+          <div class="meta" style="margin:0;line-height:1.45">
+            <b>Phyrian Strains</b> is in progress (Phase 1 — web-only). Local imprint offers and resonance
+            requests land here for accept/deny. OpenSim link / Resonant badge come later. Nothing here
+            federates.
+          </div>
+        </div>
+
+        <article class="tweet" style="margin-bottom:1rem">
+          <div class="tweet-hd">
+            <div>
+              <?php if ($phyImprinted): ?>
+                <span class="who" style="text-transform:none;letter-spacing:0"><?= h($phyStrain) ?></span>
+                <span class="meta"> · imprinted</span>
+              <?php else: ?>
+                <span class="who" style="text-transform:none;letter-spacing:0">Unknown Entity</span>
+                <span class="meta"> · unmarked</span>
+              <?php endif; ?>
+              <?php if ($phyIsOrigin): ?>
+                <span class="meta"> · origin</span>
+              <?php endif; ?>
+            </div>
+          </div>
+          <div class="meta" style="margin:.35rem 0 .75rem;display:flex;flex-wrap:wrap;gap:.75rem 1.25rem">
+            <span>Resonance <b style="color:var(--text)"><?= (int) $phyResonance ?></b><span class="meta"> / 100</span></span>
+            <span>Gen <b style="color:var(--text)"><?= (int) $phyGen ?></b></span>
+            <span>Level <b style="color:var(--text)"><?= (int) $phyLevel ?></b></span>
+          </div>
+          <?php if (!$phyImprinted): ?>
+            <div class="body feed-body" style="margin-bottom:.75rem">
+              You are an <b>Unknown Entity</b>. Accept an imprint offer from the origin (or another
+              imprinted local) to receive a strain. Until then there is no daily check-in and you
+              cannot offer imprint or exchange resonance.
+            </div>
+          <?php else: ?>
+            <div class="body feed-body" style="margin-bottom:.75rem">
+              Your lineage is <b><?= h($phyStrain) ?></b>. Check in once per UTC day, offer imprint
+              to Unknown Entities, and exchange resonance with other imprinted locals.
+            </div>
+          <?php endif; ?>
+          <div class="tweet-actions">
+            <?php if ($phyImprinted): ?>
+              <?php if ($phyCheckedInToday): ?>
+                <span class="meta">Checked in today</span>
+              <?php else: ?>
+                <form method="post" action="?view=phyrian" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="phyrian_checkin">
+                  <input type="hidden" name="return_view" value="phyrian">
+                  <button class="btn btn-primary" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Daily check-in</button>
+                </form>
+              <?php endif; ?>
+            <?php endif; ?>
+          </div>
+        </article>
+
+        <?php if ($phyPending): ?>
+          <h3 class="meta" style="margin:0 0 .55rem;text-transform:uppercase;letter-spacing:.04em">Incoming requests</h3>
+          <?php foreach ($phyPending as $preq): ?>
+            <?php
+              $preqId = (int) ($preq['id'] ?? 0);
+              $preqKind = (string) ($preq['kind'] ?? '');
+              $preqFrom = trim((string) ($preq['from_username'] ?? $preq['from_actor_key'] ?? 'someone'));
+              $preqLabel = $preqKind === 'imprint' ? 'Imprint offer' : 'Resonance exchange';
+            ?>
+            <article class="tweet" style="margin-bottom:.65rem">
+              <div class="tweet-hd">
+                <div>
+                  <span class="who" style="text-transform:none;letter-spacing:0"><?= h($preqLabel) ?></span>
+                  <span class="meta"> · from @<?= h($preqFrom) ?></span>
+                  <?php if (!empty($preq['created_at'])): ?>
+                    <span class="meta"> · <?= h(relative_time((string) $preq['created_at'])) ?></span>
+                  <?php endif; ?>
+                </div>
+              </div>
+              <div class="meta" style="margin:.25rem 0 .65rem">
+                <?php if ($preqKind === 'imprint'): ?>
+                  Accepting assigns you a strain (origin rolls random; peers transmit their own).
+                <?php else: ?>
+                  Accepting gives both of you +5 resonance (capped at 100).
+                <?php endif; ?>
+              </div>
+              <div class="tweet-actions">
+                <form method="post" action="?view=phyrian" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="phyrian_accept">
+                  <input type="hidden" name="request_id" value="<?= $preqId ?>">
+                  <input type="hidden" name="return_view" value="phyrian">
+                  <button class="btn btn-primary" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Accept</button>
+                </form>
+                <form method="post" action="?view=phyrian" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="phyrian_deny">
+                  <input type="hidden" name="request_id" value="<?= $preqId ?>">
+                  <input type="hidden" name="return_view" value="phyrian">
+                  <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Deny</button>
+                </form>
+              </div>
+            </article>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
+        <h3 class="meta" style="margin:1.1rem 0 .55rem;text-transform:uppercase;letter-spacing:.04em">Local players</h3>
+        <?php if (!$phyDirectory): ?>
+          <div class="empty">No other local accounts yet. Imprint and resonance stay on this instance for Phase 1.</div>
+        <?php else: ?>
+          <?php foreach ($phyDirectory as $pd): ?>
+            <?php
+              $pdId = (int) ($pd['id'] ?? 0);
+              $pdName = trim((string) ($pd['username'] ?? $pd['actor_key'] ?? ''));
+              $pdStatus = (string) ($pd['status'] ?? 'unknown');
+              $pdStrain = trim((string) ($pd['strain'] ?? ''));
+              $pdRes = (int) ($pd['resonance'] ?? 0);
+              $pdImprinted = ($pdStatus === 'imprinted' && $pdStrain !== '');
+              $pdCanImprint = $phyCanOfferImprint && !$pdImprinted;
+              $pdCanResonate = $phyImprinted && $pdImprinted;
+            ?>
+            <article class="tweet" style="margin-bottom:.55rem">
+              <div class="tweet-hd">
+                <div>
+                  <span class="who" style="text-transform:none;letter-spacing:0">@<?= h($pdName !== '' ? $pdName : ('user' . $pdId)) ?></span>
+                  <?php if ($pdImprinted): ?>
+                    <span class="meta"> · <?= h($pdStrain) ?></span>
+                    <span class="meta"> · <?= (int) $pdRes ?> resonance</span>
+                  <?php else: ?>
+                    <span class="meta"> · Unknown Entity</span>
+                  <?php endif; ?>
+                </div>
+              </div>
+              <?php if ($pdCanImprint || $pdCanResonate): ?>
+                <div class="tweet-actions" style="margin-top:.45rem">
+                  <?php if ($pdCanImprint): ?>
+                    <form method="post" action="?view=phyrian" style="display:inline">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="action" value="phyrian_request">
+                      <input type="hidden" name="kind" value="imprint">
+                      <input type="hidden" name="to_owner_id" value="<?= $pdId ?>">
+                      <input type="hidden" name="return_view" value="phyrian">
+                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Offer imprint</button>
+                    </form>
+                  <?php endif; ?>
+                  <?php if ($pdCanResonate): ?>
+                    <form method="post" action="?view=phyrian" style="display:inline">
+                      <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                      <input type="hidden" name="action" value="phyrian_request">
+                      <input type="hidden" name="kind" value="resonance">
+                      <input type="hidden" name="to_owner_id" value="<?= $pdId ?>">
+                      <input type="hidden" name="return_view" value="phyrian">
+                      <button class="btn btn-ghost" type="submit" style="padding:.25rem .7rem;font-size:.8rem">Request resonance</button>
+                    </form>
+                  <?php endif; ?>
+                </div>
+              <?php elseif (!$phyImprinted && !$phyIsOrigin): ?>
+                <div class="meta" style="margin-top:.35rem">Imprint first to interact.</div>
+              <?php endif; ?>
+            </article>
+          <?php endforeach; ?>
+        <?php endif; ?>
+
       <?php elseif ($view === 'drafts'): ?>
         <?php $draftRows = function_exists('ap_drafts_list') ? ap_drafts_list(100) : []; ?>
         <?php $blogDraftRows = function_exists('ap_blog_posts_list') ? array_values(array_filter(ap_blog_posts_list($vaakActorKey, false, 100), static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft')) : []; ?>
@@ -29991,24 +30346,43 @@ window.apAdminToast = function (msg, isErr) {
     if (ev.key === 'Escape') closeFolderPopover();
   });
 
+  function vaakFormatCompactCount(n) {
+    n = Math.floor(Number(n) || 0);
+    if (n < 1) return '';
+    if (n < 1000) return String(n);
+    if (n < 10000) {
+      const tenths = Math.floor(n / 100);
+      const whole = Math.floor(tenths / 10);
+      const frac = tenths % 10;
+      return frac > 0 ? (whole + '.' + frac + 'k') : (whole + 'k');
+    }
+    if (n < 1000000) return String(Math.floor(n / 1000)) + 'k';
+    const tenths = Math.floor(n / 100000);
+    const whole = Math.floor(tenths / 10);
+    const frac = tenths % 10;
+    return frac > 0 ? (whole + '.' + frac + 'M') : (whole + 'M');
+  }
   function applyInteractButton(form, data, beforeActive) {
     const btn = form.querySelector('button[type="submit"]');
     const actionInput = form.querySelector('input[name="action"]');
     if (!btn || !actionInput || !data || !data.ok) return;
     const kind = data.kind;
     const active = !!data.active;
-    const ownEng = btn.getAttribute('data-own-eng') === '1';
+    const hasEng = btn.getAttribute('data-own-eng') === '1' || btn.getAttribute('data-eng') === '1'
+      || btn.classList.contains('has-count') || btn.hasAttribute('data-eng-count');
     let countN = parseInt(btn.getAttribute('data-eng-count') || '0', 10);
     if (!Number.isFinite(countN) || countN < 0) countN = 0;
-    if (ownEng && (kind === 'favourite' || kind === 'bookmark' || kind === 'reblog')
+    if (hasEng && (kind === 'favourite' || kind === 'bookmark' || kind === 'reblog')
         && typeof beforeActive === 'boolean' && beforeActive !== active) {
       countN = Math.max(0, countN + (active ? 1 : -1));
       btn.setAttribute('data-eng-count', String(countN));
+      btn.classList.toggle('has-count', countN > 0);
     }
-    const countHtml = (ownEng && countN > 0)
-      ? '<span class="action-count" aria-hidden="true">' + String(countN) + '</span>'
+    const compact = hasEng ? vaakFormatCompactCount(countN) : '';
+    const countHtml = compact
+      ? '<span class="action-count" aria-hidden="true">' + compact + '</span>'
       : '';
-    const countSuffix = (ownEng && countN > 0) ? (' (' + countN + ')') : '';
+    const countSuffix = compact ? (' (' + compact + ')') : '';
     if (kind === 'favourite') {
       btn.innerHTML = '<i class="ph' + (active ? '-fill' : '') + ' ph-heart" aria-hidden="true"></i>' + countHtml;
       btn.classList.toggle('on', active);
@@ -36061,7 +36435,15 @@ if (VIEW === 'analytics') loadAnalytics();
     const isSearch = /[?&]view=search(?:&|$)/.test(formAction)
       || (String(form.method || 'get').toLowerCase() === 'get'
           && !!form.querySelector('input[name="q"][type="search"]'));
-    window.vaakShowLoading(isSearch ? 'Searching…' : 'Saving…');
+    let loadingText = 'Saving…';
+    if (isSearch) {
+      loadingText = 'Searching…';
+    } else if (action === 'switch_account' || action === 'switch_account_add') {
+      loadingText = 'Switching…';
+    } else if (action === 'switch_account_remove') {
+      loadingText = 'Removing…';
+    }
+    window.vaakShowLoading(loadingText);
   }, true);
   window.addEventListener('pageshow', function () {
     window.__vaakNavigationPending = false;
