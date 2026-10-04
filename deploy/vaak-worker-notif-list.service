@@ -24,7 +24,8 @@ Environment=VAAK_NOTIF_LIST_WARM=1
 Environment=VAAK_FEATURE_BLUESKY_TAB=1
 Environment=RUST_LOG=info
 # owner-id 0 = every non-disabled ap_users row each tick.
-ExecStart=/usr/local/bin/vaak-worker notif-list --loop --interval-secs 45 --owner-id 0 --limit 30
+# M4 leaner tick: PHP skip-if-fresh (~90s) + all40→all30 derive; 60s loop is enough.
+ExecStart=/usr/local/bin/vaak-worker notif-list --loop --interval-secs 60 --owner-id 0 --limit 30
 Restart=always
 RestartSec=8
 NoNewPrivileges=true

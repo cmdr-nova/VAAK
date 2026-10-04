@@ -4277,11 +4277,12 @@ function ap_masto_status_from_mention(array $row): array
             }
         }
         if ($atUri !== '' && function_exists('ap_bsky_notification_media_urls')) {
-            // Prefer cache; allow a few AppView fetches per request so older
-            // GIF/image mentions (empty media_urls) can self-heal without
-            // stalling Ice Cubes polls.
+            // Prefer cache. Request path may AppView a few misses; list-warm (M4)
+            // stays cache-only and enqueues thin-media so the worker tick stays cheap.
             static $bskyNotifMediaFetchBudget = 3;
-            $allowFetch = $bskyNotifMediaFetchBudget > 0;
+            $listWarm = function_exists('ap_masto_notifications_list_warm_mode')
+                && ap_masto_notifications_list_warm_mode();
+            $allowFetch = !$listWarm && $bskyNotifMediaFetchBudget > 0;
             if ($allowFetch) {
                 $bskyNotifMediaFetchBudget--;
             }
@@ -4295,6 +4296,9 @@ function ap_masto_status_from_mention(array $row): array
                 if ($clean !== null) {
                     $mediaUrlList[] = $clean;
                 }
+            }
+            if ($mediaUrlList === [] && $listWarm && function_exists('ap_bsky_post_preview_warm_enqueue')) {
+                ap_bsky_post_preview_warm_enqueue($atUri, (int) ($row['owner_user_id'] ?? 0));
             }
             // Persist so the next poll/Ice Cubes open is instant.
             if ($mediaUrlList !== [] && !empty($row['id'])) {
@@ -5577,6 +5581,118 @@ function ap_notification_projection_read(int $ownerUserId, int $limit, array $wa
     }
 }
 
+/** True when running under `notif-list-warm.php` / `vaak-worker notif-list`. */
+function ap_masto_notifications_list_warm_mode(): bool
+{
+    $warm = getenv('VAAK_NOTIF_LIST_WARM');
+    if ($warm === false || $warm === '') {
+        return false;
+    }
+    return !in_array(strtolower(trim((string) $warm)), ['0', 'false', 'off', 'no'], true);
+}
+
+/**
+ * Redis list key for Mastodon notification pages (Mentions / Ice Cubes).
+ *
+ * @param list<string> $want expanded type list
+ * @param list<string> $exclude
+ */
+function ap_masto_notifications_list_redis_key(
+    int $ownerUserId,
+    int $limit,
+    ?string $maxId,
+    ?string $sinceId,
+    array $want,
+    array $exclude = []
+): string {
+    return 'vaak:notifications:v1:' . $ownerUserId . ':' . hash('sha256', json_encode([
+        // Include exclusions so an Ice Cubes request using exclude_types cannot
+        // reuse a cache entry built for a different notification filter.
+        'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+}
+
+/**
+ * Expand requested notification types the same way as ap_masto_notifications_fetch.
+ *
+ * @param list<string> $types
+ * @param list<string> $exclude
+ * @return list<string>
+ */
+function ap_masto_notifications_want_types(array $types = [], array $exclude = []): array
+{
+    $want = ['mention', 'follow', 'favourite', 'reblog', 'quote', 'poll', 'update', 'bite', 'status'];
+    if ($types) {
+        $want = array_values(array_intersect($want, $types));
+    }
+    if ($exclude) {
+        $want = array_values(array_diff($want, $exclude));
+    }
+    return $want;
+}
+
+/**
+ * Age in seconds of a warm list envelope, or null if missing/unreadable.
+ */
+function ap_masto_notifications_list_cache_age(string $redisKey): ?int
+{
+    if ($redisKey === '' || !function_exists('ap_redis_json_get')) {
+        return null;
+    }
+    $cached = ap_redis_json_get($redisKey);
+    if (!is_array($cached)) {
+        return null;
+    }
+    $ts = 0;
+    if (isset($cached['items']) && is_array($cached['items'])) {
+        $ts = (int) ($cached['ts'] ?? 0);
+    } elseif ($cached === [] || array_is_list($cached)) {
+        // Legacy bare list — treat as unknown age (force refresh).
+        return null;
+    } else {
+        return null;
+    }
+    if ($ts < 1) {
+        return null;
+    }
+    return max(0, time() - $ts);
+}
+
+/**
+ * Write a Mentions list envelope (used by list-warm to derive all30 from all40).
+ *
+ * @param list<array<string,mixed>> $items
+ * @param list<string> $types
+ * @param list<string> $exclude
+ */
+function ap_masto_notifications_list_cache_put(
+    int $ownerUserId,
+    int $limit,
+    array $items,
+    array $types = [],
+    array $exclude = [],
+    ?string $source = null
+): string {
+    $want = ap_masto_notifications_want_types($types, $exclude);
+    if ($want === []) {
+        return '';
+    }
+    $redisKey = ap_masto_notifications_list_redis_key($ownerUserId, $limit, null, null, $want, $exclude);
+    if ($redisKey === '' || !function_exists('ap_redis_json_set')) {
+        return $redisKey;
+    }
+    $listRustPrimary = getenv('VAAK_NOTIF_LIST_RUST_PRIMARY');
+    $listRustPrimary = ($listRustPrimary === false || $listRustPrimary === '')
+        ? true
+        : !in_array(strtolower(trim((string) $listRustPrimary)), ['0', 'false', 'off', 'no'], true);
+    if ($source === null || $source === '') {
+        $source = ap_masto_notifications_list_warm_mode() ? 'vaak-worker-live' : 'php';
+    }
+    $ttl = $listRustPrimary ? 600 : 300;
+    ap_redis_json_set($redisKey, ['ts' => time(), 'items' => array_values($items), 'source' => $source], $ttl);
+    return $redisKey;
+}
+
 /**
  * @param list<string> $types empty = all supported
  * @param list<string> $exclude
@@ -5592,13 +5708,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     };
     $limit = max(1, min(80, $limit));
     // favourites, mentions, boosts, quote-boosts, bites, poll ended, favourited-status edits, follows, subscribed posts
-    $want = ['mention', 'follow', 'favourite', 'reblog', 'quote', 'poll', 'update', 'bite', 'status'];
-    if ($types) {
-        $want = array_values(array_intersect($want, $types));
-    }
-    if ($exclude) {
-        $want = array_values(array_diff($want, $exclude));
-    }
+    $want = ap_masto_notifications_want_types($types, $exclude);
     if (!$want) {
         $recordNotifTiming('total', $notifStartedAt);
         return [];
@@ -5615,11 +5725,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
         ? ap_db_owner_actor_id_for_user_id($ownerUserId)
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');
     $ownerActorId = rtrim($ownerActorId, '/');
-    $redisKey = 'vaak:notifications:v1:' . $ownerUserId . ':' . hash('sha256', json_encode([
-        // Include exclusions so an Ice Cubes request using exclude_types cannot
-        // reuse a cache entry built for a different notification filter.
-        'limit' => $limit, 'max' => $maxId, 'since' => $sinceId, 'types' => $want, 'exclude' => $exclude,
-    ], JSON_UNESCAPED_SLASHES) ?: '');
+    $redisKey = ap_masto_notifications_list_redis_key($ownerUserId, $limit, $maxId, $sinceId, $want, $exclude);
     $notifStampedeLock = '';
     $holdNotifLock = false;
     // When Rust/PHP list-warm owns rebuilds, trust Redis longer so Mentions soft-nav
@@ -5628,6 +5734,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     $listRustPrimary = ($listRustPrimary === false || $listRustPrimary === '')
         ? true
         : !in_array(strtolower(trim((string) $listRustPrimary)), ['0', 'false', 'off', 'no'], true);
+    $listWarmMode = ap_masto_notifications_list_warm_mode();
     $notifFreshSec = $listRustPrimary ? 120 : 45;
     $notifStaleSec = $listRustPrimary ? 600 : 300; // Ice Cubes retries fast; serve stale rather than 3–5s cold rebuilds
     $unwrapNotifCache = static function (?array $cached): ?array {
@@ -5831,15 +5938,33 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     // unknown actors still follow the existing async warm path in
     // ap_masto_remote_account(). PostgreSQL remains authoritative.
     $prefetchIds = [];
+    $bskyDids = [];
     foreach ($items as $item) {
-        $actorId = (string) ($item['row']['actor_id'] ?? '');
+        $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+        $actorId = (string) ($row['actor_id'] ?? '');
         if ($actorId !== '') {
             $prefetchIds[$actorId] = true;
+        }
+        // Flat DID Redis (actor-warm) — extract from at:// activity ids.
+        $activityId = trim((string) ($row['activity_id'] ?? ''));
+        if (preg_match('#^at://(did:[^/]+)/#', $activityId, $m)) {
+            $bskyDids[$m[1]] = true;
         }
     }
     $actorPrefetchStartedAt = microtime(true);
     if ($prefetchIds !== [] && function_exists('ap_remote_actors_prefetch')) {
         ap_remote_actors_prefetch(array_keys($prefetchIds));
+    }
+    if ($bskyDids !== []) {
+        if (!function_exists('ap_bsky_actors_prefetch')) {
+            $bskyLib = __DIR__ . '/ap-bsky.php';
+            if (is_file($bskyLib)) {
+                require_once $bskyLib;
+            }
+        }
+        if (function_exists('ap_bsky_actors_prefetch')) {
+            ap_bsky_actors_prefetch(array_keys($bskyDids));
+        }
     }
     // Favourite/reblog notifications often point at local notes. Prefetch
     // those target rows in one bounded query so each card does not repeat a
@@ -5953,10 +6078,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     // read-only and the projection is never authoritative for privacy rules.
     ap_notification_projection_write($ownerUserId, $out);
     if (function_exists('ap_redis_json_set')) {
-        $warmSource = getenv('VAAK_NOTIF_LIST_WARM');
-        $source = ($warmSource !== false && $warmSource !== '' && !in_array(strtolower(trim((string) $warmSource)), ['0', 'false', 'off', 'no'], true))
-            ? 'vaak-worker-live'
-            : 'php';
+        $source = $listWarmMode ? 'vaak-worker-live' : 'php';
         // Keep 5–10 minutes for stale-while-revalidate; freshness is gated by ts.
         $ttl = $listRustPrimary ? 600 : 300;
         ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $out, 'source' => $source], $ttl);
