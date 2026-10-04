@@ -19400,7 +19400,15 @@ function admin_notifications_page(int $limit, ?string $maxId, array $types = [])
     }
 
     $merged = $primary;
-    if ($primaryKeys !== []) {
+    // When the first page came from warm Redis (list-warm primary), skip the
+    // look-ahead cold fetch so Mentions soft-nav fill stays cheap. Groups that
+    // split at the edge complete on the next scroll page.
+    $listRustPrimary = getenv('VAAK_NOTIF_LIST_RUST_PRIMARY');
+    $listRustPrimary = ($listRustPrimary === false || $listRustPrimary === '')
+        ? true
+        : !in_array(strtolower(trim((string) $listRustPrimary)), ['0', 'false', 'off', 'no'], true);
+    $skipLookahead = $listRustPrimary && !empty($GLOBALS['ap_notif_list_cache_hit']);
+    if ($primaryKeys !== [] && !$skipLookahead) {
         $lastPrimaryId = preg_replace('/\D+/', '', (string) ($primary[count($primary) - 1]['id'] ?? '')) ?: '';
         if ($lastPrimaryId !== '') {
             // Pull a short older window so same-post likes/boosts that sit just

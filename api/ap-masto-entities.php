@@ -5582,7 +5582,7 @@ function ap_notification_projection_read(int $ownerUserId, int $limit, array $wa
  * @param list<string> $exclude
  * @return list<array<string,mixed>>
  */
-function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = []): array
+function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?string $sinceId = null, array $types = [], array $exclude = [], bool $bypassCache = false): array
 {
     $notifStartedAt = microtime(true);
     $recordNotifTiming = static function (string $phase, float $startedAt): void {
@@ -5606,6 +5606,7 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
 
     $items = [];
     $mentionTypes = ['mention', 'favourite', 'reblog', 'quote', 'update', 'bite', 'status'];
+    $GLOBALS['ap_notif_list_cache_hit'] = false;
 
     $ownerUserId = function_exists('ap_db_masto_owner_user_id')
         ? ap_db_masto_owner_user_id()
@@ -5621,8 +5622,14 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     ], JSON_UNESCAPED_SLASHES) ?: '');
     $notifStampedeLock = '';
     $holdNotifLock = false;
-    $notifFreshSec = 45;
-    $notifStaleSec = 300; // Ice Cubes retries fast; serve stale rather than 3–5s cold rebuilds
+    // When Rust/PHP list-warm owns rebuilds, trust Redis longer so Mentions soft-nav
+    // fill and Ice Cubes polls rarely cold-hydrate on the request path.
+    $listRustPrimary = getenv('VAAK_NOTIF_LIST_RUST_PRIMARY');
+    $listRustPrimary = ($listRustPrimary === false || $listRustPrimary === '')
+        ? true
+        : !in_array(strtolower(trim((string) $listRustPrimary)), ['0', 'false', 'off', 'no'], true);
+    $notifFreshSec = $listRustPrimary ? 120 : 45;
+    $notifStaleSec = $listRustPrimary ? 600 : 300; // Ice Cubes retries fast; serve stale rather than 3–5s cold rebuilds
     $unwrapNotifCache = static function (?array $cached): ?array {
         if (!is_array($cached)) {
             return null;
@@ -5632,32 +5639,38 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
             return [
                 'ts' => (int) ($cached['ts'] ?? 0),
                 'items' => $cached['items'],
+                'source' => (string) ($cached['source'] ?? ''),
             ];
         }
         if ($cached === [] || array_is_list($cached)) {
-            return ['ts' => time(), 'items' => $cached];
+            return ['ts' => time(), 'items' => $cached, 'source' => ''];
         }
         return null;
     };
-    if (function_exists('ap_redis_json_get')) {
+    if (!$bypassCache && function_exists('ap_redis_json_get')) {
         $wrapped = $unwrapNotifCache(ap_redis_json_get($redisKey));
         if (is_array($wrapped)) {
             $age = time() - (int) ($wrapped['ts'] ?? 0);
             $items = $wrapped['items'];
             if ($age >= 0 && $age <= $notifFreshSec) {
+                $GLOBALS['ap_notif_list_cache_hit'] = true;
                 $recordNotifTiming('cache_fresh', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
                 return $items;
             }
             if ($age >= 0 && $age <= $notifStaleSec) {
-                // Stale-while-revalidate: answer Ice Cubes immediately, refresh after.
-                ap_masto_notifications_schedule_rebuild(
-                    $redisKey,
-                    $limit,
-                    $maxId,
-                    $sinceId,
-                    $want
-                );
+                $GLOBALS['ap_notif_list_cache_hit'] = true;
+                // Stale-while-revalidate: answer immediately. When list-warm is
+                // primary, skip request-path rebuild — the worker refreshes keys.
+                if (!$listRustPrimary) {
+                    ap_masto_notifications_schedule_rebuild(
+                        $redisKey,
+                        $limit,
+                        $maxId,
+                        $sinceId,
+                        $want
+                    );
+                }
                 $recordNotifTiming('cache_stale', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
                 return $items;
@@ -5681,14 +5694,15 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
 
     // Redis may be empty after a restart.  Reuse a recent owner-scoped
     // projection only when it can satisfy the complete first page; otherwise
-    // fall through to authoritative mention/event queries.
-    if ($maxId === null && $sinceId === null) {
+    // fall through to authoritative mention/event queries. List-warm bypass
+    // always rebuilds so Redis gets a fresh hydrated envelope.
+    if (!$bypassCache && $maxId === null && $sinceId === null) {
         $projectionStartedAt = microtime(true);
         $projected = ap_notification_projection_read($ownerUserId, $limit, $want, $exclude);
         if ($projected !== []) {
             $recordNotifTiming('projection_hit', $projectionStartedAt);
             if (function_exists('ap_redis_json_set')) {
-                ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected], 300);
+                ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $projected, 'source' => 'php-projection'], 300);
             }
             $recordNotifTiming('total', $notifStartedAt);
             return $projected;
@@ -5939,8 +5953,13 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
     // read-only and the projection is never authoritative for privacy rules.
     ap_notification_projection_write($ownerUserId, $out);
     if (function_exists('ap_redis_json_set')) {
-        // Keep 5 minutes for stale-while-revalidate; freshness is gated by ts.
-        ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $out], 300);
+        $warmSource = getenv('VAAK_NOTIF_LIST_WARM');
+        $source = ($warmSource !== false && $warmSource !== '' && !in_array(strtolower(trim((string) $warmSource)), ['0', 'false', 'off', 'no'], true))
+            ? 'vaak-worker-live'
+            : 'php';
+        // Keep 5–10 minutes for stale-while-revalidate; freshness is gated by ts.
+        $ttl = $listRustPrimary ? 600 : 300;
+        ap_redis_json_set($redisKey, ['ts' => time(), 'items' => $out, 'source' => $source], $ttl);
     }
     if ($holdNotifLock && $notifStampedeLock !== '' && function_exists('ap_redis_unlock')) {
         ap_redis_unlock($notifStampedeLock);
@@ -5980,11 +5999,8 @@ function ap_masto_notifications_schedule_rebuild(
                 return;
             }
             try {
-                // Delete envelope so fetch rebuilds synchronously (no stale loop).
-                if (function_exists('ap_redis_delete')) {
-                    ap_redis_delete($redisKey);
-                }
-                ap_masto_notifications_fetch($limit, $maxId, $sinceId, $want, []);
+                // Bypass cache so fetch rebuilds synchronously (no stale loop).
+                ap_masto_notifications_fetch($limit, $maxId, $sinceId, $want, [], true);
             } finally {
                 if (function_exists('ap_redis_unlock')) {
                     ap_redis_unlock($lock);

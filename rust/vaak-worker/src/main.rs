@@ -1,4 +1,4 @@
-//! VAAK Rust workers — shadow + live cutover (notif badge, thin-media warm, actor warm).
+//! VAAK Rust workers — shadow + live cutover (notif badge, notif list, thin-media warm, actor warm).
 
 mod action_queue;
 mod config;
@@ -7,6 +7,7 @@ mod hidden;
 mod http;
 mod jetstream;
 mod notif;
+mod notif_list;
 mod ranked;
 mod redis_util;
 mod actor_warm;
@@ -45,6 +46,23 @@ enum Command {
         interval_secs: u64,
         #[arg(long, default_value_t = false)]
         r#loop: bool,
+    },
+    /// Mentions / Ice Cubes notification list warm (Redis list keys via PHP hydrate).
+    NotifList {
+        /// Warm one owner (or default) once, then exit.
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// Loop forever (multi-user when --owner-id 0).
+        #[arg(long, default_value_t = false)]
+        r#loop: bool,
+        /// Local ap_users.id. `0` refreshes every non-disabled account.
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        #[arg(long, default_value_t = 45)]
+        interval_secs: u64,
+        /// First-page limit for Mentions-shaped keys (also warms limit=40 all).
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
     },
     RankedNewer {
         #[arg(long, default_value_t = 0)]
@@ -153,6 +171,24 @@ async fn main() -> Result<()> {
                     cfg.default_owner_id
                 };
                 notif::run_once(&cfg, owner, compare, live).await?;
+            }
+        }
+        Command::NotifList {
+            once,
+            r#loop,
+            owner_id,
+            interval_secs,
+            limit,
+        } => {
+            if r#loop && !once {
+                notif_list::run_loop(&cfg, owner_id, interval_secs, limit).await?;
+            } else {
+                let owner = if owner_id > 0 {
+                    owner_id
+                } else {
+                    cfg.default_owner_id
+                };
+                notif_list::run_once(&cfg, owner, limit).await?;
             }
         }
         Command::RankedNewer {
