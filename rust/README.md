@@ -7,6 +7,7 @@
 | `ranked-warm --loop --owner-id 0` | **LIVE** | Home / Local / Federated ranked ID-cache warm — orchestrates PHP `bin/ranked-warm.php` into `vaak:timeline:ranked:v2:{sha256}` |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
+| `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home`, `/api/v1/notifications` (Redis-read only) |
 
@@ -20,10 +21,11 @@ systemctl enable --now vaak-worker-notif-list.service
 systemctl enable --now vaak-worker-ranked-warm.service
 systemctl enable --now vaak-worker-thin-warm.service
 systemctl enable --now vaak-worker-actor-warm.service
+systemctl enable --now vaak-worker-ap-actor-warm.service
 systemctl enable --now vaak-worker-shadow-http.service   # localhost:8787 Axum shadow
 ```
 
-Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.service`, `deploy/vaak-worker-ranked-warm.service`, `deploy/vaak-worker-thin-warm.service`, `deploy/vaak-worker-actor-warm.service`, `deploy/vaak-worker-shadow-http.service`
+Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.service`, `deploy/vaak-worker-ranked-warm.service`, `deploy/vaak-worker-thin-warm.service`, `deploy/vaak-worker-actor-warm.service`, `deploy/vaak-worker-ap-actor-warm.service`, `deploy/vaak-worker-shadow-http.service`
 
 ## Env
 
@@ -44,6 +46,7 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_PHP_BIN` | `/usr/bin/php` | materializer spawn |
 | `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
 | `VAAK_ACTOR_WARM_RUST_PRIMARY` | `1` (PHP) | thin-author LPUSH to `bsky_actor_warm` |
+| `VAAK_AP_ACTOR_WARM_RUST_PRIMARY` | `1` (PHP) | Fediverse warm_async LPUSH to `ap_actor_warm` |
 | `VAAK_BSKY_PUBLIC_API` | `https://public.api.bsky.app` | warm fetch |
 
 ## Build / install
@@ -62,4 +65,5 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home`, `/api/v1/timelines/home`
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
 - Actor warm queue: `vaak:queue:bsky_actor_warm` JSON `{did,owner,ts,source}`; flat key `vaak:actor:v1:bsky:{did}` TTL ~2700s
-- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-notif-list vaak-worker-ranked-warm vaak-worker-thin-warm vaak-worker-actor-warm vaak-worker-shadow-http` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_NOTIF_LIST_RUST_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` / `VAAK_ACTOR_WARM_RUST_PRIMARY=0` in `/etc/mkultra/vaak.env`
+- AP actor warm queue: `vaak:queue:ap_actor_warm` JSON `{actor_id,ts,source}`; flat key `vaak:actor:v1:ap:{sha256}` TTL ~2700s; PHP `ap-actor-warm.php` does signed fetch
+- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-notif-list vaak-worker-ranked-warm vaak-worker-thin-warm vaak-worker-actor-warm vaak-worker-ap-actor-warm vaak-worker-shadow-http` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_NOTIF_LIST_RUST_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` / `VAAK_ACTOR_WARM_RUST_PRIMARY=0` / `VAAK_AP_ACTOR_WARM_RUST_PRIMARY=0` in `/etc/mkultra/vaak.env`

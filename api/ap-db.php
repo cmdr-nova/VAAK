@@ -13546,6 +13546,154 @@ function ap_dm_peer_from_conversation_id(string $id, ?int $ownerUserId = null): 
 
 /* ----------------- Remote actor + media cache metadata ----------------- */
 
+/** Flat AP actor Redis key (cache DB0) — parity with `vaak:actor:v1:bsky:{did}`. */
+function ap_remote_actor_flat_redis_key(string $actorId): string
+{
+    $actorId = rtrim(trim($actorId), '/');
+    return 'vaak:actor:v1:ap:' . hash('sha256', strtolower($actorId));
+}
+
+/**
+ * Compact flat payload written beside remote_actors rows.
+ *
+ * @param array<string,mixed> $row
+ * @return array<string,mixed>
+ */
+function ap_remote_actor_flat_from_row(array $row): array
+{
+    return [
+        'actor_id' => rtrim((string) ($row['actor_id'] ?? ''), '/'),
+        'username' => isset($row['username']) ? (string) $row['username'] : null,
+        'display_name' => isset($row['display_name']) ? (string) $row['display_name'] : null,
+        'host' => isset($row['host']) ? (string) $row['host'] : null,
+        'icon_source_url' => isset($row['icon_source_url']) ? (string) $row['icon_source_url'] : null,
+        'image_source_url' => isset($row['image_source_url']) ? (string) $row['image_source_url'] : null,
+        'updated_at' => isset($row['updated_at']) ? (string) $row['updated_at'] : null,
+    ];
+}
+
+/** @param array<string,mixed> $flat */
+function ap_remote_actor_row_from_flat(array $flat): array
+{
+    return [
+        'actor_id' => rtrim((string) ($flat['actor_id'] ?? ''), '/'),
+        'username' => $flat['username'] ?? null,
+        'display_name' => $flat['display_name'] ?? null,
+        'host' => $flat['host'] ?? null,
+        'icon_source_url' => $flat['icon_source_url'] ?? null,
+        'image_source_url' => $flat['image_source_url'] ?? null,
+        'updated_at' => $flat['updated_at'] ?? null,
+    ];
+}
+
+/** TTL midpoint matching Bluesky flat actors (~45m). */
+function ap_remote_actor_flat_ttl_secs(): int
+{
+    return 2700;
+}
+
+/** Write / refresh flat Redis after a durable remote_actors upsert. */
+function ap_remote_actor_flat_put(string $actorId, ?array $row = null): void
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return;
+    }
+    if ($row === null) {
+        // Avoid recursion through get→flat: read PG memo / DB directly.
+        if (isset($GLOBALS['ap_remote_actor_memo']) && is_array($GLOBALS['ap_remote_actor_memo'])
+            && array_key_exists($actorId, $GLOBALS['ap_remote_actor_memo'])
+            && is_array($GLOBALS['ap_remote_actor_memo'][$actorId])) {
+            $row = $GLOBALS['ap_remote_actor_memo'][$actorId];
+        } else {
+            try {
+                $st = ap_db()->prepare('SELECT * FROM remote_actors WHERE actor_id = ? OR actor_id = ? LIMIT 1');
+                $st->execute([$actorId, $actorId . '/']);
+                $got = $st->fetch();
+                $row = is_array($got) ? $got : null;
+            } catch (Throwable $e) {
+                return;
+            }
+        }
+    }
+    if (!is_array($row) || rtrim((string) ($row['actor_id'] ?? ''), '/') === '') {
+        return;
+    }
+    if (!function_exists('ap_redis_json_set')) {
+        return;
+    }
+    $flat = ap_remote_actor_flat_from_row($row);
+    ap_redis_json_set(ap_remote_actor_flat_redis_key($actorId), $flat, ap_remote_actor_flat_ttl_secs());
+    $rid = rtrim((string) ($flat['actor_id'] ?? ''), '/');
+    if ($rid !== '' && $rid !== $actorId) {
+        ap_redis_json_set(ap_remote_actor_flat_redis_key($rid), $flat, ap_remote_actor_flat_ttl_secs());
+    }
+    if (!isset($GLOBALS['vaak_ap_actor_memo']) || !is_array($GLOBALS['vaak_ap_actor_memo'])) {
+        $GLOBALS['vaak_ap_actor_memo'] = [];
+    }
+    $GLOBALS['vaak_ap_actor_memo'][$actorId] = $flat;
+    if ($rid !== '' && $rid !== $actorId) {
+        $GLOBALS['vaak_ap_actor_memo'][$rid] = $flat;
+    }
+}
+
+/**
+ * MGET flat AP actor keys into `$GLOBALS['vaak_ap_actor_memo']`.
+ *
+ * @param list<string> $actorIds
+ */
+function ap_remote_actors_flat_prefetch(array $actorIds): void
+{
+    if (!isset($GLOBALS['vaak_ap_actor_memo']) || !is_array($GLOBALS['vaak_ap_actor_memo'])) {
+        $GLOBALS['vaak_ap_actor_memo'] = [];
+    }
+    /** @var array<string,array<string,mixed>|null> $flatMemo */
+    $flatMemo = &$GLOBALS['vaak_ap_actor_memo'];
+    $want = [];
+    foreach ($actorIds as $aid) {
+        $aid = rtrim(trim((string) $aid), '/');
+        if ($aid === '' || !str_starts_with($aid, 'https://')) {
+            continue;
+        }
+        if (!array_key_exists($aid, $flatMemo)) {
+            $want[$aid] = true;
+        }
+    }
+    if ($want === []) {
+        return;
+    }
+    $redis = function_exists('ap_redis_client') ? ap_redis_client('cache') : null;
+    if (!$redis) {
+        foreach (array_keys($want) as $aid) {
+            $flatMemo[$aid] = null;
+        }
+        return;
+    }
+    try {
+        foreach (array_chunk(array_keys($want), 200) as $chunk) {
+            $keys = [];
+            foreach ($chunk as $aid) {
+                $keys[] = ap_remote_actor_flat_redis_key($aid);
+            }
+            $vals = $redis->mGet($keys);
+            if (!is_array($vals)) {
+                $vals = array_fill(0, count($chunk), false);
+            }
+            foreach ($chunk as $i => $aid) {
+                $raw = $vals[$i] ?? false;
+                $decoded = is_string($raw) ? json_decode($raw, true) : null;
+                $flatMemo[$aid] = is_array($decoded) ? $decoded : null;
+            }
+        }
+    } catch (Throwable $e) {
+        foreach (array_keys($want) as $aid) {
+            if (!array_key_exists($aid, $flatMemo)) {
+                $flatMemo[$aid] = null;
+            }
+        }
+    }
+}
+
 function ap_remote_actor_get(string $actorId): ?array
 {
     $actorId = rtrim(trim($actorId), '/');
@@ -13560,6 +13708,27 @@ function ap_remote_actor_get(string $actorId): ?array
     if (array_key_exists($actorId, $memo)) {
         return $memo[$actorId];
     }
+    // Flat Redis / request memo (Rust+PHP warm) before PG.
+    $flat = null;
+    if (isset($GLOBALS['vaak_ap_actor_memo']) && is_array($GLOBALS['vaak_ap_actor_memo'])
+        && array_key_exists($actorId, $GLOBALS['vaak_ap_actor_memo'])) {
+        $flat = $GLOBALS['vaak_ap_actor_memo'][$actorId];
+    } elseif (function_exists('ap_redis_json_get') && str_starts_with($actorId, 'https://')) {
+        $flat = ap_redis_json_get(ap_remote_actor_flat_redis_key($actorId));
+        if (!isset($GLOBALS['vaak_ap_actor_memo']) || !is_array($GLOBALS['vaak_ap_actor_memo'])) {
+            $GLOBALS['vaak_ap_actor_memo'] = [];
+        }
+        $GLOBALS['vaak_ap_actor_memo'][$actorId] = is_array($flat) ? $flat : null;
+    }
+    if (is_array($flat) && rtrim((string) ($flat['actor_id'] ?? ''), '/') !== '') {
+        $row = ap_remote_actor_row_from_flat($flat);
+        $memo[$actorId] = $row;
+        $rid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        if ($rid !== '' && $rid !== $actorId) {
+            $memo[$rid] = $row;
+        }
+        return $row;
+    }
     $st = ap_db()->prepare('SELECT * FROM remote_actors WHERE actor_id = ? OR actor_id = ? LIMIT 1');
     $st->execute([$actorId, $actorId . '/']);
     $row = $st->fetch();
@@ -13569,6 +13738,8 @@ function ap_remote_actor_get(string $actorId): ?array
         if ($rid !== '' && $rid !== $actorId) {
             $memo[$rid] = $row;
         }
+        // Opportunistic flat fill so the next paint hits Redis.
+        ap_remote_actor_flat_put($actorId, $row);
     }
     return $memo[$actorId];
 }
@@ -13580,15 +13751,14 @@ function ap_remote_actor_get(string $actorId): ?array
  */
 function ap_remote_actors_prefetch(array $actorIds): void
 {
-    $want = [];
+    $roots = [];
     foreach ($actorIds as $aid) {
         $aid = rtrim(trim((string) $aid), '/');
         if ($aid !== '' && str_starts_with($aid, 'https://')) {
-            $want[$aid] = true;
-            $want[$aid . '/'] = true;
+            $roots[$aid] = true;
         }
     }
-    if ($want === []) {
+    if ($roots === []) {
         return;
     }
     if (!isset($GLOBALS['ap_remote_actor_memo']) || !is_array($GLOBALS['ap_remote_actor_memo'])) {
@@ -13596,13 +13766,32 @@ function ap_remote_actors_prefetch(array $actorIds): void
     }
     /** @var array<string,array<string,mixed>|null> $memo */
     $memo = &$GLOBALS['ap_remote_actor_memo'];
+
+    // Flat Redis MGET first (parity with Bluesky DID prefetch).
+    ap_remote_actors_flat_prefetch(array_keys($roots));
+    $flatMemo = (isset($GLOBALS['vaak_ap_actor_memo']) && is_array($GLOBALS['vaak_ap_actor_memo']))
+        ? $GLOBALS['vaak_ap_actor_memo']
+        : [];
+
     $missing = [];
-    foreach (array_keys($want) as $aid) {
-        $root = rtrim($aid, '/');
-        if (!array_key_exists($root, $memo)) {
-            $missing[$root] = true;
-            $missing[$root . '/'] = true;
+    foreach (array_keys($roots) as $root) {
+        if (array_key_exists($root, $memo)) {
+            continue;
         }
+        $flat = $flatMemo[$root] ?? null;
+        if (is_array($flat) && rtrim((string) ($flat['actor_id'] ?? ''), '/') !== '') {
+            $row = ap_remote_actor_row_from_flat($flat);
+            $memo[$root] = $row;
+            $memo[$root . '/'] = $row;
+            $rid = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            if ($rid !== '' && $rid !== $root) {
+                $memo[$rid] = $row;
+                $memo[$rid . '/'] = $row;
+            }
+            continue;
+        }
+        $missing[$root] = true;
+        $missing[$root . '/'] = true;
     }
     if ($missing === []) {
         return;
@@ -13623,6 +13812,8 @@ function ap_remote_actors_prefetch(array $actorIds): void
                 $memo[$rid] = $row;
                 $memo[$rid . '/'] = $row;
                 unset($missing[$rid], $missing[$rid . '/']);
+                // Opportunistic flat fill so the next paint hits Redis.
+                ap_remote_actor_flat_put($rid, $row);
             }
         }
         // Remember misses so we don't re-query.
@@ -13724,6 +13915,7 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     if (is_string($image)) {
         $image = ap_profile_sanitize_https_url($image);
     }
+    $now = ap_db_now();
     $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_id) DO UPDATE SET
@@ -13734,9 +13926,24 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
            image_source_url = COALESCE(excluded.image_source_url, remote_actors.image_source_url),
            updated_at = excluded.updated_at';
     // Best-effort cache write: never take down admin HTML mid-render on lock.
-    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, ap_db_now()]) === false) {
+    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, $now]) === false) {
         error_log('[ap-db] remote_actor_upsert skipped (locked): ' . $actorId);
+        return;
     }
+    $row = [
+        'actor_id' => $actorId,
+        'username' => $username,
+        'display_name' => $display,
+        'host' => $host,
+        'icon_source_url' => $icon,
+        'image_source_url' => $image,
+        'updated_at' => $now,
+    ];
+    if (!isset($GLOBALS['ap_remote_actor_memo']) || !is_array($GLOBALS['ap_remote_actor_memo'])) {
+        $GLOBALS['ap_remote_actor_memo'] = [];
+    }
+    $GLOBALS['ap_remote_actor_memo'][$actorId] = $row;
+    ap_remote_actor_flat_put($actorId, $row);
 }
 
 /**
@@ -13927,6 +14134,31 @@ function ap_remote_actor_warm_async(string $actorId): void
     if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
         return;
     }
+
+    // Prefer Redis queue for Rust ap-actor-warm worker (PHP still does signed AS2 fetch).
+    $rustPrimary = getenv('VAAK_AP_ACTOR_WARM_RUST_PRIMARY');
+    $rustPrimary = $rustPrimary === false
+        ? true
+        : !in_array(strtolower(trim((string) $rustPrimary)), ['0', 'false', 'off', 'no'], true);
+    if ($rustPrimary && function_exists('ap_redis_queue_push')) {
+        $lockKey = 'ap-actor-warm:' . hash('sha256', $actorId);
+        $locked = !function_exists('ap_redis_lock') || ap_redis_lock($lockKey, 45);
+        if ($locked) {
+            $payload = json_encode([
+                'actor_id' => $actorId,
+                'ts' => time(),
+                'source' => 'warm-async',
+            ], JSON_UNESCAPED_SLASHES);
+            if (is_string($payload) && ap_redis_queue_push('ap_actor_warm', $payload)) {
+                return;
+            }
+        } else {
+            // Another warmer already holds the lock / queue slot.
+            return;
+        }
+    }
+
+    // Fallback: direct PHP spawn (also used when Rust primary is off).
     $script = __DIR__ . '/ap-actor-warm.php';
     if (!is_file($script)) {
         return;
@@ -13945,9 +14177,11 @@ function ap_remote_actor_warm_async(string $actorId): void
     }
     flock($lock, LOCK_UN);
     fclose($lock);
-    $php = defined('PHP_BINARY') && is_executable(PHP_BINARY) && !str_contains(PHP_BINARY, 'php-fpm')
-        ? PHP_BINARY
-        : '/usr/bin/php';
+    $php = function_exists('ap_php_cli_binary')
+        ? ap_php_cli_binary()
+        : (defined('PHP_BINARY') && is_executable(PHP_BINARY) && !str_contains(PHP_BINARY, 'php-fpm')
+            ? PHP_BINARY
+            : '/usr/bin/php');
     @exec('nohup ' . escapeshellarg($php) . ' ' . escapeshellarg($script) . ' '
         . escapeshellarg($actorId) . ' >/dev/null 2>&1 </dev/null &');
 }

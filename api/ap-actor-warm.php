@@ -1,5 +1,9 @@
 <?php
-/** Background remote actor/profile warmer. Usage: php ap-actor-warm.php https://… */
+/**
+ * Background remote actor/profile warmer (signed AS2 fetch via ap_remote_actor_ensure).
+ * Usage: php ap-actor-warm.php https://…
+ * Also spawned by `vaak-worker ap-actor-warm` when draining Redis `ap_actor_warm`.
+ */
 declare(strict_types=1);
 if (PHP_SAPI !== 'cli') {
     fwrite(STDERR, "CLI only\n");
@@ -17,7 +21,11 @@ if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
 define('AP_INBOX_LIB_ONLY', true);
 require_once __DIR__ . '/ap-inbox.php';
 try {
-    ap_remote_actor_ensure($actorId, true);
+    $row = ap_remote_actor_ensure($actorId, true);
+    // Ensure upsert already flat_puts; refresh again in case ensure returned a memo hit.
+    if (is_array($row) && function_exists('ap_remote_actor_flat_put')) {
+        ap_remote_actor_flat_put($actorId, $row);
+    }
 } catch (Throwable $e) {
     error_log('[ap-actor] async warm: ' . $e->getMessage());
 }

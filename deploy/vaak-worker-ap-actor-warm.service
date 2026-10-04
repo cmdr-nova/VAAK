@@ -1,0 +1,31 @@
+# Live Fediverse (AP) actor-warm queue worker.
+# Drains vaak:queue:ap_actor_warm on Redis DB1; periodic remote_actors → flat Redis backfill.
+# Spawns PHP ap-actor-warm.php for signed AS2 fetch; writes flat cache
+# vaak:actor:v1:ap:{sha256} (Redis DB0, TTL ~2700s).
+# PHP warm_async LPUSHes here when VAAK_AP_ACTOR_WARM_RUST_PRIMARY=1 (default).
+#   systemctl enable --now vaak-worker-ap-actor-warm.service
+
+[Unit]
+Description=VAAK Rust Fediverse (AP) actor-warm worker
+After=network.target postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
+Environment=VAAK_REDIS_QUEUE_URL=redis://127.0.0.1/1
+Environment=VAAK_API_ROOT=/srv/mkultra/html/api
+Environment=VAAK_PHP_BIN=/usr/bin/php
+Environment=AP_DB_DSN=pgsql:dbname=novalandia
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker ap-actor-warm --loop --scan-interval-secs 180 --limit 40
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
