@@ -1,12 +1,13 @@
 //! Home / Local / Federated **ranked** warm (loading-plan slice 2 → native).
 //!
 //! - **Home (native):** rebuilds `vaak:timeline:ranked:v2:{sha256(logical)}` +
-//!   owner index from Postgres (follow events, own outbox, Bluesky merge, RSS
-//!   spacing). Source `vaak-worker-native`. Flag `VAAK_RANKED_NATIVE_HOME=1`.
+//!   owner index from Postgres (follow events, own outbox, favourite/toxicity
+//!   nudges when algorithm on, Bluesky merge, RSS spacing). Source
+//!   `vaak-worker-native`. Flag `VAAK_RANKED_NATIVE_HOME=1`.
 //! - **Local / Federated (native):** outbox+local boosts / firehose events with
 //!   v13 key parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on).
-//! - PHP `api/bin/ranked-warm.php` remains for Home empty/thin fallback and when
-//!   a native flag is off.
+//! - PHP `api/bin/ranked-warm.php` remains for Home empty/thin fallback
+//!   (recommendations still PHP-only) and when a native flag is off.
 //!
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
@@ -276,8 +277,71 @@ struct TimelineItem {
     sort: i64,
     id: String,
     source: String,
-    #[allow(dead_code)]
     actor_id: String,
+    /// Author used for preference / suppression (Announce → target_actor).
+    pref_actor: String,
+    summary: String,
+    visibility: String,
+    object_id: String,
+    #[allow(dead_code)]
+    event_type: String,
+}
+
+impl TimelineItem {
+    fn event(
+        id: String,
+        sort: i64,
+        actor_id: String,
+        pref_actor: String,
+        summary: String,
+        visibility: String,
+        object_id: String,
+        event_type: String,
+        source: &str,
+    ) -> Self {
+        Self {
+            kind: "event".into(),
+            sort,
+            id,
+            source: source.into(),
+            actor_id,
+            pref_actor,
+            summary,
+            visibility,
+            object_id,
+            event_type,
+        }
+    }
+
+    fn outbox(id: String, sort: i64, actor_id: String, summary: String) -> Self {
+        Self {
+            kind: "outbox".into(),
+            sort,
+            id: id.clone(),
+            source: "local".into(),
+            actor_id: actor_id.clone(),
+            pref_actor: actor_id,
+            summary,
+            visibility: "public".into(),
+            object_id: id,
+            event_type: String::new(),
+        }
+    }
+
+    fn boost(id: String, sort: i64, owner: String) -> Self {
+        Self {
+            kind: "boost".into(),
+            sort,
+            id,
+            source: "boost".into(),
+            actor_id: owner.clone(),
+            pref_actor: owner,
+            summary: String::new(),
+            visibility: "public".into(),
+            object_id: String::new(),
+            event_type: String::new(),
+        }
+    }
 }
 
 fn is_empty_private_stub(visibility: &str, summary: &str, media_urls: &str) -> bool {
@@ -322,7 +386,8 @@ async fn fetch_home_events(
     for chunk in actor_ids.chunks(400) {
         let rows = db
             .query(
-                "SELECT id, type, actor_id, summary, media_urls, created_at, visibility
+                "SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
+                        COALESCE(object_id, ''), COALESCE(target_actor, '')
                  FROM events
                  WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
                    AND action_taken = ANY(ARRAY['log','local_observe'])
@@ -335,6 +400,7 @@ async fn fetch_home_events(
             .context("select home follow events")?;
         for row in rows {
             let id: i64 = row.get(0);
+            let event_type: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
             let actor: String = row
                 .try_get::<_, Option<String>>(2)?
                 .unwrap_or_default()
@@ -347,6 +413,16 @@ async fn fetch_home_events(
             let media: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
             let created: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
             let visibility: String = row.try_get::<_, Option<String>>(6)?.unwrap_or_default();
+            let object_id: String = row
+                .try_get::<_, Option<String>>(7)?
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string();
+            let target_actor: String = row
+                .try_get::<_, Option<String>>(8)?
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string();
             if is_empty_private_stub(&visibility, &summary, &media) {
                 continue;
             }
@@ -355,13 +431,22 @@ async fn fetch_home_events(
                 continue;
             }
             per_actor.insert(actor.clone(), n + 1);
-            items.push(TimelineItem {
-                kind: "event".into(),
-                sort: parse_ts(&created),
-                id: id.to_string(),
-                source: "fediverse".into(),
-                actor_id: actor,
-            });
+            let pref = if event_type.eq_ignore_ascii_case("announce") && !target_actor.is_empty() {
+                target_actor
+            } else {
+                actor.clone()
+            };
+            items.push(TimelineItem::event(
+                id.to_string(),
+                parse_ts(&created),
+                actor,
+                pref,
+                summary,
+                visibility,
+                object_id,
+                event_type,
+                "fediverse",
+            ));
         }
     }
     Ok(items)
@@ -375,7 +460,8 @@ async fn fetch_own_outbox(db: &Client, self_actor: &str) -> Result<Vec<TimelineI
     let like = format!("{self_actor}/notes/%");
     let rows = db
         .query(
-            "SELECT id, published FROM outbox_notes
+            "SELECT id, published, COALESCE(content, '')
+             FROM outbox_notes
              WHERE id LIKE $1
              ORDER BY published DESC
              LIMIT 40",
@@ -394,13 +480,13 @@ async fn fetch_own_outbox(db: &Client, self_actor: &str) -> Result<Vec<TimelineI
             continue;
         }
         let published: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
-        items.push(TimelineItem {
-            kind: "outbox".into(),
-            sort: parse_ts(&published),
+        let content: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        items.push(TimelineItem::outbox(
             id,
-            source: "local".into(),
-            actor_id: self_actor.to_string(),
-        });
+            parse_ts(&published),
+            self_actor.to_string(),
+            content,
+        ));
     }
     Ok(items)
 }
@@ -877,13 +963,12 @@ async fn fetch_local_timeline(db: &Client) -> Result<Vec<TimelineItem>> {
             .rsplit_once("/notes/")
             .map(|(prefix, _)| prefix.to_string())
             .unwrap_or_default();
-        items.push(TimelineItem {
-            kind: "outbox".into(),
-            sort: parse_ts(&published),
+        items.push(TimelineItem::outbox(
             id,
-            source: "local".into(),
-            actor_id: actor,
-        });
+            parse_ts(&published),
+            actor,
+            String::new(),
+        ));
     }
 
     let rb_rows = db
@@ -909,13 +994,11 @@ async fn fetch_local_timeline(db: &Client) -> Result<Vec<TimelineItem>> {
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
-        items.push(TimelineItem {
-            kind: "boost".into(),
-            sort: parse_ts(&created),
-            id: status_id,
-            source: "boost".into(),
-            actor_id: owner,
-        });
+        items.push(TimelineItem::boost(
+            status_id,
+            parse_ts(&created),
+            owner,
+        ));
     }
     Ok(items)
 }
@@ -955,15 +1038,635 @@ async fn fetch_federated_events(
         if is_empty_private_stub(&visibility, &summary, &media) {
             continue;
         }
-        items.push(TimelineItem {
-            kind: "event".into(),
-            sort: parse_ts(&created),
-            id: id.to_string(),
-            source: "fediverse".into(),
-            actor_id: actor,
-        });
+        items.push(TimelineItem::event(
+            id.to_string(),
+            parse_ts(&created),
+            actor.clone(),
+            actor,
+            summary,
+            visibility,
+            String::new(),
+            String::new(),
+            "fediverse",
+        ));
     }
     Ok(items)
+}
+
+async fn load_downranking_enabled(db: &Client, actor_key: &str) -> Result<bool> {
+    if actor_key.is_empty() {
+        return Ok(true);
+    }
+    let row = db
+        .query_opt(
+            "SELECT downranking_enabled FROM actor_profile WHERE actor_key = $1 LIMIT 1",
+            &[&actor_key],
+        )
+        .await
+        .context("select actor_profile.downranking_enabled")?;
+    Ok(match row {
+        Some(r) => {
+            let v: Option<i32> = r.try_get(0).ok().flatten();
+            v.map(|n| n != 0).unwrap_or(true)
+        }
+        None => true,
+    })
+}
+
+fn strip_tags_lower(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.to_ascii_lowercase()
+}
+
+fn extract_hashtags(text: &str) -> Vec<String> {
+    let plain = strip_tags_lower(text);
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+    let bytes = plain.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'#' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() {
+                let c = bytes[end] as char;
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    end += 1;
+                } else {
+                    break;
+                }
+            }
+            if end > start {
+                let tag = plain[start..end].to_string();
+                if (2..=64).contains(&tag.len()) && seen.insert(tag.clone()) {
+                    tags.push(tag);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    tags
+}
+
+fn phrase_matches_text(text: &str, phrase: &str) -> bool {
+    let phrase = {
+        let p = strip_tags_lower(phrase);
+        let collapsed: String = p.split_whitespace().collect::<Vec<_>>().join(" ");
+        collapsed
+    };
+    if phrase.is_empty() {
+        return false;
+    }
+    // Drop hashtag tokens so admin terms don't fire on self-applied tags.
+    let lowered = strip_tags_lower(text);
+    let mut search = String::new();
+    let mut chars = lowered.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '#' {
+            while let Some(c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || *c == '_' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            search.push(' ');
+            continue;
+        }
+        search.push(ch);
+    }
+    let Ok(re) = regex::RegexBuilder::new(&format!(
+        r"(?i)(?<!\p{{L}}){}(?!\p{{L}})",
+        regex::escape(&phrase)
+    ))
+    .build() else {
+        return search.contains(&phrase);
+    };
+    re.is_match(&search)
+}
+
+fn toxicity_categories(text: &str, admin_terms: &[(String, String)]) -> Vec<String> {
+    let lower = strip_tags_lower(text);
+    if lower.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let builtins: &[(&str, &str)] = &[
+        (
+            "direct_abuse",
+            r"(?i)\b(?:fuck\s+you|suck\s+my\s+dick|go\s+fuck\s+yourself)\b",
+        ),
+        ("ai_slogan", r"(?i)\b(?:slop|ai\s+trash|clanker)\b"),
+        (
+            "misogyny",
+            r"(?i)\b(?:women\s+belong\s+in\s+the\s+kitchen|women\s+are\s+property|go\s+back\s+to\s+the\s+kitchen)\b",
+        ),
+    ];
+    for (cat, pat) in builtins {
+        if let Ok(re) = regex::Regex::new(pat) {
+            if re.is_match(&lower) {
+                matches.push((*cat).to_string());
+            }
+        }
+    }
+    for (phrase, category) in admin_terms {
+        if phrase_matches_text(&lower, phrase) {
+            matches.push(category.clone());
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+async fn load_downrank_terms(db: &Client) -> Result<Vec<(String, String)>> {
+    let rows = db
+        .query(
+            "SELECT phrase, category FROM ap_home_downrank_terms
+             WHERE enabled = 1 ORDER BY id ASC LIMIT 500",
+            &[],
+        )
+        .await
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for row in rows {
+        let phrase: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+        let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+        if phrase.is_empty() || phrase.chars().count() > 120 {
+            continue;
+        }
+        let category: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let category: String = category
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let category = if category.is_empty() {
+            "custom".into()
+        } else {
+            category.to_ascii_lowercase()
+        };
+        out.push((phrase, category));
+    }
+    Ok(out)
+}
+
+async fn load_suppression_map(
+    db: &Client,
+    owner: i64,
+) -> Result<HashMap<String, (i32, i64, Vec<String>)>> {
+    let rows = db
+        .query(
+            "SELECT actor_id, score, categories_json, suppressed_until
+             FROM ap_home_suppression WHERE owner_user_id = $1",
+            &[&owner],
+        )
+        .await
+        .unwrap_or_default();
+    let mut out = HashMap::new();
+    for row in rows {
+        let actor: String = row
+            .try_get::<_, Option<String>>(0)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if actor.is_empty() {
+            continue;
+        }
+        let score: i32 = row.try_get::<_, Option<i32>>(1)?.unwrap_or(0).max(0);
+        let cats_raw: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        let cats: Vec<String> = serde_json::from_str(&cats_raw).unwrap_or_default();
+        let until_s: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        let until = parse_ts(&until_s);
+        out.insert(actor, (score, until, cats));
+    }
+    Ok(out)
+}
+
+async fn record_suppression(
+    db: &Client,
+    owner: i64,
+    actor: &str,
+    categories: &[String],
+    object_id: &str,
+) -> Result<()> {
+    if owner < 1 || actor.is_empty() || categories.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let existing = db
+        .query_opt(
+            "SELECT score, suppressed_until, categories_json
+             FROM ap_home_suppression WHERE owner_user_id = $1 AND actor_id = $2",
+            &[&owner, &actor],
+        )
+        .await
+        .ok()
+        .flatten();
+    let (mut score, previous_until, mut all_cats) = if let Some(row) = existing {
+        let score: i32 = row.try_get::<_, Option<i32>>(0)?.unwrap_or(0).max(0);
+        let until_s: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let cats_raw: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        let cats: Vec<String> = serde_json::from_str(&cats_raw).unwrap_or_default();
+        (score, parse_ts(&until_s), cats)
+    } else {
+        (0, 0, Vec::new())
+    };
+    score = (score + 1).min(8);
+    let mut until = now + (3600 * score.max(1) as i64).min(7 * 86400);
+    if previous_until > until {
+        until = previous_until;
+    }
+    for c in categories {
+        if !all_cats.iter().any(|x| x == c) {
+            all_cats.push(c.clone());
+        }
+    }
+    let cats_json = serde_json::to_string(&all_cats).unwrap_or_else(|_| "[]".into());
+    let until_s = chrono::DateTime::from_timestamp(until, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    let now_s = chrono::Utc::now().to_rfc3339();
+    let object = object_id.chars().take(2048).collect::<String>();
+    let _ = db
+        .execute(
+            "INSERT INTO ap_home_suppression
+             (owner_user_id, actor_id, score, categories_json, suppressed_until, last_object_id, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (owner_user_id, actor_id) DO UPDATE SET
+               score = EXCLUDED.score,
+               categories_json = EXCLUDED.categories_json,
+               suppressed_until = EXCLUDED.suppressed_until,
+               last_object_id = EXCLUDED.last_object_id,
+               updated_at = EXCLUDED.updated_at",
+            &[
+                &owner,
+                &actor,
+                &score,
+                &cats_json,
+                &until_s,
+                &object,
+                &now_s,
+            ],
+        )
+        .await;
+    Ok(())
+}
+
+async fn apply_toxicity_downrank(
+    db: &Client,
+    owner: i64,
+    timeline: &mut [TimelineItem],
+) -> Result<()> {
+    if owner < 1 {
+        return Ok(());
+    }
+    let terms = load_downrank_terms(db).await.unwrap_or_default();
+    let mut states = load_suppression_map(db, owner).await.unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    for item in timeline.iter_mut() {
+        // Empty visibility defaults to public (PHP `$row['visibility'] ?? 'public'`).
+        let vis = {
+            let v = item.visibility.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                "public".to_string()
+            } else {
+                v
+            }
+        };
+        if vis != "public" && vis != "unlisted" {
+            continue;
+        }
+        let actor = if !item.pref_actor.is_empty() {
+            item.pref_actor.clone()
+        } else {
+            item.actor_id.clone()
+        };
+        if actor.is_empty() {
+            continue;
+        }
+        let cats = toxicity_categories(&item.summary, &terms);
+        if !cats.is_empty() {
+            let object = if !item.object_id.is_empty() {
+                item.object_id.clone()
+            } else {
+                item.id.clone()
+            };
+            let _ = record_suppression(db, owner, &actor, &cats, &object).await;
+            let score = states
+                .get(&actor)
+                .map(|(s, _, _)| (*s + 1).min(8))
+                .unwrap_or(1);
+            states.insert(actor.clone(), (score, now + 3600, cats));
+        }
+        if let Some((score, until, _)) = states.get(&actor) {
+            if *until > now {
+                let penalty = (1800 * (*score).max(1) as i64).min(12 * 3600);
+                item.sort -= penalty;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_favourite_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
+    if owner < 1 {
+        return HashMap::new();
+    }
+    let rows = db
+        .query(
+            "SELECT target_actor AS actor_id, COUNT(*)::bigint AS favourite_count
+             FROM masto_favourites
+             WHERE owner_user_id = $1
+               AND target_actor IS NOT NULL
+               AND target_actor <> ''
+             GROUP BY target_actor
+             ORDER BY favourite_count DESC
+             LIMIT 64",
+            &[&owner],
+        )
+        .await
+        .unwrap_or_default();
+    let mut weights = HashMap::new();
+    for row in rows {
+        let actor: String = row
+            .try_get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        let count: i64 = row.try_get::<_, Option<i64>>(1).ok().flatten().unwrap_or(0);
+        if !actor.is_empty() && count > 0 {
+            weights.insert(actor, (count as f64).min(64.0));
+        }
+    }
+    weights
+}
+
+async fn load_signal_actor_weights(db: &Client, owner: i64) -> HashMap<String, f64> {
+    if owner < 1 {
+        return HashMap::new();
+    }
+    let since = chrono::Utc::now() - chrono::Duration::days(45);
+    let since_s = since.to_rfc3339();
+    let rows = db
+        .query(
+            "SELECT signal_type, weight, metadata_json, created_at
+             FROM ap_user_signals
+             WHERE owner_user_id = $1 AND created_at >= $2
+             ORDER BY id DESC LIMIT 500",
+            &[&owner, &since_s],
+        )
+        .await
+        .unwrap_or_default();
+    let kind_weight = |kind: &str| -> f64 {
+        match kind {
+            "like" => 1.4,
+            "boost" => 1.2,
+            "reply" => 1.0,
+            "bookmark" => 1.1,
+            "follow" => 0.6,
+            "impression" => -0.03,
+            "click" => 0.30,
+            "dwell" => 0.12,
+            _ => 0.5,
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut weights = HashMap::new();
+    for row in rows {
+        let base: f64 = row
+            .try_get::<_, Option<f64>>(1)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                row.try_get::<_, Option<i32>>(1)
+                    .ok()
+                    .flatten()
+                    .map(|n| n as f64)
+            })
+            .unwrap_or(0.0);
+        if base <= 0.0 {
+            continue;
+        }
+        let kind: String = row
+            .try_get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let meta_raw: String = row
+            .try_get::<_, Option<String>>(2)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "{}".into());
+        let meta: Value = serde_json::from_str(&meta_raw).unwrap_or(json!({}));
+        let mut actor = meta
+            .get("target_actor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string();
+        if actor.is_empty() {
+            actor = meta
+                .get("author_did")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_string();
+        }
+        if actor.is_empty() {
+            if let Some(handle) = meta.get("author_handle").and_then(|v| v.as_str()) {
+                let handle = handle.trim().trim_start_matches('@');
+                if !handle.is_empty() {
+                    actor = format!("https://bsky.app/profile/{handle}");
+                }
+            }
+        }
+        if actor.is_empty() {
+            continue;
+        }
+        let created: String = row
+            .try_get::<_, Option<String>>(3)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let age = (now - parse_ts(&created)).max(0) as f64;
+        let decay = (-age / (14.0 * 86400.0)).exp();
+        let delta = base * kind_weight(&kind) * decay;
+        let entry = weights.entry(actor).or_insert(0.0);
+        *entry = (*entry + delta).clamp(-3.0, 24.0);
+    }
+    weights
+}
+
+async fn load_favourite_tag_weights(db: &Client, owner: i64) -> HashMap<String, i32> {
+    if owner < 1 {
+        return HashMap::new();
+    }
+    let fav_rows = db
+        .query(
+            "SELECT status_id, object_id FROM masto_favourites
+             WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT 200",
+            &[&owner],
+        )
+        .await
+        .unwrap_or_default();
+    let mut object_ids = Vec::new();
+    let mut status_ids: Vec<i32> = Vec::new();
+    let mut seen_oid = HashSet::new();
+    for row in fav_rows {
+        let oid: String = row
+            .try_get::<_, Option<String>>(1)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if !oid.is_empty() && seen_oid.insert(oid.clone()) {
+            object_ids.push(oid);
+        }
+        if let Ok(Some(sid_s)) = row.try_get::<_, Option<String>>(0) {
+            if let Ok(sid) = sid_s.parse::<i32>() {
+                if sid > 0 && sid < 2_000_000 {
+                    status_ids.push(sid);
+                }
+            }
+        }
+    }
+    let mut texts = Vec::new();
+    for chunk in object_ids.chunks(80) {
+        if chunk.is_empty() {
+            continue;
+        }
+        if let Ok(rows) = db
+            .query(
+                "SELECT summary FROM events WHERE object_id = ANY($1)",
+                &[&chunk],
+            )
+            .await
+        {
+            for row in rows {
+                let s: String = row
+                    .try_get::<_, Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if !s.is_empty() {
+                    texts.push(s);
+                }
+            }
+        }
+        if let Ok(rows) = db
+            .query(
+                "SELECT content FROM outbox_notes WHERE id = ANY($1)",
+                &[&chunk],
+            )
+            .await
+        {
+            for row in rows {
+                let s: String = row
+                    .try_get::<_, Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if !s.is_empty() {
+                    texts.push(s);
+                }
+            }
+        }
+    }
+    if !status_ids.is_empty() {
+        if let Ok(rows) = db
+            .query(
+                "SELECT content_text FROM masto_statuses WHERE local_id = ANY($1)",
+                &[&status_ids],
+            )
+            .await
+        {
+            for row in rows {
+                let s: String = row
+                    .try_get::<_, Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if !s.is_empty() {
+                    texts.push(s);
+                }
+            }
+        }
+    }
+    let mut weights = HashMap::new();
+    for text in texts {
+        for tag in extract_hashtags(&text) {
+            let e = weights.entry(tag).or_insert(0);
+            *e = (*e + 1).min(32);
+        }
+    }
+    let mut pairs: Vec<_> = weights.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    pairs.truncate(32);
+    pairs.into_iter().collect()
+}
+
+fn apply_favourite_rank(
+    timeline: &mut Vec<TimelineItem>,
+    actor_weights: &HashMap<String, f64>,
+    tag_weights: &HashMap<String, i32>,
+) {
+    if actor_weights.is_empty() && tag_weights.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    for item in timeline.iter_mut() {
+        let actor = if !item.pref_actor.is_empty() {
+            item.pref_actor.as_str()
+        } else {
+            item.actor_id.as_str()
+        };
+        let count = if actor.is_empty() {
+            0.0
+        } else {
+            *actor_weights.get(actor).unwrap_or(&0.0)
+        };
+        let mut tag_count = 0i32;
+        for tag in extract_hashtags(&item.summary) {
+            tag_count = tag_count.max(*tag_weights.get(&tag).unwrap_or(&0));
+        }
+        let created = item.sort;
+        if (count == 0.0 && tag_count < 1)
+            || created < (now - 172800)
+            || created > (now + 300)
+        {
+            continue;
+        }
+        let author_bonus = if count > 0.0 {
+            (600.0 * (1.0 + count).log2()).round() as i64
+        } else {
+            (60.0 * count).round() as i64
+        };
+        let author_bonus = author_bonus.max(-300);
+        let tag_bonus = if tag_count > 0 {
+            (300.0 * (1.0 + tag_count as f64).log2()).round() as i64
+        } else {
+            0
+        };
+        let bonus = (author_bonus + tag_bonus).clamp(-300, 1800);
+        if bonus != 0 {
+            item.sort = created + bonus;
+        }
+    }
 }
 
 /// Native Home ranked rebuild (no PHP).
@@ -972,6 +1675,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let db = crate::db::connect(&cfg.database_url).await?;
     let (actor_id, actor_key) = load_owner(&db, owner_user_id).await?;
     let algorithm_on = load_algorithm_enabled(&db, &actor_key).await?;
+    let downranking_on = load_downranking_enabled(&db, &actor_key).await?;
     let following = load_following_actor_ids(&db, &actor_id).await?;
     let logical = cache_key_home(owner_user_id, algorithm_on, &following);
     let hidden = hidden::load_hidden_sets(&db, owner_user_id).await?;
@@ -979,6 +1683,26 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
 
     let mut timeline = fetch_home_events(&db, &ap_following, &actor_id, &hidden).await?;
     timeline.extend(fetch_own_outbox(&db, &actor_id).await?);
+
+    if algorithm_on {
+        if downranking_on {
+            if let Err(e) = apply_toxicity_downrank(&db, owner_user_id, &mut timeline).await {
+                tracing::warn!(
+                    owner = owner_user_id,
+                    error = %format!("{e:#}"),
+                    "native home toxicity downrank skipped"
+                );
+            }
+        }
+        let mut actor_weights = load_favourite_actor_weights(&db, owner_user_id).await;
+        for (actor, weight) in load_signal_actor_weights(&db, owner_user_id).await {
+            let entry = actor_weights.entry(actor).or_insert(0.0);
+            *entry = (*entry + weight).min(64.0);
+        }
+        let tag_weights = load_favourite_tag_weights(&db, owner_user_id).await;
+        apply_favourite_rank(&mut timeline, &actor_weights, &tag_weights);
+    }
+
     let mut ranked = rank_from_timeline(timeline);
 
     let own_did = load_own_did(&db, owner_user_id).await?;
@@ -1013,8 +1737,10 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let ms = started.elapsed().as_millis();
     let counts = source_counts(&ranked);
     Ok(format!(
-        "owner={owner_user_id} view=home key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts}",
-        ranked.len()
+        "owner={owner_user_id} view=home key={logical} ranked={} ms={ms} source=vaak-worker-native algo={} downrank={} counts={counts}",
+        ranked.len(),
+        if algorithm_on { "on" } else { "off" },
+        if downranking_on { "on" } else { "off" },
     ))
 }
 
@@ -1280,6 +2006,37 @@ mod tests {
             r#"{"object":{"vaakOrigin":"bluesky","content":"hi"}}"#
         ));
         assert!(!outbox_is_bsky_import(r#"{"object":{"content":"hi"}}"#));
+    }
+
+    #[test]
+    fn hashtag_and_phrase_match() {
+        assert_eq!(extract_hashtags("Hello #Fediverse and #Art!"), vec!["fediverse", "art"]);
+        assert!(phrase_matches_text("you are a retard for this", "retard"));
+        assert!(!phrase_matches_text("tagged #retard in bio", "retard"));
+        assert!(phrase_matches_text("please kill yourself now", "kill yourself"));
+    }
+
+    #[test]
+    fn favourite_bonus_bounds() {
+        let mut items = vec![TimelineItem::event(
+            "1".into(),
+            chrono::Utc::now().timestamp() - 60,
+            "https://example.com/u/a".into(),
+            "https://example.com/u/a".into(),
+            "hi #art".into(),
+            "public".into(),
+            String::new(),
+            "Create".into(),
+            "fediverse",
+        )];
+        let mut actors = HashMap::new();
+        actors.insert("https://example.com/u/a".into(), 8.0);
+        let mut tags = HashMap::new();
+        tags.insert("art".into(), 4);
+        let before = items[0].sort;
+        apply_favourite_rank(&mut items, &actors, &tags);
+        assert!(items[0].sort > before);
+        assert!(items[0].sort - before <= 1800);
     }
 
     #[test]
