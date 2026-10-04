@@ -313,6 +313,8 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
         $st['vaak_feed_source'] = (string) $postOrItem['_vaak_feed_source'];
     }
     // Bluesky external link embeds → Mastodon preview card for shared paint.
+    // Skip media-like externals (Tenor/Klipy/Giphy GIF/MP4): those belong in
+    // media_attachments (see ap_masto_bsky_media_attachments) above the quote nest.
     if (
         empty($st['card'])
         && empty($st['media_attachments'])
@@ -331,7 +333,12 @@ function ap_normalize_from_bsky_post(array $postOrItem): ?array
         }
         if (is_array($ext)) {
             $extUri = trim((string) ($ext['uri'] ?? ''));
-            if ($extUri !== '' && preg_match('#^https?://#i', $extUri)) {
+            $looksMedia = $extUri !== '' && (
+                (function_exists('ap_bsky_url_looks_like_media') && ap_bsky_url_looks_like_media($extUri))
+                || (bool) preg_match('/\.(gif|png|jpe?g|webp|mp4|webm)(\?|#|$)/i', $extUri)
+                || (bool) preg_match('#https?://(?:(?:media|static)\.)?(?:tenor\.com|giphy\.com|klipy\.com)/#i', $extUri)
+            );
+            if ($extUri !== '' && preg_match('#^https?://#i', $extUri) && !$looksMedia) {
                 $host = parse_url($extUri, PHP_URL_HOST);
                 $st['card'] = [
                     'url' => $extUri,
