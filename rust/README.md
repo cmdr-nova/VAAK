@@ -3,7 +3,7 @@
 | Command | Mode | Role |
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
-| `notif-list --loop --owner-id 0` | **LIVE** | Mentions / Ice Cubes **list** warm — orchestrates PHP `bin/notif-list-warm.php` into `vaak:notifications:v1:{owner}:{hash}` |
+| `notif-list --loop --owner-id 0` | **LIVE** | Mentions / Ice Cubes **list** warm — PHP `bin/notif-list-warm.php` (M4: skip-if-fresh ~90s, all40→all30 derive, cache-only media + thin-media enqueue, flat DID prefetch) |
 | `ranked-warm --loop --owner-id 0` | **LIVE** | Home / Local / Federated ranked ID-cache warm — orchestrates PHP `bin/ranked-warm.php` into `vaak:timeline:ranked:v2:{sha256}` |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
