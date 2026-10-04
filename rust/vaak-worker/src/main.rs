@@ -1,4 +1,4 @@
-//! VAAK Rust workers — shadow + live cutover (notif badge, notif list, thin-media warm, actor warm).
+//! VAAK Rust workers — shadow + live cutover (notif badge/list, ranked warm, thin-media, actor warm).
 
 mod action_queue;
 mod config;
@@ -9,6 +9,7 @@ mod jetstream;
 mod notif;
 mod notif_list;
 mod ranked;
+mod ranked_warm;
 mod redis_util;
 mod actor_warm;
 mod thin_media;
@@ -63,6 +64,20 @@ enum Command {
         /// First-page limit for Mentions-shaped keys (also warms limit=40 all).
         #[arg(long, default_value_t = 30)]
         limit: i64,
+    },
+    /// Home / Local / Federated ranked ID-cache warm (Redis via PHP lean warm).
+    RankedWarm {
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        #[arg(long, default_value_t = false)]
+        r#loop: bool,
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+        /// Comma list: home,local,feed
+        #[arg(long, default_value = "home,local,feed")]
+        views: String,
     },
     RankedNewer {
         #[arg(long, default_value_t = 0)]
@@ -189,6 +204,24 @@ async fn main() -> Result<()> {
                     cfg.default_owner_id
                 };
                 notif_list::run_once(&cfg, owner, limit).await?;
+            }
+        }
+        Command::RankedWarm {
+            once,
+            r#loop,
+            owner_id,
+            interval_secs,
+            views,
+        } => {
+            if r#loop && !once {
+                ranked_warm::run_loop(&cfg, owner_id, interval_secs, &views).await?;
+            } else {
+                let owner = if owner_id > 0 {
+                    owner_id
+                } else {
+                    cfg.default_owner_id
+                };
+                ranked_warm::run_once(&cfg, owner, &views).await?;
             }
         }
         Command::RankedNewer {

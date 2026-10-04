@@ -1,20 +1,25 @@
-//! Mentions / Ice Cubes notification **list** warm (M1).
+//! Mentions / Ice Cubes notification **list** warm (M1) + Axum shadow read (M3).
 //!
 //! Orchestrates PHP `api/bin/notif-list-warm.php`, which materializes full
 //! Mastodon notification JSON into existing Redis keys
-//! `vaak:notifications:v1:{owner}:{hash}`. Entity hydrate stays in PHP so the
-//! freeze contract matches Mentions paint + Ice Cubes; Rust owns the loop,
-//! multi-owner cadence, and live cutover flag.
+//! `vaak:notifications:v1:{owner}:{hash}`. Entity hydrate stays in PHP for now
+//! so the freeze contract matches Mentions paint + Ice Cubes; Rust owns the
+//! loop, multi-owner cadence, and (M3) localhost Axum JSON read of warm Redis.
+//! End state: native hydrate + Axum live route, then drop PHP materializer.
 
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::process::Command;
 
 use crate::config::Config;
 use crate::notif;
+use crate::redis_util;
 
 #[derive(Debug, Clone)]
 struct WarmPaths {
@@ -80,6 +85,144 @@ pub async fn run_once(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<()
     let body = warm_owner(owner_user_id, limit).await?;
     println!("{body}");
     Ok(())
+}
+
+/// Mastodon-shaped notification list shadow (M3) — reads warm Redis only.
+#[derive(Debug, Serialize)]
+pub struct NotificationsShadowReport {
+    pub owner_user_id: i64,
+    pub limit: i64,
+    pub types: Vec<String>,
+    pub redis_key: String,
+    pub cache_hit: bool,
+    pub cache_ts: Option<i64>,
+    pub cache_age_secs: Option<i64>,
+    pub source: String,
+    pub count: usize,
+    pub items: Vec<Value>,
+    pub mode: &'static str,
+    pub note: &'static str,
+}
+
+fn default_want_types() -> Vec<String> {
+    [
+        "mention",
+        "follow",
+        "favourite",
+        "reblog",
+        "quote",
+        "poll",
+        "update",
+        "bite",
+        "status",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn expand_types(types: &[String]) -> Vec<String> {
+    let all = default_want_types();
+    if types.is_empty() {
+        return all;
+    }
+    let set: std::collections::HashSet<&str> = types.iter().map(|s| s.as_str()).collect();
+    all.into_iter().filter(|t| set.contains(t.as_str())).collect()
+}
+
+/// Mirror PHP `hash('sha256', json_encode([limit,max,since,types,exclude], JSON_UNESCAPED_SLASHES))`.
+///
+/// Key order must match PHP insertion order (`limit,max,since,types,exclude`). Default
+/// `serde_json::Map` is a BTreeMap and alphabetizes keys, which breaks Redis parity.
+pub fn notifications_list_redis_key(
+    owner_user_id: i64,
+    limit: i64,
+    max_id: Option<&str>,
+    since_id: Option<&str>,
+    types: &[String],
+) -> String {
+    let want = expand_types(types);
+    let max_json = max_id
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
+        .unwrap_or_else(|| "null".into());
+    let since_json = since_id
+        .map(|s| serde_json::to_string(s).unwrap_or_else(|_| "null".into()))
+        .unwrap_or_else(|| "null".into());
+    let types_json = serde_json::to_string(&want).unwrap_or_else(|_| "[]".into());
+    // exclude is always [] for Mentions warm / shadow reads today.
+    let encoded = format!(
+        "{{\"limit\":{limit},\"max\":{max_json},\"since\":{since_json},\"types\":{types_json},\"exclude\":[]}}"
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(encoded.as_bytes());
+    format!(
+        "vaak:notifications:v1:{owner_user_id}:{}",
+        hex::encode(hasher.finalize())
+    )
+}
+
+pub async fn notifications_shadow(
+    cfg: &Config,
+    owner_user_id: i64,
+    limit: i64,
+    types: &[String],
+    max_id: Option<&str>,
+    since_id: Option<&str>,
+) -> Result<NotificationsShadowReport> {
+    let limit = limit.clamp(1, 80);
+    let want = expand_types(types);
+    let redis_key =
+        notifications_list_redis_key(owner_user_id, limit, max_id, since_id, &want);
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    let cached = redis_util::json_get(&mut redis, &redis_key).await?;
+
+    let now = chrono::Utc::now().timestamp();
+    if let Some(payload) = cached {
+        let ts = payload.get("ts").and_then(|v| v.as_i64());
+        let items = payload
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let source = payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok(NotificationsShadowReport {
+            owner_user_id,
+            limit,
+            types: want,
+            redis_key,
+            cache_hit: true,
+            cache_ts: ts,
+            cache_age_secs: ts.map(|t| (now - t).max(0)),
+            source: if source.is_empty() {
+                "redis".into()
+            } else {
+                source
+            },
+            count: items.len(),
+            items,
+            mode: "shadow",
+            note: "Axum reads warm Redis list only; PHP remains live /api/v1/notifications until cutover.",
+        });
+    }
+
+    Ok(NotificationsShadowReport {
+        owner_user_id,
+        limit,
+        types: want,
+        redis_key,
+        cache_hit: false,
+        cache_ts: None,
+        cache_age_secs: None,
+        source: "miss".into(),
+        count: 0,
+        items: vec![],
+        mode: "shadow",
+        note: "Cache miss — run notif-list warm or open Mentions in PHP; shadow does not hydrate.",
+    })
 }
 
 pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limit: i64) -> Result<()> {

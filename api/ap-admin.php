@@ -7,19 +7,24 @@
  */
 declare(strict_types=1);
 
-header('X-Content-Type-Options: nosniff');
-header('X-Frame-Options: SAMEORIGIN');
-header('Referrer-Policy: strict-origin-when-cross-origin');
-if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
-    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+// CLI / worker materializers (ranked-warm, etc.) load helpers without HTML/auth.
+$vaakAdminLibOnly = defined('AP_ADMIN_LIB_ONLY') && AP_ADMIN_LIB_ONLY;
+
+if (!$vaakAdminLibOnly) {
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: SAMEORIGIN');
+    header('Referrer-Policy: strict-origin-when-cross-origin');
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+    }
+    header('Cache-Control: no-store');
+    header('X-Robots-Tag: noindex, nofollow');
+    $vaakCorrelationId = trim((string) ($_SERVER['HTTP_X_REQUEST_ID'] ?? ''));
+    if ($vaakCorrelationId === '' || !preg_match('/^[A-Za-z0-9._:-]{8,96}$/', $vaakCorrelationId)) {
+        $vaakCorrelationId = bin2hex(random_bytes(8));
+    }
+    header('X-VAAK-Request-ID: ' . $vaakCorrelationId);
 }
-header('Cache-Control: no-store');
-header('X-Robots-Tag: noindex, nofollow');
-$vaakCorrelationId = trim((string) ($_SERVER['HTTP_X_REQUEST_ID'] ?? ''));
-if ($vaakCorrelationId === '' || !preg_match('/^[A-Za-z0-9._:-]{8,96}$/', $vaakCorrelationId)) {
-    $vaakCorrelationId = bin2hex(random_bytes(8));
-}
-header('X-VAAK-Request-ID: ' . $vaakCorrelationId);
 
 require_once __DIR__ . '/ap-db.php';
 
@@ -59,17 +64,27 @@ if (!defined('AP_INBOX_LIB_ONLY')) {
 }
 require_once __DIR__ . '/ap-inbox.php';
 require_once __DIR__ . '/ap-asks.php';
-ap_asks_migrate();
-if (function_exists('ap_phyrian_migrate')) {
-    try {
-        ap_phyrian_migrate();
-    } catch (Throwable $e) {
-        // table create may need postgres ownership on first deploy
+if (!$vaakAdminLibOnly) {
+    ap_asks_migrate();
+    if (function_exists('ap_phyrian_migrate')) {
+        try {
+            ap_phyrian_migrate();
+        } catch (Throwable $e) {
+            // table create may need postgres ownership on first deploy
+        }
     }
 }
 require_once __DIR__ . '/ap-visibility.php';
 
-const LOCAL_ACTOR = 'https://mkultra.monster/users/cmdr_nova';
+if (!defined('LOCAL_ACTOR')) {
+    define('LOCAL_ACTOR', 'https://mkultra.monster/users/cmdr_nova');
+}
+
+// Workers/CLI: stop before session/HTML. Function bodies later in this file are
+// still registered (PHP compiles the whole include); only top-level page code is skipped.
+if ($vaakAdminLibOnly) {
+    return;
+}
 
 // --- Session gate (login at /vaak/) ---
 // Never auto-login from HTTP Basic — that ignored the password and bound cmdr_nova.

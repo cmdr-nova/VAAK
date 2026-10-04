@@ -1,0 +1,35 @@
+# Live Home/Local/Federated ranked ID-cache warm (Rust orchestrates PHP lean warm).
+#   systemctl enable --now vaak-worker-ranked-warm.service
+#
+# Writes vaak:timeline:ranked:v2:* via api/bin/ranked-warm.php (admin_tl_lean_ranked_warm).
+# Interim bridge — native Rust ranked rebuild replaces this, then PHP materializer drops.
+# Optional: VAAK_RANKED_RUST_PRIMARY=1 lengthens Redis TTL trust on the PHP read path later.
+
+[Unit]
+Description=VAAK Rust ranked timeline warm (Home Redis writer)
+After=network.target postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+ConditionPathExists=/srv/mkultra/html/api/bin/ranked-warm.php
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=VAAK_API_ROOT=/srv/mkultra/html/api
+Environment=VAAK_PHP_BIN=/usr/bin/php
+Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
+Environment=AP_DB_DSN=pgsql:dbname=novalandia
+Environment=VAAK_RANKED_WARM=1
+Environment=VAAK_FEATURE_BLUESKY_TAB=1
+Environment=RUST_LOG=info
+# owner-id 0 = every non-disabled ap_users row each tick.
+ExecStart=/usr/local/bin/vaak-worker ranked-warm --loop --interval-secs 60 --owner-id 0 --views home,local,feed
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
