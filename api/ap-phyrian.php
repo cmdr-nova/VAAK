@@ -23,6 +23,9 @@ const AP_PHYRIAN_ORIGIN_STRAIN = 'Phyrian';
 const AP_PHYRIAN_ORIGIN_GENERATION = 3;
 const AP_PHYRIAN_ORIGIN_LEVEL = 80;
 const AP_PHYRIAN_ORIGIN_RESONANCE = 93;
+const AP_PHYRIAN_MAX_LEVEL = 80;
+const AP_PHYRIAN_MAX_BANKED = 300;
+const AP_PHYRIAN_MAX_GENERATION = 10;
 
 function ap_phyrian_migrate(?PDO $db = null): void
 {
@@ -64,18 +67,50 @@ function ap_phyrian_migrate(?PDO $db = null): void
         'CREATE INDEX IF NOT EXISTS phyrian_requests_to_pending_idx
          ON phyrian_requests (to_owner_id, status, created_at DESC)'
     );
+    // OpenSim-parity counters for the dossier readout (safe if already present).
+    foreach ([
+        'banked_resonance INTEGER NOT NULL DEFAULT 0',
+        'resonance_exchanges INTEGER NOT NULL DEFAULT 0',
+        'inductions_given INTEGER NOT NULL DEFAULT 0',
+    ] as $colDef) {
+        try {
+            $db->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS ' . $colDef);
+        } catch (Throwable $e) {
+            // Older PG without IF NOT EXISTS — ignore duplicate_column.
+            try {
+                $db->exec('ALTER TABLE phyrian_players ADD COLUMN ' . $colDef);
+            } catch (Throwable $e2) {
+                // Column already exists.
+            }
+        }
+    }
     $done = true;
 }
 
-/** @return list<string> */
+/**
+ * OpenSim ORIGIN_RANDOM_STRAINS catalog (cosmetic labels).
+ *
+ * @return list<string>
+ */
 function ap_phyrian_strain_catalog(): array
 {
     return [
         'Cosmic Alien', 'Voidborne', 'Signal Choir', 'Astral Parasite', 'Eventide Spore',
+        'Starless Brood', 'Null Communion', 'Blacklight Kin', 'Quasar Wound', 'Eclipse Vessel',
+        'Deep Signal',
         'Bio-Horror Alien', 'Chitin Bloom', 'Marrow Signal', 'Vessel Rot', 'Bone Orchid',
+        'Spine Choir', 'Flesh Static', 'Suture Bloom', 'Moltborn', 'Cartilage Saint',
+        'Hemolymph Crown',
         'Symbiotic Alien', 'Lumen Host', 'Soft Colony', 'Rootmind', 'Amber Symbiote',
-        'Synthetic Alien', 'Chrome Chorus', 'Nullframe', 'Circuit Bloom', 'Static Saint',
-        'Post-Human Alien', 'Echo Kin', 'Second Dawn', 'Remnant Pulse', 'Phyrian',
+        'Velvet Mycelium', 'Twin Pulse', 'Murmur Host', 'Kindred Spore', 'Halo Larva',
+        'Second Skin',
+        'Synthetic Alien', 'Nanite Choir', 'Glass Protocol', 'Machine Spore', 'Chrome Mycelium',
+        'Static Engine', 'Signal Lattice', 'Nullware Host', 'Prism Circuit', 'Ghost Firmware',
+        'Iron Dream',
+        'Post-Human Mutant', 'Ash Gene', 'Static Flesh', 'Chrome Wound', 'Afterbody',
+        'Morrow Gene', 'Splice Saint', 'Grey Bloom', 'Hollow Kin', 'Burnt Genome', 'Neon Marrow',
+        'Phyrian', 'Red Tower Echo', 'Obsidian Root', 'Rose Static', 'Violet Drift',
+        'Cinder Halo', 'Witchlight Signal', 'Moonless Colony', 'Grave Neon', 'Sable Current',
     ];
 }
 
@@ -503,24 +538,35 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
         return ['ok' => true];
     }
 
+    $assignedStrain = null;
+    $originRandom = false;
     if ($kind === 'imprint') {
         $from = ap_phyrian_ensure_player($fromId, ap_phyrian_actor_id_for_owner($fromId));
         $to = ap_phyrian_ensure_player($ownerUserId, ap_phyrian_actor_id_for_owner($ownerUserId));
         if ($from === [] || $to === []) {
             return ['ok' => false, 'error' => 'Players unavailable'];
         }
-        // Origin unmarked → seed first so the recipient inherits the same strain.
-        if (ap_phyrian_is_origin_owner($fromId) && !ap_phyrian_player_is_imprinted($from)) {
+        // Origin unmarked → seed own Phyrian body first (OpenSim mirror).
+        // Recipient strain is assigned separately below.
+        $fromIsOrigin = ap_phyrian_is_origin_owner($fromId);
+        if ($fromIsOrigin && !ap_phyrian_player_is_imprinted($from)) {
             $seed = ap_phyrian_origin_self_seed($fromId);
             if (empty($seed['ok'])) {
                 return ['ok' => false, 'error' => (string) ($seed['error'] ?? 'Origin seed failed')];
             }
             $from = ap_phyrian_ensure_player($fromId, ap_phyrian_actor_id_for_owner($fromId));
         }
-        $strain = trim((string) ($from['strain'] ?? ''));
+        // OpenSim rule: origin imprint → random catalog strain; peer → transmit own.
+        if ($fromIsOrigin) {
+            $strain = ap_phyrian_pick_strain();
+            $originRandom = true;
+        } else {
+            $strain = trim((string) ($from['strain'] ?? ''));
+        }
         if ($strain === '') {
             return ['ok' => false, 'error' => 'Imprinter has no strain'];
         }
+        $assignedStrain = $strain;
         $parentGen = max(1, (int) ($from['generation'] ?? 1));
         $childGen = min(99, $parentGen + 1);
         $db->prepare(
@@ -540,6 +586,15 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
             $fromId,
             $ownerUserId,
         ]);
+        try {
+            $db->prepare(
+                'UPDATE phyrian_players
+                 SET inductions_given = inductions_given + 1, updated_at = NOW()
+                 WHERE owner_user_id = ?'
+            )->execute([$fromId]);
+        } catch (Throwable $e) {
+            // Counter column may be mid-migrate on a hot path.
+        }
     } elseif ($kind === 'resonance') {
         // Exchange fights decay: bump resonance and refresh last_decay_at.
         $db->prepare(
@@ -549,6 +604,15 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
                  updated_at = NOW()
              WHERE owner_user_id IN (?, ?)'
         )->execute([AP_PHYRIAN_MAX_RESONANCE, $fromId, $ownerUserId]);
+        try {
+            $db->prepare(
+                'UPDATE phyrian_players
+                 SET resonance_exchanges = resonance_exchanges + 1, updated_at = NOW()
+                 WHERE owner_user_id IN (?, ?)'
+            )->execute([$fromId, $ownerUserId]);
+        } catch (Throwable $e) {
+            // Counter column may be mid-migrate.
+        }
     } else {
         return ['ok' => false, 'error' => 'Unknown kind'];
     }
@@ -556,7 +620,12 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
     $db->prepare(
         "UPDATE phyrian_requests SET status = 'accepted', resolved_at = NOW() WHERE id = ?"
     )->execute([$requestId]);
-    return ['ok' => true];
+    $out = ['ok' => true];
+    if ($assignedStrain !== null) {
+        $out['strain'] = $assignedStrain;
+        $out['origin_random'] = $originRandom;
+    }
+    return $out;
 }
 
 /**
@@ -640,4 +709,85 @@ function ap_phyrian_checkin(int $ownerUserId): array
     $st = ap_db()->prepare('SELECT resonance FROM phyrian_players WHERE owner_user_id = ?');
     $st->execute([$ownerUserId]);
     return ['ok' => true, 'resonance' => (int) $st->fetchColumn()];
+}
+
+/** Rank label for HUD / dossier (OpenSim-shaped; cosmetic in Phase 1). */
+function ap_phyrian_rank_title(array $player, bool $isOrigin = false): string
+{
+    if ($isOrigin && ap_phyrian_player_is_imprinted($player)) {
+        return 'Phyrian Origin';
+    }
+    if (!ap_phyrian_player_is_imprinted($player)) {
+        return 'None';
+    }
+    $level = (int) ($player['level'] ?? 1);
+    if ($level >= 60) {
+        return 'Deep Signal';
+    }
+    if ($level >= 40) {
+        return 'Marked Host';
+    }
+    if ($level >= 20) {
+        return 'Colony Node';
+    }
+    return 'Newly Marked';
+}
+
+/**
+ * OpenSim-style public readout for one VAAK owner.
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_phyrian_dossier(int $ownerUserId): ?array
+{
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    ap_phyrian_migrate();
+    $actorId = ap_phyrian_actor_id_for_owner($ownerUserId);
+    $player = ap_phyrian_ensure_player($ownerUserId, $actorId);
+    if ($player === []) {
+        return null;
+    }
+    if (ap_phyrian_player_is_imprinted($player)) {
+        $player = ap_phyrian_apply_decay_row($player);
+    }
+    $isOrigin = ap_phyrian_is_origin_owner($ownerUserId);
+    $imprinted = ap_phyrian_player_is_imprinted($player);
+    $username = ap_phyrian_username_for_owner($ownerUserId);
+    if ($username === '') {
+        $username = 'user' . $ownerUserId;
+    }
+    $parentId = (int) ($player['imprinted_by_owner_id'] ?? 0);
+    $parentName = $parentId > 0 ? ap_phyrian_username_for_owner($parentId) : '';
+    $lineage = $imprinted ? ap_phyrian_lineage($ownerUserId, 8) : [];
+    $lineageDepth = max(1, count($lineage));
+    return [
+        'owner_user_id' => $ownerUserId,
+        'username' => $username,
+        'actor_id' => $actorId,
+        'status' => $imprinted ? ap_phyrian_stability($player) : 'Unmarked',
+        'strain' => $imprinted ? trim((string) ($player['strain'] ?? '')) : '',
+        'generation' => $imprinted ? (int) ($player['generation'] ?? 1) : null,
+        'max_generation' => AP_PHYRIAN_MAX_GENERATION,
+        'lineage_depth' => $imprinted ? $lineageDepth : null,
+        'level' => (int) ($player['level'] ?? 1),
+        'max_level' => AP_PHYRIAN_MAX_LEVEL,
+        'rank_title' => ap_phyrian_rank_title($player, $isOrigin),
+        'resonance' => (int) ($player['resonance'] ?? 0),
+        'max_resonance' => AP_PHYRIAN_MAX_RESONANCE,
+        'banked_resonance' => (int) ($player['banked_resonance'] ?? 0),
+        'max_banked_resonance' => AP_PHYRIAN_MAX_BANKED,
+        'daily_resonance_decay' => AP_PHYRIAN_DAILY_DECAY,
+        'resonance_exchanges' => (int) ($player['resonance_exchanges'] ?? 0),
+        'inductions_given' => (int) ($player['inductions_given'] ?? 0),
+        'stability' => ap_phyrian_stability($player),
+        'last_decay_at' => (string) ($player['last_decay_at'] ?? ''),
+        'last_checkin_at' => (string) ($player['last_checkin_at'] ?? ''),
+        'imprinted_at' => (string) ($player['imprinted_at'] ?? ''),
+        'imprinted_by_owner_id' => $parentId > 0 ? $parentId : null,
+        'imprinted_by_username' => $parentName !== '' ? $parentName : null,
+        'is_origin' => $isOrigin,
+        'lineage' => $lineage,
+    ];
 }
