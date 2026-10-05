@@ -127,8 +127,9 @@ pub fn plan_request_offer(
     })
 }
 
-/// PHP imprint resolution for a non-origin peer. Origin rolls remain in PHP
-/// until a deterministic, bridge-safe random source is agreed upon.
+/// PHP imprint resolution for a non-origin peer. Origin rolls use the same
+/// catalog in the authenticated mutation path; this helper remains strict so
+/// callers cannot accidentally treat an origin as a peer.
 pub fn resolve_peer_imprint(
     from_is_origin: bool,
     from_strain: &str,
@@ -142,6 +143,28 @@ pub fn resolve_peer_imprint(
         return Err("Imprinter has no strain");
     }
     Ok((strain.to_string(), (from_generation.max(1) + 1).min(99)))
+}
+
+/// Same cosmetic catalog as PHP `ap_phyrian_strain_catalog()`. The origin roll
+/// is intentionally only used after the authenticated mutation hand-off.
+const ORIGIN_STRAINS: &[&str] = &[
+    "Cosmic Alien", "Voidborne", "Signal Choir", "Astral Parasite", "Eventide Spore",
+    "Starless Brood", "Null Communion", "Blacklight Kin", "Quasar Wound", "Eclipse Vessel",
+    "Deep Signal", "Bio-Horror Alien", "Chitin Bloom", "Marrow Signal", "Vessel Rot",
+    "Bone Orchid", "Spine Choir", "Flesh Static", "Suture Bloom", "Moltborn",
+    "Cartilage Saint", "Hemolymph Crown", "Symbiotic Alien", "Lumen Host", "Soft Colony",
+    "Rootmind", "Amber Symbiote", "Velvet Mycelium", "Twin Pulse", "Murmur Host",
+    "Kindred Spore", "Halo Larva", "Second Skin", "Synthetic Alien", "Nanite Choir",
+    "Glass Protocol", "Machine Spore", "Chrome Mycelium", "Static Engine", "Signal Lattice",
+    "Nullware Host", "Prism Circuit", "Ghost Firmware", "Iron Dream", "Post-Human Mutant",
+    "Ash Gene", "Static Flesh", "Chrome Wound", "Afterbody", "Morrow Gene", "Splice Saint",
+    "Grey Bloom", "Hollow Kin", "Burnt Genome", "Neon Marrow", "Phyrian", "Red Tower Echo",
+    "Obsidian Root", "Rose Static", "Violet Drift", "Cinder Halo", "Witchlight Signal",
+    "Moonless Colony", "Grave Neon", "Sable Current",
+];
+
+fn origin_strain_roll() -> String {
+    ORIGIN_STRAINS[(rand::random::<u64>() as usize) % ORIGIN_STRAINS.len()].to_string()
 }
 
 /// Create a local-only request using the PHP schema. This is intentionally a
@@ -276,6 +299,7 @@ pub async fn resolve_local_request(
             .await?;
         let mut from_strain = String::new();
         let mut from_generation = 1;
+        let mut from_imprinted = false;
         let mut to_imprinted = false;
         for r in rows {
             let id: i64 = r.get(0);
@@ -284,6 +308,7 @@ pub async fn resolve_local_request(
             if id == from_owner {
                 from_strain = strain;
                 from_generation = r.get(2);
+                from_imprinted = status == "imprinted" && !from_strain.trim().is_empty();
             } else if id == owner {
                 to_imprinted = status == "imprinted" && !strain.trim().is_empty();
             }
@@ -291,8 +316,22 @@ pub async fn resolve_local_request(
         if to_imprinted {
             anyhow::bail!("They already have a strain");
         }
-        let (strain, generation) = resolve_peer_imprint(from_owner == 1, &from_strain, from_generation)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let (strain, generation) = if from_owner == 1 {
+            if !from_imprinted {
+                tx.execute(
+                    "UPDATE phyrian_players
+                     SET status='imprinted', strain='Phyrian', resonance=93,
+                         generation=3, level=80, imprinted_at=COALESCE(imprinted_at,NOW()),
+                         last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id=$1",
+                    &[&from_owner],
+                )
+                .await?;
+            }
+            (origin_strain_roll(), (from_generation.max(3) + 1).min(99))
+        } else {
+            resolve_peer_imprint(false, &from_strain, from_generation)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
         tx.execute(
             "UPDATE phyrian_players
              SET status='imprinted', strain=$1, resonance=GREATEST(resonance,50),
