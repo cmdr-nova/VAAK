@@ -693,6 +693,23 @@ try {
             } else {
                 $log(($dryRun ? 'would_delete' : 'downranking cleanup') . ' expired home downranking signals count=' . $n);
             }
+            // Local accounts (and admin cmdr_nova) are never valid suppression targets.
+            $localSql = "DELETE FROM ap_home_suppression
+                WHERE lower(actor_id) LIKE 'https://mkultra.monster/users/%'
+                   OR lower(actor_id) LIKE 'https://mkultra.monster/@%'
+                   OR lower(actor_id) ~ '/(users/|@)cmdr_nova/?$'";
+            if ($dryRun) {
+                $stLocal = $db->query("SELECT COUNT(*) FROM ap_home_suppression
+                    WHERE lower(actor_id) LIKE 'https://mkultra.monster/users/%'
+                       OR lower(actor_id) LIKE 'https://mkultra.monster/@%'
+                       OR lower(actor_id) ~ '/(users/|@)cmdr_nova/?$'");
+                $log('would_delete local/admin home downranking signals count=' . (int) $stLocal->fetchColumn());
+            } else {
+                $stats['downrank_local_deleted'] = (int) $db->exec($localSql);
+                if (($stats['downrank_local_deleted'] ?? 0) > 0) {
+                    $log('deleted local/admin home downranking signals count=' . $stats['downrank_local_deleted']);
+                }
+            }
         } catch (Throwable $e) {
             // Older installations may not have the optional table yet.
             $log('downranking cleanup skipped: ' . $e->getMessage());

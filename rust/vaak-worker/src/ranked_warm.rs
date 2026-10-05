@@ -1392,6 +1392,27 @@ async fn load_suppression_map(
     Ok(out)
 }
 
+/// Local mkultra.monster accounts (and admin cmdr_nova) never enter temporary
+/// Home downranking — mirrors PHP `admin_home_downrank_actor_exempt`.
+fn downrank_actor_exempt(actor: &str) -> bool {
+    let actor = actor.trim().trim_end_matches('/');
+    if actor.is_empty() {
+        return true;
+    }
+    let lower = actor.to_ascii_lowercase();
+    if lower.starts_with("https://mkultra.monster/users/")
+        || lower.starts_with("https://mkultra.monster/@")
+    {
+        return true;
+    }
+    if lower == "cmdr_nova" || lower == "cmdr_nova@mkultra.monster" {
+        return true;
+    }
+    // Path/handle forms even if host shape drifts.
+    let path = lower.rsplit('/').next().unwrap_or("");
+    path == "cmdr_nova" || path == "@cmdr_nova"
+}
+
 async fn record_suppression(
     db: &Client,
     owner: i64,
@@ -1399,7 +1420,11 @@ async fn record_suppression(
     categories: &[String],
     object_id: &str,
 ) -> Result<()> {
+    let actor = actor.trim().trim_end_matches('/');
     if owner < 1 || actor.is_empty() || categories.is_empty() {
+        return Ok(());
+    }
+    if downrank_actor_exempt(actor) {
         return Ok(());
     }
     let now = chrono::Utc::now().timestamp();
@@ -1491,7 +1516,8 @@ async fn apply_toxicity_downrank(
         } else {
             item.actor_id.clone()
         };
-        if actor.is_empty() {
+        let actor = actor.trim().trim_end_matches('/').to_string();
+        if actor.is_empty() || downrank_actor_exempt(&actor) {
             continue;
         }
         let cats = toxicity_categories(&item.summary, &terms);
@@ -2509,6 +2535,16 @@ mod tests {
         assert!(phrase_matches_text("you are a retard for this", "retard"));
         assert!(!phrase_matches_text("tagged #retard in bio", "retard"));
         assert!(phrase_matches_text("please kill yourself now", "kill yourself"));
+    }
+
+    #[test]
+    fn downrank_skips_local_and_admin() {
+        assert!(downrank_actor_exempt("https://mkultra.monster/users/cmdr_nova"));
+        assert!(downrank_actor_exempt("https://mkultra.monster/users/alice/"));
+        assert!(downrank_actor_exempt("https://mkultra.monster/@bob"));
+        assert!(downrank_actor_exempt("cmdr_nova@mkultra.monster"));
+        assert!(!downrank_actor_exempt("https://infosec.exchange/users/geeknik"));
+        assert!(!downrank_actor_exempt("https://example.com/users/cmdr_nova_fan"));
     }
 
     #[test]
