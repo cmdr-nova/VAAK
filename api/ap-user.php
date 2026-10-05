@@ -1273,6 +1273,15 @@ function ap_user_note_media_html(array $note, bool $interactive = true): string
         if (!str_starts_with($poster, 'https://')) {
             $poster = '';
         }
+        if ($poster === '' && preg_match(
+            '#^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)(?:[?#].*)?$#i',
+            $url,
+            $vm
+        )) {
+            // Match the shared PHP/Rust poster convention when a remote
+            // ActivityPub attachment omits thumbnail metadata.
+            $poster = $vm[1] . '/small/' . $vm[2] . '.png';
+        }
         $safe = htmlspecialchars($url, ENT_QUOTES, 'UTF-8');
         $safePoster = $poster !== '' ? htmlspecialchars($poster, ENT_QUOTES, 'UTF-8') : '';
         $alt = htmlspecialchars((string) ($att['name'] ?? $att['summary'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
