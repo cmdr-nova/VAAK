@@ -2,7 +2,7 @@
 //!
 //! Queue: `vaak:queue:timeline_fanout` (Redis DB1). PHP enqueues; this worker
 //! prepends into `vaak:timeline:ranked:v2:*`, invalidates Home hydrate, and
-//! optionally spawns `bin/home-timeline-warm.php` for small Home fan-outs.
+//! optionally warms ranked→hydrate envelopes for small Home fan-outs.
 //!
 //! Job `op` values:
 //! - `home_followers` — AP Create/Announce/Quote* → local followers' Home
@@ -11,20 +11,19 @@
 //! - `owner_status` — local compose/boost → one owner's views
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio_postgres::Client;
 
 use crate::config::Config;
 use crate::hidden;
+use crate::home_hydrate_ranked;
 use crate::redis_util;
+use crate::timeline;
 
 pub const QUEUE_NAME: &str = "timeline_fanout";
 const RANKED_TTL_SECS: u64 = 600;
@@ -111,14 +110,7 @@ fn owner_index_key(owner: i64) -> String {
 
 /// Parity with PHP `ap_timeline_home_hydrate_redis_key` (null since, empty x).
 fn home_hydrate_redis_key(owner: i64, limit: i64) -> String {
-    let mut m = Map::new();
-    m.insert("u".into(), json!(owner.max(0)));
-    m.insert("p".into(), json!("/api/v1/timelines/home"));
-    m.insert("l".into(), json!(limit));
-    m.insert("s".into(), Value::Null);
-    m.insert("x".into(), json!([]));
-    let payload = serde_json::to_string(&Value::Object(m)).unwrap_or_default();
-    format!("vaak:timeline:v1:{}", sha256_hex(&payload))
+    timeline::home_timeline_redis_key(owner.max(0), limit, None)
 }
 
 fn norm_actor(s: &str) -> String {
@@ -162,36 +154,26 @@ async fn invalidate_home_hydrate(
     Ok(())
 }
 
-fn home_hydrate_warm_paths() -> (PathBuf, PathBuf) {
-    let php_bin = PathBuf::from(
-        std::env::var("VAAK_PHP_BIN").unwrap_or_else(|_| "/usr/bin/php".to_string()),
-    );
-    let api_root = PathBuf::from(
-        std::env::var("VAAK_API_ROOT").unwrap_or_else(|_| "/srv/mkultra/html/api".to_string()),
-    );
-    (php_bin, api_root.join("bin/home-timeline-warm.php"))
-}
-
-async fn maybe_spawn_home_hydrate_warm(owner: i64) {
+async fn maybe_spawn_home_hydrate_warm(cfg: &Config, owner: i64) {
     if !env_flag_default_true("VAAK_HOME_HYDRATE_WARM") {
         return;
     }
-    let (php_bin, script) = home_hydrate_warm_paths();
-    if !script.is_file() {
-        return;
-    }
-    let mut cmd = Command::new(&php_bin);
-    cmd.arg(&script)
-        .arg(format!("--owner-id={owner}"))
-        .arg("--limits=15,40,80")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(false);
-    match cmd.spawn() {
-        Ok(_) => tracing::debug!(owner, "fanout hydrate warm spawned"),
-        Err(e) => tracing::warn!(owner, error = %e, "fanout hydrate warm spawn failed"),
-    }
+    let cfg = cfg.clone();
+    tokio::spawn(async move {
+        match home_hydrate_ranked::warm_owner(&cfg, owner, &[15, 40, 80]).await {
+            Ok(report) => tracing::debug!(
+                owner,
+                n = report.materialised_n,
+                ms = report.ms,
+                "fanout hydrate ranked warm ok"
+            ),
+            Err(e) => tracing::warn!(
+                owner,
+                error = %format!("{e:#}"),
+                "fanout hydrate ranked warm failed"
+            ),
+        }
+    });
 }
 
 async fn prepend_owner(
@@ -524,7 +506,7 @@ async fn process_home_followers(
         }
         invalidate_home_hydrate(cache, *owner).await?;
         if do_rewarm {
-            maybe_spawn_home_hydrate_warm(*owner).await;
+            maybe_spawn_home_hydrate_warm(cfg, *owner).await;
         }
     }
     tracing::info!(
@@ -579,7 +561,7 @@ async fn process_home_bsky(
         }
         invalidate_home_hydrate(cache, *owner).await?;
         if do_rewarm {
-            maybe_spawn_home_hydrate_warm(*owner).await;
+            maybe_spawn_home_hydrate_warm(cfg, *owner).await;
         }
     }
     tracing::info!(
@@ -590,7 +572,6 @@ async fn process_home_bsky(
         touched = stats.touched_owners,
         "timeline fanout"
     );
-    let _ = cfg;
     Ok(stats)
 }
 
@@ -679,7 +660,7 @@ async fn process_owner_status(
     let wants_home = views.contains(&"home");
     if wants_home || job.hydrate {
         invalidate_home_hydrate(cache, owner).await?;
-        maybe_spawn_home_hydrate_warm(owner).await;
+        maybe_spawn_home_hydrate_warm(cfg, owner).await;
     }
     tracing::info!(
         op = "owner_status",
@@ -690,7 +671,6 @@ async fn process_owner_status(
         touched_keys = n,
         "timeline fanout"
     );
-    let _ = cfg;
     Ok(stats)
 }
 
