@@ -6374,6 +6374,28 @@ function ap_publish_status_text(
         }
     }
 
+    // 0.6.69: prepend own note onto warm Home (+ Local when public) so first
+    // paint does not wait for the next ranked-warm cycle.
+    if ($noteId !== '' && function_exists('ap_timeline_fanout_local_status')) {
+        $fanoutOwner = function_exists('ap_db_owner_user_id_for_actor')
+            ? ap_db_owner_user_id_for_actor($actor)
+            : 0;
+        if ($fanoutOwner < 1 && function_exists('ap_db_masto_owner_user_id')) {
+            $fanoutOwner = ap_db_masto_owner_user_id();
+        }
+        if ($fanoutOwner > 0) {
+            $fanoutViews = ['home'];
+            if ($visibility === 'public') {
+                $fanoutViews[] = 'local';
+            }
+            ap_timeline_fanout_local_status($fanoutOwner, [
+                'k' => 'outbox',
+                'id' => rtrim($noteId, '/'),
+                's' => 'local',
+            ], $fanoutViews);
+        }
+    }
+
     return [
         'ok' => true,
         'note_id' => $noteId,
