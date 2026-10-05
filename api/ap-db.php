@@ -7810,6 +7810,46 @@ function ap_timeline_ranked_prepend_owner(int $ownerUserId, array $entry, array 
 }
 
 /**
+ * Prefer Rust timeline-fanout worker (0.6.73). Default on; set VAAK_TIMELINE_FANOUT_RUST=0
+ * to force in-process PHP Redis prepend.
+ */
+function ap_timeline_fanout_rust_enabled(): bool
+{
+    $raw = getenv('VAAK_TIMELINE_FANOUT_RUST');
+    if ($raw !== false && trim((string) $raw) !== '') {
+        return !in_array(strtolower(trim((string) $raw)), ['0', 'false', 'off', 'no'], true);
+    }
+    return ap_feature_enabled('TIMELINE_FANOUT_RUST', true);
+}
+
+/**
+ * Enqueue a fan-out job for vaak-worker timeline-fanout (Redis DB1).
+ *
+ * @param array<string,mixed> $job
+ */
+function ap_timeline_fanout_enqueue(array $job): bool
+{
+    if (!ap_timeline_fanout_rust_enabled()) {
+        return false;
+    }
+    if (!function_exists('ap_redis_queue_push')) {
+        return false;
+    }
+    $op = trim((string) ($job['op'] ?? ''));
+    if ($op === '') {
+        return false;
+    }
+    if (!isset($job['ts'])) {
+        $job['ts'] = time();
+    }
+    $payload = json_encode($job, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($payload) || $payload === '') {
+        return false;
+    }
+    return ap_redis_queue_push('timeline_fanout', $payload);
+}
+
+/**
  * Local compose/boost fan-out: prepend ranked IDs, drop stale hydrate, rewarm head.
  *
  * @param array{k:string,id:string,s?:string,t?:int} $entry
@@ -7818,6 +7858,32 @@ function ap_timeline_ranked_prepend_owner(int $ownerUserId, array $entry, array 
 function ap_timeline_fanout_local_status(int $ownerUserId, array $entry, array $views = ['home', 'local']): void
 {
     if ($ownerUserId < 1) {
+        return;
+    }
+    $k = trim((string) ($entry['k'] ?? ''));
+    $id = rtrim(trim((string) ($entry['id'] ?? '')), '/');
+    if ($k === '' || $id === '') {
+        return;
+    }
+    $viewList = [];
+    foreach ($views as $v) {
+        $v = strtolower(trim((string) $v));
+        if (in_array($v, ['home', 'local', 'feed'], true)) {
+            $viewList[] = $v;
+        }
+    }
+    if ($viewList === []) {
+        $viewList = ['home', 'local'];
+    }
+    if (ap_timeline_fanout_enqueue([
+        'op' => 'owner_status',
+        'owner' => $ownerUserId,
+        'k' => $k,
+        'id' => $id,
+        's' => trim((string) ($entry['s'] ?? $k)),
+        'views' => $viewList,
+        'hydrate' => true,
+    ])) {
         return;
     }
     try {
@@ -7909,6 +7975,7 @@ function ap_timeline_local_follower_owner_ids(string $actorId, ?int $limit = nul
 
 /**
  * Inbox Create/Announce/Quote* → prepend onto followers' warm Home ranked (0.6.70/0.6.71).
+ * Prefer Rust queue (0.6.73); PHP Redis path is fallback.
  * Hydrate: always invalidate; rewarm only when recipient count ≤ rewarm max.
  */
 function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $actorId): void
@@ -7920,6 +7987,17 @@ function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $
     $type = trim($type);
     $actorId = rtrim(trim((string) $actorId), '/');
     if ($eventId < 1 || $actorId === '' || !in_array($type, ['Create', 'Announce', 'Quote', 'QuotePost'], true)) {
+        return;
+    }
+
+    if (ap_timeline_fanout_enqueue([
+        'op' => 'home_followers',
+        'k' => 'event',
+        'id' => (string) $eventId,
+        's' => 'fediverse',
+        'actor' => $actorId,
+        'type' => $type,
+    ])) {
         return;
     }
 
@@ -8053,6 +8131,7 @@ function ap_timeline_actor_is_local(?string $actorId): bool
 
 /**
  * Public firehose Create/Announce/Quote* → active owners' Federated ranked (0.6.72).
+ * Prefer Rust queue (0.6.73); PHP Redis path is fallback.
  * Local actors also prepend onto Local. No Home hydrate (feed/local only).
  */
 function ap_timeline_fanout_public_local_feed(
@@ -8076,6 +8155,18 @@ function ap_timeline_fanout_public_local_feed(
         || $visibility !== 'public'
         || !in_array($type, ['Create', 'Announce', 'Quote', 'QuotePost'], true)
     ) {
+        return;
+    }
+
+    if (ap_timeline_fanout_enqueue([
+        'op' => 'public_feed',
+        'k' => 'event',
+        'id' => (string) $eventId,
+        's' => 'fediverse',
+        'actor' => $actorId,
+        'type' => $type,
+        'visibility' => $visibility,
+    ])) {
         return;
     }
 
@@ -8130,6 +8221,7 @@ function ap_timeline_fanout_public_local_feed(
 
 /**
  * New Bluesky post → prepend onto followers' (and DID owners') warm Home ranked (0.6.71).
+ * Prefer Rust queue (0.6.73); PHP Redis path is fallback.
  * Only call on first insert (Jetstream create / first upsert), never on ON CONFLICT refresh.
  * Hydrate: always invalidate; rewarm only when recipient count ≤ rewarm max.
  */
@@ -8143,6 +8235,17 @@ function ap_timeline_fanout_followers_home_bsky(string $uri, string $authorDid):
     if (!str_starts_with($uri, 'at://') || !str_starts_with($authorDid, 'did:')) {
         return;
     }
+
+    if (ap_timeline_fanout_enqueue([
+        'op' => 'home_bsky',
+        'k' => 'bsky',
+        'id' => $uri,
+        's' => 'bluesky',
+        'actor' => $authorDid,
+    ])) {
+        return;
+    }
+
     if (!function_exists('ap_bsky_jetstream_observer_ids')) {
         return;
     }
