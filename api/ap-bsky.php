@@ -3428,6 +3428,14 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
             $seenVals[$val] = true;
         }
     }
+    $isNew = false;
+    try {
+        $chk = ap_db()->prepare('SELECT 1 FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+        $chk->execute([$uri]);
+        $isNew = !$chk->fetchColumn();
+    } catch (Throwable $e) {
+        $isNew = false;
+    }
     try {
         $st = ap_db()->prepare(
             'INSERT INTO bsky_posts (
@@ -3483,6 +3491,10 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
         ]);
         if ($ownerUserId !== null && $ownerUserId > 0) {
             ap_bsky_post_observation_touch($uri, $ownerUserId);
+        }
+        // 0.6.71: first insert only → followers' Home ranked (skip ON CONFLICT refresh stampede).
+        if ($isNew && function_exists('ap_timeline_fanout_followers_home_bsky')) {
+            ap_timeline_fanout_followers_home_bsky($uri, $authorDid);
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] post_upsert: ' . $e->getMessage());

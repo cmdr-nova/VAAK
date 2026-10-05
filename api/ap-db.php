@@ -4847,10 +4847,10 @@ function ap_metrics_record(
             }
         }
         // Idempotent firehose: shared-inbox retries / multi-relay fan-in otherwise
-        // duplicate the same Create and Ice Cubes shows it twice.
+        // duplicate the same Create/Quote and Ice Cubes shows it twice.
         if (
             $objectId
-            && in_array($type, ['Create', 'Announce', 'Update'], true)
+            && in_array($type, ['Create', 'Announce', 'Update', 'Quote', 'QuotePost'], true)
             && in_array($actionTaken, ['log', 'local_observe'], true)
         ) {
             $dup = ap_db()->prepare(
@@ -4983,9 +4983,9 @@ function ap_metrics_record(
         }
         if ($insertedId > 0) {
             ap_timeline_notify($type, $actorId, $objectId, $when);
-            // 0.6.70: Create/Announce from a followed actor → followers' Home ranked.
+            // 0.6.70/0.6.71: Create/Announce/Quote* from a followed actor → followers' Home ranked.
             if (
-                in_array($type, ['Create', 'Announce'], true)
+                in_array($type, ['Create', 'Announce', 'Quote', 'QuotePost'], true)
                 && in_array($actionTaken, ['log', 'local_observe'], true)
                 && is_string($actorId)
                 && $actorId !== ''
@@ -7906,7 +7906,7 @@ function ap_timeline_local_follower_owner_ids(string $actorId, ?int $limit = nul
 }
 
 /**
- * Inbox Create/Announce → prepend onto followers' warm Home ranked (0.6.70).
+ * Inbox Create/Announce/Quote* → prepend onto followers' warm Home ranked (0.6.70/0.6.71).
  * Hydrate: always invalidate; rewarm only when recipient count ≤ rewarm max.
  */
 function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $actorId): void
@@ -7917,7 +7917,7 @@ function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $
     $eventId = max(0, $eventId);
     $type = trim($type);
     $actorId = rtrim(trim((string) $actorId), '/');
-    if ($eventId < 1 || $actorId === '' || !in_array($type, ['Create', 'Announce'], true)) {
+    if ($eventId < 1 || $actorId === '' || !in_array($type, ['Create', 'Announce', 'Quote', 'QuotePost'], true)) {
         return;
     }
 
@@ -7968,6 +7968,88 @@ function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $
             $type,
             $eventId,
             $actorId,
+            count($owners),
+            $touched
+        ));
+    }
+}
+
+/**
+ * New Bluesky post → prepend onto followers' (and DID owners') warm Home ranked (0.6.71).
+ * Only call on first insert (Jetstream create / first upsert), never on ON CONFLICT refresh.
+ * Hydrate: always invalidate; rewarm only when recipient count ≤ rewarm max.
+ */
+function ap_timeline_fanout_followers_home_bsky(string $uri, string $authorDid): void
+{
+    if (!ap_timeline_fanout_ingest_enabled()) {
+        return;
+    }
+    $uri = trim($uri);
+    $authorDid = trim($authorDid);
+    if (!str_starts_with($uri, 'at://') || !str_starts_with($authorDid, 'did:')) {
+        return;
+    }
+    if (!function_exists('ap_bsky_jetstream_observer_ids')) {
+        return;
+    }
+
+    $owners = ap_bsky_jetstream_observer_ids($authorDid);
+    if ($owners === []) {
+        return;
+    }
+    $max = ap_timeline_fanout_ingest_max_recipients();
+    if (count($owners) > $max) {
+        $owners = array_slice($owners, 0, $max);
+    }
+
+    $entry = [
+        'k' => 'bsky',
+        'id' => $uri,
+        's' => 'bluesky',
+    ];
+    $rewarmMax = ap_timeline_fanout_ingest_rewarm_max();
+    $hideFn = function_exists('ap_bsky_hide_did_set');
+    $bskyProfile = 'https://bsky.app/profile/' . $authorDid;
+    $touched = 0;
+    foreach ($owners as $ownerUserId) {
+        $ownerUserId = (int) $ownerUserId;
+        if ($ownerUserId < 1) {
+            continue;
+        }
+        if ($hideFn) {
+            $hide = ap_bsky_hide_did_set($ownerUserId);
+            if (isset($hide[$authorDid])) {
+                continue;
+            }
+        }
+        if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($bskyProfile, $ownerUserId)) {
+            continue;
+        }
+        if (function_exists('ap_row_is_hidden') && ap_row_is_hidden($bskyProfile, 'bsky.app', $ownerUserId)) {
+            continue;
+        }
+        try {
+            $res = ap_timeline_ranked_prepend_owner($ownerUserId, $entry, ['home']);
+            if (!empty($res['ok']) && (int) ($res['touched'] ?? 0) > 0) {
+                $touched++;
+            }
+            ap_timeline_home_hydrate_invalidate_owner($ownerUserId);
+            if ($rewarmMax > 0 && count($owners) <= $rewarmMax) {
+                if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+                    ap_masto_timeline_home_hydrate_warm_async($ownerUserId, 15);
+                } else {
+                    ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40');
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-db] timeline_fanout_followers_bsky owner=' . $ownerUserId . ': ' . $e->getMessage());
+        }
+    }
+    if ($touched > 0) {
+        error_log(sprintf(
+            '[ap-db] timeline_fanout_followers_bsky uri=%s did=%s owners=%d touched=%d',
+            $uri,
+            $authorDid,
             count($owners),
             $touched
         ));
