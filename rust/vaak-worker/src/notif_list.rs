@@ -1,47 +1,25 @@
 //! Mentions / Ice Cubes notification **list** warm + Axum shadow read.
 //!
-//! Warm path (10.5): prefer native Rust materialize from
+//! Warm path (10.5): native Rust materialize from
 //! `ap_notification_projection` → Redis `vaak:notifications:v1:{owner}:{hash}`.
-//! PHP `notif-list-warm.php` remains rare cold-start fallback when projection
-//! cannot fill and no confirmed warm envelope exists. Quiet accounts that
-//! already have an empty `vaak-worker-projection` / `vaak-worker-live`
-//! envelope skip-fresh (0.6.52) so PHP is not respawned every tick.
+//! PHP `bin/notif-list-warm.php` is retired (0.6.63) — incomplete projection
+//! windows soft-skip; Mentions request-path PHP hydrate still fills cold
+//! reads. Quiet accounts with empty `vaak-worker-projection` /
+//! `vaak-worker-live` envelopes skip-fresh / quiet_restamp (0.6.52).
 //! Axum `:8787` reads the same Redis keys (M3/M5).
 
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio_postgres::Client;
 
 use crate::config::Config;
 use crate::notif;
 use crate::redis_util;
-
-#[derive(Debug, Clone)]
-struct WarmPaths {
-    php_bin: PathBuf,
-    script: PathBuf,
-}
-
-fn warm_paths() -> WarmPaths {
-    let php_bin = PathBuf::from(
-        std::env::var("VAAK_PHP_BIN").unwrap_or_else(|_| "/usr/bin/php".to_string()),
-    );
-    let api_root = PathBuf::from(
-        std::env::var("VAAK_API_ROOT").unwrap_or_else(|_| "/srv/mkultra/html/api".to_string()),
-    );
-    WarmPaths {
-        php_bin,
-        script: api_root.join("bin/notif-list-warm.php"),
-    }
-}
 
 fn env_flag_default_true(name: &str) -> bool {
     match std::env::var(name) {
@@ -187,7 +165,7 @@ async fn projection_page(
         // Thin window with real hits: accept partial rather than waiting on PHP.
         return Ok(Some(out));
     }
-    // Thin/empty window (incl. scanned=0): fall through to PHP hydrate.
+    // Thin/empty window (incl. scanned=0): soft-skip (PHP bridge retired).
     Ok(None)
 }
 
@@ -204,46 +182,7 @@ async fn write_list_envelope(
     redis_util::json_set(redis, key, &payload, 600).await
 }
 
-/// PHP materializer fallback (full hydrate) when projection cannot fill pages.
-async fn warm_owner_php(owner_user_id: i64, limit: i64) -> Result<String> {
-    let paths = warm_paths();
-    if !paths.script.is_file() {
-        bail!("notif-list warm script missing: {}", paths.script.display());
-    }
-    let limit = limit.clamp(1, 80);
-    let started = Instant::now();
-    let mut cmd = Command::new(&paths.php_bin);
-    cmd.arg(&paths.script)
-        .arg(format!("--owner-id={owner_user_id}"))
-        .arg(format!("--limit={limit}"))
-        .env("VAAK_NOTIF_LIST_WARM", "1")
-        .env("VAAK_FEATURE_BLUESKY_TAB", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if std::env::var_os("AP_DB_DSN").is_none() {
-        cmd.env("AP_DB_DSN", "pgsql:dbname=novalandia");
-    }
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("spawn {} {}", paths.php_bin.display(), paths.script.display()))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let ms = started.elapsed().as_millis();
-    if !output.status.success() {
-        bail!(
-            "notif-list-warm owner={owner_user_id} exit={} ms={ms} stderr={stderr} stdout={stdout}",
-            output.status.code().unwrap_or(-1)
-        );
-    }
-    if !stderr.is_empty() {
-        tracing::warn!(owner = owner_user_id, %stderr, "notif-list-warm stderr");
-    }
-    Ok(format!("php_fallback ms={ms}\n{stdout}"))
-}
-
-/// Warm one owner: projection→Redis first; PHP spawn if any Mentions page is incomplete.
+/// Warm one owner: projection→Redis only (PHP bridge retired 0.6.63).
 pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<String> {
     let limit = limit.clamp(1, 80);
     let started = Instant::now();
@@ -251,9 +190,8 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
     let refresh = refresh_secs();
 
     if !native {
-        let body = warm_owner_php(owner_user_id, limit).await?;
         return Ok(format!(
-            "owner={owner_user_id} ms={} mode=php_only\n{body}",
+            "owner={owner_user_id} ms={} mode=skipped flag=VAAK_NOTIF_NATIVE_PROJECTION=0 php_bridge=retired",
             started.elapsed().as_millis()
         ));
     }
@@ -264,7 +202,7 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
     let mut lines: Vec<String> = Vec::new();
     let mut skip_fresh = 0u32;
     let mut native_ok = 0u32;
-    let mut need_php = false;
+    let mut skipped_incomplete = 0u32;
     let mut all40_items: Option<Vec<Value>> = None;
 
     for job in &jobs {
@@ -313,7 +251,7 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
             }
             None => {
                 // Quiet account: prior warm already confirmed empty. Re-stamp as
-                // projection instead of spawning PHP every refresh window.
+                // projection instead of leaving Mentions cold every refresh.
                 if let Some(prior) = redis_util::json_get(&mut redis, &key).await? {
                     let prior_empty = prior
                         .get("items")
@@ -341,9 +279,11 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
                         continue;
                     }
                 }
-                need_php = true;
+                // 0.6.63: PHP bridge retired — soft-skip thin/incomplete windows.
+                // Mentions HTML/API still hydrate on request-path miss.
+                skipped_incomplete += 1;
                 lines.push(format!(
-                    "owner={owner_user_id} job={} projection_incomplete ms={}",
+                    "owner={owner_user_id} job={} skipped=incomplete ms={}",
                     job.label,
                     t0.elapsed().as_millis()
                 ));
@@ -351,35 +291,16 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
         }
     }
 
-    let mut php_note = String::new();
-    if need_php {
-        match warm_owner_php(owner_user_id, limit).await {
-            Ok(body) => {
-                php_note = body;
-                lines.push("php_fallback=1".into());
-            }
-            Err(e) => {
-                tracing::error!(owner = owner_user_id, error = %e, "notif-list php fallback failed");
-                lines.push(format!("php_fallback_error={e}"));
-            }
-        }
-    }
-
     let total_ms = started.elapsed().as_millis();
     let summary = format!(
-        "owner={owner_user_id} warm_ok={} skip_fresh={skip_fresh} native={native_ok} php={} total_ms={total_ms} refresh_secs={refresh}",
+        "owner={owner_user_id} warm_ok={} skip_fresh={skip_fresh} native={native_ok} php=0 skipped_incomplete={skipped_incomplete} total_ms={total_ms} refresh_secs={refresh}",
         skip_fresh + native_ok,
-        if need_php { 1 } else { 0 },
     );
     let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
     out.push_str(&summary);
-    if !php_note.is_empty() {
-        out.push('\n');
-        out.push_str(&php_note);
-    }
     Ok(out)
 }
 
