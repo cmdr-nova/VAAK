@@ -73,6 +73,7 @@ function ap_phyrian_migrate(?PDO $db = null): void
         'banked_resonance INTEGER NOT NULL DEFAULT 0',
         'resonance_exchanges INTEGER NOT NULL DEFAULT 0',
         'inductions_given INTEGER NOT NULL DEFAULT 0',
+        'lineage_depth INTEGER',
     ] as $colDef) {
         try {
             $db->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS ' . $colDef);
@@ -203,6 +204,11 @@ function ap_phyrian_ensure_player(int $ownerUserId, string $actorId): array
 function ap_phyrian_apply_decay_row(array $row): array
 {
     if (!ap_phyrian_player_is_imprinted($row)) {
+        return $row;
+    }
+    // Linked Resonant bodies decay on OpenSim; VAAK mirrors via bridge sync.
+    $ownerId = (int) ($row['owner_user_id'] ?? 0);
+    if ($ownerId > 0 && function_exists('ap_phyrian_bridge_is_linked') && ap_phyrian_bridge_is_linked($ownerId)) {
         return $row;
     }
     $imprintedAt = (string) ($row['imprinted_at'] ?? '');
@@ -686,6 +692,11 @@ function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
 function ap_phyrian_checkin(int $ownerUserId): array
 {
     ap_phyrian_migrate();
+    // Linked bodies: OpenSim monolith is the daily claim; VAAK mirrors the result.
+    if (function_exists('ap_phyrian_bridge_is_linked') && ap_phyrian_bridge_is_linked($ownerUserId)
+        && function_exists('ap_phyrian_bridge_checkin_via_opensim')) {
+        return ap_phyrian_bridge_checkin_via_opensim($ownerUserId);
+    }
     $player = ap_phyrian_ensure_player($ownerUserId, ap_phyrian_actor_id_for_owner($ownerUserId));
     if ($player === [] || !ap_phyrian_player_is_imprinted($player)) {
         return ['ok' => false, 'error' => 'Imprint first'];
@@ -695,10 +706,6 @@ function ap_phyrian_checkin(int $ownerUserId): array
         return ['ok' => false, 'error' => 'Already checked in today'];
     }
     $bonus = 3;
-    // Resonant OpenSim link: +1 free daily resonance (Phase 3 bridge perk).
-    if (function_exists('ap_phyrian_bridge_is_linked') && ap_phyrian_bridge_is_linked($ownerUserId)) {
-        $bonus += 1;
-    }
     ap_db()->prepare(
         'UPDATE phyrian_players
          SET resonance = LEAST(?, resonance + ?),
@@ -746,6 +753,9 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
     }
     ap_phyrian_migrate();
     $actorId = ap_phyrian_actor_id_for_owner($ownerUserId);
+    if (function_exists('ap_phyrian_bridge_sync_from_opensim')) {
+        ap_phyrian_bridge_sync_from_opensim($ownerUserId, false);
+    }
     $player = ap_phyrian_ensure_player($ownerUserId, $actorId);
     if ($player === []) {
         return null;
@@ -755,6 +765,7 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
     }
     $isOrigin = ap_phyrian_is_origin_owner($ownerUserId);
     $imprinted = ap_phyrian_player_is_imprinted($player);
+    $linked = function_exists('ap_phyrian_bridge_is_linked') && ap_phyrian_bridge_is_linked($ownerUserId);
     $username = ap_phyrian_username_for_owner($ownerUserId);
     if ($username === '') {
         $username = 'user' . $ownerUserId;
@@ -762,7 +773,8 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
     $parentId = (int) ($player['imprinted_by_owner_id'] ?? 0);
     $parentName = $parentId > 0 ? ap_phyrian_username_for_owner($parentId) : '';
     $lineage = $imprinted ? ap_phyrian_lineage($ownerUserId, 8) : [];
-    $lineageDepth = max(1, count($lineage));
+    $storedDepth = (int) ($player['lineage_depth'] ?? 0);
+    $lineageDepth = $storedDepth > 0 ? $storedDepth : max(1, count($lineage));
     return [
         'owner_user_id' => $ownerUserId,
         'username' => $username,
@@ -772,6 +784,7 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
         'generation' => $imprinted ? (int) ($player['generation'] ?? 1) : null,
         'max_generation' => AP_PHYRIAN_MAX_GENERATION,
         'lineage_depth' => $imprinted ? $lineageDepth : null,
+        'opensim_synced' => $linked,
         'level' => (int) ($player['level'] ?? 1),
         'max_level' => AP_PHYRIAN_MAX_LEVEL,
         'rank_title' => ap_phyrian_rank_title($player, $isOrigin),

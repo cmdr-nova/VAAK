@@ -24,6 +24,8 @@ const AP_PHYRIAN_BRIDGE_ENV_PATH = '/etc/mkultra/phyrian-bridge.env';
 const AP_PHYRIAN_BRIDGE_TTL_SEC = 600;
 const AP_PHYRIAN_BRIDGE_CODE_LEN = 6;
 const AP_PHYRIAN_BRIDGE_ONLINE_SECS = 1800; // soft "recently active" window
+/** How often linked VAAK bodies re-pull OpenSim stats (seconds). */
+const AP_PHYRIAN_BRIDGE_SYNC_TTL_SEC = 60;
 
 /**
  * @return array<string,string>
@@ -103,6 +105,19 @@ function ap_phyrian_bridge_migrate(?PDO $db = null): void
             'CREATE INDEX IF NOT EXISTS phyrian_bridge_challenges_owner_idx
              ON phyrian_bridge_challenges (owner_user_id, expires_at DESC)'
         );
+        foreach ([
+            'last_synced_at TIMESTAMPTZ',
+        ] as $colDef) {
+            try {
+                $db->exec('ALTER TABLE phyrian_bridge_links ADD COLUMN IF NOT EXISTS ' . $colDef);
+            } catch (Throwable $e) {
+                try {
+                    $db->exec('ALTER TABLE phyrian_bridge_links ADD COLUMN ' . $colDef);
+                } catch (Throwable $e2) {
+                    // Column already exists.
+                }
+            }
+        }
     } catch (Throwable $e) {
         // Tolerate missing CREATE privilege when tables already exist.
         error_log('[phyrian-bridge] migrate: ' . $e->getMessage());
@@ -534,11 +549,24 @@ function ap_phyrian_bridge_challenge_verify(int $userId, string $codeRaw): array
         error_log('[phyrian-bridge] link_set failed: ' . (string) ($linkSet['error'] ?? ''));
     }
 
+    $sync = ap_phyrian_bridge_sync_from_opensim($userId, true);
     $link = ap_phyrian_bridge_link_for_user($userId);
+    $notice = 'Linked OpenSim avatar ' . $name
+        . '. Resonant badge, +1 daily resonance, and OpenSim body sync are active.';
+    if (!empty($sync['ok']) && is_array($sync['player'] ?? null)) {
+        $syncedStrain = trim((string) ($sync['player']['strain'] ?? ''));
+        $syncedRes = (int) ($sync['player']['resonance'] ?? 0);
+        if ($syncedStrain !== '') {
+            $notice .= ' Mirrored ' . $syncedStrain . ' @ ' . $syncedRes . ' resonance.';
+        }
+    } elseif (empty($sync['ok']) && empty($sync['skipped'])) {
+        $notice .= ' (OpenSim stats sync pending: ' . (string) ($sync['error'] ?? 'retry from hub') . ')';
+    }
     return [
         'ok' => true,
-        'notice' => 'Linked OpenSim avatar ' . $name . '. Resonant badge and +1 daily resonance are active.',
+        'notice' => $notice,
         'link' => is_array($link) ? $link : null,
+        'sync' => $sync,
     ];
 }
 
@@ -597,4 +625,260 @@ function ap_phyrian_bridge_resonant_badge_html(?array $link): string
     $titleEsc = htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     return ' <span class="resonant-badge" title="' . $titleEsc . '" aria-label="Resonant — linked OpenSim avatar">'
         . '◈ Resonant</span>';
+}
+
+/**
+ * Apply an OpenSim public_player payload onto the linked VAAK phyrian body.
+ * OpenSim is the source of truth while the Resonant link is active.
+ *
+ * @param array<string,mixed> $osPlayer
+ * @return array{ok:bool,error?:string,player?:array<string,mixed>,changed?:bool}
+ */
+function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlayer): array
+{
+    if ($ownerUserId < 1) {
+        return ['ok' => false, 'error' => 'Not signed in.'];
+    }
+    if (!function_exists('ap_phyrian_ensure_player') || !function_exists('ap_phyrian_actor_id_for_owner')) {
+        return ['ok' => false, 'error' => 'Phyrian Strains unavailable.'];
+    }
+    ap_phyrian_migrate();
+    ap_phyrian_bridge_migrate();
+    $actorId = ap_phyrian_actor_id_for_owner($ownerUserId);
+    $before = ap_phyrian_ensure_player($ownerUserId, $actorId);
+    if ($before === []) {
+        return ['ok' => false, 'error' => 'Could not load VAAK Phyrian row.'];
+    }
+
+    $strain = trim((string) ($osPlayer['strain'] ?? ''));
+    $imprinted = $strain !== '';
+    $status = $imprinted ? 'imprinted' : 'unknown';
+    $resonance = max(0, min(
+        defined('AP_PHYRIAN_MAX_RESONANCE') ? (int) AP_PHYRIAN_MAX_RESONANCE : 100,
+        (int) ($osPlayer['resonance'] ?? 0)
+    ));
+    $generation = max(1, min(
+        defined('AP_PHYRIAN_MAX_GENERATION') ? (int) AP_PHYRIAN_MAX_GENERATION : 10,
+        (int) ($osPlayer['generation'] ?? 1)
+    ));
+    $level = max(1, min(
+        defined('AP_PHYRIAN_MAX_LEVEL') ? (int) AP_PHYRIAN_MAX_LEVEL : 80,
+        (int) ($osPlayer['level'] ?? 1)
+    ));
+    $banked = max(0, min(
+        defined('AP_PHYRIAN_MAX_BANKED') ? (int) AP_PHYRIAN_MAX_BANKED : 300,
+        (int) ($osPlayer['banked_resonance'] ?? 0)
+    ));
+    $exchanges = max(0, (int) ($osPlayer['resonance_exchanges'] ?? 0));
+    $inductions = max(0, (int) ($osPlayer['inductions_given'] ?? 0));
+    $lineageDepth = max(0, (int) ($osPlayer['lineage_depth'] ?? 0));
+    $lastDecay = $osPlayer['last_decay_at'] ?? null;
+    $lastDecaySql = is_string($lastDecay) && trim($lastDecay) !== '' ? trim($lastDecay) : null;
+
+    $imprintedAt = (string) ($before['imprinted_at'] ?? '');
+    if ($imprinted && $imprintedAt === '') {
+        $imprintedAtExpr = 'NOW()';
+        $setImprintedAt = true;
+    } elseif (!$imprinted) {
+        $imprintedAtExpr = 'NULL';
+        $setImprintedAt = true;
+    } else {
+        $setImprintedAt = false;
+        $imprintedAtExpr = '';
+    }
+
+    try {
+        if ($setImprintedAt) {
+            ap_db()->prepare(
+                "UPDATE phyrian_players
+                 SET status = ?,
+                     strain = ?,
+                     resonance = ?,
+                     generation = ?,
+                     level = ?,
+                     banked_resonance = ?,
+                     resonance_exchanges = ?,
+                     inductions_given = ?,
+                     last_decay_at = ?,
+                     imprinted_at = {$imprintedAtExpr},
+                     updated_at = NOW()
+                 WHERE owner_user_id = ?"
+            )->execute([
+                $status,
+                $imprinted ? $strain : null,
+                $resonance,
+                $generation,
+                $level,
+                $banked,
+                $exchanges,
+                $inductions,
+                $lastDecaySql,
+                $ownerUserId,
+            ]);
+        } else {
+            ap_db()->prepare(
+                'UPDATE phyrian_players
+                 SET status = ?,
+                     strain = ?,
+                     resonance = ?,
+                     generation = ?,
+                     level = ?,
+                     banked_resonance = ?,
+                     resonance_exchanges = ?,
+                     inductions_given = ?,
+                     last_decay_at = ?,
+                     updated_at = NOW()
+                 WHERE owner_user_id = ?'
+            )->execute([
+                $status,
+                $strain,
+                $resonance,
+                $generation,
+                $level,
+                $banked,
+                $exchanges,
+                $inductions,
+                $lastDecaySql,
+                $ownerUserId,
+            ]);
+        }
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Could not apply OpenSim stats.'];
+    }
+
+    // Optional lineage depth column (OpenSim-shaped dossier).
+    try {
+        ap_db()->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS lineage_depth INTEGER');
+    } catch (Throwable $e) {
+    }
+    if ($lineageDepth > 0) {
+        try {
+            ap_db()->prepare('UPDATE phyrian_players SET lineage_depth = ? WHERE owner_user_id = ?')
+                ->execute([$lineageDepth, $ownerUserId]);
+        } catch (Throwable $e) {
+        }
+    }
+
+    $avatarName = trim((string) ($osPlayer['avatar_name'] ?? ''));
+    try {
+        ap_db()->prepare(
+            'UPDATE phyrian_bridge_links
+             SET avatar_name = COALESCE(NULLIF(?, \'\'), avatar_name),
+                 strain_snapshot = ?,
+                 last_synced_at = NOW(),
+                 updated_at = NOW()
+             WHERE owner_user_id = ? AND status = \'verified\' AND unlinked_at IS NULL'
+        )->execute([$avatarName, $imprinted ? $strain : null, $ownerUserId]);
+    } catch (Throwable $e) {
+        // last_synced_at may be missing until migrate; ignore soft failure.
+    }
+
+    $after = ap_phyrian_ensure_player($ownerUserId, $actorId);
+    $changed = ((int) ($before['resonance'] ?? 0) !== (int) ($after['resonance'] ?? 0))
+        || ((string) ($before['strain'] ?? '') !== (string) ($after['strain'] ?? ''))
+        || ((int) ($before['level'] ?? 0) !== (int) ($after['level'] ?? 0))
+        || ((int) ($before['generation'] ?? 0) !== (int) ($after['generation'] ?? 0))
+        || ((int) ($before['banked_resonance'] ?? 0) !== (int) ($after['banked_resonance'] ?? 0));
+
+    return [
+        'ok' => true,
+        'player' => $after,
+        'changed' => $changed,
+        'daily_claimed_today' => !empty($osPlayer['_daily_claimed_today']),
+        'opensim' => $osPlayer,
+    ];
+}
+
+/**
+ * Pull OpenSim body stats into the linked VAAK row.
+ *
+ * @return array{ok:bool,error?:string,player?:array<string,mixed>,skipped?:bool,changed?:bool}
+ */
+function ap_phyrian_bridge_sync_from_opensim(int $ownerUserId, bool $force = false): array
+{
+    $link = ap_phyrian_bridge_link_for_user($ownerUserId);
+    if ($link === null) {
+        return ['ok' => false, 'error' => 'Not linked to OpenSim.', 'skipped' => true];
+    }
+    if (!$force) {
+        $last = (string) ($link['last_synced_at'] ?? '');
+        if ($last !== '') {
+            $ts = strtotime($last);
+            if ($ts !== false && (time() - $ts) < AP_PHYRIAN_BRIDGE_SYNC_TTL_SEC) {
+                $player = function_exists('ap_phyrian_ensure_player')
+                    ? ap_phyrian_ensure_player($ownerUserId, ap_phyrian_actor_id_for_owner($ownerUserId))
+                    : [];
+                return ['ok' => true, 'skipped' => true, 'player' => $player, 'changed' => false];
+            }
+        }
+    }
+    $uuid = strtolower((string) ($link['avatar_uuid'] ?? ''));
+    if (!ap_phyrian_bridge_valid_uuid($uuid)) {
+        return ['ok' => false, 'error' => 'Linked avatar UUID is invalid.'];
+    }
+    $pull = ap_phyrian_bridge_strains_call('vaak_player_pull', ['avatar_uuid' => $uuid]);
+    if (empty($pull['ok'])) {
+        return ['ok' => false, 'error' => (string) ($pull['error'] ?? 'Could not pull OpenSim stats.')];
+    }
+    $osPlayer = is_array($pull['data']['player'] ?? null) ? $pull['data']['player'] : null;
+    if ($osPlayer === null) {
+        return ['ok' => false, 'error' => 'OpenSim returned no player payload.'];
+    }
+    $osPlayer['_daily_claimed_today'] = !empty($pull['data']['daily_claimed_today']);
+    return ap_phyrian_bridge_apply_opensim_player($ownerUserId, $osPlayer);
+}
+
+/**
+ * Linked daily check-in: claim on OpenSim (monolith + Resonant +1), then mirror onto VAAK.
+ *
+ * @return array{ok:bool,error?:string,resonance?:int,granted?:int,message?:string}
+ */
+function ap_phyrian_bridge_checkin_via_opensim(int $ownerUserId): array
+{
+    $link = ap_phyrian_bridge_link_for_user($ownerUserId);
+    if ($link === null) {
+        return ['ok' => false, 'error' => 'Not linked'];
+    }
+    $uuid = strtolower((string) ($link['avatar_uuid'] ?? ''));
+    if (!ap_phyrian_bridge_valid_uuid($uuid)) {
+        return ['ok' => false, 'error' => 'Linked avatar UUID is invalid.'];
+    }
+    $claim = ap_phyrian_bridge_strains_call('vaak_daily_claim', ['avatar_uuid' => $uuid]);
+    $data = is_array($claim['data'] ?? null) ? $claim['data'] : [];
+    if (empty($claim['ok'])) {
+        // Still mirror latest OS body so the hub stays consistent.
+        if (is_array($data['player'] ?? null)) {
+            ap_phyrian_bridge_apply_opensim_player($ownerUserId, $data['player']);
+        } else {
+            ap_phyrian_bridge_sync_from_opensim($ownerUserId, true);
+        }
+        $err = (string) ($claim['error'] ?? 'Check-in failed.');
+        if (stripos($err, 'already') !== false) {
+            $err = 'Already checked in today';
+        }
+        return ['ok' => false, 'error' => $err];
+    }
+    $osPlayer = is_array($data['player'] ?? null) ? $data['player'] : null;
+    if ($osPlayer === null) {
+        return ['ok' => false, 'error' => 'OpenSim claim succeeded but returned no player.'];
+    }
+    $applied = ap_phyrian_bridge_apply_opensim_player($ownerUserId, $osPlayer);
+    if (empty($applied['ok'])) {
+        return ['ok' => false, 'error' => (string) ($applied['error'] ?? 'Claimed on OpenSim but VAAK mirror failed.')];
+    }
+    try {
+        ap_db()->prepare(
+            'UPDATE phyrian_players
+             SET last_checkin_at = NOW(), last_decay_at = NOW(), updated_at = NOW()
+             WHERE owner_user_id = ?'
+        )->execute([$ownerUserId]);
+    } catch (Throwable $e) {
+    }
+    $resonance = (int) (($applied['player']['resonance'] ?? $osPlayer['resonance'] ?? 0));
+    return [
+        'ok' => true,
+        'resonance' => $resonance,
+        'granted' => (int) ($data['granted'] ?? 0),
+        'message' => (string) ($data['message'] ?? ''),
+    ];
 }

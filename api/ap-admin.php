@@ -4772,7 +4772,12 @@ $vaakAdminOnlyActions = [
         } elseif ($action === 'phyrian_checkin') {
             $res = ap_phyrian_checkin($ownerId);
             if (!empty($res['ok'])) {
-                $notice = 'Checked in. Resonance is now ' . (int) ($res['resonance'] ?? 0) . '.';
+                $notice = trim((string) ($res['message'] ?? ''));
+                if ($notice === '') {
+                    $notice = 'Checked in. Resonance is now ' . (int) ($res['resonance'] ?? 0) . '.';
+                } else {
+                    $notice .= ' Resonance is now ' . (int) ($res['resonance'] ?? 0) . '.';
+                }
             } else {
                 $error = (string) ($res['error'] ?? 'Check-in failed.');
             }
@@ -29758,6 +29763,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if ($phyActorId === '' && function_exists('ap_phyrian_actor_id_for_owner')) {
               $phyActorId = ap_phyrian_actor_id_for_owner((int) $vaakOwnerId);
           }
+          if ($vaakOwnerId > 0 && function_exists('ap_phyrian_bridge_sync_from_opensim')) {
+              ap_phyrian_bridge_sync_from_opensim((int) $vaakOwnerId, false);
+          }
           $phyPlayer = ($vaakOwnerId > 0 && function_exists('ap_phyrian_ensure_player'))
               ? ap_phyrian_ensure_player((int) $vaakOwnerId, $phyActorId)
               : [];
@@ -29864,7 +29872,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       <?php endif; ?>
                     </div>
                     <ul class="meta" style="margin:.55rem 0 0;padding-left:1.1rem">
-                      <li>Perks active: +1 VAAK daily check-in · +1 OpenSim monolith claim · Resonant badge</li>
+                      <li>Perks active: shared daily claim (+ Resonant +1) · Resonant badge · OpenSim body sync</li>
+                      <li>Your VAAK readout mirrors OpenSim strain, resonance, level, generation, banked, and counters</li>
                     </ul>
                   </div>
                 </div>
@@ -29959,6 +29968,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     <?php endif; ?>
                     <?php if (!empty($phyDossier['is_origin'])): ?>
                       <dt>Origin</dt><dd>Yes</dd>
+                    <?php endif; ?>
+                    <?php if (!empty($phyDossier['opensim_synced'])): ?>
+                      <dt>Body sync</dt><dd>OpenSim (NovaLandia)</dd>
                     <?php endif; ?>
                   </dl>
                   <?php if (!empty($phyDossier['lineage']) && is_array($phyDossier['lineage']) && count($phyDossier['lineage']) > 1): ?>
