@@ -465,6 +465,13 @@ function ap_phyrian_request_create(int $fromOwnerId, int $toOwnerId, string $kin
     if ($fromOwnerId < 1 || $toOwnerId < 1 || $fromOwnerId === $toOwnerId) {
         return ['ok' => false, 'error' => 'Invalid players'];
     }
+    // Phyrian requests stay on-instance — never notify remote/federated actors.
+    foreach ([$fromOwnerId, $toOwnerId] as $localOwnerId) {
+        $actorId = ap_phyrian_actor_id_for_owner($localOwnerId);
+        if ($actorId === '' || !str_starts_with($actorId, 'https://mkultra.monster/users/')) {
+            return ['ok' => false, 'error' => 'Phyrian requests are local-only'];
+        }
+    }
     $from = ap_phyrian_ensure_player($fromOwnerId, ap_phyrian_actor_id_for_owner($fromOwnerId));
     $to = ap_phyrian_ensure_player($toOwnerId, ap_phyrian_actor_id_for_owner($toOwnerId));
     if ($from === [] || $to === []) {
