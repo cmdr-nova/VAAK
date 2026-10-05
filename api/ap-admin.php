@@ -22920,6 +22920,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .body, .feed-body {
       white-space: pre-wrap; word-break: break-word; line-height: 1.45;
     }
+    /* Axum lean HTML bodies already carry <p>/<br> — avoid pre-wrap double-spacing (0.7.14). */
+    .feed-body--html {
+      white-space: normal;
+    }
+    .feed-body--html p {
+      margin: 0 0 0.35em;
+    }
+    .feed-body--html p:last-child {
+      margin-bottom: 0;
+    }
     /* Canonical Ask card — colors follow user accent (--primary / --primary-dim) */
     .ask-container {
       display: flex;
@@ -22947,9 +22957,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .body p:last-child, .feed-body p:last-child {
       margin-bottom: 0;
     }
+    .feed-body a,
     .feed-body a.mention,
     .feed-body a.hashtag,
     .feed-body a.ext-link,
+    .feed-body a.status-link,
     .quote-block a.mention,
     .quote-block a.hashtag,
     .quote-block a.status-link,
@@ -22960,9 +22972,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       overflow-wrap: anywhere;
       word-break: break-word;
     }
+    .feed-body a:hover,
     .feed-body a.mention:hover,
     .feed-body a.hashtag:hover,
     .feed-body a.ext-link:hover,
+    .feed-body a.status-link:hover,
     .quote-block a.mention:hover,
     .quote-block a.hashtag:hover,
     .quote-block a.status-link:hover,
