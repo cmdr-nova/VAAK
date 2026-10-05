@@ -3,6 +3,8 @@
 #
 # Writes vaak:notifications:v1:{owner}:{hash} from ap_notification_projection
 # (source=vaak-worker-projection). PHP bin/notif-list-warm.php retired 0.6.63.
+# 0.6.66: thin/empty projection triggers bin/notif-projection-fill.php once
+# (cooldown-gated) so heavy accounts get background Mentions warm again.
 # Mentions request-path still hydrates cold reads; set VAAK_NOTIF_LIST_RUST_PRIMARY=1
 # (default) in vaak.env / FPM.
 

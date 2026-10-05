@@ -1,20 +1,26 @@
 //! Mentions / Ice Cubes notification **list** warm + Axum shadow read.
 //!
-//! Warm path (10.5): native Rust materialize from
+//! Warm path (10.5 / 0.6.66): native Rust materialize from
 //! `ap_notification_projection` → Redis `vaak:notifications:v1:{owner}:{hash}`.
-//! PHP `bin/notif-list-warm.php` is retired (0.6.63) — incomplete projection
-//! windows soft-skip; Mentions request-path PHP hydrate still fills cold
-//! reads. Quiet accounts with empty `vaak-worker-projection` /
-//! `vaak-worker-live` envelopes skip-fresh / quiet_restamp (0.6.52).
+//! When the projection window is thin/empty, spawn temporary PHP
+//! `bin/notif-projection-fill.php` (local PG hydrate → projection + Redis)
+//! then retry native materialize. HTTP Mentions still falls back to PHP
+//! hydrate on total miss. Quiet accounts with empty `vaak-worker-projection`
+//! / `vaak-worker-live` envelopes skip-fresh / quiet_restamp (0.6.52).
 //! Axum `:8787` reads the same Redis keys (M3/M5).
+//!
+//! Destination: replace the PHP fill bridge with Rust-native hydrate.
 
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::process::Command;
 use tokio_postgres::Client;
 
 use crate::config::Config;
@@ -36,6 +42,41 @@ fn refresh_secs() -> i64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(90)
         .clamp(15, 600)
+}
+
+fn projection_fill_enabled() -> bool {
+    match std::env::var("VAAK_NOTIF_PROJECTION_FILL") {
+        Ok(v) if !v.trim().is_empty() => {
+            !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+        }
+        _ => true,
+    }
+}
+
+fn projection_fill_cooldown_secs() -> i64 {
+    std::env::var("VAAK_NOTIF_PROJECTION_FILL_COOLDOWN_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(180)
+        .clamp(60, 1800)
+}
+
+fn projection_fill_min_rows() -> i64 {
+    std::env::var("VAAK_NOTIF_PROJECTION_FILL_MIN_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40)
+        .clamp(1, 80)
+}
+
+fn projection_fill_paths() -> (PathBuf, PathBuf) {
+    let php_bin = PathBuf::from(
+        std::env::var("VAAK_PHP_BIN").unwrap_or_else(|_| "/usr/bin/php".to_string()),
+    );
+    let api_root = PathBuf::from(
+        std::env::var("VAAK_API_ROOT").unwrap_or_else(|_| "/srv/mkultra/html/api".to_string()),
+    );
+    (php_bin, api_root.join("bin/notif-projection-fill.php"))
 }
 
 struct WarmJob {
@@ -108,6 +149,115 @@ async fn redis_list_age(
     Ok(Some((Utc::now().timestamp() - ts).max(0)))
 }
 
+fn projection_cutoff() -> String {
+    // Match PHP gmdate('c') / stored updated_at (`…+00:00`), not `…Z` — text compare.
+    (Utc::now() - ChronoDuration::seconds(900))
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string()
+}
+
+async fn projection_recent_count(db: &Client, owner_user_id: i64) -> Result<i64> {
+    let cutoff = projection_cutoff();
+    let row = db
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM ap_notification_projection
+             WHERE owner_user_id = $1 AND updated_at >= $2",
+            &[&owner_user_id, &cutoff],
+        )
+        .await
+        .context("projection count")?;
+    Ok(row.get::<_, i64>(0))
+}
+
+/// Spawn temporary PHP hydrate to fill `ap_notification_projection` for an owner.
+/// Rate-limited via Redis so a failing fill cannot stampede every loop tick.
+async fn maybe_fill_projection(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner_user_id: i64,
+    limit: i64,
+) -> Result<Option<String>> {
+    if !projection_fill_enabled() {
+        return Ok(None);
+    }
+    let cooldown_key = format!("vaak:notif:proj-fill:cd:{owner_user_id}");
+    let lock_name = format!("notif-proj-fill:{owner_user_id}");
+    let holder = format!("vaak-worker-{}", std::process::id());
+    let cooldown = projection_fill_cooldown_secs();
+
+    let cooling: Option<String> = redis::cmd("GET")
+        .arg(&cooldown_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+    if cooling.is_some() {
+        return Ok(Some(format!(
+            "owner={owner_user_id} fill=skip_cooldown cooldown={cooldown}"
+        )));
+    }
+
+    if !redis_util::lock(redis, &lock_name, 120, &holder).await? {
+        return Ok(Some(format!("owner={owner_user_id} fill=skip_locked")));
+    }
+
+    let (php_bin, script) = projection_fill_paths();
+    if !script.is_file() {
+        let _ = redis_util::unlock(redis, &lock_name, &holder).await;
+        bail!("notif-projection-fill missing: {}", script.display());
+    }
+
+    let t0 = Instant::now();
+    let mut cmd = Command::new(&php_bin);
+    cmd.arg(&script)
+        .arg(format!("--owner-id={owner_user_id}"))
+        .arg(format!("--limit={}", limit.clamp(40, 80)))
+        .env("VAAK_NOTIF_LIST_WARM", "1")
+        .env("AP_DB_DSN", "pgsql:dbname=novalandia")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Ok(dsn) = std::env::var("AP_DB_DSN") {
+        cmd.env("AP_DB_DSN", dsn);
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("spawn {} {}", php_bin.display(), script.display()));
+    let _ = redis_util::unlock(redis, &lock_name, &holder).await;
+    // Always arm cooldown after an attempt so failures cannot loop every tick.
+    let _: Result<(), _> = redis::cmd("SET")
+        .arg(&cooldown_key)
+        .arg("1")
+        .arg("EX")
+        .arg(cooldown)
+        .query_async(redis)
+        .await;
+
+    let output = output?;
+    let ms = t0.elapsed().as_millis();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        tracing::warn!(
+            owner = owner_user_id,
+            ms,
+            status = ?output.status.code(),
+            %stderr,
+            "notif projection fill failed"
+        );
+        return Ok(Some(format!(
+            "owner={owner_user_id} fill=fail ms={ms} status={}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    tracing::info!(owner = owner_user_id, ms, %stdout, "notif projection fill ok");
+    Ok(Some(format!(
+        "owner={owner_user_id} fill=ok ms={ms} bytes={}",
+        stdout.len()
+    )))
+}
+
 /// Read recent projection rows and filter to a Mentions page.
 ///
 /// - Full pages (>= limit) always win.
@@ -122,10 +272,7 @@ async fn projection_page(
     want: &[String],
     limit: i64,
 ) -> Result<Option<Vec<Value>>> {
-    // Match PHP gmdate('c') / stored updated_at (`…+00:00`), not `…Z` — text compare.
-    let cutoff = (Utc::now() - ChronoDuration::seconds(900))
-        .format("%Y-%m-%dT%H:%M:%S+00:00")
-        .to_string();
+    let cutoff = projection_cutoff();
     let rows = db
         .query(
             "SELECT payload_json FROM ap_notification_projection
@@ -165,7 +312,7 @@ async fn projection_page(
         // Thin window with real hits: accept partial rather than waiting on PHP.
         return Ok(Some(out));
     }
-    // Thin/empty window (incl. scanned=0): soft-skip (PHP bridge retired).
+    // Thin/empty window (incl. scanned=0): soft-skip unless fill bridge ran.
     Ok(None)
 }
 
@@ -182,7 +329,7 @@ async fn write_list_envelope(
     redis_util::json_set(redis, key, &payload, 600).await
 }
 
-/// Warm one owner: projection→Redis only (PHP bridge retired 0.6.63).
+/// Warm one owner: projection→Redis; fill thin projection via PHP bridge when needed.
 pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<String> {
     let limit = limit.clamp(1, 80);
     let started = Instant::now();
@@ -198,8 +345,34 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
 
     let db = crate::db::connect(&cfg.database_url).await?;
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    let jobs = warm_jobs(limit);
     let mut lines: Vec<String> = Vec::new();
+    let mut php_fill: u32 = 0;
+
+    // 0.6.66: if recent projection is thin, bootstrap from local PG via PHP once
+    // (cooldown-gated), then continue with native Redis materialize.
+    let proj_count = projection_recent_count(&db, owner_user_id).await.unwrap_or(0);
+    let min_rows = projection_fill_min_rows();
+    if proj_count < min_rows {
+        match maybe_fill_projection(&mut redis, owner_user_id, limit.max(40)).await {
+            Ok(Some(line)) => {
+                if line.contains("fill=ok") {
+                    php_fill = 1;
+                }
+                lines.push(line);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(owner = owner_user_id, error = %e, "notif projection fill error");
+                lines.push(format!("owner={owner_user_id} fill=error err={e}"));
+            }
+        }
+    } else {
+        lines.push(format!(
+            "owner={owner_user_id} fill=skip_fresh_proj rows={proj_count} min={min_rows}"
+        ));
+    }
+
+    let jobs = warm_jobs(limit);
     let mut skip_fresh = 0u32;
     let mut native_ok = 0u32;
     let mut skipped_incomplete = 0u32;
@@ -291,9 +464,12 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limit: i64) -> Result<
         }
     }
 
+    let proj_after = projection_recent_count(&db, owner_user_id)
+        .await
+        .unwrap_or(proj_count);
     let total_ms = started.elapsed().as_millis();
     let summary = format!(
-        "owner={owner_user_id} warm_ok={} skip_fresh={skip_fresh} native={native_ok} php=0 skipped_incomplete={skipped_incomplete} total_ms={total_ms} refresh_secs={refresh}",
+        "owner={owner_user_id} warm_ok={} skip_fresh={skip_fresh} native={native_ok} php={php_fill} skipped_incomplete={skipped_incomplete} proj_rows={proj_count}->{proj_after} total_ms={total_ms} refresh_secs={refresh}",
         skip_fresh + native_ok,
     );
     let mut out = lines.join("\n");

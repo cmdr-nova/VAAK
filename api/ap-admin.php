@@ -10102,6 +10102,7 @@ if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
 
 // Full-page Home: prefer Axum hydrate statuses (Mentions M5 twin) before PG hydrate.
 $adminHomeAxumStatuses = null;
+$adminHomeFirstPaintStarted = microtime(true);
 if (
     !$isPartial
     && $view === 'home'
@@ -10116,9 +10117,28 @@ if (
         } else {
             $adminTlCachedHasMore = true;
         }
-    } elseif (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
-        ap_masto_timeline_home_hydrate_warm_async((int) $vaakOwnerId, $tlLimit);
+        if (function_exists('ap_timing_record')) {
+            ap_timing_record('home.first_paint.axum_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+        }
+    } else {
+        if (function_exists('ap_timing_record')) {
+            ap_timing_record('home.first_paint.axum_miss', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+        }
+        if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+            ap_masto_timeline_home_hydrate_warm_async((int) $vaakOwnerId, $tlLimit);
+        }
     }
+}
+if (
+    !$isPartial
+    && in_array($view, ['home', 'local', 'feed'], true)
+    && (int) ($_GET['offset'] ?? 0) === 0
+    && function_exists('ap_timing_record')
+) {
+    ap_timing_record(
+        $adminTlFromCache ? 'home.first_paint.ranked_hit' : 'home.first_paint.ranked_miss',
+        (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0
+    );
 }
 
 // Full-page first paint: when ranked cache hits, hydrate only the visible window
