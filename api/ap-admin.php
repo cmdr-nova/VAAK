@@ -15078,17 +15078,18 @@ function admin_render_masto_status_card(
         $bodyInner .= $askCardHtml;
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
-    // Nuke AS2 / QTCreate dumps before any body paint (shared-card path previously
-    // only scrubbed these on the legacy event_tweet dialect).
-    if ($plain !== '' && function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
-        $plain = function_exists('ap_text_scrub_as2_dump') ? ap_text_scrub_as2_dump($plain) : '';
+    // Card-only for quotes / quote-boosts: never paint raw ↪ QT / AS2 / RE: lines
+    // in feed-body. The nest (or QT-line fallback card) owns that payload.
+    $quotedPlainForStrip = null;
+    if (is_array($quote['quoted_status'] ?? null)) {
+        $quotedPlainForStrip = admin_html_to_plain((string) ($quote['quoted_status']['content'] ?? ''));
+        if ($quotedPlainForStrip === '') {
+            $quotedPlainForStrip = null;
+        }
     }
-    // Prefer a quote-block card over leaving raw "↪ QT …" in the body — even when
-    // the status entity has no structured quote yet (common for quote-boosts).
     $splitPlain = ($plain !== '') ? admin_split_quote_summary($plain) : null;
     $fallbackQuoteOpts = null;
     if (is_array($splitPlain)) {
-        $plain = (string) ($splitPlain['commentary'] ?? '');
         $quotedLine = (string) ($splitPlain['quoted'] ?? '');
         $needFallbackCard = !is_array($quote)
             || (($quote['state'] ?? '') === 'pending' && !is_array($quote['quoted_status'] ?? null))
@@ -15118,6 +15119,9 @@ function admin_render_masto_status_card(
                     if (($fallbackQuoteOpts['acct'] ?? '') === '' && $qFallbackAcct !== '') {
                         $fallbackQuoteOpts['acct'] = '@' . ltrim($qFallbackAcct, '@');
                     }
+                    if ($quotedPlainForStrip === null && ($fallbackQuoteOpts['text'] ?? '') !== '') {
+                        $quotedPlainForStrip = (string) $fallbackQuoteOpts['text'];
+                    }
                 }
             }
             if ($fallbackQuoteOpts === null && ($qFallbackText !== '' || $qFallbackAcct !== '' || $qFallbackUrl !== '')) {
@@ -15128,14 +15132,24 @@ function admin_render_masto_status_card(
                     'media' => [],
                     'open_label' => 'Open quoted',
                 ];
+                if ($quotedPlainForStrip === null && $qFallbackText !== '') {
+                    $quotedPlainForStrip = $qFallbackText;
+                }
             }
-        } elseif (is_array($quote)) {
-            // Structured quote owns the nest — commentary only in the body.
-            $plain = (string) ($splitPlain['commentary'] ?? '');
         }
-    } elseif ($plain !== '' && is_array($quote)) {
-        // Quote present but no QT marker — still drop RE:<url> glued prefixes.
-        $plain = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $plain) ?? $plain;
+    }
+    $willShowQuoteCard = is_array($quote['quoted_status'] ?? null)
+        || is_array($fallbackQuoteOpts)
+        || (is_array($quote) && ($quote['state'] ?? '') === 'pending');
+    if ($plain !== '' && function_exists('ap_plain_strip_raw_quote_lines')) {
+        $plain = ap_plain_strip_raw_quote_lines($plain, $quotedPlainForStrip);
+    } elseif ($plain !== '' && is_array($splitPlain)) {
+        $plain = (string) ($splitPlain['commentary'] ?? '');
+    }
+    // Final belt: if a quote card will paint, never leave a QT-shaped body line.
+    if ($willShowQuoteCard && $plain !== ''
+        && (bool) preg_match('/(?:↪|➡|→)\s*QT\b/u', $plain)) {
+        $plain = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)\s*QT\b.*$/us', '', $plain) ?? '';
         $plain = trim($plain);
     }
     // Media-only placeholders left in summary/content_text — never paint as body text.

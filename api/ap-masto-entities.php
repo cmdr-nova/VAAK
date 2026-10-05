@@ -7422,23 +7422,31 @@ function ap_masto_status_from_event(array $row): ?array
             if (is_array($quoteEnt)) {
                 $status['quote'] = $quoteEnt;
                 $status['quote_url'] = $quoteObjectUrl;
-                // Drop the raw ↪ QT block from body now that the nest carries it.
+                // Card-only: nest owns the quote payload; body keeps commentary only.
                 $plainBody = trim(html_entity_decode(strip_tags((string) ($status['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                if ($plainBody !== '' && (str_contains($plainBody, '↪ QT') || str_contains($plainBody, '↪QT'))) {
-                    $commentary = $plainBody;
-                    if (preg_match('/^(.*?)(?:\n\n|\n)↪\s*QT.*$/us', $plainBody, $cm)) {
-                        $commentary = trim((string) ($cm[1] ?? ''));
-                    } elseif (preg_match('/^↪\s*QT/u', $plainBody)) {
-                        $commentary = '';
+                if ($plainBody !== '') {
+                    $qPlain = null;
+                    if (is_array($quoteEnt['quoted_status'] ?? null)) {
+                        $qPlain = trim(html_entity_decode(
+                            strip_tags((string) ($quoteEnt['quoted_status']['content'] ?? '')),
+                            ENT_QUOTES | ENT_HTML5,
+                            'UTF-8'
+                        ));
+                        if ($qPlain === '') {
+                            $qPlain = null;
+                        }
                     }
-                    // Also strip a leading RE:<url> left in commentary.
-                    $commentary = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $commentary) ?? $commentary;
-                    $commentary = trim($commentary);
-                    if ($commentary === '') {
-                        $status['content'] = '';
-                    } else {
-                        $escaped = htmlspecialchars($commentary, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-                        $status['content'] = '<p>' . nl2br($escaped) . '</p>';
+                    $commentary = function_exists('ap_plain_strip_raw_quote_lines')
+                        ? ap_plain_strip_raw_quote_lines($plainBody, $qPlain)
+                        : $plainBody;
+                    if ($commentary !== $plainBody) {
+                        if ($commentary === '') {
+                            $status['content'] = '';
+                        } else {
+                            $status['content'] = function_exists('ap_plain_text_to_html')
+                                ? ap_plain_text_to_html($commentary)
+                                : ('<p>' . nl2br(htmlspecialchars($commentary, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>');
+                        }
                     }
                 }
                 // Bridge pattern: some AP bridges only put the quoted attachment on
