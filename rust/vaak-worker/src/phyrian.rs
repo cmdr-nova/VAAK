@@ -183,8 +183,8 @@ pub async fn create_local_request(
     let rows = db
         .query(
             "SELECT id, COALESCE(actor_id,''), (disabled_at IS NULL)
-             FROM ap_users WHERE id = ANY($1::bigint[])",
-            &[&vec![from_owner, to_owner]],
+             FROM ap_users WHERE id = $1 OR id = $2",
+            &[&from_owner, &to_owner],
         )
         .await
         .context("load Phyrian request players")?;
@@ -201,19 +201,20 @@ pub async fn create_local_request(
         actor_by_id.insert(id, actor);
     }
     for (owner, actor) in [(from_owner, actor_by_id[&from_owner].clone()), (to_owner, actor_by_id[&to_owner].clone())] {
+        let owner_i32 = i32::try_from(owner).context("owner id outside PostgreSQL integer range")?;
         db.execute(
             "INSERT INTO phyrian_players (owner_user_id, actor_id, status, resonance, generation, level)
              VALUES ($1,$2,'unknown',0,1,1) ON CONFLICT (owner_user_id) DO NOTHING",
-            &[&owner, &actor],
+            &[&owner_i32, &actor],
         )
         .await
-        .context("ensure Phyrian player")?;
+        .map_err(|e| anyhow::anyhow!("ensure Phyrian player: {e}"))?;
     }
     let state = db
         .query(
             "SELECT owner_user_id, status, COALESCE(strain,''), generation
-             FROM phyrian_players WHERE owner_user_id = ANY($1::bigint[])",
-            &[&vec![from_owner, to_owner]],
+             FROM phyrian_players WHERE owner_user_id = $1 OR owner_user_id = $2",
+            &[&(from_owner as i32), &(to_owner as i32)],
         )
         .await
         .context("load Phyrian player state")?;
@@ -268,12 +269,14 @@ pub async fn resolve_local_request(
     if owner < 1 || request_id < 1 {
         anyhow::bail!("Invalid request");
     }
+    let owner_i32 = i32::try_from(owner).context("owner id outside PostgreSQL integer range")?;
+    let request_i64 = request_id;
     let mut db = db::connect(&cfg.database_url).await?;
     let row = db
         .query_opt(
             "SELECT kind, from_owner_id FROM phyrian_requests
              WHERE id=$1 AND to_owner_id=$2 AND status='pending' LIMIT 1",
-            &[&request_id, &owner],
+            &[&request_i64, &owner_i32],
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("Request not found"))?;
@@ -283,7 +286,7 @@ pub async fn resolve_local_request(
     if !accept {
         tx.execute(
             "UPDATE phyrian_requests SET status='denied', resolved_at=NOW() WHERE id=$1",
-            &[&request_id],
+            &[&request_i64],
         )
         .await?;
         tx.commit().await?;
@@ -293,8 +296,8 @@ pub async fn resolve_local_request(
         let rows = tx
             .query(
                 "SELECT owner_user_id, COALESCE(strain,''), generation, status
-                 FROM phyrian_players WHERE owner_user_id = ANY($1::bigint[])",
-                &[&vec![from_owner, owner]],
+                 FROM phyrian_players WHERE owner_user_id = $1 OR owner_user_id = $2",
+                &[&(from_owner as i32), &owner_i32],
             )
             .await?;
         let mut from_strain = String::new();
@@ -323,7 +326,7 @@ pub async fn resolve_local_request(
                      SET status='imprinted', strain='Phyrian', resonance=93,
                          generation=3, level=80, imprinted_at=COALESCE(imprinted_at,NOW()),
                          last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id=$1",
-                    &[&from_owner],
+                    &[&(from_owner as i32)],
                 )
                 .await?;
             }
@@ -337,18 +340,18 @@ pub async fn resolve_local_request(
              SET status='imprinted', strain=$1, resonance=GREATEST(resonance,50),
                  generation=$2, imprinted_by_owner_id=$3, imprinted_at=NOW(),
                  last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id=$4",
-            &[&strain, &generation, &from_owner, &owner],
+            &[&strain, &(generation as i32), &(from_owner as i32), &owner_i32],
         )
         .await?;
         tx.execute(
             "UPDATE phyrian_players SET inductions_given=inductions_given+1, updated_at=NOW()
              WHERE owner_user_id=$1",
-            &[&from_owner],
+            &[&(from_owner as i32)],
         )
         .await?;
         tx.execute(
             "UPDATE phyrian_requests SET status='accepted', resolved_at=NOW() WHERE id=$1",
-            &[&request_id],
+            &[&request_i64],
         )
         .await?;
         tx.commit().await?;
@@ -362,7 +365,7 @@ pub async fn resolve_local_request(
             "UPDATE phyrian_players SET resonance=LEAST(100,resonance+5),
              last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id IN ($1,$2)
              AND status='imprinted' AND COALESCE(strain,'') <> ''",
-            &[&from_owner, &owner],
+            &[&(from_owner as i32), &owner_i32],
         )
         .await?;
     if count != 2 {
@@ -370,7 +373,7 @@ pub async fn resolve_local_request(
     }
     tx.execute(
         "UPDATE phyrian_requests SET status='accepted', resolved_at=NOW() WHERE id=$1",
-        &[&request_id],
+        &[&request_i64],
     )
     .await?;
     tx.commit().await?;
