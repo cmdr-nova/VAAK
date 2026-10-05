@@ -1954,6 +1954,9 @@ $vaakAdminOnlyActions = [
             exit;
         }
     } elseif ($action === 'delete_status') {
+        $wantJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
         $localId = (int) ($_POST['local_id'] ?? 0);
         $noteIdPost = rtrim(trim((string) ($_POST['note_id'] ?? '')), '/');
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'outbox')) ?: 'outbox';
@@ -1991,14 +1994,35 @@ $vaakAdminOnlyActions = [
             if (function_exists('ap_bsky_tl_cache_clear_owner')) {
                 ap_bsky_tl_cache_clear_owner((int) ($GLOBALS['vaak_owner_id'] ?? 0));
             }
-            $notice = 'Post has been deleted';
+            // AJAX clients fade the card in place — no toast / full reload.
+            $notice = $wantJson ? null : 'Post has been deleted';
             $view = $returnView;
         } else {
             $error = $result['error'] ?? 'Delete failed.';
             $view = $returnView;
         }
+        if ($wantJson) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            if ($error !== null) {
+                http_response_code(400);
+            }
+            echo json_encode([
+                'ok' => $error === null && !empty($result['ok']),
+                'error' => $error,
+                'notice' => '',
+                'action' => 'delete_status',
+                'note_id' => (string) ($result['note_id'] ?? $noteIdPost),
+                'local_id' => $localId,
+                'return_view' => $returnView,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
+        }
     } elseif ($action === 'delete_bsky_post') {
         // Own Bluesky post: delete local twin (federates) when mapped, else Bluesky-only deleteRecord.
+        $wantJson = !empty($_POST['ajax'])
+            || str_contains((string) ($_SERVER['HTTP_ACCEPT'] ?? ''), 'application/json')
+            || strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
         $bskyUri = trim((string) ($_POST['bsky_uri'] ?? ''));
         $returnView = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'bluesky')) ?: 'bluesky';
         require_once __DIR__ . '/ap-bsky.php';
@@ -2035,11 +2059,27 @@ $vaakAdminOnlyActions = [
             if (function_exists('ap_bsky_tl_cache_clear_owner')) {
                 ap_bsky_tl_cache_clear_owner($owner);
             }
-            $notice = 'Post has been deleted';
+            $notice = $wantJson ? null : 'Post has been deleted';
             $view = $returnView;
         } else {
             $error = $result['error'] ?? 'Delete failed.';
             $view = $returnView;
+        }
+        if ($wantJson) {
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store');
+            if ($error !== null) {
+                http_response_code(400);
+            }
+            echo json_encode([
+                'ok' => $error === null && !empty($result['ok']),
+                'error' => $error,
+                'notice' => '',
+                'action' => 'delete_bsky_post',
+                'bsky_uri' => $bskyUri,
+                'return_view' => $returnView,
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            exit;
         }
     } elseif ($action === 'queue_post') {
         $inReplyTo = trim((string) ($_POST['in_reply_to'] ?? ''));
@@ -38929,6 +38969,105 @@ if (VIEW === 'analytics') loadAnalytics();
 })();
 </script>
 <script>
+// Own-post Delete: background POST + fade the card out of the timeline.
+// Confirm stays on the form onsubmit; no full reload, no success toast.
+(function () {
+  document.addEventListener('submit', async (ev) => {
+    const form = ev.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    // Inline onsubmit confirm() returns false → defaultPrevented; bail quietly.
+    if (ev.defaultPrevented) return;
+    const actionInput = form.querySelector('input[name="action"]');
+    if (!actionInput) return;
+    const action = String(actionInput.value || '');
+    if (action !== 'delete_status' && action !== 'delete_bsky_post') return;
+    ev.preventDefault();
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    if (form.dataset.busy === '1') return;
+    form.dataset.busy = '1';
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn) btn.disabled = true;
+    const card = form.closest('article.tweet');
+    const restore = () => {
+      form.dataset.busy = '0';
+      if (btn) btn.disabled = false;
+      if (!card || !card.isConnected) return;
+      card.style.transition = '';
+      card.style.opacity = '';
+      card.style.transform = '';
+      card.style.pointerEvents = '';
+      card.style.maxHeight = '';
+      card.style.marginTop = '';
+      card.style.marginBottom = '';
+      card.style.paddingTop = '';
+      card.style.paddingBottom = '';
+      card.style.overflow = '';
+    };
+    // Fade immediately while delete runs; restore only on failure.
+    if (card) {
+      const h = card.getBoundingClientRect().height;
+      card.style.overflow = 'hidden';
+      card.style.maxHeight = Math.max(1, Math.round(h)) + 'px';
+      card.style.transition = 'opacity .28s ease, transform .28s ease, max-height .32s ease, margin .32s ease, padding .32s ease';
+      card.style.opacity = '0';
+      card.style.transform = 'scale(0.98)';
+      card.style.pointerEvents = 'none';
+      // Collapse after fade so the timeline closes the gap smoothly.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (!card.isConnected) return;
+          card.style.maxHeight = '0px';
+          card.style.marginTop = '0';
+          card.style.marginBottom = '0';
+          card.style.paddingTop = '0';
+          card.style.paddingBottom = '0';
+        });
+      });
+    }
+    if (window.vaakHaptic) window.vaakHaptic(8);
+    const fd = new FormData(form);
+    fd.set('ajax', '1');
+    if (typeof window.vaakCsrfApply === 'function') window.vaakCsrfApply(fd);
+    else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
+    try {
+      const res = await fetch(form.getAttribute('action') || window.location.href, {
+        method: 'POST',
+        body: fd,
+        credentials: 'same-origin',
+        headers: {
+          'Accept': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+          ...(window.VAAK_CSRF ? { 'X-VAAK-CSRF': window.VAAK_CSRF } : {}),
+        },
+      });
+      const data = await res.json().catch(() => null);
+      if (!data || !data.ok) {
+        throw new Error((data && data.error) || 'Delete failed.');
+      }
+      // Success: finish collapse, then drop from the DOM (no toast).
+      const finish = () => {
+        if (card && card.isConnected) card.remove();
+        form.dataset.busy = '0';
+        // Focused status page: leave an empty shell → soft-nav to return_view.
+        const rv = (form.querySelector('input[name="return_view"]') || {}).value || '';
+        const onStatus = (window.location.search || '').includes('view=status');
+        if (onStatus && rv && typeof window.vaakSoftNavTo === 'function') {
+          try { window.vaakSoftNavTo(rv, true); } catch (e) {}
+        }
+      };
+      setTimeout(finish, 340);
+    } catch (err) {
+      restore();
+      if (typeof window.apAdminToast === 'function') {
+        window.apAdminToast((err && err.message) || 'Delete failed.', true);
+      }
+    } finally {
+      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    }
+  });
+})();
+</script>
+<script>
 // Suggested-account Follow: optimistic Following + silent background queue.
 // No Saving… toast, no “queued in the background” confirmation.
 (function () {
@@ -39400,6 +39539,7 @@ if (VIEW === 'analytics') loadAnalytics();
       'suggestion_follow', 'suggestion_dismiss',
       'rss_favourite', 'rss_bookmark',
       'poll_vote', 'action_queue_status',
+      'delete_status', 'delete_bsky_post',
     ].includes(action)) {
       return;
     }
