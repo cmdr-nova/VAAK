@@ -4991,6 +4991,8 @@ function ap_metrics_record(
                 && $actorId !== ''
             ) {
                 ap_timeline_fanout_followers_home($insertedId, $type, $actorId);
+                // 0.6.72: public firehose → active owners' Federated (+ Local if local actor).
+                ap_timeline_fanout_public_local_feed($insertedId, $type, $actorId, $visibility);
             }
         }
     } catch (Throwable $e) {
@@ -7968,6 +7970,158 @@ function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $
             $type,
             $eventId,
             $actorId,
+            count($owners),
+            $touched
+        ));
+    }
+}
+
+/**
+ * Local ap_users who currently have a warm ranked owner-index (capped, Redis-cached 60s).
+ *
+ * @return list<int>
+ */
+function ap_timeline_active_owner_ids(?int $limit = null): array
+{
+    $limit = $limit ?? ap_timeline_fanout_ingest_max_recipients();
+    $limit = max(1, min(128, $limit));
+    $cacheKey = 'vaak:timeline:active-owners:v1';
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($cacheKey);
+        if (is_array($cached) && $cached !== []) {
+            $ids = [];
+            foreach ($cached as $id) {
+                $id = (int) $id;
+                if ($id > 0) {
+                    $ids[] = $id;
+                }
+                if (count($ids) >= $limit) {
+                    break;
+                }
+            }
+            if ($ids !== []) {
+                return $ids;
+            }
+        }
+    }
+
+    $ids = [];
+    try {
+        $rows = ap_db()->query('SELECT id FROM ap_users ORDER BY id ASC')->fetchAll(PDO::FETCH_COLUMN) ?: [];
+    } catch (Throwable $e) {
+        error_log('[ap-db] active_owner_ids: ' . $e->getMessage());
+        return [];
+    }
+    $redis = function_exists('ap_redis_client') ? ap_redis_client('cache') : null;
+    foreach ($rows as $uid) {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            continue;
+        }
+        $indexKey = 'vaak:timeline:owner-index:v1:' . $uid;
+        $has = false;
+        if ($redis instanceof Redis) {
+            try {
+                $has = (bool) $redis->exists($indexKey);
+            } catch (Throwable $e) {
+                $has = false;
+            }
+        }
+        if (!$has && function_exists('ap_redis_json_get')) {
+            $logicals = ap_redis_json_get($indexKey);
+            $has = is_array($logicals) && $logicals !== [];
+        }
+        if ($has) {
+            $ids[] = $uid;
+        }
+        if (count($ids) >= $limit) {
+            break;
+        }
+    }
+    if ($ids !== [] && function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($cacheKey, $ids, 60);
+    }
+    return $ids;
+}
+
+/** True when $actorId is a local mkultra.monster /users/ actor (Local timeline). */
+function ap_timeline_actor_is_local(?string $actorId): bool
+{
+    $actorId = rtrim(trim((string) $actorId), '/');
+    return $actorId !== '' && str_starts_with($actorId, 'https://mkultra.monster/users/');
+}
+
+/**
+ * Public firehose Create/Announce/Quote* → active owners' Federated ranked (0.6.72).
+ * Local actors also prepend onto Local. No Home hydrate (feed/local only).
+ */
+function ap_timeline_fanout_public_local_feed(
+    int $eventId,
+    string $type,
+    ?string $actorId,
+    string $visibility = 'public'
+): void {
+    if (!ap_timeline_fanout_ingest_enabled()) {
+        return;
+    }
+    $eventId = max(0, $eventId);
+    $type = trim($type);
+    $actorId = rtrim(trim((string) $actorId), '/');
+    $visibility = function_exists('ap_normalize_visibility')
+        ? ap_normalize_visibility($visibility)
+        : strtolower(trim($visibility));
+    if (
+        $eventId < 1
+        || $actorId === ''
+        || $visibility !== 'public'
+        || !in_array($type, ['Create', 'Announce', 'Quote', 'QuotePost'], true)
+    ) {
+        return;
+    }
+
+    $owners = ap_timeline_active_owner_ids();
+    if ($owners === []) {
+        return;
+    }
+
+    $entry = [
+        'k' => 'event',
+        'id' => (string) $eventId,
+        's' => 'fediverse',
+    ];
+    $views = ['feed'];
+    if (ap_timeline_actor_is_local($actorId)) {
+        $views[] = 'local';
+    }
+
+    $touched = 0;
+    foreach ($owners as $ownerUserId) {
+        $ownerUserId = (int) $ownerUserId;
+        if ($ownerUserId < 1) {
+            continue;
+        }
+        if (function_exists('ap_row_is_hidden') && ap_row_is_hidden($actorId, null, $ownerUserId)) {
+            continue;
+        }
+        if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actorId, $ownerUserId)) {
+            continue;
+        }
+        try {
+            $res = ap_timeline_ranked_prepend_owner($ownerUserId, $entry, $views);
+            if (!empty($res['ok']) && (int) ($res['touched'] ?? 0) > 0) {
+                $touched++;
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-db] timeline_fanout_public_feed owner=' . $ownerUserId . ': ' . $e->getMessage());
+        }
+    }
+    if ($touched > 0) {
+        error_log(sprintf(
+            '[ap-db] timeline_fanout_public_feed type=%s event=%d actor=%s views=%s owners=%d touched=%d',
+            $type,
+            $eventId,
+            $actorId,
+            implode('+', $views),
             count($owners),
             $touched
         ));
