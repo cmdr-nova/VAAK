@@ -269,7 +269,7 @@ fn avatar_img_html(acct: &Value) -> String {
     let av_src = if avatar.starts_with("https://") {
         avatar
     } else {
-        "https://mkultra.monster/img/avatar/default.jpg"
+        "https://mkultra.monster/img/avatar/default.webp"
     };
     format!(
         "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\">",
@@ -388,7 +388,7 @@ fn paint_notif_card(n: &Value) -> String {
     let av_src = if avatar.starts_with("https://") {
         avatar
     } else {
-        "https://mkultra.monster/img/avatar/default.jpg"
+        "https://mkultra.monster/img/avatar/default.webp"
     };
     let av_img = format!(
         "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\">",
@@ -648,7 +648,7 @@ mod tests {
                 "display_name": acct,
                 "uri": uri,
                 "url": uri,
-                "avatar": "https://mkultra.monster/img/avatar/default.jpg"
+                "avatar": "https://mkultra.monster/img/avatar/default.webp"
             },
             "status": {
                 "id": "1",

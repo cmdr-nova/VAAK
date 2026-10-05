@@ -1796,7 +1796,7 @@ pub fn paint_lean_embed_from(
         let av = if avatar.starts_with("https://") {
             avatar
         } else {
-            "https://mkultra.monster/img/avatar/default.jpg"
+            "https://mkultra.monster/img/avatar/default.webp"
         };
         let from_q = if from.is_empty() { "mentions" } else { from };
         let profile_href = if actor_ref.starts_with("https://") {
@@ -2381,7 +2381,7 @@ mod tests {
             "account": {
                 "acct": "cmdr_nova",
                 "display_name": "Nova",
-                "avatar": "https://mkultra.monster/img/avatar/default.jpg",
+                "avatar": "https://mkultra.monster/img/avatar/default.webp",
                 "uri": "https://mkultra.monster/users/cmdr_nova"
             },
             "media_attachments": []
@@ -2413,7 +2413,7 @@ mod tests {
             "account": {
                 "acct": "valerie",
                 "display_name": "Valerie",
-                "avatar": "https://mkultra.monster/img/avatar/default.jpg",
+                "avatar": "https://mkultra.monster/img/avatar/default.webp",
                 "uri": "https://mkultra.monster/users/valerie"
             },
             "media_attachments": []
