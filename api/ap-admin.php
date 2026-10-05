@@ -23846,8 +23846,38 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     @keyframes vaak-spinner-spin { to { transform: rotate(360deg); } }
     @keyframes vaak-v-pulse {
-      0%, 100% { opacity: .55; transform: scale(.92); filter: drop-shadow(0 0 0 transparent); }
-      50% { opacity: 1; transform: scale(1); filter: drop-shadow(0 0 12px color-mix(in srgb, var(--primary) 55%, transparent)); }
+      0%, 100% { opacity: .72; transform: scale(.94); filter: drop-shadow(0 0 4px color-mix(in srgb, var(--primary) 25%, transparent)); }
+      50% { opacity: 1; transform: scale(1.04); filter: drop-shadow(0 0 14px color-mix(in srgb, var(--primary) 70%, transparent)); }
+    }
+    @keyframes vaak-v-chroma-r {
+      0%, 86%, 100% { opacity: 0; transform: translate(0, 0); clip-path: inset(0 0 0 0); }
+      88% { opacity: .75; transform: translate(-3px, 1px); clip-path: inset(12% 0 58% 0); }
+      90% { opacity: .55; transform: translate(2px, -2px); clip-path: inset(48% 0 18% 0); }
+      92% { opacity: .8; transform: translate(-4px, 0); clip-path: inset(0 0 0 0); }
+      94% { opacity: 0; transform: translate(0, 0); }
+    }
+    @keyframes vaak-v-chroma-c {
+      0%, 87%, 100% { opacity: 0; transform: translate(0, 0); clip-path: inset(0 0 0 0); }
+      89% { opacity: .7; transform: translate(3px, -1px); clip-path: inset(30% 0 40% 0); }
+      91% { opacity: .5; transform: translate(-2px, 2px); clip-path: inset(62% 0 8% 0); }
+      93% { opacity: .85; transform: translate(4px, 1px); clip-path: inset(0 0 0 0); }
+      95% { opacity: 0; transform: translate(0, 0); }
+    }
+    @keyframes vaak-v-scan {
+      0% { transform: translateY(-120%); opacity: 0; }
+      12% { opacity: .55; }
+      45% { opacity: .35; }
+      70% { transform: translateY(120%); opacity: 0; }
+      100% { transform: translateY(120%); opacity: 0; }
+    }
+    @keyframes vaak-v-flicker {
+      0%, 100% { opacity: 1; }
+      47% { opacity: 1; }
+      48% { opacity: .35; }
+      50% { opacity: 1; }
+      73% { opacity: 1; }
+      74% { opacity: .45; }
+      76% { opacity: 1; }
     }
     .vaak-loading-indicator {
       position: fixed; inset: 0; z-index: 10080;
@@ -23864,25 +23894,67 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       opacity: 1; visibility: visible;
       transition: opacity .16s ease, visibility 0s;
     }
-    .vaak-loading-indicator .vaak-v-loader {
-      width: 72px; height: 72px; object-fit: contain;
-      animation: vaak-v-pulse 1.15s ease-in-out infinite;
+    /* Static PNG + CSS glitch (scan / chroma / flicker) — asset is not an animated GIF. */
+    .vaak-v-loader {
+      --vaak-v-src: url("/api/assets/brand/vaak-v-loader.png");
+      position: relative;
+      display: inline-block;
+      width: 72px; height: 72px; flex: 0 0 72px;
       user-select: none;
+      isolation: isolate;
+    }
+    .vaak-v-loader img {
+      display: block; width: 100%; height: 100%; object-fit: contain;
+      animation: vaak-v-pulse 1.05s ease-in-out infinite, vaak-v-flicker 2.6s linear infinite;
+    }
+    .vaak-v-loader::before,
+    .vaak-v-loader::after {
+      content: "";
+      position: absolute; inset: 0;
+      background: var(--vaak-v-src) center / contain no-repeat;
+      pointer-events: none;
+      mix-blend-mode: screen;
+      opacity: 0;
+      will-change: transform, opacity, clip-path;
+    }
+    .vaak-v-loader::before {
+      filter: drop-shadow(-2px 0 #ff4fd8) saturate(1.4);
+      animation: vaak-v-chroma-r 2.2s steps(1, end) infinite;
+    }
+    .vaak-v-loader::after {
+      filter: drop-shadow(2px 0 #4ff0ff) saturate(1.4);
+      animation: vaak-v-chroma-c 2.2s steps(1, end) infinite;
+      animation-delay: .08s;
+    }
+    .vaak-v-loader__scan {
+      position: absolute; left: -8%; right: -8%; height: 18%;
+      top: 0; pointer-events: none; z-index: 2;
+      background: linear-gradient(
+        180deg,
+        transparent 0%,
+        color-mix(in srgb, var(--primary) 35%, transparent) 45%,
+        color-mix(in srgb, #fff 25%, transparent) 50%,
+        color-mix(in srgb, var(--primary) 35%, transparent) 55%,
+        transparent 100%
+      );
+      mix-blend-mode: soft-light;
+      animation: vaak-v-scan 1.35s linear infinite;
     }
     .vaak-soft-loading {
       min-height: 42vh; display: flex; align-items: center; justify-content: center;
       flex-direction: column; gap: .85rem; color: var(--primary); font-weight: 600;
     }
-    .vaak-soft-loading .vaak-v-loader {
-      width: 72px; height: 72px; object-fit: contain;
-      animation: vaak-v-pulse 1.15s ease-in-out infinite;
-    }
     .timeline-status-loading { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
     @media (prefers-reduced-motion: reduce) {
       .vaak-spinner { animation-duration: 1.4s; }
       .vaak-loading-indicator { transition: none; }
-      .vaak-loading-indicator .vaak-v-loader,
-      .vaak-soft-loading .vaak-v-loader { animation: none; opacity: .9; }
+      /* Keep a gentle breathe so the loader still reads as “in progress”. */
+      .vaak-v-loader img {
+        animation: vaak-v-pulse 2.2s ease-in-out infinite;
+      }
+      .vaak-v-loader::before,
+      .vaak-v-loader::after,
+      .vaak-v-loader__scan { animation: none !important; opacity: 0 !important; }
     }
     .brand-profile-link {
       display: inline-block;
@@ -23910,7 +23982,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 </head>
 <body class="<?= !empty($GLOBALS['vaak_guest_profile']) ? 'vaak-guest-profile ' : '' ?><?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
-  <img class="vaak-v-loader" src="/api/assets/brand/vaak-v-loader.png" width="72" height="72" alt="" decoding="async">
+  <span class="vaak-v-loader" aria-hidden="true">
+    <img src="/api/assets/brand/vaak-v-loader.png" width="72" height="72" alt="" decoding="async">
+    <span class="vaak-v-loader__scan"></span>
+  </span>
   <span data-vaak-loading-label>Loading…</span>
 </div>
 <div class="mobile-nav-backdrop" id="mobile-nav-backdrop" hidden></div>
@@ -35546,7 +35621,9 @@ window.apAdminToast = function (msg, isErr) {
     // show the V loader instead of a blank or stale page.
     try {
       main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite">'
-        + '<img class="vaak-v-loader" src="/api/assets/brand/vaak-v-loader.png" width="72" height="72" alt="" decoding="async">'
+        + '<span class="vaak-v-loader" aria-hidden="true">'
+        + '<img src="/api/assets/brand/vaak-v-loader.png" width="72" height="72" alt="" decoding="async">'
+        + '<span class="vaak-v-loader__scan"></span></span>'
         + '<span>' + loadingLabel + '</span></div>';
     } catch (e) {}
     try {
