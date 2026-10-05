@@ -10,6 +10,9 @@ use tokio_postgres::Client;
 use crate::config::Config;
 use crate::db;
 use crate::notif_embed::paint_lean_feed_card_opts;
+use crate::self_thread::{
+    missing_self_reply_parent_uris, paint_feed_units, plan_feed_paint_units,
+};
 
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
 const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
@@ -156,6 +159,7 @@ struct OutboxPaintRow {
     published: String,
     content: String,
     raw_create_json: String,
+    in_reply_to: String,
     local_id: Option<i64>,
     spoiler_text: String,
     sensitive: bool,
@@ -230,11 +234,13 @@ async fn fetch_outbox_tab(
     offset: i64,
 ) -> Result<Vec<OutboxPaintRow>> {
     let like = format!("{prefix}%");
+    // Mastodon semantics: Posts = originals + self-replies; Replies = replies to others.
+    let self_notes_like = format!("{prefix}notes/%");
     let rows = match tab {
         "media" => {
             db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
-                        COALESCE(raw_create_json, '')
+                        COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND raw_create_json LIKE '%\"attachment\"%'
                  ORDER BY published DESC
@@ -247,13 +253,14 @@ async fn fetch_outbox_tab(
         "replies" => {
             db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
-                        COALESCE(raw_create_json, '')
+                        COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1
                    AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
+                   AND in_reply_to NOT LIKE $2
                  ORDER BY published DESC
-                 LIMIT $2 OFFSET $3",
-                &[&like, &limit, &offset],
+                 LIMIT $3 OFFSET $4",
+                &[&like, &self_notes_like, &limit, &offset],
             )
             .await
             .context("select outbox replies tab")?
@@ -261,13 +268,16 @@ async fn fetch_outbox_tab(
         _ => {
             db.query(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
-                        COALESCE(raw_create_json, '')
+                        COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1
-                   AND (in_reply_to IS NULL OR btrim(in_reply_to) = '')
+                   AND (
+                     in_reply_to IS NULL OR btrim(in_reply_to) = ''
+                     OR in_reply_to LIKE $2
+                   )
                  ORDER BY published DESC
-                 LIMIT $2 OFFSET $3",
-                &[&like, &limit, &offset],
+                 LIMIT $3 OFFSET $4",
+                &[&like, &self_notes_like, &limit, &offset],
             )
             .await
             .context("select outbox posts tab")?
@@ -285,6 +295,7 @@ async fn fetch_outbox_tab(
             published: row.get(1),
             content: row.get(2),
             raw_create_json: row.get(3),
+            in_reply_to: row.get(4),
             local_id: None,
             spoiler_text: String::new(),
             sensitive: false,
@@ -413,7 +424,7 @@ fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
         .map(|n| n.to_string())
         .unwrap_or_else(|| row.id.clone());
     let media = media_from_raw_create(&row.raw_create_json);
-    json!({
+    let mut st = json!({
         "id": sid,
         "created_at": created,
         "in_reply_to_id": Value::Null,
@@ -443,7 +454,23 @@ fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
         "emojis": [],
         "card": Value::Null,
         "poll": Value::Null,
-    })
+    });
+    let parent = row.in_reply_to.trim().trim_end_matches('/');
+    if !parent.is_empty() && parent.starts_with("https://") {
+        st["vaak_in_reply_to_url"] = json!(parent);
+        if let Some((child_actor, _)) = row.id.rsplit_once("/notes/") {
+            if let Some((parent_actor, _)) = parent.rsplit_once("/notes/") {
+                if child_actor == parent_actor {
+                    st["vaak_self_thread"] = json!(true);
+                    st["in_reply_to_id"] = json!(parent);
+                    if let Some(acct_id) = account.get("id").cloned() {
+                        st["in_reply_to_account_id"] = acct_id;
+                    }
+                }
+            }
+        }
+    }
+    st
 }
 
 fn html_escape_text(s: &str) -> String {
@@ -550,7 +577,7 @@ async fn hydrate_announce_inners(
     let rows = db
         .query(
             "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
-                    COALESCE(raw_create_json, '')
+                    COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
              FROM outbox_notes WHERE id = ANY($1)",
             &[&note_ids],
         )
@@ -564,6 +591,7 @@ async fn hydrate_announce_inners(
             published: row.get(1),
             content: row.get(2),
             raw_create_json: row.get(3),
+            in_reply_to: row.get(4),
             local_id: None,
             spoiler_text: String::new(),
             sensitive: false,
@@ -703,12 +731,21 @@ pub async fn profile_html_fill(
     // Cached OG/YouTube cards (PHP `ap_link_preview_card_for_status_text` parity).
     let _ = crate::link_preview::attach_cached_cards(&db, &mut statuses).await;
 
-    let mut html = String::with_capacity(statuses.len() * 1200);
-    let mut painted = 0usize;
-    for st in &statuses {
-        html.push_str(&paint_lean_feed_card_opts(st, "remote_profile", &viewer_actor));
-        painted += 1;
+    // Self-thread: nest reply under parent when both are local own-notes.
+    let mut extra_parents = std::collections::HashMap::new();
+    if tab == "posts" {
+        let need = missing_self_reply_parent_uris(&statuses);
+        if !need.is_empty() {
+            if let Ok(fetched) = fetch_outbox_statuses_by_uris(&db, &need).await {
+                extra_parents = fetched;
+            }
+        }
+        // Point in_reply_to_id at parent status id when parent is present.
+        crate::home_hydrate_ranked::link_outbox_reply_ids(&mut statuses);
     }
+    let units = plan_feed_paint_units(&statuses, &extra_parents);
+    let paint = |st: &Value, from: &str, viewer: &str| paint_lean_feed_card_opts(st, from, viewer);
+    let (html, painted) = paint_feed_units(&units, "remote_profile", &viewer_actor, &paint);
     if painted == 0 {
         return Ok(None);
     }
@@ -720,6 +757,109 @@ pub async fn profile_html_fill(
         next_offset: (offset as usize) + painted,
         source: "axum-profile-html".into(),
     }))
+}
+
+/// Load local outbox notes by URI for self-thread parent hydrate.
+pub async fn fetch_outbox_statuses_by_uris(
+    db: &Client,
+    uris: &[String],
+) -> Result<std::collections::HashMap<String, Value>> {
+    let mut map = std::collections::HashMap::new();
+    if uris.is_empty() {
+        return Ok(map);
+    }
+    let mut variants = Vec::new();
+    for u in uris {
+        let base = u.trim().trim_end_matches('/');
+        if base.is_empty() {
+            continue;
+        }
+        variants.push(base.to_string());
+        variants.push(format!("{base}/"));
+    }
+    variants.sort();
+    variants.dedup();
+    if variants.is_empty() {
+        return Ok(map);
+    }
+    let rows = db
+        .query(
+            "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
+                    COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
+             FROM outbox_notes WHERE id = ANY($1)",
+            &[&variants],
+        )
+        .await
+        .context("select outbox parents for self-thread")?;
+    let mut paint_rows = Vec::new();
+    for row in rows {
+        paint_rows.push(OutboxPaintRow {
+            id: row.get(0),
+            published: row.get(1),
+            content: row.get(2),
+            raw_create_json: row.get(3),
+            in_reply_to: row.get(4),
+            local_id: None,
+            spoiler_text: String::new(),
+            sensitive: false,
+            visibility: "public".into(),
+            content_text: String::new(),
+            pinned: false,
+        });
+    }
+    let mut note_ids = Vec::new();
+    for r in &paint_rows {
+        note_ids.push(r.id.trim_end_matches('/').to_string());
+        note_ids.push(format!("{}/", r.id.trim_end_matches('/')));
+    }
+    if !note_ids.is_empty() {
+        if let Ok(masto) = db
+            .query(
+                "SELECT note_id, local_id, COALESCE(spoiler_text, ''), COALESCE(sensitive, 0),
+                        COALESCE(visibility, 'public'), COALESCE(content_text, '')
+                 FROM masto_statuses WHERE note_id = ANY($1)",
+                &[&note_ids],
+            )
+            .await
+        {
+            let mut by_note = std::collections::HashMap::new();
+            for m in masto {
+                let note_id: String = m.get(0);
+                let sens_i: i64 = m.get(3);
+                by_note.insert(
+                    note_id.trim_end_matches('/').to_string(),
+                    (
+                        m.get::<_, i64>(1),
+                        m.get::<_, String>(2),
+                        sens_i != 0,
+                        m.get::<_, String>(4),
+                        m.get::<_, String>(5),
+                    ),
+                );
+            }
+            for r in &mut paint_rows {
+                let key = r.id.trim_end_matches('/').to_string();
+                if let Some((lid, spoiler, sens, vis, ctext)) = by_note.get(&key) {
+                    r.local_id = Some(*lid);
+                    r.spoiler_text = spoiler.clone();
+                    r.sensitive = *sens;
+                    r.visibility = vis.clone();
+                    r.content_text = ctext.clone();
+                }
+            }
+        }
+    }
+    for r in &paint_rows {
+        let key = r.id.trim_end_matches('/').to_string();
+        let username = key
+            .strip_prefix(LOCAL_ACTOR_PREFIX)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("unknown");
+        let actor = format!("{LOCAL_ACTOR_PREFIX}{username}");
+        let account = load_profile_account(db, username, &actor).await;
+        map.insert(key, materialize_outbox_status(r, &account));
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -759,6 +899,7 @@ mod tests {
             published: "2026-10-05 12:00:00".into(),
             content: "<p>hello</p>".into(),
             raw_create_json: String::new(),
+            in_reply_to: String::new(),
             local_id: Some(12345),
             spoiler_text: "cw".into(),
             sensitive: true,
