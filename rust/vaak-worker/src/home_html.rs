@@ -110,12 +110,16 @@ pub async fn tl_html_fill(
 
     let end = (offset + limit).min(report.items.len());
     // Flags already overlaid in timeline::view_hydrate (0.7.19).
-    let slice = &report.items[offset..end];
+    let mut slice: Vec<serde_json::Value> = report.items[offset..end].to_vec();
+    // Attach cached OG/YouTube cards (PHP paint parity) before lean HTML.
+    if let Ok(db) = db::connect(&cfg.database_url).await {
+        let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
+    }
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
 
     let mut html = String::with_capacity(slice.len() * 1200);
     let mut painted = 0usize;
-    for item in slice {
+    for item in &slice {
         if !item.is_object() {
             continue;
         }

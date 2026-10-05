@@ -654,32 +654,28 @@ function ap_link_preview_html(?array $card, bool $interactive = true): string
     $descHtml = $desc !== '' ? '<div class="link-card__desc">' . $desc . '</div>' : '';
     $provHtml = $provider !== '' ? '<div class="link-card__provider">' . $provider . '</div>' : '';
 
-    // YouTube gets a click-to-play card. Keep this isolated from ordinary
-    // link cards and uploaded media so other preview/media handling is unchanged.
+    // YouTube gets a full-width 16:9 click-to-play card (fills the post column).
     $youtubeId = ap_link_preview_youtube_id((string) $entity['url']);
     if ($youtubeId !== null) {
         $safeId = htmlspecialchars($youtubeId, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $thumb = $image !== ''
             ? $image
             : htmlspecialchars('https://i.ytimg.com/vi/' . rawurlencode($youtubeId) . '/hqdefault.jpg', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-        $thumbInner = '<img src="' . $thumb . '" alt="" loading="lazy" referrerpolicy="no-referrer"'
-            . ' style="display:block;width:100%;height:100%;min-height:102px;object-fit:cover">'
-            . '<span aria-hidden="true" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:grid;place-items:center;width:2.6rem;height:2.6rem;border-radius:50%;background:rgba(0,0,0,.78);color:#fff;font-size:1.2rem">▶</span>';
-        $thumbStyle = 'position:relative;display:block;flex:0 0 180px;width:180px;min-height:102px;padding:0;border:0;background:#080808;overflow:hidden';
+        $thumbInner = '<img src="' . $thumb . '" alt="" loading="lazy" referrerpolicy="no-referrer">'
+            . '<span class="youtube-link-card__play-icon" aria-hidden="true">▶</span>';
         if ($interactive) {
-            $play = '<button type="button" data-youtube-play aria-label="Play YouTube video" style="' . $thumbStyle . ';cursor:pointer">'
+            $play = '<button type="button" class="youtube-link-card__play" data-youtube-play aria-label="Play YouTube video">'
                 . $thumbInner
                 . '</button>';
-            $open = '<a href="' . $url . '" target="_blank" rel="nofollow noopener noreferrer"'
-                . ' style="display:inline-block;margin-top:.4rem;color:inherit;font-size:.76rem">Open on YouTube</a>';
+            $open = '<a class="youtube-link-card__open" href="' . $url . '" target="_blank" rel="nofollow noopener noreferrer">Open on YouTube</a>';
         } else {
             // Profile outbox list wraps each post in <a class="post">. Nested
             // <button>/<a> make browsers close that outer link early, so the
             // card detaches and bleeds into the next post. Keep this static.
-            $play = '<span class="youtube-link-card__thumb" aria-hidden="true" style="' . $thumbStyle . '">'
+            $play = '<span class="youtube-link-card__thumb" aria-hidden="true">'
                 . $thumbInner
                 . '</span>';
-            $open = '<span style="display:inline-block;margin-top:.4rem;color:inherit;font-size:.76rem">YouTube</span>';
+            $open = '<span class="youtube-link-card__open">YouTube</span>';
         }
         $inner = $play
             . '<div class="link-card__body">'
@@ -689,7 +685,7 @@ function ap_link_preview_html(?array $card, bool $interactive = true): string
             . $open
             . '</div>';
         $static = $interactive ? '' : ' link-card--static';
-        return '<div class="link-card youtube-link-card' . $static . '" data-youtube-id="' . $safeId . '" data-youtube-url="' . $url . '">' . $inner . '</div>';
+        return '<div class="link-card youtube-link-card youtube-link-card--wide' . $static . '" data-youtube-id="' . $safeId . '" data-youtube-url="' . $url . '">' . $inner . '</div>';
     }
 
     $imgHtml = $image !== ''
