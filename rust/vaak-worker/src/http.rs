@@ -91,6 +91,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/notif-embed", get(shadow_notif_embed))
         // Mentions fill HTML from warm Redis list (0.7.1).
         .route("/shadow/mentions-html", get(shadow_mentions_html))
+        // Home fill HTML from hydrate Redis (0.7.4).
+        .route("/shadow/home-html", get(shadow_home_html))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
         .route("/api/v1/timelines/home", get(shadow_home_masto))
         // Home live-poll: ranked head + hydrate filtered by since_ts (0.6.74).
@@ -125,6 +127,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/timelines/home",
             "/shadow/notif-embed",
             "/shadow/mentions-html",
+            "/shadow/home-html",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
             "/api/v1/notifications"
@@ -240,6 +243,66 @@ async fn shadow_notif_embed(
     }
     let _ = crate::notif_embed::set_embed_html(&mut redis, &key, &html).await;
     embed_html_response(html, "paint")
+}
+
+/// Home fill HTML (0.7.4). Cache miss → 404 so PHP keeps card paint.
+async fn shadow_home_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(15).clamp(1, 40);
+    match crate::home_html::home_html_fill(&state.cfg, owner, limit).await {
+        Ok(Some(report)) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-has-more"),
+                axum::http::HeaderValue::from_static(if report.has_more { "1" } else { "0" }),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.next_offset.to_string()) {
+                headers.insert(axum::http::HeaderName::from_static("x-next-offset"), v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-source"), v);
+            }
+            headers.insert(
+                axum::http::HeaderName::from_static("x-vaak-home-html"),
+                axum::http::HeaderValue::from_static("1"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-tl-cache"),
+                axum::http::HeaderValue::from_static("axum-home-html"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-count"), v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.hydrate_key) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-key"), v);
+            }
+            (StatusCode::OK, headers, report.html).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "home html cache miss",
+                "source": "vaak-worker-shadow"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// Mentions fill HTML (0.7.1). Cache miss → 404 so PHP keeps the old paint path.

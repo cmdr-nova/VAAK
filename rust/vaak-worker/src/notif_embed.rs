@@ -240,6 +240,11 @@ fn media_row_html(st: &Value) -> String {
 
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
 pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
+    paint_lean_embed_from(status, hide_header, "mentions")
+}
+
+/// Lean status card HTML with `from=` deep-link context (Mentions nest or Home fill).
+pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> String {
     let account = status.get("account").cloned().unwrap_or(Value::Null);
     let acct = account
         .get("acct")
@@ -306,10 +311,12 @@ pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
         } else {
             "https://mkultra.monster/img/avatar/default.jpg"
         };
+        let from_q = if from.is_empty() { "mentions" } else { from };
         let profile_href = if actor_ref.starts_with("https://") {
             format!(
-                "?view=remote_profile&actor={}&from=mentions",
-                urlencoding_encode(actor_ref)
+                "?view=remote_profile&actor={}&from={}",
+                urlencoding_encode(actor_ref),
+                urlencoding_encode(from_q)
             )
         } else {
             String::new()
@@ -406,10 +413,24 @@ pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
         inner.push_str(&body_inner);
     }
 
+    // Nested quote preview when present (lean — no link-card / poll / ask).
+    if let Some(q) = status
+        .get("quote")
+        .filter(|v| v.is_object())
+        .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
+    {
+        let q_html = paint_lean_embed_from(q, false, from);
+        inner.push_str(&format!(
+            "<div class=\"quote-block\" style=\"margin-top:.55rem\">{q_html}</div>"
+        ));
+    }
+
     if !uri.is_empty() {
+        let from_q = if from.is_empty() { "mentions" } else { from };
         let open = format!(
-            "?view=status&object={}&from=mentions",
-            urlencoding_encode(uri)
+            "?view=status&object={}&from={}",
+            urlencoding_encode(uri),
+            urlencoding_encode(from_q)
         );
         inner.push_str(&format!(
             "<div class=\"tweet-actions\"><a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Open</a></div>",
@@ -428,6 +449,97 @@ pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
         ac = article_classes,
         inner = inner
     )
+}
+
+/// Lean Home feed card: boost chrome + status body (no notif-embed wrap).
+pub fn paint_lean_feed_card(status: &Value) -> String {
+    let mut st = status.clone();
+    let mut boost_header = String::new();
+    let content_empty = {
+        let c = st.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        strip_tags(c).trim().is_empty()
+    };
+    if content_empty {
+        if let Some(inner) = st.get("reblog").filter(|v| v.is_object()).cloned() {
+            let booster = st.get("account").cloned().unwrap_or(Value::Null);
+            let booster_acct = booster
+                .get("acct")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Someone");
+            let booster_name = booster
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(booster_acct);
+            let boost_when = st
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(relative_time)
+                .unwrap_or_default();
+            let inner_uri = inner
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .or_else(|| inner.get("url").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let inner_acct = inner
+                .get("account")
+                .and_then(|a| a.get("acct"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let boost_source = if is_rss(&inner) {
+                "RSS"
+            } else if is_bsky(&inner, inner_acct, inner_uri) {
+                "Bluesky"
+            } else {
+                "Fediverse"
+            };
+            let booster_ref = booster
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .or_else(|| booster.get("url").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let booster_label = if booster_ref.starts_with("https://") {
+                format!(
+                    "<a href=\"?view=remote_profile&amp;actor={}&amp;from=home\" style=\"color:inherit;text-decoration:none\">{}</a>",
+                    urlencoding_encode(booster_ref),
+                    esc(booster_name)
+                )
+            } else {
+                esc(booster_name)
+            };
+            let when_bit = if boost_when.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", esc(&boost_when))
+            };
+            boost_header = format!(
+                "<div class=\"meta meta-row\" style=\"color:var(--primary)\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i> {booster_label} boosted{when_bit} <span class=\"tag\" style=\"margin-left:.35rem;color:var(--text)\" title=\"Boost source network\">{src}</span></div>",
+                src = esc(boost_source)
+            );
+            st = inner;
+        }
+    }
+    // Feed cards use the embed painter with header, then unwrap the outer embed div
+    // so Home timeline items stay `<article class="tweet">` peers.
+    let painted = paint_lean_embed_from(&st, false, "home");
+    let article = if let Some(start) = painted.find("<article") {
+        if let Some(end) = painted.rfind("</article>") {
+            painted[start..end + "</article>".len()].to_string()
+        } else {
+            painted
+        }
+    } else {
+        painted
+    };
+    if boost_header.is_empty() {
+        article
+    } else {
+        format!(
+            "<div class=\"tweet-boost\">{boost_header}{article}</div>",
+            boost_header = boost_header,
+            article = article
+        )
+    }
 }
 
 /// Minimal URL-encode for query values (uri / actor).
