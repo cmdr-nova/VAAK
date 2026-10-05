@@ -15,6 +15,12 @@
 
 PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Timeline fan-out (0.6.73) enqueues to Rust first; PHP Redis prepend runs only if queue push fails or `VAAK_TIMELINE_FANOUT_RUST=0`. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm keeps PHP hydrate as cold fallback; ranked Home/Local/Federated are native-only (empty soft-skips; `bin/ranked-warm.php` retired). Interim bridges drop as each surface moves fully to Rust + Axum.
 
+Notification ordering: list envelopes include a `latest_id` watermark. The live
+unread badge does not publish a newer state until the warmed list reaches that
+watermark, so clients do not receive a badge for a notification that is not yet
+available from the notification endpoint. Older envelopes are supported by
+deriving the watermark from their item IDs.
+
 ## Live systemd units
 
 ```bash
