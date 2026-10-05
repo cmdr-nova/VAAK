@@ -35529,8 +35529,23 @@ window.apAdminToast = function (msg, isErr) {
     if (typeof window.vaakShowLoading === 'function') {
       window.vaakShowLoading(loadingLabel);
     }
-    // Replace main immediately so slow shells (Followers/Following/profiles)
-    // show the V loader instead of a blank or stale page.
+    // Park the live compose panel BEFORE wiping section.main. The inline
+    // composer lives in #compose-inline-slot inside main; clearing innerHTML
+    // first destroyed the only .compose-modal__panel and left Home/FAB dead
+    // until a hard refresh (0.7.12).
+    if (typeof window.vaakParkComposerForSoftNav === 'function') {
+      try { window.vaakParkComposerForSoftNav(); } catch (e) {}
+    } else {
+      const livePanelEarly = document.querySelector('.compose-modal__panel');
+      const modalShellEarly = document.getElementById('compose-modal');
+      if (livePanelEarly && modalShellEarly) {
+        livePanelEarly.classList.remove('compose-inline-panel');
+        if (livePanelEarly.parentElement !== modalShellEarly) {
+          modalShellEarly.appendChild(livePanelEarly);
+        }
+      }
+    }
+    // Replace main immediately so slow shells show a spinner instead of stale content.
     try {
       main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite">'
         + '<span class="vaak-spinner" aria-hidden="true"></span>'
@@ -35572,13 +35587,9 @@ window.apAdminToast = function (msg, isErr) {
         return;
       }
       if (!html.trim()) throw new Error('empty-shell');
-      const livePanel = document.querySelector('.compose-modal__panel');
-      if (livePanel && main.contains(livePanel)) {
-        const modalShell = document.getElementById('compose-modal');
-        if (modalShell) {
-          livePanel.classList.remove('compose-inline-panel');
-          modalShell.appendChild(livePanel);
-        }
+      // Safety park (panel should already be outside main after the early park).
+      if (typeof window.vaakParkComposerForSoftNav === 'function') {
+        try { window.vaakParkComposerForSoftNav(); } catch (e) {}
       }
       main.innerHTML = html;
       const loadedItems = main.querySelector('#timeline-items');
@@ -36482,6 +36493,19 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     modal.setAttribute('aria-hidden', 'true');
     if (fab) fab.removeAttribute('aria-hidden');
   }
+  /** Move the live compose panel into #compose-modal before section.main is wiped. */
+  window.vaakParkComposerForSoftNav = function () {
+    const panel = getComposePanel();
+    const modalShell = document.getElementById('compose-modal');
+    if (!panel || !modalShell) return false;
+    panel.classList.remove('compose-inline-panel');
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    if (panel.parentElement !== modalShell) {
+      modalShell.appendChild(panel);
+    }
+    return true;
+  };
   window.vaakAdoptComposerAfterSoftNav = function () {
     const panel = getComposePanel();
     if (!panel) return false;
@@ -36494,7 +36518,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       if (form) ensureComposeAsLine(form);
       return true;
     }
-    if (panel.classList.contains('compose-inline-panel')) {
+    if (panel.classList.contains('compose-inline-panel') || panel.parentElement !== modal) {
       placeComposerInModal();
     }
     return true;
