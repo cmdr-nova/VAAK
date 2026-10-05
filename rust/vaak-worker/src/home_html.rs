@@ -160,7 +160,7 @@ mod tests {
                 "acct": "booster",
                 "display_name": "Booster",
                 "uri": "https://example.com/users/booster",
-                "avatar": "https://mkultra.monster/img/avatar/default.jpg"
+                "avatar": "https://mkultra.monster/img/avatar/default.webp"
             },
             "reblog": {
                 "id": "inner1",
@@ -172,7 +172,7 @@ mod tests {
                     "acct": "orig",
                     "display_name": "Orig",
                     "uri": "https://example.com/users/orig",
-                    "avatar": "https://mkultra.monster/img/avatar/default.jpg"
+                    "avatar": "https://mkultra.monster/img/avatar/default.webp"
                 },
                 "media_attachments": []
             }

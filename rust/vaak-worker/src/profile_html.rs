@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::db;
 use crate::notif_embed::paint_lean_feed_card_opts;
 
-const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.jpg";
+const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
 const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
 
 #[derive(Debug, Clone)]

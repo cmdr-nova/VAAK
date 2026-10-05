@@ -25,7 +25,10 @@ use crate::redis_util;
 use crate::timeline;
 
 const HOME_HYDRATE_TTL_SECS: u64 = 300;
-const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.jpg";
+/// Remote / unknown fallback — `default.jpg` 404s on disk; use webp.
+const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.webp";
+/// Local mkultra accounts without actor_profile.icon_url.
+const LOCAL_DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
 /// Include 50 — Ice Cubes head polls `/api/v1/timelines/home?limit=50` (0.7.21).
 const DEFAULT_LIMITS: [i64; 4] = [15, 40, 50, 80];
 
@@ -722,6 +725,12 @@ struct OutboxRow {
     content: String,
 }
 
+#[derive(Clone, Default)]
+struct LocalProfile {
+    display_name: String,
+    icon_url: String,
+}
+
 #[derive(Clone)]
 struct BoostRow {
     id: i64,
@@ -1015,7 +1024,49 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
     st
 }
 
-fn materialize_outbox(row: &OutboxRow, owner_username: &str) -> Value {
+fn local_username_from_url(url: &str) -> Option<String> {
+    let url = url.trim_end_matches('/');
+    let rest = url.strip_prefix("https://mkultra.monster/users/")?;
+    let key = rest.split('/').next().unwrap_or("").trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(key.to_ascii_lowercase())
+}
+
+fn local_account_from_profile(
+    actor_url: &str,
+    username: &str,
+    profiles: &HashMap<String, LocalProfile>,
+) -> Value {
+    let key = username.to_ascii_lowercase();
+    let (display, avatar) = if let Some(p) = profiles.get(&key) {
+        let d = if p.display_name.trim().is_empty() {
+            username.to_string()
+        } else {
+            p.display_name.trim().to_string()
+        };
+        let a = if p.icon_url.starts_with("https://") {
+            p.icon_url.clone()
+        } else {
+            LOCAL_DEFAULT_AVATAR.to_string()
+        };
+        (d, a)
+    } else {
+        (username.to_string(), LOCAL_DEFAULT_AVATAR.to_string())
+    };
+    empty_account(actor_url, username, username, &display, actor_url, &avatar)
+}
+
+fn materialize_outbox(
+    row: &OutboxRow,
+    owner_username: &str,
+    profiles: &HashMap<String, LocalProfile>,
+) -> Value {
     let created = format_time(&row.published);
     // Local note snowflake type 0 — use a stable hash slot from the note id.
     let mut hasher = Sha256::new();
@@ -1033,14 +1084,7 @@ fn materialize_outbox(row: &OutboxRow, owner_username: &str) -> Value {
         .next()
         .unwrap_or(owner_username)
         .to_string();
-    let account = empty_account(
-        &actor_url,
-        &username,
-        &username,
-        &username,
-        &actor_url,
-        DEFAULT_AVATAR,
-    );
+    let account = local_account_from_profile(&actor_url, &username, profiles);
     base_status(
         &status_id,
         &created,
@@ -1392,6 +1436,43 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
     Ok(map)
 }
 
+async fn fetch_local_profiles_map(
+    db: &Client,
+    keys: &[String],
+) -> Result<HashMap<String, LocalProfile>> {
+    let mut map = HashMap::new();
+    if keys.is_empty() {
+        return Ok(map);
+    }
+    let mut keys: Vec<String> = keys
+        .iter()
+        .map(|k| k.trim().to_ascii_lowercase())
+        .filter(|k| !k.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let rows = db
+        .query(
+            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, '')
+             FROM actor_profile
+             WHERE lower(actor_key) = ANY($1)",
+            &[&keys],
+        )
+        .await
+        .context("select actor_profile for local hydrate avatars")?;
+    for row in rows {
+        let key: String = row.get(0);
+        map.insert(
+            key,
+            LocalProfile {
+                display_name: row.get(1),
+                icon_url: row.get(2),
+            },
+        );
+    }
+    Ok(map)
+}
+
 async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String, OutboxRow>> {
     let mut map = HashMap::new();
     if ids.is_empty() {
@@ -1629,6 +1710,7 @@ fn materialize_boost(
     rb: &BoostRow,
     create: Option<&EventRow>,
     actors: &HashMap<String, ActorRow>,
+    local_profiles: &HashMap<String, LocalProfile>,
 ) -> Option<Value> {
     if reblog_is_bsky_native(&rb.status_id, &rb.object_id)
         || reblog_is_rss_local(&rb.status_id, &rb.object_id)
@@ -1651,14 +1733,18 @@ fn materialize_boost(
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown")
         .to_string();
-    let booster_acct = empty_account(
-        &owner_actor,
-        &username,
-        &username,
-        &username,
-        &owner_actor,
-        DEFAULT_AVATAR,
-    );
+    let booster_acct = if local_username_from_url(&owner_actor).is_some() {
+        local_account_from_profile(&owner_actor, &username, local_profiles)
+    } else {
+        empty_account(
+            &owner_actor,
+            &username,
+            &username,
+            &username,
+            &owner_actor,
+            DEFAULT_AVATAR,
+        )
+    };
 
     let object_id = rb.object_id.trim_end_matches('/').to_string();
     let mut inner = if let Some(crow) = create {
@@ -1877,6 +1963,25 @@ pub async fn warm_view(
     let actors_map = fetch_actors_map(&db, &actor_ids).await?;
     let outbox_map = fetch_outbox_map(&db, &outbox_ids).await?;
 
+    // Local outbox / boost authors → actor_profile icons (0.7.24).
+    let mut local_keys: Vec<String> = Vec::new();
+    for row in outbox_map.values() {
+        if let Some((prefix, _)) = row.id.rsplit_once("/notes/") {
+            if let Some(u) = local_username_from_url(prefix) {
+                local_keys.push(u);
+            }
+        }
+    }
+    for rb in boosts_map.values() {
+        if let Some(u) = local_username_from_url(&rb.owner_actor_id) {
+            local_keys.push(u);
+        }
+    }
+    if !owner_username.is_empty() {
+        local_keys.push(owner_username.to_ascii_lowercase());
+    }
+    let local_profiles = fetch_local_profiles_map(&db, &local_keys).await?;
+
     let mut statuses = Vec::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
     for e in &head {
@@ -1907,10 +2012,10 @@ pub async fn warm_view(
             }
             ("home" | "local", "outbox") => outbox_map
                 .get(e.id.trim_end_matches('/'))
-                .map(|row| materialize_outbox(row, &owner_username)),
+                .map(|row| materialize_outbox(row, &owner_username, &local_profiles)),
             ("local", "boost") => boosts_map.get(&e.id).and_then(|rb| {
                 let create = creates_map.get(rb.object_id.trim_end_matches('/'));
-                materialize_boost(rb, create, &actors_map)
+                materialize_boost(rb, create, &actors_map, &local_profiles)
             }),
             _ => None,
         };
