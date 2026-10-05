@@ -8,6 +8,7 @@ mod hidden;
 mod http;
 mod jetstream;
 mod notif;
+mod notif_embed;
 mod notif_list;
 mod ranked;
 mod ranked_warm;
