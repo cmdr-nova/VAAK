@@ -3013,6 +3013,47 @@ function ap_text_scrub_as2_dump(string $text): string
 }
 
 /**
+ * Card-only policy for quotes/quote-boosts: keep commentary, drop every raw
+ * ↪ QT / RE:<url> / AS2 dump line. Optional $quotedPlain clears body text that
+ * merely duplicates the nested quote card.
+ */
+function ap_plain_strip_raw_quote_lines(string $plain, ?string $quotedPlain = null): string
+{
+    $plain = trim($plain);
+    if ($plain === '') {
+        return '';
+    }
+    if (ap_text_looks_like_as2_json($plain)) {
+        $plain = ap_text_scrub_as2_dump($plain);
+        if ($plain === '') {
+            return '';
+        }
+    }
+    // Cut from the first QT marker to end (card owns that payload).
+    if (preg_match('/^(.*?)(?:\n\n|\n)\s*(?:↪|➡|→)\s*QT\b.*$/us', $plain, $m)) {
+        $plain = trim((string) ($m[1] ?? ''));
+    } elseif (preg_match('/^\s*(?:↪|➡|→)\s*QT\b/u', $plain)) {
+        $plain = '';
+    } else {
+        // Belts: any remaining QT line (odd separators / single-line bodies).
+        $plain = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)\s*QT\b[^\n]*/u', '', $plain) ?? $plain;
+        $plain = trim($plain);
+    }
+    $plain = preg_replace('/(?:^|\n)\s*RE:\s*https:\/\/[^\s<>]+/u', '', $plain) ?? $plain;
+    $plain = trim($plain);
+    if ($plain !== '' && is_string($quotedPlain)) {
+        $q = trim($quotedPlain);
+        if ($q !== '' && (strcasecmp($plain, $q) === 0 || str_starts_with($plain, $q) || str_contains($plain, $q))) {
+            // Body is only repeating what the nest already shows.
+            if (strcasecmp($plain, $q) === 0 || trim(str_replace($q, '', $plain)) === '') {
+                $plain = '';
+            }
+        }
+    }
+    return trim($plain);
+}
+
+/**
  * Build a plain-text feed preview for a quote: commentary + quoted snippet.
  * Handles Create wrappers, Tombstones, and never embeds raw AS2 JSON.
  */

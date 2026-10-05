@@ -161,8 +161,8 @@ function ap_normalize_apply_bsky_sensitivity(array $status): array
 }
 
 /**
- * Drop raw ↪ QT / AS2 dumps from status content once a structured quote exists,
- * and scrub QuoteAuthorization / QTCreate pollution even without a nest.
+ * Card-only quotes/quote-boosts: never leave raw ↪ QT / AS2 / RE: lines in content.
+ * Nested quote cards own that payload; body keeps commentary only.
  *
  * @param array<string,mixed> $status
  * @return array<string,mixed>
@@ -178,41 +178,38 @@ function ap_normalize_scrub_quote_pollution(array $status): array
         if ($plain === '') {
             return $st;
         }
-        $hasQuote = is_array($st['quote'] ?? null);
-        $changed = false;
-
-        if (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
-            $kept = function_exists('ap_text_scrub_as2_dump')
-                ? ap_text_scrub_as2_dump($plain)
-                : '';
-            $plain = $kept;
-            $changed = true;
-        }
-
-        // Structured quote owns the nest — never also leave raw ↪ QT in the body.
-        if ($hasQuote && $plain !== '' && (str_contains($plain, '↪ QT') || str_contains($plain, '↪QT')
-            || (bool) preg_match('/↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $plain))) {
-            $commentary = $plain;
-            if (preg_match('/^(.*?)(?:\n\n|\n)↪\s*QT.*$/us', $plain, $cm)) {
-                $commentary = trim((string) ($cm[1] ?? ''));
-            } elseif (preg_match('/^↪\s*QT/u', $plain)) {
-                $commentary = '';
+        $quotedPlain = null;
+        if (is_array($st['quote']['quoted_status'] ?? null)) {
+            $quotedPlain = trim(html_entity_decode(
+                strip_tags((string) ($st['quote']['quoted_status']['content'] ?? '')),
+                ENT_QUOTES | ENT_HTML5,
+                'UTF-8'
+            ));
+            if ($quotedPlain === '') {
+                $quotedPlain = null;
             }
-            $commentary = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $commentary) ?? $commentary;
-            $plain = trim($commentary);
-            $changed = true;
         }
-
-        if (!$changed) {
+        $hasQt = str_contains($plain, '↪ QT') || str_contains($plain, '↪QT')
+            || (bool) preg_match('/(?:↪|➡|→)\s*QT\b/u', $plain)
+            || str_contains($plain, 'RE: https://')
+            || (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain));
+        // Always strip when a nest exists or the body still carries raw QT/AS2 form.
+        if (!$hasQt && $quotedPlain === null) {
             return $st;
         }
-        if ($plain === '') {
+        $next = function_exists('ap_plain_strip_raw_quote_lines')
+            ? ap_plain_strip_raw_quote_lines($plain, $quotedPlain)
+            : $plain;
+        if ($next === $plain) {
+            return $st;
+        }
+        if ($next === '') {
             $st['content'] = '';
             return $st;
         }
         $st['content'] = function_exists('ap_plain_text_to_html')
-            ? ap_plain_text_to_html($plain)
-            : ('<p>' . nl2br(htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>');
+            ? ap_plain_text_to_html($next)
+            : ('<p>' . nl2br(htmlspecialchars($next, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>');
         return $st;
     };
 
