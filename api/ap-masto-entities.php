@@ -6876,23 +6876,37 @@ function ap_masto_notifications_mark_read(?string $lastId = null): string
     if ($lastId !== null && $lastId !== '') {
         $candidates[] = $lastId;
     }
-    // The admin page already performs a light scan to obtain $lastId. Avoid
-    // repeating that scan and hydrating another notification on page load when
-    // an explicit tip was supplied.
+    // Tip-less mark_read must stay light. A full notifications_fetch(1) /
+    // unread_state(bypass) rebuild here used to cost 10–47s on Mentions soft-nav.
+    // Prefer Axum head id first; only then cached unread-state. Never force a
+    // cold unread rebuild just to clear the badge (0.6.75).
     if ($lastId === null || $lastId === '') {
-        try {
-            $state = ap_masto_notifications_unread_state(80, true);
-            $candidates[] = (string) ($state['latest_id'] ?? '');
-            $candidates[] = (string) ($state['latest_unread_id'] ?? '');
-            $candidates[] = (string) ($state['last_read_id'] ?? '');
-        } catch (Throwable $e) {
-            // fall through
+        $haveAxumTip = false;
+        if (function_exists('ap_masto_notifications_axum_fetch')) {
+            try {
+                $axumHead = ap_masto_notifications_axum_fetch(1);
+                if (is_array($axumHead) && isset($axumHead[0]) && is_array($axumHead[0])) {
+                    $axTip = (string) ($axumHead[0]['id'] ?? '');
+                    if ($axTip !== '') {
+                        $candidates[] = $axTip;
+                        $haveAxumTip = true;
+                    }
+                }
+            } catch (Throwable $e) {
+                // fall through
+            }
         }
-        try {
-            $latest = ap_masto_notifications_fetch(1);
-            $candidates[] = (string) ($latest[0]['id'] ?? '');
-        } catch (Throwable $e) {
-            // fall through
+        if (!$haveAxumTip) {
+            try {
+                // Cache/stale only — unread_state still rebuilds on total miss,
+                // so skip when Axum already supplied a tip.
+                $state = ap_masto_notifications_unread_state(80, false);
+                $candidates[] = (string) ($state['latest_id'] ?? '');
+                $candidates[] = (string) ($state['latest_unread_id'] ?? '');
+                $candidates[] = (string) ($state['last_read_id'] ?? '');
+            } catch (Throwable $e) {
+                // fall through
+            }
         }
     }
     try {

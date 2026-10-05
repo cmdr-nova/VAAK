@@ -18749,21 +18749,24 @@ if ($isPartial && $view === 'mentions') {
     // Soft-nav paints an empty shell first; the async partial can afford a
     // wider window so like/boost groups form. Look-ahead inside
     // admin_notifications_page completes groups that would split at the edge.
-    $notifLimit = isset($_GET['limit']) ? max(1, min(60, (int) $_GET['limit'])) : 30;
+    // First Mentions page defaults to 12 (was 30) so nested card HTML stays
+    // under a couple seconds; scroll loads the rest.
+    $notifLimit = isset($_GET['limit']) ? max(1, min(60, (int) $_GET['limit'])) : ($notifShell ? 12 : 12);
     $notifMaxId = preg_replace('/\D+/', '', (string) ($_GET['notifications_max_id'] ?? '')) ?: null;
     // Soft-nav first page has no max_id; infinite scroll passes one.
     if ($notifShell) {
         $notifMaxId = null;
-        if (function_exists('ap_masto_notifications_mark_read')) {
-            try {
-                ap_masto_notifications_mark_read();
-            } catch (Throwable $e) {
-                // non-fatal
-            }
-        }
+        // Do NOT mark_read on the empty shell. mark_read() without a tip used to
+        // call notifications_fetch(1) / unread_state(bypass) (~10–47s) and made
+        // Home→Mentions soft-nav feel stuck before "Loading…" even appeared.
+        // Badge clear + markers update happen on the fill partial with a tip.
     }
-    // Partials skip followers by default — restore for Follow/relationship badges.
-    if ($followerIds === []) {
+    $notifPartialT0 = microtime(true);
+    // Mentions partials must not sync-repair Bluesky galleries (same as timeline).
+    $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
+    // Partials skip followers by default — restore for Follow/relationship badges
+    // on the fill path only (shell HTML does not render relationship pills).
+    if (!$notifShell && $followerIds === []) {
         try {
             $followers = ap_followers_list($vaakActorId);
             $followerIds = $adminIndexActorMap($followers, true);
@@ -18777,12 +18780,83 @@ if ($isPartial && $view === 'mentions') {
     $adminNotifs = [];
     $nextMaxId = '';
     $hasMore = false;
+    $notifFetchMs = 0;
+    $notifRenderMs = 0;
+    $notifPrefetchMs = 0;
     if (!$notifShell) {
         try {
+            $notifFetchT0 = microtime(true);
             $notifPage = admin_notifications_page($notifLimit, $notifMaxId, $notifTypes);
             $adminNotifs = $notifPage['items'];
             $nextMaxId = $notifPage['next_max_id'];
             $hasMore = $notifPage['has_more'];
+            $notifFetchMs = (int) round((microtime(true) - $notifFetchT0) * 1000);
+            // Tip-only mark_read after the page is in hand (no hydrate).
+            if ($notifMaxId === null && function_exists('ap_masto_notifications_mark_read')) {
+                $markTip = '';
+                foreach ($adminNotifs as $nRow) {
+                    if (!is_array($nRow)) {
+                        continue;
+                    }
+                    $markTip = preg_replace('/\D+/', '', (string) ($nRow['id'] ?? '')) ?: '';
+                    if ($markTip !== '') {
+                        break;
+                    }
+                }
+                if ($markTip !== '') {
+                    try {
+                        ap_masto_notifications_mark_read($markTip);
+                    } catch (Throwable $e) {
+                        // non-fatal
+                    }
+                }
+            }
+            // Batch-prime actors / avatars / fav+boost flags before nested cards.
+            $notifPrefetchT0 = microtime(true);
+            $notifActorIds = [];
+            $notifStatusIds = [];
+            foreach ($adminNotifs as $nRow) {
+                if (!is_array($nRow)) {
+                    continue;
+                }
+                $acct = is_array($nRow['account'] ?? null) ? $nRow['account'] : [];
+                foreach (['uri', 'url'] as $ak) {
+                    $aid = rtrim((string) ($acct[$ak] ?? ''), '/');
+                    if ($aid !== '' && str_starts_with($aid, 'https://')) {
+                        $notifActorIds[] = $aid;
+                    }
+                }
+                $st = is_array($nRow['status'] ?? null) ? $nRow['status'] : null;
+                if (is_array($st)) {
+                    $sid = (string) ($st['id'] ?? '');
+                    if ($sid !== '') {
+                        $notifStatusIds[] = $sid;
+                    }
+                    if (isset($st['reblog']) && is_array($st['reblog'])) {
+                        $rid = (string) ($st['reblog']['id'] ?? '');
+                        if ($rid !== '') {
+                            $notifStatusIds[] = $rid;
+                        }
+                    }
+                    $stAcct = is_array($st['account'] ?? null) ? $st['account'] : [];
+                    foreach (['uri', 'url'] as $ak) {
+                        $aid = rtrim((string) ($stAcct[$ak] ?? ''), '/');
+                        if ($aid !== '' && str_starts_with($aid, 'https://')) {
+                            $notifActorIds[] = $aid;
+                        }
+                    }
+                }
+            }
+            if ($notifActorIds !== [] && function_exists('ap_remote_actors_prefetch')) {
+                ap_remote_actors_prefetch($notifActorIds);
+            }
+            if ($notifActorIds !== [] && function_exists('ap_remote_media_prefetch')) {
+                ap_remote_media_prefetch($notifActorIds, 'avatar');
+            }
+            if ($notifStatusIds !== [] && function_exists('ap_masto_status_flags_prefetch')) {
+                ap_masto_status_flags_prefetch($notifStatusIds);
+            }
+            $notifPrefetchMs = (int) round((microtime(true) - $notifPrefetchT0) * 1000);
         } catch (Throwable $e) {
             error_log('[ap-admin] notifications partial: ' . $e->getMessage());
         }
@@ -18799,6 +18873,8 @@ if ($isPartial && $view === 'mentions') {
         header('X-VAAK-Notif-Source: redis');
     }
     if ($notifShell) {
+        header('X-TL-Notif-Shell: 1');
+        header('X-TL-Notif-Total-Ms: ' . (string) (int) round((microtime(true) - $notifPartialT0) * 1000));
         $notifFilterHref = static function (string $filter): string {
             return '?view=mentions&notification_filter=' . rawurlencode($filter);
         };
@@ -18835,7 +18911,16 @@ if ($isPartial && $view === 'mentions') {
         echo '<button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>';
         exit;
     }
+    $notifRenderT0 = microtime(true);
+    ob_start();
     admin_render_notification_stream($adminNotifs, $followingIds, $followerIds);
+    $notifHtml = (string) ob_get_clean();
+    $notifRenderMs = (int) round((microtime(true) - $notifRenderT0) * 1000);
+    header('X-TL-Notif-Fetch-Ms: ' . (string) $notifFetchMs);
+    header('X-TL-Notif-Prefetch-Ms: ' . (string) $notifPrefetchMs);
+    header('X-TL-Notif-Render-Ms: ' . (string) $notifRenderMs);
+    header('X-TL-Notif-Total-Ms: ' . (string) (int) round((microtime(true) - $notifPartialT0) * 1000));
+    echo $notifHtml;
     exit;
 }
 
@@ -18889,9 +18974,11 @@ if (empty($GLOBALS['vaak_guest_profile'])) {
 try {
     if ($view === 'mentions' && function_exists('ap_masto_notifications_mark_read')) {
         // Light scan only — never hydrate a full notification entity just to clear the badge.
+        // Use cached unread-state (bypassCache=false); tip-less mark_read no longer
+        // calls notifications_fetch(1) after 0.6.75.
         $markTip = null;
         if (function_exists('ap_masto_notifications_unread_state')) {
-            $markState = ap_masto_notifications_unread_state(80, true);
+            $markState = ap_masto_notifications_unread_state(80, false);
             $markTip = preg_replace('/\D+/', '', (string) ($markState['latest_id'] ?? '')) ?: null;
         }
         ap_masto_notifications_mark_read($markTip);
@@ -34023,7 +34110,7 @@ window.apAdminToast = function (msg, isErr) {
     }
     try {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
-        + encodeURIComponent(view === 'mentions' ? '30' : (view === 'outbox' ? '20' : '15'));
+        + encodeURIComponent(view === 'mentions' ? '12' : (view === 'outbox' ? '20' : '15'));
       if (view === 'mentions' && filter) url += '&notification_filter=' + encodeURIComponent(filter);
       if (view === 'favourites' && extra.network) url += '&network=' + encodeURIComponent(extra.network);
       if ((view === 'following' || view === 'followers') && extra.network) {
