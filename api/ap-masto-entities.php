@@ -6144,7 +6144,7 @@ function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit 
         return;
     }
     $scheduled[$ownerUserId] = true;
-    $limit = max(1, min(40, $limit));
+    $limit = max(1, min(80, $limit));
     $script = __DIR__ . '/bin/home-timeline-warm.php';
     if (!is_file($script)) {
         return;
@@ -6158,9 +6158,14 @@ function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit 
                 ignore_user_abort(true);
             }
             $php = getenv('VAAK_PHP_BIN') ?: PHP_BINARY ?: '/usr/bin/php';
+            // Always store 15+40+80 heads so infinite-scroll offset pages hit Axum.
+            $limits = '15,40,80';
+            if ($limit > 80) {
+                $limits = '15,40,80,' . (int) $limit;
+            }
             $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
                 . ' --owner-id=' . (int) $ownerUserId
-                . ' --limit=' . (int) $limit
+                . ' --limits=' . escapeshellarg($limits)
                 . ' >/dev/null 2>&1 &';
             if (function_exists('exec')) {
                 @exec($cmd);

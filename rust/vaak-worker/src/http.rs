@@ -44,6 +44,8 @@ pub struct OwnerQuery {
     pub bookmarked: Option<String>,
     /// Account-switch prep views: `home`, `local`, `feed` (comma-separated).
     pub views: Option<String>,
+    /// Home HTML infinite-scroll window start (0.7.9).
+    pub offset: Option<i64>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -291,14 +293,15 @@ async fn shadow_account_switch_prep(
     }
 }
 
-/// Home fill HTML (0.7.4). Cache miss → 404 so PHP keeps card paint.
+/// Home fill HTML (0.7.4). Offset pages (0.7.9). Cache miss → 404 so PHP keeps card paint.
 async fn shadow_home_html(
     State(state): State<AppState>,
     Query(q): Query<OwnerQuery>,
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let limit = q.limit.unwrap_or(15).clamp(1, 40);
-    match crate::home_html::home_html_fill(&state.cfg, owner, limit).await {
+    let offset = q.offset.unwrap_or(0).max(0);
+    match crate::home_html::home_html_fill(&state.cfg, owner, limit, offset).await {
         Ok(Some(report)) => {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(

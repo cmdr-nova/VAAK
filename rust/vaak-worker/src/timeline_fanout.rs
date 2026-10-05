@@ -148,7 +148,7 @@ async fn invalidate_home_hydrate(
     cache: &mut redis::aio::MultiplexedConnection,
     owner: i64,
 ) -> Result<()> {
-    let keys: Vec<String> = [15_i64, 40, 20, 30]
+    let keys: Vec<String> = [15_i64, 40, 80, 20, 30]
         .into_iter()
         .map(|lim| home_hydrate_redis_key(owner, lim))
         .collect();
@@ -183,7 +183,7 @@ async fn maybe_spawn_home_hydrate_warm(owner: i64) {
     let mut cmd = Command::new(&php_bin);
     cmd.arg(&script)
         .arg(format!("--owner-id={owner}"))
-        .arg("--limits=15,40")
+        .arg("--limits=15,40,80")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

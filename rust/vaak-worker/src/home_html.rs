@@ -1,7 +1,8 @@
-//! Home fill HTML from warm hydrate Redis (0.7.4).
+//! Home fill HTML from warm hydrate Redis (0.7.4+).
 //!
-//! Serves soft-nav / first-paint Home cards without PHP
+//! Serves soft-nav / first-paint / infinite-scroll Home cards without PHP
 //! `admin_render_masto_status_card` × N (Home partial p99 was multi-second).
+//! Offset pages (0.7.9) slice a larger warm envelope (15/40/80).
 
 use anyhow::Result;
 
@@ -20,38 +21,53 @@ pub struct HomeHtmlReport {
 }
 
 /// Build Home feed HTML from hydrate Redis (`vaak:timeline:v1:*`).
+///
+/// `offset` skips the head of a warm envelope so infinite-scroll pages can hit
+/// the same Axum lean paint path as first paint (0.7.9).
 pub async fn home_html_fill(
     cfg: &Config,
     owner_user_id: i64,
     limit: i64,
+    offset: i64,
 ) -> Result<Option<HomeHtmlReport>> {
     let limit = limit.clamp(1, 40) as usize;
-    let mut report = timeline::home_hydrate(cfg, owner_user_id, limit, None).await?;
-    // Warm tick writes limits 15+40; soft-nav may ask for other sizes.
-    if !report.cache_hit {
-        for alt in [15_usize, 40, 20, 30] {
-            if alt == limit {
-                continue;
-            }
+    let offset = offset.max(0) as usize;
+    let need = (offset + limit).min(80);
+
+    // Prefer the smallest warm size that covers this window, then larger heads.
+    let mut candidates: Vec<usize> = Vec::new();
+    for alt in [need, 80usize, 40, 60, 30, 20, 15] {
+        if alt >= need && !candidates.contains(&alt) {
+            candidates.push(alt);
+        }
+    }
+    // Last resort: any warm head (may be shorter than need; we still slice).
+    for alt in [80usize, 40, 15, 30, 20] {
+        if !candidates.contains(&alt) {
+            candidates.push(alt);
+        }
+    }
+
+    let mut report = timeline::home_hydrate(cfg, owner_user_id, candidates[0], None).await?;
+    if !report.cache_hit || report.items.len() <= offset {
+        for &alt in &candidates[1..] {
             let alt_report = timeline::home_hydrate(cfg, owner_user_id, alt, None).await?;
-            if alt_report.cache_hit && !alt_report.items.is_empty() {
+            if alt_report.cache_hit && alt_report.items.len() > offset {
                 report = alt_report;
                 break;
             }
         }
     }
-    if !report.cache_hit || report.items.is_empty() {
+    if !report.cache_hit || report.items.is_empty() || report.items.len() <= offset {
         return Ok(None);
     }
 
-    let mut items = report.items;
-    if items.len() > limit {
-        items.truncate(limit);
-    }
+    let end = (offset + limit).min(report.items.len());
+    let slice = &report.items[offset..end];
 
-    let mut html = String::with_capacity(items.len() * 1200);
+    let mut html = String::with_capacity(slice.len() * 1200);
     let mut painted = 0usize;
-    for item in &items {
+    for item in slice {
         if !item.is_object() {
             continue;
         }
@@ -65,8 +81,9 @@ pub async fn home_html_fill(
     Ok(Some(HomeHtmlReport {
         html,
         count: painted,
-        has_more: painted >= limit,
-        next_offset: painted.min(limit),
+        // Full page ⇒ client may ask again; Axum miss falls through to PHP.
+        has_more: painted >= limit || end < report.items.len(),
+        next_offset: offset + painted,
         source: format!("axum-home-html:{}", report.source),
         hydrate_key: report.redis_key,
     }))
