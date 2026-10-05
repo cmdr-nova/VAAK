@@ -14310,6 +14310,19 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     $isLocal = $actorId !== '' && function_exists('vaak_is_local_url') && vaak_is_local_url($actorId);
     $isSelf = $actorId !== '' && function_exists('vaak_actor_id')
         && rtrim(vaak_actor_id(), '/') === $actorId;
+    // Owner bind may lag vaak_actor_id() on some paints — also match ap_users row.
+    if (!$isSelf && $actorId !== '' && $ownerUserId > 0 && function_exists('ap_db')) {
+        try {
+            $ownSt = ap_db()->prepare('SELECT actor_id FROM ap_users WHERE id = ? LIMIT 1');
+            $ownSt->execute([$ownerUserId]);
+            $ownActor = rtrim((string) ($ownSt->fetchColumn() ?: ''), '/');
+            if ($ownActor !== '' && $ownActor === $actorId) {
+                $isSelf = true;
+            }
+        } catch (Throwable $e) {
+            // keep prior isSelf
+        }
+    }
     // Local admins must remain reachable for moderation. Personal blocks are
     // therefore never offered (or accepted) against an admin actor.
     $isLocalAdmin = $actorId !== '' && function_exists('admin_is_local_admin_actor')
@@ -14319,7 +14332,18 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $pathHandle = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
         $pathHandle = preg_replace('~^profile/~', '', $pathHandle) ?? $pathHandle;
         $isSelf = is_array($bs) && $pathHandle !== ''
-            && strcasecmp($pathHandle, (string) ($bs['handle'] ?? '')) === 0;
+            && (
+                strcasecmp($pathHandle, (string) ($bs['handle'] ?? '')) === 0
+                || strcasecmp($pathHandle, (string) ($bs['did'] ?? '')) === 0
+            );
+    }
+    if (!$isSelf && $objectId !== '' && function_exists('vaak_is_own_url') && vaak_is_own_url($objectId)) {
+        $isSelf = true;
+    }
+    // Own account / own posts: Open/Edit/Pin live in admin_own_post_action_bar.
+    // Never offer personal mute/block, server-wide mute/block, or moderation panel.
+    if ($isSelf) {
+        return '';
     }
     $personalBlock = function_exists('ap_user_block_find')
         ? ap_user_block_find($actorId, $host, $ownerUserId)
@@ -14401,7 +14425,8 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
         $menu .= '<a class="menu-action" href="' . h(admin_report_href($actorId, $objectId, $returnFrom !== '' ? $returnFrom : $returnView)) . '">Report user</a>';
     }
     // Admin-only: one mute + one block for this actor (instance blocks live under Server blocks).
-    if ($isAdmin && !$isLocal && $actorId !== '') {
+    // Self is already excluded above — keep !$isSelf as belt-and-suspenders.
+    if ($isAdmin && !$isLocal && $actorId !== '' && !$isSelf) {
         if ($menu !== '') {
             $menu .= '<div class="menu-action-sep" role="separator" aria-hidden="true"></div>';
         }
