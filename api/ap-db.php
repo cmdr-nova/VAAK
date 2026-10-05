@@ -7589,6 +7589,239 @@ function ap_timeline_cache_invalidate_owner(int $ownerUserId): void
     }
 }
 
+/** Redis key for ranked ID list (parity with admin_tl_redis_key / ranked-warm). */
+function ap_timeline_ranked_redis_key(string $logical): string
+{
+    return 'vaak:timeline:ranked:v2:' . hash('sha256', $logical);
+}
+
+/**
+ * Home hydrate Redis key for an owner (parity with ap_masto_timeline_cache_key).
+ *
+ * @param array<string,scalar|null> $extraQuery
+ */
+function ap_timeline_home_hydrate_redis_key(int $ownerUserId, int $limit, ?string $sinceId = null, array $extraQuery = []): string
+{
+    return 'vaak:timeline:v1:' . hash('sha256', json_encode([
+        'u' => max(0, $ownerUserId),
+        'p' => '/api/v1/timelines/home',
+        'l' => $limit,
+        's' => $sinceId,
+        'x' => $extraQuery,
+    ], JSON_UNESCAPED_SLASHES) ?: '');
+}
+
+/** Drop warm Home hydrate envelopes so Axum/Ice Cubes do not serve a stale head. */
+function ap_timeline_home_hydrate_invalidate_owner(int $ownerUserId): void
+{
+    $ownerUserId = max(0, $ownerUserId);
+    if ($ownerUserId < 1 || !function_exists('ap_redis_delete')) {
+        return;
+    }
+    $keys = [];
+    foreach ([15, 40, 20, 30] as $limit) {
+        $keys[] = ap_timeline_home_hydrate_redis_key($ownerUserId, $limit);
+    }
+    ap_redis_delete(...$keys);
+}
+
+/**
+ * Fire-and-forget Home hydrate warm (works without ap-masto-entities loaded).
+ */
+function ap_timeline_home_hydrate_warm_async(int $ownerUserId, string $limits = '15,40'): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    static $scheduled = [];
+    $schedKey = $ownerUserId . ':' . $limits;
+    if (isset($scheduled[$schedKey])) {
+        return;
+    }
+    $scheduled[$schedKey] = true;
+    $script = __DIR__ . '/bin/home-timeline-warm.php';
+    if (!is_file($script)) {
+        return;
+    }
+    register_shutdown_function(static function () use ($ownerUserId, $limits, $script): void {
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+            $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
+                . ' --owner-id=' . (int) $ownerUserId
+                . ' --limits=' . escapeshellarg($limits)
+                . ' >/dev/null 2>&1 &';
+            if (function_exists('exec')) {
+                @exec($cmd);
+            }
+        } catch (Throwable $e) {
+            // optional
+        }
+    });
+}
+
+/**
+ * Prepend one ranked entry into an owner's warm Home/Local caches (0.6.69).
+ * Full ranked-warm remains the periodic truth; this keeps compose/boost on head.
+ *
+ * @param array{k:string,id:string,s?:string,t?:int} $entry
+ * @param list<string> $views
+ * @return array{ok:bool,touched:int,skipped:string}
+ */
+function ap_timeline_ranked_prepend_owner(int $ownerUserId, array $entry, array $views = ['home', 'local']): array
+{
+    $ownerUserId = max(0, $ownerUserId);
+    $k = trim((string) ($entry['k'] ?? ''));
+    $id = rtrim(trim((string) ($entry['id'] ?? '')), '/');
+    if ($ownerUserId < 1 || $k === '' || $id === '') {
+        return ['ok' => false, 'touched' => 0, 'skipped' => 'bad_args'];
+    }
+    if (!function_exists('ap_redis_json_get') || !function_exists('ap_redis_json_set')) {
+        return ['ok' => false, 'touched' => 0, 'skipped' => 'no_redis'];
+    }
+
+    $want = [];
+    foreach ($views as $view) {
+        $v = strtolower(trim((string) $view));
+        if (in_array($v, ['home', 'local', 'feed'], true)) {
+            $want[$v] = true;
+        }
+    }
+    if ($want === []) {
+        $want = ['home' => true, 'local' => true];
+    }
+
+    $indexKey = 'vaak:timeline:owner-index:v1:' . $ownerUserId;
+    $logicals = ap_redis_json_get($indexKey);
+    if (!is_array($logicals) || $logicals === []) {
+        return ['ok' => true, 'touched' => 0, 'skipped' => 'no_index'];
+    }
+
+    $dedupe = $k . ':' . $id;
+    $newEntry = [
+        'k' => $k,
+        'id' => $id,
+        's' => trim((string) ($entry['s'] ?? $k)),
+    ];
+    if (!empty($entry['t'])) {
+        $newEntry['t'] = 1;
+    }
+
+    $touched = 0;
+    $ttl = 600;
+    $maxRanked = 160;
+    $prefixHome = 'v13_home_u' . $ownerUserId . '_';
+    $prefixLocal = 'v13_local_u' . $ownerUserId . '_';
+    $prefixFeed = 'v13_feed_u' . $ownerUserId . '_';
+
+    foreach ($logicals as $logical) {
+        if (!is_string($logical) || $logical === '') {
+            continue;
+        }
+        $view = null;
+        if (!empty($want['home']) && str_starts_with($logical, $prefixHome)) {
+            $view = 'home';
+        } elseif (!empty($want['local']) && str_starts_with($logical, $prefixLocal)) {
+            $view = 'local';
+        } elseif (!empty($want['feed']) && str_starts_with($logical, $prefixFeed)) {
+            $view = 'feed';
+        }
+        if ($view === null) {
+            continue;
+        }
+
+        $redisKey = ap_timeline_ranked_redis_key($logical);
+        $env = ap_redis_json_get($redisKey);
+        if (!is_array($env) || !isset($env['ranked']) || !is_array($env['ranked'])) {
+            continue;
+        }
+
+        $ranked = [];
+        $seen = [$dedupe => true];
+        $ranked[] = $newEntry;
+        foreach ($env['ranked'] as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            $rk = trim((string) ($row['k'] ?? ''));
+            $rid = rtrim(trim((string) ($row['id'] ?? '')), '/');
+            if ($rk === '' || $rid === '') {
+                continue;
+            }
+            $dk = $rk . ':' . $rid;
+            if (isset($seen[$dk])) {
+                continue;
+            }
+            $seen[$dk] = true;
+            $item = ['k' => $rk, 'id' => $rid];
+            $s = trim((string) ($row['s'] ?? ''));
+            if ($s !== '') {
+                $item['s'] = $s;
+            }
+            if (!empty($row['t'])) {
+                $item['t'] = 1;
+            }
+            $ranked[] = $item;
+            if (count($ranked) >= $maxRanked) {
+                break;
+            }
+        }
+
+        $now = time();
+        $sourceCounts = [];
+        foreach ($ranked as $row) {
+            $source = trim((string) ($row['s'] ?? $row['k'] ?? 'unknown')) ?: 'unknown';
+            $sourceCounts[$source] = (int) ($sourceCounts[$source] ?? 0) + 1;
+        }
+        ksort($sourceCounts);
+        $payload = [
+            'ts' => $now,
+            'warm_ts' => $now,
+            'source' => (string) ($env['source'] ?? 'vaak-fanout-prepend'),
+            'ranked' => $ranked,
+            'stage_meta' => [
+                'ranked_count' => count($ranked),
+                'source_counts' => $sourceCounts,
+                'fanout' => 'prepend',
+            ],
+        ];
+        if (ap_redis_json_set($redisKey, $payload, $ttl)) {
+            $touched++;
+        }
+    }
+
+    return ['ok' => true, 'touched' => $touched, 'skipped' => $touched > 0 ? '' : 'no_matching_keys'];
+}
+
+/**
+ * Local compose/boost fan-out: prepend ranked IDs, drop stale hydrate, rewarm head.
+ *
+ * @param array{k:string,id:string,s?:string,t?:int} $entry
+ * @param list<string> $views
+ */
+function ap_timeline_fanout_local_status(int $ownerUserId, array $entry, array $views = ['home', 'local']): void
+{
+    if ($ownerUserId < 1) {
+        return;
+    }
+    try {
+        ap_timeline_ranked_prepend_owner($ownerUserId, $entry, $views);
+        ap_timeline_home_hydrate_invalidate_owner($ownerUserId);
+        if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+            ap_masto_timeline_home_hydrate_warm_async($ownerUserId, 15);
+        } else {
+            ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] timeline_fanout_local: ' . $e->getMessage());
+    }
+}
+
 function ap_outbound_follow_count_recent(int $withinSeconds = 3600): int
 {
     $owner = rtrim(ap_local_actor_id(), '/');

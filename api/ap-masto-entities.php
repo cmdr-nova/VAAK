@@ -12951,5 +12951,21 @@ function ap_masto_reblog_perform(array $resolved, bool $undo = false, ?string $s
     } catch (Throwable $e) {
         // keep tmp id
     }
-        return ['ok' => true, 'status' => ap_masto_status_from_reblog($row, $original), 'bsky_mirror' => $bskyMirror];
+
+    // 0.6.69: prepend boost onto warm Home ranked so soft-nav/hard-refresh see it.
+    if ($statusId !== '' && function_exists('ap_timeline_fanout_local_status')) {
+        $fanoutOwner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+        if ($fanoutOwner < 1 && function_exists('ap_db_default_owner_user_id')) {
+            $fanoutOwner = ap_db_default_owner_user_id();
+        }
+        if ($fanoutOwner > 0) {
+            ap_timeline_fanout_local_status($fanoutOwner, [
+                'k' => 'boost',
+                'id' => $statusId,
+                's' => 'boost',
+            ], ['home']);
+        }
+    }
+
+    return ['ok' => true, 'status' => ap_masto_status_from_reblog($row, $original), 'bsky_mirror' => $bskyMirror];
 }
