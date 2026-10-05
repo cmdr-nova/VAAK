@@ -101,6 +101,9 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/mentions-html", get(shadow_mentions_html))
         // Home fill HTML from hydrate Redis (0.7.4).
         .route("/shadow/home-html", get(shadow_home_html))
+        // Local / Federated fill HTML from hydrate Redis (0.7.20).
+        .route("/shadow/local-html", get(shadow_local_html))
+        .route("/shadow/feed-html", get(shadow_feed_html))
         // Local mkultra profile tab HTML (0.7.18).
         .route("/shadow/profile-html", get(shadow_profile_html))
         // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
@@ -140,6 +143,8 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/notif-embed",
             "/shadow/mentions-html",
             "/shadow/home-html",
+            "/shadow/local-html",
+            "/shadow/feed-html",
             "/shadow/profile-html",
             "/shadow/account-switch-prep",
             "/api/v1/timelines/home",
@@ -300,15 +305,38 @@ async fn shadow_account_switch_prep(
     }
 }
 
-/// Home fill HTML (0.7.4). Offset pages (0.7.9). Cache miss → 404 so PHP keeps card paint.
-async fn shadow_home_html(
-    State(state): State<AppState>,
-    Query(q): Query<OwnerQuery>,
-) -> impl IntoResponse {
+/// Shared Home / Local / Federated fill HTML. Cache miss → 404 so PHP keeps card paint.
+async fn shadow_tl_html(
+    state: &AppState,
+    q: &OwnerQuery,
+    view: &'static str,
+) -> axum::response::Response {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let limit = q.limit.unwrap_or(15).clamp(1, 40);
     let offset = q.offset.unwrap_or(0).max(0);
-    match crate::home_html::home_html_fill(&state.cfg, owner, limit, offset).await {
+    let (flag_header, cache_token, miss_error) = match view {
+        "local" => (
+            "x-vaak-local-html",
+            "axum-local-html",
+            "local html cache miss",
+        ),
+        "feed" => (
+            "x-vaak-feed-html",
+            "axum-feed-html",
+            "feed html cache miss",
+        ),
+        _ => (
+            "x-vaak-home-html",
+            "axum-home-html",
+            "home html cache miss",
+        ),
+    };
+    let filled = if view == "home" {
+        crate::home_html::home_html_fill(&state.cfg, owner, limit, offset).await
+    } else {
+        crate::home_html::tl_html_fill(&state.cfg, owner, view, limit, offset).await
+    };
+    match filled {
         Ok(Some(report)) => {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(
@@ -330,12 +358,12 @@ async fn shadow_home_html(
                 headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-source"), v);
             }
             headers.insert(
-                axum::http::HeaderName::from_static("x-vaak-home-html"),
+                axum::http::HeaderName::from_static(flag_header),
                 axum::http::HeaderValue::from_static("1"),
             );
             headers.insert(
                 axum::http::HeaderName::from_static("x-tl-cache"),
-                axum::http::HeaderValue::from_static("axum-home-html"),
+                axum::http::HeaderValue::from_static(cache_token),
             );
             if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
                 headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-count"), v);
@@ -348,7 +376,7 @@ async fn shadow_home_html(
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": "home html cache miss",
+                "error": miss_error,
                 "source": "vaak-worker-shadow"
             })),
         )
@@ -359,6 +387,30 @@ async fn shadow_home_html(
         )
             .into_response(),
     }
+}
+
+/// Home fill HTML (0.7.4). Offset pages (0.7.9).
+async fn shadow_home_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    shadow_tl_html(&state, &q, "home").await
+}
+
+/// Local fill HTML (0.7.20).
+async fn shadow_local_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    shadow_tl_html(&state, &q, "local").await
+}
+
+/// Federated fill HTML (0.7.20).
+async fn shadow_feed_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    shadow_tl_html(&state, &q, "feed").await
 }
 
 /// Local mkultra profile tab HTML (0.7.18). Invalid/empty actor → 404 JSON.
