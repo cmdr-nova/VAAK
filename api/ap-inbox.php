@@ -2687,22 +2687,46 @@ function ap_as2_text_summary(array $obj): ?string
         ? trim($obj['name'])
         : '';
     $type = strtolower(trim((string) ($obj['type'] ?? '')));
+    $link = '';
+    $attachments = $obj['attachment'] ?? [];
+    if (is_array($attachments)
+        && (isset($attachments['type']) || isset($attachments['href']) || isset($attachments['url']))) {
+        $attachments = [$attachments];
+    }
+    foreach ((array) $attachments as $attachment) {
+        if (!is_array($attachment) || strtolower((string) ($attachment['type'] ?? '')) !== 'link') {
+            continue;
+        }
+        $candidate = is_string($attachment['href'] ?? null)
+            ? $attachment['href']
+            : (is_string($attachment['url'] ?? null) ? $attachment['url'] : '');
+        if (str_starts_with($candidate, 'https://')) {
+            $link = $candidate;
+            break;
+        }
+    }
+    $appendLink = static function (string $body) use ($link): string {
+        if ($link === '' || str_contains(strip_tags($body), $link)) {
+            return $body;
+        }
+        return $body . '<p>' . htmlspecialchars($link, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+    };
     if ($content !== '' && $name !== '' && in_array($type, ['page', 'article'], true)) {
         $titlePlain = trim(html_entity_decode(strip_tags($name), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         $bodyPlain = trim(html_entity_decode(strip_tags($content), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         // Avoid duplicating a title when a peer has already included it in
         // the first line of the HTML body.
         if ($titlePlain !== '' && !str_starts_with($bodyPlain, $titlePlain)) {
-            return '<p><strong>'
+            return $appendLink('<p><strong>'
                 . htmlspecialchars($titlePlain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-                . '</strong></p>' . $content;
+                . '</strong></p>' . $content);
         }
     }
     if ($content !== '') {
-        return $content;
+        return $appendLink($content);
     }
     if ($name !== '') {
-        return $name;
+        return $appendLink($name);
     }
     if (isset($obj['summary']) && is_string($obj['summary']) && trim($obj['summary']) !== '') {
         return $obj['summary'];
