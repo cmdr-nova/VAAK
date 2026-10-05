@@ -1523,6 +1523,177 @@ fn is_own_note(uri: &str, viewer_actor: &str) -> bool {
     uri.starts_with(&prefix)
 }
 
+fn status_account_actor(status: &Value) -> String {
+    let account = status.get("account").unwrap_or(&Value::Null);
+    account
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| account.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Stamp mute/block flags onto statuses (and nested reblogs) for lean ⋯ menus.
+pub fn stamp_viewer_moderation(statuses: &mut [Value], moderation: &crate::hidden::ViewerModeration) {
+    for st in statuses.iter_mut() {
+        stamp_viewer_moderation_one(st, moderation);
+        if let Some(reblog) = st.get_mut("reblog").filter(|v| v.is_object()) {
+            stamp_viewer_moderation_one(reblog, moderation);
+        }
+    }
+}
+
+fn stamp_viewer_moderation_one(status: &mut Value, moderation: &crate::hidden::ViewerModeration) {
+    let actor = status_account_actor(status);
+    if actor.is_empty() || !actor.starts_with("https://") {
+        return;
+    }
+    let obj = match status.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    obj.insert(
+        "_vaak_viewer_muted".to_string(),
+        Value::Bool(moderation.is_muted(&actor)),
+    );
+    if let Some(id) = moderation.block_id(&actor) {
+        obj.insert("_vaak_viewer_blocked".to_string(), Value::Bool(true));
+        obj.insert("_vaak_viewer_block_id".to_string(), Value::from(id));
+    } else {
+        obj.insert("_vaak_viewer_blocked".to_string(), Value::Bool(false));
+        obj.insert("_vaak_viewer_block_id".to_string(), Value::from(0));
+    }
+}
+
+/// Personal Block / Mute / Report overflow — PHP `block_quick_actions` (user items).
+fn paint_moderation_overflow(
+    from_q: &str,
+    actor_ref: &str,
+    object_id: &str,
+    viewer_actor: &str,
+    status: &Value,
+) -> String {
+    let actor = actor_ref.trim().trim_end_matches('/');
+    let viewer = viewer_actor.trim().trim_end_matches('/');
+    if actor.is_empty() || !actor.starts_with("https://") {
+        return String::new();
+    }
+    // Guests and self: no personal moderation chrome.
+    if viewer.is_empty() || actor.eq_ignore_ascii_case(viewer) {
+        return String::new();
+    }
+    // Own note URL as belt-and-suspenders (boost of self, etc.).
+    if is_own_note(object_id, viewer) {
+        return String::new();
+    }
+
+    let muted = json_flag(status, "_vaak_viewer_muted");
+    let blocked = json_flag(status, "_vaak_viewer_blocked");
+    let block_id = status
+        .get("_vaak_viewer_block_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let object = object_id.trim().trim_end_matches('/');
+    let action_base = format!("/vaak/?view={}", urlencoding_encode(from_q));
+    let is_bsky_object = object.to_ascii_lowercase().contains("bsky.app");
+
+    let mut menu = String::new();
+    if object.starts_with("https://") {
+        let open = format!(
+            "?view=status&object={}&from={}",
+            urlencoding_encode(object),
+            urlencoding_encode(from_q)
+        );
+        menu.push_str(&format!(
+            "<a class=\"menu-action\" href=\"{}\">Open</a>",
+            esc(&open)
+        ));
+        let remote = remote_object_href(object, "");
+        if remote.starts_with("http://") || remote.starts_with("https://") {
+            menu.push_str(&format!(
+                "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+                esc(&remote),
+                if is_bsky_object {
+                    "Open on Bluesky"
+                } else {
+                    "Remote"
+                }
+            ));
+        }
+    }
+
+    // Block for me
+    if blocked && block_id > 0 {
+        menu.push_str(&format!(
+            "<form method=\"post\" action=\"{base}\">\
+             <input type=\"hidden\" name=\"action\" value=\"user_block_remove\">\
+             <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+             <input type=\"hidden\" name=\"return_from\" value=\"{rv}\">\
+             <input type=\"hidden\" name=\"return_actor\" value=\"{actor}\">\
+             <input type=\"hidden\" name=\"id\" value=\"{id}\">\
+             <button class=\"menu-action\" type=\"submit\" title=\"Hide from your timelines only\">Unblock for me</button></form>",
+            base = esc(&action_base),
+            rv = esc(from_q),
+            actor = esc(actor),
+            id = block_id,
+        ));
+    } else {
+        menu.push_str(&format!(
+            "<form method=\"post\" action=\"{base}\">\
+             <input type=\"hidden\" name=\"action\" value=\"user_block_add\">\
+             <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+             <input type=\"hidden\" name=\"return_from\" value=\"{rv}\">\
+             <input type=\"hidden\" name=\"return_actor\" value=\"{actor}\">\
+             <input type=\"hidden\" name=\"target\" value=\"{actor}\">\
+             <button class=\"menu-action\" type=\"submit\" title=\"Hide from your timelines only\">Block for me</button></form>",
+            base = esc(&action_base),
+            rv = esc(from_q),
+            actor = esc(actor),
+        ));
+    }
+
+    // Mute for me
+    menu.push_str(&format!(
+        "<form method=\"post\" action=\"{base}\">\
+         <input type=\"hidden\" name=\"action\" value=\"{action}\">\
+         <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"return_from\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"return_actor\" value=\"{actor}\">\
+         <input type=\"hidden\" name=\"actor_id\" value=\"{actor}\">\
+         <button class=\"menu-action\" type=\"submit\" title=\"Hide from your Home / Federated / Notifications\">{label}</button></form>",
+        base = esc(&action_base),
+        action = if muted { "unmute_remote" } else { "mute_remote" },
+        rv = esc(from_q),
+        actor = esc(actor),
+        label = if muted { "Unmute for me" } else { "Mute for me" },
+    ));
+
+    // Report user (composer prefilled with actor + optional post)
+    let mut report_q = format!(
+        "?view=report&report_target={}",
+        urlencoding_encode(actor)
+    );
+    if object.starts_with("https://") {
+        report_q.push_str("&report_object=");
+        report_q.push_str(&urlencoding_encode(object));
+    }
+    if !from_q.is_empty() {
+        report_q.push_str("&from=");
+        report_q.push_str(&urlencoding_encode(from_q));
+    }
+    menu.push_str(&format!(
+        "<a class=\"menu-action\" href=\"{}\">Report user</a>",
+        esc(&report_q)
+    ));
+
+    format!(
+        "<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary>\
+         <div class=\"post-action-menu__body\">{menu}</div></details>"
+    )
+}
+
 /// Resolve `masto_statuses.local_id` for Delete forms.
 /// Profile Axum paints the real DB PK as status `id`; Home/Local hydrate paints
 /// Mastodon snowflakes. Never send a snowflake as `local_id` — PHP
@@ -2075,13 +2246,21 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
 
         if is_own && !uri.is_empty() {
             actions.push_str(&paint_own_post_controls(status, from_q, uri, &sid));
-        } else if !uri.is_empty() && !bsky {
-            let remote = remote_object_href(uri, url_hint);
-            if remote.starts_with("http://") || remote.starts_with("https://") {
-                actions.push_str(&format!(
-                    "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"meta\" title=\"Open on remote instance\">Remote</a>",
-                    esc(&remote)
-                ));
+        } else if !uri.is_empty() {
+            // Personal Block / Mute / Report (+ Open / Remote) — PHP block_quick_actions.
+            let mod_menu =
+                paint_moderation_overflow(from_q, actor_ref, uri, viewer_actor, status);
+            if !mod_menu.is_empty() {
+                actions.push_str(&mod_menu);
+            } else if !bsky {
+                // Guest / thin shells: keep a Remote link when we have no ⋯ menu.
+                let remote = remote_object_href(uri, url_hint);
+                if remote.starts_with("http://") || remote.starts_with("https://") {
+                    actions.push_str(&format!(
+                        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"meta\" title=\"Open on remote instance\">Remote</a>",
+                        esc(&remote)
+                    ));
+                }
             }
         }
     }
@@ -3050,6 +3229,45 @@ mod tests {
         assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
         assert!(html.contains("view=remote_profile"), "{html}");
         assert!(!html.contains(">Open</a></div>"), "must not be Open-only: {html}");
+    }
+
+    #[test]
+    fn remote_note_gets_block_mute_report_overflow() {
+        let st = json!({
+            "id": "99",
+            "uri": "https://mastodon.social/users/x/statuses/99",
+            "url": "https://mastodon.social/users/x/statuses/99",
+            "content": "<p>hi</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "_vaak_viewer_muted": false,
+            "_vaak_viewer_blocked": false,
+            "_vaak_viewer_block_id": 0,
+            "account": {
+                "acct": "x@mastodon.social",
+                "display_name": "X",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://mastodon.social/users/x"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "home",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(html.contains("post-action-menu"), "⋯ menu: {html}");
+        assert!(html.contains("user_block_add") || html.contains("Block for me"), "{html}");
+        assert!(html.contains("mute_remote") || html.contains("Mute for me"), "{html}");
+        assert!(
+            html.contains("view=report")
+                && html.contains("report_target=")
+                && html.contains("report_object="),
+            "Report with post ref: {html}"
+        );
+        assert!(!html.contains("delete_status"), "must not Delete peer: {html}");
     }
 
     #[test]

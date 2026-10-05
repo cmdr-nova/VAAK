@@ -114,6 +114,10 @@ pub async fn tl_html_fill(
     // Attach cached OG/YouTube cards (PHP paint parity) before lean HTML.
     if let Ok(db) = db::connect(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
+        // Mute/block labels for lean ⋯ menus (PHP block_quick_actions parity).
+        if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
+            crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
+        }
     }
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
 

@@ -1,7 +1,7 @@
 //! Mute / block sets for notification filtering (parity with ap_row_is_hidden).
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
 #[derive(Debug, Default, Clone)]
@@ -122,6 +122,67 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     }
 
     Ok(sets)
+}
+
+/// Personal mute/block state for lean ⋯ menus (PHP `block_quick_actions` labels).
+#[derive(Debug, Default, Clone)]
+pub struct ViewerModeration {
+    pub muted_actors: HashSet<String>,
+    /// actor_id → ap_user_blocks.id (scope=actor) for Unblock forms.
+    pub blocked_actors: HashMap<String, i64>,
+}
+
+impl ViewerModeration {
+    pub fn is_muted(&self, actor_id: &str) -> bool {
+        let a = norm_actor(actor_id);
+        !a.is_empty() && self.muted_actors.contains(&a)
+    }
+
+    pub fn block_id(&self, actor_id: &str) -> Option<i64> {
+        let a = norm_actor(actor_id);
+        if a.is_empty() {
+            return None;
+        }
+        self.blocked_actors.get(&a).copied()
+    }
+}
+
+pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<ViewerModeration> {
+    let mut out = ViewerModeration::default();
+    if owner_user_id < 1 {
+        return Ok(out);
+    }
+    let mute_rows = db
+        .query(
+            "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1",
+            &[&owner_user_id],
+        )
+        .await
+        .context("select ap_mutes for moderation menu")?;
+    for row in mute_rows {
+        let a: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+        let a = norm_actor(&a);
+        if !a.is_empty() {
+            out.muted_actors.insert(a);
+        }
+    }
+    let block_rows = db
+        .query(
+            "SELECT id, value FROM ap_user_blocks
+             WHERE owner_user_id = $1 AND scope = 'actor'",
+            &[&owner_user_id],
+        )
+        .await
+        .context("select ap_user_blocks for moderation menu")?;
+    for row in block_rows {
+        let id: i64 = row.try_get(0)?;
+        let value: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let a = norm_actor(&value);
+        if !a.is_empty() && id > 0 {
+            out.blocked_actors.insert(a, id);
+        }
+    }
+    Ok(out)
 }
 
 pub async fn is_favourited(db: &Client, owner_user_id: i64, object_id: &str) -> Result<bool> {
