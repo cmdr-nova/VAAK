@@ -18741,6 +18741,25 @@ if ($isPartial && $view === 'remote_profile') {
     if (($profileTab === 'replies' && $hideProfileReplies) || ($profileTab === 'boosts' && $hideProfileBoosts)) {
         $profileTab = 'posts';
     }
+    // Prefer Axum lean profile HTML (0.7.18) — same actions as Home + own-post chrome.
+    if (function_exists('admin_profile_html_axum_fetch')) {
+        $axumProfile = admin_profile_html_axum_fetch(
+            $profileActor,
+            $profileTab,
+            $profileLimit,
+            $profileOffset,
+            (int) ($vaakOwnerId ?? 0)
+        );
+        if (is_array($axumProfile) && (string) ($axumProfile['html'] ?? '') !== '') {
+            header('X-Has-More: ' . (!empty($axumProfile['has_more']) ? '1' : '0'));
+            header('X-Next-Offset: ' . (int) ($axumProfile['next_offset'] ?? ($profileOffset + $profileLimit)));
+            header('X-TL-Cache: axum-profile-html');
+            header('X-VAAK-Profile-Html: 1');
+            header('X-TL-Render-Ms: ' . (string) (int) ($axumProfile['ms'] ?? 0));
+            echo (string) $axumProfile['html'];
+            exit;
+        }
+    }
     $page = function_exists('ap_local_profile_tab_page')
         ? ap_local_profile_tab_page($profileKey, $profileActor, $profileTab, $profileLimit, $profileOffset)
         : ['items' => [], 'has_more' => false, 'next_offset' => $profileOffset];
@@ -20469,6 +20488,108 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
     }
     $decoded = json_decode($raw, true);
     return is_array($decoded) ? $decoded : null;
+}
+
+/**
+ * Fetch local profile tab HTML from Axum `/shadow/profile-html` (0.7.18).
+ * Same lean cards as Home (actions + own-post Delete/Edit/Pin).
+ * Flag: VAAK_PROFILE_HTML_AXUM (default on).
+ *
+ * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int}|null
+ */
+function admin_profile_html_axum_fetch(
+    string $actorUrl,
+    string $tab = 'posts',
+    int $limit = 20,
+    int $offset = 0,
+    int $ownerUserId = 0
+): ?array {
+    $enabled = getenv('VAAK_PROFILE_HTML_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return null;
+    }
+    $actorUrl = rtrim(trim($actorUrl), '/');
+    if ($actorUrl === '' || !preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $actorUrl)) {
+        return null;
+    }
+    $tab = strtolower(trim($tab));
+    if (!in_array($tab, ['posts', 'replies', 'boosts', 'media'], true)) {
+        $tab = 'posts';
+    }
+    if ($ownerUserId < 1 && function_exists('ap_db_masto_owner_user_id') && empty($GLOBALS['vaak_guest_profile'])) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id') && empty($GLOBALS['vaak_guest_profile'])) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $limit = max(1, min(50, $limit));
+    $offset = max(0, $offset);
+    $query = [
+        'actor' => $actorUrl,
+        'tab' => $tab,
+        'limit' => $limit,
+        'offset' => $offset,
+    ];
+    if ($ownerUserId > 0) {
+        $query['owner_id'] = $ownerUserId;
+    }
+    $url = $base . '/shadow/profile-html?' . http_build_query($query);
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    $started = microtime(true);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 2500,
+        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('profile.html.axum_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($raw)) {
+        return null;
+    }
+    $rawHeaders = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    if (!is_string($body) || $body === '') {
+        return null;
+    }
+    $hdrs = [];
+    foreach (explode("\r\n", (string) $rawHeaders) as $hline) {
+        if (str_contains($hline, ':')) {
+            [$hk, $hv] = array_map('trim', explode(':', $hline, 2));
+            $hdrs[strtolower($hk)] = $hv;
+        }
+    }
+    return [
+        'html' => $body,
+        'has_more' => (($hdrs['x-has-more'] ?? '') === '1'),
+        'next_offset' => max(0, (int) ($hdrs['x-next-offset'] ?? ($offset + $limit))),
+        'source' => (string) ($hdrs['x-vaak-tl-source'] ?? 'axum-profile-html'),
+        'ms' => $ms,
+    ];
 }
 
 /**
@@ -29867,6 +29988,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpTimelineTabs = ['posts', 'replies', 'boosts', 'media'];
           $rpLocalPageLimit = 20;
           $rpLocalNextOffset = 0;
+          $rpAxumHtml = null;
+          $rpAxumCache = '';
           if (in_array($rpTab, $rpTimelineTabs, true)) {
               $rpTabBucket = $rpTabItems[$rpTab] ?? [];
               if ($rpIsLocal && $rpLocalKey && function_exists('ap_local_profile_tab_page')) {
@@ -29914,6 +30037,32 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $rpLocalPageItems = [];
               $rpLocalHasMore = false;
               $rpLocalNextOffset = 0;
+          }
+          // Prefer Axum lean HTML for local timeline tabs when no Bluesky-only mix-in (0.7.18).
+          if ($rpIsLocal && $rpActor !== '' && in_array($rpTab, ['posts', 'replies', 'boosts', 'media'], true)
+              && function_exists('admin_profile_html_axum_fetch')) {
+              $rpHasBskyMix = false;
+              foreach ($rpLocalPageItems as $rpMixItem) {
+                  if (is_array($rpMixItem) && isset($rpMixItem['post'])) {
+                      $rpHasBskyMix = true;
+                      break;
+                  }
+              }
+              if (!$rpHasBskyMix) {
+                  $rpAxumFill = admin_profile_html_axum_fetch(
+                      $rpActor,
+                      $rpTab,
+                      (int) $rpLocalPageLimit,
+                      0,
+                      (int) ($vaakOwnerId ?? 0)
+                  );
+                  if (is_array($rpAxumFill) && (string) ($rpAxumFill['html'] ?? '') !== '') {
+                      $rpAxumHtml = (string) $rpAxumFill['html'];
+                      $rpLocalHasMore = !empty($rpAxumFill['has_more']);
+                      $rpLocalNextOffset = (int) ($rpAxumFill['next_offset'] ?? $rpLocalPageLimit);
+                      $rpAxumCache = 'axum-profile-html';
+                  }
+              }
           }
         ?>
         <?php if ($rpError): ?>
@@ -30448,9 +30597,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php endforeach; ?>
             <?php endif; ?>
           <?php elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts): ?>
-            <?php if ($rpTabItems[$rpTab] === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
-            <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= (int) $rpLocalNextOffset ?>" data-limit="<?= (int) $rpLocalPageLimit ?>" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0">
+            <?php if ($rpTabItems[$rpTab] === [] && $rpAxumHtml === null): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
+            <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= (int) $rpLocalNextOffset ?>" data-limit="<?= (int) $rpLocalPageLimit ?>" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0"<?= $rpAxumCache !== '' ? ' data-tl-cache="' . h($rpAxumCache) . '"' : '' ?>>
             <?php endif; ?>
+            <?php if ($rpAxumHtml !== null): ?>
+              <?= $rpAxumHtml ?>
+            <?php else: ?>
             <?php
               $localProfileItems = $rpIsLocal ? $rpLocalPageItems : $rpTabItems[$rpTab];
               if (!$rpIsLocal) {
@@ -30473,6 +30625,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <?php if (is_array($n)) admin_render_outbox_card($n, 'remote_profile'); ?>
               <?php endif; ?>
             <?php endforeach; ?>
+            <?php endif; ?>
             <?php if ($rpIsLocal): ?></div><div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $rpLocalHasMore ? 'Scroll for more…' : 'End of profile' ?></div><div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div><button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
             <?php endif; ?>
           <?php elseif ($rpTabItems[$rpTab] === []): ?>

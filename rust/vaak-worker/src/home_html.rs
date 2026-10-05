@@ -7,7 +7,8 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::notif_embed::paint_lean_feed_card;
+use crate::db;
+use crate::notif_embed::paint_lean_feed_card_opts;
 use crate::timeline;
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,37 @@ pub struct HomeHtmlReport {
     pub next_offset: usize,
     pub source: String,
     pub hydrate_key: String,
+}
+
+async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> String {
+    let Ok(db) = db::connect(&cfg.database_url).await else {
+        return String::new();
+    };
+    let Ok(row) = db
+        .query_opt(
+            "SELECT COALESCE(NULLIF(trim(actor_id), ''), ''), COALESCE(username, '')
+             FROM ap_users WHERE id = $1 LIMIT 1",
+            &[&owner_user_id],
+        )
+        .await
+    else {
+        return String::new();
+    };
+    let Some(row) = row else {
+        return String::new();
+    };
+    let actor_id: String = row.get(0);
+    if actor_id.starts_with("https://") {
+        return actor_id.trim_end_matches('/').to_string();
+    }
+    let username: String = row.get(1);
+    if username.is_empty() {
+        return String::new();
+    }
+    format!(
+        "https://mkultra.monster/users/{}",
+        username.to_ascii_lowercase()
+    )
 }
 
 /// Build Home feed HTML from hydrate Redis (`vaak:timeline:v1:*`).
@@ -64,6 +96,7 @@ pub async fn home_html_fill(
 
     let end = (offset + limit).min(report.items.len());
     let slice = &report.items[offset..end];
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
 
     let mut html = String::with_capacity(slice.len() * 1200);
     let mut painted = 0usize;
@@ -71,7 +104,7 @@ pub async fn home_html_fill(
         if !item.is_object() {
             continue;
         }
-        html.push_str(&paint_lean_feed_card(item));
+        html.push_str(&paint_lean_feed_card_opts(item, "home", &viewer_actor));
         painted += 1;
     }
     if painted == 0 {
@@ -91,7 +124,7 @@ pub async fn home_html_fill(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::notif_embed::paint_lean_feed_card;
     use serde_json::json;
 
     #[test]

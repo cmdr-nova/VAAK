@@ -14,6 +14,7 @@ mod mentions_html;
 mod notif;
 mod notif_embed;
 mod notif_list;
+mod profile_html;
 mod ranked;
 mod ranked_warm;
 mod redis_util;

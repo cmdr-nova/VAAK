@@ -1071,9 +1071,153 @@ fn interaction_form(
     )
 }
 
-/// Home timeline action bar — PHP `admin_render_masto_status_card` tweet-actions parity.
-/// Mentions nests keep Open-only; Home gets RSS / Bluesky / Fediverse chrome.
-fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
+/// Standard base64 (no padding crate) for edit data-* attrs.
+fn b64_encode(s: &str) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        1 => {
+            let n = (bytes[i] as u32) << 16;
+            out.push(TABLE[((n >> 18) & 63) as usize] as char);
+            out.push(TABLE[((n >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+            out.push(TABLE[((n >> 18) & 63) as usize] as char);
+            out.push(TABLE[((n >> 12) & 63) as usize] as char);
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+fn is_own_note(uri: &str, viewer_actor: &str) -> bool {
+    let viewer = viewer_actor.trim().trim_end_matches('/');
+    if viewer.is_empty() || uri.is_empty() {
+        return false;
+    }
+    let prefix = format!("{viewer}/notes/");
+    uri.starts_with(&prefix)
+}
+
+/// Own-post Delete + overflow (Open/Edit/Pin/Note) — PHP `admin_own_post_action_bar` tail.
+fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -> String {
+    let spoiler = status
+        .get("spoiler_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let sensitive = json_flag(status, "sensitive") || !spoiler.is_empty();
+    let pinned = json_flag(status, "pinned");
+    let content_html = status.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let plain = strip_tags(content_html).trim().to_string();
+    let local_id = if !sid.is_empty() && sid.chars().all(|c| c.is_ascii_digit()) {
+        sid
+    } else {
+        "0"
+    };
+    let action_base = format!("?view={}", urlencoding_encode(from_q));
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<form method=\"post\" action=\"{base}\" style=\"display:inline\" \
+         onsubmit=\"return confirm('Delete this post permanently? Remotes and Bluesky mirrors are removed too.');\">\
+         <input type=\"hidden\" name=\"action\" value=\"delete_status\">\
+         <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"local_id\" value=\"{lid}\">\
+         <input type=\"hidden\" name=\"note_id\" value=\"{nid}\">\
+         <button class=\"icon-btn\" type=\"submit\" title=\"Delete post\" aria-label=\"Delete post\" style=\"color:var(--danger)\">\
+         <i class=\"ph ph-trash\" aria-hidden=\"true\"></i></button></form>",
+        base = esc(&action_base),
+        rv = esc(from_q),
+        lid = esc(local_id),
+        nid = esc(uri),
+    ));
+
+    let open_href = format!(
+        "?view=status&object={}&from={}",
+        urlencoding_encode(uri),
+        urlencoding_encode(from_q)
+    );
+    let edit_href = format!(
+        "?view={}&compose=1&edit_note={}",
+        urlencoding_encode(from_q),
+        urlencoding_encode(uri)
+    );
+    let pin_action = if pinned { "unpin_status" } else { "pin_status" };
+    let pin_label = if pinned {
+        "Unpin from profile"
+    } else {
+        "Pin to profile"
+    };
+    let pin_title = if pinned {
+        "Remove this post from your profile pins"
+    } else {
+        "Pin on your HTML profile (up to 5; Bluesky uses the newest)"
+    };
+    let pin_cls = if pinned {
+        "menu-action on"
+    } else {
+        "menu-action"
+    };
+
+    let mut menu = String::new();
+    menu.push_str(&format!(
+        "<a class=\"menu-action\" href=\"{}\">Open</a>",
+        esc(&open_href)
+    ));
+    menu.push_str(&format!(
+        "<a class=\"menu-action js-edit-post\" href=\"{href}\" data-note-id=\"{nid}\" \
+         data-return-view=\"{rv}\" data-content-b64=\"{cb}\" data-spoiler-b64=\"{sb}\" data-sensitive=\"{sens}\">Edit</a>",
+        href = esc(&edit_href),
+        nid = esc(uri),
+        rv = esc(from_q),
+        cb = esc(&b64_encode(&plain)),
+        sb = esc(&b64_encode(spoiler)),
+        sens = if sensitive { "1" } else { "0" },
+    ));
+    menu.push_str(&format!(
+        "<form method=\"post\" action=\"{base}\" style=\"display:inline\">\
+         <input type=\"hidden\" name=\"action\" value=\"{act}\">\
+         <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"note_id\" value=\"{nid}\">\
+         <button class=\"{cls}\" type=\"submit\" title=\"{title}\">{label}</button></form>",
+        base = esc(&action_base),
+        act = pin_action,
+        rv = esc(from_q),
+        nid = esc(uri),
+        cls = pin_cls,
+        title = esc(pin_title),
+        label = esc(pin_label),
+    ));
+    menu.push_str(&format!(
+        "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Note</a>",
+        esc(uri)
+    ));
+    out.push_str(&format!(
+        "<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary>\
+         <div class=\"post-action-menu__body\">{menu}</div></details>"
+    ));
+    out
+}
+
+/// Timeline action bar — PHP `admin_render_masto_status_card` / own-post bar parity.
+/// Mentions nests keep Open-only; home / remote_profile / outbox get full chrome.
+fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -> String {
     let from_q = if from.is_empty() { "home" } else { from };
     let account = status.get("account").cloned().unwrap_or(Value::Null);
     let acct = account
@@ -1113,6 +1257,8 @@ fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
     let rss = is_rss(status);
     let bsky = is_bsky(status, acct, uri);
     let local = !rss && !bsky && is_local_uri(uri);
+    let is_own = is_own_note(uri, viewer_actor);
+    let eng_attr = if is_own { "data-own-eng" } else { "data-eng" };
     let action_base = format!("?view={}", urlencoding_encode(from_q));
     let cw_q = reply_cw_query(spoiler, sensitive);
 
@@ -1385,11 +1531,12 @@ fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
                 "icon-btn"
             };
             actions.push_str(&format!(
-                "<a class=\"{cls}\" href=\"?view={view}&amp;compose=1&amp;quote_object={qo}&amp;quote_status_id={qs}\" data-eng=\"1\" data-eng-count=\"{n}\" title=\"Quote\" aria-label=\"Quote\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{count}</a>",
+                "<a class=\"{cls}\" href=\"?view={view}&amp;compose=1&amp;quote_object={qo}&amp;quote_status_id={qs}\" {eng}=\"1\" data-eng-count=\"{n}\" title=\"Quote\" aria-label=\"Quote\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{count}</a>",
                 cls = qt_cls,
                 view = urlencoding_encode(from_q),
                 qo = urlencoding_encode(uri),
                 qs = urlencoding_encode(&sid),
+                eng = eng_attr,
                 n = qt_n,
                 count = action_count_html(qt_n),
             ));
@@ -1414,9 +1561,10 @@ fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
                 if boosted { "Undo boost" } else { "Boost" },
                 "<i class=\"ph ph-repeat\" aria-hidden=\"true\"></i>",
                 &action_count_html(rb_n),
-                &format!(" data-eng=\"1\" data-eng-count=\"{rb_n}\""),
+                &format!(" {eng_attr}=\"1\" data-eng-count=\"{rb_n}\""),
             ));
-            if !local {
+            // Bite is Fediverse-remote only — never on own/local notes.
+            if !local && !is_own {
                 actions.push_str(&format!(
                     "<form method=\"post\" action=\"{base}\" style=\"display:inline\" onsubmit=\"return confirm('Bite this post?');\">\
                      <input type=\"hidden\" name=\"action\" value=\"bite_remote\">\
@@ -1455,7 +1603,7 @@ fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
                 if fav { "Unlike" } else { "Like" },
                 fav_icon,
                 &action_count_html(fav_n),
-                &format!(" data-eng=\"1\" data-eng-count=\"{fav_n}\""),
+                &format!(" {eng_attr}=\"1\" data-eng-count=\"{fav_n}\""),
             ));
             let bm_cls = if bm { "icon-btn on" } else { "icon-btn" };
             let bm_icon = if bm {
@@ -1479,11 +1627,16 @@ fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
                 if bm { "Bookmark folders" } else { "Bookmark" },
                 bm_icon,
                 "",
-                &format!(" data-bm-picker=\"{}\"", if bm { "1" } else { "0" }),
+                &format!(
+                    " {eng_attr}=\"1\" data-bm-picker=\"{}\"",
+                    if bm { "1" } else { "0" }
+                ),
             ));
         }
 
-        if !uri.is_empty() && !bsky {
+        if is_own && !uri.is_empty() {
+            actions.push_str(&paint_own_post_controls(status, from_q, uri, &sid));
+        } else if !uri.is_empty() && !bsky {
             let remote = remote_object_href(uri, url_hint);
             if remote.starts_with("http://") || remote.starts_with("https://") {
                 actions.push_str(&format!(
@@ -1570,11 +1723,16 @@ fn media_row_html(st: &Value) -> String {
 
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
 pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
-    paint_lean_embed_from(status, hide_header, "mentions")
+    paint_lean_embed_from(status, hide_header, "mentions", "")
 }
 
 /// Lean status card HTML with `from=` deep-link context (Mentions nest or Home fill).
-pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> String {
+pub fn paint_lean_embed_from(
+    status: &Value,
+    hide_header: bool,
+    from: &str,
+    viewer_actor: &str,
+) -> String {
     let account = status.get("account").cloned().unwrap_or(Value::Null);
     let acct = account
         .get("acct")
@@ -1746,15 +1904,15 @@ pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> S
         .filter(|v| v.is_object())
         .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
-        let q_html = paint_lean_embed_from(q, false, from);
+        let q_html = paint_lean_embed_from(q, false, from, viewer_actor);
         inner.push_str(&format!(
             "<div class=\"quote-block\" style=\"margin-top:.55rem\">{q_html}</div>"
         ));
     }
 
-    // Home timeline: full PHP-parity action bar. Mentions nests stay Open-only.
-    if from == "home" {
-        inner.push_str(&paint_lean_timeline_actions(status, from));
+    // Full action bar on Home / local Profiles / outbox. Mentions nests stay Open-only.
+    if matches!(from, "home" | "remote_profile" | "outbox") {
+        inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
     } else if !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
         let open = format!(
@@ -1782,7 +1940,14 @@ pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> S
 }
 
 /// Lean Home feed card: boost chrome + status body (no notif-embed wrap).
+#[allow(dead_code)] // public helper; call sites use opts with from/viewer
 pub fn paint_lean_feed_card(status: &Value) -> String {
+    paint_lean_feed_card_opts(status, "home", "")
+}
+
+/// Lean feed card with `from=` + viewer actor (own-post Delete/Edit/Pin overflow).
+pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str) -> String {
+    let from_q = if from.is_empty() { "home" } else { from };
     let mut st = status.clone();
     let mut boost_header = String::new();
     let content_empty = {
@@ -1813,8 +1978,9 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
                 .unwrap_or("");
             let booster_label = if booster_ref.starts_with("https://") {
                 format!(
-                    "<a href=\"?view=remote_profile&amp;actor={}&amp;from=home\" style=\"color:inherit;text-decoration:none\">{}</a>",
+                    "<a href=\"?view=remote_profile&amp;actor={}&amp;from={}\" style=\"color:inherit;text-decoration:none\">{}</a>",
                     urlencoding_encode(booster_ref),
+                    urlencoding_encode(from_q),
                     esc(booster_name)
                 )
             } else {
@@ -1832,10 +1998,10 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
         }
     }
     // Feed cards use the embed painter with header, then unwrap the outer embed div
-    // so Home timeline items stay `<article class="tweet">` peers (matching PHP).
+    // so timeline items stay `<article class="tweet">` peers (matching PHP).
     // Boost chrome must live *inside* that article with class tweet-boost — wrapping
     // in a div breaks `.timeline-feed #timeline-items > article.tweet` separators.
-    let painted = paint_lean_embed_from(&st, false, "home");
+    let painted = paint_lean_embed_from(&st, false, from_q, viewer_actor);
     let article = if let Some(start) = painted.find("<article") {
         if let Some(end) = painted.rfind("</article>") {
             painted[start..end + "</article>".len()].to_string()
@@ -2169,6 +2335,98 @@ mod tests {
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("quote-block"), "{html}");
         assert!(!html.contains("class=\"link-card\""), "should dedupe OG card: {html}");
+    }
+
+    #[test]
+    fn remote_profile_gets_icon_btn_actions() {
+        let st = json!({
+            "id": "99",
+            "uri": "https://mastodon.social/users/x/statuses/1",
+            "url": "https://mastodon.social/@x/1",
+            "content": "<p>profile post</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "account": {
+                "acct": "x@mastodon.social",
+                "display_name": "X",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://mastodon.social/users/x"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card_opts(&st, "remote_profile", "");
+        assert!(html.contains("icon-btn"), "remote_profile must get actions: {html}");
+        assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
+        assert!(html.contains("view=remote_profile"), "{html}");
+        assert!(!html.contains(">Open</a></div>"), "must not be Open-only: {html}");
+    }
+
+    #[test]
+    fn own_note_with_viewer_gets_delete_edit_pin() {
+        let st = json!({
+            "id": "4242",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/abc",
+            "url": "https://mkultra.monster/users/cmdr_nova/notes/abc",
+            "content": "<p>my post</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "spoiler_text": "",
+            "sensitive": false,
+            "pinned": false,
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "account": {
+                "acct": "cmdr_nova",
+                "display_name": "Nova",
+                "avatar": "https://mkultra.monster/img/avatar/default.jpg",
+                "uri": "https://mkultra.monster/users/cmdr_nova"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "home",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(html.contains("delete_status"), "own note Delete: {html}");
+        assert!(html.contains("js-edit-post") && html.contains("edit_note="), "Edit: {html}");
+        assert!(html.contains("pin_status") || html.contains("Pin to profile"), "Pin: {html}");
+        assert!(html.contains("post-action-menu"), "overflow: {html}");
+        assert!(!html.contains("bite_remote"), "own must not Bite: {html}");
+        assert!(html.contains("data-own-eng") || html.contains("ph-heart"), "{html}");
+    }
+
+    #[test]
+    fn other_local_note_skips_delete_when_viewer_differs() {
+        let st = json!({
+            "id": "55",
+            "uri": "https://mkultra.monster/users/valerie/notes/xyz",
+            "url": "https://mkultra.monster/users/valerie/notes/xyz",
+            "content": "<p>peer post</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "account": {
+                "acct": "valerie",
+                "display_name": "Valerie",
+                "avatar": "https://mkultra.monster/img/avatar/default.jpg",
+                "uri": "https://mkultra.monster/users/valerie"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "remote_profile",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(html.contains("icon-btn"), "still has actions: {html}");
+        assert!(!html.contains("delete_status"), "must not Delete peer note: {html}");
+        assert!(!html.contains("js-edit-post"), "must not Edit peer note: {html}");
+        assert!(!html.contains("pin_status"), "must not Pin peer note: {html}");
+        assert!(!html.contains("bite_remote"), "local peer skips Bite: {html}");
     }
 
 }
