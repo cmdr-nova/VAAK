@@ -144,6 +144,95 @@ pub fn resolve_peer_imprint(
     Ok((strain.to_string(), (from_generation.max(1) + 1).min(99)))
 }
 
+/// Create a local-only request using the PHP schema. This is intentionally a
+/// library function, not a public route yet; callers must explicitly opt into
+/// the migration after comparing its result with PHP.
+pub async fn create_local_request(
+    cfg: &Config,
+    from_owner: i64,
+    to_owner: i64,
+    kind: &str,
+) -> Result<i64> {
+    if from_owner < 1 || to_owner < 1 || from_owner == to_owner {
+        anyhow::bail!("Invalid players");
+    }
+    let db = db::connect(&cfg.database_url).await?;
+    let rows = db
+        .query(
+            "SELECT id, COALESCE(actor_id,''), (disabled_at IS NULL)
+             FROM ap_users WHERE id = ANY($1::bigint[])",
+            &[&vec![from_owner, to_owner]],
+        )
+        .await
+        .context("load Phyrian request players")?;
+    if rows.len() != 2 || rows.iter().any(|r| !r.get::<_, bool>(2)) {
+        anyhow::bail!("Players unavailable");
+    }
+    let mut actor_by_id = std::collections::HashMap::new();
+    for row in rows {
+        let id: i64 = row.get(0);
+        let actor: String = row.get(1);
+        if !actor.starts_with("https://mkultra.monster/users/") {
+            anyhow::bail!("Phyrian requests are local-only");
+        }
+        actor_by_id.insert(id, actor);
+    }
+    for (owner, actor) in [(from_owner, actor_by_id[&from_owner].clone()), (to_owner, actor_by_id[&to_owner].clone())] {
+        db.execute(
+            "INSERT INTO phyrian_players (owner_user_id, actor_id, status, resonance, generation, level)
+             VALUES ($1,$2,'unknown',0,1,1) ON CONFLICT (owner_user_id) DO NOTHING",
+            &[&owner, &actor],
+        )
+        .await
+        .context("ensure Phyrian player")?;
+    }
+    let state = db
+        .query(
+            "SELECT owner_user_id, status, COALESCE(strain,''), generation
+             FROM phyrian_players WHERE owner_user_id = ANY($1::bigint[])",
+            &[&vec![from_owner, to_owner]],
+        )
+        .await
+        .context("load Phyrian player state")?;
+    let mut from_imprinted = false;
+    let mut to_imprinted = false;
+    let mut generation = 1;
+    for row in state {
+        let id: i64 = row.get(0);
+        let imprinted: String = row.get(1);
+        let strain: String = row.get(2);
+        if id == from_owner {
+            from_imprinted = imprinted == "imprinted" && !strain.trim().is_empty();
+            generation = row.get::<_, i64>(3);
+        } else if id == to_owner {
+            to_imprinted = imprinted == "imprinted" && !strain.trim().is_empty();
+        }
+    }
+    let origin = from_owner == 1;
+    plan_request_offer(kind, from_owner, to_owner, from_imprinted, to_imprinted, origin, generation)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let dup: Option<i64> = db
+        .query_opt(
+            "SELECT id FROM phyrian_requests
+             WHERE from_owner_id=$1 AND to_owner_id=$2 AND kind=$3 AND status='pending' LIMIT 1",
+            &[&from_owner, &to_owner, &kind.trim().to_ascii_lowercase()],
+        )
+        .await?
+        .map(|r| r.get(0));
+    if dup.is_some() {
+        anyhow::bail!("Request already pending");
+    }
+    let id: i64 = db
+        .query_one(
+            "INSERT INTO phyrian_requests (kind, from_owner_id, to_owner_id, status)
+             VALUES ($1,$2,$3,'pending') RETURNING id",
+            &[&kind.trim().to_ascii_lowercase(), &from_owner, &to_owner],
+        )
+        .await?
+        .get(0);
+    Ok(id)
+}
+
 fn nonnegative(v: Option<i64>) -> i64 {
     v.unwrap_or(0).max(0)
 }
