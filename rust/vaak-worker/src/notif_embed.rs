@@ -2475,6 +2475,36 @@ pub fn paint_lean_embed_from(
         article_classes.push_str(" tweet-bsky");
     }
 
+    // Stable identity attrs for client newer=1 / scroll dedupe (PHP parity:
+    // data-rss-item on shared cards). Lean paint historically omitted these, so
+    // PHP-rendered newer polls of the same RSS item slipped past textContent keys.
+    let mut article_attrs = String::new();
+    let rss_item_id = status
+        .get("vaak_rss_item_id")
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .or_else(|| {
+            status
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|id| id.strip_prefix("rss:")?.parse::<i64>().ok())
+                .filter(|n| *n > 0)
+        });
+    if let Some(rid) = rss_item_id {
+        article_attrs.push_str(&format!(
+            " data-rss-item=\"{rid}\" data-timeline-key=\"rss:{rid}\""
+        ));
+    } else if bsky && uri.starts_with("at://") {
+        article_attrs.push_str(&format!(
+            " data-bsky-uri=\"{}\" data-timeline-key=\"bsky:{}\"",
+            esc(uri),
+            esc(uri)
+        ));
+    } else if let Some(sid) = status.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    {
+        article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(sid)));
+    }
+
     let mut inner = String::new();
 
     if !hide_header {
@@ -2618,9 +2648,10 @@ pub fn paint_lean_embed_from(
         "notif-status-embed"
     };
     format!(
-        "<div class=\"{wrap}\"><article class=\"{ac}\">{inner}</article></div>",
+        "<div class=\"{wrap}\"><article class=\"{ac}\"{attrs}>{inner}</article></div>",
         wrap = wrap_class,
         ac = article_classes,
+        attrs = article_attrs,
         inner = inner
     )
 }
@@ -2943,6 +2974,14 @@ mod tests {
         assert!(html.contains("reblog_status") || html.contains("Boost (VAAK only)"), "{html}");
         assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
         assert!(!html.contains("bite_remote"), "RSS must not Bite: {html}");
+        assert!(
+            html.contains("data-rss-item=\"9\""),
+            "RSS cards need data-rss-item for client dedupe: {html}"
+        );
+        assert!(
+            html.contains("data-timeline-key=\"rss:9\""),
+            "RSS cards need data-timeline-key: {html}"
+        );
     }
 
     #[test]

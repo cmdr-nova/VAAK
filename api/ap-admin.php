@@ -15904,7 +15904,7 @@ function admin_render_masto_status_card(
             . ' data-return-view="' . h($returnView) . '"';
     }
     ?>
-          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
+          <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '" data-timeline-key="rss:' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
             <?php if (!$hideHeader): ?>
             <div class="tweet-hd">
@@ -18081,7 +18081,7 @@ function admin_render_rss_item(array $row, string $returnView): void
     // Fallback if normalize/card unavailable: open article link only.
     $url = trim((string) ($row['url'] ?? ''));
     $title = trim((string) ($row['title'] ?? ''));
-    echo '<article class="tweet" data-rss-item="' . $itemId . '">';
+    echo '<article class="tweet" data-rss-item="' . $itemId . '" data-timeline-key="rss:' . $itemId . '">';
     echo '<div class="body feed-body">' . htmlspecialchars($title !== '' ? $title : 'RSS item', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';
     if ($url !== '' && preg_match('#^https?://#i', $url)) {
         echo '<div class="meta"><a href="' . htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
@@ -24911,14 +24911,27 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $homePaintCount = $homeFromAxumHtml
               ? (int) ($adminHomeAxumHtml['next_offset'] ?? $tlLimit)
               : ($homeFromAxum ? count($adminHomeAxumStatuses) : count($homePage));
+          // Ranked Home is not chronological — use max created_at across the
+          // painted page so newer=1 cannot re-emit RSS/Bluesky cards that sit
+          // below an older head row.
           $homeNewest = time();
           if ($homeFromAxum) {
-              $ca = (string) ($adminHomeAxumStatuses[0]['created_at'] ?? '');
-              if ($ca !== '') {
-                  $ts = strtotime($ca);
-                  if ($ts !== false) {
-                      $homeNewest = (int) $ts;
+              $maxTs = 0;
+              foreach ($adminHomeAxumStatuses as $stNewest) {
+                  if (!is_array($stNewest)) {
+                      continue;
                   }
+                  $ca = (string) ($stNewest['created_at'] ?? '');
+                  if ($ca === '') {
+                      continue;
+                  }
+                  $ts = strtotime($ca);
+                  if ($ts !== false && $ts > $maxTs) {
+                      $maxTs = (int) $ts;
+                  }
+              }
+              if ($maxTs > 0) {
+                  $homeNewest = $maxTs;
               }
           } elseif (!empty($homePage[0]['sort'])) {
               $homeNewest = (int) $homePage[0]['sort'];
@@ -34537,6 +34550,12 @@ window.apAdminToast = function (msg, isErr) {
       const timelineKey = el.getAttribute('data-timeline-key') || '';
       if (timelineKey) keys['timeline:' + timelineKey] = true;
     });
+    // RSS: lean Axum + PHP shared cards stamp data-rss-item; newer=1 used to
+    // re-paint the same item with different who/text so textContent keys missed.
+    items.querySelectorAll('article[data-rss-item]').forEach((el) => {
+      const rid = el.getAttribute('data-rss-item') || '';
+      if (rid) keys['rss:' + rid] = true;
+    });
     items.querySelectorAll('a[href*="object="]').forEach((a) => {
       const href = a.getAttribute('href') || '';
       const m = href.match(/[?&]object=([^&]+)/);
@@ -34568,6 +34587,10 @@ window.apAdminToast = function (msg, isErr) {
       if (el.getAttribute) {
         const timelineKey = el.getAttribute('data-timeline-key') || '';
         if (timelineKey) key = 'timeline:' + timelineKey;
+      }
+      if (!key && el.getAttribute) {
+        const rid = el.getAttribute('data-rss-item') || '';
+        if (rid) key = 'rss:' + rid;
       }
       const link = !key && el.querySelector && el.querySelector('a[href*="object="]');
       if (link) {
