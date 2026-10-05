@@ -185,6 +185,9 @@ struct OutboxPaintRow {
     visibility: String,
     content_text: String,
     pinned: bool,
+    ask_actor: String,
+    ask_question: String,
+    ask_answer: String,
 }
 
 struct AnnouncePaintRow {
@@ -321,10 +324,44 @@ async fn fetch_outbox_tab(
             visibility: "public".into(),
             content_text: String::new(),
             pinned: false,
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
         });
     }
     if note_ids.is_empty() {
         return Ok(out);
+    }
+
+    // PHP profile parity: resolve structured Ask context from the same
+    // mentions/ap_asks records used by the canonical Ask card renderer.
+    let mut asks: std::collections::HashMap<String, (String, String, String)> = std::collections::HashMap::new();
+    if let Ok(rows) = db.query(
+        "SELECT object_id, COALESCE(ask_actor,''), COALESCE(ask_question,''), COALESCE(ask_answer,'')
+         FROM mentions WHERE object_id = ANY($1) AND deleted_at IS NULL AND ask_question <> '' ORDER BY id DESC",
+        &[&note_ids],
+    ).await {
+        for row in rows {
+            let key: String = row.get::<_, String>(0).trim_end_matches('/').to_string();
+            asks.entry(key).or_insert((row.get(1), row.get(2), row.get(3)));
+        }
+    }
+    if let Ok(rows) = db.query(
+        "SELECT answer_note_id, COALESCE(asker_actor,''), COALESCE(question,'')
+         FROM ap_asks WHERE answer_note_id = ANY($1) ORDER BY id DESC",
+        &[&note_ids],
+    ).await {
+        for row in rows {
+            let key: String = row.get::<_, String>(0).trim_end_matches('/').to_string();
+            asks.entry(key).or_insert((row.get(1), row.get(2), String::new()));
+        }
+    }
+    for row in &mut out {
+        if let Some((actor, question, answer)) = asks.get(row.id.trim_end_matches('/')) {
+            row.ask_actor = actor.clone();
+            row.ask_question = question.clone();
+            row.ask_answer = answer.clone();
+        }
     }
     note_ids.sort();
     note_ids.dedup();
@@ -474,6 +511,13 @@ fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
         "card": Value::Null,
         "poll": Value::Null,
     });
+    if !row.ask_question.trim().is_empty() {
+        st["vaak_ask"] = json!({
+            "ask_actor": row.ask_actor,
+            "ask_question": row.ask_question,
+            "ask_answer": row.ask_answer,
+        });
+    }
     let parent = row.in_reply_to.trim().trim_end_matches('/');
     if !parent.is_empty() && parent.starts_with("https://") {
         st["vaak_in_reply_to_url"] = json!(parent);
@@ -617,6 +661,9 @@ async fn hydrate_announce_inners(
             visibility: "public".into(),
             content_text: String::new(),
             pinned: false,
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
         });
     }
     let mut variants = Vec::new();
@@ -824,6 +871,9 @@ pub async fn fetch_outbox_statuses_by_uris(
             visibility: "public".into(),
             content_text: String::new(),
             pinned: false,
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
         });
     }
     let mut note_ids = Vec::new();
@@ -925,6 +975,9 @@ mod tests {
             visibility: "public".into(),
             content_text: "fallback".into(),
             pinned: true,
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
         };
         let st = materialize_outbox_status(&row, &account);
         assert_eq!(st["id"], json!("12345"));

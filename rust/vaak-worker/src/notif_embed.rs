@@ -2448,6 +2448,61 @@ fn media_row_html(st: &Value) -> String {
     )
 }
 
+/// Render the canonical VAAK/Wafrn Ask wire fragment as one timeline card.
+/// Ask answers are ordinary Notes whose content starts with an asker/`asked`
+/// paragraph and a blockquote; without this normalization the lean painter
+/// flattens the question and answer into one undifferentiated paragraph.
+fn ask_card_html(content: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r#"(?is)^\s*<p[^>]*>(.*?)\s*<a[^>]*>asked</a>\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$"#,
+    ).ok()?;
+    let caps = re.captures(content.trim())?;
+    let header = strip_tags(caps.get(1)?.as_str()).trim().to_string();
+    let question = html_entity_decode_basic(strip_tags(caps.get(2)?.as_str()).trim());
+    if header.is_empty() || question.is_empty() {
+        return None;
+    }
+    let answer = html_entity_decode_basic(&strip_tags(caps.get(3).map(|m| m.as_str()).unwrap_or(""))).trim().to_string();
+    let answer_html = if answer.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<hr class=\"ask-divider\" style=\"margin:.7rem 0;border:0;border-top:1px solid var(--primary,#ff70c7)\"><div class=\"ask-answer\" style=\"white-space:pre-wrap\">{}</div>",
+            esc(&answer).replace('\n', "<br>")
+        )
+    };
+    Some(format!(
+        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\"><div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{}</div><blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote>{}</div></div>",
+        header,
+        esc(&question).replace('\n', "<br>"),
+        answer_html
+    ))
+}
+
+fn ask_card_from_status(status: &Value) -> Option<String> {
+    let ask = status.get("vaak_ask")?.as_object()?;
+    let question = ask.get("ask_question")?.as_str()?.trim();
+    if question.is_empty() { return None; }
+    let actor = ask.get("ask_actor").and_then(|v| v.as_str()).unwrap_or("");
+    let label = actor.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("Someone");
+    let answer = ask.get("ask_answer").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let answer_html = if answer.is_empty() { String::new() } else {
+        format!(
+            "<hr class=\"ask-divider\" style=\"margin:.7rem 0;border:0;border-top:1px solid var(--primary,#ff70c7)\"><div class=\"ask-answer\" style=\"white-space:pre-wrap\">{}</div>",
+            esc(answer).replace('\n', "<br>")
+        )
+    };
+    let label_html = if actor.starts_with("https://") {
+        format!("<a class=\"ask-label\" href=\"{}\" style=\"display:inline-block;font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7);text-decoration:none\">{} asked</a>", esc(actor), esc(label))
+    } else {
+        format!("<div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{} asked</div>", esc(label))
+    };
+    Some(format!(
+        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\">{}<blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote>{}</div></div>",
+        label_html, esc(question).replace('\n', "<br>"), answer_html
+    ))
+}
+
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
 pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
     paint_lean_embed_from(status, hide_header, "mentions", "")
@@ -2626,7 +2681,9 @@ pub fn paint_lean_embed_from(
     // strip_tags+esc dropped <a> and double-encoded &#039; / &quot; into visible codes (0.7.13).
     // 0.7.14: rewrite anchors in-app, linkify bare URLs, tighten breaks, paint OG cards.
     let content_trim = content_html.trim();
-    if content_looks_like_html(content_trim) {
+    if let Some(ask_html) = ask_card_from_status(status).or_else(|| ask_card_html(content_trim)) {
+        body_inner.push_str(&ask_html);
+    } else if content_looks_like_html(content_trim) {
         let prepared = prepare_feed_body_html(content_trim, from);
         body_inner.push_str(&format!(
             "<div class=\"body feed-body feed-body--html\">{prepared}</div>"
@@ -3508,6 +3565,25 @@ mod tests {
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("cw-gate"), "media-only post should be gated: {html}");
         assert!(html.contains("photo.jpg"), "media must remain inside the gate: {html}");
+    }
+
+    #[test]
+    fn timeline_ask_uses_structured_php_context() {
+        let st = json!({
+            "id": "ask-1",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/ask-1",
+            "content": "<p>legacy flattened ask</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {"acct":"cmdr_nova","display_name":"Cmdr Nova","avatar":"https://example.com/a.png","uri":"https://mkultra.monster/users/cmdr_nova"},
+            "media_attachments": [],
+            "vaak_ask": {"ask_actor":"https://example.com/users/asker","ask_question":"What is VAAK?","ask_answer":"A social wire."}
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("What is VAAK?"), "{html}");
+        assert!(html.contains("A social wire."), "{html}");
+        assert!(html.contains("ask-divider"), "{html}");
+        assert!(!html.contains("legacy flattened ask"), "{html}");
     }
 
 }
