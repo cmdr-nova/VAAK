@@ -694,6 +694,11 @@ pub async fn profile_html_fill(
     // Live fav/boost/bookmark from masto_* (same as Home lean / Ice Cubes, 0.7.19).
     if viewer_owner_id > 0 {
         let _ = crate::interaction_flags::apply_to_statuses(&db, viewer_owner_id, &mut statuses).await;
+        if let Ok(moderation) =
+            crate::hidden::load_viewer_moderation(&db, viewer_owner_id).await
+        {
+            crate::notif_embed::stamp_viewer_moderation(&mut statuses, &moderation);
+        }
     }
     // Cached OG/YouTube cards (PHP `ap_link_preview_card_for_status_text` parity).
     let _ = crate::link_preview::attach_cached_cards(&db, &mut statuses).await;
