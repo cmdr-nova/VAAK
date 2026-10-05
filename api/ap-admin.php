@@ -262,6 +262,14 @@ register_shutdown_function(static function () use ($adminRenderHiccup): void {
 
 $notice = null;
 $error = null;
+if (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['vaak_flash_ok'])) {
+    $notice = (string) $_SESSION['vaak_flash_ok'];
+    unset($_SESSION['vaak_flash_ok']);
+}
+if (session_status() === PHP_SESSION_ACTIVE && !empty($_SESSION['vaak_flash_err'])) {
+    $error = (string) $_SESSION['vaak_flash_err'];
+    unset($_SESSION['vaak_flash_err']);
+}
 $twoFaSetup = null;
 $twoFaRecoveryCodes = [];
 $view = preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? 'home')) ?: 'home';
@@ -4802,12 +4810,26 @@ $vaakAdminOnlyActions = [
                         . (string) $res['strain']
                         . (!empty($res['origin_random']) ? ' (origin roll).' : '.');
                 } elseif ($action === 'phyrian_accept') {
-                    $notice = 'Accepted.';
+                    $notice = 'Resonance exchange accepted.';
                 } else {
-                    $notice = 'Denied.';
+                    $notice = 'Phyrian request denied.';
                 }
             } else {
                 $error = (string) ($res['error'] ?? 'Could not update request.');
+            }
+            // Mentions Accept/Deny: PRG so Mentions paints a fast shell instead of
+            // sync-hydrating ~30 notification cards in the POST response (10–15s).
+            if ($view === 'mentions') {
+                if (session_status() === PHP_SESSION_ACTIVE) {
+                    if ($notice !== null && $notice !== '') {
+                        $_SESSION['vaak_flash_ok'] = $notice;
+                    }
+                    if ($error !== null && $error !== '') {
+                        $_SESSION['vaak_flash_err'] = $error;
+                    }
+                }
+                header('Location: /vaak/?view=mentions', true, 303);
+                exit;
             }
         }
         // Keep sub-pages after POST (dossier readout, etc.).
@@ -23865,6 +23887,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <?php elseif ($view === 'mentions'): ?>
         <?php
           // Same unified feed as Ice Cubes: follows, likes, boosts, mentions, quotes…
+          // Paint an empty shell immediately; bindNotifScroll fills via partial
+          // (same path as soft-nav). Avoids 10–15s sync hydrate on hard Mentions loads
+          // such as Phyrian Accept/Deny PRG returns.
           $notifFilter = strtolower(trim((string) ($_GET['notification_filter'] ?? 'all')));
           $notifFilterOptions = [
               'all' => ['label' => 'All', 'types' => []],
@@ -23875,7 +23900,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if (!isset($notifFilterOptions[$notifFilter])) {
               $notifFilter = 'all';
           }
-          $notifTypes = $notifFilterOptions[$notifFilter]['types'];
           $notifFilterHref = static function (string $filter): string {
               return '?view=mentions&notification_filter=' . rawurlencode($filter);
           };
@@ -23888,30 +23912,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   . h((string) $filterOption['label']) . '</a>';
           }
           echo '</nav>';
-          // Wider first page + look-ahead so like/boost groups form; infinite
-          // scroll still appends older cards via ?partial=1.
-          $notifLimit = 30;
-          $adminNotifs = [];
-          $notifNextMaxId = '';
-          $notifHasMore = false;
-          try {
-              $notifPage = admin_notifications_page($notifLimit, null, $notifTypes);
-              $adminNotifs = $notifPage['items'];
-              $notifNextMaxId = $notifPage['next_max_id'];
-              $notifHasMore = $notifPage['has_more'];
-          } catch (Throwable $e) {
-              error_log('[ap-admin] notifications fetch: ' . $e->getMessage());
-          }
-          if (!$adminNotifs):
+          $notifLimit = 12;
         ?>
-          <?= admin_mascot_empty('No notifications yet.') ?>
-        <?php else: ?>
-          <div id="timeline-items" data-view="mentions" data-filter="<?= h($notifFilter) ?>" data-limit="<?= (int) $notifLimit ?>" data-max-id="<?= h($notifNextMaxId) ?>" data-has-more="<?= $notifHasMore ? '1' : '0' ?>" data-offset="0" data-newest="0">
-            <?php admin_render_notification_stream($adminNotifs, $followingIds, $followerIds); ?>
-          </div>
-          <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $notifHasMore ? 'Scroll for more…' : 'End of notifications' ?></div>
+          <div id="timeline-items" data-view="mentions" data-filter="<?= h($notifFilter) ?>" data-limit="<?= (int) $notifLimit ?>" data-max-id="" data-has-more="1" data-initial-pending="1" data-offset="0" data-newest="0"></div>
+          <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><span class="timeline-status-loading"><span class="vaak-spinner" aria-hidden="true"></span><span>Loading…</span></span></div>
           <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
-        <?php endif; ?>
 
       <?php elseif ($view === 'ask'): ?>
         <?php
@@ -34364,6 +34369,17 @@ window.apAdminToast = function (msg, isErr) {
     }, { root: feed || null, rootMargin: '400px 0px', threshold: 0 });
     io.observe(sentinel);
   }
+  window.bindNotifScroll = bindNotifScroll;
+  // Hard Mentions page paints an empty shell (data-initial-pending=1); fill async
+  // the same way soft-nav does so Accept/Deny PRG returns stay fast.
+  (function bootMentionsShell() {
+    try {
+      const items = document.getElementById('timeline-items');
+      if (!items || items.dataset.view !== 'mentions' || items.dataset.initialPending !== '1') return;
+      const main = document.querySelector('section.main') || document.body;
+      bindNotifScroll(main);
+    } catch (e) {}
+  })();
 
   function bindGenericScroll(view, main) {
     const items = document.getElementById('timeline-items');
