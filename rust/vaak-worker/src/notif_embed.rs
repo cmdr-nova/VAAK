@@ -680,66 +680,214 @@ fn is_blank_html_segment(seg: &str) -> bool {
     strip_tags(&t).trim().is_empty()
 }
 
-/// Force VAAK paragraph shape across remote software dialects.
-///
-/// Mastodon (and many peers) emit one `<p>` with `<br><br>` for paragraphs.
-/// Local VAAK posts use real `<p>` blocks. Making every `<br>` a CSS block
-/// gap made remote posts look huge; instead convert double-breaks into
-/// separate `<p>` tags and leave single `<br>` as soft line breaks.
-fn normalize_feed_paragraphs(html: &str) -> String {
-    let mut html = collapse_html_breaks(html.trim());
-    // Drop empty / br-only paragraphs some peers insert between blocks.
-    html = lazy_regex_replace_all(r"(?i)<p>\s*(?:<br\s*/?>\s*)*</p>", &html, "");
-    html = lazy_regex_replace_all(r"(?i)(<br\s*/?>\s*){2,}", &html, "<!--vaak-p-->");
+fn is_void_html_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "br" | "hr" | "img" | "input" | "meta" | "source" | "wbr" | "area" | "col" | "embed" | "track"
+    )
+}
 
-    // Prefer splitting inside a single outer <p>…</p> wrapper.
-    let trimmed = html.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("<p>") && lower.ends_with("</p>") {
-        let open_count = lower.matches("<p>").count() + lower.matches("<p ").count();
-        // One outer paragraph (possibly with nested tags, but no sibling <p>).
-        if open_count == 1 {
-            let inner = &trimmed[3..trimmed.len() - 4];
-            let parts: Vec<&str> = inner.split("<!--vaak-p-->").collect();
-            let mut out = String::with_capacity(trimmed.len() + 16);
-            for part in parts {
-                let part = part.trim();
-                if part.is_empty() || is_blank_html_segment(part) {
+fn html_tag_name(tag: &str) -> String {
+    let lower = tag.to_ascii_lowercase();
+    let body = if lower.starts_with("</") {
+        &lower[2..]
+    } else if lower.starts_with('<') {
+        &lower[1..]
+    } else {
+        return String::new();
+    };
+    body.chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn match_leading_br(s: &str) -> Option<usize> {
+    let lower_prefix: String = s.chars().take(12).collect::<String>().to_ascii_lowercase();
+    if !lower_prefix.starts_with("<br") {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 || !s[..3].eq_ignore_ascii_case("<br") {
+        return None;
+    }
+    let mut i = 3usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'/' {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'>' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    Some(i)
+}
+
+fn match_leading_double_br(s: &str) -> Option<usize> {
+    let mut matched = 0usize;
+    let mut rest = s;
+    let mut count = 0usize;
+    while let Some(n) = match_leading_br(rest) {
+        matched += n;
+        rest = &rest[n..];
+        count += 1;
+        if count >= 2 {
+            while let Some(n2) = match_leading_br(rest) {
+                matched += n2;
+                rest = &rest[n2..];
+            }
+            return Some(matched);
+        }
+    }
+    None
+}
+
+/// Split `inner` on double-`<br>` only at nesting depth 0 (not inside `<a>`/`<span>`/…).
+fn split_on_top_level_double_br(inner: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    let mut depth: i32 = 0;
+    while i < inner.len() {
+        if inner.as_bytes()[i] == b'<' {
+            if depth == 0 {
+                if let Some(n) = match_leading_double_br(&inner[i..]) {
+                    let piece = cur.trim();
+                    if !piece.is_empty() && !is_blank_html_segment(piece) {
+                        parts.push(piece.to_string());
+                    }
+                    cur.clear();
+                    i += n;
                     continue;
                 }
-                out.push_str("<p>");
-                out.push_str(part);
-                out.push_str("</p>");
             }
-            if !out.is_empty() {
-                return out;
-            }
-        }
-    }
-
-    // Multiple blocks or unwrapped HTML: split on markers and wrap bare chunks.
-    if html.contains("<!--vaak-p-->") {
-        let parts: Vec<&str> = html.split("<!--vaak-p-->").collect();
-        let mut out = String::with_capacity(html.len() + 16);
-        for part in parts {
-            let part = part.trim();
-            if part.is_empty() || is_blank_html_segment(part) {
+            if let Some(end_rel) = inner[i..].find('>') {
+                let tag_end = i + end_rel + 1;
+                let tag = &inner[i..tag_end];
+                let lower = tag.to_ascii_lowercase();
+                let name = html_tag_name(tag);
+                if lower.starts_with("</") {
+                    if !is_void_html_tag(&name) {
+                        depth = (depth - 1).max(0);
+                    }
+                } else {
+                    let self_closing = lower.trim_end().ends_with("/>") || is_void_html_tag(&name);
+                    if !name.is_empty() && !self_closing {
+                        depth += 1;
+                    }
+                }
+                cur.push_str(tag);
+                i = tag_end;
                 continue;
             }
-            let pl = part.to_ascii_lowercase();
-            if pl.starts_with("<p>") || pl.starts_with("<p ") {
-                out.push_str(part);
-            } else {
-                out.push_str("<p>");
-                out.push_str(part);
-                out.push_str("</p>");
+        }
+        let ch = inner[i..].chars().next().unwrap_or('\0');
+        cur.push(ch);
+        i += ch.len_utf8();
+    }
+    let piece = cur.trim();
+    if !piece.is_empty() && !is_blank_html_segment(piece) {
+        parts.push(piece.to_string());
+    }
+    parts
+}
+
+fn rewrite_p_inner_double_breaks(open_p: &str, inner: &str) -> String {
+    let parts = split_on_top_level_double_br(inner);
+    if parts.len() <= 1 {
+        let mut out = String::with_capacity(open_p.len() + inner.len() + 4);
+        out.push_str(open_p);
+        out.push_str(inner);
+        out.push_str("</p>");
+        return out;
+    }
+    let mut out = String::with_capacity(inner.len() + 16);
+    for part in parts {
+        out.push_str("<p>");
+        out.push_str(&part);
+        out.push_str("</p>");
+    }
+    out
+}
+
+/// Force VAAK paragraph shape across remote software dialects.
+///
+/// Mastodon often emits one `<p>` with top-level `<br><br>` for paragraphs.
+/// Convert those safe double-breaks into sibling `<p>` tags. Never split inside
+/// nested tags (`<a>`, `<span>`, …) or across sibling block boundaries.
+fn normalize_feed_paragraphs(html: &str) -> String {
+    let mut html = collapse_html_breaks(html.trim());
+    html = lazy_regex_replace_all(r"(?i)<p(?:\s[^>]*)?>\s*(?:<br\s*/?>\s*)*</p>", &html, "");
+
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut i = 0usize;
+    while i < html.len() {
+        if html.as_bytes()[i] == b'<' {
+            if let Some(end_rel) = html[i..].find('>') {
+                let tag_end = i + end_rel + 1;
+                let tag = &html[i..tag_end];
+                let lower = tag.to_ascii_lowercase();
+                if lower.starts_with("<p>") || lower.starts_with("<p ") {
+                    let open = tag;
+                    let mut j = tag_end;
+                    let mut d: i32 = 1;
+                    let mut found = None;
+                    while j < html.len() {
+                        if html.as_bytes()[j] != b'<' {
+                            j += html[j..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                            continue;
+                        }
+                        let Some(er) = html[j..].find('>') else {
+                            break;
+                        };
+                        let te = j + er + 1;
+                        let t = &html[j..te];
+                        let tl = t.to_ascii_lowercase();
+                        if tl.starts_with("</p") {
+                            d -= 1;
+                            if d == 0 {
+                                found = Some((tag_end, j, te));
+                                break;
+                            }
+                        } else if tl.starts_with("<p>") || tl.starts_with("<p ") {
+                            d += 1;
+                        }
+                        j = te;
+                    }
+                    if let Some((inner_start, inner_end, after)) = found {
+                        let inner = &html[inner_start..inner_end];
+                        out.push_str(&rewrite_p_inner_double_breaks(open, inner));
+                        i = after;
+                        continue;
+                    }
+                }
+                out.push_str(tag);
+                i = tag_end;
+                continue;
             }
         }
-        if !out.is_empty() {
-            return out;
+        let ch = html[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    if !out.to_ascii_lowercase().contains("<p") {
+        let parts = split_on_top_level_double_br(&out);
+        if parts.len() > 1 {
+            let mut wrapped = String::new();
+            for part in parts {
+                wrapped.push_str("<p>");
+                wrapped.push_str(&part);
+                wrapped.push_str("</p>");
+            }
+            return wrapped;
         }
     }
-    html.replace("<!--vaak-p-->", "<br><br>")
+    out
 }
 
 /// Prepare Mastodon/AP content HTML for lean feed paint: normalize paragraphs,
@@ -2694,6 +2842,63 @@ mod tests {
         let lower = html.to_ascii_lowercase();
         assert!(!lower.contains("<p></p>"), "empty p removed: {html}");
         assert!(html.contains("one") && html.contains("two"), "{html}");
+    }
+
+    #[test]
+    fn does_not_explode_brbr_inside_anchor() {
+        let html = prepare_feed_body_html(
+            "<p>hello <a href=\"https://x.test/1\">title<br><br>subtitle</a> end</p>",
+            "home",
+        );
+        assert!(
+            html.contains("href=\"https://x.test/1\"") && html.contains("</a>"),
+            "anchor preserved: {html}"
+        );
+        assert!(
+            html.contains("title<br><br>subtitle") || html.contains("title<br /><br />subtitle"),
+            "double br inside anchor kept (not split): {html}"
+        );
+        // Must not close </p> before </a>.
+        let a_at = html.find("<a ").expect("a");
+        let close_a = html.find("</a>").expect("/a");
+        let mid = &html[a_at..close_a];
+        assert!(
+            !mid.to_ascii_lowercase().contains("</p>"),
+            "must not split inside anchor: {html}"
+        );
+        assert_eq!(
+            html.to_ascii_lowercase().matches("<p>").count()
+                + html.to_ascii_lowercase().matches("<p ").count(),
+            html.to_ascii_lowercase().matches("</p>").count(),
+            "balanced p tags: {html}"
+        );
+    }
+
+    #[test]
+    fn does_not_explode_sibling_paragraphs() {
+        let html = prepare_feed_body_html("<p>a</p><p>b<br><br>c</p>", "home");
+        assert_eq!(
+            html.to_ascii_lowercase().matches("<p>").count(),
+            html.to_ascii_lowercase().matches("</p>").count(),
+            "{html}"
+        );
+        // Second paragraph splits safely; first stays intact.
+        assert!(html.contains("<p>a</p>"), "{html}");
+        assert!(html.contains("<p>b</p>") && html.contains("<p>c</p>"), "{html}");
+        assert!(!html.contains("<p>b<p>"), "no nested p smash: {html}");
+    }
+
+    #[test]
+    fn splits_p_with_attributes() {
+        let html = prepare_feed_body_html("<p dir=\"auto\">one<br><br>two</p>", "home");
+        assert!(
+            html.to_ascii_lowercase().matches("<p>").count()
+                + html.to_ascii_lowercase().matches("<p ").count()
+                >= 2,
+            "{html}"
+        );
+        assert!(html.contains("one") && html.contains("two"), "{html}");
+        assert!(!html.contains("<p dir=\"auto\">one<p>"), "{html}");
     }
 
     #[test]
