@@ -1625,12 +1625,19 @@ function ap_masto_api(string $method, string $path): void
         if (($sinceId === null || $sinceId === '') && isset($_GET['min_id'])) {
             $sinceId = (string) $_GET['min_id'];
         }
-        // Home Axum-primary: localhost shadow hydrate first (Mentions M5 twin).
-        // Miss / max_id / flag-off → PHP Redis/file cache, then cold merge.
-        if (ap_masto_timeline_home_axum_try($limit, $maxId, $sinceId)) {
-            return;
+        // Mastodon clients (Ice Cubes, etc.) always get chronological Home:
+        // follows + own posts. Ranked Axum hydrate mixes bsky:/rss: ids that
+        // break Decodable + Link max_id pagination; VAAK web keeps algorithm
+        // via HTML/Axum separately. Cache under mode=chrono so we never
+        // overwrite the shared ranked hydrate Redis key used by web paint.
+        if ($maxId !== null && $maxId !== '' && !ctype_digit($maxId)) {
+            $maxId = null;
         }
-        if (ap_masto_timeline_cache_try('/api/v1/timelines/home', $limit, $maxId, $sinceId)) {
+        if ($sinceId !== null && $sinceId !== '' && !ctype_digit($sinceId)) {
+            $sinceId = null;
+        }
+        $chronoExtra = ['mode' => 'chrono'];
+        if (ap_masto_timeline_cache_try('/api/v1/timelines/home', $limit, $maxId, $sinceId, $chronoExtra)) {
             return;
         }
         // Home = people you follow + your own posts (never DMs)
@@ -1638,7 +1645,7 @@ function ap_masto_api(string $method, string $path): void
             ap_masto_timeline_home_merged($limit, $maxId, $sinceId, true),
             (int) ap_db_masto_owner_user_id()
         );
-        ap_masto_timeline_cache_store($homeStatuses, '/api/v1/timelines/home', $limit, $maxId, $sinceId);
+        ap_masto_timeline_cache_store($homeStatuses, '/api/v1/timelines/home', $limit, $maxId, $sinceId, $chronoExtra);
         ap_masto_json_timeline($homeStatuses, '/api/v1/timelines/home', $limit);
         return;
     }
