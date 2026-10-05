@@ -46,6 +46,10 @@ pub struct OwnerQuery {
     pub views: Option<String>,
     /// Home HTML infinite-scroll window start (0.7.9).
     pub offset: Option<i64>,
+    /// Local profile actor URL (`/shadow/profile-html`).
+    pub actor: Option<String>,
+    /// Profile tab: posts / replies / media / boosts.
+    pub tab: Option<String>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -97,6 +101,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/mentions-html", get(shadow_mentions_html))
         // Home fill HTML from hydrate Redis (0.7.4).
         .route("/shadow/home-html", get(shadow_home_html))
+        // Local mkultra profile tab HTML (0.7.18).
+        .route("/shadow/profile-html", get(shadow_profile_html))
         // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
         .route("/shadow/account-switch-prep", get(shadow_account_switch_prep))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
@@ -134,6 +140,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/notif-embed",
             "/shadow/mentions-html",
             "/shadow/home-html",
+            "/shadow/profile-html",
             "/shadow/account-switch-prep",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
@@ -342,6 +349,80 @@ async fn shadow_home_html(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "home html cache miss",
+                "source": "vaak-worker-shadow"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Local mkultra profile tab HTML (0.7.18). Invalid/empty actor → 404 JSON.
+async fn shadow_profile_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    // Guest / missing owner → 0 so lean paint skips own-post Delete/Edit/Pin.
+    // (Unlike Home, profiles are publicly viewable.)
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(0);
+    let actor = q.actor.as_deref().unwrap_or("").trim();
+    let tab = q.tab.as_deref().unwrap_or("posts");
+    let limit = q.limit.unwrap_or(20).clamp(1, 50);
+    let offset = q.offset.unwrap_or(0).max(0);
+    if actor.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "profile actor required",
+                "source": "vaak-worker-shadow"
+            })),
+        )
+            .into_response();
+    }
+    match crate::profile_html::profile_html_fill(&state.cfg, owner, actor, tab, limit, offset)
+        .await
+    {
+        Ok(Some(report)) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-has-more"),
+                axum::http::HeaderValue::from_static(if report.has_more { "1" } else { "0" }),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.next_offset.to_string()) {
+                headers.insert(axum::http::HeaderName::from_static("x-next-offset"), v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-source"), v);
+            }
+            headers.insert(
+                axum::http::HeaderName::from_static("x-vaak-profile-html"),
+                axum::http::HeaderValue::from_static("1"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-tl-cache"),
+                axum::http::HeaderValue::from_static("axum-profile-html"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-tl-count"), v);
+            }
+            (StatusCode::OK, headers, report.html).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "profile html miss",
                 "source": "vaak-worker-shadow"
             })),
         )
