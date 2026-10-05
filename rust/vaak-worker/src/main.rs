@@ -7,6 +7,7 @@ mod db;
 mod hidden;
 mod http;
 mod jetstream;
+mod mentions_html;
 mod notif;
 mod notif_embed;
 mod notif_list;
