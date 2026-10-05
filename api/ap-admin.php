@@ -1081,6 +1081,15 @@ $vaakAdminOnlyActions = [
             if (!in_array($returnView, ['home', 'local', 'feed'], true)) {
                 $returnView = 'home';
             }
+            // 0.7.5: warm target Home ranked/hydrate/badge via Axum before 303
+            // so the landing page hits lean Home HTML instead of a cold rebuild.
+            if (function_exists('admin_account_switch_axum_prep')) {
+                try {
+                    admin_account_switch_axum_prep((int) ($target['id'] ?? 0), $returnView);
+                } catch (Throwable $e) {
+                    error_log('[ap-admin] account-switch prep: ' . $e->getMessage());
+                }
+            }
             $switchedKey = (string) ($target['actor_key'] ?? $target['username'] ?? '');
             $q = '?view=' . rawurlencode($returnView) . '&switched=1';
             if ($switchedKey !== '') {
@@ -20239,6 +20248,78 @@ function admin_notif_status_strip_reply_bake(array $status, array $knownMentions
  * @param bool $hideHeader When true (mention/quote nest), skip the nested
  *                         author row — the notif chrome already shows them.
  */
+/**
+ * Warm the target account's Home ranked + badge (+ hydrate spawn) via Axum
+ * before the switch 303 (0.7.5). Flag: VAAK_ACCOUNT_SWITCH_AXUM (default on).
+ *
+ * @return array<string,mixed>|null
+ */
+function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = 'home'): ?array
+{
+    $enabled = getenv('VAAK_ACCOUNT_SWITCH_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled || $ownerUserId < 1) {
+        return null;
+    }
+    $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
+    if (!in_array($returnView, ['home', 'local', 'feed'], true)) {
+        $returnView = 'home';
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    // Also kick hydrate immediately (not only via shutdown) so it races the 303.
+    if (function_exists('ap_timeline_home_hydrate_warm_async')) {
+        // Use the ap-db helper that supports multi-limit; start now via exec.
+        $script = __DIR__ . '/bin/home-timeline-warm.php';
+        if (is_file($script) && function_exists('exec')) {
+            $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : (getenv('VAAK_PHP_BIN') ?: '/usr/bin/php');
+            $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
+                . ' --owner-id=' . (int) $ownerUserId
+                . ' --limits=15,40 >/dev/null 2>&1 &';
+            @exec($cmd);
+        }
+    }
+    $url = $base . '/shadow/account-switch-prep?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'views' => $returnView,
+    ]);
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    $started = microtime(true);
+    // Ranked native Home can take ~0.5–1.5s on cold owners; keep under 3s.
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 3000,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('account.switch.axum_prep', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($raw) || $raw === '') {
+        return null;
+    }
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : null;
+}
+
 /**
  * Fetch Home fill HTML from Axum `/shadow/home-html` (0.7.4).
  * Lean Rust cards from hydrate Redis. Flag: VAAK_HOME_HTML_AXUM (default on).

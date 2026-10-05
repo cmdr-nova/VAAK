@@ -7,6 +7,7 @@ mod db;
 mod hidden;
 mod http;
 mod jetstream;
+mod account_switch;
 mod home_html;
 mod mentions_html;
 mod notif;
