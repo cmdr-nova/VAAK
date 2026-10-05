@@ -20554,7 +20554,8 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
 
 /**
  * Fetch local profile tab HTML from Axum `/shadow/profile-html` (0.7.18).
- * Same lean cards as Home (actions + own-post Delete/Edit/Pin).
+ * Same lean cards as Home (actions + own-post Delete/Edit/Pin) for posts /
+ * replies / media / boosts. First paint prefers Axum on every tab (0.7.23).
  * Flag: VAAK_PROFILE_HTML_AXUM (default on).
  *
  * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int}|null
@@ -30192,30 +30193,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $rpLocalHasMore = false;
               $rpLocalNextOffset = 0;
           }
-          // Prefer Axum lean HTML for local timeline tabs when no Bluesky-only mix-in (0.7.18).
+          // Prefer Axum lean HTML for every local timeline tab (0.7.18; always-on 0.7.23).
+          // Bluesky-only mix-in used to force PHP first paint on all tabs — that dropped
+          // Home-parity actions / no-network-tag chrome. Scroll partial already used Axum.
           if ($rpIsLocal && $rpActor !== '' && in_array($rpTab, ['posts', 'replies', 'boosts', 'media'], true)
               && function_exists('admin_profile_html_axum_fetch')) {
-              $rpHasBskyMix = false;
-              foreach ($rpLocalPageItems as $rpMixItem) {
-                  if (is_array($rpMixItem) && isset($rpMixItem['post'])) {
-                      $rpHasBskyMix = true;
-                      break;
-                  }
-              }
-              if (!$rpHasBskyMix) {
-                  $rpAxumFill = admin_profile_html_axum_fetch(
-                      $rpActor,
-                      $rpTab,
-                      (int) $rpLocalPageLimit,
-                      0,
-                      (int) ($vaakOwnerId ?? 0)
-                  );
-                  if (is_array($rpAxumFill) && (string) ($rpAxumFill['html'] ?? '') !== '') {
-                      $rpAxumHtml = (string) $rpAxumFill['html'];
-                      $rpLocalHasMore = !empty($rpAxumFill['has_more']);
-                      $rpLocalNextOffset = (int) ($rpAxumFill['next_offset'] ?? $rpLocalPageLimit);
-                      $rpAxumCache = 'axum-profile-html';
-                  }
+              $rpAxumFill = admin_profile_html_axum_fetch(
+                  $rpActor,
+                  $rpTab,
+                  (int) $rpLocalPageLimit,
+                  0,
+                  (int) ($vaakOwnerId ?? 0)
+              );
+              if (is_array($rpAxumFill) && (string) ($rpAxumFill['html'] ?? '') !== '') {
+                  $rpAxumHtml = (string) $rpAxumFill['html'];
+                  $rpLocalHasMore = !empty($rpAxumFill['has_more']);
+                  $rpLocalNextOffset = (int) ($rpAxumFill['next_offset'] ?? $rpLocalPageLimit);
+                  $rpAxumCache = 'axum-profile-html';
               }
           }
         ?>
