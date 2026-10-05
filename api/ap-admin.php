@@ -29833,9 +29833,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </header>
 
           <nav class="phyrian-game-nav" aria-label="Phyrian Strains pages">
-            <?php if ($phyPage !== 'hub'): ?>
-              <a class="phyrian-game-back" href="<?= h($phyHubHref) ?>">← Game</a>
-            <?php endif; ?>
             <a class="<?= $phyPage === 'hub' ? 'is-active' : '' ?>" href="<?= h($phyHubHref) ?>" <?= $phyPage === 'hub' ? 'aria-current="page"' : '' ?>>Hub</a>
             <a class="<?= $phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId ? 'is-active' : '' ?>" href="<?= h($phyOwnDossierHref) ?>" <?= ($phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId) ? 'aria-current="page"' : '' ?>>Your readout</a>
           </nav>
