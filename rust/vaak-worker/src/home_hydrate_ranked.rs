@@ -631,9 +631,38 @@ fn reblog_is_rss_local(status_id: &str, object_id: &str) -> bool {
     let oid = object_id.trim().to_ascii_lowercase();
     sid.starts_with("rss:")
         || sid.starts_with("rss-boost:")
+        || sid.starts_with("rss-quote:")
+        || sid.starts_with("rss-quote-boost:")
         || sid.starts_with("local:rss-boost:")
+        || sid.starts_with("local:rss-quote:")
         || oid.starts_with("rss:")
         || oid.starts_with("rss-boost:")
+        || oid.starts_with("rss-quote:")
+        || oid.starts_with("rss-quote-boost:")
+}
+
+fn rss_item_id_from_key(value: &str) -> Option<i64> {
+    for marker in [
+        "rss-quote-boost:",
+        "rss-quote:",
+        "rss-boost:",
+        "local:rss-quote:",
+        "local:rss-boost:",
+        "rss:",
+    ] {
+        if let Some(pos) = value.to_ascii_lowercase().find(marker) {
+            let digits = value[pos + marker.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(id) = digits.parse::<i64>() {
+                if id > 0 {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
 }
 
 struct RankedEntry {
@@ -2008,12 +2037,11 @@ fn materialize_announce(
 fn materialize_boost(
     rb: &BoostRow,
     create: Option<&EventRow>,
+    rss: Option<&RssRow>,
     actors: &HashMap<String, ActorRow>,
     local_profiles: &HashMap<String, LocalProfile>,
 ) -> Option<Value> {
-    if reblog_is_bsky_native(&rb.status_id, &rb.object_id)
-        || reblog_is_rss_local(&rb.status_id, &rb.object_id)
-    {
+    if reblog_is_bsky_native(&rb.status_id, &rb.object_id) {
         return None;
     }
     let created = format_time(&rb.created_at);
@@ -2046,7 +2074,9 @@ fn materialize_boost(
     };
 
     let object_id = rb.object_id.trim_end_matches('/').to_string();
-    let mut inner = if let Some(crow) = create {
+    let mut inner = if let Some(rss_row) = rss {
+        materialize_rss(rss_row)
+    } else if let Some(crow) = create {
         let cactor = actors.get(crow.actor_id.trim_end_matches('/'));
         materialize_event_create(crow, cactor)
     } else {
@@ -2223,10 +2253,24 @@ pub async fn warm_view(
 
     let db = crate::db::connect(&cfg.database_url).await?;
     let owner_username = load_owner_username(&db, owner_user_id).await?;
-    let rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
+    let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
     let bsky_map = fetch_bsky_map(&db, &bsky_uris).await?;
     let events_map = fetch_events_map(&db, &event_ids).await?;
     let boosts_map = fetch_boosts_map(&db, &boost_ids, owner_user_id).await?;
+    let mut rss_boost_ids = Vec::new();
+    for rb in boosts_map.values() {
+        for key in [&rb.status_id, &rb.object_id, &rb.boost_status_id] {
+            if let Some(id) = rss_item_id_from_key(key) {
+                rss_boost_ids.push(id);
+                break;
+            }
+        }
+    }
+    rss_boost_ids.sort_unstable();
+    rss_boost_ids.dedup();
+    if !rss_boost_ids.is_empty() {
+        rss_map.extend(fetch_rss_map(&db, &rss_boost_ids, owner_user_id).await?);
+    }
 
     // Announce / boost → look up Create for object_id; collect all actor ids.
     let mut announce_oids = Vec::new();
@@ -2314,7 +2358,11 @@ pub async fn warm_view(
                 .map(|row| materialize_outbox(row, &owner_username, &local_profiles)),
             ("local", "boost") => boosts_map.get(&e.id).and_then(|rb| {
                 let create = creates_map.get(rb.object_id.trim_end_matches('/'));
-                materialize_boost(rb, create, &actors_map, &local_profiles)
+                let rss = rss_item_id_from_key(&rb.status_id)
+                    .or_else(|| rss_item_id_from_key(&rb.object_id))
+                    .or_else(|| rss_item_id_from_key(&rb.boost_status_id))
+                    .and_then(|id| rss_map.get(&id));
+                materialize_boost(rb, create, rss, &actors_map, &local_profiles)
             }),
             _ => None,
         };
@@ -2591,6 +2639,9 @@ mod tests {
         assert!(reblog_is_bsky_native("bsky-repost-abc", "https://example.com/x"));
         assert!(reblog_is_bsky_native("x", "https://bsky.app/profile/a/post/b"));
         assert!(reblog_is_rss_local("rss-boost:1", ""));
+        assert!(reblog_is_rss_local("local:rss-quote:1:2", ""));
+        assert_eq!(rss_item_id_from_key("local:rss-boost:42:1"), Some(42));
+        assert_eq!(rss_item_id_from_key("rss:7"), Some(7));
         assert!(!reblog_is_bsky_native("12345", "https://example.com/notes/1"));
     }
 

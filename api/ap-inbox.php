@@ -2672,23 +2672,58 @@ function ap_activity_touches_local(array $activity): bool
     return false;
 }
 
+/**
+ * Extract a displayable body from an ActivityPub object. Lemmy publishes
+ * posts as AS2 Page objects: `name` is the title and `content` is the body.
+ * Mastodon-style Notes generally only have content, so keep their historical
+ * behavior while preserving Lemmy's title instead of silently dropping it.
+ */
+function ap_as2_text_summary(array $obj): ?string
+{
+    $content = isset($obj['content']) && is_string($obj['content'])
+        ? trim($obj['content'])
+        : '';
+    $name = isset($obj['name']) && is_string($obj['name'])
+        ? trim($obj['name'])
+        : '';
+    $type = strtolower(trim((string) ($obj['type'] ?? '')));
+    if ($content !== '' && $name !== '' && in_array($type, ['page', 'article'], true)) {
+        $titlePlain = trim(html_entity_decode(strip_tags($name), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        $bodyPlain = trim(html_entity_decode(strip_tags($content), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        // Avoid duplicating a title when a peer has already included it in
+        // the first line of the HTML body.
+        if ($titlePlain !== '' && !str_starts_with($bodyPlain, $titlePlain)) {
+            return '<p><strong>'
+                . htmlspecialchars($titlePlain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                . '</strong></p>' . $content;
+        }
+    }
+    if ($content !== '') {
+        return $content;
+    }
+    if ($name !== '') {
+        return $name;
+    }
+    if (isset($obj['summary']) && is_string($obj['summary']) && trim($obj['summary']) !== '') {
+        return $obj['summary'];
+    }
+    return null;
+}
+
 function ap_activity_text_summary(array $activity): ?string
 {
     $obj = $activity['object'] ?? null;
     if (is_array($obj)) {
-        if (isset($obj['content']) && is_string($obj['content']) && $obj['content'] !== '') {
-            return ap_fix_utf8($obj['content']);
+        $summary = ap_as2_text_summary($obj);
+        if ($summary !== null) {
+            return ap_fix_utf8($summary);
         }
         // QuotePost / Quote wrappers sometimes nest the Note
-        if (isset($obj['object']) && is_array($obj['object'])
-            && isset($obj['object']['content']) && is_string($obj['object']['content'])) {
-            return ap_fix_utf8($obj['object']['content']);
-        }
-        if (isset($obj['name']) && is_string($obj['name']) && $obj['name'] !== '') {
-            return ap_fix_utf8($obj['name']);
-        }
-        if (isset($obj['summary']) && is_string($obj['summary']) && $obj['summary'] !== '') {
-            return ap_fix_utf8($obj['summary']);
+        if (isset($obj['object']) && is_array($obj['object'])) {
+            $nested = ap_as2_text_summary($obj['object']);
+            if ($nested !== null) {
+                return ap_fix_utf8($nested);
+            }
         }
     }
     if (isset($activity['content']) && is_string($activity['content']) && $activity['content'] !== '') {
