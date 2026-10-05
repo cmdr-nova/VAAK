@@ -142,7 +142,7 @@ async fn read_hydrate_envelope(
     since_id: Option<&str>,
     view: &str,
 ) -> Result<HomeHydrateReport> {
-    let limit = limit.clamp(1, 80);
+    let limit = limit.clamp(1, 240);
     let redis_key = timeline_hydrate_redis_key(view, owner, limit, since_id);
     let envelope = redis_util::json_get(redis, &redis_key).await?;
     let source = match view {
@@ -230,8 +230,8 @@ async fn read_home_hydrate(
 }
 
 /// Warm envelope sizes we routinely write (Home HTML + Ice Cubes).
-/// Ice Cubes head polls use `limit=50` — must be in this set (0.7.21).
-const HYDRATE_WARM_LIMITS: [i64; 4] = [15, 40, 50, 80];
+/// 50 = Ice Cubes (0.7.21); 160/240 = deep HTML scroll (0.7.25).
+const HYDRATE_WARM_LIMITS: [i64; 6] = [15, 40, 50, 80, 160, 240];
 
 /// Mastodon-shaped statuses from hydrate Redis for `home` / `local` / `feed`.
 ///
@@ -249,7 +249,7 @@ pub async fn view_hydrate(
         "local" | "feed" => view,
         _ => "home",
     };
-    let limit = limit.clamp(1, 80);
+    let limit = limit.clamp(1, 240);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let mut report =
         read_hydrate_envelope(&mut redis, owner_user_id, limit as i64, since_id, view).await?;

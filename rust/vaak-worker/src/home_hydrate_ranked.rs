@@ -2,7 +2,7 @@
 //!
 //! Walks `vaak:timeline:ranked:v2:*` for an owner, materializes Mastodon-shaped
 //! status JSON, then writes PHP-compatible `vaak:timeline:v1:*` envelopes for
-//! limits 15/40/80.
+//! limits 15/40/50/80/160/240 (0.7.25 deep Home scroll).
 //!
 //! Views:
 //! - home: rss / bsky / event / outbox (Announce→reblog)
@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
@@ -29,8 +29,9 @@ const HOME_HYDRATE_TTL_SECS: u64 = 300;
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.webp";
 /// Local mkultra accounts without actor_profile.icon_url.
 const LOCAL_DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
-/// Include 50 — Ice Cubes head polls `/api/v1/timelines/home?limit=50` (0.7.21).
-const DEFAULT_LIMITS: [i64; 4] = [15, 40, 50, 80];
+/// 50 = Ice Cubes (0.7.21); 160/240 = deep HTML scroll past the old 80-head (0.7.25).
+const DEFAULT_LIMITS: [i64; 6] = [15, 40, 50, 80, 160, 240];
+const MAX_HYDRATE_LIMIT: i64 = 240;
 
 #[derive(Debug, Clone)]
 pub struct WarmReport {
@@ -501,13 +502,16 @@ fn ranked_redis_key(logical: &str) -> String {
     format!("vaak:timeline:ranked:v2:{}", hex::encode(hasher.finalize()))
 }
 
-/// Pick the ranked logical key for a view from the owner index.
+/// Collect ranked logical keys for a view from the owner index.
 ///
 /// - home: contains `_home_` or `home` (legacy index entries)
 /// - local: contains `_local_`
-/// - feed: contains `_feed_` (first match — index may list following fingerprints)
-fn pick_view_logical(index: Option<&Value>, view: &str) -> Option<String> {
-    let arr = index?.as_array()?;
+/// - feed: contains `_feed_` (index may list several follow fingerprints)
+fn collect_view_logicals(index: Option<&Value>, view: &str) -> Vec<String> {
+    let Some(arr) = index.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
     let mut first = None;
     for v in arr {
         let Some(s) = v.as_str() else { continue };
@@ -519,16 +523,22 @@ fn pick_view_logical(index: Option<&Value>, view: &str) -> Option<String> {
             "feed" => s.contains("_feed_"),
             _ => s.contains("_home_") || s.contains("home"),
         };
-        if hit {
-            return Some(s.to_string());
+        if hit && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
         }
     }
-    // Home previously fell back to the first index entry; keep that only for home.
-    if view == "home" || view.is_empty() {
-        first
-    } else {
-        None
+    // Home previously fell back to the first index entry.
+    if out.is_empty() && (view == "home" || view.is_empty()) {
+        if let Some(f) = first {
+            out.push(f);
+        }
     }
+    out
+}
+
+#[allow(dead_code)]
+fn pick_view_logical(index: Option<&Value>, view: &str) -> Option<String> {
+    collect_view_logicals(index, view).into_iter().next()
 }
 
 #[allow(dead_code)]
@@ -1168,11 +1178,42 @@ async fn load_ranked_head_for_view(
     let view = normalize_view(view);
     let index_key = format!("vaak:timeline:owner-index:v1:{owner}");
     let index = redis_util::json_get(redis, &index_key).await?;
-    let logical = pick_view_logical(index.as_ref(), view)
-        .with_context(|| format!("owner ranked index miss (no {view} logical)"))?;
-    let rk = ranked_redis_key(&logical);
-    let env = redis_util::json_get(redis, &rk)
-        .await?
+    let logicals = collect_view_logicals(index.as_ref(), view);
+    if logicals.is_empty() {
+        bail!("owner ranked index miss (no {view} logical)");
+    }
+
+    // Owner index can list several follow-fingerprint keys. Prefer the deepest
+    // envelope (then newest warm_ts) so hydrate/HTML deep scroll is not stuck
+    // on a stale 160-item fan-out head while a fresh 400+ ranked warm exists.
+    let mut best: Option<(String, Value, usize, i64)> = None;
+    for logical in &logicals {
+        let rk = ranked_redis_key(logical);
+        let Some(env) = redis_util::json_get(redis, &rk).await? else {
+            continue;
+        };
+        let n = env
+            .get("ranked")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if n == 0 {
+            continue;
+        }
+        let ts = env
+            .get("warm_ts")
+            .or_else(|| env.get("ts"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let replace = match &best {
+            None => true,
+            Some((_, _, bn, bts)) => n > *bn || (n == *bn && ts > *bts),
+        };
+        if replace {
+            best = Some((logical.clone(), env, n, ts));
+        }
+    }
+    let (logical, env, _n, _ts) = best
         .with_context(|| format!("ranked {view} envelope miss"))?;
     let ranked = env
         .get("ranked")
@@ -1870,14 +1911,14 @@ pub async fn warm_view(
     let mut limits: Vec<i64> = limits
         .iter()
         .copied()
-        .filter(|n| (1..=80).contains(n))
+        .filter(|n| (1..=MAX_HYDRATE_LIMIT).contains(n))
         .collect();
     if limits.is_empty() {
         limits = DEFAULT_LIMITS.to_vec();
     }
     limits.sort_unstable();
     limits.dedup();
-    let want = *limits.iter().max().unwrap_or(&80) as usize;
+    let want = *limits.iter().max().unwrap_or(&MAX_HYDRATE_LIMIT) as usize;
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let (head, _logical) =
@@ -2241,11 +2282,19 @@ mod tests {
         let index = json!([
             "v13_feed_u1_ana_aaa",
             "v13_local_u1_ana_bbb",
-            "v13_home_u1_aon_ccc"
+            "v13_home_u1_aon_ccc",
+            "v13_home_u1_aon_ddd"
         ]);
         assert_eq!(
             pick_view_logical(Some(&index), "home").as_deref(),
             Some("v13_home_u1_aon_ccc")
+        );
+        assert_eq!(
+            collect_view_logicals(Some(&index), "home"),
+            vec![
+                "v13_home_u1_aon_ccc".to_string(),
+                "v13_home_u1_aon_ddd".to_string()
+            ]
         );
         assert_eq!(
             pick_view_logical(Some(&index), "local").as_deref(),

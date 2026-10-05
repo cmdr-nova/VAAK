@@ -2,7 +2,7 @@
 //!
 //! Serves soft-nav / first-paint / infinite-scroll cards without PHP
 //! `admin_render_masto_status_card` × N. Offset pages (0.7.9) slice a larger warm
-//! envelope (15/40/80).
+//! envelope; 0.7.25 widens to 15/40/50/80/160/240 so deep Home scroll stays on Axum.
 
 use anyhow::Result;
 
@@ -74,17 +74,19 @@ pub async fn tl_html_fill(
     let view = normalize_view(view);
     let limit = limit.clamp(1, 40) as usize;
     let offset = offset.max(0) as usize;
-    let need = (offset + limit).min(80);
+    // Warm heads go to 240 (0.7.25). Past that → miss → PHP extend.
+    const MAX_WARM: usize = 240;
+    let need = (offset + limit).min(MAX_WARM);
 
     // Prefer the smallest warm size that covers this window, then larger heads.
     let mut candidates: Vec<usize> = Vec::new();
-    for alt in [need, 80usize, 40, 60, 30, 20, 15] {
+    for alt in [need, 240usize, 160, 80, 50, 40, 60, 30, 20, 15] {
         if alt >= need && !candidates.contains(&alt) {
             candidates.push(alt);
         }
     }
     // Last resort: any warm head (may be shorter than need; we still slice).
-    for alt in [80usize, 40, 15, 30, 20] {
+    for alt in [240usize, 160, 80, 50, 40, 15, 30, 20] {
         if !candidates.contains(&alt) {
             candidates.push(alt);
         }
@@ -124,11 +126,16 @@ pub async fn tl_html_fill(
         return Ok(None);
     }
 
+    // Hydrate envelopes are warm heads, not the full timeline. Claiming
+    // end-of-timeline at the tail of a known warm size blocked PHP extend
+    // (0.7.25 — early "End of timeline" around ~80–160 posts).
+    const WARM_HEAD_SIZES: [usize; 6] = [15, 40, 50, 80, 160, 240];
+    let exhausted = end >= report.items.len();
+    let looks_like_warm_head = WARM_HEAD_SIZES.contains(&report.items.len());
     Ok(Some(HomeHtmlReport {
         html,
         count: painted,
-        // Full page ⇒ client may ask again; Axum miss falls through to PHP.
-        has_more: painted >= limit || end < report.items.len(),
+        has_more: painted >= limit || !exhausted || looks_like_warm_head,
         next_offset: offset + painted,
         source: format!("axum-{view}-html:{}", report.source),
         hydrate_key: report.redis_key,

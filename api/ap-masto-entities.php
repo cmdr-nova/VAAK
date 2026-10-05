@@ -6159,9 +6159,9 @@ function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit 
             }
             $php = getenv('VAAK_PHP_BIN') ?: PHP_BINARY ?: '/usr/bin/php';
             // Always store 15+40+50+80 — Ice Cubes uses limit=50 (0.7.21).
-            $limits = '15,40,50,80';
-            if ($limit > 80) {
-                $limits = '15,40,50,80,' . (int) $limit;
+            $limits = '15,40,50,80,160,240';
+            if ($limit > 240) {
+                $limits = '15,40,50,80,160,240,' . (int) $limit;
             }
             $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
                 . ' --owner-id=' . (int) $ownerUserId
