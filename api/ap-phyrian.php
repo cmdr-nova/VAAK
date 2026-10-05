@@ -501,10 +501,88 @@ function ap_phyrian_request_create(int $fromOwnerId, int $toOwnerId, string $kin
         );
         $ins->execute([$kind, $fromOwnerId, $toOwnerId]);
         $id = (int) $ins->fetchColumn();
+        if (function_exists('ap_masto_notifications_unread_invalidate')) {
+            ap_masto_notifications_unread_invalidate($toOwnerId);
+        }
         return ['ok' => true, 'id' => $id];
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => 'Could not create request'];
     }
+}
+
+/**
+ * Pending imprint/resonance offers as Mentions-shaped notification entities.
+ *
+ * @return list<array<string,mixed>>
+ */
+function ap_phyrian_notification_entities(int $ownerUserId): array
+{
+    if ($ownerUserId < 1) {
+        return [];
+    }
+    $pending = ap_phyrian_pending_for($ownerUserId);
+    if ($pending === []) {
+        return [];
+    }
+    $out = [];
+    foreach ($pending as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $reqId = (int) ($row['id'] ?? 0);
+        $fromId = (int) ($row['from_owner_id'] ?? 0);
+        $kind = strtolower(trim((string) ($row['kind'] ?? '')));
+        if ($reqId < 1 || $fromId < 1 || !in_array($kind, ['imprint', 'resonance'], true)) {
+            continue;
+        }
+        $account = null;
+        try {
+            $ust = ap_db()->prepare(
+                'SELECT id, actor_key, username, actor_id FROM ap_users
+                 WHERE id = ? AND disabled_at IS NULL LIMIT 1'
+            );
+            $ust->execute([$fromId]);
+            $user = $ust->fetch(PDO::FETCH_ASSOC);
+            if (is_array($user) && function_exists('ap_masto_account_from_user')) {
+                $account = ap_masto_account_from_user($user);
+            }
+        } catch (Throwable $e) {
+            $account = null;
+        }
+        if (!is_array($account)) {
+            $uname = (string) ($row['from_username'] ?? $row['from_actor_key'] ?? ('user' . $fromId));
+            $actorKey = (string) ($row['from_actor_key'] ?? $uname);
+            $actorId = 'https://mkultra.monster/users/' . preg_replace('/[^a-z0-9_]/', '', strtolower($actorKey));
+            $account = [
+                'id' => (string) $fromId,
+                'username' => $uname,
+                'acct' => $uname,
+                'display_name' => $uname,
+                'url' => $actorId,
+                'uri' => $actorId,
+                'avatar' => '',
+                'avatar_static' => '',
+            ];
+        }
+        $created = (string) ($row['created_at'] ?? '');
+        $createdAt = $created;
+        if ($created !== '' && function_exists('ap_masto_format_time')) {
+            $createdAt = ap_masto_format_time($created);
+        } elseif ($created !== '' && str_contains($created, ' ') && !str_contains($created, 'T')) {
+            $createdAt = str_replace(' ', 'T', $created) . 'Z';
+        }
+        $out[] = [
+            'id' => 'phyrian' . $reqId,
+            'type' => $kind === 'imprint' ? 'phyrian_imprint' : 'phyrian_resonance',
+            'group_key' => 'phyrian-' . $reqId,
+            'created_at' => $createdAt,
+            'account' => $account,
+            'status' => null,
+            'phyrian_request_id' => $reqId,
+            'phyrian_kind' => $kind,
+        ];
+    }
+    return $out;
 }
 
 function ap_phyrian_actor_id_for_owner(int $ownerUserId): string
@@ -542,6 +620,9 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
         $db->prepare(
             "UPDATE phyrian_requests SET status = 'denied', resolved_at = NOW() WHERE id = ?"
         )->execute([$requestId]);
+        if (function_exists('ap_masto_notifications_unread_invalidate')) {
+            ap_masto_notifications_unread_invalidate($ownerUserId);
+        }
         return ['ok' => true];
     }
 
@@ -627,6 +708,9 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
     $db->prepare(
         "UPDATE phyrian_requests SET status = 'accepted', resolved_at = NOW() WHERE id = ?"
     )->execute([$requestId]);
+    if (function_exists('ap_masto_notifications_unread_invalidate')) {
+        ap_masto_notifications_unread_invalidate($ownerUserId);
+    }
     $out = ['ok' => true];
     if ($assignedStrain !== null) {
         $out['strain'] = $assignedStrain;

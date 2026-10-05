@@ -4726,7 +4726,8 @@ $vaakAdminOnlyActions = [
         'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
         'phyrian_bridge_start', 'phyrian_bridge_verify', 'phyrian_bridge_unlink',
     ], true)) {
-        $view = 'phyrian';
+        $phyReturn = preg_replace('/[^a-z_]/', '', (string) ($_POST['return_view'] ?? 'phyrian')) ?: 'phyrian';
+        $view = in_array($phyReturn, ['phyrian', 'mentions'], true) ? $phyReturn : 'phyrian';
         // Same pattern as RSS: this branch never inherited $ownerId from above.
         $ownerId = $vaakOwnerId > 0 ? (int) $vaakOwnerId : (int) admin_owner_user_id();
         if ($ownerId < 1) {
@@ -4787,8 +4788,8 @@ $vaakAdminOnlyActions = [
             $res = ap_phyrian_request_create($ownerId, $toId, $kind);
             if (!empty($res['ok'])) {
                 $notice = $kind === 'imprint'
-                    ? 'Imprint offer sent. They can accept it on their Phyrian Strains page.'
-                    : 'Resonance request sent. Waiting for them to accept.';
+                    ? 'Imprint offer sent. It will show in their Mentions and Phyrian hub.'
+                    : 'Resonance request sent. It will show in their Mentions and Phyrian hub.';
             } else {
                 $error = (string) ($res['error'] ?? 'Could not send request.');
             }
@@ -5204,8 +5205,10 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     }
     $latestUnread = preg_replace('/\D+/', '', (string) ($state['latest_unread_id'] ?? '')) ?: '';
     $latestAny = preg_replace('/\D+/', '', (string) ($state['latest_id'] ?? '')) ?: '';
+    // Mentions badge includes pending Phyrian offers (they render on Mentions).
+    $notifCountOut = (int) ($state['count'] ?? 0) + (int) $phyrianPending;
     echo json_encode([
-        'count' => (int) ($state['count'] ?? 0),
+        'count' => $notifCountOut,
         'dm_count' => (int) $dmCount,
         'phyrian_pending' => (int) $phyrianPending,
         'latest_unread_id' => $latestUnread,
@@ -18860,7 +18863,15 @@ if ($isPartial && $view === 'mentions') {
                     if (!is_array($nRow)) {
                         continue;
                     }
-                    $markTip = preg_replace('/\D+/', '', (string) ($nRow['id'] ?? '')) ?: '';
+                    $nRowType = (string) ($nRow['type'] ?? '');
+                    if (str_starts_with($nRowType, 'phyrian_')) {
+                        continue;
+                    }
+                    $rawNotifId = (string) ($nRow['id'] ?? '');
+                    if (str_starts_with($rawNotifId, 'phyrian')) {
+                        continue;
+                    }
+                    $markTip = preg_replace('/\D+/', '', $rawNotifId) ?: '';
                     if ($markTip !== '') {
                         break;
                     }
@@ -19058,6 +19069,10 @@ try {
     error_log('[ap-admin] notif badge: ' . $e->getMessage());
     $notifUnreadNav = 0;
 }
+}
+// Pending Phyrian offers also appear on Mentions — fold them into the Mentions badge.
+if ($phyrianPendingNav > 0) {
+    $notifUnreadNav += (int) $phyrianPendingNav;
 }
 $notifBadgeLabel = $notifUnreadNav > 99 ? '99+' : (string) (int) $notifUnreadNav;
 // Chime seed prefers the newest unread tip; fall back to overall latest when caught up.
@@ -19379,6 +19394,8 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
             'update' => '✏️ edited a post you liked',
             'bite' => '🦷 bit you / your post',
             'status' => '✉ posted',
+            'phyrian_imprint' => '◈ offered you a Phyrian imprint',
+            'phyrian_resonance' => '◈ wants to exchange Phyrian resonance',
             default => $nType,
         };
         // Account-targeted bites use synthetic /bites-received/ URIs (no real post).
@@ -19443,7 +19460,32 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         <div class="meta meta-row" style="color:var(--primary)"><?= h($typeLabel) ?></div>
       </div>
     </div>
-    <?php if ($nType === 'bite' && !$biteHasPost): ?>
+    <?php if ($nType === 'phyrian_imprint' || $nType === 'phyrian_resonance'): ?>
+      <?php
+        $phyReqId = (int) ($n['phyrian_request_id'] ?? 0);
+        $phyKindLabel = $nType === 'phyrian_imprint' ? 'imprint' : 'resonance exchange';
+      ?>
+      <div class="meta" style="margin:.45rem 0 .65rem">
+        Pending Phyrian <?= h($phyKindLabel) ?> request.
+        <a href="?view=phyrian">Open Phyrian hub</a>
+      </div>
+      <?php if ($phyReqId > 0): ?>
+        <div class="composer-actions" style="justify-content:flex-start;gap:.5rem;flex-wrap:wrap">
+          <form method="post" action="?view=mentions" style="display:inline">
+            <input type="hidden" name="action" value="phyrian_accept">
+            <input type="hidden" name="request_id" value="<?= $phyReqId ?>">
+            <input type="hidden" name="return_view" value="mentions">
+            <button class="btn btn-primary" type="submit">Accept</button>
+          </form>
+          <form method="post" action="?view=mentions" style="display:inline">
+            <input type="hidden" name="action" value="phyrian_deny">
+            <input type="hidden" name="request_id" value="<?= $phyReqId ?>">
+            <input type="hidden" name="return_view" value="mentions">
+            <button class="btn btn-ghost" type="submit">Deny</button>
+          </form>
+        </div>
+      <?php endif; ?>
+    <?php elseif ($nType === 'bite' && !$biteHasPost): ?>
       <div class="meta meta-row" style="color:var(--muted)">No associated post</div>
     <?php else: ?>
       <?php
@@ -20100,7 +20142,36 @@ function admin_notifications_page(int $limit, ?string $maxId, array $types = [])
         }
     }
 
+    // First page of All Mentions: prepend pending Phyrian imprint/resonance offers.
+    if ($maxId === null && $types === [] && function_exists('ap_phyrian_notification_entities')) {
+        $ownerForPhy = 0;
+        if (function_exists('admin_owner_user_id')) {
+            $ownerForPhy = (int) admin_owner_user_id();
+        } elseif (!empty($GLOBALS['vaak_owner_id'])) {
+            $ownerForPhy = (int) $GLOBALS['vaak_owner_id'];
+        }
+        if ($ownerForPhy > 0) {
+            try {
+                $phyNotifs = ap_phyrian_notification_entities($ownerForPhy);
+                if ($phyNotifs !== []) {
+                    $merged = array_merge($phyNotifs, $merged);
+                }
+            } catch (Throwable $e) {
+                // non-fatal
+            }
+        }
+    }
+
     $nextMaxId = preg_replace('/\D+/', '', (string) ($merged[count($merged) - 1]['id'] ?? '')) ?: '';
+    // Prefer a real Mastodon snowflake tip for pagination (skip phyrian* ids).
+    for ($i = count($merged) - 1; $i >= 0; $i--) {
+        $cand = preg_replace('/\D+/', '', (string) ($merged[$i]['id'] ?? '')) ?: '';
+        $rawId = (string) ($merged[$i]['id'] ?? '');
+        if ($cand !== '' && !str_starts_with($rawId, 'phyrian')) {
+            $nextMaxId = $cand;
+            break;
+        }
+    }
     // has_more: primary was a full page (more history exists), even when
     // look-ahead only completed groups without adding a new "page".
     $hasMore = count($primary) >= $limit && $nextMaxId !== '';
