@@ -795,6 +795,10 @@ struct OutboxRow {
     published: String,
     content: String,
     in_reply_to: String,
+    /// JSON array of https media URLs (from masto_media / Create attachments).
+    media_urls: String,
+    sensitive: bool,
+    spoiler_text: String,
 }
 
 #[derive(Clone, Default)]
@@ -1157,16 +1161,34 @@ fn materialize_outbox(
         .unwrap_or(owner_username)
         .to_string();
     let account = local_account_from_profile(&actor_url, &username, profiles);
+    let media = media_from_urls(&row.media_urls, &status_id);
+    // Media-only compose stores empty <p></p> (and masto_statuses uses "(media)").
+    // Without media_attachments lean Home painted a blank card (0.7.39).
+    let mut content = row.content.clone();
+    let plain = strip_tags_simple(&content);
+    let plain_trim = plain.trim();
+    if media.is_empty() {
+        // keep content as-is
+    } else if plain_trim.is_empty()
+        || matches!(
+            plain_trim,
+            "(attachment)" | "(media)" | "(poll)" | "(quote)" | "(boost)"
+        )
+    {
+        content.clear();
+    }
     let mut st = base_status(
         &status_id,
         &created,
-        &row.content,
+        &content,
         &row.id,
         &row.id,
         account,
-        Vec::new(),
+        media,
         None,
     );
+    st["sensitive"] = json!(row.sensitive || !row.spoiler_text.trim().is_empty());
+    st["spoiler_text"] = json!(row.spoiler_text);
     let parent = row.in_reply_to.trim().trim_end_matches('/');
     if !parent.is_empty() && parent.starts_with("https://") {
         st["vaak_in_reply_to_url"] = json!(parent);
@@ -1189,6 +1211,42 @@ fn materialize_outbox(
         }
     }
     st
+}
+
+/// Pull https attachment URLs from a stored Create/Note JSON blob.
+fn attachment_urls_from_create_json(raw: &str) -> Vec<String> {
+    let Ok(decoded) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let obj = decoded
+        .get("object")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or(decoded);
+    let atts = match obj.get("attachment") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::Object(o)) => vec![Value::Object(o.clone())],
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for att in atts {
+        if out.len() >= 4 {
+            break;
+        }
+        let url = att
+            .get("url")
+            .and_then(|u| {
+                u.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| u.get("href").and_then(|h| h.as_str()).map(|s| s.to_string()))
+            })
+            .unwrap_or_default();
+        let url = url.trim();
+        if url.to_ascii_lowercase().starts_with("https://") {
+            out.push(url.to_string());
+        }
+    }
+    out
 }
 
 /// When parent + tip land in the same hydrate page, point in_reply_to_id at the
@@ -1649,16 +1707,63 @@ async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String,
     variants.dedup();
     let rows = db
         .query(
-            "SELECT id, COALESCE(published::text,''), COALESCE(content,''),
-                    COALESCE(in_reply_to,'')
-             FROM outbox_notes WHERE id = ANY($1)",
+            "SELECT o.id,
+                    COALESCE(o.published::text,''),
+                    COALESCE(o.content,''),
+                    COALESCE(o.in_reply_to,''),
+                    COALESCE(o.raw_create_json,''),
+                    COALESCE(s.sensitive, 0),
+                    COALESCE(s.spoiler_text, '')
+             FROM outbox_notes o
+             LEFT JOIN masto_statuses s
+               ON s.note_id = o.id OR s.note_id = rtrim(o.id, '/') OR s.note_id = o.id || '/'
+             WHERE o.id = ANY($1)",
             &[&variants],
         )
         .await
         .context("select outbox_notes for hydrate")?;
+
+    // Batch media URLs by note id (masto_media via status_local_id).
+    let mut media_by_note: HashMap<String, Vec<String>> = HashMap::new();
+    if let Ok(media_rows) = db
+        .query(
+            "SELECT s.note_id, COALESCE(m.public_url, '')
+             FROM masto_statuses s
+             JOIN masto_media m ON m.status_local_id = s.local_id
+             WHERE s.note_id = ANY($1)
+             ORDER BY m.local_id ASC",
+            &[&variants],
+        )
+        .await
+    {
+        for mrow in media_rows {
+            let note: String = mrow.get(0);
+            let url: String = mrow.get(1);
+            let url = url.trim().to_string();
+            if !url.to_ascii_lowercase().starts_with("https://") {
+                continue;
+            }
+            let key = note.trim_end_matches('/').to_string();
+            let slot = media_by_note.entry(key).or_default();
+            if slot.len() < 4 && !slot.iter().any(|u| u == &url) {
+                slot.push(url);
+            }
+        }
+    }
+
     for row in rows {
         let id: String = row.get(0);
         let key = id.trim_end_matches('/').to_string();
+        let raw_create: String = row.try_get(4).unwrap_or_default();
+        let sensitive_i: i64 = row.try_get(5).unwrap_or_else(|_| {
+            i64::from(row.try_get::<_, i32>(5).unwrap_or(0))
+        });
+        let spoiler: String = row.try_get(6).unwrap_or_default();
+        let mut urls = media_by_note.remove(&key).unwrap_or_default();
+        if urls.is_empty() {
+            urls = attachment_urls_from_create_json(&raw_create);
+        }
+        let media_urls = serde_json::to_string(&urls).unwrap_or_else(|_| "[]".into());
         map.insert(
             key,
             OutboxRow {
@@ -1666,6 +1771,9 @@ async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String,
                 published: row.get(1),
                 content: row.get(2),
                 in_reply_to: row.get(3),
+                media_urls,
+                sensitive: sensitive_i != 0,
+                spoiler_text: spoiler,
             },
         );
     }

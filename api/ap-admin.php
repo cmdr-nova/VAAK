@@ -29233,6 +29233,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               'following' => '?view=following',
               'search' => '?view=search',
               'outbox' => '?view=outbox',
+              'queue' => '?view=queue',
               default => '?view=home',
           };
           $stBackLabel = match ($stFrom) {
@@ -29242,6 +29243,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               'following' => '← Following',
               'search' => '← Search',
               'outbox' => '← Your posts',
+              'queue' => '← Queue',
               default => '← Home',
           };
           if (!defined('AP_INBOX_LIB_ONLY')) {
@@ -29461,8 +29463,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               // have a healthy local reply set from a refresh.
               $stMaybeMoreReplies = $stObject !== '' && str_starts_with($stObject, 'https://');
           } elseif ($stObject !== '' && str_starts_with($stObject, 'https://') && !$isSyntheticBite) {
-              // Focus post itself missing from store — hydrate it asynchronously.
-              $stMaybeHydrateFocus = true;
+              // Own/local notes that are gone are deletes — do not spin "Loading…" forever
+              // (queue Recently published still links published_note_id after delete).
+              $stLocalGone = function_exists('vaak_is_local_url') && vaak_is_local_url($stObject)
+                  && str_contains($stObject, '/notes/');
+              if (!$stLocalGone) {
+                  // Focus post itself missing from store — hydrate it asynchronously.
+                  $stMaybeHydrateFocus = true;
+              }
           }
           // Explicit retry from failed AJAX
           if (isset($_GET['refresh_thread']) && (string) $_GET['refresh_thread'] === '1' && $stStatusId !== '') {
@@ -29588,7 +29596,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   }
                 ?>
               </div>
-            <?php elseif (!empty($stMaybeHydrateFocus) || ($stObject !== '' && str_starts_with($stObject, 'https://'))): ?>
+            <?php elseif (!empty($stMaybeHydrateFocus)): ?>
             <div id="status-thread-focus"
                  data-object="<?= h($stObject) ?>"
                  data-from="<?= h($stFrom) ?>"
@@ -29601,8 +29609,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             </div>
             <?php else: ?>
             <div class="empty">
-              Couldn’t load that post in this instance’s store.
-              <?php if ($stObject !== ''): ?>
+              <?php if ($stObject !== '' && function_exists('vaak_is_local_url') && vaak_is_local_url($stObject) && str_contains($stObject, '/notes/')): ?>
+                This post was deleted (or is no longer on this instance).
+                <?php if ($stFrom === 'queue'): ?>
+                  <div class="meta" style="margin-top:.5rem">Queue history still lists the old note id after a delete.</div>
+                <?php endif; ?>
+              <?php else: ?>
+                Couldn’t load that post in this instance’s store.
+              <?php endif; ?>
+              <?php if ($stObject !== '' && !(function_exists('vaak_is_local_url') && vaak_is_local_url($stObject))): ?>
                 <div style="margin-top:.75rem"><a href="<?= h(admin_remote_object_href($stObject)) ?>" target="_blank" rel="noopener noreferrer">Open on remote</a></div>
               <?php endif; ?>
             </div>
@@ -31156,14 +31171,53 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $noteId = (string) ($qp['published_note_id'] ?? '');
               $whenPub = ap_queue_format_local(isset($qp['published_at']) ? (string) $qp['published_at'] : null, $qSettings);
               $plainPub = trim((string) ($qp['content'] ?? ''));
+              $qMediaIds = json_decode((string) ($qp['media_ids_json'] ?? '[]'), true);
+              if (!is_array($qMediaIds)) {
+                  $qMediaIds = [];
+              }
+              $qMediaIds = array_values(array_filter(array_map('intval', $qMediaIds), static fn($i) => $i > 0));
+              $qMediaRows = ($qMediaIds !== [] && function_exists('ap_media_by_local_ids'))
+                  ? ap_media_by_local_ids($qMediaIds)
+                  : [];
+              $noteAlive = false;
+              if ($noteId !== '' && function_exists('ap_masto_status_by_note_id')) {
+                  $noteAlive = is_array(ap_masto_status_by_note_id($noteId));
+              }
             ?>
             <article class="tweet">
-              <div class="meta"><?= h($whenPub !== '' ? $whenPub : 'Published') ?></div>
+              <div class="meta">
+                <?= h($whenPub !== '' ? $whenPub : 'Published') ?>
+                <?php if ($noteId !== '' && !$noteAlive): ?>
+                  <span class="tag" style="margin-left:.35rem">Deleted</span>
+                <?php elseif ($plainPub === '' && $qMediaRows !== []): ?>
+                  <span class="tag" style="margin-left:.35rem">Media</span>
+                <?php endif; ?>
+              </div>
               <?php if ($plainPub !== ''): ?>
                 <div class="body feed-body" style="white-space:pre-wrap;margin-top:.35rem"><?= h(mb_strlen($plainPub) > 280 ? mb_substr($plainPub, 0, 277) . '…' : $plainPub) ?></div>
               <?php endif; ?>
+              <?php if ($qMediaRows !== []): ?>
+                <div class="media-row media-count-<?= min(4, count($qMediaRows)) ?>" style="margin-top:.45rem">
+                  <?php foreach (array_slice($qMediaRows, 0, 4) as $qm): ?>
+                    <?php
+                      $qUrl = trim((string) ($qm['public_url'] ?? ''));
+                      $qPrev = trim((string) ($qm['preview_url'] ?? ''));
+                      if ($qPrev === '' || !str_starts_with($qPrev, 'https://')) {
+                          $qPrev = $qUrl;
+                      }
+                      if ($qUrl === '' || !str_starts_with($qUrl, 'https://')) {
+                          continue;
+                      }
+                    ?>
+                    <a href="<?= h($qUrl) ?>" target="_blank" rel="noopener noreferrer">
+                      <img src="<?= h($qPrev) ?>" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer"
+                           style="max-width:100%;border-radius:10px;display:block">
+                    </a>
+                  <?php endforeach; ?>
+                </div>
+              <?php endif; ?>
               <div class="tweet-actions">
-                <?php if ($noteId !== ''): ?>
+                <?php if ($noteId !== '' && $noteAlive): ?>
                   <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, 'queue')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
                   <?php
                     $queueOwnProfile = function_exists('ap_vaak_pretty_profile_path')
@@ -31171,6 +31225,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                         : ('?view=remote_profile&actor=' . rawurlencode((string) ($vaakActorId ?? '')));
                   ?>
                   <a href="<?= h($queueOwnProfile) ?>" class="meta">Your profile</a>
+                <?php elseif ($noteId !== '' && !$noteAlive): ?>
+                  <span class="meta">No longer on this instance</span>
                 <?php endif; ?>
               </div>
             </article>
