@@ -15148,8 +15148,8 @@ function admin_render_masto_status_card(
     }
     // Final belt: if a quote card will paint, never leave a QT-shaped body line.
     if ($willShowQuoteCard && $plain !== ''
-        && (bool) preg_match('/(?:↪|➡|→)\s*QT\b/u', $plain)) {
-        $plain = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)\s*QT\b.*$/us', '', $plain) ?? '';
+        && (bool) preg_match('/(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b/u', $plain)) {
+        $plain = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b.*$/us', '', $plain) ?? '';
         $plain = trim($plain);
     }
     // Media-only placeholders left in summary/content_text — never paint as body text.
@@ -15231,6 +15231,7 @@ function admin_render_masto_status_card(
             }
         }
         // Cache hit for the quoted object → render a real quote card.
+        // Includes GTS @handle/id → /ap/users/{numeric}/statuses/{id} bridge.
         if ($pendingUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
             $pendingQuoted = ap_masto_lookup_status_by_object_url($pendingUrl, 0, false, true);
             if (is_array($pendingQuoted)) {
@@ -15251,10 +15252,25 @@ function admin_render_masto_status_card(
                 ap_bsky_post_preview_warm_enqueue($pendingUrl, $ownerForBsky);
             }
         }
+        $preview = is_array($st['vaak_quote_preview'] ?? null) ? $st['vaak_quote_preview'] : null;
         if (is_array($bskyPending) && (trim((string) ($bskyPending['text'] ?? '')) !== ''
             || trim((string) ($bskyPending['handle'] ?? '')) !== ''
             || !empty($bskyPending['media']))) {
             $bodyInner .= admin_quote_card_html(admin_quote_opts_from_bsky($bskyPending, $pendingUrl), $returnView);
+        } elseif (is_array($preview) && trim((string) ($preview['text'] ?? '')) !== '') {
+            // Summary still had the quoted snippet — paint a card now, warm async.
+            if ($pendingUrl !== '' && function_exists('ap_quote_target_warm_async')) {
+                ap_quote_target_warm_async($pendingUrl);
+            }
+            $bodyInner .= admin_quote_card_html([
+                'acct' => trim((string) ($preview['acct'] ?? '')),
+                'text' => trim((string) ($preview['text'] ?? '')),
+                'url' => (string) ($preview['url'] ?? $pendingUrl),
+                'open_label' => 'Open quoted',
+            ], $returnView);
+        } elseif (is_array($fallbackQuoteOpts)) {
+            $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
+            $fallbackQuoteOpts = null;
         } elseif ($pendingUrl !== '') {
             $unavail = function_exists('ap_object_target_unavailable_reason')
                 ? ap_object_target_unavailable_reason($pendingUrl)
@@ -15279,11 +15295,6 @@ function admin_render_masto_status_card(
                     'open_label' => 'Quoted post (not cached yet) — open',
                 ], $returnView);
             }
-        } elseif (is_array($fallbackQuoteOpts)) {
-            // Pending with no URL recovery — still paint the QT-line fallback card
-            // instead of leaving raw ↪ QT in the body (already stripped above).
-            $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
-            $fallbackQuoteOpts = null;
         }
     } elseif (is_array($fallbackQuoteOpts)) {
         // No structured quote on the status — paint from the ↪ QT line so

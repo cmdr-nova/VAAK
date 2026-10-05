@@ -3029,14 +3029,22 @@ function ap_plain_strip_raw_quote_lines(string $plain, ?string $quotedPlain = nu
             return '';
         }
     }
+    // Normalize glued AS2 type names (QTCreate / QTNote) before cutting —
+    // QT\b alone misses those and left dumps in the body.
+    $plain = preg_replace(
+        '/(?:^|\n)\s*(?:↪|➡|→)?\s*QT(?=Create|Announce|Update|Note|QuotePost|\b)/u',
+        "\n↪ QT",
+        $plain
+    ) ?? $plain;
+    $plain = trim($plain);
     // Cut from the first QT marker to end (card owns that payload).
-    if (preg_match('/^(.*?)(?:\n\n|\n)\s*(?:↪|➡|→)\s*QT\b.*$/us', $plain, $m)) {
+    if (preg_match('/^(.*?)(?:\n\n|\n)\s*(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b.*$/us', $plain, $m)) {
         $plain = trim((string) ($m[1] ?? ''));
-    } elseif (preg_match('/^\s*(?:↪|➡|→)\s*QT\b/u', $plain)) {
+    } elseif (preg_match('/^\s*(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b/u', $plain)) {
         $plain = '';
     } else {
         // Belts: any remaining QT line (odd separators / single-line bodies).
-        $plain = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)\s*QT\b[^\n]*/u', '', $plain) ?? $plain;
+        $plain = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b[^\n]*/u', '', $plain) ?? $plain;
         $plain = trim($plain);
     }
     $plain = preg_replace('/(?:^|\n)\s*RE:\s*https:\/\/[^\s<>]+/u', '', $plain) ?? $plain;

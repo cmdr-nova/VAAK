@@ -1206,6 +1206,59 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
 }
 
 /**
+ * Find a Create/Update event when only the host + status snowflake are reliable
+ * (GoToSocial @handle/id web URLs vs /ap/users/{numeric}/statuses/{id} storage).
+ *
+ * @return array<string,mixed>|null
+ */
+function ap_masto_event_row_by_host_status_id(string $objectUrl): ?array
+{
+    $objectUrl = rtrim(trim($objectUrl), '/');
+    if ($objectUrl === '' || !str_starts_with($objectUrl, 'https://')) {
+        return null;
+    }
+    $host = parse_url($objectUrl, PHP_URL_HOST);
+    if (!is_string($host) || $host === '') {
+        return null;
+    }
+    $statusId = '';
+    if (preg_match('#/@[^/]+/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $statusId = $m[1];
+    } elseif (preg_match('#/(?:statuses|posts|notes)/([A-Za-z0-9_-]+)$#', $objectUrl, $m)) {
+        $statusId = $m[1];
+    }
+    if ($statusId === '' || !preg_match('/^[0-9]+$/', $statusId)) {
+        // Only numeric snowflakes — opaque Misskey ids need exact URL forms.
+        return null;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT * FROM events
+             WHERE type IN ('Create', 'Update')
+               AND object_id LIKE ?
+               AND (
+                    object_id LIKE ?
+                 OR object_id LIKE ?
+                 OR object_id LIKE ?
+               )
+               AND COALESCE(action_taken, '') != 'deleted'
+             ORDER BY CASE type WHEN 'Update' THEN 0 ELSE 1 END, id DESC
+             LIMIT 1"
+        );
+        $st->execute([
+            'https://' . $host . '/%',
+            '%/statuses/' . $statusId,
+            '%/posts/' . $statusId,
+            '%/notes/' . $statusId,
+        ]);
+        $row = $st->fetch();
+        return is_array($row) ? $row : null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
  * Alternate forms of a status/object URL for cache hits without HTTP.
  * Prefers shared ap_object_url_lookup_candidates() from ap-inbox.php when loaded.
  *
@@ -1322,6 +1375,23 @@ function ap_masto_lookup_status_by_object_url(string $objectUrl, int $quoteDepth
                 unset($status['quote']);
                 return $status;
             }
+        }
+    }
+
+    // GTS/Akkoma gap: web form https://host/@handle/123456 never matches stored
+    // https://host/ap/users/{numeric}/statuses/123456. Fall back to host+status-id.
+    $erow = ap_masto_event_row_by_host_status_id($objectUrl);
+    if (is_array($erow)) {
+        if ($allowHiddenActor) {
+            $erow['_allow_hidden_actor'] = true;
+        }
+        $status = ap_masto_status_from_event($erow);
+        if (is_array($status)) {
+            if (!empty($status['reblog']) && is_array($status['reblog'])) {
+                $status = $status['reblog'];
+            }
+            unset($status['quote']);
+            return $status;
         }
     }
 
@@ -7424,6 +7494,35 @@ function ap_masto_status_from_event(array $row): ?array
                 $status['quote_url'] = $quoteObjectUrl;
                 // Card-only: nest owns the quote payload; body keeps commentary only.
                 $plainBody = trim(html_entity_decode(strip_tags((string) ($status['content'] ?? '')), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                // When the nest is still pending, keep a preview from the ↪ QT line so
+                // paint can show a real quote card instead of "not cached yet".
+                if (($quoteEnt['state'] ?? '') === 'pending' && $plainBody !== ''
+                    && !is_array($quoteEnt['quoted_status'] ?? null)) {
+                    $splitForPreview = null;
+                    if (function_exists('admin_split_quote_summary')) {
+                        $splitForPreview = admin_split_quote_summary($plainBody);
+                    } elseif (preg_match('/^(.*?)(?:\n\n|\n)↪\s*QT(?:\s+@(\S+))?\s*:\s*(.*)$/us', $plainBody, $pm)) {
+                        $splitForPreview = [
+                            'commentary' => trim((string) ($pm[1] ?? '')),
+                            'quoted' => '↪ QT' . (isset($pm[2]) && $pm[2] !== '' ? ' @' . $pm[2] : '') . ': ' . trim((string) ($pm[3] ?? '')),
+                        ];
+                    }
+                    if (is_array($splitForPreview)) {
+                        $qLine = (string) ($splitForPreview['quoted'] ?? '');
+                        if (preg_match('/^↪\s*QT(?:\s+@(\S+))?\s*:\s*(.*)$/us', $qLine, $qm)) {
+                            $prevText = trim((string) ($qm[2] ?? ''));
+                            if ($prevText !== '' && $prevText !== '(quoted post unavailable)'
+                                && $prevText !== '(quoted post)'
+                                && !(str_starts_with($prevText, 'https://') && !str_contains($prevText, ' '))) {
+                                $status['vaak_quote_preview'] = [
+                                    'acct' => trim((string) ($qm[1] ?? '')),
+                                    'text' => $prevText,
+                                    'url' => $quoteObjectUrl,
+                                ];
+                            }
+                        }
+                    }
+                }
                 if ($plainBody !== '') {
                     $qPlain = null;
                     if (is_array($quoteEnt['quoted_status'] ?? null)) {
