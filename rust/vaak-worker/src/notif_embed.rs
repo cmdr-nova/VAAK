@@ -1668,6 +1668,74 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
     format!("<div class=\"tweet-actions\">{actions}</div>")
 }
 
+/// True when a URL can be used as an HTML `<video poster>` (image, not the video).
+fn is_image_poster_url(url: &str) -> bool {
+    let url = url.trim();
+    if !url.starts_with("https://") {
+        return false;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if [".mp4", ".webm", ".mov", ".m4v", ".m3u8", ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return false;
+    }
+    if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return true;
+    }
+    // Bluesky CDN thumbs /playlist sibling thumbnail.jpg often omit sniffable
+    // Content-Type but are still usable posters.
+    url.contains("cdn.bsky.app/")
+        || url.contains("/img/")
+        || url.contains("thumbnail")
+        || url.contains("/small/")
+}
+
+/// Mastodon-family hosts keep a still under `/small/*.png` next to `/original/*.mp4`.
+fn guess_video_poster_url(url: &str) -> String {
+    let url = url.trim();
+    if !url.starts_with("https://") {
+        return String::new();
+    }
+    // Same idea as PHP admin_guess_video_poster_url.
+    let re = match regex::Regex::new(
+        r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$",
+    ) {
+        Ok(re) => re,
+        Err(_) => return String::new(),
+    };
+    if let Some(c) = re.captures(url) {
+        return format!("{}/small/{}.png", &c[1], &c[2]);
+    }
+    // Bluesky HLS playlist → sibling thumbnail.jpg
+    if url.contains("video.bsky.app/") {
+        if let Some(idx) = url.find("/playlist.m3u8") {
+            return format!("{}thumbnail.jpg", &url[..idx + 1]);
+        }
+    }
+    String::new()
+}
+
+fn video_poster_attr(url: &str, preview: &str) -> String {
+    let mut poster = preview.trim().to_string();
+    if !is_image_poster_url(&poster) {
+        poster = guess_video_poster_url(url);
+    }
+    if is_image_poster_url(&poster) {
+        format!(" poster=\"{}\"", esc(&poster))
+    } else {
+        String::new()
+    }
+}
+
 fn media_row_html(st: &Value) -> String {
     let Some(atts) = st.get("media_attachments").and_then(|v| v.as_array()) else {
         return String::new();
@@ -1692,11 +1760,9 @@ fn media_row_html(st: &Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if atype == "video" || atype == "gifv" {
-            let poster = if preview.starts_with("https://") {
-                format!(" poster=\"{}\"", esc(preview))
-            } else {
-                String::new()
-            };
+            let poster = video_poster_attr(url, preview);
+            // preload=metadata helps progressive MP4s show a first frame when
+            // no image poster is available (PHP parity).
             cells.push(format!(
                 "<video class=\"media-video\" src=\"{}\" controls loop playsinline preload=\"metadata\"{} referrerpolicy=\"no-referrer\"></video>",
                 esc(url),
@@ -1718,8 +1784,9 @@ fn media_row_html(st: &Value) -> String {
         return String::new();
     }
     let n = cells.len();
+    // `media-count-N` matches PHP timeline CSS (grid + single-video min-height).
     format!(
-        "<div class=\"media-row media-row--n{n}\">{}</div>",
+        "<div class=\"media-row media-count-{n}\">{}</div>",
         cells.join("")
     )
 }
@@ -2261,6 +2328,46 @@ mod tests {
         assert!(html.contains("reblog_status") || html.contains("Boost (VAAK only)"), "{html}");
         assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
         assert!(!html.contains("bite_remote"), "RSS must not Bite: {html}");
+    }
+
+    #[test]
+    fn video_poster_guesses_mastodon_small_png() {
+        let mp4 = "https://files.mastodon.social/media_attachments/files/1/2/original/abc.mp4";
+        let poster = guess_video_poster_url(mp4);
+        assert_eq!(
+            poster,
+            "https://files.mastodon.social/media_attachments/files/1/2/small/abc.png"
+        );
+        assert!(is_image_poster_url(&poster));
+        assert!(!is_image_poster_url(mp4));
+
+        let st = json!({
+            "id": "1",
+            "uri": "https://example.com/users/x/statuses/1",
+            "content": "<p>clip</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {
+                "acct": "x",
+                "display_name": "X",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://example.com/users/x"
+            },
+            "media_attachments": [{
+                "id": "m1",
+                "type": "video",
+                "url": mp4,
+                "preview_url": mp4
+            }]
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(
+            html.contains("poster=\"https://files.mastodon.social/media_attachments/files/1/2/small/abc.png\""),
+            "{html}"
+        );
+        assert!(
+            !html.contains("poster=\"https://files.mastodon.social/media_attachments/files/1/2/original/abc.mp4\""),
+            "must not use mp4 as poster: {html}"
+        );
     }
 
     #[test]
