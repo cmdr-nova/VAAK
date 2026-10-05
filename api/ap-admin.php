@@ -23148,12 +23148,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     /* Axum lean HTML bodies already carry <p>/<br> — avoid pre-wrap double-spacing (0.7.14). */
     .feed-body--html {
       white-space: normal;
+      line-height: 1.55;
     }
     .feed-body--html p {
-      margin: 0 0 0.35em;
+      margin: 0 0 0.55em;
     }
     .feed-body--html p:last-child {
       margin-bottom: 0;
+    }
+    /* Soft line breaks in lean HTML had no extra gap (0.7.26). */
+    .feed-body--html br {
+      content: "";
+      display: block;
+      margin-top: 0.4em;
     }
     /* Canonical Ask card — colors follow user accent (--primary / --primary-dim) */
     .ask-container {

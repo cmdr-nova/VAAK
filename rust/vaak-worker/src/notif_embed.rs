@@ -659,11 +659,14 @@ enum LinkifyKind {
     Hashtag { raw: String, tag: String },
 }
 
-/// Collapse consecutive breaks and tighten Mastodon HTML for feed bodies.
+/// Tighten Mastodon HTML breaks for feed bodies.
+///
+/// Keep a double `<br>` as a paragraph gap (0.7.26); only collapse runs of
+/// 3+ breaks down to two so intentional paragraph returns stay visible.
 fn collapse_html_breaks(html: &str) -> String {
     let mut out = html.to_string();
     for _ in 0..4 {
-        let next = lazy_regex_replace_all(r"(?i)(<br\s*/?>\s*){2,}", &out, "<br>");
+        let next = lazy_regex_replace_all(r"(?i)(<br\s*/?>\s*){3,}", &out, "<br><br>");
         if next == out {
             break;
         }
@@ -2262,11 +2265,19 @@ mod tests {
 
     #[test]
     fn collapse_consecutive_breaks() {
-        let html = "<p>one<br />\n<br />\ntwo</p>";
-        let out = prepare_feed_body_html(html, "home");
-        assert!(!out.to_ascii_lowercase().contains("<br><br>"), "{out}");
-        assert!(!out.to_ascii_lowercase().contains("<br /><br"), "{out}");
-        assert!(out.contains("one") && out.contains("two"), "{out}");
+        // Double break = paragraph gap (kept). Triple+ collapses to double.
+        let para = prepare_feed_body_html("<p>one<br />\n<br />\ntwo</p>", "home");
+        let lower = para.to_ascii_lowercase();
+        assert!(
+            lower.contains("<br><br>") || lower.contains("<br /><br") || lower.matches("<br").count() >= 2,
+            "paragraph break should remain: {para}"
+        );
+        assert!(para.contains("one") && para.contains("two"), "{para}");
+
+        let tight = prepare_feed_body_html("<p>one<br /><br /><br />two</p>", "home");
+        let brs = tight.to_ascii_lowercase().matches("<br").count();
+        assert!(brs <= 2, "3+ breaks should collapse to a double: {tight}");
+        assert!(tight.contains("one") && tight.contains("two"), "{tight}");
     }
 
     #[test]
