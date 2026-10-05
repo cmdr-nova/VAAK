@@ -4,7 +4,7 @@
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
 | `notif-list --loop --owner-id 0` | **LIVE** | Mentions list warm — **native projection→Redis** first; quiet confirmed-empty envelopes skip/restamp (0.6.52); PHP `notif-list-warm.php` only on true cold-start / incomplete projection |
-| `ranked-warm --loop --owner-id 0` | **LIVE** | Home + Local + Federated ranked rebuild **native-only** (`source=vaak-worker-native`, FoF/recs on Home); PHP `bin/ranked-warm.php` retired → `vaak:timeline:ranked:v2:{sha256}` |
+| `ranked-warm --loop --owner-id 0` | **LIVE** | Home + Local + Federated ranked rebuild **native-only** (`source=vaak-worker-native`, FoF/recs on Home); after non-empty Home write, fire-and-forget `bin/home-timeline-warm.php --limits=15,40` (0.6.67); PHP `bin/ranked-warm.php` retired → `vaak:timeline:ranked:v2:{sha256}` |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
@@ -44,7 +44,9 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_SHADOW_HTTP` | `http://127.0.0.1:8787` | Axum shadow base for Mentions M5 + Home Axum-primary (loopback only) |
 | `VAAK_RANKED_NATIVE_HOME` | `1` (default) | Home ranked rebuild in Rust (incl. FoF/cold-start recommendations); `0` skips Home warm |
 | `VAAK_RANKED_NATIVE_LOCAL_FEED` | `1` (default) | Local + Federated ranked rebuild in Rust; `0` skips those views |
-| `VAAK_API_ROOT` | `/srv/mkultra/html/api` | notif-list PHP materializer path |
+| `VAAK_HOME_HYDRATE_WARM` | `1` (default) | After non-empty Home ranked write, spawn `bin/home-timeline-warm.php --limits=15,40` (Axum hydrate); `0` disables |
+| `VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS` | `60` | Redis cooldown between Home hydrate spawns per owner (30–600) |
+| `VAAK_API_ROOT` | `/srv/mkultra/html/api` | notif-list / home-timeline-warm PHP path |
 | `VAAK_PHP_BIN` | `/usr/bin/php` | materializer spawn |
 | `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
 | `VAAK_ACTOR_WARM_RUST_PRIMARY` | `1` (PHP) | thin-author LPUSH to `bsky_actor_warm` |
@@ -64,7 +66,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Notif live key: `vaak:notifications:v1:unread:{owner}:{scan}:{sha256(last_read)}` TTL 45s; source `vaak-worker-live`
 - Notif list key: `vaak:notifications:v1:{owner}:{sha256(limit,max,since,types,exclude)}` envelope `{ts,items,source}` TTL 600s when list-warm primary; source `vaak-worker-projection` (native); `bin/notif-list-warm.php` retired (0.6.63); hash JSON key order must match PHP: `limit,max,since,types,exclude`
 - Ranked key: `vaak:timeline:ranked:v2:{sha256(logical)}` + owner index `vaak:timeline:owner-index:v1:{owner}`; Home/Local/Federated source `vaak-worker-native` (0.6.48–0.6.60); `bin/ranked-warm.php` retired (0.6.60); HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`
-- Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss). Prime with `bin/home-timeline-warm.php` or Ice Cubes head polls.
+- Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss). Prime via ranked-warm post-Home spawn (0.6.67, TTL 300s), `bin/home-timeline-warm.php`, or Ice Cubes head polls.
 - Home Axum-primary (0.6.51): PHP `ap_masto_timeline_home_axum_try` → localhost Axum when `VAAK_HOME_AXUM_PRIMARY=1`; header `X-VAAK-TL-Cache: axum-shadow` on hit.
 - HTML Home Axum assist (0.6.62): soft-nav shell + full-page first paint prefer `ap_masto_timeline_home_axum_fetch` → masto cards; miss schedules `bin/home-timeline-warm.php`; `X-TL-Cache: axum-shadow` / `data-tl-cache=axum-shadow`.
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`

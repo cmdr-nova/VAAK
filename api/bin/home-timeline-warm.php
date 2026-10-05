@@ -6,18 +6,19 @@ declare(strict_types=1);
  * Materialize Mastodon Home timeline JSON into Redis `vaak:timeline:v1:*`
  * (same envelope Ice Cubes / ap_masto_timeline_cache_store already uses).
  *
- * Used to prime Axum `/api/v1/timelines/home` hydrate shadow (loading-plan
- * slice 4). Not a live systemd loop yet — run on demand or from smoke.
+ * Primed by `vaak-worker ranked-warm` after a successful Home rebuild (0.6.67),
+ * or on demand / HTML Axum miss (`ap_masto_timeline_home_hydrate_warm_async`).
  *
  * Usage:
  *   sudo -u www-data env AP_DB_DSN='pgsql:dbname=novalandia' \
  *     php api/bin/home-timeline-warm.php --owner-id=1
  *   php api/bin/home-timeline-warm.php --owner-id=1 --limit=40
+ *   php api/bin/home-timeline-warm.php --owner-id=1 --limits=15,40
  */
 
-$opts = getopt('', ['owner-id:', 'limit:', 'help']);
+$opts = getopt('', ['owner-id:', 'limit:', 'limits:', 'help']);
 if (isset($opts['help'])) {
-    fwrite(STDOUT, "home-timeline-warm.php --owner-id=N [--limit=40]\n");
+    fwrite(STDOUT, "home-timeline-warm.php --owner-id=N [--limit=40|--limits=15,40]\n");
     exit(0);
 }
 
@@ -26,7 +27,20 @@ if ($ownerId < 1) {
     fwrite(STDERR, "home-timeline-warm: --owner-id=N required\n");
     exit(2);
 }
-$limit = isset($opts['limit']) ? max(1, min(80, (int) $opts['limit'])) : 40;
+$limits = [];
+if (isset($opts['limits']) && is_string($opts['limits']) && trim($opts['limits']) !== '') {
+    foreach (explode(',', (string) $opts['limits']) as $part) {
+        $n = (int) trim($part);
+        if ($n >= 1 && $n <= 80) {
+            $limits[] = $n;
+        }
+    }
+}
+if ($limits === []) {
+    $limits[] = isset($opts['limit']) ? max(1, min(80, (int) $opts['limit'])) : 40;
+}
+$limits = array_values(array_unique($limits));
+sort($limits);
 
 if (getenv('AP_DB_DSN') === false || getenv('AP_DB_DSN') === '') {
     putenv('AP_DB_DSN=pgsql:dbname=novalandia');
@@ -57,19 +71,29 @@ if (!function_exists('ap_masto_timeline_home_merged')
 }
 
 $started = microtime(true);
-$statuses = ap_masto_timeline_home_merged($limit, null, null, true);
+// Build once at the largest limit, then store head slices (15 + 40 share the same merge).
+$maxLimit = max($limits);
+$statuses = ap_masto_timeline_home_merged($maxLimit, null, null, true);
 if (function_exists('ap_visibility_filter_statuses')) {
     $statuses = ap_visibility_filter_statuses($statuses, $ownerId);
 }
-ap_masto_timeline_cache_store($statuses, '/api/v1/timelines/home', $limit, null, null);
-$key = ap_masto_timeline_cache_key('/api/v1/timelines/home', $limit, null, []);
+$stored = [];
+foreach ($limits as $limit) {
+    $slice = array_slice($statuses, 0, $limit);
+    ap_masto_timeline_cache_store($slice, '/api/v1/timelines/home', $limit, null, null);
+    $stored[] = [
+        'limit' => $limit,
+        'n' => count($slice),
+        'redis_key' => ap_masto_timeline_cache_key('/api/v1/timelines/home', $limit, null, []),
+    ];
+}
 $ms = (int) round((microtime(true) - $started) * 1000);
 
 $out = [
     'owner' => $ownerId,
-    'limit' => $limit,
+    'limits' => $limits,
     'n' => count($statuses),
-    'redis_key' => $key,
+    'stored' => $stored,
     'ms' => $ms,
     'source' => 'home-timeline-warm',
     'first_id' => isset($statuses[0]['id']) ? (string) $statuses[0]['id'] : null,

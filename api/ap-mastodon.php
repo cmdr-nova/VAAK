@@ -461,9 +461,12 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
         $link = implode(', ', $parts);
     }
     if (function_exists('ap_redis_json_set')) {
+        // Home hydrate must outlive ranked-warm (~70s) so Axum HTML assist can hit
+        // across hard-refresh; Ice Cubes freshness still uses created_at vs 45s in cache_try.
+        $redisTtl = ($path === '/api/v1/timelines/home') ? 300 : 45;
         ap_redis_json_set(ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery), [
             'created_at' => time(), 'body' => $json, 'link' => $link,
-        ], max(5, min(90, 45)));
+        ], max(5, min(600, $redisTtl)));
     }
     @file_put_contents($file, $json, LOCK_EX);
     @file_put_contents($file . '.link', $link, LOCK_EX);
