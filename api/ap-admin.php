@@ -4755,10 +4755,27 @@ $vaakAdminOnlyActions = [
             $reqId = (int) ($_POST['request_id'] ?? 0);
             $res = ap_phyrian_request_resolve($ownerId, $reqId, $action === 'phyrian_accept');
             if (!empty($res['ok'])) {
-                $notice = $action === 'phyrian_accept' ? 'Accepted.' : 'Denied.';
+                if ($action === 'phyrian_accept' && !empty($res['strain'])) {
+                    $notice = 'Imprint accepted. You are now marked by '
+                        . (string) $res['strain']
+                        . (!empty($res['origin_random']) ? ' (origin roll).' : '.');
+                } elseif ($action === 'phyrian_accept') {
+                    $notice = 'Accepted.';
+                } else {
+                    $notice = 'Denied.';
+                }
             } else {
                 $error = (string) ($res['error'] ?? 'Could not update request.');
             }
+        }
+        // Keep sub-pages after POST (dossier readout, etc.).
+        $phyReturnPage = preg_replace('/[^a-z]/', '', (string) ($_POST['phy_page'] ?? ''));
+        if ($phyReturnPage !== '' && $phyReturnPage !== 'hub') {
+            $_GET['page'] = $phyReturnPage;
+        }
+        $phyReturnOwner = (int) ($_POST['phy_owner'] ?? 0);
+        if ($phyReturnOwner > 0) {
+            $_GET['owner'] = (string) $phyReturnOwner;
         }
     }
 }
@@ -22583,6 +22600,40 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       box-shadow: inset 0 0 0 1px var(--border);
     }
     .phyrian-act--ghost img { opacity: .55; }
+    .phyrian-game-nav {
+      display: flex; flex-wrap: wrap; gap: .4rem; align-items: center;
+      margin: 0 0 .85rem; padding: .45rem 0; border-bottom: 1px solid rgba(148,120,180,.28);
+    }
+    .phyrian-game-nav a {
+      color: #cbb8e0; text-decoration: none; font-size: .82rem; letter-spacing: .04em;
+      padding: .35rem .7rem; border-radius: 999px; border: 1px solid transparent;
+    }
+    .phyrian-game-nav a:hover { color: #fff; border-color: rgba(94,231,255,.35); background: rgba(94,231,255,.06); }
+    .phyrian-game-nav a.is-active {
+      color: #fff; border-color: rgba(94,231,255,.45); background: rgba(94,231,255,.1);
+    }
+    .phyrian-game-nav .phyrian-game-back {
+      margin-right: .25rem; color: #5ee7ff; border-color: rgba(94,231,255,.3);
+    }
+    .phyrian-dossier {
+      display: grid; grid-template-columns: 140px 1fr; gap: 1.15rem; align-items: start;
+      padding: 1rem; border: 1px solid rgba(148,120,180,.35); border-radius: 14px;
+      background: linear-gradient(165deg, rgba(28,18,36,.92), rgba(12,10,18,.96));
+    }
+    .phyrian-dossier-av {
+      width: 140px; height: 140px; border-radius: 12px; object-fit: cover;
+      border: 1px solid rgba(94,231,255,.35); background: #120e18;
+    }
+    .phyrian-dossier h3 { margin: 0 0 .55rem; font-size: 1.15rem; letter-spacing: .02em; }
+    .phyrian-dossier-grid {
+      display: grid; grid-template-columns: 9.5rem 1fr; gap: .28rem .7rem;
+      margin: 0; font-size: .9rem;
+    }
+    .phyrian-dossier-grid dt { margin: 0; color: var(--muted); }
+    .phyrian-dossier-grid dd { margin: 0; color: var(--text); word-break: break-word; }
+    .phyrian-dossier-grid dd b { font-variant-numeric: tabular-nums; }
+    .phyrian-card a.phyrian-card-link { color: inherit; text-decoration: none; display: block; min-width: 0; }
+    .phyrian-card a.phyrian-card-link:hover .who { color: #5ee7ff; }
     @media (max-width: 600px) {
       .phyrian-hud { grid-template-columns: 1fr; }
       .phyrian-hud-art { flex-direction: row; justify-content: flex-start; gap: .65rem; }
@@ -22591,6 +22642,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       .phyrian-hero { min-height: 9.5rem; }
       .phyrian-hero img { height: 9.5rem; }
       .phyrian-dir { grid-template-columns: 1fr; }
+      .phyrian-dossier { grid-template-columns: 1fr; }
+      .phyrian-dossier-av { width: 112px; height: 112px; }
     }
     .home-suggestion { min-width: 0; display: flex; gap: .5rem; align-items: stretch; padding: .55rem; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
     .home-suggestion .tweet-av { width: 40px; height: 40px; flex: 0 0 40px; }
@@ -29691,6 +29744,23 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $phyAsset = static function (string $file): string {
               return '/api/assets/phyrian/' . ltrim($file, '/');
           };
+          // Mafia Wars-style sub-pages inside the game shell.
+          $phyPage = preg_replace('/[^a-z]/', '', strtolower((string) ($_GET['page'] ?? 'hub'))) ?: 'hub';
+          if (!in_array($phyPage, ['hub', 'dossier'], true)) {
+              $phyPage = 'hub';
+          }
+          $phyDossierOwner = (int) ($_GET['owner'] ?? 0);
+          if ($phyDossierOwner < 1) {
+              $phyDossierOwner = (int) $vaakOwnerId;
+          }
+          $phyHubHref = '?view=phyrian';
+          $phyOwnDossierHref = '?view=phyrian&page=dossier';
+          $phyDossierHref = static function (int $ownerId) use ($vaakOwnerId): string {
+              if ($ownerId < 1 || $ownerId === (int) $vaakOwnerId) {
+                  return '?view=phyrian&page=dossier';
+              }
+              return '?view=phyrian&page=dossier&owner=' . $ownerId;
+          };
         ?>
         <section class="phyrian">
           <header class="phyrian-hero">
@@ -29701,6 +29771,98 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <p>Consent-based imprint and resonance on this instance. OpenSim link / Resonant badge come later — nothing here federates.</p>
             </div>
           </header>
+
+          <nav class="phyrian-game-nav" aria-label="Phyrian Strains pages">
+            <?php if ($phyPage !== 'hub'): ?>
+              <a class="phyrian-game-back" href="<?= h($phyHubHref) ?>">← Game</a>
+            <?php endif; ?>
+            <a class="<?= $phyPage === 'hub' ? 'is-active' : '' ?>" href="<?= h($phyHubHref) ?>" <?= $phyPage === 'hub' ? 'aria-current="page"' : '' ?>>Hub</a>
+            <a class="<?= $phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId ? 'is-active' : '' ?>" href="<?= h($phyOwnDossierHref) ?>" <?= ($phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId) ? 'aria-current="page"' : '' ?>>Your readout</a>
+          </nav>
+
+          <?php if ($phyPage === 'dossier'): ?>
+            <?php
+              $phyDossier = function_exists('ap_phyrian_dossier')
+                  ? ap_phyrian_dossier($phyDossierOwner)
+                  : null;
+              $phyDossierSelf = $phyDossierOwner === (int) $vaakOwnerId;
+              $phyDossierActor = is_array($phyDossier) ? rtrim((string) ($phyDossier['actor_id'] ?? ''), '/') : '';
+              $phyDossierAv = ($phyDossierActor !== '' && function_exists('admin_actor_avatar_url'))
+                  ? admin_actor_avatar_url($phyDossierActor)
+                  : '';
+            ?>
+            <?php if (!is_array($phyDossier)): ?>
+              <div class="empty">No Strains readout found for that player.</div>
+            <?php else: ?>
+              <article class="phyrian-dossier" aria-label="Phyrian readout">
+                <?php if ($phyDossierAv !== ''): ?>
+                  <img class="phyrian-dossier-av" src="<?= h($phyDossierAv) ?>" alt="" width="140" height="140" loading="lazy" referrerpolicy="no-referrer" decoding="async">
+                <?php else: ?>
+                  <div class="phyrian-dossier-av" aria-hidden="true"></div>
+                <?php endif; ?>
+                <div>
+                  <h3>@<?= h((string) ($phyDossier['username'] ?? 'player')) ?><?= $phyDossierSelf ? ' · you' : '' ?></h3>
+                  <p class="meta" style="margin:0 0 .75rem">terminal readout // The Phyrian Strains</p>
+                  <dl class="phyrian-dossier-grid">
+                    <dt>Status</dt><dd><?= h((string) ($phyDossier['status'] ?? 'Unmarked')) ?></dd>
+                    <dt>Strain</dt><dd><?= h(((string) ($phyDossier['strain'] ?? '')) !== '' ? (string) $phyDossier['strain'] : 'None') ?></dd>
+                    <dt>Generation</dt>
+                    <dd><?php
+                      $g = $phyDossier['generation'] ?? null;
+                      echo $g === null ? 'None' : ('<b>' . (int) $g . '</b> / ' . (int) ($phyDossier['max_generation'] ?? 10));
+                    ?></dd>
+                    <dt>Lineage Depth</dt>
+                    <dd><?= isset($phyDossier['lineage_depth']) ? '<b>' . (int) $phyDossier['lineage_depth'] . '</b>' : 'None' ?></dd>
+                    <dt>Level</dt>
+                    <dd><b><?= (int) ($phyDossier['level'] ?? 1) ?></b> / <?= (int) ($phyDossier['max_level'] ?? 80) ?></dd>
+                    <dt>Rank</dt><dd><?= h((string) ($phyDossier['rank_title'] ?? 'None')) ?></dd>
+                    <dt>Resonance</dt>
+                    <dd><b><?= (int) ($phyDossier['resonance'] ?? 0) ?></b> / <?= (int) ($phyDossier['max_resonance'] ?? 100) ?></dd>
+                    <dt>Banked</dt>
+                    <dd><b><?= (int) ($phyDossier['banked_resonance'] ?? 0) ?></b> / <?= (int) ($phyDossier['max_banked_resonance'] ?? 300) ?></dd>
+                    <dt>Daily Decay</dt><dd>−<?= (int) ($phyDossier['daily_resonance_decay'] ?? 5) ?></dd>
+                    <dt>Exchanges</dt><dd><b><?= (int) ($phyDossier['resonance_exchanges'] ?? 0) ?></b></dd>
+                    <dt>Inductions</dt><dd><b><?= (int) ($phyDossier['inductions_given'] ?? 0) ?></b></dd>
+                    <dt>Stability</dt><dd><?= h((string) ($phyDossier['stability'] ?? 'Unmarked')) ?></dd>
+                    <dt>Last Decay</dt><dd><?= h(((string) ($phyDossier['last_decay_at'] ?? '')) !== '' ? (string) $phyDossier['last_decay_at'] : 'None') ?></dd>
+                    <dt>Last Check-in</dt><dd><?= h(((string) ($phyDossier['last_checkin_at'] ?? '')) !== '' ? (string) $phyDossier['last_checkin_at'] : 'None') ?></dd>
+                    <?php if (!empty($phyDossier['imprinted_by_username'])): ?>
+                      <dt>Imprinted by</dt><dd>@<?= h((string) $phyDossier['imprinted_by_username']) ?></dd>
+                    <?php endif; ?>
+                    <?php if (!empty($phyDossier['is_origin'])): ?>
+                      <dt>Origin</dt><dd>Yes</dd>
+                    <?php endif; ?>
+                  </dl>
+                  <?php if (!empty($phyDossier['lineage']) && is_array($phyDossier['lineage']) && count($phyDossier['lineage']) > 1): ?>
+                    <p class="phyrian-lineage meta" style="margin:.85rem 0 0">
+                      <?php
+                        $phyChain = [];
+                        foreach ($phyDossier['lineage'] as $hop) {
+                            if (!is_array($hop)) {
+                                continue;
+                            }
+                            $hopName = trim((string) ($hop['username'] ?? ''));
+                            if ($hopName === '') {
+                                $hopName = 'user' . (int) ($hop['owner_user_id'] ?? 0);
+                            }
+                            $phyChain[] = (!empty($hop['is_self']) ? 'You' : '@' . h($hopName))
+                                . ' <span class="meta">(' . h((string) ($hop['strain'] ?? '')) . ')</span>';
+                        }
+                        echo implode(' <span class="meta">←</span> ', $phyChain);
+                      ?>
+                    </p>
+                  <?php endif; ?>
+                  <p class="composer-actions" style="margin:.9rem 0 0">
+                    <a class="btn btn-ghost" href="<?= h($phyHubHref) ?>">← Return to game</a>
+                    <?php if (!$phyDossierSelf): ?>
+                      <a class="btn btn-ghost" href="<?= h($phyOwnDossierHref) ?>">Your readout</a>
+                    <?php endif; ?>
+                  </p>
+                </div>
+              </article>
+            <?php endif; ?>
+
+          <?php else: /* hub */ ?>
 
           <div class="phyrian-hud">
             <div class="phyrian-hud-art">
@@ -29766,8 +29928,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php if (!$phyImprinted): ?>
                 <p class="phyrian-hud-copy">
                   <?php if ($phyIsOrigin): ?>
-                    You are the <b>origin</b>. Seed your own strain, or offer imprint to an Unknown Entity —
-                    accepting will seed you first and transmit that same strain so lineage stays coherent.
+                    You are the <b>origin</b>. Seed your own Phyrian body, then imprint Unknown Entities —
+                    each origin imprint rolls a <b>random catalog strain</b> for them (OpenSim rule). Peers transmit their own.
                   <?php else: ?>
                     Accept an imprint offer from the origin (or another imprinted local) to receive a strain.
                     Until then there is no daily check-in and you cannot offer imprint or exchange resonance.
@@ -29801,6 +29963,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       <button class="btn btn-primary" type="submit">Daily check-in</button>
                     </form>
                   <?php endif; ?>
+                  <a class="btn btn-ghost" href="<?= h($phyOwnDossierHref) ?>">Full readout</a>
+                <?php else: ?>
+                  <a class="btn btn-ghost" href="<?= h($phyOwnDossierHref) ?>">Your readout</a>
                 <?php endif; ?>
               </div>
             </div>
@@ -29831,7 +29996,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                   <div class="meta">
                     <?php if ($preqKind === 'imprint'): ?>
-                      Accepting assigns you their strain (origin seeds first if unmarked, then transmits; peers transmit their own). Gen = parent + 1.
+                      Origin imprint rolls a random catalog strain for you; peer imprint transmits their strain. Gen = parent + 1.
                     <?php else: ?>
                       Accepting gives both of you +5 resonance (capped at 100) and refreshes decay.
                     <?php endif; ?>
@@ -29882,14 +30047,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 <article class="phyrian-card">
                   <div class="phyrian-card-hd">
                     <img src="<?= h($phyAsset($pdImprinted ? 'icon-status.png' : 'icon-register.png')) ?>" alt="" width="48" height="48" loading="lazy" decoding="async">
-                    <div style="min-width:0">
+                    <a class="phyrian-card-link" href="<?= h($phyDossierHref($pdId)) ?>">
                       <span class="who">@<?= h($pdHandle) ?></span>
                       <?php if ($pdImprinted): ?>
                         <div class="meta"><?= h($pdStrain) ?> · gen <?= (int) $pdGen ?> · <?= (int) $pdRes ?> resonance<?= $pdStab !== '' ? ' · ' . h($pdStab) : '' ?></div>
                       <?php else: ?>
-                        <div class="meta">Unknown Entity</div>
+                        <div class="meta">Unknown Entity · open readout</div>
                       <?php endif; ?>
-                    </div>
+                    </a>
                   </div>
                   <?php if ($pdCanImprint || $pdCanResonate): ?>
                     <div class="tweet-actions">
@@ -29927,6 +30092,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php endforeach; ?>
             </div>
           <?php endif; ?>
+          <?php endif; /* hub */ ?>
         </section>
 
       <?php elseif ($view === 'drafts'): ?>
