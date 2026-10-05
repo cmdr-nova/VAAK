@@ -321,8 +321,22 @@ async fn write_list_envelope(
     key: &str,
     items: Vec<Value>,
 ) -> Result<()> {
+    // Carry the newest notification id alongside the list. The unread badge
+    // uses this watermark to avoid announcing a row before the list cache can
+    // serve it, keeping badge and notification arrival ordered.
+    let latest_id = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+        .filter(|id| id.chars().all(|c| c.is_ascii_digit()))
+        .max_by(|a, b| {
+            a.len()
+                .cmp(&b.len())
+                .then_with(|| a.cmp(b))
+        })
+        .unwrap_or("");
     let payload = json!({
         "ts": Utc::now().timestamp(),
+        "latest_id": latest_id,
         "items": items,
         "source": "vaak-worker-projection",
     });

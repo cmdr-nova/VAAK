@@ -410,6 +410,59 @@ fn shadow_redis_key(owner_user_id: i64, scan: i64, last_read: &str) -> String {
     format!("vaak:shadow:notifications:v1:unread:{owner_user_id}:{scan}:{hash}")
 }
 
+fn decimal_at_least(candidate: &str, watermark: &str) -> bool {
+    let candidate = candidate.trim_start_matches('0');
+    let watermark = watermark.trim_start_matches('0');
+    if watermark.is_empty() {
+        return true;
+    }
+    if candidate.is_empty() {
+        return false;
+    }
+    candidate.len() > watermark.len()
+        || (candidate.len() == watermark.len() && candidate >= watermark)
+}
+
+fn list_is_ready(list_latest: Option<&str>, badge_latest: &str) -> bool {
+    if badge_latest.is_empty() {
+        return true;
+    }
+    matches!(list_latest, Some(latest) if !latest.is_empty() && decimal_at_least(latest, badge_latest))
+}
+
+async fn list_watermark(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner_user_id: i64,
+) -> Result<Option<String>> {
+    let key = crate::notif_list::notifications_list_redis_key(
+        owner_user_id,
+        40,
+        None,
+        None,
+        &[],
+    );
+    let Some(payload) = redis_util::json_get(redis, &key).await? else {
+        return Ok(None);
+    };
+    let latest = payload
+        .get("latest_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            payload.get("items").and_then(|v| v.as_array()).and_then(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+                    .filter(|id| id.chars().all(|c| c.is_ascii_digit()))
+                    .max_by(|a, b| {
+                        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                    })
+                    .map(str::to_string)
+            })
+        });
+    Ok(latest)
+}
+
 /// Compute + write Redis. When `live`, also writes the production notif key + file cache.
 pub async fn compute_and_cache(
     cfg: &Config,
@@ -441,6 +494,22 @@ pub async fn compute_and_cache(
 
     let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
     if live {
+        let list_latest = list_watermark(&mut redis, owner_user_id).await?;
+        if !list_is_ready(list_latest.as_deref(), &state.latest_id) {
+            tracing::debug!(
+                owner = owner_user_id,
+                badge_latest = %state.latest_id,
+                list_latest = ?list_latest,
+                "deferring notif badge until list cache reaches watermark"
+            );
+            let mut deferred = serde_json::to_value(&state)?;
+            if let Some(obj) = deferred.as_object_mut() {
+                obj.insert("live_mode".into(), serde_json::json!(true));
+                obj.insert("badge_deferred".into(), serde_json::json!(true));
+                obj.insert("list_latest_id".into(), serde_json::json!(list_latest));
+            }
+            return Ok(deferred);
+        }
         // Match PHP cache TTL (45s) so badge polls stay hot under Rust ownership.
         redis_util::json_set(&mut redis, &live_key, &payload, 45).await?;
         write_file_cache(cfg, owner_user_id, &state.last_read_id, &payload)?;
@@ -575,7 +644,7 @@ pub async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::snowflake_id;
+    use super::{decimal_at_least, list_is_ready, snowflake_id};
 
     #[test]
     fn snowflake_matches_php_shape() {
@@ -586,5 +655,17 @@ mod tests {
         let n: i64 = id.parse().unwrap();
         assert_eq!(n % 100_000_000, 1018);
         assert_eq!((n % 1_000_000_000) / 100_000_000, 5);
+    }
+
+    #[test]
+    fn watermark_compares_large_decimal_ids_without_float_loss() {
+        assert!(decimal_at_least("1000000000000000001", "1000000000000000000"));
+        assert!(!decimal_at_least("999999999999999999", "1000000000000000000"));
+        assert!(decimal_at_least("00042", "42"));
+        assert!(decimal_at_least("42", ""));
+        assert!(!list_is_ready(Some(""), "42"));
+        assert!(!list_is_ready(None, "42"));
+        assert!(list_is_ready(Some("42"), "42"));
+        assert!(list_is_ready(None, ""));
     }
 }
