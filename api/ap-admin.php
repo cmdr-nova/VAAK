@@ -11466,12 +11466,19 @@ function admin_split_quote_summary(string $summaryRaw): ?array
         return null;
     }
     // Normalize odd markers into the canonical form.
-    $norm = preg_replace('/(?:^|\n)\s*(?:↪|➡|→)?\s*QT\b/u', "\n↪ QT", $summaryRaw);
+    // Allow glued AS2 type names (QTCreate / QTNote) — QT\b alone misses those.
+    $norm = preg_replace(
+        '/(?:^|\n)\s*(?:↪|➡|→)?\s*QT(?=Create|Announce|Update|Note|QuotePost|\b)/u',
+        "\n↪ QT",
+        $summaryRaw
+    );
     if (!is_string($norm)) {
         $norm = $summaryRaw;
     }
     $norm = ltrim($norm, "\n");
-    if (!str_contains($norm, '↪ QT')) {
+    // After rewrite, glued forms become "↪ QTCreate" — still countable as a QT marker.
+    $hasQt = str_contains($norm, '↪ QT') || (bool) preg_match('/↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $norm);
+    if (!$hasQt) {
         if (preg_match('/^(.*?)(?:\n|^)RE:\s*(https:\/\/[^\s<>]+)\s*$/us', $summaryRaw, $m)) {
             $commentary = trim((string) ($m[1] ?? ''));
             $url = rtrim((string) ($m[2] ?? ''), '.,);]');
@@ -11484,27 +11491,32 @@ function admin_split_quote_summary(string $summaryRaw): ?array
         }
         return null;
     }
-    $chunks = preg_split('/\n\n↪ QT/u', $norm, 2);
+    $chunks = preg_split('/\n\n↪\s*QT/u', $norm, 2);
     if (!is_array($chunks) || count($chunks) !== 2) {
-        $chunks = preg_split('/\n↪ QT/u', $norm, 2);
+        $chunks = preg_split('/\n↪\s*QT/u', $norm, 2);
     }
     if (!is_array($chunks) || count($chunks) !== 2) {
-        if (preg_match('/^↪ QT/u', $norm)) {
-            return ['commentary' => '', 'quoted' => $norm];
+        if (preg_match('/^↪\s*QT/u', $norm)) {
+            $quotedOnly = $norm;
+            if (preg_match('/^↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $quotedOnly)
+                || (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($quotedOnly))) {
+                $quotedOnly = '↪ QT: (quoted post unavailable)';
+            }
+            return ['commentary' => '', 'quoted' => $quotedOnly];
         }
         return null;
     }
     $commentary = trim((string) $chunks[0]);
     $quoted = trim('↪ QT' . $chunks[1]);
-    if (preg_match('/^↪ QT(Create|Announce|Update|Note|QuotePost)\b/u', $quoted)
+    if (preg_match('/^↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $quoted)
         || (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($quoted))) {
         $quoted = '↪ QT: (quoted post unavailable)';
     }
     if (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($commentary)) {
         $commentary = '';
     }
-    if (str_contains($commentary, '↪ QT')) {
-        $again = preg_split('/\n\n↪ QT|\n↪ QT/u', $commentary, 2);
+    if (str_contains($commentary, '↪ QT') || preg_match('/↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $commentary)) {
+        $again = preg_split('/\n\n↪\s*QT|\n↪\s*QT/u', $commentary, 2);
         $commentary = is_array($again) ? trim((string) ($again[0] ?? '')) : $commentary;
     }
     return [
@@ -15066,13 +15078,65 @@ function admin_render_masto_status_card(
         $bodyInner .= $askCardHtml;
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
-    // If the status already carries a structured quote, never also show raw ↪ QT
-    // lines in the commentary body.
-    if ($plain !== '' && is_array($quote)) {
-        $splitPlain = admin_split_quote_summary($plain);
-        if (is_array($splitPlain)) {
+    // Nuke AS2 / QTCreate dumps before any body paint (shared-card path previously
+    // only scrubbed these on the legacy event_tweet dialect).
+    if ($plain !== '' && function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
+        $plain = function_exists('ap_text_scrub_as2_dump') ? ap_text_scrub_as2_dump($plain) : '';
+    }
+    // Prefer a quote-block card over leaving raw "↪ QT …" in the body — even when
+    // the status entity has no structured quote yet (common for quote-boosts).
+    $splitPlain = ($plain !== '') ? admin_split_quote_summary($plain) : null;
+    $fallbackQuoteOpts = null;
+    if (is_array($splitPlain)) {
+        $plain = (string) ($splitPlain['commentary'] ?? '');
+        $quotedLine = (string) ($splitPlain['quoted'] ?? '');
+        $needFallbackCard = !is_array($quote)
+            || (($quote['state'] ?? '') === 'pending' && !is_array($quote['quoted_status'] ?? null))
+            || (!is_array($quote['quoted_status'] ?? null) && ($quote['state'] ?? '') !== 'pending');
+        if ($needFallbackCard && $quotedLine !== '' && $quotedLine !== '↪ QT: (quoted post unavailable)') {
+            $qFallbackAcct = '';
+            $qFallbackText = '';
+            $qFallbackUrl = '';
+            if (preg_match('/^↪\s*QT(?:\s+@(\S+))?\s*:\s*(.*)$/us', $quotedLine, $qfm)) {
+                $qFallbackAcct = trim((string) ($qfm[1] ?? ''));
+                $qFallbackText = trim((string) ($qfm[2] ?? ''));
+                if ($qFallbackText === '(quoted post unavailable)' || $qFallbackText === '(quoted post)') {
+                    $qFallbackText = '';
+                }
+                if (str_starts_with($qFallbackText, 'https://') && !str_contains($qFallbackText, ' ')) {
+                    $qFallbackUrl = rtrim($qFallbackText, '.,);]');
+                    $qFallbackText = '';
+                }
+            }
+            if ($qFallbackUrl === '' && !empty($st['quote_url']) && is_string($st['quote_url'])) {
+                $qFallbackUrl = (string) $st['quote_url'];
+            }
+            if ($qFallbackUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
+                $fbStatus = ap_masto_lookup_status_by_object_url($qFallbackUrl, 0, false, true);
+                if (is_array($fbStatus)) {
+                    $fallbackQuoteOpts = admin_quote_opts_from_status($fbStatus, $qFallbackUrl);
+                    if (($fallbackQuoteOpts['acct'] ?? '') === '' && $qFallbackAcct !== '') {
+                        $fallbackQuoteOpts['acct'] = '@' . ltrim($qFallbackAcct, '@');
+                    }
+                }
+            }
+            if ($fallbackQuoteOpts === null && ($qFallbackText !== '' || $qFallbackAcct !== '' || $qFallbackUrl !== '')) {
+                $fallbackQuoteOpts = [
+                    'acct' => $qFallbackAcct !== '' ? ('@' . ltrim($qFallbackAcct, '@')) : '',
+                    'text' => $qFallbackText,
+                    'url' => $qFallbackUrl,
+                    'media' => [],
+                    'open_label' => 'Open quoted',
+                ];
+            }
+        } elseif (is_array($quote)) {
+            // Structured quote owns the nest — commentary only in the body.
             $plain = (string) ($splitPlain['commentary'] ?? '');
         }
+    } elseif ($plain !== '' && is_array($quote)) {
+        // Quote present but no QT marker — still drop RE:<url> glued prefixes.
+        $plain = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $plain) ?? $plain;
+        $plain = trim($plain);
     }
     // Media-only placeholders left in summary/content_text — never paint as body text.
     if ($plain !== '' && preg_match('/^\((?:attachment|media|poll|quote|boost)\)$/i', trim($plain))) {
@@ -15091,6 +15155,9 @@ function admin_render_masto_status_card(
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
         $qst = $quote['quoted_status'];
         $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
+        if ($qplain !== '' && function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($qplain)) {
+            $qplain = function_exists('ap_text_scrub_as2_dump') ? ap_text_scrub_as2_dump($qplain) : '';
+        }
         $qacct = (string) ($qst['account']['acct'] ?? '');
         $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
         $qMentions = [];
@@ -15102,6 +15169,12 @@ function admin_render_masto_status_card(
             }
         }
         $qOpts = admin_quote_opts_from_status($qst, $quri);
+        if ($qOpts['text'] !== '' && function_exists('ap_text_looks_like_as2_json')
+            && ap_text_looks_like_as2_json((string) $qOpts['text'])) {
+            $qOpts['text'] = function_exists('ap_text_scrub_as2_dump')
+                ? ap_text_scrub_as2_dump((string) $qOpts['text'])
+                : '';
+        }
         if (($qOpts['text'] ?? '') === '' && $qplain !== '') {
             $qOpts['text'] = $qplain;
         }
@@ -15192,7 +15265,16 @@ function admin_render_masto_status_card(
                     'open_label' => 'Quoted post (not cached yet) — open',
                 ], $returnView);
             }
+        } elseif (is_array($fallbackQuoteOpts)) {
+            // Pending with no URL recovery — still paint the QT-line fallback card
+            // instead of leaving raw ↪ QT in the body (already stripped above).
+            $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
+            $fallbackQuoteOpts = null;
         }
+    } elseif (is_array($fallbackQuoteOpts)) {
+        // No structured quote on the status — paint from the ↪ QT line so
+        // quote-boosts don't stay as raw text in the feed body.
+        $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
     }
     // Status Open / masto cards: attach poll UI (timeline outbox path already does).
     $pollHtml = '';
