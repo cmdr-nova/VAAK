@@ -6654,11 +6654,11 @@ function ap_masto_notifications_unread_axum_fetch(int $ownerUserId, int $scan = 
         return null;
     }
     // Axum live compute is ~30ms; keep the budget tight so a down worker
-    // fails into PHP without parking an FPM worker.
+    // fails into stale-file/PHP without parking an FPM worker on every paint.
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CONNECTTIMEOUT_MS => 120,
-        CURLOPT_TIMEOUT_MS => 800,
+        CURLOPT_CONNECTTIMEOUT_MS => 80,
+        CURLOPT_TIMEOUT_MS => 400,
         CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
     ]);
     $raw = curl_exec($ch);
@@ -6771,8 +6771,22 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             $GLOBALS['ap_notif_unread_source'] = 'redis';
             return $readUnreadCache($redisCached);
         }
+    }
+
+    // 0.7.3: on Redis miss, prefer Axum live (~30ms) before stale-file /
+    // stampede / PHP rebuild. Every HTML paint (nav badge) and ajax poll
+    // shares this path — keeps soft-nav and full pages off the 14–62s cliff.
+    if (function_exists('ap_masto_notifications_unread_axum_fetch')) {
+        $axumState = ap_masto_notifications_unread_axum_fetch($ownerUserId, $scan);
+        if (is_array($axumState)) {
+            $GLOBALS['ap_notif_unread_source'] = 'axum';
+            return $axumState;
+        }
+    }
+
+    if ($cacheTtl > 0) {
         // Prefer a slightly stale file badge before any stampede wait — page
-        // paints (profiles/Home) must not block ~4.5s when Rust/peer is busy.
+        // paints (profiles/Home) must not block when Axum/peer is busy.
         // Uncovered owners rebuild after the normal 45s TTL instead of 300–600s.
         $staleAge = $rustCoversOwner ? 300 : $cacheTtl;
         $staleBeforeWait = $readFileUnread($staleAge);
@@ -6780,55 +6794,42 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
             $GLOBALS['ap_notif_unread_source'] = 'file';
             return $staleBeforeWait;
         }
-        $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
-        $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
-        if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
-            // Brief wait only — never park a PHP worker for multi-second badge sync.
-            $peerWaitMs = $notifRustPrimary ? 250 : 200;
-            $peer = ap_redis_stampede_wait(
-                static function () use ($redisKey) {
-                    $row = ap_redis_json_get($redisKey);
-                    return (is_array($row) && isset($row['c'])) ? $row : null;
-                },
-                $peerWaitMs
-            );
-            if (is_array($peer) && isset($peer['c'])) {
-                $GLOBALS['ap_notif_unread_source'] = 'redis-peer';
-                return $readUnreadCache($peer);
-            }
-            $stale = $readFileUnread($staleAge);
-            if (is_array($stale)) {
-                $GLOBALS['ap_notif_unread_source'] = 'file';
-                return $stale;
+        if (function_exists('ap_redis_json_get')) {
+            $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
+            $holdUnreadLock = function_exists('ap_redis_lock') && ap_redis_lock($unreadStampedeLock, 20);
+            if (!$holdUnreadLock && function_exists('ap_redis_stampede_wait')) {
+                // Brief wait only — never park a PHP worker for multi-second badge sync.
+                $peerWaitMs = $notifRustPrimary ? 250 : 200;
+                $peer = ap_redis_stampede_wait(
+                    static function () use ($redisKey) {
+                        $row = ap_redis_json_get($redisKey);
+                        return (is_array($row) && isset($row['c'])) ? $row : null;
+                    },
+                    $peerWaitMs
+                );
+                if (is_array($peer) && isset($peer['c'])) {
+                    $GLOBALS['ap_notif_unread_source'] = 'redis-peer';
+                    return $readUnreadCache($peer);
+                }
+                $stale = $readFileUnread($staleAge);
+                if (is_array($stale)) {
+                    $GLOBALS['ap_notif_unread_source'] = 'file';
+                    return $stale;
+                }
             }
         }
-    }
-    if ($cacheTtl > 0) {
         $freshFile = $readFileUnread($cacheTtl);
         if (is_array($freshFile)) {
             $GLOBALS['ap_notif_unread_source'] = 'file';
             return $freshFile;
         }
-    }
-    // Last resort under Rust ownership for covered owners only.
-    if ($rustCoversOwner && $cacheTtl > 0) {
-        $stale = $readFileUnread(600);
-        if (is_array($stale)) {
-            $GLOBALS['ap_notif_unread_source'] = 'file-stale';
-            return $stale;
-        }
-    }
-
-    // Prefer Axum live badge (~30ms) over PHP PG rebuild (Caddy outliers 14–62s).
-    // live=1 also warms the production Redis key for the next poll.
-    if (function_exists('ap_masto_notifications_unread_axum_fetch')) {
-        $axumState = ap_masto_notifications_unread_axum_fetch($ownerUserId, $scan);
-        if (is_array($axumState)) {
-            if ($holdUnreadLock && $unreadStampedeLock !== '' && function_exists('ap_redis_unlock')) {
-                ap_redis_unlock($unreadStampedeLock);
+        // Last resort under Rust ownership for covered owners only.
+        if ($rustCoversOwner) {
+            $stale = $readFileUnread(600);
+            if (is_array($stale)) {
+                $GLOBALS['ap_notif_unread_source'] = 'file-stale';
+                return $stale;
             }
-            $GLOBALS['ap_notif_unread_source'] = 'axum';
-            return $axumState;
         }
     }
 
