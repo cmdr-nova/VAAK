@@ -10974,6 +10974,59 @@ function admin_status_href(string $objectUrl, string $from = 'home'): string
 }
 
 /**
+ * True when two URLs name the same status (exact match, candidate forms, or
+ * same host + numeric snowflake — GTS @handle/id vs /ap/users/…/statuses/id).
+ */
+function admin_status_urls_equivalent(string $a, string $b): bool
+{
+    $a = rtrim(trim($a), '/');
+    $b = rtrim(trim($b), '/');
+    if ($a === '' || $b === '' || !str_starts_with($a, 'https://') || !str_starts_with($b, 'https://')) {
+        return false;
+    }
+    if (strcasecmp($a, $b) === 0) {
+        return true;
+    }
+    $hostA = parse_url($a, PHP_URL_HOST);
+    $hostB = parse_url($b, PHP_URL_HOST);
+    if (is_string($hostA) && is_string($hostB) && strcasecmp($hostA, $hostB) === 0) {
+        $idOf = static function (string $url): string {
+            if (preg_match('#/@[^/]+/([0-9]+)$#', $url, $m)) {
+                return $m[1];
+            }
+            if (preg_match('#/(?:statuses|posts|notes)/([0-9]+)$#', $url, $m)) {
+                return $m[1];
+            }
+            return '';
+        };
+        $idA = $idOf($a);
+        $idB = $idOf($b);
+        if ($idA !== '' && $idA === $idB) {
+            return true;
+        }
+    }
+    if (function_exists('ap_object_url_lookup_candidates')) {
+        $ca = ap_object_url_lookup_candidates($a);
+        $cb = ap_object_url_lookup_candidates($b);
+        $norm = static function (string $u): string {
+            return strtolower(rtrim($u, '/'));
+        };
+        $set = [];
+        foreach ($ca as $u) {
+            if (is_string($u) && $u !== '') {
+                $set[$norm($u)] = true;
+            }
+        }
+        foreach ($cb as $u) {
+            if (is_string($u) && $u !== '' && isset($set[$norm($u)])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * Open Moderation report composer with account (+ optional post) prefilled.
  * Timeline ⚑ uses this instead of instantly POSTing an empty Flag.
  */
@@ -15166,6 +15219,9 @@ function admin_render_masto_status_card(
         $bodyInner .= admin_media_row_html($media);
     }
 
+    // URL of any quote card we paint — used to suppress a duplicate OG link-card
+    // (GTS often attaches card.url = the quoted status web URL).
+    $paintedQuoteUrl = '';
     if (is_array($quote) && is_array($quote['quoted_status'] ?? null)) {
         $qst = $quote['quoted_status'];
         $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
@@ -15213,6 +15269,10 @@ function admin_render_masto_status_card(
                 $qOpts['acct'] = '@' . ltrim((string) $bskyQ['handle'], '@');
             }
         }
+        $paintedQuoteUrl = trim((string) ($qOpts['url'] ?? $quri));
+        if ($paintedQuoteUrl === '' && !empty($st['quote_url']) && is_string($st['quote_url'])) {
+            $paintedQuoteUrl = (string) $st['quote_url'];
+        }
         $bodyInner .= admin_quote_card_html($qOpts, $returnView);
     } elseif (is_array($quote) && ($quote['state'] ?? '') === 'pending') {
         // Recover quote URL from status fields / local outbox AS2 when pending.
@@ -15239,6 +15299,7 @@ function admin_render_masto_status_card(
                     admin_quote_opts_from_status($pendingQuoted, $pendingUrl),
                     $returnView
                 );
+                $paintedQuoteUrl = $pendingUrl;
                 $pendingUrl = ''; // done
             }
         }
@@ -15257,19 +15318,23 @@ function admin_render_masto_status_card(
             || trim((string) ($bskyPending['handle'] ?? '')) !== ''
             || !empty($bskyPending['media']))) {
             $bodyInner .= admin_quote_card_html(admin_quote_opts_from_bsky($bskyPending, $pendingUrl), $returnView);
+            $paintedQuoteUrl = $pendingUrl !== '' ? $pendingUrl : $paintedQuoteUrl;
         } elseif (is_array($preview) && trim((string) ($preview['text'] ?? '')) !== '') {
             // Summary still had the quoted snippet — paint a card now, warm async.
             if ($pendingUrl !== '' && function_exists('ap_quote_target_warm_async')) {
                 ap_quote_target_warm_async($pendingUrl);
             }
+            $previewUrl = (string) ($preview['url'] ?? $pendingUrl);
             $bodyInner .= admin_quote_card_html([
                 'acct' => trim((string) ($preview['acct'] ?? '')),
                 'text' => trim((string) ($preview['text'] ?? '')),
-                'url' => (string) ($preview['url'] ?? $pendingUrl),
+                'url' => $previewUrl,
                 'open_label' => 'Open quoted',
             ], $returnView);
+            $paintedQuoteUrl = $previewUrl !== '' ? $previewUrl : $paintedQuoteUrl;
         } elseif (is_array($fallbackQuoteOpts)) {
             $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
+            $paintedQuoteUrl = trim((string) ($fallbackQuoteOpts['url'] ?? $pendingUrl));
             $fallbackQuoteOpts = null;
         } elseif ($pendingUrl !== '') {
             $unavail = function_exists('ap_object_target_unavailable_reason')
@@ -15295,11 +15360,13 @@ function admin_render_masto_status_card(
                     'open_label' => 'Quoted post (not cached yet) — open',
                 ], $returnView);
             }
+            $paintedQuoteUrl = $pendingUrl;
         }
     } elseif (is_array($fallbackQuoteOpts)) {
         // No structured quote on the status — paint from the ↪ QT line so
         // quote-boosts don't stay as raw text in the feed body.
         $bodyInner .= admin_quote_card_html($fallbackQuoteOpts, $returnView);
+        $paintedQuoteUrl = trim((string) ($fallbackQuoteOpts['url'] ?? ''));
     }
     // Status Open / masto cards: attach poll UI (timeline outbox path already does).
     $pollHtml = '';
@@ -15312,8 +15379,17 @@ function admin_render_masto_status_card(
     $hasMedia = $media !== [];
     $cardHtml = '';
     if (!$hasMedia && $pollHtml === '' && function_exists('ap_link_preview_html')) {
-        if (is_array($st['card'] ?? null)) {
-            $cardHtml = ap_link_preview_html(array_merge($st['card'], ['status' => 'ok']), true);
+        $stCard = is_array($st['card'] ?? null) ? $st['card'] : null;
+        // GTS quote posts attach card.url = quoted status web URL. Nested quote
+        // card already owns that payload — skip the duplicate OG link-card.
+        if (is_array($stCard) && $paintedQuoteUrl !== '') {
+            $stCardUrl = trim((string) ($stCard['url'] ?? ''));
+            if ($stCardUrl !== '' && admin_status_urls_equivalent($stCardUrl, $paintedQuoteUrl)) {
+                $stCard = null;
+            }
+        }
+        if (is_array($stCard)) {
+            $cardHtml = ap_link_preview_html(array_merge($stCard, ['status' => 'ok']), true);
         }
         // Bluesky external embed (when card was not attached upstream).
         if (
@@ -15367,6 +15443,13 @@ function admin_render_masto_status_card(
                 $warmUrl = ap_link_preview_extract_url((string) ($st['content'] ?? $plain));
                 if (is_string($warmUrl) && $warmUrl !== '') {
                     ap_link_preview_warm_async($warmUrl);
+                }
+            }
+            if (is_array($pcard)) {
+                $pcardUrl = trim((string) ($pcard['url'] ?? ''));
+                if ($paintedQuoteUrl !== '' && $pcardUrl !== ''
+                    && admin_status_urls_equivalent($pcardUrl, $paintedQuoteUrl)) {
+                    $pcard = null;
                 }
             }
             if (is_array($pcard)) {
