@@ -28,6 +28,63 @@ const AP_PHYRIAN_MAX_LEVEL = 80;
 const AP_PHYRIAN_MAX_BANKED = 300;
 const AP_PHYRIAN_MAX_GENERATION = 10;
 
+/**
+ * Optional Rust mutation hand-off. Disabled by default so PHP remains the
+ * write owner while the Axum route is being verified in production.
+ *
+ * A null return means the Rust worker was unavailable; callers must fall back
+ * to the canonical PHP implementation. A decoded array (including an error)
+ * means Rust handled the request and its result should be preserved.
+ *
+ * @param array<string,mixed> $payload
+ * @return array<string,mixed>|null
+ */
+function ap_phyrian_rust_mutation(string $action, array $payload): ?array
+{
+    $enabled = strtolower(trim((string) (getenv('VAAK_PHYRIAN_RUST_MUTATIONS') ?: '')));
+    if (!in_array($enabled, ['1', 'true', 'yes', 'on'], true)
+        || !function_exists('curl_init')) {
+        return null;
+    }
+    $token = trim((string) (getenv('VAAK_PHYRIAN_MUTATION_TOKEN') ?: ''));
+    if ($token === '') {
+        return null;
+    }
+    $body = json_encode(array_merge($payload, ['action' => $action]), JSON_UNESCAPED_SLASHES);
+    if (!is_string($body)) {
+        return null;
+    }
+    $ch = curl_init('http://127.0.0.1:8787/internal/phyrian/mutate');
+    if ($ch === false) {
+        return null;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 1,
+        CURLOPT_TIMEOUT => 3,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'X-VAAK-Internal-Token: ' . $token,
+        ],
+        CURLOPT_POSTFIELDS => $body,
+    ]);
+    $raw = curl_exec($ch);
+    $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    // 409 is the deliberate Rust→PHP fallback signal for origin randomness
+    // and other behavior that still belongs to the canonical PHP path.
+    if ($http === 409) {
+        return null;
+    }
+    if (!is_string($raw) || $raw === '' || $http < 200 || ($http >= 300 && $http !== 422)) {
+        return null;
+    }
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : null;
+}
+
 function ap_phyrian_migrate(?PDO $db = null): void
 {
     static $done = false;
@@ -472,6 +529,20 @@ function ap_phyrian_request_create(int $fromOwnerId, int $toOwnerId, string $kin
             return ['ok' => false, 'error' => 'Phyrian requests are local-only'];
         }
     }
+    $rust = ap_phyrian_rust_mutation('create', [
+        'from_owner_id' => $fromOwnerId,
+        'to_owner_id' => $toOwnerId,
+        'kind' => $kind,
+    ]);
+    if (is_array($rust)) {
+        if (!empty($rust['ok'])) {
+            if (function_exists('ap_masto_notifications_unread_invalidate')) {
+                ap_masto_notifications_unread_invalidate($toOwnerId);
+            }
+            return ['ok' => true, 'id' => (int) ($rust['id'] ?? 0)];
+        }
+        return ['ok' => false, 'error' => (string) ($rust['error'] ?? 'Could not create request')];
+    }
     $from = ap_phyrian_ensure_player($fromOwnerId, ap_phyrian_actor_id_for_owner($fromOwnerId));
     $to = ap_phyrian_ensure_player($toOwnerId, ap_phyrian_actor_id_for_owner($toOwnerId));
     if ($from === [] || $to === []) {
@@ -611,6 +682,24 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
     ap_phyrian_migrate();
     if ($ownerUserId < 1 || $requestId < 1) {
         return ['ok' => false, 'error' => 'Invalid request'];
+    }
+    $rust = ap_phyrian_rust_mutation('resolve', [
+        'owner_id' => $ownerUserId,
+        'request_id' => $requestId,
+        'accept' => $accept,
+    ]);
+    if (is_array($rust)) {
+        if (!empty($rust['ok'])) {
+            if (function_exists('ap_masto_notifications_unread_invalidate')) {
+                ap_masto_notifications_unread_invalidate($ownerUserId);
+            }
+            $out = ['ok' => true];
+            if (array_key_exists('strain', $rust) && is_string($rust['strain'])) {
+                $out['strain'] = $rust['strain'];
+            }
+            return $out;
+        }
+        return ['ok' => false, 'error' => (string) ($rust['error'] ?? 'Could not resolve request')];
     }
     $db = ap_db();
     $st = $db->prepare(

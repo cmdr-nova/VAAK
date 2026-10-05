@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
@@ -50,6 +50,17 @@ pub struct OwnerQuery {
     pub actor: Option<String>,
     /// Profile tab: posts / replies / media / boosts.
     pub tab: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhyrianMutation {
+    action: String,
+    from_owner_id: Option<i64>,
+    to_owner_id: Option<i64>,
+    owner_id: Option<i64>,
+    request_id: Option<i64>,
+    kind: Option<String>,
+    accept: Option<bool>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -108,6 +119,9 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/profile-html", get(shadow_profile_html))
         // Read-only Phyrian dossier/directory parity projection (10.6).
         .route("/shadow/phyrian", get(shadow_phyrian))
+        // Guarded migration endpoint. Disabled unless an internal token is
+        // configured; loopback binding is still required by `serve`.
+        .route("/internal/phyrian/mutate", post(internal_phyrian_mutate))
         // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
         .route("/shadow/account-switch-prep", get(shadow_account_switch_prep))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
@@ -149,12 +163,65 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/feed-html",
             "/shadow/profile-html",
             "/shadow/phyrian",
+            "/internal/phyrian/mutate (token-gated, disabled unless configured)",
             "/shadow/account-switch-prep",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
             "/api/v1/notifications"
         ],
     }))
+}
+
+async fn internal_phyrian_mutate(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(input): Json<PhyrianMutation>,
+) -> impl IntoResponse {
+    let Some(expected) = state.cfg.phyrian_mutation_token.as_deref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Phyrian mutation route disabled"})),
+        )
+            .into_response();
+    };
+    let supplied = headers
+        .get("x-vaak-internal-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if supplied != expected {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        )
+            .into_response();
+    }
+    let action = input.action.trim().to_ascii_lowercase();
+    match action.as_str() {
+        "create" => {
+            let from = input.from_owner_id.unwrap_or(0);
+            let to = input.to_owner_id.unwrap_or(0);
+            let kind = input.kind.as_deref().unwrap_or("");
+            match crate::phyrian::create_local_request(&state.cfg, from, to, kind).await {
+                Ok(id) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "id": id}))).into_response(),
+                Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+            }
+        }
+        "resolve" => {
+            let owner = input.owner_id.unwrap_or(0);
+            let request_id = input.request_id.unwrap_or(0);
+            let accept = input.accept.unwrap_or(false);
+            match crate::phyrian::resolve_local_request(&state.cfg, owner, request_id, accept).await {
+                Ok(strain) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "strain": strain}))).into_response(),
+                Err(e) if e.to_string().contains("Origin imprint requires") => (StatusCode::CONFLICT, Json(serde_json::json!({"ok": false, "fallback": true, "error": e.to_string()}))).into_response(),
+                Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+            }
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Unknown mutation action"})),
+        )
+            .into_response(),
+    }
 }
 
 fn embed_html_response(html: String, source: &'static str) -> axum::response::Response {

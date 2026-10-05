@@ -17,6 +17,9 @@ pub struct Config {
     pub default_owner_id: i64,
     pub bsky_public_api: String,
     pub notif_cache_dir: PathBuf,
+    /// Shared secret for loopback-only migration mutation routes. Empty keeps
+    /// those routes disabled even when the shadow HTTP service is running.
+    pub phyrian_mutation_token: Option<String>,
 }
 
 impl Config {
@@ -52,6 +55,10 @@ impl Config {
         let notif_cache_dir = PathBuf::from(
             env::var("VAAK_NOTIF_CACHE_DIR").unwrap_or_else(|_| "/var/lib/mkultra/ap".to_string()),
         );
+        let phyrian_mutation_token = env::var("VAAK_PHYRIAN_MUTATION_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         Ok(Self {
             database_url,
@@ -61,6 +68,7 @@ impl Config {
             default_owner_id,
             bsky_public_api,
             notif_cache_dir,
+            phyrian_mutation_token,
         })
     }
 }
@@ -99,6 +107,7 @@ pub fn env_snapshot() -> HashMap<String, String> {
         "VAAK_BSKY_PUBLIC_API",
         "AP_BSKY_PUBLIC_API",
         "VAAK_NOTIF_CACHE_DIR",
+        "VAAK_PHYRIAN_MUTATION_TOKEN",
         "AP_DB_DSN",
     ] {
         if let Ok(v) = env::var(key) {
