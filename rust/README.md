@@ -42,6 +42,7 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_NOTIF_AXUM_PRIMARY` | `1` (PHP) | Mentions M5: `admin_notifications_page` reads localhost Axum `/api/v1/notifications` first; PHP Redis/hydrate fallback on miss |
 | `VAAK_NOTIF_UNREAD_AXUM` | `1` (PHP) | Badge poll: on Redis miss prefer Axum `/shadow/notif?live=1` (~30ms) before PHP PG rebuild; header `X-VAAK-Notif-Unread-Source` |
 | `VAAK_HOME_HTML_AXUM` | `1` (PHP) | Home soft-nav/first-paint prefer Axum `/shadow/home-html` lean cards; miss → JSON→PHP cards. Header `X-VAAK-Home-Html` / `data-tl-cache=axum-home-html` |
+| `VAAK_ACCOUNT_SWITCH_AXUM` | `1` (PHP) | On `switch_account`, call `/shadow/account-switch-prep` (ranked + badge + hydrate spawn) before 303 so landing hits warm Home HTML |
 | `VAAK_HOME_AXUM_PRIMARY` | `1` (PHP) | Home Mastodon API: `/api/v1/timelines/home` tries localhost Axum hydrate first; PHP Redis/file + cold merge on miss. Head-only (no max_id). Rollback: `0` |
 | `VAAK_NOTIF_NATIVE_PROJECTION` | `1` | notif-list writes Redis from `ap_notification_projection` before PHP spawn; empty thin windows fall through to PHP (0.6.43) |
 | `VAAK_NOTIF_LIST_REFRESH_SECS` | `90` | skip-if-fresh window for list keys |
@@ -76,6 +77,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Unread badge Axum prefer (0.7.2–0.7.3): `ap_masto_notifications_unread_state` calls `/shadow/notif?live=1` on Redis miss **before** stale-file/stampede/PHP rebuild (shared by every HTML nav paint + ajax poll); `ajax=notif_unread` exposes `X-VAAK-Notif-Unread-Source: axum|redis|file|php`. Rollback: `VAAK_NOTIF_UNREAD_AXUM=0`.
 - Mentions HTML grouping (0.7.3): Axum `/shadow/mentions-html` collapses favourite/reblog rows into avatar-stack cards (presentation-only; tip/pagination unchanged).
 - Home HTML fill (0.7.4): `GET /shadow/home-html` lean feed cards from hydrate Redis; PHP soft-nav + full-page prefer Axum (`VAAK_HOME_HTML_AXUM`). Lean gaps: no fav/boost/bookmark action bar, no poll/ask widgets.
+- Account-switch prep (0.7.5): `GET /shadow/account-switch-prep?owner_id=&views=home` warms native ranked (on hydrate miss) + live unread badge + forces hydrate spawn; PHP calls it on successful `switch_account` before 303.
 - Home Axum-primary (0.6.51): PHP `ap_masto_timeline_home_axum_try` → localhost Axum when `VAAK_HOME_AXUM_PRIMARY=1`; header `X-VAAK-TL-Cache: axum-shadow` on hit.
 - HTML Home Axum assist (0.6.62): soft-nav shell + full-page first paint prefer `ap_masto_timeline_home_axum_fetch` → masto cards; miss schedules `bin/home-timeline-warm.php`; `X-TL-Cache: axum-shadow` / `data-tl-cache=axum-shadow`.
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`

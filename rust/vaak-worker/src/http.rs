@@ -42,6 +42,8 @@ pub struct OwnerQuery {
     pub favourited: Option<String>,
     pub reblogged: Option<String>,
     pub bookmarked: Option<String>,
+    /// Account-switch prep views: `home`, `local`, `feed` (comma-separated).
+    pub views: Option<String>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -93,6 +95,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/mentions-html", get(shadow_mentions_html))
         // Home fill HTML from hydrate Redis (0.7.4).
         .route("/shadow/home-html", get(shadow_home_html))
+        // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
+        .route("/shadow/account-switch-prep", get(shadow_account_switch_prep))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
         .route("/api/v1/timelines/home", get(shadow_home_masto))
         // Home live-poll: ranked head + hydrate filtered by since_ts (0.6.74).
@@ -128,6 +132,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/notif-embed",
             "/shadow/mentions-html",
             "/shadow/home-html",
+            "/shadow/account-switch-prep",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
             "/api/v1/notifications"
@@ -243,6 +248,47 @@ async fn shadow_notif_embed(
     }
     let _ = crate::notif_embed::set_embed_html(&mut redis, &key, &html).await;
     embed_html_response(html, "paint")
+}
+
+/// Account-switch prep (0.7.5): warm ranked/badge/hydrate for the target owner.
+async fn shadow_account_switch_prep(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(0);
+    let views = q
+        .views
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("home");
+    match crate::account_switch::prep(&state.cfg, owner, views).await {
+        Ok(report) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-vaak-switch-prep"),
+                axum::http::HeaderValue::from_static("1"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.ms.to_string()) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-switch-ms"), v);
+            }
+            (
+                StatusCode::OK,
+                headers,
+                Json(crate::account_switch::report_json(&report)),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// Home fill HTML (0.7.4). Cache miss → 404 so PHP keeps card paint.
