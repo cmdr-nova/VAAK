@@ -6337,11 +6337,12 @@ if ($hydrateBoost || $hydrateCreate) {
 
 // Phase 2: short-lived ranked timeline index so first paint + infinite scroll
 // can hydrate a window instead of rebuilding Home/Local/Federated.
-// Refresh (?_r=) bypasses cache so operators still get a hard rebuild.
+// ?_r= is a browser cache-buster / hardNav same-URL nudge (SWR): still serve
+// warm ranked + Axum hydrate. True rebuild reserved for ?_force=1 (0.6.68).
 $adminTlCacheKey = '';
 $adminTlRankedCached = null;
 $adminTlFromCache = false;
-$adminTlForceRefresh = isset($_GET['_r']);
+$adminTlForceRefresh = isset($_GET['_force']);
 $adminTlCachedHasMore = false;
 $adminTlCachedTotal = 0;
 $adminTlStampedeLock = '';
@@ -33551,7 +33552,9 @@ window.apAdminToast = function (msg, isErr) {
       });
     }
     // Same view in the address bar (common after Mentions soft-nav left a
-    // stale home URL, or hardNav retry) must force a real load.
+    // stale home URL, or hardNav retry) needs a real navigation. ?_r= busts
+    // the browser URL identity; server still serves warm ranked (SWR, 0.6.68).
+    // Ops true rebuild: append &_force=1 manually.
     try {
       const cur = new URL(window.location.href);
       const onPretty = typeof window.vaakIsPrettyProfilePath === 'function'
