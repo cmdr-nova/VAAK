@@ -812,6 +812,9 @@ struct EventRow {
     spoiler_text: String,
     host: String,
     target_actor: String,
+    ask_actor: String,
+    ask_question: String,
+    ask_answer: String,
 }
 
 struct ActorRow {
@@ -831,6 +834,16 @@ struct OutboxRow {
     media_urls: String,
     sensitive: bool,
     spoiler_text: String,
+    ask_actor: String,
+    ask_question: String,
+    ask_answer: String,
+}
+
+#[derive(Clone, Default)]
+struct AskContext {
+    actor: String,
+    question: String,
+    answer: String,
 }
 
 #[derive(Clone, Default)]
@@ -1129,6 +1142,13 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
     let mut st = base_status(&status_id, &created, &content, uri, uri, account, media, None);
     st["sensitive"] = json!(row.sensitive || !row.spoiler_text.trim().is_empty());
     st["spoiler_text"] = json!(row.spoiler_text);
+    if !row.ask_question.trim().is_empty() {
+        st["vaak_ask"] = json!({
+            "ask_actor": row.ask_actor,
+            "ask_question": row.ask_question,
+            "ask_answer": row.ask_answer,
+        });
+    }
     st
 }
 
@@ -1221,6 +1241,13 @@ fn materialize_outbox(
     );
     st["sensitive"] = json!(row.sensitive || !row.spoiler_text.trim().is_empty());
     st["spoiler_text"] = json!(row.spoiler_text);
+    if !row.ask_question.trim().is_empty() {
+        st["vaak_ask"] = json!({
+            "ask_actor": row.ask_actor,
+            "ask_question": row.ask_question,
+            "ask_answer": row.ask_answer,
+        });
+    }
     let parent = row.in_reply_to.trim().trim_end_matches('/');
     if !parent.is_empty() && parent.starts_with("https://") {
         st["vaak_in_reply_to_url"] = json!(parent);
@@ -1605,6 +1632,9 @@ async fn fetch_events_map(db: &Client, ids: &[i64]) -> Result<HashMap<i64, Event
                 spoiler_text: row.get(8),
                 host: row.get(9),
                 target_actor: row.get(10),
+                ask_actor: String::new(),
+                ask_question: String::new(),
+                ask_answer: String::new(),
             },
         );
     }
@@ -1664,6 +1694,9 @@ async fn fetch_creates_by_object(
                 spoiler_text: row.get(8),
                 host: row.get(9),
                 target_actor: row.get(10),
+                ask_actor: String::new(),
+                ask_question: String::new(),
+                ask_answer: String::new(),
             },
         );
     }
@@ -1834,10 +1867,57 @@ async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String,
                 media_urls,
                 sensitive: sensitive_i != 0,
                 spoiler_text: spoiler,
+                ask_actor: String::new(),
+                ask_question: String::new(),
+                ask_answer: String::new(),
             },
         );
     }
     Ok(map)
+}
+
+async fn fetch_ask_context_map(db: &Client, object_ids: &[String]) -> Result<HashMap<String, AskContext>> {
+    let mut keys: Vec<String> = object_ids
+        .iter()
+        .map(|id| id.trim_end_matches('/').to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut variants = keys.clone();
+    variants.extend(keys.iter().map(|id| format!("{id}/")));
+    variants.sort();
+    variants.dedup();
+    let mut out = HashMap::new();
+    if let Ok(rows) = db.query(
+        "SELECT object_id, COALESCE(ask_actor,''), COALESCE(ask_question,''), COALESCE(ask_answer,'')
+         FROM mentions WHERE object_id = ANY($1) AND deleted_at IS NULL AND ask_question <> ''
+         ORDER BY id DESC",
+        &[&variants],
+    ).await {
+        for row in rows {
+            let key: String = row.get::<_, String>(0).trim_end_matches('/').to_string();
+            out.entry(key).or_insert(AskContext {
+                actor: row.get(1), question: row.get(2), answer: row.get(3),
+            });
+        }
+    }
+    if let Ok(rows) = db.query(
+        "SELECT answer_note_id, COALESCE(asker_actor,''), COALESCE(question,'')
+         FROM ap_asks WHERE answer_note_id = ANY($1) ORDER BY id DESC",
+        &[&variants],
+    ).await {
+        for row in rows {
+            let key: String = row.get::<_, String>(0).trim_end_matches('/').to_string();
+            out.entry(key).or_insert(AskContext {
+                actor: row.get(1), question: row.get(2), answer: String::new(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 async fn load_owner_username(db: &Client, owner: i64) -> Result<String> {
@@ -2228,7 +2308,7 @@ pub async fn warm_view(
                 }
             }
             ("home", "bsky") => bsky_uris.push(e.id.clone()),
-            ("home" | "feed", "event") => {
+            ("home" | "local" | "feed", "event") => {
                 if let Ok(id) = e.id.parse::<i64>() {
                     if id > 0 {
                         event_ids.push(id);
@@ -2255,7 +2335,7 @@ pub async fn warm_view(
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
     let bsky_map = fetch_bsky_map(&db, &bsky_uris).await?;
-    let events_map = fetch_events_map(&db, &event_ids).await?;
+    let mut events_map = fetch_events_map(&db, &event_ids).await?;
     let boosts_map = fetch_boosts_map(&db, &boost_ids, owner_user_id).await?;
     let mut rss_boost_ids = Vec::new();
     for rb in boosts_map.values() {
@@ -2304,7 +2384,24 @@ pub async fn warm_view(
     actor_ids.sort();
     actor_ids.dedup();
     let actors_map = fetch_actors_map(&db, &actor_ids).await?;
-    let outbox_map = fetch_outbox_map(&db, &outbox_ids).await?;
+    let mut outbox_map = fetch_outbox_map(&db, &outbox_ids).await?;
+    let mut ask_ids: Vec<String> = events_map.values().map(|e| e.object_id.clone()).collect();
+    ask_ids.extend(outbox_map.keys().cloned());
+    let ask_map = fetch_ask_context_map(&db, &ask_ids).await?;
+    for event in events_map.values_mut() {
+        if let Some(ask) = ask_map.get(event.object_id.trim_end_matches('/')) {
+            event.ask_actor = ask.actor.clone();
+            event.ask_question = ask.question.clone();
+            event.ask_answer = ask.answer.clone();
+        }
+    }
+    for (id, note) in outbox_map.iter_mut() {
+        if let Some(ask) = ask_map.get(id.trim_end_matches('/')) {
+            note.ask_actor = ask.actor.clone();
+            note.ask_question = ask.question.clone();
+            note.ask_answer = ask.answer.clone();
+        }
+    }
 
     // Local outbox / boost authors → actor_profile icons (0.7.24).
     let mut local_keys: Vec<String> = Vec::new();
@@ -2699,6 +2796,9 @@ mod tests {
             spoiler_text: "Gallery".into(),
             host: "mkultra.monster".into(),
             target_actor: String::new(),
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
         };
         let mut federated = local.clone();
         federated.id = 42;
