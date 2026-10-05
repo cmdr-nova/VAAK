@@ -21922,7 +21922,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .resonant-badge {
       display: inline-flex; align-items: center; gap: .28rem;
-      margin-left: .45rem; padding: .18rem .5rem;
+      margin: .2rem .2rem .4rem .45rem; padding: .18rem .5rem;
       border: 1px solid rgba(180,120,255,.5); border-radius: 999px;
       background: rgba(140,80,255,.12); color: #d4b8ff;
       font-size: .72em; font-weight: 650; line-height: 1.25;
