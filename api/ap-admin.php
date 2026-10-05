@@ -58,6 +58,7 @@ require_once __DIR__ . '/ap-bsky.php'; // Phase A Bluesky tab (opt-in, feature-f
 require_once __DIR__ . '/ap-action-queue.php'; // Durable reversible timeline actions
 require_once __DIR__ . '/ap-rss.php'; // You → RSS → Home mix
 require_once __DIR__ . '/ap-phyrian.php'; // Phyrian Strains web game (Phase 1)
+require_once __DIR__ . '/ap-phyrian-bridge.php'; // OpenSim ↔ VAAK Resonant bridge (Phase 3)
 // Quote helpers (ap_quote_target_pack, ap_fetch_as2_object, local note docs, etc.)
 if (!defined('AP_INBOX_LIB_ONLY')) {
     define('AP_INBOX_LIB_ONLY', true);
@@ -69,6 +70,13 @@ if (!$vaakAdminLibOnly) {
     if (function_exists('ap_phyrian_migrate')) {
         try {
             ap_phyrian_migrate();
+        } catch (Throwable $e) {
+            // table create may need postgres ownership on first deploy
+        }
+    }
+    if (function_exists('ap_phyrian_bridge_migrate')) {
+        try {
+            ap_phyrian_bridge_migrate();
         } catch (Throwable $e) {
             // table create may need postgres ownership on first deploy
         }
@@ -4716,6 +4724,7 @@ $vaakAdminOnlyActions = [
         }
     } elseif (in_array($action, [
         'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
+        'phyrian_bridge_start', 'phyrian_bridge_verify', 'phyrian_bridge_unlink',
     ], true)) {
         $view = 'phyrian';
         // Same pattern as RSS: this branch never inherited $ownerId from above.
@@ -4724,6 +4733,33 @@ $vaakAdminOnlyActions = [
             $error = 'Not signed in.';
         } elseif (!function_exists('ap_phyrian_ensure_player')) {
             $error = 'Phyrian Strains is unavailable.';
+        } elseif ($action === 'phyrian_bridge_start') {
+            $res = function_exists('ap_phyrian_bridge_challenge_start')
+                ? ap_phyrian_bridge_challenge_start($ownerId, (string) ($_POST['opensim_identify'] ?? ''))
+                : ['ok' => false, 'error' => 'Bridge unavailable'];
+            if (!empty($res['ok'])) {
+                $notice = (string) ($res['notice'] ?? 'Claim code queued for your OpenSim avatar.');
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not start OpenSim link.');
+            }
+        } elseif ($action === 'phyrian_bridge_verify') {
+            $res = function_exists('ap_phyrian_bridge_challenge_verify')
+                ? ap_phyrian_bridge_challenge_verify($ownerId, (string) ($_POST['opensim_code'] ?? ''))
+                : ['ok' => false, 'error' => 'Bridge unavailable'];
+            if (!empty($res['ok'])) {
+                $notice = (string) ($res['notice'] ?? 'OpenSim avatar linked.');
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not verify code.');
+            }
+        } elseif ($action === 'phyrian_bridge_unlink') {
+            $res = function_exists('ap_phyrian_bridge_unlink')
+                ? ap_phyrian_bridge_unlink($ownerId)
+                : ['ok' => false, 'error' => 'Bridge unavailable'];
+            if (!empty($res['ok'])) {
+                $notice = (string) ($res['notice'] ?? 'OpenSim avatar unlinked.');
+            } else {
+                $error = (string) ($res['error'] ?? 'Could not unlink.');
+            }
         } elseif ($action === 'phyrian_self_seed') {
             $res = function_exists('ap_phyrian_origin_self_seed')
                 ? ap_phyrian_origin_self_seed($ownerId)
@@ -21808,6 +21844,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       font-size: .72em; font-weight: 800; line-height: 1;
       vertical-align: middle; position: relative; top: -0.05em;
     }
+    .resonant-badge {
+      display: inline-flex; align-items: center; gap: .28rem;
+      margin-left: .45rem; padding: .18rem .5rem;
+      border: 1px solid rgba(180,120,255,.5); border-radius: 999px;
+      background: rgba(140,80,255,.12); color: #d4b8ff;
+      font-size: .72em; font-weight: 650; line-height: 1.25;
+      vertical-align: middle; white-space: nowrap;
+    }
     .who .custom-emoji, .tweet-hd .custom-emoji, .body .custom-emoji, .feed-body .custom-emoji {
       width: 1.25em; height: 1.25em; vertical-align: -0.25em;
       object-fit: contain; display: inline;
@@ -28144,6 +28188,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpMeta = null;
           $rpBio = '';
           $rpProfileBadges = [];
+          $rpPhyrianBridge = null;
           $rpAvatar = null;
           $rpHeader = null;
           $rpFollowing = false;
@@ -28327,6 +28372,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       : null;
                   $rpWowLink = function_exists('ap_wow_link_for_actor_key')
                       ? ap_wow_link_for_actor_key((string) $rpLocalKey)
+                      : null;
+                  $rpPhyrianBridge = function_exists('ap_phyrian_bridge_link_for_actor_key')
+                      ? ap_phyrian_bridge_link_for_actor_key((string) $rpLocalKey)
                       : null;
                   // Pinned / Featured / Blog (local-only parity with HTML profiles).
                   if (function_exists('ap_masto_pinned_statuses') && function_exists('ap_masto_status_from_row')) {
@@ -28878,7 +28926,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   <?= admin_avatar_img($rpActor) ?>
                 <?php endif; ?>
                 <div style="min-width:0">
-                  <div class="who"><?= admin_emoji_html((string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor)), $rpActor) ?></div>
+                  <div class="who"><?= admin_emoji_html((string) ((is_array($rpMeta) ? ($rpMeta['display_name'] ?? null) : null) ?: actor_handle($rpActor)), $rpActor) ?><?php
+                    if ($rpIsLocal && !empty($rpPhyrianBridge) && function_exists('ap_phyrian_bridge_resonant_badge_html')) {
+                        echo ap_phyrian_bridge_resonant_badge_html(is_array($rpPhyrianBridge) ? $rpPhyrianBridge : null);
+                    }
+                  ?></div>
                   <div class="meta"><?= h($rpIsBsky && $rpBskyHandle !== '' ? ('@' . $rpBskyHandle) : actor_handle($rpActor, is_array($rpMeta) ? ($rpMeta['username'] ?? null) : null)) ?>
                     <?php if ($rpIsLocal): ?><span class="tag" style="margin-left:.35rem" title="Account on this instance">local</span><?php endif; ?>
                     <?php if ($rpIsBsky): ?><span class="tag" style="margin-left:.35rem" title="Bluesky / AT Protocol">Bluesky</span><?php endif; ?>
@@ -29766,9 +29818,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <header class="phyrian-hero">
             <img src="<?= h($phyAsset('title-header.jpg')) ?>" alt="" width="900" height="583" decoding="async">
             <div class="phyrian-hero-copy">
-              <p class="meta">Phase 1 · web-only</p>
+              <p class="meta">Phase 3 · web + OpenSim bridge</p>
               <h2>Phyrian Strains</h2>
-              <p>Consent-based imprint and resonance on this instance. OpenSim link / Resonant badge come later — nothing here federates.</p>
+              <p>Consent-based imprint and resonance on this instance. Link a NovaLandia OpenSim avatar for +1 daily resonance and a Resonant profile badge — nothing here federates.</p>
             </div>
           </header>
 
@@ -29779,6 +29831,82 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <a class="<?= $phyPage === 'hub' ? 'is-active' : '' ?>" href="<?= h($phyHubHref) ?>" <?= $phyPage === 'hub' ? 'aria-current="page"' : '' ?>>Hub</a>
             <a class="<?= $phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId ? 'is-active' : '' ?>" href="<?= h($phyOwnDossierHref) ?>" <?= ($phyPage === 'dossier' && $phyDossierOwner === (int) $vaakOwnerId) ? 'aria-current="page"' : '' ?>>Your readout</a>
           </nav>
+
+          <?php if ($phyPage === 'hub'): ?>
+            <?php
+              $phyBridgeLink = function_exists('ap_phyrian_bridge_link_for_user')
+                  ? ap_phyrian_bridge_link_for_user((int) $vaakOwnerId)
+                  : null;
+              $phyBridgePending = ($phyBridgeLink === null && function_exists('ap_phyrian_bridge_pending_challenge'))
+                  ? ap_phyrian_bridge_pending_challenge((int) $vaakOwnerId)
+                  : null;
+            ?>
+            <section class="phyrian-bridge composer" aria-label="Link OpenSim avatar" style="margin:1rem 0 1.25rem">
+              <div class="meta" style="margin-bottom:.75rem">
+                <b style="color:var(--primary)">Link OpenSim</b><br>
+                Connect your <a href="https://novalandia.online/" target="_blank" rel="noopener noreferrer">NovaLandia</a> avatar for dual-world perks:
+                <b>+1 daily resonance</b> on both bodies and a public <span class="resonant-badge" style="margin-left:.15rem">◈ Resonant</span> profile badge.
+                We send a one-time claim code to your avatar in-world via the Phyrian Strains HUD — that only works if you have a NovaLandia account.
+                <?php if ($phyBridgeLink === null): ?>
+                  <br>Need an account? <a href="https://novalandia.online/register/" target="_blank" rel="noopener noreferrer">Register</a>
+                  or ask Valerie / use a Clearance invite. VAAK-only play stays complete without a link.
+                <?php endif; ?>
+              </div>
+              <?php if (is_array($phyBridgeLink)): ?>
+                <div style="display:flex;gap:.75rem;align-items:flex-start;margin-bottom:.75rem;flex-wrap:wrap">
+                  <div>
+                    <div class="who">Linked as <?= h((string) ($phyBridgeLink['avatar_name'] ?? 'avatar')) ?></div>
+                    <div class="meta">
+                      Verified <?= h(function_exists('relative_time') ? relative_time((string) ($phyBridgeLink['verified_at'] ?? '')) : (string) ($phyBridgeLink['verified_at'] ?? '')) ?>
+                      · <a href="<?= h(function_exists('ap_phyrian_bridge_profile_url') ? ap_phyrian_bridge_profile_url((string) ($phyBridgeLink['avatar_uuid'] ?? '')) : 'https://strains.novalandia.online/') ?>" target="_blank" rel="noopener noreferrer">Strains profile</a>
+                      <?php if (!empty($phyBridgeLink['strain_snapshot'])): ?>
+                        · strain <?= h((string) $phyBridgeLink['strain_snapshot']) ?>
+                      <?php endif; ?>
+                    </div>
+                    <ul class="meta" style="margin:.55rem 0 0;padding-left:1.1rem">
+                      <li>Perks active: +1 VAAK daily check-in · +1 OpenSim monolith claim · Resonant badge</li>
+                    </ul>
+                  </div>
+                </div>
+                <form method="post" action="?view=phyrian" onsubmit="return confirm('Unlink this OpenSim avatar from your VAAK account?');">
+                  <input type="hidden" name="action" value="phyrian_bridge_unlink">
+                  <div class="composer-actions">
+                    <span class="meta">One OpenSim avatar per VAAK account</span>
+                    <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Unlink</button>
+                  </div>
+                </form>
+              <?php else: ?>
+                <?php if (is_array($phyBridgePending)): ?>
+                  <div class="meta" style="margin-bottom:.75rem;color:var(--primary)">
+                    Code queued for <code><?= h((string) ($phyBridgePending['avatar_name'] ?? '')) ?></code>
+                    — wear the HUD in NovaLandia, touch <b>Status</b>, then enter the code below
+                    (expires <?= h(function_exists('relative_time') ? relative_time((string) ($phyBridgePending['expires_at'] ?? '')) : (string) ($phyBridgePending['expires_at'] ?? '')) ?>).
+                  </div>
+                  <form method="post" action="?view=phyrian" style="margin-bottom:1rem">
+                    <input type="hidden" name="action" value="phyrian_bridge_verify">
+                    <label for="opensim-code">Claim code</label>
+                    <input id="opensim-code" type="text" name="opensim_code" required maxlength="16" autocomplete="one-time-code"
+                           placeholder="e.g. A7K3MQ" style="text-transform:uppercase;letter-spacing:.08em">
+                    <div class="composer-actions">
+                      <span class="meta">From the Phyrian Strains HUD message</span>
+                      <button class="btn btn-primary" type="submit">Confirm link</button>
+                    </div>
+                  </form>
+                <?php endif; ?>
+                <form method="post" action="?view=phyrian">
+                  <input type="hidden" name="action" value="phyrian_bridge_start">
+                  <label for="opensim-identify">NovaLandia avatar</label>
+                  <input id="opensim-identify" type="text" name="opensim_identify" required maxlength="200"
+                         placeholder="val3r1e flux · strains URL · or UUID"
+                         value="<?= h((string) ($phyBridgePending['avatar_name'] ?? '')) ?>">
+                  <div class="composer-actions">
+                    <span class="meta">You must be logged into OpenSim as this avatar to receive the code</span>
+                    <button class="btn btn-primary" type="submit"><?= is_array($phyBridgePending) ? 'Resend claim code' : 'Send claim code' ?></button>
+                  </div>
+                </form>
+              <?php endif; ?>
+            </section>
+          <?php endif; ?>
 
           <?php if ($phyPage === 'dossier'): ?>
             <?php
