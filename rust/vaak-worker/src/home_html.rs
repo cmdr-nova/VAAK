@@ -95,6 +95,7 @@ pub async fn home_html_fill(
     }
 
     let end = (offset + limit).min(report.items.len());
+    // Flags already overlaid in timeline::home_hydrate (0.7.19).
     let slice = &report.items[offset..end];
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
 

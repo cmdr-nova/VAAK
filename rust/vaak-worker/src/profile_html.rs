@@ -691,6 +691,11 @@ pub async fn profile_html_fill(
         return Ok(None);
     }
 
+    // Live fav/boost/bookmark from masto_* (same as Home lean / Ice Cubes, 0.7.19).
+    if viewer_owner_id > 0 {
+        let _ = crate::interaction_flags::apply_to_statuses(&db, viewer_owner_id, &mut statuses).await;
+    }
+
     let mut html = String::with_capacity(statuses.len() * 1200);
     let mut painted = 0usize;
     for st in &statuses {

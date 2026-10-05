@@ -803,8 +803,16 @@ fn materialize_bsky(row: &BskyRow) -> Value {
     // Keep body as plain-ish HTML paragraphs; lean paint linkifies @/#/URLs.
     let content = plain_to_html(row.text.replace("\r\n", "\n").trim());
     let account = empty_account(did, username, acct, display, &profile_url, &row.author_avatar);
+    // Canonical status_id matches PHP ap_masto_canonical_interaction_keys (bsky:<sha256[:32]>).
+    // Keep uri as at:// for Bluesky actions; url as https permalink for object_id parity.
+    let mut hasher = Sha256::new();
+    hasher.update(row.uri.as_bytes());
+    let bsky_sid = format!(
+        "bsky:{}",
+        &hex::encode(hasher.finalize())[..32]
+    );
     let mut st = base_status(
-        &row.uri,
+        &bsky_sid,
         &created,
         &content,
         &row.uri,
