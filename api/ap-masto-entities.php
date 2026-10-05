@@ -6615,6 +6615,75 @@ function ap_masto_notifications_schedule_rebuild(
 }
 
 /**
+ * Prefer Axum `/shadow/notif?live=1` for the unread badge (~30ms Rust compute)
+ * over PHP PG rebuild (Caddy outliers 14–62s). Writes the live Redis key so
+ * subsequent PHP polls stay hot. Flag: VAAK_NOTIF_UNREAD_AXUM (default on).
+ *
+ * @return array{count:int,last_read_id:string,latest_unread_id:string,latest_id:string}|null
+ */
+function ap_masto_notifications_unread_axum_fetch(int $ownerUserId, int $scan = 80): ?array
+{
+    $enabled = getenv('VAAK_NOTIF_UNREAD_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled || $ownerUserId < 1) {
+        return null;
+    }
+    $scan = max(1, min(80, $scan));
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/shadow/notif?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'live' => '1',
+    ]);
+    $body = null;
+    $code = 0;
+    $started = microtime(true);
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    // Axum live compute is ~30ms; keep the budget tight so a down worker
+    // fails into PHP without parking an FPM worker.
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 800,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('notif.unread.axum_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($raw) || $raw === '') {
+        return null;
+    }
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded) || !array_key_exists('count', $decoded)) {
+        return null;
+    }
+    return [
+        'count' => max(0, min($scan, (int) ($decoded['count'] ?? 0))),
+        'last_read_id' => preg_replace('/\D+/', '', (string) ($decoded['last_read_id'] ?? '0')) ?: '0',
+        'latest_unread_id' => preg_replace('/\D+/', '', (string) ($decoded['latest_unread_id'] ?? '')) ?: '',
+        'latest_id' => preg_replace('/\D+/', '', (string) ($decoded['latest_id'] ?? '')) ?: '',
+    ];
+}
+
+/**
  * Unread notification state vs masto_markers.notifications.last_read_id.
  *
  * @return array{count:int,last_read_id:string,latest_unread_id:string,latest_id:string}
@@ -6639,6 +6708,7 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     // Guests / unbound sessions have no badge — never stampede-wait on a key
     // the Rust live writer will not populate.
     if ($ownerUserId < 1 || !empty($GLOBALS['vaak_guest_profile'])) {
+        $GLOBALS['ap_notif_unread_source'] = 'guest';
         return [
             'count' => 0,
             'last_read_id' => $lastRead,
@@ -6698,6 +6768,7 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     if ($cacheTtl > 0 && function_exists('ap_redis_json_get')) {
         $redisCached = ap_redis_json_get($redisKey);
         if (is_array($redisCached) && isset($redisCached['c'])) {
+            $GLOBALS['ap_notif_unread_source'] = 'redis';
             return $readUnreadCache($redisCached);
         }
         // Prefer a slightly stale file badge before any stampede wait — page
@@ -6706,6 +6777,7 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
         $staleAge = $rustCoversOwner ? 300 : $cacheTtl;
         $staleBeforeWait = $readFileUnread($staleAge);
         if (is_array($staleBeforeWait)) {
+            $GLOBALS['ap_notif_unread_source'] = 'file';
             return $staleBeforeWait;
         }
         $unreadStampedeLock = 'notif-unread:' . substr(hash('sha256', $redisKey), 0, 16);
@@ -6721,10 +6793,12 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
                 $peerWaitMs
             );
             if (is_array($peer) && isset($peer['c'])) {
+                $GLOBALS['ap_notif_unread_source'] = 'redis-peer';
                 return $readUnreadCache($peer);
             }
             $stale = $readFileUnread($staleAge);
             if (is_array($stale)) {
+                $GLOBALS['ap_notif_unread_source'] = 'file';
                 return $stale;
             }
         }
@@ -6732,6 +6806,7 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     if ($cacheTtl > 0) {
         $freshFile = $readFileUnread($cacheTtl);
         if (is_array($freshFile)) {
+            $GLOBALS['ap_notif_unread_source'] = 'file';
             return $freshFile;
         }
     }
@@ -6739,10 +6814,25 @@ function ap_masto_notifications_unread_state(int $scan = 80, bool $bypassCache =
     if ($rustCoversOwner && $cacheTtl > 0) {
         $stale = $readFileUnread(600);
         if (is_array($stale)) {
+            $GLOBALS['ap_notif_unread_source'] = 'file-stale';
             return $stale;
         }
     }
 
+    // Prefer Axum live badge (~30ms) over PHP PG rebuild (Caddy outliers 14–62s).
+    // live=1 also warms the production Redis key for the next poll.
+    if (function_exists('ap_masto_notifications_unread_axum_fetch')) {
+        $axumState = ap_masto_notifications_unread_axum_fetch($ownerUserId, $scan);
+        if (is_array($axumState)) {
+            if ($holdUnreadLock && $unreadStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+                ap_redis_unlock($unreadStampedeLock);
+            }
+            $GLOBALS['ap_notif_unread_source'] = 'axum';
+            return $axumState;
+        }
+    }
+
+    $GLOBALS['ap_notif_unread_source'] = 'php';
     $ownerActorId = function_exists('ap_db_owner_actor_id_for_user_id')
         ? ap_db_owner_actor_id_for_user_id($ownerUserId)
         : (string) ($GLOBALS['vaak_actor_id'] ?? 'https://mkultra.monster/users/cmdr_nova');

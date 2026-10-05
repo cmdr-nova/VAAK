@@ -5188,12 +5188,15 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     // refreshed frequently enough for notification badges and chimes.
     // latest_unread_id (not overall latest) drives the AIM chime — hydration
     // of the full notifications feed used to make overall latest_id jump around.
+    // On Redis miss, unread_state prefers Axum /shadow/notif live (~30ms)
+    // before the PHP PG rebuild that used to spike 14–62s (0.7.2).
     $state = [
         'count' => 0,
         'last_read_id' => '0',
         'latest_unread_id' => '',
         'latest_id' => '',
     ];
+    $GLOBALS['ap_notif_unread_source'] = 'none';
     try {
         if (function_exists('ap_masto_notifications_unread_state')) {
             $state = ap_masto_notifications_unread_state(80, false);
@@ -5203,6 +5206,8 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'notif_unread') {
     } catch (Throwable $e) {
         // Keep the lightweight badge endpoint usable if a remote actor is stale.
     }
+    $unreadSrc = preg_replace('/[^a-z0-9_-]+/i', '', (string) ($GLOBALS['ap_notif_unread_source'] ?? 'php')) ?: 'php';
+    header('X-VAAK-Notif-Unread-Source: ' . $unreadSrc);
     $dmCount = function_exists('ap_dm_unread_count') ? ap_dm_unread_count() : 0;
     $latestDmId = '';
     $ownerForBadge = function_exists('admin_owner_user_id') ? admin_owner_user_id() : (int) ($vaakUser['id'] ?? 0);
