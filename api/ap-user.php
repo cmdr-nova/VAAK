@@ -1137,13 +1137,15 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             : '<p class="muted">No featured accounts yet.</p>';
         echo '</section>';
     } elseif ($tab === 'pinned') {
-        echo '<section id="profile-posts" class="posts" aria-label="Pinned">';
+        echo '<section id="profile-posts" class="posts" aria-label="Pinned" data-vaak-pinned-feed="1">';
         if (!$pinnedNotes) {
             echo '<p class="muted">No pinned posts yet.</p>';
         } else {
+            $GLOBALS['vaak_pin_media_silent'] = true;
             foreach ($pinnedNotes as $pinNote) {
                 echo ap_user_post_preview_html($actorKey, $pinNote);
             }
+            $GLOBALS['vaak_pin_media_silent'] = false;
         }
         echo '</section>';
     } else {
@@ -1195,6 +1197,7 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
 
     echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
     echo '<script>(function(){const top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();const box=document.querySelector(".profile-infinite");if(!box||!window.IntersectionObserver)return;let page=+(box.dataset.profilePage||1),pages=+(box.dataset.profilePages||1),busy=false;const load=async()=>{if(busy||page>=pages)return;busy=true;try{const u=new URL(location.href);u.searchParams.set("page",String(page+1));const r=await fetch(u,{credentials:"same-origin",headers:{"X-Requested-With":"profile-infinite"}});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector(".profile-infinite");if(!n)throw 0;const marker=box.querySelector(".profile-infinite-sentinel");Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("profile-pager"))box.insertBefore(el,marker);});page++;box.dataset.profilePage=String(page);if(page>=pages){if(marker)marker.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
+    echo '<script>(function(){var sel="[data-vaak-pinned-feed] video,[data-vaak-pinned-feed] audio,.post-wrap.is-pinned video,.post-wrap.is-pinned audio";function silence(root){var scope=root&&root.querySelectorAll?root:document;scope.querySelectorAll(sel).forEach(function(el){try{el.autoplay=false;el.removeAttribute("autoplay");el.muted=true;if(!el.paused)el.pause();}catch(e){}});}function inPinned(el){return !!(el&&el.closest&&el.closest("[data-vaak-pinned-feed],.post-wrap.is-pinned"));}document.addEventListener("play",function(ev){var el=ev.target;if(!(el instanceof HTMLMediaElement)||!inPinned(el))return;if(el.dataset.vaakPinSoundOk==="1")return;try{el.muted=true;}catch(e){}},true);document.addEventListener("volumechange",function(ev){var el=ev.target;if(!(el instanceof HTMLMediaElement)||!inPinned(el))return;if(!el.muted&&el.volume>0)el.dataset.vaakPinSoundOk="1";},true);silence(document);})();</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode($actorId, JSON_UNESCAPED_SLASHES) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';
@@ -1265,15 +1268,18 @@ function ap_user_note_media_html(array $note, bool $interactive = true): string
                 $cells[] = '<img src="' . $safe . '" alt="' . $alt . '" loading="lazy" referrerpolicy="no-referrer">';
             }
         } elseif ($isVideo) {
+            // Pinned profile cards stay muted until the visitor unmutes.
+            $muteDefault = !$interactive || !empty($GLOBALS['vaak_pin_media_silent']);
             $cells[] = '<video class="media-video" src="' . $safe . '" '
-                . ($interactive ? 'controls ' : 'muted ')
+                . ($interactive ? 'controls ' : '')
+                . ($muteDefault ? 'muted ' : '')
                 . 'playsinline loop preload="metadata"'
                 . ($safePoster !== '' ? ' poster="' . $safePoster . '"' : '')
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (str_starts_with($mt, 'audio/') || $atype === 'Audio') {
             $cells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
                 . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
-                . '<audio class="media-audio" src="' . $safe . '" controls preload="auto"></audio>'
+                . '<audio class="media-audio" src="' . $safe . '" controls preload="metadata"></audio>'
                 . '</div>';
         }
         if (count($cells) >= 4) {
