@@ -6566,9 +6566,23 @@ if (
             exit;
         }
     }
-    // Home: prefer Axum hydrate statuses (Mentions M5 twin) before PG hydrate.
+    // Home: prefer Axum lean HTML fill (0.7.4) before JSON→PHP card paint / PG hydrate.
     $shellAxumHit = false;
-    if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_fetch')) {
+    if ($view === 'home' && function_exists('admin_home_html_axum_fetch')) {
+        $axumHtml = admin_home_html_axum_fetch($shellLimit, (int) $vaakOwnerId);
+        if (is_array($axumHtml) && (string) ($axumHtml['html'] ?? '') !== '') {
+            $shellBody = (string) $axumHtml['html'];
+            $shellAxumHit = true;
+            $shellHasMore = !empty($axumHtml['has_more']);
+            if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+                $shellHasMore = count($adminTlRankedCached) > $shellLimit;
+            }
+            $shellNext = max($shellLimit, (int) ($axumHtml['next_offset'] ?? $shellLimit));
+            $shellCache = 'axum-home-html';
+            header('X-VAAK-Home-Html: 1');
+        }
+    }
+    if ($view === 'home' && !$shellAxumHit && function_exists('ap_masto_timeline_home_axum_fetch')) {
         $axumStatuses = ap_masto_timeline_home_axum_fetch($shellLimit, (int) $vaakOwnerId);
         if (is_array($axumStatuses) && $axumStatuses !== [] && function_exists('admin_render_masto_status_card')) {
             $flagIds = [];
@@ -10216,32 +10230,48 @@ if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
     $adminTlStampedeLock = '';
 }
 
-// Full-page Home: prefer Axum hydrate statuses (Mentions M5 twin) before PG hydrate.
+// Full-page Home: prefer Axum lean HTML (0.7.4), then JSON→PHP cards, before PG.
 $adminHomeAxumStatuses = null;
+$adminHomeAxumHtml = null;
 $adminHomeFirstPaintStarted = microtime(true);
 if (
     !$isPartial
     && $view === 'home'
     && (int) ($_GET['offset'] ?? 0) === 0
-    && function_exists('ap_masto_timeline_home_axum_fetch')
 ) {
-    $axumHome = ap_masto_timeline_home_axum_fetch($tlLimit, (int) $vaakOwnerId);
-    if (is_array($axumHome) && $axumHome !== []) {
-        $adminHomeAxumStatuses = $axumHome;
-        if ($adminTlFromCache && is_array($adminTlRankedCached)) {
-            $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
+    if (function_exists('admin_home_html_axum_fetch')) {
+        $axumHomeHtml = admin_home_html_axum_fetch($tlLimit, (int) $vaakOwnerId);
+        if (is_array($axumHomeHtml) && (string) ($axumHomeHtml['html'] ?? '') !== '') {
+            $adminHomeAxumHtml = $axumHomeHtml;
+            if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+                $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
+            } else {
+                $adminTlCachedHasMore = !empty($axumHomeHtml['has_more']);
+            }
+            if (function_exists('ap_timing_record')) {
+                ap_timing_record('home.first_paint.axum_html_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+            }
+        }
+    }
+    if ($adminHomeAxumHtml === null && function_exists('ap_masto_timeline_home_axum_fetch')) {
+        $axumHome = ap_masto_timeline_home_axum_fetch($tlLimit, (int) $vaakOwnerId);
+        if (is_array($axumHome) && $axumHome !== []) {
+            $adminHomeAxumStatuses = $axumHome;
+            if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+                $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
+            } else {
+                $adminTlCachedHasMore = true;
+            }
+            if (function_exists('ap_timing_record')) {
+                ap_timing_record('home.first_paint.axum_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+            }
         } else {
-            $adminTlCachedHasMore = true;
-        }
-        if (function_exists('ap_timing_record')) {
-            ap_timing_record('home.first_paint.axum_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
-        }
-    } else {
-        if (function_exists('ap_timing_record')) {
-            ap_timing_record('home.first_paint.axum_miss', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
-        }
-        if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
-            ap_masto_timeline_home_hydrate_warm_async((int) $vaakOwnerId, $tlLimit);
+            if (function_exists('ap_timing_record')) {
+                ap_timing_record('home.first_paint.axum_miss', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+            }
+            if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+                ap_masto_timeline_home_hydrate_warm_async((int) $vaakOwnerId, $tlLimit);
+            }
         }
     }
 }
@@ -10267,8 +10297,10 @@ if (
     && in_array($view, ['home', 'feed', 'local'], true)
     && !(
         $view === 'home'
-        && is_array($adminHomeAxumStatuses)
-        && $adminHomeAxumStatuses !== []
+        && (
+            (is_array($adminHomeAxumHtml) && (string) ($adminHomeAxumHtml['html'] ?? '') !== '')
+            || (is_array($adminHomeAxumStatuses) && $adminHomeAxumStatuses !== [])
+        )
     )
 ) {
     $adminTlCachedTotal = count($adminTlRankedCached);
@@ -20208,6 +20240,89 @@ function admin_notif_status_strip_reply_bake(array $status, array $knownMentions
  *                         author row — the notif chrome already shows them.
  */
 /**
+ * Fetch Home fill HTML from Axum `/shadow/home-html` (0.7.4).
+ * Lean Rust cards from hydrate Redis. Flag: VAAK_HOME_HTML_AXUM (default on).
+ *
+ * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int}|null
+ */
+function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0): ?array
+{
+    $enabled = getenv('VAAK_HOME_HTML_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return null;
+    }
+    if ($ownerUserId < 1 && function_exists('ap_db_masto_owner_user_id')) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id')) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/shadow/home-html?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'limit' => max(1, min(40, $limit)),
+    ]);
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    $started = microtime(true);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 1500,
+        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('home.html.axum_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($raw)) {
+        return null;
+    }
+    $rawHeaders = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    if (!is_string($body) || $body === '') {
+        return null;
+    }
+    $hdrs = [];
+    foreach (explode("\r\n", (string) $rawHeaders) as $hline) {
+        if (str_contains($hline, ':')) {
+            [$hk, $hv] = array_map('trim', explode(':', $hline, 2));
+            $hdrs[strtolower($hk)] = $hv;
+        }
+    }
+    return [
+        'html' => $body,
+        'has_more' => (($hdrs['x-has-more'] ?? '') === '1'),
+        'next_offset' => max(0, (int) ($hdrs['x-next-offset'] ?? $limit)),
+        'source' => (string) ($hdrs['x-vaak-tl-source'] ?? 'axum-home-html'),
+        'ms' => $ms,
+    ];
+}
+
+/**
  * Fetch Mentions fill HTML from Axum `/shadow/mentions-html` (0.7.1).
  * Returns ['html'=>…, 'has_more'=>bool, 'next_max_id'=>…, 'tip_id'=>…, 'source'=>…, 'ms'=>int]
  * or null on miss/error. Flag: VAAK_MENTIONS_HTML_AXUM (default on).
@@ -24094,15 +24209,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'home'): ?>
         <?php
-          $homeFromAxum = is_array($adminHomeAxumStatuses ?? null) && $adminHomeAxumStatuses !== [];
-          $homePage = $homeFromAxum ? [] : array_slice($homeTimeline, 0, $tlLimit);
+          $homeFromAxumHtml = is_array($adminHomeAxumHtml ?? null)
+              && (string) ($adminHomeAxumHtml['html'] ?? '') !== '';
+          $homeFromAxum = !$homeFromAxumHtml
+              && is_array($adminHomeAxumStatuses ?? null)
+              && $adminHomeAxumStatuses !== [];
+          $homePage = ($homeFromAxumHtml || $homeFromAxum) ? [] : array_slice($homeTimeline, 0, $tlLimit);
           $homeHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($homeTimeline) > $tlLimit || !empty($GLOBALS['admin_home_queued_bsky']));
-          if ($homeFromAxum) {
+          if ($homeFromAxumHtml) {
+              $homeHasMore = !empty($adminTlCachedHasMore) || !empty($adminHomeAxumHtml['has_more']);
+          } elseif ($homeFromAxum) {
               $homeHasMore = !empty($adminTlCachedHasMore) || count($adminHomeAxumStatuses) >= $tlLimit;
           }
-          $homeNeedsFill = !$homeFromAxum && (
+          $homeNeedsFill = !$homeFromAxumHtml && !$homeFromAxum && (
               !empty($adminTlFullPageDefer) || ($homePage === [] && $homeHasMore)
           );
           if ($homeNeedsFill) {
@@ -24133,10 +24254,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               if (function_exists('ap_masto_status_flags_prefetch') && $flagIds !== []) {
                   ap_masto_status_flags_prefetch($flagIds);
               }
-          } elseif (function_exists('ap_masto_status_flags_prefetch')) {
+          } elseif (!$homeFromAxumHtml && function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($homePage));
           }
-          $homePaintCount = $homeFromAxum ? count($adminHomeAxumStatuses) : count($homePage);
+          $homePaintCount = $homeFromAxumHtml
+              ? (int) ($adminHomeAxumHtml['next_offset'] ?? $tlLimit)
+              : ($homeFromAxum ? count($adminHomeAxumStatuses) : count($homePage));
           $homeNewest = time();
           if ($homeFromAxum) {
               $ca = (string) ($adminHomeAxumStatuses[0]['created_at'] ?? '');
@@ -24149,6 +24272,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           } elseif (!empty($homePage[0]['sort'])) {
               $homeNewest = (int) $homePage[0]['sort'];
           }
+          $homeTlCacheAttr = $homeFromAxumHtml
+              ? 'axum-home-html'
+              : ($homeFromAxum ? 'axum-shadow' : '');
         ?>
         <?php if (!empty($homeOnboard['active'])): ?>
           <div class="home-onboarding" role="status">
@@ -24169,11 +24295,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
           <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
         <?php endif; ?>
-        <?php if (!$homeFromAxum && !$homeTimeline && empty($adminTlFullPageDefer)): ?>
+        <?php if (!$homeFromAxumHtml && !$homeFromAxum && !$homeTimeline && empty($adminTlFullPageDefer)): ?>
           <div class="mascot-empty"><img src="/api/assets/mascot/vaak-neutral.png" alt=""><span>Nothing here yet. Follow people, <a href="?view=tags">follow hashtags</a>, or hit ＋ to post.</span></div>
         <?php endif; ?>
-        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) $homePaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) $homeNewest ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $homeFromAxum ? ' data-tl-cache="axum-shadow"' : '' ?>>
-          <?php if ($homeFromAxum): ?>
+        <div id="timeline-items" data-view="home" data-offset="<?= $homeNeedsFill ? '0' : (int) $homePaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $homeHasMore ? '1' : '0' ?>" data-newest="<?= (int) $homeNewest ?>"<?= $homeNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $homeTlCacheAttr !== '' ? ' data-tl-cache="' . h($homeTlCacheAttr) . '"' : '' ?>>
+          <?php if ($homeFromAxumHtml): ?>
+            <?= $adminHomeAxumHtml['html'] ?>
+            <?php if (empty($homeOnboard['active'])): ?>
+              <div id="home-suggestions-slot" class="home-suggestions-slot" data-deferred="1" hidden></div>
+            <?php endif; ?>
+          <?php elseif ($homeFromAxum): ?>
             <?php foreach ($adminHomeAxumStatuses as $homeIndex => $st): ?>
               <?php
                 if (!is_array($st) || !function_exists('admin_render_masto_status_card')) {
@@ -24213,7 +24344,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           <?php endif; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeNeedsFill ? 'Loading timeline…' : ($homeHasMore ? 'Scroll for more…' : (($homeFromAxum || $homeTimeline) ? 'End of timeline' : '')) ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $homeNeedsFill ? 'Loading timeline…' : ($homeHasMore ? 'Scroll for more…' : (($homeFromAxumHtml || $homeFromAxum || $homeTimeline) ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'local'): ?>

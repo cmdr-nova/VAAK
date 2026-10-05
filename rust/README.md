@@ -41,6 +41,7 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_NOTIF_LIST_RUST_PRIMARY` | `1` (PHP) | Mentions list Redis fresh 120s / stale 600s; skip request-path stale rebuild + look-ahead on cache hit |
 | `VAAK_NOTIF_AXUM_PRIMARY` | `1` (PHP) | Mentions M5: `admin_notifications_page` reads localhost Axum `/api/v1/notifications` first; PHP Redis/hydrate fallback on miss |
 | `VAAK_NOTIF_UNREAD_AXUM` | `1` (PHP) | Badge poll: on Redis miss prefer Axum `/shadow/notif?live=1` (~30ms) before PHP PG rebuild; header `X-VAAK-Notif-Unread-Source` |
+| `VAAK_HOME_HTML_AXUM` | `1` (PHP) | Home soft-nav/first-paint prefer Axum `/shadow/home-html` lean cards; miss → JSON→PHP cards. Header `X-VAAK-Home-Html` / `data-tl-cache=axum-home-html` |
 | `VAAK_HOME_AXUM_PRIMARY` | `1` (PHP) | Home Mastodon API: `/api/v1/timelines/home` tries localhost Axum hydrate first; PHP Redis/file + cold merge on miss. Head-only (no max_id). Rollback: `0` |
 | `VAAK_NOTIF_NATIVE_PROJECTION` | `1` | notif-list writes Redis from `ap_notification_projection` before PHP spawn; empty thin windows fall through to PHP (0.6.43) |
 | `VAAK_NOTIF_LIST_REFRESH_SECS` | `90` | skip-if-fresh window for list keys |
@@ -74,6 +75,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss), `/shadow/notif` (unread badge live compute), `/shadow/notif-embed`, `/shadow/mentions-html` (Mentions nest HTML from `vaak:notif-embed:v1:*`; miss lean-paints from Mentions envelopes, 0.6.91). Prime via ranked-warm post-Home spawn (0.6.67, TTL 300s), `bin/home-timeline-warm.php`, or Ice Cubes head polls.
 - Unread badge Axum prefer (0.7.2–0.7.3): `ap_masto_notifications_unread_state` calls `/shadow/notif?live=1` on Redis miss **before** stale-file/stampede/PHP rebuild (shared by every HTML nav paint + ajax poll); `ajax=notif_unread` exposes `X-VAAK-Notif-Unread-Source: axum|redis|file|php`. Rollback: `VAAK_NOTIF_UNREAD_AXUM=0`.
 - Mentions HTML grouping (0.7.3): Axum `/shadow/mentions-html` collapses favourite/reblog rows into avatar-stack cards (presentation-only; tip/pagination unchanged).
+- Home HTML fill (0.7.4): `GET /shadow/home-html` lean feed cards from hydrate Redis; PHP soft-nav + full-page prefer Axum (`VAAK_HOME_HTML_AXUM`). Lean gaps: no fav/boost/bookmark action bar, no poll/ask widgets.
 - Home Axum-primary (0.6.51): PHP `ap_masto_timeline_home_axum_try` → localhost Axum when `VAAK_HOME_AXUM_PRIMARY=1`; header `X-VAAK-TL-Cache: axum-shadow` on hit.
 - HTML Home Axum assist (0.6.62): soft-nav shell + full-page first paint prefer `ap_masto_timeline_home_axum_fetch` → masto cards; miss schedules `bin/home-timeline-warm.php`; `X-TL-Cache: axum-shadow` / `data-tl-cache=axum-shadow`.
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
