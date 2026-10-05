@@ -92,6 +92,36 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Normalize Postgres `timestamptz::text` (e.g. `2026-10-05 08:43:15+02`) into
+/// something chrono/RFC3339 can parse. Ice Cubes rejects non-ISO `created_at`.
+fn normalize_pg_timestamptz(raw: &str) -> String {
+    let mut s = raw.trim().replace(' ', "T");
+    // "+02" / "-05" → "+02:00" / "-05:00"
+    if s.len() >= 3 {
+        let bytes = s.as_bytes();
+        let n = bytes.len();
+        if (bytes[n - 3] == b'+' || bytes[n - 3] == b'-')
+            && bytes[n - 2].is_ascii_digit()
+            && bytes[n - 1].is_ascii_digit()
+        {
+            s.push_str(":00");
+        } else if n >= 5
+            && (bytes[n - 5] == b'+' || bytes[n - 5] == b'-')
+            && bytes[n - 4].is_ascii_digit()
+            && bytes[n - 3].is_ascii_digit()
+            && bytes[n - 2].is_ascii_digit()
+            && bytes[n - 1].is_ascii_digit()
+            && bytes[n - 3] != b':'
+        {
+            // "+0200" → "+02:00"
+            let head = s[..n - 2].to_string();
+            let tail = s[n - 2..].to_string();
+            s = format!("{head}:{tail}");
+        }
+    }
+    s
+}
+
 fn format_time(raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -103,8 +133,7 @@ fn format_time(raw: &str) -> String {
             .format("%Y-%m-%dT%H:%M:%S.000Z")
             .to_string();
     }
-    // Postgres timestamptz often comes as "2026-10-05 08:16:22+02"
-    let cleaned = raw.replace(' ', "T");
+    let cleaned = normalize_pg_timestamptz(raw);
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&cleaned) {
         return dt
             .with_timezone(&chrono::Utc)
@@ -117,13 +146,22 @@ fn format_time(raw: &str) -> String {
             .format("%Y-%m-%dT%H:%M:%S.000Z")
             .to_string();
     }
+    if let Ok(dt) = chrono::DateTime::parse_from_str(&cleaned, "%Y-%m-%dT%H:%M:%S%z") {
+        return dt
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S.000Z")
+            .to_string();
+    }
     if let Ok(dt) = chrono::DateTime::parse_from_str(&format!("{raw}+00"), "%Y-%m-%d %H:%M:%S%z") {
         return dt
             .with_timezone(&chrono::Utc)
             .format("%Y-%m-%dT%H:%M:%S.000Z")
             .to_string();
     }
-    raw.to_string()
+    // Last resort: never emit a non-ISO timestamp (Ice Cubes decode fails hard).
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S.000Z")
+        .to_string()
 }
 
 fn snowflake_id(iso: &str, db_id: i64, type_code: i64) -> String {
@@ -2243,6 +2281,21 @@ mod tests {
         let b = snowflake_id("2026-10-05T07:00:45.000Z", 690764, 1);
         assert_eq!(a, b);
         assert!(a.len() >= 16);
+    }
+
+    #[test]
+    fn format_time_postgres_short_offset() {
+        // rss_items.published_at::text often looks like this — Ice Cubes needs ISO.
+        let out = format_time("2026-10-05 08:43:15+02");
+        assert!(
+            out.ends_with('Z') && out.contains('T'),
+            "expected RFC3339 UTC, got {out}"
+        );
+        assert_eq!(out, "2026-10-05T06:43:15.000Z");
+        let out2 = format_time("2026-10-05 08:43:15+0200");
+        assert_eq!(out2, "2026-10-05T06:43:15.000Z");
+        let out3 = format_time("2026-10-05T08:43:15.000Z");
+        assert_eq!(out3, "2026-10-05T08:43:15.000Z");
     }
 
     #[test]
