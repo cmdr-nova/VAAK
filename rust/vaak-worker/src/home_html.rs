@@ -107,6 +107,18 @@ mod tests {
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("boosted"));
         assert!(html.contains("hello world"));
-        assert!(html.contains("tweet-boost") || html.contains("ph-repeat"));
+        assert!(
+            html.contains("class=\"tweet tweet-boost"),
+            "boost must be article.tweet.tweet-boost for timeline separators: {html}"
+        );
+        assert!(
+            !html.contains("<div class=\"tweet-boost\">"),
+            "must not wrap boost in div (breaks #timeline-items > article.tweet borders): {html}"
+        );
+        // Boost chrome is inside the article, before the original author header.
+        let article_at = html.find("<article").expect("article");
+        let boost_at = html.find("boosted").expect("boosted");
+        let close_at = html.find("</article>").expect("close");
+        assert!(article_at < boost_at && boost_at < close_at);
     }
 }

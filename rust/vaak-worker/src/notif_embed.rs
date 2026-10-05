@@ -520,7 +520,9 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
         }
     }
     // Feed cards use the embed painter with header, then unwrap the outer embed div
-    // so Home timeline items stay `<article class="tweet">` peers.
+    // so Home timeline items stay `<article class="tweet">` peers (matching PHP).
+    // Boost chrome must live *inside* that article with class tweet-boost — wrapping
+    // in a div breaks `.timeline-feed #timeline-items > article.tweet` separators.
     let painted = paint_lean_embed_from(&st, false, "home");
     let article = if let Some(start) = painted.find("<article") {
         if let Some(end) = painted.rfind("</article>") {
@@ -532,13 +534,32 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
         painted
     };
     if boost_header.is_empty() {
-        article
+        return article;
+    }
+    // Match PHP admin_render_masto_status_card: <article class="tweet tweet-boost">…
+    let with_class = if let Some(idx) = article.find("class=\"tweet") {
+        let mut s = String::with_capacity(article.len() + 16);
+        s.push_str(&article[..idx]);
+        s.push_str("class=\"tweet tweet-boost");
+        s.push_str(&article[idx + "class=\"tweet".len()..]);
+        s
+    } else if let Some(gt) = article.find('>') {
+        let mut s = String::with_capacity(article.len() + 32);
+        s.push_str(&article[..gt]);
+        s.push_str(" class=\"tweet tweet-boost\"");
+        s.push_str(&article[gt..]);
+        s
     } else {
-        format!(
-            "<div class=\"tweet-boost\">{boost_header}{article}</div>",
-            boost_header = boost_header,
-            article = article
-        )
+        format!("<article class=\"tweet tweet-boost\">{article}</article>")
+    };
+    if let Some(gt) = with_class.find('>') {
+        let mut out = String::with_capacity(with_class.len() + boost_header.len());
+        out.push_str(&with_class[..=gt]);
+        out.push_str(&boost_header);
+        out.push_str(&with_class[gt + 1..]);
+        out
+    } else {
+        format!("<article class=\"tweet tweet-boost\">{boost_header}{with_class}</article>")
     }
 }
 

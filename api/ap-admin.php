@@ -22669,14 +22669,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
       border-radius: 0; box-shadow: none; padding: .85rem .25rem 1rem;
     }
-    .timeline-feed #timeline-items > article.tweet {
+    .timeline-feed #timeline-items > article.tweet,
+    .timeline-feed #timeline-items > .tweet-boost {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
       border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
     }
-    .timeline-feed #timeline-items > article.tweet:hover {
+    .timeline-feed #timeline-items > article.tweet:hover,
+    .timeline-feed #timeline-items > .tweet-boost:hover {
       border-color: var(--border); background: transparent;
     }
-    .timeline-feed #timeline-items > article.tweet:last-of-type { border-bottom: 0; }
+    .timeline-feed #timeline-items > article.tweet:last-of-type,
+    .timeline-feed #timeline-items > .tweet-boost:last-child { border-bottom: 0; }
     /* Your Posts uses the same flat, separated Mastodon-like timeline surface. */
     .your-posts-feed > article.tweet {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
