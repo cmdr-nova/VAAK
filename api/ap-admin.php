@@ -15006,8 +15006,10 @@ function admin_render_masto_status_card(
     }
     $plain = admin_html_to_plain((string) ($st['content'] ?? ''));
     $isLocalEarly = !$isRss && !$isBsky && $uri !== '' && vaak_is_own_url($uri);
-    // Local posts: prefer stored plain text so blank lines match compose / remotes
-    if ($isLocalEarly) {
+    $mentionsLean = !empty($GLOBALS['admin_mentions_lean_embed']);
+    // Local posts: prefer stored plain text so blank lines match compose / remotes.
+    // Mentions lean embeds skip this round-trip when HTML→plain already has body.
+    if ($isLocalEarly && !($mentionsLean && $plain !== '')) {
         try {
             $pst = ap_db()->prepare(
                 'SELECT content_text FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1'
@@ -15089,9 +15091,11 @@ function admin_render_masto_status_card(
     $askRow = null;
     if (!empty($st['vaak_ask']) && is_array($st['vaak_ask'])) {
         $askRow = $st['vaak_ask'];
-    } elseif ($uri !== '' && function_exists('ap_ask_context_for_object')) {
+    } elseif ($uri !== '' && empty($GLOBALS['admin_mentions_lean_embed'])
+        && function_exists('ap_ask_context_for_object')) {
         $askRow = ap_ask_context_for_object($uri, $plain);
-    } elseif ($uri !== '' && function_exists('ap_ask_answer_for_note')) {
+    } elseif ($uri !== '' && empty($GLOBALS['admin_mentions_lean_embed'])
+        && function_exists('ap_ask_answer_for_note')) {
         $askRow = ap_ask_answer_for_note($uri);
     }
     if (is_array($askRow) && function_exists('ap_ask_card_html_from_row')) {
@@ -15369,8 +15373,9 @@ function admin_render_masto_status_card(
         $paintedQuoteUrl = trim((string) ($fallbackQuoteOpts['url'] ?? ''));
     }
     // Status Open / masto cards: attach poll UI (timeline outbox path already does).
+    // Mentions lean embeds skip poll DB work — rare on nested like/mention cards.
     $pollHtml = '';
-    if ($uri !== '' && function_exists('admin_poll_block_html')) {
+    if ($uri !== '' && function_exists('admin_poll_block_html') && empty($GLOBALS['admin_mentions_lean_embed'])) {
         $pollHtml = admin_poll_block_html($uri, true, $returnView === 'status' ? 'status' : $returnView);
     }
     if ($pollHtml !== '') {
@@ -19232,6 +19237,16 @@ if ($isPartial && $view === 'mentions') {
     header('X-TL-Notif-Prefetch-Ms: ' . (string) $notifPrefetchMs);
     header('X-TL-Notif-Render-Ms: ' . (string) $notifRenderMs);
     header('X-TL-Notif-Total-Ms: ' . (string) (int) round((microtime(true) - $notifPartialT0) * 1000));
+    $embedStats = is_array($GLOBALS['admin_notif_embed_cache_stats'] ?? null)
+        ? $GLOBALS['admin_notif_embed_cache_stats']
+        : [];
+    if ($embedStats !== []) {
+        header(
+            'X-TL-Notif-Embed-Cache: memo=' . (int) ($embedStats['hit_memo'] ?? 0)
+            . ';redis=' . (int) ($embedStats['hit_redis'] ?? 0)
+            . ';miss=' . (int) ($embedStats['miss'] ?? 0)
+        );
+    }
     echo $notifHtml;
     exit;
 }
@@ -20142,6 +20157,10 @@ function admin_notif_status_strip_reply_bake(array $status, array $knownMentions
  * underlying status has a visible body/media. Falls back to the legacy
  * quote-block / snippet preview when the status is empty or converters failed.
  *
+ * Uses request-local memo + Redis HTML fragment cache so Mentions fill does
+ * not re-render the same nested card ~300–1500ms each time (common on like
+ * groups). Lean paint skips link-preview fetches and extra local DB reads.
+ *
  * @param array<string,mixed>|null $status
  * @param array<int|string,mixed> $followingIds
  * @param bool $hideHeader When true (mention/quote nest), skip the nested
@@ -20155,6 +20174,56 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     if (!function_exists('admin_render_masto_status_card')) {
         return false;
     }
+
+    $uri = rtrim((string) ($status['uri'] ?? $status['url'] ?? ''), '/');
+    $ownerUserId = 0;
+    if (function_exists('ap_db_masto_owner_user_id')) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    $flagBits = (!empty($status['favourited']) ? '1' : '0')
+        . (!empty($status['reblogged']) ? '1' : '0')
+        . (!empty($status['bookmarked']) ? '1' : '0');
+    $fragLogical = $ownerUserId . '|' . $uri . '|h' . ($hideHeader ? '1' : '0') . '|f' . $flagBits
+        . '|id' . (string) ($status['id'] ?? '');
+    $fragKey = 'vaak:notif-embed:v1:' . hash('sha256', $fragLogical);
+
+    static $fragMemo = [];
+    $track = static function (string $src) use ($fragKey): void {
+        $g = &$GLOBALS['admin_notif_embed_cache_stats'];
+        if (!is_array($g)) {
+            $g = ['hit_memo' => 0, 'hit_redis' => 0, 'miss' => 0];
+        }
+        $g[$src] = (int) ($g[$src] ?? 0) + 1;
+    };
+
+    if (array_key_exists($fragKey, $fragMemo)) {
+        $cached = $fragMemo[$fragKey];
+        if (is_string($cached) && $cached !== '') {
+            $track('hit_memo');
+            echo $cached;
+            return true;
+        }
+        $track('miss');
+        return false;
+    }
+
+    if (function_exists('ap_redis_client')) {
+        try {
+            $redis = ap_redis_client('cache');
+            if ($redis) {
+                $hit = $redis->get($fragKey);
+                if (is_string($hit) && $hit !== '') {
+                    $fragMemo[$fragKey] = $hit;
+                    $track('hit_redis');
+                    echo $hit;
+                    return true;
+                }
+            }
+        } catch (Throwable $e) {
+            // paint fresh
+        }
+    }
+
     // Mentions reply rows bake "↩ parent\n\nreply" into content for Ice Cubes.
     // Shared-card ↩ chrome already shows the parent — strip the bake so the nest
     // body is only the reply (Open/status view never had the bake).
@@ -20168,11 +20237,58 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
         function_exists('ap_normalize_status_has_visible_body')
         && !ap_normalize_status_has_visible_body($status)
     ) {
+        $fragMemo[$fragKey] = '';
+        $track('miss');
         return false;
     }
+
+    $prevLean = $GLOBALS['admin_mentions_lean_embed'] ?? null;
+    $prevLp = $GLOBALS['admin_status_link_preview_budget'] ?? null;
+    $prevQp = $GLOBALS['admin_quote_link_preview_budget'] ?? null;
+    $GLOBALS['admin_mentions_lean_embed'] = true;
+    $GLOBALS['admin_status_link_preview_budget'] = 0;
+    $GLOBALS['admin_quote_link_preview_budget'] = 0;
+
+    ob_start();
     echo '<div class="notif-status-embed' . ($hideHeader ? ' notif-status-embed--nohd' : '') . '">';
     admin_render_masto_status_card($status, $followingIds, 'mentions', false, true, $hideHeader);
     echo '</div>';
+    $html = (string) ob_get_clean();
+
+    if ($prevLean === null) {
+        unset($GLOBALS['admin_mentions_lean_embed']);
+    } else {
+        $GLOBALS['admin_mentions_lean_embed'] = $prevLean;
+    }
+    if ($prevLp === null) {
+        unset($GLOBALS['admin_status_link_preview_budget']);
+    } else {
+        $GLOBALS['admin_status_link_preview_budget'] = $prevLp;
+    }
+    if ($prevQp === null) {
+        unset($GLOBALS['admin_quote_link_preview_budget']);
+    } else {
+        $GLOBALS['admin_quote_link_preview_budget'] = $prevQp;
+    }
+
+    $track('miss');
+    if ($html === '') {
+        $fragMemo[$fragKey] = '';
+        return false;
+    }
+
+    $fragMemo[$fragKey] = $html;
+    if (function_exists('ap_redis_client')) {
+        try {
+            $redis = ap_redis_client('cache');
+            if ($redis) {
+                $redis->setex($fragKey, 180, $html);
+            }
+        } catch (Throwable $e) {
+            // non-fatal
+        }
+    }
+    echo $html;
     return true;
 }
 
