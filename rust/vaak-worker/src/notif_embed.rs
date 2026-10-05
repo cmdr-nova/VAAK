@@ -125,13 +125,21 @@ fn strip_tags(html: &str) -> String {
             _ => {}
         }
     }
-    // Collapse common entities enough for body plain.
+    // Collapse common entities enough for body plain / empty checks.
     out.replace("&nbsp;", " ")
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&#039;", "'")
+        .replace("&apos;", "'")
+}
+
+/// True when Mastodon/AP `content` looks like markup we should paint as HTML.
+fn content_looks_like_html(s: &str) -> bool {
+    let t = s.trim();
+    t.contains('<') && (t.contains("</") || t.contains("/>") || t.contains("<p") || t.contains("<a "))
 }
 
 fn relative_time(created_at: &str) -> String {
@@ -390,7 +398,14 @@ pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> S
     }
 
     let mut body_inner = String::new();
-    if !plain.is_empty() {
+    // Prefer original status HTML (mentions/hashtags/links + correct entities).
+    // strip_tags+esc dropped <a> and double-encoded &#039; / &quot; into visible codes (0.7.13).
+    let content_trim = content_html.trim();
+    if content_looks_like_html(content_trim) {
+        body_inner.push_str(&format!(
+            "<div class=\"body feed-body\">{content_trim}</div>"
+        ));
+    } else if !plain.is_empty() {
         body_inner.push_str(&format!(
             "<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{}</div>",
             esc(&plain)
@@ -605,10 +620,10 @@ mod tests {
     }
 
     #[test]
-    fn paint_hides_header_and_escapes() {
+    fn paint_hides_header_and_keeps_html_body() {
         let st = json!({
             "uri": "https://example.com/users/x/notes/1",
-            "content": "<p>hi <b>there</b> & stuff</p>",
+            "content": "<p>hi <b>there</b> &amp; stuff</p>",
             "created_at": "2026-10-05T05:00:00.000Z",
             "account": {
                 "acct": "x@example.com",
@@ -621,9 +636,38 @@ mod tests {
         let html = paint_lean_embed(&st, true);
         assert!(html.contains("notif-status-embed--nohd"));
         assert!(html.contains("tweet-embed-nohd"));
-        assert!(html.contains("hi there &amp; stuff") || html.contains("hi there & stuff"));
+        // Status HTML is painted as HTML (links/markup), not strip+esc plain.
+        assert!(html.contains("<b>there</b>"));
+        assert!(html.contains("&amp; stuff") || html.contains("& stuff"));
         assert!(!html.contains("<script>"));
         assert!(html.contains("Open"));
         assert!(html.contains("view=status"));
+    }
+
+    #[test]
+    fn paint_keeps_links_and_avoids_double_escaped_entities() {
+        let st = json!({
+            "id": "1",
+            "uri": "https://example.com/users/x/statuses/1",
+            "content": "<p>&quot;whatever you do, don&#039;t look&quot; — <a href=\"https://example.com/u/bob\" class=\"mention\">@bob</a></p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {
+                "acct": "x",
+                "display_name": "X",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://example.com/users/x"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(
+            html.contains("class=\"mention\"") && html.contains("@bob"),
+            "mention link must survive: {html}"
+        );
+        assert!(
+            !html.contains("&amp;quot;") && !html.contains("&amp;#039;"),
+            "must not double-escape entities into visible codes: {html}"
+        );
+        assert!(html.contains("&quot;") || html.contains('\"') || html.contains("whatever"));
     }
 }
