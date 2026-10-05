@@ -1508,6 +1508,34 @@ async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashMap<String, 
             },
         );
     }
+    // Jetstream can persist a thin post before its author view arrives. Use the
+    // durable actor-profile cache as a second read source so cards do not paint
+    // a DID/default avatar while actor-warm catches up.
+    let missing: Vec<String> = map.values()
+        .filter(|r| r.author_handle.trim().is_empty() || r.author_avatar.trim().is_empty())
+        .map(|r| r.author_did.clone())
+        .filter(|did| !did.trim().is_empty())
+        .collect();
+    if !missing.is_empty() {
+        if let Ok(rows) = db.query(
+            "SELECT did, profile_json FROM bsky_actor_profiles WHERE did = ANY($1) OR actor_ref = ANY($1)",
+            &[&missing],
+        ).await {
+            for row in rows {
+                let did: String = row.get(0);
+                let raw: String = row.get(1);
+                let Ok(profile) = serde_json::from_str::<Value>(&raw) else { continue; };
+                let handle = profile.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let display = profile.get("displayName").or_else(|| profile.get("display_name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let avatar = profile.get("avatar").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                for post in map.values_mut().filter(|p| p.author_did == did) {
+                    if post.author_handle.trim().is_empty() { post.author_handle = handle.clone(); }
+                    if post.author_display.trim().is_empty() { post.author_display = display.clone(); }
+                    if post.author_avatar.trim().is_empty() { post.author_avatar = avatar.clone(); }
+                }
+            }
+        }
+    }
     Ok(map)
 }
 
