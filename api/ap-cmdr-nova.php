@@ -946,6 +946,7 @@ function ap_cmdr_shell_start(string $title, array $meta = []): void
       .profile-bio p:last-child{margin-bottom:0}
       .vanity-verified{display:inline-flex;align-items:center;justify-content:center;width:1.05em;height:1.05em;margin-left:.2rem;border-radius:50%;background:#1d9bf0;color:#fff;font-size:.72em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.08em}
       .operator-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(0,255,159,.45);border-radius:999px;background:rgba(0,255,159,.1);color:#8fffc8;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:normal}
+      .resonant-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(180,120,255,.5);border-radius:999px;background:rgba(140,80,255,.12);color:#d4b8ff;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:nowrap}
       .fields{display:grid;grid-template-columns:1fr 1fr;gap:.65rem .85rem;margin-top:1rem;font-size:.88rem}
       .fields .field{min-width:0;overflow:hidden}
       .fields .field-label{display:block;color:#999;font-size:.75rem;margin:0 0 .2rem}
@@ -1195,6 +1196,7 @@ function ap_cmdr_site_shell_start(string $title, array $meta = []): void
       body.ap-site-shell .ap-site-main .profile-bio p:last-child{margin-bottom:0}
       body.ap-site-shell .ap-site-main .field-verified{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;margin-left:.35rem;border-radius:50%;background:rgba(0,255,159,.2);color:#00ff9f;font-size:.75em;font-weight:800;line-height:1;vertical-align:middle;position:relative;top:-.05em}
       body.ap-site-shell .ap-site-main .operator-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(0,255,159,.45);border-radius:999px;background:rgba(0,255,159,.1);color:#8fffc8;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:normal}
+      body.ap-site-shell .ap-site-main .resonant-badge{display:inline-flex;align-items:center;gap:.28rem;margin-left:.55rem;padding:.18rem .5rem;border:1px solid rgba(180,120,255,.5);border-radius:999px;background:rgba(140,80,255,.12);color:#d4b8ff;font-size:.55em;font-weight:650;line-height:1.25;vertical-align:middle;position:relative;top:-.08em;white-space:nowrap}
       body.ap-site-shell .ap-site-main .row{display:flex;gap:1rem;align-items:flex-start}
       body.ap-site-shell .ap-site-main .av{width:72px;height:72px;border-radius:50%;object-fit:cover;border:2px solid #333;background:#222;flex-shrink:0}
       body.ap-site-shell .ap-site-main h1{font-size:1.35rem;margin:0 0 .35rem;color:#e8e8e8}
@@ -1789,6 +1791,16 @@ function ap_cmdr_html(): void
         ? ' <span class="vanity-verified" title="Vanity verified (just for fun)" aria-label="Verified">✓</span>'
         : '';
     $operatorBadge = ' <span class="operator-badge" title="Administrator and operator of this VAAK server" aria-label="Server operator">Server operator</span>';
+    if (!function_exists('ap_phyrian_bridge_link_for_actor_key')) {
+        $bridgeFile = __DIR__ . '/ap-phyrian-bridge.php';
+        if (is_readable($bridgeFile)) {
+            require_once $bridgeFile;
+        }
+    }
+    $resonantBadge = '';
+    if (function_exists('ap_phyrian_bridge_link_for_actor_key') && function_exists('ap_phyrian_bridge_resonant_badge_html')) {
+        $resonantBadge = ap_phyrian_bridge_resonant_badge_html(ap_phyrian_bridge_link_for_actor_key('cmdr_nova'));
+    }
     // Keep anchors clickable; force safe rel on any <a>
     $summary = strip_tags($p['summary'], '<p><br><a><code><strong><em><b><i>');
     $summary = preg_replace_callback(
@@ -1825,7 +1837,7 @@ function ap_cmdr_html(): void
     $automatedBadge = !empty($p['automated'])
         ? ' <span class="automated-flare" title="Automated account">Automated</span>'
         : '';
-    echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . $automatedBadge . '</h1>';
+    echo '<div><h1>' . $name . $vanityBadge . $operatorBadge . $resonantBadge . $automatedBadge . '</h1>';
     echo '<p class="muted" style="margin:0">@cmdr_nova@mkultra.monster</p>';
     $profileBadges = function_exists('ap_profile_normalize_badges')
         ? ap_profile_normalize_badges($p['profile_badges'] ?? [])

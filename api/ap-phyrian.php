@@ -5,7 +5,8 @@ declare(strict_types=1);
  * Phyrian Strains — VAAK web game (Phase 1).
  *
  * Consent-based imprint + local resonance exchange + daily decay.
- * OpenSim bridge is Phase 3. See Projects/NovaLandia/Phyrian Strains/Plan.md.
+ * OpenSim ↔ VAAK Resonant bridge: ap-phyrian-bridge.php (Phase 3).
+ * See Projects/NovaLandia/Phyrian Strains/Plan.md.
  */
 
 /** Web daily decay (OpenSim uses generation-scaled ~7–8; Phase-1 web is slightly gentler). */
@@ -694,9 +695,9 @@ function ap_phyrian_checkin(int $ownerUserId): array
         return ['ok' => false, 'error' => 'Already checked in today'];
     }
     $bonus = 3;
-    if (trim((string) ($player['strain'] ?? '')) !== '') {
-        // Linked OpenSim Resonant perk lands in Phase 3; stub hook only.
-        $bonus += 0;
+    // Resonant OpenSim link: +1 free daily resonance (Phase 3 bridge perk).
+    if (function_exists('ap_phyrian_bridge_is_linked') && ap_phyrian_bridge_is_linked($ownerUserId)) {
+        $bonus += 1;
     }
     ap_db()->prepare(
         'UPDATE phyrian_players
