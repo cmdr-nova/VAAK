@@ -31371,7 +31371,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if ($phyActorId === '' && function_exists('ap_phyrian_actor_id_for_owner')) {
               $phyActorId = ap_phyrian_actor_id_for_owner((int) $vaakOwnerId);
           }
-          if ($vaakOwnerId > 0 && function_exists('ap_phyrian_bridge_sync_from_opensim')) {
+          if ($vaakOwnerId > 0 && function_exists('ap_phyrian_bridge_sync_from_opensim')
+              && (!function_exists('ap_phyrian_bridge_sync_on_page') || ap_phyrian_bridge_sync_on_page())) {
               ap_phyrian_bridge_sync_from_opensim((int) $vaakOwnerId, false);
           }
           $phyPlayer = ($vaakOwnerId > 0 && function_exists('ap_phyrian_ensure_player'))

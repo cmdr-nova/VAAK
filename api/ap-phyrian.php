@@ -844,7 +844,8 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
     }
     ap_phyrian_migrate();
     $actorId = ap_phyrian_actor_id_for_owner($ownerUserId);
-    if (function_exists('ap_phyrian_bridge_sync_from_opensim')) {
+    if (function_exists('ap_phyrian_bridge_sync_from_opensim')
+        && (!function_exists('ap_phyrian_bridge_sync_on_page') || ap_phyrian_bridge_sync_on_page())) {
         ap_phyrian_bridge_sync_from_opensim($ownerUserId, false);
     }
     $player = ap_phyrian_ensure_player($ownerUserId, $actorId);
