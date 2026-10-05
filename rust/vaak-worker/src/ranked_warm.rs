@@ -590,9 +590,54 @@ fn rank_from_timeline(mut items: Vec<TimelineItem>) -> Vec<Value> {
     if items.len() > MAX_TIMELINE {
         items.truncate(MAX_TIMELINE);
     }
+    // Quote-boost dual publish: same actor Create/Quote + Announce of one
+    // object_id → keep the Create/Quote card, drop the self-Announce.
+    let mut create_keys: HashSet<String> = HashSet::new();
+    for it in &items {
+        if it.kind != "event" {
+            continue;
+        }
+        let et = it.event_type.to_ascii_lowercase();
+        if !matches!(et.as_str(), "create" | "quote" | "quotepost" | "update") {
+            continue;
+        }
+        let actor = it.actor_id.trim_end_matches('/');
+        let oid = it.object_id.trim_end_matches('/');
+        if actor.is_empty() || oid.is_empty() {
+            continue;
+        }
+        create_keys.insert(format!("{actor}\n{oid}"));
+        if let Some(parent) = oid.strip_suffix("/QuotePost") {
+            let parent = parent.trim_end_matches('/');
+            if !parent.is_empty() {
+                create_keys.insert(format!("{actor}\n{parent}"));
+            }
+        }
+    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for it in items {
+        if it.kind == "event"
+            && it.event_type.eq_ignore_ascii_case("announce")
+            && !create_keys.is_empty()
+        {
+            let actor = it.actor_id.trim_end_matches('/');
+            let oid = it.object_id.trim_end_matches('/');
+            if !actor.is_empty() && !oid.is_empty() {
+                let key = format!("{actor}\n{oid}");
+                if create_keys.contains(&key) {
+                    continue;
+                }
+                if let Some(parent) = oid.strip_suffix("/QuotePost") {
+                    let parent = parent.trim_end_matches('/');
+                    if !parent.is_empty()
+                        && create_keys.contains(&format!("{actor}\n{parent}"))
+                    {
+                        continue;
+                    }
+                }
+            }
+        }
         let dedupe = format!("{}:{}", it.kind, it.id.trim_end_matches('/'));
         if !seen.insert(dedupe) {
             continue;

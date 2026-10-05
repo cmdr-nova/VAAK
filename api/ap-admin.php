@@ -8981,6 +8981,23 @@ function admin_tl_hydrate(array $slice): array
             ap_remote_media_prefetch($actorIds, 'avatar');
         }
     }
+    // Quote-boost dual publish: drop same-actor Announce when Create/Quote of
+    // the same object is in this ranked window (keep the richer quote card).
+    $skipSelfAnnounceIds = [];
+    if ($eventsById !== [] && function_exists('ap_events_collapse_self_announces')) {
+        $collapsed = ap_events_collapse_self_announces(array_values($eventsById));
+        $keepIds = [];
+        foreach ($collapsed as $crow) {
+            if (is_array($crow)) {
+                $keepIds[(int) ($crow['id'] ?? 0)] = true;
+            }
+        }
+        foreach ($eventsById as $eid => $_erow) {
+            if (!isset($keepIds[(int) $eid])) {
+                $skipSelfAnnounceIds[(int) $eid] = true;
+            }
+        }
+    }
     // Bluesky authors: prefetch flat DID Redis before enrich/paint in post_item_by_uri.
     if ($bskyUris !== [] && function_exists('ap_bsky_actors_prefetch')) {
         $bskyDids = [];
@@ -9021,6 +9038,9 @@ function admin_tl_hydrate(array $slice): array
         $k = (string) ($entry['k'] ?? '');
         $id = (string) ($entry['id'] ?? '');
         if ($k === 'event') {
+            if (!empty($skipSelfAnnounceIds[(int) $id])) {
+                continue;
+            }
             $erow = $eventsById[(int) $id] ?? null;
             if (!is_array($erow)) {
                 continue;
@@ -9280,6 +9300,9 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             }
             return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
         });
+        if (function_exists('ap_events_collapse_self_announces')) {
+            $homeRaw = ap_events_collapse_self_announces($homeRaw);
+        }
         /** @var list<array<string,mixed>> $homeCand */
         $homeCand = [];
         foreach ($homeRaw as $e) {
@@ -9702,6 +9725,10 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
             });
             $homeRaw = array_slice($homeRaw, 0, 120);
+            // Quote-boost dual publish → one card (prefer Create/Quote over self-Announce).
+            if (function_exists('ap_events_collapse_self_announces')) {
+                $homeRaw = ap_events_collapse_self_announces($homeRaw);
+            }
         }
         foreach ($homeRaw as $e) {
             $sourceAid = rtrim((string) ($e['actor_id'] ?? ''), '/');
