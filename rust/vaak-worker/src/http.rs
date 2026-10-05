@@ -35,6 +35,13 @@ pub struct OwnerQuery {
     pub since_id: Option<String>,
     /// Ice Cubes pull-to-refresh uses min_id (same exclusive lower bound as since_id).
     pub min_id: Option<String>,
+    /// Mentions nested-card HTML fragment (`/shadow/notif-embed`).
+    pub uri: Option<String>,
+    pub status_id: Option<String>,
+    pub hide_header: Option<String>,
+    pub favourited: Option<String>,
+    pub reblogged: Option<String>,
+    pub bookmarked: Option<String>,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -80,6 +87,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
+        // Mentions nested status HTML fragments (PHP writes `vaak:notif-embed:v1:*`).
+        .route("/shadow/notif-embed", get(shadow_notif_embed))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
         .route("/api/v1/timelines/home", get(shadow_home_masto))
         // Home live-poll: ranked head + hydrate filtered by since_ts (0.6.74).
@@ -112,11 +121,96 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/jetstream",
             "/shadow/thin-media",
             "/shadow/timelines/home",
+            "/shadow/notif-embed",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
             "/api/v1/notifications"
         ],
     }))
+}
+
+/// Serve Mentions nested-card HTML from Redis (`vaak:notif-embed:v1:*`).
+/// Key parity with PHP `admin_notif_try_embed_status_card` (0.6.89).
+async fn shadow_notif_embed(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let uri = q
+        .uri
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    if uri.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "uri required"})),
+        )
+            .into_response();
+    }
+    let hide = truthy(q.hide_header.as_deref());
+    let fav = truthy(q.favourited.as_deref());
+    let reblog = truthy(q.reblogged.as_deref());
+    let bookmarked = truthy(q.bookmarked.as_deref());
+    let sid = q.status_id.as_deref().unwrap_or("").trim();
+    let flag_bits = format!(
+        "{}{}{}",
+        if fav { "1" } else { "0" },
+        if reblog { "1" } else { "0" },
+        if bookmarked { "1" } else { "0" }
+    );
+    let logical = format!(
+        "{owner}|{uri}|h{}|f{flag_bits}|id{sid}",
+        if hide { "1" } else { "0" }
+    );
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(logical.as_bytes());
+    let key = format!("vaak:notif-embed:v1:{}", hex::encode(hasher.finalize()));
+
+    match crate::redis_util::connect(&state.cfg.redis_url).await {
+        Ok(mut redis) => match redis_util_get_string(&mut redis, &key).await {
+            Ok(Some(html)) if !html.is_empty() => (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (axum::http::header::CACHE_CONTROL, "no-store"),
+                ],
+                html,
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "notif embed cache miss",
+                    "key": key,
+                    "source": "vaak-worker-shadow"
+                })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn redis_util_get_string(
+    redis: &mut redis::aio::MultiplexedConnection,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    use redis::AsyncCommands;
+    let v: Option<String> = redis.get(key).await?;
+    Ok(v)
 }
 
 async fn shadow_notif(
