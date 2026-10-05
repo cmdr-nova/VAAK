@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::redis_util;
 
 const HOME_PATH: &str = "/api/v1/timelines/home";
+const PUBLIC_PATH: &str = "/api/v1/timelines/public";
 /// Match PHP Home Redis TTL (0.6.67: 300s). Ice Cubes `cache_try` still uses 45s
 /// for client freshness; Axum serves any present envelope until Redis expiry.
 const HOME_TL_FRESH_SECS: i64 = 300;
@@ -71,19 +72,23 @@ pub struct HomeShadowItem {
     pub account_hint: Option<String>,
 }
 
-/// PHP `ap_masto_timeline_cache_key` parity for Home head polls.
-///
-/// PHP `json_encode` keeps insertion order `u,p,l,s,x`. Default `serde_json::Map`
-/// is a BTreeMap (sorted keys), so we format the payload string manually.
-pub fn home_timeline_redis_key(owner: i64, limit: i64, since_id: Option<&str>) -> String {
-    let s_json = match since_id.map(str::trim).filter(|s| !s.is_empty()) {
+fn since_id_json(since_id: Option<&str>) -> String {
+    match since_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => {
             // Mirror PHP JSON_UNESCAPED_SLASHES string encoding for ids.
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             format!("\"{escaped}\"")
         }
         None => "null".to_string(),
-    };
+    }
+}
+
+/// PHP `ap_masto_timeline_cache_key` parity for Home head polls.
+///
+/// PHP `json_encode` keeps insertion order `u,p,l,s,x`. Default `serde_json::Map`
+/// is a BTreeMap (sorted keys), so we format the payload string manually.
+pub fn home_timeline_redis_key(owner: i64, limit: i64, since_id: Option<&str>) -> String {
+    let s_json = since_id_json(since_id);
     let raw = format!(
         r#"{{"u":{owner},"p":"{HOME_PATH}","l":{limit},"s":{s_json},"x":[]}}"#
     );
@@ -92,15 +97,64 @@ pub fn home_timeline_redis_key(owner: i64, limit: i64, since_id: Option<&str>) -
     format!("vaak:timeline:v1:{}", hex::encode(hasher.finalize()))
 }
 
-async fn read_home_hydrate(
+/// PHP `ap_masto_timeline_cache_key` for Local (`local=true`) / Federated public.
+///
+/// Local: `x={"local":"true"}` (PHP assoc array → JSON object).
+/// Federated: `x=[]`.
+pub fn public_timeline_redis_key(
+    owner: i64,
+    limit: i64,
+    local: bool,
+    since_id: Option<&str>,
+) -> String {
+    let s_json = since_id_json(since_id);
+    let x_json = if local {
+        r#"{"local":"true"}"#
+    } else {
+        "[]"
+    };
+    let raw = format!(
+        r#"{{"u":{owner},"p":"{PUBLIC_PATH}","l":{limit},"s":{s_json},"x":{x_json}}}"#
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("vaak:timeline:v1:{}", hex::encode(hasher.finalize()))
+}
+
+/// Hydrate redis key for a timeline view (`home` / `local` / `feed`).
+pub fn timeline_hydrate_redis_key(
+    view: &str,
+    owner: i64,
+    limit: i64,
+    since_id: Option<&str>,
+) -> String {
+    match view {
+        "local" => public_timeline_redis_key(owner, limit, true, since_id),
+        "feed" => public_timeline_redis_key(owner, limit, false, since_id),
+        _ => home_timeline_redis_key(owner, limit, since_id),
+    }
+}
+
+async fn read_hydrate_envelope(
     redis: &mut redis::aio::MultiplexedConnection,
     owner: i64,
     limit: i64,
     since_id: Option<&str>,
+    view: &str,
 ) -> Result<HomeHydrateReport> {
     let limit = limit.clamp(1, 80);
-    let redis_key = home_timeline_redis_key(owner, limit, since_id);
+    let redis_key = timeline_hydrate_redis_key(view, owner, limit, since_id);
     let envelope = redis_util::json_get(redis, &redis_key).await?;
+    let source = match view {
+        "local" => "vaak-worker-local-hydrate",
+        "feed" => "vaak-worker-feed-hydrate",
+        _ => "vaak-worker-home-hydrate",
+    };
+    let note = match view {
+        "local" => "Mastodon Local JSON from vaak:timeline:v1 public?local=true envelope.",
+        "feed" => "Mastodon Federated JSON from vaak:timeline:v1 public envelope.",
+        _ => "Mastodon Home JSON from PHP vaak:timeline:v1 envelope; PHP remains Home owner.",
+    };
     let mut report = HomeHydrateReport {
         owner_user_id: owner,
         limit: limit as usize,
@@ -115,8 +169,8 @@ async fn read_home_hydrate(
         n: 0,
         items: Vec::new(),
         link: None,
-        source: "vaak-worker-home-hydrate",
-        note: "Mastodon Home JSON from PHP vaak:timeline:v1 envelope; PHP remains Home owner.",
+        source,
+        note,
     };
     let Some(env) = envelope else {
         report.note = "hydrate cache miss (run bin/home-timeline-warm.php or wait for Ice Cubes head poll)";
@@ -166,21 +220,30 @@ async fn read_home_hydrate(
     Ok(report)
 }
 
-/// Mastodon-shaped Home statuses from hydrate Redis (for `/api/v1/timelines/home`).
-pub async fn home_hydrate(
+async fn read_home_hydrate(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner: i64,
+    limit: i64,
+    since_id: Option<&str>,
+) -> Result<HomeHydrateReport> {
+    read_hydrate_envelope(redis, owner, limit, since_id, "home").await
+}
+
+/// Mastodon-shaped statuses from hydrate Redis for `home` / `local` / `feed`.
+pub async fn view_hydrate(
     cfg: &Config,
     owner_user_id: i64,
+    view: &str,
     limit: usize,
     since_id: Option<&str>,
 ) -> Result<HomeHydrateReport> {
+    let view = match view {
+        "local" | "feed" => view,
+        _ => "home",
+    };
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    let mut report = read_home_hydrate(
-        &mut redis,
-        owner_user_id,
-        limit as i64,
-        since_id,
-    )
-    .await?;
+    let mut report =
+        read_hydrate_envelope(&mut redis, owner_user_id, limit as i64, since_id, view).await?;
     // Overlay live viewer flags — warm envelopes hard-code false (0.7.19).
     if report.cache_hit && !report.items.is_empty() {
         let _ = crate::interaction_flags::apply_to_statuses_with_cfg(
@@ -191,6 +254,16 @@ pub async fn home_hydrate(
         .await;
     }
     Ok(report)
+}
+
+/// Mastodon-shaped Home statuses from hydrate Redis (for `/api/v1/timelines/home`).
+pub async fn home_hydrate(
+    cfg: &Config,
+    owner_user_id: i64,
+    limit: usize,
+    since_id: Option<&str>,
+) -> Result<HomeHydrateReport> {
+    view_hydrate(cfg, owner_user_id, "home", limit, since_id).await
 }
 
 /// Live-poll "newer than since_ts" from ranked head + hydrate envelope.
@@ -537,6 +610,24 @@ mod tests {
         assert_eq!(
             key,
             "vaak:timeline:v1:1a447a10f787cb14d3ccad2ce2235aabc8f4eceaad3514e89621a9498ce82ae3"
+        );
+    }
+
+    #[test]
+    fn public_local_timeline_key_matches_php_sha() {
+        let key = public_timeline_redis_key(1, 40, true, None);
+        assert_eq!(
+            key,
+            "vaak:timeline:v1:a8b35a548a2ff8a676f190ba6a7c86952aef9377121adc0b9f57894a16c8432f"
+        );
+    }
+
+    #[test]
+    fn public_federated_timeline_key_matches_php_sha() {
+        let key = public_timeline_redis_key(1, 40, false, None);
+        assert_eq!(
+            key,
+            "vaak:timeline:v1:692c38c6d84ed90c708da63e5da55cd2e67fae9e340487501592a63ea92f15df"
         );
     }
 

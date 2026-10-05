@@ -174,13 +174,22 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Materialize Home hydrate envelopes from ranked IDs (RSS/Bluesky/fedi).
+    /// Materialize timeline hydrate envelopes from ranked IDs.
+    ///
+    /// Views: `home` (rss/bsky/event/outbox), `local` (outbox/boost), `feed` (event).
+    /// Use `--view` for one view (default home) or `--views home,local,feed`.
     HomeHydrateWarm {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
         /// Comma list of envelope limits (default 15,40,80).
         #[arg(long, default_value = "15,40,80")]
         limits: String,
+        /// Single view: home | local | feed (default home).
+        #[arg(long, default_value = "home")]
+        view: String,
+        /// Optional comma list of views (overrides --view when non-empty).
+        #[arg(long, default_value = "")]
+        views: String,
     },
     /// Drain `vaak:queue:timeline_fanout` (ranked prepend + Home hydrate).
     TimelineFanout {
@@ -363,7 +372,12 @@ async fn main() -> Result<()> {
             };
             timeline::run(&cfg, owner, limit).await?;
         }
-        Command::HomeHydrateWarm { owner_id, limits } => {
+        Command::HomeHydrateWarm {
+            owner_id,
+            limits,
+            view,
+            views,
+        } => {
             let owner = if owner_id > 0 {
                 owner_id
             } else {
@@ -374,15 +388,38 @@ async fn main() -> Result<()> {
                 .filter_map(|p| p.trim().parse().ok())
                 .filter(|n| (1..=80).contains(n))
                 .collect();
-            let report = if parsed.is_empty() {
-                home_hydrate_ranked::warm_owner_now(&cfg, owner).await?
+            let mut wanted: Vec<&str> = Vec::new();
+            if !views.trim().is_empty() {
+                for part in views.split(',') {
+                    match part.trim().to_ascii_lowercase().as_str() {
+                        "home" if !wanted.contains(&"home") => wanted.push("home"),
+                        "local" if !wanted.contains(&"local") => wanted.push("local"),
+                        "feed" if !wanted.contains(&"feed") => wanted.push("feed"),
+                        _ => {}
+                    }
+                }
+            }
+            if wanted.is_empty() {
+                wanted.push(match view.trim().to_ascii_lowercase().as_str() {
+                    "local" => "local",
+                    "feed" => "feed",
+                    _ => "home",
+                });
+            }
+            let mut reports = Vec::new();
+            for v in wanted {
+                let report = if parsed.is_empty() {
+                    home_hydrate_ranked::warm_view_now(&cfg, owner, v).await?
+                } else {
+                    home_hydrate_ranked::warm_view(&cfg, owner, v, &parsed).await?
+                };
+                reports.push(home_hydrate_ranked::report_json(&report));
+            }
+            if reports.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&reports[0])?);
             } else {
-                home_hydrate_ranked::warm_owner(&cfg, owner, &parsed).await?
-            };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&home_hydrate_ranked::report_json(&report))?
-            );
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            }
         }
         Command::TimelineFanout { r#loop, once_json } => {
             if r#loop {

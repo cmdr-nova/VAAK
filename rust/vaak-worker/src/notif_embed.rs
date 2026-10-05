@@ -1910,8 +1910,9 @@ pub fn paint_lean_embed_from(
         ));
     }
 
-    // Full action bar on Home / local Profiles / outbox. Mentions nests stay Open-only.
-    if matches!(from, "home" | "remote_profile" | "outbox") {
+    // Full action bar on Home / Local / Federated / local Profiles / outbox.
+    // Mentions nests stay Open-only.
+    if matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox") {
         inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
     } else if !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };

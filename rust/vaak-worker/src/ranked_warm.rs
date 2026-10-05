@@ -5,11 +5,10 @@
 //!   recommendations, favourite/toxicity nudges when algorithm on, Bluesky
 //!   merge, RSS spacing). Source `vaak-worker-native`. Flag
 //!   `VAAK_RANKED_NATIVE_HOME=1` (default on; `0` skips Home warm).
-//! - After a non-empty Home ranked write, fire-and-forget Rust ranked→hydrate
-//!   (`home_hydrate_ranked`) so Axum HTML assist hits `vaak:timeline:v1:*` with
-//!   the same RSS/Bluesky/fedi mix as ranked (0.7.15; was PHP chronological
-//!   `home-timeline-warm.php` through 0.7.14). Cooldown ~60s; disable with
-//!   `VAAK_HOME_HYDRATE_WARM=0`.
+//! - After a non-empty Home/Local/Federated ranked write, fire-and-forget Rust
+//!   ranked→hydrate (`home_hydrate_ranked`) so Axum HTML hits `vaak:timeline:v1:*`
+//!   (Home 0.7.15; Local/Federated 0.7.20). Cooldown ~60s; disable with
+//!   `VAAK_HOME_HYDRATE_WARM=0` / `VAAK_PUBLIC_HYDRATE_WARM=0`.
 //! - **Local / Federated:** outbox+local boosts / firehose events with v13 key
 //!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
 //! - Empty timelines soft-skip (no Redis write). PHP `bin/ranked-warm.php` is
@@ -2260,10 +2259,13 @@ pub async fn warm_local_native(cfg: &Config, owner_user_id: i64) -> Result<Strin
         "vaak-worker-native",
     )
     .await?;
+    let hydrate =
+        home_hydrate_ranked::maybe_warm_after_ranked_view(&mut redis, cfg, owner_user_id, "local")
+            .await;
     let ms = started.elapsed().as_millis();
     let counts = source_counts(&ranked);
     Ok(format!(
-        "owner={owner_user_id} view=local key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts}",
+        "owner={owner_user_id} view=local key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts} {hydrate}",
         ranked.len()
     ))
 }
@@ -2293,10 +2295,13 @@ pub async fn warm_feed_native(cfg: &Config, owner_user_id: i64) -> Result<String
         "vaak-worker-native",
     )
     .await?;
+    let hydrate =
+        home_hydrate_ranked::maybe_warm_after_ranked_view(&mut redis, cfg, owner_user_id, "feed")
+            .await;
     let ms = started.elapsed().as_millis();
     let counts = source_counts(&ranked);
     Ok(format!(
-        "owner={owner_user_id} view=feed key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts}",
+        "owner={owner_user_id} view=feed key={logical} ranked={} ms={ms} source=vaak-worker-native counts={counts} {hydrate}",
         ranked.len()
     ))
 }

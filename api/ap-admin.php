@@ -6516,19 +6516,19 @@ if (
     }
 }
 
-// Home infinite-scroll / non-shell partial: prefer Axum lean HTML from hydrate
-// Redis (0.7.9) *before* PG timeline rebuild + admin_tl_hydrate + full cards.
+// Home/Local/Federated infinite-scroll / non-shell partial: prefer Axum lean HTML
+// from hydrate Redis (Home 0.7.9, Local/Federated 0.7.20) *before* PG rebuild.
 // First-page soft-nav shell keeps its own path above.
 if (
     $isPartial
     && !$wantNewerPoll
-    && $view === 'home'
+    && in_array($view, ['home', 'local', 'feed'], true)
     && !(isset($_GET['shell']) && (string) $_GET['shell'] === '1')
-    && function_exists('admin_home_html_axum_fetch')
+    && function_exists('admin_tl_html_axum_fetch')
 ) {
     $fillLimit = max(1, min(40, (int) ($_GET['limit'] ?? $tlLimit)));
     $fillOffset = max(0, (int) ($_GET['offset'] ?? 0));
-    $axumFill = admin_home_html_axum_fetch($fillLimit, (int) $vaakOwnerId, $fillOffset);
+    $axumFill = admin_tl_html_axum_fetch($view, $fillLimit, (int) $vaakOwnerId, $fillOffset);
     if (is_array($axumFill) && (string) ($axumFill['html'] ?? '') !== '') {
         if (function_exists('ap_auth_session_write_close')) {
             ap_auth_session_write_close();
@@ -6541,31 +6541,44 @@ if (
             $hasMore = $hasMore || $nextOff < count($adminTlRankedCached);
         }
         $nextOffset = (int) ($axumFill['next_offset'] ?? ($fillOffset + $fillLimit));
+        $tlCacheLabel = 'axum-' . $view . '-html';
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
         header('X-Has-More: ' . ($hasMore ? '1' : '0'));
         header('X-Next-Offset: ' . (string) $nextOffset);
-        header('X-TL-Cache: axum-home-html');
-        header('X-VAAK-Home-Html: 1');
+        header('X-TL-Cache: ' . $tlCacheLabel);
+        if ($view === 'home') {
+            header('X-VAAK-Home-Html: 1');
+        } else {
+            header('X-VAAK-Tl-Html: 1');
+        }
         header('X-TL-Hydrate-Ms: 0');
         header('X-TL-Flags-Ms: 0');
         header('X-TL-Render-Ms: ' . (string) (int) ($axumFill['ms'] ?? 0));
         header('X-TL-Partial-Ms: ' . (string) (int) ($axumFill['ms'] ?? 0));
-        header('X-VAAK-View: home');
+        header('X-VAAK-View: ' . $view);
         if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
             ap_redis_unlock($adminTlStampedeLock);
             $adminTlStampedeLock = '';
         }
         // Keep the next window warm so scroll page N+1 also hits Axum.
-        if ($hasMore && function_exists('ap_timeline_home_hydrate_warm_async')) {
-            ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+        if ($hasMore) {
+            if ($view === 'home' && function_exists('ap_timeline_home_hydrate_warm_async')) {
+                ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+            } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
+                ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
+            }
         }
         echo (string) $axumFill['html'];
         exit;
     }
     // Miss (deep offset / cold envelope): prime 80-head for the next attempt.
-    if ($fillOffset > 0 && function_exists('ap_timeline_home_hydrate_warm_async')) {
-        ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+    if ($fillOffset > 0) {
+        if ($view === 'home' && function_exists('ap_timeline_home_hydrate_warm_async')) {
+            ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+        } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
+            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
+        }
     }
 }
 
@@ -6650,10 +6663,10 @@ if (
             exit;
         }
     }
-    // Home: prefer Axum lean HTML fill (0.7.4) before JSON→PHP card paint / PG hydrate.
+    // Home/Local/Federated: prefer Axum lean HTML fill before JSON→PHP / PG hydrate.
     $shellAxumHit = false;
-    if ($view === 'home' && function_exists('admin_home_html_axum_fetch')) {
-        $axumHtml = admin_home_html_axum_fetch($shellLimit, (int) $vaakOwnerId);
+    if (in_array($view, ['home', 'local', 'feed'], true) && function_exists('admin_tl_html_axum_fetch')) {
+        $axumHtml = admin_tl_html_axum_fetch($view, $shellLimit, (int) $vaakOwnerId);
         if (is_array($axumHtml) && (string) ($axumHtml['html'] ?? '') !== '') {
             $shellBody = (string) $axumHtml['html'];
             $shellAxumHit = true;
@@ -6662,8 +6675,14 @@ if (
                 $shellHasMore = count($adminTlRankedCached) > $shellLimit;
             }
             $shellNext = max($shellLimit, (int) ($axumHtml['next_offset'] ?? $shellLimit));
-            $shellCache = 'axum-home-html';
-            header('X-VAAK-Home-Html: 1');
+            $shellCache = 'axum-' . $view . '-html';
+            if ($view === 'home') {
+                header('X-VAAK-Home-Html: 1');
+            } else {
+                header('X-VAAK-Tl-Html: 1');
+            }
+        } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
+            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
         }
     }
     if ($view === 'home' && !$shellAxumHit && function_exists('ap_masto_timeline_home_axum_fetch')) {
@@ -10414,30 +10433,41 @@ if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
     $adminTlStampedeLock = '';
 }
 
-// Full-page Home: prefer Axum lean HTML (0.7.4), then JSON→PHP cards, before PG.
+// Full-page Home/Local/Federated: prefer Axum lean HTML, then Home JSON→PHP, before PG.
 $adminHomeAxumStatuses = null;
 $adminHomeAxumHtml = null;
+$adminTlAxumHtml = null;
 $adminHomeFirstPaintStarted = microtime(true);
 if (
     !$isPartial
-    && $view === 'home'
+    && in_array($view, ['home', 'local', 'feed'], true)
     && (int) ($_GET['offset'] ?? 0) === 0
 ) {
-    if (function_exists('admin_home_html_axum_fetch')) {
-        $axumHomeHtml = admin_home_html_axum_fetch($tlLimit, (int) $vaakOwnerId);
-        if (is_array($axumHomeHtml) && (string) ($axumHomeHtml['html'] ?? '') !== '') {
-            $adminHomeAxumHtml = $axumHomeHtml;
+    if (function_exists('admin_tl_html_axum_fetch')) {
+        $axumTlHtml = admin_tl_html_axum_fetch($view, $tlLimit, (int) $vaakOwnerId);
+        if (is_array($axumTlHtml) && (string) ($axumTlHtml['html'] ?? '') !== '') {
+            if ($view === 'home') {
+                $adminHomeAxumHtml = $axumTlHtml;
+            } else {
+                $adminTlAxumHtml = $axumTlHtml;
+            }
             if ($adminTlFromCache && is_array($adminTlRankedCached)) {
                 $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
             } else {
-                $adminTlCachedHasMore = !empty($axumHomeHtml['has_more']);
+                $adminTlCachedHasMore = !empty($axumTlHtml['has_more']);
             }
             if (function_exists('ap_timing_record')) {
-                ap_timing_record('home.first_paint.axum_html_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
+                ap_timing_record($view . '.first_paint.axum_html_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
             }
+        } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
+            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
         }
     }
-    if ($adminHomeAxumHtml === null && function_exists('ap_masto_timeline_home_axum_fetch')) {
+    if (
+        $view === 'home'
+        && $adminHomeAxumHtml === null
+        && function_exists('ap_masto_timeline_home_axum_fetch')
+    ) {
         $axumHome = ap_masto_timeline_home_axum_fetch($tlLimit, (int) $vaakOwnerId);
         if (is_array($axumHome) && $axumHome !== []) {
             $adminHomeAxumStatuses = $axumHome;
@@ -10473,17 +10503,24 @@ if (
 
 // Full-page first paint: when ranked cache hits, hydrate only the visible window
 // (builders above were skipped via $adminTlFromCache). Partials hydrate later.
-// Home skips PG hydrate when Axum already supplied first-paint statuses.
+// Skip PG hydrate when Axum already supplied first-paint HTML/statuses.
 if (
     !$isPartial
     && $adminTlFromCache
     && is_array($adminTlRankedCached)
     && in_array($view, ['home', 'feed', 'local'], true)
     && !(
-        $view === 'home'
-        && (
-            (is_array($adminHomeAxumHtml) && (string) ($adminHomeAxumHtml['html'] ?? '') !== '')
-            || (is_array($adminHomeAxumStatuses) && $adminHomeAxumStatuses !== [])
+        (
+            $view === 'home'
+            && (
+                (is_array($adminHomeAxumHtml) && (string) ($adminHomeAxumHtml['html'] ?? '') !== '')
+                || (is_array($adminHomeAxumStatuses) && $adminHomeAxumStatuses !== [])
+            )
+        )
+        || (
+            in_array($view, ['local', 'feed'], true)
+            && is_array($adminTlAxumHtml)
+            && (string) ($adminTlAxumHtml['html'] ?? '') !== ''
         )
     )
 ) {
@@ -20593,15 +20630,22 @@ function admin_profile_html_axum_fetch(
 }
 
 /**
- * Fetch Home fill HTML from Axum `/shadow/home-html` (0.7.4).
- * Offset pages supported (0.7.9). Lean Rust cards from hydrate Redis.
- * Flag: VAAK_HOME_HTML_AXUM (default on).
+ * Fetch timeline fill HTML from Axum lean paint (Home 0.7.4, Local/Federated 0.7.20).
+ * Offset pages supported. Lean Rust cards from hydrate Redis.
  *
- * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int}|null
+ * Flags: VAAK_HOME_HTML_AXUM (home), VAAK_LOCAL_FEED_HTML_AXUM (local+feed). Default on.
+ *
+ * @param 'home'|'local'|'feed' $view
+ * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int,view:string}|null
  */
-function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offset = 0): ?array
+function admin_tl_html_axum_fetch(string $view, int $limit, int $ownerUserId = 0, int $offset = 0): ?array
 {
-    $enabled = getenv('VAAK_HOME_HTML_AXUM');
+    $view = strtolower(trim($view));
+    if (!in_array($view, ['home', 'local', 'feed'], true)) {
+        return null;
+    }
+    $flag = $view === 'home' ? 'VAAK_HOME_HTML_AXUM' : 'VAAK_LOCAL_FEED_HTML_AXUM';
+    $enabled = getenv($flag);
     $enabled = ($enabled === false || $enabled === '')
         ? true
         : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
@@ -20634,7 +20678,12 @@ function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offse
     if ($offset > 0) {
         $query['offset'] = $offset;
     }
-    $url = $base . '/shadow/home-html?' . http_build_query($query);
+    $path = match ($view) {
+        'local' => '/shadow/local-html',
+        'feed' => '/shadow/feed-html',
+        default => '/shadow/home-html',
+    };
+    $url = $base . $path . '?' . http_build_query($query);
     if (!function_exists('curl_init')) {
         return null;
     }
@@ -20656,7 +20705,7 @@ function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offse
     curl_close($ch);
     $ms = (int) round((microtime(true) - $started) * 1000);
     if (function_exists('ap_timing_record')) {
-        ap_timing_record('home.html.axum_fetch', (float) $ms);
+        ap_timing_record($view . '.html.axum_fetch', (float) $ms);
     }
     if ($code !== 200 || !is_string($raw)) {
         return null;
@@ -20677,9 +20726,63 @@ function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offse
         'html' => $body,
         'has_more' => (($hdrs['x-has-more'] ?? '') === '1'),
         'next_offset' => max(0, (int) ($hdrs['x-next-offset'] ?? ($offset + $limit))),
-        'source' => (string) ($hdrs['x-vaak-tl-source'] ?? 'axum-home-html'),
+        'source' => (string) ($hdrs['x-vaak-tl-source'] ?? ('axum-' . $view . '-html')),
         'ms' => $ms,
+        'view' => $view,
     ];
+}
+
+/**
+ * Fetch Home fill HTML from Axum `/shadow/home-html` (0.7.4).
+ *
+ * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int}|null
+ */
+function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offset = 0): ?array
+{
+    return admin_tl_html_axum_fetch('home', $limit, $ownerUserId, $offset);
+}
+
+/**
+ * Spawn Rust hydrate warm for Local/Federated after Axum HTML miss (0.7.20).
+ */
+function ap_timeline_public_hydrate_warm_async(int $ownerUserId, string $view, string $limits = '15,40,80'): void
+{
+    $view = strtolower(trim($view));
+    if ($ownerUserId < 1 || !in_array($view, ['local', 'feed', 'home'], true)) {
+        return;
+    }
+    static $scheduled = [];
+    $schedKey = $view . ':' . $ownerUserId . ':' . $limits;
+    if (isset($scheduled[$schedKey])) {
+        return;
+    }
+    $scheduled[$schedKey] = true;
+    $bin = getenv('VAAK_WORKER_BIN');
+    $bin = is_string($bin) && trim($bin) !== '' ? trim($bin) : '/usr/local/bin/vaak-worker';
+    if (!is_file($bin) || !is_executable($bin)) {
+        return;
+    }
+    register_shutdown_function(static function () use ($ownerUserId, $view, $limits, $bin): void {
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                @fastcgi_finish_request();
+            }
+            if (function_exists('ignore_user_abort')) {
+                ignore_user_abort(true);
+            }
+            $cmd = escapeshellarg($bin)
+                . ' home-hydrate-warm'
+                . ' --owner-id=' . (int) $ownerUserId
+                . ' --view=' . escapeshellarg($view)
+                . ' --limits=' . escapeshellarg($limits)
+                . ' >/dev/null 2>&1 &';
+            if (function_exists('exec')) {
+                @exec($cmd);
+            }
+        } catch (Throwable $e) {
+            // optional
+        }
+    });
 }
 
 /**
@@ -24734,60 +24837,86 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'local'): ?>
         <?php
-          $localPage = array_slice($localTimeline, 0, $tlLimit);
+          $localFromAxumHtml = is_array($adminTlAxumHtml ?? null)
+              && (string) ($adminTlAxumHtml['html'] ?? '') !== '';
+          $localPage = $localFromAxumHtml ? [] : array_slice($localTimeline, 0, $tlLimit);
           $localHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($localTimeline) > $tlLimit);
-          $localNeedsFill = !empty($adminTlFullPageDefer) || ($localPage === [] && $localHasMore);
+          if ($localFromAxumHtml) {
+              $localHasMore = !empty($adminTlCachedHasMore) || !empty($adminTlAxumHtml['has_more']);
+          }
+          $localNeedsFill = !$localFromAxumHtml && (!empty($adminTlFullPageDefer) || ($localPage === [] && $localHasMore));
           if ($localNeedsFill) {
               $localHasMore = true;
           }
-          if (function_exists('ap_masto_status_flags_prefetch')) {
+          $localPaintCount = $localFromAxumHtml
+              ? (int) ($adminTlAxumHtml['next_offset'] ?? $tlLimit)
+              : count($localPage);
+          $localTlCacheAttr = $localFromAxumHtml ? 'axum-local-html' : '';
+          if (!$localFromAxumHtml && function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($localPage));
           }
         ?>
-        <?php if (!$localTimeline && empty($adminTlFullPageDefer)): ?>
+        <?php if (!$localFromAxumHtml && !$localTimeline && empty($adminTlFullPageDefer)): ?>
           <?= admin_mascot_empty('No local posts yet. When anyone on this instance posts, it shows up here.') ?>
         <?php endif; ?>
-        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) count($localPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($localPage[0]['sort']) ? $localPage[0]['sort'] : time()) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?>>
-          <?php foreach ($localPage as $item): ?>
-            <?php
-              if (admin_timeline_item_muted_by_words($item)) {
-                  continue;
-              }
-              admin_render_timeline_item($item, $followingIds, 'local');
-            ?>
-          <?php endforeach; ?>
+        <div id="timeline-items" data-view="local" data-offset="<?= $localNeedsFill ? '0' : (int) $localPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $localHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($localPage[0]['sort']) ? $localPage[0]['sort'] : time()) ?>"<?= $localNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $localTlCacheAttr !== '' ? ' data-tl-cache="' . h($localTlCacheAttr) . '"' : '' ?>>
+          <?php if ($localFromAxumHtml): ?>
+            <?= $adminTlAxumHtml['html'] ?>
+          <?php else: ?>
+            <?php foreach ($localPage as $item): ?>
+              <?php
+                if (admin_timeline_item_muted_by_words($item)) {
+                    continue;
+                }
+                admin_render_timeline_item($item, $followingIds, 'local');
+              ?>
+            <?php endforeach; ?>
+          <?php endif; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $localNeedsFill ? 'Loading timeline…' : ($localHasMore ? 'Scroll for more…' : ($localTimeline ? 'End of timeline' : '')) ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= $localNeedsFill ? 'Loading timeline…' : ($localHasMore ? 'Scroll for more…' : (($localFromAxumHtml || $localTimeline) ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'feed'): ?>
         <?php
-          $feedPage = array_slice($feedTimeline, 0, $tlLimit);
+          $feedFromAxumHtml = is_array($adminTlAxumHtml ?? null)
+              && (string) ($adminTlAxumHtml['html'] ?? '') !== '';
+          $feedPage = $feedFromAxumHtml ? [] : array_slice($feedTimeline, 0, $tlLimit);
           $feedHasMore = $adminTlFromCache
               ? $adminTlCachedHasMore
               : (count($feedTimeline) > $tlLimit);
-          $feedNeedsFill = !empty($adminTlFullPageDefer) || ($feedPage === [] && $feedHasMore);
+          if ($feedFromAxumHtml) {
+              $feedHasMore = !empty($adminTlCachedHasMore) || !empty($adminTlAxumHtml['has_more']);
+          }
+          $feedNeedsFill = !$feedFromAxumHtml && (!empty($adminTlFullPageDefer) || ($feedPage === [] && $feedHasMore));
           if ($feedNeedsFill) {
               $feedHasMore = true;
           }
-          if (function_exists('ap_masto_status_flags_prefetch')) {
+          $feedPaintCount = $feedFromAxumHtml
+              ? (int) ($adminTlAxumHtml['next_offset'] ?? $tlLimit)
+              : count($feedPage);
+          $feedTlCacheAttr = $feedFromAxumHtml ? 'axum-feed-html' : '';
+          if (!$feedFromAxumHtml && function_exists('ap_masto_status_flags_prefetch')) {
               ap_masto_status_flags_prefetch(admin_timeline_status_ids($feedPage));
           }
         ?>
-        <?php if (!$feedTimeline && empty($adminTlFullPageDefer)): ?><?= admin_mascot_empty('No federation events yet.') ?><?php endif; ?>
-        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) count($feedPage) ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($feedPage[0]['sort']) ? $feedPage[0]['sort'] : time()) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?>>
-          <?php foreach ($feedPage as $item): ?>
-            <?php
-              if (admin_timeline_item_muted_by_words($item)) {
-                  continue;
-              }
-              admin_render_timeline_item($item, $followingIds, 'feed');
-            ?>
-          <?php endforeach; ?>
+        <?php if (!$feedFromAxumHtml && !$feedTimeline && empty($adminTlFullPageDefer)): ?><?= admin_mascot_empty('No federation events yet.') ?><?php endif; ?>
+        <div id="timeline-items" data-view="feed" data-offset="<?= $feedNeedsFill ? '0' : (int) $feedPaintCount ?>" data-limit="<?= (int) $tlLimit ?>" data-has-more="<?= $feedHasMore ? '1' : '0' ?>" data-newest="<?= (int) (!empty($feedPage[0]['sort']) ? $feedPage[0]['sort'] : time()) ?>"<?= $feedNeedsFill ? ' data-needs-fill="1"' : '' ?><?= $feedTlCacheAttr !== '' ? ' data-tl-cache="' . h($feedTlCacheAttr) . '"' : '' ?>>
+          <?php if ($feedFromAxumHtml): ?>
+            <?= $adminTlAxumHtml['html'] ?>
+          <?php else: ?>
+            <?php foreach ($feedPage as $item): ?>
+              <?php
+                if (admin_timeline_item_muted_by_words($item)) {
+                    continue;
+                }
+                admin_render_timeline_item($item, $followingIds, 'feed');
+              ?>
+            <?php endforeach; ?>
+          <?php endif; ?>
         </div>
-        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= !empty($feedNeedsFill) ? 'Loading timeline…' : ($feedHasMore ? 'Scroll for more…' : ($feedTimeline ? 'End of timeline' : '')) ?></div>
+        <div id="timeline-status" class="meta" style="padding:.75rem 0;text-align:center"><?= !empty($feedNeedsFill) ? 'Loading timeline…' : ($feedHasMore ? 'Scroll for more…' : (($feedFromAxumHtml || $feedTimeline) ? 'End of timeline' : '')) ?></div>
         <div id="timeline-sentinel" aria-hidden="true" style="height:1px"></div>
 
       <?php elseif ($view === 'favourites'): ?>

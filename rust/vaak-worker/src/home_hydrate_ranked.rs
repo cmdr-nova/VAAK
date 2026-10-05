@@ -1,11 +1,16 @@
-//! Home hydrate from ranked IDs (Rust-native).
+//! Timeline hydrate from ranked IDs (Rust-native).
 //!
 //! Walks `vaak:timeline:ranked:v2:*` for an owner, materializes Mastodon-shaped
-//! status JSON for rss / bsky / event / outbox (and Announce→reblog), then writes
-//! PHP-compatible `vaak:timeline:v1:*` envelopes for limits 15/40/80.
+//! status JSON, then writes PHP-compatible `vaak:timeline:v1:*` envelopes for
+//! limits 15/40/80.
 //!
-//! Replaces `bin/home-timeline-warm.php` → chronological `ap_masto_timeline_home_merged`
-//! which dropped the ranked RSS/Bluesky mix (Home Axum HTML/API showed fedi-only).
+//! Views:
+//! - home: rss / bsky / event / outbox (Announce→reblog)
+//! - local: outbox / boost (`masto_reblogs`)
+//! - feed: event only
+//!
+//! Replaces `bin/home-timeline-warm.php` chronological merge which dropped the
+//! ranked RSS/Bluesky mix on Home.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -492,7 +497,12 @@ fn ranked_redis_key(logical: &str) -> String {
     format!("vaak:timeline:ranked:v2:{}", hex::encode(hasher.finalize()))
 }
 
-fn pick_home_logical(index: Option<&Value>) -> Option<String> {
+/// Pick the ranked logical key for a view from the owner index.
+///
+/// - home: contains `_home_` or `home` (legacy index entries)
+/// - local: contains `_local_`
+/// - feed: contains `_feed_` (first match — index may list following fingerprints)
+fn pick_view_logical(index: Option<&Value>, view: &str) -> Option<String> {
     let arr = index?.as_array()?;
     let mut first = None;
     for v in arr {
@@ -500,11 +510,52 @@ fn pick_home_logical(index: Option<&Value>) -> Option<String> {
         if first.is_none() {
             first = Some(s.to_string());
         }
-        if s.contains("home") {
+        let hit = match view {
+            "local" => s.contains("_local_"),
+            "feed" => s.contains("_feed_"),
+            _ => s.contains("_home_") || s.contains("home"),
+        };
+        if hit {
             return Some(s.to_string());
         }
     }
-    first
+    // Home previously fell back to the first index entry; keep that only for home.
+    if view == "home" || view.is_empty() {
+        first
+    } else {
+        None
+    }
+}
+
+#[allow(dead_code)]
+fn pick_home_logical(index: Option<&Value>) -> Option<String> {
+    pick_view_logical(index, "home")
+}
+
+fn normalize_view(view: &str) -> &'static str {
+    match view.trim().to_ascii_lowercase().as_str() {
+        "local" => "local",
+        "feed" => "feed",
+        _ => "home",
+    }
+}
+
+fn reblog_is_bsky_native(status_id: &str, object_id: &str) -> bool {
+    let sid = status_id.trim().to_ascii_lowercase();
+    let oid = object_id.trim().to_ascii_lowercase();
+    sid.starts_with("bsky-repost-")
+        || oid.starts_with("https://bsky.app/")
+        || oid.contains("bsky.mkultra.monster/")
+}
+
+fn reblog_is_rss_local(status_id: &str, object_id: &str) -> bool {
+    let sid = status_id.trim().to_ascii_lowercase();
+    let oid = object_id.trim().to_ascii_lowercase();
+    sid.starts_with("rss:")
+        || sid.starts_with("rss-boost:")
+        || sid.starts_with("local:rss-boost:")
+        || oid.starts_with("rss:")
+        || oid.starts_with("rss-boost:")
 }
 
 struct RankedEntry {
@@ -668,6 +719,20 @@ struct OutboxRow {
     id: String,
     published: String,
     content: String,
+}
+
+#[derive(Clone)]
+struct BoostRow {
+    id: i64,
+    #[allow(dead_code)]
+    owner_user_id: i64,
+    owner_actor_id: String,
+    status_id: String,
+    boost_status_id: String,
+    object_id: String,
+    target_actor: String,
+    announce_activity_id: String,
+    created_at: String,
 }
 
 fn materialize_rss(row: &RssRow) -> Value {
@@ -1015,7 +1080,7 @@ fn html_entity_decode(s: &str) -> String {
         .replace("&nbsp;", " ")
 }
 
-fn link_header(statuses: &[Value], limit: i64) -> String {
+fn link_header(statuses: &[Value], limit: i64, view: &str) -> String {
     if statuses.is_empty() {
         return String::new();
     }
@@ -1027,34 +1092,43 @@ fn link_header(statuses: &[Value], limit: i64) -> String {
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let base = "https://mkultra.monster/api/v1/timelines/home";
+    let (base, extra) = match view {
+        "local" => (
+            "https://mkultra.monster/api/v1/timelines/public",
+            "&local=true",
+        ),
+        "feed" => ("https://mkultra.monster/api/v1/timelines/public", ""),
+        _ => ("https://mkultra.monster/api/v1/timelines/home", ""),
+    };
     let mut parts = Vec::new();
     if !last.is_empty() {
         parts.push(format!(
-            "<{base}?limit={limit}&max_id={last}>; rel=\"next\""
+            "<{base}?limit={limit}{extra}&max_id={last}>; rel=\"next\""
         ));
     }
     if !first.is_empty() {
         parts.push(format!(
-            "<{base}?limit={limit}&min_id={first}>; rel=\"prev\""
+            "<{base}?limit={limit}{extra}&min_id={first}>; rel=\"prev\""
         ));
     }
     parts.join(", ")
 }
 
-async fn load_ranked_head(
+async fn load_ranked_head_for_view(
     redis: &mut redis::aio::MultiplexedConnection,
     owner: i64,
     want: usize,
+    view: &str,
 ) -> Result<(Vec<RankedEntry>, String)> {
+    let view = normalize_view(view);
     let index_key = format!("vaak:timeline:owner-index:v1:{owner}");
     let index = redis_util::json_get(redis, &index_key).await?;
-    let logical = pick_home_logical(index.as_ref())
-        .context("owner ranked index miss (no home logical)")?;
+    let logical = pick_view_logical(index.as_ref(), view)
+        .with_context(|| format!("owner ranked index miss (no {view} logical)"))?;
     let rk = ranked_redis_key(&logical);
     let env = redis_util::json_get(redis, &rk)
         .await?
-        .context("ranked home envelope miss")?;
+        .with_context(|| format!("ranked {view} envelope miss"))?;
     let ranked = env
         .get("ranked")
         .and_then(|v| v.as_array())
@@ -1081,6 +1155,15 @@ async fn load_ranked_head(
         out.push(RankedEntry { kind, id });
     }
     Ok((out, logical))
+}
+
+#[allow(dead_code)]
+async fn load_ranked_head(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner: i64,
+    want: usize,
+) -> Result<(Vec<RankedEntry>, String)> {
+    load_ranked_head_for_view(redis, owner, want, "home").await
 }
 
 async fn fetch_rss_map(db: &Client, ids: &[i64], owner: i64) -> Result<HashMap<i64, RssRow>> {
@@ -1359,6 +1442,60 @@ async fn load_owner_username(db: &Client, owner: i64) -> Result<String> {
         .unwrap_or_else(|| "cmdr_nova".into()))
 }
 
+/// Local ranked boost ids are `masto_reblogs.status_id` (sometimes boost_status_id).
+/// Prefer rows for `owner_user_id` when duplicates exist (PHP parity).
+async fn fetch_boosts_map(
+    db: &Client,
+    ids: &[String],
+    owner_user_id: i64,
+) -> Result<HashMap<String, BoostRow>> {
+    let mut map = HashMap::new();
+    if ids.is_empty() {
+        return Ok(map);
+    }
+    let rows = db
+        .query(
+            "SELECT id, owner_user_id, COALESCE(owner_actor_id,''), COALESCE(status_id,''),
+                    COALESCE(boost_status_id,''), COALESCE(object_id,''),
+                    COALESCE(target_actor,''), COALESCE(announce_activity_id,''),
+                    COALESCE(created_at::text,'')
+             FROM masto_reblogs
+             WHERE status_id = ANY($1) OR boost_status_id = ANY($1)
+             ORDER BY CASE WHEN owner_user_id = $2 THEN 0 ELSE 1 END, id DESC",
+            &[&ids, &owner_user_id],
+        )
+        .await
+        .context("select masto_reblogs for local hydrate")?;
+    for row in rows {
+        let owner_uid = row.try_get::<_, i64>(1).unwrap_or_else(|_| {
+            i64::from(row.try_get::<_, i32>(1).unwrap_or(0))
+        });
+        let rb_id = row.try_get::<_, i64>(0).unwrap_or_else(|_| {
+            i64::from(row.try_get::<_, i32>(0).unwrap_or(0))
+        });
+        let rb = BoostRow {
+            id: rb_id,
+            owner_user_id: owner_uid,
+            owner_actor_id: row.get(2),
+            status_id: row.get(3),
+            boost_status_id: row.get(4),
+            object_id: row.get(5),
+            target_actor: row.get(6),
+            announce_activity_id: row.get(7),
+            created_at: row.get(8),
+        };
+        // Index under both keys so ranked status_id or boost_status_id resolve.
+        if !rb.status_id.is_empty() {
+            map.entry(rb.status_id.clone()).or_insert_with(|| rb.clone());
+        }
+        if !rb.boost_status_id.is_empty() {
+            map.entry(rb.boost_status_id.clone())
+                .or_insert_with(|| rb.clone());
+        }
+    }
+    Ok(map)
+}
+
 fn materialize_announce(
     announce: &EventRow,
     booster: Option<&ActorRow>,
@@ -1486,9 +1623,162 @@ fn materialize_announce(
     })
 }
 
-/// Materialize Mastodon Home statuses from the owner's ranked head and write
+/// PHP `ap_masto_status_from_reblog` + thin Create fallback (Local boosts).
+fn materialize_boost(
+    rb: &BoostRow,
+    create: Option<&EventRow>,
+    actors: &HashMap<String, ActorRow>,
+) -> Option<Value> {
+    if reblog_is_bsky_native(&rb.status_id, &rb.object_id)
+        || reblog_is_rss_local(&rb.status_id, &rb.object_id)
+    {
+        return None;
+    }
+    let created = format_time(&rb.created_at);
+    let outer_id = if !rb.boost_status_id.trim().is_empty() {
+        rb.boost_status_id.clone()
+    } else if rb.id > 0 {
+        snowflake_id(&created, rb.id, 4)
+    } else {
+        return None;
+    };
+
+    let owner_actor = rb.owner_actor_id.trim_end_matches('/').to_string();
+    let username = owner_actor
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let booster_acct = empty_account(
+        &owner_actor,
+        &username,
+        &username,
+        &username,
+        &owner_actor,
+        DEFAULT_AVATAR,
+    );
+
+    let object_id = rb.object_id.trim_end_matches('/').to_string();
+    let mut inner = if let Some(crow) = create {
+        let cactor = actors.get(crow.actor_id.trim_end_matches('/'));
+        materialize_event_create(crow, cactor)
+    } else {
+        // Thin degraded original (PHP stub when Create missing).
+        let target = if !rb.target_actor.trim().is_empty() {
+            rb.target_actor.trim_end_matches('/').to_string()
+        } else {
+            String::new()
+        };
+        let account = if !target.is_empty() {
+            if let Some(a) = actors.get(target.as_str()) {
+                actor_to_account(a)
+            } else {
+                let host = host_from_url(&target);
+                let uname = target
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let acct = if host.is_empty() {
+                    uname.clone()
+                } else {
+                    format!("{uname}@{host}")
+                };
+                empty_account(&target, &uname, &acct, &uname, &target, DEFAULT_AVATAR)
+            }
+        } else {
+            empty_account("unknown", "unknown", "unknown", "unknown", "", DEFAULT_AVATAR)
+        };
+        let uri = if object_id.is_empty() {
+            rb.status_id.as_str()
+        } else {
+            object_id.as_str()
+        };
+        let inner_id = if !rb.status_id.is_empty() {
+            rb.status_id.clone()
+        } else {
+            announce_inner_synth_id(&created, uri)
+        };
+        let mut st = base_status(
+            &inner_id,
+            &created,
+            "<p></p>",
+            uri,
+            uri,
+            account,
+            Vec::new(),
+            None,
+        );
+        st["reblogged"] = json!(true);
+        st["vaak_degraded"] = json!(true);
+        st["vaak_degraded_reason"] = json!("boost_original_missing");
+        st
+    };
+
+    // Unwrap nested boosts — wrapper always points at the original Note.
+    if let Some(nested) = inner.get("reblog").filter(|v| v.is_object()).cloned() {
+        inner = nested;
+    }
+    inner["reblogged"] = json!(true);
+    inner["reblog"] = Value::Null;
+
+    let announce_uri = rb.announce_activity_id.trim();
+    let uri = if !announce_uri.is_empty() {
+        announce_uri.to_string()
+    } else {
+        format!("{owner_actor}/announces/{outer_id}")
+    };
+    let url = inner
+        .get("url")
+        .and_then(|v| v.as_str())
+        .or_else(|| inner.get("uri").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    Some(json!({
+        "id": outer_id,
+        "created_at": created,
+        "in_reply_to_id": Value::Null,
+        "in_reply_to_account_id": Value::Null,
+        "sensitive": false,
+        "spoiler_text": "",
+        "visibility": "public",
+        "language": Value::Null,
+        "uri": uri,
+        "url": url,
+        "replies_count": 0,
+        "reblogs_count": 1,
+        "favourites_count": 0,
+        "edited_at": Value::Null,
+        "favourited": false,
+        "reblogged": true,
+        "muted": false,
+        "bookmarked": false,
+        "pinned": false,
+        "content": "",
+        "reblog": inner,
+        "application": {"name": "mkultra.monster", "website": "https://mkultra.monster"},
+        "account": booster_acct,
+        "media_attachments": [],
+        "mentions": [],
+        "tags": [],
+        "emojis": [],
+        "card": Value::Null,
+        "poll": Value::Null,
+        "vaak_boost_row_id": rb.id,
+    }))
+}
+
+/// Materialize Mastodon statuses from a view's ranked head and write
 /// `vaak:timeline:v1:*` envelopes for each limit.
-pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Result<WarmReport> {
+pub async fn warm_view(
+    cfg: &Config,
+    owner_user_id: i64,
+    view: &str,
+    limits: &[i64],
+) -> Result<WarmReport> {
+    let view = normalize_view(view);
     let started = Instant::now();
     let mut limits: Vec<i64> = limits
         .iter()
@@ -1503,31 +1793,34 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
     let want = *limits.iter().max().unwrap_or(&80) as usize;
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    let (head, _logical) = load_ranked_head(&mut redis, owner_user_id, want.max(80)).await?;
+    let (head, _logical) =
+        load_ranked_head_for_view(&mut redis, owner_user_id, want.max(80), view).await?;
     let ranked_n = head.len();
 
     let mut rss_ids = Vec::new();
     let mut bsky_uris = Vec::new();
     let mut event_ids = Vec::new();
     let mut outbox_ids = Vec::new();
+    let mut boost_ids = Vec::new();
     for e in &head {
-        match e.kind.as_str() {
-            "rss" => {
+        match (view, e.kind.as_str()) {
+            ("home", "rss") => {
                 if let Ok(id) = e.id.parse::<i64>() {
                     if id > 0 {
                         rss_ids.push(id);
                     }
                 }
             }
-            "bsky" => bsky_uris.push(e.id.clone()),
-            "event" => {
+            ("home", "bsky") => bsky_uris.push(e.id.clone()),
+            ("home" | "feed", "event") => {
                 if let Ok(id) = e.id.parse::<i64>() {
                     if id > 0 {
                         event_ids.push(id);
                     }
                 }
             }
-            "outbox" => outbox_ids.push(e.id.clone()),
+            ("home" | "local", "outbox") => outbox_ids.push(e.id.clone()),
+            ("local", "boost") => boost_ids.push(e.id.clone()),
             _ => {}
         }
     }
@@ -1539,14 +1832,17 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
     event_ids.dedup();
     outbox_ids.sort();
     outbox_ids.dedup();
+    boost_ids.sort();
+    boost_ids.dedup();
 
     let db = crate::db::connect(&cfg.database_url).await?;
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
     let bsky_map = fetch_bsky_map(&db, &bsky_uris).await?;
     let events_map = fetch_events_map(&db, &event_ids).await?;
+    let boosts_map = fetch_boosts_map(&db, &boost_ids, owner_user_id).await?;
 
-    // Announce → look up Create for object_id; collect all actor ids.
+    // Announce / boost → look up Create for object_id; collect all actor ids.
     let mut announce_oids = Vec::new();
     let mut actor_ids = Vec::new();
     for ev in events_map.values() {
@@ -1556,6 +1852,17 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
         }
         if ev.event_type.eq_ignore_ascii_case("announce") && !ev.object_id.is_empty() {
             announce_oids.push(ev.object_id.trim_end_matches('/').to_string());
+        }
+    }
+    for rb in boosts_map.values() {
+        if !rb.owner_actor_id.is_empty() {
+            actor_ids.push(rb.owner_actor_id.trim_end_matches('/').to_string());
+        }
+        if !rb.target_actor.is_empty() {
+            actor_ids.push(rb.target_actor.trim_end_matches('/').to_string());
+        }
+        if !rb.object_id.is_empty() {
+            announce_oids.push(rb.object_id.trim_end_matches('/').to_string());
         }
     }
     announce_oids.sort();
@@ -1572,13 +1879,13 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
     let mut statuses = Vec::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
     for e in &head {
-        let st = match e.kind.as_str() {
-            "rss" => {
+        let st = match (view, e.kind.as_str()) {
+            ("home", "rss") => {
                 let id = e.id.parse::<i64>().unwrap_or(0);
                 rss_map.get(&id).map(materialize_rss)
             }
-            "bsky" => bsky_map.get(&e.id).map(materialize_bsky),
-            "event" => {
+            ("home", "bsky") => bsky_map.get(&e.id).map(materialize_bsky),
+            ("home" | "feed", "event") => {
                 let id = e.id.parse::<i64>().unwrap_or(0);
                 events_map.get(&id).and_then(|ev| {
                     let actor = actors_map.get(ev.actor_id.trim_end_matches('/'));
@@ -1597,9 +1904,13 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
                     }
                 })
             }
-            "outbox" => outbox_map
+            ("home" | "local", "outbox") => outbox_map
                 .get(e.id.trim_end_matches('/'))
                 .map(|row| materialize_outbox(row, &owner_username)),
+            ("local", "boost") => boosts_map.get(&e.id).and_then(|rb| {
+                let create = creates_map.get(rb.object_id.trim_end_matches('/'));
+                materialize_boost(rb, create, &actors_map)
+            }),
             _ => None,
         };
         if let Some(st) = st {
@@ -1616,8 +1927,8 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
     for &limit in &limits {
         let slice: Vec<Value> = statuses.iter().take(limit as usize).cloned().collect();
         let body = serde_json::to_string(&slice).unwrap_or_else(|_| "[]".into());
-        let link = link_header(&slice, limit);
-        let key = timeline::home_timeline_redis_key(owner_user_id, limit, None);
+        let link = link_header(&slice, limit, view);
+        let key = timeline::timeline_hydrate_redis_key(view, owner_user_id, limit, None);
         let envelope = json!({
             "created_at": now,
             "body": body,
@@ -1633,6 +1944,11 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
         .map(|(k, n)| format!("{k}:{n}"))
         .collect::<Vec<_>>()
         .join(",");
+    let source = match view {
+        "local" => "vaak-worker-local-hydrate-ranked",
+        "feed" => "vaak-worker-feed-hydrate-ranked",
+        _ => "vaak-worker-home-hydrate-ranked",
+    };
     Ok(WarmReport {
         owner_user_id,
         ranked_n,
@@ -1640,27 +1956,45 @@ pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Res
         stored,
         kinds,
         ms,
-        source: "vaak-worker-home-hydrate-ranked",
-        note: format!("ranked={ranked_n} materialised={} kinds={kinds_note}", statuses.len()),
+        source,
+        note: format!(
+            "view={view} ranked={ranked_n} materialised={} kinds={kinds_note}",
+            statuses.len()
+        ),
     })
 }
 
-/// Fire-and-forget ranked→hydrate for an owner (cooldown via Redis).
+/// Home-only wrapper (account-switch / existing callers).
+pub async fn warm_owner(cfg: &Config, owner_user_id: i64, limits: &[i64]) -> Result<WarmReport> {
+    warm_view(cfg, owner_user_id, "home", limits).await
+}
+
+/// Fire-and-forget ranked→hydrate for a view (cooldown via Redis).
 /// Returns a short status token for ranked-warm log lines.
-pub async fn maybe_warm_after_ranked(
+pub async fn maybe_warm_after_ranked_view(
     redis: &mut redis::aio::MultiplexedConnection,
     cfg: &Config,
     owner_user_id: i64,
+    view: &str,
 ) -> String {
-    if !env_flag_default_true("VAAK_HOME_HYDRATE_WARM") {
+    let view = normalize_view(view);
+    let flag = match view {
+        "local" | "feed" => "VAAK_PUBLIC_HYDRATE_WARM",
+        _ => "VAAK_HOME_HYDRATE_WARM",
+    };
+    if !env_flag_default_true(flag) {
         return "hydrate=skip_flag".into();
     }
-    let cooldown = std::env::var("VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS")
+    let cooldown_env = match view {
+        "local" | "feed" => "VAAK_PUBLIC_HYDRATE_WARM_COOLDOWN_SECS",
+        _ => "VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS",
+    };
+    let cooldown = std::env::var(cooldown_env)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(60)
         .clamp(30, 600);
-    let cooldown_key = format!("vaak:home:hydrate-warm:cd:{owner_user_id}");
+    let cooldown_key = format!("vaak:{view}:hydrate-warm:cd:{owner_user_id}");
     let cooling: Option<String> = redis::cmd("GET")
         .arg(&cooldown_key)
         .query_async(redis)
@@ -1678,25 +2012,28 @@ pub async fn maybe_warm_after_ranked(
         .await;
 
     let cfg = cfg.clone();
+    let view_owned = view.to_string();
     tokio::spawn(async move {
         let t0 = Instant::now();
-        match warm_owner(&cfg, owner_user_id, &DEFAULT_LIMITS).await {
+        match warm_view(&cfg, owner_user_id, &view_owned, &DEFAULT_LIMITS).await {
             Ok(report) => {
                 tracing::info!(
                     owner = owner_user_id,
+                    view = %view_owned,
                     ms = report.ms,
                     n = report.materialised_n,
                     ranked = report.ranked_n,
                     note = %report.note,
-                    "home hydrate ranked warm ok"
+                    "timeline hydrate ranked warm ok"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     owner = owner_user_id,
+                    view = %view_owned,
                     ms = t0.elapsed().as_millis(),
                     error = %format!("{e:#}"),
-                    "home hydrate ranked warm failed"
+                    "timeline hydrate ranked warm failed"
                 );
             }
         }
@@ -1704,16 +2041,31 @@ pub async fn maybe_warm_after_ranked(
     "hydrate=spawned_ranked".into()
 }
 
-/// CLI / account-switch: warm immediately (clears cooldown).
-pub async fn warm_owner_now(cfg: &Config, owner_user_id: i64) -> Result<WarmReport> {
+/// Fire-and-forget Home ranked→hydrate (cooldown via Redis).
+pub async fn maybe_warm_after_ranked(
+    redis: &mut redis::aio::MultiplexedConnection,
+    cfg: &Config,
+    owner_user_id: i64,
+) -> String {
+    maybe_warm_after_ranked_view(redis, cfg, owner_user_id, "home").await
+}
+
+/// CLI: warm a view immediately (clears cooldown).
+pub async fn warm_view_now(cfg: &Config, owner_user_id: i64, view: &str) -> Result<WarmReport> {
+    let view = normalize_view(view);
     if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
-        let cooldown_key = format!("vaak:home:hydrate-warm:cd:{owner_user_id}");
+        let cooldown_key = format!("vaak:{view}:hydrate-warm:cd:{owner_user_id}");
         let _: Result<(), _> = redis::cmd("DEL")
             .arg(&cooldown_key)
             .query_async(&mut redis)
             .await;
     }
-    warm_owner(cfg, owner_user_id, &DEFAULT_LIMITS).await
+    warm_view(cfg, owner_user_id, view, &DEFAULT_LIMITS).await
+}
+
+/// CLI / account-switch: warm Home immediately (clears cooldown).
+pub async fn warm_owner_now(cfg: &Config, owner_user_id: i64) -> Result<WarmReport> {
+    warm_view_now(cfg, owner_user_id, "home").await
 }
 
 pub fn report_json(r: &WarmReport) -> Value {
@@ -1776,5 +2128,34 @@ mod tests {
         assert!(!bsky_is_sensitive(clean));
         let self_lab = r#"{"record":{"selfLabels":{"values":[{"val":"nudity"}]}}}"#;
         assert!(bsky_is_sensitive(self_lab));
+    }
+
+    #[test]
+    fn pick_view_logical_home_local_feed() {
+        let index = json!([
+            "v13_feed_u1_ana_aaa",
+            "v13_local_u1_ana_bbb",
+            "v13_home_u1_aon_ccc"
+        ]);
+        assert_eq!(
+            pick_view_logical(Some(&index), "home").as_deref(),
+            Some("v13_home_u1_aon_ccc")
+        );
+        assert_eq!(
+            pick_view_logical(Some(&index), "local").as_deref(),
+            Some("v13_local_u1_ana_bbb")
+        );
+        assert_eq!(
+            pick_view_logical(Some(&index), "feed").as_deref(),
+            Some("v13_feed_u1_ana_aaa")
+        );
+    }
+
+    #[test]
+    fn reblog_skip_helpers() {
+        assert!(reblog_is_bsky_native("bsky-repost-abc", "https://example.com/x"));
+        assert!(reblog_is_bsky_native("x", "https://bsky.app/profile/a/post/b"));
+        assert!(reblog_is_rss_local("rss-boost:1", ""));
+        assert!(!reblog_is_bsky_native("12345", "https://example.com/notes/1"));
     }
 }
