@@ -9112,10 +9112,19 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
                             if (is_array($doc['image'] ?? null) && is_string($doc['image']['url'] ?? null)) {
                                 $image = $doc['image']['url'];
                             }
+                            $summaryHtml = null;
+                            if (!empty($doc['summary']) && is_string($doc['summary'])) {
+                                $summaryHtml = trim($doc['summary']) ?: null;
+                            }
+                            $profileJson = (!empty($doc['attachment']) && is_array($doc['attachment']))
+                                ? $doc['attachment']
+                                : null;
                             ap_remote_actor_upsert($resolved, [
                                 'username' => $uname,
                                 'display_name' => $dname,
                                 'host' => is_string($host) ? $host : null,
+                                'summary' => $summaryHtml,
+                                'profile_json' => $profileJson,
                                 'icon_source_url' => $icon,
                                 'image_source_url' => $image,
                             ]);

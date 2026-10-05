@@ -1542,7 +1542,9 @@ CREATE TABLE IF NOT EXISTS remote_actors (
     host TEXT,
     icon_source_url TEXT,
     image_source_url TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    summary TEXT,
+    profile_json TEXT
 );
 
 -- Mastodon account id (crc32 of username@host when known, else actor URL) → canonical AP actor
@@ -13569,6 +13571,8 @@ function ap_remote_actor_flat_from_row(array $row): array
         'icon_source_url' => isset($row['icon_source_url']) ? (string) $row['icon_source_url'] : null,
         'image_source_url' => isset($row['image_source_url']) ? (string) $row['image_source_url'] : null,
         'updated_at' => isset($row['updated_at']) ? (string) $row['updated_at'] : null,
+        'summary' => isset($row['summary']) ? (string) $row['summary'] : null,
+        'profile_json' => isset($row['profile_json']) ? (string) $row['profile_json'] : null,
     ];
 }
 
@@ -13583,6 +13587,8 @@ function ap_remote_actor_row_from_flat(array $flat): array
         'icon_source_url' => $flat['icon_source_url'] ?? null,
         'image_source_url' => $flat['image_source_url'] ?? null,
         'updated_at' => $flat['updated_at'] ?? null,
+        'summary' => $flat['summary'] ?? null,
+        'profile_json' => $flat['profile_json'] ?? null,
     ];
 }
 
@@ -14022,18 +14028,43 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
     if (is_string($image)) {
         $image = ap_profile_sanitize_https_url($image);
     }
+    $incomingSummary = array_key_exists('summary', $fields) ? $fields['summary'] : null;
+    if (is_string($incomingSummary)) {
+        $incomingSummary = trim($incomingSummary);
+        if ($incomingSummary === '') {
+            $incomingSummary = null;
+        }
+    } else {
+        $incomingSummary = null;
+    }
+    $summary = $incomingSummary ?? (is_array($existing) ? ($existing['summary'] ?? null) : null);
+    $incomingProfileJson = array_key_exists('profile_json', $fields) ? $fields['profile_json'] : null;
+    if (is_array($incomingProfileJson)) {
+        $encoded = json_encode($incomingProfileJson, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        $incomingProfileJson = is_string($encoded) ? $encoded : null;
+    } elseif (is_string($incomingProfileJson)) {
+        $incomingProfileJson = trim($incomingProfileJson);
+        if ($incomingProfileJson === '') {
+            $incomingProfileJson = null;
+        }
+    } else {
+        $incomingProfileJson = null;
+    }
+    $profileJson = $incomingProfileJson ?? (is_array($existing) ? ($existing['profile_json'] ?? null) : null);
     $now = ap_db_now();
-    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+    $sql = 'INSERT INTO remote_actors (actor_id, username, display_name, host, icon_source_url, image_source_url, updated_at, summary, profile_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_id) DO UPDATE SET
            username = COALESCE(excluded.username, remote_actors.username),
            display_name = COALESCE(excluded.display_name, remote_actors.display_name),
            host = COALESCE(excluded.host, remote_actors.host),
            icon_source_url = COALESCE(excluded.icon_source_url, remote_actors.icon_source_url),
            image_source_url = COALESCE(excluded.image_source_url, remote_actors.image_source_url),
+           summary = COALESCE(excluded.summary, remote_actors.summary),
+           profile_json = COALESCE(excluded.profile_json, remote_actors.profile_json),
            updated_at = excluded.updated_at';
     // Best-effort cache write: never take down admin HTML mid-render on lock.
-    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, $now]) === false) {
+    if (ap_db_execute_retry($sql, [$actorId, $username, $display, $host, $icon, $image, $now, $summary, $profileJson]) === false) {
         error_log('[ap-db] remote_actor_upsert skipped (locked): ' . $actorId);
         return;
     }
@@ -14045,6 +14076,8 @@ function ap_remote_actor_upsert(string $actorId, array $fields): void
         'icon_source_url' => $icon,
         'image_source_url' => $image,
         'updated_at' => $now,
+        'summary' => $summary,
+        'profile_json' => $profileJson,
     ];
     if (!isset($GLOBALS['ap_remote_actor_memo']) || !is_array($GLOBALS['ap_remote_actor_memo'])) {
         $GLOBALS['ap_remote_actor_memo'] = [];
@@ -14125,12 +14158,25 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
                 }
                 $host = parse_url($actorId, PHP_URL_HOST);
                 $hostNorm = is_string($host) ? strtolower($host) : null;
+                $summaryHtml = null;
+                if (!empty($doc['summary']) && is_string($doc['summary'])) {
+                    $summaryHtml = trim($doc['summary']);
+                    if ($summaryHtml === '') {
+                        $summaryHtml = null;
+                    }
+                }
+                $profileJson = null;
+                if (!empty($doc['attachment']) && is_array($doc['attachment'])) {
+                    $profileJson = $doc['attachment'];
+                }
                 $fields = [
                     'username' => ($uname !== null && $uname !== '') ? $uname : null,
                     'display_name' => ($dname !== null && $dname !== '') ? $dname : null,
                     'host' => $hostNorm,
                     'icon_source_url' => $icon,
                     'image_source_url' => $image,
+                    'summary' => $summaryHtml,
+                    'profile_json' => $profileJson,
                 ];
                 ap_remote_actor_upsert($actorId, $fields);
                 // Mastodon dual IRI: seed /users/{preferredUsername} when we only
