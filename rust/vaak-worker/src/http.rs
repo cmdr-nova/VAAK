@@ -89,6 +89,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/timelines/home", get(shadow_home))
         // Mentions nested status HTML fragments (PHP writes `vaak:notif-embed:v1:*`).
         .route("/shadow/notif-embed", get(shadow_notif_embed))
+        // Mentions fill HTML from warm Redis list (0.7.1).
+        .route("/shadow/mentions-html", get(shadow_mentions_html))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
         .route("/api/v1/timelines/home", get(shadow_home_masto))
         // Home live-poll: ranked head + hydrate filtered by since_ts (0.6.74).
@@ -122,6 +124,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/thin-media",
             "/shadow/timelines/home",
             "/shadow/notif-embed",
+            "/shadow/mentions-html",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
             "/api/v1/notifications"
@@ -237,6 +240,74 @@ async fn shadow_notif_embed(
     }
     let _ = crate::notif_embed::set_embed_html(&mut redis, &key, &html).await;
     embed_html_response(html, "paint")
+}
+
+/// Mentions fill HTML (0.7.1). Cache miss → 404 so PHP keeps the old paint path.
+async fn shadow_mentions_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(12).clamp(1, 60);
+    let types = parse_types(q.types.as_deref());
+    match crate::mentions_html::mentions_html_fill(
+        &state.cfg,
+        owner,
+        limit,
+        &types,
+        q.max_id.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(report)) => {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            headers.insert(
+                axum::http::HeaderName::from_static("x-has-more"),
+                axum::http::HeaderValue::from_static(if report.has_more { "1" } else { "0" }),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.next_max_id) {
+                headers.insert(axum::http::HeaderName::from_static("x-next-max-id"), v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.tip_id) {
+                headers.insert(axum::http::HeaderName::from_static("x-notif-tip-id"), v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-notif-source"), v);
+            }
+            headers.insert(
+                axum::http::HeaderName::from_static("x-vaak-mentions-html"),
+                axum::http::HeaderValue::from_static("1"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-notif-count"), v);
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.redis_key) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-notif-key"), v);
+            }
+            (StatusCode::OK, headers, report.html).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "mentions html cache miss",
+                "source": "vaak-worker-shadow"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn redis_util_get_string(

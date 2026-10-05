@@ -19073,6 +19073,41 @@ if ($isPartial && $view === 'mentions') {
     $notifPartialT0 = microtime(true);
     // Mentions partials must not sync-repair Bluesky galleries (same as timeline).
     $GLOBALS['admin_bsky_gallery_repair_budget'] = 0;
+
+    // 0.7.1: prefer Axum Mentions fill HTML (warm Redis list + lean Rust paint).
+    // Skips followers prefetch, PHP stream render, and per-card embed HTTP.
+    if (!$notifShell && function_exists('admin_mentions_html_axum_fetch')) {
+        $axumFill = admin_mentions_html_axum_fetch($notifLimit, $notifMaxId, $notifTypes);
+        if (is_array($axumFill) && isset($axumFill['html'])) {
+            $axumMs = (int) ($axumFill['ms'] ?? 0);
+            header('Content-Type: text/html; charset=utf-8');
+            header('Cache-Control: no-store');
+            header('X-Has-More: ' . (!empty($axumFill['has_more']) ? '1' : '0'));
+            header('X-Next-Max-Id: ' . (string) ($axumFill['next_max_id'] ?? ''));
+            header('X-VAAK-View: mentions');
+            header('X-VAAK-Notif-Source: ' . preg_replace(
+                '/[^a-z0-9._:-]+/i',
+                '',
+                (string) ($axumFill['source'] ?? 'axum-mentions-html')
+            ));
+            header('X-VAAK-Mentions-Html: 1');
+            header('X-TL-Notif-Fetch-Ms: 0');
+            header('X-TL-Notif-Prefetch-Ms: 0');
+            header('X-TL-Notif-Render-Ms: ' . (string) $axumMs);
+            header('X-TL-Notif-Total-Ms: ' . (string) (int) round((microtime(true) - $notifPartialT0) * 1000));
+            $tip = preg_replace('/\D+/', '', (string) ($axumFill['tip_id'] ?? '')) ?: '';
+            if ($tip !== '' && $notifMaxId === null && function_exists('ap_masto_notifications_mark_read')) {
+                try {
+                    ap_masto_notifications_mark_read($tip);
+                } catch (Throwable $e) {
+                    // non-fatal
+                }
+            }
+            echo (string) $axumFill['html'];
+            exit;
+        }
+    }
+
     // Partials skip followers by default — restore for Follow/relationship badges
     // on the fill path only (shell HTML does not render relationship pills).
     if (!$notifShell && $followerIds === []) {
@@ -20167,6 +20202,105 @@ function admin_notif_status_strip_reply_bake(array $status, array $knownMentions
  * @param bool $hideHeader When true (mention/quote nest), skip the nested
  *                         author row — the notif chrome already shows them.
  */
+/**
+ * Fetch Mentions fill HTML from Axum `/shadow/mentions-html` (0.7.1).
+ * Returns ['html'=>…, 'has_more'=>bool, 'next_max_id'=>…, 'tip_id'=>…, 'source'=>…, 'ms'=>int]
+ * or null on miss/error. Flag: VAAK_MENTIONS_HTML_AXUM (default on).
+ *
+ * @param list<string> $types
+ * @return array{html:string,has_more:bool,next_max_id:string,tip_id:string,source:string,ms:int}|null
+ */
+function admin_mentions_html_axum_fetch(int $limit, ?string $maxId, array $types = []): ?array
+{
+    $enabled = getenv('VAAK_MENTIONS_HTML_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return null;
+    }
+    $ownerUserId = 0;
+    if (function_exists('ap_db_masto_owner_user_id')) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id')) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $qs = [
+        'owner_id' => $ownerUserId,
+        'limit' => max(1, min(60, $limit)),
+    ];
+    if ($maxId !== null && $maxId !== '') {
+        $qs['max_id'] = $maxId;
+    }
+    if ($types !== []) {
+        $qs['types'] = implode(',', array_values(array_filter(array_map(
+            static fn($t) => strtolower(trim((string) $t)),
+            $types
+        ), static fn($t) => $t !== '')));
+    }
+    $url = $base . '/shadow/mentions-html?' . http_build_query($qs);
+    $body = null;
+    $code = 0;
+    $hdrs = [];
+    $started = microtime(true);
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 1500,
+        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('notif.mentions_html.axum_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($raw)) {
+        return null;
+    }
+    $rawHeaders = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    if (!is_string($body)) {
+        return null;
+    }
+    foreach (explode("\r\n", (string) $rawHeaders) as $hline) {
+        if (str_contains($hline, ':')) {
+            [$hk, $hv] = array_map('trim', explode(':', $hline, 2));
+            $hdrs[strtolower($hk)] = $hv;
+        }
+    }
+    return [
+        'html' => $body,
+        'has_more' => (($hdrs['x-has-more'] ?? '') === '1'),
+        'next_max_id' => preg_replace('/\D+/', '', (string) ($hdrs['x-next-max-id'] ?? '')) ?: '',
+        'tip_id' => preg_replace('/\D+/', '', (string) ($hdrs['x-notif-tip-id'] ?? '')) ?: '',
+        'source' => (string) ($hdrs['x-vaak-notif-source'] ?? 'axum-mentions-html'),
+        'ms' => $ms,
+    ];
+}
+
 /**
  * Fetch Mentions nested-card HTML from Axum `/shadow/notif-embed` (0.6.90).
  * Key parity with Redis `vaak:notif-embed:v1:*`. Returns HTML on 200, null on miss/error.
