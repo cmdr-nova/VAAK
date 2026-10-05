@@ -183,6 +183,141 @@ pub async fn home_hydrate(
     .await
 }
 
+/// Live-poll "newer than since_ts" from ranked head + hydrate envelope.
+///
+/// Ranked items carry no per-row timestamp; filter hydrate statuses by
+/// `created_at` (unix). Requires both ranked Home key and a hydrate hit —
+/// miss means PHP should fall back to `admin_tl_fetch_newer`.
+#[derive(Debug, Serialize)]
+pub struct HomeSinceReport {
+    pub owner_user_id: i64,
+    pub since_ts: i64,
+    pub limit: usize,
+    pub cache_hit: bool,
+    pub ranked_ok: bool,
+    pub hydrate_ok: bool,
+    pub n: usize,
+    pub newest_ts: i64,
+    pub items: Vec<Value>,
+    pub ranked_key: Option<String>,
+    pub hydrate_key: Option<String>,
+    pub source: &'static str,
+    pub note: &'static str,
+}
+
+fn status_created_ts(st: &Value) -> i64 {
+    let raw = st
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        return 0;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return dt.timestamp();
+    }
+    // PHP sometimes emits "YYYY-MM-DDTHH:MM:SS.sssZ" — chrono handles that via RFC3339.
+    // Fallback: try without fractional seconds.
+    let trimmed = raw.trim_end_matches('Z');
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return dt.and_utc().timestamp();
+    }
+    0
+}
+
+pub async fn home_since(
+    cfg: &Config,
+    owner_user_id: i64,
+    since_ts: i64,
+    limit: usize,
+) -> Result<HomeSinceReport> {
+    let limit = limit.clamp(1, 40);
+    let since_ts = since_ts.max(0);
+    let mut report = HomeSinceReport {
+        owner_user_id,
+        since_ts,
+        limit,
+        cache_hit: false,
+        ranked_ok: false,
+        hydrate_ok: false,
+        n: 0,
+        newest_ts: since_ts,
+        items: Vec::new(),
+        ranked_key: None,
+        hydrate_key: None,
+        source: "vaak-worker-home-since",
+        note: "ranked+hydrate since filter",
+    };
+    if since_ts <= 0 {
+        report.note = "since_ts required";
+        return Ok(report);
+    }
+
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    let index_key = format!("vaak:timeline:owner-index:v1:{owner_user_id}");
+    let index = redis_util::json_get(&mut redis, &index_key).await?;
+    let Some(logical) = pick_home_logical_key(index.as_ref()) else {
+        report.note = "owner ranked index miss (no home logical)";
+        return Ok(report);
+    };
+    let rk = ranked_redis_key(&logical);
+    report.ranked_key = Some(rk.clone());
+    let ranked_env = redis_util::json_get(&mut redis, &rk).await?;
+    let Some(ranked_env) = ranked_env else {
+        report.note = "ranked home envelope miss";
+        return Ok(report);
+    };
+    let ranked_n = ranked_env
+        .get("ranked")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    if ranked_n == 0 {
+        report.note = "ranked home empty";
+        return Ok(report);
+    }
+    report.ranked_ok = true;
+
+    // Prefer the larger hydrate head (Ice Cubes / warm job writes 15 and 40).
+    let mut hydrate = read_home_hydrate(&mut redis, owner_user_id, 40, None).await?;
+    if !hydrate.cache_hit {
+        hydrate = read_home_hydrate(&mut redis, owner_user_id, 15, None).await?;
+    }
+    report.hydrate_key = Some(hydrate.redis_key.clone());
+    if !hydrate.cache_hit {
+        report.note = "hydrate miss (ranked ok; PHP may PG-fallback)";
+        return Ok(report);
+    }
+    report.hydrate_ok = true;
+    report.cache_hit = true;
+
+    let mut newer: Vec<(i64, Value)> = Vec::new();
+    for st in hydrate.items {
+        let ts = status_created_ts(&st);
+        if ts <= since_ts {
+            continue;
+        }
+        newer.push((ts, st));
+    }
+    newer.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some((ts, _)) = newer.first() {
+        report.newest_ts = *ts;
+    }
+    report.items = newer
+        .into_iter()
+        .take(limit)
+        .map(|(_, st)| st)
+        .collect();
+    report.n = report.items.len();
+    if report.n == 0 {
+        report.note = "ranked+hydrate hit; nothing newer than since_ts";
+    } else {
+        report.note = "ranked+hydrate since hit";
+    }
+    Ok(report)
+}
+
 pub async fn home_shadow(cfg: &Config, owner_user_id: i64, limit: usize) -> Result<HomeShadowReport> {
     let limit = limit.clamp(1, 40);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
@@ -387,6 +522,12 @@ mod tests {
             key,
             "vaak:timeline:v1:1a447a10f787cb14d3ccad2ce2235aabc8f4eceaad3514e89621a9498ce82ae3"
         );
+    }
+
+    #[test]
+    fn status_created_ts_parses_rfc3339_z() {
+        let st = serde_json::json!({"created_at": "2026-10-05T01:57:08.000Z"});
+        assert_eq!(status_created_ts(&st), 1791165428);
     }
 }
 

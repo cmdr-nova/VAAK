@@ -18358,22 +18358,73 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                 }
             }
             $streamFirstPass = false;
-            $slice = admin_tl_fetch_newer($view, $following, $streamSince, max(8, min(30, $tlLimit)));
+            $streamLimit = max(8, min(30, $tlLimit));
             $newest = $streamSince;
             $html = '';
-            if ($slice !== []) {
-                ob_start();
-                foreach ($slice as $item) {
-                    $newest = max($newest, (int) ($item['sort'] ?? 0));
-                    if (admin_timeline_item_muted_by_words($item)) continue;
-                    admin_render_timeline_item($item, $followingIds, $view);
+            $streamCount = 0;
+            $streamAxumHit = false;
+            // Home SSE: same Axum ranked-since short-circuit as newer=1 (0.6.74).
+            if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_since_fetch')) {
+                $axumSince = ap_masto_timeline_home_axum_since_fetch(
+                    $streamSince,
+                    $streamLimit,
+                    (int) admin_owner_user_id()
+                );
+                if (is_array($axumSince) && array_key_exists('statuses', $axumSince)) {
+                    $streamAxumHit = true;
+                    $axumStatuses = is_array($axumSince['statuses'] ?? null) ? $axumSince['statuses'] : [];
+                    $newest = max($streamSince, (int) ($axumSince['newest'] ?? $streamSince));
+                    if ($axumStatuses !== [] && function_exists('admin_render_masto_status_card')) {
+                        $flagIds = [];
+                        foreach ($axumStatuses as $st) {
+                            if (!is_array($st)) {
+                                continue;
+                            }
+                            $sid = (string) ($st['id'] ?? '');
+                            if ($sid !== '') {
+                                $flagIds[] = $sid;
+                            }
+                        }
+                        if (function_exists('ap_masto_status_flags_prefetch') && $flagIds !== []) {
+                            ap_masto_status_flags_prefetch($flagIds);
+                        }
+                        ob_start();
+                        foreach ($axumStatuses as $st) {
+                            if (!is_array($st)) {
+                                continue;
+                            }
+                            if (function_exists('ap_row_matches_muted_words')) {
+                                $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
+                                if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) admin_owner_user_id())) {
+                                    continue;
+                                }
+                            }
+                            admin_render_masto_status_card($st, $followingIds, $view, false, true);
+                            $streamCount++;
+                        }
+                        $html = (string) ob_get_clean();
+                    }
                 }
-                $html = (string) ob_get_clean();
+            }
+            if (!$streamAxumHit) {
+                $slice = admin_tl_fetch_newer($view, $following, $streamSince, $streamLimit);
+                if ($slice !== []) {
+                    ob_start();
+                    foreach ($slice as $item) {
+                        $newest = max($newest, (int) ($item['sort'] ?? 0));
+                        if (admin_timeline_item_muted_by_words($item)) {
+                            continue;
+                        }
+                        admin_render_timeline_item($item, $followingIds, $view);
+                        $streamCount++;
+                    }
+                    $html = (string) ob_get_clean();
+                }
             }
             if ($newest > $streamSince || $html !== '') {
                 $payload = json_encode([
                     'html' => $html,
-                    'count' => count($slice),
+                    'count' => $streamCount,
                     'newest' => $newest,
                 ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
                 echo "event: posts\n";
@@ -18395,10 +18446,82 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         if ($sinceTs <= 0) {
             header('X-New-Count: 0');
             header('X-Newest: 0');
+            header('X-TL-Newer-Source: empty');
             exit;
         }
         $newerT0 = microtime(true);
-        $slice = admin_tl_fetch_newer($view, $following, $sinceTs, max(8, min(30, $tlLimit)));
+        $newerLimit = max(8, min(30, $tlLimit));
+        // Home: prefer Axum ranked+hydrate since (0.6.74). Confirmed empty must
+        // short-circuit — do not fall through to multi-chunk PG fetch.
+        if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_since_fetch')) {
+            $axumSince = ap_masto_timeline_home_axum_since_fetch(
+                $sinceTs,
+                $newerLimit,
+                (int) admin_owner_user_id()
+            );
+            if (is_array($axumSince) && array_key_exists('statuses', $axumSince)) {
+                $newerFetchMs = (int) round((microtime(true) - $newerT0) * 1000);
+                /** @var list<array<string,mixed>> $axumStatuses */
+                $axumStatuses = is_array($axumSince['statuses'] ?? null) ? $axumSince['statuses'] : [];
+                $newest = max($sinceTs, (int) ($axumSince['newest'] ?? $sinceTs));
+                if ($axumStatuses === []) {
+                    header('X-New-Count: 0');
+                    header('X-Newest: ' . $newest);
+                    header('X-TL-Newer-Source: axum-ranked');
+                    header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
+                    header('X-TL-Newer-Render-Ms: 0');
+                    header('X-TL-Newer-Total-Ms: ' . (string) $newerFetchMs);
+                    exit;
+                }
+                $flagIds = [];
+                foreach ($axumStatuses as $st) {
+                    if (!is_array($st)) {
+                        continue;
+                    }
+                    $sid = (string) ($st['id'] ?? '');
+                    if ($sid !== '') {
+                        $flagIds[] = $sid;
+                    }
+                    if (isset($st['reblog']) && is_array($st['reblog'])) {
+                        $rid = (string) ($st['reblog']['id'] ?? '');
+                        if ($rid !== '') {
+                            $flagIds[] = $rid;
+                        }
+                    }
+                }
+                if (function_exists('ap_masto_status_flags_prefetch') && $flagIds !== []) {
+                    ap_masto_status_flags_prefetch($flagIds);
+                }
+                $newerRenderT0 = microtime(true);
+                ob_start();
+                $rendered = 0;
+                foreach ($axumStatuses as $st) {
+                    if (!is_array($st)) {
+                        continue;
+                    }
+                    if (function_exists('ap_row_matches_muted_words')) {
+                        $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
+                        if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) admin_owner_user_id())) {
+                            continue;
+                        }
+                    }
+                    if (function_exists('admin_render_masto_status_card')) {
+                        admin_render_masto_status_card($st, $followingIds, $view, false, true);
+                        $rendered++;
+                    }
+                }
+                $newerHtml = (string) ob_get_clean();
+                header('X-New-Count: ' . $rendered);
+                header('X-Newest: ' . $newest);
+                header('X-TL-Newer-Source: axum-ranked');
+                header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
+                header('X-TL-Newer-Render-Ms: ' . (string) (int) round((microtime(true) - $newerRenderT0) * 1000));
+                header('X-TL-Newer-Total-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
+                echo $newerHtml;
+                exit;
+            }
+        }
+        $slice = admin_tl_fetch_newer($view, $following, $sinceTs, $newerLimit);
         $newerFetchMs = (int) round((microtime(true) - $newerT0) * 1000);
         $newest = $sinceTs;
         foreach ($slice as $it) {
@@ -18418,6 +18541,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         $newerHtml = (string) ob_get_clean();
         header('X-New-Count: ' . count($slice));
         header('X-Newest: ' . $newest);
+        header('X-TL-Newer-Source: php-pg');
         header('X-TL-Newer-Fetch-Ms: ' . (string) $newerFetchMs);
         header('X-TL-Newer-Render-Ms: ' . (string) (int) round((microtime(true) - $newerRenderT0) * 1000));
         header('X-TL-Newer-Total-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
