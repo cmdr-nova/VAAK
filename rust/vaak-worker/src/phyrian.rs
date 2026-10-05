@@ -282,6 +282,22 @@ pub async fn resolve_local_request(
         .ok_or_else(|| anyhow::anyhow!("Request not found"))?;
     let kind: String = row.get(0);
     let from_owner: i64 = row.get(1);
+    if kind == "resonance" {
+        let linked_row = db
+            .query_one(
+                "SELECT EXISTS(
+                   SELECT 1 FROM phyrian_bridge_links
+                   WHERE owner_user_id IN ($1,$2)
+                     AND status='verified' AND unlinked_at IS NULL
+                 )",
+                &[&(from_owner as i32), &owner_i32],
+            )
+            .await?;
+        let is_linked: bool = linked_row.get(0);
+        if is_linked {
+            anyhow::bail!("Linked OpenSim bodies must exchange resonance in OpenSim");
+        }
+    }
     let tx = db.transaction().await?;
     if !accept {
         tx.execute(

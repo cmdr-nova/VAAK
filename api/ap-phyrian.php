@@ -712,6 +712,11 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
     }
     $kind = (string) ($req['kind'] ?? '');
     $fromId = (int) ($req['from_owner_id'] ?? 0);
+    if ($accept && $kind === 'resonance'
+        && function_exists('ap_phyrian_bridge_is_linked')
+        && (ap_phyrian_bridge_is_linked($ownerUserId) || ap_phyrian_bridge_is_linked($fromId))) {
+        return ['ok' => false, 'error' => 'Linked OpenSim bodies must exchange resonance in OpenSim'];
+    }
     if (!$accept) {
         $db->prepare(
             "UPDATE phyrian_requests SET status = 'denied', resolved_at = NOW() WHERE id = ?"
