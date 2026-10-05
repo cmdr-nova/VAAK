@@ -10,6 +10,7 @@ mod jetstream;
 mod account_switch;
 mod home_html;
 mod home_hydrate_ranked;
+mod interaction_flags;
 mod mentions_html;
 mod notif;
 mod notif_embed;

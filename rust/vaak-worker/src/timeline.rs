@@ -174,13 +174,23 @@ pub async fn home_hydrate(
     since_id: Option<&str>,
 ) -> Result<HomeHydrateReport> {
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    read_home_hydrate(
+    let mut report = read_home_hydrate(
         &mut redis,
         owner_user_id,
         limit as i64,
         since_id,
     )
-    .await
+    .await?;
+    // Overlay live viewer flags — warm envelopes hard-code false (0.7.19).
+    if report.cache_hit && !report.items.is_empty() {
+        let _ = crate::interaction_flags::apply_to_statuses_with_cfg(
+            &cfg.database_url,
+            owner_user_id,
+            &mut report.items,
+        )
+        .await;
+    }
+    Ok(report)
 }
 
 /// Live-poll "newer than since_ts" from ranked head + hydrate envelope.
@@ -314,6 +324,12 @@ pub async fn home_since(
         report.note = "ranked+hydrate hit; nothing newer than since_ts";
     } else {
         report.note = "ranked+hydrate since hit";
+        let _ = crate::interaction_flags::apply_to_statuses_with_cfg(
+            &cfg.database_url,
+            owner_user_id,
+            &mut report.items,
+        )
+        .await;
     }
     Ok(report)
 }
