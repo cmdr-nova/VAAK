@@ -19243,6 +19243,7 @@ if ($isPartial && $view === 'mentions') {
     if ($embedStats !== []) {
         header(
             'X-TL-Notif-Embed-Cache: memo=' . (int) ($embedStats['hit_memo'] ?? 0)
+            . ';axum=' . (int) ($embedStats['hit_axum'] ?? 0)
             . ';redis=' . (int) ($embedStats['hit_redis'] ?? 0)
             . ';miss=' . (int) ($embedStats['miss'] ?? 0)
         );
@@ -20166,6 +20167,101 @@ function admin_notif_status_strip_reply_bake(array $status, array $knownMentions
  * @param bool $hideHeader When true (mention/quote nest), skip the nested
  *                         author row — the notif chrome already shows them.
  */
+/**
+ * Fetch Mentions nested-card HTML from Axum `/shadow/notif-embed` (0.6.90).
+ * Key parity with Redis `vaak:notif-embed:v1:*`. Returns HTML on 200, null on miss/error.
+ *
+ * Flag: VAAK_NOTIF_EMBED_AXUM (default on). Rollback: set 0.
+ */
+function admin_notif_embed_axum_fetch(
+    int $ownerUserId,
+    string $uri,
+    bool $hideHeader,
+    string $flagBits,
+    string $statusId
+): ?string {
+    $enabled = getenv('VAAK_NOTIF_EMBED_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled || $uri === '') {
+        return null;
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $qs = [
+        'owner_id' => max(0, $ownerUserId),
+        'uri' => $uri,
+        'hide_header' => $hideHeader ? '1' : '0',
+        'favourited' => ($flagBits[0] ?? '0') === '1' ? '1' : '0',
+        'reblogged' => ($flagBits[1] ?? '0') === '1' ? '1' : '0',
+        'bookmarked' => ($flagBits[2] ?? '0') === '1' ? '1' : '0',
+    ];
+    if ($statusId !== '') {
+        $qs['status_id'] = $statusId;
+    }
+    $url = $base . '/shadow/notif-embed?' . http_build_query($qs);
+    $body = null;
+    $code = 0;
+    $started = microtime(true);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return null;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => 80,
+            CURLOPT_TIMEOUT_MS => 200,
+            CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+        ]);
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 0.2,
+                'header' => "Accept: text/html\r\nConnection: close\r\n",
+                'ignore_errors' => true,
+            ],
+        ]);
+        $raw = @file_get_contents($url, false, $ctx);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $hline) {
+                if (preg_match('#^HTTP/\S+\s+(\d+)#', (string) $hline, $m)) {
+                    $code = (int) $m[1];
+                }
+            }
+        }
+    }
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('notif.embed.axum_fetch', (float) $ms);
+    }
+    if ($code === 404) {
+        // Same Redis key as Axum — miss means empty; skip direct Redis.
+        return '';
+    }
+    if ($code !== 200 || !is_string($body) || $body === '') {
+        return null; // connection/error → caller may try Redis
+    }
+    return $body;
+}
+
 function admin_notif_try_embed_status_card(?array $status, array $followingIds, bool $hideHeader = false): bool
 {
     if (!is_array($status) || $status === []) {
@@ -20183,15 +20279,16 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     $flagBits = (!empty($status['favourited']) ? '1' : '0')
         . (!empty($status['reblogged']) ? '1' : '0')
         . (!empty($status['bookmarked']) ? '1' : '0');
+    $statusId = (string) ($status['id'] ?? '');
     $fragLogical = $ownerUserId . '|' . $uri . '|h' . ($hideHeader ? '1' : '0') . '|f' . $flagBits
-        . '|id' . (string) ($status['id'] ?? '');
+        . '|id' . $statusId;
     $fragKey = 'vaak:notif-embed:v1:' . hash('sha256', $fragLogical);
 
     static $fragMemo = [];
     $track = static function (string $src) use ($fragKey): void {
         $g = &$GLOBALS['admin_notif_embed_cache_stats'];
         if (!is_array($g)) {
-            $g = ['hit_memo' => 0, 'hit_redis' => 0, 'miss' => 0];
+            $g = ['hit_memo' => 0, 'hit_axum' => 0, 'hit_redis' => 0, 'miss' => 0];
         }
         $g[$src] = (int) ($g[$src] ?? 0) + 1;
     };
@@ -20207,7 +20304,17 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
         return false;
     }
 
-    if (function_exists('ap_redis_client')) {
+    // Prefer Axum fragment serve (0.6.90). '' = confirmed miss; null = try Redis.
+    $axumHtml = admin_notif_embed_axum_fetch($ownerUserId, $uri, $hideHeader, $flagBits, $statusId);
+    if (is_string($axumHtml) && $axumHtml !== '') {
+        $fragMemo[$fragKey] = $axumHtml;
+        $track('hit_axum');
+        echo $axumHtml;
+        return true;
+    }
+    $axumConfirmedMiss = is_string($axumHtml) && $axumHtml === '';
+
+    if (!$axumConfirmedMiss && function_exists('ap_redis_client')) {
         try {
             $redis = ap_redis_client('cache');
             if ($redis) {
