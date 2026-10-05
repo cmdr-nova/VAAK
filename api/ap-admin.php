@@ -1961,10 +1961,29 @@ $vaakAdminOnlyActions = [
             define('AP_INBOX_LIB_ONLY', true);
         }
         require_once __DIR__ . '/ap-inbox.php';
-        if ($localId < 1 && $noteIdPost !== '' && str_starts_with($noteIdPost, 'https://')
-            && function_exists('ap_masto_status_by_note_id')) {
-            $nrow = ap_masto_status_by_note_id($noteIdPost);
-            $localId = is_array($nrow) ? (int) ($nrow['local_id'] ?? 0) : 0;
+        // Lean Home/Local paint used to POST Mastodon snowflakes as local_id.
+        // Prefer note_id → real masto_statuses.local_id whenever the posted PK
+        // is missing or does not resolve (snowflake / stale form).
+        if ($noteIdPost !== '' && str_starts_with($noteIdPost, 'https://')) {
+            $fromNote = 0;
+            try {
+                $st = ap_db()->prepare(
+                    'SELECT local_id FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1'
+                );
+                $st->execute([$noteIdPost, $noteIdPost . '/']);
+                $fromNote = (int) ($st->fetchColumn() ?: 0);
+            } catch (Throwable $e) {
+                $fromNote = 0;
+            }
+            if ($fromNote > 0) {
+                $rowOk = null;
+                if ($localId > 0 && function_exists('ap_masto_status_by_local_id')) {
+                    $rowOk = ap_masto_status_by_local_id($localId);
+                }
+                if ($localId < 1 || !is_array($rowOk)) {
+                    $localId = $fromNote;
+                }
+            }
         }
         $result = function_exists('ap_delete_local_status') ? ap_delete_local_status($localId) : ['ok' => false, 'error' => 'Delete unavailable'];
         if (!empty($result['ok'])) {

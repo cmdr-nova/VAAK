@@ -1117,6 +1117,39 @@ fn is_own_note(uri: &str, viewer_actor: &str) -> bool {
     uri.starts_with(&prefix)
 }
 
+/// Resolve `masto_statuses.local_id` for Delete forms.
+/// Profile Axum paints the real DB PK as status `id`; Home/Local hydrate paints
+/// Mastodon snowflakes. Never send a snowflake as `local_id` — PHP
+/// `ap_delete_local_status` would miss and skip the `note_id` fallback when
+/// the posted value is &gt; 0. Digit ids below the snowflake floor (&lt; 2e6,
+/// matching PHP `ap_masto_*`) are treated as real PKs; otherwise `0` so PHP
+/// resolves via `note_id`.
+fn own_post_local_id(status: &Value, sid: &str) -> String {
+    if let Some(n) = status
+        .get("vaak_local_id")
+        .and_then(|v| v.as_i64())
+        .filter(|&n| n > 0)
+    {
+        return n.to_string();
+    }
+    if let Some(n) = status
+        .get("vaak_local_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.to_string();
+    }
+    if !sid.is_empty() && sid.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(n) = sid.parse::<u64>() {
+            if n > 0 && n < 2_000_000 {
+                return sid.to_string();
+            }
+        }
+    }
+    "0".to_string()
+}
+
 /// Own-post Delete + overflow (Open/Edit/Pin/Note) — PHP `admin_own_post_action_bar` tail.
 fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -> String {
     let spoiler = status
@@ -1128,12 +1161,9 @@ fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -
     let pinned = json_flag(status, "pinned");
     let content_html = status.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let plain = strip_tags(content_html).trim().to_string();
-    let local_id = if !sid.is_empty() && sid.chars().all(|c| c.is_ascii_digit()) {
-        sid
-    } else {
-        "0"
-    };
-    let action_base = format!("?view={}", urlencoding_encode(from_q));
+    let local_id = own_post_local_id(status, sid);
+    // Absolute /vaak/ — relative ?view= from some soft-nav paths can miss the admin POST.
+    let action_base = format!("/vaak/?view={}", urlencoding_encode(from_q));
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -1147,7 +1177,7 @@ fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -
          <i class=\"ph ph-trash\" aria-hidden=\"true\"></i></button></form>",
         base = esc(&action_base),
         rv = esc(from_q),
-        lid = esc(local_id),
+        lid = esc(&local_id),
         nid = esc(uri),
     ));
 
@@ -2510,11 +2540,55 @@ mod tests {
             "https://mkultra.monster/users/cmdr_nova",
         );
         assert!(html.contains("delete_status"), "own note Delete: {html}");
+        assert!(
+            html.contains("name=\"local_id\" value=\"4242\""),
+            "profile-style small id is real local_id: {html}"
+        );
         assert!(html.contains("js-edit-post") && html.contains("edit_note="), "Edit: {html}");
         assert!(html.contains("pin_status") || html.contains("Pin to profile"), "Pin: {html}");
         assert!(html.contains("post-action-menu"), "overflow: {html}");
         assert!(!html.contains("bite_remote"), "own must not Bite: {html}");
         assert!(html.contains("data-own-eng") || html.contains("ph-heart"), "{html}");
+        assert!(
+            html.contains("action=\"/vaak/?view=home\""),
+            "absolute /vaak/ delete action: {html}"
+        );
+    }
+
+    #[test]
+    fn timeline_snowflake_id_does_not_become_local_id() {
+        let st = json!({
+            "id": "1791191756040454296",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/abc",
+            "url": "https://mkultra.monster/users/cmdr_nova/notes/abc",
+            "content": "<p></p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {
+                "acct": "cmdr_nova",
+                "display_name": "Nova",
+                "avatar": "https://mkultra.monster/img/avatar/local-default.webp",
+                "uri": "https://mkultra.monster/users/cmdr_nova"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "local",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(html.contains("delete_status"), "own note Delete: {html}");
+        assert!(
+            html.contains("name=\"local_id\" value=\"0\""),
+            "snowflake must not be posted as local_id: {html}"
+        );
+        assert!(
+            !html.contains("name=\"local_id\" value=\"1791191756040454296\""),
+            "must not send snowflake: {html}"
+        );
+        assert!(
+            html.contains("name=\"note_id\" value=\"https://mkultra.monster/users/cmdr_nova/notes/abc\""),
+            "note_id present for PHP resolve: {html}"
+        );
     }
 
     #[test]
