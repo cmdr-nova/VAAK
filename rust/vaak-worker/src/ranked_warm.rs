@@ -5,11 +5,11 @@
 //!   recommendations, favourite/toxicity nudges when algorithm on, Bluesky
 //!   merge, RSS spacing). Source `vaak-worker-native`. Flag
 //!   `VAAK_RANKED_NATIVE_HOME=1` (default on; `0` skips Home warm).
-//! - After a non-empty Home ranked write, fire-and-forget
-//!   `bin/home-timeline-warm.php --limits=15,40,80` so Axum HTML assist can hit
-//!   `vaak:timeline:v1:*` across hard-refresh (0.6.67) and scroll pages (0.7.9).
-//!   Cooldown ~60s;
-//!   disable with `VAAK_HOME_HYDRATE_WARM=0`.
+//! - After a non-empty Home ranked write, fire-and-forget Rust ranked→hydrate
+//!   (`home_hydrate_ranked`) so Axum HTML assist hits `vaak:timeline:v1:*` with
+//!   the same RSS/Bluesky/fedi mix as ranked (0.7.15; was PHP chronological
+//!   `home-timeline-warm.php` through 0.7.14). Cooldown ~60s; disable with
+//!   `VAAK_HOME_HYDRATE_WARM=0`.
 //! - **Local / Federated:** outbox+local boosts / firehose events with v13 key
 //!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
 //! - Empty timelines soft-skip (no Redis write). PHP `bin/ranked-warm.php` is
@@ -18,18 +18,16 @@
 //! Cache key parity with PHP `admin_tl_cache_key` (v13).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 use tokio_postgres::Client;
 
 use crate::config::Config;
 use crate::hidden;
+use crate::home_hydrate_ranked;
 use crate::notif;
 use crate::redis_util;
 
@@ -55,112 +53,13 @@ fn native_local_feed_enabled() -> bool {
     env_flag_default_true("VAAK_RANKED_NATIVE_LOCAL_FEED")
 }
 
-fn home_hydrate_warm_enabled() -> bool {
-    env_flag_default_true("VAAK_HOME_HYDRATE_WARM")
-}
-
-fn home_hydrate_warm_cooldown_secs() -> i64 {
-    std::env::var("VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60)
-        .clamp(30, 600)
-}
-
-fn home_hydrate_warm_paths() -> (PathBuf, PathBuf) {
-    let php_bin = PathBuf::from(
-        std::env::var("VAAK_PHP_BIN").unwrap_or_else(|_| "/usr/bin/php".to_string()),
-    );
-    let api_root = PathBuf::from(
-        std::env::var("VAAK_API_ROOT").unwrap_or_else(|_| "/srv/mkultra/html/api".to_string()),
-    );
-    (php_bin, api_root.join("bin/home-timeline-warm.php"))
-}
-
-/// After ranked Home write: spawn PHP hydrate for limits 15+40 (Axum first paint).
-/// Fire-and-forget so the ranked loop is not blocked; Redis cooldown prevents stampede.
+/// After ranked Home write: materialize hydrate from ranked (RSS/Bluesky/fedi).
 async fn maybe_spawn_home_hydrate_warm(
     redis: &mut redis::aio::MultiplexedConnection,
+    cfg: &Config,
     owner_user_id: i64,
 ) -> String {
-    if !home_hydrate_warm_enabled() {
-        return "hydrate=skip_flag".to_string();
-    }
-    let cooldown = home_hydrate_warm_cooldown_secs();
-    let cooldown_key = format!("vaak:home:hydrate-warm:cd:{owner_user_id}");
-    let cooling: Option<String> = redis::cmd("GET")
-        .arg(&cooldown_key)
-        .query_async(redis)
-        .await
-        .unwrap_or(None);
-    if cooling.is_some() {
-        return format!("hydrate=skip_cooldown cooldown={cooldown}");
-    }
-
-    let (php_bin, script) = home_hydrate_warm_paths();
-    if !script.is_file() {
-        tracing::warn!(
-            owner = owner_user_id,
-            path = %script.display(),
-            "home-timeline-warm.php missing; skip hydrate spawn"
-        );
-        return "hydrate=skip_missing_script".to_string();
-    }
-
-    let _: Result<(), _> = redis::cmd("SET")
-        .arg(&cooldown_key)
-        .arg("1")
-        .arg("EX")
-        .arg(cooldown)
-        .query_async(redis)
-        .await;
-
-    let mut cmd = Command::new(&php_bin);
-    cmd.arg(&script)
-        .arg(format!("--owner-id={owner_user_id}"))
-        .arg("--limits=15,40,80")
-        .env("AP_DB_DSN", "pgsql:dbname=novalandia")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(false);
-    if let Ok(dsn) = std::env::var("AP_DB_DSN") {
-        cmd.env("AP_DB_DSN", dsn);
-    }
-
-    tokio::spawn(async move {
-        let t0 = Instant::now();
-        match cmd.output().await {
-            Ok(output) => {
-                let ms = t0.elapsed().as_millis();
-                if output.status.success() {
-                    tracing::info!(
-                        owner = owner_user_id,
-                        ms,
-                        "home hydrate warm ok"
-                    );
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!(
-                        owner = owner_user_id,
-                        ms,
-                        status = ?output.status.code(),
-                        %stderr,
-                        "home hydrate warm failed"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    owner = owner_user_id,
-                    error = %e,
-                    "home hydrate warm spawn error"
-                );
-            }
-        }
-    });
-
-    format!("hydrate=spawned cooldown={cooldown}")
+    home_hydrate_ranked::maybe_warm_after_ranked(redis, cfg, owner_user_id).await
 }
 
 fn parse_views(views: &str) -> Vec<&'static str> {
@@ -2324,7 +2223,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     )
     .await?;
 
-    let hydrate = maybe_spawn_home_hydrate_warm(&mut redis, owner_user_id).await;
+    let hydrate = maybe_spawn_home_hydrate_warm(&mut redis, cfg, owner_user_id).await;
 
     let ms = started.elapsed().as_millis();
     let counts = source_counts(&ranked);

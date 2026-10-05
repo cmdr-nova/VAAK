@@ -9,6 +9,7 @@ mod http;
 mod jetstream;
 mod account_switch;
 mod home_html;
+mod home_hydrate_ranked;
 mod mentions_html;
 mod notif;
 mod notif_embed;
@@ -170,6 +171,14 @@ enum Command {
         owner_id: i64,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Materialize Home hydrate envelopes from ranked IDs (RSS/Bluesky/fedi).
+    HomeHydrateWarm {
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        /// Comma list of envelope limits (default 15,40,80).
+        #[arg(long, default_value = "15,40,80")]
+        limits: String,
     },
     /// Drain `vaak:queue:timeline_fanout` (ranked prepend + Home hydrate).
     TimelineFanout {
@@ -351,6 +360,27 @@ async fn main() -> Result<()> {
                 cfg.default_owner_id
             };
             timeline::run(&cfg, owner, limit).await?;
+        }
+        Command::HomeHydrateWarm { owner_id, limits } => {
+            let owner = if owner_id > 0 {
+                owner_id
+            } else {
+                cfg.default_owner_id
+            };
+            let parsed: Vec<i64> = limits
+                .split(',')
+                .filter_map(|p| p.trim().parse().ok())
+                .filter(|n| (1..=80).contains(n))
+                .collect();
+            let report = if parsed.is_empty() {
+                home_hydrate_ranked::warm_owner_now(&cfg, owner).await?
+            } else {
+                home_hydrate_ranked::warm_owner(&cfg, owner, &parsed).await?
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&home_hydrate_ranked::report_json(&report))?
+            );
         }
         Command::TimelineFanout { r#loop, once_json } => {
             if r#loop {

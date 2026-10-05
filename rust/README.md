@@ -4,7 +4,8 @@
 |---|---|---|
 | `notif-badge --live --loop --owner-id 0` | **LIVE** | Owns production notif Redis + file cache for **all** local `ap_users` (multi-user) |
 | `notif-list --loop --owner-id 0` | **LIVE** | Mentions list warm — **native projection→Redis** first; quiet confirmed-empty envelopes skip/restamp (0.6.52); PHP `notif-list-warm.php` only on true cold-start / incomplete projection |
-| `ranked-warm --loop --owner-id 0` | **LIVE** | Home + Local + Federated ranked rebuild **native-only** (`source=vaak-worker-native`, FoF/recs on Home); after non-empty Home write, fire-and-forget `bin/home-timeline-warm.php --limits=15,40` (0.6.67); PHP `bin/ranked-warm.php` retired → `vaak:timeline:ranked:v2:{sha256}` |
+| `ranked-warm --loop --owner-id 0` | **LIVE** | Home + Local + Federated ranked rebuild **native-only** (`source=vaak-worker-native`, FoF/recs on Home); after non-empty Home write, fire-and-forget Rust ranked→hydrate (`home-hydrate-warm`, 0.7.15); PHP `bin/ranked-warm.php` retired → `vaak:timeline:ranked:v2:{sha256}` |
+| `home-hydrate-warm --owner-id N` | **LIVE** | Materialize Home `vaak:timeline:v1:*` from ranked IDs (rss/bsky/event/outbox); replaces chronological PHP `home-timeline-warm.php` for Axum Home HTML/API |
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
@@ -49,7 +50,7 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_SHADOW_HTTP` | `http://127.0.0.1:8787` | Axum shadow base for Mentions M5 + Home Axum-primary (loopback only) |
 | `VAAK_RANKED_NATIVE_HOME` | `1` (default) | Home ranked rebuild in Rust (incl. FoF/cold-start recommendations); `0` skips Home warm |
 | `VAAK_RANKED_NATIVE_LOCAL_FEED` | `1` (default) | Local + Federated ranked rebuild in Rust; `0` skips those views |
-| `VAAK_HOME_HYDRATE_WARM` | `1` (default) | After non-empty Home ranked write, spawn `bin/home-timeline-warm.php --limits=15,40` (Axum hydrate); `0` disables |
+| `VAAK_HOME_HYDRATE_WARM` | `1` (default) | After non-empty Home ranked write, warm ranked→hydrate envelopes (15/40/80) in-process; `0` disables |
 | `VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS` | `60` | Redis cooldown between Home hydrate spawns per owner (30–600) |
 | `VAAK_TIMELINE_FANOUT_RUST` | `1` (default) | PHP enqueues timeline fan-out to Rust; `0` forces in-process PHP Redis prepend |
 | `VAAK_HOME_FANOUT_INGEST` | `1` (default) | Master enable for Home/Federated/Local ingest fan-out (PHP + Rust) |
@@ -73,7 +74,7 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Notif live key: `vaak:notifications:v1:unread:{owner}:{scan}:{sha256(last_read)}` TTL 45s; source `vaak-worker-live`
 - Notif list key: `vaak:notifications:v1:{owner}:{sha256(limit,max,since,types,exclude)}` envelope `{ts,items,source}` TTL 600s when list-warm primary; source `vaak-worker-projection` (native); `bin/notif-list-warm.php` retired (0.6.63); hash JSON key order must match PHP: `limit,max,since,types,exclude`
 - Ranked key: `vaak:timeline:ranked:v2:{sha256(logical)}` + owner index `vaak:timeline:owner-index:v1:{owner}`; Home/Local/Federated source `vaak-worker-native` (0.6.48–0.6.60); `bin/ranked-warm.php` retired (0.6.60); HTML soft-nav still uses in-process `admin_tl_lean_ranked_warm`
-- Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss), `/shadow/notif` (unread badge live compute), `/shadow/notif-embed`, `/shadow/mentions-html` (Mentions nest HTML from `vaak:notif-embed:v1:*`; miss lean-paints from Mentions envelopes, 0.6.91). Prime via ranked-warm post-Home spawn (0.6.67, TTL 300s), `bin/home-timeline-warm.php`, or Ice Cubes head polls.
+- Shadow HTTP (127.0.0.1:8787): `/shadow/notifications`, `/api/v1/notifications` (Redis-read; 404 on miss), `/shadow/timelines/home` (ranked IDs + hydrate probe), `/api/v1/timelines/home` (Mastodon status array from `vaak:timeline:v1:*`; 404 on miss), `/shadow/notif` (unread badge live compute), `/shadow/notif-embed`, `/shadow/mentions-html` (Mentions nest HTML from `vaak:notif-embed:v1:*`; miss lean-paints from Mentions envelopes, 0.6.91). Prime via ranked-warm → Rust ranked hydrate (0.7.15, TTL 300s), `vaak-worker home-hydrate-warm`, or Ice Cubes head polls.
 - Unread badge Axum prefer (0.7.2–0.7.3): `ap_masto_notifications_unread_state` calls `/shadow/notif?live=1` on Redis miss **before** stale-file/stampede/PHP rebuild (shared by every HTML nav paint + ajax poll); `ajax=notif_unread` exposes `X-VAAK-Notif-Unread-Source: axum|redis|file|php`. Rollback: `VAAK_NOTIF_UNREAD_AXUM=0`.
 - Mentions HTML grouping (0.7.3): Axum `/shadow/mentions-html` collapses favourite/reblog rows into avatar-stack cards (presentation-only; tip/pagination unchanged).
 - Home HTML fill (0.7.4): `GET /shadow/home-html` lean feed cards from hydrate Redis; PHP soft-nav + full-page prefer Axum (`VAAK_HOME_HTML_AXUM`). Lean gaps: no fav/boost/bookmark action bar, no poll/ask widgets.

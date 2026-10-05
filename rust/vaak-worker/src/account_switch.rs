@@ -9,7 +9,6 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::notif;
 use crate::ranked_warm;
-use crate::redis_util;
 use crate::timeline;
 
 #[derive(Debug, Clone)]
@@ -121,31 +120,18 @@ pub async fn prep(cfg: &Config, owner_user_id: i64, views: &str) -> Result<Accou
 }
 
 async fn force_spawn_home_hydrate(cfg: &Config, owner_user_id: i64) -> String {
-    // Clear ranked-warm cooldown so switch always kicks a hydrate rebuild.
-    if let Ok(mut redis) = redis_util::connect(&cfg.redis_url).await {
-        let cooldown_key = format!("vaak:home:hydrate-warm:cd:{owner_user_id}");
-        let _: Result<(), _> = redis::cmd("DEL")
-            .arg(&cooldown_key)
-            .query_async(&mut redis)
-            .await;
-    }
-    let php = std::env::var("VAAK_PHP_BIN").unwrap_or_else(|_| "/usr/bin/php".into());
-    let api_root = std::env::var("VAAK_API_ROOT").unwrap_or_else(|_| "/srv/mkultra/html/api".into());
-    let script = std::path::PathBuf::from(&api_root).join("bin/home-timeline-warm.php");
-    if !script.is_file() {
-        return "hydrate=skip_missing_script".into();
-    }
-    match std::process::Command::new(&php)
-        .arg(&script)
-        .arg(format!("--owner-id={owner_user_id}"))
-        .arg("--limits=15,40,80")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(_) => "hydrate=spawned".into(),
-        Err(e) => format!("hydrate=spawn_err:{e}"),
+    match crate::home_hydrate_ranked::warm_owner_now(cfg, owner_user_id).await {
+        Ok(report) => format!(
+            "hydrate=ranked_ok n={} kinds={}",
+            report.materialised_n,
+            report
+                .kinds
+                .iter()
+                .map(|(k, n)| format!("{k}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Err(e) => format!("hydrate=ranked_err:{e:#}"),
     }
 }
 
