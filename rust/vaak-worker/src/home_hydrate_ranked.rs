@@ -794,6 +794,7 @@ struct OutboxRow {
     id: String,
     published: String,
     content: String,
+    in_reply_to: String,
 }
 
 #[derive(Clone, Default)]
@@ -1156,7 +1157,7 @@ fn materialize_outbox(
         .unwrap_or(owner_username)
         .to_string();
     let account = local_account_from_profile(&actor_url, &username, profiles);
-    base_status(
+    let mut st = base_status(
         &status_id,
         &created,
         &row.content,
@@ -1165,7 +1166,62 @@ fn materialize_outbox(
         account,
         Vec::new(),
         None,
-    )
+    );
+    let parent = row.in_reply_to.trim().trim_end_matches('/');
+    if !parent.is_empty() && parent.starts_with("https://") {
+        st["vaak_in_reply_to_url"] = json!(parent);
+        if let Some((child_actor, _)) = row.id.rsplit_once("/notes/") {
+            if let Some((parent_actor, _)) = parent.rsplit_once("/notes/") {
+                if child_actor == parent_actor {
+                    st["vaak_self_thread"] = json!(true);
+                    // Paint/grouping key; snowflake parent id filled when parent
+                    // is in the same hydrate batch (link_outbox_reply_ids).
+                    st["in_reply_to_id"] = json!(parent);
+                    if let Some(acct_id) = st
+                        .get("account")
+                        .and_then(|a| a.get("id"))
+                        .cloned()
+                    {
+                        st["in_reply_to_account_id"] = acct_id;
+                    }
+                }
+            }
+        }
+    }
+    st
+}
+
+/// When parent + tip land in the same hydrate page, point in_reply_to_id at the
+/// parent's status id (snowflake) instead of the note URL.
+pub fn link_outbox_reply_ids(statuses: &mut [Value]) {
+    let mut uri_to_id: HashMap<String, String> = HashMap::new();
+    for st in statuses.iter() {
+        let uri = st
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .or_else(|| st.get("url").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        let id = st.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !uri.is_empty() && !id.is_empty() {
+            uri_to_id.insert(uri.to_string(), id.to_string());
+        }
+    }
+    for st in statuses.iter_mut() {
+        let parent = st
+            .get("vaak_in_reply_to_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        if parent.is_empty() {
+            continue;
+        }
+        if let Some(pid) = uri_to_id.get(parent) {
+            st["in_reply_to_id"] = json!(pid);
+        }
+    }
 }
 
 fn strip_tags_simple(html: &str) -> String {
@@ -1593,7 +1649,8 @@ async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String,
     variants.dedup();
     let rows = db
         .query(
-            "SELECT id, COALESCE(published::text,''), COALESCE(content,'')
+            "SELECT id, COALESCE(published::text,''), COALESCE(content,''),
+                    COALESCE(in_reply_to,'')
              FROM outbox_notes WHERE id = ANY($1)",
             &[&variants],
         )
@@ -1608,6 +1665,7 @@ async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String,
                 id,
                 published: row.get(1),
                 content: row.get(2),
+                in_reply_to: row.get(3),
             },
         );
     }
@@ -2129,6 +2187,7 @@ pub async fn warm_view(
             break;
         }
     }
+    link_outbox_reply_ids(&mut statuses);
 
     let mut stored = Vec::new();
     let now = chrono::Utc::now().timestamp();

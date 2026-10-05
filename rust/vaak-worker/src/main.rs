@@ -20,6 +20,7 @@ mod profile_html;
 mod ranked;
 mod ranked_warm;
 mod redis_util;
+mod self_thread;
 mod actor_warm;
 mod thin_media;
 mod thin_media_warm;

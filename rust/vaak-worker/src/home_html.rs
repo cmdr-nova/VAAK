@@ -9,6 +9,9 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::db;
 use crate::notif_embed::paint_lean_feed_card_opts;
+use crate::self_thread::{
+    missing_self_reply_parent_uris, paint_feed_units, plan_feed_paint_units,
+};
 use crate::timeline;
 
 #[derive(Debug, Clone)]
@@ -111,6 +114,7 @@ pub async fn tl_html_fill(
     let end = (offset + limit).min(report.items.len());
     // Flags already overlaid in timeline::view_hydrate (0.7.19).
     let mut slice: Vec<serde_json::Value> = report.items[offset..end].to_vec();
+    let mut extra_parents = std::collections::HashMap::new();
     // Attach cached OG/YouTube cards (PHP paint parity) before lean HTML.
     if let Ok(db) = db::connect(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
@@ -118,18 +122,24 @@ pub async fn tl_html_fill(
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
+        // Self-thread parents not in this hydrate window (common on Home).
+        let need = missing_self_reply_parent_uris(&slice);
+        if !need.is_empty() {
+            if let Ok(fetched) =
+                crate::profile_html::fetch_outbox_statuses_by_uris(&db, &need).await
+            {
+                extra_parents = fetched;
+            }
+        }
+        crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
     }
     let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
 
-    let mut html = String::with_capacity(slice.len() * 1200);
-    let mut painted = 0usize;
-    for item in &slice {
-        if !item.is_object() {
-            continue;
-        }
-        html.push_str(&paint_lean_feed_card_opts(item, view, &viewer_actor));
-        painted += 1;
-    }
+    let units = plan_feed_paint_units(&slice, &extra_parents);
+    let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
+        paint_lean_feed_card_opts(st, from, viewer)
+    };
+    let (html, painted) = paint_feed_units(&units, view, &viewer_actor, &paint);
     if painted == 0 {
         return Ok(None);
     }

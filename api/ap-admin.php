@@ -23088,6 +23088,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     }
     .timeline-feed #timeline-items > article.tweet:last-of-type,
     .timeline-feed #timeline-items > .tweet-boost:last-child { border-bottom: 0; }
+    /* Self-thread: parent ancestor + tip in one timeline card (0.7.37). */
+    article.tweet.tweet-thread { position: relative; }
+    .tweet-thread-seg--ancestor { opacity: .92; padding-bottom: .55rem; }
+    .tweet-thread-seg--tip { padding-top: .15rem; }
+    .tweet-thread-rail {
+      width: 2px; margin: 0 0 .35rem 1.15rem; min-height: .55rem;
+      background: var(--border); border-radius: 1px;
+    }
+    .tweet-thread-seg--ancestor .tweet-actions { display: none; }
     /* Your Posts uses the same flat, separated Mastodon-like timeline surface. */
     .your-posts-feed > article.tweet {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
@@ -23097,6 +23106,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .your-posts-feed > article.tweet:last-of-type { border-bottom: 0; }
     .timeline-feed .feed-new-btn { margin-inline: .25rem; }
     .remote-profile-feed > article.tweet,
+    .remote-profile-feed > article.tweet.tweet-thread,
     .remote-profile-feed > .remote-profile-posts > article.tweet {
       background: transparent; border: 0; border-bottom: 1px solid var(--border);
       border-radius: 0; box-shadow: none; margin: 0; padding: 1rem .25rem;
@@ -30167,8 +30177,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               foreach ($rpOutboxPosts as $item) {
                   $create = json_decode((string) ($item['raw_create_json'] ?? ''), true);
                   $obj = is_array($create) && is_array($create['object'] ?? null) ? $create['object'] : [];
-                  if (!empty($obj['inReplyTo'])) $rpTabItems['replies'][] = $item;
-                  else $rpTabItems['posts'][] = $item;
+                  if (!empty($obj['inReplyTo'])) {
+                      $irt = rtrim((string) $obj['inReplyTo'], '/');
+                      $isSelf = $irt !== '' && function_exists('vaak_is_own_url') && vaak_is_own_url($irt)
+                          && str_contains($irt, '/notes/');
+                      if ($isSelf) {
+                          $rpTabItems['posts'][] = $item;
+                      } else {
+                          $rpTabItems['replies'][] = $item;
+                      }
+                  } else {
+                      $rpTabItems['posts'][] = $item;
+                  }
                   // A local quote is still an authored post, not a repost.
                   // The renderer reads the quote object from raw_create_json.
                   if (!empty($obj['attachment']) || !empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
@@ -30244,9 +30264,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           } else {
               foreach ($rpPosts as $item) {
                   $type = strtolower((string) ($item['type'] ?? 'create'));
-                  if ($type === 'announce') $rpTabItems['boosts'][] = $item;
-                  elseif (!empty($item['in_reply_to']) || !empty($item['in_reply_to_id'])) $rpTabItems['replies'][] = $item;
-                  else $rpTabItems['posts'][] = $item;
+                  if ($type === 'announce') {
+                      $rpTabItems['boosts'][] = $item;
+                  } elseif (!empty($item['in_reply_to']) || !empty($item['in_reply_to_id'])) {
+                      $irt = rtrim((string) ($item['in_reply_to'] ?? $item['in_reply_to_id'] ?? ''), '/');
+                      $isSelf = $irt !== '' && function_exists('vaak_is_own_url') && vaak_is_own_url($irt)
+                          && str_contains($irt, '/notes/');
+                      if ($isSelf) {
+                          $rpTabItems['posts'][] = $item;
+                      } else {
+                          $rpTabItems['replies'][] = $item;
+                      }
+                  } else {
+                      $rpTabItems['posts'][] = $item;
+                  }
                   if (!empty($item['media_urls']) && $item['media_urls'] !== '[]') $rpTabItems['media'][] = $item;
               }
           }
