@@ -68,6 +68,7 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
         anyhow::bail!("owner_id must be positive");
     }
     let client = db::connect(&cfg.database_url).await?;
+    let owner_i32 = i32::try_from(owner).context("owner_id outside PostgreSQL integer range")?;
     let row = client
         .query_opt(
             "SELECT u.username, u.actor_key, p.actor_id, p.status, p.strain,
@@ -126,12 +127,12 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
                     r.status, to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
              FROM phyrian_requests r
              LEFT JOIN ap_users u ON u.id = r.from_owner_id
-             WHERE r.to_owner_id = $1 AND r.status = 'pending'
+             WHERE r.to_owner_id = $1::integer AND r.status = 'pending'
              ORDER BY r.created_at DESC LIMIT 40",
-            &[&owner],
+            &[&owner_i32],
         )
         .await
-        .context("query pending Phyrian requests")?
+        .map_err(|e| anyhow::anyhow!("query pending Phyrian requests: {e}"))?
         .into_iter()
         .map(|r| Request {
             id: r.try_get(0).unwrap_or(0),
