@@ -161,6 +161,75 @@ function ap_normalize_apply_bsky_sensitivity(array $status): array
 }
 
 /**
+ * Drop raw ↪ QT / AS2 dumps from status content once a structured quote exists,
+ * and scrub QuoteAuthorization / QTCreate pollution even without a nest.
+ *
+ * @param array<string,mixed> $status
+ * @return array<string,mixed>
+ */
+function ap_normalize_scrub_quote_pollution(array $status): array
+{
+    $scrubOne = static function (array $st): array {
+        $content = (string) ($st['content'] ?? '');
+        if ($content === '') {
+            return $st;
+        }
+        $plain = trim(html_entity_decode(strip_tags($content), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        if ($plain === '') {
+            return $st;
+        }
+        $hasQuote = is_array($st['quote'] ?? null);
+        $changed = false;
+
+        if (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain)) {
+            $kept = function_exists('ap_text_scrub_as2_dump')
+                ? ap_text_scrub_as2_dump($plain)
+                : '';
+            $plain = $kept;
+            $changed = true;
+        }
+
+        // Structured quote owns the nest — never also leave raw ↪ QT in the body.
+        if ($hasQuote && $plain !== '' && (str_contains($plain, '↪ QT') || str_contains($plain, '↪QT')
+            || (bool) preg_match('/↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $plain))) {
+            $commentary = $plain;
+            if (preg_match('/^(.*?)(?:\n\n|\n)↪\s*QT.*$/us', $plain, $cm)) {
+                $commentary = trim((string) ($cm[1] ?? ''));
+            } elseif (preg_match('/^↪\s*QT/u', $plain)) {
+                $commentary = '';
+            }
+            $commentary = preg_replace('/(?:^|\n)RE:\s*https:\/\/[^\s<>]+/u', '', $commentary) ?? $commentary;
+            $plain = trim($commentary);
+            $changed = true;
+        }
+
+        if (!$changed) {
+            return $st;
+        }
+        if ($plain === '') {
+            $st['content'] = '';
+            return $st;
+        }
+        $st['content'] = function_exists('ap_plain_text_to_html')
+            ? ap_plain_text_to_html($plain)
+            : ('<p>' . nl2br(htmlspecialchars($plain, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>');
+        return $st;
+    };
+
+    $status = $scrubOne($status);
+    if (isset($status['reblog']) && is_array($status['reblog'])) {
+        $status['reblog'] = $scrubOne($status['reblog']);
+        if (isset($status['reblog']['quote']['quoted_status']) && is_array($status['reblog']['quote']['quoted_status'])) {
+            $status['reblog']['quote']['quoted_status'] = $scrubOne($status['reblog']['quote']['quoted_status']);
+        }
+    }
+    if (isset($status['quote']['quoted_status']) && is_array($status['quote']['quoted_status'])) {
+        $status['quote']['quoted_status'] = $scrubOne($status['quote']['quoted_status']);
+    }
+    return $status;
+}
+
+/**
  * Canonical pass for an already-built Mastodon-compatible status.
  *
  * @param array<string,mixed> $status
@@ -170,6 +239,7 @@ function ap_normalize_status(array $status): array
 {
     $status = ap_normalize_attach_ask($status);
     $status = ap_normalize_apply_bsky_sensitivity($status);
+    $status = ap_normalize_scrub_quote_pollution($status);
     return $status;
 }
 

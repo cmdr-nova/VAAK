@@ -2976,12 +2976,40 @@ function ap_quote_post_parent_url(?string $objectId): ?string
 function ap_text_looks_like_as2_json(string $text): bool
 {
     $t = ltrim($text);
-    if ($t === '' || ($t[0] !== '{' && $t[0] !== '[')) {
+    if ($t === '') {
+        return false;
+    }
+    // Prefixed dumps from broken quote enrichment: "↪ QTCreate Note\n{@context":…}"
+    if (preg_match('/↪\s*QT(Create|Announce|Update|Note|QuotePost)\b/u', $t)
+        || str_contains($t, 'QuoteAuthorization')
+        || str_contains($t, 'interactionPolicy')) {
+        return true;
+    }
+    if ($t[0] !== '{' && $t[0] !== '[') {
         return false;
     }
     return str_contains($t, '"@context"')
         || str_contains($t, '"type"') && str_contains($t, '"attributedTo"')
         || str_contains($t, 'activitystreams');
+}
+
+/**
+ * Strip dumped AS2 / glued QTCreate blocks from feed text, keeping leading commentary.
+ * Returns empty string when the whole blob is unusable.
+ */
+function ap_text_scrub_as2_dump(string $text): string
+{
+    $text = trim($text);
+    if ($text === '' || !ap_text_looks_like_as2_json($text)) {
+        return $text;
+    }
+    if (preg_match('/^(.*?)(?:\n\n↪\s*QT|\n↪\s*QT)/us', $text, $m)) {
+        $keep = trim((string) ($m[1] ?? ''));
+        if ($keep !== '' && !ap_text_looks_like_as2_json($keep)) {
+            return $keep;
+        }
+    }
+    return '';
 }
 
 /**
