@@ -11818,13 +11818,17 @@ function admin_media_row_html(array $items, string $hint = ''): string
             // Wafrn-style: preload=metadata so progressive MP4s show a first
             // frame even without a poster. Prefer an explicit image poster when
             // we have one (local ffmpeg still, Bluesky thumbnail, Mastodon /small/).
+            // Pinned profile surfaces stay muted until the visitor unmutes —
+            // mobile Safari/Chrome otherwise start the soundtrack on navigate.
+            $muteAttr = !empty($GLOBALS['vaak_pin_media_silent']) ? ' muted' : '';
             $cells[] = '<video class="media-video" data-media-warm-url="' . h($warmUrl) . '"' . $sourceAttr . ' controls loop playsinline preload="metadata"'
+                . $muteAttr
                 . $posterAttr
                 . ' referrerpolicy="no-referrer"></video>';
         } elseif (admin_media_is_audio($url, $mt)) {
             $cells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
                 . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
-                . '<audio class="media-audio" src="' . h($url) . '" controls preload="auto"></audio>'
+                . '<audio class="media-audio" src="' . h($url) . '" controls preload="metadata"></audio>'
                 . '</div>';
         } else {
             $hasImage = true;
@@ -29164,11 +29168,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php if ($rpPinnedStatuses === []): ?>
               <div class="empty">No pinned posts.</div>
             <?php else: ?>
-              <?php foreach ($rpPinnedStatuses as $pinSt): ?>
-                <?php if (is_array($pinSt)) {
-                    admin_render_masto_status_card($pinSt, $followingIds, 'remote_profile', false, true);
-                } ?>
-              <?php endforeach; ?>
+              <div class="profile-pinned-feed" data-vaak-pinned-feed="1">
+              <?php
+                $GLOBALS['vaak_pin_media_silent'] = true;
+                foreach ($rpPinnedStatuses as $pinSt):
+                  if (is_array($pinSt)) {
+                      admin_render_masto_status_card($pinSt, $followingIds, 'remote_profile', false, true);
+                  }
+                endforeach;
+                $GLOBALS['vaak_pin_media_silent'] = false;
+              ?>
+              </div>
             <?php endif; ?>
           <?php elseif ($rpTab === 'featured'): ?>
             <?php
@@ -30099,10 +30109,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <div class="side-card" style="margin:0 0 1rem;padding:.85rem 1rem">
             <h3 style="margin:0 0 .35rem;font-size:.95rem">Pinned on profile</h3>
             <div class="meta" style="margin-bottom:.75rem">These posts appear at the top of your HTML profile. Use ⋯ → Unpin from profile to remove one.</div>
-            <div class="your-posts-pinned">
-              <?php foreach ($pinnedOutboxRows as $pinnedRow): ?>
-                <?php admin_render_outbox_card($pinnedRow, 'outbox'); ?>
-              <?php endforeach; ?>
+            <div class="your-posts-pinned" data-vaak-pinned-feed="1">
+              <?php
+                $GLOBALS['vaak_pin_media_silent'] = true;
+                foreach ($pinnedOutboxRows as $pinnedRow):
+                  admin_render_outbox_card($pinnedRow, 'outbox');
+                endforeach;
+                $GLOBALS['vaak_pin_media_silent'] = false;
+              ?>
             </div>
           </div>
         <?php endif; ?>
@@ -34157,6 +34171,9 @@ window.apAdminToast = function (msg, isErr) {
       if (loadedItems && loadedItems.dataset.view && loadedItems.dataset.view !== view) {
         throw new Error('shell-view-mismatch');
       }
+      if (typeof window.vaakSilencePinnedMedia === 'function') {
+        try { window.vaakSilencePinnedMedia(main); } catch (e) {}
+      }
       if (typeof window.vaakAdoptComposerAfterSoftNav === 'function') {
         window.vaakAdoptComposerAfterSoftNav();
       }
@@ -37349,6 +37366,53 @@ if (VIEW === 'analytics') loadAnalytics();
   });
   window.vaakPauseTimelineVideos = pauseAll;
   window.vaakBindTimelineVideos = observeVideos;
+})();
+</script>
+<script>
+(function () {
+  // Pinned profile media must not surprise visitors with soundtrack on navigate
+  // (logged-in or guest, mobile especially). Stay muted until they unmute.
+  const PIN_SEL = '[data-vaak-pinned-feed] video, [data-vaak-pinned-feed] audio, .your-posts-pinned video, .your-posts-pinned audio, .post-wrap.is-pinned video, .post-wrap.is-pinned audio';
+  function silencePinned(root) {
+    const scope = root && root.querySelectorAll ? root : document;
+    scope.querySelectorAll(PIN_SEL).forEach((el) => {
+      try {
+        el.autoplay = false;
+        el.removeAttribute('autoplay');
+        el.muted = true;
+        if (!el.paused) el.pause();
+        el.dataset.vaakPinSoundOk = el.dataset.vaakPinSoundOk || '0';
+      } catch (_) {}
+    });
+  }
+  function inPinned(el) {
+    return !!(el && el.closest && el.closest('[data-vaak-pinned-feed], .your-posts-pinned, .post-wrap.is-pinned'));
+  }
+  document.addEventListener('play', (ev) => {
+    const el = ev.target;
+    if (!(el instanceof HTMLMediaElement) || !inPinned(el)) return;
+    if (el.dataset.vaakPinSoundOk === '1') return;
+    try {
+      el.muted = true;
+    } catch (_) {}
+  }, true);
+  document.addEventListener('volumechange', (ev) => {
+    const el = ev.target;
+    if (!(el instanceof HTMLMediaElement) || !inPinned(el)) return;
+    if (!el.muted && el.volume > 0) el.dataset.vaakPinSoundOk = '1';
+  }, true);
+  silencePinned(document);
+  if (typeof MutationObserver !== 'undefined' && document.body) {
+    const mo = new MutationObserver((records) => {
+      records.forEach((rec) => {
+        rec.addedNodes.forEach((node) => {
+          if (node.nodeType === 1) silencePinned(node);
+        });
+      });
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+  window.vaakSilencePinnedMedia = silencePinned;
 })();
 </script>
 <script>

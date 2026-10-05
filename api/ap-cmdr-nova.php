@@ -1404,7 +1404,7 @@ function ap_cmdr_note_html(array $row, array $create): void
             } elseif (str_starts_with($mt, 'audio/') || $atype === 'Audio') {
                 $mediaCells[] = '<div class="media-audio-card" role="group" aria-label="Audio post">'
                     . '<img class="media-audio-art" src="/api/assets/audio-post-default.jpg" alt="" loading="lazy" decoding="async">'
-                    . '<audio class="media-audio" src="' . $safe . '" controls preload="auto"></audio>'
+                    . '<audio class="media-audio" src="' . $safe . '" controls preload="metadata"></audio>'
                     . '</div>';
             } else {
                 $mediaHtml .= '<p class="media"><a href="' . $safe . '" target="_blank" rel="noopener">' . ($alt !== '' ? $alt : $safe) . '</a></p>';
@@ -2067,7 +2067,7 @@ function ap_cmdr_html(): void
             : '<p class="muted">No featured accounts yet.</p>';
         echo '</section>';
     } elseif ($tab === 'pinned') {
-        echo '<section id="profile-posts" class="posts" aria-label="Pinned">';
+        echo '<section id="profile-posts" class="posts" aria-label="Pinned" data-vaak-pinned-feed="1">';
         echo '<h2 class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)">Pinned</h2>';
         if (!$postsData['rows']) {
             echo '<p class="muted">No pinned posts yet.</p>';
@@ -2109,6 +2109,7 @@ function ap_cmdr_html(): void
     echo '<p class="back"><a href="https://mkultra.monster/">← mkultra.monster</a> · <a href="/users/cmdr_nova/outbox">outbox</a></p>';
     echo '<button type="button" class="profile-top-btn" id="profile-top-btn" hidden aria-label="Back to top">↑</button>';
     echo '<script>(function(){const box=document.getElementById("profile-posts"),top=document.getElementById("profile-top-btn");if(!top)return;const sync=()=>{top.hidden=(window.scrollY||0)<500;};window.addEventListener("scroll",sync,{passive:true});top.addEventListener("click",()=>window.scrollTo({top:0,behavior:"smooth"}));sync();if(!box)return;let cursor=box.dataset.profileNextCursor||"",busy=false;const load=async()=>{if(busy||!cursor)return;busy=true;const requested=cursor;try{const u=new URL(location.href);u.searchParams.delete("page");u.searchParams.set("cursor",requested);const r=await fetch(u,{credentials:"same-origin"});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),"text/html");const n=d.querySelector("#profile-posts");if(!n)throw 0;Array.from(n.children).forEach(el=>{if(!el.classList.contains("profile-infinite-sentinel")&&!el.classList.contains("pager"))box.insertBefore(el,box.querySelector(".profile-infinite-sentinel"));});cursor=n.dataset.profileNextCursor||"";box.dataset.profileNextCursor=cursor;if(!cursor){const old=box.querySelector(".profile-infinite-sentinel");if(old)old.remove();}}catch(e){}finally{busy=false;}};const io=new IntersectionObserver(es=>{if(es.some(x=>x.isIntersecting))load();},{rootMargin:"500px"});const sentinel=box.querySelector(".profile-infinite-sentinel");if(sentinel)io.observe(sentinel);}());</script>';
+    echo '<script>(function(){var sel="[data-vaak-pinned-feed] video,[data-vaak-pinned-feed] audio,.post-wrap.is-pinned video,.post-wrap.is-pinned audio";function silence(root){var scope=root&&root.querySelectorAll?root:document;scope.querySelectorAll(sel).forEach(function(el){try{el.autoplay=false;el.removeAttribute("autoplay");el.muted=true;if(!el.paused)el.pause();}catch(e){}});}function inPinned(el){return !!(el&&el.closest&&el.closest("[data-vaak-pinned-feed],.post-wrap.is-pinned"));}document.addEventListener("play",function(ev){var el=ev.target;if(!(el instanceof HTMLMediaElement)||!inPinned(el))return;if(el.dataset.vaakPinSoundOk==="1")return;try{el.muted=true;}catch(e){}},true);document.addEventListener("volumechange",function(ev){var el=ev.target;if(!(el instanceof HTMLMediaElement)||!inPinned(el))return;if(!el.muted&&el.volume>0)el.dataset.vaakPinSoundOk="1";},true);silence(document);})();</script>';
     echo '<script>(function(){';
     echo 'var ACTOR=' . json_encode(CMDR_ACTOR_ID) . ';';
     echo 'var toggle=document.getElementById("ap-follow-toggle");';
