@@ -11521,8 +11521,9 @@ function admin_delete_post_button(string $noteId, string $returnView = 'home', s
             $actionUrl .= '&from=' . rawurlencode($from);
         }
     }
+    // Confirm + AJAX fade handled in capture-phase JS (data-vaak-ajax-delete).
     return '<form method="post" action="' . h($actionUrl) . '" style="display:inline" '
-        . 'onsubmit="return confirm(\'Delete this post permanently? Remotes and Bluesky mirrors are removed too.\');">'
+        . 'data-vaak-ajax-delete="1">'
         . '<input type="hidden" name="csrf" value="' . h(ap_auth_csrf_token()) . '">'
         . '<input type="hidden" name="action" value="delete_status">'
         . '<input type="hidden" name="return_view" value="' . h($returnView) . '">'
@@ -17943,7 +17944,8 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
             <?= admin_own_post_overflow($fediId, $composeView) ?>
           <?php else: ?>
             <form method="post" action="?view=<?= h($composeView) ?>" style="display:inline"
-              onsubmit="return confirm('Delete this Bluesky post<?= $fediId !== '' ? ' (and federate Delete for the VAAK twin if mapped)' : '' ?>?');">
+              data-vaak-ajax-delete="1"
+              data-vaak-delete-confirm="Delete this Bluesky post<?= $fediId !== '' ? ' (and federate Delete for the VAAK twin if mapped)' : '' ?>?">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
               <input type="hidden" name="action" value="delete_bsky_post">
               <input type="hidden" name="return_view" value="<?= h($composeView) ?>">
@@ -38969,22 +38971,31 @@ if (VIEW === 'analytics') loadAnalytics();
 })();
 </script>
 <script>
-// Own-post Delete: background POST + fade the card out of the timeline.
-// Confirm stays on the form onsubmit; no full reload, no success toast.
+// Own-post Delete: capture-phase intercept so Saving… / full POST never win.
+// Confirm in JS (forms use data-vaak-ajax-delete; no inline onsubmit).
 (function () {
-  document.addEventListener('submit', async (ev) => {
+  const DEFAULT_CONFIRM =
+    'Delete this post permanently? Remotes and Bluesky mirrors are removed too.';
+
+  document.addEventListener('submit', function (ev) {
     const form = ev.target;
     if (!(form instanceof HTMLFormElement)) return;
-    // Inline onsubmit confirm() returns false → defaultPrevented; bail quietly.
-    if (ev.defaultPrevented) return;
     const actionInput = form.querySelector('input[name="action"]');
-    if (!actionInput) return;
-    const action = String(actionInput.value || '');
-    if (action !== 'delete_status' && action !== 'delete_bsky_post') return;
+    const action = actionInput ? String(actionInput.value || '') : '';
+    const marked = form.getAttribute('data-vaak-ajax-delete') === '1';
+    if (!marked && action !== 'delete_status' && action !== 'delete_bsky_post') return;
+
+    // Synchronous — must beat the capture-phase Saving… pill and native navigate.
     ev.preventDefault();
+    ev.stopPropagation();
+    if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
     if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+
+    const msg = form.getAttribute('data-vaak-delete-confirm') || DEFAULT_CONFIRM;
+    if (!window.confirm(msg)) return;
     if (form.dataset.busy === '1') return;
     form.dataset.busy = '1';
+
     const btn = form.querySelector('button[type="submit"]');
     if (btn) btn.disabled = true;
     const card = form.closest('article.tweet');
@@ -39003,7 +39014,7 @@ if (VIEW === 'analytics') loadAnalytics();
       card.style.paddingBottom = '';
       card.style.overflow = '';
     };
-    // Fade immediately while delete runs; restore only on failure.
+
     if (card) {
       const h = card.getBoundingClientRect().height;
       card.style.overflow = 'hidden';
@@ -39012,7 +39023,6 @@ if (VIEW === 'analytics') loadAnalytics();
       card.style.opacity = '0';
       card.style.transform = 'scale(0.98)';
       card.style.pointerEvents = 'none';
-      // Collapse after fade so the timeline closes the gap smoothly.
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           if (!card.isConnected) return;
@@ -39025,46 +39035,48 @@ if (VIEW === 'analytics') loadAnalytics();
       });
     }
     if (window.vaakHaptic) window.vaakHaptic(8);
+
     const fd = new FormData(form);
     fd.set('ajax', '1');
     if (typeof window.vaakCsrfApply === 'function') window.vaakCsrfApply(fd);
     else if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
-    try {
-      const res = await fetch(form.getAttribute('action') || window.location.href, {
-        method: 'POST',
-        body: fd,
-        credentials: 'same-origin',
-        headers: {
-          'Accept': 'application/json',
-          'X-Requested-With': 'XMLHttpRequest',
-          ...(window.VAAK_CSRF ? { 'X-VAAK-CSRF': window.VAAK_CSRF } : {}),
-        },
-      });
-      const data = await res.json().catch(() => null);
-      if (!data || !data.ok) {
-        throw new Error((data && data.error) || 'Delete failed.');
-      }
-      // Success: finish collapse, then drop from the DOM (no toast).
-      const finish = () => {
-        if (card && card.isConnected) card.remove();
-        form.dataset.busy = '0';
-        // Focused status page: leave an empty shell → soft-nav to return_view.
-        const rv = (form.querySelector('input[name="return_view"]') || {}).value || '';
-        const onStatus = (window.location.search || '').includes('view=status');
-        if (onStatus && rv && typeof window.vaakSoftNavTo === 'function') {
-          try { window.vaakSoftNavTo(rv, true); } catch (e) {}
+
+    const postUrl = form.getAttribute('action') || '/vaak/?view=home';
+    fetch(postUrl, {
+      method: 'POST',
+      body: fd,
+      credentials: 'same-origin',
+      headers: {
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        ...(window.VAAK_CSRF ? { 'X-VAAK-CSRF': window.VAAK_CSRF } : {}),
+      },
+    })
+      .then((res) => res.json().catch(() => null).then((data) => ({ res, data })))
+      .then(({ res, data }) => {
+        if (!data || !data.ok) {
+          throw new Error((data && data.error) || (res && !res.ok ? 'Delete failed.' : 'Delete failed.'));
         }
-      };
-      setTimeout(finish, 340);
-    } catch (err) {
-      restore();
-      if (typeof window.apAdminToast === 'function') {
-        window.apAdminToast((err && err.message) || 'Delete failed.', true);
-      }
-    } finally {
-      if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
-    }
-  });
+        setTimeout(() => {
+          if (card && card.isConnected) card.remove();
+          form.dataset.busy = '0';
+          const rv = (form.querySelector('input[name="return_view"]') || {}).value || '';
+          const onStatus = (window.location.search || '').includes('view=status');
+          if (onStatus && rv && typeof window.vaakSoftNavTo === 'function') {
+            try { window.vaakSoftNavTo(rv, true); } catch (e) {}
+          }
+        }, 340);
+      })
+      .catch((err) => {
+        restore();
+        if (typeof window.apAdminToast === 'function') {
+          window.apAdminToast((err && err.message) || 'Delete failed.', true);
+        }
+      })
+      .finally(() => {
+        if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+      });
+  }, true); // capture — before Saving… pill and before native submit
 })();
 </script>
 <script>

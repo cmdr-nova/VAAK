@@ -1743,9 +1743,9 @@ fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -
     let action_base = format!("/vaak/?view={}", urlencoding_encode(from_q));
 
     let mut out = String::new();
+    // Confirm + AJAX fade handled in capture-phase JS (data-vaak-ajax-delete).
     out.push_str(&format!(
-        "<form method=\"post\" action=\"{base}\" style=\"display:inline\" \
-         onsubmit=\"return confirm('Delete this post permanently? Remotes and Bluesky mirrors are removed too.');\">\
+        "<form method=\"post\" action=\"{base}\" style=\"display:inline\" data-vaak-ajax-delete=\"1\">\
          <input type=\"hidden\" name=\"action\" value=\"delete_status\">\
          <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
          <input type=\"hidden\" name=\"local_id\" value=\"{lid}\">\
