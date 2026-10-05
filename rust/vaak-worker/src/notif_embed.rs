@@ -1210,6 +1210,41 @@ fn quote_url_for_dedupe(st: &Value) -> String {
     String::new()
 }
 
+/// Normalize Mastodon/Wafrn quote envelopes to the actual quoted status.
+///
+/// Different ActivityPub servers expose the nested object as either
+/// `quote.quoted_status`, `quote.status`, or directly as `quote`.  PHP's
+/// entity layer unwraps these before painting; keeping the same rule here
+/// prevents blank quote cards and preserves attachment media when a server
+/// puts it on the outer envelope.
+fn quote_preview_status<'a>(quote: &'a Value) -> &'a Value {
+    quote
+        .get("quoted_status")
+        .filter(|v| v.is_object())
+        .or_else(|| quote.get("status").filter(|v| v.is_object()))
+        .unwrap_or(quote)
+}
+
+fn normalized_quote_preview(quote: &Value) -> Value {
+    let mut nested = quote_preview_status(quote).clone();
+    // Some Wafrn/Mastodon bridges keep attachment previews on the envelope,
+    // not on quoted_status.  PHP merges those before entity serialization;
+    // do the same so quote media is not silently lost in Axum cards.
+    let nested_empty = nested
+        .get("media_attachments")
+        .and_then(|v| v.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(true);
+    if nested_empty {
+        if let Some(media) = quote.get("media_attachments").filter(|v| v.is_array()) {
+            if !media.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                nested["media_attachments"] = media.clone();
+            }
+        }
+    }
+    nested
+}
+
 fn paint_status_link_card(st: &Value) -> String {
     if status_has_media(st) {
         return String::new();
@@ -2621,12 +2656,13 @@ pub fn paint_lean_embed_from(
     }
 
     // Nested quote preview when present (lean — no link-card / poll / ask).
-    if let Some(q) = status
+    if let Some(q_raw) = status
         .get("quote")
         .filter(|v| v.is_object())
         .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
-        let q_html = paint_lean_embed_from(q, false, from, viewer_actor);
+        let q = normalized_quote_preview(q_raw);
+        let q_html = paint_lean_embed_from(&q, false, from, viewer_actor);
         inner.push_str(&format!(
             "<div class=\"quote-block\" style=\"margin-top:.55rem\">{q_html}</div>"
         ));
@@ -3232,6 +3268,7 @@ mod tests {
                 "provider_name": "eigenmagic.net"
             },
             "quote": {
+                "media_attachments": [{"type":"image","url":"https://example.com/outer.jpg","preview_url":"https://example.com/outer.jpg"}],
                 "quoted_status": {
                     "uri": "https://eigenmagic.net/@daedalus/117356806278610958",
                     "url": "https://eigenmagic.net/@daedalus/117356806278610958",
@@ -3248,6 +3285,8 @@ mod tests {
         });
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("quote-block"), "{html}");
+        assert!(html.contains("nested"), "quoted_status envelope must render its nested body: {html}");
+        assert!(html.contains("outer.jpg"), "envelope media must survive quote normalization: {html}");
         assert!(!html.contains("class=\"link-card\""), "should dedupe OG card: {html}");
     }
 
