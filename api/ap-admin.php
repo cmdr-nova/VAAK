@@ -7772,15 +7772,67 @@ function admin_home_suppression_map(int $ownerUserId): array
     }
 }
 
-/** @return list<array<string,mixed>> Aggregated private signals for admins. */
+/**
+ * Local accounts (and the instance admin) never enter temporary Home downranking.
+ * Matches mkultra.monster /users/ and /@ forms; cmdr_nova is always exempt.
+ */
+function admin_home_downrank_actor_exempt(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return true;
+    }
+    $lower = strtolower($actorId);
+    if (str_starts_with($lower, 'https://mkultra.monster/users/')) {
+        return true;
+    }
+    if (str_starts_with($lower, 'https://mkultra.monster/@')) {
+        return true;
+    }
+    // Admin especially: catch handle/path forms even if host shape drifts.
+    if (preg_match('#/(?:users/|@)cmdr_nova$#i', $actorId) === 1) {
+        return true;
+    }
+    if ($lower === 'cmdr_nova' || $lower === 'cmdr_nova@mkultra.monster') {
+        return true;
+    }
+    return false;
+}
+
+/** Drop expired + exempt rows so the admin list stays current between nightly maintain. */
+function admin_home_downrank_purge_stale(): void
+{
+    try {
+        $db = ap_db();
+        $db->prepare('DELETE FROM ap_home_suppression WHERE suppressed_until < ?')->execute([gmdate('c')]);
+        $db->exec(
+            "DELETE FROM ap_home_suppression
+             WHERE lower(actor_id) LIKE 'https://mkultra.monster/users/%'
+                OR lower(actor_id) LIKE 'https://mkultra.monster/@%'
+                OR lower(actor_id) ~ '/(users/|@)cmdr_nova/?$'"
+        );
+    } catch (Throwable $e) {
+        // Optional ranking signal table; never block the admin page.
+    }
+}
+
+/** @return list<array<string,mixed>> Aggregated private signals for admins (active only). */
 function admin_home_downranked_actor_rows(): array
 {
     try {
+        admin_home_downrank_purge_stale();
         $rows = ap_db()->query('SELECT actor_id, owner_user_id, score, categories_json, suppressed_until, last_object_id, updated_at FROM ap_home_suppression ORDER BY suppressed_until DESC, score DESC')->fetchAll() ?: [];
         $out = [];
+        $now = time();
         foreach ($rows as $row) {
             $actor = rtrim(trim((string) ($row['actor_id'] ?? '')), '/');
-            if ($actor === '') continue;
+            if ($actor === '' || admin_home_downrank_actor_exempt($actor)) {
+                continue;
+            }
+            $until = strtotime((string) ($row['suppressed_until'] ?? '')) ?: 0;
+            if ($until <= $now) {
+                continue;
+            }
             if (!isset($out[$actor])) {
                 $out[$actor] = [
                     'actor_id' => $actor,
@@ -7795,7 +7847,6 @@ function admin_home_downranked_actor_rows(): array
             $item =& $out[$actor];
             $item['score'] = max((int) $item['score'], (int) ($row['score'] ?? 0));
             $item['viewers']++;
-            $until = strtotime((string) ($row['suppressed_until'] ?? '')) ?: 0;
             if ($until > (int) $item['until']) {
                 $item['until'] = $until;
                 $item['last_object_id'] = (string) ($row['last_object_id'] ?? '');
@@ -7879,7 +7930,9 @@ function admin_home_downrank_audit_rows(int $limit = 50): array
 
 function admin_home_record_suppression(int $ownerUserId, string $actorId, array $categories, string $objectId): void
 {
+    $actorId = rtrim(trim($actorId), '/');
     if ($ownerUserId < 1 || $actorId === '' || $categories === []) return;
+    if (admin_home_downrank_actor_exempt($actorId)) return;
     try {
         $db = ap_db();
         $now = time();
@@ -7914,7 +7967,7 @@ function admin_home_apply_temporary_toxicity_downrank(array $timeline, int $owne
         $visibility = strtolower((string) ($row['visibility'] ?? 'public'));
         if ($visibility !== 'public' && $visibility !== 'unlisted') continue;
         $actor = rtrim((string) ($row['actor_id'] ?? $row['attributedTo'] ?? ''), '/');
-        if ($actor === '') continue;
+        if ($actor === '' || admin_home_downrank_actor_exempt($actor)) continue;
         $text = implode("\n", array_map(static fn(string $key): string => (string) ($row[$key] ?? ''), ['summary', 'content', 'content_text', 'spoiler_text']));
         $categories = admin_home_toxicity_categories($text);
         $state = $states[$actor] ?? null;
@@ -25540,7 +25593,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <?php else: ?>
           <?php
             $downrankedQuery = trim((string) ($_GET['q'] ?? ''));
-            $downrankedPage = max(1, (int) ($_GET['page'] ?? 1));
             $allDownrankedActors = admin_home_downranked_actor_rows();
             if ($downrankedQuery !== '') {
                 $needle = strtolower($downrankedQuery);
@@ -25550,15 +25602,13 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 }));
             }
             $downrankedPerPage = 25;
-            $downrankedPages = max(1, (int) ceil(count($allDownrankedActors) / $downrankedPerPage));
-            $downrankedPage = min($downrankedPage, $downrankedPages);
-            $downrankedActors = array_slice($allDownrankedActors, ($downrankedPage - 1) * $downrankedPerPage, $downrankedPerPage);
-            $downrankedQueryParam = $downrankedQuery !== '' ? '&amp;q=' . rawurlencode($downrankedQuery) : '';
+            $downrankedTotal = count($allDownrankedActors);
             $downrankAuditRows = admin_home_downrank_audit_rows();
           ?>
           <div class="meta" style="margin-bottom:1rem">
             Private, temporary Home-ranking signals grouped by actor. These are not public labels or moderation decisions.
             Review the evidence categories and expiry before taking any server-wide action.
+            Local accounts (including cmdr_nova) are excluded from downranking; expired signals are removed automatically.
           </div>
           <form method="get" action="" style="display:flex;gap:.5rem;align-items:center;margin-bottom:1rem">
             <input type="hidden" name="view" value="downranked">
@@ -25569,28 +25619,29 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php if (!$allDownrankedActors): ?>
             <div class="empty">No active temporary downranking signals.</div>
           <?php else: ?>
-            <div style="display:flex;flex-direction:column;gap:.7rem">
-              <?php foreach ($downrankedActors as $dr): ?>
+            <div id="downranked-panel" class="downranked-panel" data-per-page="<?= (int) $downrankedPerPage ?>" data-total="<?= (int) $downrankedTotal ?>" style="border:1px solid var(--border);border-radius:12px;padding:.75rem;background:rgba(0,0,0,.12)">
+              <div class="meta" style="margin-bottom:.55rem"><?= (int) $downrankedTotal ?> active signal<?= $downrankedTotal === 1 ? '' : 's' ?></div>
+              <div id="downranked-list" class="downranked-list" style="display:flex;flex-direction:column;gap:.7rem;max-height:min(70vh,42rem);overflow:auto;padding-right:.15rem">
+              <?php foreach ($allDownrankedActors as $drIndex => $dr): ?>
                 <?php
                   $drActor = (string) ($dr['actor_id'] ?? '');
                   $drName = function_exists('actor_display_name') ? actor_display_name($drActor, false) : $drActor;
                   $drUntil = (int) ($dr['until'] ?? 0);
-                  $drExpired = $drUntil <= time();
                   $drCategoryList = array_values(array_filter(array_map('strval', (array) ($dr['categories'] ?? []))));
                   $drCats = implode(', ', $drCategoryList);
                   $drEvidence = admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5);
                 ?>
-                <article class="tweet" style="padding:.85rem 1rem">
+                <article class="tweet downranked-item" data-dr-index="<?= (int) $drIndex ?>" style="padding:.85rem 1rem;display:none">
                   <div class="tweet-hd">
                     <div style="min-width:0">
                       <div class="who" style="overflow-wrap:anywhere"><?= h($drName !== '' ? $drName : $drActor) ?></div>
                       <div class="meta" style="overflow-wrap:anywhere"><?= h($drActor) ?></div>
                     </div>
-                    <span class="tag"><?= $drExpired ? 'expired' : 'active' ?></span>
+                    <span class="tag">active</span>
                   </div>
                   <div class="meta" style="margin-top:.55rem">
                     Categories: <?= h($drCats !== '' ? $drCats : 'uncategorized') ?> · score <?= (int) ($dr['score'] ?? 0) ?> · <?= (int) ($dr['viewers'] ?? 0) ?> viewer<?= ((int) ($dr['viewers'] ?? 0) === 1 ? '' : 's') ?>
-                    <?php if ($drUntil > 0): ?> · <?= $drExpired ? 'expired' : 'expires ' . h(relative_time(gmdate('c', $drUntil))) ?><?php endif; ?>
+                    <?php if ($drUntil > 0): ?> · expires <?= h(relative_time(gmdate('c', $drUntil))) ?><?php endif; ?>
                   </div>
                   <?php if ($drEvidence): ?>
                     <div class="meta" style="margin-top:.55rem">Recent matching evidence:</div>
@@ -25638,12 +25689,44 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   </div>
                 </article>
               <?php endforeach; ?>
+              </div>
+              <nav id="downranked-pager" class="composer-actions" aria-label="Downranked pages" style="margin-top:.75rem;justify-content:center;gap:.5rem;display:none">
+                <button type="button" class="btn btn-ghost" id="downranked-prev" style="padding:.25rem .7rem;font-size:.8rem">Previous</button>
+                <span class="meta" id="downranked-page-label">Page 1 of 1</span>
+                <button type="button" class="btn btn-ghost" id="downranked-next" style="padding:.25rem .7rem;font-size:.8rem">Next</button>
+              </nav>
             </div>
-            <?php if ($downrankedPages > 1): ?><nav class="composer-actions" aria-label="Downranked pages" style="margin-top:1rem;justify-content:center;gap:.5rem">
-              <?php if ($downrankedPage > 1): ?><a class="btn btn-ghost" href="?view=downranked&amp;page=<?= $downrankedPage - 1 ?><?= $downrankedQueryParam ?>">Previous</a><?php endif; ?>
-              <span class="meta">Page <?= $downrankedPage ?> of <?= $downrankedPages ?></span>
-              <?php if ($downrankedPage < $downrankedPages): ?><a class="btn btn-ghost" href="?view=downranked&amp;page=<?= $downrankedPage + 1 ?><?= $downrankedQueryParam ?>">Next</a><?php endif; ?>
-            </nav><?php endif; ?>
+            <script>
+            (function () {
+              var panel = document.getElementById('downranked-panel');
+              if (!panel) return;
+              var perPage = Math.max(1, parseInt(panel.getAttribute('data-per-page') || '25', 10) || 25);
+              var items = Array.prototype.slice.call(panel.querySelectorAll('.downranked-item'));
+              var total = items.length;
+              var pages = Math.max(1, Math.ceil(total / perPage));
+              var page = 1;
+              var pager = document.getElementById('downranked-pager');
+              var label = document.getElementById('downranked-page-label');
+              var prev = document.getElementById('downranked-prev');
+              var next = document.getElementById('downranked-next');
+              var list = document.getElementById('downranked-list');
+              function render() {
+                var start = (page - 1) * perPage;
+                var end = start + perPage;
+                for (var i = 0; i < items.length; i++) {
+                  items[i].style.display = (i >= start && i < end) ? '' : 'none';
+                }
+                if (label) label.textContent = 'Page ' + page + ' of ' + pages;
+                if (prev) prev.disabled = page <= 1;
+                if (next) next.disabled = page >= pages;
+                if (pager) pager.style.display = pages > 1 ? 'flex' : 'none';
+                if (list) list.scrollTop = 0;
+              }
+              if (prev) prev.addEventListener('click', function () { if (page > 1) { page -= 1; render(); } });
+              if (next) next.addEventListener('click', function () { if (page < pages) { page += 1; render(); } });
+              render();
+            })();
+            </script>
           <?php endif; ?>
           <details class="blocks-section" style="margin-top:1.5rem">
             <summary><span class="who">Recent audit trail</span><span class="meta">admin vocabulary and escalation actions</span></summary>
