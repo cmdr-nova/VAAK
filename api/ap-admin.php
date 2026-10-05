@@ -21892,6 +21892,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       }
       .link-card { max-width: 100%; }
       .link-card__media { flex-basis: 96px; }
+      .youtube-link-card--wide { max-width: 100%; width: 100%; }
       .wide, .feed.wide-feed { max-width: 100%; }
       .stats-grid, .profile-grid { grid-template-columns: 1fr !important; }
     }
@@ -22220,6 +22221,65 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .link-card__desc {
       font-size: .8rem; color: var(--muted); margin-top: .25rem; line-height: 1.35;
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    /* Full-width YouTube click-to-play — fills the post column (16:9). */
+    .youtube-link-card.youtube-link-card--wide,
+    .youtube-link-card--wide {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: 100%;
+      width: 100%;
+    }
+    .youtube-link-card__play,
+    .youtube-link-card__thumb {
+      position: relative;
+      display: block;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      padding: 0;
+      border: 0;
+      margin: 0;
+      background: #080808;
+      overflow: hidden;
+      cursor: pointer;
+      flex: 0 0 auto;
+    }
+    .youtube-link-card__play img,
+    .youtube-link-card__thumb img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .youtube-link-card__play-icon {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      display: grid;
+      place-items: center;
+      width: 3.1rem;
+      height: 3.1rem;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, .78);
+      color: #fff;
+      font-size: 1.35rem;
+      pointer-events: none;
+    }
+    .youtube-link-card--wide .link-card__body {
+      flex: 0 0 auto;
+      width: 100%;
+    }
+    .youtube-link-card__open {
+      display: inline-block;
+      margin-top: .4rem;
+      color: inherit;
+      font-size: .76rem;
+    }
+    .youtube-link-card--loaded {
+      max-width: 100%;
+      width: 100%;
     }
 
     .main { min-width: 0; }

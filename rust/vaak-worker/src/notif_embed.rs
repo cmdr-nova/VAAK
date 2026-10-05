@@ -726,6 +726,175 @@ fn prepare_feed_body_html(html: &str, from: &str) -> String {
     out
 }
 
+fn youtube_id_ok(id: &str) -> bool {
+    let id = id.trim_end_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    id.len() >= 6
+        && id.len() <= 20
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Extract a YouTube video id from watch / youtu.be / shorts / embed URLs.
+fn youtube_id_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    if let Some(pos) = lower.find("youtu.be/") {
+        let rest = &url[pos + "youtu.be/".len()..];
+        let id = rest.split(['?', '#', '/']).next().unwrap_or("");
+        if youtube_id_ok(id) {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(pos) = lower.find("youtube.com/shorts/") {
+        let rest = &url[pos + "youtube.com/shorts/".len()..];
+        let id = rest.split(['?', '#', '/']).next().unwrap_or("");
+        if youtube_id_ok(id) {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(pos) = lower
+        .find("youtube.com/embed/")
+        .or_else(|| lower.find("youtube-nocookie.com/embed/"))
+    {
+        let marker_len = if lower[pos..].starts_with("youtube-nocookie.com/embed/") {
+            "youtube-nocookie.com/embed/".len()
+        } else {
+            "youtube.com/embed/".len()
+        };
+        let rest = &url[pos + marker_len..];
+        let id = rest.split(['?', '#', '/']).next().unwrap_or("");
+        if youtube_id_ok(id) {
+            return Some(id.to_string());
+        }
+    }
+    if lower.contains("youtube.com/watch") {
+        if let Some(vpos) = lower.find("v=") {
+            let rest = &url[vpos + 2..];
+            let id = rest.split(['&', '#', '/', '?']).next().unwrap_or("");
+            if youtube_id_ok(id) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn first_https_urls_from_text(text_or_html: &str) -> Vec<String> {
+    let plain = strip_tags(text_or_html)
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let mut out = Vec::new();
+    let bytes = plain.as_str();
+    let mut search_from = 0usize;
+    while let Some(rel) = bytes[search_from..].find("https://") {
+        let start = search_from + rel;
+        let tail = &bytes[start..];
+        let end_rel = tail
+            .find(|c: char| c.is_whitespace() || "<>\"'".contains(c))
+            .unwrap_or(tail.len());
+        let mut url = tail[..end_rel].trim_end_matches(|c: char| ".,);]!?'\"".contains(c));
+        if let Some(second) = url[8..].find("https://") {
+            url = &url[..8 + second];
+        }
+        url = url.trim_end_matches(|c: char| ".,);]!?'\"/".contains(c));
+        if url.starts_with("https://") && !out.iter().any(|u| u == url) {
+            out.push(url.to_string());
+        }
+        search_from = start + end_rel.max(1);
+        if search_from >= bytes.len() {
+            break;
+        }
+    }
+    out
+}
+
+fn youtube_watch_url(id: &str) -> String {
+    format!("https://www.youtube.com/watch?v={id}")
+}
+
+fn youtube_thumb_url(id: &str) -> String {
+    format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")
+}
+
+/// Resolve YouTube preview data from status.card and/or body URLs.
+fn youtube_preview_from_status(st: &Value) -> Option<(String, String, String, String)> {
+    let card = st.get("card").filter(|v| v.is_object());
+    if let Some(card) = card {
+        let curl = card.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(id) = youtube_id_from_url(curl) {
+            let title = card
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let image = card
+                .get("image")
+                .and_then(|v| v.as_str())
+                .filter(|s| s.starts_with("https://"))
+                .unwrap_or("")
+                .to_string();
+            let title = if title.is_empty() {
+                "YouTube video".to_string()
+            } else {
+                title.to_string()
+            };
+            let image = if image.is_empty() {
+                youtube_thumb_url(&id)
+            } else {
+                image
+            };
+            return Some((id.clone(), youtube_watch_url(&id), title, image));
+        }
+    }
+    let content = st.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    for url in first_https_urls_from_text(content) {
+        if let Some(id) = youtube_id_from_url(&url) {
+            return Some((
+                id.clone(),
+                youtube_watch_url(&id),
+                "YouTube video".to_string(),
+                youtube_thumb_url(&id),
+            ));
+        }
+    }
+    None
+}
+
+/// Full-width 16:9 click-to-play YouTube card (PHP `ap_link_preview_html` parity + wide layout).
+fn paint_youtube_link_card(id: &str, url: &str, title: &str, image: &str) -> String {
+    let title = if title.trim().is_empty() {
+        "YouTube video"
+    } else {
+        title.trim()
+    };
+    let image = if image.starts_with("https://") {
+        image
+    } else {
+        // fallback path constructed by caller usually; keep safe
+        return String::new();
+    };
+    format!(
+        "<div class=\"link-card youtube-link-card youtube-link-card--wide\" data-youtube-id=\"{id}\" data-youtube-url=\"{url}\">\
+         <button type=\"button\" class=\"youtube-link-card__play\" data-youtube-play aria-label=\"Play YouTube video\">\
+         <img src=\"{img}\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">\
+         <span class=\"youtube-link-card__play-icon\" aria-hidden=\"true\">▶</span></button>\
+         <div class=\"link-card__body\">\
+         <div class=\"link-card__provider\">YouTube</div>\
+         <div class=\"link-card__title\">{title}</div>\
+         <a class=\"youtube-link-card__open\" href=\"{url}\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">Open on YouTube</a>\
+         </div></div>",
+        id = esc(id),
+        url = esc(url),
+        img = esc(image),
+        title = esc(title),
+    )
+}
+
 fn paint_link_card_html(card: &Value) -> String {
     let url = card
         .get("url")
@@ -734,6 +903,16 @@ fn paint_link_card_html(card: &Value) -> String {
         .trim();
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return String::new();
+    }
+    if let Some(id) = youtube_id_from_url(url) {
+        let title = card.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let image = card
+            .get("image")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("https://"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| youtube_thumb_url(&id));
+        return paint_youtube_link_card(&id, &youtube_watch_url(&id), title, &image);
     }
     let title = card.get("title").and_then(|v| v.as_str()).unwrap_or("").trim();
     let desc = card
@@ -820,18 +999,30 @@ fn paint_status_link_card(st: &Value) -> String {
     if status_has_media(st) {
         return String::new();
     }
-    let Some(card) = st.get("card").filter(|v| v.is_object()) else {
-        return String::new();
-    };
-    let card_url = card.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let painted_quote = quote_url_for_dedupe(st);
-    if !painted_quote.is_empty()
-        && !card_url.is_empty()
-        && urls_loosely_equivalent(card_url, &painted_quote)
-    {
-        return String::new();
+    if let Some(card) = st.get("card").filter(|v| v.is_object()) {
+        let card_url = card.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if !painted_quote.is_empty()
+            && !card_url.is_empty()
+            && urls_loosely_equivalent(card_url, &painted_quote)
+        {
+            // Fall through — body may still have a YouTube URL to preview.
+        } else {
+            let painted = paint_link_card_html(card);
+            if !painted.is_empty() {
+                return painted;
+            }
+        }
     }
-    paint_link_card_html(card)
+    // Hydrate often leaves card=null; PHP looked up link_preview_cards at paint.
+    // Synthesize a usable YouTube click-to-play card from the body URL.
+    if let Some((id, url, title, image)) = youtube_preview_from_status(st) {
+        if !painted_quote.is_empty() && urls_loosely_equivalent(&url, &painted_quote) {
+            return String::new();
+        }
+        return paint_youtube_link_card(&id, &url, &title, &image);
+    }
+    String::new()
 }
 
 /// Tiny helpers over the `regex` crate without threading Regex objects everywhere.
@@ -2444,6 +2635,62 @@ mod tests {
         assert!(html.contains("Mag art"), "{html}");
         assert!(html.contains("feed-body--html"), "{html}");
         assert!(html.contains("class=\"ext-link\""), "bare url should linkify: {html}");
+    }
+
+    #[test]
+    fn paints_full_width_youtube_from_body_url_without_card() {
+        let st = json!({
+            "id": "1",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/abc",
+            "content": "<p>watch https://youtu.be/z6hGTNMgl28?si=Rg2HeQfcZQFT7Z5B</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {
+                "acct": "cmdr_nova",
+                "display_name": "Nova",
+                "avatar": "https://mkultra.monster/img/avatar/local-default.webp",
+                "uri": "https://mkultra.monster/users/cmdr_nova"
+            },
+            "media_attachments": [],
+            "card": null
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(
+            html.contains("youtube-link-card--wide") && html.contains("data-youtube-id=\"z6hGTNMgl28\""),
+            "youtube wide card: {html}"
+        );
+        assert!(html.contains("data-youtube-play"), "click-to-play: {html}");
+        assert!(
+            html.contains("i.ytimg.com/vi/z6hGTNMgl28/hqdefault.jpg"),
+            "thumb: {html}"
+        );
+        assert!(html.contains("Open on YouTube"), "{html}");
+    }
+
+    #[test]
+    fn paints_youtube_from_card_with_title() {
+        let st = json!({
+            "id": "1",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/abc",
+            "content": "<p>ep</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {
+                "acct": "cmdr_nova",
+                "display_name": "Nova",
+                "avatar": "https://mkultra.monster/img/avatar/local-default.webp",
+                "uri": "https://mkultra.monster/users/cmdr_nova"
+            },
+            "media_attachments": [],
+            "card": {
+                "url": "https://www.youtube.com/watch?v=z6hGTNMgl28",
+                "title": "The World is Empty",
+                "provider_name": "YouTube",
+                "image": "https://i.ytimg.com/vi/z6hGTNMgl28/hqdefault.jpg"
+            }
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("The World is Empty"), "{html}");
+        assert!(html.contains("youtube-link-card--wide"), "{html}");
+        assert!(!html.contains("class=\"link-card__media\""), "must not use side thumb: {html}");
     }
 
     #[test]

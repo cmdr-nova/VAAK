@@ -11,6 +11,7 @@ mod account_switch;
 mod home_html;
 mod home_hydrate_ranked;
 mod interaction_flags;
+mod link_preview;
 mod mentions_html;
 mod notif;
 mod notif_embed;

@@ -695,6 +695,8 @@ pub async fn profile_html_fill(
     if viewer_owner_id > 0 {
         let _ = crate::interaction_flags::apply_to_statuses(&db, viewer_owner_id, &mut statuses).await;
     }
+    // Cached OG/YouTube cards (PHP `ap_link_preview_card_for_status_text` parity).
+    let _ = crate::link_preview::attach_cached_cards(&db, &mut statuses).await;
 
     let mut html = String::with_capacity(statuses.len() * 1200);
     let mut painted = 0usize;
