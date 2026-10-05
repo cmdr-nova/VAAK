@@ -11845,7 +11845,6 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
         if ($isRss) {
             $html .= '<div class="meta" style="margin-top:.3rem">'
                 . h($acct)
-                . ' <span class="tag" title="From an RSS/Atom feed">RSS</span>'
                 . '</div>';
         } else {
             if ($acct[0] !== '@' && !str_starts_with($acct, 'http')) {
@@ -13559,7 +13558,6 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
         if ($parentLabel !== '') {
             $html .= '<span>' . h($parentLabel) . '</span> ';
         }
-        $html .= '<span class="tag" style="margin-left:.15rem" title="Reply source">Bluesky</span> ';
         if ($href !== '' && $href !== '#') {
             $html .= '<a href="' . h($href) . '">' . h($linkText) . '</a>';
         } else {
@@ -15135,18 +15133,6 @@ function admin_render_masto_status_card(
         $boosterAcct = (string) ($st['account']['acct'] ?? '');
         $boosterName = (string) ($st['account']['display_name'] ?? $boosterAcct);
         $boostWhen = (string) ($st['created_at'] ?? '');
-        $innerReblog = is_array($st['reblog'] ?? null) ? $st['reblog'] : [];
-        $innerSid = (string) ($innerReblog['id'] ?? '');
-        $innerIsRss = !empty($innerReblog['vaak_rss_item_id'])
-            || (!empty($innerReblog['source']) && (string) $innerReblog['source'] === 'rss')
-            || str_starts_with($innerSid, 'rss:');
-        if ($innerIsRss) {
-            $boostSource = 'RSS';
-        } elseif (admin_object_url_is_bluesky((string) ($innerReblog['uri'] ?? $innerReblog['url'] ?? ''))) {
-            $boostSource = 'Bluesky';
-        } else {
-            $boostSource = 'Fediverse';
-        }
         $boosterAccount = is_array($st['account'] ?? null) ? $st['account'] : [];
         $boosterRef = function_exists('admin_account_actor_ref')
             ? admin_account_actor_ref($boosterAccount)
@@ -15170,7 +15156,6 @@ function admin_render_masto_status_card(
             . $boosterLabel
             . ' boosted'
             . ($boostWhen !== '' ? ' · ' . htmlspecialchars(relative_time($boostWhen), ENT_QUOTES, 'UTF-8') : '')
-            . ' <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">' . h($boostSource) . '</span>'
             . '</div>';
         if ($announceEventId < 1) {
             $announceEventId = (int) ($st['reblog']['vaak_announce_event_id'] ?? 0);
@@ -15824,7 +15809,6 @@ function admin_render_masto_status_card(
                   <?php if ($isRss): ?>
                     <span class="who"><?= h($display !== '' ? $display : 'RSS') ?></span>
                     <span class="meta"> · <?= h(relative_time((string) ($st['created_at'] ?? ''))) ?></span>
-                    <span class="tag" title="From an RSS/Atom feed you added">RSS</span>
                   <?php elseif ($actorRef !== '' && !$isLocal && $profileAppHref !== ''): ?>
                     <a class="who" href="<?= h($profileAppHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($display, $actorRef) ?></a>
                     <a class="meta" href="<?= h($profileAppHref) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($acct) ?></a>
@@ -15832,7 +15816,6 @@ function admin_render_masto_status_card(
                     <?php if (!empty($st['edited_at'])): ?>
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
-                    <?php if ($isBsky): ?><span class="tag" title="From Bluesky">Bluesky</span><?php endif; ?>
                     <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
                     <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
@@ -15844,7 +15827,6 @@ function admin_render_masto_status_card(
                     <?php if (!empty($st['edited_at'])): ?>
                       <span class="meta" title="<?= h((string) $st['edited_at']) ?>"> · edited</span>
                     <?php endif; ?>
-                    <?php if ($isBsky): ?><span class="tag" title="From Bluesky">Bluesky</span><?php endif; ?>
                     <?php if (!empty($st['vaak_from_followed_tag'])): ?><span class="tag" title="Matched a hashtag you follow">followed tag</span><?php endif; ?>
                     <?php $stVis = admin_visibility_meta($st['visibility'] ?? 'public'); ?>
                     <?= admin_anti_ai_tag_html($plain, $actorRef !== '' ? $actorRef : null) ?>
@@ -15859,16 +15841,10 @@ function admin_render_masto_status_card(
             </div>
             <?php else: ?>
               <?php
-                // Mentions nest: author lives on the notif header. Keep network /
-                // visibility chips so Bluesky/followers-only posts stay labeled.
+                // Mentions nest: author lives on the notif header. Audience /
+                // anti-AI chips only — no Bluesky/RSS network badges.
                 $stVis = admin_visibility_meta($st['visibility'] ?? 'public');
                 $embedChips = '';
-                if ($isBsky) {
-                    $embedChips .= '<span class="tag" title="From Bluesky">Bluesky</span>';
-                }
-                if ($isRss) {
-                    $embedChips .= '<span class="tag" title="From an RSS/Atom feed you added">RSS</span>';
-                }
                 if (($stVis['key'] ?? 'public') !== 'public') {
                     $embedChips .= '<span class="tag" title="Audience">' . h($stVis['label']) . '</span>';
                 }
@@ -16420,7 +16396,6 @@ function admin_render_remote_boost_card(
                 <span style="opacity:.75"><?= h($boosterHandle) ?></span>
               <?php endif; ?>
               · <?= h(relative_time($created)) ?>
-              <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Fediverse</span>
               <?php if ($fromFollowedTag): ?><span class="tag" style="margin-left:.35rem">followed tag</span><?php endif; ?>
             </div>
             <div class="tweet-hd">
@@ -17743,7 +17718,7 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     ?>
     <article class="tweet tweet-bsky<?= $isRepost ? ' tweet-boost' : '' ?><?= $isHome ? ' tweet-bsky-home' : '' ?>" data-bsky-uri="<?= h($uri) ?>" data-bsky-cid="<?= h($cid) ?>"<?= $rankAttrs ?>>
       <?php if ($reasonLabel !== ''): ?>
-        <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= $reasonLabel ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?> <span class="tag" style="margin-left:.35rem;color:var(--text)" title="Boost source network">Bluesky</span></div>
+        <div class="meta meta-row" style="color:var(--primary)"><i class="ph ph-repeat" aria-hidden="true"></i> <?= $reasonLabel ?><?php if ($reasonIndexedAt !== ''): ?> · <?= h(relative_time($reasonIndexedAt)) ?><?php endif; ?></div>
       <?php endif; ?>
       <?php if (!$isHome && $feedSource !== ''): ?>
         <div class="meta" style="margin:0 0 .35rem">☁ From saved feed</div>
@@ -17779,7 +17754,6 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
             <?php if ($displayCreated !== ''): ?>
               <span class="meta"> · <?= h(relative_time($displayCreated)) ?></span>
             <?php endif; ?>
-            <span class="tag" title="From Bluesky">Bluesky</span>
             <?= admin_anti_ai_tag_html($text, $authorDid !== '' ? $authorDid : null) ?>
             <?php if ($quote !== null): ?>
               <span class="tag" title="<?= $isQuoteBoost ? 'Quote post' : 'Quote with commentary' ?>">quote</span>

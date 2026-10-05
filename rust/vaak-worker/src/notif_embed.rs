@@ -1619,7 +1619,6 @@ pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> S
         .unwrap_or(false)
         || !spoiler.is_empty();
     let bsky = is_bsky(status, acct, uri);
-    let rss = is_rss(status);
     let visibility = status
         .get("visibility")
         .and_then(|v| v.as_str())
@@ -1679,33 +1678,21 @@ pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> S
                 esc(acct)
             )
         };
-        let mut tags = String::new();
-        if bsky {
-            tags.push_str("<span class=\"tag\" title=\"From Bluesky\">Bluesky</span>");
-        }
-        if rss {
-            tags.push_str("<span class=\"tag\" title=\"From an RSS/Atom feed you added\">RSS</span>");
-        }
+        // Network source tags (Bluesky / RSS) omitted — they only crowded the header.
         let when_html = if when.is_empty() {
             String::new()
         } else {
             format!("<span class=\"meta\"> · {}</span>", esc(&when))
         };
         inner.push_str(&format!(
-            "<div class=\"tweet-hd\">{av}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}{tags}</div></div></div>",
+            "<div class=\"tweet-hd\">{av}<div class=\"tweet-hd-main tweet-hd-main--fedi\"><div>{who}{when}</div></div></div>",
             av = av_block,
             who = who,
-            when = when_html,
-            tags = tags
+            when = when_html
         ));
     } else {
+        // Nest chips: keep audience only (no Bluesky/RSS network badges).
         let mut chips = String::new();
-        if bsky {
-            chips.push_str("<span class=\"tag\" title=\"From Bluesky\">Bluesky</span>");
-        }
-        if rss {
-            chips.push_str("<span class=\"tag\" title=\"From an RSS/Atom feed you added\">RSS</span>");
-        }
         if visibility != "public" {
             chips.push_str(&format!(
                 "<span class=\"tag\" title=\"Audience\">{}</span>",
@@ -1819,23 +1806,6 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
                 .and_then(|v| v.as_str())
                 .map(relative_time)
                 .unwrap_or_default();
-            let inner_uri = inner
-                .get("uri")
-                .and_then(|v| v.as_str())
-                .or_else(|| inner.get("url").and_then(|v| v.as_str()))
-                .unwrap_or("");
-            let inner_acct = inner
-                .get("account")
-                .and_then(|a| a.get("acct"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let boost_source = if is_rss(&inner) {
-                "RSS"
-            } else if is_bsky(&inner, inner_acct, inner_uri) {
-                "Bluesky"
-            } else {
-                "Fediverse"
-            };
             let booster_ref = booster
                 .get("uri")
                 .and_then(|v| v.as_str())
@@ -1856,8 +1826,7 @@ pub fn paint_lean_feed_card(status: &Value) -> String {
                 format!(" · {}", esc(&boost_when))
             };
             boost_header = format!(
-                "<div class=\"meta meta-row\" style=\"color:var(--primary)\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i> {booster_label} boosted{when_bit} <span class=\"tag\" style=\"margin-left:.35rem;color:var(--text)\" title=\"Boost source network\">{src}</span></div>",
-                src = esc(boost_source)
+                "<div class=\"meta meta-row\" style=\"color:var(--primary)\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i> {booster_label} boosted{when_bit}</div>"
             );
             st = inner;
         }
