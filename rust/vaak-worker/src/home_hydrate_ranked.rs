@@ -348,7 +348,7 @@ fn media_from_urls(urls_json: &str, status_id: &str) -> Vec<Value> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for (i, u) in arr.iter().enumerate() {
+    for u in arr {
         if out.len() >= 4 {
             break;
         }
@@ -372,8 +372,11 @@ fn media_from_urls(urls_json: &str, status_id: &str) -> Vec<Value> {
         } else {
             clean.to_string()
         };
+        // Attachment ids are local to the emitted list.  Do not leak gaps
+        // when malformed/non-HTTPS URLs are skipped (PHP/Mastodon clients
+        // expect stable 1..N attachment slots).
         out.push(json!({
-            "id": format!("{status_id}{}", i + 1),
+            "id": format!("{status_id}{}", out.len() + 1),
             "type": mtype,
             "url": clean,
             "preview_url": if preview.starts_with("https://") {
@@ -2583,5 +2586,37 @@ mod tests {
         assert!(reblog_is_bsky_native("x", "https://bsky.app/profile/a/post/b"));
         assert!(reblog_is_rss_local("rss-boost:1", ""));
         assert!(!reblog_is_bsky_native("12345", "https://example.com/notes/1"));
+    }
+
+    #[test]
+    fn shared_public_media_materializer_preserves_images_and_video_posters() {
+        let urls = serde_json::json!([
+            "https://cdn.example/media/photo.jpg?width=1200",
+            "https://files.example/media/original/clip.mp4",
+            "http://insecure.example/nope.jpg",
+            "https://cdn.example/media/second.webp",
+            "https://cdn.example/media/third.png",
+            "https://cdn.example/media/fifth.jpg"
+        ])
+        .to_string();
+        let media = media_from_urls(&urls, "status-1");
+        // Local and Federated use this same materializer; keep PHP's four-item
+        // attachment limit and never emit non-HTTPS media.
+        assert_eq!(media.len(), 4);
+        assert_eq!(media[0]["type"], "image");
+        assert_eq!(media[0]["preview_url"], "https://cdn.example/media/photo.jpg?width=1200");
+        assert_eq!(media[1]["type"], "video");
+        assert_eq!(
+            media[1]["preview_url"],
+            "https://files.example/media/small/clip.png"
+        );
+        assert_eq!(media[3]["id"], "status-14");
+    }
+
+    #[test]
+    fn shared_public_media_materializer_rejects_malformed_payloads() {
+        assert!(media_from_urls("not-json", "status").is_empty());
+        assert!(media_from_urls("{}", "status").is_empty());
+        assert!(media_from_urls(r#"[null, 42, "ftp://example/file.jpg"]"#, "status").is_empty());
     }
 }
