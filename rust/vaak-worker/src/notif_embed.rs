@@ -661,8 +661,7 @@ enum LinkifyKind {
 
 /// Tighten Mastodon HTML breaks for feed bodies.
 ///
-/// Keep a double `<br>` as a paragraph gap (0.7.26); only collapse runs of
-/// 3+ breaks down to two so intentional paragraph returns stay visible.
+/// Collapse runs of 3+ `<br>` down to two (paragraph split marker).
 fn collapse_html_breaks(html: &str) -> String {
     let mut out = html.to_string();
     for _ in 0..4 {
@@ -675,10 +674,78 @@ fn collapse_html_breaks(html: &str) -> String {
     out
 }
 
-/// Prepare Mastodon/AP content HTML for lean feed paint: tighten breaks,
+fn is_blank_html_segment(seg: &str) -> bool {
+    let t = lazy_regex_replace_all(r"(?i)<br\s*/?>", seg, " ");
+    let t = lazy_regex_replace_all(r"(?i)&nbsp;", &t, " ");
+    strip_tags(&t).trim().is_empty()
+}
+
+/// Force VAAK paragraph shape across remote software dialects.
+///
+/// Mastodon (and many peers) emit one `<p>` with `<br><br>` for paragraphs.
+/// Local VAAK posts use real `<p>` blocks. Making every `<br>` a CSS block
+/// gap made remote posts look huge; instead convert double-breaks into
+/// separate `<p>` tags and leave single `<br>` as soft line breaks.
+fn normalize_feed_paragraphs(html: &str) -> String {
+    let mut html = collapse_html_breaks(html.trim());
+    // Drop empty / br-only paragraphs some peers insert between blocks.
+    html = lazy_regex_replace_all(r"(?i)<p>\s*(?:<br\s*/?>\s*)*</p>", &html, "");
+    html = lazy_regex_replace_all(r"(?i)(<br\s*/?>\s*){2,}", &html, "<!--vaak-p-->");
+
+    // Prefer splitting inside a single outer <p>…</p> wrapper.
+    let trimmed = html.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<p>") && lower.ends_with("</p>") {
+        let open_count = lower.matches("<p>").count() + lower.matches("<p ").count();
+        // One outer paragraph (possibly with nested tags, but no sibling <p>).
+        if open_count == 1 {
+            let inner = &trimmed[3..trimmed.len() - 4];
+            let parts: Vec<&str> = inner.split("<!--vaak-p-->").collect();
+            let mut out = String::with_capacity(trimmed.len() + 16);
+            for part in parts {
+                let part = part.trim();
+                if part.is_empty() || is_blank_html_segment(part) {
+                    continue;
+                }
+                out.push_str("<p>");
+                out.push_str(part);
+                out.push_str("</p>");
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+
+    // Multiple blocks or unwrapped HTML: split on markers and wrap bare chunks.
+    if html.contains("<!--vaak-p-->") {
+        let parts: Vec<&str> = html.split("<!--vaak-p-->").collect();
+        let mut out = String::with_capacity(html.len() + 16);
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() || is_blank_html_segment(part) {
+                continue;
+            }
+            let pl = part.to_ascii_lowercase();
+            if pl.starts_with("<p>") || pl.starts_with("<p ") {
+                out.push_str(part);
+            } else {
+                out.push_str("<p>");
+                out.push_str(part);
+                out.push_str("</p>");
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    html.replace("<!--vaak-p-->", "<br><br>")
+}
+
+/// Prepare Mastodon/AP content HTML for lean feed paint: normalize paragraphs,
 /// rewrite mention/hashtag/ext anchors in-app, and linkify bare URLs.
 fn prepare_feed_body_html(html: &str, from: &str) -> String {
-    let collapsed = collapse_html_breaks(html.trim());
+    let collapsed = normalize_feed_paragraphs(html);
     let mut out = String::with_capacity(collapsed.len() + 64);
     let mut rest = collapsed.as_str();
     let mut in_anchor = false;
@@ -2593,19 +2660,40 @@ mod tests {
 
     #[test]
     fn collapse_consecutive_breaks() {
-        // Double break = paragraph gap (kept). Triple+ collapses to double.
+        // Double <br> inside one <p> → real sibling paragraphs (VAAK shape).
         let para = prepare_feed_body_html("<p>one<br />\n<br />\ntwo</p>", "home");
         let lower = para.to_ascii_lowercase();
         assert!(
-            lower.contains("<br><br>") || lower.contains("<br /><br") || lower.matches("<br").count() >= 2,
-            "paragraph break should remain: {para}"
+            lower.matches("<p>").count() >= 2,
+            "double br should become separate p tags: {para}"
+        );
+        assert!(
+            !lower.contains("<br><br>") && !lower.contains("<br /><br"),
+            "should not leave double br: {para}"
         );
         assert!(para.contains("one") && para.contains("two"), "{para}");
 
         let tight = prepare_feed_body_html("<p>one<br /><br /><br />two</p>", "home");
-        let brs = tight.to_ascii_lowercase().matches("<br").count();
-        assert!(brs <= 2, "3+ breaks should collapse to a double: {tight}");
+        let lower_t = tight.to_ascii_lowercase();
+        assert!(
+            lower_t.matches("<p>").count() >= 2,
+            "3+ breaks should still become paragraphs: {tight}"
+        );
         assert!(tight.contains("one") && tight.contains("two"), "{tight}");
+
+        // Soft single <br> stays inside one paragraph.
+        let soft = prepare_feed_body_html("<p>one<br />two</p>", "home");
+        let soft_l = soft.to_ascii_lowercase();
+        assert_eq!(soft_l.matches("<p>").count(), 1, "soft br stays one p: {soft}");
+        assert!(soft_l.contains("<br"), "soft br preserved: {soft}");
+    }
+
+    #[test]
+    fn strips_empty_paragraph_spacers() {
+        let html = prepare_feed_body_html("<p>one</p><p></p><p><br></p><p>two</p>", "home");
+        let lower = html.to_ascii_lowercase();
+        assert!(!lower.contains("<p></p>"), "empty p removed: {html}");
+        assert!(html.contains("one") && html.contains("two"), "{html}");
     }
 
     #[test]

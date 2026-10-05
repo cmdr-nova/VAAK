@@ -23229,18 +23229,16 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       white-space: normal;
       line-height: 1.55;
     }
+    /* Uniform paragraph gap for local + remote (Mastodon often uses <br><br>
+       inside one <p>; lean paint normalizes those to real <p> blocks). */
     .feed-body--html p {
-      margin: 0 0 0.55em;
+      margin: 0 0 0.35em;
     }
     .feed-body--html p:last-child {
       margin-bottom: 0;
     }
-    /* Soft line breaks in lean HTML had no extra gap (0.7.26). */
-    .feed-body--html br {
-      content: "";
-      display: block;
-      margin-top: 0.4em;
-    }
+    /* Soft <br> stays a normal line break — do NOT promote every br to a
+       block gap (that made remote Mastodon posts look hugely spaced). */
     /* Canonical Ask card — colors follow user accent (--primary / --primary-dim) */
     .ask-container {
       display: flex;
@@ -23263,7 +23261,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .ask-container .ask-divider-fallback { display: none; }
     /* Modest gap between paragraphs (HTML from compose / remotes) */
     .body p, .feed-body p {
-      margin: 0 0 0.75em;
+      margin: 0 0 0.35em;
     }
     .body p:last-child, .feed-body p:last-child {
       margin-bottom: 0;
