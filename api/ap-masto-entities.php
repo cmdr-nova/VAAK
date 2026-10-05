@@ -7746,6 +7746,115 @@ function ap_timeline_author_diversity(array $statuses, int $limit): array
  * @param array<string,mixed> $row
  * @return array<string,mixed>
  */
+/**
+ * Drop same-actor Announce rows when a Create/Quote/QuotePost/Update of the
+ * same object_id is already in the window (quote-boost dual publish).
+ *
+ * Legitimate boosts of someone else's post keep different actor_ids, so they
+ * stay. Self-announces of a quote note collapse to the richer Create/Quote card.
+ *
+ * @param list<array<string,mixed>> $rows events rows
+ * @return list<array<string,mixed>>
+ */
+function ap_events_collapse_self_announces(array $rows): array
+{
+    $createKeys = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $type = strtolower((string) ($row['type'] ?? ''));
+        if (!in_array($type, ['create', 'quote', 'quotepost', 'update'], true)) {
+            continue;
+        }
+        $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+        $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
+        if ($actor === '' || $oid === '') {
+            continue;
+        }
+        $createKeys[$actor . "\n" . $oid] = true;
+        if (preg_match('#^(https://.+)/QuotePost$#i', $oid, $m)) {
+            $createKeys[$actor . "\n" . rtrim($m[1], '/')] = true;
+        }
+    }
+    if ($createKeys === []) {
+        return $rows;
+    }
+    $out = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        if (strcasecmp((string) ($row['type'] ?? ''), 'Announce') === 0) {
+            $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            $oid = rtrim((string) ($row['object_id'] ?? ''), '/');
+            if ($actor !== '' && $oid !== '' && !empty($createKeys[$actor . "\n" . $oid])) {
+                continue;
+            }
+            if (
+                $actor !== ''
+                && $oid !== ''
+                && preg_match('#^(https://.+)/QuotePost$#i', $oid, $m)
+                && !empty($createKeys[$actor . "\n" . rtrim($m[1], '/')])
+            ) {
+                continue;
+            }
+        }
+        $out[] = $row;
+    }
+    return $out;
+}
+
+/**
+ * Same collapse for Mastodon status arrays: drop a reblog when another status
+ * in the page is the same account's non-reblog of the reblogged URI.
+ *
+ * @param list<array<string,mixed>> $statuses
+ * @return list<array<string,mixed>>
+ */
+function ap_masto_collapse_self_announce_statuses(array $statuses): array
+{
+    $createKeys = [];
+    foreach ($statuses as $st) {
+        if (!is_array($st) || !empty($st['reblog'])) {
+            continue;
+        }
+        $acct = is_array($st['account'] ?? null) ? $st['account'] : [];
+        $acctId = (string) ($acct['id'] ?? '');
+        $uri = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
+        if ($uri !== '' && str_contains($uri, '#')) {
+            $uri = rtrim((string) (preg_replace('/#.*$/', '', $uri) ?? $uri), '/');
+        }
+        if ($acctId === '' || $uri === '') {
+            continue;
+        }
+        $createKeys[$acctId . "\n" . $uri] = true;
+    }
+    if ($createKeys === []) {
+        return $statuses;
+    }
+    $out = [];
+    foreach ($statuses as $st) {
+        if (!is_array($st)) {
+            continue;
+        }
+        if (!empty($st['reblog']) && is_array($st['reblog'])) {
+            $acct = is_array($st['account'] ?? null) ? $st['account'] : [];
+            $acctId = (string) ($acct['id'] ?? '');
+            $inner = $st['reblog'];
+            $uri = rtrim((string) ($inner['uri'] ?? $inner['url'] ?? ''), '/');
+            if ($uri !== '' && str_contains($uri, '#')) {
+                $uri = rtrim((string) (preg_replace('/#.*$/', '', $uri) ?? $uri), '/');
+            }
+            if ($acctId !== '' && $uri !== '' && !empty($createKeys[$acctId . "\n" . $uri])) {
+                continue;
+            }
+        }
+        $out[] = $st;
+    }
+    return $out;
+}
+
 function ap_masto_peertube_prefer_create_event(array $row): array
 {
     if (strcasecmp((string) ($row['type'] ?? ''), 'Announce') !== 0) {
@@ -7914,6 +8023,13 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     $st = ap_db()->prepare($sql);
     $st->execute($params);
     $rows = $st->fetchAll();
+    if (!is_array($rows)) {
+        $rows = [];
+    }
+    // Quote-boost dual publish: same actor Create + Announce of one note → keep Create.
+    if ($mode === 'home' && function_exists('ap_events_collapse_self_announces')) {
+        $rows = ap_events_collapse_self_announces($rows);
+    }
     $queryMs = (microtime(true) - $queryStartedAt) * 1000.0;
     $hydrateStartedAt = microtime(true);
     $out = [];
@@ -8323,6 +8439,9 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     };
 
     $all = array_merge($remote, $local, $boosts, $tagPosts);
+    if (function_exists('ap_masto_collapse_self_announce_statuses')) {
+        $all = ap_masto_collapse_self_announce_statuses($all);
+    }
     usort($all, static function ($a, $b) use ($rankTs) {
         $cmp = strcmp($rankTs($b), $rankTs($a));
         if ($cmp !== 0) {

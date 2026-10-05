@@ -7990,6 +7990,32 @@ function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $
         return;
     }
 
+    // Skip fan-out of self-Announce when Create/Quote of the same object already
+    // exists (quote-boost dual publish — Home already has the richer card).
+    if (strcasecmp($type, 'Announce') === 0) {
+        try {
+            $stObj = ap_db()->prepare('SELECT object_id FROM events WHERE id = ? LIMIT 1');
+            $stObj->execute([$eventId]);
+            $oid = rtrim((string) ($stObj->fetchColumn() ?: ''), '/');
+            if ($oid !== '') {
+                $stC = ap_db()->prepare(
+                    "SELECT 1 FROM events
+                     WHERE actor_id IN (?, ?)
+                       AND (object_id = ? OR object_id = ?)
+                       AND type IN ('Create', 'Quote', 'QuotePost', 'Update')
+                       AND action_taken IN ('log', 'local_observe')
+                     LIMIT 1"
+                );
+                $stC->execute([$actorId, $actorId . '/', $oid, $oid . '/']);
+                if ($stC->fetchColumn()) {
+                    return;
+                }
+            }
+        } catch (Throwable $e) {
+            // Fall through to normal fan-out on lookup failure.
+        }
+    }
+
     if (ap_timeline_fanout_enqueue([
         'op' => 'home_followers',
         'k' => 'event',
