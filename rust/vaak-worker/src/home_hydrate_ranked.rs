@@ -2619,4 +2619,41 @@ mod tests {
         assert!(media_from_urls("{}", "status").is_empty());
         assert!(media_from_urls(r#"[null, 42, "ftp://example/file.jpg"]"#, "status").is_empty());
     }
+
+    #[test]
+    fn local_and_federated_event_cards_keep_media_and_cw_metadata() {
+        let media_urls = serde_json::json!(["https://cdn.example/media/photo.jpg"]).to_string();
+        let actor = ActorRow {
+            actor_id: "https://mkultra.monster/users/test_account".into(),
+            username: "test_account".into(),
+            display_name: "Test Account".into(),
+            host: "mkultra.monster".into(),
+            icon: DEFAULT_AVATAR.into(),
+        };
+        let local = EventRow {
+            id: 41,
+            event_type: "Create".into(),
+            actor_id: actor.actor_id.clone(),
+            object_id: "https://mkultra.monster/notes/41".into(),
+            summary: "(media)".into(),
+            media_urls: media_urls.clone(),
+            created_at: "2026-10-05T12:00:00Z".into(),
+            sensitive: false,
+            spoiler_text: "Gallery".into(),
+            host: "mkultra.monster".into(),
+            target_actor: String::new(),
+        };
+        let mut federated = local.clone();
+        federated.id = 42;
+        federated.actor_id = "https://remote.example/users/test".into();
+        federated.object_id = "https://remote.example/notes/42".into();
+        federated.host = "remote.example".into();
+        let local_status = materialize_event_create(&local, Some(&actor));
+        let federated_status = materialize_event_create(&federated, None);
+        for status in [local_status, federated_status] {
+            assert_eq!(status["media_attachments"].as_array().map(Vec::len), Some(1));
+            assert_eq!(status["spoiler_text"], json!("Gallery"));
+            assert_eq!(status["content"], json!(""));
+        }
+    }
 }
