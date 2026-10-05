@@ -13,8 +13,9 @@ use crate::config::Config;
 use crate::redis_util;
 
 const HOME_PATH: &str = "/api/v1/timelines/home";
-/// Match PHP `ap_masto_timeline_cache_try` default TTL window for freshness note.
-const HOME_TL_FRESH_SECS: i64 = 45;
+/// Match PHP Home Redis TTL (0.6.67: 300s). Ice Cubes `cache_try` still uses 45s
+/// for client freshness; Axum serves any present envelope until Redis expiry.
+const HOME_TL_FRESH_SECS: i64 = 300;
 
 #[derive(Debug, Serialize)]
 pub struct HomeShadowReport {
@@ -160,7 +161,7 @@ async fn read_home_hydrate(
     if report.fresh {
         report.note = "hydrate cache hit (fresh)";
     } else {
-        report.note = "hydrate cache hit (stale vs 45s window; still served for shadow)";
+        report.note = "hydrate cache hit (stale vs freshness window; still served for shadow)";
     }
     Ok(report)
 }
