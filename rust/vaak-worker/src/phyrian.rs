@@ -233,6 +233,111 @@ pub async fn create_local_request(
     Ok(id)
 }
 
+/// Resolve a local request using the PHP schema. Origin imprint acceptance is
+/// intentionally refused here until the PHP catalog roll is migrated; peer
+/// imprints and resonance exchanges are deterministic and safe to mirror.
+pub async fn resolve_local_request(
+    cfg: &Config,
+    owner: i64,
+    request_id: i64,
+    accept: bool,
+) -> Result<Option<String>> {
+    if owner < 1 || request_id < 1 {
+        anyhow::bail!("Invalid request");
+    }
+    let mut db = db::connect(&cfg.database_url).await?;
+    let row = db
+        .query_opt(
+            "SELECT kind, from_owner_id FROM phyrian_requests
+             WHERE id=$1 AND to_owner_id=$2 AND status='pending' LIMIT 1",
+            &[&request_id, &owner],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Request not found"))?;
+    let kind: String = row.get(0);
+    let from_owner: i64 = row.get(1);
+    let tx = db.transaction().await?;
+    if !accept {
+        tx.execute(
+            "UPDATE phyrian_requests SET status='denied', resolved_at=NOW() WHERE id=$1",
+            &[&request_id],
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(None);
+    }
+    if kind == "imprint" {
+        let rows = tx
+            .query(
+                "SELECT owner_user_id, COALESCE(strain,''), generation, status
+                 FROM phyrian_players WHERE owner_user_id = ANY($1::bigint[])",
+                &[&vec![from_owner, owner]],
+            )
+            .await?;
+        let mut from_strain = String::new();
+        let mut from_generation = 1;
+        let mut to_imprinted = false;
+        for r in rows {
+            let id: i64 = r.get(0);
+            let strain: String = r.get(1);
+            let status: String = r.get(3);
+            if id == from_owner {
+                from_strain = strain;
+                from_generation = r.get(2);
+            } else if id == owner {
+                to_imprinted = status == "imprinted" && !strain.trim().is_empty();
+            }
+        }
+        if to_imprinted {
+            anyhow::bail!("They already have a strain");
+        }
+        let (strain, generation) = resolve_peer_imprint(from_owner == 1, &from_strain, from_generation)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        tx.execute(
+            "UPDATE phyrian_players
+             SET status='imprinted', strain=$1, resonance=GREATEST(resonance,50),
+                 generation=$2, imprinted_by_owner_id=$3, imprinted_at=NOW(),
+                 last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id=$4",
+            &[&strain, &generation, &from_owner, &owner],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE phyrian_players SET inductions_given=inductions_given+1, updated_at=NOW()
+             WHERE owner_user_id=$1",
+            &[&from_owner],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE phyrian_requests SET status='accepted', resolved_at=NOW() WHERE id=$1",
+            &[&request_id],
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(Some(strain));
+    }
+    if kind != "resonance" {
+        anyhow::bail!("Unknown request kind");
+    }
+    let count = tx
+        .execute(
+            "UPDATE phyrian_players SET resonance=LEAST(100,resonance+5),
+             last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id IN ($1,$2)
+             AND status='imprinted' AND COALESCE(strain,'') <> ''",
+            &[&from_owner, &owner],
+        )
+        .await?;
+    if count != 2 {
+        anyhow::bail!("Both players must be imprinted to exchange resonance");
+    }
+    tx.execute(
+        "UPDATE phyrian_requests SET status='accepted', resolved_at=NOW() WHERE id=$1",
+        &[&request_id],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(None)
+}
+
 fn nonnegative(v: Option<i64>) -> i64 {
     v.unwrap_or(0).max(0)
 }
