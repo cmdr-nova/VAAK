@@ -22,6 +22,8 @@ struct AppState {
 pub struct OwnerQuery {
     pub owner_id: Option<i64>,
     pub since_secs: Option<i64>,
+    /// Absolute unix seconds cursor for Home live-poll (`/api/v1/timelines/home/since`).
+    pub since_ts: Option<i64>,
     pub limit: Option<i64>,
     /// Accepts true/false/1/0/yes/no (string form in query).
     pub compare: Option<String>,
@@ -80,6 +82,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/timelines/home", get(shadow_home))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
         .route("/api/v1/timelines/home", get(shadow_home_masto))
+        // Home live-poll: ranked head + hydrate filtered by since_ts (0.6.74).
+        .route("/api/v1/timelines/home/since", get(shadow_home_since))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
         .with_state(state);
 
@@ -109,6 +113,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/thin-media",
             "/shadow/timelines/home",
             "/api/v1/timelines/home",
+            "/api/v1/timelines/home/since",
             "/api/v1/notifications"
         ],
     }))
@@ -219,6 +224,69 @@ async fn shadow_home_masto(
             Json(serde_json::json!({
                 "error": "home hydrate cache miss",
                 "redis_key": report.redis_key,
+                "note": report.note,
+                "mode": "shadow",
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Home live-poll: statuses newer than `since_ts` from ranked + hydrate (404 on miss).
+///
+/// 200 + `[]` means confirmed empty (warm caches, nothing newer) — PHP must not
+/// fall through to the multi-chunk PG `admin_tl_fetch_newer` path.
+async fn shadow_home_since(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(20).clamp(1, 40) as usize;
+    let since_ts = q.since_ts.unwrap_or(0);
+    if since_ts <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "since_ts required",
+                "mode": "shadow",
+            })),
+        )
+            .into_response();
+    }
+    match crate::timeline::home_since(&state.cfg, owner, since_ts, limit).await {
+        Ok(report) if report.cache_hit => {
+            let mut resp = (StatusCode::OK, Json(report.items)).into_response();
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-vaak-tl-cache"),
+                axum::http::HeaderValue::from_static("axum-ranked-since"),
+            );
+            if let Ok(val) = axum::http::HeaderValue::from_str(&report.newest_ts.to_string()) {
+                resp.headers_mut().insert(
+                    axum::http::HeaderName::from_static("x-newest"),
+                    val,
+                );
+            }
+            if let Ok(val) = axum::http::HeaderValue::from_str(&report.n.to_string()) {
+                resp.headers_mut().insert(
+                    axum::http::HeaderName::from_static("x-new-count"),
+                    val,
+                );
+            }
+            resp
+        }
+        Ok(report) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "home since cache miss",
+                "ranked_ok": report.ranked_ok,
+                "hydrate_ok": report.hydrate_ok,
+                "ranked_key": report.ranked_key,
+                "hydrate_key": report.hydrate_key,
                 "note": report.note,
                 "mode": "shadow",
             })),

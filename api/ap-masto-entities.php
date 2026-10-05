@@ -5919,6 +5919,149 @@ function ap_masto_timeline_home_axum_fetch(int $limit = 15, int $ownerUserId = 0
 }
 
 /**
+ * Home live-poll via Axum ranked+hydrate since filter (0.6.74).
+ *
+ * Hit semantics (distinct from ap_masto_timeline_home_axum_fetch):
+ * - null → miss/disabled/error → PHP must fall back to admin_tl_fetch_newer
+ * - array with 'statuses' => [] → confirmed empty (do NOT hit PG)
+ * - array with non-empty statuses → paint via admin_render_masto_status_card
+ *
+ * Flag: VAAK_HOME_NEWER_AXUM (default on). Rollback: set 0.
+ *
+ * @return array{statuses:list<array<string,mixed>>,newest:int,source:string}|null
+ */
+function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, int $ownerUserId = 0): ?array
+{
+    $enabled = getenv('VAAK_HOME_NEWER_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled) {
+        return null;
+    }
+    $sinceTs = max(0, $sinceTs);
+    if ($sinceTs <= 0) {
+        return null;
+    }
+    if ($ownerUserId < 1) {
+        $ownerUserId = function_exists('ap_db_masto_owner_user_id')
+            ? (int) ap_db_masto_owner_user_id()
+            : (int) (function_exists('ap_db_default_owner_user_id') ? ap_db_default_owner_user_id() : 0);
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id')) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $limit = max(1, min(40, $limit));
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/api/v1/timelines/home/since?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'since_ts' => $sinceTs,
+        'limit' => $limit,
+    ]);
+    $body = null;
+    $code = 0;
+    $cacheHdr = '';
+    $newestHdr = 0;
+    $started = microtime(true);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) {
+            return null;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => 120,
+            CURLOPT_TIMEOUT_MS => 400,
+            CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+            CURLOPT_HEADER => true,
+        ]);
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        curl_close($ch);
+        if (!is_string($raw)) {
+            return null;
+        }
+        $rawHeaders = substr($raw, 0, $headerSize);
+        $body = substr($raw, $headerSize);
+        foreach (preg_split('/\r\n|\n|\r/', (string) $rawHeaders) ?: [] as $hline) {
+            if (stripos($hline, 'X-VAAK-TL-Cache:') === 0) {
+                $cacheHdr = trim(substr($hline, strlen('X-VAAK-TL-Cache:')));
+            } elseif (stripos($hline, 'X-Newest:') === 0) {
+                $newestHdr = (int) trim(substr($hline, strlen('X-Newest:')));
+            }
+        }
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'timeout' => 0.4,
+                'header' => "Accept: application/json\r\nConnection: close\r\n",
+                'ignore_errors' => true,
+            ],
+        ]);
+        $raw = @file_get_contents($url, false, $ctx);
+        if (is_string($raw)) {
+            $body = $raw;
+        }
+        if (isset($http_response_header) && is_array($http_response_header)) {
+            foreach ($http_response_header as $hline) {
+                if (preg_match('#^HTTP/\S+\s+(\d+)#', (string) $hline, $m)) {
+                    $code = (int) $m[1];
+                } elseif (stripos((string) $hline, 'X-VAAK-TL-Cache:') === 0) {
+                    $cacheHdr = trim(substr((string) $hline, strlen('X-VAAK-TL-Cache:')));
+                } elseif (stripos((string) $hline, 'X-Newest:') === 0) {
+                    $newestHdr = (int) trim(substr((string) $hline, strlen('X-Newest:')));
+                }
+            }
+        }
+    }
+    $ms = (int) round((microtime(true) - $started) * 1000);
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timelines.home.axum_since_fetch', (float) $ms);
+    }
+    if ($code !== 200 || !is_string($body)) {
+        return null;
+    }
+    if (stripos($cacheHdr, 'axum-ranked-since') === false) {
+        return null;
+    }
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded) || !array_is_list($decoded)) {
+        return null;
+    }
+    /** @var list<array<string,mixed>> $statuses */
+    $statuses = [];
+    $newest = max($sinceTs, $newestHdr);
+    foreach ($decoded as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $statuses[] = $row;
+        $created = (string) ($row['created_at'] ?? '');
+        $ts = $created !== '' ? (int) strtotime($created) : 0;
+        if ($ts > $newest) {
+            $newest = $ts;
+        }
+    }
+    return [
+        'statuses' => $statuses,
+        'newest' => $newest,
+        'source' => 'axum-ranked',
+    ];
+}
+
+/**
  * Best-effort prime of Home hydrate Redis so HTML Axum assist can hit next time.
  */
 function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit = 15): void
