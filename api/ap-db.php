@@ -4983,6 +4983,15 @@ function ap_metrics_record(
         }
         if ($insertedId > 0) {
             ap_timeline_notify($type, $actorId, $objectId, $when);
+            // 0.6.70: Create/Announce from a followed actor → followers' Home ranked.
+            if (
+                in_array($type, ['Create', 'Announce'], true)
+                && in_array($actionTaken, ['log', 'local_observe'], true)
+                && is_string($actorId)
+                && $actorId !== ''
+            ) {
+                ap_timeline_fanout_followers_home($insertedId, $type, $actorId);
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-db] metrics_record: ' . $e->getMessage());
@@ -7819,6 +7828,149 @@ function ap_timeline_fanout_local_status(int $ownerUserId, array $entry, array $
         }
     } catch (Throwable $e) {
         error_log('[ap-db] timeline_fanout_local: ' . $e->getMessage());
+    }
+}
+
+function ap_timeline_fanout_ingest_enabled(): bool
+{
+    $raw = getenv('VAAK_HOME_FANOUT_INGEST');
+    if ($raw !== false && trim((string) $raw) !== '') {
+        return !in_array(strtolower(trim((string) $raw)), ['0', 'false', 'off', 'no'], true);
+    }
+    return ap_feature_enabled('HOME_FANOUT_INGEST', true);
+}
+
+function ap_timeline_fanout_ingest_max_recipients(): int
+{
+    $raw = getenv('VAAK_HOME_FANOUT_INGEST_MAX');
+    if ($raw === false || trim((string) $raw) === '') {
+        return 64;
+    }
+    return max(1, min(128, (int) $raw));
+}
+
+/** Rewarm Axum hydrate only for small fan-outs (avoid stampede on popular actors). */
+function ap_timeline_fanout_ingest_rewarm_max(): int
+{
+    $raw = getenv('VAAK_HOME_FANOUT_INGEST_REWARM_MAX');
+    if ($raw === false || trim((string) $raw) === '') {
+        return 4;
+    }
+    return max(0, min(32, (int) $raw));
+}
+
+/**
+ * Local ap_users.id values that follow $actorId (Home fan-out recipients).
+ *
+ * @return list<int>
+ */
+function ap_timeline_local_follower_owner_ids(string $actorId, ?int $limit = null): array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return [];
+    }
+    $limit = $limit ?? ap_timeline_fanout_ingest_max_recipients();
+    $limit = max(1, min(128, $limit));
+    $ownerActors = [];
+    try {
+        $st = ap_db()->prepare(
+            'SELECT DISTINCT owner_actor_id FROM following
+             WHERE actor_id = ? OR actor_id = ?
+             LIMIT ?'
+        );
+        $st->execute([$actorId, $actorId . '/', $limit]);
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $oa) {
+            $oa = rtrim(trim((string) $oa), '/');
+            if ($oa !== '' && str_starts_with($oa, 'https://mkultra.monster/users/')) {
+                $ownerActors[$oa] = true;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] local_follower_owner_ids: ' . $e->getMessage());
+        return [];
+    }
+    $ids = [];
+    foreach (array_keys($ownerActors) as $oa) {
+        $uid = function_exists('ap_db_owner_user_id_for_actor')
+            ? ap_db_owner_user_id_for_actor($oa)
+            : 0;
+        if ($uid > 0) {
+            $ids[$uid] = true;
+        }
+        if (count($ids) >= $limit) {
+            break;
+        }
+    }
+    return array_map('intval', array_keys($ids));
+}
+
+/**
+ * Inbox Create/Announce → prepend onto followers' warm Home ranked (0.6.70).
+ * Hydrate: always invalidate; rewarm only when recipient count ≤ rewarm max.
+ */
+function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $actorId): void
+{
+    if (!ap_timeline_fanout_ingest_enabled()) {
+        return;
+    }
+    $eventId = max(0, $eventId);
+    $type = trim($type);
+    $actorId = rtrim(trim((string) $actorId), '/');
+    if ($eventId < 1 || $actorId === '' || !in_array($type, ['Create', 'Announce'], true)) {
+        return;
+    }
+
+    $owners = ap_timeline_local_follower_owner_ids($actorId);
+    if ($owners === []) {
+        return;
+    }
+
+    $entry = [
+        'k' => 'event',
+        'id' => (string) $eventId,
+        's' => 'fediverse',
+    ];
+    $rewarmMax = ap_timeline_fanout_ingest_rewarm_max();
+    $touched = 0;
+    foreach ($owners as $ownerUserId) {
+        $ownerUserId = (int) $ownerUserId;
+        if ($ownerUserId < 1) {
+            continue;
+        }
+        // Skip muted/blocked authors for that owner when helpers are loaded.
+        if (function_exists('ap_row_is_hidden') && ap_row_is_hidden($actorId, null, $ownerUserId)) {
+            continue;
+        }
+        if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actorId, $ownerUserId)) {
+            continue;
+        }
+        try {
+            $res = ap_timeline_ranked_prepend_owner($ownerUserId, $entry, ['home']);
+            if (!empty($res['ok']) && (int) ($res['touched'] ?? 0) > 0) {
+                $touched++;
+            }
+            ap_timeline_home_hydrate_invalidate_owner($ownerUserId);
+            if ($rewarmMax > 0 && count($owners) <= $rewarmMax) {
+                if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
+                    ap_masto_timeline_home_hydrate_warm_async($ownerUserId, 15);
+                } else {
+                    ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40');
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-db] timeline_fanout_followers owner=' . $ownerUserId . ': ' . $e->getMessage());
+        }
+    }
+    if ($touched > 0) {
+        error_log(sprintf(
+            '[ap-db] timeline_fanout_followers type=%s event=%d actor=%s owners=%d touched=%d',
+            $type,
+            $eventId,
+            $actorId,
+            count($owners),
+            $touched
+        ));
     }
 }
 
