@@ -16,6 +16,7 @@ mod actor_warm;
 mod thin_media;
 mod thin_media_warm;
 mod timeline;
+mod timeline_fanout;
 
 use std::net::SocketAddr;
 
@@ -165,6 +166,15 @@ enum Command {
         owner_id: i64,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Drain `vaak:queue:timeline_fanout` (ranked prepend + Home hydrate).
+    TimelineFanout {
+        /// Process forever (BRPOP on Redis queue DB).
+        #[arg(long, default_value_t = false)]
+        r#loop: bool,
+        /// Process one job JSON once (smoke / debug), then exit.
+        #[arg(long)]
+        once_json: Option<String>,
     },
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -337,6 +347,15 @@ async fn main() -> Result<()> {
                 cfg.default_owner_id
             };
             timeline::run(&cfg, owner, limit).await?;
+        }
+        Command::TimelineFanout { r#loop, once_json } => {
+            if r#loop {
+                timeline_fanout::run_worker_loop(&cfg).await?;
+            } else if let Some(raw) = once_json {
+                timeline_fanout::run_once_cli(&cfg, &raw).await?;
+            } else {
+                anyhow::bail!("timeline-fanout requires --loop or --once-json");
+            }
         }
         Command::Serve { bind } => {
             let addr: SocketAddr = bind.parse()?;

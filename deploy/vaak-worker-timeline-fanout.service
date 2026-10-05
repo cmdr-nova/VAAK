@@ -1,0 +1,29 @@
+# Live timeline ranked fan-out (Rust-primary).
+# Drains vaak:queue:timeline_fanout on Redis DB1; PHP enqueues, falls back in-process
+# if queue push fails or VAAK_TIMELINE_FANOUT_RUST=0.
+#   systemctl enable --now vaak-worker-timeline-fanout.service
+
+[Unit]
+Description=VAAK Rust timeline ranked fan-out worker
+After=network.target postgresql.service redis-server.service
+ConditionPathExists=/usr/local/bin/vaak-worker
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
+Environment=VAAK_SHADOW_OWNER_ID=1
+Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
+Environment=VAAK_REDIS_QUEUE_URL=redis://127.0.0.1/1
+Environment=VAAK_HOME_FANOUT_INGEST=1
+Environment=VAAK_HOME_HYDRATE_WARM=1
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/vaak-worker timeline-fanout --loop
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

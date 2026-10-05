@@ -8,10 +8,11 @@
 | `thin-media-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_post_warm` (Redis DB1); AppView upsert |
 | `actor-warm --loop` | **LIVE** | Drains `vaak:queue:bsky_actor_warm` (Redis DB1); `getProfiles` → `bsky_actor_profiles` + flat DID Redis |
 | `ap-actor-warm --loop` | **LIVE** | Drains `vaak:queue:ap_actor_warm` (Redis DB1); spawns PHP signed AS2 fetch → `remote_actors` + flat AP Redis |
+| `timeline-fanout --loop` | **LIVE** | Drains `vaak:queue:timeline_fanout` (Redis DB1); ranked prepend + Home hydrate invalidate (0.6.73); PHP enqueue with in-process fallback |
 | `notif-badge` / `ranked-newer` / … | shadow | Parity / soak helpers |
 | `serve` | shadow HTTP | Localhost `/shadow/*` + Mastodon-shaped `/api/v1/timelines/home` (hydrate Redis), `/api/v1/notifications` (Redis-read) |
 
-PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm keeps PHP hydrate as cold fallback; ranked Home/Local/Federated are native-only (empty soft-skips; `bin/ranked-warm.php` retired). Interim bridges drop as each surface moves fully to Rust + Axum.
+PHP remains fallback: notif badge/list rebuild on Redis miss; warm enqueue falls back to `ap-bsky-post-warm.php` if queue push fails. Timeline fan-out (0.6.73) enqueues to Rust first; PHP Redis prepend runs only if queue push fails or `VAAK_TIMELINE_FANOUT_RUST=0`. Actor warm is best-effort Redis LPUSH from thin-author enrich; PG `bsky_actor_refresh_queue` still has the PHP worker for sync jobs. Mentions list-warm keeps PHP hydrate as cold fallback; ranked Home/Local/Federated are native-only (empty soft-skips; `bin/ranked-warm.php` retired). Interim bridges drop as each surface moves fully to Rust + Axum.
 
 ## Live systemd units
 
@@ -22,10 +23,11 @@ systemctl enable --now vaak-worker-ranked-warm.service
 systemctl enable --now vaak-worker-thin-warm.service
 systemctl enable --now vaak-worker-actor-warm.service
 systemctl enable --now vaak-worker-ap-actor-warm.service
+systemctl enable --now vaak-worker-timeline-fanout.service
 systemctl enable --now vaak-worker-shadow-http.service   # localhost:8787 Axum shadow
 ```
 
-Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.service`, `deploy/vaak-worker-ranked-warm.service`, `deploy/vaak-worker-thin-warm.service`, `deploy/vaak-worker-actor-warm.service`, `deploy/vaak-worker-ap-actor-warm.service`, `deploy/vaak-worker-shadow-http.service`
+Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.service`, `deploy/vaak-worker-ranked-warm.service`, `deploy/vaak-worker-thin-warm.service`, `deploy/vaak-worker-actor-warm.service`, `deploy/vaak-worker-ap-actor-warm.service`, `deploy/vaak-worker-timeline-fanout.service`, `deploy/vaak-worker-shadow-http.service`
 
 ## Env
 
@@ -46,6 +48,8 @@ Units: `deploy/vaak-worker-notif.service`, `deploy/vaak-worker-notif-list.servic
 | `VAAK_RANKED_NATIVE_LOCAL_FEED` | `1` (default) | Local + Federated ranked rebuild in Rust; `0` skips those views |
 | `VAAK_HOME_HYDRATE_WARM` | `1` (default) | After non-empty Home ranked write, spawn `bin/home-timeline-warm.php --limits=15,40` (Axum hydrate); `0` disables |
 | `VAAK_HOME_HYDRATE_WARM_COOLDOWN_SECS` | `60` | Redis cooldown between Home hydrate spawns per owner (30–600) |
+| `VAAK_TIMELINE_FANOUT_RUST` | `1` (default) | PHP enqueues timeline fan-out to Rust; `0` forces in-process PHP Redis prepend |
+| `VAAK_HOME_FANOUT_INGEST` | `1` (default) | Master enable for Home/Federated/Local ingest fan-out (PHP + Rust) |
 | `VAAK_API_ROOT` | `/srv/mkultra/html/api` | notif-list / home-timeline-warm PHP path |
 | `VAAK_PHP_BIN` | `/usr/bin/php` | materializer spawn |
 | `VAAK_THIN_MEDIA_RUST_PRIMARY` | `1` (PHP) | enqueue via Redis queue first |
@@ -72,4 +76,5 @@ scp target/release/vaak-worker root@144.91.124.35:/usr/local/bin/vaak-worker
 - Warm queue: `vaak:queue:bsky_post_warm` JSON `{uri,owner,ts,source}`
 - Actor warm queue: `vaak:queue:bsky_actor_warm` JSON `{did,owner,ts,source}`; flat key `vaak:actor:v1:bsky:{did}` TTL ~2700s
 - AP actor warm queue: `vaak:queue:ap_actor_warm` JSON `{actor_id,ts,source}`; flat key `vaak:actor:v1:ap:{sha256}` TTL ~2700s; PHP `ap-actor-warm.php` does signed fetch
-- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-notif-list vaak-worker-ranked-warm vaak-worker-thin-warm vaak-worker-actor-warm vaak-worker-ap-actor-warm vaak-worker-shadow-http` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_NOTIF_LIST_RUST_PRIMARY=0` / `VAAK_HOME_AXUM_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` / `VAAK_ACTOR_WARM_RUST_PRIMARY=0` / `VAAK_AP_ACTOR_WARM_RUST_PRIMARY=0` in `/etc/mkultra/vaak.env`
+- Timeline fan-out queue (0.6.73): `vaak:queue:timeline_fanout` JSON `{op,k,id,s,actor?,owner?,views?,visibility?,type?,hydrate?,ts}` — ops `home_followers` / `home_bsky` / `public_feed` / `owner_status`; stage_meta `fanout_src=vaak-worker`
+- Rollback: `systemctl disable --now vaak-worker-notif vaak-worker-notif-list vaak-worker-ranked-warm vaak-worker-thin-warm vaak-worker-actor-warm vaak-worker-ap-actor-warm vaak-worker-timeline-fanout vaak-worker-shadow-http` and set `VAAK_NOTIF_RUST_PRIMARY=0` / `VAAK_NOTIF_LIST_RUST_PRIMARY=0` / `VAAK_HOME_AXUM_PRIMARY=0` / `VAAK_THIN_MEDIA_RUST_PRIMARY=0` / `VAAK_ACTOR_WARM_RUST_PRIMARY=0` / `VAAK_AP_ACTOR_WARM_RUST_PRIMARY=0` / `VAAK_TIMELINE_FANOUT_RUST=0` in `/etc/mkultra/vaak.env`
