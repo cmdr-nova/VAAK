@@ -3484,4 +3484,30 @@ mod tests {
         assert!(!html.contains("bite_remote"), "local peer skips Bite: {html}");
     }
 
+    #[test]
+    fn media_only_cw_posts_keep_media_inside_the_cw_gate() {
+        let st = json!({
+            "id": "media-only-1",
+            "uri": "https://example.com/users/a/statuses/1",
+            "content": "",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "sensitive": true,
+            "spoiler_text": "Gallery",
+            "account": {
+                "acct": "a@example.com",
+                "display_name": "A",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://example.com/users/a"
+            },
+            "media_attachments": [{
+                "type": "image",
+                "url": "https://example.com/media/photo.jpg",
+                "preview_url": "https://example.com/media/photo.jpg"
+            }]
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("cw-gate"), "media-only post should be gated: {html}");
+        assert!(html.contains("photo.jpg"), "media must remain inside the gate: {html}");
+    }
+
 }
