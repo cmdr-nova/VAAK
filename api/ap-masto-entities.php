@@ -3244,12 +3244,14 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
         return null;
     }
 
-    $summary = null;
-    if (!empty($doc['content']) && is_string($doc['content'])) {
+    $summary = function_exists('ap_as2_text_summary')
+        ? ap_as2_text_summary($doc)
+        : null;
+    if ($summary === null && !empty($doc['content']) && is_string($doc['content'])) {
         $summary = $doc['content'];
-    } elseif (!empty($doc['summary']) && is_string($doc['summary'])) {
+    } elseif ($summary === null && !empty($doc['summary']) && is_string($doc['summary'])) {
         $summary = $doc['summary'];
-    } elseif (!empty($doc['name']) && is_string($doc['name'])) {
+    } elseif ($summary === null && !empty($doc['name']) && is_string($doc['name'])) {
         $summary = $doc['name'];
     }
     if (($summary === null || trim(strip_tags((string) $summary)) === '')) {
