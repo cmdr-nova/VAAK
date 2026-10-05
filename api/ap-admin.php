@@ -30648,6 +30648,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if ($rpFieldName === '' || trim(strip_tags($rpFieldRaw)) === '') {
                       continue;
                   }
+                  // Remote actors sometimes entity-encode an entire HTML
+                  // fragment (`&lt;a ...&gt;`). Decode once before the allowlist
+                  // so markup cannot leak through as visible raw HTML.
+                  $rpFieldRaw = html_entity_decode($rpFieldRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8');
                   $rpFieldValue = function_exists('ap_html_sanitize_allowlist')
                       ? ap_html_sanitize_allowlist($rpFieldRaw, '<a>')
                       : htmlspecialchars(strip_tags($rpFieldRaw), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
