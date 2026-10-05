@@ -2328,6 +2328,12 @@ pub async fn warm_view(
     }
     link_outbox_reply_ids(&mut statuses);
 
+    // Hydrated timelines are consumed directly by Mastodon-compatible clients
+    // as well as the lean HTML painter. Resolve already-cached OG/YouTube cards
+    // here so Local and Federated JSON have the same preview metadata as Home;
+    // the HTML path still repeats this cheaply at paint time for cache misses.
+    let _ = crate::link_preview::attach_cached_cards(&db, &mut statuses).await;
+
     let mut stored = Vec::new();
     let now = chrono::Utc::now().timestamp();
     for &limit in &limits {
