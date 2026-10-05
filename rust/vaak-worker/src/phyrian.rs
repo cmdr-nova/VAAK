@@ -94,7 +94,7 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
     let status: String = row.try_get(3).unwrap_or_else(|_| "unknown".into());
     let strain: String = row.try_get::<_, Option<String>>(4).unwrap_or(None).unwrap_or_default();
     let imprinted = status == "imprinted" && !strain.trim().is_empty();
-    let mut resonance: i64 = row.try_get(5).unwrap_or(0);
+    let stored_resonance: i64 = row.try_get(5).unwrap_or(0);
     let age_secs: i64 = row.try_get(13).unwrap_or(0);
     let decay_secs: i64 = row.try_get(14).unwrap_or(0);
     let decay_days = if imprinted && age_secs >= DECAY_GRACE_SECS {
@@ -103,8 +103,7 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
         0
     };
     // Projection only: PHP remains responsible for persisting lazy decay.
-    let applied = (decay_days * DAILY_DECAY).min(resonance).max(0);
-    resonance -= applied;
+    let (resonance, applied) = projected_decay(&status, &strain, stored_resonance, age_secs, decay_days * 86_400);
 
     let player = Player {
         status: status.clone(),
@@ -178,14 +177,35 @@ fn stability(imprinted: bool, resonance: i64) -> String {
     match resonance { r if r <= 0 => "Dormant", r if r < 25 => "Critical", r if r < 50 => "Fading", _ => "Stable" }.into()
 }
 
+fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, decay_secs: i64) -> (i64, i64) {
+    let imprinted = status == "imprinted" && !strain.trim().is_empty();
+    if !imprinted || age_secs < DECAY_GRACE_SECS { return (resonance, 0); }
+    let days = (decay_secs.max(0) / 86_400).max(0);
+    let amount = (days * DAILY_DECAY).min(resonance.max(0));
+    ((resonance - amount).max(0), amount)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::stability;
+    use super::{projected_decay, stability};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
         assert_eq!(stability(true, 24), "Critical");
         assert_eq!(stability(true, 49), "Fading");
         assert_eq!(stability(true, 50), "Stable");
+    }
+
+    #[test]
+    fn php_parity_fixture_decay_and_stability() {
+        #[derive(serde::Deserialize)]
+        struct Case { status: String, strain: String, resonance: i64, age_secs: i64, decay_secs: i64, expected_resonance: i64, expected_stability: String, expected_decay: i64 }
+        let cases: Vec<Case> = serde_json::from_str(include_str!("../fixtures/phyrian/php-parity.json")).expect("fixture JSON");
+        for case in cases {
+            let (resonance, decay) = projected_decay(&case.status, &case.strain, case.resonance, case.age_secs, case.decay_secs);
+            assert_eq!(resonance, case.expected_resonance);
+            assert_eq!(decay, case.expected_decay);
+            assert_eq!(stability(case.status == "imprinted" && !case.strain.is_empty(), resonance), case.expected_stability);
+        }
     }
 }

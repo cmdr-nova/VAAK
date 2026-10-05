@@ -1,0 +1,7 @@
+[
+  {"name":"unmarked","status":"unknown","strain":"","resonance":80,"age_secs":90000,"decay_secs":90000,"expected_resonance":80,"expected_stability":"Unmarked","expected_decay":0},
+  {"name":"imprinted_grace","status":"imprinted","strain":"Soft Colony","resonance":80,"age_secs":86399,"decay_secs":0,"expected_resonance":80,"expected_stability":"Stable","expected_decay":0},
+  {"name":"imprinted_one_day","status":"imprinted","strain":"Soft Colony","resonance":80,"age_secs":172800,"decay_secs":86400,"expected_resonance":75,"expected_stability":"Stable","expected_decay":5},
+  {"name":"imprinted_low","status":"imprinted","strain":"Voidborne","resonance":24,"age_secs":259200,"decay_secs":86400,"expected_resonance":19,"expected_stability":"Critical","expected_decay":5},
+  {"name":"imprinted_floor","status":"imprinted","strain":"Voidborne","resonance":3,"age_secs":259200,"decay_secs":172800,"expected_resonance":0,"expected_stability":"Dormant","expected_decay":3}
+]
