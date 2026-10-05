@@ -190,7 +190,7 @@ function ap_normalize_scrub_quote_pollution(array $status): array
             }
         }
         $hasQt = str_contains($plain, '↪ QT') || str_contains($plain, '↪QT')
-            || (bool) preg_match('/(?:↪|➡|→)\s*QT\b/u', $plain)
+            || (bool) preg_match('/(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b/u', $plain)
             || str_contains($plain, 'RE: https://')
             || (function_exists('ap_text_looks_like_as2_json') && ap_text_looks_like_as2_json($plain));
         // Always strip when a nest exists or the body still carries raw QT/AS2 form.
