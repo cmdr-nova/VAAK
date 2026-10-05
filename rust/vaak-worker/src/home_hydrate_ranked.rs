@@ -536,9 +536,109 @@ struct BskyRow {
     published_at: String,
     text: String,
     embed_json: String,
+    raw_json: String,
     like_count: i64,
     repost_count: i64,
     reply_count: i64,
+}
+
+const BSKY_SENSITIVE_LABELS: &[&str] = &[
+    "porn",
+    "sexual",
+    "nudity",
+    "graphic-media",
+    "sexual-cartoon",
+    "sexual-figurative",
+    "nsfw",
+    "self-harm",
+    "sensitive",
+];
+
+fn bsky_label_vals_from_json(raw: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push_list = |labels: &Value| {
+        let list = if let Some(values) = labels.get("values").and_then(|v| v.as_array()) {
+            values.as_slice()
+        } else if let Some(arr) = labels.as_array() {
+            arr.as_slice()
+        } else {
+            return;
+        };
+        for lab in list {
+            let val = if let Some(s) = lab.as_str() {
+                s.to_ascii_lowercase()
+            } else {
+                lab.get("val")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            };
+            let val = val.trim().to_string();
+            if !val.is_empty() && !out.iter().any(|x| x == &val) {
+                out.push(val);
+            }
+        }
+    };
+    if let Some(labels) = raw.get("labels") {
+        push_list(labels);
+    }
+    if let Some(record) = raw.get("record") {
+        if let Some(labels) = record
+            .get("labels")
+            .or_else(|| record.get("selfLabels"))
+        {
+            push_list(labels);
+        }
+    }
+    out
+}
+
+fn bsky_is_sensitive(raw_json: &str) -> bool {
+    let Ok(raw) = serde_json::from_str::<Value>(raw_json) else {
+        return false;
+    };
+    let sens: std::collections::HashSet<&str> = BSKY_SENSITIVE_LABELS.iter().copied().collect();
+    bsky_label_vals_from_json(&raw)
+        .iter()
+        .any(|v| sens.contains(v.as_str()))
+}
+
+fn bsky_cid_from_raw(raw_json: &str) -> String {
+    serde_json::from_str::<Value>(raw_json)
+        .ok()
+        .and_then(|v| {
+            v.get("cid")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn bsky_viewer_flags(raw_json: &str) -> (bool, bool, bool, String, String) {
+    let Ok(raw) = serde_json::from_str::<Value>(raw_json) else {
+        return (false, false, false, String::new(), String::new());
+    };
+    let viewer = raw.get("viewer").cloned().unwrap_or(Value::Null);
+    let like = viewer
+        .get("like")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let repost = viewer
+        .get("repost")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let bookmarked = viewer
+        .get("bookmarked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || viewer
+            .get("bookmark")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || viewer.get("bookmark").and_then(|v| v.as_str()).is_some();
+    (!like.is_empty(), !repost.is_empty(), bookmarked, like, repost)
 }
 
 #[derive(Clone)]
@@ -700,6 +800,7 @@ fn materialize_bsky(row: &BskyRow) -> Value {
         &row.indexed_at
     });
     let (media, card) = bsky_media_and_card(&row.embed_json, &row.uri);
+    // Keep body as plain-ish HTML paragraphs; lean paint linkifies @/#/URLs.
     let content = plain_to_html(row.text.replace("\r\n", "\n").trim());
     let account = empty_account(did, username, acct, display, &profile_url, &row.author_avatar);
     let mut st = base_status(
@@ -718,6 +819,33 @@ fn materialize_bsky(row: &BskyRow) -> Value {
     st["source"] = json!("bluesky");
     st["author_did"] = json!(did);
     st["language"] = json!("en");
+    let cid = bsky_cid_from_raw(&row.raw_json);
+    if !cid.is_empty() {
+        st["bsky_cid"] = json!(cid);
+    }
+    let (liked, reposted, bookmarked, like_rec, repost_rec) = bsky_viewer_flags(&row.raw_json);
+    st["favourited"] = json!(liked);
+    st["reblogged"] = json!(reposted);
+    st["bookmarked"] = json!(bookmarked);
+    if !like_rec.is_empty() {
+        st["vaak_bsky_like_record"] = json!(like_rec);
+    }
+    if !repost_rec.is_empty() {
+        st["vaak_bsky_repost_record"] = json!(repost_rec);
+    }
+    if bsky_is_sensitive(&row.raw_json) {
+        st["sensitive"] = json!(true);
+        if st
+            .get("spoiler_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            st["spoiler_text"] = json!("Sensitive content");
+        }
+        st["vaak_bsky_sensitive"] = json!(true);
+    }
     st
 }
 
@@ -1000,7 +1128,7 @@ async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashMap<String, 
             "SELECT bsky_uri, COALESCE(author_did,''), COALESCE(author_handle,''),
                     COALESCE(author_display,''), COALESCE(author_avatar,''),
                     COALESCE(indexed_at::text,''), COALESCE(published_at::text,''),
-                    COALESCE(text,''), COALESCE(embed_json,''),
+                    COALESCE(text,''), COALESCE(embed_json,''), COALESCE(raw_json,''),
                     COALESCE(like_count,0), COALESCE(repost_count,0), COALESCE(reply_count,0)
              FROM bsky_posts WHERE bsky_uri = ANY($1)",
             &[&uris],
@@ -1021,9 +1149,10 @@ async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashMap<String, 
                 published_at: row.get(6),
                 text: row.get(7),
                 embed_json: row.get(8),
-                like_count: i64::from(row.get::<_, i32>(9)),
-                repost_count: i64::from(row.get::<_, i32>(10)),
-                reply_count: i64::from(row.get::<_, i32>(11)),
+                raw_json: row.get(9),
+                like_count: i64::from(row.get::<_, i32>(10)),
+                repost_count: i64::from(row.get::<_, i32>(11)),
+                reply_count: i64::from(row.get::<_, i32>(12)),
             },
         );
     }
@@ -1628,5 +1757,16 @@ mod tests {
             bsky_https_url(at, "gamingonlinux.com"),
             "https://bsky.app/profile/gamingonlinux.com/post/3mx4"
         );
+    }
+
+    #[test]
+    fn bsky_sensitive_from_top_level_labels() {
+        // PHP ap_bsky_sensitive_label_vals / PostView labels parity.
+        let raw = r#"{"uri":"at://did:plc:x/app.bsky.feed.post/y","cid":"bafy","labels":[{"val":"porn","src":"did:plc:mod"}]}"#;
+        assert!(bsky_is_sensitive(raw));
+        let clean = r#"{"uri":"at://did:plc:x/app.bsky.feed.post/y","cid":"bafy","labels":[]}"#;
+        assert!(!bsky_is_sensitive(clean));
+        let self_lab = r#"{"record":{"selfLabels":{"values":[{"val":"nudity"}]}}}"#;
+        assert!(bsky_is_sensitive(self_lab));
     }
 }

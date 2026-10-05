@@ -327,78 +327,336 @@ fn percent_decode_basic(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+fn parse_acct_mention(after: &str) -> Option<(&str, &str)> {
+    // user@host where host has a dot TLD
+    let user_end = after
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+    if user_end == 0 {
+        return None;
+    }
+    if after.as_bytes().get(user_end) != Some(&b'@') {
+        return None;
+    }
+    let user = &after[..user_end];
+    let host_part = &after[user_end + 1..];
+    let host_len = host_part
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .count();
+    if host_len < 3 {
+        return None;
+    }
+    let host = &host_part[..host_len];
+    if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
+        return None;
+    }
+    // Require a letter TLD-ish (≥2 alpha at end)
+    let tld = host.rsplit('.').next().unwrap_or("");
+    if tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some((user, host))
+}
+
+fn parse_dotted_handle(after: &str) -> Option<&str> {
+    // Bluesky / Bridgy: alice.bsky.social or custom.domain — must contain a dot.
+    let mut len = 0usize;
+    let mut has_dot = false;
+    for (i, c) in after.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            len = i + c.len_utf8();
+        } else if c == '.' {
+            has_dot = true;
+            len = i + 1;
+        } else {
+            break;
+        }
+    }
+    if !has_dot || len < 3 {
+        return None;
+    }
+    // Trim trailing dots
+    let mut handle = &after[..len];
+    while handle.ends_with('.') {
+        handle = &handle[..handle.len() - 1];
+    }
+    if !handle.contains('.') || handle.len() < 3 {
+        return None;
+    }
+    // Must not be followed by more handle chars
+    let next = after[len..].chars().next();
+    if let Some(c) = next {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '@' {
+            return None;
+        }
+    }
+    // First char alphanumeric
+    let first = handle.chars().next()?;
+    if !first.is_ascii_alphanumeric() {
+        return None;
+    }
+    Some(handle)
+}
+
+fn parse_bare_handle(after: &str) -> Option<&str> {
+    let mut len = 0usize;
+    for (i, c) in after.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            len = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if len < 2 || len > 32 {
+        return None;
+    }
+    let next = after[len..].chars().next();
+    if let Some(c) = next {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '@' {
+            return None;
+        }
+    }
+    Some(&after[..len])
+}
+
+fn parse_hashtag_token(after: &str) -> Option<&str> {
+    let mut len = 0usize;
+    let mut chars = 0usize;
+    for (i, c) in after.char_indices() {
+        if c.is_alphanumeric() || c == '_' {
+            len = i + c.len_utf8();
+            chars += 1;
+            if chars > 100 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if chars == 0 {
+        return None;
+    }
+    Some(&after[..len])
+}
+
+/// Linkify bare URLs, @mentions, and #hashtags in a text segment.
+/// Parity target: PHP `admin_linkify_body_html` (lean — no DB mention resolution).
 fn linkify_text_segment(text: &str, from: &str) -> String {
-    if !text.contains("http://") && !text.contains("https://") && !text.contains("www.") {
+    if !text.contains("http://")
+        && !text.contains("https://")
+        && !text.contains("www.")
+        && !text.contains('@')
+        && !text.contains('#')
+    {
         return text.to_string();
     }
     let from_q = if from.is_empty() { "home" } else { from };
-    let mut out = String::with_capacity(text.len() + 32);
-    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 64);
     let mut i = 0usize;
-    while i < bytes.len() {
+    while i < text.len() {
         let rest = &text[i..];
-        let http = rest.find("https://");
-        let http2 = rest.find("http://");
-        let www = rest.find("www.");
-        let mut cand: Option<(usize, bool)> = None;
-        for (idx, needs) in [(http, false), (http2, false), (www, true)] {
-            if let Some(p) = idx {
-                if cand.map(|(c, _)| p < c).unwrap_or(true) {
-                    if needs {
-                        let abs = i + p;
-                        if abs >= 8 {
-                            let prev = &text[abs.saturating_sub(8)..abs];
-                            if prev.ends_with("https://") || prev.ends_with("http://") {
-                                continue;
-                            }
-                        }
+        // Find earliest hit among URL / @ / #
+        let mut cand: Option<(usize, LinkifyKind)> = None;
+        let consider = |cand: &mut Option<(usize, LinkifyKind)>, at: usize, kind: LinkifyKind| {
+            if cand.as_ref().map(|(c, _)| at < *c).unwrap_or(true) {
+                *cand = Some((at, kind));
+            }
+        };
+
+        for (pat, needs_https) in [("https://", false), ("http://", false), ("www.", true)] {
+            if let Some(p) = rest.find(pat) {
+                if needs_https {
+                    let prev = rest.get(..p).unwrap_or("");
+                    if prev.ends_with("https://") || prev.ends_with("http://") {
+                        continue;
                     }
-                    cand = Some((p, needs));
                 }
+                consider(&mut cand, p, LinkifyKind::Url { needs_https });
             }
         }
-        let Some((rel, needs_https)) = cand else {
+
+        let bytes = rest.as_bytes();
+        let mut ai = 0usize;
+        while ai < bytes.len() {
+            if bytes[ai] == b'@' {
+                let prev_ok = ai == 0 || {
+                    let c = rest[..ai].chars().next_back().unwrap_or(' ');
+                    !(c.is_ascii_alphanumeric() || c == '_' || c == '@' || c == '/')
+                };
+                if prev_ok {
+                    let after = &rest[ai + 1..];
+                    if let Some((user, host)) = parse_acct_mention(after) {
+                        let len = 1 + user.len() + 1 + host.len();
+                        consider(
+                            &mut cand,
+                            ai,
+                            LinkifyKind::Mention {
+                                raw: rest[ai..ai + len].to_string(),
+                                href_kind: MentionHref::Acct {
+                                    user: user.to_string(),
+                                    host: host.to_string(),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    if let Some(handle) = parse_dotted_handle(after) {
+                        let len = 1 + handle.len();
+                        consider(
+                            &mut cand,
+                            ai,
+                            LinkifyKind::Mention {
+                                raw: rest[ai..ai + len].to_string(),
+                                href_kind: MentionHref::BskyHandle {
+                                    handle: handle.to_string(),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                    if let Some(user) = parse_bare_handle(after) {
+                        let len = 1 + user.len();
+                        consider(
+                            &mut cand,
+                            ai,
+                            LinkifyKind::Mention {
+                                raw: rest[ai..ai + len].to_string(),
+                                href_kind: MentionHref::Bare {
+                                    user: user.to_string(),
+                                },
+                            },
+                        );
+                        break;
+                    }
+                }
+            }
+            if bytes[ai] == b'#' {
+                let prev_ok = ai == 0 || {
+                    let c = rest[..ai].chars().next_back().unwrap_or(' ');
+                    !(c.is_ascii_alphanumeric() || c == '_' || c == '&' || c == '/' || c == '%')
+                };
+                if prev_ok {
+                    let after = &rest[ai + 1..];
+                    if let Some(tag) = parse_hashtag_token(after) {
+                        let len = 1 + tag.len();
+                        consider(
+                            &mut cand,
+                            ai,
+                            LinkifyKind::Hashtag {
+                                raw: rest[ai..ai + len].to_string(),
+                                tag: tag.to_string(),
+                            },
+                        );
+                        break;
+                    }
+                }
+            }
+            ai += 1;
+        }
+
+        let Some((rel, kind)) = cand else {
             out.push_str(rest);
             break;
         };
         out.push_str(&rest[..rel]);
         let after = &rest[rel..];
-        let mut end = after
-            .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
-            .unwrap_or(after.len());
-        let (core, trail) = strip_trailing_url_punct(&after[..end]);
-        end = core.len();
-        let mut href = if needs_https {
-            format!("https://{core}")
-        } else {
-            core.to_string()
-        };
-        href = html_entity_decode_basic(&href);
-        if href.contains("...") || href.contains('…') || !href.starts_with("http") {
-            out.push_str(&after[..end]);
-            out.push_str(trail);
-            i += rel + end + trail.len();
-            continue;
+        match kind {
+            LinkifyKind::Url { needs_https } => {
+                let end = after
+                    .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
+                    .unwrap_or(after.len());
+                let (core, trail) = strip_trailing_url_punct(&after[..end]);
+                let mut href = if needs_https {
+                    format!("https://{core}")
+                } else {
+                    core.to_string()
+                };
+                href = html_entity_decode_basic(&href);
+                if href.contains("...") || href.contains('…') || !href.starts_with("http") {
+                    out.push_str(&after[..core.len()]);
+                    out.push_str(trail);
+                    i += rel + core.len() + trail.len();
+                    continue;
+                }
+                let label = esc(core);
+                let anchor = if looks_like_status_url(&href) {
+                    let new_href = format!(
+                        "?view=status&object={}&from={}",
+                        urlencoding_encode(&href),
+                        urlencoding_encode(from_q)
+                    );
+                    format!("<a class=\"status-link\" href=\"{}\">{label}</a>", esc(&new_href))
+                } else {
+                    format!(
+                        "<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">{label}</a>",
+                        esc(&href)
+                    )
+                };
+                out.push_str(&anchor);
+                out.push_str(trail);
+                i += rel + core.len() + trail.len();
+            }
+            LinkifyKind::Mention { raw, href_kind } => {
+                let href = match href_kind {
+                    MentionHref::Acct { user, host } => {
+                        let actor = format!("https://{host}/users/{user}");
+                        format!(
+                            "?view=remote_profile&actor={}&from={}",
+                            urlencoding_encode(&actor),
+                            urlencoding_encode(from_q)
+                        )
+                    }
+                    MentionHref::BskyHandle { handle } => {
+                        let actor = format!("https://bsky.app/profile/{}", handle);
+                        format!(
+                            "?view=remote_profile&actor={}&from={}",
+                            urlencoding_encode(&actor),
+                            urlencoding_encode(from_q)
+                        )
+                    }
+                    MentionHref::Bare { user } => {
+                        format!(
+                            "?view=search&q={}&type=accounts&resolve=1",
+                            urlencoding_encode(&format!("@{user}"))
+                        )
+                    }
+                };
+                out.push_str(&format!(
+                    "<a class=\"mention\" href=\"{}\">{}</a>",
+                    esc(&href),
+                    esc(&raw)
+                ));
+                i += rel + raw.len();
+            }
+            LinkifyKind::Hashtag { raw, tag } => {
+                let href = format!(
+                    "?view=search&q={}&type=statuses",
+                    urlencoding_encode(&format!("#{tag}"))
+                );
+                out.push_str(&format!(
+                    "<a class=\"hashtag\" href=\"{}\">{}</a>",
+                    esc(&href),
+                    esc(&raw)
+                ));
+                i += rel + raw.len();
+            }
         }
-        let label = esc(core);
-        let anchor = if looks_like_status_url(&href) {
-            let new_href = format!(
-                "?view=status&object={}&from={}",
-                urlencoding_encode(&href),
-                urlencoding_encode(from_q)
-            );
-            format!("<a class=\"status-link\" href=\"{}\">{label}</a>", esc(&new_href))
-        } else {
-            format!(
-                "<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">{label}</a>",
-                esc(&href)
-            )
-        };
-        out.push_str(&anchor);
-        out.push_str(trail);
-        i += rel + end + trail.len();
     }
     out
+}
+
+#[derive(Clone)]
+enum MentionHref {
+    Acct { user: String, host: String },
+    BskyHandle { handle: String },
+    Bare { user: String },
+}
+
+#[derive(Clone)]
+enum LinkifyKind {
+    Url { needs_https: bool },
+    Mention { raw: String, href_kind: MentionHref },
+    Hashtag { raw: String, tag: String },
 }
 
 /// Collapse consecutive breaks and tighten Mastodon HTML for feed bodies.
@@ -633,6 +891,625 @@ fn is_rss(st: &Value) -> bool {
     }
     let sid = st.get("id").and_then(|v| v.as_str()).unwrap_or("");
     sid.starts_with("rss:")
+}
+
+fn is_local_uri(uri: &str) -> bool {
+    uri.trim()
+        .to_ascii_lowercase()
+        .starts_with("https://mkultra.monster/")
+}
+
+fn json_flag(st: &Value, key: &str) -> bool {
+    match st.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(s)) => matches!(s.as_str(), "1" | "true" | "True" | "yes"),
+        _ => false,
+    }
+}
+
+fn json_count(st: &Value, key: &str) -> i64 {
+    st.get(key)
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            st.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|u| u as i64)
+        })
+        .or_else(|| {
+            st.get(key)
+                .and_then(|v| v.as_f64())
+                .map(|f| f as i64)
+        })
+        .or_else(|| {
+            st.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(0)
+        .max(0)
+}
+
+/// PHP `admin_format_compact_count` parity.
+fn format_compact_count(n: i64) -> String {
+    if n < 1 {
+        return String::new();
+    }
+    if n < 1000 {
+        return n.to_string();
+    }
+    if n < 10_000 {
+        let tenths = n / 100;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        if frac > 0 {
+            format!("{whole}.{frac}k")
+        } else {
+            format!("{whole}k")
+        }
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1000)
+    } else {
+        let tenths = n / 100_000;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        if frac > 0 {
+            format!("{whole}.{frac}M")
+        } else {
+            format!("{whole}M")
+        }
+    }
+}
+
+fn action_count_html(n: i64) -> String {
+    let label = format_compact_count(n);
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!("<span class=\"action-count\" aria-hidden=\"true\">{}</span>", esc(&label))
+    }
+}
+
+fn reply_cw_query(spoiler: &str, sensitive: bool) -> String {
+    let spoiler = spoiler.trim();
+    if spoiler.is_empty() && !sensitive {
+        return String::new();
+    }
+    let mut q = String::new();
+    if !spoiler.is_empty() {
+        let clipped: String = spoiler.chars().take(500).collect();
+        q.push_str(&format!("&cw={}", urlencoding_encode(&clipped)));
+    }
+    if sensitive || !spoiler.is_empty() {
+        q.push_str("&sensitive=1");
+    }
+    q
+}
+
+fn bsky_https_object_ref(st: &Value, uri: &str) -> String {
+    let url = st.get("url").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if url.starts_with("https://bsky.app/") {
+        return url.trim_end_matches('/').to_string();
+    }
+    if uri.starts_with("https://bsky.app/") {
+        return uri.trim_end_matches('/').to_string();
+    }
+    if let Some(rest) = uri.strip_prefix("at://") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        // at://did:plc:…/app.bsky.feed.post/rkey
+        if parts.len() >= 3 {
+            let actor = parts[0];
+            let rkey = parts[parts.len() - 1];
+            if !actor.is_empty() && !rkey.is_empty() {
+                return format!("https://bsky.app/profile/{actor}/post/{rkey}");
+            }
+        }
+    }
+    uri.trim_end_matches('/').to_string()
+}
+
+fn bsky_at_uri(st: &Value, uri: &str) -> String {
+    if uri.starts_with("at://") {
+        return uri.to_string();
+    }
+    st.get("uri")
+        .and_then(|v| v.as_str())
+        .filter(|u| u.starts_with("at://"))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn remote_object_href(uri: &str, url_hint: &str) -> String {
+    let hint = url_hint.trim();
+    if hint.starts_with("https://") && !hint.contains("bridgy") {
+        return hint.to_string();
+    }
+    uri.to_string()
+}
+
+fn interaction_form(
+    action_base: &str,
+    action: &str,
+    return_view: &str,
+    status_id: &str,
+    object_id: &str,
+    target_actor: &str,
+    btn_class: &str,
+    title: &str,
+    aria: &str,
+    icon: &str,
+    count_html: &str,
+    extra_attrs: &str,
+) -> String {
+    let mut fields = format!(
+        "<input type=\"hidden\" name=\"action\" value=\"{a}\">\
+         <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"status_id\" value=\"{sid}\">\
+         <input type=\"hidden\" name=\"object_id\" value=\"{oid}\">",
+        a = esc(action),
+        rv = esc(return_view),
+        sid = esc(status_id),
+        oid = esc(object_id),
+    );
+    if !target_actor.is_empty() {
+        fields.push_str(&format!(
+            "<input type=\"hidden\" name=\"target_actor\" value=\"{}\">",
+            esc(target_actor)
+        ));
+    }
+    format!(
+        "<form method=\"post\" action=\"{base}\" style=\"display:inline\">{fields}\
+         <button class=\"{cls}\" type=\"submit\" title=\"{title}\" aria-label=\"{aria}\"{extra}>{icon}{count}</button></form>",
+        base = esc(action_base),
+        fields = fields,
+        cls = btn_class,
+        title = esc(title),
+        aria = esc(aria),
+        extra = extra_attrs,
+        icon = icon,
+        count = count_html,
+    )
+}
+
+/// Home timeline action bar — PHP `admin_render_masto_status_card` tweet-actions parity.
+/// Mentions nests keep Open-only; Home gets RSS / Bluesky / Fediverse chrome.
+fn paint_lean_timeline_actions(status: &Value, from: &str) -> String {
+    let from_q = if from.is_empty() { "home" } else { from };
+    let account = status.get("account").cloned().unwrap_or(Value::Null);
+    let acct = account
+        .get("acct")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let actor_ref = account
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| account.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let uri = status
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| status.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let url_hint = status.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let sid = status
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| status.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()))
+        .unwrap_or_default();
+    let fav = json_flag(status, "favourited");
+    let boosted = json_flag(status, "reblogged");
+    let bm = json_flag(status, "bookmarked");
+    let spoiler = status
+        .get("spoiler_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let sensitive = json_flag(status, "sensitive") || !spoiler.is_empty();
+    let fav_n = json_count(status, "favourites_count");
+    let rb_n = json_count(status, "reblogs_count");
+    let qt_n = json_count(status, "quotes_count");
+    let rss = is_rss(status);
+    let bsky = is_bsky(status, acct, uri);
+    let local = !rss && !bsky && is_local_uri(uri);
+    let action_base = format!("?view={}", urlencoding_encode(from_q));
+    let cw_q = reply_cw_query(spoiler, sensitive);
+
+    let mut actions = String::new();
+
+    if rss {
+        let rss_item = status
+            .get("vaak_rss_item_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let rss_feed = status
+            .get("vaak_rss_feed_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let fav_cls = if fav { "icon-btn on" } else { "icon-btn" };
+        let fav_icon = if fav {
+            "<i class=\"ph-fill ph-heart\" aria-hidden=\"true\"></i>"
+        } else {
+            "<i class=\"ph ph-heart\" aria-hidden=\"true\"></i>"
+        };
+        actions.push_str(&interaction_form(
+            &action_base,
+            if fav {
+                "unfavourite_status"
+            } else {
+                "favourite_status"
+            },
+            from_q,
+            &sid,
+            &sid,
+            "",
+            fav_cls,
+            if fav { "Unlike" } else { "Like (VAAK only)" },
+            if fav { "Unlike" } else { "Like" },
+            fav_icon,
+            "",
+            "",
+        ));
+        if rss_item > 0 {
+            let q_cls = if json_flag(status, "vaak_rss_quoted") {
+                "icon-btn on"
+            } else {
+                "icon-btn"
+            };
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"{base}\" style=\"display:inline\">\
+                 <input type=\"hidden\" name=\"action\" value=\"rss_quote\">\
+                 <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+                 <input type=\"hidden\" name=\"item_id\" value=\"{item}\">\
+                 <button class=\"{cls}\" type=\"submit\" title=\"Quote boost (VAAK only)\" aria-label=\"Quote boost\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i></button></form>",
+                base = esc(&action_base),
+                rv = esc(from_q),
+                item = rss_item,
+                cls = q_cls,
+            ));
+        }
+        let boost_cls = if boosted { "icon-btn on" } else { "icon-btn" };
+        actions.push_str(&interaction_form(
+            &action_base,
+            if boosted {
+                "unreblog_status"
+            } else {
+                "reblog_status"
+            },
+            from_q,
+            &sid,
+            &sid,
+            "",
+            boost_cls,
+            if boosted {
+                "Undo boost (VAAK only)"
+            } else {
+                "Boost (VAAK only)"
+            },
+            if boosted { "Undo boost" } else { "Boost" },
+            "<i class=\"ph ph-repeat\" aria-hidden=\"true\"></i>",
+            "",
+            &format!(
+                " aria-pressed=\"{}\"",
+                if boosted { "true" } else { "false" }
+            ),
+        ));
+        let bm_cls = if bm { "icon-btn on" } else { "icon-btn" };
+        let bm_icon = if bm {
+            "<i class=\"ph-fill ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+        } else {
+            "<i class=\"ph ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+        };
+        actions.push_str(&interaction_form(
+            &action_base,
+            if bm {
+                "unbookmark_status"
+            } else {
+                "bookmark_status"
+            },
+            from_q,
+            &sid,
+            &sid,
+            "",
+            bm_cls,
+            if bm { "Bookmark folders" } else { "Bookmark" },
+            if bm { "Bookmark folders" } else { "Bookmark" },
+            bm_icon,
+            "",
+            &format!(" data-bm-picker=\"{}\"", if bm { "1" } else { "0" }),
+        ));
+        let mut overflow = String::new();
+        if uri.starts_with("http://") || uri.starts_with("https://") {
+            overflow.push_str(&format!(
+                "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open</a>",
+                esc(uri)
+            ));
+        }
+        if rss_feed > 0 {
+            overflow.push_str(&format!(
+                "<form method=\"post\" action=\"?view={rv}\" onsubmit=\"return confirm('Remove this RSS feed from your Home mix?');\">\
+                 <input type=\"hidden\" name=\"action\" value=\"rss_remove_feed\">\
+                 <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+                 <input type=\"hidden\" name=\"feed_id\" value=\"{fid}\">\
+                 <button class=\"menu-action\" type=\"submit\" style=\"color:var(--danger)\">Remove feed</button></form>",
+                rv = esc(from_q),
+                fid = rss_feed,
+            ));
+        }
+        if !overflow.is_empty() {
+            actions.push_str(&format!(
+                "<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary>\
+                 <div class=\"post-action-menu__body\">{overflow}</div></details>"
+            ));
+        }
+    } else {
+        // Reply (Fediverse + Bluesky + local)
+        if !uri.is_empty() {
+            let reply_target = if bsky {
+                bsky_https_object_ref(status, uri)
+            } else {
+                uri.to_string()
+            };
+            let mut reply_href = format!(
+                "?view={}&compose=1&reply_to={}",
+                urlencoding_encode(from_q),
+                urlencoding_encode(&reply_target)
+            );
+            if !local && actor_ref.starts_with("https://") {
+                reply_href.push_str(&format!("&to={}", urlencoding_encode(actor_ref)));
+            }
+            reply_href.push_str(&cw_q);
+            actions.push_str(&format!(
+                "<a class=\"icon-btn\" href=\"{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",
+                esc(&reply_href)
+            ));
+        }
+
+        if bsky && !uri.is_empty() {
+            let at = bsky_at_uri(status, uri);
+            let object_ref = bsky_https_object_ref(status, uri);
+            let cid = status
+                .get("bsky_cid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let like_rec = status
+                .get("vaak_bsky_like_record")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let repost_rec = status
+                .get("vaak_bsky_repost_record")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let reposted = boosted || !repost_rec.is_empty();
+            let liked = fav || !like_rec.is_empty();
+            let bm_sid = if sid.is_empty() && !at.is_empty() {
+                let mut hasher = Sha256::new();
+                hasher.update(at.as_bytes());
+                let digest = hex::encode(hasher.finalize());
+                format!("bsky:{}", &digest[..32.min(digest.len())])
+            } else {
+                sid.clone()
+            };
+            let bm_oid = if object_ref.is_empty() {
+                uri
+            } else {
+                object_ref.as_str()
+            };
+
+            let qt_cls = if qt_n > 0 {
+                "icon-btn has-count"
+            } else {
+                "icon-btn"
+            };
+            actions.push_str(&format!(
+                "<a class=\"{cls}\" href=\"?view={view}&amp;compose=1&amp;quote_object={qo}\" data-eng=\"1\" data-eng-count=\"{n}\" title=\"Quote\" aria-label=\"Quote\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{count}</a>",
+                cls = qt_cls,
+                view = urlencoding_encode(from_q),
+                qo = urlencoding_encode(&object_ref),
+                n = qt_n,
+                count = action_count_html(qt_n),
+            ));
+            if !at.is_empty() {
+                let rb_cls = format!(
+                    "icon-btn bsky-action{}{}",
+                    if reposted { " on" } else { "" },
+                    if rb_n > 0 { " has-count" } else { "" }
+                );
+                actions.push_str(&format!(
+                    "<button type=\"button\" class=\"{cls}\" data-bsky-action=\"repost\" data-uri=\"{uri}\" data-cid=\"{cid}\" data-record-uri=\"{rec}\" data-object-ref=\"{oref}\" data-return-view=\"{rv}\" data-eng=\"1\" data-eng-count=\"{n}\" title=\"{title}\" aria-label=\"{aria}\" aria-pressed=\"{pressed}\"><i class=\"ph ph-repeat\" aria-hidden=\"true\"></i>{count}</button>",
+                    cls = rb_cls,
+                    uri = esc(&at),
+                    cid = esc(cid),
+                    rec = esc(repost_rec),
+                    oref = esc(&object_ref),
+                    rv = esc(from_q),
+                    n = rb_n,
+                    title = if reposted { "Undo boost" } else { "Boost" },
+                    aria = if reposted { "Undo boost" } else { "Boost" },
+                    pressed = if reposted { "true" } else { "false" },
+                    count = action_count_html(rb_n),
+                ));
+            }
+            let like_cls = format!(
+                "icon-btn bsky-action{}{}",
+                if liked { " on" } else { "" },
+                if fav_n > 0 { " has-count" } else { "" }
+            );
+            let like_icon = if liked {
+                "<i class=\"ph-fill ph-heart\" aria-hidden=\"true\"></i>"
+            } else {
+                "<i class=\"ph ph-heart\" aria-hidden=\"true\"></i>"
+            };
+            actions.push_str(&format!(
+                "<button type=\"button\" class=\"{cls}\" data-bsky-action=\"like\" data-uri=\"{uri}\" data-cid=\"{cid}\" data-record-uri=\"{rec}\" data-object-ref=\"{oref}\" data-return-view=\"{rv}\" data-eng=\"1\" data-eng-count=\"{n}\" title=\"{title}\" aria-label=\"{aria}\" aria-pressed=\"{pressed}\">{icon}{count}</button>",
+                cls = like_cls,
+                uri = esc(&at),
+                cid = esc(cid),
+                rec = esc(like_rec),
+                oref = esc(&object_ref),
+                rv = esc(from_q),
+                n = fav_n,
+                title = if liked { "Unlike" } else { "Like on Bluesky" },
+                aria = if liked { "Unlike" } else { "Like on Bluesky" },
+                pressed = if liked { "true" } else { "false" },
+                icon = like_icon,
+                count = action_count_html(fav_n),
+            ));
+            let bm_cls = format!("icon-btn bsky-action{}", if bm { " on" } else { "" });
+            let bm_icon = if bm {
+                "<i class=\"ph-fill ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+            } else {
+                "<i class=\"ph ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+            };
+            actions.push_str(&format!(
+                "<button type=\"button\" class=\"{cls}\" data-bsky-action=\"bookmark\" data-uri=\"{uri}\" data-cid=\"{cid}\" data-status-id=\"{sid}\" data-object-id=\"{oid}\" data-object-ref=\"{oref}\" data-return-view=\"{rv}\" data-bm-picker=\"{pick}\" title=\"{title}\" aria-label=\"{aria}\" aria-pressed=\"{pressed}\">{icon}</button>",
+                cls = bm_cls,
+                uri = esc(&at),
+                cid = esc(cid),
+                sid = esc(&bm_sid),
+                oid = esc(bm_oid),
+                oref = esc(&object_ref),
+                rv = esc(from_q),
+                pick = if bm { "1" } else { "0" },
+                title = if bm { "Bookmark folders" } else { "Bookmark" },
+                aria = if bm { "Bookmark folders" } else { "Bookmark" },
+                pressed = if bm { "true" } else { "false" },
+                icon = bm_icon,
+            ));
+        } else if !sid.is_empty() && !uri.is_empty() {
+            // Fediverse / local (PHP remote branch; local skips Bite)
+            let qt_cls = if qt_n > 0 {
+                "icon-btn has-count"
+            } else {
+                "icon-btn"
+            };
+            actions.push_str(&format!(
+                "<a class=\"{cls}\" href=\"?view={view}&amp;compose=1&amp;quote_object={qo}&amp;quote_status_id={qs}\" data-eng=\"1\" data-eng-count=\"{n}\" title=\"Quote\" aria-label=\"Quote\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{count}</a>",
+                cls = qt_cls,
+                view = urlencoding_encode(from_q),
+                qo = urlencoding_encode(uri),
+                qs = urlencoding_encode(&sid),
+                n = qt_n,
+                count = action_count_html(qt_n),
+            ));
+            let boost_cls = format!(
+                "icon-btn{}{}",
+                if boosted { " on" } else { "" },
+                if rb_n > 0 { " has-count" } else { "" }
+            );
+            actions.push_str(&interaction_form(
+                &action_base,
+                if boosted {
+                    "unreblog_status"
+                } else {
+                    "reblog_status"
+                },
+                from_q,
+                &sid,
+                uri,
+                actor_ref,
+                &boost_cls,
+                if boosted { "Undo boost" } else { "Boost" },
+                if boosted { "Undo boost" } else { "Boost" },
+                "<i class=\"ph ph-repeat\" aria-hidden=\"true\"></i>",
+                &action_count_html(rb_n),
+                &format!(" data-eng=\"1\" data-eng-count=\"{rb_n}\""),
+            ));
+            if !local {
+                actions.push_str(&format!(
+                    "<form method=\"post\" action=\"{base}\" style=\"display:inline\" onsubmit=\"return confirm('Bite this post?');\">\
+                     <input type=\"hidden\" name=\"action\" value=\"bite_remote\">\
+                     <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+                     <input type=\"hidden\" name=\"bite_kind\" value=\"post\">\
+                     <input type=\"hidden\" name=\"target\" value=\"{target}\">\
+                     <button class=\"icon-btn\" type=\"submit\" title=\"Bite (Wafrn)\" aria-label=\"Bite\"><i class=\"ph ph-tooth\" aria-hidden=\"true\"></i></button></form>",
+                    base = esc(&action_base),
+                    rv = esc(from_q),
+                    target = esc(uri),
+                ));
+            }
+            let fav_cls = format!(
+                "icon-btn{}{}",
+                if fav { " on" } else { "" },
+                if fav_n > 0 { " has-count" } else { "" }
+            );
+            let fav_icon = if fav {
+                "<i class=\"ph-fill ph-heart\" aria-hidden=\"true\"></i>"
+            } else {
+                "<i class=\"ph ph-heart\" aria-hidden=\"true\"></i>"
+            };
+            actions.push_str(&interaction_form(
+                &action_base,
+                if fav {
+                    "unfavourite_status"
+                } else {
+                    "favourite_status"
+                },
+                from_q,
+                &sid,
+                uri,
+                actor_ref,
+                &fav_cls,
+                if fav { "Unlike" } else { "Like" },
+                if fav { "Unlike" } else { "Like" },
+                fav_icon,
+                &action_count_html(fav_n),
+                &format!(" data-eng=\"1\" data-eng-count=\"{fav_n}\""),
+            ));
+            let bm_cls = if bm { "icon-btn on" } else { "icon-btn" };
+            let bm_icon = if bm {
+                "<i class=\"ph-fill ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+            } else {
+                "<i class=\"ph ph-bookmark-simple\" aria-hidden=\"true\"></i>"
+            };
+            actions.push_str(&interaction_form(
+                &action_base,
+                if bm {
+                    "unbookmark_status"
+                } else {
+                    "bookmark_status"
+                },
+                from_q,
+                &sid,
+                uri,
+                "",
+                bm_cls,
+                if bm { "Bookmark folders" } else { "Bookmark" },
+                if bm { "Bookmark folders" } else { "Bookmark" },
+                bm_icon,
+                "",
+                &format!(" data-bm-picker=\"{}\"", if bm { "1" } else { "0" }),
+            ));
+        }
+
+        if !uri.is_empty() && !bsky {
+            let remote = remote_object_href(uri, url_hint);
+            if remote.starts_with("http://") || remote.starts_with("https://") {
+                actions.push_str(&format!(
+                    "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"meta\" title=\"Open on remote instance\">Remote</a>",
+                    esc(&remote)
+                ));
+            }
+        }
+    }
+
+    if actions.is_empty() {
+        // Fallback Open when we lack ids (thin shells).
+        if !uri.is_empty() {
+            let open = format!(
+                "?view=status&object={}&from={}",
+                urlencoding_encode(uri),
+                urlencoding_encode(from_q)
+            );
+            return format!(
+                "<div class=\"tweet-actions\"><a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Open</a></div>",
+                esc(&open)
+            );
+        }
+        return String::new();
+    }
+    format!("<div class=\"tweet-actions\">{actions}</div>")
 }
 
 fn media_row_html(st: &Value) -> String {
@@ -888,7 +1765,10 @@ pub fn paint_lean_embed_from(status: &Value, hide_header: bool, from: &str) -> S
         ));
     }
 
-    if !uri.is_empty() {
+    // Home timeline: full PHP-parity action bar. Mentions nests stay Open-only.
+    if from == "home" {
+        inner.push_str(&paint_lean_timeline_actions(status, from));
+    } else if !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
         let open = format!(
             "?view=status&object={}&from={}",
@@ -1131,6 +2011,117 @@ mod tests {
         assert!(out.contains("view=search") && out.contains("rust"), "hashtag search: {out}");
         assert!(out.contains("class=\"ext-link\"") && out.contains("https://example.com/path"), "bare url: {out}");
         assert!(!out.contains("<br><br>") && !out.contains("<br /><br"), "{out}");
+    }
+
+    #[test]
+    fn linkifies_plain_handles_and_hashtags() {
+        let out = linkify_text_segment(
+            "hi @alice@mastodon.social and @bob.bsky.social see #fediverse",
+            "home",
+        );
+        assert!(out.contains("class=\"mention\"") && out.contains("@alice@mastodon.social"), "{out}");
+        assert!(out.contains("view=remote_profile") && out.contains("mastodon.social"), "{out}");
+        assert!(
+            out.contains("@bob.bsky.social")
+                && (out.contains("bsky.app/profile") || out.contains("bsky.app%2Fprofile")),
+            "{out}"
+        );
+        assert!(out.contains("class=\"hashtag\"") && out.contains("#fediverse"), "{out}");
+        assert!(out.contains("view=search") && out.contains("type=statuses"), "{out}");
+    }
+
+    #[test]
+    fn home_feed_card_paints_fedi_action_bar() {
+        let st = json!({
+            "id": "12345",
+            "uri": "https://mastodon.social/users/x/statuses/1",
+            "url": "https://mastodon.social/@x/1",
+            "content": "<p>hello @bob@example.com #hi</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "favourites_count": 3,
+            "reblogs_count": 1,
+            "quotes_count": 0,
+            "account": {
+                "acct": "x@mastodon.social",
+                "display_name": "X",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://mastodon.social/users/x"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("icon-btn"), "expected action icons: {html}");
+        assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
+        assert!(html.contains("reblog_status") || html.contains("ph-repeat"), "{html}");
+        assert!(html.contains("bite_remote") && html.contains("ph-tooth"), "{html}");
+        assert!(html.contains("bookmark_status") || html.contains("ph-bookmark"), "{html}");
+        assert!(html.contains("compose=1") && html.contains("reply_to="), "{html}");
+        assert!(!html.contains(">Open</a></div>"), "Home should not be Open-only: {html}");
+    }
+
+    #[test]
+    fn home_feed_card_paints_bsky_action_bar() {
+        let st = json!({
+            "id": "bsky:abc",
+            "uri": "at://did:plc:test/app.bsky.feed.post/rkey1",
+            "url": "https://bsky.app/profile/did:plc:test/post/rkey1",
+            "content": "<p>hello @alice.bsky.social</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "source": "bluesky",
+            "bsky_cid": "cid123",
+            "favourited": true,
+            "reblogged": false,
+            "bookmarked": false,
+            "favourites_count": 2,
+            "reblogs_count": 0,
+            "sensitive": true,
+            "spoiler_text": "Sensitive content",
+            "account": {
+                "acct": "test.bsky.social",
+                "display_name": "Test",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://bsky.app/profile/test.bsky.social"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("bsky-action"), "{html}");
+        assert!(html.contains("data-bsky-action=\"like\""), "{html}");
+        assert!(html.contains("data-bsky-action=\"repost\""), "{html}");
+        assert!(html.contains("data-bsky-action=\"bookmark\""), "{html}");
+        assert!(html.contains("cw-gate"), "Bluesky sensitive must gate: {html}");
+        assert!(html.contains("class=\"mention\"") && html.contains("@alice.bsky.social"), "{html}");
+    }
+
+    #[test]
+    fn home_feed_card_paints_rss_local_actions() {
+        let st = json!({
+            "id": "rss:9",
+            "uri": "https://example.com/feed/post",
+            "content": "<p>rss item</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "source": "rss",
+            "vaak_rss_item_id": 9,
+            "vaak_rss_feed_id": 3,
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "account": {
+                "acct": "example.com",
+                "display_name": "Example",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://example.com/"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("rss_quote") || html.contains("ph-quotes"), "{html}");
+        assert!(html.contains("reblog_status") || html.contains("Boost (VAAK only)"), "{html}");
+        assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
+        assert!(!html.contains("bite_remote"), "RSS must not Bite: {html}");
     }
 
     #[test]
