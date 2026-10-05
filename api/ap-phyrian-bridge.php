@@ -28,6 +28,18 @@ const AP_PHYRIAN_BRIDGE_ONLINE_SECS = 1800; // soft "recently active" window
 const AP_PHYRIAN_BRIDGE_SYNC_TTL_SEC = 60;
 
 /**
+ * Synchronous page-load pulls are opt-in now that phyrian-sync.php mirrors
+ * linked OpenSim bodies every five minutes. Keeping this off avoids making a
+ * Phyrian page wait on the external bridge; operators can enable it during a
+ * recovery window with VAAK_PHYRIAN_SYNC_ON_PAGE=1.
+ */
+function ap_phyrian_bridge_sync_on_page(): bool
+{
+    $raw = strtolower(trim((string) (getenv('VAAK_PHYRIAN_SYNC_ON_PAGE') ?: '')));
+    return in_array($raw, ['1', 'true', 'yes', 'on'], true);
+}
+
+/**
  * @return array<string,string>
  */
 function ap_phyrian_bridge_env(): array
