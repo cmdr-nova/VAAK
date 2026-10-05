@@ -26,7 +26,8 @@ use crate::timeline;
 
 const HOME_HYDRATE_TTL_SECS: u64 = 300;
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.jpg";
-const DEFAULT_LIMITS: [i64; 3] = [15, 40, 80];
+/// Include 50 — Ice Cubes head polls `/api/v1/timelines/home?limit=50` (0.7.21).
+const DEFAULT_LIMITS: [i64; 4] = [15, 40, 50, 80];
 
 #[derive(Debug, Clone)]
 pub struct WarmReport {
