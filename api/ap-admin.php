@@ -6516,6 +6516,59 @@ if (
     }
 }
 
+// Home infinite-scroll / non-shell partial: prefer Axum lean HTML from hydrate
+// Redis (0.7.9) *before* PG timeline rebuild + admin_tl_hydrate + full cards.
+// First-page soft-nav shell keeps its own path above.
+if (
+    $isPartial
+    && !$wantNewerPoll
+    && $view === 'home'
+    && !(isset($_GET['shell']) && (string) $_GET['shell'] === '1')
+    && function_exists('admin_home_html_axum_fetch')
+) {
+    $fillLimit = max(1, min(40, (int) ($_GET['limit'] ?? $tlLimit)));
+    $fillOffset = max(0, (int) ($_GET['offset'] ?? 0));
+    $axumFill = admin_home_html_axum_fetch($fillLimit, (int) $vaakOwnerId, $fillOffset);
+    if (is_array($axumFill) && (string) ($axumFill['html'] ?? '') !== '') {
+        if (function_exists('ap_auth_session_write_close')) {
+            ap_auth_session_write_close();
+        } elseif (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
+        }
+        $hasMore = !empty($axumFill['has_more']);
+        if ($adminTlFromCache && is_array($adminTlRankedCached)) {
+            $nextOff = (int) ($axumFill['next_offset'] ?? ($fillOffset + $fillLimit));
+            $hasMore = $hasMore || $nextOff < count($adminTlRankedCached);
+        }
+        $nextOffset = (int) ($axumFill['next_offset'] ?? ($fillOffset + $fillLimit));
+        header('Content-Type: text/html; charset=utf-8');
+        header('Cache-Control: no-store');
+        header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+        header('X-Next-Offset: ' . (string) $nextOffset);
+        header('X-TL-Cache: axum-home-html');
+        header('X-VAAK-Home-Html: 1');
+        header('X-TL-Hydrate-Ms: 0');
+        header('X-TL-Flags-Ms: 0');
+        header('X-TL-Render-Ms: ' . (string) (int) ($axumFill['ms'] ?? 0));
+        header('X-TL-Partial-Ms: ' . (string) (int) ($axumFill['ms'] ?? 0));
+        header('X-VAAK-View: home');
+        if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+            $adminTlStampedeLock = '';
+        }
+        // Keep the next window warm so scroll page N+1 also hits Axum.
+        if ($hasMore && function_exists('ap_timeline_home_hydrate_warm_async')) {
+            ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+        }
+        echo (string) $axumFill['html'];
+        exit;
+    }
+    // Miss (deep offset / cold envelope): prime 80-head for the next attempt.
+    if ($fillOffset > 0 && function_exists('ap_timeline_home_hydrate_warm_async')) {
+        ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+    }
+}
+
 // Full-page Home/Local/Federated cache miss (account switch / cold cache):
 // seed a lean ranked index synchronously for first paint (fast SQL), then
 // hydrate. Avoids 30–90s full rebuild AND empty timelines after switch.
@@ -19027,20 +19080,22 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
     }
     $adminTlPerfT0 = microtime(true);
     $adminTlPerfHydrateMs = 0.0;
-    // Short-lived HTML fragment cache for identical head/page windows.
+    // Short-lived HTML fragment cache for identical page windows (incl. offset,
+    // 0.7.9 — Local/Federated scroll reuse; Home prefers Axum above).
     // Keyed by owner + view + offset + ranked-cache identity so mutations that
     // clear the ranked index also miss here after invalidation.
     $adminTlFragmentHit = false;
     $adminTlFragmentKey = '';
-    if ($tlOffset === 0 && in_array($view, ['home', 'local', 'feed'], true)
+    if (in_array($view, ['home', 'local', 'feed'], true)
         && function_exists('ap_redis_json_get') && function_exists('ap_redis_json_set')) {
         $fragOwner = admin_owner_user_id();
         $fragIdentity = ($adminTlCacheKey !== '' ? $adminTlCacheKey : $view)
+            . '|off=' . (int) $tlOffset
             . '|' . ($adminTlFromCache ? 'hit' : 'miss')
             . '|' . (string) $tlLimit;
         if ($adminTlFromCache && is_array($adminTlRankedCached)) {
             $headIds = [];
-            foreach (array_slice($adminTlRankedCached, 0, $tlLimit) as $row) {
+            foreach (array_slice($adminTlRankedCached, $tlOffset, $tlLimit) as $row) {
                 if (is_array($row)) {
                     $headIds[] = (string) ($row['k'] ?? '') . ':' . (string) ($row['id'] ?? '');
                 }
@@ -20405,7 +20460,7 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
             $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : (getenv('VAAK_PHP_BIN') ?: '/usr/bin/php');
             $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
                 . ' --owner-id=' . (int) $ownerUserId
-                . ' --limits=15,40 >/dev/null 2>&1 &';
+                . ' --limits=15,40,80 >/dev/null 2>&1 &';
             @exec($cmd);
         }
     }
@@ -20444,11 +20499,12 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
 
 /**
  * Fetch Home fill HTML from Axum `/shadow/home-html` (0.7.4).
- * Lean Rust cards from hydrate Redis. Flag: VAAK_HOME_HTML_AXUM (default on).
+ * Offset pages supported (0.7.9). Lean Rust cards from hydrate Redis.
+ * Flag: VAAK_HOME_HTML_AXUM (default on).
  *
  * @return array{html:string,has_more:bool,next_offset:int,source:string,ms:int}|null
  */
-function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0): ?array
+function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offset = 0): ?array
 {
     $enabled = getenv('VAAK_HOME_HTML_AXUM');
     $enabled = ($enabled === false || $enabled === '')
@@ -20474,10 +20530,16 @@ function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0): ?array
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
         return null;
     }
-    $url = $base . '/shadow/home-html?' . http_build_query([
+    $limit = max(1, min(40, $limit));
+    $offset = max(0, $offset);
+    $query = [
         'owner_id' => $ownerUserId,
-        'limit' => max(1, min(40, $limit)),
-    ]);
+        'limit' => $limit,
+    ];
+    if ($offset > 0) {
+        $query['offset'] = $offset;
+    }
+    $url = $base . '/shadow/home-html?' . http_build_query($query);
     if (!function_exists('curl_init')) {
         return null;
     }
@@ -20519,7 +20581,7 @@ function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0): ?array
     return [
         'html' => $body,
         'has_more' => (($hdrs['x-has-more'] ?? '') === '1'),
-        'next_offset' => max(0, (int) ($hdrs['x-next-offset'] ?? $limit)),
+        'next_offset' => max(0, (int) ($hdrs['x-next-offset'] ?? ($offset + $limit))),
         'source' => (string) ($hdrs['x-vaak-tl-source'] ?? 'axum-home-html'),
         'ms' => $ms,
     ];

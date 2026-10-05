@@ -138,7 +138,7 @@ async fn force_spawn_home_hydrate(cfg: &Config, owner_user_id: i64) -> String {
     match std::process::Command::new(&php)
         .arg(&script)
         .arg(format!("--owner-id={owner_user_id}"))
-        .arg("--limits=15,40")
+        .arg("--limits=15,40,80")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

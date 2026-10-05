@@ -6,8 +6,9 @@
 //!   merge, RSS spacing). Source `vaak-worker-native`. Flag
 //!   `VAAK_RANKED_NATIVE_HOME=1` (default on; `0` skips Home warm).
 //! - After a non-empty Home ranked write, fire-and-forget
-//!   `bin/home-timeline-warm.php --limits=15,40` so Axum HTML assist can hit
-//!   `vaak:timeline:v1:*` across hard-refresh (0.6.67). Cooldown ~60s;
+//!   `bin/home-timeline-warm.php --limits=15,40,80` so Axum HTML assist can hit
+//!   `vaak:timeline:v1:*` across hard-refresh (0.6.67) and scroll pages (0.7.9).
+//!   Cooldown ~60s;
 //!   disable with `VAAK_HOME_HYDRATE_WARM=0`.
 //! - **Local / Federated:** outbox+local boosts / firehose events with v13 key
 //!   parity. Flag `VAAK_RANKED_NATIVE_LOCAL_FEED=1` (default on; `0` skips).
@@ -117,7 +118,7 @@ async fn maybe_spawn_home_hydrate_warm(
     let mut cmd = Command::new(&php_bin);
     cmd.arg(&script)
         .arg(format!("--owner-id={owner_user_id}"))
-        .arg("--limits=15,40")
+        .arg("--limits=15,40,80")
         .env("AP_DB_DSN", "pgsql:dbname=novalandia")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
