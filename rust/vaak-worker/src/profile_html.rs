@@ -125,7 +125,10 @@ fn media_from_raw_create(raw: &str) -> Vec<Value> {
         _ => return Vec::new(),
     };
     let mut out = Vec::new();
-    for att in atts.into_iter().take(4) {
+    for att in atts {
+        if out.len() >= 4 {
+            break;
+        }
         let url = att
             .get("url")
             .and_then(|v| {
@@ -937,5 +940,21 @@ mod tests {
         let media = media_from_raw_create(raw);
         assert_eq!(media[0]["type"], json!("video"));
         assert_eq!(media[0]["preview_url"], json!("https://files.example/small/clip.png"));
+    }
+
+    #[test]
+    fn profile_media_parser_keeps_four_valid_attachments_after_bad_urls() {
+        let raw = r#"{"object":{"attachment":[
+          {"type":"Image","mediaType":"image/jpeg","url":"http://bad.example/a.jpg"},
+          {"type":"Image","mediaType":"image/jpeg","url":"https://files.example/a.jpg"},
+          {"type":"Image","mediaType":"image/jpeg","url":"https://files.example/b.jpg"},
+          {"type":"Image","mediaType":"image/jpeg","url":"https://files.example/c.jpg"},
+          {"type":"Image","mediaType":"image/jpeg","url":"https://files.example/d.jpg"},
+          {"type":"Image","mediaType":"image/jpeg","url":"https://files.example/e.jpg"}
+        ]}}"#;
+        let media = media_from_raw_create(raw);
+        assert_eq!(media.len(), 4);
+        assert_eq!(media[0]["url"], json!("https://files.example/a.jpg"));
+        assert_eq!(media[3]["url"], json!("https://files.example/d.jpg"));
     }
 }
