@@ -1003,7 +1003,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
     $pinnedCount = count($pinnedNotes);
     $tabTotal = match ($tab) {
         'pinned' => $pinnedCount,
-        'media' => function_exists('ap_outbox_media_count') ? ap_outbox_media_count($actorKey) : count($mediaNotes),
+            // The tab count is a total, not the number of media notes loaded
+            // for the current page.  Counting $mediaNotes made the badge
+            // drift (and usually read as zero) once pagination was enabled.
+            'media' => function_exists('ap_outbox_media_count')
+                ? ap_outbox_media_count($actorKey)
+                : count($mediaNotes),
         'replies' => (function_exists('ap_outbox_replies_count') ? ap_outbox_replies_count($actorKey) : count($profileReplyNotes)) + count($profileBskyReplies),
         'boosts' => $profileBoostTotal,
         'featured' => $featuredCount,
@@ -1042,7 +1047,12 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
             'posts' => ['Posts', $profileTotal + $profileBskyCount + $profileBoostTotal],
             'replies' => $hideProfileReplies ? null : ['Replies', count($profileReplyNotes) + count($profileBskyReplies)],
             'boosts' => $hideProfileBoosts ? null : ['Boosts', $profileBoostTotal],
-            'media' => ['Media', count($mediaNotes)],
+            'media' => [
+                'Media',
+                function_exists('ap_outbox_media_count')
+                    ? ap_outbox_media_count($actorKey)
+                    : count($mediaNotes),
+            ],
             'featured' => ['Featured', $featuredCount],
             'blog' => ['Blog', $blogCount],
         ]) as $tKey => $tInfo
