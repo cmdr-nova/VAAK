@@ -7,11 +7,16 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{config::Config, db};
 
 const DAILY_DECAY: i64 = 5;
 const DECAY_GRACE_SECS: i64 = 86_400;
+const MAX_RESONANCE: i64 = 100;
+const MAX_GENERATION: i64 = 10;
+const MAX_LEVEL: i64 = 80;
+const MAX_BANKED: i64 = 300;
 
 #[derive(Debug, Serialize)]
 pub struct Projection {
@@ -61,6 +66,64 @@ pub struct DirectoryEntry {
     pub resonance: i64,
     pub generation: i64,
     pub stability: String,
+}
+
+/// Canonicalized OpenSim player state for a future mutation hand-off.
+///
+/// This deliberately does not write to PostgreSQL or call the Strains bridge.
+/// PHP currently owns those side effects; keeping this pure lets Axum prove
+/// payload/clamp parity before ownership is moved and prevents duplicate
+/// OpenSim mutations during the migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenSimPlayerPlan {
+    pub status: String,
+    pub strain: String,
+    pub resonance: i64,
+    pub generation: i64,
+    pub level: i64,
+    pub banked_resonance: i64,
+    pub resonance_exchanges: i64,
+    pub inductions_given: i64,
+    pub lineage_depth: i64,
+    pub last_decay_at: Option<String>,
+}
+
+fn nonnegative(v: Option<i64>) -> i64 {
+    v.unwrap_or(0).max(0)
+}
+
+fn int_field(input: &Value, key: &str) -> Option<i64> {
+    input.get(key).and_then(|v| {
+        v.as_i64().or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+    })
+}
+
+/// Match PHP `ap_phyrian_bridge_apply_opensim_player` normalization exactly.
+pub fn normalize_opensim_player(input: &Value) -> OpenSimPlayerPlan {
+    let strain = input
+        .get("strain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let imprinted = !strain.is_empty();
+    OpenSimPlayerPlan {
+        status: if imprinted { "imprinted" } else { "unknown" }.into(),
+        strain,
+        resonance: int_field(input, "resonance").unwrap_or(0).clamp(0, MAX_RESONANCE),
+        generation: int_field(input, "generation").unwrap_or(1).clamp(1, MAX_GENERATION),
+        level: int_field(input, "level").unwrap_or(1).clamp(1, MAX_LEVEL),
+        banked_resonance: int_field(input, "banked_resonance").unwrap_or(0).clamp(0, MAX_BANKED),
+        resonance_exchanges: nonnegative(int_field(input, "resonance_exchanges")),
+        inductions_given: nonnegative(int_field(input, "inductions_given")),
+        lineage_depth: nonnegative(int_field(input, "lineage_depth")),
+        last_decay_at: input
+            .get("last_decay_at")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    }
 }
 
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {
@@ -187,7 +250,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{projected_decay, stability};
+    use super::{normalize_opensim_player, projected_decay, stability};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -207,5 +270,36 @@ mod tests {
             assert_eq!(decay, case.expected_decay);
             assert_eq!(stability(case.status == "imprinted" && !case.strain.is_empty(), resonance), case.expected_stability);
         }
+    }
+
+    #[test]
+    fn opensim_player_normalization_matches_php_clamps() {
+        let input = serde_json::json!({
+            "strain": "  Voidborne ", "resonance": 999, "generation": 0,
+            "level": 999, "banked_resonance": -4,
+            "resonance_exchanges": -2, "inductions_given": 7,
+            "lineage_depth": -1, "last_decay_at": " 2026-10-05T00:00:00Z "
+        });
+        let got = normalize_opensim_player(&input);
+        assert_eq!(got.status, "imprinted");
+        assert_eq!(got.strain, "Voidborne");
+        assert_eq!(got.resonance, 100);
+        assert_eq!(got.generation, 1);
+        assert_eq!(got.level, 80);
+        assert_eq!(got.banked_resonance, 0);
+        assert_eq!(got.resonance_exchanges, 0);
+        assert_eq!(got.inductions_given, 7);
+        assert_eq!(got.lineage_depth, 0);
+        assert_eq!(got.last_decay_at.as_deref(), Some("2026-10-05T00:00:00Z"));
+    }
+
+    #[test]
+    fn opensim_unmarked_player_uses_php_defaults() {
+        let got = normalize_opensim_player(&serde_json::json!({"strain": ""}));
+        assert_eq!(got.status, "unknown");
+        assert_eq!(got.resonance, 0);
+        assert_eq!(got.generation, 1);
+        assert_eq!(got.level, 1);
+        assert_eq!(got.last_decay_at, None);
     }
 }
