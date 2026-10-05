@@ -5859,26 +5859,33 @@ if ($view === 'stats') {
 }
 
 // Follow graphs: full pages need rich URL aliases; partials only need actor_id keys.
-// Soft-nav shells for Following/Followers still need the full row lists.
+// Soft-nav shells for Following/Followers still need the row lists for the active view.
 $accountSwitcherView = $view === 'account_switcher';
 $shellFollowGraph = $isPartial
     && isset($_GET['shell']) && (string) $_GET['shell'] === '1'
     && in_array($view, ['following', 'followers'], true);
-$followers = (($isPartial && !$shellFollowGraph) || $accountSwitcherView) ? [] : ap_followers_list($vaakActorId);
-$following = $accountSwitcherView ? [] : ap_following_list($vaakActorId);
+$needFollowersRows = !$accountSwitcherView && (
+    (!$isPartial && $view === 'followers')
+    || $shellFollowGraph && $view === 'followers'
+    || (!$isPartial && !in_array($view, ['following', 'mentions', 'account_switcher'], true))
+);
+// Following *rows* are only required to paint the Following page. Membership for
+// cards/Follow-back uses ap_following_id_set (Redis) instead of merging every
+// Bluesky profile handle on each soft-nav.
+$needFollowingRows = !$accountSwitcherView && (
+    $view === 'following'
+    || (!$isPartial && !in_array($view, ['followers', 'mentions', 'account_switcher'], true))
+);
+$followers = $needFollowersRows ? ap_followers_list($vaakActorId) : [];
+$following = $needFollowingRows ? ap_following_list($vaakActorId) : [];
 if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
-    if (function_exists('ap_bsky_admin_following_rows')) {
-        // Notifications only need relationship membership; avoid resolving a
-        // profile cache entry for every followed Bluesky account on page load.
-        // Timeline hydration only needs stable actor IDs. Resolving every
-        // Bluesky DID into a profile handle here can turn a tab switch into
-        // dozens of cache misses/XRPC refreshes; relationship pages resolve
-        // handles when they actually render those rows.
-        $resolveBskyHandles = in_array($view, ['following', 'followers'], true)
-            && (!$isPartial || $shellFollowGraph);
-        $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId, $resolveBskyHandles));
+    if ($needFollowingRows && function_exists('ap_bsky_admin_following_rows')) {
+        // Never resolve every Bluesky DID→handle on the request path (was ~1.4s
+        // for ~450 follows). DID profile URLs render fine; actor-refresh fills
+        // handles in the background for the visible page slice.
+        $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId, false));
     }
-    if ((!$isPartial || $shellFollowGraph) && in_array($view, ['followers', 'following'], true)
+    if ($needFollowersRows && in_array($view, ['followers', 'following'], true)
         && function_exists('ap_bsky_admin_follower_rows')) {
         $followers = ap_bsky_merge_follow_rows($followers, ap_bsky_admin_follower_rows($vaakOwnerId, $vaakActorId));
     }
@@ -5887,10 +5894,16 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_
     }
 }
 // Scope remote_actors username lookups to the follow graph (not the whole table).
+// Soft-nav follow pages only need aliases for the first painted page (limit).
 $adminUnameByActor = [];
 if ((!$isPartial || !empty($shellFollowGraph)) && !$accountSwitcherView && $view !== 'mentions') {
     $aliasActorIds = [];
-    foreach (array_merge($followers, $following) as $grow) {
+    $aliasSource = ($view === 'followers') ? $followers : (($view === 'following') ? $following : array_merge($followers, $following));
+    if ($shellFollowGraph) {
+        $aliasLimit = max(40, min(200, (int) ($_GET['limit'] ?? 40)));
+        $aliasSource = array_slice($aliasSource, 0, $aliasLimit);
+    }
+    foreach ($aliasSource as $grow) {
         if (!is_array($grow)) {
             continue;
         }
@@ -6006,12 +6019,20 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_following_i
 $GLOBALS['vaak_following_ids'] = $followingIds;
 // Phase 4: warm moderation sets for every authenticated page so later
 // Home/search/DMs hit Redis instead of cold-building after idle.
-if (!$accountSwitcherView && $vaakOwnerId > 0 && !$isPartial) {
+// Soft-nav Followers/Following must warm too — per-row mute/block without a
+// warm set was ~7s for 40 rows on production.
+if (!$accountSwitcherView && $vaakOwnerId > 0 && (!$isPartial || $shellFollowGraph)) {
     if (function_exists('ap_mutes_set_cached')) {
         ap_mutes_set_cached($vaakOwnerId);
     }
     if (function_exists('ap_blocks_actor_id_set')) {
         ap_blocks_actor_id_set($vaakOwnerId);
+    }
+    if (function_exists('ap_block_list_cached')) {
+        ap_block_list_cached();
+    }
+    if (function_exists('ap_server_blocked_actors_set')) {
+        ap_server_blocked_actors_set();
     }
     if (function_exists('ap_muted_words_phrases_cached')) {
         ap_muted_words_phrases_cached($vaakOwnerId);
@@ -6189,6 +6210,7 @@ if (isset($_GET['partial'], $_GET['shell'])
             $filtered = array_values(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
         }
         $shown = array_slice($filtered, 0, $followLimit);
+        $shown = admin_follow_rows_resolve_bsky_handles($shown, $vaakOwnerId);
         $nAll = count($rowsSrc);
         $nBsky = count(array_filter($rowsSrc, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
         $nFedi = $nAll - $nBsky;
@@ -7770,6 +7792,53 @@ function admin_home_suppression_map(int $ownerUserId): array
     } catch (Throwable $e) {
         return [];
     }
+}
+
+/**
+ * Resolve Bluesky handles for a small visible follow-graph page only.
+ * Full-graph resolve on soft-nav was ~1.4s for ~450 follows.
+ *
+ * @param list<array<string,mixed>> $rows
+ * @return list<array<string,mixed>>
+ */
+function admin_follow_rows_resolve_bsky_handles(array $rows, int $ownerUserId): array
+{
+    if ($rows === [] || $ownerUserId < 1 || !function_exists('ap_bsky_actor_profile_cache_get')) {
+        return $rows;
+    }
+    foreach ($rows as &$row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $did = trim((string) ($row['bsky_did'] ?? ''));
+        $handle = trim((string) ($row['bsky_handle'] ?? ''));
+        if ($handle === '' && (($row['host'] ?? '') === 'bsky.app' || str_contains((string) ($row['actor_id'] ?? ''), 'bsky.app'))) {
+            $uname = trim((string) ($row['username'] ?? ''));
+            if ($uname !== '' && str_contains($uname, '.') && !str_starts_with($uname, 'did:')) {
+                $handle = $uname;
+            }
+        }
+        if ($handle !== '' || !str_starts_with($did, 'did:')) {
+            continue;
+        }
+        $cached = ap_bsky_actor_profile_cache_get($did, $ownerUserId);
+        $handle = trim((string) (($cached['profile']['handle'] ?? '') ?: ''));
+        if ($handle === '') {
+            if (function_exists('ap_bsky_actor_refresh_enqueue')) {
+                ap_bsky_actor_refresh_enqueue($ownerUserId, $did);
+            }
+            continue;
+        }
+        $row['bsky_handle'] = $handle;
+        $row['username'] = $handle;
+        if (function_exists('ap_bsky_actor_profile_url')) {
+            $row['actor_id'] = ap_bsky_actor_profile_url($handle);
+        } else {
+            $row['actor_id'] = 'https://bsky.app/profile/' . rawurlencode($handle);
+        }
+    }
+    unset($row);
+    return $rows;
 }
 
 /**
@@ -23711,24 +23780,44 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       vertical-align: -.15em;
     }
     @keyframes vaak-spinner-spin { to { transform: rotate(360deg); } }
+    @keyframes vaak-v-pulse {
+      0%, 100% { opacity: .55; transform: scale(.92); filter: drop-shadow(0 0 0 transparent); }
+      50% { opacity: 1; transform: scale(1); filter: drop-shadow(0 0 12px color-mix(in srgb, var(--primary) 55%, transparent)); }
+    }
     .vaak-loading-indicator {
-      position: fixed; bottom: 1rem; left: 50%; z-index: 10080;
-      display: inline-flex; align-items: center; gap: .5rem;
-      padding: .6rem .95rem; border: 1px solid var(--border);
-      border-radius: 999px; background: color-mix(in srgb, var(--panel) 92%, transparent);
-      color: var(--primary); box-shadow: 0 8px 24px rgba(0,0,0,.28);
+      position: fixed; inset: 0; z-index: 10080;
+      display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: .85rem;
+      background: color-mix(in srgb, var(--bg, #0b0d10) 72%, transparent);
+      backdrop-filter: blur(2px);
+      color: var(--primary);
       opacity: 0; visibility: hidden; pointer-events: none;
-      transform: translate(-50%, .5rem); transition: opacity .16s ease, transform .16s ease, visibility 0s linear .16s;
-      font-size: .88rem; font-weight: 600;
+      transition: opacity .16s ease, visibility 0s linear .16s;
+      font-size: .92rem; font-weight: 600; letter-spacing: .02em;
     }
     .vaak-loading-indicator.is-visible {
-      opacity: 1; visibility: visible; transform: translate(-50%, 0);
-      transition: opacity .16s ease, transform .16s ease, visibility 0s;
+      opacity: 1; visibility: visible;
+      transition: opacity .16s ease, visibility 0s;
+    }
+    .vaak-loading-indicator .vaak-v-loader {
+      width: 72px; height: 72px; object-fit: contain;
+      animation: vaak-v-pulse 1.15s ease-in-out infinite;
+      user-select: none;
+    }
+    .vaak-soft-loading {
+      min-height: 42vh; display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: .85rem; color: var(--primary); font-weight: 600;
+    }
+    .vaak-soft-loading .vaak-v-loader {
+      width: 72px; height: 72px; object-fit: contain;
+      animation: vaak-v-pulse 1.15s ease-in-out infinite;
     }
     .timeline-status-loading { display: inline-flex; align-items: center; justify-content: center; gap: .45rem; }
     @media (prefers-reduced-motion: reduce) {
       .vaak-spinner { animation-duration: 1.4s; }
       .vaak-loading-indicator { transition: none; }
+      .vaak-loading-indicator .vaak-v-loader,
+      .vaak-soft-loading .vaak-v-loader { animation: none; opacity: .9; }
     }
     .brand-profile-link {
       display: inline-block;
@@ -23756,7 +23845,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 </head>
 <body class="<?= !empty($GLOBALS['vaak_guest_profile']) ? 'vaak-guest-profile ' : '' ?><?= $view === 'dms' ? ('dm-fullscreen' . (!empty($_GET['peer']) ? ' dm-peer-open' : '')) : ($view === 'blog' ? 'blog-fullscreen' : '') ?>">
 <div id="vaak-loading-indicator" class="vaak-loading-indicator" role="status" aria-live="polite" aria-hidden="true">
-  <span class="vaak-spinner" aria-hidden="true"></span><span data-vaak-loading-label>Loading…</span>
+  <img class="vaak-v-loader" src="/api/assets/brand/vaak-v-loader.png" width="72" height="72" alt="" decoding="async">
+  <span data-vaak-loading-label>Loading…</span>
 </div>
 <div class="mobile-nav-backdrop" id="mobile-nav-backdrop" hidden></div>
 <header class="mobile-topbar" id="mobile-topbar">
@@ -28489,7 +28579,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           } elseif ($followNet === 'fedi') {
               $followersFiltered = array_values(array_filter($followers, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           }
-          $followersShown = array_slice($followersFiltered, 0, $followLimit);
+          $followersShown = admin_follow_rows_resolve_bsky_handles(array_slice($followersFiltered, 0, $followLimit), $vaakOwnerId);
           $followTab = static function (string $viewName, string $net, string $label, int $count, string $cur) : string {
               $cls = $cur === $net ? 'btn-primary' : 'btn-ghost';
               return '<a class="btn ' . $cls . '" href="?view=' . rawurlencode($viewName) . '&amp;network=' . rawurlencode($net)
@@ -28586,7 +28676,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           } elseif ($followNet === 'fedi') {
               $followingFiltered = array_values(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') !== 'bsky.app' && !str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           }
-          $followingShown = array_slice($followingFiltered, 0, $followLimit);
+          $followingShown = admin_follow_rows_resolve_bsky_handles(array_slice($followingFiltered, 0, $followLimit), $vaakOwnerId);
           $nAll = count($following);
           $nBsky = count(array_filter($following, static fn(array $r): bool => ($r['host'] ?? '') === 'bsky.app' || str_contains((string) ($r['actor_id'] ?? ''), 'bsky.app')));
           $nFedi = $nAll - $nBsky;
@@ -35383,9 +35473,17 @@ window.apAdminToast = function (msg, isErr) {
     if (typeof window.vaakAbortNotifScroll === 'function') {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
     }
+    const loadingLabel = view === 'search' ? 'Searching…' : 'Loading…';
     if (typeof window.vaakShowLoading === 'function') {
-      window.vaakShowLoading(view === 'search' ? 'Searching…' : 'Loading…');
+      window.vaakShowLoading(loadingLabel);
     }
+    // Replace main immediately so slow shells (Followers/Following/profiles)
+    // show the V loader instead of a blank or stale page.
+    try {
+      main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite">'
+        + '<img class="vaak-v-loader" src="/api/assets/brand/vaak-v-loader.png" width="72" height="72" alt="" decoding="async">'
+        + '<span>' + loadingLabel + '</span></div>';
+    } catch (e) {}
     try {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
         + encodeURIComponent(view === 'mentions' ? '12' : (view === 'outbox' ? '20' : '15'));

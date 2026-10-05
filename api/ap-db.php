@@ -8732,6 +8732,52 @@ function ap_is_blocked_host(?string $host): bool
     return false;
 }
 
+/** @return array<string,bool> Expanded server-wide actor block membership. */
+function ap_server_blocked_actors_set(bool $refresh = false): array
+{
+    static $cache = null;
+    if ($refresh) {
+        $cache = null;
+        if (function_exists('ap_redis_delete')) {
+            ap_redis_delete('vaak:moderation:server-blocks:v1');
+        }
+    }
+    if (is_array($cache)) {
+        return $cache;
+    }
+    $redisKey = 'vaak:moderation:server-blocks:v1';
+    if (function_exists('ap_redis_json_get')) {
+        $hit = ap_redis_json_get($redisKey);
+        if (is_array($hit)) {
+            return $cache = $hit;
+        }
+    }
+    $map = [];
+    foreach (ap_block_list_cached() as $b) {
+        if (($b['scope'] ?? '') !== 'actor' || ($b['kind'] ?? 'block') === 'mute') {
+            continue;
+        }
+        $val = rtrim((string) ($b['value'] ?? ''), '/');
+        if ($val === '') {
+            continue;
+        }
+        foreach (ap_actor_moderation_aliases($val) as $alias) {
+            $alias = rtrim((string) $alias, '/');
+            if ($alias !== '') {
+                $map[$alias] = true;
+                $map[$alias . '/'] = true;
+            }
+        }
+        foreach (ap_moderation_syntactic_refs($val) as $alias) {
+            $map[$alias] = true;
+        }
+    }
+    if (function_exists('ap_redis_json_set')) {
+        ap_redis_json_set($redisKey, $map, function_exists('ap_redis_relset_ttl') ? ap_redis_relset_ttl() : 300);
+    }
+    return $cache = $map;
+}
+
 function ap_is_blocked_actor(?string $actorId): bool
 {
     if ($actorId === null || $actorId === '') {
@@ -8752,42 +8798,10 @@ function ap_is_blocked_actor(?string $actorId): bool
         // Explicit domain block of bsky.app (rare) still means all Bluesky.
         return true;
     }
-    // Bluesky DID/handle aliases plus Fediverse /users/ ↔ /@user forms.
-    // Side-effect unfollow already used masto aliases; block checks must too.
-    if (!function_exists('ap_masto_actor_id_aliases') && is_file(__DIR__ . '/ap-masto-entities.php')) {
-        require_once __DIR__ . '/ap-masto-entities.php';
-    }
-    $aliasSet = array_fill_keys(ap_actor_moderation_aliases($actorId), true);
-    if (function_exists('ap_masto_actor_id_aliases') && str_starts_with($actorId, 'https://')) {
-        foreach (ap_masto_actor_id_aliases($actorId) as $al) {
-            $al = rtrim((string) $al, '/');
-            if ($al !== '') {
-                $aliasSet[$al] = true;
-            }
-        }
-    }
-    foreach (ap_block_list_cached() as $b) {
-        if (($b['scope'] ?? '') !== 'actor' || ($b['kind'] ?? 'block') === 'mute') {
-            continue;
-        }
-        $val = rtrim((string) ($b['value'] ?? ''), '/');
-        if ($val === '') {
-            continue;
-        }
-        if (isset($aliasSet[$val])) {
+    $set = ap_server_blocked_actors_set();
+    foreach (ap_moderation_syntactic_refs($actorId) as $alias) {
+        if (!empty($set[$alias])) {
             return true;
-        }
-        $blockAliases = ap_actor_moderation_aliases($val);
-        if (function_exists('ap_masto_actor_id_aliases') && str_starts_with($val, 'https://')) {
-            foreach (ap_masto_actor_id_aliases($val) as $al) {
-                $blockAliases[] = $al;
-            }
-        }
-        foreach ($blockAliases as $alias) {
-            $alias = rtrim((string) $alias, '/');
-            if ($alias !== '' && isset($aliasSet[$alias])) {
-                return true;
-            }
         }
     }
     return false;
@@ -9726,6 +9740,51 @@ function ap_mutes_list(int $ownerUserId): array
 }
 
 /** @return array<string,bool> */
+/**
+ * Fast URL-shape variants for mute/block membership checks.
+ * Avoids ap_actor_moderation_aliases DB lookups (bsky_posts handle→DID was
+ * ~250ms each and made Followers/Following soft-nav multi-second).
+ *
+ * @return list<string>
+ */
+function ap_moderation_syntactic_refs(string $actorId): array
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if ($actorId === '') {
+        return [];
+    }
+    $out = [$actorId, $actorId . '/'];
+    if (str_starts_with($actorId, 'did:')) {
+        $out[] = 'https://bsky.app/profile/' . $actorId;
+        $out[] = 'https://bsky.app/profile/' . rawurlencode($actorId);
+    } elseif (preg_match('~^https://bsky\.app/profile/([^/?#]+)$~i', $actorId, $m)) {
+        $part = rawurldecode((string) $m[1]);
+        if ($part !== '') {
+            $out[] = $part;
+            $out[] = 'https://bsky.app/profile/' . $part;
+            $out[] = 'https://bsky.app/profile/' . rawurlencode($part);
+        }
+    } elseif (preg_match('#^(https://[^/]+)/(?:users|@)([^/]+)$#i', $actorId, $m)) {
+        $host = strtolower($m[1]);
+        $user = rawurldecode($m[2]);
+        if ($user !== '' && !ctype_digit($user)) {
+            $out[] = $host . '/users/' . $user;
+            $out[] = $host . '/@' . $user;
+            $out[] = $host . '/users/' . rawurlencode($user);
+            $out[] = $host . '/@' . rawurlencode($user);
+        }
+    }
+    $uniq = [];
+    foreach ($out as $v) {
+        $v = rtrim((string) $v, '/');
+        if ($v !== '') {
+            $uniq[$v] = true;
+            $uniq[$v . '/'] = true;
+        }
+    }
+    return array_keys($uniq);
+}
+
 function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
 {
     static $cache = [];
@@ -9737,10 +9796,12 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
     }
     if ($refresh) {
         unset($cache[$ownerUserId]);
+        if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:v2:' . $ownerUserId);
         if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:' . $ownerUserId);
     }
     if (!isset($cache[$ownerUserId])) {
-        $redisKey = 'vaak:moderation:mutes:' . $ownerUserId;
+        // v2 expands stored mute aliases once so list checks stay O(1).
+        $redisKey = 'vaak:moderation:mutes:v2:' . $ownerUserId;
         $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
         if (is_array($redisCached)) {
             if (function_exists('ap_redis_relset_metric')) {
@@ -9754,9 +9815,19 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
             $cache[$ownerUserId] = [];
             foreach (ap_mutes_list($ownerUserId) as $row) {
                 $id = rtrim((string) ($row['actor_id'] ?? ''), '/');
-                if ($id !== '') {
-                    $cache[$ownerUserId][$id] = true;
-                    $cache[$ownerUserId][$id . '/'] = true;
+                if ($id === '') {
+                    continue;
+                }
+                foreach (ap_actor_moderation_aliases($id) as $alias) {
+                    $alias = rtrim((string) $alias, '/');
+                    if ($alias === '') {
+                        continue;
+                    }
+                    $cache[$ownerUserId][$alias] = true;
+                    $cache[$ownerUserId][$alias . '/'] = true;
+                }
+                foreach (ap_moderation_syntactic_refs($id) as $alias) {
+                    $cache[$ownerUserId][$alias] = true;
                 }
             }
             if (function_exists('ap_redis_json_set')) {
@@ -9789,8 +9860,9 @@ function ap_is_muted_actor(?string $actorId, int $ownerUserId): bool
     }
     $actorId = rtrim($actorId, '/');
     $set = ap_mutes_set_cached($ownerUserId);
-    foreach (ap_actor_moderation_aliases($actorId) as $alias) {
-        if (!empty($set[$alias]) || !empty($set[$alias . '/'])) {
+    // Syntactic refs only — stored mute aliases were expanded when the set was built.
+    foreach (ap_moderation_syntactic_refs($actorId) as $alias) {
+        if (!empty($set[$alias])) {
             return true;
         }
     }
@@ -10682,8 +10754,9 @@ function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): 
     }
     if ($actorId !== null && $actorId !== '' && function_exists('ap_blocks_actor_id_set')) {
         $actorSet = ap_blocks_actor_id_set($ownerUserId);
-        foreach (ap_actor_moderation_aliases($actorId) as $alias) {
-            if (!empty($actorSet[$alias]) || !empty($actorSet[$alias . '/'])) {
+        // Syntactic refs only — block-set build already expands stored aliases.
+        foreach (ap_moderation_syntactic_refs($actorId) as $alias) {
+            if (!empty($actorSet[$alias])) {
                 return true;
             }
         }
