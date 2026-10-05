@@ -330,6 +330,16 @@ fn base_status(
     st
 }
 
+/// Mastodon `/original/*.mp4` → `/small/*.png` still (Ice Cubes + lean poster).
+fn guess_masto_video_preview(url: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$",
+    )
+    .ok()?;
+    let c = re.captures(url)?;
+    Some(format!("{}/small/{}.png", &c[1], &c[2]))
+}
+
 fn media_from_urls(urls_json: &str, status_id: &str) -> Vec<Value> {
     let Ok(decoded) = serde_json::from_str::<Value>(urls_json) else {
         return Vec::new();
@@ -355,11 +365,24 @@ fn media_from_urls(urls_json: &str, status_id: &str) -> Vec<Value> {
             .iter()
             .any(|ext| path.ends_with(ext));
         let mtype = if is_video { "video" } else { "image" };
+        // Never set preview_url to the playable video itself — browsers ignore
+        // non-image <video poster> and Ice Cubes shows a blank card.
+        let preview = if is_video {
+            guess_masto_video_preview(clean).unwrap_or_default()
+        } else {
+            clean.to_string()
+        };
         out.push(json!({
             "id": format!("{status_id}{}", i + 1),
             "type": mtype,
             "url": clean,
-            "preview_url": clean,
+            "preview_url": if preview.starts_with("https://") {
+                Value::String(preview)
+            } else if is_video {
+                Value::Null
+            } else {
+                Value::String(clean.into())
+            },
             "remote_url": clean,
             "description": Value::Null,
             "blurhash": Value::Null,
