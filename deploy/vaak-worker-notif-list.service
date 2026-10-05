@@ -1,14 +1,15 @@
-# Live Mentions / Ice Cubes notification list warm (Rust orchestrates PHP hydrate).
+# Live Mentions / Ice Cubes notification list warm (native projection→Redis).
 #   systemctl enable --now vaak-worker-notif-list.service
 #
-# Writes vaaks notifications:v1:{owner}:{hash} envelopes via api/bin/notif-list-warm.php.
-# PHP reads Redis first; set VAAK_NOTIF_LIST_RUST_PRIMARY=1 (default) in vaak.env / FPM.
+# Writes vaak:notifications:v1:{owner}:{hash} from ap_notification_projection
+# (source=vaak-worker-projection). PHP bin/notif-list-warm.php retired 0.6.63.
+# Mentions request-path still hydrates cold reads; set VAAK_NOTIF_LIST_RUST_PRIMARY=1
+# (default) in vaak.env / FPM.
 
 [Unit]
 Description=VAAK Rust notif list warm (Mentions Redis writer)
 After=network.target postgresql.service redis-server.service
 ConditionPathExists=/usr/local/bin/vaak-worker
-ConditionPathExists=/srv/mkultra/html/api/bin/notif-list-warm.php
 
 [Service]
 Type=simple
@@ -17,14 +18,12 @@ Group=www-data
 Environment=VAAK_ENV_FILE=/etc/mkultra/vaak.env
 Environment=VAAK_SHADOW_OWNER_ID=1
 Environment=VAAK_API_ROOT=/srv/mkultra/html/api
-Environment=VAAK_PHP_BIN=/usr/bin/php
 Environment=VAAK_REDIS_URL=redis://127.0.0.1/0
 Environment=AP_DB_DSN=pgsql:dbname=novalandia
-Environment=VAAK_NOTIF_LIST_WARM=1
 Environment=VAAK_FEATURE_BLUESKY_TAB=1
 Environment=RUST_LOG=info
 # owner-id 0 = every non-disabled ap_users row each tick.
-# M4 leaner tick: PHP skip-if-fresh (~90s) + all40→all30 derive; 60s loop is enough.
+# Native projection + skip-fresh / quiet_restamp; incomplete windows soft-skip.
 ExecStart=/usr/local/bin/vaak-worker notif-list --loop --interval-secs 60 --owner-id 0 --limit 30
 Restart=always
 RestartSec=8
