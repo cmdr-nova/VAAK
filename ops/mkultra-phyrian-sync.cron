@@ -1,0 +1,3 @@
+# Mirror linked OpenSim Phyrian state into VAAK; the script never claims or
+# mutates OpenSim, and its own TTL coalesces repeated pulls.
+*/5 * * * * www-data /usr/bin/php /srv/mkultra/html/api/bin/phyrian-sync.php >> /var/log/mkultra/phyrian-sync.log 2>&1
