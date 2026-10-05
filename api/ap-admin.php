@@ -4718,7 +4718,11 @@ $vaakAdminOnlyActions = [
         'phyrian_request', 'phyrian_accept', 'phyrian_deny', 'phyrian_checkin', 'phyrian_self_seed',
     ], true)) {
         $view = 'phyrian';
-        if (!function_exists('ap_phyrian_ensure_player')) {
+        // Same pattern as RSS: this branch never inherited $ownerId from above.
+        $ownerId = $vaakOwnerId > 0 ? (int) $vaakOwnerId : (int) admin_owner_user_id();
+        if ($ownerId < 1) {
+            $error = 'Not signed in.';
+        } elseif (!function_exists('ap_phyrian_ensure_player')) {
             $error = 'Phyrian Strains is unavailable.';
         } elseif ($action === 'phyrian_self_seed') {
             $res = function_exists('ap_phyrian_origin_self_seed')
@@ -29484,14 +29488,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <div class="phyrian-stats">
                 <span>Gen <b><?= (int) $phyGen ?></b></span>
                 <span>Level <b><?= (int) $phyLevel ?></b></span>
+                <?php if ($phyIsOrigin && $phyImprinted): ?>
+                  <span>Rank <b>Phyrian Origin</b></span>
+                <?php endif; ?>
                 <?php if ($phyImprinted): ?>
                   <span>Decay <b>−<?= (int) $phyDecayDaily ?>/day</b></span>
                 <?php endif; ?>
               </div>
-              <?php if ($phyImprinted && ($phyParentName !== '' || count($phyLineage) > 1)): ?>
+              <?php if ($phyImprinted && ($phyIsOrigin || $phyParentName !== '' || count($phyLineage) > 1)): ?>
                 <p class="phyrian-lineage meta">
                   <?php if ($phyParentName !== ''): ?>
                     Imprinted by <b>@<?= h($phyParentName) ?></b>
+                  <?php elseif ($phyIsOrigin): ?>
+                    Lineage · Phyrian Origin (depth 1)
                   <?php else: ?>
                     Origin seed
                   <?php endif; ?>

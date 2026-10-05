@@ -8,12 +8,21 @@ declare(strict_types=1);
  * OpenSim bridge is Phase 3. See Projects/NovaLandia/Phyrian Strains/Plan.md.
  */
 
-/** Web daily decay (OpenSim uses 8; Phase-1 web is slightly gentler). */
+/** Web daily decay (OpenSim uses generation-scaled ~7–8; Phase-1 web is slightly gentler). */
 const AP_PHYRIAN_DAILY_DECAY = 5;
 const AP_PHYRIAN_MAX_RESONANCE = 100;
 const AP_PHYRIAN_IMPRINT_START_RESONANCE = 50;
 /** One UTC day of grace after imprint before decay starts. */
 const AP_PHYRIAN_DECAY_GRACE_SECONDS = 86400;
+
+/**
+ * OpenSim origin mirror for the VAAK seed account (val3r1e flux on strains.novalandia.online).
+ * Phase-1 web seed should match this body; live bridge sync is Phase 3.
+ */
+const AP_PHYRIAN_ORIGIN_STRAIN = 'Phyrian';
+const AP_PHYRIAN_ORIGIN_GENERATION = 3;
+const AP_PHYRIAN_ORIGIN_LEVEL = 80;
+const AP_PHYRIAN_ORIGIN_RESONANCE = 93;
 
 function ap_phyrian_migrate(?PDO $db = null): void
 {
@@ -300,9 +309,11 @@ function ap_phyrian_lineage(int $ownerUserId, int $maxHops = 4): array
 }
 
 /**
- * Origin-only: imprint yourself with a random catalog strain (no peer required).
+ * Origin-only: imprint with the OpenSim-mirrored origin body (no peer required).
+ * Re-running syncs strain/generation/level/resonance to the OpenSim canon values
+ * so a bad random seed (Soft Colony, etc.) can be corrected.
  *
- * @return array{ok:bool,error?:string,strain?:string,resonance?:int}
+ * @return array{ok:bool,error?:string,strain?:string,resonance?:int,generation?:int,level?:int}
  */
 function ap_phyrian_origin_self_seed(int $ownerUserId): array
 {
@@ -314,33 +325,47 @@ function ap_phyrian_origin_self_seed(int $ownerUserId): array
     if ($player === []) {
         return ['ok' => false, 'error' => 'Player unavailable'];
     }
-    if (ap_phyrian_player_is_imprinted($player)) {
-        return [
-            'ok' => true,
-            'strain' => trim((string) ($player['strain'] ?? '')),
-            'resonance' => (int) ($player['resonance'] ?? 0),
-        ];
-    }
-    $strain = ap_phyrian_pick_strain();
+    $strain = AP_PHYRIAN_ORIGIN_STRAIN;
+    $generation = AP_PHYRIAN_ORIGIN_GENERATION;
+    $level = AP_PHYRIAN_ORIGIN_LEVEL;
+    $resonance = AP_PHYRIAN_ORIGIN_RESONANCE;
+    $already = ap_phyrian_player_is_imprinted($player);
     try {
-        ap_db()->prepare(
-            "UPDATE phyrian_players
-             SET status = 'imprinted', strain = ?,
-                 resonance = GREATEST(resonance, ?),
-                 generation = 1,
-                 imprinted_by_owner_id = NULL,
-                 imprinted_at = NOW(),
-                 last_decay_at = NOW(),
-                 updated_at = NOW()
-             WHERE owner_user_id = ?"
-        )->execute([$strain, AP_PHYRIAN_IMPRINT_START_RESONANCE, $ownerUserId]);
+        // Preserve imprinted_at / last_checkin when re-syncing an existing origin body.
+        if ($already) {
+            ap_db()->prepare(
+                "UPDATE phyrian_players
+                 SET status = 'imprinted', strain = ?,
+                     resonance = ?,
+                     generation = ?,
+                     level = ?,
+                     imprinted_by_owner_id = NULL,
+                     updated_at = NOW()
+                 WHERE owner_user_id = ?"
+            )->execute([$strain, $resonance, $generation, $level, $ownerUserId]);
+        } else {
+            ap_db()->prepare(
+                "UPDATE phyrian_players
+                 SET status = 'imprinted', strain = ?,
+                     resonance = ?,
+                     generation = ?,
+                     level = ?,
+                     imprinted_by_owner_id = NULL,
+                     imprinted_at = NOW(),
+                     last_decay_at = NOW(),
+                     updated_at = NOW()
+                 WHERE owner_user_id = ?"
+            )->execute([$strain, $resonance, $generation, $level, $ownerUserId]);
+        }
     } catch (Throwable $e) {
         return ['ok' => false, 'error' => 'Could not seed origin'];
     }
     return [
         'ok' => true,
         'strain' => $strain,
-        'resonance' => AP_PHYRIAN_IMPRINT_START_RESONANCE,
+        'resonance' => $resonance,
+        'generation' => $generation,
+        'level' => $level,
     ];
 }
 
