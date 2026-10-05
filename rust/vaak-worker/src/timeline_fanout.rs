@@ -140,7 +140,7 @@ async fn invalidate_home_hydrate(
     cache: &mut redis::aio::MultiplexedConnection,
     owner: i64,
 ) -> Result<()> {
-    let keys: Vec<String> = [15_i64, 40, 80, 20, 30]
+    let keys: Vec<String> = [15_i64, 40, 50, 80, 20, 30]
         .into_iter()
         .map(|lim| home_hydrate_redis_key(owner, lim))
         .collect();
@@ -160,7 +160,7 @@ async fn maybe_spawn_home_hydrate_warm(cfg: &Config, owner: i64) {
     }
     let cfg = cfg.clone();
     tokio::spawn(async move {
-        match home_hydrate_ranked::warm_owner(&cfg, owner, &[15, 40, 80]).await {
+        match home_hydrate_ranked::warm_owner(&cfg, owner, &[15, 40, 50, 80]).await {
             Ok(report) => tracing::debug!(
                 owner,
                 n = report.materialised_n,

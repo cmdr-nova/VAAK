@@ -229,7 +229,15 @@ async fn read_home_hydrate(
     read_hydrate_envelope(redis, owner, limit, since_id, "home").await
 }
 
+/// Warm envelope sizes we routinely write (Home HTML + Ice Cubes).
+/// Ice Cubes head polls use `limit=50` — must be in this set (0.7.21).
+const HYDRATE_WARM_LIMITS: [i64; 4] = [15, 40, 50, 80];
+
 /// Mastodon-shaped statuses from hydrate Redis for `home` / `local` / `feed`.
+///
+/// Exact-limit miss (head poll, no since_id): try a larger warm envelope and
+/// slice — Ice Cubes `limit=50` must not fall through to a multi-second PHP
+/// cold merge when an 80-head is already warm.
 pub async fn view_hydrate(
     cfg: &Config,
     owner_user_id: i64,
@@ -241,9 +249,40 @@ pub async fn view_hydrate(
         "local" | "feed" => view,
         _ => "home",
     };
+    let limit = limit.clamp(1, 80);
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let mut report =
         read_hydrate_envelope(&mut redis, owner_user_id, limit as i64, since_id, view).await?;
+
+    // Head-only fallback: larger warm envelope → slice to requested limit.
+    if !report.cache_hit && since_id.map(str::trim).filter(|s| !s.is_empty()).is_none() {
+        let mut alts: Vec<i64> = HYDRATE_WARM_LIMITS
+            .iter()
+            .copied()
+            .filter(|n| *n > limit as i64)
+            .collect();
+        // Prefer smallest covering head first.
+        alts.sort_unstable();
+        for alt in alts {
+            let alt_report =
+                read_hydrate_envelope(&mut redis, owner_user_id, alt, None, view).await?;
+            if alt_report.cache_hit && !alt_report.items.is_empty() {
+                let mut sliced = alt_report;
+                if sliced.items.len() > limit {
+                    sliced.items.truncate(limit);
+                }
+                sliced.limit = limit;
+                sliced.n = sliced.items.len();
+                sliced.note = "hydrate cache hit via larger warm envelope slice";
+                // Re-key report to the requested limit for diagnostics.
+                sliced.redis_key =
+                    timeline_hydrate_redis_key(view, owner_user_id, limit as i64, None);
+                report = sliced;
+                break;
+            }
+        }
+    }
+
     // Overlay live viewer flags — warm envelopes hard-code false (0.7.19).
     if report.cache_hit && !report.items.is_empty() {
         let _ = crate::interaction_flags::apply_to_statuses_with_cfg(

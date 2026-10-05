@@ -181,8 +181,8 @@ enum Command {
     HomeHydrateWarm {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
-        /// Comma list of envelope limits (default 15,40,80).
-        #[arg(long, default_value = "15,40,80")]
+        /// Comma list of envelope limits (default 15,40,50,80 — 50 for Ice Cubes).
+        #[arg(long, default_value = "15,40,50,80")]
         limits: String,
         /// Single view: home | local | feed (default home).
         #[arg(long, default_value = "home")]

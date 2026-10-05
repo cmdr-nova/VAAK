@@ -13,12 +13,12 @@ declare(strict_types=1);
  *   sudo -u www-data env AP_DB_DSN='pgsql:dbname=novalandia' \
  *     php api/bin/home-timeline-warm.php --owner-id=1
  *   php api/bin/home-timeline-warm.php --owner-id=1 --limit=40
- *   php api/bin/home-timeline-warm.php --owner-id=1 --limits=15,40,80
+ *   php api/bin/home-timeline-warm.php --owner-id=1 --limits=15,40,50,80
  */
 
 $opts = getopt('', ['owner-id:', 'limit:', 'limits:', 'help']);
 if (isset($opts['help'])) {
-    fwrite(STDOUT, "home-timeline-warm.php --owner-id=N [--limit=40|--limits=15,40,80]\n");
+    fwrite(STDOUT, "home-timeline-warm.php --owner-id=N [--limit=40|--limits=15,40,50,80]\n");
     exit(0);
 }
 

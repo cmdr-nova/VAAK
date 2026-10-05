@@ -6564,9 +6564,9 @@ if (
         // Keep the next window warm so scroll page N+1 also hits Axum.
         if ($hasMore) {
             if ($view === 'home' && function_exists('ap_timeline_home_hydrate_warm_async')) {
-                ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+                ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,50,80');
             } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
-                ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
+                ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80');
             }
         }
         echo (string) $axumFill['html'];
@@ -6575,9 +6575,9 @@ if (
     // Miss (deep offset / cold envelope): prime 80-head for the next attempt.
     if ($fillOffset > 0) {
         if ($view === 'home' && function_exists('ap_timeline_home_hydrate_warm_async')) {
-            ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,80');
+            ap_timeline_home_hydrate_warm_async((int) $vaakOwnerId, '15,40,50,80');
         } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
-            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
+            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80');
         }
     }
 }
@@ -6682,7 +6682,7 @@ if (
                 header('X-VAAK-Tl-Html: 1');
             }
         } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
-            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
+            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80');
         }
     }
     if ($view === 'home' && !$shellAxumHit && function_exists('ap_masto_timeline_home_axum_fetch')) {
@@ -10460,7 +10460,7 @@ if (
                 ap_timing_record($view . '.first_paint.axum_html_hit', (microtime(true) - $adminHomeFirstPaintStarted) * 1000.0);
             }
         } elseif ($view !== 'home' && function_exists('ap_timeline_public_hydrate_warm_async')) {
-            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,80');
+            ap_timeline_public_hydrate_warm_async((int) $vaakOwnerId, $view, '15,40,50,80');
         }
     }
     if (
@@ -20490,7 +20490,7 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
             $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : (getenv('VAAK_PHP_BIN') ?: '/usr/bin/php');
             $cmd = escapeshellarg($php) . ' ' . escapeshellarg($script)
                 . ' --owner-id=' . (int) $ownerUserId
-                . ' --limits=15,40,80 >/dev/null 2>&1 &';
+                . ' --limits=15,40,50,80 >/dev/null 2>&1 &';
             @exec($cmd);
         }
     }
@@ -20745,7 +20745,7 @@ function admin_home_html_axum_fetch(int $limit, int $ownerUserId = 0, int $offse
 /**
  * Spawn Rust hydrate warm for Local/Federated after Axum HTML miss (0.7.20).
  */
-function ap_timeline_public_hydrate_warm_async(int $ownerUserId, string $view, string $limits = '15,40,80'): void
+function ap_timeline_public_hydrate_warm_async(int $ownerUserId, string $view, string $limits = '15,40,50,80'): void
 {
     $view = strtolower(trim($view));
     if ($ownerUserId < 1 || !in_array($view, ['local', 'feed', 'home'], true)) {
