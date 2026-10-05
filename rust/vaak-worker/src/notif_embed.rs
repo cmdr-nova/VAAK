@@ -148,7 +148,7 @@ fn looks_like_status_url(url: &str) -> bool {
         return false;
     }
     lazy_regex_is_match(
-        r"(?i)^https://[^/]+/(?:users|@)[^/]+/(?:statuses|posts)/",
+        r"(?i)^https://[^/]+/(?:users/[^/]+|@[^/]+)/(?:statuses|posts)/",
         u,
     ) || lazy_regex_is_match(r"(?i)^https://bsky\.app/profile/[^/]+/post/", u)
         || lazy_regex_is_match(r"(?i)^https://[^/]+/ap/(?:users|actors?)/[^/]+/statuses/", u)
@@ -1215,11 +1215,18 @@ fn paint_status_link_card(st: &Value) -> String {
         return String::new();
     }
     let painted_quote = quote_url_for_dedupe(st);
+    let has_structured_quote = st.get("quote").filter(|v| v.is_object()).is_some()
+        || st.get("vaak_quote_preview").filter(|v| v.is_object()).is_some();
     if let Some(card) = st.get("card").filter(|v| v.is_object()) {
         let card_url = card.get("url").and_then(|v| v.as_str()).unwrap_or("");
-        if !painted_quote.is_empty()
-            && !card_url.is_empty()
-            && urls_loosely_equivalent(card_url, &painted_quote)
+        let suppress_status_card = (has_structured_quote && looks_like_status_url(card_url))
+            || (!painted_quote.is_empty()
+                && (urls_loosely_equivalent(card_url, &painted_quote)
+                    // Bridgy/AppView may expose a different permalink for the
+                    // same quoted status. Once a structured quote owns a status
+                    // URL, do not paint a second generic status card beneath it.
+                    || looks_like_status_url(card_url)));
+        if !card_url.is_empty() && suppress_status_card
         {
             // Fall through — body may still have a YouTube URL to preview.
         } else {
@@ -3242,6 +3249,25 @@ mod tests {
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("quote-block"), "{html}");
         assert!(!html.contains("class=\"link-card\""), "should dedupe OG card: {html}");
+    }
+
+    #[test]
+    fn suppresses_alternate_status_card_under_structured_quote() {
+        assert!(looks_like_status_url("https://bridge.example/users/y/statuses/99"));
+        let mut st = json!({
+            "id": "2", "uri": "https://example.com/users/x/statuses/2",
+            "content": "<p>qt</p>", "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {"acct":"x","display_name":"X","avatar":"https://example.com/a.png","uri":"https://example.com/users/x"},
+            "media_attachments": [],
+            "card": {"url":"https://bridge.example/users/y/statuses/99","title":"quoted"},
+            "quote": {"quoted_status": {"url":"https://origin.example/@y/99","content":"<p>nested</p>","account":{"acct":"y","display_name":"Y","avatar":"https://example.com/a.png"},"media_attachments":[]}}
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("quote-block"), "{html}");
+        assert!(!html.contains("class=\"link-card\""), "alternate status card should be suppressed: {html}");
+        st["card"]["url"] = json!("https://example.org/article");
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("class=\"link-card\""), "unrelated article card should remain: {html}");
     }
 
     #[test]
