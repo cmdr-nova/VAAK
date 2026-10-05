@@ -106,6 +106,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/feed-html", get(shadow_feed_html))
         // Local mkultra profile tab HTML (0.7.18).
         .route("/shadow/profile-html", get(shadow_profile_html))
+        // Read-only Phyrian dossier/directory parity projection (10.6).
+        .route("/shadow/phyrian", get(shadow_phyrian))
         // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
         .route("/shadow/account-switch-prep", get(shadow_account_switch_prep))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
@@ -146,6 +148,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/local-html",
             "/shadow/feed-html",
             "/shadow/profile-html",
+            "/shadow/phyrian",
             "/shadow/account-switch-prep",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
@@ -811,4 +814,15 @@ async fn shadow_notifications_masto(
         )
             .into_response(),
     }
+}
+
+/// Read-only Phyrian dossier projection. PHP remains the mutation owner.
+async fn shadow_phyrian(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let include_directory = truthy(q.fetch.as_deref());
+    let limit = q.limit.unwrap_or(40);
+    json_result(crate::phyrian::dossier(&state.cfg, owner, include_directory, limit).await)
 }
