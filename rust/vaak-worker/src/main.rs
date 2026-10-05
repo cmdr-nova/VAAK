@@ -181,8 +181,8 @@ enum Command {
     HomeHydrateWarm {
         #[arg(long, default_value_t = 0)]
         owner_id: i64,
-        /// Comma list of envelope limits (default 15,40,50,80 — 50 for Ice Cubes).
-        #[arg(long, default_value = "15,40,50,80")]
+        /// Comma list of envelope limits (default includes 160/240 for deep Home scroll).
+        #[arg(long, default_value = "15,40,50,80,160,240")]
         limits: String,
         /// Single view: home | local | feed (default home).
         #[arg(long, default_value = "home")]
@@ -386,7 +386,7 @@ async fn main() -> Result<()> {
             let parsed: Vec<i64> = limits
                 .split(',')
                 .filter_map(|p| p.trim().parse().ok())
-                .filter(|n| (1..=80).contains(n))
+                .filter(|n| (1..=240).contains(n))
                 .collect();
             let mut wanted: Vec<&str> = Vec::new();
             if !views.trim().is_empty() {

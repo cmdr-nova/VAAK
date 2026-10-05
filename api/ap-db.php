@@ -7632,7 +7632,7 @@ function ap_timeline_home_hydrate_invalidate_owner(int $ownerUserId): void
     $keys = [];
     // Include 50 — Ice Cubes head polls limit=50 (0.7.21). Leaving it out let
     // a stale cold-merge envelope survive fan-out invalidation.
-    foreach ([15, 40, 50, 80, 20, 30] as $limit) {
+    foreach ([15, 40, 50, 80, 160, 240, 20, 30] as $limit) {
         $keys[] = ap_timeline_home_hydrate_redis_key($ownerUserId, $limit);
     }
     ap_redis_delete(...$keys);
@@ -7641,7 +7641,7 @@ function ap_timeline_home_hydrate_invalidate_owner(int $ownerUserId): void
 /**
  * Fire-and-forget Home hydrate warm (works without ap-masto-entities loaded).
  */
-function ap_timeline_home_hydrate_warm_async(int $ownerUserId, string $limits = '15,40,50,80'): void
+function ap_timeline_home_hydrate_warm_async(int $ownerUserId, string $limits = '15,40,50,80,160,240'): void
 {
     if ($ownerUserId < 1) {
         return;
@@ -7894,7 +7894,7 @@ function ap_timeline_fanout_local_status(int $ownerUserId, array $entry, array $
         if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
             ap_masto_timeline_home_hydrate_warm_async($ownerUserId, 15);
         } else {
-            ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40,50,80');
+            ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40,50,80,160,240');
         }
     } catch (Throwable $e) {
         error_log('[ap-db] timeline_fanout_local: ' . $e->getMessage());
@@ -8063,7 +8063,7 @@ function ap_timeline_fanout_followers_home(int $eventId, string $type, ?string $
                 if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
                     ap_masto_timeline_home_hydrate_warm_async($ownerUserId, 15);
                 } else {
-                    ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40,50,80');
+                    ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40,50,80,160,240');
                 }
             }
         } catch (Throwable $e) {
@@ -8323,7 +8323,7 @@ function ap_timeline_fanout_followers_home_bsky(string $uri, string $authorDid):
                 if (function_exists('ap_masto_timeline_home_hydrate_warm_async')) {
                     ap_masto_timeline_home_hydrate_warm_async($ownerUserId, 15);
                 } else {
-                    ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40,50,80');
+                    ap_timeline_home_hydrate_warm_async($ownerUserId, '15,40,50,80,160,240');
                 }
             }
         } catch (Throwable $e) {

@@ -32,7 +32,8 @@ use crate::redis_util;
 
 const CACHE_VERSION: &str = "v13";
 const HOME_TTL_SECS: u64 = 600;
-const MAX_TIMELINE: usize = 160;
+/// Deep Home scroll head (0.7.25). Was 160 — scrolling past ~100–200 hit End of timeline.
+const MAX_TIMELINE: usize = 400;
 const PER_ACTOR_CAP: usize = 25;
 
 fn env_flag_default_true(name: &str) -> bool {
