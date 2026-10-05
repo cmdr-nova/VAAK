@@ -99,6 +99,17 @@ fn empty_account(actor_url: &str, username: &str, display: &str, avatar: &str) -
     })
 }
 
+/// Mastodon-style video attachments need an image poster; browsers ignore an
+/// MP4 used directly as `<video poster>`. Keep profile tabs in parity with the
+/// Home hydrate path.
+fn guess_video_preview(url: &str) -> Option<String> {
+    let re = regex::Regex::new(
+        r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$",
+    ).ok()?;
+    let c = re.captures(url)?;
+    Some(format!("{}/small/{}.png", &c[1], &c[2]))
+}
+
 fn media_from_raw_create(raw: &str) -> Vec<Value> {
     let Ok(decoded) = serde_json::from_str::<Value>(raw) else {
         return Vec::new();
@@ -139,11 +150,16 @@ fn media_from_raw_create(raw: &str) -> Vec<Value> {
         } else {
             "image"
         };
+        let preview = if kind == "video" {
+            guess_video_preview(&url)
+        } else {
+            Some(url.clone())
+        };
         out.push(json!({
             "id": url,
             "type": kind,
             "url": url,
-            "preview_url": url,
+            "preview_url": preview.unwrap_or_default(),
             "remote_url": Value::Null,
             "preview_remote_url": Value::Null,
             "text_url": Value::Null,
@@ -913,5 +929,13 @@ mod tests {
         assert_eq!(st["spoiler_text"], json!("cw"));
         assert_eq!(st["pinned"], json!(true));
         assert_eq!(st["sensitive"], json!(true));
+    }
+
+    #[test]
+    fn profile_video_attachment_gets_image_poster() {
+        let raw = r#"{"object":{"attachment":{"type":"Video","mediaType":"video/mp4","url":"https://files.example/original/clip.mp4"}}}"#;
+        let media = media_from_raw_create(raw);
+        assert_eq!(media[0]["type"], json!("video"));
+        assert_eq!(media[0]["preview_url"], json!("https://files.example/small/clip.png"));
     }
 }
