@@ -27885,16 +27885,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   define('AP_INBOX_LIB_ONLY', true);
               }
               require_once __DIR__ . '/ap-inbox.php';
-              // Web profile URL → actor id (skip Bluesky — handled below via AT Protocol)
+              // Web profile URL → actor id (skip Bluesky — handled below via AT Protocol).
+              // Prefer flat/PG + acct/WebFinger; never sync AS2 here (0.6.64).
               if ($rpActor !== '' && !str_starts_with($rpActor, 'https://bsky.app/')
                   && preg_match('#^(https://[^/]+)/@([^/]+)/?$#', rtrim($rpActor, '/'), $wm)) {
                   $cand = $wm[1] . '/users/' . rawurlencode(rawurldecode($wm[2]));
-                  if (ap_remote_actor_get($cand) || (function_exists('ap_fetch_as2_object') && is_array(ap_fetch_as2_object($cand)))) {
+                  if (ap_remote_actor_get($cand)) {
                       $rpActor = $cand;
                   } else {
                       $wf = ap_resolve_actor_ref('@' . rawurldecode($wm[2]) . '@' . parse_url($wm[1], PHP_URL_HOST));
                       if (is_string($wf) && $wf !== '') {
                           $rpActor = $wf;
+                      } else {
+                          $rpActor = $cand;
+                          if (function_exists('ap_remote_actor_warm_async')) {
+                              ap_remote_actor_warm_async($cand);
+                          }
                       }
                   }
               }
@@ -28175,86 +28181,42 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   }
               } elseif (!$rpIsBsky) {
                   $rpMeta = $rpActor !== '' ? ap_remote_actor_get($rpActor) : null;
-                  // Cache-first: regular profile views never wait on the remote
-                  // server. The warmer refreshes missing/stale actor metadata in
-                  // the background; explicit Refresh remains an immediate fetch.
+                  // Cache-first (0.6.64): never sync AS2 on remote_profile paint.
+                  // Flat/PG bio + fields paint immediately; miss/stale/force
+                  // Refresh enqueue ap_actor_warm (button title already said queue).
+                  $rpFresh = $rpActor !== ''
+                      && function_exists('ap_remote_actor_profile_fresh_for_resolve')
+                      && ap_remote_actor_profile_fresh_for_resolve($rpActor);
                   $rpUserCached = is_array($rpMeta) ? trim((string) ($rpMeta['username'] ?? '')) : '';
                   $rpUserPlaceholder = $rpUserCached === ''
                       || (function_exists('ap_remote_actor_username_is_placeholder')
                           && ap_remote_actor_username_is_placeholder($rpUserCached));
                   $rpMetaUpdated = is_array($rpMeta) ? (strtotime((string) ($rpMeta['updated_at'] ?? '')) ?: 0) : 0;
-                  $rpNeedsWarm = $rpActor !== '' && (!$rpMeta || $rpUserPlaceholder || $rpMetaUpdated < time() - 12 * 3600);
-                  $rpNeedFetch = $rpForceRefresh && $rpNeedsWarm && function_exists('ap_fetch_as2_object');
-                  if ($rpNeedsWarm && !$rpForceRefresh && function_exists('ap_remote_actor_warm_async')) {
+                  $rpNeedsWarm = $rpActor !== '' && (
+                      !$rpMeta
+                      || $rpUserPlaceholder
+                      || !$rpFresh
+                      || $rpMetaUpdated < time() - 12 * 3600
+                      || $rpForceRefresh
+                  );
+                  if ($rpNeedsWarm && function_exists('ap_remote_actor_warm_async')) {
                       ap_remote_actor_warm_async($rpActor);
                   }
-                  if ($rpNeedFetch) {
-                      $rpDoc = ap_fetch_as2_object($rpActor);
-                      if (is_array($rpDoc)) {
-                          // Cache/refresh basic fields
-                          $uname = null;
-                          if (!empty($rpDoc['preferredUsername']) && is_string($rpDoc['preferredUsername'])) {
-                              $uname = function_exists('ap_remote_actor_normalize_username')
-                                  ? ap_remote_actor_normalize_username($rpDoc['preferredUsername'])
-                                  : ltrim(trim($rpDoc['preferredUsername']), '@');
+                  if (is_array($rpMeta)) {
+                      $sum = trim((string) ($rpMeta['summary'] ?? ''));
+                      if ($sum !== '') {
+                          $rpBio = function_exists('ap_html_to_plain_text')
+                              ? ap_html_to_plain_text($sum)
+                              : trim(html_entity_decode(strip_tags($sum), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                      }
+                      $pj = $rpMeta['profile_json'] ?? null;
+                      if (is_string($pj) && $pj !== '') {
+                          $decoded = json_decode($pj, true);
+                          if (is_array($decoded)) {
+                              $rpProfileFields = $decoded;
                           }
-                          $dname = null;
-                          if (!empty($rpDoc['name']) && is_string($rpDoc['name'])) {
-                              $dname = $rpDoc['name'];
-                          }
-                          $icon = null;
-                          if (isset($rpDoc['icon'])) {
-                              if (is_array($rpDoc['icon']) && !empty($rpDoc['icon']['url'])) {
-                                  $icon = (string) $rpDoc['icon']['url'];
-                              } elseif (is_string($rpDoc['icon'])) {
-                                  $icon = $rpDoc['icon'];
-                              }
-                          }
-                          $image = null;
-                          if (isset($rpDoc['image'])) {
-                              if (is_array($rpDoc['image']) && !empty($rpDoc['image']['url'])) {
-                                  $image = (string) $rpDoc['image']['url'];
-                              } elseif (is_string($rpDoc['image'])) {
-                                  $image = $rpDoc['image'];
-                              }
-                          }
-                          try {
-                              $rpHost = parse_url($rpActor, PHP_URL_HOST) ?: null;
-                              $rpHost = is_string($rpHost) ? strtolower($rpHost) : null;
-                              $fields = [
-                                  'username' => $uname,
-                                  'display_name' => $dname,
-                                  'host' => $rpHost,
-                                  'icon_source_url' => $icon,
-                                  'image_source_url' => $image,
-                              ];
-                              ap_remote_actor_upsert($rpActor, $fields);
-                              // Mastodon dual IRI: also cache /users/{preferredUsername}
-                              // so timelines that only saw /ap/users/{snowflake} resolve.
-                              if (is_string($uname) && $uname !== '' && $rpHost !== ''
-                                  && !(function_exists('ap_remote_actor_username_is_placeholder')
-                                      && ap_remote_actor_username_is_placeholder($uname))) {
-                                  $canon = 'https://' . $rpHost . '/users/' . rawurlencode($uname);
-                                  if (rtrim($canon, '/') !== rtrim($rpActor, '/')) {
-                                      ap_remote_actor_upsert($canon, $fields);
-                                  }
-                              }
-                              if (function_exists('ap_remote_emoji_ingest_actor_doc')) {
-                                  ap_remote_emoji_ingest_actor_doc($rpActor, $rpDoc);
-                              }
-                              $rpMeta = ap_remote_actor_get($rpActor) ?: $rpMeta;
-                          } catch (Throwable $e) {
-                              error_log('[ap-admin] remote_profile upsert: ' . $e->getMessage());
-                          }
-                          if (!empty($rpDoc['summary']) && is_string($rpDoc['summary'])) {
-                              $rpBio = function_exists('ap_html_to_plain_text')
-                                  ? ap_html_to_plain_text($rpDoc['summary'])
-                                  : trim(html_entity_decode(strip_tags($rpDoc['summary']), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                          }
-                          // Mastodon-style profile fields (PropertyValue attachments).
-                          if (!empty($rpDoc['attachment']) && is_array($rpDoc['attachment'])) {
-                              $rpProfileFields = $rpDoc['attachment'];
-                          }
+                      } elseif (is_array($pj)) {
+                          $rpProfileFields = $pj;
                       }
                   }
                   if ($rpActor !== '' && function_exists('ap_remote_media_get')) {
