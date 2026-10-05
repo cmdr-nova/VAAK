@@ -88,6 +88,62 @@ pub struct OpenSimPlayerPlan {
     pub last_decay_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestOfferPlan {
+    pub kind: String,
+    pub child_generation: i64,
+}
+
+/// PHP `ap_phyrian_request_create` validation, kept pure for parity tests.
+pub fn plan_request_offer(
+    kind: &str,
+    from_owner: i64,
+    to_owner: i64,
+    from_imprinted: bool,
+    to_imprinted: bool,
+    from_is_origin: bool,
+    from_generation: i64,
+) -> Result<RequestOfferPlan, &'static str> {
+    let kind = kind.trim().to_ascii_lowercase();
+    if !matches!(kind.as_str(), "imprint" | "resonance") {
+        return Err("Unknown request kind");
+    }
+    if from_owner < 1 || to_owner < 1 || from_owner == to_owner {
+        return Err("Invalid players");
+    }
+    if kind == "imprint" {
+        if !from_imprinted && !from_is_origin {
+            return Err("Only imprinted players (or the origin) can offer imprint");
+        }
+        if to_imprinted {
+            return Err("They already have a strain");
+        }
+    } else if !from_imprinted || !to_imprinted {
+        return Err("Both players must be imprinted to exchange resonance");
+    }
+    Ok(RequestOfferPlan {
+        kind,
+        child_generation: (from_generation.max(1) + 1).min(99),
+    })
+}
+
+/// PHP imprint resolution for a non-origin peer. Origin rolls remain in PHP
+/// until a deterministic, bridge-safe random source is agreed upon.
+pub fn resolve_peer_imprint(
+    from_is_origin: bool,
+    from_strain: &str,
+    from_generation: i64,
+) -> Result<(String, i64), &'static str> {
+    if from_is_origin {
+        return Err("Origin imprint requires the PHP catalog roll");
+    }
+    let strain = from_strain.trim();
+    if strain.is_empty() {
+        return Err("Imprinter has no strain");
+    }
+    Ok((strain.to_string(), (from_generation.max(1) + 1).min(99)))
+}
+
 fn nonnegative(v: Option<i64>) -> i64 {
     v.unwrap_or(0).max(0)
 }
@@ -250,7 +306,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_opensim_player, projected_decay, stability};
+    use super::{normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -301,5 +357,40 @@ mod tests {
         assert_eq!(got.generation, 1);
         assert_eq!(got.level, 1);
         assert_eq!(got.last_decay_at, None);
+    }
+
+    #[test]
+    fn request_offer_rules_match_php() {
+        let plan = plan_request_offer(" IMPRINT ", 2, 3, true, false, false, 2).unwrap();
+        assert_eq!(plan.kind, "imprint");
+        assert_eq!(plan.child_generation, 3);
+        assert_eq!(
+            plan_request_offer("resonance", 2, 3, true, false, false, 1),
+            Err("Both players must be imprinted to exchange resonance")
+        );
+        assert_eq!(
+            plan_request_offer("imprint", 2, 3, false, false, false, 1),
+            Err("Only imprinted players (or the origin) can offer imprint")
+        );
+        assert_eq!(
+            plan_request_offer("imprint", 2, 2, true, false, false, 1),
+            Err("Invalid players")
+        );
+    }
+
+    #[test]
+    fn peer_imprint_resolution_preserves_strain_and_generation() {
+        assert_eq!(
+            resolve_peer_imprint(false, "  Voidborne ", 4).unwrap(),
+            ("Voidborne".to_string(), 5)
+        );
+        assert_eq!(
+            resolve_peer_imprint(true, "Voidborne", 4),
+            Err("Origin imprint requires the PHP catalog roll")
+        );
+        assert_eq!(
+            resolve_peer_imprint(false, "", 4),
+            Err("Imprinter has no strain")
+        );
     }
 }
