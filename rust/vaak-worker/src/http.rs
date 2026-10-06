@@ -194,7 +194,7 @@ async fn shadow_library_fragment(
     let kind = q.library_kind.as_deref().unwrap_or("").trim().to_ascii_lowercase();
     let suffix = q.library_suffix.as_deref().unwrap_or("").trim();
     if owner < 1
-        || !matches!(kind.as_str(), "favourites_bsky" | "bookmarks_bsky")
+        || !matches!(kind.as_str(), "favourites_fedi" | "favourites_bsky" | "bookmarks_fedi" | "bookmarks_bsky")
         || suffix.is_empty()
         || suffix.len() > 256
     {
