@@ -920,6 +920,10 @@ pub async fn profile_html_fill(
     }
 
     let _ = hydrate_local_quote_targets(&db, &mut statuses).await;
+    // Profile timelines have a separate painter from Home/Local/Federated.
+    // Reuse the canonical quote resolver so remote Fediverse targets already
+    // present in the event cache render as full posts here too.
+    let _ = crate::home_hydrate_ranked::hydrate_local_quote_targets(&db, &mut statuses).await;
 
     // Live fav/boost/bookmark from masto_* (same as Home lean / Ice Cubes, 0.7.19).
     if viewer_owner_id > 0 {
