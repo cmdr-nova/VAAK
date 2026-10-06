@@ -5048,7 +5048,7 @@ function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, strin
 }
 
 /** Structured read-only Favourites projection; PHP still hydrates/cards/writes. */
-function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $limit = 20, string $libraryKind = 'favourites'): ?array
+function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $limit = 20, string $libraryKind = 'favourites', int $folderId = 0): ?array
 {
     if ($ownerUserId < 1 || !function_exists('curl_init')) return null;
     $base = getenv('VAAK_SHADOW_HTTP');
@@ -5056,7 +5056,7 @@ function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $l
     $host = parse_url($base, PHP_URL_HOST);
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
     $libraryKind = in_array($libraryKind, ['favourites', 'bookmarks'], true) ? $libraryKind : 'favourites';
-    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'offset' => max(0, $offset), 'limit' => max(10, min(40, $limit))]));
+    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'folder_id' => max(0, $folderId), 'offset' => max(0, $offset), 'limit' => max(10, min(40, $limit))]));
     if ($ch === false) return null;
     curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
     $raw = curl_exec($ch);
@@ -5077,7 +5077,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_fedi') {
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
     $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
-    if ($folderId === 0 && is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks'))) {
+    if (is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks', $folderId))) {
         $items = [];
         foreach ($bookmarkData['fedi_rows'] as $bookmarkRow) {
             if (is_array($bookmarkRow) && function_exists('ap_masto_interaction_row_to_status')) {
@@ -5089,7 +5089,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_fedi') {
         header('X-VAAK-Fragment: axum-data');
         ob_start();
         echo '<div data-fedi-bookmark-fragment data-offset="' . (int) count($items) . '" data-limit="' . (int) $limit . '" data-has-more="' . (!empty($bookmarkData['has_more_fedi']) ? '1' : '0') . '">';
-        if ($items === []) echo '<div class="empty" data-fedi-bookmark-empty>No Fediverse bookmarks yet.</div>';
+        if ($items === []) echo '<div class="empty" data-fedi-bookmark-empty>' . ($folderId > 0 ? 'No Fediverse bookmarks in this folder.' : 'No Fediverse bookmarks yet.') . '</div>';
         else { echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Fediverse bookmarks</h3>'; $GLOBALS['admin_library_fetch_budget'] = 3; foreach ($items as $item) admin_render_library_status_card($item, 'bookmarks'); }
         echo '</div>';
         echo ob_get_clean();
@@ -5152,13 +5152,13 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
     $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
-    if ($folderId === 0 && is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks'))) {
+    if (is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks', $folderId))) {
         $items = is_array($bookmarkData['bsky_rows'] ?? null) ? $bookmarkData['bsky_rows'] : [];
         header('X-Has-More: ' . ((count($items) >= $limit) ? '1' : '0'));
         header('X-VAAK-Fragment: axum-data');
         ob_start();
         echo '<div data-bsky-bookmark-fragment data-offset="' . (int) count($items) . '" data-limit="' . (int) $limit . '" data-has-more="' . ((count($items) >= $limit) ? '1' : '0') . '" data-loaded="1">';
-        if ($items === []) echo '<div class="empty" data-bsky-bookmark-empty>No cached Bluesky bookmarks yet. They will appear after the background sync completes.</div>';
+        if ($items === []) echo '<div class="empty" data-bsky-bookmark-empty>' . ($folderId > 0 ? 'No Bluesky bookmarks in this folder.' : 'No cached Bluesky bookmarks yet. They will appear after the background sync completes.') . '</div>';
         else { echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>'; foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'bookmarks'); }
         echo '</div>';
         echo ob_get_clean();
