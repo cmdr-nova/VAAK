@@ -1470,6 +1470,53 @@ fn bsky_at_uri(st: &Value, uri: &str) -> String {
         .to_string()
 }
 
+/// Render reply context even when the parent was not included in the current
+/// timeline page.  The API still carries the canonical parent URL in
+/// `vaak_in_reply_to_url`; relying only on `in_reply_to_id` made those posts
+/// look like standalone posts in the native Rust timeline.
+fn paint_reply_context(status: &Value, from: &str) -> String {
+    if status.get("vaak_ask").is_some() {
+        return String::new();
+    }
+    let mut parent = status
+        .get("vaak_in_reply_to_url")
+        .and_then(|v| v.as_str())
+        .or_else(|| status.get("in_reply_to").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string();
+    if parent.is_empty() {
+        if let Some(candidate) = status.get("in_reply_to_id").and_then(|v| v.as_str()) {
+            let candidate = candidate.trim().trim_end_matches('/');
+            if candidate.starts_with("https://") || candidate.starts_with("at://") {
+                parent = candidate.to_string();
+            }
+        }
+    }
+    if parent.starts_with("at://") {
+        let parts: Vec<&str> = parent[5..].split('/').collect();
+        if parts.len() >= 3 && !parts[0].is_empty() && !parts[2].is_empty() {
+            parent = format!(
+                "https://bsky.app/profile/{}/post/{}",
+                parts[0], parts[2]
+            );
+        }
+    }
+    if !parent.starts_with("https://") {
+        return String::new();
+    }
+    let return_view = if from.is_empty() { "home" } else { from };
+    let href = format!(
+        "?view=status&object={}&from={}",
+        urlencoding_encode(&parent),
+        urlencoding_encode(return_view)
+    );
+    format!(
+        "<div class=\"meta reply-context\" style=\"margin:.35rem 0 .5rem\">↩ <a href=\"{}\">replying to this post</a></div>",
+        esc(&href)
+    )
+}
+
 fn remote_object_href(uri: &str, url_hint: &str) -> String {
     let hint = url_hint.trim();
     if hint.starts_with("https://") && !hint.contains("bridgy") {
@@ -1894,6 +1941,30 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
         .map(|s| s.to_string())
         .or_else(|| status.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()))
         .unwrap_or_default();
+    // A boost card can arrive as an Announce/reblog wrapper.  Interactions
+    // must target the underlying status, not the synthetic wrapper ID/URI.
+    // This is especially important for boosting an already-boosted post.
+    let interaction = status
+        .get("reblog")
+        .filter(|v| v.is_object())
+        .unwrap_or(status);
+    let interaction_uri = interaction
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| interaction.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let interaction_sid = interaction
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| interaction.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()))
+        .unwrap_or_else(|| sid.clone());
+    let interaction_actor_ref = interaction
+        .get("account")
+        .and_then(|a| a.get("uri").and_then(|v| v.as_str()))
+        .or_else(|| interaction.get("account").and_then(|a| a.get("url").and_then(|v| v.as_str())))
+        .unwrap_or(actor_ref);
     let fav = json_flag(status, "favourited");
     let boosted = json_flag(status, "reblogged");
     let bm = json_flag(status, "bookmarked");
@@ -2045,9 +2116,9 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
         // Reply (Fediverse + Bluesky + local)
         if !uri.is_empty() {
             let reply_target = if bsky {
-                bsky_https_object_ref(status, uri)
+                bsky_https_object_ref(status, interaction_uri)
             } else {
-                uri.to_string()
+                interaction_uri.to_string()
             };
             let mut reply_href = format!(
                 "?view={}&compose=1&reply_to={}",
@@ -2175,7 +2246,7 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 pressed = if bm { "true" } else { "false" },
                 icon = bm_icon,
             ));
-        } else if !sid.is_empty() && !uri.is_empty() {
+        } else if !interaction_sid.is_empty() && !interaction_uri.is_empty() {
             // Fediverse / local (PHP remote branch; local skips Bite)
             let qt_cls = if qt_n > 0 {
                 "icon-btn has-count"
@@ -2186,8 +2257,8 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 "<a class=\"{cls}\" href=\"?view={view}&amp;compose=1&amp;quote_object={qo}&amp;quote_status_id={qs}\" {eng}=\"1\" data-eng-count=\"{n}\" title=\"Quote\" aria-label=\"Quote\"><i class=\"ph ph-quotes\" aria-hidden=\"true\"></i>{count}</a>",
                 cls = qt_cls,
                 view = urlencoding_encode(from_q),
-                qo = urlencoding_encode(uri),
-                qs = urlencoding_encode(&sid),
+                qo = urlencoding_encode(interaction_uri),
+                qs = urlencoding_encode(&interaction_sid),
                 eng = eng_attr,
                 n = qt_n,
                 count = action_count_html(qt_n),
@@ -2205,9 +2276,9 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                     "reblog_status"
                 },
                 from_q,
-                &sid,
-                uri,
-                actor_ref,
+                &interaction_sid,
+                interaction_uri,
+                interaction_actor_ref,
                 &boost_cls,
                 if boosted { "Undo boost" } else { "Boost" },
                 if boosted { "Undo boost" } else { "Boost" },
@@ -2247,8 +2318,8 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                     "favourite_status"
                 },
                 from_q,
-                &sid,
-                uri,
+                &interaction_sid,
+                interaction_uri,
                 actor_ref,
                 &fav_cls,
                 if fav { "Unlike" } else { "Like" },
@@ -2271,8 +2342,8 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                     "bookmark_status"
                 },
                 from_q,
-                &sid,
-                uri,
+                &interaction_sid,
+                interaction_uri,
                 "",
                 bm_cls,
                 if bm { "Bookmark folders" } else { "Bookmark" },
@@ -2709,6 +2780,9 @@ pub fn paint_lean_embed_from(
     }
 
     let mut body_inner = String::new();
+    // Keep reply-shaped cards visibly threaded even when their parent was
+    // hydrated on a different page (or is remote and cache-only).
+    body_inner.push_str(&paint_reply_context(status, from));
     // Prefer original status HTML (mentions/hashtags/links + correct entities).
     // strip_tags+esc dropped <a> and double-encoded &#039; / &quot; into visible codes (0.7.13).
     // 0.7.14: rewrite anchors in-app, linkify bare URLs, tighten breaks, paint OG cards.
@@ -3048,6 +3122,49 @@ mod tests {
         assert!(html.contains("bookmark_status") || html.contains("ph-bookmark"), "{html}");
         assert!(html.contains("compose=1") && html.contains("reply_to="), "{html}");
         assert!(!html.contains(">Open</a></div>"), "Home should not be Open-only: {html}");
+    }
+
+    #[test]
+    fn boosted_card_targets_underlying_status_and_keeps_reply_context() {
+        let st = json!({
+            "id": "announce-wrapper",
+            "uri": "https://remote.example/announce/99",
+            "content": "",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "reblogged": false,
+            "account": {"acct": "booster@remote.example", "display_name": "Booster", "uri": "https://remote.example/users/booster"},
+            "reblog": {
+                "id": "12345",
+                "uri": "https://origin.example/users/author/statuses/12345",
+                "content": "<p>reply-shaped post</p>",
+                "created_at": "2026-10-05T04:00:00.000Z",
+                "in_reply_to_id": "https://origin.example/users/author/statuses/1",
+                "vaak_in_reply_to_url": "https://origin.example/users/author/statuses/1",
+                "account": {"acct": "author@origin.example", "display_name": "Author", "uri": "https://origin.example/users/author"},
+                "media_attachments": []
+            }
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("reply-context") && html.contains("replying to this post"), "{html}");
+        assert!(html.contains("name=\"object_id\" value=\"https://origin.example/users/author/statuses/12345\""), "boost must target original object: {html}");
+        assert!(!html.contains("value=\"https://remote.example/announce/99\""), "wrapper URI leaked into action: {html}");
+    }
+
+    #[test]
+    fn bsky_reply_context_converts_at_uri() {
+        let st = json!({
+            "id": "bsky:reply",
+            "uri": "at://did:plc:child/app.bsky.feed.post/child",
+            "content": "<p>reply</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "source": "bluesky",
+            "vaak_in_reply_to_url": "at://did:plc:parent/app.bsky.feed.post/parent",
+            "account": {"acct": "child.bsky.social", "display_name": "Child", "uri": "https://bsky.app/profile/child.bsky.social"},
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("replying to this post"), "{html}");
+        assert!(html.contains("bsky.app%2Fprofile%2Fdid%3Aplc%3Aparent%2Fpost%2Fparent"), "{html}");
     }
 
     #[test]
