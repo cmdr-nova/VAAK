@@ -2,7 +2,14 @@
 declare(strict_types=1);
 
 /** Pure settings safety gate; never connects to production or writes data. */
-$fixturePath = dirname(__DIR__, 2) . '/rust/vaak-worker/fixtures/settings/profile-fields.json';
+$fixtureCandidates = [
+    __DIR__ . '/../fixtures/settings/profile-fields.json',
+    dirname(__DIR__, 2) . '/rust/vaak-worker/fixtures/settings/profile-fields.json',
+];
+$fixturePath = '';
+foreach ($fixtureCandidates as $candidate) {
+    if (is_file($candidate)) { $fixturePath = $candidate; break; }
+}
 $fixture = is_file($fixturePath) ? json_decode((string) file_get_contents($fixturePath), true) : null;
 $canonical = [
     'name', 'summary', 'attachment_json', 'icon_url', 'image_url',
