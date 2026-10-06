@@ -1251,22 +1251,6 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     st
 }
 
-fn hydrated_status_hidden(st: &Value, hidden: &crate::hidden::HiddenSets) -> bool {
-    let actor_hidden = |value: &Value| {
-        value
-            .get("account")
-            .and_then(|a| a.get("uri").and_then(|v| v.as_str()).or_else(|| a.get("url").and_then(|v| v.as_str())))
-            .map(|actor| hidden.is_hidden(actor))
-            .unwrap_or(false)
-    };
-    actor_hidden(st)
-        || st
-            .get("reblog")
-            .filter(|v| v.is_object())
-            .map(actor_hidden)
-            .unwrap_or(false)
-}
-
 fn actor_to_account(actor: &ActorRow) -> Value {
     let host = if actor.host.is_empty() {
         host_from_url(&actor.actor_id)
@@ -3060,7 +3044,7 @@ pub async fn warm_view(
             // Ranked caches can briefly contain an item from before a mute or
             // instance block changed. Filter again at hydration so stale
             // envelopes cannot leak blocked actors into the Rust timeline.
-            if hydrated_status_hidden(&st, &hidden) {
+            if crate::hidden::status_hidden(&st, &hidden) {
                 continue;
             }
             *kinds.entry(e.kind.clone()).or_insert(0) += 1;
@@ -3510,6 +3494,6 @@ mod tests {
             "account": {"uri": "https://booster.example/users/y"},
             "reblog": {"account": {"uri": "https://blocked.example/users/x"}}
         });
-        assert!(hydrated_status_hidden(&status, &hidden));
+        assert!(crate::hidden::status_hidden(&status, &hidden));
     }
 }

@@ -14707,7 +14707,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
                 ? '<input type="hidden" name="id" value="' . (int) ($personalBlock['id'] ?? 0) . '">'
                 : '<input type="hidden" name="target" value="' . h($actorId) . '">')
             . '<button class="menu-action" type="submit" title="Hide from your timelines only">'
-            . ($isBlocked ? 'Unblock for me' : 'Block for me') . '</button>'
+            . ($isBlocked ? 'Unblock' : 'Block') . '</button>'
             . '</form>';
         } else {
             $menu .= '<span class="menu-action menu-action-disabled" aria-disabled="true" title="Administrators cannot be blocked">Admin account — cannot be blocked</span>';
@@ -14720,7 +14720,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
             . '<input type="hidden" name="return_actor" value="' . h($actorId) . '">'
             . '<input type="hidden" name="actor_id" value="' . h($actorId) . '">'
             . '<button class="menu-action" type="submit" title="Hide from your Home / Federated / Notifications">'
-            . ($isMuted ? 'Unmute for me' : 'Mute for me') . '</button>'
+            . ($isMuted ? 'Unmute' : 'Mute') . '</button>'
             . '</form>';
         // Soft-rank on Home only — still shows on Federated / Local / notifications.
         $menu .= '<form method="post" action="?view=' . h($returnView) . '">'

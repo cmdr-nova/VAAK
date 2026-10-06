@@ -285,6 +285,14 @@ pub async fn view_hydrate(
 
     // Overlay live viewer flags — warm envelopes hard-code false (0.7.19).
     if report.cache_hit && !report.items.is_empty() {
+        // Moderation changes must invalidate stale cached envelopes at read
+        // time, not only when the fan-out worker happens to rewarm them.
+        let moderation_db = crate::db::connect(&cfg.database_url).await?;
+        let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id)
+            .await
+            .unwrap_or_default();
+        report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
+        report.n = report.items.len();
         let _ = crate::interaction_flags::apply_to_statuses_with_cfg(
             &cfg.database_url,
             owner_user_id,
@@ -754,5 +762,4 @@ async fn enrich_item(
     }
     Ok((None, None))
 }
-
 

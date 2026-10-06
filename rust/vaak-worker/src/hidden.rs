@@ -1,6 +1,7 @@
 //! Mute / block sets for notification filtering (parity with ap_row_is_hidden).
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
@@ -15,15 +16,17 @@ pub struct HiddenSets {
 
 impl HiddenSets {
     pub fn is_hidden(&self, actor_id: &str) -> bool {
-        let actor = actor_id.trim_end_matches('/');
+        let actor = actor_id.trim().trim_end_matches('/');
         if actor.is_empty() {
             return false;
         }
-        if self.muted_actors.contains(actor) || self.user_blocked_actors.contains(actor) {
-            return true;
-        }
-        if self.instance_blocked_actors.contains(actor) {
-            return true;
+        for alias in actor_aliases(actor) {
+            if self.muted_actors.contains(&alias)
+                || self.user_blocked_actors.contains(&alias)
+                || self.instance_blocked_actors.contains(&alias)
+            {
+                return true;
+            }
         }
         let host = host_of(actor);
         if let Some(host) = host {
@@ -38,6 +41,25 @@ impl HiddenSets {
     }
 }
 
+/// Apply viewer moderation to already-hydrated cards as well as ranked IDs.
+/// Cached envelopes can outlive a mute/block change, so both the card author
+/// and a boost/reblog's underlying author must be checked at read time.
+pub fn status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
+    let actor_hidden = |value: &Value| {
+        value
+            .get("account")
+            .and_then(|a| a.get("uri").and_then(|v| v.as_str()).or_else(|| a.get("url").and_then(|v| v.as_str())))
+            .map(|actor| hidden.is_hidden(actor))
+            .unwrap_or(false)
+    };
+    actor_hidden(status)
+        || status
+            .get("reblog")
+            .filter(|v| v.is_object())
+            .map(actor_hidden)
+            .unwrap_or(false)
+}
+
 fn host_of(actor: &str) -> Option<String> {
     let rest = actor.strip_prefix("https://")?;
     let host = rest.split('/').next()?;
@@ -49,7 +71,40 @@ fn host_of(actor: &str) -> Option<String> {
 }
 
 fn norm_actor(s: &str) -> String {
-    s.trim().trim_end_matches('/').to_string()
+    s.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn actor_aliases(s: &str) -> Vec<String> {
+    let actor = norm_actor(s);
+    if actor.is_empty() {
+        return Vec::new();
+    }
+    let mut aliases = vec![actor.clone()];
+    if let Some(rest) = actor.strip_prefix("https://") {
+        let mut parts = rest.splitn(2, '/');
+        let host = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("").trim_matches('/');
+        if !host.is_empty() {
+            if let Some(name) = path.strip_prefix("users/") {
+                if !name.is_empty() {
+                    aliases.push(format!("https://{host}/@{name}"));
+                }
+            } else if let Some(name) = path.strip_prefix('@') {
+                if !name.is_empty() {
+                    aliases.push(format!("https://{host}/users/{name}"));
+                }
+            }
+        }
+    }
+    aliases.sort();
+    aliases.dedup();
+    aliases
+}
+
+fn insert_actor_aliases(set: &mut HashSet<String>, actor: &str) {
+    for alias in actor_aliases(actor) {
+        set.insert(alias);
+    }
 }
 
 pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenSets> {
@@ -66,7 +121,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
         let a: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
         let a = norm_actor(&a);
         if !a.is_empty() {
-            sets.muted_actors.insert(a);
+            insert_actor_aliases(&mut sets.muted_actors, &a);
         }
     }
 
@@ -84,7 +139,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
             "actor" => {
                 let a = norm_actor(&value);
                 if !a.is_empty() {
-                    sets.user_blocked_actors.insert(a);
+                    insert_actor_aliases(&mut sets.user_blocked_actors, &a);
                 }
             }
             "domain" => {
@@ -108,7 +163,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
             "actor" => {
                 let a = norm_actor(&value);
                 if !a.is_empty() {
-                    sets.instance_blocked_actors.insert(a);
+                    insert_actor_aliases(&mut sets.instance_blocked_actors, &a);
                 }
             }
             "domain" => {
@@ -200,6 +255,20 @@ pub async fn is_favourited(db: &Client, owner_user_id: i64, object_id: &str) -> 
         .await
         .context("select masto_favourites")?;
     Ok(row.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moderation_matches_actor_url_aliases_case_insensitively() {
+        let mut hidden = HiddenSets::default();
+        insert_actor_aliases(&mut hidden.muted_actors, "https://mas.corq.co/users/rogue_corq");
+        assert!(hidden.is_hidden("https://mas.corq.co/users/rogue_corq/"));
+        assert!(hidden.is_hidden("https://MAS.CORQ.CO/@ROGUE_CORQ"));
+        assert!(!hidden.is_hidden("https://mas.corq.co/users/other"));
+    }
 }
 
 pub async fn load_post_subscriptions(db: &Client, owner_user_id: i64) -> Result<HashSet<String>> {
