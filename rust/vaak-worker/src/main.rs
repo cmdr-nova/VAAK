@@ -31,6 +31,7 @@ mod timeline_fanout;
 mod you;
 mod relationships;
 mod settings;
+mod library;
 
 use std::net::SocketAddr;
 

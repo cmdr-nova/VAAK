@@ -116,6 +116,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/you", get(shadow_you))
         .route("/shadow/relationships", get(shadow_relationships))
         .route("/shadow/settings", get(shadow_settings))
+        .route("/shadow/library-data", get(shadow_library_data))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
@@ -174,6 +175,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/you",
             "/shadow/relationships",
             "/shadow/settings",
+            "/shadow/library-data",
             "/shadow/jetstream",
             "/shadow/thin-media",
             "/shadow/timelines/home",
@@ -774,6 +776,18 @@ async fn shadow_settings(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     json_result(crate::settings::project(&state.cfg, owner).await)
+}
+
+async fn shadow_library_data(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let kind = q.library_kind.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    if kind != "favourites" && kind != "favourites_all" {
+        return (StatusCode::BAD_REQUEST, "unsupported library data projection").into_response();
+    }
+    json_result(crate::library::favourites(&state.cfg, owner, q.offset.unwrap_or(0), q.limit.unwrap_or(20)).await)
 }
 
 async fn shadow_jetstream(State(state): State<AppState>) -> impl IntoResponse {
