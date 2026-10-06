@@ -5031,6 +5031,59 @@ function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, strin
     return is_string($html) && $html !== '' ? ['html' => $html, 'has_more' => (($headers['x-has-more'] ?? '') === '1')] : null;
 }
 
+// Cache-first Fediverse bookmark cards. Bluesky bookmarks use the sibling
+// handler below; both fragments share the same folder filter semantics.
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_fedi') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    $folderId = (int) ($_GET['folder'] ?? 0);
+    $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
+    $limit = (int) (ceil($limit / 20) * 20);
+    $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
+    if (is_array($axumFrag = admin_library_fragment_axum_fetch('bookmarks_fedi', $vaakOwnerId, $fragSuffix))) {
+        header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
+    }
+    if (function_exists('ap_redis_library_html_get')) {
+        $fragHit = ap_redis_library_html_get('bookmarks_fedi', $vaakOwnerId, $fragSuffix);
+        if (is_array($fragHit)) { header('X-VAAK-Fragment: hit'); echo $fragHit['html']; exit; }
+    }
+    $keys = ['status_ids' => [], 'object_ids' => []];
+    if ($folderId > 0 && function_exists('vaak_bookmark_folder_match_keys')) {
+        $keys = vaak_bookmark_folder_match_keys($folderId, $vaakOwnerId, 500);
+    }
+    $items = ($folderId > 0 && function_exists('ap_masto_bookmarks_for_status_ids'))
+        ? ap_masto_bookmarks_for_status_ids($keys['status_ids'] ?? [], $vaakOwnerId)
+        : ap_masto_bookmarks_list($limit, null);
+    $allowed = array_fill_keys($keys['status_ids'] ?? [], true);
+    $allowedObjects = array_fill_keys($keys['object_ids'] ?? [], true);
+    $seen = [];
+    $items = array_values(array_filter($items, static function ($st) use (&$seen, $folderId, $allowed, $allowedObjects): bool {
+        if (!is_array($st)) return false;
+        $sid = trim((string) ($st['id'] ?? ''));
+        $uri = rtrim((string) ($st['uri'] ?? $st['url'] ?? ''), '/');
+        if (str_starts_with($sid, 'bsky:') || str_starts_with($uri, 'at://') || str_contains($uri, 'bsky.app/')) return false;
+        if ($folderId > 0 && !isset($allowed[$sid]) && !isset($allowedObjects[$uri])) return false;
+        $key = $uri !== '' ? 'u:' . $uri : 'i:' . $sid;
+        if ($key === 'u:' || isset($seen[$key])) return false;
+        $seen[$key] = true; return true;
+    }));
+    $hasMore = count($items) > $limit;
+    $items = array_slice($items, 0, $limit);
+    ob_start();
+    if ($items === []) {
+        echo '<div class="empty" data-fedi-bookmark-empty>' . ($folderId > 0 ? 'No Fediverse bookmarks in this folder.' : 'No Fediverse bookmarks yet.') . '</div>';
+    } else {
+        echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Fediverse bookmarks</h3>';
+        $GLOBALS['admin_library_fetch_budget'] = 3;
+        foreach ($items as $item) admin_render_library_status_card($item, 'bookmarks');
+    }
+    $html = ob_get_clean();
+    if (function_exists('ap_redis_library_html_set')) ap_redis_library_html_set('bookmarks_fedi', $vaakOwnerId, $fragSuffix, $html, $hasMore);
+    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    header('X-VAAK-Fragment: miss'); echo $html; exit;
+}
+
 // Cache-first bookmark cards.  The page shell should never wait for the
 // Bluesky collection or its card renderer; this fragment is loaded after the
 // first paint and is backed by the durable cache/worker path.
@@ -25402,11 +25455,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Delete this folder</button>
           </form>
         <?php endif; ?>
-        <?php if (!$bmList && !$bskyBookmarksEnabled): ?>
-          <?= admin_mascot_empty($bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.') ?>
-        <?php elseif (!$bmList && $bskyBookmarksEnabled): ?>
-          <div class="empty" id="bookmarks-empty-fedi" hidden><?= $bmFolderFilter > 0 ? 'No bookmarks in this folder yet.' : 'No bookmarks yet.' ?></div>
-        <?php endif; ?>
+        <div id="bookmarks-fedi-slot" data-folder="<?= (int) $bmFolderFilter ?>" data-limit="<?= (int) $bookmarkLimit ?>" aria-live="polite">
+          <div class="meta" style="padding:.75rem 0">Loading Fediverse bookmarks…</div>
+        </div>
         <?php if ($bskyBookmarksEnabled): ?>
           <div id="bookmarks-bsky-slot"
                data-folder="<?= (int) $bmFolderFilter ?>"
@@ -25414,10 +25465,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                aria-live="polite">
             <div class="meta" style="padding:.75rem 0">Loading Bluesky bookmarks…</div>
           </div>
-        <?php endif; ?>
-        <?php if ($bmList): ?>
-          <?php $GLOBALS['admin_library_fetch_budget'] = 3; ?>
-          <?php foreach ($bmList as $st): admin_render_library_status_card($st, 'bookmarks'); endforeach; ?>
         <?php endif; ?>
         <?php if ($bookmarkLimit < 80 && count($bmList) >= $bookmarkLimit): ?>
           <div class="tweet-actions" style="justify-content:center;margin:1rem 0 2rem">
@@ -36562,26 +36609,25 @@ window.apAdminToast = function (msg, isErr) {
 
   window.vaakBootBookmarks = function (main) {
     const root = main || document.querySelector('section.main');
-    const slot = root ? root.querySelector('#bookmarks-bsky-slot') : document.getElementById('bookmarks-bsky-slot');
-    if (!slot || slot.dataset.loaded === '1') return;
-    slot.dataset.loaded = '1';
-    const folder = slot.getAttribute('data-folder') || '0';
-    const limit = slot.getAttribute('data-limit') || '20';
-    const url = '?ajax=bookmarks_bsky&folder=' + encodeURIComponent(folder)
-      + '&limit=' + encodeURIComponent(limit);
-    fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html' } })
-      .then((res) => res.ok ? res.text() : Promise.reject(new Error('bookmarks_bsky ' + res.status)))
-      .then((html) => {
-        const trimmed = (html || '').trim();
-        slot.innerHTML = trimmed !== '' ? trimmed : '';
-        if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(slot);
-        if (typeof window.vaakBindFeedTopBtn === 'function') {
-          window.vaakBindFeedTopBtn(document.querySelector('section.main'));
-        }
-      })
-      .catch(() => {
-        slot.innerHTML = '<div class="meta">Couldn’t load Bluesky bookmarks right now.</div>';
-      });
+    ['fedi', 'bsky'].forEach((network) => {
+      const id = network === 'fedi' ? '#bookmarks-fedi-slot' : '#bookmarks-bsky-slot';
+      const slot = root ? root.querySelector(id) : document.querySelector(id);
+      if (!slot || slot.dataset.loaded === '1') return;
+      slot.dataset.loaded = '1';
+      const folder = slot.getAttribute('data-folder') || '0';
+      const limit = slot.getAttribute('data-limit') || '20';
+      const url = '?ajax=bookmarks_' + network + '&folder=' + encodeURIComponent(folder)
+        + '&limit=' + encodeURIComponent(limit);
+      fetch(url, { credentials: 'same-origin', headers: { Accept: 'text/html' } })
+        .then((res) => res.ok ? res.text() : Promise.reject(new Error('bookmarks_' + network + ' ' + res.status)))
+        .then((html) => {
+          const trimmed = (html || '').trim();
+          slot.innerHTML = trimmed !== '' ? trimmed : '';
+          if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(slot);
+          if (typeof window.vaakBindFeedTopBtn === 'function') window.vaakBindFeedTopBtn(document.querySelector('section.main'));
+        })
+        .catch(() => { slot.innerHTML = '<div class="meta">Couldn’t load ' + (network === 'fedi' ? 'Fediverse' : 'Bluesky') + ' bookmarks right now.</div>'; });
+    });
   };
 
   // Full-page boots (soft-nav calls these explicitly after shell swap).
@@ -36590,7 +36636,7 @@ window.apAdminToast = function (msg, isErr) {
   } else if (document.querySelector('[data-fedi-favourites-fragment]')) {
     window.vaakBootFavouritesFedi(document.querySelector('section.main'));
   }
-  if (document.getElementById('bookmarks-bsky-slot')) {
+  if (document.getElementById('bookmarks-bsky-slot') || document.getElementById('bookmarks-fedi-slot')) {
     window.vaakBootBookmarks(document.querySelector('section.main'));
   }
 })();
