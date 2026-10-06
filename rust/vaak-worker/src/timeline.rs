@@ -369,6 +369,18 @@ fn status_created_ts(st: &Value) -> i64 {
     0
 }
 
+/// Stable object identity used by newer polls. The ranked/hydrate path can
+/// briefly contain the same object from both the Rust warm pass and the PHP
+/// compatibility feed; timestamps alone cannot distinguish that overlap.
+fn status_identity(st: &Value) -> String {
+    for key in ["uri", "url", "object_id"] {
+        if let Some(value) = st.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()) {
+            return value.trim_end_matches('/').to_string();
+        }
+    }
+    st.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("").to_string()
+}
+
 pub async fn home_since(
     cfg: &Config,
     owner_user_id: i64,
@@ -436,9 +448,14 @@ pub async fn home_since(
     report.cache_hit = true;
 
     let mut newer: Vec<(i64, Value)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for st in hydrate.items {
         let ts = status_created_ts(&st);
         if ts <= since_ts {
+            continue;
+        }
+        let identity = status_identity(&st);
+        if !identity.is_empty() && !seen.insert(identity) {
             continue;
         }
         newer.push((ts, st));
@@ -696,6 +713,13 @@ mod tests {
     fn status_created_ts_parses_rfc3339_z() {
         let st = serde_json::json!({"created_at": "2026-10-05T01:57:08.000Z"});
         assert_eq!(status_created_ts(&st), 1791165428);
+    }
+
+    #[test]
+    fn newer_poll_identity_dedupes_uri_before_id() {
+        let a = serde_json::json!({"id":"rust-wrapper","uri":"https://example.test/posts/1"});
+        let b = serde_json::json!({"id":"php-wrapper","uri":"https://example.test/posts/1/"});
+        assert_eq!(status_identity(&a), status_identity(&b));
     }
 }
 
