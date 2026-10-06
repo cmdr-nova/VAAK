@@ -1559,6 +1559,17 @@ fn local_username_from_url(url: &str) -> Option<String> {
 }
 
 fn reply_handle_from_object_url(url: &str) -> String {
+    // Bluesky web URLs use /profile/{handle}/post/{rkey}; unlike ActivityPub
+    // /statuses/ and /notes/ URLs the actor is not the URL prefix before a
+    // status segment. Preserve the human handle here so local replies to a
+    // Bluesky post render as replies (and seed the composer) instead of bare
+    // standalone text or a DID.
+    if let Some(rest) = url.strip_prefix("https://bsky.app/profile/") {
+        let handle = rest.split('/').next().unwrap_or("").trim();
+        if !handle.is_empty() && !handle.starts_with("did:") {
+            return handle.to_string();
+        }
+    }
     let actor = url
         .split_once("/statuses/")
         .map(|(prefix, _)| prefix)

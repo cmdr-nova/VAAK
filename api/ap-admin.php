@@ -11313,6 +11313,28 @@ function admin_render_compose_panel(bool $inline = false): void
         <div class="meta compose-as-line" style="margin-bottom:.5rem">As <b style="color:var(--primary)"><?= h($composeAsLabel) ?></b><?php if ($composeIsDraft): ?> · <span style="color:var(--muted)">draft #<?= (int) $prefillDraftId ?></span><?php endif; ?></div>
         <?php if ($composeIsSelfReply): ?>
           <div class="quote-block" style="margin-bottom:.75rem"><span class="qt-label">Replying to your post</span><br><span class="mono"><?= h($prefillReplyTo) ?></span></div>
+        <?php elseif ($prefillReplyTo !== ''): ?>
+          <?php
+            // Keep reply context visible for remote/Fediverse replies too. The
+            // hidden in_reply_to field is easy to miss, especially in the
+            // inline composer, and previously made a reply look like a new
+            // standalone post. Prefer a human handle over a raw URL/DID.
+            $composeReplyLabel = '';
+            if (preg_match('#^https://bsky\\.app/profile/([^/]+)/post/#i', $prefillReplyTo, $cm)) {
+                $composeReplyLabel = '@' . rawurldecode((string) $cm[1]);
+            } elseif (preg_match('#/users/([^/]+)/#i', $prefillReplyTo, $cm)) {
+                $composeReplyLabel = '@' . rawurldecode((string) $cm[1]);
+            } elseif (function_exists('actor_handle')) {
+                $composeReplyLabel = trim((string) actor_handle($prefillReplyTo));
+            }
+            if ($composeReplyLabel === '') {
+                $composeReplyLabel = 'the original post';
+            }
+          ?>
+          <div class="quote-block compose-reply-context" style="margin-bottom:.75rem">
+            <span class="qt-label">Replying to</span>
+            <strong><?= h($composeReplyLabel) ?></strong>
+          </div>
         <?php endif; ?>
       <?php endif; ?>
       <input name="spoiler_text" maxlength="500" placeholder="Content warning (optional)" style="margin-bottom:.5rem;flex:0 0 auto" value="<?= h($prefillEditSpoiler) ?>">
@@ -13981,6 +14003,13 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
     $parentIsBsky = str_contains(strtolower($replyUrl), 'bsky.app')
         || str_starts_with(strtolower($replyUrl), 'at://');
     $parentSource = $parentIsBsky ? 'Bluesky' : 'fediverse';
+    // A locally authored reply to a Bluesky post stores the canonical web
+    // parent URL in outbox_notes. There is no local events actor row to ask
+    // for a handle, so derive it from /profile/{handle}/post/{rkey} rather
+    // than exposing a DID or the generic "parent post" label.
+    if ($parentHandle === '' && preg_match('#^https://bsky\\.app/profile/([^/]+)/post/#i', $replyUrl, $bskyParentMatch)) {
+        $parentHandle = rawurldecode((string) $bskyParentMatch[1]);
+    }
     $href = function_exists('admin_status_href')
         ? admin_status_href($replyUrl, $returnView)
         : ('?view=status&object=' . rawurlencode($replyUrl));
