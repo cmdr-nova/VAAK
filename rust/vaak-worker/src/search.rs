@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::{json, Value};
 use tokio_postgres::Client;
 
 use crate::hidden::HiddenSets;
@@ -19,6 +20,7 @@ pub struct SearchRow {
     pub object_id: Option<String>,
     pub created_at: String,
     pub rank: f64,
+    pub status: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,6 +31,7 @@ pub struct SearchResults {
     pub query_type: String,
     pub normalized_query: Option<String>,
     pub rows: Vec<SearchRow>,
+    pub statuses: Vec<Value>,
     pub accounts: Vec<SearchAccount>,
     pub hashtags: Vec<SearchHashtag>,
     pub redirect_url: Option<String>,
@@ -105,6 +108,76 @@ fn postgres_tsquery(match_query: &str) -> String {
         .replace(" OR ", " | ")
 }
 
+fn html_text(text: &str) -> String {
+    let mut out = String::from("<p>");
+    for c in text.trim().chars() {
+        match c { '&' => out.push_str("&amp;"), '<' => out.push_str("&lt;"), '>' => out.push_str("&gt;"), '"' => out.push_str("&quot;"), '\'' => out.push_str("&#39;"), '\n' => out.push_str("<br>"), _ => out.push(c) }
+    }
+    if out == "<p>" { String::new() } else { out.push_str("</p>"); out }
+}
+
+fn status_id(created: &str, db_id: i64, kind: i64) -> String {
+    let sec = chrono::DateTime::parse_from_rfc3339(created).map(|d| d.timestamp()).unwrap_or(0);
+    format!("{}", sec.saturating_mul(1_000_000_000) + kind * 100_000_000 + db_id.rem_euclid(100_000_000))
+}
+
+fn account_json(actor: &str, username: &str, display: &str, host: &str, avatar: Option<&str>) -> Value {
+    let av = avatar.filter(|v| v.starts_with("https://")).unwrap_or("https://mkultra.monster/img/avatar/default.webp");
+    let acct = if host.is_empty() { username.to_string() } else { format!("{username}@{host}") };
+    json!({"id": actor, "username": username, "acct": acct, "display_name": if display.is_empty() { username } else { display },
+        "locked": false, "bot": false, "discoverable": false, "group": false,
+        "created_at": "2018-01-01T00:00:00.000Z", "note": "", "url": actor, "uri": actor,
+        "avatar": av, "avatar_static": av, "header": "", "header_static": "",
+        "followers_count": 0, "following_count": 0, "statuses_count": 0, "last_status_at": null,
+        "emojis": [], "fields": []})
+}
+
+fn status_json(id: String, created: &str, uri: &str, content: &str, account: Value) -> Value {
+    json!({"id": id, "created_at": created, "in_reply_to_id": null, "in_reply_to_account_id": null,
+        "sensitive": false, "spoiler_text": "", "visibility": "public", "language": null,
+        "uri": uri, "url": uri, "replies_count": 0, "reblogs_count": 0, "favourites_count": 0,
+        "edited_at": null, "favourited": false, "reblogged": false, "muted": false,
+        "bookmarked": false, "pinned": false, "content": html_text(content), "reblog": null,
+        "application": null, "account": account, "media_attachments": [], "mentions": [], "tags": [],
+        "emojis": [], "card": null, "poll": null, "quote": null})
+}
+
+async fn serialize_candidate(db: &Client, source: &str, source_pk: i64, object_id: Option<&str>, created: &str) -> Option<Value> {
+    match source {
+        "event" => {
+            let r = db.query_opt("SELECT actor_id, COALESCE(summary,''), COALESCE(object_id,''), COALESCE(host,'') FROM events WHERE id = $1", &[&source_pk]).await.ok()??;
+            let actor: String = r.get(0); let text: String = r.get(1); let uri: String = r.get(2);
+            let host: String = r.get(3);
+            let username = actor.rsplit('/').next().unwrap_or("unknown");
+            Some(status_json(status_id(created, source_pk, 1), created, if uri.is_empty() { actor.as_str() } else { uri.as_str() }, &text, account_json(&actor, username, username, &host, None)))
+        }
+        "mention" => {
+            let r = db.query_opt("SELECT actor_id, COALESCE(content,''), COALESCE(object_id,'') FROM mentions WHERE id = $1 AND deleted_at IS NULL", &[&source_pk]).await.ok()??;
+            let actor: String = r.get(0); let text: String = r.get(1); let uri: String = r.get(2);
+            let username = actor.rsplit('/').next().unwrap_or("unknown");
+            Some(status_json(status_id(created, source_pk, 2), created, if uri.is_empty() { actor.as_str() } else { uri.as_str() }, &text, account_json(&actor, username, username, "", None)))
+        }
+        "status" => {
+            let r = db.query_opt("SELECT note_id, COALESCE(content_text,''), COALESCE(published,'') FROM masto_statuses WHERE local_id = $1", &[&source_pk]).await.ok()??;
+            let uri: String = r.get(0); let text: String = r.get(1); let published: String = r.get(2);
+            let actor = uri.split("/notes/").next().unwrap_or("https://mkultra.monster/users/cmdr_nova").to_string();
+            let username = actor.rsplit('/').next().unwrap_or("cmdr_nova");
+            Some(status_json(status_id(&published, source_pk, 0), &published, &uri, &text, account_json(&actor, username, username, "mkultra.monster", None)))
+        }
+        "bsky_post" => {
+            let uri = object_id.unwrap_or("");
+            let r = db.query_opt("SELECT COALESCE(raw_json,''), COALESCE(author_did,''), COALESCE(author_handle,''), COALESCE(author_display,'') FROM bsky_posts WHERE bsky_uri = $1", &[&uri]).await.ok()??;
+            let raw: String = r.get(0); let did: String = r.get(1); let handle: String = r.get(2); let display: String = r.get(3);
+            let post = serde_json::from_str::<Value>(&raw).ok().and_then(|v| v.get("post").cloned().or(Some(v))).unwrap_or(Value::Null);
+            let text = post.get("record").and_then(|v| v.get("text")).and_then(Value::as_str).or_else(|| post.get("text").and_then(Value::as_str)).unwrap_or("");
+            let user = if handle.is_empty() { did.as_str() } else { handle.as_str() };
+            let actor = format!("https://bsky.app/profile/{user}");
+            Some(status_json(uri.to_string(), created, uri, text, account_json(&actor, user, &display, "bsky.app", None)))
+        }
+        _ => None,
+    }
+}
+
 async fn candidate_actor(db: &Client, source: &str, source_pk: i64) -> Result<(String, String)> {
     match source {
         "event" => {
@@ -163,7 +236,7 @@ async fn bsky_rows(db: &Client, hidden: &HiddenSets, query: &str, limit: i64) ->
         let rank = terms.iter().map(|term| lower.matches(term).count() as f64).sum();
         out.push(SearchRow {
             source: "bsky_post".into(), source_pk: 0, object_id: Some(uri),
-            created_at, rank,
+            created_at, rank, status: None,
         });
         if out.len() >= limit as usize { break; }
     }
@@ -268,7 +341,7 @@ pub async fn project(
     if kind == "remote_url" || query.trim_start().starts_with("http://") || query.trim_start().starts_with("https://") {
         return Ok(SearchResults {
             owner_id, actor_key, query: query.to_string(), query_type: kind,
-            normalized_query: None, rows: Vec::new(), privacy_filtered: false,
+            normalized_query: None, rows: Vec::new(), statuses: Vec::new(), privacy_filtered: false,
             accounts: Vec::new(), hashtags: Vec::new(), redirect_url: Some(query.trim().to_string()),
             fallback: "php", source: "vaak-worker-shadow", mutation_enabled: false,
         });
@@ -277,7 +350,7 @@ pub async fn project(
     if kind == "accounts" {
         let accounts = account_rows(&db, &hidden, query, limit).await?;
         return Ok(SearchResults { owner_id, actor_key, query: query.to_string(), query_type: kind,
-            normalized_query: None, rows: Vec::new(), accounts, hashtags: Vec::new(), redirect_url: None,
+            normalized_query: None, rows: Vec::new(), statuses: Vec::new(), accounts, hashtags: Vec::new(), redirect_url: None,
             privacy_filtered: true, fallback: "php", source: "vaak-worker-shadow", mutation_enabled: false });
     }
     let match_query = if kind == "hashtags" {
@@ -287,7 +360,7 @@ pub async fn project(
     };
     let Some(match_query) = match_query else {
         return Ok(SearchResults { owner_id, actor_key, query: query.to_string(), query_type: kind,
-            normalized_query: None, rows: Vec::new(), accounts: Vec::new(), hashtags: Vec::new(), redirect_url: None, privacy_filtered: true,
+            normalized_query: None, rows: Vec::new(), statuses: Vec::new(), accounts: Vec::new(), hashtags: Vec::new(), redirect_url: None, privacy_filtered: true,
             fallback: "php", source: "vaak-worker-shadow", mutation_enabled: false });
     };
     let tsquery = postgres_tsquery(&match_query);
@@ -310,6 +383,7 @@ pub async fn project(
         }
         rows.push(SearchRow {
             source, source_pk, object_id: row.get(2), created_at: row.get(3), rank: row.get(4),
+            status: None,
         });
     }
     rows.truncate(limit as usize);
@@ -318,9 +392,15 @@ pub async fn project(
         rows.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal).then_with(|| b.created_at.cmp(&a.created_at)));
         rows.truncate(limit as usize);
     }
+    let mut statuses = Vec::new();
+    for row in &rows {
+        if let Some(status) = serialize_candidate(&db, &row.source, row.source_pk, row.object_id.as_deref(), &row.created_at).await {
+            statuses.push(status);
+        }
+    }
     let hashtags = if kind == "hashtags" { hashtag_rows(&db, owner_id, tag.unwrap_or(query), limit).await.unwrap_or_default() } else { Vec::new() };
     Ok(SearchResults { owner_id, actor_key, query: query.to_string(), query_type: kind,
-        normalized_query: Some(match_query), rows, accounts: Vec::new(), hashtags, redirect_url: None, privacy_filtered: true,
+        normalized_query: Some(match_query), rows, statuses, accounts: Vec::new(), hashtags, redirect_url: None, privacy_filtered: true,
         fallback: "php", source: "vaak-worker-shadow", mutation_enabled: false })
 }
 

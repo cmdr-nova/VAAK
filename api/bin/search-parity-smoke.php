@@ -51,20 +51,23 @@ try {
         || ($text['fallback'] ?? '') !== 'php'
         || ($text['privacy_filtered'] ?? false) !== true
         || !is_array($text['accounts'] ?? null)
-        || !is_array($text['hashtags'] ?? null)) {
+        || !is_array($text['hashtags'] ?? null)
+        || !is_array($text['statuses'] ?? null)) {
         throw new RuntimeException('text indexed projection parity failed');
     }
     $tag = $call($resultBase . '/shadow/search-results?owner_id=' . $owner . '&q=%23vaak&tag=vaak&search_type=hashtags');
     if (($tag['query_type'] ?? '') !== 'hashtags'
         || ($tag['normalized_query'] ?? '') !== 'htag_vaak OR vaak'
         || !is_array($tag['rows'] ?? null)
-        || !is_array($tag['hashtags'] ?? null)) {
+        || !is_array($tag['hashtags'] ?? null)
+        || !is_array($tag['statuses'] ?? null)) {
         throw new RuntimeException('hashtag indexed projection parity failed');
     }
     $accounts = $call($resultBase . '/shadow/search-results?owner_id=' . $owner . '&q=alice&search_type=accounts');
     if (($accounts['fallback'] ?? '') !== 'php'
         || !empty($accounts['rows'] ?? [])
-        || !is_array($accounts['accounts'] ?? null)) {
+        || !is_array($accounts['accounts'] ?? null)
+        || !is_array($accounts['statuses'] ?? null)) {
         throw new RuntimeException('account PHP fallback marker missing');
     }
     echo "search-parity: PASS (FTS text/tag normalization, ordering shape, privacy filters, PHP account/URL fallback)\n";
