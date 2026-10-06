@@ -61,6 +61,10 @@ pub struct OwnerQuery {
     pub kind: Option<String>,
     /// Read-only Followers/Following projection kind.
     pub relationship: Option<String>,
+    /// Search projection query and type (text/hashtags/accounts/remote_url).
+    pub q: Option<String>,
+    pub search_type: Option<String>,
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +125,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/you-integrations", get(shadow_you_integrations))
         .route("/shadow/private-surfaces", get(shadow_private_surfaces))
         .route("/shadow/search-contract", get(shadow_search_contract))
+        .route("/shadow/search-results", get(shadow_search_results))
         .route("/shadow/library-data", get(shadow_library_data))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
@@ -183,6 +188,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/you-integrations",
             "/shadow/private-surfaces",
             "/shadow/search-contract",
+            "/shadow/search-results",
             "/shadow/library-data",
             "/shadow/jetstream",
             "/shadow/thin-media",
@@ -812,6 +818,19 @@ async fn shadow_search_contract(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     json_result(crate::search_contract::project(&state.cfg, owner).await)
+}
+
+/// Read-only indexed Search projection. Accounts and remote URLs deliberately
+/// return a PHP fallback marker until remote/account hydration is fixture-safe.
+async fn shadow_search_results(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let query = q.q.as_deref().unwrap_or("");
+    json_result(crate::search::project(
+        &state.cfg, owner, query, q.search_type.as_deref(), q.tag.as_deref(), q.limit.unwrap_or(25),
+    ).await)
 }
 
 async fn shadow_library_data(
