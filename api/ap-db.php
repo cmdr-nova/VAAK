@@ -13860,6 +13860,27 @@ function ap_html_sanitize_allowlist(string $html, string $allowedTags = '<p><br>
 }
 
 /**
+ * Render a profile PropertyValue field safely. Profile-field links are
+ * user-supplied external destinations, so they must not replace the active
+ * VAAK page when clicked.
+ */
+function ap_profile_field_html(string $html): string
+{
+    $safe = ap_html_sanitize_allowlist($html, '<a>');
+    return preg_replace_callback(
+        '/<a\b([^>]*)>/i',
+        static function (array $m): string {
+            $attrs = (string) ($m[1] ?? '');
+            if (preg_match('/\btarget\s*=/i', $attrs)) {
+                return '<a' . $attrs . '>';
+            }
+            return '<a' . $attrs . ' target="_blank">';
+        },
+        $safe
+    ) ?? $safe;
+}
+
+/**
  * Keep Bridgy/Mastodon DM HTML usable: allow formatting + https links only.
  */
 function ap_dm_sanitize_html(string $html): string

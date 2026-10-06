@@ -748,8 +748,8 @@ function ap_user_profile_html(string $actorKey, string $actorId): void
                 continue;
             }
             $ln = htmlspecialchars((string) ($att['name'] ?? ''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-            $lv = function_exists('ap_html_sanitize_allowlist')
-                ? ap_html_sanitize_allowlist((string) ($att['value'] ?? ''), '<a>')
+            $lv = function_exists('ap_profile_field_html')
+                ? ap_profile_field_html((string) ($att['value'] ?? ''))
                 : htmlspecialchars(strip_tags((string) ($att['value'] ?? '')), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
             if ($ln === '' || $lv === '') {
                 continue;
