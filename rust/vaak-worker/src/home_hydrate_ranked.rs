@@ -830,6 +830,7 @@ struct RssRow {
     feed_url: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct BskyRow {
     pub(crate) uri: String,
     pub(crate) author_did: String,
@@ -1669,10 +1670,12 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
     if targets.is_empty() { return Ok(()); }
     let bsky_targets: Vec<String> = targets
         .iter()
-        .filter(|target| target.starts_with("at://"))
+        .filter(|target| !target.starts_with(LOCAL_ACTOR_PREFIX))
         .cloned()
         .collect();
-    let bsky_quotes = fetch_bsky_map(db, &bsky_targets).await.unwrap_or_default();
+    let bsky_quotes = fetch_bsky_map_for_targets(db, &bsky_targets)
+        .await
+        .unwrap_or_default();
     let local_targets: Vec<String> = targets
         .iter()
         .filter(|target| target.starts_with(LOCAL_ACTOR_PREFIX))
@@ -2069,6 +2072,61 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
         }
     }
     Ok(map)
+}
+
+pub(crate) async fn fetch_bsky_map_for_targets(
+    db: &Client,
+    targets: &[String],
+) -> Result<HashMap<String, BskyRow>> {
+    let direct: Vec<String> = targets
+        .iter()
+        .filter(|target| target.starts_with("at://"))
+        .cloned()
+        .collect();
+    let canonical = fetch_bsky_map(db, &direct).await?;
+    let mut out = HashMap::new();
+    for target in &direct {
+        if let Some(row) = canonical.get(target) {
+            out.insert(target.clone(), row.clone());
+        }
+    }
+    for target in targets
+        .iter()
+        .filter(|target| target.starts_with("https://bsky.app/profile/"))
+    {
+        let Some(rest) = target.strip_prefix("https://bsky.app/profile/") else {
+            continue;
+        };
+        let Some((actor, rkey)) = rest.split_once("/post/") else {
+            continue;
+        };
+        if actor.is_empty() || rkey.is_empty() {
+            continue;
+        }
+        let suffix = format!("%/{rkey}");
+        let row = db
+            .query_opt(
+                "SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE $1 AND lower(author_handle)=lower($2) LIMIT 1",
+                &[&suffix, &actor],
+            )
+            .await?;
+        let row = match row {
+            Some(row) => Some(row),
+            None => db
+                .query_opt(
+                    "SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE $1 LIMIT 1",
+                    &[&suffix],
+                )
+                .await?,
+        };
+        let Some(row) = row else { continue };
+        let uri: String = row.get(0);
+        let fetched = fetch_bsky_map(db, std::slice::from_ref(&uri)).await?;
+        if let Some(post) = fetched.get(&uri) {
+            out.insert(target.clone(), post.clone());
+        }
+    }
+    Ok(out)
 }
 
 async fn fetch_events_map(db: &Client, ids: &[i64]) -> Result<HashMap<i64, EventRow>> {

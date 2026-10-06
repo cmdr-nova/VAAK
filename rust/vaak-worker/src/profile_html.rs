@@ -306,10 +306,10 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
     }
     let bsky_targets: Vec<String> = targets
         .iter()
-        .filter(|target| target.starts_with("at://"))
+        .filter(|target| !target.starts_with(LOCAL_ACTOR_PREFIX))
         .cloned()
         .collect();
-    let bsky_quotes = crate::home_hydrate_ranked::fetch_bsky_map(db, &bsky_targets)
+    let bsky_quotes = crate::home_hydrate_ranked::fetch_bsky_map_for_targets(db, &bsky_targets)
         .await
         .unwrap_or_default();
     let local_targets: Vec<String> = targets
