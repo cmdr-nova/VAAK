@@ -5154,10 +5154,10 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
     if (is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks', $folderId))) {
         $items = is_array($bookmarkData['bsky_rows'] ?? null) ? $bookmarkData['bsky_rows'] : [];
-        header('X-Has-More: ' . ((count($items) >= $limit) ? '1' : '0'));
+        header('X-Has-More: ' . (!empty($bookmarkData['has_more_bsky']) ? '1' : '0'));
         header('X-VAAK-Fragment: axum-data');
         ob_start();
-        echo '<div data-bsky-bookmark-fragment data-offset="' . (int) count($items) . '" data-limit="' . (int) $limit . '" data-has-more="' . ((count($items) >= $limit) ? '1' : '0') . '" data-loaded="1">';
+        echo '<div data-bsky-bookmark-fragment data-offset="' . (int) count($items) . '" data-limit="' . (int) $limit . '" data-has-more="' . (!empty($bookmarkData['has_more_bsky']) ? '1' : '0') . '" data-loaded="1">';
         if ($items === []) echo '<div class="empty" data-bsky-bookmark-empty>' . ($folderId > 0 ? 'No Bluesky bookmarks in this folder.' : 'No cached Bluesky bookmarks yet. They will appear after the background sync completes.') . '</div>';
         else { echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>'; foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'bookmarks'); }
         echo '</div>';
@@ -5246,7 +5246,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
     if (is_array($favData = admin_library_data_axum_fetch($vaakOwnerId, $offset, $limit))) {
         $items = $favData['bsky_rows'];
-        $hasMore = ($offset + $limit) < (int) ($favData['total_bsky'] ?? 0);
+        $hasMore = !empty($favData['has_more_bsky']);
         ob_start();
         echo '<div data-bsky-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-loaded="1">';
         if ($items === [] && $offset === 0) {

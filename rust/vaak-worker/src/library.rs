@@ -15,6 +15,7 @@ pub struct FavouritesProjection {
     pub offset: i64,
     pub limit: i64,
     pub has_more_fedi: bool,
+    pub has_more_bsky: bool,
     pub source: &'static str,
     pub note: &'static str,
 }
@@ -29,6 +30,7 @@ pub struct BookmarksProjection {
     pub offset: i64,
     pub limit: i64,
     pub has_more_fedi: bool,
+    pub has_more_bsky: bool,
     pub source: &'static str,
     pub note: &'static str,
 }
@@ -63,7 +65,7 @@ pub async fn favourites(cfg: &crate::config::Config, owner_id: i64, offset: i64,
         Some(v)
     }).collect::<Vec<_>>();
     let total_bsky: i64 = db.query_opt("SELECT COUNT(*) FROM bsky_favourite_cache WHERE owner_user_id = $1", &[&owner_id]).await.ok().flatten().map(|r| r.get(0)).unwrap_or(0);
-    Ok(FavouritesProjection { owner_id, fedi_rows, bsky_rows, total_fedi, total_bsky, offset, limit, has_more_fedi: offset + limit < total_fedi, source: "vaak-worker-shadow", note: "Read-only favourites projection; PHP remains the card renderer and favourite/unfavourite owner." })
+    Ok(FavouritesProjection { owner_id, fedi_rows, bsky_rows, total_fedi, total_bsky, offset, limit, has_more_fedi: offset + limit < total_fedi, has_more_bsky: offset + limit < total_bsky, source: "vaak-worker-shadow", note: "Read-only favourites projection; PHP remains the card renderer and favourite/unfavourite owner." })
 }
 
 pub async fn bookmarks(cfg: &crate::config::Config, owner_id: i64, offset: i64, limit: i64, folder_id: Option<i64>) -> Result<BookmarksProjection> {
@@ -109,7 +111,7 @@ pub async fn bookmarks(cfg: &crate::config::Config, owner_id: i64, offset: i64, 
         Some(v)
     }).collect::<Vec<_>>();
     let total_bsky: i64 = db.query_opt("SELECT COUNT(*) FROM bsky_bookmark_cache c WHERE c.owner_user_id = $1 AND ($2::bigint IS NULL OR EXISTS (SELECT 1 FROM vaak_bookmark_folder_items fi LEFT JOIN masto_bookmarks mb ON mb.owner_user_id = c.owner_user_id AND mb.status_id = fi.status_id WHERE fi.folder_id = $2 AND fi.owner_user_id = $1 AND (fi.status_id = c.bookmark_uri OR mb.object_id = c.bookmark_uri)))", &[&owner_id, &folder_id]).await.ok().flatten().map(|r| r.get(0)).unwrap_or(0);
-    Ok(BookmarksProjection { owner_id, fedi_rows, bsky_rows, total_fedi, total_bsky, offset, limit, has_more_fedi: offset + limit < total_fedi, source: "vaak-worker-shadow", note: "Read-only bookmarks projection; PHP remains the folder and bookmark mutation owner." })
+    Ok(BookmarksProjection { owner_id, fedi_rows, bsky_rows, total_fedi, total_bsky, offset, limit, has_more_fedi: offset + limit < total_fedi, has_more_bsky: offset + limit < total_bsky, source: "vaak-worker-shadow", note: "Read-only bookmarks projection; PHP remains the folder and bookmark mutation owner." })
 }
 
 fn r_to_json(row: &tokio_postgres::Row) -> Value {
