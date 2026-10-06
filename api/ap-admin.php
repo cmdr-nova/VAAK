@@ -24820,8 +24820,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       <details class="nav-group" data-nav-key="library" <?= $navLibraryOpen ? 'open' : '' ?>>
         <summary><span class="ico">☰</span><span class="label">Library</span></summary>
         <div class="nav-sub">
-          <a class="<?= $view === 'favourites' ? 'active' : '' ?>" href="?view=favourites" data-vaak-soft-nav="favourites"><span class="ico"><i class="ph ph-star" aria-hidden="true"></i></span><span class="label">Favourites</span></a>
-          <a class="<?= $view === 'bookmarks' ? 'active' : '' ?>" href="?view=bookmarks" data-vaak-soft-nav="bookmarks"><span class="ico"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></span><span class="label">Bookmarks</span></a>
+          <a class="<?= $view === 'favourites' ? 'active' : '' ?>" href="/vaak/?view=favourites" data-vaak-soft-nav="favourites"><span class="ico"><i class="ph ph-star" aria-hidden="true"></i></span><span class="label">Favourites</span></a>
+          <a class="<?= $view === 'bookmarks' ? 'active' : '' ?>" href="/vaak/?view=bookmarks" data-vaak-soft-nav="bookmarks"><span class="ico"><i class="ph ph-bookmark-simple" aria-hidden="true"></i></span><span class="label">Bookmarks</span></a>
           <a class="<?= $view === 'followers' ? 'active' : '' ?>" href="?view=followers" data-vaak-soft-nav="followers"><span class="ico">◎</span><span class="label">Followers</span></a>
           <a class="<?= $view === 'following' ? 'active' : '' ?>" href="?view=following" data-vaak-soft-nav="following"><span class="ico">⇄</span><span class="label">Following</span></a>
           <a class="<?= $view === 'tags' ? 'active' : '' ?>" href="?view=tags"><span class="ico">＃</span><span class="label">Hashtags</span></a>
