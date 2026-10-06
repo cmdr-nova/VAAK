@@ -1170,6 +1170,10 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
     if text.contains('<') {
         text = strip_tags_simple(&text);
     }
+    let (quote_commentary, quote_preview) = split_quote_summary(&text);
+    if quote_preview.is_some() {
+        text = quote_commentary;
+    }
     if matches!(
         text.trim(),
         "(attachment)" | "(media)" | "(poll)" | "(quote)" | "(boost)"
@@ -1195,7 +1199,89 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
             "ask_answer": row.ask_answer,
         });
     }
+    if let Some(quote) = quote_preview {
+        st["vaak_quote_preview"] = quote;
+    }
     st
+}
+
+/// PHP parity fallback for ActivityPub/Wafrn quote summaries. Native event
+/// rows may only retain the enriched summary, so synthesize the same lean
+/// quote status shape used by the shared painter instead of leaking `↪ QT` or
+/// `RE:` markup into the post body.
+fn split_quote_summary(summary: &str) -> (String, Option<Value>) {
+    let raw = summary.trim();
+    if raw.is_empty() {
+        return (String::new(), None);
+    }
+    let re = regex::Regex::new(
+        r"(?is)^(.*?)(?:\n\s*\n|\n)(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b\s*(?:@([^\s:]+)\s*)?:\s*(.*?)\s*$",
+    )
+    .ok();
+    let captures = re.as_ref().and_then(|r| r.captures(raw));
+    let (commentary, acct, quoted) = if let Some(c) = captures {
+        (
+            c.get(1).map(|m| m.as_str().trim()).unwrap_or(""),
+            c.get(2).map(|m| m.as_str().trim()).unwrap_or(""),
+            c.get(3).map(|m| m.as_str().trim()).unwrap_or(""),
+        )
+    } else {
+        let re_url = regex::Regex::new(r"(?is)^(.*?)\n\s*RE:\s*(https://\S+)\s*$").ok();
+        let Some(c) = re_url.as_ref().and_then(|r| r.captures(raw)) else {
+            return (raw.to_string(), None);
+        };
+        (
+            c.get(1).map(|m| m.as_str().trim()).unwrap_or(""),
+            "",
+            c.get(2).map(|m| m.as_str().trim()).unwrap_or(""),
+        )
+    };
+    if quoted.is_empty() {
+        return (commentary.to_string(), None);
+    }
+    let url = regex::Regex::new(r"https://[^\s<>]+")
+        .ok()
+        .and_then(|r| r.find(quoted).map(|m| m.as_str().trim_end_matches(['.', ',', ')']).to_string()))
+        .unwrap_or_default();
+    let acct = acct.trim_start_matches('@');
+    let display = if acct.is_empty() { "Quoted post" } else { acct };
+    let account_url = if url.is_empty() { String::new() } else { url.clone() };
+    let quote_id = if url.is_empty() {
+        let mut hasher = Sha256::new();
+        hasher.update(quoted.as_bytes());
+        format!("quote:{}", &hex::encode(hasher.finalize())[..24])
+    } else {
+        url.clone()
+    };
+    let account = json!({
+        "id": if acct.is_empty() { "quote:unknown" } else { acct },
+        "username": display,
+        "acct": if acct.is_empty() { "quoted" } else { acct },
+        "display_name": display,
+        "avatar": DEFAULT_AVATAR,
+        "avatar_static": DEFAULT_AVATAR,
+        "url": account_url,
+        "uri": if url.is_empty() { String::new() } else { url.clone() },
+        "emojis": [],
+        "fields": []
+    });
+    let mut preview = json!({
+        "id": quote_id,
+        "uri": if url.is_empty() { String::new() } else { url.clone() },
+        "url": url,
+        "created_at": "",
+        "content": plain_to_html(quoted),
+        "account": account,
+        "media_attachments": [],
+        "card": Value::Null,
+        "sensitive": false,
+        "spoiler_text": "",
+        "emojis": []
+    });
+    if let Some(obj) = preview.as_object_mut() {
+        obj.insert("source".into(), json!("quote-summary"));
+    }
+    (commentary.to_string(), Some(preview))
 }
 
 fn local_username_from_url(url: &str) -> Option<String> {
@@ -2904,6 +2990,27 @@ mod tests {
             assert_eq!(status["spoiler_text"], json!("Gallery"));
             assert_eq!(status["content"], json!(""));
         }
+    }
+
+    #[test]
+    fn quote_summary_becomes_structured_preview_and_keeps_commentary() {
+        let (commentary, quote) = split_quote_summary(
+            "My commentary\n\n↪ QT @alice@example.test: quoted words https://example.test/posts/9",
+        );
+        assert_eq!(commentary, "My commentary");
+        let quote = quote.expect("quote preview");
+        assert_eq!(quote["account"]["acct"], "alice@example.test");
+        assert_eq!(quote["url"], "https://example.test/posts/9");
+        assert!(quote["content"].as_str().unwrap_or("").contains("quoted words"));
+    }
+
+    #[test]
+    fn quote_summary_supports_re_permalink_fallback() {
+        let (commentary, quote) = split_quote_summary(
+            "A reply\nRE: https://example.test/@alice/9",
+        );
+        assert_eq!(commentary, "A reply");
+        assert_eq!(quote.expect("quote preview")["url"], "https://example.test/@alice/9");
     }
 
     #[test]
