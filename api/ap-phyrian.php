@@ -823,11 +823,23 @@ function ap_phyrian_request_resolve(int $ownerUserId, int $requestId, bool $acce
 /**
  * @return list<array{id:int,username:string,actor_key:string,status:string,strain:?string,resonance:int,generation:int,stability:string}>
  */
-function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
+function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40, int $offset = 0, string $search = ''): array
 {
     ap_phyrian_migrate();
     $limit = max(1, min(80, $limit));
+    $offset = max(0, $offset);
+    $search = trim($search);
     try {
+        $whereSearch = '';
+        $params = [$viewerOwnerId];
+        if ($search !== '') {
+            $whereSearch = ' AND (u.username ILIKE ? OR u.actor_key ILIKE ?)';
+            $needle = '%' . $search . '%';
+            $params[] = $needle;
+            $params[] = $needle;
+        }
+        $params[] = $limit;
+        $params[] = $offset;
         $st = ap_db()->prepare(
             "SELECT u.id, u.username, u.actor_key, u.actor_id,
                     COALESCE(p.status, 'unknown') AS status,
@@ -838,10 +850,11 @@ function ap_phyrian_local_directory(int $viewerOwnerId, int $limit = 40): array
              FROM ap_users u
              LEFT JOIN phyrian_players p ON p.owner_user_id = u.id
              WHERE u.disabled_at IS NULL AND u.id <> ?
+             {$whereSearch}
              ORDER BY lower(u.username) ASC
-             LIMIT ?"
+             LIMIT ? OFFSET ?"
         );
-        $st->execute([$viewerOwnerId, $limit]);
+        $st->execute($params);
         $out = [];
         foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
             if (!is_array($row)) {

@@ -5048,14 +5048,15 @@ function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, strin
 }
 
 /** Structured read-only Favourites projection; PHP still hydrates/cards/writes. */
-function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $limit = 20): ?array
+function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $limit = 20, string $libraryKind = 'favourites'): ?array
 {
     if ($ownerUserId < 1 || !function_exists('curl_init')) return null;
     $base = getenv('VAAK_SHADOW_HTTP');
     $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
     $host = parse_url($base, PHP_URL_HOST);
     if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
-    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => 'favourites', 'offset' => max(0, $offset), 'limit' => max(10, min(40, $limit))]));
+    $libraryKind = in_array($libraryKind, ['favourites', 'bookmarks'], true) ? $libraryKind : 'favourites';
+    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => $libraryKind, 'offset' => max(0, $offset), 'limit' => max(10, min(40, $limit))]));
     if ($ch === false) return null;
     curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
     $raw = curl_exec($ch);
@@ -5076,6 +5077,24 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_fedi') {
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
     $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
+    if ($folderId === 0 && is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks'))) {
+        $items = [];
+        foreach ($bookmarkData['fedi_rows'] as $bookmarkRow) {
+            if (is_array($bookmarkRow) && function_exists('ap_masto_interaction_row_to_status')) {
+                $status = ap_masto_interaction_row_to_status($bookmarkRow, 'bookmarked');
+                if (is_array($status)) $items[] = $status;
+            }
+        }
+        header('X-Has-More: ' . (!empty($bookmarkData['has_more_fedi']) ? '1' : '0'));
+        header('X-VAAK-Fragment: axum-data');
+        ob_start();
+        echo '<div data-fedi-bookmark-fragment data-offset="' . (int) count($items) . '" data-limit="' . (int) $limit . '" data-has-more="' . (!empty($bookmarkData['has_more_fedi']) ? '1' : '0') . '">';
+        if ($items === []) echo '<div class="empty" data-fedi-bookmark-empty>No Fediverse bookmarks yet.</div>';
+        else { echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Fediverse bookmarks</h3>'; $GLOBALS['admin_library_fetch_budget'] = 3; foreach ($items as $item) admin_render_library_status_card($item, 'bookmarks'); }
+        echo '</div>';
+        echo ob_get_clean();
+        exit;
+    }
     if (is_array($axumFrag = admin_library_fragment_axum_fetch('bookmarks_fedi', $vaakOwnerId, $fragSuffix))) {
         header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
     }
@@ -5133,6 +5152,18 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
     $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
+    if ($folderId === 0 && is_array($bookmarkData = admin_library_data_axum_fetch($vaakOwnerId, 0, $limit, 'bookmarks'))) {
+        $items = is_array($bookmarkData['bsky_rows'] ?? null) ? $bookmarkData['bsky_rows'] : [];
+        header('X-Has-More: ' . ((count($items) >= $limit) ? '1' : '0'));
+        header('X-VAAK-Fragment: axum-data');
+        ob_start();
+        echo '<div data-bsky-bookmark-fragment data-offset="' . (int) count($items) . '" data-limit="' . (int) $limit . '" data-has-more="' . ((count($items) >= $limit) ? '1' : '0') . '" data-loaded="1">';
+        if ($items === []) echo '<div class="empty" data-bsky-bookmark-empty>No cached Bluesky bookmarks yet. They will appear after the background sync completes.</div>';
+        else { echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky bookmarks</h3>'; foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'bookmarks'); }
+        echo '</div>';
+        echo ob_get_clean();
+        exit;
+    }
     if (is_array($axumFrag = admin_library_fragment_axum_fetch('bookmarks_bsky', $vaakOwnerId, $fragSuffix))) {
         header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
     }
@@ -31837,8 +31868,11 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $phyPending = ($vaakOwnerId > 0 && function_exists('ap_phyrian_pending_for'))
               ? ap_phyrian_pending_for((int) $vaakOwnerId)
               : [];
+          $phyDirectoryPageSize = 10;
+          $phyDirectorySearch = trim((string) ($_GET['player_search'] ?? ''));
+          $phyDirectoryOffset = max(0, (int) ($_GET['player_offset'] ?? 0));
           $phyDirectory = ($vaakOwnerId > 0 && function_exists('ap_phyrian_local_directory'))
-              ? ap_phyrian_local_directory((int) $vaakOwnerId, 40)
+              ? ap_phyrian_local_directory((int) $vaakOwnerId, $phyDirectoryPageSize, $phyDirectoryOffset, $phyDirectorySearch)
               : [];
           $phyCheckedInToday = false;
           $phyLastCheckin = (string) ($phyPlayer['last_checkin_at'] ?? '');
@@ -32209,6 +32243,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <img src="<?= h($phyAsset('icon-profile.png')) ?>" alt="" width="40" height="40" decoding="async">
             Local players
           </h3>
+          <form method="get" action="" class="phyrian-player-search" style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:0 0 .75rem">
+            <input type="hidden" name="view" value="phyrian">
+            <input type="search" name="player_search" value="<?= h($phyDirectorySearch) ?>" placeholder="Search local players…" aria-label="Search local players" style="flex:1;min-width:12rem">
+            <button class="btn btn-ghost" type="submit">Search</button>
+            <?php if ($phyDirectorySearch !== ''): ?><a class="btn btn-ghost" href="?view=phyrian">Clear</a><?php endif; ?>
+          </form>
           <?php if (!$phyDirectory): ?>
             <div class="empty">No other local accounts yet. Imprint and resonance stay on this instance for Phase 1.</div>
           <?php else: ?>
@@ -32274,6 +32314,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                 </article>
               <?php endforeach; ?>
             </div>
+            <nav aria-label="Local player pages" style="display:flex;justify-content:space-between;gap:.75rem;margin-top:.75rem">
+              <?php if ($phyDirectoryOffset > 0): ?>
+                <a class="btn btn-ghost" href="?view=phyrian&amp;player_search=<?= rawurlencode($phyDirectorySearch) ?>&amp;player_offset=<?= max(0, $phyDirectoryOffset - $phyDirectoryPageSize) ?>">Previous</a>
+              <?php else: ?><span></span><?php endif; ?>
+              <?php if (count($phyDirectory) === $phyDirectoryPageSize): ?>
+                <a class="btn btn-ghost" href="?view=phyrian&amp;player_search=<?= rawurlencode($phyDirectorySearch) ?>&amp;player_offset=<?= $phyDirectoryOffset + $phyDirectoryPageSize ?>">Next</a>
+              <?php endif; ?>
+            </nav>
           <?php endif; ?>
           <?php endif; /* hub */ ?>
         </section>
