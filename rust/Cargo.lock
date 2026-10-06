@@ -1970,7 +1970,6 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
- "rand",
  "redis",
  "regex",
  "reqwest",
