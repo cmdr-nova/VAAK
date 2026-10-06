@@ -1260,6 +1260,44 @@ async fn load_downrank_terms(db: &Client) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+async fn load_deprioritized_actors(db: &Client, owner: i64) -> HashSet<String> {
+    if owner < 1 {
+        return HashSet::new();
+    }
+    let rows = db
+        .query(
+            "SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = $1",
+            &[&owner],
+        )
+        .await
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| row.try_get::<_, Option<String>>(0).ok().flatten())
+        .map(|actor| actor.trim().trim_end_matches('/').to_ascii_lowercase())
+        .filter(|actor| !actor.is_empty())
+        .collect()
+}
+
+/// PHP parity: Home-only Deprioritize shifts an author's sort timestamp back
+/// six hours. It remains a soft rank adjustment; Local/Federated are untouched.
+fn apply_deprioritized_rank(timeline: &mut [TimelineItem], actors: &HashSet<String>) {
+    if actors.is_empty() {
+        return;
+    }
+    const PENALTY_SECS: i64 = 6 * 3600;
+    for item in timeline.iter_mut() {
+        let actor = item
+            .pref_actor
+            .as_str()
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        if !actor.is_empty() && actors.contains(&actor) {
+            item.sort -= PENALTY_SECS;
+        }
+    }
+}
+
 async fn load_suppression_map(
     db: &Client,
     owner: i64,
@@ -2147,6 +2185,8 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
 
     let mut timeline = fetch_home_events(&db, &ap_following, &actor_id, &hidden).await?;
     timeline.extend(fetch_own_outbox(&db, &actor_id).await?);
+    let deprioritized = load_deprioritized_actors(&db, owner_user_id).await;
+    apply_deprioritized_rank(&mut timeline, &deprioritized);
 
     if algorithm_on {
         // Match PHP order: recommendations → toxicity → favourite.
@@ -2441,6 +2481,26 @@ mod tests {
         assert!(phrase_matches_text("you are a retard for this", "retard"));
         assert!(!phrase_matches_text("tagged #retard in bio", "retard"));
         assert!(phrase_matches_text("please kill yourself now", "kill yourself"));
+    }
+
+    #[test]
+    fn deprioritize_is_home_only_six_hour_soft_penalty() {
+        let actor = "https://remote.example/users/loud".to_string();
+        let mut timeline = vec![TimelineItem::event(
+            "1".into(),
+            100_000,
+            actor.clone(),
+            actor.clone(),
+            "hello".into(),
+            "public".into(),
+            "https://remote.example/notes/1".into(),
+            "Create".into(),
+            "home",
+        )];
+        let mut set = HashSet::new();
+        set.insert(actor);
+        apply_deprioritized_rank(&mut timeline, &set);
+        assert_eq!(timeline[0].sort, 100_000 - 6 * 3600);
     }
 
     #[test]
