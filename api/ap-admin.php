@@ -30242,6 +30242,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpBskyFollowing = false;
           $rpBskyFollowsYou = false;
           $rpBskyPosts = [];
+          $rpPrepStartedAt = microtime(true);
           // Secondary profile tabs do not need a full Bluesky author-feed
           // hydration. Keep the first paint focused on the requested tab.
           $rpRequestedTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
@@ -30668,6 +30669,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               error_log('[ap-admin] remote_profile: ' . $e->getMessage());
               $rpError = $e->getMessage();
           }
+              if (function_exists('ap_timing_record')) {
+                  ap_timing_record('profile.php.prepare', (microtime(true) - $rpPrepStartedAt) * 1000.0);
+              }
               $rpTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
               $rpAllowedTabs = ['posts', 'replies', 'boosts', 'media'];
               if ($rpIsLocal) {
