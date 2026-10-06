@@ -8279,9 +8279,19 @@ function admin_home_record_suppression(int $ownerUserId, string $actorId, array 
     try {
         $db = ap_db();
         $now = time();
-        $st = $db->prepare('SELECT score, suppressed_until, categories_json FROM ap_home_suppression WHERE owner_user_id = ? AND actor_id = ?');
+        $st = $db->prepare('SELECT score, suppressed_until, categories_json, seen_object_ids_json FROM ap_home_suppression WHERE owner_user_id = ? AND actor_id = ?');
         $st->execute([$ownerUserId, $actorId]);
         $old = $st->fetch() ?: [];
+        $objectId = rtrim(trim($objectId), '/');
+        $seen = json_decode((string) ($old['seen_object_ids_json'] ?? '[]'), true);
+        $seen = is_array($seen) ? array_values(array_filter(array_map(static fn($value): string => rtrim(trim((string) $value), '/'), $seen))) : [];
+        if ($objectId !== '' && in_array($objectId, $seen, true)) {
+            return;
+        }
+        if ($objectId !== '') {
+            $seen[] = $objectId;
+            $seen = array_slice(array_values(array_unique($seen)), -256);
+        }
         $score = max(0, (int) ($old['score'] ?? 0));
         $previousUntil = strtotime((string) ($old['suppressed_until'] ?? '')) ?: 0;
         $score = min(8, $score + 1);
@@ -8289,11 +8299,11 @@ function admin_home_record_suppression(int $ownerUserId, string $actorId, array 
         if ($previousUntil > $until) $until = $previousUntil;
         $oldCats = json_decode((string) ($old['categories_json'] ?? '[]'), true);
         $allCats = array_values(array_unique(array_merge(is_array($oldCats) ? $oldCats : [], $categories)));
-        $values = [$score, json_encode($allCats, JSON_UNESCAPED_SLASHES), gmdate('c', $until), substr($objectId, 0, 2048), gmdate('c'), $ownerUserId, $actorId];
+        $values = [$score, json_encode($allCats, JSON_UNESCAPED_SLASHES), gmdate('c', $until), substr($objectId, 0, 2048), json_encode($seen, JSON_UNESCAPED_SLASHES), gmdate('c'), $ownerUserId, $actorId];
         if ($old) {
-            $db->prepare('UPDATE ap_home_suppression SET score = ?, categories_json = ?, suppressed_until = ?, last_object_id = ?, updated_at = ? WHERE owner_user_id = ? AND actor_id = ?')->execute($values);
+            $db->prepare('UPDATE ap_home_suppression SET score = ?, categories_json = ?, suppressed_until = ?, last_object_id = ?, seen_object_ids_json = ?, updated_at = ? WHERE owner_user_id = ? AND actor_id = ?')->execute($values);
         } else {
-            $db->prepare('INSERT INTO ap_home_suppression (owner_user_id, actor_id, score, categories_json, suppressed_until, last_object_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')->execute([$ownerUserId, $actorId, $score, $values[1], $values[2], $values[3], $values[4]]);
+            $db->prepare('INSERT INTO ap_home_suppression (owner_user_id, actor_id, score, categories_json, suppressed_until, last_object_id, seen_object_ids_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')->execute([$ownerUserId, $actorId, $score, $values[1], $values[2], $values[3], $values[4], $values[5]]);
         }
     } catch (Throwable $e) {
         // Optional ranking signal; never affect timeline availability.
