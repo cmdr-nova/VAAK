@@ -8193,26 +8193,39 @@ function admin_home_downranked_actor_rows(): array
 }
 
 /** @return list<array{object_id:string,created_at:string,summary:string,categories:list<string>}> */
-function admin_home_downrank_evidence_rows(string $actorId, array $categories, int $limit = 5): array
+function admin_home_downrank_evidence_rows(string $actorId, array $categories, int $limit = 5, string $lastObjectId = ''): array
 {
     $actorId = rtrim(trim($actorId), '/');
+    $lastObjectId = rtrim(trim($lastObjectId), '/');
     $wanted = array_values(array_filter(array_map('strval', $categories)));
     if ($actorId === '' || $wanted === [] || $limit < 1) return [];
     try {
         // Keep this bounded: the page is an admin review surface and evidence
         // should come from the recent cached events that can be opened in VAAK.
         $st = ap_db()->prepare("SELECT object_id, created_at, summary
+            , spoiler_text
             FROM events
-            WHERE actor_id = ? AND visibility IN ('public', 'unlisted')
+            WHERE rtrim(actor_id, '/') = rtrim(?, '/')
+              AND visibility IN ('public', 'unlisted')
             ORDER BY created_at DESC
             LIMIT 100");
         $st->execute([$actorId]);
         $out = [];
         foreach ($st->fetchAll() ?: [] as $row) {
             $objectId = rtrim(trim((string) ($row['object_id'] ?? '')), '/');
-            $summary = trim((string) ($row['summary'] ?? ''));
+            $summary = trim(implode("\n", array_filter([
+                (string) ($row['summary'] ?? ''),
+                (string) ($row['spoiler_text'] ?? ''),
+            ], static fn(string $value): bool => trim($value) !== '')));
             if ($objectId === '' || $summary === '') continue;
             $matched = array_values(array_intersect($wanted, admin_home_toxicity_categories($summary)));
+            // A signal may have been recorded from a richer hydrated payload
+            // than the compact event row retained in the cache. The exact
+            // object that created the active signal is still useful evidence,
+            // even when its compact summary no longer reproduces the match.
+            if ($matched === [] && $lastObjectId !== '' && $objectId === $lastObjectId) {
+                $matched = $wanted;
+            }
             if ($matched === []) continue;
             $out[] = [
                 'object_id' => $objectId,
@@ -26383,7 +26396,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   $drUntil = (int) ($dr['until'] ?? 0);
                   $drCategoryList = array_values(array_filter(array_map('strval', (array) ($dr['categories'] ?? []))));
                   $drCats = implode(', ', $drCategoryList);
-                  $drEvidence = admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5);
+                  $drEvidence = admin_home_downrank_evidence_rows($drActor, $drCategoryList, 5, (string) ($dr['last_object_id'] ?? ''));
                 ?>
                 <article class="tweet downranked-item" data-dr-index="<?= (int) $drIndex ?>" style="padding:.85rem 1rem;display:none">
                   <div class="tweet-hd">
