@@ -1542,10 +1542,19 @@ fn paint_reply_context(status: &Value, from: &str) -> String {
         .or_else(|| status.get("vaak_reply_parent_display").and_then(|v| v.as_str()))
         .unwrap_or("")
         .trim();
+    // A thin Jetstream row can carry the parent DID as its temporary handle.
+    // Never render that implementation identifier to users; the hydration
+    // pass will replace it with the cached actor handle when available.
+    let cached_parent_label = if cached_parent_label.starts_with("did:") {
+        ""
+    } else {
+        cached_parent_label
+    };
     let parent_label = if !cached_parent_label.is_empty() {
         cached_parent_label
     } else if let Some(rest) = parent.strip_prefix("https://bsky.app/profile/") {
-        rest.split('/').next().unwrap_or("").trim()
+        let candidate = rest.split('/').next().unwrap_or("").trim();
+        if candidate.starts_with("did:") { "" } else { candidate }
     } else if let Some(pos) = parent.find("/users/") {
         parent[pos + 7..].split('/').next().unwrap_or("").trim()
     } else {
