@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
@@ -76,6 +77,12 @@ struct PhyrianMutation {
     request_id: Option<i64>,
     kind: Option<String>,
     accept: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhyrianBridgeRequest {
+    action: String,
+    body: Value,
 }
 
 fn truthy(raw: Option<&str>) -> bool {
@@ -148,6 +155,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         // Guarded migration endpoint. Disabled unless an internal token is
         // configured; loopback binding is still required by `serve`.
         .route("/internal/phyrian/mutate", post(internal_phyrian_mutate))
+        .route("/internal/phyrian/bridge", post(internal_phyrian_bridge))
         // Account-switch prep: ranked + badge + hydrate spawn (0.7.5).
         .route("/shadow/account-switch-prep", get(shadow_account_switch_prep))
         // Mastodon-shaped Home: hydrated status JSON from vaak:timeline:v1 (slice 4).
@@ -312,6 +320,24 @@ async fn internal_phyrian_mutate(
             Json(serde_json::json!({"error": "Unknown mutation action"})),
         )
             .into_response(),
+    }
+}
+
+async fn internal_phyrian_bridge(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(input): Json<PhyrianBridgeRequest>,
+) -> impl IntoResponse {
+    let Some(expected) = state.cfg.phyrian_mutation_token.as_deref() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Phyrian bridge route disabled"}))).into_response();
+    };
+    let supplied = headers.get("x-vaak-internal-token").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if supplied != expected {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+    match crate::phyrian::bridge_read(&state.cfg, input.action.trim(), input.body).await {
+        Ok(data) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "data": data}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
     }
 }
 
