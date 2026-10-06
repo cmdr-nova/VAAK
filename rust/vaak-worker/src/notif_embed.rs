@@ -2621,13 +2621,15 @@ pub fn paint_lean_embed_from(
             String::new()
         };
         let av_img = format!(
-            "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\">",
-            esc(av)
+            "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" data-profile-hover-actor=\"{}\">",
+            esc(av),
+            esc(actor_ref)
         );
         let av_block = if !profile_href.is_empty() {
             format!(
-                "<a href=\"{}\" style=\"text-decoration:none\">{}</a>",
+                "<a href=\"{}\" data-profile-hover-actor=\"{}\" style=\"text-decoration:none\">{}</a>",
                 esc(&profile_href),
+                esc(actor_ref),
                 av_img
             )
         } else {
@@ -2635,10 +2637,12 @@ pub fn paint_lean_embed_from(
         };
         let who = if !profile_href.is_empty() {
             format!(
-                "<a class=\"who\" href=\"{}\" style=\"color:inherit;text-decoration:none\">{}</a><a class=\"meta\" href=\"{}\" style=\"color:var(--muted);text-decoration:none\"> @{}</a>",
+                "<a class=\"who\" href=\"{}\" data-profile-hover-actor=\"{}\" style=\"color:inherit;text-decoration:none\">{}</a><a class=\"meta\" href=\"{}\" data-profile-hover-actor=\"{}\" style=\"color:var(--muted);text-decoration:none\"> @{}</a>",
                 esc(&profile_href),
+                esc(actor_ref),
                 esc(display),
                 esc(&profile_href),
+                esc(actor_ref),
                 esc(acct)
             )
         } else {
@@ -3389,6 +3393,7 @@ mod tests {
         assert!(html.contains("icon-btn"), "remote_profile must get actions: {html}");
         assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
         assert!(html.contains("view=remote_profile"), "{html}");
+        assert!(html.contains("data-profile-hover-actor=\"https://mastodon.social/users/x\""), "hover actor missing: {html}");
         assert!(!html.contains(">Open</a></div>"), "must not be Open-only: {html}");
     }
 
