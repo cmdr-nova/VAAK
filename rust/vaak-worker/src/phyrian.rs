@@ -6,6 +6,7 @@
 //! mutation or OpenSim bridge ownership moves.
 
 use anyhow::{Context, Result};
+use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 use rand::Rng;
@@ -491,6 +492,35 @@ pub fn decode_bridge_response(http: i64, raw: &str) -> Value {
         .map(str::to_string)
         .unwrap_or_else(|| format!("Strains HTTP {http}"));
     serde_json::json!({"ok": false, "http": http, "data": data, "error": message})
+}
+
+/// Read-only OpenSim bridge call. Mutation actions are intentionally not
+/// exposed here until the Rust client has a canary and rollback path.
+pub async fn bridge_read(cfg: &Config, action: &str, body: Value) -> Result<Value> {
+    if !matches!(action, "vaak_resolve" | "vaak_player_pull") {
+        anyhow::bail!("Bridge action is not read-only");
+    }
+    let secret = cfg.phyrian_bridge_secret.as_deref()
+        .filter(|s| !s.is_empty())
+        .context("OpenSim bridge secret is not configured")?;
+    let payload = bridge_request_payload(action, &body, secret);
+    let response = Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()?
+        .post(format!("{}/", cfg.phyrian_bridge_url.trim_end_matches('/')))
+        .header("X-Strains-Bridge-Secret", secret)
+        .header("User-Agent", "VAAK-Phyrian-Bridge/1.0 (+https://vaak.monster)")
+        .json(&payload)
+        .send()
+        .await
+        .context("OpenSim bridge request")?;
+    let status = response.status().as_u16() as i64;
+    let raw = response.text().await.context("OpenSim bridge response")?;
+    let decoded = decode_bridge_response(status, &raw);
+    if decoded.get("ok").and_then(Value::as_bool) != Some(true) {
+        anyhow::bail!(decoded.get("error").and_then(Value::as_str).unwrap_or("OpenSim bridge request failed").to_string());
+    }
+    Ok(decoded.get("data").cloned().unwrap_or(Value::Null))
 }
 
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {

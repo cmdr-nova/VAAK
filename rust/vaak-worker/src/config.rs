@@ -20,6 +20,8 @@ pub struct Config {
     /// Shared secret for loopback-only migration mutation routes. Empty keeps
     /// those routes disabled even when the shadow HTTP service is running.
     pub phyrian_mutation_token: Option<String>,
+    pub phyrian_bridge_url: String,
+    pub phyrian_bridge_secret: Option<String>,
 }
 
 impl Config {
@@ -27,6 +29,13 @@ impl Config {
         let env_file = env::var("VAAK_ENV_FILE").unwrap_or_else(|_| "/etc/mkultra/vaak.env".to_string());
         if Path::new(&env_file).is_file() {
             load_dotenv_file(&env_file)?;
+        }
+        // The bridge secret is kept in its own root-owned file and is loaded
+        // only into the process environment; env_snapshot redacts secrets.
+        let bridge_env_file = env::var("VAAK_PHYRIAN_BRIDGE_ENV_FILE")
+            .unwrap_or_else(|_| "/etc/mkultra/phyrian-bridge.env".to_string());
+        if Path::new(&bridge_env_file).is_file() {
+            load_dotenv_file(&bridge_env_file)?;
         }
 
         let database_url = env::var("VAAK_DATABASE_URL").unwrap_or_else(|_| {
@@ -59,6 +68,14 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let phyrian_bridge_url = env::var("PHYRIAN_STRAINS_API_URL")
+            .unwrap_or_else(|_| "https://strains.novalandia.online/".to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let phyrian_bridge_secret = env::var("PHYRIAN_STRAINS_BRIDGE_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         Ok(Self {
             database_url,
@@ -69,6 +86,8 @@ impl Config {
             bsky_public_api,
             notif_cache_dir,
             phyrian_mutation_token,
+            phyrian_bridge_url,
+            phyrian_bridge_secret,
         })
     }
 }
