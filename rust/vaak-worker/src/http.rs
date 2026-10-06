@@ -784,10 +784,16 @@ async fn shadow_library_data(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let kind = q.library_kind.as_deref().unwrap_or("").trim().to_ascii_lowercase();
-    if kind != "favourites" && kind != "favourites_all" {
+    if !matches!(kind.as_str(), "favourites" | "favourites_all" | "bookmarks" | "bookmarks_all") {
         return (StatusCode::BAD_REQUEST, "unsupported library data projection").into_response();
     }
-    json_result(crate::library::favourites(&state.cfg, owner, q.offset.unwrap_or(0), q.limit.unwrap_or(20)).await)
+    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(20);
+    if kind.starts_with("bookmarks") {
+        json_result(crate::library::bookmarks(&state.cfg, owner, offset, limit).await)
+    } else {
+        json_result(crate::library::favourites(&state.cfg, owner, offset, limit).await)
+    }
 }
 
 async fn shadow_jetstream(State(state): State<AppState>) -> impl IntoResponse {
