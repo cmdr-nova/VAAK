@@ -1685,6 +1685,39 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
             "media_attachments": media,
         }));
     }
+    // Remote Fediverse quote targets are durable firehose Create events, not
+    // Bluesky rows. Resolve them from the same event/actor caches used by the
+    // timeline so a quote does not degrade to the synthetic “Quoted post”
+    // placeholder when the original is already ingested locally.
+    let fed_targets: Vec<String> = targets
+        .iter()
+        .filter(|target| {
+            !target.starts_with(LOCAL_ACTOR_PREFIX)
+                && !target.starts_with("at://")
+                && !target.contains("bsky.app/")
+        })
+        .cloned()
+        .collect();
+    let fed_quotes = fetch_creates_by_object(db, &fed_targets)
+        .await
+        .unwrap_or_default();
+    let fed_actor_ids: Vec<String> = fed_quotes.values().map(|row| row.actor_id.clone()).collect();
+    let fed_actors = fetch_actors_map(db, &fed_actor_ids)
+        .await
+        .unwrap_or_default();
+    for (target, event) in fed_quotes {
+        let actor = fed_actors.get(event.actor_id.trim_end_matches('/'));
+        let mut quoted = materialize_event_create(&event, actor);
+        let internal_url = format!(
+            "?view=status&object={}&from=home",
+            urlencoding_encode(&target)
+        );
+        quoted["url"] = json!(internal_url.clone());
+        if let Some(card) = quoted.get_mut("card").filter(|v| v.is_object()) {
+            card["url"] = json!(internal_url);
+        }
+        by_target.insert(target, quoted);
+    }
     for (target, bsky) in bsky_quotes {
         let mut quoted = materialize_bsky(&bsky);
         let internal_url = format!(
