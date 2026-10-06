@@ -201,6 +201,28 @@ function ap_phyrian_bridge_request_payload(string $action, array $body, string $
 }
 
 /**
+ * Decode a bridge response without network or database side effects. This is
+ * the canonical response contract used by the mocked OpenSim parity tests.
+ *
+ * @return array{ok:bool,http:int,data?:array<string,mixed>,error?:string}
+ */
+function ap_phyrian_bridge_decode_response(int $http, string $raw): array
+{
+    if ($raw === '') {
+        return ['ok' => false, 'http' => $http, 'error' => 'Empty response from strains API.'];
+    }
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        return ['ok' => false, 'http' => $http, 'error' => 'Invalid JSON from strains API.'];
+    }
+    if ($http >= 200 && $http < 300 && !empty($data['ok'])) {
+        return ['ok' => true, 'http' => $http, 'data' => $data];
+    }
+    $msg = (string) ($data['error'] ?? $data['message'] ?? ('Strains HTTP ' . $http));
+    return ['ok' => false, 'http' => $http, 'data' => $data, 'error' => $msg];
+}
+
+/**
  * Normalize identify field: URL / UUID / avatar name.
  *
  * @return array{kind:string,value:string}|null
@@ -273,18 +295,14 @@ function ap_phyrian_bridge_strains_call(string $action, array $body): array
     $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $err = curl_error($ch);
     curl_close($ch);
-    if (!is_string($resp) || $resp === '') {
-        return ['ok' => false, 'http' => $http, 'error' => $err !== '' ? $err : 'Empty response from strains API.'];
+    if (!is_string($resp)) {
+        $resp = '';
     }
-    $data = json_decode($resp, true);
-    if (!is_array($data)) {
-        return ['ok' => false, 'http' => $http, 'error' => 'Invalid JSON from strains API.'];
+    $decoded = ap_phyrian_bridge_decode_response($http, $resp);
+    if (!$decoded['ok'] && $decoded['error'] === 'Empty response from strains API.' && $err !== '') {
+        $decoded['error'] = $err;
     }
-    if ($http >= 200 && $http < 300 && !empty($data['ok'])) {
-        return ['ok' => true, 'http' => $http, 'data' => $data];
-    }
-    $msg = (string) ($data['error'] ?? $data['message'] ?? ('Strains HTTP ' . $http));
-    return ['ok' => false, 'http' => $http, 'data' => $data, 'error' => $msg];
+    return $decoded;
 }
 
 /**
