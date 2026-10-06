@@ -33,6 +33,7 @@ mod relationships;
 mod settings;
 mod library;
 mod integrations;
+mod private_surfaces;
 
 use std::net::SocketAddr;
 
