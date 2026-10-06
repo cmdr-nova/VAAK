@@ -230,6 +230,7 @@ fn rewrite_anchor_open(tag: &str, from: &str) -> String {
     let is_mention = class_list_has(classes, "mention") && !class_list_has(classes, "hashtag");
     let is_hashtag = class_list_has(classes, "hashtag");
     let from_q = if from.is_empty() { "home" } else { from };
+    let profile_surface = from_q.contains("profile");
 
     if is_hashtag {
         let tag_name = percent_decode_basic(
@@ -268,7 +269,12 @@ fn rewrite_anchor_open(tag: &str, from: &str) -> String {
                 urlencoding_encode(&href),
                 urlencoding_encode(from_q)
             );
-            return format!("<a class=\"status-link\" href=\"{}\">", esc(&new_href));
+            let target = if profile_surface {
+                " target=\"_blank\" rel=\"noopener noreferrer\""
+            } else {
+                ""
+            };
+            return format!("<a class=\"status-link\" href=\"{}\"{}>", esc(&new_href), target);
         }
         return format!(
             "<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">",
@@ -585,7 +591,12 @@ fn linkify_text_segment(text: &str, from: &str) -> String {
                         urlencoding_encode(&href),
                         urlencoding_encode(from_q)
                     );
-                    format!("<a class=\"status-link\" href=\"{}\">{label}</a>", esc(&new_href))
+                    let target = if from_q.contains("profile") {
+                        " target=\"_blank\" rel=\"noopener noreferrer\""
+                    } else {
+                        ""
+                    };
+                    format!("<a class=\"status-link\" href=\"{}\"{}>{label}</a>", esc(&new_href), target)
                 } else {
                     format!(
                         "<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">{label}</a>",
@@ -2563,11 +2574,23 @@ fn media_row_html(st: &Value) -> String {
             .unwrap_or("");
         if atype == "video" || atype == "gifv" {
             let poster = video_poster_attr(url, preview);
+            let is_hls = url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(url)
+                .to_ascii_lowercase()
+                .ends_with(".m3u8")
+                || url.contains("video.bsky.app/");
+            let source = if is_hls {
+                format!(" data-hls-src=\"{}\"", esc(url))
+            } else {
+                format!(" src=\"{}\"", esc(url))
+            };
             // preload=metadata helps progressive MP4s show a first frame when
             // no image poster is available (PHP parity).
             cells.push(format!(
-                "<video class=\"media-video\" src=\"{}\" controls loop playsinline preload=\"metadata\"{} referrerpolicy=\"no-referrer\"></video>",
-                esc(url),
+                "<video class=\"media-video\"{} controls loop playsinline preload=\"metadata\"{} referrerpolicy=\"no-referrer\"></video>",
+                source,
                 poster
             ));
         } else if atype == "audio" {
@@ -3172,6 +3195,15 @@ mod tests {
     }
 
     #[test]
+    fn profile_status_links_open_in_new_tab_but_home_links_stay_in_app() {
+        let body = "<p>See <a href=\"https://mkultra.monster/users/x/statuses/42\">this post</a></p>";
+        let profile = prepare_feed_body_html(body, "remote_profile");
+        assert!(profile.contains("class=\"status-link\"") && profile.contains("target=\"_blank\""), "{profile}");
+        let home = prepare_feed_body_html(body, "home");
+        assert!(home.contains("class=\"status-link\"") && !home.contains("target=\"_blank\""), "{home}");
+    }
+
+    #[test]
     fn linkifies_plain_handles_and_hashtags() {
         let out = linkify_text_segment(
             "hi @alice@mastodon.social and @bob.bsky.social see #fediverse",
@@ -3379,6 +3411,22 @@ mod tests {
             !html.contains("poster=\"https://files.mastodon.social/media_attachments/files/1/2/original/abc.mp4\""),
             "must not use mp4 as poster: {html}"
         );
+    }
+
+    #[test]
+    fn bluesky_hls_video_uses_lazy_hls_source() {
+        let playlist = "https://video.bsky.app/watch/did:plc:test/3abc/playlist.m3u8";
+        let st = json!({
+            "id": "bsky:test-video",
+            "uri": "at://did:plc:test/app.bsky.feed.post/3abc",
+            "content": "<p>video</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "account": {"acct": "test.bsky.social", "display_name": "Test", "avatar": "https://example.com/a.png", "uri": "https://bsky.app/profile/test.bsky.social"},
+            "media_attachments": [{"type": "video", "url": playlist, "preview_url": "https://video.bsky.app/watch/did:plc:test/3abc/thumbnail.jpg"}]
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("data-hls-src=\"https://video.bsky.app/watch/did:plc:test/3abc/playlist.m3u8\""), "{html}");
+        assert!(!html.contains(" src=\"https://video.bsky.app/watch/did:plc:test/3abc/playlist.m3u8\""), "HLS must be attached by hls.js: {html}");
     }
 
     #[test]

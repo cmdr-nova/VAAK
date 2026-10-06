@@ -39813,9 +39813,8 @@ if (VIEW === 'analytics') loadAnalytics();
 </script>
 <script>
 (function () {
-  const videos = Array.from(document.querySelectorAll('video[data-hls-src]'));
-  if (!videos.length) return;
   let loader;
+  let observer;
   function loadHls() {
     if (!loader) {
       loader = new Promise((resolve, reject) => {
@@ -39851,17 +39850,37 @@ if (VIEW === 'analytics') loadAnalytics();
       }
     } catch (_) {}
   }
+  function observeVideo(video) {
+    if (!video || video.dataset.hlsObserved === '1') return;
+    video.dataset.hlsObserved = '1';
+    if (observer) {
+      observer.observe(video);
+    } else {
+      prepare(video);
+    }
+  }
+  function scan(root) {
+    const scope = root && root.querySelectorAll ? root : document;
+    if (scope.matches && scope.matches('video[data-hls-src]')) observeVideo(scope);
+    scope.querySelectorAll('video[data-hls-src]').forEach(observeVideo);
+  }
   if ('IntersectionObserver' in window) {
-    const observer = new IntersectionObserver((entries) => {
+    observer = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
         if (!entry.isIntersecting) return;
         observer.unobserve(entry.target);
         prepare(entry.target);
       });
     }, { rootMargin: '500px 0px' });
-    videos.forEach((video) => observer.observe(video));
-  } else {
-    videos.forEach(prepare);
+  }
+  scan(document);
+  if (document.body && 'MutationObserver' in window) {
+    const mutations = new MutationObserver((records) => {
+      records.forEach((record) => record.addedNodes.forEach((node) => {
+        if (node.nodeType === 1) scan(node);
+      }));
+    });
+    mutations.observe(document.body, { childList: true, subtree: true });
   }
 })();
 </script>
