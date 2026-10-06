@@ -32732,6 +32732,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
       // misleading “Show more” control on an otherwise short post.
       el.classList.remove('is-collapsed', 'is-expanded');
       const textLength = Array.from(el.querySelectorAll('.feed-body, .body'))
+        .filter((node) => !node.closest('.quote-block'))
         .reduce((total, node) => total + (node.textContent || '').trim().length, 0);
       if (textLength <= FOLD_TEXT_MIN) {
         clearTweetFold(el);
