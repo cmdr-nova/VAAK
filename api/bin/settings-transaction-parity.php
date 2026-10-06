@@ -66,6 +66,47 @@ try {
         throw new RuntimeException('second account changed during first account save');
     }
 
+    // Two independent PHP processes must not lose each other's partial save.
+    $child = tempnam(sys_get_temp_dir(), 'vaak-settings-child-');
+    if ($child === false) throw new RuntimeException('unable to create concurrency child');
+    $childCode = <<<'PHP_CHILD'
+<?php
+require __AP_DB_FILE__;
+usleep(250000);
+$field = (string) ($argv[1] ?? '');
+$result = ap_profile_save(['name' => 'Settings Test 201', 'summary' => 'Initial bio 201', $field => false], 'settings_test_201');
+exit(!empty($result['ok']) ? 0 : 1);
+PHP_CHILD;
+    $childCode = str_replace('__AP_DB_FILE__', var_export(dirname(__DIR__) . '/ap-db.php', true), $childCode);
+    file_put_contents($child, $childCode);
+    $children = [];
+    foreach (['algorithm_enabled', 'asks_enabled'] as $field) {
+        $pipes = [];
+        $env = ['AP_DB_DSN' => $dsn, 'VAAK_PHYRIAN_RUST_MUTATIONS' => '0'];
+        $children[] = [$field, proc_open([PHP_BINARY, $child, $field], [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']], $pipes, null, $env), $pipes];
+    }
+    foreach ($children as [$field, $proc, $pipes]) {
+        if (!is_resource($proc)) {
+            @unlink($child);
+            throw new RuntimeException('concurrent partial save failed: ' . $field);
+        }
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($proc);
+        if ($exit !== 0) {
+            @unlink($child);
+            throw new RuntimeException('concurrent partial save failed: ' . $field . ' ' . trim((string) $stderr . ' ' . (string) $stdout));
+        }
+    }
+    @unlink($child);
+    $concurrent = rust_settings($rustUrl, 201)['fields'];
+    if (($concurrent['algorithm_enabled'] ?? true) !== false || ($concurrent['asks_enabled'] ?? true) !== false) {
+        throw new RuntimeException('concurrent partial saves lost a preference');
+    }
+
     // Explicit transaction rollback must leave the canonical values unchanged.
     $db->beginTransaction();
     $db->prepare('UPDATE actor_profile SET name = ?, algorithm_enabled = ? WHERE actor_key = ?')->execute(['SHOULD ROLLBACK', 1, 'settings_test_201']);

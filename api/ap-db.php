@@ -2915,7 +2915,28 @@ function ap_profile_plain_bio_to_html(string $plain): string
  *
  * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool,algorithm_enabled?:bool,downranking_enabled?:bool,asks_enabled?:bool,webmentions_enabled?:bool} $fields
  */
+/**
+ * Serialize profile writes per actor. Profile saves intentionally build a
+ * complete canonical row from the existing row plus the submitted fields;
+ * without a per-actor lock, two partial saves could otherwise overwrite one
+ * another's preference changes.
+ */
 function ap_profile_save(array $fields, string $actorKey = 'cmdr_nova'): array
+{
+    $db = ap_db();
+    if ((string) $db->getAttribute(PDO::ATTR_DRIVER_NAME) !== 'pgsql') {
+        return ap_profile_save_unlocked($fields, $actorKey);
+    }
+    $lockKey = strtolower(trim($actorKey));
+    $db->prepare('SELECT pg_advisory_lock(hashtext(?))')->execute(['vaak:profile-save:' . $lockKey]);
+    try {
+        return ap_profile_save_unlocked($fields, $actorKey);
+    } finally {
+        $db->prepare('SELECT pg_advisory_unlock(hashtext(?))')->execute(['vaak:profile-save:' . $lockKey]);
+    }
+}
+
+function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova'): array
 {
     $name = trim(ap_fix_utf8((string) ($fields['name'] ?? '')));
     if ($name === '' || mb_strlen($name) > 100) {
