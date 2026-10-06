@@ -53,6 +53,18 @@ try {
     if (($after['algorithm_enabled'] ?? true) !== false || ($after['asks_enabled'] ?? true) !== false || ($after['name'] ?? '') !== $before['name']) {
         throw new RuntimeException('partial-save preservation mismatch direct=' . json_encode($debug) . ' after=' . json_encode(['name' => $after['name'] ?? null, 'algorithm_enabled' => $after['algorithm_enabled'] ?? null, 'asks_enabled' => $after['asks_enabled'] ?? null]) . ' before=' . json_encode(['name' => $before['name'] ?? null]));
     }
+    foreach ($before as $field => $value) {
+        if (in_array($field, ['name', 'algorithm_enabled', 'asks_enabled'], true)) {
+            continue;
+        }
+        if (($after[$field] ?? null) !== $value) {
+            throw new RuntimeException('omitted field changed during partial save: ' . $field);
+        }
+    }
+    $bAfter = rust_settings($rustUrl, 202)['fields'];
+    if ($bAfter !== $b['fields']) {
+        throw new RuntimeException('second account changed during first account save');
+    }
 
     // Explicit transaction rollback must leave the canonical values unchanged.
     $db->beginTransaction();
