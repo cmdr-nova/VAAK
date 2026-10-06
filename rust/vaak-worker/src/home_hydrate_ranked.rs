@@ -323,6 +323,12 @@ fn base_status(
         "emojis": [],
         "card": Value::Null,
         "poll": Value::Null,
+        "quote": Value::Null,
+        "quote_approval": {
+            "automatic": ["public"],
+            "manual": [],
+            "current_user": "automatic"
+        },
     });
     if let Some(c) = card {
         st["card"] = c;
@@ -1200,7 +1206,20 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
         });
     }
     if let Some(quote) = quote_preview {
-        st["vaak_quote_preview"] = quote;
+        let quote_id = quote.get("id").cloned().unwrap_or(Value::Null);
+        st["vaak_quote_preview"] = quote.clone();
+        // Mastodon 4.4+/Ice Cubes contract. Keep the lean preview extension
+        // for VAAK HTML paint, but expose the standard envelope to clients.
+        st["quote"] = json!({
+            "state": "accepted",
+            "quoted_status": quote,
+            "quoted_status_id": quote_id,
+        });
+        st["quote_approval"] = json!({
+            "automatic": ["public"],
+            "manual": [],
+            "current_user": "automatic",
+        });
     }
     st
 }
@@ -3002,6 +3021,27 @@ mod tests {
         assert_eq!(quote["account"]["acct"], "alice@example.test");
         assert_eq!(quote["url"], "https://example.test/posts/9");
         assert!(quote["content"].as_str().unwrap_or("").contains("quoted words"));
+
+        let row = EventRow {
+            id: 901,
+            event_type: "Create".into(),
+            actor_id: "https://remote.example/users/author".into(),
+            object_id: "https://remote.example/notes/901".into(),
+            summary: "My commentary\n\n↪ QT @alice@example.test: quoted words https://example.test/posts/9".into(),
+            media_urls: "[]".into(),
+            created_at: "2026-10-05T12:00:00Z".into(),
+            sensitive: false,
+            spoiler_text: String::new(),
+            host: "remote.example".into(),
+            target_actor: String::new(),
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+        };
+        let status = materialize_event_create(&row, None);
+        assert_eq!(status["quote"]["state"], "accepted");
+        assert_eq!(status["quote"]["quoted_status"]["url"], "https://example.test/posts/9");
+        assert_eq!(status["content"], "<p>My commentary</p>");
     }
 
     #[test]
