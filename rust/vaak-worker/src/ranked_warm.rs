@@ -1608,33 +1608,53 @@ async fn record_suppression(
     actor: &str,
     categories: &[String],
     object_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let actor = actor.trim().trim_end_matches('/');
     if owner < 1 || actor.is_empty() || categories.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     if downrank_actor_exempt(actor) {
-        return Ok(());
+        return Ok(false);
     }
     let now = chrono::Utc::now().timestamp();
     let existing = db
         .query_opt(
-            "SELECT score, suppressed_until, categories_json
+            "SELECT score, suppressed_until, categories_json, seen_object_ids_json
              FROM ap_home_suppression WHERE owner_user_id = $1 AND actor_id = $2",
             &[&owner, &actor],
         )
         .await
         .ok()
         .flatten();
-    let (mut score, previous_until, mut all_cats) = if let Some(row) = existing {
+    let (mut score, previous_until, mut all_cats, mut seen_objects) = if let Some(row) = existing {
         let score: i32 = row.try_get::<_, Option<i32>>(0)?.unwrap_or(0).max(0);
         let until_s: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
         let cats_raw: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
         let cats: Vec<String> = serde_json::from_str(&cats_raw).unwrap_or_default();
-        (score, parse_ts(&until_s), cats)
+        let seen_raw: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        let seen: Vec<String> = serde_json::from_str(&seen_raw).unwrap_or_default();
+        (score, parse_ts(&until_s), cats, seen)
     } else {
-        (0, 0, Vec::new())
+        (0, 0, Vec::new(), Vec::new())
     };
+    let object = object_id
+        .trim()
+        .trim_end_matches('/')
+        .chars()
+        .take(2048)
+        .collect::<String>();
+    if !object.is_empty() && seen_objects.iter().any(|seen| seen == &object) {
+        return Ok(false);
+    }
+    if !object.is_empty() {
+        seen_objects.push(object.clone());
+        seen_objects.sort();
+        seen_objects.dedup();
+        if seen_objects.len() > 256 {
+            let keep_from = seen_objects.len() - 256;
+            seen_objects = seen_objects.split_off(keep_from);
+        }
+    }
     score = (score + 1).min(8);
     let mut until = now + (3600 * score.max(1) as i64).min(7 * 86400);
     if previous_until > until {
@@ -1646,21 +1666,22 @@ async fn record_suppression(
         }
     }
     let cats_json = serde_json::to_string(&all_cats).unwrap_or_else(|_| "[]".into());
+    let seen_json = serde_json::to_string(&seen_objects).unwrap_or_else(|_| "[]".into());
     let until_s = chrono::DateTime::from_timestamp(until, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default();
     let now_s = chrono::Utc::now().to_rfc3339();
-    let object = object_id.chars().take(2048).collect::<String>();
     let _ = db
         .execute(
             "INSERT INTO ap_home_suppression
-             (owner_user_id, actor_id, score, categories_json, suppressed_until, last_object_id, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             (owner_user_id, actor_id, score, categories_json, suppressed_until, last_object_id, seen_object_ids_json, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
              ON CONFLICT (owner_user_id, actor_id) DO UPDATE SET
                score = EXCLUDED.score,
                categories_json = EXCLUDED.categories_json,
                suppressed_until = EXCLUDED.suppressed_until,
                last_object_id = EXCLUDED.last_object_id,
+               seen_object_ids_json = EXCLUDED.seen_object_ids_json,
                updated_at = EXCLUDED.updated_at",
             &[
                 &owner,
@@ -1669,11 +1690,12 @@ async fn record_suppression(
                 &cats_json,
                 &until_s,
                 &object,
+                &seen_json,
                 &now_s,
             ],
         )
         .await;
-    Ok(())
+    Ok(true)
 }
 
 async fn apply_toxicity_downrank(
@@ -1716,12 +1738,16 @@ async fn apply_toxicity_downrank(
             } else {
                 item.id.clone()
             };
-            let _ = record_suppression(db, owner, &actor, &cats, &object).await;
-            let score = states
-                .get(&actor)
-                .map(|(s, _, _)| (*s + 1).min(8))
-                .unwrap_or(1);
-            states.insert(actor.clone(), (score, now + 3600, cats));
+            let counted = record_suppression(db, owner, &actor, &cats, &object)
+                .await
+                .unwrap_or(false);
+            if counted {
+                let score = states
+                    .get(&actor)
+                    .map(|(s, _, _)| (*s + 1).min(8))
+                    .unwrap_or(1);
+                states.insert(actor.clone(), (score, now + 3600, cats));
+            }
         }
         if let Some((score, until, _)) = states.get(&actor) {
             if *until > now {

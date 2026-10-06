@@ -6,9 +6,13 @@ CREATE TABLE IF NOT EXISTS ap_home_suppression (
     categories_json TEXT NOT NULL DEFAULT '[]',
     suppressed_until TEXT NOT NULL,
     last_object_id TEXT NOT NULL DEFAULT '',
+    seen_object_ids_json TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL,
     PRIMARY KEY (owner_user_id, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ap_home_suppression_until
     ON ap_home_suppression(owner_user_id, suppressed_until);
 GRANT SELECT, INSERT, UPDATE, DELETE ON ap_home_suppression TO "www-data";
+
+ALTER TABLE ap_home_suppression
+    ADD COLUMN IF NOT EXISTS seen_object_ids_json TEXT NOT NULL DEFAULT '[]';

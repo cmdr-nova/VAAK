@@ -973,6 +973,7 @@ CREATE TABLE IF NOT EXISTS ap_home_suppression (
     categories_json TEXT NOT NULL DEFAULT '[]',
     suppressed_until TEXT NOT NULL,
     last_object_id TEXT NOT NULL DEFAULT '',
+    seen_object_ids_json TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL,
     PRIMARY KEY (owner_user_id, actor_id)
 );
@@ -1184,6 +1185,14 @@ SQL);
     }
     if (!in_array('visibility', $outboxNames, true)) {
         $db->exec("ALTER TABLE outbox_notes ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'");
+    }
+    try {
+        $suppCols = $db->query('PRAGMA table_info(ap_home_suppression)')->fetchAll();
+        if ($suppCols && !in_array('seen_object_ids_json', array_column($suppCols, 'name'), true)) {
+            $db->exec("ALTER TABLE ap_home_suppression ADD COLUMN seen_object_ids_json TEXT NOT NULL DEFAULT '[]'");
+        }
+    } catch (Throwable $e) {
+        // Optional downranking deduplication state; do not block startup.
     }
     try {
         $blogCols = $db->query('PRAGMA table_info(vaak_blog_posts)')->fetchAll();
