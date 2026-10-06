@@ -77,6 +77,8 @@ struct PhyrianMutation {
     request_id: Option<i64>,
     kind: Option<String>,
     accept: Option<bool>,
+    identify: Option<String>,
+    code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +314,29 @@ async fn internal_phyrian_mutate(
             match crate::phyrian::resolve_local_request(&state.cfg, owner, request_id, accept).await {
                 Ok(strain) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "strain": strain}))).into_response(),
                 Err(e) if e.to_string().contains("Origin imprint requires") => (StatusCode::CONFLICT, Json(serde_json::json!({"ok": false, "fallback": true, "error": e.to_string()}))).into_response(),
+                Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+            }
+        }
+        "bridge_challenge_start" => {
+            let owner = input.owner_id.unwrap_or(0);
+            let identify = input.identify.as_deref().unwrap_or("");
+            match crate::phyrian::bridge_challenge_start(&state.cfg, owner, identify).await {
+                Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+                Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+            }
+        }
+        "bridge_challenge_verify" => {
+            let owner = input.owner_id.unwrap_or(0);
+            let code = input.code.as_deref().unwrap_or("");
+            match crate::phyrian::bridge_challenge_verify(&state.cfg, owner, code).await {
+                Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+                Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+            }
+        }
+        "bridge_unlink" => {
+            let owner = input.owner_id.unwrap_or(0);
+            match crate::phyrian::bridge_unlink(&state.cfg, owner).await {
+                Ok(data) => (StatusCode::OK, Json(data)).into_response(),
                 Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
             }
         }

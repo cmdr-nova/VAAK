@@ -448,6 +448,14 @@ function ap_phyrian_bridge_resolve(int $userId, string $identifyRaw): array
  */
 function ap_phyrian_bridge_challenge_start(int $userId, string $identifyRaw): array
 {
+    $rust = function_exists('ap_phyrian_rust_mutation')
+        ? ap_phyrian_rust_mutation('bridge_challenge_start', [
+            'owner_id' => $userId,
+            'identify' => $identifyRaw,
+        ]) : null;
+    if (is_array($rust)) {
+        return $rust;
+    }
     $resolved = ap_phyrian_bridge_resolve($userId, $identifyRaw);
     if (empty($resolved['ok'])) {
         return $resolved;
@@ -525,6 +533,14 @@ function ap_phyrian_bridge_challenge_start(int $userId, string $identifyRaw): ar
  */
 function ap_phyrian_bridge_challenge_verify(int $userId, string $codeRaw): array
 {
+    $rust = function_exists('ap_phyrian_rust_mutation')
+        ? ap_phyrian_rust_mutation('bridge_challenge_verify', [
+            'owner_id' => $userId,
+            'code' => $codeRaw,
+        ]) : null;
+    if (is_array($rust)) {
+        return $rust;
+    }
     if ($userId <= 0) {
         return ['ok' => false, 'error' => 'Not signed in.'];
     }
@@ -658,6 +674,11 @@ function ap_phyrian_bridge_challenge_verify(int $userId, string $codeRaw): array
  */
 function ap_phyrian_bridge_unlink(int $userId): array
 {
+    $rust = function_exists('ap_phyrian_rust_mutation')
+        ? ap_phyrian_rust_mutation('bridge_unlink', ['owner_id' => $userId]) : null;
+    if (is_array($rust)) {
+        return $rust;
+    }
     if ($userId <= 0) {
         return ['ok' => false, 'error' => 'Not signed in.'];
     }

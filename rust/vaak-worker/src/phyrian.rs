@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 use rand::Rng;
+use sha2::{Digest, Sha256};
 
 use crate::{config::Config, db};
 
@@ -496,10 +497,7 @@ pub fn decode_bridge_response(http: i64, raw: &str) -> Value {
 
 /// Read-only OpenSim bridge call. Mutation actions are intentionally not
 /// exposed here until the Rust client has a canary and rollback path.
-pub async fn bridge_read(cfg: &Config, action: &str, body: Value) -> Result<Value> {
-    if !matches!(action, "vaak_resolve" | "vaak_player_pull") {
-        anyhow::bail!("Bridge action is not read-only");
-    }
+pub async fn bridge_call(cfg: &Config, action: &str, body: Value) -> Result<Value> {
     let secret = cfg.phyrian_bridge_secret.as_deref()
         .filter(|s| !s.is_empty())
         .context("OpenSim bridge secret is not configured")?;
@@ -521,6 +519,98 @@ pub async fn bridge_read(cfg: &Config, action: &str, body: Value) -> Result<Valu
         anyhow::bail!(decoded.get("error").and_then(Value::as_str).unwrap_or("OpenSim bridge request failed").to_string());
     }
     Ok(decoded.get("data").cloned().unwrap_or(Value::Null))
+}
+
+pub async fn bridge_read(cfg: &Config, action: &str, body: Value) -> Result<Value> {
+    if !matches!(action, "vaak_resolve" | "vaak_player_pull") {
+        anyhow::bail!("Bridge action is not read-only");
+    }
+    bridge_call(cfg, action, body).await
+}
+
+fn identify_kind(raw: &str) -> Option<(&'static str, String)> {
+    let value = raw.trim();
+    if value.is_empty() { return None; }
+    if uuid::Uuid::parse_str(value).is_ok() {
+        return Some(("uuid", value.to_ascii_lowercase()));
+    }
+    if value.chars().count() <= 80 {
+        return Some(("name", value.to_string()));
+    }
+    None
+}
+
+fn sha256_hex(value: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(value.as_bytes());
+    hex::encode(h.finalize())
+}
+
+pub async fn bridge_challenge_start(cfg: &Config, owner: i64, identify: &str) -> Result<Value> {
+    if owner < 1 { anyhow::bail!("Not signed in."); }
+    let (kind, query) = identify_kind(identify).context("Enter a NovaLandia avatar name or UUID")?;
+    let resolved = bridge_call(cfg, "vaak_resolve", serde_json::json!({"query": query, "query_kind": kind})).await?;
+    let avatar = resolved.get("avatar").filter(|v| v.is_object()).cloned().context("No NovaLandia Strains avatar matched that input")?;
+    let uuid = avatar.get("avatar_uuid").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+    let name = avatar.get("avatar_name").and_then(Value::as_str).unwrap_or("Unknown").trim().to_string();
+    if uuid::Uuid::parse_str(&uuid).is_err() { anyhow::bail!("OpenSim returned an invalid avatar UUID"); }
+    let code: String = (0..8).map(|_| {
+        const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        ALPHABET[rand::thread_rng().gen_range(0..ALPHABET.len())] as char
+    }).collect();
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(600);
+    let hash = sha256_hex(&format!("{code}|{uuid}|{owner}"));
+    let db = db::connect(&cfg.database_url).await?;
+    db.execute("DELETE FROM phyrian_bridge_challenges WHERE owner_user_id=$1 OR expires_at<NOW()", &[&(owner as i32)]).await?;
+    db.execute("INSERT INTO phyrian_bridge_challenges (owner_user_id,avatar_uuid,avatar_name,code_hash,attempts,expires_at) VALUES ($1,$2,$3,$4,0,$5)", &[&(owner as i32), &uuid, &name, &hash, &expires]).await?;
+    let deliver = bridge_call(cfg, "vaak_claim_deliver", serde_json::json!({
+        "avatar_uuid": uuid, "avatar_name": name, "code": code,
+        "expires_at": expires.to_rfc3339(), "ttl_seconds": 600
+    })).await;
+    Ok(serde_json::json!({
+        "ok": true, "avatar": avatar,
+        "challenge": {"avatar_uuid": uuid, "avatar_name": name, "expires_at": expires.to_rfc3339(), "deliver_ok": deliver.is_ok()},
+        "notice": format!("Claim code queued for {name}. Wear the Phyrian Strains HUD and touch Status (or Register), then paste it here. Valid ~10 minutes.")
+    }))
+}
+
+pub async fn bridge_challenge_verify(cfg: &Config, owner: i64, raw_code: &str) -> Result<Value> {
+    if owner < 1 { anyhow::bail!("Not signed in."); }
+    let code: String = raw_code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_uppercase();
+    if code.len() < 4 { anyhow::bail!("Enter the code from your Phyrian Strains HUD."); }
+    let mut db = db::connect(&cfg.database_url).await?;
+    let row = db.query_opt("SELECT id,avatar_uuid,avatar_name,code_hash,attempts FROM phyrian_bridge_challenges WHERE owner_user_id=$1 AND expires_at>=NOW() ORDER BY id DESC LIMIT 1", &[&(owner as i32)]).await?.context("No active code — request a new one")?;
+    let id: i64 = row.get(0); let uuid: String = row.get(1); let name: String = row.get(2); let expected: String = row.get(3); let attempts: i32 = row.get(4);
+    if attempts >= 8 { anyhow::bail!("Too many attempts — request a new code."); }
+    db.execute("UPDATE phyrian_bridge_challenges SET attempts=attempts+1 WHERE id=$1", &[&id]).await?;
+    if sha256_hex(&format!("{code}|{uuid}|{owner}")).as_str() != expected { anyhow::bail!("That code does not match. Check the HUD message and try again."); }
+    let resolved = bridge_call(cfg, "vaak_resolve", serde_json::json!({"query": uuid, "query_kind": "uuid"})).await.unwrap_or(Value::Null);
+    let avatar = resolved.get("avatar").filter(|v| v.is_object());
+    let avatar_name = avatar.and_then(|a| a.get("avatar_name")).and_then(Value::as_str).unwrap_or(&name).to_string();
+    let strain = avatar.and_then(|a| a.get("strain")).and_then(Value::as_str).map(str::to_string);
+    let actor_row = db.query_one("SELECT actor_key,COALESCE(NULLIF(username,''),actor_key) FROM ap_users WHERE id=$1 LIMIT 1", &[&(owner as i64)]).await?;
+    let actor_key: String = actor_row.get(0); let handle: String = actor_row.get(1);
+    let tx = db.transaction().await?;
+    tx.execute("DELETE FROM phyrian_bridge_challenges WHERE owner_user_id=$1", &[&(owner as i32)]).await?;
+    tx.execute("UPDATE phyrian_bridge_links SET status='revoked',unlinked_at=NOW(),updated_at=NOW() WHERE (owner_user_id=$1 OR avatar_uuid=$2) AND status='verified' AND unlinked_at IS NULL", &[&(owner as i32), &uuid]).await?;
+    tx.execute("DELETE FROM phyrian_bridge_links WHERE owner_user_id=$1 OR avatar_uuid=$2", &[&(owner as i32), &uuid]).await?;
+    tx.execute("INSERT INTO phyrian_bridge_links (owner_user_id,avatar_uuid,avatar_name,strain_snapshot,status,verified_at,created_at,updated_at) VALUES ($1,$2,$3,$4,'verified',NOW(),NOW(),NOW())", &[&(owner as i32), &uuid, &avatar_name, &strain]).await?;
+    tx.commit().await?;
+    let link_set = bridge_call(cfg, "vaak_link_set", serde_json::json!({"avatar_uuid": uuid, "vaak_owner_id": owner, "vaak_actor_key": actor_key, "vaak_handle": handle})).await;
+    Ok(serde_json::json!({"ok": true, "notice": format!("Linked OpenSim avatar {avatar_name}. OpenSim body sync is active."), "link_set_ok": link_set.is_ok(), "link": {"avatar_uuid": uuid, "avatar_name": avatar_name, "strain_snapshot": strain, "status": "verified"}}))
+}
+
+pub async fn bridge_unlink(cfg: &Config, owner: i64) -> Result<Value> {
+    if owner < 1 { anyhow::bail!("Not signed in."); }
+    let db = db::connect(&cfg.database_url).await?;
+    let uuid: Option<String> = db.query_opt("SELECT avatar_uuid FROM phyrian_bridge_links WHERE owner_user_id=$1 AND status='verified' AND unlinked_at IS NULL LIMIT 1", &[&(owner as i32)]).await?.map(|r| r.get(0));
+    db.execute("UPDATE phyrian_bridge_links SET status='revoked',unlinked_at=NOW(),updated_at=NOW() WHERE owner_user_id=$1 AND status='verified'", &[&(owner as i32)]).await?;
+    db.execute("DELETE FROM phyrian_bridge_links WHERE owner_user_id=$1", &[&(owner as i32)]).await?;
+    db.execute("DELETE FROM phyrian_bridge_challenges WHERE owner_user_id=$1", &[&(owner as i32)]).await?;
+    if let Some(uuid) = uuid.filter(|u| uuid::Uuid::parse_str(u).is_ok()) {
+        let _ = bridge_call(cfg, "vaak_link_clear", serde_json::json!({"avatar_uuid": uuid})).await;
+    }
+    Ok(serde_json::json!({"ok": true, "notice": "OpenSim avatar unlinked. Resonant perk removed."}))
 }
 
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {
