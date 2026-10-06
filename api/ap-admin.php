@@ -35632,7 +35632,10 @@ window.apAdminToast = function (msg, isErr) {
     stopTimelineStream();
     stopTimelinePollTimer();
     tabSwapBusy = true;
-    if (status) status.textContent = 'Loading…';
+    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
+    // Navigation progress is shown by the detached global loading indicator;
+    // keep the timeline status area free of a second loader.
+    if (status) status.textContent = '';
     items.classList.add('timeline-swapping');
     try {
       const url = '?view=' + encodeURIComponent(nextView)
@@ -36232,9 +36235,7 @@ window.apAdminToast = function (msg, isErr) {
       // After Mentions soft-nav the URL can still say home while #timeline-items
       // is Mentions (or a detached Home node) — in-place swap then no-ops.
       if (['home', 'local', 'feed'].includes(cur) && ['home', 'local', 'feed'].includes(liveView)) {
-        // Timeline swaps and soft shells render their own inline spinner. Do
-        // not also show the global bottom loading pill (duplicate feedback).
-        if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+        if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
         const swapped = await window.vaakSwapTimelineView(view, push !== false);
         if (swapped !== false) {
           updateChrome(view);
@@ -36260,9 +36261,7 @@ window.apAdminToast = function (msg, isErr) {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
     }
     const loadingLabel = view === 'search' ? 'Searching…' : 'Loading…';
-    // The replacement shell below contains the authoritative inline spinner;
-    // keep the global loading pill for full navigations only.
-    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
+    if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading(loadingLabel);
     // Park the live compose panel BEFORE wiping section.main. The inline
     // composer lives in #compose-inline-slot inside main; clearing innerHTML
     // first destroyed the only .compose-modal__panel and left Home/FAB dead
@@ -36281,9 +36280,9 @@ window.apAdminToast = function (msg, isErr) {
     }
     // Replace main immediately so slow shells show a spinner instead of stale content.
     try {
-      main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite">'
-        + '<span class="vaak-spinner" aria-hidden="true"></span>'
-        + '<span>' + loadingLabel + '</span></div>';
+      // Keep the shell visually empty while the detached global indicator
+      // communicates progress; avoid two simultaneous Loading… messages.
+      main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite" aria-busy="true"></div>';
     } catch (e) {}
     try {
       let url = '?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
