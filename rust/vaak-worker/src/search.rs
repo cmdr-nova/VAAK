@@ -210,7 +210,7 @@ async fn account_rows(db: &Client, hidden: &HiddenSets, query: &str, limit: i64)
             "SELECT DISTINCT author_did, COALESCE(author_handle,''), COALESCE(author_display,'')
              FROM bsky_posts
              WHERE lower(COALESCE(author_handle,'')) LIKE $1 OR lower(COALESCE(author_display,'')) LIKE $1
-                OR lower(author_did) LIKE $1 ORDER BY author_handle LIMIT $2",
+             OR lower(author_did) LIKE $1 ORDER BY 2 LIMIT $2",
             &[&like, &(limit * 2).min(80)],
         ).await?;
         for row in bsky {
