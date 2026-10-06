@@ -10,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
@@ -50,6 +51,10 @@ pub struct OwnerQuery {
     pub actor: Option<String>,
     /// Profile tab: posts / replies / media / boosts.
     pub tab: Option<String>,
+    /// Library fragment kind (`favourites_bsky`, `bookmarks_bsky`) and the
+    /// exact PHP cache suffix. This route is cache-only; PHP remains fallback.
+    pub library_kind: Option<String>,
+    pub library_suffix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +122,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/feed-html", get(shadow_feed_html))
         // Local mkultra profile tab HTML (0.7.18).
         .route("/shadow/profile-html", get(shadow_profile_html))
+        // Cache-only Library fragments; PHP remains the miss/write fallback.
+        .route("/shadow/library-fragment", get(shadow_library_fragment))
         // Read-only Phyrian dossier/directory parity projection (10.6).
         .route("/shadow/phyrian", get(shadow_phyrian))
         // Guarded migration endpoint. Disabled unless an internal token is
@@ -164,6 +171,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/local-html",
             "/shadow/feed-html",
             "/shadow/profile-html",
+            "/shadow/library-fragment",
             "/shadow/phyrian",
             "/internal/phyrian/mutate (token-gated, disabled unless configured)",
             "/shadow/account-switch-prep",
@@ -173,6 +181,58 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/api/v1/notifications"
         ],
     }))
+}
+
+/// Return a previously-rendered PHP Library fragment without touching the
+/// database or remote services. A miss is deliberately a 404 so the caller
+/// can fall back to the existing PHP renderer.
+async fn shadow_library_fragment(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(0);
+    let kind = q.library_kind.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    let suffix = q.library_suffix.as_deref().unwrap_or("").trim();
+    if owner < 1
+        || !matches!(kind.as_str(), "favourites_bsky" | "bookmarks_bsky")
+        || suffix.is_empty()
+        || suffix.len() > 256
+    {
+        return (StatusCode::BAD_REQUEST, "invalid library fragment query").into_response();
+    }
+    let mut digest = Sha256::new();
+    digest.update(suffix.as_bytes());
+    let key = format!(
+        "vaak:fragment:lib:v1:{kind}:{owner}:{}",
+        hex::encode(digest.finalize())
+    );
+    let mut redis = match crate::redis_util::connect(&state.cfg.redis_url).await {
+        Ok(conn) => conn,
+        Err(_) => return (StatusCode::NOT_FOUND, "library fragment unavailable").into_response(),
+    };
+    let payload = match crate::redis_util::json_get(&mut redis, &key).await {
+        Ok(Some(v)) => v,
+        _ => return (StatusCode::NOT_FOUND, "library fragment miss").into_response(),
+    };
+    let Some(html) = payload.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+        return (StatusCode::NOT_FOUND, "library fragment miss").into_response();
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    headers.insert(
+        axum::http::HeaderName::from_static("x-vaak-library-fragment"),
+        axum::http::HeaderValue::from_static("redis"),
+    );
+    if let Some(has_more) = payload.get("has_more").and_then(|v| v.as_bool()) {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-has-more"),
+            axum::http::HeaderValue::from_static(if has_more { "1" } else { "0" }),
+        );
+    }
+    (StatusCode::OK, headers, html.to_owned()).into_response()
 }
 
 async fn internal_phyrian_mutate(

@@ -4984,6 +4984,35 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     exit;
 }
 
+/** Cache-only Rust fast path; PHP remains the renderer/cache writer on miss. */
+function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, string $suffix): ?array
+{
+    $kind = strtolower(trim($kind));
+    if (!in_array($kind, ['favourites_bsky', 'bookmarks_bsky'], true)
+        || $ownerUserId < 1 || $suffix === '' || strlen($suffix) > 256
+        || !function_exists('curl_init')) return null;
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
+    $ch = curl_init($base . '/shadow/library-fragment?' . http_build_query([
+        'owner_id' => $ownerUserId, 'library_kind' => $kind, 'library_suffix' => $suffix,
+    ]));
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HEADER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close']]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    if ($code !== 200 || !is_string($raw)) return null;
+    $headers = [];
+    foreach (explode("\r\n", substr($raw, 0, $headerSize)) as $line) {
+        if (str_contains($line, ':')) { [$name, $value] = array_map('trim', explode(':', $line, 2)); $headers[strtolower($name)] = $value; }
+    }
+    $html = substr($raw, $headerSize);
+    return is_string($html) && $html !== '' ? ['html' => $html, 'has_more' => (($headers['x-has-more'] ?? '') === '1')] : null;
+}
+
 // Cache-first bookmark cards.  The page shell should never wait for the
 // Bluesky collection or its card renderer; this fragment is loaded after the
 // first paint and is backed by the durable cache/worker path.
@@ -4998,6 +5027,9 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmarks_bsky') {
     $limit = max(20, min(80, (int) ($_GET['limit'] ?? 20)));
     $limit = (int) (ceil($limit / 20) * 20);
     $fragSuffix = 'folder=' . $folderId . '|limit=' . $limit;
+    if (is_array($axumFrag = admin_library_fragment_axum_fetch('bookmarks_bsky', $vaakOwnerId, $fragSuffix))) {
+        header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
+    }
     if (function_exists('ap_redis_library_html_get')) {
         $fragHit = ap_redis_library_html_get('bookmarks_bsky', $vaakOwnerId, $fragSuffix);
         if (is_array($fragHit)) {
@@ -5076,6 +5108,10 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     $offset = max(0, (int) ($_GET['offset'] ?? 0));
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
     $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
+    if (is_array($axumFrag = admin_library_fragment_axum_fetch('favourites_bsky', $vaakOwnerId, $fragSuffix))) {
+        header('X-Has-More: ' . (!empty($axumFrag['has_more']) ? '1' : '0'));
+        header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
+    }
     if (function_exists('ap_redis_library_html_get')) {
         $fragHit = ap_redis_library_html_get('favourites_bsky', $vaakOwnerId, $fragSuffix);
         if (is_array($fragHit)) {
