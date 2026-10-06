@@ -4961,6 +4961,18 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     header('Cache-Control: no-store');
     $offset = max(0, (int) ($_GET['offset'] ?? 0));
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
+    if (is_array($axumFrag = admin_library_fragment_axum_fetch('favourites_fedi', $vaakOwnerId, $fragSuffix))) {
+        header('X-Has-More: ' . (!empty($axumFrag['has_more']) ? '1' : '0'));
+        header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
+    }
+    if (function_exists('ap_redis_library_html_get')) {
+        $fragHit = ap_redis_library_html_get('favourites_fedi', $vaakOwnerId, $fragSuffix);
+        if (is_array($fragHit)) {
+            header('X-Has-More: ' . (!empty($fragHit['has_more']) ? '1' : '0'));
+            header('X-VAAK-Fragment: hit'); echo $fragHit['html']; exit;
+        }
+    }
     $rows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list($offset + $limit + 20, null) : [];
     $rows = array_values(array_filter($rows, static function ($st): bool {
         if (!is_array($st)) {
@@ -4975,12 +4987,18 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     $items = array_slice($rows, $offset, $limit);
     $hasMore = count($rows) > ($offset + $limit);
     header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    ob_start();
     echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
     $GLOBALS['admin_library_fetch_budget'] = 3;
     foreach ($items as $item) {
         admin_render_library_status_card($item, 'favourites');
     }
     echo '</div>';
+    $html = ob_get_clean();
+    if (function_exists('ap_redis_library_html_set')) {
+        ap_redis_library_html_set('favourites_fedi', $vaakOwnerId, $fragSuffix, $html, $hasMore);
+    }
+    echo $html;
     exit;
 }
 
@@ -4988,7 +5006,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
 function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, string $suffix): ?array
 {
     $kind = strtolower(trim($kind));
-    if (!in_array($kind, ['favourites_bsky', 'bookmarks_bsky'], true)
+    if (!in_array($kind, ['favourites_fedi', 'favourites_bsky', 'bookmarks_fedi', 'bookmarks_bsky'], true)
         || $ownerUserId < 1 || $suffix === '' || strlen($suffix) > 256
         || !function_exists('curl_init')) return null;
     $base = getenv('VAAK_SHADOW_HTTP');
