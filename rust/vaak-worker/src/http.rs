@@ -118,6 +118,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/you", get(shadow_you))
         .route("/shadow/relationships", get(shadow_relationships))
         .route("/shadow/settings", get(shadow_settings))
+        .route("/shadow/you-integrations", get(shadow_you_integrations))
         .route("/shadow/library-data", get(shadow_library_data))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
@@ -177,6 +178,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/you",
             "/shadow/relationships",
             "/shadow/settings",
+            "/shadow/you-integrations",
             "/shadow/library-data",
             "/shadow/jetstream",
             "/shadow/thin-media",
@@ -778,6 +780,16 @@ async fn shadow_settings(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     json_result(crate::settings::project(&state.cfg, owner).await)
+}
+
+/// Read-only capability manifest for Security, Import/Export, and Phyrian.
+/// PHP remains the renderer, CSRF boundary, and mutation owner.
+async fn shadow_you_integrations(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    json_result(crate::integrations::project(&state.cfg, owner).await)
 }
 
 async fn shadow_library_data(

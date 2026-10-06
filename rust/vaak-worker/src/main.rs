@@ -32,6 +32,7 @@ mod you;
 mod relationships;
 mod settings;
 mod library;
+mod integrations;
 
 use std::net::SocketAddr;
 
