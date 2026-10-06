@@ -29,6 +29,7 @@ const HOME_HYDRATE_TTL_SECS: u64 = 300;
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/default.webp";
 /// Local mkultra accounts without actor_profile.icon_url.
 const LOCAL_DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
+const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
 /// 50 = Ice Cubes (0.7.21); 160/240 = deep HTML scroll past the old 80-head (0.7.25).
 const DEFAULT_LIMITS: [i64; 6] = [15, 40, 50, 80, 160, 240];
 const MAX_HYDRATE_LIMIT: i64 = 240;
@@ -970,6 +971,30 @@ struct OutboxRow {
     ask_actor: String,
     ask_question: String,
     ask_answer: String,
+    quote_object: String,
+}
+
+/// Extract the canonical quoted-object URL from an ActivityPub/ActivityJSON
+/// Create payload. Quote metadata is stored in `outbox_notes.raw_create_json`;
+/// it is deliberately not duplicated in `masto_statuses`.
+fn quote_target_from_raw_create(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return String::new();
+    };
+    let object = value.get("object").unwrap_or(&value);
+    for key in ["quote", "quoteUri", "quoteUrl", "_misskey_quote"] {
+        let Some(candidate) = object.get(key) else { continue };
+        let target = candidate
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| candidate.get("id").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| candidate.get("url").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        if target.starts_with("https://") || target.starts_with("http://") || target.starts_with("at://") {
+            return target.trim_end_matches('/').to_string();
+        }
+    }
+    String::new()
 }
 
 #[derive(Clone, Default)]
@@ -1567,6 +1592,29 @@ fn materialize_outbox(
             "ask_answer": row.ask_answer,
         });
     }
+    if !row.quote_object.trim().is_empty() {
+        let target = row.quote_object.trim().trim_end_matches('/');
+        let quoted_account = empty_account(
+            target,
+            "quoted",
+            "Quoted post",
+            LOCAL_DEFAULT_AVATAR,
+            target,
+            LOCAL_DEFAULT_AVATAR,
+        );
+        let quoted = json!({
+            "id": target,
+            "uri": target,
+            "url": target,
+            "content": "",
+            "account": quoted_account,
+            "media_attachments": [],
+            "card": {"url": target, "title": "Quoted post", "description": "Open quoted post", "provider_name": "VAAK", "type": "link"}
+        });
+        st["vaak_quote_preview"] = quoted.clone();
+        st["quote"] = json!({"state": "accepted", "quoted_status": quoted, "quoted_status_id": target});
+        st["quote_approval"] = json!({"automatic": ["public"], "manual": [], "current_user": "automatic"});
+    }
     let parent = row.in_reply_to.trim().trim_end_matches('/');
     if !parent.is_empty() && (parent.starts_with("https://") || parent.starts_with("at://")) {
         st["vaak_in_reply_to_url"] = json!(parent);
@@ -1589,6 +1637,53 @@ fn materialize_outbox(
         }
     }
     st
+}
+
+/// Fill local quote targets from outbox storage before painting Home/Local.
+/// This keeps quote-boosts from degrading to a bare `quote_object` URL while
+/// remaining cache/DB-only and bounded to the current page.
+async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let mut targets = Vec::new();
+    for st in statuses.iter() {
+        if let Some(uri) = st.get("quote").and_then(|q| q.get("quoted_status"))
+            .and_then(|q| q.get("uri")).and_then(|v| v.as_str())
+            .filter(|u| u.starts_with(LOCAL_ACTOR_PREFIX)) {
+            targets.push(uri.trim_end_matches('/').to_string());
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() { return Ok(()); }
+    let rows = db.query(
+        "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
+        &[&targets],
+    ).await.context("select local quote targets")?;
+    let mut by_target = HashMap::new();
+    for row in rows {
+        let id: String = row.get(0);
+        let id = id.trim_end_matches('/').to_string();
+        let username = id.strip_prefix(LOCAL_ACTOR_PREFIX)
+            .and_then(|rest| rest.split('/').next()).unwrap_or("quoted");
+        let media = media_from_urls(&serde_json::to_string(&attachment_urls_from_create_json(&row.get::<_, String>(2))).unwrap_or_else(|_| "[]".into()), &id);
+        by_target.insert(id.clone(), json!({
+            "id": id,
+            "uri": id,
+            "url": id,
+            "content": row.get::<_, String>(1),
+            "account": empty_account(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, username, username, &format!("{LOCAL_ACTOR_PREFIX}{username}"), LOCAL_DEFAULT_AVATAR),
+            "media_attachments": media,
+        }));
+    }
+    for st in statuses.iter_mut() {
+        let target = st.get("quote").and_then(|q| q.get("quoted_status"))
+            .and_then(|q| q.get("uri")).and_then(|v| v.as_str()).unwrap_or("")
+            .trim_end_matches('/');
+        if let Some(quoted) = by_target.get(target) {
+            st["quote"]["quoted_status"] = quoted.clone();
+            st["vaak_quote_preview"] = quoted.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Pull https attachment URLs from a stored Create/Note JSON blob.
@@ -2234,6 +2329,7 @@ async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String,
                 ask_actor: String::new(),
                 ask_question: String::new(),
                 ask_answer: String::new(),
+                quote_object: quote_target_from_raw_create(&raw_create),
             },
         );
     }
@@ -2880,6 +2976,7 @@ pub async fn warm_view(
             break;
         }
     }
+    let _ = hydrate_local_quote_targets(&db, &mut statuses).await;
     link_outbox_reply_ids(&mut statuses);
 
     // Hydrated timelines are consumed directly by Mastodon-compatible clients
@@ -3055,6 +3152,12 @@ pub fn report_json(r: &WarmReport) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_target_reads_activitypub_quote_field() {
+        let raw = r#"{"type":"Create","object":{"type":"Note","quote":"https://mkultra.monster/users/cmdr_nova/notes/quoted/"}}"#;
+        assert_eq!(quote_target_from_raw_create(raw), "https://mkultra.monster/users/cmdr_nova/notes/quoted");
+    }
 
     #[test]
     fn snowflake_stable() {

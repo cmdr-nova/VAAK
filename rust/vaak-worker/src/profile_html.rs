@@ -188,6 +188,29 @@ struct OutboxPaintRow {
     ask_actor: String,
     ask_question: String,
     ask_answer: String,
+    quote_object: String,
+}
+
+/// Quote metadata lives in the canonical raw Create payload, not in
+/// `masto_statuses`; keep profile rendering in parity with timeline rendering.
+fn quote_target_from_raw_create(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return String::new();
+    };
+    let object = value.get("object").unwrap_or(&value);
+    for key in ["quote", "quoteUri", "quoteUrl", "_misskey_quote"] {
+        let Some(candidate) = object.get(key) else { continue };
+        let target = candidate
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| candidate.get("id").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| candidate.get("url").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        if target.starts_with("https://") || target.starts_with("http://") || target.starts_with("at://") {
+            return target.trim_end_matches('/').to_string();
+        }
+    }
+    String::new()
 }
 
 struct AnnouncePaintRow {
@@ -246,6 +269,58 @@ async fn load_profile_account(db: &Client, username: &str, actor_url: &str) -> V
         }
     }
     empty_account(actor_url, username, &display, &avatar)
+}
+
+/// Resolve local quote targets in one bounded query so profile quote cards
+/// show the quoted post body/media instead of only a transport URL.
+async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let mut targets = Vec::new();
+    for st in statuses.iter() {
+        if let Some(uri) = st
+            .get("quote")
+            .and_then(|q| q.get("quoted_status"))
+            .and_then(|q| q.get("uri"))
+            .and_then(|v| v.as_str())
+            .filter(|u| u.starts_with(LOCAL_ACTOR_PREFIX))
+        {
+            targets.push(uri.trim_end_matches('/').to_string());
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let rows = db.query(
+        "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
+        &[&targets],
+    ).await.context("select local quote targets")?;
+    let mut by_target = std::collections::HashMap::new();
+    for row in rows {
+        let id: String = row.get(0);
+        let id = id.trim_end_matches('/').to_string();
+        let username = id.strip_prefix(LOCAL_ACTOR_PREFIX)
+            .and_then(|rest| rest.split('/').next()).unwrap_or("quoted");
+        let media = media_from_raw_create(&row.get::<_, String>(2));
+        by_target.insert(id.clone(), json!({
+            "id": id,
+            "uri": id,
+            "url": id,
+            "content": row.get::<_, String>(1),
+            "account": empty_account(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, username, DEFAULT_AVATAR),
+            "media_attachments": media,
+        }));
+    }
+    for st in statuses.iter_mut() {
+        let target = st.get("quote").and_then(|q| q.get("quoted_status"))
+            .and_then(|q| q.get("uri")).and_then(|v| v.as_str()).unwrap_or("")
+            .trim_end_matches('/');
+        if let Some(quoted) = by_target.get(target) {
+            st["quote"]["quoted_status"] = quoted.clone();
+            st["vaak_quote_preview"] = quoted.clone();
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_outbox_tab(
@@ -327,6 +402,7 @@ async fn fetch_outbox_tab(
             ask_actor: String::new(),
             ask_question: String::new(),
             ask_answer: String::new(),
+            quote_object: String::new(),
         });
     }
     if note_ids.is_empty() {
@@ -423,6 +499,7 @@ async fn fetch_outbox_tab(
             row.sensitive = *sens;
             row.visibility = vis.clone();
             row.content_text = ctext.clone();
+            row.quote_object = quote_target_from_raw_create(&row.raw_create_json);
             row.pinned = pinned.contains(lid);
         }
     }
@@ -517,6 +594,22 @@ fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
             "ask_question": row.ask_question,
             "ask_answer": row.ask_answer,
         });
+    }
+    if !row.quote_object.trim().is_empty() {
+        let target = row.quote_object.trim().trim_end_matches('/');
+        let quoted_account = empty_account(target, "quoted", "Quoted post", DEFAULT_AVATAR);
+        let quoted = json!({
+            "id": target,
+            "uri": target,
+            "url": target,
+            "content": "",
+            "account": quoted_account,
+            "media_attachments": [],
+            "card": {"url": target, "title": "Quoted post", "description": "Open quoted post", "provider_name": "VAAK", "type": "link"}
+        });
+        st["vaak_quote_preview"] = quoted.clone();
+        st["quote"] = json!({"state": "accepted", "quoted_status": quoted, "quoted_status_id": target});
+        st["quote_approval"] = json!({"automatic": ["public"], "manual": [], "current_user": "automatic"});
     }
     let parent = row.in_reply_to.trim().trim_end_matches('/');
     if !parent.is_empty() && parent.starts_with("https://") {
@@ -664,6 +757,7 @@ async fn hydrate_announce_inners(
             ask_actor: String::new(),
             ask_question: String::new(),
             ask_answer: String::new(),
+            quote_object: String::new(),
         });
     }
     let mut variants = Vec::new();
@@ -785,6 +879,8 @@ pub async fn profile_html_fill(
         return Ok(None);
     }
 
+    let _ = hydrate_local_quote_targets(&db, &mut statuses).await;
+
     // Live fav/boost/bookmark from masto_* (same as Home lean / Ice Cubes, 0.7.19).
     if viewer_owner_id > 0 {
         let _ = crate::interaction_flags::apply_to_statuses(&db, viewer_owner_id, &mut statuses).await;
@@ -874,6 +970,7 @@ pub async fn fetch_outbox_statuses_by_uris(
             ask_actor: String::new(),
             ask_question: String::new(),
             ask_answer: String::new(),
+            quote_object: String::new(),
         });
     }
     let mut note_ids = Vec::new();
@@ -936,6 +1033,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quote_target_reads_nested_quote_url() {
+        let raw = r#"{"object":{"quote":{"url":"https://example.test/posts/42/"}}}"#;
+        assert_eq!(quote_target_from_raw_create(raw), "https://example.test/posts/42");
+    }
+
+    #[test]
     fn parses_local_actor() {
         assert_eq!(
             parse_local_actor("https://mkultra.monster/users/cmdr_nova"),
@@ -978,6 +1081,7 @@ mod tests {
             ask_actor: String::new(),
             ask_question: String::new(),
             ask_answer: String::new(),
+            quote_object: String::new(),
         };
         let st = materialize_outbox_status(&row, &account);
         assert_eq!(st["id"], json!("12345"));
