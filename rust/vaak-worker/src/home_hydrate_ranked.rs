@@ -80,6 +80,88 @@ fn plain_to_html(plain: &str) -> String {
     format!("<p>{}</p>", esc(t).replace('\n', "<br>"))
 }
 
+/// Render Bluesky rich-text link facets without losing the visible label.
+///
+/// Bluesky permits a post to display a shortened label (for example
+/// `bsky.app/profile/did:...`) while the facet carries the complete target
+/// URI.  The old plain-text materializer discarded that facet, leaving a
+/// truncated, non-clickable string in native Home cards.
+fn bsky_text_to_html(plain: &str, raw_json: &str) -> String {
+    let text = plain.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let Ok(raw) = serde_json::from_str::<Value>(raw_json) else {
+        return plain_to_html(text);
+    };
+    let facets = raw
+        .get("record")
+        .and_then(|v| v.get("facets"))
+        .or_else(|| raw.get("facets"))
+        .and_then(|v| v.as_array());
+    let Some(facets) = facets else {
+        return plain_to_html(text);
+    };
+
+    let bytes = text.as_bytes();
+    let mut links: Vec<(usize, usize, String)> = Vec::new();
+    for facet in facets {
+        let start = facet
+            .get("index")
+            .and_then(|v| v.get("byteStart"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let end = facet
+            .get("index")
+            .and_then(|v| v.get("byteEnd"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let uri = facet
+            .get("features")
+            .and_then(|v| v.as_array())
+            .and_then(|features| {
+                features.iter().find_map(|feature| {
+                    let kind = feature.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind.ends_with("#link") {
+                        feature.get("uri").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                })
+            });
+        let (Some(start), Some(end), Some(uri)) = (start, end, uri) else {
+            continue;
+        };
+        if start >= end || end > bytes.len() || !uri.starts_with("http") {
+            continue;
+        }
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        links.push((start, end, uri.to_string()));
+    }
+    if links.is_empty() {
+        return plain_to_html(text);
+    }
+    links.sort_by_key(|(start, _, _)| *start);
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (start, end, uri) in links {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&esc(&text[cursor..start]).replace('\n', "<br>"));
+        out.push_str(&format!(
+            "<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">{}</a>",
+            esc(&uri),
+            esc(&text[start..end]).replace('\n', "<br>")
+        ));
+        cursor = end;
+    }
+    out.push_str(&esc(&text[cursor..]).replace('\n', "<br>"));
+    format!("<p>{out}</p>")
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -1048,7 +1130,10 @@ fn materialize_bsky(row: &BskyRow) -> Value {
     });
     let (media, card) = bsky_media_and_card(&row.embed_json, &row.uri);
     // Keep body as plain-ish HTML paragraphs; lean paint linkifies @/#/URLs.
-    let content = plain_to_html(row.text.replace("\r\n", "\n").trim());
+    let content = bsky_text_to_html(
+        row.text.replace("\r\n", "\n").trim(),
+        &row.raw_json,
+    );
     let account = empty_account(did, username, acct, display, &profile_url, &row.author_avatar);
     // Canonical status_id matches PHP ap_masto_canonical_interaction_keys (bsky:<sha256[:32]>).
     // Keep uri as at:// for Bluesky actions; url as https permalink for object_id parity.
