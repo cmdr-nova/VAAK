@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
+use rand::Rng;
 
 use crate::{config::Config, db};
 
@@ -175,6 +176,11 @@ fn configured_origin_owner() -> i64 {
         .unwrap_or(1)
 }
 
+fn pick_origin_strain() -> String {
+    let index = rand::thread_rng().gen_range(0..ORIGIN_STRAINS.len());
+    ORIGIN_STRAINS[index].to_string()
+}
+
 /// Create a local-only request using the PHP schema. This is intentionally a
 /// library function, not a public route yet; callers must explicitly opt into
 /// the migration after comparing its result with PHP.
@@ -308,12 +314,6 @@ pub async fn resolve_local_request(
             anyhow::bail!("Linked OpenSim bodies must exchange resonance in OpenSim");
         }
     }
-    // PHP owns `random_int()` origin selection. Returning the deliberate
-    // conflict signal lets the caller execute the canonical PHP path instead
-    // of silently producing a different strain in Rust.
-    if kind == "imprint" && from_owner == configured_origin_owner() {
-        anyhow::bail!("Origin imprint requires the PHP catalog roll");
-    }
     let tx = db.transaction().await?;
     if !accept {
         tx.execute(
@@ -349,8 +349,28 @@ pub async fn resolve_local_request(
         if to_imprinted {
             anyhow::bail!("They already have a strain");
         }
-        let (strain, generation) = resolve_peer_imprint(false, &from_strain, from_generation)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let from_is_origin = from_owner == configured_origin_owner();
+        if from_is_origin && from_strain.trim().is_empty() {
+            // Seed the canonical origin body in the same transaction as the
+            // offer resolution. This removes the last local-only PHP fallback
+            // while keeping linked OpenSim bodies protected elsewhere.
+            tx.execute(
+                "UPDATE phyrian_players
+                 SET status='imprinted', strain='Phyrian', resonance=GREATEST(resonance,93),
+                     generation=3, level=80, last_decay_at=NOW(), updated_at=NOW()
+                 WHERE owner_user_id=$1",
+                &[&(from_owner as i32)],
+            ).await?;
+            from_strain = "Phyrian".to_string();
+            from_generation = 3;
+        }
+        let strain = if from_is_origin {
+            pick_origin_strain()
+        } else {
+            resolve_peer_imprint(false, &from_strain, from_generation)
+                .map_err(|e| anyhow::anyhow!(e))?.0
+        };
+        let generation = (from_generation.max(1) + 1).min(99);
         tx.execute(
             "UPDATE phyrian_players
              SET status='imprinted', strain=$1, resonance=GREATEST(resonance,50),
@@ -609,7 +629,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS, DAILY_DECAY};
+    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, normalize_opensim_player, pick_origin_strain, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS, DAILY_DECAY};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -740,14 +760,11 @@ mod tests {
     }
 
     #[test]
-    fn origin_roll_is_always_deferred_to_php() {
-        // The default and configured operator IDs must both take the guarded
-        // origin path; Rust never invents a catalog result independently.
+    fn origin_roll_uses_the_shared_catalog() {
         assert_eq!(configured_origin_owner(), 1);
-        assert_eq!(
-            resolve_peer_imprint(true, "Phyrian", 3),
-            Err("Origin imprint requires the PHP catalog roll")
-        );
+        for _ in 0..32 {
+            assert!(ORIGIN_STRAINS.contains(&pick_origin_strain().as_str()));
+        }
     }
 
     #[test]
