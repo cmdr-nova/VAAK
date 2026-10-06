@@ -6556,6 +6556,35 @@ function ap_bsky_reply_parent_preview_enrich(array $prev, int $ownerUserId = 0):
         }
     }
 
+    // Final cache-only parity fallback: AppView can return the DID as the
+    // parent's handle even when the durable actor profile has the real handle.
+    // Never expose a raw DID in reply chrome when our profile cache can resolve
+    // it locally; this must remain non-blocking and must not fetch the network.
+    if ($did !== '' && str_starts_with($did, 'did:') && $handleThin) {
+        try {
+            $pst = ap_db()->prepare('SELECT profile_json FROM bsky_actor_profiles WHERE did = ? LIMIT 1');
+            $pst->execute([$did]);
+            $prow = $pst->fetch();
+            if (is_array($prow)) {
+                $profile = json_decode((string) ($prow['profile_json'] ?? ''), true);
+                if (is_array($profile)) {
+                    $ph = trim((string) ($profile['handle'] ?? ''));
+                    $pd = trim((string) ($profile['displayName'] ?? $profile['display_name'] ?? ''));
+                    if ($ph !== '' && !str_starts_with($ph, 'did:')) {
+                        $handle = $ph;
+                        $handleThin = false;
+                    }
+                    if ($displayThin && $pd !== '') {
+                        $display = $pd;
+                        $displayThin = false;
+                    }
+                }
+            }
+        } catch (Throwable $e) {
+            // cache enrichment is best-effort
+        }
+    }
+
     if ($displayThin) {
         $display = $handle !== '' ? $handle : 'parent post';
     }
