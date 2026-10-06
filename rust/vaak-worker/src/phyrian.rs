@@ -43,6 +43,7 @@ pub struct Player {
     pub last_decay_at: String,
     pub stability: String,
     pub decay_applied_in_projection: i64,
+    pub daily_resonance_decay: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -482,6 +483,10 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
         .query_opt(
             "SELECT u.username, u.actor_key, p.actor_id, p.status, p.strain,
                     p.resonance, p.generation, p.level, p.imprinted_by_owner_id,
+                    COALESCE(p.daily_resonance_decay, 5),
+                    EXISTS (SELECT 1 FROM phyrian_bridge_links l
+                            WHERE l.owner_user_id = u.id
+                              AND l.status = 'verified' AND l.unlinked_at IS NULL),
                     COALESCE(to_char(p.imprinted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), ''),
                     COALESCE(to_char(p.last_checkin_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), ''),
                     COALESCE(to_char(p.last_decay_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), ''),
@@ -504,15 +509,21 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
     let strain: String = row.try_get::<_, Option<String>>(4).unwrap_or(None).unwrap_or_default();
     let imprinted = status == "imprinted" && !strain.trim().is_empty();
     let stored_resonance: i64 = i64::from(row.try_get::<_, i32>(5).unwrap_or(0));
-    let age_secs: i64 = row.try_get(13).unwrap_or(0);
-    let decay_secs: i64 = row.try_get(14).unwrap_or(0);
+    let daily_decay: i64 = i64::from(row.try_get::<_, i32>(9).unwrap_or(DAILY_DECAY as i32)).max(0);
+    let linked: bool = row.try_get(10).unwrap_or(false);
+    let age_secs: i64 = row.try_get(15).unwrap_or(0);
+    let decay_secs: i64 = row.try_get(16).unwrap_or(0);
     let decay_days = if imprinted && age_secs >= DECAY_GRACE_SECS {
         (decay_secs.max(0) / 86_400).max(0)
     } else {
         0
     };
     // Projection only: PHP remains responsible for persisting lazy decay.
-    let (resonance, applied) = projected_decay(&status, &strain, stored_resonance, age_secs, decay_days * 86_400);
+    let (resonance, applied) = if linked {
+        (stored_resonance, 0)
+    } else {
+        projected_decay(&status, &strain, stored_resonance, age_secs, decay_days * 86_400, daily_decay)
+    };
 
     let player = Player {
         status: status.clone(),
@@ -526,6 +537,7 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
         last_decay_at: row.try_get(11).unwrap_or_default(),
         stability: stability(imprinted, resonance),
         decay_applied_in_projection: applied,
+        daily_resonance_decay: daily_decay,
     };
 
     let pending_requests = client
@@ -587,17 +599,17 @@ fn stability(imprinted: bool, resonance: i64) -> String {
     match resonance { r if r <= 0 => "Dormant", r if r < 25 => "Critical", r if r < 50 => "Fading", _ => "Stable" }.into()
 }
 
-fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, decay_secs: i64) -> (i64, i64) {
+fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, decay_secs: i64, daily_decay: i64) -> (i64, i64) {
     let imprinted = status == "imprinted" && !strain.trim().is_empty();
     if !imprinted || age_secs < DECAY_GRACE_SECS { return (resonance, 0); }
     let days = (decay_secs.max(0) / 86_400).max(0);
-    let amount = (days * DAILY_DECAY).min(resonance.max(0));
+    let amount = (days * daily_decay.max(0)).min(resonance.max(0));
     ((resonance - amount).max(0), amount)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS};
+    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS, DAILY_DECAY};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -612,7 +624,7 @@ mod tests {
         struct Case { status: String, strain: String, resonance: i64, age_secs: i64, decay_secs: i64, expected_resonance: i64, expected_stability: String, expected_decay: i64 }
         let cases: Vec<Case> = serde_json::from_str(include_str!("../fixtures/phyrian/php-parity.json")).expect("fixture JSON");
         for case in cases {
-            let (resonance, decay) = projected_decay(&case.status, &case.strain, case.resonance, case.age_secs, case.decay_secs);
+            let (resonance, decay) = projected_decay(&case.status, &case.strain, case.resonance, case.age_secs, case.decay_secs, DAILY_DECAY);
             assert_eq!(resonance, case.expected_resonance);
             assert_eq!(decay, case.expected_decay);
             assert_eq!(stability(case.status == "imprinted" && !case.strain.is_empty(), resonance), case.expected_stability);

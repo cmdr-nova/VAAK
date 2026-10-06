@@ -178,6 +178,7 @@ function ap_phyrian_bridge_normalize_opensim_player(array $osPlayer): array
         'resonance_exchanges' => max(0, (int) ($osPlayer['resonance_exchanges'] ?? 0)),
         'inductions_given' => max(0, (int) ($osPlayer['inductions_given'] ?? 0)),
         'lineage_depth' => max(0, (int) ($osPlayer['lineage_depth'] ?? 0)),
+        'daily_resonance_decay' => max(0, min(100, (int) ($osPlayer['daily_resonance_decay'] ?? 5))),
         'last_decay_at' => is_string($osPlayer['last_decay_at'] ?? null)
             && trim((string) $osPlayer['last_decay_at']) !== ''
             ? trim((string) $osPlayer['last_decay_at'])
@@ -743,6 +744,7 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
     $exchanges = (int) $normalized['resonance_exchanges'];
     $inductions = (int) $normalized['inductions_given'];
     $lineageDepth = (int) $normalized['lineage_depth'];
+    $dailyDecay = (int) $normalized['daily_resonance_decay'];
     $lastDecaySql = is_string($normalized['last_decay_at']) ? $normalized['last_decay_at'] : null;
 
     $imprintedAt = (string) ($before['imprinted_at'] ?? '');
@@ -769,6 +771,7 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
                      banked_resonance = ?,
                      resonance_exchanges = ?,
                      inductions_given = ?,
+                     daily_resonance_decay = ?,
                      last_decay_at = ?,
                      imprinted_at = {$imprintedAtExpr},
                      updated_at = NOW()
@@ -782,6 +785,7 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
                 $banked,
                 $exchanges,
                 $inductions,
+                $dailyDecay,
                 $lastDecaySql,
                 $ownerUserId,
             ]);
@@ -796,6 +800,7 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
                      banked_resonance = ?,
                      resonance_exchanges = ?,
                      inductions_given = ?,
+                     daily_resonance_decay = ?,
                      last_decay_at = ?,
                      updated_at = NOW()
                  WHERE owner_user_id = ?'
@@ -808,6 +813,7 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
                 $banked,
                 $exchanges,
                 $inductions,
+                $dailyDecay,
                 $lastDecaySql,
                 $ownerUserId,
             ]);

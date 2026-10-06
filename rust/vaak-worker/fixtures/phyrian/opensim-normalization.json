@@ -10,6 +10,7 @@
       "resonance_exchanges": -2,
       "inductions_given": 7,
       "lineage_depth": -1,
+      "daily_resonance_decay": 7,
       "last_decay_at": " 2026-10-05T00:00:00Z "
     },
     "expected": {
@@ -22,6 +23,7 @@
       "resonance_exchanges": 0,
       "inductions_given": 7,
       "lineage_depth": 0,
+      "daily_resonance_decay": 7,
       "last_decay_at": "2026-10-05T00:00:00Z"
     }
   },
@@ -38,6 +40,7 @@
       "resonance_exchanges": 0,
       "inductions_given": 0,
       "lineage_depth": 0,
+      "daily_resonance_decay": 5,
       "last_decay_at": null
     }
   },
@@ -52,6 +55,7 @@
       "resonance_exchanges": 3,
       "inductions_given": 0,
       "lineage_depth": 4,
+      "daily_resonance_decay": 5,
       "last_decay_at": "   "
     },
     "expected": {
@@ -64,6 +68,7 @@
       "resonance_exchanges": 3,
       "inductions_given": 0,
       "lineage_depth": 4,
+      "daily_resonance_decay": 5,
       "last_decay_at": null
     }
   }
