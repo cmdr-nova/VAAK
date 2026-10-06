@@ -1567,6 +1567,29 @@ async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashMap<String, 
             },
         );
     }
+    // PHP parity: thin Jetstream/AppView rows can have empty denormalized
+    // author columns while raw_json already contains the PostView author.
+    // Patch those fields before the durable profile-cache fallback so a new
+    // Bluesky card never paints as “Bluesky User” merely because actor-warm is
+    // a few seconds behind ingestion.
+    for post in map.values_mut() {
+        if let Ok(raw) = serde_json::from_str::<Value>(&post.raw_json) {
+            let author = raw.get("author")
+                .or_else(|| raw.get("post").and_then(|p| p.get("author")));
+            if let Some(author) = author {
+                if post.author_handle.trim().is_empty() {
+                    post.author_handle = author.get("handle").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                }
+                if post.author_display.trim().is_empty() {
+                    post.author_display = author.get("displayName").or_else(|| author.get("display_name"))
+                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                }
+                if post.author_avatar.trim().is_empty() {
+                    post.author_avatar = author.get("avatar").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                }
+            }
+        }
+    }
     // Jetstream can persist a thin post before its author view arrives. Use the
     // durable actor-profile cache as a second read source so cards do not paint
     // a DID/default avatar while actor-warm catches up.
@@ -1722,7 +1745,7 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
     let rows = db
         .query(
             "SELECT COALESCE(actor_id,''), COALESCE(username,''), COALESCE(display_name,''),
-                    COALESCE(host,''), COALESCE(icon_source_url,'')
+                    COALESCE(host,''), COALESCE(icon_source_url,''), COALESCE(profile_json,'')
              FROM remote_actors WHERE actor_id = ANY($1)",
             &[&variants],
         )
@@ -1731,14 +1754,33 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
     for row in rows {
         let actor_id: String = row.get(0);
         let key = actor_id.trim_end_matches('/').to_string();
+        let mut username: String = row.get(1);
+        let mut display_name: String = row.get(2);
+        let mut icon: String = row.get(4);
+        // Older remote_actors rows may retain a complete profile_json even
+        // when the denormalized label/avatar columns are blank.
+        if let Ok(profile) = serde_json::from_str::<Value>(&row.get::<_, String>(5)) {
+            if username.trim().is_empty() {
+                username = profile.get("preferredUsername").or_else(|| profile.get("username"))
+                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+            if display_name.trim().is_empty() {
+                display_name = profile.get("name").or_else(|| profile.get("displayName"))
+                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            }
+            if icon.trim().is_empty() {
+                icon = profile.get("icon").and_then(|v| v.get("url")).and_then(|v| v.as_str())
+                    .or_else(|| profile.get("icon").and_then(|v| v.as_str())).unwrap_or("").to_string();
+            }
+        }
         map.insert(
             key,
             ActorRow {
                 actor_id,
-                username: row.get(1),
-                display_name: row.get(2),
+                username,
+                display_name,
                 host: row.get(3),
-                icon: row.get(4),
+                icon,
             },
         );
     }
