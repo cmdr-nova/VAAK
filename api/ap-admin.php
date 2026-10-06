@@ -6141,14 +6141,14 @@ $shellFollowGraph = $isPartial
 $needFollowersRows = !$accountSwitcherView && (
     (!$isPartial && $view === 'followers')
     || $shellFollowGraph && $view === 'followers'
-    || (!$isPartial && !in_array($view, ['following', 'mentions', 'account_switcher'], true))
+    || (!$isPartial && !in_array($view, ['following', 'mentions', 'account_switcher', 'remote_profile'], true))
 );
 // Following *rows* are only required to paint the Following page. Membership for
 // cards/Follow-back uses ap_following_id_set (Redis) instead of merging every
 // Bluesky profile handle on each soft-nav.
 $needFollowingRows = !$accountSwitcherView && (
     $view === 'following'
-    || (!$isPartial && !in_array($view, ['followers', 'mentions', 'account_switcher'], true))
+    || (!$isPartial && !in_array($view, ['followers', 'mentions', 'account_switcher', 'remote_profile'], true))
 );
 $relationshipProjectionView = in_array($view, ['followers', 'following'], true) || $shellFollowGraph;
 $followersShadow = $relationshipProjectionView && $needFollowersRows
