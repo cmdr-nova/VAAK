@@ -1676,6 +1676,57 @@ fn status_account_actor(status: &Value) -> String {
         .to_string()
 }
 
+/// Build the PHP-compatible reply mention seed from the parent author and any
+/// structured participants already present on the status. Handles are
+/// normalized and deduplicated so repeated replies do not grow duplicate
+/// @mentions in the composer.
+fn reply_mention_query(status: &Value, viewer_actor: &str) -> String {
+    // Compare against the viewer's actual account key, not the whole actor URL
+    // (a substring check would incorrectly drop unrelated handles).
+    let viewer = viewer_actor.trim().trim_end_matches('/');
+    let viewer_key = viewer
+        .rsplit_once("/users/")
+        .map(|(_, name)| name)
+        .or_else(|| viewer.rsplit_once("/profile/").map(|(_, name)| name))
+        .unwrap_or(viewer)
+        .trim_matches('/')
+        .to_ascii_lowercase();
+    let viewer_keys = [viewer_key.clone(), format!("{viewer_key}@mkultra.monster")];
+    let mut handles: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |raw: &str| {
+        let mut h = raw.trim().trim_start_matches('@').to_string();
+        if h.is_empty() { return; }
+        if h.ends_with("@bsky.app") {
+            h.truncate(h.len().saturating_sub("@bsky.app".len()));
+        }
+        let key = h.to_ascii_lowercase();
+        if key.is_empty()
+            || key.starts_with("did:")
+            || viewer_keys.iter().any(|candidate| candidate == &key)
+            || !seen.insert(key)
+        {
+            return;
+        }
+        handles.push(h);
+    };
+    // A hydrated Bluesky reply can expose the parent handle separately. Put
+    // that first so the direct recipient is always preserved, then add the
+    // status author and any remaining chain participants.
+    if let Some(parent) = status.get("vaak_reply_parent_handle").and_then(|v| v.as_str()) { push(parent); }
+    if let Some(account) = status.get("account") {
+        if let Some(acct) = account.get("acct").and_then(|v| v.as_str()) { push(acct); }
+    }
+    if let Some(mentions) = status.get("mentions").and_then(|v| v.as_array()) {
+        for mention in mentions {
+            if let Some(acct) = mention.get("acct").and_then(|v| v.as_str()) { push(acct); }
+            else if let Some(username) = mention.get("username").and_then(|v| v.as_str()) { push(username); }
+        }
+    }
+    if handles.is_empty() { return String::new(); }
+    format!("&mention={}", urlencoding_encode(&handles.join(",")))
+}
+
 /// Stamp mute/block flags onto statuses (and nested reblogs) for lean ⋯ menus.
 pub fn stamp_viewer_moderation(statuses: &mut [Value], moderation: &crate::hidden::ViewerModeration) {
     for st in statuses.iter_mut() {
@@ -2213,6 +2264,7 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
             if !local && actor_ref.starts_with("https://") {
                 reply_href.push_str(&format!("&to={}", urlencoding_encode(actor_ref)));
             }
+            reply_href.push_str(&reply_mention_query(status, viewer_actor));
             reply_href.push_str(&cw_q);
             actions.push_str(&format!(
                 "<a class=\"icon-btn\" href=\"{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",
@@ -3255,6 +3307,26 @@ mod tests {
         assert!(html.contains("compose=1") && html.contains("reply_to="), "{html}");
         assert!(html.contains("view=dms&amp;peer="), "Fediverse overflow should offer DM: {html}");
         assert!(!html.contains(">Open</a></div>"), "Home should not be Open-only: {html}");
+    }
+
+    #[test]
+    fn reply_seed_includes_chain_participants_once_and_skips_viewer() {
+        let st = json!({
+            "account": {"acct": "author@remote.example"},
+            "vaak_reply_parent_handle": "parent.example",
+            "mentions": [
+                {"acct": "author@remote.example"},
+                {"acct": "parent.example"},
+                {"acct": "viewer@mkultra.monster"},
+                {"acct": "alice.bsky.social@bsky.app"}
+            ]
+        });
+        let query = reply_mention_query(&st, "https://mkultra.monster/users/viewer");
+        assert_eq!(
+            query,
+            "&mention=parent.example%2Cauthor%40remote.example%2Calice.bsky.social",
+            "reply seeds must be stable, deduplicated, and viewer-safe"
+        );
     }
 
     #[test]

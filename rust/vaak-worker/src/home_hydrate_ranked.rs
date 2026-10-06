@@ -176,6 +176,46 @@ fn bsky_text_to_html(plain: &str, raw_json: &str) -> String {
     format!("<p>{out}</p>")
 }
 
+/// Convert Bluesky mention facets into Mastodon-compatible mention objects.
+/// The visible facet text is the best available handle until the DID has been
+/// hydrated; retaining it still lets reply composers address the full chain.
+fn bsky_mentions_from_raw(text: &str, raw_json: &str) -> Vec<Value> {
+    let Ok(raw) = serde_json::from_str::<Value>(raw_json) else {
+        return Vec::new();
+    };
+    let facets = raw
+        .get("record")
+        .and_then(|v| v.get("facets"))
+        .or_else(|| raw.get("facets"))
+        .and_then(|v| v.as_array());
+    let Some(facets) = facets else { return Vec::new(); };
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for facet in facets {
+        let start = facet.get("index").and_then(|v| v.get("byteStart")).and_then(Value::as_u64).map(|n| n as usize);
+        let end = facet.get("index").and_then(|v| v.get("byteEnd")).and_then(Value::as_u64).map(|n| n as usize);
+        let did = facet.get("features").and_then(Value::as_array).and_then(|features| {
+            features.iter().find_map(|feature| {
+                let kind = feature.get("$type").and_then(Value::as_str).unwrap_or("");
+                if kind.ends_with("#mention") { feature.get("did").and_then(Value::as_str) } else { None }
+            })
+        });
+        let (Some(start), Some(end), Some(did)) = (start, end, did) else { continue; };
+        if start >= end || end > bytes.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) { continue; }
+        let visible = text[start..end].trim().trim_start_matches('@').trim();
+        if visible.is_empty() || !seen.insert(visible.to_ascii_lowercase()) { continue; }
+        out.push(json!({
+            "id": did,
+            "username": visible,
+            "acct": visible,
+            "url": format!("https://bsky.app/profile/{did}"),
+            "uri": format!("https://bsky.app/profile/{did}"),
+        }));
+    }
+    out
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -959,6 +999,7 @@ struct EventRow {
     spoiler_text: String,
     host: String,
     target_actor: String,
+    in_reply_to: String,
     ask_actor: String,
     ask_question: String,
     ask_answer: String,
@@ -1198,6 +1239,7 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     st["source"] = json!("bluesky");
     st["author_did"] = json!(did);
     st["language"] = json!("en");
+    st["mentions"] = json!(bsky_mentions_from_raw(row.text.trim(), &row.raw_json));
     let cid = bsky_cid_from_raw(&row.raw_json);
     if !cid.is_empty() {
         st["bsky_cid"] = json!(cid);
@@ -1389,6 +1431,14 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
     let mut st = base_status(&status_id, &created, &content, uri, uri, account, media, None);
     st["sensitive"] = json!(row.sensitive || !row.spoiler_text.trim().is_empty());
     st["spoiler_text"] = json!(row.spoiler_text);
+    let parent = row.in_reply_to.trim().trim_end_matches('/');
+    if !parent.is_empty() && (parent.starts_with("https://") || parent.starts_with("http://")) {
+        st["vaak_in_reply_to_url"] = json!(parent);
+        let parent_handle = reply_handle_from_object_url(parent);
+        if !parent_handle.is_empty() {
+            st["vaak_reply_parent_handle"] = json!(parent_handle);
+        }
+    }
     if !row.ask_question.trim().is_empty() {
         st["vaak_ask"] = json!({
             "ask_actor": row.ask_actor,
@@ -1508,6 +1558,19 @@ fn local_username_from_url(url: &str) -> Option<String> {
     Some(key.to_ascii_lowercase())
 }
 
+fn reply_handle_from_object_url(url: &str) -> String {
+    let actor = url
+        .split_once("/statuses/")
+        .map(|(prefix, _)| prefix)
+        .or_else(|| url.split_once("/notes/").map(|(prefix, _)| prefix))
+        .unwrap_or("");
+    if actor.is_empty() { return String::new(); }
+    let username = actor.rsplit('/').next().unwrap_or("").trim();
+    let host = host_from_url(actor);
+    if username.is_empty() || host.is_empty() { return String::new(); }
+    format!("{username}@{host}")
+}
+
 fn local_account_from_profile(
     actor_url: &str,
     username: &str,
@@ -1616,6 +1679,10 @@ fn materialize_outbox(
     let parent = row.in_reply_to.trim().trim_end_matches('/');
     if !parent.is_empty() && (parent.starts_with("https://") || parent.starts_with("at://")) {
         st["vaak_in_reply_to_url"] = json!(parent);
+        let parent_handle = reply_handle_from_object_url(parent);
+        if !parent_handle.is_empty() {
+            st["vaak_reply_parent_handle"] = json!(parent_handle);
+        }
         if let Some((child_actor, _)) = row.id.rsplit_once("/notes/") {
             if let Some((parent_actor, _)) = parent.rsplit_once("/notes/") {
                 if child_actor == parent_actor {
@@ -2156,7 +2223,7 @@ async fn fetch_events_map(db: &Client, ids: &[i64]) -> Result<HashMap<i64, Event
             "SELECT id, COALESCE(type,''), COALESCE(actor_id,''), COALESCE(object_id,''),
                     COALESCE(summary,''), COALESCE(media_urls,'[]'),
                     COALESCE(created_at::text,''), COALESCE(sensitive, 0),
-                    COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,'')
+                    COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,''), COALESCE(in_reply_to,'')
              FROM events WHERE id = ANY($1)",
             &[&ids],
         )
@@ -2180,6 +2247,7 @@ async fn fetch_events_map(db: &Client, ids: &[i64]) -> Result<HashMap<i64, Event
                 spoiler_text: row.get(8),
                 host: row.get(9),
                 target_actor: row.get(10),
+                in_reply_to: row.get(11),
                 ask_actor: String::new(),
                 ask_question: String::new(),
                 ask_answer: String::new(),
@@ -2213,7 +2281,7 @@ async fn fetch_creates_by_object(
                     id, COALESCE(type,''), COALESCE(actor_id,''), COALESCE(object_id,''),
                     COALESCE(summary,''), COALESCE(media_urls,'[]'),
                     COALESCE(created_at::text,''), COALESCE(sensitive, 0),
-                    COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,'')
+                    COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,''), COALESCE(in_reply_to,'')
              FROM events
              WHERE type = 'Create' AND rtrim(object_id, '/') = ANY($1)
              ORDER BY rtrim(object_id, '/'), id DESC",
@@ -2240,6 +2308,7 @@ async fn fetch_creates_by_object(
                 spoiler_text: row.get(8),
                 host: row.get(9),
                 target_actor: row.get(10),
+                in_reply_to: row.get(11),
                 ask_actor: String::new(),
                 ask_question: String::new(),
                 ask_answer: String::new(),
@@ -3418,6 +3487,7 @@ mod tests {
             spoiler_text: "Gallery".into(),
             host: "mkultra.monster".into(),
             target_actor: String::new(),
+            in_reply_to: String::new(),
             ask_actor: String::new(),
             ask_question: String::new(),
             ask_answer: String::new(),
@@ -3459,6 +3529,7 @@ mod tests {
             spoiler_text: String::new(),
             host: "remote.example".into(),
             target_actor: String::new(),
+            in_reply_to: String::new(),
             ask_actor: String::new(),
             ask_question: String::new(),
             ask_answer: String::new(),
