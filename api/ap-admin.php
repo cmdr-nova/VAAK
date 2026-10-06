@@ -30237,6 +30237,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $rpBskyFollowing = false;
           $rpBskyFollowsYou = false;
           $rpBskyPosts = [];
+          // Secondary profile tabs do not need a full Bluesky author-feed
+          // hydration. Keep the first paint focused on the requested tab.
+          $rpRequestedTab = strtolower(trim((string) ($_GET['tab'] ?? 'posts')));
           try {
               if (!defined('AP_INBOX_LIB_ONLY')) {
                   define('AP_INBOX_LIB_ONLY', true);
@@ -30367,10 +30370,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                           $rpBskyFollowing = is_array(ap_bsky_graph_sync_get($vaakOwnerId, 'follow', $rpBskyDid));
                       }
                   }
-                  if ($rpBskyDid !== '' && function_exists('ap_bsky_author_feed_refresh_enqueue')) {
+                  if ($rpBskyDid !== '' && in_array($rpRequestedTab, ['posts', 'replies', 'boosts', 'media'], true)
+                      && function_exists('ap_bsky_author_feed_refresh_enqueue')) {
                       ap_bsky_author_feed_refresh_enqueue($vaakOwnerId, $rpBskyDid);
                   }
-                  if ($rpBskyDid !== '' && function_exists('ap_bsky_posts_for_author')) {
+                  if ($rpBskyDid !== '' && in_array($rpRequestedTab, ['posts', 'replies', 'boosts', 'media'], true)
+                      && function_exists('ap_bsky_posts_for_author')) {
                       $rpBskyPosts = ap_bsky_posts_for_author($rpBskyDid, 40);
                   }
               } elseif ($rpIsBsky && !$rpIsLocal) {
@@ -30504,10 +30509,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                       $ownBskySession = ap_bsky_session_row((int) $vaakOwnerId);
                       $ownBskyDid = trim((string) ($ownBskySession['did'] ?? ''));
                       if ($ownBskyDid !== '') {
-                          if (function_exists('ap_bsky_author_feed_refresh_enqueue')) {
+                          if (in_array($rpRequestedTab, ['posts', 'replies', 'boosts', 'media'], true)
+                              && function_exists('ap_bsky_author_feed_refresh_enqueue')) {
                               ap_bsky_author_feed_refresh_enqueue((int) $vaakOwnerId, $ownBskyDid);
                           }
-                          if (function_exists('ap_bsky_posts_for_author')) {
+                          if (in_array($rpRequestedTab, ['posts', 'replies', 'boosts', 'media'], true)
+                              && function_exists('ap_bsky_posts_for_author')) {
                               $rpBskyPosts = ap_bsky_posts_for_author($ownBskyDid, 40);
                           }
                       }
