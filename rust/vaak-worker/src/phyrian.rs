@@ -145,8 +145,11 @@ pub fn resolve_peer_imprint(
     Ok((strain.to_string(), (from_generation.max(1) + 1).min(99)))
 }
 
-/// Same cosmetic catalog as PHP `ap_phyrian_strain_catalog()`. The origin roll
-/// is intentionally only used after the authenticated mutation hand-off.
+/// Same cosmetic catalog as PHP `ap_phyrian_strain_catalog()`.
+///
+/// The catalog is retained as a parity fixture, but Rust must not select from
+/// it during a mutation: PHP's `random_int()` result is the canonical origin
+/// roll until a cross-runtime fixture/seed protocol exists.
 const ORIGIN_STRAINS: &[&str] = &[
     "Cosmic Alien", "Voidborne", "Signal Choir", "Astral Parasite", "Eventide Spore",
     "Starless Brood", "Null Communion", "Blacklight Kin", "Quasar Wound", "Eclipse Vessel",
@@ -163,8 +166,12 @@ const ORIGIN_STRAINS: &[&str] = &[
     "Moonless Colony", "Grave Neon", "Sable Current",
 ];
 
-fn origin_strain_roll() -> String {
-    ORIGIN_STRAINS[(rand::random::<u64>() as usize) % ORIGIN_STRAINS.len()].to_string()
+fn configured_origin_owner() -> i64 {
+    std::env::var("VAAK_PHYRIAN_ORIGIN_OWNER_ID")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .unwrap_or(1)
 }
 
 /// Create a local-only request using the PHP schema. This is intentionally a
@@ -232,7 +239,7 @@ pub async fn create_local_request(
             to_imprinted = imprinted == "imprinted" && !strain.trim().is_empty();
         }
     }
-    let origin = from_owner == 1;
+    let origin = from_owner == configured_origin_owner();
     plan_request_offer(kind, from_owner, to_owner, from_imprinted, to_imprinted, origin, generation)
         .map_err(|e| anyhow::anyhow!(e))?;
     let dup: Option<i64> = db
@@ -298,6 +305,12 @@ pub async fn resolve_local_request(
             anyhow::bail!("Linked OpenSim bodies must exchange resonance in OpenSim");
         }
     }
+    // PHP owns `random_int()` origin selection. Returning the deliberate
+    // conflict signal lets the caller execute the canonical PHP path instead
+    // of silently producing a different strain in Rust.
+    if kind == "imprint" && from_owner == configured_origin_owner() {
+        anyhow::bail!("Origin imprint requires the PHP catalog roll");
+    }
     let tx = db.transaction().await?;
     if !accept {
         tx.execute(
@@ -318,7 +331,6 @@ pub async fn resolve_local_request(
             .await?;
         let mut from_strain = String::new();
         let mut from_generation = 1;
-        let mut from_imprinted = false;
         let mut to_imprinted = false;
         for r in rows {
             let id: i64 = r.get(0);
@@ -327,7 +339,6 @@ pub async fn resolve_local_request(
             if id == from_owner {
                 from_strain = strain;
                 from_generation = r.get(2);
-                from_imprinted = status == "imprinted" && !from_strain.trim().is_empty();
             } else if id == owner {
                 to_imprinted = status == "imprinted" && !strain.trim().is_empty();
             }
@@ -335,22 +346,8 @@ pub async fn resolve_local_request(
         if to_imprinted {
             anyhow::bail!("They already have a strain");
         }
-        let (strain, generation) = if from_owner == 1 {
-            if !from_imprinted {
-                tx.execute(
-                    "UPDATE phyrian_players
-                     SET status='imprinted', strain='Phyrian', resonance=93,
-                         generation=3, level=80, imprinted_at=COALESCE(imprinted_at,NOW()),
-                         last_decay_at=NOW(), updated_at=NOW() WHERE owner_user_id=$1",
-                    &[&(from_owner as i32)],
-                )
-                .await?;
-            }
-            (origin_strain_roll(), (from_generation.max(3) + 1).min(99))
-        } else {
-            resolve_peer_imprint(false, &from_strain, from_generation)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let (strain, generation) = resolve_peer_imprint(false, &from_strain, from_generation)
+            .map_err(|e| anyhow::anyhow!(e))?;
         tx.execute(
             "UPDATE phyrian_players
              SET status='imprinted', strain=$1, resonance=GREATEST(resonance,50),
@@ -558,7 +555,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability};
+    use super::{configured_origin_owner, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, ORIGIN_STRAINS};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -644,5 +641,24 @@ mod tests {
             resolve_peer_imprint(false, "", 4),
             Err("Imprinter has no strain")
         );
+    }
+
+    #[test]
+    fn origin_roll_is_always_deferred_to_php() {
+        // The default and configured operator IDs must both take the guarded
+        // origin path; Rust never invents a catalog result independently.
+        assert_eq!(configured_origin_owner(), 1);
+        assert_eq!(
+            resolve_peer_imprint(true, "Phyrian", 3),
+            Err("Origin imprint requires the PHP catalog roll")
+        );
+    }
+
+    #[test]
+    fn origin_catalog_order_matches_php_fixture_shape() {
+        assert_eq!(ORIGIN_STRAINS.len(), 65);
+        assert_eq!(ORIGIN_STRAINS.first(), Some(&"Cosmic Alien"));
+        assert_eq!(ORIGIN_STRAINS[55], "Phyrian");
+        assert_eq!(ORIGIN_STRAINS.last(), Some(&"Sable Current"));
     }
 }
