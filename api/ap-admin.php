@@ -1130,7 +1130,9 @@ $vaakAdminOnlyActions = [
         header('Content-Type: application/json; charset=utf-8');
         header('Cache-Control: no-store');
         $actor = trim((string) ($_POST['actor'] ?? ''));
-        $payload = admin_profile_hover_payload($actor, $vaakOwnerId, $vaakActorId);
+        $source = trim((string) ($_POST['source'] ?? ''));
+        $label = trim((string) ($_POST['label'] ?? ''));
+        $payload = admin_profile_hover_payload($actor, $vaakOwnerId, $vaakActorId, $source, $label);
         echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         exit;
     }
@@ -14671,7 +14673,7 @@ function admin_profile_hover_attr(?string $actorId): string
 }
 
 /** Cache-only hover data; remote profile warming is queued, never fetched inline. */
-function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $ownerActorId): array
+function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $ownerActorId, string $source = '', string $label = ''): array
 {
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with(strtolower($actorId), 'https://') || !filter_var($actorId, FILTER_VALIDATE_URL)) {
@@ -14680,6 +14682,23 @@ function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $
     $profileUrl = function_exists('admin_profile_app_href')
         ? admin_profile_app_href($actorId, 'home')
         : ('?view=remote_profile&actor=' . rawurlencode($actorId) . '&from=home');
+    if (strtolower($source) === 'rss') {
+        return [
+            'ok' => true,
+            'loading' => false,
+            'actor' => $actorId,
+            'profile_url' => '',
+            'platform' => 'rss',
+            'display_name' => $label !== '' ? $label : 'RSS feed',
+            'handle' => '',
+            'avatar' => '',
+            'bio' => 'RSS item',
+            'following' => false,
+            'follows_you' => false,
+            'own' => false,
+            'can_follow' => false,
+        ];
+    }
     $own = function_exists('vaak_is_own_url') && vaak_is_own_url($actorId);
     $platform = function_exists('ap_bsky_is_profile_ref') && ap_bsky_is_profile_ref($actorId) ? 'bluesky' : 'fediverse';
     $display = '';
@@ -39581,9 +39600,11 @@ if (VIEW === 'analytics') loadAnalytics();
     }
     foot.appendChild(actions); card.appendChild(foot); position();
   }
-  async function load(actor, seq) {
+  async function load(actor, seq, source, label) {
     try {
       const fd = new FormData(); fd.set('action', 'profile_hover_data'); fd.set('actor', actor);
+      if (source) fd.set('source', source);
+      if (label) fd.set('label', label);
       if (window.VAAK_CSRF) fd.set('csrf', window.VAAK_CSRF);
       const res = await fetch(window.location.pathname + (window.location.search || ''), {
         method: 'POST', body: fd, credentials: 'same-origin',
@@ -39606,7 +39627,7 @@ if (VIEW === 'analytics') loadAnalytics();
       anchor = el; const seq = ++requestSeq;
       card.hidden = false; card.style.left = '12px'; card.style.top = '12px';
       card.innerHTML = '<div class="profile-hover-head"><span class="profile-hover-spinner" aria-hidden="true"></span><span>Loading profile…</span></div>';
-      position(); load(actor, seq);
+      position(); load(actor, seq, el.dataset.profileHoverSource || '', el.dataset.profileHoverLabel || '');
     }, SHOW_DELAY_MS);
   }
   function scheduleHide() {

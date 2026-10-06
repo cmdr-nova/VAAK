@@ -2563,6 +2563,19 @@ pub fn paint_lean_embed_from(
         .get("visibility")
         .and_then(|v| v.as_str())
         .unwrap_or("public");
+    let rss = status
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(|v| v.eq_ignore_ascii_case("rss"))
+        .unwrap_or(false);
+    let hover_meta = if rss {
+        format!(
+            " data-profile-hover-source=\"rss\" data-profile-hover-label=\"{}\"",
+            esc(if display.is_empty() { acct } else { display })
+        )
+    } else {
+        String::new()
+    };
 
     let mut article_classes = String::from("tweet");
     if hide_header {
@@ -2621,15 +2634,17 @@ pub fn paint_lean_embed_from(
             String::new()
         };
         let av_img = format!(
-            "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" data-profile-hover-actor=\"{}\">",
+            "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\" data-profile-hover-actor=\"{}\"{}>",
             esc(av),
-            esc(actor_ref)
+            esc(actor_ref),
+            hover_meta
         );
         let av_block = if !profile_href.is_empty() {
             format!(
-                "<a href=\"{}\" data-profile-hover-actor=\"{}\" style=\"text-decoration:none\">{}</a>",
+                "<a href=\"{}\" data-profile-hover-actor=\"{}\"{} style=\"text-decoration:none\">{}</a>",
                 esc(&profile_href),
                 esc(actor_ref),
+                hover_meta,
                 av_img
             )
         } else {
@@ -2637,12 +2652,14 @@ pub fn paint_lean_embed_from(
         };
         let who = if !profile_href.is_empty() {
             format!(
-                "<a class=\"who\" href=\"{}\" data-profile-hover-actor=\"{}\" style=\"color:inherit;text-decoration:none\">{}</a><a class=\"meta\" href=\"{}\" data-profile-hover-actor=\"{}\" style=\"color:var(--muted);text-decoration:none\"> @{}</a>",
+                "<a class=\"who\" href=\"{}\" data-profile-hover-actor=\"{}\"{} style=\"color:inherit;text-decoration:none\">{}</a><a class=\"meta\" href=\"{}\" data-profile-hover-actor=\"{}\"{} style=\"color:var(--muted);text-decoration:none\"> @{}</a>",
                 esc(&profile_href),
                 esc(actor_ref),
+                hover_meta,
                 esc(display),
                 esc(&profile_href),
                 esc(actor_ref),
+                hover_meta,
                 esc(acct)
             )
         } else {
