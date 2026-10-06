@@ -1217,6 +1217,29 @@ function ap_bsky_at_uri_from_https(string $url, int $ownerUserId = 0): ?string
     } catch (Throwable $e) {
         // ignore
     }
+    // Quote objects frequently retain the bsky.app web permalink even when
+    // the post exists only in the shared bsky_posts cache. Resolve by handle
+    // and rkey before attempting identity resolution or a network fetch.
+    try {
+        $st = ap_db()->prepare(
+            'SELECT bsky_uri FROM bsky_posts
+             WHERE bsky_uri LIKE ? AND lower(author_handle) = lower(?)
+             LIMIT 1'
+        );
+        $st->execute(['%/' . $rkey, $actor]);
+        $cachedUri = $st->fetchColumn();
+        if (is_string($cachedUri) && str_starts_with($cachedUri, 'at://')) {
+            return $cachedUri;
+        }
+        $st = ap_db()->prepare('SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE ? LIMIT 1');
+        $st->execute(['%/' . $rkey]);
+        $cachedUri = $st->fetchColumn();
+        if (is_string($cachedUri) && str_starts_with($cachedUri, 'at://')) {
+            return $cachedUri;
+        }
+    } catch (Throwable $e) {
+        // ignore cache lookup failures; identity resolution remains the fallback
+    }
     // Resolve handle → DID (uses existing ap_bsky_resolve_handle_did later in this file).
     $did = ap_bsky_resolve_handle_did($actor, $ownerUserId);
     if ($did !== null && str_starts_with($did, 'did:')) {
