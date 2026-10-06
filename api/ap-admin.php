@@ -15861,6 +15861,22 @@ function admin_render_masto_status_card(
         }
         $qacct = (string) ($qst['account']['acct'] ?? '');
         $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
+        // Rust may have cached the quote envelope before the remote target was
+        // hydrated. If it is still the synthetic empty “quoted” account,
+        // resolve the canonical Fediverse object through PHP's authoritative
+        // status lookup before painting the card.
+        $syntheticQuote = $qplain === ''
+            && ($qacct === '' || strtolower(ltrim($qacct, '@')) === 'quoted')
+            && $quri !== '';
+        if ($syntheticQuote && function_exists('ap_masto_lookup_status_by_object_url')) {
+            $resolvedQuote = ap_masto_lookup_status_by_object_url($quri, 0, false, true);
+            if (is_array($resolvedQuote)) {
+                $qst = $resolvedQuote;
+                $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
+                $qacct = (string) ($qst['account']['acct'] ?? '');
+                $quri = (string) ($qst['uri'] ?? $qst['url'] ?? $quri);
+            }
+        }
         $qMentions = [];
         if (!empty($qst['mentions']) && is_array($qst['mentions'])) {
             foreach ($qst['mentions'] as $qm) {
