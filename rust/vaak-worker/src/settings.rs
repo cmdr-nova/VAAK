@@ -15,7 +15,23 @@ pub struct SettingsProjection {
     pub fields: Value,
     pub source: &'static str,
     pub note: &'static str,
+    pub mutation_owner: &'static str,
+    pub mutation_enabled: bool,
 }
+
+/// Canonical persisted profile/settings fields. Keep this list aligned with
+/// PHP's `ap_profile_save()` contract before a Rust settings editor is ever
+/// considered. Credentials, sessions, integrations, and local browser theme
+/// state are intentionally excluded.
+pub const CANONICAL_FIELDS: &[&str] = &[
+    "name", "summary", "attachment_json", "icon_url", "image_url",
+    "manually_approves", "discoverable", "indexable", "collection_consent",
+    "vanity_verified", "auto_follow_back", "anti_ai_marker",
+    "auto_unblur_sensitive", "auto_delete_posts_7d", "automated",
+    "reply_policy", "quote_policy", "forum_signature", "profile_badges",
+    "hide_profile_replies", "hide_profile_boosts", "algorithm_enabled",
+    "downranking_enabled", "asks_enabled", "webmentions_enabled", "updated_at",
+];
 
 pub async fn project(cfg: &crate::config::Config, owner_id: i64) -> Result<SettingsProjection> {
     if owner_id < 1 {
@@ -76,5 +92,24 @@ pub async fn project(cfg: &crate::config::Config, owner_id: i64) -> Result<Setti
         fields,
         source: "vaak-worker-shadow",
         note: "Read-only settings projection; PHP remains renderer, CSRF, and mutation owner.",
+        mutation_owner: "php",
+        mutation_enabled: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CANONICAL_FIELDS;
+    use serde_json::Value;
+
+    #[test]
+    fn settings_contract_matches_fixture_and_excludes_sensitive_fields() {
+        let fixture: Value = serde_json::from_str(include_str!("../fixtures/settings/profile-fields.json")).unwrap();
+        let fields = fixture["fields"].as_array().unwrap();
+        let names: Vec<&str> = fields.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(names, CANONICAL_FIELDS);
+        for forbidden in ["email", "password", "password_hash", "api_key", "session_token", "totp_secret"] {
+            assert!(!names.contains(&forbidden));
+        }
+    }
 }
