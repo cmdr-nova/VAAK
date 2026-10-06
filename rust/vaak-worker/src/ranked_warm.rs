@@ -31,6 +31,12 @@ use crate::notif;
 use crate::redis_util;
 
 const CACHE_VERSION: &str = "v13";
+// Home mix guardrails: keep the feed lively without allowing one source to
+// drown everything else. Bluesky is slightly favored because it has the
+// highest activity rate; Fediverse, followed hashtags, and RSS remain visible.
+const HOME_BSKY_MAX_RATIO: f64 = 0.60;
+const HOME_RSS_MAX_RATIO: f64 = 0.28;
+const HOME_FOLLOWED_TAG_CAP: usize = 72;
 const HOME_TTL_SECS: u64 = 600;
 /// Deep Home scroll head (0.7.25). Was 160 — scrolling past ~100–200 hit End of timeline.
 const MAX_TIMELINE: usize = 400;
@@ -541,7 +547,7 @@ async fn fetch_followed_tag_events(
     let wanted: HashSet<&str> = tags.iter().map(String::as_str).collect();
     let mut out = Vec::new();
     for row in rows {
-        if out.len() >= 48 {
+        if out.len() >= HOME_FOLLOWED_TAG_CAP {
             break;
         }
         let id: i64 = row.get(0);
@@ -911,7 +917,9 @@ fn flush_bsky(
         if *since_bsky < 1 && !out.is_empty() {
             break;
         }
-        if !out.is_empty() && (*bsky_emitted + 1) as f64 / (out.len() + 1) as f64 > 0.50 {
+        if !out.is_empty()
+            && (*bsky_emitted + 1) as f64 / (out.len() + 1) as f64 > HOME_BSKY_MAX_RATIO
+        {
             break;
         }
         out.push(queued[*qi].clone());
@@ -961,7 +969,7 @@ fn merge_bsky_ranked(
         return ranked;
     }
     if ranked.is_empty() {
-        return queued.into_iter().take(60).collect();
+        return queued.into_iter().take(80).collect();
     }
     let mut out = Vec::new();
     let mut qi = 0usize;
@@ -1089,7 +1097,7 @@ fn flush_rss(
         if *since_rss < 2 && !out.is_empty() {
             break;
         }
-        if (*rss_emitted + 1) as f64 / (tail_emitted + *rss_emitted + 1) as f64 > 0.22 {
+        if (*rss_emitted + 1) as f64 / (tail_emitted + *rss_emitted + 1) as f64 > HOME_RSS_MAX_RATIO {
             break;
         }
         out.push(queued[*qi].clone());
@@ -1120,7 +1128,7 @@ fn queue_rss_after_first_page(ranked: Vec<Value>, rss_ids: &[String], first_page
         return ranked;
     }
     if ranked.is_empty() {
-        return queued.into_iter().take(16).collect();
+        return queued.into_iter().take(24).collect();
     }
     let first_page = first_page.min(ranked.len());
     let mut out: Vec<Value> = ranked[..first_page].to_vec();
@@ -2480,7 +2488,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let mut ranked = rank_from_timeline(timeline);
 
     let own_did = load_own_did(&db, owner_user_id).await?;
-    let mut bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref(), 120).await?;
+    let mut bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref(), 160).await?;
     if !followed_tags.is_empty() {
         let mut existing: HashSet<String> = bsky.iter().map(|row| row.0.clone()).collect();
         for row in fetch_bsky_followed_tag_keys(
@@ -2504,7 +2512,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
 
     if algorithm_on {
-        match fetch_rss_keys(&db, owner_user_id, 24).await {
+        match fetch_rss_keys(&db, owner_user_id, 32).await {
             Ok(rss) => ranked = queue_rss_after_first_page(ranked, &rss, 5),
             Err(e) => tracing::warn!(
                 owner = owner_user_id,
