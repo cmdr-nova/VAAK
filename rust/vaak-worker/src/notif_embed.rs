@@ -2683,7 +2683,7 @@ fn media_row_html(st: &Value) -> String {
 /// Ask answers are ordinary Notes whose content starts with an asker/`asked`
 /// paragraph and a blockquote; without this normalization the lean painter
 /// flattens the question and answer into one undifferentiated paragraph.
-fn ask_card_html(content: &str) -> Option<String> {
+fn ask_card_parts(content: &str) -> Option<(String, String)> {
     let re = regex::Regex::new(
         r#"(?is)^\s*<p[^>]*>(.*?)\s*<a[^>]*>asked</a>\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$"#,
     ).ok()?;
@@ -2711,44 +2711,46 @@ fn ask_card_html(content: &str) -> Option<String> {
     if header.is_empty() || question.is_empty() {
         return None;
     }
-    let answer_html = if answer.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<hr class=\"ask-divider\" style=\"margin:.7rem 0;border:0;border-top:1px solid var(--primary,#ff70c7)\"><div class=\"ask-answer\" style=\"white-space:pre-wrap\">{}</div>",
-            esc(&answer).replace('\n', "<br>")
-        )
-    };
-    Some(format!(
-        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\"><div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{}</div><blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote>{}</div></div>",
+    let card = format!(
+        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\"><div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{}</div><blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote></div></div>",
         header,
-        esc(&question).replace('\n', "<br>"),
-        answer_html
-    ))
+        esc(&question).replace('\n', "<br>")
+    );
+    Some((card, answer))
 }
 
-fn ask_card_from_status(status: &Value) -> Option<String> {
+fn ask_card_html(content: &str) -> Option<String> {
+    ask_card_parts(content).map(|(card, _)| card)
+}
+
+fn ask_card_from_status(status: &Value) -> Option<(String, String)> {
     let ask = status.get("vaak_ask")?.as_object()?;
     let question = ask.get("ask_question")?.as_str()?.trim();
     if question.is_empty() { return None; }
     let actor = ask.get("ask_actor").and_then(|v| v.as_str()).unwrap_or("");
     let label = actor.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("Someone");
     let answer = ask.get("ask_answer").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let answer_html = if answer.is_empty() { String::new() } else {
-        format!(
-            "<hr class=\"ask-divider\" style=\"margin:.7rem 0;border:0;border-top:1px solid var(--primary,#ff70c7)\"><div class=\"ask-answer\" style=\"white-space:pre-wrap\">{}</div>",
-            esc(answer).replace('\n', "<br>")
-        )
-    };
     let label_html = if actor.starts_with("https://") {
         format!("<a class=\"ask-label\" href=\"{}\" style=\"display:inline-block;font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7);text-decoration:none\">{} asked</a>", esc(actor), esc(label))
     } else {
         format!("<div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{} asked</div>", esc(label))
     };
-    Some(format!(
-        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\">{}<blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote>{}</div></div>",
-        label_html, esc(question).replace('\n', "<br>"), answer_html
-    ))
+    Some((format!(
+        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\">{}<blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote></div></div>",
+        label_html, esc(question).replace('\n', "<br>")
+    ), answer.to_string()))
+}
+
+fn ask_answer_html(answer: &str) -> String {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<hr class=\"ask-divider\" style=\"margin:.7rem 0;border:0;border-top:1px solid var(--primary,#ff70c7)\"><div class=\"ask-answer ask-answer--standalone\" style=\"margin:.7rem 0 .35rem;padding:.15rem 0 .15rem .8rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</div>",
+            esc(answer).replace('\n', "<br>")
+        )
+    }
 }
 
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
@@ -2964,8 +2966,11 @@ pub fn paint_lean_embed_from(
     // strip_tags+esc dropped <a> and double-encoded &#039; / &quot; into visible codes (0.7.13).
     // 0.7.14: rewrite anchors in-app, linkify bare URLs, tighten breaks, paint OG cards.
     let content_trim = content_html.trim();
-    if let Some(ask_html) = ask_card_from_status(status).or_else(|| ask_card_html(content_trim)) {
+    if let Some((ask_html, answer)) = ask_card_from_status(status)
+        .or_else(|| ask_card_parts(content_trim))
+    {
         body_inner.push_str(&ask_html);
+        body_inner.push_str(&ask_answer_html(&answer));
     } else if content_looks_like_html(content_trim) {
         let prepared = prepare_feed_body_html(content_trim, from);
         body_inner.push_str(&format!(
@@ -4028,6 +4033,7 @@ mod tests {
         assert!(html.contains("What is VAAK?"), "{html}");
         assert!(html.contains("A social wire."), "{html}");
         assert!(html.contains("ask-divider"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
         assert!(!html.contains("legacy flattened ask"), "{html}");
     }
 
@@ -4043,6 +4049,7 @@ mod tests {
         assert!(html.contains("What is VAAK?"), "{html}");
         assert!(html.contains("A social bridge."), "{html}");
         assert!(html.contains("ask-divider"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
     }
 
 }
