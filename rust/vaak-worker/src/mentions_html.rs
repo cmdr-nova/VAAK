@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::notif_embed::{self, paint_lean_embed};
+use crate::notif_embed::{self, paint_lean_embed_from};
 use crate::notif_list::notifications_shadow;
 
 #[derive(Debug, Clone)]
@@ -324,7 +324,7 @@ fn paint_grouped_card(g: &GroupedNotif) -> String {
     if let Some(st) = g.row.get("status").filter(|v| v.is_object()) {
         let uri = status_uri_of(&g.row);
         if !uri.is_empty() {
-            body.push_str(&paint_lean_embed(st, false));
+            body.push_str(&paint_lean_embed_from(st, false, "mentions", ""));
         }
     }
 
@@ -459,7 +459,7 @@ fn paint_notif_card(n: &Value) -> String {
             "mention" | "quote" | "favourite" | "reblog" | "update" | "poll" | "status" | "bite"
         ) && !status_uri.is_empty()
         {
-            body.push_str(&paint_lean_embed(st, hide_header));
+            body.push_str(&paint_lean_embed_from(st, hide_header, "mentions", ""));
         } else {
             let plain = strip_tags(st.get("content").and_then(|v| v.as_str()).unwrap_or(""))
                 .trim()
@@ -484,13 +484,10 @@ fn paint_notif_card(n: &Value) -> String {
             esc(&profile_href)
         ));
     }
-    if matches!(n_type, "mention" | "quote") && !status_uri.is_empty() {
-        actions.push_str(&format!(
-            "<a class=\"icon-btn\" href=\"?view=mentions&amp;compose=1&amp;reply_to={}&amp;to={}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",
-            urlencoding_encode(status_uri),
-            urlencoding_encode(actor_ref)
-        ));
-    }
+    // Status notifications paint their complete interaction bar inside the
+    // shared lean embed above. Keeping a second reply-only bar here caused
+    // Rust Notifications to lose quote/boost/favourite/bookmark parity and
+    // produced duplicate reply buttons when the embed was present.
     if !actions.is_empty() {
         body.push_str(&format!(
             "<div class=\"tweet-actions\">{actions}</div>"
@@ -599,7 +596,7 @@ pub async fn mentions_html_fill(
             if !uri.is_empty() {
                 let key =
                     notif_embed::frag_key(owner_user_id, uri, hide, fav, reblog, bookmarked, sid);
-                let frag = paint_lean_embed(st, hide);
+                let frag = paint_lean_embed_from(st, hide, "mentions", "");
                 if let Some(ref mut r) = redis {
                     let _ = notif_embed::set_embed_html(r, &key, &frag).await;
                 }
@@ -690,5 +687,39 @@ mod tests {
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].count, 1);
     }
-}
 
+    #[test]
+    fn status_notifications_keep_full_interaction_bar() {
+        let row = json!({
+            "id": "99",
+            "type": "mention",
+            "created_at": "2026-10-06T00:00:00Z",
+            "account": {
+                "acct": "alice@example.test",
+                "display_name": "Alice",
+                "uri": "https://example.test/users/alice",
+                "url": "https://example.test/@alice",
+                "avatar": "https://example.test/avatar.webp"
+            },
+            "status": {
+                "id": "123",
+                "uri": "https://mkultra.monster/users/you/notes/123",
+                "url": "https://mkultra.monster/users/you/notes/123",
+                "content": "<p>Hello</p>",
+                "account": {
+                    "acct": "you@mkultra.monster",
+                    "uri": "https://mkultra.monster/users/you"
+                },
+                "favourited": false,
+                "reblogged": false,
+                "bookmarked": false
+            }
+        });
+        let html = paint_notif_card(&row);
+        assert!(html.contains("name=\"action\" value=\"favourite_status\""), "missing favourite action: {html}");
+        assert!(html.contains("name=\"action\" value=\"reblog_status\""), "missing boost action: {html}");
+        assert!(html.contains("quote_object="), "missing quote action: {html}");
+        assert!(html.contains("name=\"action\" value=\"bookmark_status\""), "missing bookmark action: {html}");
+        assert_eq!(html.matches("title=\"Reply\"").count(), 1, "reply action duplicated: {html}");
+    }
+}
