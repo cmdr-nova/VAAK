@@ -200,6 +200,7 @@ pub async fn create_local_request(
     }
     let mut actor_by_id = std::collections::HashMap::new();
     for row in rows {
+        // ap_users.id is BIGINT, matching the public account table.
         let id: i64 = row.get(0);
         let actor: String = row.get(1);
         if !actor.starts_with("https://mkultra.monster/users/") {
@@ -229,13 +230,14 @@ pub async fn create_local_request(
     let mut to_imprinted = false;
     let mut generation = 1;
     for row in state {
-        let id: i64 = row.get(0);
+        // Phyrian owner columns are INTEGER in the canonical PostgreSQL schema.
+        let id: i32 = row.get(0);
         let imprinted: String = row.get(1);
         let strain: String = row.get(2);
-        if id == from_owner {
+        if i64::from(id) == from_owner {
             from_imprinted = imprinted == "imprinted" && !strain.trim().is_empty();
-            generation = row.get::<_, i64>(3);
-        } else if id == to_owner {
+            generation = i64::from(row.get::<_, i32>(3));
+        } else if i64::from(id) == to_owner {
             to_imprinted = imprinted == "imprinted" && !strain.trim().is_empty();
         }
     }
@@ -246,7 +248,7 @@ pub async fn create_local_request(
         .query_opt(
             "SELECT id FROM phyrian_requests
              WHERE from_owner_id=$1 AND to_owner_id=$2 AND kind=$3 AND status='pending' LIMIT 1",
-            &[&from_owner, &to_owner, &kind.trim().to_ascii_lowercase()],
+            &[&(from_owner as i32), &(to_owner as i32), &kind.trim().to_ascii_lowercase()],
         )
         .await?
         .map(|r| r.get(0));
@@ -257,7 +259,7 @@ pub async fn create_local_request(
         .query_one(
             "INSERT INTO phyrian_requests (kind, from_owner_id, to_owner_id, status)
              VALUES ($1,$2,$3,'pending') RETURNING id",
-            &[&kind.trim().to_ascii_lowercase(), &from_owner, &to_owner],
+            &[&kind.trim().to_ascii_lowercase(), &(from_owner as i32), &(to_owner as i32)],
         )
         .await?
         .get(0);
@@ -288,7 +290,7 @@ pub async fn resolve_local_request(
         .await?
         .ok_or_else(|| anyhow::anyhow!("Request not found"))?;
     let kind: String = row.get(0);
-    let from_owner: i64 = row.get(1);
+    let from_owner: i64 = i64::from(row.get::<_, i32>(1));
     if kind == "resonance" {
         let linked_row = db
             .query_one(
@@ -333,13 +335,13 @@ pub async fn resolve_local_request(
         let mut from_generation = 1;
         let mut to_imprinted = false;
         for r in rows {
-            let id: i64 = r.get(0);
+            let id: i32 = r.get(0);
             let strain: String = r.get(1);
             let status: String = r.get(3);
-            if id == from_owner {
+            if i64::from(id) == from_owner {
                 from_strain = strain;
-                from_generation = r.get(2);
-            } else if id == owner {
+                from_generation = i64::from(r.get::<_, i32>(2));
+            } else if i64::from(id) == owner {
                 to_imprinted = status == "imprinted" && !strain.trim().is_empty();
             }
         }
@@ -384,6 +386,12 @@ pub async fn resolve_local_request(
     if count != 2 {
         anyhow::bail!("Both players must be imprinted to exchange resonance");
     }
+    tx.execute(
+        "UPDATE phyrian_players SET resonance_exchanges=resonance_exchanges+1, updated_at=NOW()
+         WHERE owner_user_id IN ($1,$2)",
+        &[&(from_owner as i32), &owner_i32],
+    )
+    .await?;
     tx.execute(
         "UPDATE phyrian_requests SET status='accepted', resolved_at=NOW() WHERE id=$1",
         &[&request_i64],
@@ -495,7 +503,7 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
     let status: String = row.try_get(3).unwrap_or_else(|_| "unknown".into());
     let strain: String = row.try_get::<_, Option<String>>(4).unwrap_or(None).unwrap_or_default();
     let imprinted = status == "imprinted" && !strain.trim().is_empty();
-    let stored_resonance: i64 = row.try_get(5).unwrap_or(0);
+    let stored_resonance: i64 = i64::from(row.try_get::<_, i32>(5).unwrap_or(0));
     let age_secs: i64 = row.try_get(13).unwrap_or(0);
     let decay_secs: i64 = row.try_get(14).unwrap_or(0);
     let decay_days = if imprinted && age_secs >= DECAY_GRACE_SECS {
@@ -510,9 +518,9 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
         status: status.clone(),
         strain: if imprinted { strain.clone() } else { String::new() },
         resonance,
-        generation: row.try_get(6).unwrap_or(1),
-        level: row.try_get(7).unwrap_or(1),
-        imprinted_by_owner_id: row.try_get(8).unwrap_or(None),
+        generation: i64::from(row.try_get::<_, i32>(6).unwrap_or(1)),
+        level: i64::from(row.try_get::<_, i32>(7).unwrap_or(1)),
+        imprinted_by_owner_id: row.try_get::<_, Option<i32>>(8).unwrap_or(None).map(i64::from),
         imprinted_at: row.try_get(9).unwrap_or_default(),
         last_checkin_at: row.try_get(10).unwrap_or_default(),
         last_decay_at: row.try_get(11).unwrap_or_default(),
@@ -537,7 +545,7 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
         .map(|r| Request {
             id: r.try_get(0).unwrap_or(0),
             kind: r.try_get(1).unwrap_or_default(),
-            from_owner_id: r.try_get(2).unwrap_or(0),
+            from_owner_id: i64::from(r.try_get::<_, i32>(2).unwrap_or(0)),
             from_username: r.try_get(3).unwrap_or_default(),
             from_actor_key: r.try_get(4).unwrap_or_default(),
             status: r.try_get(5).unwrap_or_default(),
@@ -564,8 +572,9 @@ pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i
                 let s: String = r.try_get(3).unwrap_or_else(|_| "unknown".into());
                 let strain: String = r.try_get(4).unwrap_or_default();
                 let imprinted = s == "imprinted" && !strain.trim().is_empty();
-                let resonance: i64 = r.try_get(5).unwrap_or(0);
-                DirectoryEntry { id: r.try_get(0).unwrap_or(0), username: r.try_get(1).unwrap_or_default(), actor_key: r.try_get(2).unwrap_or_default(), status: s, strain, resonance, generation: r.try_get(6).unwrap_or(1), stability: stability(imprinted, resonance) }
+                let resonance: i64 = i64::from(r.try_get::<_, i32>(5).unwrap_or(0));
+                let generation: i64 = i64::from(r.try_get::<_, i32>(6).unwrap_or(1));
+                DirectoryEntry { id: r.try_get(0).unwrap_or(0), username: r.try_get(1).unwrap_or_default(), actor_key: r.try_get(2).unwrap_or_default(), status: s, strain, resonance, generation, stability: stability(imprinted, resonance) }
             })
             .collect()
     } else { Vec::new() };

@@ -87,7 +87,7 @@ function player_row(int $id): array
 {
     $st = ap_db()->prepare(
         'SELECT status, COALESCE(strain, \'\') AS strain, resonance, generation,
-                COALESCE(imprinted_by_owner_id, 0) AS imprinted_by_owner_id,
+                CASE WHEN imprinted_by_owner_id IS NULL THEN 0 ELSE 1 END AS has_parent,
                 inductions_given, resonance_exchanges
          FROM phyrian_players WHERE owner_user_id = ?'
     );
@@ -102,10 +102,15 @@ try {
     }
 
     // Create and deny: compares request rows and the denial transition.
+    // Use a valid non-origin sender so this exercises the normal peer path;
+    // origin imprint creation is intentionally PHP-owned and tested by the
+    // separate fixture suite.
+    ap_db()->exec("UPDATE phyrian_players SET status='imprinted', strain='Voidborne', resonance=50, generation=2 WHERE owner_user_id IN (101,103)");
+    ap_db()->exec("UPDATE phyrian_players SET status='unknown', strain=NULL, resonance=0, generation=1 WHERE owner_user_id IN (102,104)");
     $phpCreate = ap_phyrian_request_create(101, 102, 'imprint');
     $rustCreate = rust_call($rustUrl, $token, ['action' => 'create', 'from_owner_id' => 103, 'to_owner_id' => 104, 'kind' => 'imprint']);
     if (empty($phpCreate['ok']) || empty($rustCreate['ok'])) {
-        throw new RuntimeException('create scenario failed');
+        throw new RuntimeException('create scenario failed PHP=' . json_encode($phpCreate) . ' Rust=' . json_encode($rustCreate));
     }
     assert_equal('create semantics',
         ['kind' => request_row((int) $phpCreate['id'])['kind'] ?? '', 'status' => request_row((int) $phpCreate['id'])['status'] ?? ''],
@@ -117,7 +122,9 @@ try {
         request_row((int) $phpCreate['id'])['status'] ?? '',
         request_row((int) $rustCreate['id'])['status'] ?? '');
 
-    // Peer imprint: compare the exact state transition and induction counter.
+    // Peer imprint: compare the state transition and induction counter. Parent
+    // IDs differ between the PHP and Rust pairs by design, so compare the
+    // presence of lineage rather than the fixture-specific owner number.
     ap_db()->exec("UPDATE phyrian_players SET status='imprinted', strain='Voidborne', resonance=61, generation=4, inductions_given=2 WHERE owner_user_id IN (105,107)");
     ap_db()->exec("UPDATE phyrian_players SET status='unknown', strain=NULL, resonance=0, generation=1, inductions_given=0 WHERE owner_user_id IN (106,108)");
     $phpPeer = ap_phyrian_request_create(105, 106, 'imprint');
