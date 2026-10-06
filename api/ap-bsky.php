@@ -7951,6 +7951,12 @@ function ap_bsky_is_profile_ref(string $ref): bool
     if (str_starts_with($ref, 'https://bsky.app/profile/')) {
         return true;
     }
+    // Bridgy Fed exposes Bluesky identities as ActivityPub actors at
+    // https://bsky.brid.gy/ap/{did}; hover cards and profile hydration should
+    // use the same cached Bluesky profile as native bsky.app references.
+    if (preg_match('#^https://bsky\.brid\.gy/ap/did:[a-z0-9:]+$#i', rtrim($ref, '/'))) {
+        return true;
+    }
     if (str_starts_with($ref, 'at://did:')) {
         return true;
     }
