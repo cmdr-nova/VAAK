@@ -4961,6 +4961,22 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     header('Cache-Control: no-store');
     $offset = max(0, (int) ($_GET['offset'] ?? 0));
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    if (is_array($favData = admin_library_data_axum_fetch($vaakOwnerId, $offset, $limit))) {
+        $items = [];
+        foreach ($favData['fedi_rows'] as $favRow) {
+            if (is_array($favRow) && function_exists('ap_masto_interaction_row_to_status')) {
+                $status = ap_masto_interaction_row_to_status($favRow, 'favourited');
+                if (is_array($status)) $items[] = $status;
+            }
+        }
+        header('X-Has-More: ' . (!empty($favData['has_more_fedi']) ? '1' : '0'));
+        header('X-VAAK-Fragment: axum-data');
+        echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . (!empty($favData['has_more_fedi']) ? '1' : '0') . '">';
+        $GLOBALS['admin_library_fetch_budget'] = 3;
+        foreach ($items as $item) admin_render_library_status_card($item, 'favourites');
+        echo '</div>';
+        exit;
+    }
     $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
     if (is_array($axumFrag = admin_library_fragment_axum_fetch('favourites_fedi', $vaakOwnerId, $fragSuffix))) {
         header('X-Has-More: ' . (!empty($axumFrag['has_more']) ? '1' : '0'));
@@ -5029,6 +5045,25 @@ function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, strin
     }
     $html = substr($raw, $headerSize);
     return is_string($html) && $html !== '' ? ['html' => $html, 'has_more' => (($headers['x-has-more'] ?? '') === '1')] : null;
+}
+
+/** Structured read-only Favourites projection; PHP still hydrates/cards/writes. */
+function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $limit = 20): ?array
+{
+    if ($ownerUserId < 1 || !function_exists('curl_init')) return null;
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
+    $ch = curl_init($base . '/shadow/library-data?' . http_build_query(['owner_id' => $ownerUserId, 'library_kind' => 'favourites', 'offset' => max(0, $offset), 'limit' => max(10, min(40, $limit))]));
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($code !== 200 || !is_string($raw) || $raw === '') return null;
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) && is_array($decoded['fedi_rows'] ?? null) && is_array($decoded['bsky_rows'] ?? null) ? $decoded : null;
 }
 
 // Cache-first Fediverse bookmark cards. Bluesky bookmarks use the sibling
@@ -5178,6 +5213,23 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
     }
     $offset = max(0, (int) ($_GET['offset'] ?? 0));
     $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
+    if (is_array($favData = admin_library_data_axum_fetch($vaakOwnerId, $offset, $limit))) {
+        $items = $favData['bsky_rows'];
+        $hasMore = ($offset + $limit) < (int) ($favData['total_bsky'] ?? 0);
+        ob_start();
+        echo '<div data-bsky-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '" data-loaded="1">';
+        if ($items === [] && $offset === 0) {
+            echo '<div class="empty" data-bsky-favourite-empty>No cached Bluesky favourites yet. They will appear after the background sync completes.</div>';
+        } else {
+            if ($offset === 0) echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
+            foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'favourites');
+        }
+        echo '</div>';
+        header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+        header('X-VAAK-Fragment: axum-data');
+        echo ob_get_clean();
+        exit;
+    }
     $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
     if (is_array($axumFrag = admin_library_fragment_axum_fetch('favourites_bsky', $vaakOwnerId, $fragSuffix))) {
         header('X-Has-More: ' . (!empty($axumFrag['has_more']) ? '1' : '0'));
@@ -25479,7 +25531,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
         <?php if ($favNet === 'fedi'): ?>
           <?php
-            $favRows = ap_masto_favourites_list(40, null);
+            $favData = admin_library_data_axum_fetch($vaakOwnerId, 0, 40);
+            if (is_array($favData)) {
+                $favRows = [];
+                foreach ($favData['fedi_rows'] as $favRow) {
+                    if (is_array($favRow) && function_exists('ap_masto_interaction_row_to_status')) {
+                        $status = ap_masto_interaction_row_to_status($favRow, 'favourited');
+                        if (is_array($status)) $favRows[] = $status;
+                    }
+                }
+                $favHasMore = !empty($favData['has_more_fedi']);
+            } else {
+                $favRows = ap_masto_favourites_list(40, null);
+                $favHasMore = count($favRows) > 20;
+            }
             // Bluesky likes mirrored into masto_favourites only have URL stubs.
             $favRows = array_values(array_filter($favRows, static function ($st): bool {
                 if (!is_array($st)) {
@@ -25491,7 +25556,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                     || str_starts_with($uri, 'at://')
                     || str_contains($uri, 'bsky.app/'));
             }));
-            $favHasMore = count($favRows) > 20;
+            $favHasMore = $favHasMore || count($favRows) > 20;
             $favList = array_slice($favRows, 0, 20);
           ?>
           <?php if (!$favList): ?>
@@ -27188,15 +27253,8 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }
         ?>
         <?php if ($view === 'profile'): ?>
-        <?php $settingsShadow = admin_settings_projection_axum_fetch((int) $vaakOwnerId); ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
-          <?php if (is_array($settingsShadow)): ?>
-            <div class="meta" style="margin:0 0 1rem;padding:.65rem .8rem;border:1px solid color-mix(in srgb,var(--primary) 35%,var(--border));border-radius:10px">
-              Rust read-only settings projection is available for this account. PHP remains the canonical editor and write owner; saved values are not replaced during this migration.
-              <?php if (!empty($settingsShadow['fields']['updated_at'])): ?> <span>Last persisted update: <?= h((string) $settingsShadow['fields']['updated_at']) ?></span><?php endif; ?>
-            </div>
-          <?php endif; ?>
           <div class="profile-preview">
             <?php
               $previewAv = function_exists('ap_local_avatar_url')
