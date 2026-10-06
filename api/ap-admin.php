@@ -31962,7 +31962,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               $phyCheckedInToday = true;
           }
           $phyCanOfferImprint = $phyImprinted || $phyIsOrigin;
-          $phyDecayDaily = defined('AP_PHYRIAN_DAILY_DECAY') ? (int) AP_PHYRIAN_DAILY_DECAY : 5;
+          $phyDecayDaily = max(0, (int) ($phyPlayer['daily_resonance_decay'] ?? (defined('AP_PHYRIAN_DAILY_DECAY') ? AP_PHYRIAN_DAILY_DECAY : 5)));
           $phyAsset = static function (string $file): string {
               return '/api/assets/phyrian/' . ltrim($file, '/');
           };
@@ -32000,80 +32000,6 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </nav>
 
           <?php if ($phyPage === 'hub'): ?>
-            <?php
-              $phyBridgeLink = function_exists('ap_phyrian_bridge_link_for_user')
-                  ? ap_phyrian_bridge_link_for_user((int) $vaakOwnerId)
-                  : null;
-              $phyBridgePending = ($phyBridgeLink === null && function_exists('ap_phyrian_bridge_pending_challenge'))
-                  ? ap_phyrian_bridge_pending_challenge((int) $vaakOwnerId)
-                  : null;
-            ?>
-            <section class="phyrian-bridge composer" aria-label="Link OpenSim avatar" style="margin:1rem 0 1.25rem">
-              <div class="meta" style="margin-bottom:.75rem">
-                <b style="color:var(--primary)">Link OpenSim</b><br>
-                Connect your <a href="https://novalandia.online/" target="_blank" rel="noopener noreferrer">NovaLandia</a> avatar for dual-world perks:
-                <b>+1 daily resonance</b> on both bodies and a public <span class="resonant-badge" style="margin-left:.15rem">◈ Resonant</span> profile badge.
-                We send a one-time claim code to your avatar in-world via the Phyrian Strains HUD — that only works if you have a NovaLandia account.
-                <?php if ($phyBridgeLink === null): ?>
-                  <br>Need an account? <a href="https://novalandia.online/register/" target="_blank" rel="noopener noreferrer">Register</a>
-                  or ask Valerie / use a Clearance invite. VAAK-only play stays complete without a link.
-                <?php endif; ?>
-              </div>
-              <?php if (is_array($phyBridgeLink)): ?>
-                <div style="display:flex;gap:.75rem;align-items:flex-start;margin-bottom:.75rem;flex-wrap:wrap">
-                  <div>
-                    <div class="who">Linked as <?= h((string) ($phyBridgeLink['avatar_name'] ?? 'avatar')) ?></div>
-                    <div class="meta">
-                      Verified <?= h(function_exists('relative_time') ? relative_time((string) ($phyBridgeLink['verified_at'] ?? '')) : (string) ($phyBridgeLink['verified_at'] ?? '')) ?>
-                      · <a href="<?= h(function_exists('ap_phyrian_bridge_profile_url') ? ap_phyrian_bridge_profile_url((string) ($phyBridgeLink['avatar_uuid'] ?? '')) : 'https://strains.novalandia.online/') ?>" target="_blank" rel="noopener noreferrer">Strains profile</a>
-                      <?php if (!empty($phyBridgeLink['strain_snapshot'])): ?>
-                        · strain <?= h((string) $phyBridgeLink['strain_snapshot']) ?>
-                      <?php endif; ?>
-                    </div>
-                    <ul class="meta" style="margin:.55rem 0 0;padding-left:1.1rem">
-                      <li>Perks active: shared daily claim (+ Resonant +1) · Resonant badge · OpenSim body sync</li>
-                      <li>Your VAAK readout mirrors OpenSim strain, resonance, level, generation, banked, and counters</li>
-                    </ul>
-                  </div>
-                </div>
-                <form method="post" action="?view=phyrian" onsubmit="return confirm('Unlink this OpenSim avatar from your VAAK account?');">
-                  <input type="hidden" name="action" value="phyrian_bridge_unlink">
-                  <div class="composer-actions">
-                    <span class="meta">One OpenSim avatar per VAAK account</span>
-                    <button class="btn btn-ghost" type="submit" style="color:var(--danger)">Unlink</button>
-                  </div>
-                </form>
-              <?php else: ?>
-                <?php if (is_array($phyBridgePending)): ?>
-                  <div class="meta" style="margin-bottom:.75rem;color:var(--primary)">
-                    Code queued for <code><?= h((string) ($phyBridgePending['avatar_name'] ?? '')) ?></code>
-                    — wear the HUD in NovaLandia, touch <b>Status</b>, then enter the code below
-                    (expires <?= h(function_exists('relative_time') ? relative_time((string) ($phyBridgePending['expires_at'] ?? '')) : (string) ($phyBridgePending['expires_at'] ?? '')) ?>).
-                  </div>
-                  <form method="post" action="?view=phyrian" style="margin-bottom:1rem">
-                    <input type="hidden" name="action" value="phyrian_bridge_verify">
-                    <label for="opensim-code">Claim code</label>
-                    <input id="opensim-code" type="text" name="opensim_code" required maxlength="16" autocomplete="one-time-code"
-                           placeholder="e.g. A7K3MQ" style="text-transform:uppercase;letter-spacing:.08em">
-                    <div class="composer-actions">
-                      <span class="meta">From the Phyrian Strains HUD message</span>
-                      <button class="btn btn-primary" type="submit">Confirm link</button>
-                    </div>
-                  </form>
-                <?php endif; ?>
-                <form method="post" action="?view=phyrian">
-                  <input type="hidden" name="action" value="phyrian_bridge_start">
-                  <label for="opensim-identify">NovaLandia avatar</label>
-                  <input id="opensim-identify" type="text" name="opensim_identify" required maxlength="200"
-                         placeholder="val3r1e flux · strains URL · or UUID"
-                         value="<?= h((string) ($phyBridgePending['avatar_name'] ?? '')) ?>">
-                  <div class="composer-actions">
-                    <span class="meta">You must be logged into OpenSim as this avatar to receive the code</span>
-                    <button class="btn btn-primary" type="submit"><?= is_array($phyBridgePending) ? 'Resend claim code' : 'Send claim code' ?></button>
-                  </div>
-                </form>
-              <?php endif; ?>
-            </section>
           <?php endif; ?>
 
           <?php if ($phyPage === 'dossier'): ?>
@@ -32405,6 +32331,60 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
               <?php endif; ?>
             </nav>
           <?php endif; ?>
+          <?php
+            $phyBridgeLink = function_exists('ap_phyrian_bridge_link_for_user')
+                ? ap_phyrian_bridge_link_for_user((int) $vaakOwnerId)
+                : null;
+            $phyBridgePending = ($phyBridgeLink === null && function_exists('ap_phyrian_bridge_pending_challenge'))
+                ? ap_phyrian_bridge_pending_challenge((int) $vaakOwnerId)
+                : null;
+          ?>
+          <section class="phyrian-bridge composer" aria-label="Link OpenSim avatar" style="margin:1.25rem 0 1rem">
+            <div class="meta" style="margin-bottom:.75rem">
+              <b style="color:var(--primary)">Link OpenSim</b><br>
+              Connect your <a href="https://novalandia.online/" target="_blank" rel="noopener noreferrer">NovaLandia</a> avatar for dual-world perks:
+              <b>+1 daily resonance</b> on both bodies and a public <span class="resonant-badge" style="margin-left:.15rem">◈ Resonant</span> profile badge.
+              We send a one-time claim code to your avatar in-world via the Phyrian Strains HUD — that only works if you have a NovaLandia account.
+              <?php if ($phyBridgeLink === null): ?>
+                <br>Need an account? <a href="https://novalandia.online/register/" target="_blank" rel="noopener noreferrer">Register</a>
+                or ask Valerie / use a Clearance invite. VAAK-only play stays complete without a link.
+              <?php endif; ?>
+            </div>
+            <?php if (is_array($phyBridgeLink)): ?>
+              <div style="display:flex;gap:.75rem;align-items:flex-start;margin-bottom:.75rem;flex-wrap:wrap">
+                <div>
+                  <div class="who">Linked as <?= h((string) ($phyBridgeLink['avatar_name'] ?? 'avatar')) ?></div>
+                  <div class="meta">
+                    Verified <?= h(function_exists('relative_time') ? relative_time((string) ($phyBridgeLink['verified_at'] ?? '')) : (string) ($phyBridgeLink['verified_at'] ?? '')) ?>
+                    · <a href="<?= h(function_exists('ap_phyrian_bridge_profile_url') ? ap_phyrian_bridge_profile_url((string) ($phyBridgeLink['avatar_uuid'] ?? '')) : 'https://strains.novalandia.online/') ?>" target="_blank" rel="noopener noreferrer">Strains profile</a>
+                    <?php if (!empty($phyBridgeLink['strain_snapshot'])): ?> · strain <?= h((string) $phyBridgeLink['strain_snapshot']) ?><?php endif; ?>
+                  </div>
+                  <ul class="meta" style="margin:.55rem 0 0;padding-left:1.1rem">
+                    <li>Perks active: shared daily claim (+ Resonant +1) · Resonant badge · OpenSim body sync</li>
+                    <li>Your VAAK readout mirrors OpenSim strain, resonance, level, generation, banked, and counters</li>
+                  </ul>
+                </div>
+              </div>
+              <form method="post" action="?view=phyrian" onsubmit="return confirm('Unlink this OpenSim avatar from your VAAK account?');">
+                <input type="hidden" name="action" value="phyrian_bridge_unlink">
+                <div class="composer-actions"><span class="meta">One OpenSim avatar per VAAK account</span><button class="btn btn-ghost" type="submit" style="color:var(--danger)">Unlink</button></div>
+              </form>
+            <?php else: ?>
+              <?php if (is_array($phyBridgePending)): ?>
+                <div class="meta" style="margin-bottom:.75rem;color:var(--primary)">Code queued for <code><?= h((string) ($phyBridgePending['avatar_name'] ?? '')) ?></code> — wear the HUD in NovaLandia, touch <b>Status</b>, then enter the code below (expires <?= h(function_exists('relative_time') ? relative_time((string) ($phyBridgePending['expires_at'] ?? '')) : (string) ($phyBridgePending['expires_at'] ?? '')) ?>).</div>
+                <form method="post" action="?view=phyrian" style="margin-bottom:1rem">
+                  <input type="hidden" name="action" value="phyrian_bridge_verify"><label for="opensim-code">Claim code</label>
+                  <input id="opensim-code" type="text" name="opensim_code" required maxlength="16" autocomplete="one-time-code" placeholder="e.g. A7K3MQ" style="text-transform:uppercase;letter-spacing:.08em">
+                  <div class="composer-actions"><span class="meta">From the Phyrian Strains HUD message</span><button class="btn btn-primary" type="submit">Confirm link</button></div>
+                </form>
+              <?php endif; ?>
+              <form method="post" action="?view=phyrian">
+                <input type="hidden" name="action" value="phyrian_bridge_start"><label for="opensim-identify">NovaLandia avatar</label>
+                <input id="opensim-identify" type="text" name="opensim_identify" required maxlength="200" placeholder="val3r1e flux · strains URL · or UUID" value="<?= h((string) ($phyBridgePending['avatar_name'] ?? '')) ?>">
+                <div class="composer-actions"><span class="meta">You must be logged into OpenSim as this avatar to receive the code</span><button class="btn btn-primary" type="submit"><?= is_array($phyBridgePending) ? 'Resend claim code' : 'Send claim code' ?></button></div>
+              </form>
+            <?php endif; ?>
+          </section>
           <?php endif; /* hub */ ?>
         </section>
 
