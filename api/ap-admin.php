@@ -8358,7 +8358,7 @@ function admin_home_apply_follower_fallback(array $timeline, int $pageSize = 15)
 
 /**
  * Merge cached Bluesky Home candidates into the ranked Home set. Keep the
- * share bounded at ~50% with light spacing, but allow Bluesky cards on page one.
+ * share bounded at ~60% with light spacing, but allow Bluesky cards on page one.
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
@@ -8375,7 +8375,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
             $ownDid = (string) ($sess['did'] ?? '');
         }
     }
-    $keys = ap_bsky_home_rank_keys($ownerUserId, 80, $ownDid !== '' ? $ownDid : null);
+    $keys = ap_bsky_home_rank_keys($ownerUserId, 120, $ownDid !== '' ? $ownDid : null);
     if ($keys === []) {
         return $ranked;
     }
@@ -8419,7 +8419,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
     }
     // No Fediverse head (muted follows / empty AP graph) — Bluesky-only Home seed.
     if ($ranked === []) {
-        return array_slice($queued, 0, 60);
+        return array_slice($queued, 0, 80);
     }
     $tail = $ranked;
     $out = [];
@@ -8431,7 +8431,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
             if ($sinceBsky < 1 && $out !== []) {
                 break;
             }
-            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.50) {
+            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.60) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -8450,7 +8450,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
 }
 
 /**
- * Queue RSS item ids into later Home pages (~22%, ≥2 other cards between).
+ * Queue RSS item ids into later Home pages (~28%, ≥2 other cards between).
  *
  * @param list<array{k:string,id:string,t?:int}> $ranked
  * @return list<array{k:string,id:string,t?:int}>
@@ -8460,7 +8460,7 @@ function admin_home_queue_rss_after_first_page(
     int $ownerUserId,
     int $firstPage = 5,
     ?int $beforeTs = null,
-    int $candidateLimit = 24
+    int $candidateLimit = 32
 ): array
 {
     if ($ownerUserId < 1 || !function_exists('ap_rss_home_rank_keys')) {
@@ -8515,7 +8515,7 @@ function admin_home_queue_rss_after_first_page(
         return $ranked;
     }
     if ($ranked === []) {
-        return array_slice($queued, 0, 16);
+        return array_slice($queued, 0, 24);
     }
     $head = array_slice($ranked, 0, $firstPage);
     $tail = array_slice($ranked, $firstPage);
@@ -8524,7 +8524,7 @@ function admin_home_queue_rss_after_first_page(
     $rssEmitted = 0;
     $sinceRss = 2;
     $tailEmitted = 0;
-    // Space RSS like a peer network (~22% share, ≥2 non-RSS between inserts)
+    // Space RSS like a peer network (~28% share, ≥2 non-RSS between inserts)
     // so many subscriptions cannot carpet Home, but the feed stays busier.
     $flush = static function () use (&$out, &$queued, &$qi, &$rssEmitted, &$sinceRss, &$tailEmitted): void {
         while (isset($queued[$qi])) {
@@ -8532,8 +8532,9 @@ function admin_home_queue_rss_after_first_page(
                 break;
             }
             // Measure the ratio within the window being mixed, not against the
-            // already-rendered head. Otherwise deep pages drift toward 25% RSS.
-            if (($rssEmitted + 1) / max(1, $tailEmitted + $rssEmitted + 1) > 0.22) {
+            // already-rendered head. Otherwise deep pages drift toward the
+            // configured RSS share.
+            if (($rssEmitted + 1) / max(1, $tailEmitted + $rssEmitted + 1) > 0.28) {
                 break;
             }
             $out[] = $queued[$qi];
@@ -9836,7 +9837,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
             $isBsky = ((string) ($cand['k'] ?? '')) === 'bsky';
             if ($isBsky) {
                 if (($sinceBsky < 1 && $added !== [])
-                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.50)
+                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.60)
                 ) {
                     $deferred[] = $cand;
                     continue;
@@ -9849,7 +9850,7 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
                     if ($sinceBsky < 1) {
                         break;
                     }
-                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.50) {
+                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.60) {
                         break;
                     }
                     $d = array_shift($deferred);
@@ -10333,7 +10334,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
     $homeHasFollowedTags = function_exists('ap_masto_followed_tags')
         && ap_masto_followed_tags(0, admin_owner_user_id()) !== [];
     if ($homeHasFollowedTags && function_exists('ap_masto_followed_tag_event_rows')) {
-        foreach (ap_masto_followed_tag_event_rows(48, admin_owner_user_id()) as $e) {
+        foreach (ap_masto_followed_tag_event_rows(72, admin_owner_user_id()) as $e) {
             $oid = rtrim((string) ($e['object_id'] ?? ''), '/');
             if ($oid !== '' && isset($homeSeenObject[$oid])) {
                 continue;
