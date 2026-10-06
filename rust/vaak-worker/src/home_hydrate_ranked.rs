@@ -2197,18 +2197,16 @@ async fn fetch_creates_by_object(
     if object_ids.is_empty() {
         return Ok(map);
     }
-    // Match with and without trailing slash via OR on normalized set.
-    let mut variants = Vec::new();
-    for oid in object_ids {
-        let base = oid.trim_end_matches('/').to_string();
-        if base.is_empty() {
-            continue;
-        }
-        variants.push(base.clone());
-        variants.push(format!("{base}/"));
-    }
-    variants.sort();
-    variants.dedup();
+    // Compare normalized object IDs directly. Remote servers and our inbox
+    // store disagree on trailing slashes, and profile quote envelopes must not
+    // miss an otherwise exact cached Create because of that difference.
+    let mut targets: Vec<String> = object_ids
+        .iter()
+        .map(|oid| oid.trim_end_matches('/').to_string())
+        .filter(|oid| !oid.is_empty())
+        .collect();
+    targets.sort();
+    targets.dedup();
     let rows = db
         .query(
             "SELECT DISTINCT ON (rtrim(object_id, '/'))
@@ -2217,9 +2215,9 @@ async fn fetch_creates_by_object(
                     COALESCE(created_at::text,''), COALESCE(sensitive, 0),
                     COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,'')
              FROM events
-             WHERE type = 'Create' AND object_id = ANY($1)
+             WHERE type = 'Create' AND rtrim(object_id, '/') = ANY($1)
              ORDER BY rtrim(object_id, '/'), id DESC",
-            &[&variants],
+            &[&targets],
         )
         .await
         .context("select Create events for announce hydrate")?;
