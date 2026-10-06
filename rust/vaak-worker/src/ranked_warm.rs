@@ -1619,7 +1619,7 @@ async fn record_suppression(
     let now = chrono::Utc::now().timestamp();
     let existing = db
         .query_opt(
-            "SELECT score, suppressed_until, categories_json, seen_object_ids_json
+            "SELECT score, suppressed_until, categories_json, seen_object_ids_json, last_object_id
              FROM ap_home_suppression WHERE owner_user_id = $1 AND actor_id = $2",
             &[&owner, &actor],
         )
@@ -1632,7 +1632,14 @@ async fn record_suppression(
         let cats_raw: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
         let cats: Vec<String> = serde_json::from_str(&cats_raw).unwrap_or_default();
         let seen_raw: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
-        let seen: Vec<String> = serde_json::from_str(&seen_raw).unwrap_or_default();
+        let mut seen: Vec<String> = serde_json::from_str(&seen_raw).unwrap_or_default();
+        if seen.is_empty() {
+            let last_object: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+            let last_object = last_object.trim().trim_end_matches('/').to_string();
+            if !last_object.is_empty() {
+                seen.push(last_object);
+            }
+        }
         (score, parse_ts(&until_s), cats, seen)
     } else {
         (0, 0, Vec::new(), Vec::new())

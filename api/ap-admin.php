@@ -8285,6 +8285,9 @@ function admin_home_record_suppression(int $ownerUserId, string $actorId, array 
         $objectId = rtrim(trim($objectId), '/');
         $seen = json_decode((string) ($old['seen_object_ids_json'] ?? '[]'), true);
         $seen = is_array($seen) ? array_values(array_filter(array_map(static fn($value): string => rtrim(trim((string) $value), '/'), $seen))) : [];
+        if ($seen === [] && !empty($old['last_object_id'])) {
+            $seen = [rtrim(trim((string) $old['last_object_id']), '/')];
+        }
         if ($objectId !== '' && in_array($objectId, $seen, true)) {
             return;
         }
