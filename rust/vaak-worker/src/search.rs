@@ -312,6 +312,7 @@ pub async fn project(
             source, source_pk, object_id: row.get(2), created_at: row.get(3), rank: row.get(4),
         });
     }
+    rows.truncate(limit as usize);
     if kind == "text" {
         rows.extend(bsky_rows(&db, &hidden, query, limit).await.unwrap_or_default());
         rows.sort_by(|a, b| b.rank.partial_cmp(&a.rank).unwrap_or(std::cmp::Ordering::Equal).then_with(|| b.created_at.cmp(&a.created_at)));
