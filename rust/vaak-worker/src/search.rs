@@ -142,6 +142,24 @@ fn status_json(id: String, created: &str, uri: &str, content: &str, account: Val
         "emojis": [], "card": null, "poll": null, "quote": null})
 }
 
+fn bsky_media(embed: &Value, status_id: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    let images = embed.get("images").and_then(Value::as_array)
+        .or_else(|| embed.get("media").and_then(|v| v.get("images")).and_then(Value::as_array));
+    if let Some(images) = images {
+        for (i, image) in images.iter().take(4).enumerate() {
+            let url = image.get("fullsize").and_then(Value::as_str)
+                .or_else(|| image.get("thumb").and_then(Value::as_str)).unwrap_or("");
+            if !url.starts_with("https://") { continue; }
+            out.push(json!({"id": format!("{status_id}-{i}"), "type": "image", "url": url,
+                "preview_url": image.get("thumb").and_then(Value::as_str).unwrap_or(url),
+                "remote_url": url, "description": image.get("alt").and_then(Value::as_str).unwrap_or(""),
+                "meta": null}));
+        }
+    }
+    out
+}
+
 async fn hydrated_account(db: &Client, actor: &str, username: &str, host: &str) -> Value {
     if let Ok(Some(row)) = db.query_opt(
         "SELECT COALESCE(username,''), COALESCE(display_name,''), COALESCE(icon_source_url,'')
@@ -195,6 +213,8 @@ async fn serialize_candidate(db: &Client, source: &str, source_pk: i64, object_i
                     obj.insert("vaak_in_reply_to_url".into(), json!(reply_parent));
                 }
                 if let Ok(embed_value) = serde_json::from_str::<Value>(&embed) {
+                    let media = bsky_media(&embed_value, uri);
+                    if !media.is_empty() { obj.insert("media_attachments".into(), Value::Array(media)); }
                     if let Some(external) = embed_value.get("external") {
                         if let Some(url) = external.get("uri").and_then(Value::as_str) {
                             obj.insert("card".into(), json!({"url": url, "title": external.get("title").and_then(Value::as_str).unwrap_or("Bluesky link"), "description": external.get("description").and_then(Value::as_str).unwrap_or(""), "type": "link", "provider_name": "Bluesky"}));
@@ -245,7 +265,7 @@ async fn bsky_rows(db: &Client, hidden: &HiddenSets, query: &str, limit: i64) ->
     // Rust so one user's connected account cannot expand another's results.
     let rows = db.query(
         "SELECT bsky_uri, COALESCE(published_at, indexed_at, updated_at),
-                COALESCE(text,''), COALESCE(author_did,'')
+                COALESCE(text,''), COALESCE(author_did,''), COALESCE(author_handle,'')
          FROM bsky_posts
          WHERE lower(COALESCE(text,'')) LIKE $1
          ORDER BY COALESCE(published_at, indexed_at, updated_at) DESC
@@ -261,7 +281,11 @@ async fn bsky_rows(db: &Client, hidden: &HiddenSets, query: &str, limit: i64) ->
         }
         let uri: String = row.get(0);
         let author_did: String = row.get(3);
-        if hidden.is_hidden(&author_did) { continue; }
+        let author_handle: String = row.get(4);
+        let author_ref = if author_handle.is_empty() { author_did.clone() } else {
+            format!("https://bsky.app/profile/{author_handle}")
+        };
+        if hidden.is_hidden(&author_ref) || hidden.is_hidden(&author_did) { continue; }
         let created_at: String = row.get(1);
         let rank = terms.iter().map(|term| lower.matches(term).count() as f64).sum();
         out.push(SearchRow {
@@ -376,7 +400,9 @@ pub async fn project(
             fallback: "php", source: "vaak-worker-shadow", mutation_enabled: false,
         });
     }
-    let hidden = crate::hidden::load_hidden_sets(&db, owner_id).await.unwrap_or_else(|_| HiddenSets::default());
+    // Search is fail-closed: a moderation-table/cache failure must not expose
+    // a candidate that should have been hidden.
+    let hidden = crate::hidden::load_hidden_sets(&db, owner_id).await.context("load search moderation")?;
     if kind == "accounts" {
         let accounts = account_rows(&db, &hidden, query, limit).await?;
         return Ok(SearchResults { owner_id, actor_key, query: query.to_string(), query_type: kind,
@@ -407,7 +433,10 @@ pub async fn project(
     for row in candidates {
         let source: String = row.get(0);
         let source_pk: i64 = row.get(1);
-        let (actor, target) = candidate_actor(&db, &source, source_pk).await.unwrap_or_default();
+        let (actor, target) = match candidate_actor(&db, &source, source_pk).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if hidden.is_hidden(&actor) || (source == "event" && !target.is_empty() && hidden.is_hidden(&target)) {
             continue;
         }
@@ -436,7 +465,8 @@ pub async fn project(
 
 #[cfg(test)]
 mod tests {
-    use super::{tag_match_query, text_match_query};
+    use super::{bsky_media, status_json, tag_match_query, text_match_query};
+    use serde_json::json;
 
     #[test]
     fn text_matches_php_prefix_normalization() {
@@ -450,5 +480,15 @@ mod tests {
     fn tag_matches_php_marker_query() {
         assert_eq!(tag_match_query("#Rust"), Some("htag_rust OR rust".into()));
         assert_eq!(tag_match_query("!!!"), None);
+    }
+
+    #[test]
+    fn serialized_search_status_has_mastodon_shape_and_media() {
+        let status = status_json("1".into(), "2026-01-01T00:00:00.000Z", "https://example.test/p/1", "hello", json!({"id":"a"}));
+        assert!(status.get("id").is_some());
+        assert!(status.get("account").is_some());
+        assert!(status.get("media_attachments").is_some());
+        let media = bsky_media(&json!({"images":[{"fullsize":"https://cdn.test/a.jpg","alt":"a"}]}), "at://x");
+        assert_eq!(media.len(), 1);
     }
 }
