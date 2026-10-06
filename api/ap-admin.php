@@ -30836,7 +30836,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }
           // Pinned / Featured / Blog render from dedicated lists — not $rpTabItems.
           $rpTimelineTabs = ['posts', 'replies', 'boosts', 'media'];
-          $rpLocalPageLimit = 20;
+          // Keep profile first paint lighter than a timeline; infinite scroll
+          // still exposes the complete tab after the initial 12 cards.
+          $rpLocalPageLimit = 12;
           $rpLocalNextOffset = 0;
           $rpAxumHtml = null;
           $rpAxumCache = '';
