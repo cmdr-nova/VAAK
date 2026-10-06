@@ -1661,7 +1661,7 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
     for st in statuses.iter() {
         if let Some(uri) = st.get("quote").and_then(|q| q.get("quoted_status"))
             .and_then(|q| q.get("uri")).and_then(|v| v.as_str())
-            .filter(|u| u.starts_with(LOCAL_ACTOR_PREFIX)) {
+            .filter(|u| !u.trim().is_empty()) {
             targets.push(uri.trim_end_matches('/').to_string());
         }
     }
