@@ -142,6 +142,19 @@ fn status_json(id: String, created: &str, uri: &str, content: &str, account: Val
         "emojis": [], "card": null, "poll": null, "quote": null})
 }
 
+async fn hydrated_account(db: &Client, actor: &str, username: &str, host: &str) -> Value {
+    if let Ok(Some(row)) = db.query_opt(
+        "SELECT COALESCE(username,''), COALESCE(display_name,''), COALESCE(icon_source_url,'')
+         FROM remote_actors WHERE actor_id = $1 LIMIT 1", &[&actor]
+    ).await {
+        let cached_user: String = row.get(0);
+        let display: String = row.get(1);
+        let avatar: String = row.get(2);
+        return account_json(actor, if cached_user.is_empty() { username } else { &cached_user }, &display, host, Some(&avatar));
+    }
+    account_json(actor, username, username, host, None)
+}
+
 async fn serialize_candidate(db: &Client, source: &str, source_pk: i64, object_id: Option<&str>, created: &str) -> Option<Value> {
     match source {
         "event" => {
@@ -149,30 +162,47 @@ async fn serialize_candidate(db: &Client, source: &str, source_pk: i64, object_i
             let actor: String = r.get(0); let text: String = r.get(1); let uri: String = r.get(2);
             let host: String = r.get(3);
             let username = actor.rsplit('/').next().unwrap_or("unknown");
-            Some(status_json(status_id(created, source_pk, 1), created, if uri.is_empty() { actor.as_str() } else { uri.as_str() }, &text, account_json(&actor, username, username, &host, None)))
+            let account = hydrated_account(db, &actor, username, &host).await;
+            Some(status_json(status_id(created, source_pk, 1), created, if uri.is_empty() { actor.as_str() } else { uri.as_str() }, &text, account))
         }
         "mention" => {
             let r = db.query_opt("SELECT actor_id, COALESCE(content,''), COALESCE(object_id,'') FROM mentions WHERE id = $1 AND deleted_at IS NULL", &[&source_pk]).await.ok()??;
             let actor: String = r.get(0); let text: String = r.get(1); let uri: String = r.get(2);
             let username = actor.rsplit('/').next().unwrap_or("unknown");
-            Some(status_json(status_id(created, source_pk, 2), created, if uri.is_empty() { actor.as_str() } else { uri.as_str() }, &text, account_json(&actor, username, username, "", None)))
+            let account = hydrated_account(db, &actor, username, "").await;
+            Some(status_json(status_id(created, source_pk, 2), created, if uri.is_empty() { actor.as_str() } else { uri.as_str() }, &text, account))
         }
         "status" => {
             let r = db.query_opt("SELECT note_id, COALESCE(content_text,''), COALESCE(published,'') FROM masto_statuses WHERE local_id = $1", &[&source_pk]).await.ok()??;
             let uri: String = r.get(0); let text: String = r.get(1); let published: String = r.get(2);
             let actor = uri.split("/notes/").next().unwrap_or("https://mkultra.monster/users/cmdr_nova").to_string();
             let username = actor.rsplit('/').next().unwrap_or("cmdr_nova");
-            Some(status_json(status_id(&published, source_pk, 0), &published, &uri, &text, account_json(&actor, username, username, "mkultra.monster", None)))
+            let account = hydrated_account(db, &actor, username, "mkultra.monster").await;
+            Some(status_json(status_id(&published, source_pk, 0), &published, &uri, &text, account))
         }
         "bsky_post" => {
             let uri = object_id.unwrap_or("");
-            let r = db.query_opt("SELECT COALESCE(raw_json,''), COALESCE(author_did,''), COALESCE(author_handle,''), COALESCE(author_display,'') FROM bsky_posts WHERE bsky_uri = $1", &[&uri]).await.ok()??;
-            let raw: String = r.get(0); let did: String = r.get(1); let handle: String = r.get(2); let display: String = r.get(3);
+            let r = db.query_opt("SELECT COALESCE(raw_json,''), COALESCE(author_did,''), COALESCE(author_handle,''), COALESCE(author_display,''), COALESCE(embed_json,''), COALESCE(reply_parent,'') FROM bsky_posts WHERE bsky_uri = $1", &[&uri]).await.ok()??;
+            let raw: String = r.get(0); let did: String = r.get(1); let handle: String = r.get(2); let display: String = r.get(3); let embed: String = r.get(4); let reply_parent: String = r.get(5);
             let post = serde_json::from_str::<Value>(&raw).ok().and_then(|v| v.get("post").cloned().or(Some(v))).unwrap_or(Value::Null);
             let text = post.get("record").and_then(|v| v.get("text")).and_then(Value::as_str).or_else(|| post.get("text").and_then(Value::as_str)).unwrap_or("");
             let user = if handle.is_empty() { did.as_str() } else { handle.as_str() };
             let actor = format!("https://bsky.app/profile/{user}");
-            Some(status_json(uri.to_string(), created, uri, text, account_json(&actor, user, &display, "bsky.app", None)))
+            let mut status = status_json(uri.to_string(), created, uri, text, account_json(&actor, user, &display, "bsky.app", None));
+            if let Some(obj) = status.as_object_mut() {
+                if !reply_parent.is_empty() {
+                    obj.insert("in_reply_to_id".into(), json!(reply_parent));
+                    obj.insert("vaak_in_reply_to_url".into(), json!(reply_parent));
+                }
+                if let Ok(embed_value) = serde_json::from_str::<Value>(&embed) {
+                    if let Some(external) = embed_value.get("external") {
+                        if let Some(url) = external.get("uri").and_then(Value::as_str) {
+                            obj.insert("card".into(), json!({"url": url, "title": external.get("title").and_then(Value::as_str).unwrap_or("Bluesky link"), "description": external.get("description").and_then(Value::as_str).unwrap_or(""), "type": "link", "provider_name": "Bluesky"}));
+                        }
+                    }
+                }
+            }
+            Some(status)
         }
         _ => None,
     }
