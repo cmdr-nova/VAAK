@@ -5826,6 +5826,7 @@ $slowRouteRows = [];
 $healthDb = ['ok' => false, 'latency_ms' => null, 'error' => null];
 $healthRedisCache = [];
 $healthRedisQueue = [];
+$rustAdminHealth = null;
 if ($view === 'queue_health') {
     // Read-only measurements; this view never claims jobs or changes worker concurrency.
     $healthDbStarted = microtime(true);
@@ -5929,6 +5930,7 @@ if ($view === 'queue_health') {
     if (function_exists('ap_slow_route_snapshot')) {
         $slowRouteRows = ap_slow_route_snapshot(20);
     }
+    $rustAdminHealth = admin_shadow_admin_health_fetch();
 }
 if ($view === 'stats') {
     try {
@@ -20836,6 +20838,25 @@ function admin_account_switch_axum_prep(int $ownerUserId, string $returnView = '
     return is_array($decoded) ? $decoded : null;
 }
 
+/** Read-only Admin health comparison; PHP remains the source of truth. */
+function admin_shadow_admin_health_fetch(): ?array
+{
+    if (!function_exists('curl_init')) return null;
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
+    $ch = curl_init($base . '/shadow/admin-health');
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($code !== 200 || !is_string($raw) || $raw === '') return null;
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : null;
+}
+
 /**
  * Fetch local profile tab HTML from Axum `/shadow/profile-html` (0.7.18).
  * Same lean cards as Home (actions + own-post Delete/Edit/Pin) for posts /
@@ -32304,6 +32325,18 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           <?php $healthWarnings = array_merge((array) ($healthDb['error'] ?? ''), (array) ($healthRedisCache['warnings'] ?? []), (array) ($healthRedisQueue['warnings'] ?? [])); $healthWarnings = array_values(array_filter(array_map('strval', $healthWarnings))); ?>
           <?php if ($healthWarnings): ?><div class="meta" style="margin-top:.65rem;color:var(--warning)"><?= h(implode(' · ', array_slice($healthWarnings, 0, 3))) ?></div><?php endif; ?>
         </div>
+        <?php if (is_array($rustAdminHealth)): ?>
+        <div class="side-card" style="margin-top:1rem">
+          <h3>Rust shadow comparison</h3>
+          <div class="meta" style="margin-bottom:.6rem">Read-only Axum projection; PHP remains authoritative for queue claims, reports, moderation, and all writes.</div>
+          <div class="stat-grid">
+            <div class="stat"><div class="n" style="color:<?= !empty($rustAdminHealth['database']) ? 'var(--primary)' : 'var(--danger)' ?>"><?= !empty($rustAdminHealth['database']) ? 'OK' : 'FAIL' ?></div><div class="l">Rust PostgreSQL</div></div>
+            <div class="stat"><div class="n"><?= (int) ($rustAdminHealth['open_reports'] ?? 0) ?></div><div class="l">Open reports</div></div>
+            <div class="stat"><div class="n"><?= (int) ($rustAdminHealth['active_downranked'] ?? 0) ?></div><div class="l">Active downranked</div></div>
+            <div class="stat"><div class="n"><?= count(array_filter((array) ($rustAdminHealth['queues'] ?? []), static fn($q): bool => !empty($q['available']))) ?></div><div class="l">Rust queues available</div></div>
+          </div>
+        </div>
+        <?php endif; ?>
         <div class="side-card" style="margin-top:1rem">
           <h3>Queue classes</h3>
           <div style="overflow-x:auto">
