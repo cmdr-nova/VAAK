@@ -57,6 +57,8 @@ pub struct OwnerQuery {
     pub library_suffix: Option<String>,
     /// Read-only You projection: blog, rss, queue, or drafts.
     pub kind: Option<String>,
+    /// Read-only Followers/Following projection kind.
+    pub relationship: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +114,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/action-queue", get(shadow_action_queue))
         .route("/shadow/admin-health", get(shadow_admin_health))
         .route("/shadow/you", get(shadow_you))
+        .route("/shadow/relationships", get(shadow_relationships))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
@@ -168,6 +171,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/action-queue",
             "/shadow/admin-health",
             "/shadow/you",
+            "/shadow/relationships",
             "/shadow/jetstream",
             "/shadow/thin-media",
             "/shadow/timelines/home",
@@ -750,6 +754,16 @@ async fn shadow_you(
     let kind = q.kind.as_deref().unwrap_or("");
     let limit = q.limit.unwrap_or(100);
     json_result(crate::you::project(&state.cfg, owner, kind, limit).await)
+}
+
+async fn shadow_relationships(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let relationship = q.relationship.as_deref().unwrap_or("");
+    let limit = q.limit.unwrap_or(200);
+    json_result(crate::relationships::project(&state.cfg, owner, relationship, limit).await)
 }
 
 async fn shadow_jetstream(State(state): State<AppState>) -> impl IntoResponse {

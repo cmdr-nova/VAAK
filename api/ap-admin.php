@@ -6067,16 +6067,27 @@ $needFollowingRows = !$accountSwitcherView && (
     $view === 'following'
     || (!$isPartial && !in_array($view, ['followers', 'mentions', 'account_switcher'], true))
 );
-$followers = $needFollowersRows ? ap_followers_list($vaakActorId) : [];
-$following = $needFollowingRows ? ap_following_list($vaakActorId) : [];
+$relationshipProjectionView = in_array($view, ['followers', 'following'], true) || $shellFollowGraph;
+$followersShadow = $relationshipProjectionView && $needFollowersRows
+    ? admin_relationship_projection_axum_fetch('followers', (int) $vaakOwnerId)
+    : null;
+$followingShadow = $relationshipProjectionView && $needFollowingRows
+    ? admin_relationship_projection_axum_fetch('following', (int) $vaakOwnerId)
+    : null;
+$followers = is_array($followersShadow)
+    ? array_values(array_filter($followersShadow['rows'] ?? [], 'is_array'))
+    : ($needFollowersRows ? ap_followers_list($vaakActorId) : []);
+$following = is_array($followingShadow)
+    ? array_values(array_filter($followingShadow['rows'] ?? [], 'is_array'))
+    : ($needFollowingRows ? ap_following_list($vaakActorId) : []);
 if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_bsky_merge_follow_rows')) {
-    if ($needFollowingRows && function_exists('ap_bsky_admin_following_rows')) {
+    if ($needFollowingRows && !is_array($followingShadow) && function_exists('ap_bsky_admin_following_rows')) {
         // Never resolve every Bluesky DID→handle on the request path (was ~1.4s
         // for ~450 follows). DID profile URLs render fine; actor-refresh fills
         // handles in the background for the visible page slice.
         $following = ap_bsky_merge_follow_rows($following, ap_bsky_admin_following_rows($vaakOwnerId, false));
     }
-    if ($needFollowersRows && in_array($view, ['followers', 'following'], true)
+    if ($needFollowersRows && !is_array($followersShadow) && in_array($view, ['followers', 'following'], true)
         && function_exists('ap_bsky_admin_follower_rows')) {
         $followers = ap_bsky_merge_follow_rows($followers, ap_bsky_admin_follower_rows($vaakOwnerId, $vaakActorId));
     }
@@ -20896,6 +20907,31 @@ function admin_you_projection_axum_fetch(string $kind, int $ownerUserId, int $li
     $decoded = json_decode($raw, true);
     if (!is_array($decoded) || ($decoded['kind'] ?? '') !== $kind || !is_array($decoded['rows'] ?? null)) return null;
     $decoded['secondary'] = is_array($decoded['secondary'] ?? null) ? $decoded['secondary'] : [];
+    return $decoded;
+}
+
+/** Read-only Followers/Following projection; PHP remains the write owner. */
+function admin_relationship_projection_axum_fetch(string $relationship, int $ownerUserId, int $limit = 500): ?array
+{
+    $relationship = strtolower(trim($relationship));
+    if (!in_array($relationship, ['followers', 'following'], true) || $ownerUserId < 1 || !function_exists('curl_init')) return null;
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
+    $ch = curl_init($base . '/shadow/relationships?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'relationship' => $relationship,
+        'limit' => max(1, min(500, $limit)),
+    ]));
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($code !== 200 || !is_string($raw) || $raw === '') return null;
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded) || ($decoded['relationship'] ?? '') !== $relationship || !is_array($decoded['rows'] ?? null)) return null;
     return $decoded;
 }
 
