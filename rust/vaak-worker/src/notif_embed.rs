@@ -2056,30 +2056,6 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
             .get("vaak_rss_feed_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let fav_cls = if fav { "icon-btn on" } else { "icon-btn" };
-        let fav_icon = if fav {
-            "<i class=\"ph-fill ph-heart\" aria-hidden=\"true\"></i>"
-        } else {
-            "<i class=\"ph ph-heart\" aria-hidden=\"true\"></i>"
-        };
-        actions.push_str(&interaction_form(
-            &action_base,
-            if fav {
-                "unfavourite_status"
-            } else {
-                "favourite_status"
-            },
-            from_q,
-            &sid,
-            &sid,
-            "",
-            fav_cls,
-            if fav { "Unlike" } else { "Like (VAAK only)" },
-            if fav { "Unlike" } else { "Like" },
-            fav_icon,
-            "",
-            "",
-        ));
         if rss_item > 0 {
             let q_cls = if json_flag(status, "vaak_rss_quoted") {
                 "icon-btn on"
@@ -2123,6 +2099,32 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 " aria-pressed=\"{}\"",
                 if boosted { "true" } else { "false" }
             ),
+        ));
+        // Keep RSS actions in the same interaction order as other timeline
+        // cards: Favourite immediately precedes Bookmark.
+        let fav_cls = if fav { "icon-btn on" } else { "icon-btn" };
+        let fav_icon = if fav {
+            "<i class=\"ph-fill ph-heart\" aria-hidden=\"true\"></i>"
+        } else {
+            "<i class=\"ph ph-heart\" aria-hidden=\"true\"></i>"
+        };
+        actions.push_str(&interaction_form(
+            &action_base,
+            if fav {
+                "unfavourite_status"
+            } else {
+                "favourite_status"
+            },
+            from_q,
+            &sid,
+            &sid,
+            "",
+            fav_cls,
+            if fav { "Unlike" } else { "Like (VAAK only)" },
+            if fav { "Unlike" } else { "Like" },
+            fav_icon,
+            "",
+            "",
         ));
         let bm_cls = if bm { "icon-btn on" } else { "icon-btn" };
         let bm_icon = if bm {
@@ -3286,6 +3288,9 @@ mod tests {
         assert!(html.contains("rss_quote") || html.contains("ph-quotes"), "{html}");
         assert!(html.contains("reblog_status") || html.contains("Boost (VAAK only)"), "{html}");
         assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
+        let favourite_pos = html.find("value=\"favourite_status\"").expect("RSS favourite action");
+        let bookmark_pos = html.find("value=\"bookmark_status\"").expect("RSS bookmark action");
+        assert!(favourite_pos < bookmark_pos, "RSS Favourite must precede Bookmark: {html}");
         assert!(!html.contains("bite_remote"), "RSS must not Bite: {html}");
         assert!(
             html.contains("data-rss-item=\"9\""),
