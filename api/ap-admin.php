@@ -32849,14 +32849,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     const original = new URL(window.location.href);
     const u = new URL(original.href);
     if (typeof mutate === 'function') mutate(u);
-    // Keep /users/{key} stable while clearing compose/modal flags or changing
-    // profile tabs. Only timeline navigation should intentionally leave the
-    // profile route and return to the app shell.
+    // Keep /users/{key} stable while changing profile tabs. Library, timeline,
+    // and account surfaces must leave the pretty profile route; otherwise a
+    // soft-nav updates the content but a hard refresh re-enters remote_profile.
     const timelineViews = new Set(['home', 'local', 'feed']);
+    const appViews = new Set(['home', 'local', 'feed', 'mentions', 'asks', 'dms', 'favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists', 'profile', 'blog', 'rss', 'phyrian', 'queue', 'drafts', 'search']);
     const nextView = u.searchParams.get('view') || '';
-    if (window.vaakIsPrettyProfilePath(original.pathname) && timelineViews.has(nextView)) {
+    if (window.vaakIsPrettyProfilePath(original.pathname) && appViews.has(nextView)) {
       u.pathname = '/vaak/';
-      u.search = '';
+      if (timelineViews.has(nextView)) u.search = '';
       u.hash = '';
     }
     return u.pathname + u.search + (u.hash || '');
