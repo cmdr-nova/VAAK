@@ -97,7 +97,10 @@ pub async fn tl_html_fill(
 
     let mut report =
         timeline::view_hydrate(cfg, owner_user_id, view, candidates[0], None).await?;
-    if !report.cache_hit || report.items.len() <= offset {
+    if !report.cache_hit
+        || report.items.len() <= offset
+        || (report.filtered && report.items.len() < offset + limit)
+    {
         for &alt in &candidates[1..] {
             let alt_report =
                 timeline::view_hydrate(cfg, owner_user_id, view, alt, None).await?;
@@ -153,7 +156,7 @@ pub async fn tl_html_fill(
     Ok(Some(HomeHtmlReport {
         html,
         count: painted,
-        has_more: painted >= limit || !exhausted || looks_like_warm_head,
+        has_more: painted >= limit || !exhausted || looks_like_warm_head || report.filtered,
         next_offset: offset + painted,
         source: format!("axum-{view}-html:{}", report.source),
         hydrate_key: report.redis_key,

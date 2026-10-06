@@ -1805,7 +1805,7 @@ fn paint_moderation_overflow(
              <input type=\"hidden\" name=\"return_from\" value=\"{rv}\">\
              <input type=\"hidden\" name=\"return_actor\" value=\"{actor}\">\
              <input type=\"hidden\" name=\"id\" value=\"{id}\">\
-             <button class=\"menu-action\" type=\"submit\" title=\"Hide from your timelines only\">Unblock for me</button></form>",
+             <button class=\"menu-action\" type=\"submit\" title=\"Hide from your timelines only\">Unblock</button></form>",
             base = esc(&action_base),
             rv = esc(from_q),
             actor = esc(actor),
@@ -1819,7 +1819,7 @@ fn paint_moderation_overflow(
              <input type=\"hidden\" name=\"return_from\" value=\"{rv}\">\
              <input type=\"hidden\" name=\"return_actor\" value=\"{actor}\">\
              <input type=\"hidden\" name=\"target\" value=\"{actor}\">\
-             <button class=\"menu-action\" type=\"submit\" title=\"Hide from your timelines only\">Block for me</button></form>",
+             <button class=\"menu-action\" type=\"submit\" title=\"Hide from your timelines only\">Block</button></form>",
             base = esc(&action_base),
             rv = esc(from_q),
             actor = esc(actor),
@@ -1839,7 +1839,7 @@ fn paint_moderation_overflow(
         action = if muted { "unmute_remote" } else { "mute_remote" },
         rv = esc(from_q),
         actor = esc(actor),
-        label = if muted { "Unmute for me" } else { "Mute for me" },
+        label = if muted { "Unmute" } else { "Mute" },
     ));
 
     // Report user (composer prefilled with actor + optional post)
