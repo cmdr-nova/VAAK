@@ -170,6 +170,49 @@ pub async fn home_html_fill(
     tl_html_fill(cfg, owner_user_id, "home", limit, offset).await
 }
 
+/// Build the Home live-poll fragment with the same lean Rust painter used by
+/// the initial and infinite-scroll timeline paths.
+pub async fn home_html_since(
+    cfg: &Config,
+    owner_user_id: i64,
+    since_ts: i64,
+    limit: i64,
+) -> Result<Option<HomeHtmlReport>> {
+    let report = timeline::home_since(cfg, owner_user_id, since_ts, limit.clamp(1, 40) as usize).await?;
+    if !report.cache_hit {
+        return Ok(None);
+    }
+    let mut slice = report.items;
+    let mut extra_parents = std::collections::HashMap::new();
+    if let Ok(db) = db::connect(&cfg.database_url).await {
+        let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
+        if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
+            crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
+        }
+        let need = missing_self_reply_parent_uris(&slice);
+        if !need.is_empty() {
+            if let Ok(fetched) = crate::profile_html::fetch_outbox_statuses_by_uris(&db, &need).await {
+                extra_parents = fetched;
+            }
+        }
+        crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
+    }
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
+    let units = plan_feed_paint_units(&slice, &extra_parents);
+    let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
+        paint_lean_feed_card_opts(st, from, viewer)
+    };
+    let (html, painted) = paint_feed_units(&units, "home", &viewer_actor, &paint);
+    Ok(Some(HomeHtmlReport {
+        html,
+        count: painted,
+        has_more: false,
+        next_offset: painted,
+        source: "axum-home-since-html".to_string(),
+        hydrate_key: report.hydrate_key.unwrap_or_default(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::notif_embed::paint_lean_feed_card;

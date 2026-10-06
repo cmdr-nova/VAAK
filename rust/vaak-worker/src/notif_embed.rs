@@ -1740,6 +1740,18 @@ fn paint_moderation_overflow(
     let is_bsky_object = object.to_ascii_lowercase().contains("bsky.app");
 
     let mut menu = String::new();
+    // Direct messages are an ActivityPub/Fediverse action. Keep the Rust
+    // timeline overflow in parity with PHP, while never routing Bluesky
+    // actors through the Fediverse DM composer.
+    let is_bsky_actor = actor.to_ascii_lowercase().contains("bsky.app")
+        || actor.to_ascii_lowercase().starts_with("https://bsky.")
+        || actor.to_ascii_lowercase().starts_with("at://");
+    if !blocked && !is_bsky_actor {
+        menu.push_str(&format!(
+            "<a class=\"menu-action\" href=\"?view=dms&amp;peer={}\">DM</a>",
+            esc(&urlencoding_encode(actor))
+        ));
+    }
     if object.starts_with("https://") {
         let open = format!(
             "?view=status&object={}&from={}",
@@ -3176,13 +3188,18 @@ mod tests {
             },
             "media_attachments": []
         });
-        let html = paint_lean_feed_card(&st);
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "home",
+            "https://mkultra.monster/users/viewer",
+        );
         assert!(html.contains("icon-btn"), "expected action icons: {html}");
         assert!(html.contains("favourite_status") || html.contains("ph-heart"), "{html}");
         assert!(html.contains("reblog_status") || html.contains("ph-repeat"), "{html}");
         assert!(html.contains("bite_remote") && html.contains("ph-tooth"), "{html}");
         assert!(html.contains("bookmark_status") || html.contains("ph-bookmark"), "{html}");
         assert!(html.contains("compose=1") && html.contains("reply_to="), "{html}");
+        assert!(html.contains("view=dms&amp;peer="), "Fediverse overflow should offer DM: {html}");
         assert!(!html.contains(">Open</a></div>"), "Home should not be Open-only: {html}");
     }
 

@@ -19166,6 +19166,26 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         }
         $newerT0 = microtime(true);
         $newerLimit = max(8, min(30, $tlLimit));
+        // Prefer the native Rust/Axum HTML painter for live Home inserts, just
+        // as the initial/fill paths do. This prevents a successful Axum poll
+        // from silently falling back to PHP's legacy Open/Remote action bar.
+        if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_since_html_fetch')) {
+            $axumHtml = ap_masto_timeline_home_axum_since_html_fetch(
+                $sinceTs,
+                $newerLimit,
+                (int) admin_owner_user_id()
+            );
+            if (is_array($axumHtml)) {
+                header('X-New-Count: ' . (int) ($axumHtml['count'] ?? 0));
+                header('X-Newest: ' . (int) ($axumHtml['newest'] ?? $sinceTs));
+                header('X-TL-Newer-Source: axum-ranked-since-html');
+                header('X-TL-Newer-Fetch-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
+                header('X-TL-Newer-Render-Ms: 0');
+                header('X-TL-Newer-Total-Ms: ' . (string) (int) round((microtime(true) - $newerT0) * 1000));
+                echo (string) ($axumHtml['html'] ?? '');
+                exit;
+            }
+        }
         // Home: prefer Axum ranked+hydrate since (0.6.74). Confirmed empty must
         // short-circuit — do not fall through to multi-chunk PG fetch.
         if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_since_fetch')) {

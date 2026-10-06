@@ -6134,6 +6134,92 @@ function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, 
 }
 
 /**
+ * Fetch the Home live-poll HTML painted by Rust/Axum. This is deliberately a
+ * separate endpoint from the Mastodon-shaped JSON poll: the browser's “New N
+ * posts” insertion must not regress to the PHP card renderer (and its legacy
+ * Open/Remote action row) when the Axum poll succeeds.
+ *
+ * @return array{html:string,newest:int,count:int,source:string}|null
+ */
+function ap_masto_timeline_home_axum_since_html_fetch(int $sinceTs, int $limit = 20, int $ownerUserId = 0): ?array
+{
+    $enabled = getenv('VAAK_HOME_NEWER_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled || $sinceTs <= 0 || !function_exists('curl_init')) {
+        return null;
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id')) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    if ($ownerUserId < 1 && function_exists('ap_db_masto_owner_user_id')) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/shadow/home-since-html?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'since_ts' => max(0, $sinceTs),
+        'limit' => max(1, min(40, $limit)),
+    ]);
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    $started = microtime(true);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 700,
+        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    if (!is_string($raw) || $code !== 200) {
+        return null;
+    }
+    $headers = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    $cache = '';
+    $newest = $sinceTs;
+    $count = 0;
+    foreach (preg_split('/\r\n|\n|\r/', $headers) ?: [] as $line) {
+        if (stripos($line, 'X-VAAK-TL-Cache:') === 0) {
+            $cache = trim(substr($line, strlen('X-VAAK-TL-Cache:')));
+        } elseif (stripos($line, 'X-Newest:') === 0) {
+            $newest = max($newest, (int) trim(substr($line, strlen('X-Newest:'))));
+        } elseif (stripos($line, 'X-New-Count:') === 0) {
+            $count = max(0, (int) trim(substr($line, strlen('X-New-Count:'))));
+        }
+    }
+    if (stripos($cache, 'axum-ranked-since-html') === false) {
+        return null;
+    }
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timelines.home.axum_since_html_fetch', (microtime(true) - $started) * 1000.0);
+    }
+    return [
+        'html' => is_string($body) ? $body : '',
+        'newest' => $newest,
+        'count' => $count,
+        'source' => 'axum-ranked-since-html',
+    ];
+}
+
+/**
  * Best-effort prime of Home hydrate Redis so HTML Axum assist can hit next time.
  */
 function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit = 15): void

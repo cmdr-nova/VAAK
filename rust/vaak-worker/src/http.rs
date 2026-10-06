@@ -128,6 +128,8 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/api/v1/timelines/home", get(shadow_home_masto))
         // Home live-poll: ranked head + hydrate filtered by since_ts (0.6.74).
         .route("/api/v1/timelines/home/since", get(shadow_home_since))
+        // Home live-poll HTML uses the same Rust painter as initial/fill cards.
+        .route("/shadow/home-since-html", get(shadow_home_since_html))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
         .with_state(state);
 
@@ -167,6 +169,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/account-switch-prep",
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
+            "/shadow/home-since-html",
             "/api/v1/notifications"
         ],
     }))
@@ -807,6 +810,48 @@ async fn shadow_home_since(
             })),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// Home live-poll HTML. Cache misses return 404 so PHP can retain its
+/// compatibility fallback; a cache hit with no newer rows returns an empty
+/// 200 body and must not be re-rendered by the legacy PHP card painter.
+async fn shadow_home_since_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(20).clamp(1, 40);
+    let since_ts = q.since_ts.unwrap_or(0);
+    if since_ts <= 0 {
+        return (StatusCode::BAD_REQUEST, "since_ts required").into_response();
+    }
+    match crate::home_html::home_html_since(&state.cfg, owner, since_ts, limit).await {
+        Ok(Some(report)) => {
+            let mut resp = (StatusCode::OK, report.html).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            resp.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-vaak-tl-cache"),
+                axum::http::HeaderValue::from_static("axum-ranked-since-html"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
+                resp.headers_mut().insert(axum::http::HeaderName::from_static("x-new-count"), v);
+            }
+            resp
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
