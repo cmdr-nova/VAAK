@@ -8375,7 +8375,7 @@ function admin_home_record_suppression(int $ownerUserId, string $actorId, array 
     try {
         $db = ap_db();
         $now = time();
-        $st = $db->prepare('SELECT score, suppressed_until, categories_json, seen_object_ids_json FROM ap_home_suppression WHERE owner_user_id = ? AND actor_id = ?');
+        $st = $db->prepare('SELECT score, suppressed_until, categories_json, seen_object_ids_json, last_object_id FROM ap_home_suppression WHERE owner_user_id = ? AND actor_id = ?');
         $st->execute([$ownerUserId, $actorId]);
         $old = $st->fetch() ?: [];
         $objectId = rtrim(trim($objectId), '/');
