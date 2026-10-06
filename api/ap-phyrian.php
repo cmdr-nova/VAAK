@@ -131,6 +131,7 @@ function ap_phyrian_migrate(?PDO $db = null): void
         'resonance_exchanges INTEGER NOT NULL DEFAULT 0',
         'inductions_given INTEGER NOT NULL DEFAULT 0',
         'lineage_depth INTEGER',
+        'daily_resonance_decay INTEGER NOT NULL DEFAULT 5',
     ] as $colDef) {
         try {
             $db->exec('ALTER TABLE phyrian_players ADD COLUMN IF NOT EXISTS ' . $colDef);
@@ -991,7 +992,9 @@ function ap_phyrian_dossier(int $ownerUserId): ?array
         'max_resonance' => AP_PHYRIAN_MAX_RESONANCE,
         'banked_resonance' => (int) ($player['banked_resonance'] ?? 0),
         'max_banked_resonance' => AP_PHYRIAN_MAX_BANKED,
-        'daily_resonance_decay' => AP_PHYRIAN_DAILY_DECAY,
+        // Linked OpenSim bodies carry the authoritative generation-scaled
+        // decay; unlinked VAAK bodies retain the local Phase-1 default.
+        'daily_resonance_decay' => max(0, (int) ($player['daily_resonance_decay'] ?? AP_PHYRIAN_DAILY_DECAY)),
         'resonance_exchanges' => (int) ($player['resonance_exchanges'] ?? 0),
         'inductions_given' => (int) ($player['inductions_given'] ?? 0),
         'stability' => ap_phyrian_stability($player),
