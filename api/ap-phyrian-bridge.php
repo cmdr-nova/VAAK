@@ -146,6 +146,61 @@ function ap_phyrian_bridge_valid_uuid(string $id): bool
 }
 
 /**
+ * Pure OpenSim payload normalizer shared by the bridge writer and parity
+ * fixtures. Keeping this separate from the database apply step lets Rust and
+ * PHP compare the exact same clamping/default behavior without mutating state.
+ *
+ * @param array<string,mixed> $osPlayer
+ * @return array<string,mixed>
+ */
+function ap_phyrian_bridge_normalize_opensim_player(array $osPlayer): array
+{
+    $strain = trim((string) ($osPlayer['strain'] ?? ''));
+    return [
+        'status' => $strain !== '' ? 'imprinted' : 'unknown',
+        'strain' => $strain,
+        'resonance' => max(0, min(
+            defined('AP_PHYRIAN_MAX_RESONANCE') ? (int) AP_PHYRIAN_MAX_RESONANCE : 100,
+            (int) ($osPlayer['resonance'] ?? 0)
+        )),
+        'generation' => max(1, min(
+            defined('AP_PHYRIAN_MAX_GENERATION') ? (int) AP_PHYRIAN_MAX_GENERATION : 10,
+            (int) ($osPlayer['generation'] ?? 1)
+        )),
+        'level' => max(1, min(
+            defined('AP_PHYRIAN_MAX_LEVEL') ? (int) AP_PHYRIAN_MAX_LEVEL : 80,
+            (int) ($osPlayer['level'] ?? 1)
+        )),
+        'banked_resonance' => max(0, min(
+            defined('AP_PHYRIAN_MAX_BANKED') ? (int) AP_PHYRIAN_MAX_BANKED : 300,
+            (int) ($osPlayer['banked_resonance'] ?? 0)
+        )),
+        'resonance_exchanges' => max(0, (int) ($osPlayer['resonance_exchanges'] ?? 0)),
+        'inductions_given' => max(0, (int) ($osPlayer['inductions_given'] ?? 0)),
+        'lineage_depth' => max(0, (int) ($osPlayer['lineage_depth'] ?? 0)),
+        'last_decay_at' => is_string($osPlayer['last_decay_at'] ?? null)
+            && trim((string) $osPlayer['last_decay_at']) !== ''
+            ? trim((string) $osPlayer['last_decay_at'])
+            : null,
+    ];
+}
+
+/**
+ * Build the authenticated bridge envelope without performing I/O. This is
+ * the contract surface exercised by the PHP/Rust bridge parity fixtures.
+ *
+ * @param array<string,mixed> $body
+ * @return array<string,mixed>
+ */
+function ap_phyrian_bridge_request_payload(string $action, array $body, string $secret): array
+{
+    return array_merge($body, [
+        'action' => $action,
+        'bridge_secret' => $secret,
+    ]);
+}
+
+/**
  * Normalize identify field: URL / UUID / avatar name.
  *
  * @return array{kind:string,value:string}|null
@@ -189,10 +244,7 @@ function ap_phyrian_bridge_strains_call(string $action, array $body): array
     if (!function_exists('curl_init')) {
         return ['ok' => false, 'http' => 0, 'error' => 'curl extension required.'];
     }
-    $payload = array_merge($body, [
-        'action' => $action,
-        'bridge_secret' => $secret,
-    ]);
+    $payload = ap_phyrian_bridge_request_payload($action, $body, $secret);
     $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     if (!is_string($json)) {
         return ['ok' => false, 'http' => 0, 'error' => 'Could not encode bridge request.'];
@@ -662,30 +714,18 @@ function ap_phyrian_bridge_apply_opensim_player(int $ownerUserId, array $osPlaye
         return ['ok' => false, 'error' => 'Could not load VAAK Phyrian row.'];
     }
 
-    $strain = trim((string) ($osPlayer['strain'] ?? ''));
-    $imprinted = $strain !== '';
-    $status = $imprinted ? 'imprinted' : 'unknown';
-    $resonance = max(0, min(
-        defined('AP_PHYRIAN_MAX_RESONANCE') ? (int) AP_PHYRIAN_MAX_RESONANCE : 100,
-        (int) ($osPlayer['resonance'] ?? 0)
-    ));
-    $generation = max(1, min(
-        defined('AP_PHYRIAN_MAX_GENERATION') ? (int) AP_PHYRIAN_MAX_GENERATION : 10,
-        (int) ($osPlayer['generation'] ?? 1)
-    ));
-    $level = max(1, min(
-        defined('AP_PHYRIAN_MAX_LEVEL') ? (int) AP_PHYRIAN_MAX_LEVEL : 80,
-        (int) ($osPlayer['level'] ?? 1)
-    ));
-    $banked = max(0, min(
-        defined('AP_PHYRIAN_MAX_BANKED') ? (int) AP_PHYRIAN_MAX_BANKED : 300,
-        (int) ($osPlayer['banked_resonance'] ?? 0)
-    ));
-    $exchanges = max(0, (int) ($osPlayer['resonance_exchanges'] ?? 0));
-    $inductions = max(0, (int) ($osPlayer['inductions_given'] ?? 0));
-    $lineageDepth = max(0, (int) ($osPlayer['lineage_depth'] ?? 0));
-    $lastDecay = $osPlayer['last_decay_at'] ?? null;
-    $lastDecaySql = is_string($lastDecay) && trim($lastDecay) !== '' ? trim($lastDecay) : null;
+    $normalized = ap_phyrian_bridge_normalize_opensim_player($osPlayer);
+    $strain = (string) $normalized['strain'];
+    $imprinted = $normalized['status'] === 'imprinted';
+    $status = (string) $normalized['status'];
+    $resonance = (int) $normalized['resonance'];
+    $generation = (int) $normalized['generation'];
+    $level = (int) $normalized['level'];
+    $banked = (int) $normalized['banked_resonance'];
+    $exchanges = (int) $normalized['resonance_exchanges'];
+    $inductions = (int) $normalized['inductions_given'];
+    $lineageDepth = (int) $normalized['lineage_depth'];
+    $lastDecaySql = is_string($normalized['last_decay_at']) ? $normalized['last_decay_at'] : null;
 
     $imprintedAt = (string) ($before['imprinted_at'] ?? '');
     if ($imprinted && $imprintedAt === '') {
