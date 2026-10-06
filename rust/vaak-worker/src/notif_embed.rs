@@ -1505,15 +1505,36 @@ fn paint_reply_context(status: &Value, from: &str) -> String {
     if !parent.starts_with("https://") {
         return String::new();
     }
+    let cached_parent_label = status
+        .get("vaak_reply_parent_handle")
+        .and_then(|v| v.as_str())
+        .or_else(|| status.get("vaak_reply_parent_display").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim();
+    let parent_label = if !cached_parent_label.is_empty() {
+        cached_parent_label
+    } else if let Some(rest) = parent.strip_prefix("https://bsky.app/profile/") {
+        rest.split('/').next().unwrap_or("").trim()
+    } else if let Some(pos) = parent.find("/users/") {
+        parent[pos + 7..].split('/').next().unwrap_or("").trim()
+    } else {
+        ""
+    };
     let return_view = if from.is_empty() { "home" } else { from };
     let href = format!(
         "?view=status&object={}&from={}",
         urlencoding_encode(&parent),
         urlencoding_encode(return_view)
     );
+    let label = if parent_label.is_empty() {
+        "the parent post".to_string()
+    } else {
+        format!("@{}", esc(parent_label))
+    };
     format!(
-        "<div class=\"meta reply-context\" style=\"margin:.35rem 0 .5rem\">↩ <a href=\"{}\">replying to this post</a></div>",
-        esc(&href)
+        "<div class=\"meta reply-context\" style=\"margin:.35rem 0 .5rem\">↩ in reply to <a href=\"{}\">{}</a></div>",
+        esc(&href),
+        label
     )
 }
 
@@ -1701,16 +1722,25 @@ fn paint_moderation_overflow(
         ));
         let remote = remote_object_href(object, "");
         if remote.starts_with("http://") || remote.starts_with("https://") {
-            menu.push_str(&format!(
-                "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
+        menu.push_str(&format!(
+            "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
                 esc(&remote),
                 if is_bsky_object {
                     "Open on Bluesky"
                 } else {
                     "Remote"
-                }
-            ));
-        }
+            }
+        ));
+        let copy_href = format!(
+            "https://vaak.monster/vaak/?view=status&object={}&from={}",
+            urlencoding_encode(object),
+            urlencoding_encode(from_q)
+        );
+        menu.push_str(&format!(
+            "<button type=\"button\" class=\"menu-action\" data-copy-value=\"{}\" title=\"Copy link to post\">Copy link</button>",
+            esc(&copy_href)
+        ));
+    }
     }
 
     // Block for me
@@ -3145,7 +3175,7 @@ mod tests {
             }
         });
         let html = paint_lean_feed_card(&st);
-        assert!(html.contains("reply-context") && html.contains("replying to this post"), "{html}");
+        assert!(html.contains("reply-context") && html.contains("in reply to"), "{html}");
         assert!(html.contains("name=\"object_id\" value=\"https://origin.example/users/author/statuses/12345\""), "boost must target original object: {html}");
         assert!(!html.contains("value=\"https://remote.example/announce/99\""), "wrapper URI leaked into action: {html}");
     }
@@ -3163,7 +3193,7 @@ mod tests {
             "media_attachments": []
         });
         let html = paint_lean_feed_card(&st);
-        assert!(html.contains("replying to this post"), "{html}");
+        assert!(html.contains("in reply to"), "{html}");
         assert!(html.contains("bsky.app%2Fprofile%2Fdid%3Aplc%3Aparent%2Fpost%2Fparent"), "{html}");
     }
 

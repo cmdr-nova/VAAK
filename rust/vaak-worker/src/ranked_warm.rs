@@ -417,6 +417,15 @@ async fn fetch_home_events(
                 .unwrap_or_default()
                 .trim_end_matches('/')
                 .to_string();
+            // A boost is still hidden when the boosted author is blocked or
+            // muted, even if the booster themselves is followed. PHP applies
+            // this rule to the underlying object; do the same before ranking.
+            if event_type.eq_ignore_ascii_case("announce")
+                && !target_actor.is_empty()
+                && hidden.is_hidden(&target_actor)
+            {
+                continue;
+            }
             if is_empty_private_stub(&visibility, &summary, &media) {
                 continue;
             }
