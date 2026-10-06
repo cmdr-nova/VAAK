@@ -2169,6 +2169,32 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
     Ok(map)
 }
 
+/// Resolve Bluesky DIDs to human handles from the durable actor-profile cache.
+/// Jetstream may persist a reply before the parent post/profile is hydrated;
+/// timeline chrome must never expose the DID in that window.
+async fn fetch_bsky_profile_handles(db: &Client, dids: &[String]) -> Result<HashMap<String, String>> {
+    let dids: Vec<String> = dids.iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| d.starts_with("did:"))
+        .collect();
+    if dids.is_empty() { return Ok(HashMap::new()); }
+    let rows = db.query(
+        "SELECT did, profile_json FROM bsky_actor_profiles WHERE did = ANY($1) OR actor_ref = ANY($1)",
+        &[&dids],
+    ).await?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let did: String = row.get(0);
+        let raw: String = row.get(1);
+        let Ok(profile) = serde_json::from_str::<Value>(&raw) else { continue; };
+        let handle = profile.get("handle").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if !handle.is_empty() && !handle.starts_with("did:") {
+            out.insert(did, handle.to_string());
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) async fn fetch_bsky_map_for_targets(
     db: &Client,
     targets: &[String],
@@ -3003,6 +3029,23 @@ pub async fn warm_view(
     bsky_parent_uris.sort();
     bsky_parent_uris.dedup();
     let bsky_parent_map = fetch_bsky_map(&db, &bsky_parent_uris).await?;
+    let unresolved_parent_dids: Vec<String> = bsky_parent_uris.iter()
+        .filter_map(|uri| {
+            let did = uri.strip_prefix("at://")?.split('/').next()?.trim();
+            if did.starts_with("did:") {
+                let row_handle = bsky_parent_map.get(uri)
+                    .map(|row| row.author_handle.trim())
+                    .unwrap_or("");
+                if row_handle.is_empty() || row_handle.starts_with("did:") {
+                    return Some(did.to_string());
+                }
+            }
+            None
+        })
+        .collect();
+    let bsky_parent_profile_handles = fetch_bsky_profile_handles(&db, &unresolved_parent_dids)
+        .await
+        .unwrap_or_default();
     let mut events_map = fetch_events_map(&db, &event_ids).await?;
     let boosts_map = fetch_boosts_map(&db, &boost_ids, owner_user_id).await?;
     let mut rss_boost_ids = Vec::new();
@@ -3100,13 +3143,27 @@ pub async fn warm_view(
             }
             ("home", "bsky") => bsky_map.get(&e.id).map(|row| {
                 let mut st = materialize_bsky(row);
-                if let Some(parent_uri) = st.get("vaak_in_reply_to_url").and_then(|v| v.as_str()) {
-                    if let Some(parent) = bsky_parent_map.get(parent_uri) {
-                        if !parent.author_handle.trim().is_empty() {
+                if let Some(parent_uri) = st.get("vaak_in_reply_to_url").and_then(|v| v.as_str()).map(str::to_owned) {
+                    if let Some(parent) = bsky_parent_map.get(&parent_uri) {
+                        if !parent.author_handle.trim().is_empty()
+                            && !parent.author_handle.trim().starts_with("did:") {
                             st["vaak_reply_parent_handle"] = json!(parent.author_handle.trim());
                         }
                         if !parent.author_display.trim().is_empty() {
                             st["vaak_reply_parent_display"] = json!(parent.author_display.trim());
+                        }
+                    }
+                    if st.get("vaak_reply_parent_handle")
+                        .and_then(|v| v.as_str())
+                        .map(|h| h.is_empty() || h.starts_with("did:"))
+                        .unwrap_or(true)
+                    {
+                        if let Some(did) = parent_uri.strip_prefix("at://")
+                            .and_then(|rest| rest.split('/').next())
+                        {
+                            if let Some(handle) = bsky_parent_profile_handles.get(did) {
+                                st["vaak_reply_parent_handle"] = json!(handle);
+                            }
                         }
                     }
                 }
