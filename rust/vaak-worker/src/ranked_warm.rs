@@ -265,6 +265,36 @@ fn ap_following_for_events(following: &[String]) -> Vec<String> {
         .collect()
 }
 
+async fn load_followed_tags(db: &Client, owner: i64) -> Vec<String> {
+    if owner < 1 {
+        return Vec::new();
+    }
+    let rows = db
+        .query(
+            "SELECT name FROM masto_followed_tags
+             WHERE owner_user_id = $1 ORDER BY followed_at DESC LIMIT 128",
+            &[&owner],
+        )
+        .await
+        .unwrap_or_default();
+    let mut tags = Vec::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        let tag: String = row
+            .try_get::<_, Option<String>>(0)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches('#')
+            .to_ascii_lowercase();
+        if !tag.is_empty() && seen.insert(tag.clone()) {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
 #[derive(Debug, Clone)]
 struct TimelineItem {
     kind: String,
@@ -455,6 +485,97 @@ async fn fetch_home_events(
     Ok(items)
 }
 
+/// Add recent cached Fediverse events matching the user's followed hashtags.
+/// This is deliberately bounded and cache-only; it never performs remote work.
+async fn fetch_followed_tag_events(
+    db: &Client,
+    tags: &[String],
+    hidden: &hidden::HiddenSets,
+) -> Result<Vec<TimelineItem>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::days(14)).to_rfc3339();
+    let rows = db
+        .query(
+            "SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
+                    COALESCE(object_id, ''), COALESCE(target_actor, '')
+             FROM events
+             WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
+               AND action_taken = ANY(ARRAY['log','local_observe'])
+               AND created_at >= $1
+             ORDER BY created_at DESC, id DESC
+             LIMIT 600",
+            &[&since],
+        )
+        .await
+        .context("select followed hashtag events")?;
+    let wanted: HashSet<&str> = tags.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for row in rows {
+        if out.len() >= 48 {
+            break;
+        }
+        let id: i64 = row.get(0);
+        let event_type: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let actor = row
+            .try_get::<_, Option<String>>(2)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if actor.is_empty() || hidden.is_hidden(&actor) {
+            continue;
+        }
+        let summary = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        if !extract_hashtags(&summary)
+            .iter()
+            .any(|tag| wanted.contains(tag.as_str()))
+        {
+            continue;
+        }
+        let media = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+        let created = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+        let visibility = row.try_get::<_, Option<String>>(6)?.unwrap_or_default();
+        if !matches!(visibility.as_str(), "public" | "unlisted" | "") {
+            continue;
+        }
+        let object_id = row
+            .try_get::<_, Option<String>>(7)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        let target_actor = row
+            .try_get::<_, Option<String>>(8)?
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_string();
+        if event_type.eq_ignore_ascii_case("announce")
+            && !target_actor.is_empty()
+            && hidden.is_hidden(&target_actor)
+        {
+            continue;
+        }
+        let pref = if event_type.eq_ignore_ascii_case("announce") && !target_actor.is_empty() {
+            target_actor
+        } else {
+            actor.clone()
+        };
+        out.push(TimelineItem::event(
+            id.to_string(),
+            parse_ts(&created),
+            actor,
+            pref,
+            summary,
+            visibility,
+            object_id,
+            event_type,
+            "fediverse",
+        ));
+        let _ = media; // Media is hydrated from the canonical event row later.
+    }
+    Ok(out)
+}
+
 async fn fetch_own_outbox(db: &Client, self_actor: &str) -> Result<Vec<TimelineItem>> {
     let self_actor = self_actor.trim_end_matches('/');
     if !self_actor.starts_with("https://mkultra.monster/users/") {
@@ -598,12 +719,13 @@ async fn fetch_bsky_keys(
     owner: i64,
     exclude_did: Option<&str>,
     limit: i64,
-) -> Result<Vec<(String, String, String)>> {
-    // (uri, fediverse_id, author_did)
+) -> Result<Vec<(String, String, String, String, String)>> {
+    // (uri, fediverse_id, author_did, author_handle, text)
     let limit = limit.clamp(1, 120);
     let rows = if let Some(did) = exclude_did.filter(|d| d.starts_with("did:")) {
         db.query(
-            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, '')
+            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, '')
              FROM bsky_posts p
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE EXISTS (
@@ -619,7 +741,8 @@ async fn fetch_bsky_keys(
         .await
     } else {
         db.query(
-            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, '')
+            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, '')
              FROM bsky_posts p
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE EXISTS (
@@ -646,9 +769,92 @@ async fn fetch_bsky_keys(
             .trim_end_matches('/')
             .to_string();
         let author: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
-        out.push((uri, fedi, author));
+        let handle: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        let text: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+        out.push((uri, fedi, author, handle, text));
     }
     Ok(out)
+}
+
+async fn fetch_bsky_followed_tag_keys(
+    db: &Client,
+    owner: i64,
+    exclude_did: Option<&str>,
+    tags: &[String],
+) -> Result<Vec<(String, String, String, String, String)>> {
+    if owner < 1 || tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = db
+        .query(
+            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, '')
+             FROM bsky_posts p
+             LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
+             WHERE EXISTS (
+               SELECT 1 FROM bsky_post_observations o
+               WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = $1
+             )
+               AND p.text IS NOT NULL
+               AND p.indexed_at::timestamptz >= NOW() - INTERVAL '14 days'
+             ORDER BY p.indexed_at DESC, p.updated_at DESC
+             LIMIT 400",
+            &[&owner],
+        )
+        .await
+        .context("select bsky followed hashtag keys")?;
+    let wanted: HashSet<&str> = tags.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for row in rows {
+        let uri: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+        let fedi: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let did: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+        let handle: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        let text: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+        if exclude_did.is_some_and(|excluded| did == excluded)
+            || !uri.starts_with("at://")
+            || !extract_hashtags(&text)
+                .iter()
+                .any(|tag| wanted.contains(tag.as_str()))
+        {
+            continue;
+        }
+        out.push((uri, fedi, did, handle, text));
+    }
+    Ok(out)
+}
+
+fn rank_bsky_keys(
+    mut keys: Vec<(String, String, String, String, String)>,
+    actor_weights: &HashMap<String, f64>,
+    tag_weights: &HashMap<String, i32>,
+) -> Vec<(String, String, String, String, String)> {
+    if actor_weights.is_empty() && tag_weights.is_empty() {
+        return keys;
+    }
+    let score = |key: &(String, String, String, String, String)| {
+        let (_, _, did, handle, text) = key;
+        let mut actor = actor_weights.get(did).copied().unwrap_or(0.0);
+        if !handle.is_empty() {
+            actor = actor.max(
+                actor_weights
+                    .get(&format!("https://bsky.app/profile/{handle}"))
+                    .copied()
+                    .unwrap_or(0.0),
+            );
+        }
+        let tag = extract_hashtags(text)
+            .iter()
+            .map(|tag| *tag_weights.get(tag).unwrap_or(&0) as f64)
+            .fold(0.0_f64, f64::max);
+        actor + tag * 0.5
+    };
+    keys.sort_by(|a, b| {
+        score(b)
+            .partial_cmp(&score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    keys
 }
 
 fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str) -> bool {
@@ -689,7 +895,7 @@ fn flush_bsky(
 
 fn merge_bsky_ranked(
     ranked: Vec<Value>,
-    bsky: &[(String, String, String)],
+    bsky: &[(String, String, String, String, String)],
     hidden: &hidden::HiddenSets,
 ) -> Vec<Value> {
     let mut seen_fedi = HashSet::new();
@@ -707,7 +913,7 @@ fn merge_bsky_ranked(
         }
     }
     let mut queued: Vec<Value> = Vec::new();
-    for (uri, fedi, author_did) in bsky {
+    for (uri, fedi, author_did, _author_handle, _text) in bsky {
         if seen_bsky.contains(uri) {
             continue;
         }
@@ -1530,14 +1736,18 @@ async fn load_signal_actor_weights(db: &Client, owner: i64) -> HashMap<String, f
     if owner < 1 {
         return HashMap::new();
     }
-    let since = chrono::Utc::now() - chrono::Duration::days(45);
+    // Keep more of the durable interaction history available to ranking while
+    // retaining a hard row bound so a very active account cannot make rebuilds
+    // unbounded. The database retention window is longer than the old 45-day
+    // native read window.
+    let since = chrono::Utc::now() - chrono::Duration::days(90);
     let since_s = since.to_rfc3339();
     let rows = db
         .query(
             "SELECT signal_type, weight, metadata_json, created_at
              FROM ap_user_signals
              WHERE owner_user_id = $1 AND created_at >= $2
-             ORDER BY id DESC LIMIT 500",
+             ORDER BY id DESC LIMIT 2000",
             &[&owner, &since_s],
         )
         .await
@@ -2191,20 +2401,24 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let logical = cache_key_home(owner_user_id, algorithm_on, &following);
     let hidden = hidden::load_hidden_sets(&db, owner_user_id).await?;
     let ap_following = ap_following_for_events(&following);
+    let followed_tags = load_followed_tags(&db, owner_user_id).await;
 
     let mut timeline = fetch_home_events(&db, &ap_following, &actor_id, &hidden).await?;
+    timeline.extend(fetch_followed_tag_events(&db, &followed_tags, &hidden).await?);
     timeline.extend(fetch_own_outbox(&db, &actor_id).await?);
     let deprioritized = load_deprioritized_actors(&db, owner_user_id).await;
     apply_deprioritized_rank(&mut timeline, &deprioritized);
 
+    let mut actor_weights = HashMap::new();
+    let mut tag_weights = HashMap::new();
     if algorithm_on {
         // Match PHP order: recommendations → toxicity → favourite.
-        let mut actor_weights = load_favourite_actor_weights(&db, owner_user_id).await;
+        actor_weights = load_favourite_actor_weights(&db, owner_user_id).await;
         for (actor, weight) in load_signal_actor_weights(&db, owner_user_id).await {
             let entry = actor_weights.entry(actor).or_insert(0.0);
             *entry = (*entry + weight).min(64.0);
         }
-        let tag_weights = load_favourite_tag_weights(&db, owner_user_id).await;
+        tag_weights = load_favourite_tag_weights(&db, owner_user_id).await;
         if let Err(e) = apply_cached_recommendations(
             &db,
             owner_user_id,
@@ -2238,7 +2452,27 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let mut ranked = rank_from_timeline(timeline);
 
     let own_did = load_own_did(&db, owner_user_id).await?;
-    let bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref(), 80).await?;
+    let mut bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref(), 120).await?;
+    if !followed_tags.is_empty() {
+        let mut existing: HashSet<String> = bsky.iter().map(|row| row.0.clone()).collect();
+        for row in fetch_bsky_followed_tag_keys(
+            &db,
+            owner_user_id,
+            own_did.as_deref(),
+            &followed_tags,
+        )
+        .await?
+        {
+            if existing.insert(row.0.clone()) {
+                bsky.push(row);
+            }
+        }
+    }
+    let bsky = if algorithm_on {
+        rank_bsky_keys(bsky, &actor_weights, &tag_weights)
+    } else {
+        bsky
+    };
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
 
     if algorithm_on {
