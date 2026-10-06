@@ -2877,6 +2877,26 @@ pub fn paint_lean_embed_from(
     body_inner.push_str(&media_row_html(status));
     body_inner.push_str(&paint_status_link_card(status));
 
+    // Match PHP's degraded-card contract: a queued/partially hydrated object
+    // must never collapse into an empty article. Media-only posts remain
+    // paintable above; this message is only used when no body, media, quote,
+    // or link card is available yet.
+    if body_inner.trim().is_empty() && json_flag(status, "vaak_degraded") {
+        let reason = status
+            .get("vaak_degraded_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("empty_shell");
+        let message = match reason {
+            "announce_only" | "boost_original_missing" => "Loading boosted post…",
+            "half_parsed" => "This post only partially parsed on VAAK.",
+            _ => "Loading post…",
+        };
+        body_inner.push_str(&format!(
+            "<div class=\"body feed-body meta vaak-degraded\"><span class=\"vaak-degraded-status\">{}</span></div>",
+            esc(message)
+        ));
+    }
+
     if sensitive && !body_inner.is_empty() {
         let label = if spoiler.is_empty() {
             "Sensitive content".to_string()
@@ -3823,6 +3843,23 @@ mod tests {
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("cw-gate"), "media-only post should be gated: {html}");
         assert!(html.contains("photo.jpg"), "media must remain inside the gate: {html}");
+    }
+
+    #[test]
+    fn queued_degraded_cards_never_render_as_empty_articles() {
+        let st = json!({
+            "id": "queued-1",
+            "uri": "https://remote.example/users/a/statuses/1",
+            "content": "",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "vaak_degraded": true,
+            "vaak_degraded_reason": "empty_shell",
+            "account": {"acct": "a@remote.example", "display_name": "A", "uri": "https://remote.example/users/a"},
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("vaak-degraded-status"), "queued status needs a visible state: {html}");
+        assert!(html.contains("Loading post"), "queued status needs a loading label: {html}");
     }
 
     #[test]
