@@ -441,6 +441,29 @@ pub fn bridge_request_payload(action: &str, body: &Value, secret: &str) -> Value
     Value::Object(payload)
 }
 
+/// Classify the same bridge response cases as PHP, without performing I/O.
+pub fn decode_bridge_response(http: i64, raw: &str) -> Value {
+    if raw.is_empty() {
+        return serde_json::json!({"ok": false, "http": http, "error": "Empty response from strains API."});
+    }
+    let Ok(data) = serde_json::from_str::<Value>(raw) else {
+        return serde_json::json!({"ok": false, "http": http, "error": "Invalid JSON from strains API."});
+    };
+    let Some(object) = data.as_object() else {
+        return serde_json::json!({"ok": false, "http": http, "error": "Invalid JSON from strains API."});
+    };
+    if (200..300).contains(&http) && object.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return serde_json::json!({"ok": true, "http": http, "data": data});
+    }
+    let message = object
+        .get("error")
+        .or_else(|| object.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Strains HTTP {http}"));
+    serde_json::json!({"ok": false, "http": http, "data": data, "error": message})
+}
+
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {
     if owner < 1 {
         anyhow::bail!("owner_id must be positive");
@@ -565,7 +588,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_request_payload, configured_origin_owner, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS};
+    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -647,6 +670,17 @@ mod tests {
                 "bridge_secret": "fixture-secret"
             })
         );
+    }
+
+    #[test]
+    fn mocked_bridge_responses_match_php_contract() {
+        let ok = decode_bridge_response(200, r#"{"ok":true,"player":{"resonance":94}}"#);
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["data"]["player"]["resonance"], 94);
+        assert_eq!(decode_bridge_response(200, r#"{"ok":false,"error":"Already checked in today"}"#)["error"], "Already checked in today");
+        assert_eq!(decode_bridge_response(502, r#"{"message":"upstream unavailable"}"#)["error"], "upstream unavailable");
+        assert_eq!(decode_bridge_response(200, "")["error"], "Empty response from strains API.");
+        assert_eq!(decode_bridge_response(200, "not-json")["error"], "Invalid JSON from strains API.");
     }
 
     #[test]

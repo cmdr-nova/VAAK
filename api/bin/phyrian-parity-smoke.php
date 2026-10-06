@@ -60,4 +60,19 @@ if ($envelope !== $expectedEnvelope) {
     fwrite(STDERR, "phyrian-parity: bridge envelope mismatch\n");
     exit(1);
 }
+$bridgeCases = [
+    [200, '{"ok":true,"player":{"resonance":94}}', true, null],
+    [200, '{"ok":false,"error":"Already checked in today"}', false, 'Already checked in today'],
+    [502, '{"message":"upstream unavailable"}', false, 'upstream unavailable'],
+    [200, '', false, 'Empty response from strains API.'],
+    [200, 'not-json', false, 'Invalid JSON from strains API.'],
+];
+foreach ($bridgeCases as [$http, $raw, $expectedOk, $expectedError]) {
+    $actual = ap_phyrian_bridge_decode_response($http, $raw);
+    if ((bool) ($actual['ok'] ?? false) !== $expectedOk
+        || ($expectedError !== null && (string) ($actual['error'] ?? '') !== $expectedError)) {
+        fwrite(STDERR, "phyrian-parity: bridge response mismatch\n");
+        exit(1);
+    }
+}
 fwrite(STDOUT, sprintf("phyrian-parity: PASS (%d normalization fixtures)\n", count($cases)));
