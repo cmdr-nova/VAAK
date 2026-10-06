@@ -73,6 +73,19 @@ fn esc(s: &str) -> String {
     out
 }
 
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn plain_to_html(plain: &str) -> String {
     let t = plain.trim();
     if t.is_empty() {
@@ -817,20 +830,20 @@ struct RssRow {
     feed_url: String,
 }
 
-struct BskyRow {
-    uri: String,
-    author_did: String,
-    author_handle: String,
-    author_display: String,
-    author_avatar: String,
-    indexed_at: String,
-    published_at: String,
-    text: String,
-    embed_json: String,
-    raw_json: String,
-    like_count: i64,
-    repost_count: i64,
-    reply_count: i64,
+pub(crate) struct BskyRow {
+    pub(crate) uri: String,
+    pub(crate) author_did: String,
+    pub(crate) author_handle: String,
+    pub(crate) author_display: String,
+    pub(crate) author_avatar: String,
+    pub(crate) indexed_at: String,
+    pub(crate) published_at: String,
+    pub(crate) text: String,
+    pub(crate) embed_json: String,
+    pub(crate) raw_json: String,
+    pub(crate) like_count: i64,
+    pub(crate) repost_count: i64,
+    pub(crate) reply_count: i64,
 }
 
 const BSKY_SENSITIVE_LABELS: &[&str] = &[
@@ -1128,7 +1141,7 @@ fn materialize_rss(row: &RssRow) -> Value {
     st
 }
 
-fn materialize_bsky(row: &BskyRow) -> Value {
+pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     let handle = row.author_handle.trim();
     let did = row.author_did.trim();
     let display = if row.author_display.trim().is_empty() {
@@ -1654,9 +1667,20 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
     targets.sort();
     targets.dedup();
     if targets.is_empty() { return Ok(()); }
+    let bsky_targets: Vec<String> = targets
+        .iter()
+        .filter(|target| target.starts_with("at://"))
+        .cloned()
+        .collect();
+    let bsky_quotes = fetch_bsky_map(db, &bsky_targets).await.unwrap_or_default();
+    let local_targets: Vec<String> = targets
+        .iter()
+        .filter(|target| target.starts_with(LOCAL_ACTOR_PREFIX))
+        .cloned()
+        .collect();
     let rows = db.query(
         "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
-        &[&targets],
+        &[&local_targets],
     ).await.context("select local quote targets")?;
     let mut by_target = HashMap::new();
     for row in rows {
@@ -1673,6 +1697,18 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
             "account": empty_account(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, username, username, &format!("{LOCAL_ACTOR_PREFIX}{username}"), LOCAL_DEFAULT_AVATAR),
             "media_attachments": media,
         }));
+    }
+    for (target, bsky) in bsky_quotes {
+        let mut quoted = materialize_bsky(&bsky);
+        let internal_url = format!(
+            "?view=status&object={}&from=home",
+            urlencoding_encode(&target)
+        );
+        quoted["url"] = json!(internal_url.clone());
+        if let Some(card) = quoted.get_mut("card").filter(|v| v.is_object()) {
+            card["url"] = json!(internal_url);
+        }
+        by_target.insert(target, quoted);
     }
     for st in statuses.iter_mut() {
         let target = st.get("quote").and_then(|q| q.get("quoted_status"))
@@ -1943,7 +1979,7 @@ async fn fetch_rss_map(db: &Client, ids: &[i64], owner: i64) -> Result<HashMap<i
     Ok(map)
 }
 
-async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashMap<String, BskyRow>> {
+pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashMap<String, BskyRow>> {
     let mut map = HashMap::new();
     if uris.is_empty() {
         return Ok(map);
