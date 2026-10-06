@@ -6293,7 +6293,8 @@ $adminIndexActorMap = static function (array $rows, bool $richAliases = true) us
     return $map;
 };
 $relsetRich = !$isPartial && $view !== 'mentions';
-if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_following_id_set')) {
+if (!$accountSwitcherView && $vaakOwnerId > 0 && function_exists('ap_following_id_set')
+    && $view !== 'remote_profile') {
     // Compact Redis membership set (Fediverse + Bluesky graph_sync). Full
     // $following rows remain available for the Following page renderer.
     $followingIds = ap_following_id_set($vaakActorId, $vaakOwnerId, $relsetRich);
@@ -6330,7 +6331,7 @@ if (!$accountSwitcherView && $vaakOwnerId > 0 && (!$isPartial || $shellFollowGra
 if ($isPartial || $accountSwitcherView) {
     $followerIds = [];
 } elseif ($vaakOwnerId > 0 && function_exists('ap_followers_id_set')
-    && in_array($view, ['following', 'followers', 'remote_profile', 'search', 'home', 'feed', 'local'], true)) {
+    && in_array($view, ['following', 'followers', 'search', 'home', 'feed', 'local'], true)) {
     $followerIds = ap_followers_id_set($vaakActorId, $vaakOwnerId, $relsetRich);
 } else {
     $followerIds = $adminIndexActorMap($followers, $relsetRich);
@@ -30925,11 +30926,32 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
           <?php endif; ?>
           <?php
-            $rpRel = $rpIsBsky
-                ? ($rpBskyFollowing
+            if ($rpIsBsky) {
+                $rpRel = $rpBskyFollowing
                     ? ($rpBskyFollowsYou ? 'mutual' : 'following')
-                    : ($rpBskyFollowsYou ? 'follows_you' : 'none'))
-                : admin_rel_state($followingIds, $followerIds, $rpActor);
+                    : ($rpBskyFollowsYou ? 'follows_you' : 'none');
+            } else {
+                // Profile pages intentionally skip rebuilding the full
+                // relationship sets. Resolve only this actor with indexed
+                // owner/actor lookups so follow badges stay accurate without
+                // paying the graph warm cost.
+                $rpOut = false;
+                $rpIn = false;
+                try {
+                    $relDb = ap_db();
+                    $viewerRefs = [rtrim((string) $vaakActorId, '/'), rtrim((string) $vaakActorId, '/') . '/'];
+                    $targetRefs = [rtrim($rpActor, '/'), rtrim($rpActor, '/') . '/'];
+                    $relSt = $relDb->prepare('SELECT 1 FROM following WHERE owner_actor_id IN (?, ?) AND actor_id IN (?, ?) LIMIT 1');
+                    $relSt->execute([$viewerRefs[0], $viewerRefs[1], $targetRefs[0], $targetRefs[1]]);
+                    $rpOut = (bool) $relSt->fetchColumn();
+                    $relSt = $relDb->prepare('SELECT 1 FROM followers WHERE owner_actor_id IN (?, ?) AND actor_id IN (?, ?) LIMIT 1');
+                    $relSt->execute([$viewerRefs[0], $viewerRefs[1], $targetRefs[0], $targetRefs[1]]);
+                    $rpIn = (bool) $relSt->fetchColumn();
+                } catch (Throwable $e) {
+                    // Keep the profile usable if a relationship lookup is busy.
+                }
+                $rpRel = $rpOut ? ($rpIn ? 'mutual' : 'following') : ($rpIn ? 'follows_you' : 'none');
+            }
             $rpFollowing = $rpRel === 'mutual' || $rpRel === 'following';
             $rpFollowsYou = $rpIsBsky
                 ? $rpBskyFollowsYou
