@@ -36071,7 +36071,6 @@ window.apAdminToast = function (msg, isErr) {
       bindNewPostsBtn();
       ensureTimelinePollTimer();
       syncTimelineStreamVisibility();
-      try { pollNewer(); } catch (e) {}
       // Timeline tabs are swapped in-place, so the shared capture-phase
       // navigation handler has no full-page `pageshow` event to clear its
       // indicator.  Hide it when the partial swap (or its error path) ends.
@@ -36137,7 +36136,10 @@ window.apAdminToast = function (msg, isErr) {
     try { bindNewPostsBtn(); } catch (e) {}
     try { ensureTimelinePollTimer(); } catch (e) {}
     try { syncTimelineStreamVisibility(); } catch (e) {}
-    try { pollNewer(); } catch (e) {}
+    // The initial shell already contains the current head.  Do not issue an
+    // extra newer-post request immediately after soft-nav: the normal bounded
+    // poll/SSE path below will pick up new content without making Home repaint
+    // a second time while the user is arriving.
     if (typeof window.vaakBindFeedTopBtn === 'function') {
       window.vaakBindFeedTopBtn(document.querySelector('section.main'));
     }
