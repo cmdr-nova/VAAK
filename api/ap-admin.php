@@ -36232,7 +36232,9 @@ window.apAdminToast = function (msg, isErr) {
       // After Mentions soft-nav the URL can still say home while #timeline-items
       // is Mentions (or a detached Home node) — in-place swap then no-ops.
       if (['home', 'local', 'feed'].includes(cur) && ['home', 'local', 'feed'].includes(liveView)) {
-        if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
+        // Timeline swaps and soft shells render their own inline spinner. Do
+        // not also show the global bottom loading pill (duplicate feedback).
+        if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
         const swapped = await window.vaakSwapTimelineView(view, push !== false);
         if (swapped !== false) {
           updateChrome(view);
@@ -36258,9 +36260,9 @@ window.apAdminToast = function (msg, isErr) {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
     }
     const loadingLabel = view === 'search' ? 'Searching…' : 'Loading…';
-    if (typeof window.vaakShowLoading === 'function') {
-      window.vaakShowLoading(loadingLabel);
-    }
+    // The replacement shell below contains the authoritative inline spinner;
+    // keep the global loading pill for full navigations only.
+    if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
     // Park the live compose panel BEFORE wiping section.main. The inline
     // composer lives in #compose-inline-slot inside main; clearing innerHTML
     // first destroyed the only .compose-modal__panel and left Home/FAB dead
