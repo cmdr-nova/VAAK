@@ -15611,6 +15611,13 @@ function admin_render_masto_status_card(
     bool $showOpen = true,
     bool $hideHeader = false
 ): void {
+    // All surfaces (Home, standalone status, notifications, and profiles) use
+    // the same Ask normalizer.  Remote Wafrn Asks are ordinary Note text, so
+    // normalize here as a final boundary guard when a caller skipped the
+    // usual ap_normalize_status() pass.
+    if (function_exists('ap_normalize_attach_ask')) {
+        $st = ap_normalize_attach_ask($st);
+    }
     $boostHeader = '';
     // Preserve Announce event id across reblog unwrap for thin-boost AJAX hydrate.
     $announceEventId = (int) ($st['vaak_announce_event_id'] ?? 0);
