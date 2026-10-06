@@ -20935,6 +20935,25 @@ function admin_relationship_projection_axum_fetch(string $relationship, int $own
     return $decoded;
 }
 
+/** Read-only Settings/Profile preference projection; never used for writes. */
+function admin_settings_projection_axum_fetch(int $ownerUserId): ?array
+{
+    if ($ownerUserId < 1 || !function_exists('curl_init')) return null;
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
+    $ch = curl_init($base . '/shadow/settings?' . http_build_query(['owner_id' => $ownerUserId]));
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close']]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($code !== 200 || !is_string($raw) || $raw === '') return null;
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) && is_array($decoded['fields'] ?? null) ? $decoded : null;
+}
+
 /**
  * Fetch local profile tab HTML from Axum `/shadow/profile-html` (0.7.18).
  * Same lean cards as Home (actions + own-post Delete/Edit/Pin) for posts /
@@ -27169,8 +27188,15 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           }
         ?>
         <?php if ($view === 'profile'): ?>
+        <?php $settingsShadow = admin_settings_projection_axum_fetch((int) $vaakOwnerId); ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
+          <?php if (is_array($settingsShadow)): ?>
+            <div class="meta" style="margin:0 0 1rem;padding:.65rem .8rem;border:1px solid color-mix(in srgb,var(--primary) 35%,var(--border));border-radius:10px">
+              Rust read-only settings projection is available for this account. PHP remains the canonical editor and write owner; saved values are not replaced during this migration.
+              <?php if (!empty($settingsShadow['fields']['updated_at'])): ?> <span>Last persisted update: <?= h((string) $settingsShadow['fields']['updated_at']) ?></span><?php endif; ?>
+            </div>
+          <?php endif; ?>
           <div class="profile-preview">
             <?php
               $previewAv = function_exists('ap_local_avatar_url')
