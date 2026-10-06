@@ -12915,6 +12915,61 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
         }
     }
 
+    // Our Local timeline represents a stored boost with a type-4
+    // `boost_status_id`. Resolve that wrapper before rejecting the action: a
+    // user may boost a post that somebody else already boosted, and the
+    // wrapper's synthetic id is not present in `masto_statuses` or `events`.
+    // Keep the original object URI as the interaction target so
+    // `ap_masto_reblog_perform()` can never announce another boost wrapper.
+    $boostRow = function_exists('ap_masto_reblog_row_by_boost_id')
+        ? ap_masto_reblog_row_by_boost_id((string) $statusId)
+        : null;
+    if ($boostRow === null && $parsed && ($parsed['type'] ?? '') === 'reblog'
+        && (int) ($parsed['db_id'] ?? 0) > 0) {
+        try {
+            $st = ap_db()->prepare('SELECT * FROM masto_reblogs WHERE id = ?');
+            $st->execute([(int) $parsed['db_id']]);
+            $candidate = $st->fetch();
+            $boostRow = is_array($candidate) ? $candidate : null;
+        } catch (Throwable $e) {
+            $boostRow = null;
+        }
+    }
+    if (is_array($boostRow)) {
+        $original = null;
+        $origSid = (int) ($boostRow['status_id'] ?? 0);
+        if ($origSid > 0 && $origSid !== $statusId) {
+            $origResolved = ap_masto_resolve_status_interaction($origSid);
+            $original = is_array($origResolved['status'] ?? null)
+                ? $origResolved['status']
+                : null;
+        }
+        $objectId = rtrim((string) ($boostRow['object_id'] ?? ''), '/');
+        if ($original === null && $objectId !== ''
+            && function_exists('ap_masto_lookup_status_by_object_url')) {
+            // Cache-only lookup; actions must stay responsive and must not
+            // turn a boost click into a synchronous remote fetch.
+            $original = ap_masto_lookup_status_by_object_url($objectId, 0, false);
+        }
+        if ($original === null && $objectId !== '') {
+            // A thin original still contains everything the boost mutation
+            // needs. The next timeline warm can hydrate its body/media.
+            $original = [
+                'id' => (string) ($boostRow['status_id'] ?? $statusId),
+                'uri' => $objectId,
+                'url' => $objectId,
+                'content' => '',
+                'account' => [],
+                'reblog' => null,
+            ];
+        }
+        if (is_array($original) && $objectId !== '') {
+            $targetActor = trim((string) ($boostRow['target_actor'] ?? '')) ?: null;
+            $wrapped = ap_masto_status_from_reblog($boostRow, $original);
+            return $pack($wrapped, $objectId, $targetActor);
+        }
+    }
+
     $dmId = ap_masto_dm_id_from_status_id($statusId);
     if ($dmId !== null) {
         $dm = ap_dm_by_id($dmId);
