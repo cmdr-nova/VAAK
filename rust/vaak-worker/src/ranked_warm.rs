@@ -2826,6 +2826,19 @@ mod tests {
     }
 
     #[test]
+    fn toxicity_matches_php_builtins_and_admin_terms_case_insensitively() {
+        let builtins = toxicity_categories("This is an AI SLOP rant: GO FUCK YOURSELF", &[]);
+        assert!(builtins.contains(&"ai_slogan".to_string()));
+        assert!(builtins.contains(&"direct_abuse".to_string()));
+
+        let manual = toxicity_categories(
+            "Please stop using My Added Phrase here",
+            &[("my added phrase".into(), "custom".into())],
+        );
+        assert_eq!(manual, vec!["custom".to_string()]);
+    }
+
+    #[test]
     fn favourite_bonus_bounds() {
         let mut items = vec![TimelineItem::event(
             "1".into(),
