@@ -14699,6 +14699,34 @@ function admin_profile_hover_payload(string $actorId, int $ownerUserId, string $
             ap_bsky_actor_refresh_enqueue($ownerUserId, $actorId);
         }
         $profile = is_array($cached['profile'] ?? null) ? $cached['profile'] : [];
+        // A post can be visible before actor-warm has populated the durable
+        // profile cache. Reuse the denormalized author columns already stored
+        // for that Bluesky handle so hover cards do not fall back to the
+        // generic "Bluesky User" label during the warm-up window.
+        if ($profile === [] && preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorId, $hm)) {
+            try {
+                $handleRef = rawurldecode($hm[1]);
+                $stPost = ap_db()->prepare(
+                    "SELECT author_did, author_handle, author_display, author_avatar
+                     FROM bsky_posts
+                     WHERE lower(author_handle) = lower(?)
+                     ORDER BY indexed_at DESC NULLS LAST
+                     LIMIT 1"
+                );
+                $stPost->execute([$handleRef]);
+                $postAuthor = $stPost->fetch();
+                if (is_array($postAuthor)) {
+                    $profile = [
+                        'did' => (string) ($postAuthor['author_did'] ?? ''),
+                        'handle' => (string) ($postAuthor['author_handle'] ?? $handleRef),
+                        'displayName' => (string) ($postAuthor['author_display'] ?? ''),
+                        'avatar' => (string) ($postAuthor['author_avatar'] ?? ''),
+                    ];
+                }
+            } catch (Throwable $e) {
+                // Actor refresh remains the normal fallback if this cache read fails.
+            }
+        }
         $did = trim((string) ($profile['did'] ?? ($cached['did'] ?? '')));
         $handle = trim((string) ($profile['handle'] ?? ''));
         $display = trim((string) ($profile['displayName'] ?? '')) ?: ($handle !== '' ? '@' . $handle : 'Bluesky user');
