@@ -589,7 +589,7 @@ pub async fn bridge_challenge_start(cfg: &Config, owner: i64, identify: &str) ->
     let db = db::connect(&cfg.database_url).await?;
     db.execute("DELETE FROM phyrian_bridge_challenges WHERE owner_user_id=$1 OR expires_at<NOW()", &[&(owner as i32)]).await?;
     db.execute("INSERT INTO phyrian_bridge_challenges (owner_user_id,avatar_uuid,avatar_name,code_hash,attempts,expires_at) VALUES ($1,$2,$3,$4,0,$5)", &[&(owner as i32), &uuid, &name, &hash, &expires]).await?;
-    let deliver = bridge_call(cfg, "vaak_claim_deliver", serde_json::json!({
+    let deliver = bridge_write(cfg, "vaak_claim_deliver", serde_json::json!({
         "avatar_uuid": uuid, "avatar_name": name, "code": code,
         "expires_at": expires.to_rfc3339(), "ttl_seconds": 600
     })).await;
@@ -622,7 +622,7 @@ pub async fn bridge_challenge_verify(cfg: &Config, owner: i64, raw_code: &str) -
     tx.execute("DELETE FROM phyrian_bridge_links WHERE owner_user_id=$1 OR avatar_uuid=$2", &[&(owner as i32), &uuid]).await?;
     tx.execute("INSERT INTO phyrian_bridge_links (owner_user_id,avatar_uuid,avatar_name,strain_snapshot,status,verified_at,created_at,updated_at) VALUES ($1,$2,$3,$4,'verified',NOW(),NOW(),NOW())", &[&(owner as i32), &uuid, &avatar_name, &strain]).await?;
     tx.commit().await?;
-    let link_set = bridge_call(cfg, "vaak_link_set", serde_json::json!({"avatar_uuid": uuid, "vaak_owner_id": owner, "vaak_actor_key": actor_key, "vaak_handle": handle})).await;
+    let link_set = bridge_write(cfg, "vaak_link_set", serde_json::json!({"avatar_uuid": uuid, "vaak_owner_id": owner, "vaak_actor_key": actor_key, "vaak_handle": handle})).await;
     Ok(serde_json::json!({"ok": true, "notice": format!("Linked OpenSim avatar {avatar_name}. OpenSim body sync is active."), "link_set_ok": link_set.is_ok(), "link": {"avatar_uuid": uuid, "avatar_name": avatar_name, "strain_snapshot": strain, "status": "verified"}}))
 }
 
@@ -634,7 +634,7 @@ pub async fn bridge_unlink(cfg: &Config, owner: i64) -> Result<Value> {
     db.execute("DELETE FROM phyrian_bridge_links WHERE owner_user_id=$1", &[&(owner as i32)]).await?;
     db.execute("DELETE FROM phyrian_bridge_challenges WHERE owner_user_id=$1", &[&(owner as i32)]).await?;
     if let Some(uuid) = uuid.filter(|u| uuid::Uuid::parse_str(u).is_ok()) {
-        let _ = bridge_call(cfg, "vaak_link_clear", serde_json::json!({"avatar_uuid": uuid})).await;
+        let _ = bridge_write(cfg, "vaak_link_clear", serde_json::json!({"avatar_uuid": uuid})).await;
     }
     Ok(serde_json::json!({"ok": true, "notice": "OpenSim avatar unlinked. Resonant perk removed."}))
 }
@@ -868,6 +868,31 @@ mod tests {
         assert_eq!(decode_bridge_response(502, r#"{"message":"upstream unavailable"}"#)["error"], "upstream unavailable");
         assert_eq!(decode_bridge_response(200, "")["error"], "Empty response from strains API.");
         assert_eq!(decode_bridge_response(200, "not-json")["error"], "Invalid JSON from strains API.");
+    }
+
+    #[test]
+    fn bridge_mutation_fixtures_match_php_envelopes_and_errors() {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(
+            include_str!("../fixtures/phyrian/bridge-mutations.json"),
+        ).expect("bridge mutation fixtures");
+        for case in cases {
+            let action = case["action"].as_str().expect("fixture action");
+            let body = case["body"].clone();
+            let envelope = bridge_request_payload(action, &body, "fixture-secret");
+            assert_eq!(envelope["action"], action);
+            assert_eq!(envelope["bridge_secret"], "fixture-secret");
+            for key in body.as_object().expect("fixture body").keys() {
+                assert_eq!(envelope[key], body[key]);
+            }
+            let ok = decode_bridge_response(200, &case["response_ok"].to_string());
+            assert_eq!(ok["ok"], true);
+            let already = decode_bridge_response(409, &case["response_already"].to_string());
+            assert_eq!(already["ok"], false);
+            assert!(already["error"].as_str().is_some());
+        }
+        assert_eq!(decode_bridge_response(503, r#"{"message":"bridge unavailable"}"#)["error"], "bridge unavailable");
+        assert_eq!(decode_bridge_response(200, "")["error"], "Empty response from strains API.");
+        assert_eq!(decode_bridge_response(200, "{}") ["error"], "Strains HTTP 200");
     }
 
     #[test]

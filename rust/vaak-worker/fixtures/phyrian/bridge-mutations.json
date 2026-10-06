@@ -1,0 +1,37 @@
+[
+  {
+    "action": "vaak_claim_deliver",
+    "body": {
+      "avatar_uuid": "803bdca1-f996-4620-bea8-6177e1c3dfbe",
+      "avatar_name": "val3r1e flux",
+      "code": "Q6FJ4R",
+      "expires_at": "2026-10-06T12:30:00Z",
+      "ttl_seconds": 600
+    },
+    "response_ok": {"ok": true, "delivered": true},
+    "response_already": {"ok": false, "error": "Claim code already delivered"}
+  },
+  {
+    "action": "vaak_link_set",
+    "body": {
+      "avatar_uuid": "803bdca1-f996-4620-bea8-6177e1c3dfbe",
+      "vaak_owner_id": 9,
+      "vaak_actor_key": "https://vaak.monster/users/test",
+      "vaak_handle": "test@mkultra.monster"
+    },
+    "response_ok": {"ok": true, "linked": true},
+    "response_already": {"ok": false, "error": "Avatar is already linked"}
+  },
+  {
+    "action": "vaak_link_clear",
+    "body": {"avatar_uuid": "803bdca1-f996-4620-bea8-6177e1c3dfbe"},
+    "response_ok": {"ok": true, "cleared": true},
+    "response_already": {"ok": false, "error": "Avatar link not found"}
+  },
+  {
+    "action": "vaak_daily_claim",
+    "body": {"avatar_uuid": "803bdca1-f996-4620-bea8-6177e1c3dfbe"},
+    "response_ok": {"ok": true, "granted": 1, "player": {"resonance": 100, "daily_decay": 7}},
+    "response_already": {"ok": false, "error": "Already checked in today", "player": {"resonance": 100, "daily_decay": 7}}
+  }
+]
