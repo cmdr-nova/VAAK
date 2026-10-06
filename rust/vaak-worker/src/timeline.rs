@@ -55,6 +55,8 @@ pub struct HomeHydrateReport {
     pub fresh: bool,
     pub n: usize,
     pub items: Vec<Value>,
+    /// At least one cached card was removed by viewer moderation on read.
+    pub filtered: bool,
     pub link: Option<String>,
     pub source: &'static str,
     pub note: &'static str,
@@ -168,6 +170,7 @@ async fn read_hydrate_envelope(
         fresh: false,
         n: 0,
         items: Vec::new(),
+        filtered: false,
         link: None,
         source,
         note,
@@ -291,7 +294,9 @@ pub async fn view_hydrate(
         let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id)
             .await
             .unwrap_or_default();
+        let before = report.items.len();
         report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
+        report.filtered = report.items.len() != before;
         report.n = report.items.len();
         let _ = crate::interaction_flags::apply_to_statuses_with_cfg(
             &cfg.database_url,
@@ -493,6 +498,7 @@ pub async fn home_shadow(cfg: &Config, owner_user_id: i64, limit: usize) -> Resu
             fresh: false,
             n: 0,
             items: Vec::new(),
+            filtered: false,
             link: None,
             source: "vaak-worker-home-hydrate",
             note: "hydrate lookup failed",
@@ -762,4 +768,3 @@ async fn enrich_item(
     }
     Ok((None, None))
 }
-
