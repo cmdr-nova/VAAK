@@ -639,6 +639,51 @@ pub async fn bridge_unlink(cfg: &Config, owner: i64) -> Result<Value> {
     Ok(serde_json::json!({"ok": true, "notice": "OpenSim avatar unlinked. Resonant perk removed."}))
 }
 
+/// Claim the linked avatar's daily OpenSim resonance and mirror the returned
+/// body into VAAK atomically. This is implemented behind the internal route;
+/// PHP remains the public check-in owner until the dedicated feature gate is
+/// enabled after canary review.
+pub async fn bridge_daily_claim(cfg: &Config, owner: i64) -> Result<Value> {
+    if owner < 1 { anyhow::bail!("Not signed in."); }
+    let mut client = db::connect(&cfg.database_url).await?;
+    let row = client.query_opt(
+        "SELECT avatar_uuid FROM phyrian_bridge_links WHERE owner_user_id=$1 AND status='verified' AND unlinked_at IS NULL LIMIT 1",
+        &[&(owner as i32)],
+    ).await?.context("Not linked to OpenSim")?;
+    let uuid: String = row.get(0);
+    let data = bridge_write(cfg, "vaak_daily_claim", serde_json::json!({"avatar_uuid": uuid})).await?;
+    let player = data.get("player").filter(|v| v.is_object()).cloned()
+        .context("OpenSim claim succeeded but returned no player")?;
+    let plan = normalize_opensim_player(&player);
+    let strain = if plan.strain.is_empty() { None } else { Some(plan.strain.as_str()) };
+    let tx = client.transaction().await?;
+    let updated = tx.execute(
+        "UPDATE phyrian_players
+         SET status=$1, strain=$2, resonance=$3, generation=$4, level=$5,
+             banked_resonance=$6, resonance_exchanges=$7, inductions_given=$8,
+             lineage_depth=$9, daily_resonance_decay=$10,
+             last_checkin_at=NOW(), last_decay_at=NOW(), updated_at=NOW()
+         WHERE owner_user_id=$11",
+        &[
+            &plan.status, &strain, &(plan.resonance as i32), &(plan.generation as i32),
+            &(plan.level as i32), &(plan.banked_resonance as i32),
+            &(plan.resonance_exchanges as i32), &(plan.inductions_given as i32),
+            &(plan.lineage_depth as i32),
+            &(int_field(&player, "daily_resonance_decay").unwrap_or(DAILY_DECAY).max(0) as i32),
+            &(owner as i32),
+        ],
+    ).await?;
+    if updated == 0 { anyhow::bail!("Linked player row not found"); }
+    tx.commit().await?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "resonance": plan.resonance,
+        "granted": data.get("granted").cloned().unwrap_or(Value::from(0)),
+        "message": data.get("message").cloned().unwrap_or(Value::String(String::new())),
+        "player": player,
+    }))
+}
+
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {
     if owner < 1 {
         anyhow::bail!("owner_id must be positive");
