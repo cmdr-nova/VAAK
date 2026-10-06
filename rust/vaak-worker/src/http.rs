@@ -120,6 +120,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/settings", get(shadow_settings))
         .route("/shadow/you-integrations", get(shadow_you_integrations))
         .route("/shadow/private-surfaces", get(shadow_private_surfaces))
+        .route("/shadow/search-contract", get(shadow_search_contract))
         .route("/shadow/library-data", get(shadow_library_data))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
@@ -181,6 +182,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/settings",
             "/shadow/you-integrations",
             "/shadow/private-surfaces",
+            "/shadow/search-contract",
             "/shadow/library-data",
             "/shadow/jetstream",
             "/shadow/thin-media",
@@ -801,6 +803,15 @@ async fn shadow_private_surfaces(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     json_result(crate::private_surfaces::project(&state.cfg, owner).await)
+}
+
+/// Content-free Search migration contract. PHP owns result queries and URLs.
+async fn shadow_search_contract(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    json_result(crate::search_contract::project(&state.cfg, owner).await)
 }
 
 async fn shadow_library_data(

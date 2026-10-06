@@ -34,6 +34,7 @@ mod settings;
 mod library;
 mod integrations;
 mod private_surfaces;
+mod search_contract;
 
 use std::net::SocketAddr;
 
