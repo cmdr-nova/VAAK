@@ -32576,13 +32576,19 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     return /^(\/vaak)?\/users\/[A-Za-z0-9_]+\/?$/.test(String(pathname || ''));
   };
   window.vaakAppHistoryUrl = function (mutate) {
-    const u = new URL(window.location.href);
-    if (window.vaakIsPrettyProfilePath(u.pathname)) {
+    const original = new URL(window.location.href);
+    const u = new URL(original.href);
+    if (typeof mutate === 'function') mutate(u);
+    // Keep /users/{key} stable while clearing compose/modal flags or changing
+    // profile tabs. Only timeline navigation should intentionally leave the
+    // profile route and return to the app shell.
+    const timelineViews = new Set(['home', 'local', 'feed']);
+    const nextView = u.searchParams.get('view') || '';
+    if (window.vaakIsPrettyProfilePath(original.pathname) && timelineViews.has(nextView)) {
       u.pathname = '/vaak/';
       u.search = '';
       u.hash = '';
     }
-    if (typeof mutate === 'function') mutate(u);
     return u.pathname + u.search + (u.hash || '');
   };
 
