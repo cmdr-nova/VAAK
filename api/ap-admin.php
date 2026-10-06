@@ -6948,6 +6948,27 @@ if (
             exit;
         }
     }
+    // A You/Library → Home soft-nav can arrive while the ranked envelope is
+    // cold. Seed the lean index before returning the shell so the first paint
+    // can hydrate in one response instead of showing an empty shell followed
+    // immediately by a second fill request (the old double-load flash).
+    if (!$adminTlFromCache && $adminTlCacheKey !== '' && function_exists('admin_tl_lean_ranked_warm')) {
+        try {
+            admin_tl_lean_ranked_warm($view, $following, $adminTlCacheKey);
+            $seededShell = admin_tl_cache_get($adminTlCacheKey, 300);
+            if (is_array($seededShell) && $seededShell !== []) {
+                $adminTlRankedCached = $seededShell;
+                $adminTlFromCache = true;
+                $adminTlCachedHasMore = count($seededShell) > $shellLimit;
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-admin] soft shell lean seed: ' . $e->getMessage());
+        }
+        if ($adminTlStampedeLock !== '' && function_exists('ap_redis_unlock')) {
+            ap_redis_unlock($adminTlStampedeLock);
+            $adminTlStampedeLock = '';
+        }
+    }
     // Home/Local/Federated: prefer Axum lean HTML fill before JSON→PHP / PG hydrate.
     $shellAxumHit = false;
     if (in_array($view, ['home', 'local', 'feed'], true) && function_exists('admin_tl_html_axum_fetch')) {
