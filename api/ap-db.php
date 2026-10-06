@@ -6761,15 +6761,34 @@ function ap_outbox_replies_count(string $actorKey): int
     }
     $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
-        $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 5000');
+        // Keep the profile header cheap: the old path loaded and JSON-decoded
+        // up to 5,000 notes just to compute one badge. These indexed/text
+        // predicates cover replies and the persisted mention markers; the
+        // fallback below preserves compatibility with legacy rows.
+        $st = ap_db()->prepare(
+            "SELECT COUNT(*) FROM outbox_notes
+             WHERE id LIKE ? AND (
+                 TRIM(COALESCE(in_reply_to, '')) <> ''
+                 OR raw_create_json LIKE '%\"type\":\"Mention\"%'
+                 OR raw_create_json LIKE '%\"type\": \"Mention\"%'
+                 OR content LIKE '%class=\"%mention%'
+                 OR content LIKE '%class=''%mention%'
+             )"
+        );
         $st->execute([$prefix . '%']);
-        $count = count(array_filter($st->fetchAll() ?: [], 'ap_outbox_note_is_reply_or_mention'));
+        $count = max(0, (int) $st->fetchColumn());
         if (function_exists('ap_redis_json_set')) {
             ap_redis_json_set($key, ['count' => $count], 60);
         }
         return $count;
     } catch (Throwable $e) {
-        return 0;
+        try {
+            $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id LIKE ? ORDER BY published DESC LIMIT 5000');
+            $st->execute([$prefix . '%']);
+            return count(array_filter($st->fetchAll() ?: [], 'ap_outbox_note_is_reply_or_mention'));
+        } catch (Throwable $e2) {
+            return 0;
+        }
     }
 }
 

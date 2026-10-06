@@ -31346,6 +31346,12 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
                   if (isset($rpBoostTotal) && !$rpHideProfileBoosts) {
                       $rpTabCountBoosts = max($rpTabCountBoosts, (int) $rpBoostTotal);
                   }
+                  if (function_exists('ap_outbox_media_count')) {
+                      $rpTabCountMedia = max($rpTabCountMedia, ap_outbox_media_count((string) $rpLocalKey));
+                  }
+                  if ($rpBskyPostCount > 0) {
+                      $rpTabCountPosts = max($rpTabCountPosts, (int) $rpBskyPostCount);
+                  }
               }
               $rpTabDefs = [
                   'pinned' => $rpIsLocal && $rpPinnedStatuses !== [] ? ['Pinned', count($rpPinnedStatuses)] : null,
