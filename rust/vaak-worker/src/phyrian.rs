@@ -528,6 +528,16 @@ pub async fn bridge_read(cfg: &Config, action: &str, body: Value) -> Result<Valu
     bridge_call(cfg, action, body).await
 }
 
+/// OpenSim bridge mutation client. This is deliberately separate from the
+/// read-only client so callers cannot accidentally turn a read path into a
+/// write. PHP remains the active owner until each action has a canary.
+pub async fn bridge_write(cfg: &Config, action: &str, body: Value) -> Result<Value> {
+    if !matches!(action, "vaak_claim_deliver" | "vaak_link_set" | "vaak_link_clear" | "vaak_daily_claim") {
+        anyhow::bail!("Bridge action is not an approved mutation");
+    }
+    bridge_call(cfg, action, body).await
+}
+
 fn identify_kind(raw: &str) -> Option<(&'static str, String)> {
     let value = raw.trim();
     if value.is_empty() { return None; }
