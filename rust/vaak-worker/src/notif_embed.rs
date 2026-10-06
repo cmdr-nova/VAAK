@@ -2687,13 +2687,30 @@ fn ask_card_html(content: &str) -> Option<String> {
     let re = regex::Regex::new(
         r#"(?is)^\s*<p[^>]*>(.*?)\s*<a[^>]*>asked</a>\s*</p>\s*<blockquote[^>]*>(.*?)</blockquote>\s*(.*)$"#,
     ).ok()?;
-    let caps = re.captures(content.trim())?;
-    let header = strip_tags(caps.get(1)?.as_str()).trim().to_string();
-    let question = html_entity_decode_basic(strip_tags(caps.get(2)?.as_str()).trim());
+    let (header, question, answer) = if let Some(caps) = re.captures(content.trim()) {
+        let header = strip_tags(caps.get(1)?.as_str()).trim().to_string();
+        let question = html_entity_decode_basic(strip_tags(caps.get(2)?.as_str()).trim());
+        let answer = html_entity_decode_basic(&strip_tags(caps.get(3).map(|m| m.as_str()).unwrap_or(""))).trim().to_string();
+        (header, question, answer)
+    } else {
+        // Wafrn's federated form is often plain text after ActivityPub
+        // normalization: "@asker@host asked\n\nquestion\n\nanswer".
+        let plain = html_entity_decode_basic(&strip_tags(content));
+        let compact = regex::Regex::new(r"(?is)^\s*(.{1,240}?)\s+asked\s*\n+(.+)$").ok()?;
+        let caps = compact.captures(plain.trim())?;
+        let header = caps.get(1)?.as_str().trim().to_string();
+        if !header.contains('@') { return None; }
+        let rest = caps.get(2)?.as_str().trim();
+        let (question, answer) = if let Some((q, a)) = rest.split_once("\n\n") {
+            (q.trim().to_string(), a.trim().to_string())
+        } else {
+            (rest.to_string(), String::new())
+        };
+        (header, question, answer)
+    };
     if header.is_empty() || question.is_empty() {
         return None;
     }
-    let answer = html_entity_decode_basic(&strip_tags(caps.get(3).map(|m| m.as_str()).unwrap_or(""))).trim().to_string();
     let answer_html = if answer.is_empty() {
         String::new()
     } else {
@@ -4012,6 +4029,20 @@ mod tests {
         assert!(html.contains("A social wire."), "{html}");
         assert!(html.contains("ask-divider"), "{html}");
         assert!(!html.contains("legacy flattened ask"), "{html}");
+    }
+
+    #[test]
+    fn timeline_ask_parses_plain_wafrn_compact_form() {
+        let st = json!({
+            "uri": "https://app.wafrn.net/fediverse/post/ask",
+            "content": "@asker@example.test asked\n\nWhat is VAAK?\n\nA social bridge.",
+            "account": {"acct": "wafrn@example.test", "display_name": "Wafrn User"}
+        });
+        let html = paint_lean_embed(&st, false);
+        assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("What is VAAK?"), "{html}");
+        assert!(html.contains("A social bridge."), "{html}");
+        assert!(html.contains("ask-divider"), "{html}");
     }
 
 }
