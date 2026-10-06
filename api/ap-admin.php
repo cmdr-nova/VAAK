@@ -24417,7 +24417,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     @keyframes vaak-spinner-spin { to { transform: rotate(360deg); } }
     /* Classic bottom pill + spinner (restored; V glitch loader retired). */
     .vaak-loading-indicator {
-      position: fixed; bottom: 1rem; left: 50%; z-index: 10080;
+      position: fixed; bottom: 1rem; left: calc(50% - 40px); z-index: 10080;
       display: inline-flex; align-items: center; gap: .5rem;
       padding: .6rem .95rem; border: 1px solid var(--border);
       border-radius: 999px; background: color-mix(in srgb, var(--panel) 92%, transparent);
@@ -24441,6 +24441,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     @media (prefers-reduced-motion: reduce) {
       .vaak-spinner { animation-duration: 1.4s; }
       .vaak-loading-indicator { transition: none; }
+    }
+    /* Center the detached toast over the active VAAK content column rather
+       than over the full three-column viewport. */
+    @media (max-width: 1100px) and (min-width: 701px) {
+      .vaak-loading-indicator { left: calc(50% + 36px); }
+    }
+    @media (max-width: 700px) {
+      .vaak-loading-indicator { left: 50%; }
     }
     .brand-profile-link {
       display: inline-block;
