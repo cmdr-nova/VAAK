@@ -55,6 +55,8 @@ pub struct OwnerQuery {
     /// exact PHP cache suffix. This route is cache-only; PHP remains fallback.
     pub library_kind: Option<String>,
     pub library_suffix: Option<String>,
+    /// VAAK-only bookmark folder filter; folder writes remain PHP-owned.
+    pub folder_id: Option<i64>,
     /// Read-only You projection: blog, rss, queue, or drafts.
     pub kind: Option<String>,
     /// Read-only Followers/Following projection kind.
@@ -790,7 +792,7 @@ async fn shadow_library_data(
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(20);
     if kind.starts_with("bookmarks") {
-        json_result(crate::library::bookmarks(&state.cfg, owner, offset, limit).await)
+        json_result(crate::library::bookmarks(&state.cfg, owner, offset, limit, q.folder_id.filter(|v| *v > 0)).await)
     } else {
         json_result(crate::library::favourites(&state.cfg, owner, offset, limit).await)
     }
