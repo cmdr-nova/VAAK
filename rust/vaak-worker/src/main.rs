@@ -8,6 +8,7 @@ mod hidden;
 mod http;
 mod jetstream;
 mod account_switch;
+mod admin_health;
 mod home_html;
 mod home_hydrate_ranked;
 mod interaction_flags;

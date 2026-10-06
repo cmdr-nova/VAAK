@@ -108,6 +108,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/notifications", get(shadow_notifications))
         .route("/shadow/ranked-newer", get(shadow_ranked))
         .route("/shadow/action-queue", get(shadow_action_queue))
+        .route("/shadow/admin-health", get(shadow_admin_health))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
@@ -162,6 +163,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/notifications",
             "/shadow/ranked-newer",
             "/shadow/action-queue",
+            "/shadow/admin-health",
             "/shadow/jetstream",
             "/shadow/thin-media",
             "/shadow/timelines/home",
@@ -730,6 +732,10 @@ async fn shadow_action_queue(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(25);
     json_result(crate::action_queue::report(&state.cfg, limit).await)
+}
+
+async fn shadow_admin_health(State(state): State<AppState>) -> impl IntoResponse {
+    json_result(crate::admin_health::report(&state.cfg).await)
 }
 
 async fn shadow_jetstream(State(state): State<AppState>) -> impl IntoResponse {
