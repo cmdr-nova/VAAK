@@ -823,6 +823,7 @@ struct ActorRow {
     display_name: String,
     host: String,
     icon: String,
+    emojis: Value,
 }
 
 struct OutboxRow {
@@ -1079,14 +1080,59 @@ fn actor_to_account(actor: &ActorRow) -> Value {
     } else {
         actor.display_name.trim()
     };
-    empty_account(
+    let mut account = empty_account(
         &actor.actor_id,
         &username,
         &acct,
         display,
         &actor.actor_id,
         &actor.icon,
-    )
+    );
+    account["emojis"] = actor.emojis.clone();
+    account
+}
+
+/// Extract Mastodon-compatible custom emoji metadata from a cached ActivityPub
+/// actor document. PHP accepts both `tag: [{type: Emoji, name, icon}]` and the
+/// older Wafrn/Misskey-style `attachment` form; keep this cache-only so a
+/// timeline render never performs a remote fetch.
+fn actor_emojis(profile: &Value) -> Value {
+    let mut out = Vec::new();
+    let sources = [profile.get("tag"), profile.get("attachment")];
+    for source in sources.into_iter().flatten() {
+        let items: Vec<&Value> = match source {
+            Value::Array(items) => items.iter().collect(),
+            Value::Object(_) => vec![source],
+            _ => Vec::new(),
+        };
+        for item in items {
+            if item.get("type").and_then(Value::as_str).map(|t| !t.eq_ignore_ascii_case("emoji")).unwrap_or(true) {
+                continue;
+            }
+            let raw_name = item.get("name").and_then(Value::as_str).unwrap_or("").trim();
+            let shortcode = raw_name.trim_matches(':').trim();
+            let url = item
+                .get("icon")
+                .and_then(|v| v.get("url"))
+                .and_then(Value::as_str)
+                .or_else(|| item.get("image").and_then(Value::as_str))
+                .unwrap_or("")
+                .trim();
+            if shortcode.is_empty() || !url.starts_with("https://") {
+                continue;
+            }
+            if out.iter().any(|e: &Value| e.get("shortcode").and_then(Value::as_str) == Some(shortcode)) {
+                continue;
+            }
+            out.push(json!({
+                "shortcode": shortcode,
+                "url": url,
+                "static_url": url,
+                "visible_in_picker": true,
+            }));
+        }
+    }
+    Value::Array(out)
 }
 
 fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
@@ -1759,6 +1805,7 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
         let mut icon: String = row.get(4);
         // Older remote_actors rows may retain a complete profile_json even
         // when the denormalized label/avatar columns are blank.
+        let mut emojis = Value::Array(Vec::new());
         if let Ok(profile) = serde_json::from_str::<Value>(&row.get::<_, String>(5)) {
             if username.trim().is_empty() {
                 username = profile.get("preferredUsername").or_else(|| profile.get("username"))
@@ -1772,6 +1819,7 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
                 icon = profile.get("icon").and_then(|v| v.get("url")).and_then(|v| v.as_str())
                     .or_else(|| profile.get("icon").and_then(|v| v.as_str())).unwrap_or("").to_string();
             }
+            emojis = actor_emojis(&profile);
         }
         map.insert(
             key,
@@ -1781,6 +1829,7 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
                 display_name,
                 host: row.get(3),
                 icon,
+                emojis,
             },
         );
     }
@@ -2825,6 +2874,7 @@ mod tests {
             display_name: "Test Account".into(),
             host: "mkultra.monster".into(),
             icon: DEFAULT_AVATAR.into(),
+            emojis: Value::Array(Vec::new()),
         };
         let local = EventRow {
             id: 41,
@@ -2854,5 +2904,21 @@ mod tests {
             assert_eq!(status["spoiler_text"], json!("Gallery"));
             assert_eq!(status["content"], json!(""));
         }
+    }
+
+    #[test]
+    fn cached_actor_emoji_metadata_matches_mastodon_shape() {
+        let profile = serde_json::json!({
+            "tag": [
+                {"type":"Emoji", "name":":spark:", "icon":{"url":"https://cdn.example/spark.png"}},
+                {"type":"Emoji", "name":"spark", "icon":{"url":"https://cdn.example/spark.png"}},
+                {"type":"Hashtag", "name":"#ignored"},
+                {"type":"Emoji", "name":":insecure:", "icon":{"url":"http://cdn.example/nope.png"}}
+            ]
+        });
+        let emojis = actor_emojis(&profile);
+        assert_eq!(emojis.as_array().map(Vec::len), Some(1));
+        assert_eq!(emojis[0]["shortcode"], "spark");
+        assert_eq!(emojis[0]["static_url"], "https://cdn.example/spark.png");
     }
 }
