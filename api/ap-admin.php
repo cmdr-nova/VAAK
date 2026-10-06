@@ -14010,6 +14010,23 @@ function admin_status_reply_to_meta_html(array $st, string $returnView): string
     if ($parentHandle === '' && preg_match('#^https://bsky\\.app/profile/([^/]+)/post/#i', $replyUrl, $bskyParentMatch)) {
         $parentHandle = rawurldecode((string) $bskyParentMatch[1]);
     }
+    // Thin Bluesky reply envelopes can persist the parent URL with its DID in
+    // the profile segment. Resolve it from the durable actor cache; a DID is
+    // an implementation key and must not be shown as a user-facing handle.
+    if (str_starts_with($parentHandle, 'did:') && function_exists('ap_db')) {
+        try {
+            $pst = ap_db()->prepare('SELECT profile_json FROM bsky_actor_profiles WHERE did = ? LIMIT 1');
+            $pst->execute([$parentHandle]);
+            $prow = $pst->fetch();
+            $profile = is_array($prow) ? json_decode((string) ($prow['profile_json'] ?? ''), true) : null;
+            $cachedHandle = is_array($profile) ? trim((string) ($profile['handle'] ?? '')) : '';
+            $parentHandle = ($cachedHandle !== '' && !str_starts_with($cachedHandle, 'did:'))
+                ? $cachedHandle
+                : '';
+        } catch (Throwable $e) {
+            $parentHandle = '';
+        }
+    }
     $href = function_exists('admin_status_href')
         ? admin_status_href($replyUrl, $returnView)
         : ('?view=status&object=' . rawurlencode($replyUrl));
