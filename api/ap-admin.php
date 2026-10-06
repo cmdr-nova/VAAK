@@ -16069,14 +16069,6 @@ function admin_render_masto_status_card(
                 ?>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
-                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
-                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
-                  <input type="hidden" name="object_id" value="<?= h($sid) ?>">
-                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like (VAAK only)' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
-                </form>
-                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
-                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
                   <input type="hidden" name="action" value="rss_quote">
                   <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
                   <input type="hidden" name="item_id" value="<?= (int) $rssItemId ?>">
@@ -16089,6 +16081,14 @@ function admin_render_masto_status_card(
                   <input type="hidden" name="status_id" value="<?= h($sid) ?>">
                   <input type="hidden" name="object_id" value="<?= h($sid) ?>">
                   <button class="icon-btn<?= $boosted ? ' on' : '' ?>" type="submit" title="<?= $boosted ? 'Undo boost (VAAK only)' : 'Boost (VAAK only)' ?>" aria-label="<?= $boosted ? 'Undo boost' : 'Boost' ?>" aria-pressed="<?= $boosted ? 'true' : 'false' ?>"><i class="ph ph-repeat" aria-hidden="true"></i></button>
+                </form>
+                <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="action" value="<?= $fav ? 'unfavourite_status' : 'favourite_status' ?>">
+                  <input type="hidden" name="return_view" value="<?= h($returnView) ?>">
+                  <input type="hidden" name="status_id" value="<?= h($sid) ?>">
+                  <input type="hidden" name="object_id" value="<?= h($sid) ?>">
+                  <button class="icon-btn<?= $fav ? ' on' : '' ?>" type="submit" title="<?= $fav ? 'Unlike' : 'Like (VAAK only)' ?>" aria-label="<?= $fav ? 'Unlike' : 'Like' ?>"><i class="ph<?= $fav ? '-fill' : '' ?> ph-heart" aria-hidden="true"></i></button>
                 </form>
                 <form method="post" action="<?= h($actionBase) ?>" style="display:inline">
                   <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
