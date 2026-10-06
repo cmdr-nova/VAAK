@@ -2672,6 +2672,17 @@ pub fn paint_lean_embed_from(
         // Network source tags (Bluesky / RSS) omitted — they only crowded the header.
         let when_html = if when.is_empty() {
             String::new()
+        } else if !uri.is_empty() {
+            let status_href = format!(
+                "?view=status&object={}&from={}",
+                urlencoding_encode(uri),
+                urlencoding_encode(from_q)
+            );
+            format!(
+                "<a class=\"meta tweet-time\" href=\"{}\" title=\"Open post\"> · {}</a>",
+                esc(&status_href),
+                esc(&when)
+            )
         } else {
             format!("<span class=\"meta\"> · {}</span>", esc(&when))
         };
@@ -2970,6 +2981,10 @@ mod tests {
             "must not double-escape entities into visible codes: {html}"
         );
         assert!(html.contains("&quot;") || html.contains('\"') || html.contains("whatever"));
+        assert!(
+            html.contains("class=\"meta tweet-time\"") && html.contains("title=\"Open post\""),
+            "timestamp must deep-link to the status: {html}"
+        );
     }
 
     #[test]
