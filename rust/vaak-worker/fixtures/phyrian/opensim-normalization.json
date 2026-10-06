@@ -1,0 +1,70 @@
+[
+  {
+    "name": "clamps_and_trim",
+    "input": {
+      "strain": "  Voidborne ",
+      "resonance": 999,
+      "generation": 0,
+      "level": 999,
+      "banked_resonance": -4,
+      "resonance_exchanges": -2,
+      "inductions_given": 7,
+      "lineage_depth": -1,
+      "last_decay_at": " 2026-10-05T00:00:00Z "
+    },
+    "expected": {
+      "status": "imprinted",
+      "strain": "Voidborne",
+      "resonance": 100,
+      "generation": 1,
+      "level": 80,
+      "banked_resonance": 0,
+      "resonance_exchanges": 0,
+      "inductions_given": 7,
+      "lineage_depth": 0,
+      "last_decay_at": "2026-10-05T00:00:00Z"
+    }
+  },
+  {
+    "name": "missing_fields_default",
+    "input": {"strain": ""},
+    "expected": {
+      "status": "unknown",
+      "strain": "",
+      "resonance": 0,
+      "generation": 1,
+      "level": 1,
+      "banked_resonance": 0,
+      "resonance_exchanges": 0,
+      "inductions_given": 0,
+      "lineage_depth": 0,
+      "last_decay_at": null
+    }
+  },
+  {
+    "name": "lower_bounds_and_blank_timestamp",
+    "input": {
+      "strain": "   ",
+      "resonance": -3,
+      "generation": -8,
+      "level": -2,
+      "banked_resonance": 900,
+      "resonance_exchanges": 3,
+      "inductions_given": 0,
+      "lineage_depth": 4,
+      "last_decay_at": "   "
+    },
+    "expected": {
+      "status": "unknown",
+      "strain": "",
+      "resonance": 0,
+      "generation": 1,
+      "level": 1,
+      "banked_resonance": 300,
+      "resonance_exchanges": 3,
+      "inductions_given": 0,
+      "lineage_depth": 4,
+      "last_decay_at": null
+    }
+  }
+]

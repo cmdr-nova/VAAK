@@ -74,7 +74,7 @@ pub struct DirectoryEntry {
 /// PHP currently owns those side effects; keeping this pure lets Axum prove
 /// payload/clamp parity before ownership is moved and prevents duplicate
 /// OpenSim mutations during the migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct OpenSimPlayerPlan {
     pub status: String,
     pub strain: String,
@@ -431,6 +431,16 @@ pub fn normalize_opensim_player(input: &Value) -> OpenSimPlayerPlan {
     }
 }
 
+/// Build the same authenticated OpenSim bridge envelope as PHP. The Rust
+/// worker does not send it yet; this pure contract is what lets us compare
+/// payloads before moving bridge side effects.
+pub fn bridge_request_payload(action: &str, body: &Value, secret: &str) -> Value {
+    let mut payload = body.as_object().cloned().unwrap_or_default();
+    payload.insert("action".into(), Value::String(action.to_string()));
+    payload.insert("bridge_secret".into(), Value::String(secret.to_string()));
+    Value::Object(payload)
+}
+
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {
     if owner < 1 {
         anyhow::bail!("owner_id must be positive");
@@ -555,7 +565,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_origin_owner, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, ORIGIN_STRAINS};
+    use super::{bridge_request_payload, configured_origin_owner, normalize_opensim_player, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -606,6 +616,37 @@ mod tests {
         assert_eq!(got.generation, 1);
         assert_eq!(got.level, 1);
         assert_eq!(got.last_decay_at, None);
+    }
+
+    #[test]
+    fn opensim_normalization_matches_shared_php_fixtures() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            input: serde_json::Value,
+            expected: OpenSimPlayerPlan,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!("../fixtures/phyrian/opensim-normalization.json"))
+            .expect("OpenSim normalization fixture JSON");
+        for case in cases {
+            assert_eq!(normalize_opensim_player(&case.input), case.expected);
+        }
+    }
+
+    #[test]
+    fn bridge_request_envelope_matches_php_contract() {
+        let payload = bridge_request_payload(
+            "vaak_player_pull",
+            &serde_json::json!({"avatar_uuid": "abc"}),
+            "fixture-secret",
+        );
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "avatar_uuid": "abc",
+                "action": "vaak_player_pull",
+                "bridge_secret": "fixture-secret"
+            })
+        );
     }
 
     #[test]
