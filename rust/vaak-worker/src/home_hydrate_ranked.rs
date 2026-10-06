@@ -455,6 +455,36 @@ fn bsky_media_and_card(embed_json: &str, status_id: &str) -> (Vec<Value>, Option
     let mut media = Vec::new();
     let mut card = None;
 
+    // Bluesky record embeds can point at graph lists or Starter Packs rather
+    // than another post. Preserve that semantic type for the shared VAAK
+    // painter instead of degrading it to a generic Bluesky-post card.
+    if etype.contains("record#view") || etype.contains("embed.record") {
+        let record = embed.get("record").unwrap_or(&Value::Null);
+        let record_uri = record
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .or_else(|| record.get("record").and_then(|r| r.get("uri")).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim();
+        let kind = if record_uri.contains("/app.bsky.graph.starterpack/") {
+            Some("starter_pack")
+        } else if record_uri.contains("/app.bsky.graph.list/") {
+            Some("list")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            card = Some(json!({
+                "url": "",
+                "title": if kind == "starter_pack" { "Bluesky Starter Pack" } else { "Bluesky List" },
+                "description": if kind == "starter_pack" { "A starter pack shared from Bluesky" } else { "A list shared from Bluesky" },
+                "provider_name": "VAAK collection",
+                "vaak_collection_kind": kind,
+                "vaak_collection_uri": record_uri,
+            }));
+        }
+    }
+
     for source in sources {
         if media.len() >= 4 {
             break;

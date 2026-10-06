@@ -1178,6 +1178,23 @@ fn paint_link_card_html(card: &Value) -> String {
     )
 }
 
+fn paint_collection_card(card: &Value) -> String {
+    let kind = card
+        .get("vaak_collection_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if kind.is_empty() {
+        return String::new();
+    }
+    let title = card.get("title").and_then(|v| v.as_str()).unwrap_or("Collection");
+    let desc = card.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let provider = card.get("provider_name").and_then(|v| v.as_str()).unwrap_or("VAAK collection");
+    format!(
+        "<div class=\"link-card bsky-collection-card\" role=\"group\"><div class=\"link-card__body\"><div class=\"link-card__provider\">{}</div><div class=\"link-card__title\">{}</div><div class=\"link-card__desc\">{}</div></div></div>",
+        esc(provider), esc(title), esc(desc)
+    )
+}
+
 fn status_has_media(st: &Value) -> bool {
     st.get("media_attachments")
         .and_then(|v| v.as_array())
@@ -1253,6 +1270,9 @@ fn paint_status_link_card(st: &Value) -> String {
     let has_structured_quote = st.get("quote").filter(|v| v.is_object()).is_some()
         || st.get("vaak_quote_preview").filter(|v| v.is_object()).is_some();
     if let Some(card) = st.get("card").filter(|v| v.is_object()) {
+        if card.get("vaak_collection_kind").is_some() {
+            return paint_collection_card(card);
+        }
         let card_url = card.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let suppress_status_card = (has_structured_quote && looks_like_status_url(card_url))
             || (!painted_quote.is_empty()
@@ -3495,6 +3515,28 @@ mod tests {
         assert!(html.contains("The World is Empty"), "{html}");
         assert!(html.contains("youtube-link-card--wide"), "{html}");
         assert!(!html.contains("class=\"link-card__media\""), "must not use side thumb: {html}");
+    }
+
+    #[test]
+    fn paints_starter_pack_as_inline_collection_card() {
+        let st = json!({
+            "id": "bsky:starter",
+            "uri": "at://did:plc:test/app.bsky.feed.post/starter",
+            "content": "",
+            "account": {"acct": "creator.bsky.social", "display_name": "Creator"},
+            "card": {
+                "url": "",
+                "title": "Bluesky Starter Pack",
+                "description": "A starter pack shared from Bluesky",
+                "provider_name": "VAAK collection",
+                "vaak_collection_kind": "starter_pack"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(html.contains("bsky-collection-card"), "{html}");
+        assert!(html.contains("Bluesky Starter Pack"), "{html}");
+        assert!(!html.contains("Bluesky post"), "{html}");
     }
 
     #[test]
