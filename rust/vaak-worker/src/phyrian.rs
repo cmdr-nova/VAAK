@@ -531,11 +531,27 @@ pub async fn bridge_read(cfg: &Config, action: &str, body: Value) -> Result<Valu
 fn identify_kind(raw: &str) -> Option<(&'static str, String)> {
     let value = raw.trim();
     if value.is_empty() { return None; }
+    // Keep parity with PHP's accepted Strains profile URL format.
+    // The public UI commonly submits https://strains.novalandia.online/?uuid=…
+    // rather than the UUID itself.
+    if let Some((_, query)) = value.split_once("?uuid=") {
+        let candidate = query.split('&').next().unwrap_or("").trim();
+        if uuid::Uuid::parse_str(candidate).is_ok() {
+            return Some(("uuid", candidate.to_ascii_lowercase()));
+        }
+    }
     if uuid::Uuid::parse_str(value).is_ok() {
         return Some(("uuid", value.to_ascii_lowercase()));
     }
-    if value.chars().count() <= 80 {
-        return Some(("name", value.to_string()));
+    let normalized = value.replace(['+', '.'], " ");
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let valid_name = !normalized.is_empty()
+        && normalized.chars().count() <= 80
+        && !normalized.contains('@')
+        && !normalized.contains('/')
+        && normalized.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '\'' | '-'));
+    if valid_name {
+        return Some(("name", normalized));
     }
     None
 }
@@ -749,7 +765,7 @@ fn projected_decay(status: &str, strain: &str, resonance: i64, age_secs: i64, de
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, normalize_opensim_player, pick_origin_strain, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS, DAILY_DECAY};
+    use super::{bridge_request_payload, configured_origin_owner, decode_bridge_response, identify_kind, normalize_opensim_player, pick_origin_strain, plan_request_offer, projected_decay, resolve_peer_imprint, stability, OpenSimPlayerPlan, ORIGIN_STRAINS, DAILY_DECAY};
     #[test] fn php_stability_boundaries_match() {
         assert_eq!(stability(false, 99), "Unmarked");
         assert_eq!(stability(true, 0), "Dormant");
@@ -893,5 +909,16 @@ mod tests {
         assert_eq!(ORIGIN_STRAINS.first(), Some(&"Cosmic Alien"));
         assert_eq!(ORIGIN_STRAINS[55], "Phyrian");
         assert_eq!(ORIGIN_STRAINS.last(), Some(&"Sable Current"));
+    }
+
+    #[test]
+    fn bridge_identify_inputs_match_php_url_and_name_rules() {
+        assert_eq!(
+            identify_kind("https://strains.novalandia.online/?uuid=803bdca1-f996-4620-bea8-6177e1c3dfbe&foo=1"),
+            Some(("uuid", "803bdca1-f996-4620-bea8-6177e1c3dfbe".to_string()))
+        );
+        assert_eq!(identify_kind("Val3r1e.Flux"), Some(("name", "Val3r1e Flux".to_string())));
+        assert!(identify_kind("bad/name").is_none());
+        assert!(identify_kind("@bad").is_none());
     }
 }
