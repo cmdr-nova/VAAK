@@ -1389,6 +1389,27 @@ $vaakAdminOnlyActions = [
                 $error = 'Direct messages cannot be interacted with as public statuses.';
             } elseif ($action === 'reblog_status' || $action === 'unreblog_status') {
                 $interactKind = 'reblog';
+                // Rust boost cards submit the canonical underlying object URI.
+                // A remote Announce can legitimately have no resolvable
+                // synthetic status snowflake (deleted/hidden wrapper event),
+                // so use the cache-only object lookup before rejecting the
+                // interaction. Never fetch the network in this request.
+                if ($resolved === null && str_starts_with($objectId, 'https://')
+                    && function_exists('ap_masto_lookup_status_by_object_url')) {
+                    $cached = ap_masto_lookup_status_by_object_url($objectId, 0, false, true);
+                    if (is_array($cached)) {
+                        $cachedActor = '';
+                        if (is_array($cached['account'] ?? null)) {
+                            $cachedActor = (string) (($cached['account']['uri'] ?? '') ?: ($cached['account']['url'] ?? ''));
+                        }
+                        $resolved = [
+                            'status' => $cached,
+                            'object_id' => $objectId,
+                            'target_actor' => $cachedActor !== '' ? $cachedActor : null,
+                            'is_ours' => false,
+                        ];
+                    }
+                }
                 if ($resolved === null) {
                     $error = 'Status not found in local store.';
                 } elseif ($wantJson) {

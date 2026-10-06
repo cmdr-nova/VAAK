@@ -1400,7 +1400,7 @@ fn materialize_outbox(
         });
     }
     let parent = row.in_reply_to.trim().trim_end_matches('/');
-    if !parent.is_empty() && parent.starts_with("https://") {
+    if !parent.is_empty() && (parent.starts_with("https://") || parent.starts_with("at://")) {
         st["vaak_in_reply_to_url"] = json!(parent);
         if let Some((child_actor, _)) = row.id.rsplit_once("/notes/") {
             if let Some((parent_actor, _)) = parent.rsplit_once("/notes/") {
