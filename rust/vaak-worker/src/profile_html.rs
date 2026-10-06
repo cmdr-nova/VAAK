@@ -17,6 +17,19 @@ use crate::self_thread::{
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
 const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
 
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct ProfileHtmlReport {
     pub html: String,
@@ -291,9 +304,22 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
     if targets.is_empty() {
         return Ok(());
     }
+    let bsky_targets: Vec<String> = targets
+        .iter()
+        .filter(|target| target.starts_with("at://"))
+        .cloned()
+        .collect();
+    let bsky_quotes = crate::home_hydrate_ranked::fetch_bsky_map(db, &bsky_targets)
+        .await
+        .unwrap_or_default();
+    let local_targets: Vec<String> = targets
+        .iter()
+        .filter(|target| target.starts_with(LOCAL_ACTOR_PREFIX))
+        .cloned()
+        .collect();
     let rows = db.query(
         "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
-        &[&targets],
+        &[&local_targets],
     ).await.context("select local quote targets")?;
     let mut by_target = std::collections::HashMap::new();
     for row in rows {
@@ -310,6 +336,20 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
             "account": empty_account(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, username, DEFAULT_AVATAR),
             "media_attachments": media,
         }));
+    }
+    for (target, bsky) in bsky_quotes {
+        let mut quoted = crate::home_hydrate_ranked::materialize_bsky(&bsky);
+        // Keep the canonical at:// URI for identity/actions, but make the
+        // quote card itself resolve inside VAAK rather than opening Bluesky.
+        let internal_url = format!(
+            "?view=status&object={}&from=home",
+            urlencoding_encode(&target)
+        );
+        quoted["url"] = json!(internal_url.clone());
+        if let Some(card) = quoted.get_mut("card").filter(|v| v.is_object()) {
+            card["url"] = json!(internal_url);
+        }
+        by_target.insert(target, quoted);
     }
     for st in statuses.iter_mut() {
         let target = st.get("quote").and_then(|q| q.get("quoted_status"))

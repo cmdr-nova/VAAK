@@ -2922,7 +2922,7 @@ pub fn paint_lean_embed_from(
         let quote_from = if from == "mentions" { "notification-embed" } else { from };
         let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor);
         inner.push_str(&format!(
-            "<div class=\"quote-block\" style=\"margin-top:.55rem\">{q_html}</div>"
+            "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{q_html}</div>"
         ));
     }
 
