@@ -304,6 +304,14 @@ pub async fn view_hydrate(
             &mut report.items,
         )
         .await;
+        // Cached envelopes can predate quote-target hydration. Re-run the
+        // bounded local/Fediverse/Bluesky quote resolver on read so an older
+        // Home/Local/Federated cache cannot keep exposing a generic link card.
+        let _ = crate::home_hydrate_ranked::hydrate_local_quote_targets(
+            &moderation_db,
+            &mut report.items,
+        )
+        .await;
     }
     Ok(report)
 }

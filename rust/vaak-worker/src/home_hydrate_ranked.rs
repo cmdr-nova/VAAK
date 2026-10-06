@@ -1640,7 +1640,7 @@ fn materialize_outbox(
 /// Fill local quote targets from outbox storage before painting Home/Local.
 /// This keeps quote-boosts from degrading to a bare `quote_object` URL while
 /// remaining cache/DB-only and bounded to the current page.
-async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Result<()> {
+pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Result<()> {
     let mut targets = Vec::new();
     for st in statuses.iter() {
         if let Some(uri) = st.get("quote").and_then(|q| q.get("quoted_status"))
