@@ -35,13 +35,28 @@ try {
 
     putenv('AP_DB_DSN=' . $dsn);
     require_once dirname(__DIR__) . '/ap-db.php';
+    require_once dirname(__DIR__) . '/ap-reports.php';
     $db = ap_db();
     foreach (['ap_reports', 'ap_home_downrank_terms', 'ap_home_downrank_audit', 'ap_home_suppression'] as $table) {
         $st = $db->prepare('SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?');
         $st->execute([$table]);
         if (!$st->fetchColumn()) throw new RuntimeException('required moderation table missing: ' . $table);
     }
-    echo "admin-safety: PASS (read-only projection, PHP authorization and moderation ownership)\n";
+    $activity = 'settings-admin-parity-' . bin2hex(random_bytes(8));
+    $now = gmdate('c');
+    $insert = $db->prepare('INSERT INTO ap_reports (activity_id, direction, reporter_actor_id, target_actor_id, status_uris_json, comment, about_us, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?) RETURNING id');
+    $insert->execute([$activity, 'in', 'https://example.test/users/reporter', 'https://mkultra.monster/users/test', '[]', 'parity fixture', 'open', $now, $now]);
+    $reportId = (int) $insert->fetchColumn();
+    if (!ap_report_set_state($reportId, 'ignored')['ok']) throw new RuntimeException('PHP report state mutation failed');
+    if (ap_report_set_state($reportId, 'not-a-state')['ok']) throw new RuntimeException('invalid report state accepted');
+    if (!ap_report_append_admin_note($reportId, 'parity note', 'parity-test')['ok']) throw new RuntimeException('PHP admin note mutation failed');
+    $check = $db->prepare('SELECT state, admin_notes FROM ap_reports WHERE id = ?');
+    $check->execute([$reportId]);
+    $row = $check->fetch(PDO::FETCH_ASSOC) ?: [];
+    if (($row['state'] ?? '') !== 'ignored' || !str_contains((string) ($row['admin_notes'] ?? ''), 'parity note')) {
+        throw new RuntimeException('PHP moderation mutation result mismatch');
+    }
+    echo "admin-safety: PASS (projection, PHP authorization, report state, admin note, moderation ownership)\n";
 } catch (Throwable $e) {
     fwrite(STDERR, 'admin-safety: FAIL: ' . $e->getMessage() . "\n");
     exit(1);
