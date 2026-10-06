@@ -32676,8 +32676,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     input.value = window.VAAK_CSRF || '';
   }, true);
 
-  // Fold long timeline posts (text + images + link cards) behind Show more
+  // Keep ordinary posts fully visible. Only exceptionally long, non-CW text
+  // gets an optional fold; media/link-card height alone must not trigger it.
   const FOLD_MAX = Math.round(18 * parseFloat(getComputedStyle(document.documentElement).fontSize || '16'));
+  const FOLD_TEXT_MIN = 4000;
   function ensureMoreBtn(content) {
     let btn = content.nextElementSibling;
     if (btn && btn.classList && btn.classList.contains('tweet-content-more')) return btn;
@@ -32726,8 +32728,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         return;
       }
       if (el.dataset.foldBound === '1') return;
-      // Measure natural height (text + media + cards as one block)
+      // Measure text separately so a large image/card does not create a
+      // misleading “Show more” control on an otherwise short post.
       el.classList.remove('is-collapsed', 'is-expanded');
+      const textLength = Array.from(el.querySelectorAll('.feed-body, .body'))
+        .reduce((total, node) => total + (node.textContent || '').trim().length, 0);
+      if (textLength <= FOLD_TEXT_MIN) {
+        clearTweetFold(el);
+        return;
+      }
+      // Measure natural height (text + media + cards as one block) only for
+      // the very-long-text case.
       const full = el.scrollHeight;
       if (full <= FOLD_MAX + 24) {
         el.dataset.foldBound = '1';
