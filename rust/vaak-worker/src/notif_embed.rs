@@ -2650,7 +2650,7 @@ fn ask_card_from_status(status: &Value) -> Option<String> {
 
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
 pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
-    paint_lean_embed_from(status, hide_header, "mentions", "")
+    paint_lean_embed_from(status, hide_header, "notification-embed", "")
 }
 
 /// Lean status card HTML with `from=` deep-link context (Mentions nest or Home fill).
@@ -2919,15 +2919,17 @@ pub fn paint_lean_embed_from(
         .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
         let q = normalized_quote_preview(q_raw);
-        let q_html = paint_lean_embed_from(&q, false, from, viewer_actor);
+        let quote_from = if from == "mentions" { "notification-embed" } else { from };
+        let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor);
         inner.push_str(&format!(
             "<div class=\"quote-block\" style=\"margin-top:.55rem\">{q_html}</div>"
         ));
     }
 
-    // Full action bar on Home / Local / Federated / local Profiles / outbox.
-    // Mentions nests stay Open-only.
-    if matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox") {
+    // Full action bar on Home / Local / Federated / profiles / outbox and
+    // Notifications. PHP's notification cards expose the same interaction
+    // set as timeline cards: reply, quote, boost, favourite, and bookmark.
+    if matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox" | "mentions") {
         inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
     } else if !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
