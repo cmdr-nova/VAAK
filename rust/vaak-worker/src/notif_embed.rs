@@ -1545,7 +1545,7 @@ fn paint_reply_context(status: &Value, from: &str) -> String {
     // A thin Jetstream row can carry the parent DID as its temporary handle.
     // Never render that implementation identifier to users; the hydration
     // pass will replace it with the cached actor handle when available.
-    let cached_parent_label = if cached_parent_label.starts_with("did:") {
+    let cached_parent_label = if cached_parent_label.trim_start_matches('@').starts_with("did:") {
         ""
     } else {
         cached_parent_label
@@ -1566,6 +1566,8 @@ fn paint_reply_context(status: &Value, from: &str) -> String {
         urlencoding_encode(&parent),
         urlencoding_encode(return_view)
     );
+    let parent_label = parent_label.trim_start_matches('@');
+    let parent_label = if parent_label.starts_with("did:") { "" } else { parent_label };
     let label = if parent_label.is_empty() {
         "the parent post".to_string()
     } else {
