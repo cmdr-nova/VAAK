@@ -1705,7 +1705,17 @@ fn paint_moderation_overflow(
         .get("_vaak_viewer_block_id")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let object = object_id.trim().trim_end_matches('/');
+    let object_raw = object_id.trim().trim_end_matches('/');
+    let object = if object_raw.starts_with("https://") {
+        object_raw
+    } else {
+        status
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|u| u.starts_with("https://"))
+            .unwrap_or(object_raw)
+            .trim_end_matches('/')
+    };
     let action_base = format!("/vaak/?view={}", urlencoding_encode(from_q));
     let is_bsky_object = object.to_ascii_lowercase().contains("bsky.app");
 
