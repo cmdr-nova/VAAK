@@ -6306,7 +6306,11 @@ $GLOBALS['vaak_following_ids'] = $followingIds;
 // Home/search/DMs hit Redis instead of cold-building after idle.
 // Soft-nav Followers/Following must warm too — per-row mute/block without a
 // warm set was ~7s for 40 rows on production.
-if (!$accountSwitcherView && $vaakOwnerId > 0 && (!$isPartial || $shellFollowGraph)) {
+if (!$accountSwitcherView && $vaakOwnerId > 0 && (!$isPartial || $shellFollowGraph)
+    // A profile only needs actor-specific moderation checks. Warming every
+    // moderation set here made a cold own-profile request pay the full cache
+    // rebuild cost before the profile could paint.
+    && $view !== 'remote_profile') {
     if (function_exists('ap_mutes_set_cached')) {
         ap_mutes_set_cached($vaakOwnerId);
     }
