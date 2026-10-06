@@ -416,6 +416,20 @@ async fn fetch_home_events(
                  WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
                    AND action_taken = ANY(ARRAY['log','local_observe'])
                    AND actor_id = ANY($1)
+                   AND (
+                     type <> 'Announce'
+                     OR COALESCE(summary, '') <> ''
+                     OR COALESCE(media_urls, '') NOT IN ('', '[]')
+                     OR (
+                       COALESCE(object_id, '') <> ''
+                       AND EXISTS (
+                         SELECT 1 FROM events original
+                         WHERE original.type = 'Create'
+                           AND original.action_taken = ANY(ARRAY['log','local_observe'])
+                           AND original.object_id = events.object_id
+                       )
+                     )
+                   )
                  ORDER BY created_at DESC, id DESC
                  LIMIT 240",
                 &[&chunk],
@@ -504,6 +518,20 @@ async fn fetch_followed_tag_events(
              WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
                AND action_taken = ANY(ARRAY['log','local_observe'])
                AND created_at >= $1
+               AND (
+                 type <> 'Announce'
+                 OR COALESCE(summary, '') <> ''
+                 OR COALESCE(media_urls, '') NOT IN ('', '[]')
+                 OR (
+                   COALESCE(object_id, '') <> ''
+                   AND EXISTS (
+                     SELECT 1 FROM events original
+                     WHERE original.type = 'Create'
+                       AND original.action_taken = ANY(ARRAY['log','local_observe'])
+                       AND original.object_id = events.object_id
+                   )
+                 )
+               )
              ORDER BY created_at DESC, id DESC
              LIMIT 600",
             &[&since],

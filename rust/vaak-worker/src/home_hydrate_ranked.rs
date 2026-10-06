@@ -2518,6 +2518,11 @@ fn materialize_boost(
     };
 
     let object_id = rb.object_id.trim_end_matches('/').to_string();
+    if create.is_none() && rss.is_none() {
+        // Keep unresolved local boosts out of visible timelines. The ranked
+        // worker will include them after the original object is cached.
+        return None;
+    }
     let mut inner = if let Some(rss_row) = rss {
         materialize_rss(rss_row)
     } else if let Some(crow) = create {
@@ -2828,6 +2833,13 @@ pub async fn warm_view(
                     let actor = actors_map.get(ev.actor_id.trim_end_matches('/'));
                     if ev.event_type.eq_ignore_ascii_case("announce") {
                         let create = creates_map.get(ev.object_id.trim_end_matches('/'));
+                        let summary_empty = strip_tags_simple(&ev.summary).trim().is_empty();
+                        let media_empty = ev.media_urls.is_empty() || ev.media_urls == "[]";
+                        if create.is_none() && summary_empty && media_empty {
+                            // Do not expose a hollow boost while its original
+                            // Create is still waiting on ingestion/hydration.
+                            return None;
+                        }
                         Some(materialize_announce(ev, actor, create, &actors_map))
                     } else {
                         // Skip empty private-ish stubs with no body/media/CW.
