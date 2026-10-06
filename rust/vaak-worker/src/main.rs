@@ -28,6 +28,7 @@ mod thin_media;
 mod thin_media_warm;
 mod timeline;
 mod timeline_fanout;
+mod you;
 
 use std::net::SocketAddr;
 

@@ -20858,6 +20858,48 @@ function admin_shadow_admin_health_fetch(): ?array
 }
 
 /**
+ * Read-only You projection from the Rust shadow worker.  Every mutation on
+ * Blog, RSS, Queue, and Drafts stays in these PHP handlers until parity is
+ * proven; a miss always returns null so the existing PHP query is used.
+ *
+ * @return array{kind:string,owner_id:int,rows:array,secondary:array,source:string}|null
+ */
+function admin_you_projection_axum_fetch(string $kind, int $ownerUserId, int $limit = 100): ?array
+{
+    $kind = strtolower(trim($kind));
+    if (!in_array($kind, ['blog', 'rss', 'queue', 'drafts'], true) || $ownerUserId < 1 || !function_exists('curl_init')) {
+        return null;
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/shadow/you?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'kind' => $kind,
+        'limit' => max(1, min(200, $limit)),
+    ]);
+    $ch = curl_init($url);
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 80,
+        CURLOPT_TIMEOUT_MS => 350,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($code !== 200 || !is_string($raw) || $raw === '') return null;
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded) || ($decoded['kind'] ?? '') !== $kind || !is_array($decoded['rows'] ?? null)) return null;
+    $decoded['secondary'] = is_array($decoded['secondary'] ?? null) ? $decoded['secondary'] : [];
+    return $decoded;
+}
+
+/**
  * Fetch local profile tab HTML from Axum `/shadow/profile-html` (0.7.18).
  * Same lean cards as Home (actions + own-post Delete/Edit/Pin) for posts /
  * replies / media / boosts. First paint prefers Axum on every tab (0.7.23).
@@ -24858,11 +24900,21 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if (!is_array($editingDraft) || (string) ($editingDraft['status'] ?? '') !== 'draft') {
               $editingDraft = null;
           }
-          $publishedBlogs = ap_blog_posts_list($vaakActorKey, true, 100);
-          $draftBlogs = array_values(array_filter(
-              ap_blog_posts_list($vaakActorKey, false, 100),
-              static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft'
-          ));
+          $blogShadow = admin_you_projection_axum_fetch('blog', (int) $vaakOwnerId, 100);
+          if (is_array($blogShadow)) {
+              $blogRows = array_map(static function (array $row): array {
+                  $row['tags'] = ap_blog_tags_decode($row['tags_json'] ?? '[]');
+                  return $row;
+              }, array_values(array_filter($blogShadow['rows'] ?? [], 'is_array')));
+              $publishedBlogs = array_values(array_filter($blogRows, static fn(array $row): bool => (string) ($row['status'] ?? '') === 'published'));
+              $draftBlogs = array_values(array_filter($blogRows, static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft'));
+          } else {
+              $publishedBlogs = ap_blog_posts_list($vaakActorKey, true, 100);
+              $draftBlogs = array_values(array_filter(
+                  ap_blog_posts_list($vaakActorKey, false, 100),
+                  static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft'
+              ));
+          }
           if ($blogPost):
         ?>
           <article class="side-card blog-post-card">
@@ -31236,7 +31288,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           if (!in_array($qFilter, ['all', 'pending', 'publishing', 'failed'], true)) {
               $qFilter = 'all';
           }
-          $qAll = ap_queue_list_pending(200);
+          $queueShadow = admin_you_projection_axum_fetch('queue', (int) $vaakOwnerId, 200);
+          $qAll = is_array($queueShadow)
+              ? array_values(array_filter($queueShadow['rows'] ?? [], 'is_array'))
+              : ap_queue_list_pending(200);
           $qCounts = ['all' => count($qAll), 'pending' => 0, 'publishing' => 0, 'failed' => 0];
           foreach ($qAll as $qCountRow) {
               $qStateCount = (string) ($qCountRow['state'] ?? 'pending');
@@ -31247,7 +31302,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           $qPending = $qFilter === 'all'
               ? $qAll
               : array_values(array_filter($qAll, static fn(array $row): bool => (string) ($row['state'] ?? '') === $qFilter));
-          $qPublished = ap_queue_list_published(15);
+          $qPublished = is_array($queueShadow)
+              ? array_values(array_filter($queueShadow['secondary'] ?? [], 'is_array'))
+              : ap_queue_list_published(15);
         ?>
         <form class="composer" method="post" action="?view=queue" style="margin-bottom:1rem">
           <input type="hidden" name="action" value="queue_settings">
@@ -31484,7 +31541,10 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
       <?php elseif ($view === 'rss'): ?>
         <?php
-          $rssFeeds = function_exists('ap_rss_feeds_for_owner') ? ap_rss_feeds_for_owner($vaakOwnerId) : [];
+          $rssShadow = admin_you_projection_axum_fetch('rss', (int) $vaakOwnerId, 100);
+          $rssFeeds = is_array($rssShadow)
+              ? array_values(array_filter($rssShadow['rows'] ?? [], 'is_array'))
+              : (function_exists('ap_rss_feeds_for_owner') ? ap_rss_feeds_for_owner($vaakOwnerId) : []);
         ?>
         <div class="meta" style="margin-bottom:1rem">
           Add RSS/Atom feeds to mix into <b>Home</b> (evenly spaced with Fediverse and Bluesky — more feeds do not flood the timeline).
@@ -32091,8 +32151,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         </section>
 
       <?php elseif ($view === 'drafts'): ?>
-        <?php $draftRows = function_exists('ap_drafts_list') ? ap_drafts_list(100) : []; ?>
-        <?php $blogDraftRows = function_exists('ap_blog_posts_list') ? array_values(array_filter(ap_blog_posts_list($vaakActorKey, false, 100), static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft')) : []; ?>
+        <?php $draftShadow = admin_you_projection_axum_fetch('drafts', (int) $vaakOwnerId, 100); ?>
+        <?php $draftRows = is_array($draftShadow) ? array_values(array_filter($draftShadow['rows'] ?? [], 'is_array')) : (function_exists('ap_drafts_list') ? ap_drafts_list(100) : []); ?>
+        <?php $blogDraftRows = is_array($draftShadow) ? array_values(array_filter($draftShadow['secondary'] ?? [], 'is_array')) : (function_exists('ap_blog_posts_list') ? array_values(array_filter(ap_blog_posts_list($vaakActorKey, false, 100), static fn(array $row): bool => (string) ($row['status'] ?? '') === 'draft')) : []); ?>
         <div class="meta" style="margin-bottom:1rem">
           Closing the composer (or tapping <b>Save draft</b>) keeps unfinished posts here. Resume to edit, or publish / queue from the composer.
         </div>

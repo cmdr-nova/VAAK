@@ -55,6 +55,8 @@ pub struct OwnerQuery {
     /// exact PHP cache suffix. This route is cache-only; PHP remains fallback.
     pub library_kind: Option<String>,
     pub library_suffix: Option<String>,
+    /// Read-only You projection: blog, rss, queue, or drafts.
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +111,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/ranked-newer", get(shadow_ranked))
         .route("/shadow/action-queue", get(shadow_action_queue))
         .route("/shadow/admin-health", get(shadow_admin_health))
+        .route("/shadow/you", get(shadow_you))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
         .route("/shadow/timelines/home", get(shadow_home))
@@ -164,6 +167,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/ranked-newer",
             "/shadow/action-queue",
             "/shadow/admin-health",
+            "/shadow/you",
             "/shadow/jetstream",
             "/shadow/thin-media",
             "/shadow/timelines/home",
@@ -736,6 +740,16 @@ async fn shadow_action_queue(
 
 async fn shadow_admin_health(State(state): State<AppState>) -> impl IntoResponse {
     json_result(crate::admin_health::report(&state.cfg).await)
+}
+
+async fn shadow_you(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let kind = q.kind.as_deref().unwrap_or("");
+    let limit = q.limit.unwrap_or(100);
+    json_result(crate::you::project(&state.cfg, owner, kind, limit).await)
 }
 
 async fn shadow_jetstream(State(state): State<AppState>) -> impl IntoResponse {
