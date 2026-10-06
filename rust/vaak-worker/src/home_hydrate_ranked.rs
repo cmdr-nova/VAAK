@@ -419,6 +419,20 @@ fn bsky_https_url(at_uri: &str, handle: &str) -> String {
     format!("https://bsky.app/profile/{actor}/post/{rkey}")
 }
 
+fn bsky_reply_parent_uri(raw_json: &str) -> String {
+    let Ok(raw) = serde_json::from_str::<Value>(raw_json) else {
+        return String::new();
+    };
+    raw.get("record")
+        .and_then(|r| r.get("reply"))
+        .and_then(|r| r.get("parent"))
+        .and_then(|p| p.get("uri"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn bsky_media_and_card(embed_json: &str, status_id: &str) -> (Vec<Value>, Option<Value>) {
     let Ok(embed) = serde_json::from_str::<Value>(embed_json) else {
         return (Vec::new(), None);
@@ -1057,7 +1071,46 @@ fn materialize_bsky(row: &BskyRow) -> Value {
         }
         st["vaak_bsky_sensitive"] = json!(true);
     }
+    let parent = bsky_reply_parent_uri(&row.raw_json);
+    if !parent.is_empty() {
+        st["vaak_in_reply_to_url"] = json!(parent);
+    }
+    // A valid Bluesky record may contain no text (for example a list/record
+    // embed). Never paint that as an empty timeline card; retain a clickable
+    // permalink as the minimum useful representation.
+    if row.text.trim().is_empty()
+        && st
+            .get("media_attachments")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true)
+        && st.get("card").map(|v| v.is_null()).unwrap_or(true)
+    {
+        st["card"] = json!({
+            "url": https_url,
+            "title": "Bluesky post",
+            "description": "Open this post on Bluesky",
+            "provider_name": "Bluesky",
+            "type": "link"
+        });
+    }
     st
+}
+
+fn hydrated_status_hidden(st: &Value, hidden: &crate::hidden::HiddenSets) -> bool {
+    let actor_hidden = |value: &Value| {
+        value
+            .get("account")
+            .and_then(|a| a.get("uri").and_then(|v| v.as_str()).or_else(|| a.get("url").and_then(|v| v.as_str())))
+            .map(|actor| hidden.is_hidden(actor))
+            .unwrap_or(false)
+    };
+    actor_hidden(st)
+        || st
+            .get("reblog")
+            .filter(|v| v.is_object())
+            .map(actor_hidden)
+            .unwrap_or(false)
 }
 
 fn actor_to_account(actor: &ActorRow) -> Value {
@@ -2528,9 +2581,23 @@ pub async fn warm_view(
     boost_ids.dedup();
 
     let db = crate::db::connect(&cfg.database_url).await?;
+    let hidden = crate::hidden::load_hidden_sets(&db, owner_user_id).await?;
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
     let bsky_map = fetch_bsky_map(&db, &bsky_uris).await?;
+    // Reply cards need the parent's author label even when the parent itself
+    // is not on this timeline page. Hydrate the already-cached parent records
+    // in one bounded query (never a network fetch).
+    let mut bsky_parent_uris = Vec::new();
+    for row in bsky_map.values() {
+        let parent = bsky_reply_parent_uri(&row.raw_json);
+        if !parent.is_empty() {
+            bsky_parent_uris.push(parent);
+        }
+    }
+    bsky_parent_uris.sort();
+    bsky_parent_uris.dedup();
+    let bsky_parent_map = fetch_bsky_map(&db, &bsky_parent_uris).await?;
     let mut events_map = fetch_events_map(&db, &event_ids).await?;
     let boosts_map = fetch_boosts_map(&db, &boost_ids, owner_user_id).await?;
     let mut rss_boost_ids = Vec::new();
@@ -2626,7 +2693,20 @@ pub async fn warm_view(
                 let id = e.id.parse::<i64>().unwrap_or(0);
                 rss_map.get(&id).map(materialize_rss)
             }
-            ("home", "bsky") => bsky_map.get(&e.id).map(materialize_bsky),
+            ("home", "bsky") => bsky_map.get(&e.id).map(|row| {
+                let mut st = materialize_bsky(row);
+                if let Some(parent_uri) = st.get("vaak_in_reply_to_url").and_then(|v| v.as_str()) {
+                    if let Some(parent) = bsky_parent_map.get(parent_uri) {
+                        if !parent.author_handle.trim().is_empty() {
+                            st["vaak_reply_parent_handle"] = json!(parent.author_handle.trim());
+                        }
+                        if !parent.author_display.trim().is_empty() {
+                            st["vaak_reply_parent_display"] = json!(parent.author_display.trim());
+                        }
+                    }
+                }
+                st
+            }),
             ("home" | "feed", "event") => {
                 let id = e.id.parse::<i64>().unwrap_or(0);
                 events_map.get(&id).and_then(|ev| {
@@ -2660,6 +2740,12 @@ pub async fn warm_view(
             _ => None,
         };
         if let Some(st) = st {
+            // Ranked caches can briefly contain an item from before a mute or
+            // instance block changed. Filter again at hydration so stale
+            // envelopes cannot leak blocked actors into the Rust timeline.
+            if hydrated_status_hidden(&st, &hidden) {
+                continue;
+            }
             *kinds.entry(e.kind.clone()).or_insert(0) += 1;
             statuses.push(st);
         }
@@ -3067,5 +3153,39 @@ mod tests {
         assert_eq!(emojis.as_array().map(Vec::len), Some(1));
         assert_eq!(emojis[0]["shortcode"], "spark");
         assert_eq!(emojis[0]["static_url"], "https://cdn.example/spark.png");
+    }
+
+    #[test]
+    fn bsky_empty_record_gets_permalink_card_and_reply_parent() {
+        let row = BskyRow {
+            uri: "at://did:plc:child/app.bsky.feed.post/rkey".into(),
+            author_did: "did:plc:child".into(),
+            author_handle: "child.example".into(),
+            author_display: "Child".into(),
+            author_avatar: String::new(),
+            indexed_at: "2026-10-06T01:00:00Z".into(),
+            published_at: "2026-10-06T01:00:00Z".into(),
+            text: String::new(),
+            embed_json: String::new(),
+            raw_json: r#"{"record":{"text":"","reply":{"parent":{"uri":"at://did:plc:parent/app.bsky.feed.post/parent"}}}}"#.into(),
+            like_count: 0,
+            repost_count: 0,
+            reply_count: 0,
+        };
+        let status = materialize_bsky(&row);
+        assert_eq!(status["vaak_in_reply_to_url"], "at://did:plc:parent/app.bsky.feed.post/parent");
+        assert_eq!(status["card"]["title"], "Bluesky post");
+        assert!(status["card"]["url"].as_str().unwrap_or("").contains("bsky.app/profile/child.example/post/rkey"));
+    }
+
+    #[test]
+    fn hydrated_boost_is_hidden_when_underlying_actor_is_blocked() {
+        let mut hidden = crate::hidden::HiddenSets::default();
+        hidden.instance_blocked_actors.insert("https://blocked.example/users/x".into());
+        let status = json!({
+            "account": {"uri": "https://booster.example/users/y"},
+            "reblog": {"account": {"uri": "https://blocked.example/users/x"}}
+        });
+        assert!(hydrated_status_hidden(&status, &hidden));
     }
 }
