@@ -119,6 +119,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/relationships", get(shadow_relationships))
         .route("/shadow/settings", get(shadow_settings))
         .route("/shadow/you-integrations", get(shadow_you_integrations))
+        .route("/shadow/private-surfaces", get(shadow_private_surfaces))
         .route("/shadow/library-data", get(shadow_library_data))
         .route("/shadow/jetstream", get(shadow_jetstream))
         .route("/shadow/thin-media", get(shadow_thin_media))
@@ -179,6 +180,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/shadow/relationships",
             "/shadow/settings",
             "/shadow/you-integrations",
+            "/shadow/private-surfaces",
             "/shadow/library-data",
             "/shadow/jetstream",
             "/shadow/thin-media",
@@ -790,6 +792,15 @@ async fn shadow_you_integrations(
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     json_result(crate::integrations::project(&state.cfg, owner).await)
+}
+
+/// Content-free DM/Ask/moderation privacy contract. PHP owns all writes.
+async fn shadow_private_surfaces(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    json_result(crate::private_surfaces::project(&state.cfg, owner).await)
 }
 
 async fn shadow_library_data(
