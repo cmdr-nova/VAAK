@@ -913,6 +913,14 @@ function ap_phyrian_bridge_sync_from_opensim(int $ownerUserId, bool $force = fal
     if (!ap_phyrian_bridge_valid_uuid($uuid)) {
         return ['ok' => false, 'error' => 'Linked avatar UUID is invalid.'];
     }
+    // Read-only mirror. A timeout or a Rust error falls through to PHP.
+    // This path never calls vaak_daily_claim.
+    $rust = function_exists('ap_phyrian_rust_mutation')
+        ? ap_phyrian_rust_mutation('bridge_sync', ['owner_id' => $ownerUserId])
+        : null;
+    if (is_array($rust) && !empty($rust['ok'])) {
+        return $rust;
+    }
     $pull = ap_phyrian_bridge_strains_call('vaak_player_pull', ['avatar_uuid' => $uuid]);
     if (empty($pull['ok'])) {
         return ['ok' => false, 'error' => (string) ($pull['error'] ?? 'Could not pull OpenSim stats.')];

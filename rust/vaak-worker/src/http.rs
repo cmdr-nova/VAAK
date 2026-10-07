@@ -353,6 +353,13 @@ async fn internal_phyrian_mutate(
                 Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
             }
         }
+        "bridge_sync" => {
+            let owner = input.owner_id.unwrap_or(0);
+            match crate::phyrian::bridge_sync(&state.cfg, owner).await {
+                Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+                Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+            }
+        }
         _ => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Unknown mutation action"})),
