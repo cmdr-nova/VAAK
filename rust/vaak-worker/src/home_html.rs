@@ -57,6 +57,29 @@ pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> Strin
     )
 }
 
+async fn attach_visible_polls(
+    db: &tokio_postgres::Client,
+    slice: &mut [serde_json::Value],
+    extra: &mut std::collections::HashMap<String, serde_json::Value>,
+    viewer_actor: &str,
+) {
+    let _ = crate::home_hydrate_ranked::attach_polls(db, slice, viewer_actor).await;
+    if extra.is_empty() {
+        return;
+    }
+    let keys: Vec<String> = extra.keys().cloned().collect();
+    let mut vals = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if let Some(value) = extra.remove(key) {
+            vals.push(value);
+        }
+    }
+    let _ = crate::home_hydrate_ranked::attach_polls(db, &mut vals, viewer_actor).await;
+    for (key, value) in keys.into_iter().zip(vals) {
+        extra.insert(key, value);
+    }
+}
+
 fn normalize_view(view: &str) -> &'static str {
     match view.trim().to_ascii_lowercase().as_str() {
         "local" => "local",
@@ -119,6 +142,7 @@ pub async fn tl_html_fill(
     let end = (offset + limit).min(report.items.len());
     // Flags already overlaid in timeline::view_hydrate (0.7.19).
     let mut slice: Vec<serde_json::Value> = report.items[offset..end].to_vec();
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let mut extra_parents = std::collections::HashMap::new();
     // Attach cached OG/YouTube cards (PHP paint parity) before lean HTML.
     if let Ok(db) = db::connect(&cfg.database_url).await {
@@ -137,8 +161,8 @@ pub async fn tl_html_fill(
             }
         }
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
+        attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
     }
-    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
 
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
@@ -191,6 +215,7 @@ pub async fn home_html_since(
     // Cursor stays on created_at, including statuses dropped as twins.
     let newest_ts = report.newest_ts;
     let mut slice = report.items;
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let mut extra_parents = std::collections::HashMap::new();
     if let Ok(db) = db::connect(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
@@ -204,8 +229,8 @@ pub async fn home_html_since(
             }
         }
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
+        attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
     }
-    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
         paint_lean_feed_card_opts(st, from, viewer)
@@ -249,6 +274,7 @@ pub async fn tl_html_since(
     }
     let newest_ts = report.newest_ts;
     let mut slice = report.items;
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let mut extra_parents = std::collections::HashMap::new();
     if let Ok(db) = db::connect(&cfg.database_url).await {
         let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
@@ -262,8 +288,8 @@ pub async fn tl_html_since(
             }
         }
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
+        attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
     }
-    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
         paint_lean_feed_card_opts(st, from, viewer)

@@ -498,19 +498,22 @@ fn media_from_urls(urls_json: &str, status_id: &str) -> Vec<Value> {
         if !clean.to_ascii_lowercase().starts_with("https://") {
             continue;
         }
-        let path = clean
-            .split(['?', '#'])
-            .next()
-            .unwrap_or(clean)
-            .to_ascii_lowercase();
-        let is_video = [".mp4", ".webm", ".mov", ".m4v", ".m3u8"]
-            .iter()
-            .any(|ext| path.ends_with(ext));
-        let mtype = if is_video { "video" } else { "image" };
-        // Never set preview_url to the playable video itself — browsers ignore
-        // non-image <video poster> and Ice Cubes shows a blank card.
+        let sniffed = crate::notif_embed::media_kind_from_url(clean);
+        let is_audio = sniffed == "audio";
+        let is_video = sniffed == "video";
+        let mtype = if is_audio {
+            "audio"
+        } else if is_video {
+            "video"
+        } else {
+            "image"
+        };
+        // Never set preview_url to the playable file itself — browsers ignore
+        // non-image <video poster> and an mp3 is not an <img>.
         let preview = if is_video {
             guess_masto_video_preview(clean).unwrap_or_default()
+        } else if is_audio {
+            String::new()
         } else {
             clean.to_string()
         };
@@ -523,7 +526,7 @@ fn media_from_urls(urls_json: &str, status_id: &str) -> Vec<Value> {
             "url": clean,
             "preview_url": if preview.starts_with("https://") {
                 Value::String(preview)
-            } else if is_video {
+            } else if is_video || is_audio {
                 Value::Null
             } else {
                 Value::String(clean.into())
@@ -3377,6 +3380,184 @@ pub async fn warm_owner_now(cfg: &Config, owner_user_id: i64) -> Result<WarmRepo
     warm_view_now(cfg, owner_user_id, "home").await
 }
 
+fn status_note_uri(st: &Value) -> String {
+    st.get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| st.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn collect_poll_uris(st: &Value, out: &mut Vec<String>) {
+    let uri = status_note_uri(st);
+    if uri.starts_with("https://") {
+        out.push(uri);
+    }
+    if let Some(reblog) = st.get("reblog").filter(|v| v.is_object()) {
+        collect_poll_uris(reblog, out);
+    }
+    if let Some(quoted) = st
+        .get("quote")
+        .and_then(|q| q.get("quoted_status"))
+        .filter(|v| v.is_object())
+    {
+        collect_poll_uris(quoted, out);
+    }
+    if let Some(quoted) = st.get("vaak_quote_preview").filter(|v| v.is_object()) {
+        collect_poll_uris(quoted, out);
+    }
+}
+
+fn apply_saved_poll(st: &mut Value, polls: &HashMap<String, Value>) {
+    let uri = status_note_uri(st);
+    if let Some(poll) = polls.get(&uri) {
+        if let Some(obj) = st.as_object_mut() {
+            obj.insert("poll".to_string(), poll.clone());
+        }
+    }
+    if let Some(reblog) = st.get_mut("reblog").filter(|v| v.is_object()) {
+        apply_saved_poll(reblog, polls);
+    }
+    if let Some(quoted) = st
+        .get_mut("quote")
+        .and_then(|q| q.get_mut("quoted_status"))
+        .filter(|v| v.is_object())
+    {
+        apply_saved_poll(quoted, polls);
+    }
+    if let Some(quoted) = st.get_mut("vaak_quote_preview").filter(|v| v.is_object()) {
+        apply_saved_poll(quoted, polls);
+    }
+}
+
+fn poll_expires_label(raw: &str) -> (bool, String) {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return (false, String::new());
+    }
+    let when = chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc));
+    let Some(when) = when else {
+        return (false, String::new());
+    };
+    let expired = when <= chrono::Utc::now();
+    use chrono::{Datelike, Timelike};
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS
+        .get(when.month0() as usize)
+        .copied()
+        .unwrap_or("Jan");
+    (
+        expired,
+        format!(
+            "{} {month} {}, {} · {:02}:{:02} UTC",
+            if expired { "ended" } else { "ends" },
+            when.day(),
+            when.year(),
+            when.hour(),
+            when.minute()
+        ),
+    )
+}
+
+fn poll_voter_hit(voters_json: &str, viewer_actor: &str) -> bool {
+    let viewer = viewer_actor.trim().trim_end_matches('/').to_ascii_lowercase();
+    if viewer.is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(voters_json) else {
+        return false;
+    };
+    let Some(voters) = value.as_array() else {
+        return false;
+    };
+    voters.iter().any(|voter| {
+        voter
+            .as_str()
+            .map(|s| s.trim().trim_end_matches('/').eq_ignore_ascii_case(&viewer))
+            .unwrap_or(false)
+    })
+}
+
+/// Overlay `masto_polls` onto already-hydrated statuses. Warm Redis envelopes
+/// hard-code `poll: null`; Home, Local, Federated, and profiles paint from
+/// those envelopes, so the options have to be attached at request time.
+pub async fn attach_polls(db: &Client, statuses: &mut [Value], viewer_actor: &str) -> Result<()> {
+    let mut uris = Vec::new();
+    for st in statuses.iter() {
+        collect_poll_uris(st, &mut uris);
+    }
+    uris.sort();
+    uris.dedup();
+    if uris.is_empty() {
+        return Ok(());
+    }
+    let mut keys = uris.clone();
+    keys.extend(uris.iter().map(|uri| format!("{uri}/")));
+    let rows = db
+        .query(
+            "SELECT local_id::bigint,
+                    rtrim(note_id, '/'),
+                    COALESCE(multiple, 0)::text,
+                    COALESCE(expires_at::text, ''),
+                    COALESCE(options_json, '[]'),
+                    COALESCE(votes_count, 0)::bigint,
+                    COALESCE(voters_count, 0)::bigint,
+                    COALESCE(voters_json, '[]')
+             FROM masto_polls
+             WHERE note_id = ANY($1)",
+            &[&keys],
+        )
+        .await
+        .context("select masto_polls for timeline cards")?;
+    let mut polls: HashMap<String, Value> = HashMap::new();
+    for row in rows {
+        let local_id: i64 = row.try_get(0).unwrap_or(0);
+        let note_id: String = row.try_get::<_, String>(1).unwrap_or_default();
+        let note_id = note_id.trim().trim_end_matches('/').to_string();
+        if note_id.is_empty() {
+            continue;
+        }
+        let multiple_s: String = row.try_get(2).unwrap_or_default();
+        let multiple = matches!(
+            multiple_s.trim().to_ascii_lowercase().as_str(),
+            "1" | "t" | "true"
+        );
+        let expires_at: String = row.try_get(3).unwrap_or_default();
+        let options_json: String = row.try_get(4).unwrap_or_else(|_| "[]".into());
+        let votes_count: i64 = row.try_get(5).unwrap_or(0);
+        let voters_count: i64 = row.try_get(6).unwrap_or(0);
+        let voters_json: String = row.try_get(7).unwrap_or_else(|_| "[]".into());
+        let (expired, expires_label) = poll_expires_label(&expires_at);
+        let options = serde_json::from_str::<Value>(&options_json).unwrap_or(Value::Null);
+        polls.insert(
+            note_id,
+            json!({
+                "id": local_id.to_string(),
+                "expired": expired,
+                "multiple": multiple,
+                "votes_count": votes_count,
+                "voters_count": voters_count,
+                "voted": poll_voter_hit(&voters_json, viewer_actor),
+                "expires_label": expires_label,
+                "options": options,
+            }),
+        );
+    }
+    if polls.is_empty() {
+        return Ok(());
+    }
+    for st in statuses.iter_mut() {
+        apply_saved_poll(st, &polls);
+    }
+    Ok(())
+}
+
 pub fn report_json(r: &WarmReport) -> Value {
     let stored: Vec<Value> = r
         .stored
@@ -3523,6 +3704,23 @@ mod tests {
             "https://files.example/media/small/clip.png"
         );
         assert_eq!(media[3]["id"], "status-14");
+    }
+
+    #[test]
+    fn shared_public_media_materializer_classifies_audio_and_voice_notes() {
+        let urls = serde_json::json!([
+            "https://cdn.example/media/voice.mp3?download=1",
+            "https://cdn.example/media/voice-note-abc.webm",
+            "https://cdn.example/media/clip.webm",
+            "https://cdn.example/media/photo.jpg"
+        ])
+        .to_string();
+        let media = media_from_urls(&urls, "status");
+        assert_eq!(media[0]["type"], "audio");
+        assert!(media[0]["preview_url"].is_null());
+        assert_eq!(media[1]["type"], "audio");
+        assert_eq!(media[2]["type"], "video");
+        assert_eq!(media[3]["type"], "image");
     }
 
     #[test]
