@@ -638,6 +638,160 @@ pub async fn notifications_shadow(
     })
 }
 
+pub(crate) fn notif_id_digits(item: &Value) -> String {
+    match item.get("id") {
+        Some(Value::String(s)) => s.chars().filter(|c| c.is_ascii_digit()).collect(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Newest-first rows strictly after the cursor row.
+/// `None` when that id is not in the envelope.
+pub(crate) fn items_after_cursor(items: &[Value], cursor_digits: &str) -> Option<Vec<Value>> {
+    if cursor_digits.is_empty() {
+        return None;
+    }
+    let mut seen = false;
+    let mut tail = Vec::new();
+    for item in items {
+        if !seen {
+            if notif_id_digits(item) == cursor_digits {
+                seen = true;
+            }
+            continue;
+        }
+        tail.push(item.clone());
+    }
+    if seen { Some(tail) } else { None }
+}
+
+/// Full pages only. A shorter tail is a miss: the warm head may have ended
+/// while older notifications still exist, and a short 200 would stop Ice Cubes.
+pub(crate) fn full_page_after_cursor(
+    items: &[Value],
+    cursor_digits: &str,
+    limit: i64,
+) -> Option<Vec<Value>> {
+    let tail = items_after_cursor(items, cursor_digits)?;
+    if (tail.len() as i64) < limit.clamp(1, 80) {
+        return None;
+    }
+    Some(tail)
+}
+
+/// Deepest warm head first. notif-list writes all40, then all30, plus filtered
+/// lists at the worker limit.
+pub(crate) fn warm_head_limits(limit: i64) -> Vec<i64> {
+    let mut limits = vec![40_i64, 30, limit.clamp(1, 80), 20];
+    limits.sort_by(|a, b| b.cmp(a));
+    limits.dedup();
+    limits
+}
+
+fn cursor_digits(raw: Option<&str>) -> Option<String> {
+    let digits: String = raw
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() { None } else { Some(digits) }
+}
+
+fn tag_source(source: &str, suffix: &str) -> String {
+    let base = if source.is_empty() { "redis" } else { source };
+    format!("{base}:{suffix}")
+}
+
+fn truncate_page(report: &mut NotificationsShadowReport, limit: i64) {
+    let limit = limit.clamp(1, 80) as usize;
+    if report.items.len() > limit {
+        report.items.truncate(limit);
+        report.count = report.items.len();
+    }
+}
+
+/// Slice a no-`max_id` warm head past the scroll cursor.
+/// An exact paged Redis key is never written by notif-list.
+async fn warm_head_page_after(
+    cfg: &Config,
+    owner_user_id: i64,
+    types: &[String],
+    max_id: &str,
+    limit: i64,
+) -> Result<Option<NotificationsShadowReport>> {
+    let Some(cursor) = cursor_digits(Some(max_id)) else {
+        return Ok(None);
+    };
+    let limit = limit.clamp(1, 80);
+    for alt in warm_head_limits(limit) {
+        let mut head = notifications_shadow(cfg, owner_user_id, alt, types, None, None).await?;
+        if !head.cache_hit || head.items.is_empty() {
+            continue;
+        }
+        let Some(tail) = full_page_after_cursor(&head.items, &cursor, limit) else {
+            if items_after_cursor(&head.items, &cursor).is_some() {
+                // This head contains the cursor but cannot fill the page.
+                // Smaller heads are prefixes of the same list.
+                return Ok(None);
+            }
+            continue;
+        };
+        head.source = tag_source(&head.source, "max-slice");
+        head.items = tail;
+        head.count = head.items.len();
+        truncate_page(&mut head, limit);
+        return Ok(Some(head));
+    }
+    Ok(None)
+}
+
+/// Exact warm key, then a slice of the warm head.
+///
+/// `since_id` / `min_id` pulls stay a miss so pull-to-refresh still reads PHP.
+/// A short scroll tail stays a miss so a client does not treat the warm cap as
+/// the end of the notifications list.
+pub async fn notifications_shadow_resolved(
+    cfg: &Config,
+    owner_user_id: i64,
+    limit: i64,
+    types: &[String],
+    max_id: Option<&str>,
+    since_id: Option<&str>,
+) -> Result<NotificationsShadowReport> {
+    let limit = limit.clamp(1, 80);
+    let mut report =
+        notifications_shadow(cfg, owner_user_id, limit, types, max_id, since_id).await?;
+    if report.cache_hit {
+        truncate_page(&mut report, limit);
+        return Ok(report);
+    }
+    // Newer-than cursor is not a slice of the head.
+    if cursor_digits(since_id).is_some() {
+        return Ok(report);
+    }
+    if cursor_digits(max_id).is_some() {
+        if let Some(sliced) =
+            warm_head_page_after(cfg, owner_user_id, types, max_id.unwrap_or(""), limit).await?
+        {
+            return Ok(sliced);
+        }
+        return Ok(report);
+    }
+    for alt in warm_head_limits(limit) {
+        if alt == limit {
+            continue;
+        }
+        let mut head = notifications_shadow(cfg, owner_user_id, alt, types, None, None).await?;
+        if head.cache_hit && head.items.len() >= limit as usize {
+            head.source = tag_source(&head.source, "head-slice");
+            truncate_page(&mut head, limit);
+            return Ok(head);
+        }
+    }
+    Ok(report)
+}
+
 pub async fn run_loop(cfg: &Config, owner_user_id: i64, interval_secs: u64, limit: i64) -> Result<()> {
     let interval = Duration::from_secs(interval_secs.max(15));
     loop {

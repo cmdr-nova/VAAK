@@ -102,6 +102,35 @@ fn owner_index_key(owner: i64) -> String {
     format!("vaak:timeline:owner-index:v1:{}", owner.max(0))
 }
 
+/// Weights the Home rebuild already computed. Live fan-out reads this so a
+/// new post is inserted with the same author bonus the next rebuild would use.
+pub(crate) fn home_rank_weights_key(owner: i64) -> String {
+    format!("vaak:home:rank-weights:v1:{}", owner.max(0))
+}
+
+/// Author/tag nudge shared by the Home rebuild and the live fan-out insert.
+/// Clamped to the same −300..=1800 seconds as the favourite pass.
+pub(crate) fn affinity_bonus(actor_weight: f64, tag_count: i32) -> i64 {
+    let author_bonus = if actor_weight > 0.0 {
+        (600.0 * (1.0 + actor_weight).log2()).round() as i64
+    } else {
+        (60.0 * actor_weight).round() as i64
+    };
+    let author_bonus = author_bonus.max(-300);
+    let tag_bonus = if tag_count > 0 {
+        (300.0 * (1.0 + tag_count as f64).log2()).round() as i64
+    } else {
+        0
+    };
+    (author_bonus + tag_bonus).clamp(-300, 1800)
+}
+
+/// Recommendation freshness bump. Capped at 30 minutes so a cold
+/// recommendation cannot sit above a follow from the last half hour.
+pub(crate) fn recommendation_bump(score: f64) -> i64 {
+    ((1800.0 * (1.0 + score.max(0.0)).log2()).round() as i64).min(1800)
+}
+
 /// PHP `admin_tl_cache_key` for Home.
 fn cache_key_home(owner: i64, algorithm_on: bool, following_actor_ids: &[String]) -> String {
     let mut parts = following_actor_ids.to_vec();
@@ -710,6 +739,13 @@ fn rank_from_timeline(mut items: Vec<TimelineItem>) -> Vec<Value> {
         entry.insert("k".into(), json!(it.kind));
         entry.insert("id".into(), json!(it.id));
         entry.insert("s".into(), json!(it.source));
+        // `sort` is the placement the poller and the live insert both read.
+        // `o` is the object identity used to collapse event/outbox/Bluesky twins.
+        entry.insert("sort".into(), json!(it.sort));
+        let object = it.object_id.trim().trim_end_matches('/');
+        if !object.is_empty() {
+            entry.insert("o".into(), json!(object));
+        }
         out.push(Value::Object(entry));
     }
     out
@@ -748,18 +784,54 @@ async fn load_own_did(db: &Client, owner: i64) -> Result<Option<String>> {
     }))
 }
 
+struct BskyKey {
+    uri: String,
+    fedi: String,
+    author_did: String,
+    author_handle: String,
+    text: String,
+    indexed_at: i64,
+    sort: i64,
+}
+
+fn bsky_key_from_row(row: &tokio_postgres::Row) -> Result<Option<BskyKey>> {
+    let uri: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+    if !uri.starts_with("at://") {
+        return Ok(None);
+    }
+    let fedi: String = row
+        .try_get::<_, Option<String>>(1)?
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    let author_did: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
+    let author_handle: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+    let text: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
+    let indexed_raw: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+    Ok(Some(BskyKey {
+        uri,
+        fedi,
+        author_did,
+        author_handle,
+        text,
+        indexed_at: parse_ts(&indexed_raw),
+        sort: 0,
+    }))
+}
+
 async fn fetch_bsky_keys(
     db: &Client,
     owner: i64,
     exclude_did: Option<&str>,
     limit: i64,
-) -> Result<Vec<(String, String, String, String, String)>> {
-    // (uri, fediverse_id, author_did, author_handle, text)
+) -> Result<Vec<BskyKey>> {
     let limit = limit.clamp(1, 120);
     let rows = if let Some(did) = exclude_did.filter(|d| d.starts_with("did:")) {
         db.query(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
-                    COALESCE(p.author_handle, ''), COALESCE(p.text, '')
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
+                    COALESCE(p.indexed_at::text, '')
              FROM bsky_posts p
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE EXISTS (
@@ -776,7 +848,8 @@ async fn fetch_bsky_keys(
     } else {
         db.query(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
-                    COALESCE(p.author_handle, ''), COALESCE(p.text, '')
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
+                    COALESCE(p.indexed_at::text, '')
              FROM bsky_posts p
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE EXISTS (
@@ -793,19 +866,9 @@ async fn fetch_bsky_keys(
     .context("select bsky home rank keys")?;
     let mut out = Vec::new();
     for row in rows {
-        let uri: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
-        if !uri.starts_with("at://") {
-            continue;
+        if let Some(key) = bsky_key_from_row(&row)? {
+            out.push(key);
         }
-        let fedi: String = row
-            .try_get::<_, Option<String>>(1)?
-            .unwrap_or_default()
-            .trim_end_matches('/')
-            .to_string();
-        let author: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
-        let handle: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
-        let text: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
-        out.push((uri, fedi, author, handle, text));
     }
     Ok(out)
 }
@@ -815,14 +878,15 @@ async fn fetch_bsky_followed_tag_keys(
     owner: i64,
     exclude_did: Option<&str>,
     tags: &[String],
-) -> Result<Vec<(String, String, String, String, String)>> {
+) -> Result<Vec<BskyKey>> {
     if owner < 1 || tags.is_empty() {
         return Ok(Vec::new());
     }
     let rows = db
         .query(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
-                    COALESCE(p.author_handle, ''), COALESCE(p.text, '')
+                    COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
+                    COALESCE(p.indexed_at::text, '')
              FROM bsky_posts p
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE EXISTS (
@@ -840,55 +904,76 @@ async fn fetch_bsky_followed_tag_keys(
     let wanted: HashSet<&str> = tags.iter().map(String::as_str).collect();
     let mut out = Vec::new();
     for row in rows {
-        let uri: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
-        let fedi: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
-        let did: String = row.try_get::<_, Option<String>>(2)?.unwrap_or_default();
-        let handle: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
-        let text: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
-        if exclude_did.is_some_and(|excluded| did == excluded)
-            || !uri.starts_with("at://")
-            || !extract_hashtags(&text)
+        let Some(key) = bsky_key_from_row(&row)? else {
+            continue;
+        };
+        if exclude_did.is_some_and(|excluded| key.author_did == excluded)
+            || !extract_hashtags(&key.text)
                 .iter()
                 .any(|tag| wanted.contains(tag.as_str()))
         {
             continue;
         }
-        out.push((uri, fedi, did, handle, text));
+        out.push(key);
     }
     Ok(out)
 }
 
-fn rank_bsky_keys(
-    mut keys: Vec<(String, String, String, String, String)>,
+fn bsky_actor_weight(key: &BskyKey, actor_weights: &HashMap<String, f64>) -> f64 {
+    let mut actor = actor_weights.get(&key.author_did).copied().unwrap_or(0.0);
+    if !key.author_handle.is_empty() {
+        actor = actor.max(
+            actor_weights
+                .get(&format!("https://bsky.app/profile/{}", key.author_handle))
+                .copied()
+                .unwrap_or(0.0),
+        );
+    }
+    if key.author_did.starts_with("did:") {
+        actor = actor.max(
+            actor_weights
+                .get(&format!("https://bsky.app/profile/{}", key.author_did))
+                .copied()
+                .unwrap_or(0.0),
+        );
+    }
+    actor
+}
+
+fn bsky_tag_count(key: &BskyKey, tag_weights: &HashMap<String, i32>) -> i32 {
+    extract_hashtags(&key.text)
+        .iter()
+        .map(|tag| *tag_weights.get(tag).unwrap_or(&0))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Indexed time plus the same capped author/tag bonus follows get.
+/// Empty weights leave the SQL `indexed_at` order alone.
+fn stamp_bsky_sort(
+    keys: &mut [BskyKey],
     actor_weights: &HashMap<String, f64>,
     tag_weights: &HashMap<String, i32>,
-) -> Vec<(String, String, String, String, String)> {
-    if actor_weights.is_empty() && tag_weights.is_empty() {
-        return keys;
-    }
-    let score = |key: &(String, String, String, String, String)| {
-        let (_, _, did, handle, text) = key;
-        let mut actor = actor_weights.get(did).copied().unwrap_or(0.0);
-        if !handle.is_empty() {
-            actor = actor.max(
-                actor_weights
-                    .get(&format!("https://bsky.app/profile/{handle}"))
-                    .copied()
-                    .unwrap_or(0.0),
-            );
+) {
+    let rank = !actor_weights.is_empty() || !tag_weights.is_empty();
+    let now = chrono::Utc::now().timestamp();
+    for key in keys.iter_mut() {
+        let created = key.indexed_at;
+        if !rank || created <= 0 {
+            key.sort = created.max(0);
+            continue;
         }
-        let tag = extract_hashtags(text)
-            .iter()
-            .map(|tag| *tag_weights.get(tag).unwrap_or(&0) as f64)
-            .fold(0.0_f64, f64::max);
-        actor + tag * 0.5
-    };
-    keys.sort_by(|a, b| {
-        score(b)
-            .partial_cmp(&score(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    keys
+        let count = bsky_actor_weight(key, actor_weights);
+        let tag_count = bsky_tag_count(key, tag_weights);
+        if (count == 0.0 && tag_count < 1) || created < (now - 172800) || created > (now + 300) {
+            key.sort = created;
+            continue;
+        }
+        key.sort = created + affinity_bonus(count, tag_count);
+    }
+    if rank {
+        keys.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
+    }
 }
 
 fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str) -> bool {
@@ -906,32 +991,20 @@ fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str) -> bool {
     false
 }
 
-fn flush_bsky(
-    out: &mut Vec<Value>,
-    queued: &[Value],
-    qi: &mut usize,
-    bsky_emitted: &mut usize,
-    since_bsky: &mut usize,
-) {
-    while *qi < queued.len() {
-        if *since_bsky < 1 && !out.is_empty() {
-            break;
-        }
-        if !out.is_empty()
-            && (*bsky_emitted + 1) as f64 / (out.len() + 1) as f64 > HOME_BSKY_MAX_RATIO
-        {
-            break;
-        }
-        out.push(queued[*qi].clone());
-        *qi += 1;
-        *bsky_emitted += 1;
-        *since_bsky = 0;
+fn ranked_row_sort(row: &Value) -> i64 {
+    row.get("sort").and_then(|v| v.as_i64()).unwrap_or(0)
+}
+
+fn bsky_ratio_allows(out_len: usize, bsky_emitted: usize) -> bool {
+    if out_len == 0 {
+        return true;
     }
+    (bsky_emitted + 1) as f64 / (out_len + 1) as f64 <= HOME_BSKY_MAX_RATIO
 }
 
 fn merge_bsky_ranked(
     ranked: Vec<Value>,
-    bsky: &[(String, String, String, String, String)],
+    bsky: &[BskyKey],
     hidden: &hidden::HiddenSets,
 ) -> Vec<Value> {
     let mut seen_fedi = HashSet::new();
@@ -947,23 +1020,38 @@ fn merge_bsky_ranked(
         } else if k == "bsky" {
             seen_bsky.insert(id.to_string());
         }
+        if let Some(object) = row.get("o").and_then(|v| v.as_str()) {
+            let object = object.trim().trim_end_matches('/');
+            if !object.is_empty() {
+                seen_fedi.insert(object.to_string());
+            }
+        }
     }
     let mut queued: Vec<Value> = Vec::new();
-    for (uri, fedi, author_did, _author_handle, _text) in bsky {
-        if seen_bsky.contains(uri) {
+    for key in bsky {
+        if seen_bsky.contains(&key.uri) {
             continue;
         }
-        if !fedi.is_empty()
-            && (seen_fedi.contains(fedi) || seen_fedi.contains(&format!("{fedi}/")))
-        {
+        if !key.fedi.is_empty() && seen_fedi.contains(&key.fedi) {
             continue;
         }
-        if bsky_author_hidden(hidden, author_did) {
+        if bsky_author_hidden(hidden, &key.author_did) {
             continue;
         }
-        // Match PHP merge shape (k+id); s helps stage_meta source_counts.
-        queued.push(json!({"k": "bsky", "id": uri, "s": "bluesky"}));
-        seen_bsky.insert(uri.clone());
+        let mut entry = json!({
+            "k": "bsky",
+            "id": key.uri,
+            "s": "bluesky",
+            "sort": key.sort,
+        });
+        if !key.fedi.is_empty() {
+            entry["o"] = json!(key.fedi);
+        }
+        queued.push(entry);
+        seen_bsky.insert(key.uri.clone());
+        if !key.fedi.is_empty() {
+            seen_fedi.insert(key.fedi.clone());
+        }
     }
     if queued.is_empty() {
         return ranked;
@@ -971,27 +1059,32 @@ fn merge_bsky_ranked(
     if ranked.is_empty() {
         return queued.into_iter().take(80).collect();
     }
+    // Higher placement sort wins. The 60% cap still stops a Bluesky burst
+    // from filling the page; a blocked Bluesky row waits for the next slot.
     let mut out = Vec::new();
-    let mut qi = 0usize;
+    let mut fi = 0usize;
+    let mut bi = 0usize;
     let mut bsky_emitted = 0usize;
-    let mut since_bsky = 1usize;
-    flush_bsky(
-        &mut out,
-        &queued,
-        &mut qi,
-        &mut bsky_emitted,
-        &mut since_bsky,
-    );
-    for item in ranked {
-        out.push(item);
-        since_bsky += 1;
-        flush_bsky(
-            &mut out,
-            &queued,
-            &mut qi,
-            &mut bsky_emitted,
-            &mut since_bsky,
-        );
+    while fi < ranked.len() || bi < queued.len() {
+        let bsky_sort = queued.get(bi).map(ranked_row_sort);
+        let fedi_sort = ranked.get(fi).map(ranked_row_sort);
+        let bsky_wins = match (bsky_sort, fedi_sort) {
+            (Some(bs), Some(fs)) => bs >= fs,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if bsky_wins && bsky_ratio_allows(out.len(), bsky_emitted) {
+            out.push(queued[bi].clone());
+            bi += 1;
+            bsky_emitted += 1;
+            continue;
+        }
+        if fi < ranked.len() {
+            out.push(ranked[fi].clone());
+            fi += 1;
+            continue;
+        }
+        break;
     }
     out
 }
@@ -1177,6 +1270,32 @@ fn source_counts(ranked: &[Value]) -> Value {
         map.insert(source.to_string(), json!(n));
     }
     Value::Object(map)
+}
+
+async fn write_home_rank_weights(
+    redis: &mut redis::aio::MultiplexedConnection,
+    owner: i64,
+    algorithm_on: bool,
+    actor_weights: &HashMap<String, f64>,
+    tag_weights: &HashMap<String, i32>,
+    deprioritized: &HashSet<String>,
+) -> Result<()> {
+    let mut deprioritized_actors: Vec<_> = deprioritized.iter().cloned().collect();
+    deprioritized_actors.sort();
+    let payload = json!({
+        "algorithm": algorithm_on,
+        "actors": serde_json::to_value(actor_weights).unwrap_or_else(|_| json!({})),
+        "tags": serde_json::to_value(tag_weights).unwrap_or_else(|_| json!({})),
+        "deprioritized": deprioritized_actors,
+    });
+    redis_util::json_set(
+        redis,
+        &home_rank_weights_key(owner),
+        &payload,
+        HOME_TTL_SECS,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn write_ranked_cache(
@@ -2195,8 +2314,7 @@ impl RecoState<'_> {
             return false;
         }
         let mut sort = parse_ts(&created);
-        let bump = ((1800.0 * (1.0 + score.max(0.0)).log2()).round() as i64).min(12 * 3600);
-        sort += bump;
+        sort += recommendation_bump(score);
         self.timeline.push(TimelineItem::event(
             row_id.to_string(),
             sort,
@@ -2441,18 +2559,7 @@ fn apply_favourite_rank(
         {
             continue;
         }
-        let author_bonus = if count > 0.0 {
-            (600.0 * (1.0 + count).log2()).round() as i64
-        } else {
-            (60.0 * count).round() as i64
-        };
-        let author_bonus = author_bonus.max(-300);
-        let tag_bonus = if tag_count > 0 {
-            (300.0 * (1.0 + tag_count as f64).log2()).round() as i64
-        } else {
-            0
-        };
-        let bonus = (author_bonus + tag_bonus).clamp(-300, 1800);
+        let bonus = affinity_bonus(count, tag_count);
         if bonus != 0 {
             item.sort = created + bonus;
         }
@@ -2523,7 +2630,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let own_did = load_own_did(&db, owner_user_id).await?;
     let mut bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref(), 160).await?;
     if !followed_tags.is_empty() {
-        let mut existing: HashSet<String> = bsky.iter().map(|row| row.0.clone()).collect();
+        let mut existing: HashSet<String> = bsky.iter().map(|row| row.uri.clone()).collect();
         for row in fetch_bsky_followed_tag_keys(
             &db,
             owner_user_id,
@@ -2532,16 +2639,13 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         )
         .await?
         {
-            if existing.insert(row.0.clone()) {
+            if existing.insert(row.uri.clone()) {
                 bsky.push(row);
             }
         }
     }
-    let bsky = if algorithm_on {
-        rank_bsky_keys(bsky, &actor_weights, &tag_weights)
-    } else {
-        bsky
-    };
+    // Algorithm-off leaves both maps empty, so this keeps indexed_at order.
+    stamp_bsky_sort(&mut bsky, &actor_weights, &tag_weights);
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
 
     if algorithm_on {
@@ -2555,6 +2659,24 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         }
     }
 
+    let mut redis = redis_util::connect(&cfg.redis_url).await?;
+    if let Err(e) = write_home_rank_weights(
+        &mut redis,
+        owner_user_id,
+        algorithm_on,
+        &actor_weights,
+        &tag_weights,
+        &deprioritized,
+    )
+    .await
+    {
+        tracing::warn!(
+            owner = owner_user_id,
+            error = %format!("{e:#}"),
+            "native home rank-weight cache skipped"
+        );
+    }
+
     if ranked.is_empty() {
         // Parity with Local/Federated: empty accounts skip without PHP fallback.
         let ms = started.elapsed().as_millis();
@@ -2565,7 +2687,6 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         ));
     }
 
-    let mut redis = redis_util::connect(&cfg.redis_url).await?;
     write_ranked_cache(
         &mut redis,
         owner_user_id,
@@ -2836,6 +2957,117 @@ mod tests {
             &[("my added phrase".into(), "custom".into())],
         );
         assert_eq!(manual, vec!["custom".to_string()]);
+    }
+
+    fn bsky_key(uri: &str, did: &str, indexed_at: i64, sort: i64) -> BskyKey {
+        BskyKey {
+            uri: uri.into(),
+            fedi: String::new(),
+            author_did: did.into(),
+            author_handle: String::new(),
+            text: String::new(),
+            indexed_at,
+            sort,
+        }
+    }
+
+    #[test]
+    fn recommendation_bump_caps_at_thirty_minutes() {
+        assert_eq!(recommendation_bump(0.0), 0);
+        assert_eq!(recommendation_bump(1.0), 1800);
+        assert_eq!(recommendation_bump(64.0), 1800);
+        assert_eq!(recommendation_bump(10_000.0), 1800);
+    }
+
+    #[test]
+    fn rank_rows_keep_sort_and_object() {
+        let items = vec![TimelineItem::event(
+            "42".into(),
+            1_700_000_000,
+            "https://example.com/users/a".into(),
+            "https://example.com/users/a".into(),
+            "hello".into(),
+            "public".into(),
+            "https://example.com/notes/1".into(),
+            "Create".into(),
+            "fediverse",
+        )];
+        let ranked = rank_from_timeline(items);
+        assert_eq!(ranked[0]["sort"], json!(1_700_000_000));
+        assert_eq!(ranked[0]["o"], json!("https://example.com/notes/1"));
+        assert_eq!(ranked[0]["k"], json!("event"));
+    }
+
+    #[test]
+    fn bluesky_fresh_post_outranks_stale_favourite() {
+        let now = chrono::Utc::now().timestamp();
+        let mut keys = vec![
+            bsky_key("at://did:high/app.bsky.feed.post/old", "did:high", now - 6 * 3600, 0),
+            bsky_key("at://did:low/app.bsky.feed.post/new", "did:low", now - 60, 0),
+        ];
+        let mut actors = HashMap::new();
+        actors.insert("did:high".into(), 64.0);
+        actors.insert("did:low".into(), 1.0);
+        stamp_bsky_sort(&mut keys, &actors, &HashMap::new());
+        assert_eq!(keys[0].author_did, "did:low");
+        assert!(keys[0].sort > keys[1].sort);
+        assert!(keys[0].sort - (now - 60) <= 1800);
+    }
+
+    #[test]
+    fn merge_bsky_follows_sort_and_keeps_ratio() {
+        let hidden = hidden::HiddenSets::default();
+        let fresh = merge_bsky_ranked(
+            vec![json!({"k":"event","id":"1","s":"fediverse","sort": 1_700_000_100})],
+            &[bsky_key("at://did:x/app.bsky.feed.post/1", "did:x", 1_700_000_000, 1_700_000_000)],
+            &hidden,
+        );
+        assert_eq!(fresh[0]["k"], json!("event"));
+
+        let lead = merge_bsky_ranked(
+            vec![json!({"k":"event","id":"1","s":"fediverse","sort": 1_700_000_100})],
+            &[bsky_key("at://did:x/app.bsky.feed.post/1", "did:x", 1_700_000_200, 1_700_000_200)],
+            &hidden,
+        );
+        assert_eq!(lead[0]["k"], json!("bsky"));
+
+        let fedi: Vec<Value> = (0..10)
+            .map(|i| json!({"k":"event","id": format!("{i}"), "s":"fediverse","sort": 1_000 - i}))
+            .collect();
+        let bsky: Vec<BskyKey> = (0..10)
+            .map(|i| bsky_key(&format!("at://did:x/app.bsky.feed.post/{i}"), "did:x", 2_000 - i, 2_000 - i))
+            .collect();
+        let merged = merge_bsky_ranked(fedi, &bsky, &hidden);
+        let bsky_n = merged
+            .iter()
+            .filter(|row| row.get("k").and_then(|v| v.as_str()) == Some("bsky"))
+            .count();
+        assert!(!merged.is_empty());
+        assert!(
+            (bsky_n as f64) / (merged.len() as f64) <= HOME_BSKY_MAX_RATIO + 0.001,
+            "bsky {bsky_n} of {}",
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn merge_bsky_drops_fediverse_twin() {
+        let hidden = hidden::HiddenSets::default();
+        let mut twin = bsky_key("at://did:x/app.bsky.feed.post/1", "did:x", 50, 50);
+        twin.fedi = "https://example.com/notes/1".into();
+        let merged = merge_bsky_ranked(
+            vec![json!({
+                "k":"event",
+                "id":"9",
+                "s":"fediverse",
+                "sort": 40,
+                "o":"https://example.com/notes/1"
+            })],
+            &[twin],
+            &hidden,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["k"], json!("event"));
     }
 
     #[test]

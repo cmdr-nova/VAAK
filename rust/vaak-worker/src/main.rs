@@ -37,6 +37,7 @@ mod integrations;
 mod private_surfaces;
 mod search_contract;
 mod search;
+mod cleanup;
 
 use std::net::SocketAddr;
 
@@ -228,6 +229,12 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
+    },
+    /// Print the cleanup retention plan. PHP still owns deletes.
+    CleanupShadow {
+        /// Refused. Present so a cutover attempt fails closed.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
     },
 }
 
@@ -466,6 +473,12 @@ async fn main() -> Result<()> {
         Command::Serve { bind } => {
             let addr: SocketAddr = bind.parse()?;
             http::serve(cfg, addr).await?;
+        }
+        Command::CleanupShadow { execute } => {
+            match cleanup::shadow_report(execute) {
+                Ok(report) => println!("{report}"),
+                Err(message) => anyhow::bail!(message),
+            }
         }
     }
     Ok(())

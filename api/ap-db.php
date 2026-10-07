@@ -5024,6 +5024,26 @@ function ap_metrics_record(
                 // 0.6.72: public firehose → active owners' Federated (+ Local if local actor).
                 ap_timeline_fanout_public_local_feed($insertedId, $type, $actorId, $visibility);
             }
+            // Follow notifications live in events, not mentions. Mentions already
+            // drop the list cache in ap_mention_store. Without the same drop, the
+            // badge worker sees the follow immediately and Mentions keeps the
+            // previous projection.
+            if (
+                $type === 'Follow'
+                && in_array($actionTaken, ['local_accept_followback', 'bsky_follow'], true)
+            ) {
+                $followOwner = function_exists('ap_db_owner_user_id_for_actor')
+                    ? (int) ap_db_owner_user_id_for_actor(is_string($targetActor) ? $targetActor : '')
+                    : 0;
+                if ($followOwner > 0) {
+                    if (function_exists('ap_notification_projection_invalidate_owner')) {
+                        ap_notification_projection_invalidate_owner($followOwner);
+                    }
+                    if (function_exists('ap_masto_notifications_unread_invalidate')) {
+                        ap_masto_notifications_unread_invalidate($followOwner);
+                    }
+                }
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-db] metrics_record: ' . $e->getMessage());
@@ -7770,6 +7790,13 @@ function ap_timeline_ranked_prepend_owner(int $ownerUserId, array $entry, array 
         'id' => $id,
         's' => trim((string) ($entry['s'] ?? $k)),
     ];
+    if (isset($entry['sort']) && is_numeric($entry['sort'])) {
+        $newEntry['sort'] = (int) $entry['sort'];
+    }
+    $object = rtrim(trim((string) ($entry['o'] ?? '')), '/');
+    if ($object !== '') {
+        $newEntry['o'] = $object;
+    }
     if (!empty($entry['t'])) {
         $newEntry['t'] = 1;
     }
@@ -7824,6 +7851,13 @@ function ap_timeline_ranked_prepend_owner(int $ownerUserId, array $entry, array 
             $s = trim((string) ($row['s'] ?? ''));
             if ($s !== '') {
                 $item['s'] = $s;
+            }
+            if (isset($row['sort']) && is_numeric($row['sort'])) {
+                $item['sort'] = (int) $row['sort'];
+            }
+            $rowObject = rtrim(trim((string) ($row['o'] ?? '')), '/');
+            if ($rowObject !== '') {
+                $item['o'] = $rowObject;
             }
             if (!empty($row['t'])) {
                 $item['t'] = 1;

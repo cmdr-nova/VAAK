@@ -137,31 +137,39 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-async fn invalidate_home_hydrate(
+/// Drop only the first-page hydrate windows. Deeper scroll envelopes stay
+/// until the next full rebuild, so one new post does not rebuild six heads.
+async fn invalidate_home_hydrate_head(
     cache: &mut redis::aio::MultiplexedConnection,
     owner: i64,
-) -> Result<()> {
-    let keys: Vec<String> = [15_i64, 40, 50, 80, 160, 240, 20, 30]
-        .into_iter()
-        .map(|lim| home_hydrate_redis_key(owner, lim))
-        .collect();
-    if !keys.is_empty() {
-        let mut cmd = redis::cmd("DEL");
-        for k in &keys {
-            cmd.arg(k);
-        }
-        let _: Result<i64, _> = cmd.query_async(cache).await;
+) -> Result<bool> {
+    let key40 = home_hydrate_redis_key(owner, 40);
+    let warm40: bool = redis::cmd("EXISTS")
+        .arg(&key40)
+        .query_async(cache)
+        .await
+        .unwrap_or(0i64)
+        > 0;
+    let mut keys = vec![home_hydrate_redis_key(owner, 15)];
+    if warm40 {
+        keys.push(key40);
     }
-    Ok(())
+    let mut cmd = redis::cmd("DEL");
+    for k in &keys {
+        cmd.arg(k);
+    }
+    let _: Result<i64, _> = cmd.query_async(cache).await;
+    Ok(warm40)
 }
 
-async fn maybe_spawn_home_hydrate_warm(cfg: &Config, owner: i64) {
+async fn maybe_spawn_home_hydrate_warm(cfg: &Config, owner: i64, warm40: bool) {
     if !env_flag_default_true("VAAK_HOME_HYDRATE_WARM") {
         return;
     }
     let cfg = cfg.clone();
     tokio::spawn(async move {
-        match home_hydrate_ranked::warm_owner(&cfg, owner, &[15, 40, 50, 80, 160, 240]).await {
+        let limits: &[i64] = if warm40 { &[15, 40] } else { &[15] };
+        match home_hydrate_ranked::warm_owner(&cfg, owner, limits).await {
             Ok(report) => tracing::debug!(
                 owner,
                 n = report.materialised_n,
@@ -177,6 +185,206 @@ async fn maybe_spawn_home_hydrate_warm(cfg: &Config, owner: i64) {
     });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaceMode {
+    /// Local and Federated stay chronological. Home uses this until every
+    /// existing row carries the ranker's sort.
+    Front,
+    /// Insert by the same descending sort the Home rebuild stored.
+    BySort,
+}
+
+fn row_sort(row: &Value) -> Option<i64> {
+    row.get("sort").and_then(|v| v.as_i64())
+}
+
+fn row_object(row: &Value) -> String {
+    row.get("o")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn copy_ranked_row(row: &Value) -> Option<Value> {
+    let rk = row.get("k").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let rid = row
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/');
+    if rk.is_empty() || rid.is_empty() {
+        return None;
+    }
+    let mut item = json!({"k": rk, "id": rid});
+    if let Some(s) = row.get("s").and_then(|v| v.as_str()).map(str::trim) {
+        if !s.is_empty() {
+            item["s"] = json!(s);
+        }
+    }
+    if row.get("t").and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
+        item["t"] = json!(1);
+    }
+    if let Some(sort) = row_sort(row) {
+        item["sort"] = json!(sort);
+    }
+    let object = row_object(row);
+    if !object.is_empty() {
+        item["o"] = json!(object);
+    }
+    Some(item)
+}
+
+/// Place one ranked row. Returns the rewritten list. A k:id or object twin
+/// that is already present is left where the ranker put it.
+fn place_ranked_rows(old: &[Value], new_entry: Value, mode: PlaceMode) -> Vec<Value> {
+    let new_k = new_entry.get("k").and_then(|v| v.as_str()).unwrap_or("");
+    let new_id = new_entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let new_key = format!("{new_k}:{new_id}");
+    let new_object = row_object(&new_entry);
+    let mut copied = Vec::with_capacity(old.len());
+    let mut seen = HashSet::new();
+    let mut already = false;
+    for row in old {
+        let Some(item) = copy_ranked_row(row) else {
+            continue;
+        };
+        let rk = item.get("k").and_then(|v| v.as_str()).unwrap_or("");
+        let rid = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !seen.insert(format!("{rk}:{rid}")) {
+            continue;
+        }
+        let object = row_object(&item);
+        if format!("{rk}:{rid}") == new_key || (!new_object.is_empty() && object == new_object) {
+            already = true;
+        }
+        copied.push(item);
+    }
+    if already {
+        copied.truncate(MAX_RANKED);
+        return copied;
+    }
+    // Pre-deploy lists have no sort at all, so keep the old front insert.
+    // A mixed list (RSS rows have no sort) still places by the rows that do.
+    let mode = if mode == PlaceMode::BySort
+        && (copied.is_empty() || copied.iter().any(|row| row_sort(row).is_some()))
+    {
+        PlaceMode::BySort
+    } else {
+        PlaceMode::Front
+    };
+    let mut ranked = Vec::with_capacity(copied.len().saturating_add(1).min(MAX_RANKED));
+    if mode == PlaceMode::BySort {
+        let new_sort = row_sort(&new_entry).unwrap_or(0);
+        let mut inserted = false;
+        for row in copied {
+            if !inserted && row_sort(&row).unwrap_or(0) < new_sort {
+                ranked.push(new_entry.clone());
+                inserted = true;
+            }
+            ranked.push(row);
+            if ranked.len() >= MAX_RANKED {
+                break;
+            }
+        }
+        if !inserted && ranked.len() < MAX_RANKED {
+            ranked.push(new_entry);
+        }
+    } else {
+        ranked.push(new_entry);
+        for row in copied {
+            ranked.push(row);
+            if ranked.len() >= MAX_RANKED {
+                break;
+            }
+        }
+    }
+    ranked.truncate(MAX_RANKED);
+    ranked
+}
+
+#[derive(Debug, Default)]
+struct HomeRankWeights {
+    algorithm: bool,
+    actors: HashMap<String, f64>,
+    deprioritized: HashSet<String>,
+}
+
+async fn load_home_rank_weights(
+    cache: &mut redis::aio::MultiplexedConnection,
+    owner: i64,
+) -> HomeRankWeights {
+    let key = crate::ranked_warm::home_rank_weights_key(owner);
+    let Ok(Some(value)) = redis_util::json_get(cache, &key).await else {
+        return HomeRankWeights::default();
+    };
+    let mut weights = HomeRankWeights {
+        algorithm: value.get("algorithm").and_then(|v| v.as_bool()).unwrap_or(false),
+        ..HomeRankWeights::default()
+    };
+    if let Some(map) = value.get("actors").and_then(|v| v.as_object()) {
+        for (actor, weight) in map {
+            if let Some(n) = weight.as_f64().or_else(|| weight.as_i64().map(|i| i as f64)) {
+                weights.actors.insert(actor.clone(), n);
+            }
+        }
+    }
+    if let Some(list) = value.get("deprioritized").and_then(|v| v.as_array()) {
+        for actor in list {
+            if let Some(actor) = actor.as_str() {
+                let actor = actor.trim().trim_end_matches('/').to_ascii_lowercase();
+                if !actor.is_empty() {
+                    weights.deprioritized.insert(actor);
+                }
+            }
+        }
+    }
+    weights
+}
+
+fn lookup_actor_weight(actors: &HashMap<String, f64>, actor: &str) -> f64 {
+    let actor = actor.trim().trim_end_matches('/');
+    if actor.is_empty() {
+        return 0.0;
+    }
+    if let Some(weight) = actors.get(actor) {
+        return *weight;
+    }
+    if let Some(did) = actor.strip_prefix("https://bsky.app/profile/") {
+        if let Some(weight) = actors.get(did) {
+            return *weight;
+        }
+    }
+    if let Some(rest) = actor.strip_prefix("did:") {
+        let profile = format!("https://bsky.app/profile/did:{rest}");
+        if let Some(weight) = actors.get(&profile) {
+            return *weight;
+        }
+    }
+    0.0
+}
+
+/// Same placement the Home rebuild would give this author at `created`.
+fn home_placement_sort(weights: &HomeRankWeights, actor: &str, created: i64) -> i64 {
+    let now = now_unix();
+    let created = if created > 0 { created } else { now };
+    let mut sort = created;
+    let actor_key = actor.trim().trim_end_matches('/').to_ascii_lowercase();
+    if !actor_key.is_empty() && weights.deprioritized.contains(&actor_key) {
+        sort -= 6 * 3600;
+    }
+    if !weights.algorithm {
+        return sort;
+    }
+    let count = lookup_actor_weight(&weights.actors, actor);
+    if count == 0.0 || sort < (now - 172800) || sort > (now + 300) {
+        return sort;
+    }
+    sort + crate::ranked_warm::affinity_bonus(count, 0)
+}
+
 async fn prepend_owner(
     cache: &mut redis::aio::MultiplexedConnection,
     owner: i64,
@@ -184,6 +392,7 @@ async fn prepend_owner(
     entry_id: &str,
     entry_s: &str,
     views: &[&str],
+    home_sort: Option<i64>,
 ) -> Result<usize> {
     let owner = owner.max(0);
     let entry_k = entry_k.trim();
@@ -206,7 +415,6 @@ async fn prepend_owner(
         _ => return Ok(0),
     };
 
-    let dedupe = format!("{entry_k}:{entry_id}");
     let new_entry = json!({
         "k": entry_k,
         "id": entry_id,
@@ -232,7 +440,6 @@ async fn prepend_owner(
         } else {
             continue;
         };
-        let _ = view;
 
         let redis_key = ranked_redis_key(logical);
         let env = match redis_util::json_get(cache, &redis_key).await? {
@@ -240,43 +447,21 @@ async fn prepend_owner(
             None => continue,
         };
         let old_ranked = match env.get("ranked").and_then(|r| r.as_array()) {
-            Some(a) => a,
+            Some(a) => a.clone(),
             None => continue,
         };
-
-        let mut ranked = Vec::with_capacity(old_ranked.len().saturating_add(1).min(MAX_RANKED));
-        let mut seen = HashSet::new();
-        seen.insert(dedupe.clone());
-        ranked.push(new_entry.clone());
-        for row in old_ranked {
-            let rk = row.get("k").and_then(|v| v.as_str()).unwrap_or("").trim();
-            let rid = row
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .trim_end_matches('/');
-            if rk.is_empty() || rid.is_empty() {
-                continue;
-            }
-            let dk = format!("{rk}:{rid}");
-            if !seen.insert(dk) {
-                continue;
-            }
-            let mut item = json!({"k": rk, "id": rid});
-            if let Some(s) = row.get("s").and_then(|v| v.as_str()).map(str::trim) {
-                if !s.is_empty() {
-                    item["s"] = json!(s);
-                }
-            }
-            if row.get("t").and_then(|v| v.as_i64()).unwrap_or(0) != 0 {
-                item["t"] = json!(1);
-            }
-            ranked.push(item);
-            if ranked.len() >= MAX_RANKED {
-                break;
+        let mode = if view == "home" {
+            PlaceMode::BySort
+        } else {
+            PlaceMode::Front
+        };
+        let mut entry = new_entry.clone();
+        if view == "home" {
+            if let Some(sort) = home_sort {
+                entry["sort"] = json!(sort);
             }
         }
+        let ranked = place_ranked_rows(&old_ranked, entry, mode);
 
         let mut source_counts: HashMap<String, i64> = HashMap::new();
         for row in &ranked {
@@ -304,7 +489,7 @@ async fn prepend_owner(
             "stage_meta": {
                 "ranked_count": ranked.len(),
                 "source_counts": Value::Object(sc_obj),
-                "fanout": "prepend",
+                "fanout": if view == "home" { "sort" } else { "prepend" },
                 "fanout_src": "vaak-worker",
             },
         });
@@ -500,14 +685,16 @@ async fn process_home_followers(
             stats.skipped += 1;
             continue;
         }
-        let n = prepend_owner(cache, *owner, k, id, s, &["home"]).await?;
+        let weights = load_home_rank_weights(cache, *owner).await;
+        let sort = home_placement_sort(&weights, &actor, job.ts);
+        let n = prepend_owner(cache, *owner, k, id, s, &["home"], Some(sort)).await?;
         if n > 0 {
             stats.touched_owners += 1;
             stats.prepended_keys += n;
         }
-        invalidate_home_hydrate(cache, *owner).await?;
+        let warm40 = invalidate_home_hydrate_head(cache, *owner).await?;
         if do_rewarm {
-            maybe_spawn_home_hydrate_warm(cfg, *owner).await;
+            maybe_spawn_home_hydrate_warm(cfg, *owner, warm40).await;
         }
     }
     tracing::info!(
@@ -555,14 +742,16 @@ async fn process_home_bsky(
             stats.skipped += 1;
             continue;
         }
-        let n = prepend_owner(cache, *owner, k, uri, s, &["home"]).await?;
+        let weights = load_home_rank_weights(cache, *owner).await;
+        let sort = home_placement_sort(&weights, did, job.ts);
+        let n = prepend_owner(cache, *owner, k, uri, s, &["home"], Some(sort)).await?;
         if n > 0 {
             stats.touched_owners += 1;
             stats.prepended_keys += n;
         }
-        invalidate_home_hydrate(cache, *owner).await?;
+        let warm40 = invalidate_home_hydrate_head(cache, *owner).await?;
         if do_rewarm {
-            maybe_spawn_home_hydrate_warm(cfg, *owner).await;
+            maybe_spawn_home_hydrate_warm(cfg, *owner, warm40).await;
         }
     }
     tracing::info!(
@@ -606,7 +795,7 @@ async fn process_public_feed(
             stats.skipped += 1;
             continue;
         }
-        let n = prepend_owner(cache, *owner, k, id, s, &views).await?;
+        let n = prepend_owner(cache, *owner, k, id, s, &views, None).await?;
         if n > 0 {
             stats.touched_owners += 1;
             stats.prepended_keys += n;
@@ -653,15 +842,21 @@ async fn process_owner_status(
         stats.skipped += 1;
         return Ok(stats);
     }
-    let n = prepend_owner(cache, owner, k, id, s, &views).await?;
+    let home_sort = if views.contains(&"home") {
+        let weights = load_home_rank_weights(cache, owner).await;
+        Some(home_placement_sort(&weights, &job.actor, job.ts))
+    } else {
+        None
+    };
+    let n = prepend_owner(cache, owner, k, id, s, &views, home_sort).await?;
     if n > 0 {
         stats.touched_owners = 1;
         stats.prepended_keys = n;
     }
     let wants_home = views.contains(&"home");
     if wants_home || job.hydrate {
-        invalidate_home_hydrate(cache, owner).await?;
-        maybe_spawn_home_hydrate_warm(cfg, owner).await;
+        let warm40 = invalidate_home_hydrate_head(cache, owner).await?;
+        maybe_spawn_home_hydrate_warm(cfg, owner, warm40).await;
     }
     tracing::info!(
         op = "owner_status",
@@ -752,5 +947,69 @@ pub async fn run_worker_loop(cfg: &Config) -> Result<()> {
                 q = redis_util::connect(&cfg.redis_queue_url).await?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_insert_uses_sort_between_existing_rows() {
+        let old = vec![
+            json!({"k":"event","id":"1","s":"fediverse","sort": 200, "o":"https://example.test/a"}),
+            json!({"k":"event","id":"2","s":"fediverse","sort": 100}),
+        ];
+        let new_entry = json!({"k":"event","id":"3","s":"fediverse","sort": 150});
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        assert_eq!(out[0]["id"], "1");
+        assert_eq!(out[1]["id"], "3");
+        assert_eq!(out[2]["id"], "2");
+        assert_eq!(out[2]["sort"], 100);
+        assert_eq!(out[0]["o"], "https://example.test/a");
+    }
+
+    #[test]
+    fn home_insert_places_around_unsorted_rss_rows() {
+        let old = vec![
+            json!({"k":"event","id":"1","s":"fediverse","sort": 200}),
+            json!({"k":"rss","id":"9","s":"rss"}),
+            json!({"k":"event","id":"2","s":"fediverse","sort": 100}),
+        ];
+        let new_entry = json!({"k":"event","id":"3","s":"fediverse","sort": 150});
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        let ids: Vec<_> = out.iter().filter_map(|row| row.get("id").and_then(|v| v.as_str())).collect();
+        assert_eq!(ids, vec!["1", "3", "9", "2"]);
+    }
+
+    #[test]
+    fn home_insert_stays_at_front_until_rows_have_sort() {
+        let old = vec![json!({"k":"event","id":"1","s":"fediverse"})];
+        let new_entry = json!({"k":"event","id":"2","s":"fediverse","sort": 50});
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        assert_eq!(out[0]["id"], "2");
+        assert_eq!(out[1]["id"], "1");
+    }
+
+    #[test]
+    fn home_insert_skips_object_twin() {
+        let old = vec![json!({"k":"event","id":"1","s":"fediverse","o":"https://example.test/n/1","sort": 10})];
+        let new_entry = json!({"k":"bsky","id":"at://did/app.bsky.feed.post/1","s":"bluesky","o":"https://example.test/n/1","sort": 99});
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["k"], "event");
+    }
+
+    #[test]
+    fn placement_sort_matches_rebuild_bonus_cap() {
+        let mut weights = HomeRankWeights {
+            algorithm: true,
+            ..HomeRankWeights::default()
+        };
+        weights.actors.insert("https://example.test/users/a".into(), 64.0);
+        let now = now_unix();
+        let sort = home_placement_sort(&weights, "https://example.test/users/a", now - 60);
+        assert!(sort > now - 60);
+        assert!(sort - (now - 60) <= 1800);
     }
 }
