@@ -23,6 +23,9 @@ pub struct UnreadState {
     pub hidden_skipped: i64,
     pub update_kept: i64,
     pub source: String,
+    /// Newest-first snowflakes considered for this scan. Not part of the cache JSON.
+    #[serde(default, skip)]
+    pub scanned_ids: Vec<String>,
 }
 
 pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Result<UnreadState> {
@@ -191,22 +194,14 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
     let mut count = 0_i64;
     let mut latest_id = String::new();
     let mut latest_unread_id = String::new();
+    let mut scanned_ids = Vec::with_capacity(ids.len());
     for nid_raw in &ids {
-        let nid: String = nid_raw.chars().filter(|c| c.is_ascii_digit()).collect();
-        let nid = if nid.is_empty() {
-            "0".to_string()
-        } else {
-            nid
-        };
+        let nid = digits_only(nid_raw);
+        scanned_ids.push(nid.clone());
         if latest_id.is_empty() {
             latest_id = nid.clone();
         }
-        let unread = if nid.len() == last_read.len() {
-            nid.as_str() > last_read.as_str()
-        } else {
-            nid.len() > last_read.len()
-        };
-        if unread {
+        if snowflake_is_unread(&nid, &last_read) {
             count += 1;
             if latest_unread_id.is_empty() {
                 latest_unread_id = nid;
@@ -227,6 +222,7 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         hidden_skipped,
         update_kept,
         source: "vaak-worker-shadow".into(),
+        scanned_ids,
     })
 }
 
@@ -430,6 +426,67 @@ fn list_is_ready(list_latest: Option<&str>, badge_latest: &str) -> bool {
     matches!(list_latest, Some(latest) if !latest.is_empty() && decimal_at_least(latest, badge_latest))
 }
 
+fn digits_only(raw: &str) -> String {
+    let nid: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if nid.is_empty() {
+        "0".into()
+    } else {
+        nid
+    }
+}
+
+fn snowflake_is_unread(nid: &str, last_read: &str) -> bool {
+    if nid.is_empty() || nid == "0" {
+        return false;
+    }
+    if nid.len() == last_read.len() {
+        nid > last_read
+    } else {
+        nid.len() > last_read.len()
+    }
+}
+
+/// Unread ids the warmed Mentions list can already serve.
+///
+/// `ids` are newest-first. A missing list publishes nothing, so the nav badge
+/// cannot get ahead of the page. Ids newer than `list_latest` are left out;
+/// older unread ids still count.
+fn clamp_published_unread(ids: &[String], last_read: &str, list_latest: Option<&str>) -> (i64, String) {
+    let Some(list_latest) = list_latest.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (0, String::new());
+    };
+    let mut count = 0_i64;
+    let mut latest_unread = String::new();
+    for raw in ids {
+        let nid = digits_only(raw);
+        if !decimal_at_least(list_latest, &nid) {
+            continue;
+        }
+        if snowflake_is_unread(&nid, last_read) {
+            count += 1;
+            if latest_unread.is_empty() {
+                latest_unread = nid;
+            }
+        }
+    }
+    (count, latest_unread)
+}
+
+fn unread_cache_payload(state: &UnreadState) -> serde_json::Value {
+    serde_json::json!({
+        "c": state.count,
+        "u": state.latest_unread_id,
+        "l": state.latest_id,
+        "ts": chrono::Utc::now().timestamp(),
+        "source": state.source,
+        "mention_kept": state.mention_kept,
+        "mention_skipped": state.mention_skipped,
+        "follow_kept": state.follow_kept,
+        "hidden_skipped": state.hidden_skipped,
+        "update_kept": state.update_kept,
+    })
+}
+
 async fn list_watermark(
     redis: &mut redis::aio::MultiplexedConnection,
     owner_user_id: i64,
@@ -477,50 +534,50 @@ pub async fn compute_and_cache(
     }
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    let payload = serde_json::json!({
-        "c": state.count,
-        "u": state.latest_unread_id,
-        "l": state.latest_id,
-        "ts": chrono::Utc::now().timestamp(),
-        "source": state.source,
-        "mention_kept": state.mention_kept,
-        "mention_skipped": state.mention_skipped,
-        "follow_kept": state.follow_kept,
-        "hidden_skipped": state.hidden_skipped,
-        "update_kept": state.update_kept,
-    });
-    let shadow_key = shadow_redis_key(owner_user_id, state.scan, &state.last_read_id);
-    redis_util::json_set(&mut redis, &shadow_key, &payload, 120).await?;
+    // Shadow keeps the raw scan. Live publish is clamped to the list watermark.
+    let raw_state = state.clone();
+    let shadow_payload = unread_cache_payload(&raw_state);
+    let shadow_key = shadow_redis_key(owner_user_id, raw_state.scan, &raw_state.last_read_id);
+    redis_util::json_set(&mut redis, &shadow_key, &shadow_payload, 120).await?;
 
     let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
+    let mut badge_deferred = false;
+    let mut list_latest_dbg: Option<String> = None;
     if live {
         let list_latest = list_watermark(&mut redis, owner_user_id).await?;
-        if !list_is_ready(list_latest.as_deref(), &state.latest_id) {
-            tracing::debug!(
-                owner = owner_user_id,
-                badge_latest = %state.latest_id,
-                list_latest = ?list_latest,
-                "deferring notif badge until list cache reaches watermark"
+        list_latest_dbg = list_latest.clone();
+        if !list_is_ready(list_latest.as_deref(), &raw_state.latest_id) {
+            let (count, unread) = clamp_published_unread(
+                &raw_state.scanned_ids,
+                &raw_state.last_read_id,
+                list_latest.as_deref(),
             );
-            let mut deferred = serde_json::to_value(&state)?;
-            if let Some(obj) = deferred.as_object_mut() {
-                obj.insert("live_mode".into(), serde_json::json!(true));
-                obj.insert("badge_deferred".into(), serde_json::json!(true));
-                obj.insert("list_latest_id".into(), serde_json::json!(list_latest));
-            }
-            return Ok(deferred);
+            state.count = count;
+            state.latest_unread_id = unread;
+            // Keep latest_id at the real tip. The published count is what clients paint.
+            badge_deferred = true;
+            tracing::info!(
+                owner = owner_user_id,
+                raw_count = raw_state.count,
+                published = count,
+                badge_latest = %raw_state.latest_id,
+                list_latest = ?list_latest,
+                "notif badge clamped until list cache reaches watermark"
+            );
         }
-        // Match PHP cache TTL (45s) so badge polls stay hot under Rust ownership.
+        let payload = unread_cache_payload(&state);
+        // Always overwrite. Skipping the write left the previous count in Redis
+        // and the HTTP body still returned the unclamped count to PHP.
         redis_util::json_set(&mut redis, &live_key, &payload, 45).await?;
         write_file_cache(cfg, owner_user_id, &state.last_read_id, &payload)?;
-        tracing::info!(%live_key, count = state.count, "notif live cache written");
+        tracing::info!(%live_key, count = state.count, deferred = badge_deferred, "notif live cache written");
     }
 
     if compare {
         let live_cache = redis_util::json_get(&mut redis, &live_key).await?;
         tracing::info!(%shadow_key, live = ?live_cache, "notif compare");
         Ok(serde_json::json!({
-            "shadow": state,
+            "shadow": raw_state,
             "live_mode": live,
             "shadow_redis_key": shadow_key,
             "live_redis_key": live_key,
@@ -531,6 +588,11 @@ pub async fn compute_and_cache(
         if let Some(obj) = v.as_object_mut() {
             obj.insert("live_mode".into(), serde_json::json!(live));
             obj.insert("live_redis_key".into(), serde_json::json!(live_key));
+            if badge_deferred {
+                obj.insert("badge_deferred".into(), serde_json::json!(true));
+                obj.insert("list_latest_id".into(), serde_json::json!(list_latest_dbg));
+                obj.insert("raw_count".into(), serde_json::json!(raw_state.count));
+            }
         }
         Ok(v)
     }
@@ -644,7 +706,7 @@ pub async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{decimal_at_least, list_is_ready, snowflake_id};
+    use super::{clamp_published_unread, decimal_at_least, list_is_ready, snowflake_id};
 
     #[test]
     fn snowflake_matches_php_shape() {
@@ -667,5 +729,33 @@ mod tests {
         assert!(!list_is_ready(None, "42"));
         assert!(list_is_ready(Some("42"), "42"));
         assert!(list_is_ready(None, ""));
+    }
+
+    #[test]
+    fn badge_publish_stops_at_the_list_watermark() {
+        let ids = vec![
+            "1791371595600739639".to_string(),
+            "1791368209500001230".to_string(),
+            "1791359835500001227".to_string(),
+        ];
+        let last_read = "1791368209500001230";
+        let (count, unread) = clamp_published_unread(&ids, last_read, None);
+        assert_eq!(count, 0);
+        assert_eq!(unread, "");
+        let (count, unread) =
+            clamp_published_unread(&ids, last_read, Some("1791368209500001230"));
+        assert_eq!(count, 0, "follow ahead of the list must not badge");
+        assert_eq!(unread, "");
+        let (count, unread) =
+            clamp_published_unread(&ids, last_read, Some("1791371595600739639"));
+        assert_eq!(count, 1);
+        assert_eq!(unread, "1791371595600739639");
+        let (count, unread) = clamp_published_unread(
+            &["300".into(), "200".into(), "100".into()],
+            "50",
+            Some("200"),
+        );
+        assert_eq!(count, 2);
+        assert_eq!(unread, "200");
     }
 }

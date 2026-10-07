@@ -1490,15 +1490,49 @@ fn bsky_https_object_ref(st: &Value, uri: &str) -> String {
     uri.trim_end_matches('/').to_string()
 }
 
+/// AT post URI for Bluesky actions.
+///
+/// Mention rows usually store the public `https://bsky.app/...` permalink on
+/// `uri` and keep `at://` on `vaak_bsky_uri` (the mentions.activity_id). DID
+/// web URLs convert locally. Handle web URLs stay unresolved here; the boost
+/// button still paints with `data-object-ref` and the click handler resolves
+/// the record.
 fn bsky_at_uri(st: &Value, uri: &str) -> String {
-    if uri.starts_with("at://") {
-        return uri.to_string();
+    fn post_at(raw: &str) -> Option<String> {
+        let s = raw.trim().trim_end_matches('/');
+        if s.is_empty() {
+            return None;
+        }
+        if s.starts_with("at://") && s.contains("/app.bsky.feed.post/") {
+            let cut = s.split(['?', '#']).next().unwrap_or(s);
+            return Some(cut.to_string());
+        }
+        let web = s.strip_prefix("https://bsky.app/profile/")?;
+        let mut parts = web.split('/');
+        let actor = parts.next().unwrap_or("");
+        let kind = parts.next().unwrap_or("");
+        let rkey = parts.next().unwrap_or("");
+        if kind != "post" || !actor.starts_with("did:") || rkey.is_empty() {
+            return None;
+        }
+        let rkey = rkey.split(['?', '#']).next().unwrap_or(rkey);
+        Some(format!("at://{actor}/app.bsky.feed.post/{rkey}"))
     }
-    st.get("uri")
-        .and_then(|v| v.as_str())
-        .filter(|u| u.starts_with("at://"))
-        .unwrap_or("")
-        .to_string()
+    let extra = [
+        st.get("vaak_bsky_uri").and_then(|v| v.as_str()),
+        st.get("bsky_uri").and_then(|v| v.as_str()),
+        st.get("uri").and_then(|v| v.as_str()),
+        st.get("url").and_then(|v| v.as_str()),
+    ];
+    if let Some(at) = post_at(uri) {
+        return at;
+    }
+    for candidate in extra.into_iter().flatten() {
+        if let Some(at) = post_at(candidate) {
+            return at;
+        }
+    }
+    String::new()
 }
 
 /// Render reply context even when the parent was not included in the current
@@ -1745,6 +1779,37 @@ pub fn stamp_viewer_moderation(statuses: &mut [Value], moderation: &crate::hidde
         if let Some(reblog) = st.get_mut("reblog").filter(|v| v.is_object()) {
             stamp_viewer_moderation_one(reblog, moderation);
         }
+    }
+}
+
+/// Stamp the status the notification card paints, plus a nested reblog or quote.
+pub fn stamp_viewer_moderation_tree(
+    status: &mut Value,
+    moderation: &crate::hidden::ViewerModeration,
+) {
+    stamp_viewer_moderation_one(status, moderation);
+    if let Some(reblog) = status.get_mut("reblog").filter(|v| v.is_object()) {
+        stamp_viewer_moderation_one(reblog, moderation);
+    }
+    stamp_nested_quote(status.get_mut("quote"), moderation);
+    stamp_nested_quote(status.get_mut("vaak_quote_preview"), moderation);
+}
+
+fn stamp_nested_quote(
+    quote: Option<&mut Value>,
+    moderation: &crate::hidden::ViewerModeration,
+) {
+    let Some(quote) = quote.filter(|v| v.is_object()) else {
+        return;
+    };
+    if quote.get("quoted_status").is_some() {
+        if let Some(quoted) = quote.get_mut("quoted_status").filter(|v| v.is_object()) {
+            stamp_viewer_moderation_one(quoted, moderation);
+        }
+        return;
+    }
+    if quote.get("account").is_some() || quote.get("uri").is_some() || quote.get("url").is_some() {
+        stamp_viewer_moderation_one(quote, moderation);
     }
 }
 
@@ -2060,7 +2125,8 @@ fn paint_own_post_controls(status: &Value, from_q: &str, uri: &str, sid: &str) -
 }
 
 /// Timeline action bar — PHP `admin_render_masto_status_card` / own-post bar parity.
-/// Mentions nests keep Open-only; home / remote_profile / outbox get full chrome.
+/// Home, profiles, outbox, and Notifications (replies and quote-boosts) get the
+/// full bar, including the overflow menu when the viewer actor is known.
 fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -> String {
     let from_q = if from.is_empty() { "home" } else { from };
     let account = status.get("account").cloned().unwrap_or(Value::Null);
@@ -2327,7 +2393,10 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 n = qt_n,
                 count = action_count_html(qt_n),
             ));
-            if !at.is_empty() {
+            // https://bsky.app permalinks are enough: the click handler
+            // accepts data-object-ref without an at:// and resolves the CID.
+            let can_boost = !at.is_empty() || object_ref.starts_with("https://bsky.app/");
+            if can_boost {
                 let rb_cls = format!(
                     "icon-btn bsky-action{}{}",
                     if reposted { " on" } else { "" },
@@ -2699,7 +2768,8 @@ fn ask_card_parts(content: &str) -> Option<(String, String)> {
         let compact = regex::Regex::new(r"(?is)^\s*(.{1,240}?)\s+asked\s*\n+(.+)$").ok()?;
         let caps = compact.captures(plain.trim())?;
         let header = caps.get(1)?.as_str().trim().to_string();
-        if !header.contains('@') { return None; }
+        let anonymous = header.trim().eq_ignore_ascii_case("anonymous");
+        if !header.contains('@') && !anonymous { return None; }
         let rest = caps.get(2)?.as_str().trim();
         let (question, answer) = if let Some((q, a)) = rest.split_once("\n\n") {
             (q.trim().to_string(), a.trim().to_string())
@@ -2753,9 +2823,54 @@ fn ask_answer_html(answer: &str) -> String {
     }
 }
 
+/// Drop the Ice Cubes parent teaser (`↩` + up to 140 chars, then a blank line)
+/// from a Mentions reply. The card already has "in reply to @user".
+fn strip_mentions_reply_bake(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let plain = strip_tags(trimmed);
+    if !plain.trim().starts_with('↩') {
+        return trimmed.to_string();
+    }
+    if let Some(rest) = drop_leading_reply_bake_paragraph(trimmed) {
+        return rest;
+    }
+    if let Some(idx) = plain.find("\n\n") {
+        let rest = plain[idx..].trim();
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// `<p>↩ parent…</p>` then the reply. Leave the content alone when nothing
+/// remains, so a post that is only the teaser does not become a blank card.
+fn drop_leading_reply_bake_paragraph(html: &str) -> Option<String> {
+    let trim = html.trim_start();
+    let lower = trim.to_ascii_lowercase();
+    if !lower.starts_with("<p") {
+        return None;
+    }
+    let close = lower.find("</p>")?;
+    let first_plain = strip_tags(&trim[..close]);
+    if !first_plain.trim().starts_with('↩') {
+        return None;
+    }
+    let rest = trim[close + 4..].trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// Lean Mentions nest HTML — classes match PHP `notif-status-embed` chrome.
+/// Full post actions (reply, quote, boost, like, bookmark). Overflow needs a
+/// viewer actor; [`paint_lean_embed_from`] is the path that has one.
 pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
-    paint_lean_embed_from(status, hide_header, "notification-embed", "")
+    paint_lean_embed_from(status, hide_header, "mentions", "")
 }
 
 /// Lean status card HTML with `from=` deep-link context (Mentions nest or Home fill).
@@ -2796,7 +2911,15 @@ pub fn paint_lean_embed_from(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let when = relative_time(created);
-    let content_html = status.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let raw_content = status.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    // Mentions nests already show "in reply to @user". The API still bakes a
+    // parent teaser into content for Ice Cubes; do not paint that twice.
+    let baked_content = if hide_header && from == "mentions" {
+        strip_mentions_reply_bake(raw_content)
+    } else {
+        raw_content.to_string()
+    };
+    let content_html = baked_content.as_str();
     let plain = strip_tags(content_html).trim().to_string();
     let spoiler = status
         .get("spoiler_text")
@@ -2854,12 +2977,21 @@ pub fn paint_lean_embed_from(
         article_attrs.push_str(&format!(
             " data-rss-item=\"{rid}\" data-timeline-key=\"rss:{rid}\""
         ));
-    } else if bsky && uri.starts_with("at://") {
-        article_attrs.push_str(&format!(
-            " data-bsky-uri=\"{}\" data-timeline-key=\"bsky:{}\"",
-            esc(uri),
-            esc(uri)
-        ));
+    } else if bsky {
+        // data-bsky-uri is an at:// fallback for the click handler. HTTPS
+        // permalinks stay on the button's data-object-ref, not this attribute.
+        let at = bsky_at_uri(status, uri);
+        if at.starts_with("at://") {
+            article_attrs.push_str(&format!(" data-bsky-uri=\"{}\"", esc(&at)));
+        }
+        if uri.starts_with("at://") {
+            article_attrs.push_str(&format!(" data-timeline-key=\"bsky:{}\"", esc(uri)));
+        } else if let Some(sid) = status.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        {
+            article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(sid)));
+        } else if at.starts_with("at://") {
+            article_attrs.push_str(&format!(" data-timeline-key=\"bsky:{}\"", esc(&at)));
+        }
     } else if let Some(sid) = status.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
     {
         article_attrs.push_str(&format!(" data-timeline-key=\"{}\"", esc(sid)));
@@ -3027,7 +3159,10 @@ pub fn paint_lean_embed_from(
         .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
         let q = normalized_quote_preview(q_raw);
-        let quote_from = if from == "mentions" { "notification-embed" } else { from };
+        // Quote-boosts in Notifications keep the same action row as the outer
+        // reply, including overflow. Downgrading the nest to Open-only dropped
+        // Boost / Block / Mute / Report on scrolled Fediverse quotes.
+        let quote_from = if from.is_empty() { "mentions" } else { from };
         let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor);
         inner.push_str(&format!(
             "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{q_html}</div>"
@@ -3212,6 +3347,7 @@ mod tests {
     #[test]
     fn paint_hides_header_and_keeps_html_body() {
         let st = json!({
+            "id": "1",
             "uri": "https://example.com/users/x/notes/1",
             "content": "<p>hi <b>there</b> &amp; stuff</p>",
             "created_at": "2026-10-05T05:00:00.000Z",
@@ -3230,8 +3366,9 @@ mod tests {
         assert!(html.contains("<b>there</b>"));
         assert!(html.contains("&amp; stuff") || html.contains("& stuff"));
         assert!(!html.contains("<script>"));
-        assert!(html.contains("Open"));
-        assert!(html.contains("view=status"));
+        assert!(html.contains("title=\"Reply\""), "mention embed must keep reply: {html}");
+        assert!(html.contains("reblog_status"), "mention embed must keep boost: {html}");
+        assert!(html.contains("view=status") || html.contains("quote_object="), "{html}");
     }
 
     #[test]
@@ -3340,6 +3477,46 @@ mod tests {
         assert!(html.contains("compose=1") && html.contains("reply_to="), "{html}");
         assert!(html.contains("view=dms&amp;peer="), "Fediverse overflow should offer DM: {html}");
         assert!(!html.contains(">Open</a></div>"), "Home should not be Open-only: {html}");
+    }
+
+    #[test]
+    fn mentions_reply_drops_baked_parent_preview() {
+        let st = json!({
+            "id": "1791368209200001230",
+            "uri": "https://gts.ghp.social/users/ghp/statuses/01M4AXV8J1JSAQ2FT16GVHR6B3",
+            "url": "https://gts.ghp.social/users/ghp/statuses/01M4AXV8J1JSAQ2FT16GVHR6B3",
+            "content": "<p>↩ i don&#039;t know what &quot;snac&quot; is but hey at least its posts kind of display properly on here</p>\n<p><span class=\"h-card\"><a class=\"mention\" href=\"https://mkultra.monster/users/cmdr_nova\">@<span>cmdr_nova</span></a></span>&quot;A simple, minimalistic ActivityPub instance written in portable C&quot;</p>",
+            "created_at": "2026-10-07T10:14:00.000Z",
+            "vaak_in_reply_to_url": "https://mkultra.monster/users/cmdr_nova/notes/a3784809cd039060",
+            "account": {
+                "acct": "ghp@gts.ghp.social",
+                "display_name": "Gerold",
+                "uri": "https://gts.ghp.social/users/ghp",
+                "avatar": "https://example.com/a.png"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_embed_from(
+            &st,
+            true,
+            "mentions",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(html.contains("in reply to"), "{html}");
+        assert!(html.contains("@cmdr_nova"), "{html}");
+        assert!(
+            html.contains("A simple, minimalistic ActivityPub instance"),
+            "the reply body must stay: {html}"
+        );
+        assert!(
+            !html.contains("i don") && !html.contains("display properly"),
+            "baked parent preview must not be painted beside in-reply-to: {html}"
+        );
+        let home = paint_lean_embed_from(&st, false, "home", "");
+        assert!(
+            home.contains("display properly"),
+            "Home must keep the teaser; only Mentions nests strip it: {home}"
+        );
     }
 
     #[test]
@@ -4049,6 +4226,20 @@ mod tests {
         assert!(html.contains("What is VAAK?"), "{html}");
         assert!(html.contains("A social bridge."), "{html}");
         assert!(html.contains("ask-divider"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
+    }
+
+    #[test]
+    fn timeline_ask_parses_anonymous_wafrn_compact_form() {
+        let st = json!({
+            "uri": "https://app.wafrn.net/fediverse/post/anonymous-ask",
+            "content": "anonymous asked\n\nthoughts on crows and ravens?\n\ngive them shiny stuff",
+            "account": {"acct": "admin@app.wafrn.net", "display_name": "Wafrn"}
+        });
+        let html = paint_lean_embed(&st, false);
+        assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("thoughts on crows and ravens?"), "{html}");
+        assert!(html.contains("give them shiny stuff"), "{html}");
         assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
     }
 

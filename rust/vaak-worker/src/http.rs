@@ -166,6 +166,10 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/api/v1/timelines/home/since", get(shadow_home_since))
         // Home live-poll HTML uses the same Rust painter as initial/fill cards.
         .route("/shadow/home-since-html", get(shadow_home_since_html))
+        // Local / Federated live-poll HTML. Empty heads stay 404 so PHP can
+        // still see posts that are not in the warm envelope yet.
+        .route("/shadow/local-since-html", get(shadow_local_since_html))
+        .route("/shadow/feed-since-html", get(shadow_feed_since_html))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
         .with_state(state);
 
@@ -216,6 +220,8 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             "/api/v1/timelines/home",
             "/api/v1/timelines/home/since",
             "/shadow/home-since-html",
+            "/shadow/local-since-html",
+            "/shadow/feed-since-html",
             "/api/v1/notifications"
         ],
     }))
@@ -467,7 +473,17 @@ async fn shadow_notif_embed(
             .into_response();
     };
 
-    let html = crate::notif_embed::paint_lean_embed(&status, hide);
+    // PHP scroll fetches this fragment and skips its own action row when the
+    // embed hits. Paint the same full bar as the Mentions page, including
+    // overflow for the signed-in actor.
+    let viewer = crate::home_html::load_viewer_actor(&state.cfg, owner).await;
+    let mut status = status;
+    if let Ok(db) = crate::db::connect(&state.cfg.database_url).await {
+        if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner).await {
+            crate::notif_embed::stamp_viewer_moderation_tree(&mut status, &moderation);
+        }
+    }
+    let html = crate::notif_embed::paint_lean_embed_from(&status, hide, "mentions", &viewer);
     if html.is_empty() {
         return (
             StatusCode::NOT_FOUND,
@@ -1086,9 +1102,82 @@ async fn shadow_home_since_html(
             if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
                 resp.headers_mut().insert(axum::http::HeaderName::from_static("x-new-count"), v);
             }
+            if report.newest_ts > 0 {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&report.newest_ts.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::HeaderName::from_static("x-newest"), v);
+                }
+            }
             resp
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn shadow_local_since_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    shadow_chrono_since_html(&state, &q, "local").await
+}
+
+async fn shadow_feed_since_html(
+    State(state): State<AppState>,
+    Query(q): Query<OwnerQuery>,
+) -> impl IntoResponse {
+    shadow_chrono_since_html(&state, &q, "feed").await
+}
+
+/// Local and Federated live-poll HTML. A warm head with nothing newer is a
+/// 404, not an empty 200: the chronological envelope lags fan-out, and PHP
+/// must still be allowed to find those posts.
+async fn shadow_chrono_since_html(
+    state: &AppState,
+    q: &OwnerQuery,
+    view: &'static str,
+) -> axum::response::Response {
+    let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
+    let limit = q.limit.unwrap_or(20).clamp(1, 40);
+    let since_ts = q.since_ts.unwrap_or(0);
+    if since_ts <= 0 {
+        return (StatusCode::BAD_REQUEST, "since_ts required").into_response();
+    }
+    match crate::home_html::tl_html_since(&state.cfg, owner, view, since_ts, limit).await {
+        Ok(Some(report)) if report.count > 0 => {
+            let mut resp = (StatusCode::OK, report.html).into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            resp.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static("x-vaak-tl-cache"),
+                axum::http::HeaderValue::from_static("axum-chrono-since-html"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.count.to_string()) {
+                resp.headers_mut().insert(axum::http::HeaderName::from_static("x-new-count"), v);
+            }
+            if report.newest_ts > 0 {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&report.newest_ts.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::HeaderName::from_static("x-newest"), v);
+                }
+            }
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
+                resp.headers_mut()
+                    .insert(axum::http::HeaderName::from_static("x-vaak-tl-source"), v);
+            }
+            resp
+        }
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -1128,7 +1217,9 @@ async fn shadow_notifications(
     )
 }
 
-/// Mastodon-shaped body: bare notification array when cache hits (Ice Cubes-friendly).
+/// Mastodon-shaped body: a bare notification array (Ice Cubes decodes this).
+/// No Link header here. PHP owns the public URL and pagination host.
+/// `min_id` is the same newer-than cursor as `since_id` and is not sliced.
 async fn shadow_notifications_masto(
     State(state): State<AppState>,
     Query(q): Query<OwnerQuery>,
@@ -1136,17 +1227,28 @@ async fn shadow_notifications_masto(
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(state.cfg.default_owner_id);
     let limit = q.limit.unwrap_or(30);
     let types = parse_types(q.types.as_deref());
-    match crate::notif_list::notifications_shadow(
+    let since = q
+        .since_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or(q.min_id.as_deref().filter(|s| !s.trim().is_empty()));
+    match crate::notif_list::notifications_shadow_resolved(
         &state.cfg,
         owner,
         limit,
         &types,
         q.max_id.as_deref(),
-        q.since_id.as_deref(),
+        since,
     )
     .await
     {
-        Ok(report) if report.cache_hit => (StatusCode::OK, Json(report.items)).into_response(),
+        Ok(report) if report.cache_hit => {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(v) = axum::http::HeaderValue::from_str(&report.source) {
+                headers.insert(axum::http::HeaderName::from_static("x-vaak-notif-source"), v);
+            }
+            (StatusCode::OK, headers, Json(report.items)).into_response()
+        }
         Ok(report) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({

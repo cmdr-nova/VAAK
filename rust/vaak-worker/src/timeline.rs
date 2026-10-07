@@ -326,11 +326,12 @@ pub async fn home_hydrate(
     view_hydrate(cfg, owner_user_id, "home", limit, since_id).await
 }
 
-/// Live-poll "newer than since_ts" from ranked head + hydrate envelope.
+/// Live-poll "newer than since_ts" from the Home ranked list.
 ///
-/// Ranked items carry no per-row timestamp; filter hydrate statuses by
-/// `created_at` (unix). Requires both ranked Home key and a hydrate hit —
-/// miss means PHP should fall back to `admin_tl_fetch_newer`.
+/// The ranker (rebuild + live insert) is the only ordering. This reads that
+/// list, keeps hydrate cards whose `created_at` is past the client cursor,
+/// and drops identities the ranker already placed on screen. Miss means PHP
+/// should fall back to `admin_tl_fetch_newer`.
 #[derive(Debug, Serialize)]
 pub struct HomeSinceReport {
     pub owner_user_id: i64,
@@ -367,6 +368,202 @@ fn status_created_ts(st: &Value) -> i64 {
         return dt.and_utc().timestamp();
     }
     0
+}
+
+fn norm_identity(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+fn push_identity(out: &mut Vec<String>, raw: &str) {
+    let key = norm_identity(raw);
+    if key.is_empty() || out.iter().any(|existing| existing == &key) {
+        return;
+    }
+    out.push(key);
+}
+
+fn json_id(value: &Value) -> String {
+    match value.get("id") {
+        Some(Value::String(s)) => norm_identity(s),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn status_alias_keys(st: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["uri", "url", "object_id", "id"] {
+        if let Some(value) = st.get(key).and_then(Value::as_str) {
+            push_identity(&mut out, value);
+        }
+    }
+    let id = json_id(st);
+    if !id.is_empty() {
+        push_identity(&mut out, &id);
+    }
+    push_identity(&mut out, &status_identity(st));
+    if let Some(rss_id) = st.get("vaak_rss_item_id").and_then(|v| v.as_i64()) {
+        push_identity(&mut out, &rss_id.to_string());
+        push_identity(&mut out, &format!("rss:{rss_id}"));
+    }
+    if let Some(event_id) = st.get("vaak_announce_event_id").and_then(|v| v.as_i64()) {
+        push_identity(&mut out, &event_id.to_string());
+    }
+    if let Some(reblog) = st.get("reblog").filter(|v| v.is_object()) {
+        for key in ["uri", "url", "object_id", "id"] {
+            if let Some(value) = reblog.get(key).and_then(Value::as_str) {
+                push_identity(&mut out, value);
+            }
+        }
+        if let Some(rss_id) = reblog.get("vaak_rss_item_id").and_then(|v| v.as_i64()) {
+            push_identity(&mut out, &rss_id.to_string());
+            push_identity(&mut out, &format!("rss:{rss_id}"));
+        }
+    }
+    out
+}
+
+fn ranked_alias_keys(row: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let kind = row.get("k").and_then(Value::as_str).unwrap_or("");
+    let id = json_id(row);
+    if !kind.is_empty() && !id.is_empty() {
+        push_identity(&mut out, &format!("{kind}:{id}"));
+    }
+    if !id.is_empty() {
+        push_identity(&mut out, &id);
+        if kind == "rss" {
+            push_identity(&mut out, &format!("rss:{id}"));
+        }
+    }
+    if let Some(object) = row.get("o").and_then(Value::as_str) {
+        push_identity(&mut out, object);
+    }
+    out
+}
+
+fn keys_hit(keys: &[String], set: &std::collections::HashSet<String>) -> bool {
+    keys.iter().any(|key| set.contains(key))
+}
+
+/// Newer cards in the ranker's order. `newest_ts` stays on `created_at` so
+/// the client cursor does not chase the affinity bonus.
+pub(crate) fn select_newer_like_ranked(
+    ranked: &[Value],
+    statuses: Vec<Value>,
+    since_ts: i64,
+    limit: usize,
+) -> (Vec<Value>, i64) {
+    let limit = limit.max(1);
+    let mut painted = std::collections::HashSet::new();
+    let mut newer = Vec::new();
+    let mut newest = since_ts;
+    for st in statuses {
+        let ts = status_created_ts(&st);
+        if ts > since_ts {
+            if ts > newest {
+                newest = ts;
+            }
+            newer.push(st);
+        } else {
+            for key in status_alias_keys(&st) {
+                painted.insert(key);
+            }
+        }
+    }
+    for _ in 0..ranked.len().saturating_add(1) {
+        let mut grew = false;
+        for row in ranked {
+            let keys = ranked_alias_keys(row);
+            if keys_hit(&keys, &painted) {
+                for key in keys {
+                    if painted.insert(key) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    let mut kept: Vec<(usize, i64, Value)> = Vec::new();
+    let mut seen_new = std::collections::HashSet::new();
+    for st in newer {
+        let keys = status_alias_keys(&st);
+        if keys_hit(&keys, &painted) || keys_hit(&keys, &seen_new) {
+            continue;
+        }
+        let matched = ranked.iter().enumerate().find(|(_, row)| {
+            let row_keys = ranked_alias_keys(row);
+            keys.iter().any(|key| row_keys.iter().any(|row_key| row_key == key))
+        });
+        if let Some((idx, row)) = matched {
+            let row_keys = ranked_alias_keys(row);
+            if keys_hit(&row_keys, &painted) || keys_hit(&row_keys, &seen_new) {
+                continue;
+            }
+            for key in row_keys {
+                seen_new.insert(key);
+            }
+            for key in keys {
+                seen_new.insert(key);
+            }
+            kept.push((idx, status_created_ts(&st), st));
+        } else {
+            for key in keys {
+                seen_new.insert(key);
+            }
+            kept.push((usize::MAX, status_created_ts(&st), st));
+        }
+    }
+    kept.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let items = kept.into_iter().take(limit).map(|row| row.2).collect();
+    (items, newest)
+}
+
+/// Newer cards in the envelope's existing order. Local and Federated are
+/// chronological, so this does not consult Home rank indexes. `newest_ts`
+/// still advances for a twin that is dropped, matching the Home cursor.
+pub(crate) fn select_newer_chronological(
+    statuses: Vec<Value>,
+    since_ts: i64,
+    limit: usize,
+) -> (Vec<Value>, i64) {
+    let limit = limit.max(1);
+    let mut painted = std::collections::HashSet::new();
+    let mut newer = Vec::new();
+    let mut newest = since_ts;
+    for st in statuses {
+        let ts = status_created_ts(&st);
+        if ts > since_ts {
+            if ts > newest {
+                newest = ts;
+            }
+            newer.push(st);
+        } else {
+            for key in status_alias_keys(&st) {
+                painted.insert(key);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    for st in newer {
+        let keys = status_alias_keys(&st);
+        if keys_hit(&keys, &painted) || keys_hit(&keys, &seen) {
+            continue;
+        }
+        for key in keys {
+            seen.insert(key);
+        }
+        kept.push(st);
+        if kept.len() == limit {
+            break;
+        }
+    }
+    (kept, newest)
 }
 
 /// Stable object identity used by newer polls. The ranked/hydrate path can
@@ -412,23 +609,38 @@ pub async fn home_since(
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let index_key = format!("vaak:timeline:owner-index:v1:{owner_user_id}");
     let index = redis_util::json_get(&mut redis, &index_key).await?;
-    let Some(logical) = pick_home_logical_key(index.as_ref()) else {
+    // The owner index lists older Home logicals ahead of the one warm just
+    // wrote. Hydrate already skips those misses and keeps the deepest list.
+    let logicals = home_logical_keys(index.as_ref());
+    if logicals.is_empty() {
         report.note = "owner ranked index miss (no home logical)";
         return Ok(report);
-    };
-    let rk = ranked_redis_key(&logical);
-    report.ranked_key = Some(rk.clone());
-    let ranked_env = redis_util::json_get(&mut redis, &rk).await?;
-    let Some(ranked_env) = ranked_env else {
+    }
+    let mut best: Option<(String, Value, usize, i64)> = None;
+    for logical in &logicals {
+        let rk = ranked_redis_key(logical);
+        let Some(env) = redis_util::json_get(&mut redis, &rk).await? else {
+            continue;
+        };
+        let Some((n, ts)) = ranked_envelope_score(&env) else {
+            continue;
+        };
+        if ranked_score_wins(best.as_ref().map(|row| (row.2, row.3)), n, ts) {
+            best = Some((logical.clone(), env, n, ts));
+        }
+    }
+    let Some((logical, ranked_env, _, _)) = best else {
+        report.ranked_key = logicals.first().map(|logical| ranked_redis_key(logical));
         report.note = "ranked home envelope miss";
         return Ok(report);
     };
-    let ranked_n = ranked_env
+    report.ranked_key = Some(ranked_redis_key(&logical));
+    let ranked_rows = ranked_env
         .get("ranked")
         .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    if ranked_n == 0 {
+        .cloned()
+        .unwrap_or_default();
+    if ranked_rows.is_empty() {
         report.note = "ranked home empty";
         return Ok(report);
     }
@@ -447,28 +659,9 @@ pub async fn home_since(
     report.hydrate_ok = true;
     report.cache_hit = true;
 
-    let mut newer: Vec<(i64, Value)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for st in hydrate.items {
-        let ts = status_created_ts(&st);
-        if ts <= since_ts {
-            continue;
-        }
-        let identity = status_identity(&st);
-        if !identity.is_empty() && !seen.insert(identity) {
-            continue;
-        }
-        newer.push((ts, st));
-    }
-    newer.sort_by(|a, b| b.0.cmp(&a.0));
-    if let Some((ts, _)) = newer.first() {
-        report.newest_ts = *ts;
-    }
-    report.items = newer
-        .into_iter()
-        .take(limit)
-        .map(|(_, st)| st)
-        .collect();
+    let (items, newest) = select_newer_like_ranked(&ranked_rows, hydrate.items, since_ts, limit);
+    report.newest_ts = newest;
+    report.items = items;
     report.n = report.items.len();
     if report.n == 0 {
         report.note = "ranked+hydrate hit; nothing newer than since_ts";
@@ -481,6 +674,72 @@ pub async fn home_since(
         )
         .await;
     }
+    Ok(report)
+}
+
+/// Local / Federated live poll from the warm chronological envelope.
+///
+/// An empty selection stays `cache_hit` so the caller can tell a warm miss
+/// from "nothing newer in this head". Callers must not treat that empty
+/// selection as authoritative: fan-out prepends the ranked list before the
+/// hydrate envelope is rebuilt, and PHP still has to query those rows.
+pub async fn chrono_since(
+    cfg: &Config,
+    owner_user_id: i64,
+    view: &str,
+    since_ts: i64,
+    limit: usize,
+) -> Result<HomeSinceReport> {
+    let view = match view {
+        "local" | "feed" => view,
+        _ => "local",
+    };
+    let limit = limit.clamp(1, 40);
+    let since_ts = since_ts.max(0);
+    let source = if view == "feed" {
+        "vaak-worker-feed-since"
+    } else {
+        "vaak-worker-local-since"
+    };
+    let mut report = HomeSinceReport {
+        owner_user_id,
+        since_ts,
+        limit,
+        cache_hit: false,
+        ranked_ok: false,
+        hydrate_ok: false,
+        n: 0,
+        newest_ts: since_ts,
+        items: Vec::new(),
+        ranked_key: None,
+        hydrate_key: None,
+        source,
+        note: "chronological hydrate since filter",
+    };
+    if since_ts <= 0 {
+        report.note = "since_ts required";
+        return Ok(report);
+    }
+    let mut hydrate = view_hydrate(cfg, owner_user_id, view, 40, None).await?;
+    if !hydrate.cache_hit {
+        hydrate = view_hydrate(cfg, owner_user_id, view, 15, None).await?;
+    }
+    report.hydrate_key = Some(hydrate.redis_key.clone());
+    if !hydrate.cache_hit {
+        report.note = "hydrate miss (PHP may PG-fallback)";
+        return Ok(report);
+    }
+    report.hydrate_ok = true;
+    report.cache_hit = true;
+    let (items, newest) = select_newer_chronological(hydrate.items, since_ts, limit);
+    report.newest_ts = newest;
+    report.items = items;
+    report.n = report.items.len();
+    report.note = if report.n == 0 {
+        "chronological hydrate hit; nothing newer than since_ts"
+    } else {
+        "chronological hydrate since hit"
+    };
     Ok(report)
 }
 
@@ -655,20 +914,56 @@ pub async fn run(cfg: &Config, owner_user_id: i64, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn pick_home_logical_key(index: Option<&Value>) -> Option<String> {
-    let arr = index?.as_array()?;
-    // Prefer a home key (v12_home_…); else first string.
+fn home_logical_keys(index: Option<&Value>) -> Vec<String> {
+    let Some(arr) = index.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
     let mut first = None;
     for v in arr {
         let Some(s) = v.as_str() else { continue };
         if first.is_none() {
             first = Some(s.to_string());
         }
-        if s.contains("home") {
-            return Some(s.to_string());
+        if (s.contains("_home_") || s.contains("home")) && !out.iter().any(|row| row == s) {
+            out.push(s.to_string());
         }
     }
-    first
+    if out.is_empty() {
+        if let Some(first) = first {
+            out.push(first);
+        }
+    }
+    out
+}
+
+fn pick_home_logical_key(index: Option<&Value>) -> Option<String> {
+    home_logical_keys(index).into_iter().next()
+}
+
+/// Non-empty ranked lists only. Score is `(row count, warm timestamp)`.
+fn ranked_envelope_score(env: &Value) -> Option<(usize, i64)> {
+    let n = env
+        .get("ranked")
+        .and_then(|v| v.as_array())
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    if n == 0 {
+        return None;
+    }
+    let ts = env
+        .get("warm_ts")
+        .or_else(|| env.get("ts"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Some((n, ts))
+}
+
+fn ranked_score_wins(best: Option<(usize, i64)>, n: usize, ts: i64) -> bool {
+    match best {
+        None => true,
+        Some((best_n, best_ts)) => n > best_n || (n == best_n && ts > best_ts),
+    }
 }
 
 fn ranked_redis_key(logical: &str) -> String {
@@ -689,6 +984,26 @@ mod tests {
             key,
             "vaak:timeline:v1:1a447a10f787cb14d3ccad2ce2235aabc8f4eceaad3514e89621a9498ce82ae3"
         );
+    }
+
+    #[test]
+    fn home_since_prefers_deepest_existing_envelope() {
+        let index = serde_json::json!([
+            "v13_home_u1_aon_stale",
+            "v13_home_u1_aon_live",
+            "v13_local_u1_ana_other"
+        ]);
+        let keys = home_logical_keys(Some(&index));
+        assert_eq!(keys, vec!["v13_home_u1_aon_stale", "v13_home_u1_aon_live"]);
+        let stale = serde_json::json!({"ranked": [], "warm_ts": 50});
+        let live = serde_json::json!({"ranked": [{"k":"event","id":"1"},{"k":"bsky","id":"at://x"}], "warm_ts": 10});
+        let shorter = serde_json::json!({"ranked": [{"k":"event","id":"1"}], "warm_ts": 99});
+        assert!(ranked_envelope_score(&stale).is_none());
+        assert_eq!(ranked_envelope_score(&live), Some((2, 10)));
+        assert_eq!(ranked_envelope_score(&shorter), Some((1, 99)));
+        assert!(ranked_score_wins(None, 2, 10));
+        assert!(!ranked_score_wins(Some((2, 10)), 1, 99));
+        assert!(ranked_score_wins(Some((2, 10)), 2, 11));
     }
 
     #[test]
@@ -720,6 +1035,103 @@ mod tests {
         let a = serde_json::json!({"id":"rust-wrapper","uri":"https://example.test/posts/1"});
         let b = serde_json::json!({"id":"php-wrapper","uri":"https://example.test/posts/1/"});
         assert_eq!(status_identity(&a), status_identity(&b));
+    }
+
+    #[test]
+    fn newer_poll_follows_rank_order_and_drops_painted_twin() {
+        let ranked = vec![
+            serde_json::json!({
+                "k": "event",
+                "id": "9",
+                "s": "fediverse",
+                "sort": 9000,
+                "o": "https://example.test/notes/weighted"
+            }),
+            serde_json::json!({
+                "k": "event",
+                "id": "8",
+                "s": "fediverse",
+                "sort": 1000,
+                "o": "https://example.test/notes/cold"
+            }),
+            serde_json::json!({
+                "k": "bsky",
+                "id": "at://did:plc:twin/app.bsky.feed.post/1",
+                "s": "bluesky",
+                "sort": 8000,
+                "o": "https://example.test/notes/already"
+            }),
+        ];
+        let statuses = vec![
+            serde_json::json!({
+                "id": "snow-cold",
+                "uri": "https://example.test/notes/cold",
+                "created_at": "2026-10-05T01:57:30.000Z"
+            }),
+            serde_json::json!({
+                "id": "snow-weighted",
+                "uri": "https://example.test/notes/weighted",
+                "created_at": "2026-10-05T01:57:08.000Z"
+            }),
+            serde_json::json!({
+                "id": "bsky:twin",
+                "uri": "at://did:plc:twin/app.bsky.feed.post/1",
+                "created_at": "2026-10-05T01:57:40.000Z"
+            }),
+            serde_json::json!({
+                "id": "snow-old",
+                "uri": "https://example.test/notes/already",
+                "created_at": "2026-10-05T01:00:00.000Z"
+            }),
+        ];
+        let since = status_created_ts(&statuses[3]);
+        let (items, newest) = select_newer_like_ranked(&ranked, statuses, since, 20);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["uri"], "https://example.test/notes/weighted");
+        assert_eq!(items[1]["uri"], "https://example.test/notes/cold");
+        assert!(newest > since);
+    }
+
+    #[test]
+    fn chrono_since_keeps_envelope_order_and_drops_painted_twin() {
+        let statuses = vec![
+            serde_json::json!({
+                "id": "new-a",
+                "uri": "https://example.test/notes/new-a",
+                "created_at": "2026-10-05T01:57:40.000Z"
+            }),
+            serde_json::json!({
+                "id": "twin-new",
+                "uri": "https://example.test/notes/already",
+                "created_at": "2026-10-05T01:57:30.000Z"
+            }),
+            serde_json::json!({
+                "id": "new-b",
+                "uri": "https://example.test/notes/new-b",
+                "created_at": "2026-10-05T01:57:20.000Z"
+            }),
+            serde_json::json!({
+                "id": "old",
+                "uri": "https://example.test/notes/already",
+                "created_at": "2026-10-05T01:00:00.000Z"
+            }),
+        ];
+        let since = status_created_ts(&statuses[3]);
+        let (items, newest) = select_newer_chronological(statuses, since, 20);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["uri"], "https://example.test/notes/new-a");
+        assert_eq!(items[1]["uri"], "https://example.test/notes/new-b");
+        assert_eq!(newest, 1791165460);
+        let (limited, _) = select_newer_chronological(
+            vec![
+                serde_json::json!({"id":"a","uri":"https://example.test/a","created_at":"2026-10-05T01:57:40.000Z"}),
+                serde_json::json!({"id":"b","uri":"https://example.test/b","created_at":"2026-10-05T01:57:20.000Z"}),
+            ],
+            since,
+            1,
+        );
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0]["id"], "a");
     }
 }
 

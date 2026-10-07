@@ -4,13 +4,18 @@
 //! `admin_render_notification_stream` (~11s p50 on prod). Nested cards reuse
 //! `notif_embed::paint_lean_embed` in-process (no per-card HTTP).
 //! 0.7.3: like/boost avatar-stack grouping (presentation-only).
+//! Scroll reuses the warm head past `max_id`. A short tail stays a miss so
+//! PHP can read older rows the head does not hold.
+
+use std::collections::HashSet;
 
 use anyhow::Result;
 use serde_json::Value;
 
 use crate::config::Config;
+use crate::home_html::load_viewer_actor;
 use crate::notif_embed::{self, paint_lean_embed_from};
-use crate::notif_list::notifications_shadow;
+
 
 #[derive(Debug, Clone)]
 pub struct MentionsHtmlReport {
@@ -293,7 +298,7 @@ fn profile_href_for(acct: &Value) -> String {
     }
 }
 
-fn paint_grouped_card(g: &GroupedNotif) -> String {
+fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
     let n_type = g.row.get("type").and_then(|v| v.as_str()).unwrap_or("favourite");
     let label = if n_type == "reblog" {
         "boosted your post"
@@ -324,7 +329,7 @@ fn paint_grouped_card(g: &GroupedNotif) -> String {
     if let Some(st) = g.row.get("status").filter(|v| v.is_object()) {
         let uri = status_uri_of(&g.row);
         if !uri.is_empty() {
-            body.push_str(&paint_lean_embed_from(st, false, "mentions", ""));
+            body.push_str(&paint_lean_embed_from(st, false, "mentions", viewer_actor));
         }
     }
 
@@ -341,7 +346,235 @@ fn paint_grouped_card(g: &GroupedNotif) -> String {
     )
 }
 
-fn paint_notif_card(n: &Value) -> String {
+fn follow_key(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `https://host/@user` web profile, with nothing after the handle.
+fn is_web_at_profile(url: &str) -> bool {
+    let key = url.trim().trim_end_matches('/');
+    let Some(rest) = key.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((_, path)) = rest.split_once('/') else {
+        return false;
+    };
+    let Some(user) = path.strip_prefix('@') else {
+        return false;
+    };
+    !user.is_empty() && !user.contains('/')
+}
+
+/// PHP `admin_account_actor_ref`: prefer the ActivityPub actor, and turn a
+/// `/@user` web URL into `/users/user` before posting follow_remote.
+fn follow_target(uri: &str, url: &str) -> String {
+    let uri = uri.trim().trim_end_matches('/');
+    let url = url.trim().trim_end_matches('/');
+    if uri.starts_with("https://") && !is_web_at_profile(uri) {
+        return uri.to_string();
+    }
+    if url.starts_with("https://") {
+        if let Some(users) = at_profile_to_users(url) {
+            return users;
+        }
+        return url.to_string();
+    }
+    if let Some(users) = at_profile_to_users(uri) {
+        return users;
+    }
+    if !uri.is_empty() {
+        uri.to_string()
+    } else {
+        url.to_string()
+    }
+}
+
+fn at_profile_to_users(url: &str) -> Option<String> {
+    if !is_web_at_profile(url) {
+        return None;
+    }
+    let key = url.trim().trim_end_matches('/');
+    let rest = key.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    let user = percent_decode(path.strip_prefix('@')?);
+    if host.is_empty() || user.is_empty() || user.contains('/') {
+        return None;
+    }
+    Some(format!("https://{host}/users/{}", urlencoding_encode(&user)))
+}
+
+fn follow_aliases(key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(did) = key.strip_prefix("did:") {
+        if !did.is_empty() && !did.contains('/') {
+            out.push(format!("https://bsky.app/profile/{key}"));
+        }
+    }
+    let Some(rest) = key.strip_prefix("https://") else {
+        return out;
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return out;
+    };
+    if host == "bsky.app" {
+        if let Some(ident) = path.strip_prefix("profile/") {
+            let ident = percent_decode(ident);
+            if ident.starts_with("did:") && !ident.contains('/') {
+                out.push(ident);
+            }
+        }
+    }
+    let user = if let Some(user) = path.strip_prefix('@') {
+        Some(percent_decode(user))
+    } else if let Some(user) = path.strip_prefix("users/") {
+        Some(percent_decode(user))
+    } else {
+        None
+    };
+    if let Some(user) = user {
+        // Numeric segments are Mastodon snowflakes, not handles.
+        if !user.is_empty()
+            && !user.contains('/')
+            && !user.chars().all(|c| c.is_ascii_digit())
+        {
+            let user = urlencoding_encode(&user).to_ascii_lowercase();
+            if path.starts_with('@') {
+                out.push(format!("https://{host}/users/{user}"));
+            } else {
+                out.push(format!("https://{host}/@{user}"));
+            }
+        }
+    }
+    out
+}
+
+fn remember_follow(set: &mut HashSet<String>, raw: &str) {
+    let key = follow_key(raw);
+    if key.is_empty() {
+        return;
+    }
+    let aliases = follow_aliases(&key);
+    set.insert(key);
+    for alias in aliases {
+        set.insert(alias);
+    }
+}
+
+fn already_following(set: &HashSet<String>, actor: &str) -> bool {
+    let key = follow_key(actor);
+    if key.is_empty() {
+        return false;
+    }
+    if set.contains(&key) {
+        return true;
+    }
+    follow_aliases(&key).iter().any(|alias| set.contains(alias))
+}
+
+fn same_actor(a: &str, b: &str) -> bool {
+    let a = follow_key(a);
+    let b = follow_key(b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || follow_aliases(&a).iter().any(|alias| alias == &b)
+}
+
+/// Actor ids this viewer already follows. Empty on a database miss so the
+/// Follow back button still renders; a repeat follow is a no-op server-side.
+async fn load_viewer_follows(
+    cfg: &Config,
+    owner_user_id: i64,
+    viewer_actor: &str,
+) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let Ok(db) = crate::db::connect(&cfg.database_url).await else {
+        return set;
+    };
+    let owner = viewer_actor.trim().trim_end_matches('/').to_string();
+    if owner.starts_with("https://") {
+        let owner_slash = format!("{owner}/");
+        if let Ok(rows) = db
+            .query(
+                "SELECT actor_id FROM following WHERE owner_actor_id = $1 OR owner_actor_id = $2",
+                &[&owner, &owner_slash],
+            )
+            .await
+        {
+            for row in rows {
+                let aid: String = row
+                    .try_get::<_, Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                remember_follow(&mut set, &aid);
+            }
+        }
+    }
+    if owner_user_id > 0 {
+        if let Ok(rows) = db
+            .query(
+                "SELECT target_did FROM bsky_graph_sync WHERE owner_user_id = $1 AND kind = 'follow'",
+                &[&owner_user_id],
+            )
+            .await
+        {
+            for row in rows {
+                let did: String = row
+                    .try_get::<_, Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                remember_follow(&mut set, did.trim());
+            }
+        }
+        // Handle URLs are optional. A missing table must not hide Follow back.
+        if let Ok(rows) = db
+            .query(
+                "SELECT actor_ref FROM bsky_actor_viewers WHERE owner_user_id = $1 AND COALESCE(following_uri, '') <> ''",
+                &[&owner_user_id],
+            )
+            .await
+        {
+            for row in rows {
+                let actor_ref: String = row
+                    .try_get::<_, Option<String>>(0)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                remember_follow(&mut set, &actor_ref);
+            }
+        }
+    }
+    set
+}
+
+fn paint_notif_card(n: &Value, viewer_actor: &str) -> String {
+    paint_notif_card_follows(n, viewer_actor, &HashSet::new())
+}
+
+fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<String>) -> String {
     let n_type = n.get("type").and_then(|v| v.as_str()).unwrap_or("mention");
     let account = n.get("account").cloned().unwrap_or(Value::Null);
     let acct = account
@@ -358,11 +591,13 @@ fn paint_notif_card(n: &Value) -> String {
         .and_then(|v| v.as_str())
         .or_else(|| account.get("avatar_static").and_then(|v| v.as_str()))
         .unwrap_or("");
-    let actor_ref = account
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .or_else(|| account.get("url").and_then(|v| v.as_str()))
-        .unwrap_or("");
+    let account_uri = account.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+    let account_url = account.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let actor_ref = if !account_uri.is_empty() {
+        account_uri
+    } else {
+        account_url
+    };
     let created = n.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
     let when = relative_time(created);
     let status = n.get("status").filter(|v| v.is_object());
@@ -459,7 +694,7 @@ fn paint_notif_card(n: &Value) -> String {
             "mention" | "quote" | "favourite" | "reblog" | "update" | "poll" | "status" | "bite"
         ) && !status_uri.is_empty()
         {
-            body.push_str(&paint_lean_embed_from(st, hide_header, "mentions", ""));
+            body.push_str(&paint_lean_embed_from(st, hide_header, "mentions", viewer_actor));
         } else {
             let plain = strip_tags(st.get("content").and_then(|v| v.as_str()).unwrap_or(""))
                 .trim()
@@ -483,6 +718,25 @@ fn paint_notif_card(n: &Value) -> String {
             "<a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Profile</a>",
             esc(&profile_href)
         ));
+    }
+    // New follower rows: follow them back without leaving Notifications.
+    // Same queued follow_remote form as the PHP Mentions fallback (Fediverse and Bluesky).
+    if n_type == "follow" {
+        let actor = follow_target(account_uri, account_url);
+        let viewer = viewer_actor.trim().trim_end_matches('/');
+        if actor.starts_with("https://")
+            && !same_actor(&actor, viewer)
+            && !already_following(following, &actor)
+        {
+            actions.push_str(&format!(
+                "<form method=\"post\" action=\"?view=mentions\" style=\"display:inline\">\
+                 <input type=\"hidden\" name=\"action\" value=\"follow_remote\">\
+                 <input type=\"hidden\" name=\"return_view\" value=\"mentions\">\
+                 <input type=\"hidden\" name=\"actor_id\" value=\"{actor}\">\
+                 <button class=\"btn btn-ghost\" type=\"submit\" style=\"padding:.25rem .7rem;font-size:.8rem\" title=\"Follow back\">Follow back</button></form>",
+                actor = esc(&actor),
+            ));
+        }
     }
     // Status notifications paint their complete interaction bar inside the
     // shared lean embed above. Keeping a second reply-only bar here caused
@@ -517,28 +771,31 @@ pub async fn mentions_html_fill(
     max_id: Option<&str>,
 ) -> Result<Option<MentionsHtmlReport>> {
     let limit = limit.clamp(1, 60);
-    let mut report = notifications_shadow(cfg, owner_user_id, limit, types, max_id, None).await?;
-    // notif-list warms all30/all40; Mentions UI asks for 12. On head miss, reuse a
-    // larger warm envelope and slice — avoids falling back to PHP hydrate (~11s).
-    if !report.cache_hit && max_id.is_none() {
-        for alt in [30_i64, 40, 20] {
-            if alt == limit {
-                continue;
-            }
-            let alt_report =
-                notifications_shadow(cfg, owner_user_id, alt, types, None, None).await?;
-            if alt_report.cache_hit && !alt_report.items.is_empty() {
-                report = alt_report;
-                break;
-            }
-        }
-    }
+    // Same warm-head slice as `/api/v1/notifications`. A short tail stays a miss.
+    let mut report = crate::notif_list::notifications_shadow_resolved(
+        cfg,
+        owner_user_id,
+        limit,
+        types,
+        max_id,
+        None,
+    )
+    .await?;
     if !report.cache_hit {
         return Ok(None);
     }
-    if report.items.len() > limit as usize {
-        report.items.truncate(limit as usize);
-        report.count = report.items.len();
+
+    // Replies and quote-boosts need the signed-in actor or the ⋯ menu is omitted.
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
+    let following = load_viewer_follows(cfg, owner_user_id, &viewer_actor).await;
+    if let Ok(db) = crate::db::connect(&cfg.database_url).await {
+        if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
+            for item in report.items.iter_mut() {
+                if let Some(st) = item.get_mut("status") {
+                    notif_embed::stamp_viewer_moderation_tree(st, &moderation);
+                }
+            }
+        }
     }
 
     // Also write nest fragment cache while painting so PHP/Axum embed path stays warm.
@@ -596,7 +853,7 @@ pub async fn mentions_html_fill(
             if !uri.is_empty() {
                 let key =
                     notif_embed::frag_key(owner_user_id, uri, hide, fav, reblog, bookmarked, sid);
-                let frag = paint_lean_embed_from(st, hide, "mentions", "");
+                let frag = paint_lean_embed_from(st, hide, "mentions", &viewer_actor);
                 if let Some(ref mut r) = redis {
                     let _ = notif_embed::set_embed_html(r, &key, &frag).await;
                 }
@@ -607,9 +864,13 @@ pub async fn mentions_html_fill(
     // Like/boost avatar-stack grouping (0.7.3) — parity with PHP stream.
     for grouped in group_notification_rows(&report.items) {
         if grouped.count > 1 {
-            html.push_str(&paint_grouped_card(&grouped));
+            html.push_str(&paint_grouped_card(&grouped, &viewer_actor));
         } else {
-            html.push_str(&paint_notif_card(&grouped.row));
+            html.push_str(&paint_notif_card_follows(
+                &grouped.row,
+                &viewer_actor,
+                &following,
+            ));
         }
     }
 
@@ -633,6 +894,7 @@ pub async fn mentions_html_fill(
 mod tests {
     use super::*;
     use serde_json::json;
+    use crate::notif_list::{full_page_after_cursor, items_after_cursor, notif_id_digits, warm_head_limits};
 
     fn fav(id: &str, acct: &str, uri: &str, status: &str) -> Value {
         json!({
@@ -669,7 +931,7 @@ mod tests {
         assert_eq!(grouped[0].count, 2);
         assert_eq!(grouped[0].accounts.len(), 2);
         assert_eq!(grouped[1].count, 1);
-        let html = paint_grouped_card(&grouped[0]);
+        let html = paint_grouped_card(&grouped[0], "");
         assert!(html.contains("tweet-notif-grouped"));
         assert!(html.contains("2 people liked your post"));
         assert!(html.contains("notification-avatar-stack"));
@@ -715,11 +977,313 @@ mod tests {
                 "bookmarked": false
             }
         });
-        let html = paint_notif_card(&row);
+        let html = paint_notif_card(&row, "https://mkultra.monster/users/cmdr_nova");
         assert!(html.contains("name=\"action\" value=\"favourite_status\""), "missing favourite action: {html}");
         assert!(html.contains("name=\"action\" value=\"reblog_status\""), "missing boost action: {html}");
         assert!(html.contains("quote_object="), "missing quote action: {html}");
         assert!(html.contains("name=\"action\" value=\"bookmark_status\""), "missing bookmark action: {html}");
+        assert!(html.contains("post-action-menu"), "missing overflow: {html}");
+        assert!(html.contains(">Block</button>"), "missing block: {html}");
+        assert!(html.contains(">Mute</button>"), "missing mute: {html}");
+        assert!(html.contains(">Report user</a>"), "missing report: {html}");
         assert_eq!(html.matches("title=\"Reply\"").count(), 1, "reply action duplicated: {html}");
+    }
+
+    #[test]
+    fn bluesky_reply_keeps_boost_and_overflow_without_at_uri() {
+        let row = json!({
+            "id": "1225",
+            "type": "mention",
+            "created_at": "2026-10-06T00:00:00Z",
+            "account": {
+                "acct": "foxgrrl.northsky.social",
+                "display_name": "Fox",
+                "uri": "https://bsky.app/profile/foxgrrl.northsky.social",
+                "url": "https://bsky.app/profile/foxgrrl.northsky.social",
+                "avatar": "https://example.test/a.webp"
+            },
+            "status": {
+                "id": "1791355324200001225",
+                "uri": "https://bsky.app/profile/foxgrrl.northsky.social/post/3mxbdtfyqac2z",
+                "url": "https://bsky.app/profile/foxgrrl.northsky.social/post/3mxbdtfyqac2z",
+                "content": "<p>reply</p>",
+                "account": {
+                    "acct": "foxgrrl.northsky.social",
+                    "uri": "https://bsky.app/profile/foxgrrl.northsky.social"
+                }
+            }
+        });
+        let html = paint_notif_card(&row, "https://mkultra.monster/users/cmdr_nova");
+        assert!(html.contains("data-bsky-action=\"repost\""), "missing bluesky boost: {html}");
+        assert!(html.contains("data-object-ref=\"https://bsky.app/profile/foxgrrl.northsky.social/post/3mxbdtfyqac2z\""), "{html}");
+        assert!(html.contains("data-bsky-action=\"like\""), "{html}");
+        assert!(html.contains("data-bsky-action=\"bookmark\""), "{html}");
+        assert!(html.contains("post-action-menu"), "missing overflow: {html}");
+        assert!(html.contains(">Block</button>"), "{html}");
+        assert!(html.contains("Open on Bluesky"), "{html}");
+        assert!(!html.contains(">DM</a>"), "bluesky actors must not get a fediverse DM: {html}");
+    }
+
+    #[test]
+    fn bluesky_reply_uses_stored_at_uri_for_the_boost_target() {
+        let row = json!({
+            "id": "1225",
+            "type": "mention",
+            "account": {
+                "acct": "foxgrrl.northsky.social",
+                "uri": "https://bsky.app/profile/foxgrrl.northsky.social"
+            },
+            "status": {
+                "id": "1791355324200001225",
+                "uri": "https://bsky.app/profile/foxgrrl.northsky.social/post/3mxbdtfyqac2z",
+                "url": "https://bsky.app/profile/foxgrrl.northsky.social/post/3mxbdtfyqac2z",
+                "vaak_bsky_uri": "at://did:plc:g6upn5vo6kbqffgtdo32hnoi/app.bsky.feed.post/3mxbdtfyqac2z",
+                "content": "<p>reply</p>",
+                "account": {
+                    "acct": "foxgrrl.northsky.social",
+                    "uri": "https://bsky.app/profile/foxgrrl.northsky.social"
+                }
+            }
+        });
+        let html = paint_notif_card(&row, "https://mkultra.monster/users/cmdr_nova");
+        assert!(html.contains("data-uri=\"at://did:plc:g6upn5vo6kbqffgtdo32hnoi/app.bsky.feed.post/3mxbdtfyqac2z\""), "{html}");
+        assert!(html.contains("data-bsky-uri=\"at://did:plc:g6upn5vo6kbqffgtdo32hnoi/app.bsky.feed.post/3mxbdtfyqac2z\""), "{html}");
+    }
+
+    #[test]
+    fn fediverse_quote_boost_keeps_actions_on_the_nested_post() {
+        let row = json!({
+            "id": "80",
+            "type": "quote",
+            "account": {
+                "acct": "alice@example.test",
+                "uri": "https://example.test/users/alice"
+            },
+            "status": {
+                "id": "80",
+                "uri": "https://example.test/users/alice/statuses/80",
+                "url": "https://example.test/users/alice/statuses/80",
+                "content": "<p>quoting you</p>",
+                "account": {
+                    "acct": "alice@example.test",
+                    "uri": "https://example.test/users/alice"
+                },
+                "quote": {
+                    "id": "1",
+                    "uri": "https://labyrinth.zone/users/scooter/statuses/9",
+                    "url": "https://labyrinth.zone/users/scooter/statuses/9",
+                    "content": "<p>original</p>",
+                    "account": {
+                        "acct": "scooter@labyrinth.zone",
+                        "uri": "https://labyrinth.zone/users/scooter"
+                    }
+                }
+            }
+        });
+        let html = paint_notif_card(&row, "https://mkultra.monster/users/cmdr_nova");
+        assert!(html.matches("name=\"action\" value=\"reblog_status\"").count() >= 2, "outer quote and nested post need boost: {html}");
+        assert!(html.matches("post-action-menu").count() >= 2, "outer quote and nested post need overflow: {html}");
+        assert!(html.contains("https://labyrinth.zone/users/scooter"), "{html}");
+        assert!(!html.contains("Follow back"), "quote cards do not follow back: {html}");
+    }
+
+    fn follow_row(uri: &str, url: &str) -> Value {
+        json!({
+            "id": "1002001",
+            "type": "follow",
+            "created_at": "2026-10-06T12:00:00Z",
+            "account": {
+                "acct": "alice@example.test",
+                "display_name": "Alice",
+                "uri": uri,
+                "url": url,
+                "avatar": "https://example.test/a.webp"
+            }
+        })
+    }
+
+    #[test]
+    fn already_following_matches_aliases_and_bsky_dids() {
+        let mut set = HashSet::new();
+        remember_follow(&mut set, "https://example.test/users/alice");
+        assert!(already_following(&set, "https://example.test/@alice"));
+        assert!(already_following(&set, "https://example.test/users/alice/"));
+        assert!(!already_following(&set, "https://example.test/users/bob"));
+
+        let mut bsky = HashSet::new();
+        remember_follow(&mut bsky, "did:plc:abc123");
+        assert!(already_following(
+            &bsky,
+            "https://bsky.app/profile/did:plc:abc123"
+        ));
+        assert!(!already_following(
+            &bsky,
+            "https://bsky.app/profile/someone.bsky.social"
+        ));
+
+        let mut snow = HashSet::new();
+        remember_follow(&mut snow, "https://mastodon.social/users/1168123");
+        assert!(already_following(
+            &snow,
+            "https://mastodon.social/users/1168123"
+        ));
+        assert!(!already_following(&snow, "https://mastodon.social/@1168123"));
+    }
+
+    #[test]
+    fn new_follower_offers_follow_back() {
+        let html = paint_notif_card_follows(
+            &follow_row(
+                "https://example.test/users/alice",
+                "https://example.test/@alice",
+            ),
+            "https://mkultra.monster/users/cmdr_nova",
+            &HashSet::new(),
+        );
+        assert!(html.contains("name=\"action\" value=\"follow_remote\""), "{html}");
+        assert!(html.contains("name=\"return_view\" value=\"mentions\""), "{html}");
+        assert!(
+            html.contains("name=\"actor_id\" value=\"https://example.test/users/alice\""),
+            "{html}"
+        );
+        assert!(html.contains(">Follow back</button>"), "{html}");
+        assert!(html.contains(">Profile</a>"), "{html}");
+    }
+
+    #[test]
+    fn web_profile_follow_posts_the_users_actor() {
+        let html = paint_notif_card_follows(
+            &follow_row("https://example.test/@alice", "https://example.test/@alice"),
+            "https://mkultra.monster/users/cmdr_nova",
+            &HashSet::new(),
+        );
+        assert!(
+            html.contains("name=\"actor_id\" value=\"https://example.test/users/alice\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn follow_back_hidden_when_already_following() {
+        let mut set = HashSet::new();
+        remember_follow(&mut set, "https://example.test/@alice");
+        let html = paint_notif_card_follows(
+            &follow_row(
+                "https://example.test/users/alice",
+                "https://example.test/@alice",
+            ),
+            "https://mkultra.monster/users/cmdr_nova",
+            &set,
+        );
+        assert!(!html.contains("follow_remote"), "{html}");
+        assert!(!html.contains("Follow back"), "{html}");
+        assert!(html.contains(">Profile</a>"), "{html}");
+    }
+
+    #[test]
+    fn bluesky_follow_back_hidden_when_did_is_followed() {
+        let mut set = HashSet::new();
+        remember_follow(&mut set, "did:plc:g6upn5vo6kbqffgtdo32hnoi");
+        let html = paint_notif_card_follows(
+            &follow_row(
+                "https://bsky.app/profile/did:plc:g6upn5vo6kbqffgtdo32hnoi",
+                "https://bsky.app/profile/foxgrrl.northsky.social",
+            ),
+            "https://mkultra.monster/users/cmdr_nova",
+            &set,
+        );
+        assert!(!html.contains("Follow back"), "{html}");
+        assert!(html.contains(">Profile</a>"), "{html}");
+    }
+
+    #[test]
+    fn mention_cards_do_not_offer_follow_back() {
+        let row = json!({
+            "id": "99",
+            "type": "mention",
+            "account": {
+                "acct": "alice@example.test",
+                "uri": "https://example.test/users/alice",
+                "url": "https://example.test/@alice"
+            },
+            "status": {
+                "id": "123",
+                "uri": "https://mkultra.monster/users/you/notes/123",
+                "url": "https://mkultra.monster/users/you/notes/123",
+                "content": "<p>Hello</p>",
+                "account": {"acct": "you", "uri": "https://mkultra.monster/users/you"}
+            }
+        });
+        let html = paint_notif_card_follows(
+            &row,
+            "https://mkultra.monster/users/cmdr_nova",
+            &HashSet::new(),
+        );
+        assert!(!html.contains("Follow back"), "{html}");
+        assert!(!html.contains("follow_remote"), "{html}");
+    }
+
+    #[test]
+    fn does_not_offer_follow_back_to_self() {
+        let html = paint_notif_card_follows(
+            &follow_row(
+                "https://mkultra.monster/users/cmdr_nova",
+                "https://mkultra.monster/@cmdr_nova",
+            ),
+            "https://mkultra.monster/users/cmdr_nova/",
+            &HashSet::new(),
+        );
+        assert!(!html.contains("Follow back"), "{html}");
+    }
+
+    fn row(id: &str) -> Value {
+        json!({"id": id, "type": "follow"})
+    }
+
+    #[test]
+    fn scroll_slice_keeps_rows_after_the_cursor() {
+        let items = vec![row("30"), row("20"), row("10"), row("9"), row("8")];
+        let page = full_page_after_cursor(&items, "20", 2).expect("full page");
+        assert_eq!(
+            page.iter().map(notif_id_digits).collect::<Vec<_>>(),
+            vec!["10", "9", "8"]
+        );
+    }
+
+    #[test]
+    fn scroll_slice_matches_digit_cursor_against_decorated_ids() {
+        let items = vec![row("id:30"), row("id:20"), row("id:10")];
+        let page = full_page_after_cursor(&items, "20", 1).expect("full page");
+        assert_eq!(notif_id_digits(&page[0]), "10");
+    }
+
+    #[test]
+    fn scroll_slice_misses_when_the_cursor_is_absent() {
+        let items = vec![row("30"), row("20"), row("10")];
+        assert!(full_page_after_cursor(&items, "15", 1).is_none());
+        assert!(items_after_cursor(&items, "15").is_none());
+    }
+
+    #[test]
+    fn scroll_slice_misses_a_short_tail() {
+        let items = vec![row("30"), row("20"), row("10")];
+        assert!(items_after_cursor(&items, "20").unwrap().len() == 1);
+        assert!(full_page_after_cursor(&items, "20", 2).is_none());
+    }
+
+    #[test]
+    fn scroll_slice_excludes_the_cursor_row() {
+        let items = vec![row("5"), row("4"), row("4"), row("3")];
+        let tail = items_after_cursor(&items, "4").unwrap();
+        assert_eq!(
+            tail.iter().map(notif_id_digits).collect::<Vec<_>>(),
+            vec!["4", "3"]
+        );
+    }
+
+    #[test]
+    fn warm_heads_are_tried_deepest_first() {
+        assert_eq!(warm_head_limits(12), vec![40, 30, 20, 12]);
+        assert_eq!(warm_head_limits(40), vec![40, 30, 20]);
     }
 }

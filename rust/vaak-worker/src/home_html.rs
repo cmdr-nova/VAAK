@@ -22,9 +22,11 @@ pub struct HomeHtmlReport {
     pub next_offset: usize,
     pub source: String,
     pub hydrate_key: String,
+    /// Max `created_at` the live poll considered. 0 on the fill path.
+    pub newest_ts: i64,
 }
 
-async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> String {
+pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> String {
     let Ok(db) = db::connect(&cfg.database_url).await else {
         return String::new();
     };
@@ -160,6 +162,7 @@ pub async fn tl_html_fill(
         next_offset: offset + painted,
         source: format!("axum-{view}-html:{}", report.source),
         hydrate_key: report.redis_key,
+        newest_ts: 0,
     }))
 }
 
@@ -185,6 +188,8 @@ pub async fn home_html_since(
     if !report.cache_hit {
         return Ok(None);
     }
+    // Cursor stays on created_at, including statuses dropped as twins.
+    let newest_ts = report.newest_ts;
     let mut slice = report.items;
     let mut extra_parents = std::collections::HashMap::new();
     if let Ok(db) = db::connect(&cfg.database_url).await {
@@ -213,6 +218,68 @@ pub async fn home_html_since(
         next_offset: painted,
         source: "axum-home-since-html".to_string(),
         hydrate_key: report.hydrate_key.unwrap_or_default(),
+        newest_ts,
+    }))
+}
+
+/// Local / Federated live-poll fragment. Uses the same lean painter as the
+/// timeline fill. Returns `None` when the warm head has nothing newer so PHP
+/// can still query posts that fan-out has not hydrated yet.
+pub async fn tl_html_since(
+    cfg: &Config,
+    owner_user_id: i64,
+    view: &str,
+    since_ts: i64,
+    limit: i64,
+) -> Result<Option<HomeHtmlReport>> {
+    let view = normalize_view(view);
+    if view == "home" {
+        return home_html_since(cfg, owner_user_id, since_ts, limit).await;
+    }
+    let report = timeline::chrono_since(
+        cfg,
+        owner_user_id,
+        view,
+        since_ts,
+        limit.clamp(1, 40) as usize,
+    )
+    .await?;
+    if !report.cache_hit || report.items.is_empty() {
+        return Ok(None);
+    }
+    let newest_ts = report.newest_ts;
+    let mut slice = report.items;
+    let mut extra_parents = std::collections::HashMap::new();
+    if let Ok(db) = db::connect(&cfg.database_url).await {
+        let _ = crate::link_preview::attach_cached_cards(&db, &mut slice).await;
+        if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
+            crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
+        }
+        let need = missing_self_reply_parent_uris(&slice);
+        if !need.is_empty() {
+            if let Ok(fetched) = crate::profile_html::fetch_outbox_statuses_by_uris(&db, &need).await {
+                extra_parents = fetched;
+            }
+        }
+        crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
+    }
+    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
+    let units = plan_feed_paint_units(&slice, &extra_parents);
+    let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
+        paint_lean_feed_card_opts(st, from, viewer)
+    };
+    let (html, painted) = paint_feed_units(&units, view, &viewer_actor, &paint);
+    if painted == 0 {
+        return Ok(None);
+    }
+    Ok(Some(HomeHtmlReport {
+        html,
+        count: painted,
+        has_more: false,
+        next_offset: painted,
+        source: format!("axum-{view}-since-html"),
+        hydrate_key: report.hydrate_key.unwrap_or_default(),
+        newest_ts,
     }))
 }
 

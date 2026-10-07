@@ -65,10 +65,22 @@ try {
     }
     $accounts = $call($resultBase . '/shadow/search-results?owner_id=' . $owner . '&q=alice&search_type=accounts');
     if (($accounts['fallback'] ?? '') !== 'php'
+        || ($accounts['mutation_enabled'] ?? true) !== false
         || !empty($accounts['rows'] ?? [])
         || !is_array($accounts['accounts'] ?? null)
         || !is_array($accounts['statuses'] ?? null)) {
         throw new RuntimeException('account PHP fallback marker missing');
+    }
+    $remoteUrl = 'https://example.test/users/alice/statuses/1';
+    $remote = $call($resultBase . '/shadow/search-results?owner_id=' . $owner . '&q=' . rawurlencode($remoteUrl) . '&search_type=remote_url');
+    if (($remote['query_type'] ?? '') !== 'remote_url'
+        || ($remote['fallback'] ?? '') !== 'php'
+        || ($remote['mutation_enabled'] ?? true) !== false
+        || !empty($remote['rows'] ?? null)
+        || !empty($remote['statuses'] ?? null)
+        || !empty($remote['accounts'] ?? null)
+        || ($remote['redirect_url'] ?? '') !== $remoteUrl) {
+        throw new RuntimeException('remote URL resolution did not stay on PHP');
     }
     echo "search-parity: PASS (FTS text/tag normalization, ordering shape, privacy filters, PHP account/URL fallback)\n";
 } catch (Throwable $e) {
