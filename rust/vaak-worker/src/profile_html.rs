@@ -1010,6 +1010,20 @@ pub async fn profile_html_fill(
         // Point in_reply_to_id at parent status id when parent is present.
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut statuses);
     }
+    let _ = crate::home_hydrate_ranked::attach_polls(&db, &mut statuses, &viewer_actor).await;
+    if !extra_parents.is_empty() {
+        let keys: Vec<String> = extra_parents.keys().cloned().collect();
+        let mut vals = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(value) = extra_parents.remove(key) {
+                vals.push(value);
+            }
+        }
+        let _ = crate::home_hydrate_ranked::attach_polls(&db, &mut vals, &viewer_actor).await;
+        for (key, value) in keys.into_iter().zip(vals) {
+            extra_parents.insert(key, value);
+        }
+    }
     let units = plan_feed_paint_units(&statuses, &extra_parents);
     let paint = |st: &Value, from: &str, viewer: &str| paint_lean_feed_card_opts(st, from, viewer);
     let (html, painted) = paint_feed_units(&units, "remote_profile", &viewer_actor, &paint);

@@ -179,12 +179,17 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     Ok(sets)
 }
 
-/// Personal mute/block state for lean ⋯ menus (PHP `block_quick_actions` labels).
+/// Personal mute/block/deprioritize state for lean ⋯ menus (PHP `block_quick_actions`).
 #[derive(Debug, Default, Clone)]
 pub struct ViewerModeration {
     pub muted_actors: HashSet<String>,
     /// actor_id → ap_user_blocks.id (scope=actor) for Unblock forms.
     pub blocked_actors: HashMap<String, i64>,
+    /// Home soft-rank targets. Never includes the viewer.
+    pub deprioritized_actors: HashSet<String>,
+    /// Lowercased Bluesky handle and DID for this viewer, so own Bluesky
+    /// posts do not offer personal moderation.
+    pub own_bsky_keys: HashSet<String>,
 }
 
 impl ViewerModeration {
@@ -199,6 +204,28 @@ impl ViewerModeration {
             return None;
         }
         self.blocked_actors.get(&a).copied()
+    }
+
+    pub fn is_deprioritized(&self, actor_id: &str) -> bool {
+        if actor_id.trim().is_empty() {
+            return false;
+        }
+        actor_aliases(actor_id)
+            .into_iter()
+            .any(|alias| self.deprioritized_actors.contains(&alias))
+    }
+
+    /// True when `actor_id` is this viewer's linked Bluesky profile.
+    pub fn is_self_bsky(&self, actor_id: &str) -> bool {
+        if self.own_bsky_keys.is_empty() {
+            return false;
+        }
+        let actor = norm_actor(actor_id);
+        let Some(rest) = actor.strip_prefix("https://bsky.app/profile/") else {
+            return false;
+        };
+        let key = rest.trim_matches('/').split('/').next().unwrap_or("");
+        !key.is_empty() && self.own_bsky_keys.contains(key)
     }
 }
 
@@ -235,6 +262,37 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
         let a = norm_actor(&value);
         if !a.is_empty() && id > 0 {
             out.blocked_actors.insert(a, id);
+        }
+    }
+    if let Ok(rows) = db
+        .query(
+            "SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = $1",
+            &[&owner_user_id],
+        )
+        .await
+    {
+        for row in rows {
+            let a: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+            insert_actor_aliases(&mut out.deprioritized_actors, &a);
+        }
+    }
+    if let Ok(row) = db
+        .query_opt(
+            "SELECT COALESCE(handle, ''), COALESCE(did, '')
+             FROM bsky_sessions WHERE owner_user_id = $1 LIMIT 1",
+            &[&owner_user_id],
+        )
+        .await
+    {
+        if let Some(row) = row {
+            let handle: String = row.try_get(0).unwrap_or_default();
+            let did: String = row.try_get(1).unwrap_or_default();
+            for key in [handle, did] {
+                let key = key.trim().trim_start_matches('@').to_ascii_lowercase();
+                if !key.is_empty() {
+                    out.own_bsky_keys.insert(key);
+                }
+            }
         }
     }
     Ok(out)

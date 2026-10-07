@@ -1826,6 +1826,13 @@ fn stamp_viewer_moderation_one(status: &mut Value, moderation: &crate::hidden::V
         "_vaak_viewer_muted".to_string(),
         Value::Bool(moderation.is_muted(&actor)),
     );
+    obj.insert(
+        "_vaak_viewer_deprioritized".to_string(),
+        Value::Bool(moderation.is_deprioritized(&actor)),
+    );
+    if moderation.is_self_bsky(&actor) {
+        obj.insert("_vaak_viewer_self".to_string(), Value::Bool(true));
+    }
     if let Some(id) = moderation.block_id(&actor) {
         obj.insert("_vaak_viewer_blocked".to_string(), Value::Bool(true));
         obj.insert("_vaak_viewer_block_id".to_string(), Value::from(id));
@@ -1849,7 +1856,10 @@ fn paint_moderation_overflow(
         return String::new();
     }
     // Guests and self: no personal moderation chrome.
-    if viewer.is_empty() || actor.eq_ignore_ascii_case(viewer) {
+    // Deprioritize is one of those actions — it is never offered on your own
+    // posts, including a linked Bluesky profile stamped `_vaak_viewer_self`.
+    if viewer.is_empty() || actor.eq_ignore_ascii_case(viewer) || json_flag(status, "_vaak_viewer_self")
+    {
         return String::new();
     }
     // Own note URL as belt-and-suspenders (boost of self, etc.).
@@ -1858,6 +1868,7 @@ fn paint_moderation_overflow(
     }
 
     let muted = json_flag(status, "_vaak_viewer_muted");
+    let deprioritized = json_flag(status, "_vaak_viewer_deprioritized");
     let blocked = json_flag(status, "_vaak_viewer_blocked");
     let block_id = status
         .get("_vaak_viewer_block_id")
@@ -1967,6 +1978,31 @@ fn paint_moderation_overflow(
         rv = esc(from_q),
         actor = esc(actor),
         label = if muted { "Unmute" } else { "Mute" },
+    ));
+
+    // Home soft-rank. Still visible on Local, Federated, and notifications.
+    // Own posts already returned above, and PHP rejects a self target.
+    menu.push_str(&format!(
+        "<form method=\"post\" action=\"{base}\">\
+         <input type=\"hidden\" name=\"action\" value=\"{action}\">\
+         <input type=\"hidden\" name=\"return_view\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"return_from\" value=\"{rv}\">\
+         <input type=\"hidden\" name=\"return_actor\" value=\"{actor}\">\
+         <input type=\"hidden\" name=\"actor_id\" value=\"{actor}\">\
+         <button class=\"menu-action\" type=\"submit\" title=\"Soft-rank on Home only. Still shows on Federated, Local, and notifications\">{label}</button></form>",
+        base = esc(&action_base),
+        action = if deprioritized {
+            "undeprioritize_remote"
+        } else {
+            "deprioritize_remote"
+        },
+        rv = esc(from_q),
+        actor = esc(actor),
+        label = if deprioritized {
+            "Stop deprioritizing"
+        } else {
+            "Deprioritize on Home"
+        },
     ));
 
     // Report user (composer prefilled with actor + optional post)
@@ -2681,6 +2717,74 @@ fn video_poster_attr(url: &str, preview: &str) -> String {
     }
 }
 
+/// URL-only media projections (Home/Local/Federated hydrate) do not keep MIME.
+/// Voice notes named `voice-note-*.webm` are audio, not video squares.
+pub(crate) fn media_kind_from_url(url: &str) -> &'static str {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim()
+        .to_ascii_lowercase();
+    if path.is_empty() {
+        return "unknown";
+    }
+    let file = path.rsplit('/').next().unwrap_or(&path);
+    if file.starts_with("voice-note") {
+        return "audio";
+    }
+    if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return "unknown";
+    }
+    if [".mp3", ".m4a", ".aac", ".ogg", ".oga", ".wav", ".flac", ".opus"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return "audio";
+    }
+    if [".mp4", ".webm", ".mov", ".m4v", ".m3u8"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return "video";
+    }
+    if path.contains("/audio/") || path.contains("/voice/") {
+        return "audio";
+    }
+    "unknown"
+}
+
+fn attachment_paint_kind(att: &Value, url: &str) -> &'static str {
+    let sniffed = media_kind_from_url(url);
+    if sniffed == "audio" {
+        return "audio";
+    }
+    let declared = att
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime = att
+        .get("mime")
+        .or_else(|| att.get("mediaType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if mime.starts_with("audio/") || declared == "audio" {
+        return "audio";
+    }
+    if declared == "gifv" {
+        return "gifv";
+    }
+    if declared == "video" || sniffed == "video" {
+        return "video";
+    }
+    "image"
+}
+
 fn media_row_html(st: &Value) -> String {
     let Some(atts) = st.get("media_attachments").and_then(|v| v.as_array()) else {
         return String::new();
@@ -2695,11 +2799,7 @@ fn media_row_html(st: &Value) -> String {
         if !url.starts_with("https://") {
             continue;
         }
-        let atype = att
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let atype = attachment_paint_kind(att, url);
         let preview = att
             .get("preview_url")
             .and_then(|v| v.as_str())
@@ -2727,7 +2827,7 @@ fn media_row_html(st: &Value) -> String {
             ));
         } else if atype == "audio" {
             cells.push(format!(
-                "<div class=\"media-audio-card\" role=\"group\" aria-label=\"Audio post\"><audio class=\"media-audio\" src=\"{}\" controls preload=\"metadata\"></audio></div>",
+                "<div class=\"media-audio-card\" role=\"group\" aria-label=\"Audio post\"><img class=\"media-audio-art\" src=\"/api/assets/audio-post-default.jpg\" alt=\"\" loading=\"lazy\" decoding=\"async\"><audio class=\"media-audio\" src=\"{}\" controls preload=\"metadata\"></audio></div>",
                 esc(url)
             ));
         } else {
@@ -2746,6 +2846,156 @@ fn media_row_html(st: &Value) -> String {
         "<div class=\"media-row media-count-{n}\">{}</div>",
         cells.join("")
     )
+}
+
+/// PHP `admin_poll_block_html` markup. Options come from `status.poll`, filled
+/// at paint time from `masto_polls` so a warm hydrate envelope can stay stale.
+fn poll_block_html(st: &Value, from: &str) -> String {
+    let Some(poll) = st.get("poll").filter(|v| v.is_object()) else {
+        return String::new();
+    };
+    let Some(options) = poll.get("options").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut opts: Vec<(String, i64)> = Vec::new();
+    for opt in options {
+        let title = opt
+            .get("title")
+            .and_then(|v| v.as_str())
+            .or_else(|| opt.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim();
+        if title.is_empty() {
+            continue;
+        }
+        let votes = opt
+            .get("votes_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        opts.push((title.to_string(), votes));
+    }
+    if opts.is_empty() {
+        return String::new();
+    }
+    let poll_id = poll
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            poll.get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .unwrap_or(0);
+    let expired = json_flag(poll, "expired");
+    let voted = json_flag(poll, "voted");
+    let multiple = json_flag(poll, "multiple");
+    let mut votes_count = poll
+        .get("votes_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if votes_count <= 0 {
+        votes_count = opts.iter().map(|(_, n)| *n).sum();
+    }
+    let voters_count = poll
+        .get("voters_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let note_id = st
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| st.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let show_results = expired || voted || poll_id <= 0;
+    let can_vote = poll_id > 0 && !expired && !voted && note_id.starts_with("https://");
+    let return_view = {
+        let raw = from.trim();
+        if raw.is_empty() { "home" } else { raw }
+    };
+    let label = if expired {
+        "Poll · closed"
+    } else if voted {
+        "Poll · voted"
+    } else {
+        "Poll"
+    };
+    let mut html = format!(
+        "<div class=\"poll-block\" data-note-id=\"{}\"{}>",
+        esc(note_id),
+        if poll_id > 0 {
+            format!(" data-poll-id=\"{poll_id}\"")
+        } else {
+            String::new()
+        }
+    );
+    html.push_str(&format!("<span class=\"poll-label\">{}</span>", esc(label)));
+    if can_vote {
+        let input_type = if multiple { "checkbox" } else { "radio" };
+        html.push_str(&format!(
+            "<form method=\"post\" action=\"?view={view}\" class=\"poll-vote-form\">\
+             <input type=\"hidden\" name=\"action\" value=\"poll_vote\">\
+             <input type=\"hidden\" name=\"poll_id\" value=\"{poll_id}\">\
+             <input type=\"hidden\" name=\"note_id\" value=\"{note}\">\
+             <input type=\"hidden\" name=\"return_view\" value=\"{view}\">",
+            view = esc(return_view),
+            note = esc(note_id),
+        ));
+        for (i, (title, _)) in opts.iter().enumerate() {
+            html.push_str(&format!(
+                "<label class=\"poll-opt poll-opt--vote\"><input type=\"{input_type}\" name=\"choices[]\" value=\"{i}\"><span>{}</span></label>",
+                esc(title)
+            ));
+        }
+        html.push_str(
+            "<button class=\"btn btn-ghost\" type=\"submit\" style=\"margin-top:.4rem;padding:.3rem .7rem;font-size:.82rem\">Vote</button></form>",
+        );
+    } else {
+        for (title, votes) in &opts {
+            let pct = if show_results && votes_count > 0 {
+                ((*votes as f64 / votes_count as f64) * 100.0).round() as i64
+            } else {
+                0
+            };
+            html.push_str(&format!(
+                "<div class=\"poll-opt{}\"><div class=\"poll-opt-bar\" style=\"width:{pct}%\"></div><span class=\"poll-opt-text\">{}</span>",
+                if show_results { " poll-opt--result" } else { "" },
+                esc(title)
+            ));
+            if show_results {
+                html.push_str(&format!(
+                    "<span class=\"poll-opt-count\">{pct}% · {votes}</span>"
+                ));
+            }
+            html.push_str("</div>");
+        }
+    }
+    let mut meta = Vec::new();
+    if show_results {
+        meta.push(format!(
+            "{votes_count} vote{}",
+            if votes_count == 1 { "" } else { "s" }
+        ));
+        if voters_count > 0 {
+            meta.push(format!(
+                "{voters_count} voter{}",
+                if voters_count == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    if let Some(when) = poll.get("expires_label").and_then(|v| v.as_str()) {
+        let when = when.trim();
+        if !when.is_empty() {
+            meta.push(when.to_string());
+        }
+    }
+    if !meta.is_empty() {
+        html.push_str(&format!(
+            "<div class=\"poll-meta\">{}</div>",
+            esc(&meta.join(" · "))
+        ));
+    }
+    html.push_str("</div>");
+    html
 }
 
 /// Render the canonical VAAK/Wafrn Ask wire fragment as one timeline card.
@@ -3098,7 +3348,12 @@ pub fn paint_lean_embed_from(
     // strip_tags+esc dropped <a> and double-encoded &#039; / &quot; into visible codes (0.7.13).
     // 0.7.14: rewrite anchors in-app, linkify bare URLs, tighten breaks, paint OG cards.
     let content_trim = content_html.trim();
-    if let Some((ask_html, answer)) = ask_card_from_status(status)
+    let poll_html = poll_block_html(status, from);
+    // Local poll posts store the sentinel "(poll)" when the question text is empty.
+    let poll_sentinel = !poll_html.is_empty() && plain.trim() == "(poll)";
+    if poll_sentinel {
+        // The poll block below is the post.
+    } else if let Some((ask_html, answer)) = ask_card_from_status(status)
         .or_else(|| ask_card_parts(content_trim))
     {
         body_inner.push_str(&ask_html);
@@ -3115,6 +3370,7 @@ pub fn paint_lean_embed_from(
         ));
     }
     body_inner.push_str(&media_row_html(status));
+    body_inner.push_str(&poll_html);
     body_inner.push_str(&paint_status_link_card(status));
 
     // Match PHP's degraded-card contract: a queued/partially hydrated object
@@ -4038,7 +4294,123 @@ mod tests {
                 && html.contains("report_object="),
             "Report with post ref: {html}"
         );
+        assert!(
+            html.contains("deprioritize_remote") && html.contains("Deprioritize on Home"),
+            "Deprioritize on Home: {html}"
+        );
         assert!(!html.contains("delete_status"), "must not Delete peer: {html}");
+    }
+
+    #[test]
+    fn deprioritized_actor_offers_stop_and_own_posts_do_not() {
+        let mut st = json!({
+            "id": "99",
+            "uri": "https://mastodon.social/users/x/statuses/99",
+            "url": "https://mastodon.social/users/x/statuses/99",
+            "content": "<p>hi</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "_vaak_viewer_muted": false,
+            "_vaak_viewer_blocked": false,
+            "_vaak_viewer_deprioritized": true,
+            "account": {
+                "acct": "x@mastodon.social",
+                "display_name": "X",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://mastodon.social/users/x"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "feed",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(html.contains("undeprioritize_remote"), "{html}");
+        assert!(html.contains("Stop deprioritizing"), "{html}");
+        assert!(
+            !html.contains("value=\"deprioritize_remote\""),
+            "stop form must not also add: {html}"
+        );
+        st["_vaak_viewer_self"] = json!(true);
+        let html = paint_lean_feed_card_opts(
+            &st,
+            "local",
+            "https://mkultra.monster/users/cmdr_nova",
+        );
+        assert!(!html.contains("deprioritize_remote"), "own bluesky/self: {html}");
+        assert!(!html.contains("undeprioritize_remote"), "own bluesky/self: {html}");
+    }
+
+    #[test]
+    fn audio_only_and_poll_cards_render_on_timelines() {
+        let audio = json!({
+            "id": "a1",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/audio1",
+            "url": "https://mkultra.monster/users/cmdr_nova/notes/audio1",
+            "content": "<p></p>",
+            "created_at": "2026-10-07T12:00:00.000Z",
+            "account": {
+                "acct": "cmdr_nova",
+                "display_name": "Nova",
+                "avatar": "https://mkultra.monster/img/avatar/local-default.webp",
+                "uri": "https://mkultra.monster/users/cmdr_nova"
+            },
+            "media_attachments": [{
+                "type": "image",
+                "url": "https://media.example/mkultra/media/2026/10/07/clip.mp3",
+                "preview_url": "https://media.example/mkultra/media/2026/10/07/clip.mp3"
+            }]
+        });
+        let html = paint_lean_feed_card_opts(&audio, "local", "");
+        assert!(html.contains("media-audio-card"), "{html}");
+        assert!(html.contains("audio-post-default.jpg"), "{html}");
+        assert!(html.contains("class=\"media-audio\""), "{html}");
+        assert!(!html.contains("media-lightbox-trigger"), "mp3 must not paint as an image: {html}");
+
+        let poll = json!({
+            "id": "p1",
+            "uri": "https://mkultra.monster/users/cmdr_nova/notes/poll1",
+            "url": "https://mkultra.monster/users/cmdr_nova/notes/poll1",
+            "content": "<p>(poll)</p>",
+            "created_at": "2026-10-07T12:00:00.000Z",
+            "account": {
+                "acct": "cmdr_nova",
+                "display_name": "Nova",
+                "avatar": "https://mkultra.monster/img/avatar/local-default.webp",
+                "uri": "https://mkultra.monster/users/cmdr_nova"
+            },
+            "media_attachments": [],
+            "poll": {
+                "id": "4",
+                "expired": false,
+                "multiple": false,
+                "votes_count": 4,
+                "voters_count": 3,
+                "voted": false,
+                "expires_label": "ends Oct 8, 2026 · 02:39 UTC",
+                "options": [
+                    {"title": "ew what the hell", "votes_count": 2},
+                    {"title": "i love napkins", "votes_count": 2}
+                ]
+            }
+        });
+        let html = paint_lean_feed_card_opts(
+            &poll,
+            "home",
+            "https://mkultra.monster/users/someone",
+        );
+        assert!(html.contains("poll-block"), "{html}");
+        assert!(html.contains("poll_vote"), "{html}");
+        assert!(html.contains("ew what the hell"), "{html}");
+        assert!(html.contains("i love napkins"), "{html}");
+        assert!(!html.contains("(poll)"), "sentinel text should stay hidden: {html}");
+        assert!(
+            html.contains("Deprioritize on Home"),
+            "another person's poll keeps the overflow action: {html}"
+        );
     }
 
     #[test]
@@ -4076,6 +4448,8 @@ mod tests {
         assert!(html.contains("js-edit-post") && html.contains("edit_note="), "Edit: {html}");
         assert!(html.contains("pin_status") || html.contains("Pin to profile"), "Pin: {html}");
         assert!(html.contains("post-action-menu"), "overflow: {html}");
+        assert!(!html.contains("deprioritize_remote"), "own post must not deprioritize: {html}");
+        assert!(!html.contains("undeprioritize_remote"), "own post must not deprioritize: {html}");
         assert!(!html.contains("bite_remote"), "own must not Bite: {html}");
         assert!(html.contains("data-own-eng") || html.contains("ph-heart"), "{html}");
         assert!(
