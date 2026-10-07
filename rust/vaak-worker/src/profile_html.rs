@@ -112,6 +112,23 @@ fn empty_account(actor_url: &str, username: &str, display: &str, avatar: &str) -
     })
 }
 
+fn actor_username_from_object_url(url: &str) -> String {
+    let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
+    for marker in ["statuses", "posts", "notes", "objects"] {
+        if let Some(pos) = parts.iter().position(|part| part.eq_ignore_ascii_case(marker)) {
+            if pos > 0 && !parts[pos - 1].is_empty() {
+                return parts[pos - 1].trim_start_matches('@').to_string();
+            }
+        }
+    }
+    parts
+        .iter()
+        .rev()
+        .find(|part| !part.is_empty())
+        .map(|part| part.trim_start_matches('@').to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 /// Mastodon-style video attachments need an image poster; browsers ignore an
 /// MP4 used directly as `<video poster>`. Keep profile tabs in parity with the
 /// Home hydrate path.
@@ -691,16 +708,12 @@ fn materialize_announce_status(
             format!("<p>{}</p>", html_escape_text(plain))
         };
         let thin_acct = {
-            let username = object_id
-                .rsplit('/')
-                .nth(1)
-                .or_else(|| object_id.rsplit('/').next())
-                .unwrap_or("unknown");
+            let username = actor_username_from_object_url(object_id);
             // Prefer /users/{name}/notes/… username.
             let uname = if let Some(rest) = object_id.strip_prefix(LOCAL_ACTOR_PREFIX) {
-                rest.split('/').next().unwrap_or(username)
+                rest.split('/').next().unwrap_or(&username)
             } else {
-                username
+                username.as_str()
             };
             empty_account(object_id, uname, uname, DEFAULT_AVATAR)
         };
@@ -765,8 +778,12 @@ async fn hydrate_announce_inners(
             note_ids.push(format!("{oid}/"));
         }
     }
-    if note_ids.is_empty() {
-        return Ok(map);
+    for a in anns {
+        let oid = a.object_id.trim_end_matches('/');
+        if !oid.is_empty() {
+            note_ids.push(oid.to_string());
+            note_ids.push(format!("{oid}/"));
+        }
     }
     note_ids.sort();
     note_ids.dedup();
@@ -800,11 +817,7 @@ async fn hydrate_announce_inners(
             quote_object: String::new(),
         });
     }
-    let mut variants = Vec::new();
-    for r in &paint_rows {
-        variants.push(r.id.trim_end_matches('/').to_string());
-        variants.push(format!("{}/", r.id.trim_end_matches('/')));
-    }
+    let mut variants = note_ids.clone();
     if !variants.is_empty() {
         if let Ok(masto) = db
             .query(
@@ -840,6 +853,54 @@ async fn hydrate_announce_inners(
                     r.content_text = ctext.clone();
                 }
             }
+        }
+    }
+    // Remote originals live in the event ledger rather than outbox_notes.
+    // Hydrate those Create rows so profile boosts do not degrade to empty
+    // synthetic cards.
+    if let Ok(events) = db
+        .query(
+            "SELECT id, actor_id, object_id, COALESCE(summary,''),
+                    COALESCE(created_at::text,''), COALESCE(host,'')
+             FROM events
+             WHERE type = 'Create' AND object_id = ANY($1)
+             ORDER BY id DESC",
+            &[&variants],
+        )
+        .await
+    {
+        for event in events {
+            let object_id: String = event.get(2);
+            let key = object_id.trim_end_matches('/').to_string();
+            if map.contains_key(&key) {
+                continue;
+            }
+            let actor_id: String = event.get(1);
+            let username = actor_username_from_object_url(&actor_id);
+            let summary: String = event.get(3);
+            let content = if summary.trim().is_empty() {
+                String::new()
+            } else {
+                format!("<p>{}</p>", html_escape_text(&summary))
+            };
+            let inner = json!({
+                "id": format!("event-inner:{}", event.get::<_, i64>(0)),
+                "created_at": format_published(&event.get::<_, String>(4)),
+                "sensitive": false,
+                "spoiler_text": "",
+                "visibility": "public",
+                "uri": key,
+                "url": key,
+                "content": content,
+                "account": empty_account(&actor_id, &username, &username, DEFAULT_AVATAR),
+                "media_attachments": [],
+                "reblog": Value::Null,
+                "favourited": false,
+                "reblogged": false,
+                "bookmarked": false,
+                "pinned": false,
+            });
+            map.insert(key, inner);
         }
     }
     for r in &paint_rows {
