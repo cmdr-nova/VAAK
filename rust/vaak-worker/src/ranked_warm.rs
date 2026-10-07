@@ -38,6 +38,19 @@ const HOME_BSKY_MAX_RATIO: f64 = 0.60;
 const HOME_RSS_MAX_RATIO: f64 = 0.28;
 const HOME_FOLLOWED_TAG_CAP: usize = 72;
 const HOME_TTL_SECS: u64 = 600;
+/// Fediverse rows older than this, relative to the next Bluesky row, stay
+/// behind the fresh head. The 60% cap must not drag last month's posts up
+/// between posts from the last hour.
+const HOME_STALE_FEDI_GAP_SECS: i64 = 48 * 3600;
+/// When a follow graph has fewer than this many posts from the last two days,
+/// fill the rest with recent public federated posts.
+const HOME_FLOOR_MIN_FRESH: usize = 40;
+const HOME_FLOOR_FRESH_SECS: i64 = 48 * 3600;
+const HOME_FLOOR_TARGET: usize = 80;
+const HOME_FLOOR_PER_ACTOR: usize = 2;
+const HOME_FLOOR_PER_HOST: usize = 3;
+/// Own outbox rows older than this are history, not a Home head.
+const HOME_OWN_MAX_AGE_SECS: i64 = 7 * 24 * 3600;
 /// Deep Home scroll head (0.7.25). Was 160 — scrolling past ~100–200 hit End of timeline.
 const MAX_TIMELINE: usize = 400;
 const PER_ACTOR_CAP: usize = 25;
@@ -675,7 +688,74 @@ async fn fetch_own_outbox(db: &Client, self_actor: &str) -> Result<Vec<TimelineI
             content,
         ));
     }
+    let own_cutoff = chrono::Utc::now().timestamp() - HOME_OWN_MAX_AGE_SECS;
+    items.retain(|item| item.sort >= own_cutoff);
     Ok(items)
+}
+
+/// Recent public posts from other servers. Used when this account's follows
+/// have not posted enough in the last two days, so Home does not freeze on
+/// one local account or on the viewer's own old notes.
+async fn fetch_federated_floor(
+    db: &Client,
+    hidden: &hidden::HiddenSets,
+) -> Result<Vec<TimelineItem>> {
+    let since = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+    let rows = db
+        .query(
+            "SELECT id, actor_id, COALESCE(object_id,''), COALESCE(summary,''),
+                    created_at, COALESCE(visibility,'public'), COALESCE(host,'')
+             FROM events
+             WHERE type = 'Create'
+               AND action_taken = ANY(ARRAY['log','local_observe'])
+               AND created_at >= $1
+               AND visibility = ANY(ARRAY['public','unlisted'])
+               AND actor_id NOT LIKE 'https://mkultra.monster/users/%'
+             ORDER BY created_at DESC, id DESC
+             LIMIT 500",
+            &[&since],
+        )
+        .await
+        .context("select federated home floor")?;
+    let mut out = Vec::new();
+    let mut per_actor: HashMap<String, usize> = HashMap::new();
+    let mut per_host: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        if out.len() >= HOME_FLOOR_TARGET {
+            break;
+        }
+        let (id, actor, object_id, summary, created, visibility, host) = parse_reco_row(&row)?;
+        if actor.is_empty() || hidden.is_hidden(&actor) {
+            continue;
+        }
+        let host = if host.is_empty() {
+            host_of_actor(&actor)
+        } else {
+            host.to_ascii_lowercase()
+        };
+        if *per_actor.get(&actor).unwrap_or(&0) >= HOME_FLOOR_PER_ACTOR {
+            continue;
+        }
+        if !host.is_empty() && *per_host.get(&host).unwrap_or(&0) >= HOME_FLOOR_PER_HOST {
+            continue;
+        }
+        *per_actor.entry(actor.clone()).or_insert(0) += 1;
+        if !host.is_empty() {
+            *per_host.entry(host).or_insert(0) += 1;
+        }
+        out.push(TimelineItem::event(
+            id.to_string(),
+            parse_ts(&created),
+            actor.clone(),
+            actor,
+            summary,
+            visibility,
+            object_id,
+            "Create".into(),
+            "federated",
+        ));
+    }
+    Ok(out)
 }
 
 fn rank_from_timeline(mut items: Vec<TimelineItem>) -> Vec<Value> {
@@ -1073,7 +1153,14 @@ fn merge_bsky_ranked(
             (Some(_), None) => true,
             _ => false,
         };
-        if bsky_wins && bsky_ratio_allows(out.len(), bsky_emitted) {
+        // A stale follow or own note must not take a fresh slot just because
+        // Bluesky would otherwise pass 60%. Leave it until the fresh rows
+        // are placed.
+        let fedi_is_stale = match (bsky_sort, fedi_sort) {
+            (Some(bs), Some(fs)) => bs.saturating_sub(fs) > HOME_STALE_FEDI_GAP_SECS,
+            _ => false,
+        };
+        if bsky_wins && (bsky_ratio_allows(out.len(), bsky_emitted) || fedi_is_stale) {
             out.push(queued[bi].clone());
             bi += 1;
             bsky_emitted += 1;
@@ -2582,6 +2669,23 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     let mut timeline = fetch_home_events(&db, &ap_following, &actor_id, &hidden).await?;
     timeline.extend(fetch_followed_tag_events(&db, &followed_tags, &hidden).await?);
     timeline.extend(fetch_own_outbox(&db, &actor_id).await?);
+    if algorithm_on {
+        let fresh_cutoff = chrono::Utc::now().timestamp() - HOME_FLOOR_FRESH_SECS;
+        let fresh_follows = timeline
+            .iter()
+            .filter(|item| item.source == "fediverse" && item.sort >= fresh_cutoff)
+            .count();
+        if fresh_follows < HOME_FLOOR_MIN_FRESH {
+            match fetch_federated_floor(&db, &hidden).await {
+                Ok(floor) => timeline.extend(floor),
+                Err(e) => tracing::warn!(
+                    owner = owner_user_id,
+                    error = %format!("{e:#}"),
+                    "native home federated floor skipped"
+                ),
+            }
+        }
+    }
     let deprioritized = load_deprioritized_actors(&db, owner_user_id).await;
     apply_deprioritized_rank(&mut timeline, &deprioritized);
 
@@ -3068,6 +3172,32 @@ mod tests {
         );
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["k"], json!("event"));
+    }
+
+    #[test]
+    fn merge_does_not_interleave_week_old_posts_into_a_fresh_bluesky_head() {
+        let hidden = hidden::HiddenSets::default();
+        let now = chrono::Utc::now().timestamp();
+        let fedi = vec![json!({
+            "k": "event",
+            "id": "old",
+            "s": "fediverse",
+            "sort": now - 13 * 24 * 3600
+        })];
+        let bsky: Vec<BskyKey> = (0..4)
+            .map(|i| {
+                bsky_key(
+                    &format!("at://did:x/app.bsky.feed.post/{i}"),
+                    "did:x",
+                    now - i * 60,
+                    now - i * 60,
+                )
+            })
+            .collect();
+        let merged = merge_bsky_ranked(fedi, &bsky, &hidden);
+        assert_eq!(merged.len(), 5);
+        assert!(merged[..4].iter().all(|row| row["k"] == json!("bsky")));
+        assert_eq!(merged[4]["id"], json!("old"));
     }
 
     #[test]
