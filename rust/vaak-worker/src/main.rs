@@ -32,6 +32,7 @@ mod you;
 mod relationships;
 mod settings;
 mod library;
+mod ml_ranker;
 mod integrations;
 mod private_surfaces;
 mod search_contract;
@@ -107,6 +108,18 @@ enum Command {
         since_secs: i64,
         #[arg(long, default_value_t = 20)]
         limit: i64,
+    },
+    /// Train the explainable Home ranker in shadow mode from durable signals.
+    MlTrain {
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+    },
+    /// Compare the shadow model with the current heuristic actor ranking.
+    MlCompare {
+        #[arg(long, default_value_t = 0)]
+        owner_id: i64,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     ActionQueue {
         #[arg(long, default_value_t = true)]
@@ -298,6 +311,14 @@ async fn main() -> Result<()> {
                 cfg.default_owner_id
             };
             ranked::run(&cfg, owner, since_secs, limit).await?;
+        }
+        Command::MlTrain { owner_id } => {
+            let owner = if owner_id > 0 { owner_id } else { cfg.default_owner_id };
+            ml_ranker::run(&cfg, owner).await?;
+        }
+        Command::MlCompare { owner_id, limit } => {
+            let owner = if owner_id > 0 { owner_id } else { cfg.default_owner_id };
+            ml_ranker::compare(&cfg, owner, limit).await?;
         }
         Command::ActionQueue { list: _, limit } => {
             action_queue::list_pending(&cfg, limit).await?;
