@@ -684,6 +684,146 @@ pub async fn bridge_daily_claim(cfg: &Config, owner: i64) -> Result<Value> {
     }))
 }
 
+fn parse_bridge_time(raw: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// Pull the linked OpenSim body and mirror it into VAAK. This does not claim
+/// daily resonance. PHP keeps the public check-in and remains the fallback
+/// when this pull fails.
+pub async fn bridge_sync(cfg: &Config, owner: i64) -> Result<Value> {
+    if owner < 1 {
+        anyhow::bail!("Not signed in.");
+    }
+    let mut client = db::connect(&cfg.database_url).await?;
+    let owner_i32 = i32::try_from(owner).context("owner_id outside PostgreSQL integer range")?;
+    let link = client
+        .query_opt(
+            "SELECT avatar_uuid, avatar_name FROM phyrian_bridge_links
+             WHERE owner_user_id=$1 AND status='verified' AND unlinked_at IS NULL
+             LIMIT 1",
+            &[&owner_i32],
+        )
+        .await?
+        .context("Not linked to OpenSim")?;
+    let uuid: String = link.get(0);
+    let avatar_name: String = link.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+    let data = bridge_read(cfg, "vaak_player_pull", serde_json::json!({"avatar_uuid": uuid})).await?;
+    let player = data
+        .get("player")
+        .filter(|v| v.is_object())
+        .cloned()
+        .context("OpenSim returned no player payload")?;
+    let plan = normalize_opensim_player(&player);
+    let decay = int_field(&player, "daily_resonance_decay")
+        .unwrap_or(5)
+        .clamp(0, 100) as i32;
+    let last_decay = parse_bridge_time(plan.last_decay_at.as_deref());
+    let strain = if plan.strain.is_empty() {
+        None
+    } else {
+        Some(plan.strain.as_str())
+    };
+    let before = client
+        .query_opt(
+            "SELECT status, COALESCE(strain, ''), resonance, generation, level,
+                    banked_resonance, resonance_exchanges, inductions_given,
+                    COALESCE(lineage_depth, 0), COALESCE(daily_resonance_decay, 5)
+             FROM phyrian_players WHERE owner_user_id=$1",
+            &[&owner_i32],
+        )
+        .await?
+        .context("Linked player row not found")?;
+    let before_status: String = before.get(0);
+    let before_strain: String = before.get(1);
+    let before_resonance: i32 = before.get(2);
+    let before_generation: i32 = before.get(3);
+    let before_level: i32 = before.get(4);
+    let before_banked: i32 = before.get(5);
+    let before_exchanges: i32 = before.get(6);
+    let before_inductions: i32 = before.get(7);
+    let before_lineage: i32 = before.get(8);
+    let before_decay: i32 = before.get(9);
+    let tx = client.transaction().await?;
+    let updated = tx
+        .execute(
+            "UPDATE phyrian_players
+             SET status=$1, strain=$2, resonance=$3, generation=$4, level=$5,
+                 banked_resonance=$6, resonance_exchanges=$7, inductions_given=$8,
+                 lineage_depth=$9, daily_resonance_decay=$10,
+                 last_decay_at=COALESCE($11, last_decay_at), updated_at=NOW()
+             WHERE owner_user_id=$12",
+            &[
+                &plan.status,
+                &strain,
+                &(plan.resonance as i32),
+                &(plan.generation as i32),
+                &(plan.level as i32),
+                &(plan.banked_resonance as i32),
+                &(plan.resonance_exchanges as i32),
+                &(plan.inductions_given as i32),
+                &(plan.lineage_depth as i32),
+                &decay,
+                &last_decay,
+                &owner_i32,
+            ],
+        )
+        .await?;
+    if updated == 0 {
+        anyhow::bail!("Linked player row not found");
+    }
+    let snapshot = strain.unwrap_or("");
+    let _ = tx
+        .execute(
+            "UPDATE phyrian_bridge_links
+             SET avatar_name = COALESCE(NULLIF($1, ''), avatar_name),
+                 strain_snapshot = NULLIF($2, ''),
+                 last_synced_at = NOW(),
+                 updated_at = NOW()
+             WHERE owner_user_id=$3 AND status='verified' AND unlinked_at IS NULL",
+            &[&avatar_name, &snapshot, &owner_i32],
+        )
+        .await;
+    tx.commit().await?;
+    let changed = before_status != plan.status
+        || before_strain != plan.strain
+        || before_resonance != plan.resonance as i32
+        || before_generation != plan.generation as i32
+        || before_level != plan.level as i32
+        || before_banked != plan.banked_resonance as i32
+        || before_exchanges != plan.resonance_exchanges as i32
+        || before_inductions != plan.inductions_given as i32
+        || before_lineage != plan.lineage_depth as i32
+        || before_decay != decay;
+    Ok(serde_json::json!({
+        "ok": true,
+        "skipped": false,
+        "changed": changed,
+        "daily_claimed_today": data.get("daily_claimed_today").cloned().unwrap_or(Value::Bool(false)),
+        "player": {
+            "status": plan.status,
+            "strain": plan.strain,
+            "resonance": plan.resonance,
+            "generation": plan.generation,
+            "level": plan.level,
+            "banked_resonance": plan.banked_resonance,
+            "resonance_exchanges": plan.resonance_exchanges,
+            "inductions_given": plan.inductions_given,
+            "lineage_depth": plan.lineage_depth,
+            "daily_resonance_decay": decay,
+        }
+    }))
+}
+
 pub async fn dossier(cfg: &Config, owner: i64, include_directory: bool, limit: i64) -> Result<Projection> {
     if owner < 1 {
         anyhow::bail!("owner_id must be positive");

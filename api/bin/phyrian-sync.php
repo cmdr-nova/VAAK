@@ -47,6 +47,34 @@ require $apiDir . '/ap-db.php';
 require_once $apiDir . '/ap-phyrian.php';
 require_once $apiDir . '/ap-phyrian-bridge.php';
 
+// The five-minute job is CLI, so it does not inherit the php-fpm flag.
+// Rust mirrors the pull; a failed call still uses the PHP bridge below.
+$workerEnv = '/etc/mkultra/vaak.env';
+if (is_readable($workerEnv)) {
+    $envLines = file($workerEnv, FILE_IGNORE_NEW_LINES);
+    if (is_array($envLines)) {
+        foreach ($envLines as $envLine) {
+            $envLine = trim($envLine);
+            if ($envLine === '' || str_starts_with($envLine, '#') || !str_contains($envLine, '=')) {
+                continue;
+            }
+            [$envKey, $envValue] = explode('=', $envLine, 2);
+            if (trim($envKey) !== 'VAAK_PHYRIAN_MUTATION_TOKEN') {
+                continue;
+            }
+            $envValue = trim($envValue, " \t\"'");
+            if ($envValue !== '' && getenv('VAAK_PHYRIAN_MUTATION_TOKEN') === false) {
+                putenv('VAAK_PHYRIAN_MUTATION_TOKEN=' . $envValue);
+                $_ENV['VAAK_PHYRIAN_MUTATION_TOKEN'] = $envValue;
+            }
+        }
+    }
+}
+if (trim((string) getenv('VAAK_PHYRIAN_RUST_MUTATIONS')) === '') {
+    putenv('VAAK_PHYRIAN_RUST_MUTATIONS=1');
+    $_ENV['VAAK_PHYRIAN_RUST_MUTATIONS'] = '1';
+}
+
 $lockPath = '/tmp/ap-phyrian-sync.lock';
 $lockFh = @fopen($lockPath, 'c+');
 if ($lockFh === false || !flock($lockFh, LOCK_EX | LOCK_NB)) {
