@@ -6,9 +6,6 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-const LOCAL_NOTES_MARKER: &str = "/notes/";
-const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
-
 /// Status URI/url trimmed (note or remote object).
 pub fn status_object_uri(st: &Value) -> String {
     st.get("uri")
@@ -20,33 +17,104 @@ pub fn status_object_uri(st: &Value) -> String {
         .to_string()
 }
 
-/// Parent note URL when `st` is a local self-reply continuation.
-pub fn self_reply_parent_uri(st: &Value) -> Option<String> {
-    let child = status_object_uri(st);
-    if child.is_empty() || !child.contains(LOCAL_NOTES_MARKER) {
+/// Account URL for a status permalink that includes the author.
+/// Misskey-style `https://host/notes/{id}` has no author in the path, so it
+/// returns none instead of treating every note on that host as one person.
+fn status_actor_url(uri: &str) -> Option<String> {
+    let uri = uri.trim().trim_end_matches('/');
+    for marker in ["/notes/", "/statuses/", "/objects/"] {
+        if let Some((actor, _)) = uri.rsplit_once(marker) {
+            if actor.starts_with("https://") && (actor.contains("/users/") || actor.contains("/@")) {
+                return Some(actor.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// DID of an `at://` Bluesky post. Other collections (lists, starter packs)
+/// are not timeline posts, so they do not form a self-thread.
+fn at_post_did(uri: &str) -> Option<String> {
+    let rest = uri.trim().trim_end_matches('/').strip_prefix("at://")?;
+    let (did, tail) = rest.split_once('/')?;
+    if !did.starts_with("did:") || !tail.starts_with("app.bsky.feed.post/") {
         return None;
     }
-    let parent = st
-        .get("vaak_in_reply_to_url")
+    let rkey = &tail["app.bsky.feed.post/".len()..];
+    if rkey.is_empty() || rkey.contains('/') {
+        return None;
+    }
+    Some(did.to_string())
+}
+
+/// Handle from `https://bsky.app/profile/{handle}/post/{rkey}`.
+fn bsky_https_post_handle(uri: &str) -> Option<String> {
+    let uri = uri.trim().trim_end_matches('/');
+    let rest = uri.strip_prefix("https://bsky.app/profile/")?;
+    let (handle, tail) = rest.split_once("/post/")?;
+    if handle.is_empty() || handle.contains('/') || tail.is_empty() || tail.contains('/') {
+        return None;
+    }
+    Some(handle.to_string())
+}
+
+fn reply_parent_uri(st: &Value) -> Option<String> {
+    st.get("vaak_in_reply_to_url")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| s.starts_with("https://") || s.starts_with("at://"))
         .or_else(|| {
             st.get("in_reply_to_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| s.starts_with("https://") && s.contains(LOCAL_NOTES_MARKER))
-        })?;
-    let child_actor = child
-        .rsplit_once(LOCAL_NOTES_MARKER)
-        .map(|(p, _)| p)?;
-    let parent_actor = parent
-        .rsplit_once(LOCAL_NOTES_MARKER)
-        .map(|(p, _)| p)?;
-    if child_actor != parent_actor {
+                .filter(|s| s.starts_with("https://") || s.starts_with("at://"))
+        })
+}
+
+fn bsky_child_did(st: &Value) -> Option<String> {
+    st.get("author_did")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with("did:"))
+        .map(str::to_string)
+        .or_else(|| at_post_did(&status_object_uri(st)))
+}
+
+fn bsky_child_handle(st: &Value) -> Option<String> {
+    if let Some(handle) = bsky_https_post_handle(&status_object_uri(st)) {
+        return Some(handle);
+    }
+    let bsky = st.get("source").and_then(|v| v.as_str()) == Some("bluesky")
+        || bsky_child_did(st).is_some();
+    if !bsky {
         return None;
     }
-    if !child_actor.starts_with(LOCAL_ACTOR_PREFIX) {
+    st.get("account")
+        .and_then(|a| a.get("acct"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('@'))
+        .map(str::to_string)
+}
+
+/// Parent URL when `st` continues the same author's own status.
+pub fn self_reply_parent_uri(st: &Value) -> Option<String> {
+    let parent = reply_parent_uri(st)?;
+    if let Some(parent_did) = at_post_did(&parent) {
+        let same = bsky_child_did(st)
+            .as_deref()
+            .is_some_and(|did| did == parent_did);
+        return same.then_some(parent);
+    }
+    if let Some(parent_handle) = bsky_https_post_handle(&parent) {
+        let same = bsky_child_handle(st)
+            .as_deref()
+            .is_some_and(|handle| handle.eq_ignore_ascii_case(&parent_handle));
+        return same.then_some(parent);
+    }
+    let child_actor = status_actor_url(&status_object_uri(st))?;
+    let parent_actor = status_actor_url(&parent)?;
+    if child_actor != parent_actor {
         return None;
     }
     Some(parent)
@@ -141,6 +209,48 @@ fn article_inner_html(painted: &str) -> Option<String> {
     Some(trimmed[start..end].to_string())
 }
 
+fn article_open_head(painted: &str) -> &str {
+    let trimmed = painted.trim_start();
+    let Some(rest) = trimmed.strip_prefix("<article") else {
+        return "";
+    };
+    match rest.find('>') {
+        Some(end) => &rest[..end],
+        None => "",
+    }
+}
+
+/// Copy one already-escaped attribute off a painted `<article>` open tag.
+fn copy_attr(head: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = head.find(&needle)?;
+    let val_start = start + needle.len();
+    let rel_end = head[val_start..].find('"')?;
+    Some(format!(
+        " {name}=\"{}\"",
+        &head[val_start..val_start + rel_end]
+    ))
+}
+
+/// Identity attrs live on the outer `<article>`. Thread segments keep the
+/// inner HTML only, so without this copy the parent id disappears and the
+/// next page paints that same post again.
+fn copied_identity_attrs(painted: &str) -> String {
+    let head = article_open_head(painted);
+    let mut out = String::new();
+    for name in [
+        "data-timeline-key",
+        "data-bsky-uri",
+        "data-rss-item",
+        "data-note-id",
+    ] {
+        if let Some(attr) = copy_attr(head, name) {
+            out.push_str(&attr);
+        }
+    }
+    out
+}
+
 /// One timeline/profile card: parent ancestor + tip reply.
 pub fn paint_lean_self_thread(
     parent: &Value,
@@ -151,13 +261,18 @@ pub fn paint_lean_self_thread(
 ) -> String {
     let parent_html = paint_card(parent, from, viewer_actor);
     let tip_html = paint_card(tip, from, viewer_actor);
-    let parent_inner = article_inner_html(&parent_html).unwrap_or(parent_html);
-    let tip_inner = article_inner_html(&tip_html).unwrap_or(tip_html);
+    let parent_inner = article_inner_html(&parent_html).unwrap_or_else(|| parent_html.clone());
+    let tip_inner = article_inner_html(&tip_html).unwrap_or_else(|| tip_html.clone());
+    let parent_attrs = copied_identity_attrs(&parent_html);
+    let tip_attrs = copied_identity_attrs(&tip_html);
+    // The outer card's id is the tip. The ancestor keeps its own id so a later
+    // page that reaches the parent row is recognized as already on screen.
+    let tip_key = copy_attr(article_open_head(&tip_html), "data-timeline-key").unwrap_or_default();
     format!(
-        "<article class=\"tweet tweet-thread\">\
-<div class=\"tweet-thread-seg tweet-thread-seg--ancestor\">{parent_inner}</div>\
+        "<article class=\"tweet tweet-thread\"{tip_key}>\
+<div class=\"tweet-thread-seg tweet-thread-seg--ancestor\"{parent_attrs}>{parent_inner}</div>\
 <div class=\"tweet-thread-rail\" aria-hidden=\"true\"></div>\
-<div class=\"tweet-thread-seg tweet-thread-seg--tip\">{tip_inner}</div>\
+<div class=\"tweet-thread-seg tweet-thread-seg--tip\"{tip_attrs}>{tip_inner}</div>\
 </article>"
     )
 }
@@ -224,6 +339,107 @@ mod tests {
             Some("https://example.com/users/x/statuses/1"),
         );
         assert!(self_reply_parent_uri(&other).is_none());
+        let masto_parent = "https://mastodon.social/users/ada/statuses/1";
+        let masto = note(
+            "https://mastodon.social/users/ada/statuses/2",
+            Some(masto_parent),
+        );
+        assert_eq!(self_reply_parent_uri(&masto).as_deref(), Some(masto_parent));
+        let other_user = note(
+            "https://mastodon.social/users/ada/statuses/2",
+            Some("https://mastodon.social/users/bob/statuses/9"),
+        );
+        assert!(self_reply_parent_uri(&other_user).is_none());
+        // Host-only note URLs do not identify the author.
+        let misskey = note(
+            "https://transfem.social/notes/child",
+            Some("https://transfem.social/notes/parent"),
+        );
+        assert!(self_reply_parent_uri(&misskey).is_none());
+    }
+
+    #[test]
+    fn thread_keeps_parent_and_tip_keys() {
+        let parent = json!({"id": "parent-id"});
+        let tip = json!({"id": "tip-id"});
+        let paint = |st: &Value, _from: &str, _viewer: &str| {
+            let id = st.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            format!(
+                "<article class=\"tweet\" data-timeline-key=\"{id}\"><div class=\"tweet-body\">{id}</div></article>"
+            )
+        };
+        let html = paint_lean_self_thread(&parent, &tip, "home", "", &paint);
+        assert!(
+            html.starts_with("<article class=\"tweet tweet-thread\" data-timeline-key=\"tip-id\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<div class=\"tweet-thread-seg tweet-thread-seg--ancestor\" data-timeline-key=\"parent-id\">"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "<div class=\"tweet-thread-seg tweet-thread-seg--tip\" data-timeline-key=\"tip-id\">"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<div class=\"tweet-body\">parent-id</div>"), "{html}");
+        assert!(html.contains("<div class=\"tweet-body\">tip-id</div>"), "{html}");
+    }
+
+    fn bsky_note(uri: &str, did: &str, reply_to: Option<&str>) -> Value {
+        let mut st = json!({
+            "id": uri,
+            "uri": uri,
+            "url": uri,
+            "author_did": did,
+            "source": "bluesky",
+            "content": "<p>x</p>",
+            "account": {
+                "acct": "edithcharles.bsky.social",
+                "uri": format!("https://bsky.app/profile/{did}"),
+            },
+        });
+        if let Some(parent) = reply_to {
+            st["vaak_in_reply_to_url"] = json!(parent);
+        }
+        st
+    }
+
+    #[test]
+    fn detects_bsky_self_reply_by_did() {
+        let did = "did:plc:qnwrertmdznkkexzktkweuvb";
+        let parent = "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/3mxemkna5uk25";
+        let tip = bsky_note(
+            "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/3mxemsceigc25",
+            did,
+            Some(parent),
+        );
+        assert_eq!(self_reply_parent_uri(&tip).as_deref(), Some(parent));
+        let other = bsky_note(
+            "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/child",
+            did,
+            Some("at://did:plc:someoneelse/app.bsky.feed.post/parent"),
+        );
+        assert!(self_reply_parent_uri(&other).is_none());
+        let list = bsky_note(
+            "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/child",
+            did,
+            Some("at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.graph.list/xyz"),
+        );
+        assert!(self_reply_parent_uri(&list).is_none());
+        let https_parent = "https://bsky.app/profile/edithcharles.bsky.social/post/3mxemkna5uk25";
+        let https_tip = bsky_note(
+            "at://did:plc:qnwrertmdznkkexzktkweuvb/app.bsky.feed.post/3mxemsceigc25",
+            did,
+            Some(https_parent),
+        );
+        assert_eq!(
+            self_reply_parent_uri(&https_tip).as_deref(),
+            Some(https_parent)
+        );
     }
 
     #[test]

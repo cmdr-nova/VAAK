@@ -907,19 +907,28 @@ async fn fetch_bsky_keys(
     limit: i64,
 ) -> Result<Vec<BskyKey>> {
     let limit = limit.clamp(1, 120);
+    // Home Bluesky is the owner's follow graph. bsky_post_observations also
+    // records suggested posts, and those were taking the recent slots on
+    // accounts with a smaller follow list. Read the newest posts per followed
+    // DID from the existing author index, then keep the global newest page.
     let rows = if let Some(did) = exclude_did.filter(|d| d.starts_with("did:")) {
         db.query(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
                     COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
                     COALESCE(p.indexed_at::text, '')
-             FROM bsky_posts p
+             FROM bsky_graph_sync g
+             JOIN LATERAL (
+               SELECT bsky_uri, author_did, author_handle, text, indexed_at, updated_at
+               FROM bsky_posts
+               WHERE author_did = g.target_did
+                 AND text IS NOT NULL
+               ORDER BY indexed_at DESC
+               LIMIT 25
+             ) p ON true
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-             WHERE EXISTS (
-               SELECT 1 FROM bsky_post_observations o
-               WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = $1
-             )
-               AND p.text IS NOT NULL
-               AND p.author_did <> $2
+             WHERE g.owner_user_id = $1
+               AND g.kind = 'follow'
+               AND g.target_did <> $2
              ORDER BY p.indexed_at DESC, p.updated_at DESC
              LIMIT $3",
             &[&owner, &did, &limit],
@@ -930,13 +939,18 @@ async fn fetch_bsky_keys(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
                     COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
                     COALESCE(p.indexed_at::text, '')
-             FROM bsky_posts p
+             FROM bsky_graph_sync g
+             JOIN LATERAL (
+               SELECT bsky_uri, author_did, author_handle, text, indexed_at, updated_at
+               FROM bsky_posts
+               WHERE author_did = g.target_did
+                 AND text IS NOT NULL
+               ORDER BY indexed_at DESC
+               LIMIT 25
+             ) p ON true
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-             WHERE EXISTS (
-               SELECT 1 FROM bsky_post_observations o
-               WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = $1
-             )
-               AND p.text IS NOT NULL
+             WHERE g.owner_user_id = $1
+               AND g.kind = 'follow'
              ORDER BY p.indexed_at DESC, p.updated_at DESC
              LIMIT $2",
             &[&owner, &limit],
@@ -1615,41 +1629,93 @@ fn extract_hashtags(text: &str) -> Vec<String> {
     tags
 }
 
+/// Letters, numbers, and underscores keep going as one token.
+/// Hyphens and apostrophes still separate words, matching PHP
+/// `admin_home_phrase_matches_text`.
+fn phrase_char_continues_word(ch: char) -> bool {
+    ch.is_alphabetic() || ch.is_numeric() || ch == '_'
+}
+
+fn char_eq_fold(a: char, b: char) -> bool {
+    a == b || a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
+}
+
+fn strip_tags_keep_case(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Drop a complete hashtag token. The `#` has to start a token, same as PHP.
+fn strip_hashtags_for_downrank(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '#' {
+            let boundary = i == 0 || !phrase_char_continues_word(chars[i - 1]);
+            if boundary {
+                let mut j = i + 1;
+                while j < chars.len() && phrase_char_continues_word(chars[j]) {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    out.push(' ');
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
 fn phrase_matches_text(text: &str, phrase: &str) -> bool {
     let phrase = {
-        let p = strip_tags_lower(phrase);
-        let collapsed: String = p.split_whitespace().collect::<Vec<_>>().join(" ");
-        collapsed
+        let p = strip_tags_keep_case(phrase);
+        p.split_whitespace().collect::<Vec<_>>().join(" ")
     };
     if phrase.is_empty() {
         return false;
     }
-    // Drop hashtag tokens so admin terms don't fire on self-applied tags.
-    let lowered = strip_tags_lower(text);
-    let mut search = String::new();
-    let mut chars = lowered.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '#' {
-            while let Some(c) = chars.peek() {
-                if c.is_ascii_alphanumeric() || *c == '_' {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            search.push(' ');
+    // The regex crate cannot compile look-around, and the old fallback was
+    // `contains`, which treated a listed word as a hit inside a longer word.
+    // Scan for the whole phrase with token boundaries instead.
+    let phrase_chars: Vec<char> = phrase.chars().collect();
+    let search_chars: Vec<char> = strip_hashtags_for_downrank(&strip_tags_keep_case(text))
+        .chars()
+        .collect();
+    let n = phrase_chars.len();
+    if n == 0 || n > search_chars.len() {
+        return false;
+    }
+    for i in 0..=search_chars.len() - n {
+        let window = &search_chars[i..i + n];
+        if !window
+            .iter()
+            .zip(phrase_chars.iter())
+            .all(|(got, want)| char_eq_fold(*got, *want))
+        {
             continue;
         }
-        search.push(ch);
+        let before_ok = i == 0 || !phrase_char_continues_word(search_chars[i - 1]);
+        let after = i + n;
+        let after_ok = after == search_chars.len() || !phrase_char_continues_word(search_chars[after]);
+        if before_ok && after_ok {
+            return true;
+        }
     }
-    let Ok(re) = regex::RegexBuilder::new(&format!(
-        r"(?i)(?<!\p{{L}}){}(?!\p{{L}})",
-        regex::escape(&phrase)
-    ))
-    .build() else {
-        return search.contains(&phrase);
-    };
-    re.is_match(&search)
+    false
 }
 
 fn toxicity_categories(text: &str, admin_terms: &[(String, String)]) -> Vec<String> {
@@ -3018,6 +3084,17 @@ mod tests {
         assert!(phrase_matches_text("you are a retard for this", "retard"));
         assert!(!phrase_matches_text("tagged #retard in bio", "retard"));
         assert!(phrase_matches_text("please kill yourself now", "kill yourself"));
+        assert!(!phrase_matches_text("this is retardation", "retard"));
+        assert!(!phrase_matches_text("killing yourself now", "kill yourself"));
+        assert!(!phrase_matches_text("classic passage and a cocktail", "ass"));
+        assert!(!phrase_matches_text("classic passage and a cocktail", "cock"));
+        assert!(!phrase_matches_text("grape and therapist and transparent", "rape"));
+        assert!(!phrase_matches_text("grape and therapist and transparent", "trans"));
+        assert!(phrase_matches_text("trans rights", "trans"));
+        assert!(phrase_matches_text("Cat.", "cat"));
+        assert!(!phrase_matches_text("bobcat and category", "cat"));
+        assert!(!phrase_matches_text("cat2 and cat_video", "cat"));
+        assert!(phrase_matches_text("<b>Retard</b>", "retard"));
     }
 
     #[test]

@@ -139,14 +139,22 @@ pub async fn fetch_newer_home(
         });
     }
 
-    // Bluesky observations for this owner.
+    // Bluesky posts from accounts this owner follows. Observations also
+    // include suggested posts, which are not Home follows.
     let bsky_rows = db
         .query(
             "SELECT p.bsky_uri, p.indexed_at
-             FROM bsky_posts p
-             JOIN bsky_post_observations o ON o.bsky_uri = p.bsky_uri
-             WHERE o.owner_user_id = $1
-               AND p.indexed_at > $2
+             FROM bsky_graph_sync g
+             JOIN LATERAL (
+               SELECT bsky_uri, indexed_at
+               FROM bsky_posts
+               WHERE author_did = g.target_did
+                 AND indexed_at > $2
+               ORDER BY indexed_at DESC
+               LIMIT 25
+             ) p ON true
+             WHERE g.owner_user_id = $1
+               AND g.kind = 'follow'
              ORDER BY p.indexed_at DESC
              LIMIT $3",
             &[&owner_user_id, &since_at, &limit],

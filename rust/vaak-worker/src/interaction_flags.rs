@@ -81,27 +81,86 @@ fn collect_keys(st: &Value, status_ids: &mut HashSet<String>, object_ids: &mut H
     }
 }
 
-fn apply_one(st: &mut Value, fav: &HashSet<String>, bm: &HashSet<String>, rb: &HashSet<String>) {
+fn at_record_did(uri: &str) -> Option<&str> {
+    let rest = uri.trim().strip_prefix("at://")?;
+    let did = rest.split('/').next().unwrap_or("");
+    if did.starts_with("did:") {
+        Some(did)
+    } else {
+        None
+    }
+}
+
+/// Keep a baked Bluesky like/repost record only when this owner still has the
+/// action and the record URI belongs to their DID. Shared raw_json viewer
+/// state is the ingesting account's, so another local account must not undo it.
+fn keep_bsky_record(uri: &str, active: bool, viewer_did: Option<&str>) -> bool {
+    if !active {
+        return false;
+    }
+    match (viewer_did, at_record_did(uri)) {
+        (Some(viewer), Some(record)) => viewer == record,
+        _ => false,
+    }
+}
+
+fn scrub_bsky_record(st: &mut Value, key: &str, active: bool, viewer_did: Option<&str>) {
+    let keep = st
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|uri| keep_bsky_record(uri, active, viewer_did))
+        .unwrap_or(false);
+    if !keep {
+        if let Some(obj) = st.as_object_mut() {
+            obj.remove(key);
+        }
+    }
+}
+
+fn apply_one(
+    st: &mut Value,
+    fav: &HashSet<String>,
+    bm: &HashSet<String>,
+    rb: &HashSet<String>,
+    viewer_did: Option<&str>,
+) {
     let mut sids = HashSet::new();
     let mut oids = HashSet::new();
     collect_keys(st, &mut sids, &mut oids);
     let favourited = sids.iter().any(|k| fav.contains(k)) || oids.iter().any(|k| fav.contains(k));
     let bookmarked = sids.iter().any(|k| bm.contains(k)) || oids.iter().any(|k| bm.contains(k));
     let reblogged = sids.iter().any(|k| rb.contains(k)) || oids.iter().any(|k| rb.contains(k));
-    if favourited {
-        st["favourited"] = json!(true);
-    }
-    if bookmarked {
-        st["bookmarked"] = json!(true);
-    }
-    if reblogged {
-        st["reblogged"] = json!(true);
-    }
+    // Authoritative for this owner. Warm envelopes bake another account's
+    // Bluesky viewer.like / a boost row as true and never undo it.
+    st["favourited"] = json!(favourited);
+    st["bookmarked"] = json!(bookmarked);
+    st["reblogged"] = json!(reblogged);
+    scrub_bsky_record(st, "vaak_bsky_like_record", favourited, viewer_did);
+    scrub_bsky_record(st, "vaak_bsky_repost_record", reblogged, viewer_did);
     if let Some(inner) = st.get_mut("reblog").filter(|v| v.is_object()) {
         // Nested original keeps its own viewer flags (PHP applies recursively).
         let mut nested = inner.clone();
-        apply_one(&mut nested, fav, bm, rb);
+        apply_one(&mut nested, fav, bm, rb, viewer_did);
         *inner = nested;
+    }
+}
+
+async fn load_viewer_did(db: &Client, owner: i64) -> Option<String> {
+    if owner < 1 {
+        return None;
+    }
+    let row = db
+        .query_opt(
+            "SELECT did FROM bsky_sessions WHERE owner_user_id = $1",
+            &[&owner],
+        )
+        .await
+        .ok()??;
+    let did: String = row.try_get(0).ok()?;
+    if did.starts_with("did:") {
+        Some(did)
+    } else {
+        None
     }
 }
 
@@ -205,31 +264,62 @@ async fn load_hits(
     Ok((fav, bm, rb))
 }
 
-/// Overlay live viewer flags from masto_favourites / bookmarks / reblogs.
+/// Overlay this owner's fav/boost/bookmark state onto Mastodon-shaped statuses.
+///
+/// Always writes true and false. A miss is not "leave the envelope alone":
+/// hydrate bakes boost cards and the ingesting Bluesky account's viewer
+/// flags as true, and that stuck state survived logout and account switch.
 pub async fn apply_to_statuses(db: &Client, owner_user_id: i64, statuses: &mut [Value]) -> Result<()> {
-    if owner_user_id < 1 || statuses.is_empty() {
+    if statuses.is_empty() {
         return Ok(());
     }
-    let mut status_ids = HashSet::new();
-    let mut object_ids = HashSet::new();
-    for st in statuses.iter() {
-        if st.is_object() {
-            collect_keys(st, &mut status_ids, &mut object_ids);
+    let viewer_did = load_viewer_did(db, owner_user_id).await;
+    let (fav, bm, rb) = if owner_user_id > 0 {
+        let mut status_ids = HashSet::new();
+        let mut object_ids = HashSet::new();
+        for st in statuses.iter() {
+            if st.is_object() {
+                collect_keys(st, &mut status_ids, &mut object_ids);
+            }
         }
-    }
-    if status_ids.is_empty() && object_ids.is_empty() {
-        return Ok(());
-    }
-    let sid_list: Vec<String> = status_ids.into_iter().collect();
-    let oid_list: Vec<String> = object_ids.into_iter().collect();
-    let (fav, bm, rb) = load_hits(db, owner_user_id, &sid_list, &oid_list).await?;
-    if fav.is_empty() && bm.is_empty() && rb.is_empty() {
-        return Ok(());
-    }
+        if status_ids.is_empty() && object_ids.is_empty() {
+            (HashSet::new(), HashSet::new(), HashSet::new())
+        } else {
+            let sid_list: Vec<String> = status_ids.into_iter().collect();
+            let oid_list: Vec<String> = object_ids.into_iter().collect();
+            load_hits(db, owner_user_id, &sid_list, &oid_list).await?
+        }
+    } else {
+        (HashSet::new(), HashSet::new(), HashSet::new())
+    };
+    let did = viewer_did.as_deref();
     for st in statuses.iter_mut() {
         if st.is_object() {
-            apply_one(st, &fav, &bm, &rb);
+            apply_one(st, &fav, &bm, &rb, did);
         }
+    }
+    Ok(())
+}
+
+/// Same overlay for self-thread parents keyed by URI.
+pub async fn apply_to_status_map(
+    db: &Client,
+    owner_user_id: i64,
+    statuses: &mut std::collections::HashMap<String, Value>,
+) -> Result<()> {
+    if statuses.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = statuses.keys().cloned().collect();
+    let mut vals = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if let Some(value) = statuses.get(key) {
+            vals.push(value.clone());
+        }
+    }
+    apply_to_statuses(db, owner_user_id, &mut vals).await?;
+    for (key, value) in keys.into_iter().zip(vals) {
+        statuses.insert(key, value);
     }
     Ok(())
 }
@@ -240,7 +330,7 @@ pub async fn apply_to_statuses_with_cfg(
     owner_user_id: i64,
     statuses: &mut [Value],
 ) -> Result<()> {
-    if owner_user_id < 1 || statuses.is_empty() {
+    if statuses.is_empty() {
         return Ok(());
     }
     let db = crate::db::connect(database_url).await?;
@@ -281,8 +371,76 @@ mod tests {
         push_key(&mut fav, "https://example.com/users/a/statuses/1");
         let bm = HashSet::new();
         let rb = HashSet::new();
-        apply_one(&mut st, &fav, &bm, &rb);
+        apply_one(&mut st, &fav, &bm, &rb, None);
         assert_eq!(st["favourited"], json!(true));
         assert_eq!(st["bookmarked"], json!(false));
+        assert_eq!(st["reblogged"], json!(false));
+    }
+
+    #[test]
+    fn apply_one_clears_baked_flags_and_foreign_bsky_records() {
+        let mut st = json!({
+            "id": "announce-wrapper",
+            "uri": "https://mkultra.monster/users/cmdr_nova/announces/1",
+            "favourited": true,
+            "bookmarked": true,
+            "reblogged": true,
+            "vaak_bsky_like_record": "at://did:plc:other/app.bsky.feed.like/abc",
+            "vaak_bsky_repost_record": "at://did:plc:other/app.bsky.feed.repost/abc",
+            "reblog": {
+                "id": "1791",
+                "uri": "https://example.com/users/a/statuses/1",
+                "favourited": true,
+                "reblogged": true,
+                "bookmarked": false
+            }
+        });
+        apply_one(
+            &mut st,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            Some("did:plc:me"),
+        );
+        assert_eq!(st["favourited"], json!(false));
+        assert_eq!(st["bookmarked"], json!(false));
+        assert_eq!(st["reblogged"], json!(false));
+        assert!(st.get("vaak_bsky_like_record").is_none());
+        assert!(st.get("vaak_bsky_repost_record").is_none());
+        assert_eq!(st["reblog"]["favourited"], json!(false));
+        assert_eq!(st["reblog"]["reblogged"], json!(false));
+    }
+
+    #[test]
+    fn apply_one_keeps_own_bsky_like_record_only_while_favourited() {
+        let uri = "at://did:plc:author/app.bsky.feed.post/xyz";
+        let mut st = json!({
+            "id": "bsky:abc",
+            "uri": uri,
+            "url": "https://bsky.app/profile/did:plc:author/post/xyz",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "vaak_bsky_like_record": "at://did:plc:me/app.bsky.feed.like/abc"
+        });
+        let mut fav = HashSet::new();
+        push_key(&mut fav, "bsky:abc");
+        apply_one(&mut st, &fav, &HashSet::new(), &HashSet::new(), Some("did:plc:me"));
+        assert_eq!(st["favourited"], json!(true));
+        assert_eq!(
+            st["vaak_bsky_like_record"],
+            json!("at://did:plc:me/app.bsky.feed.like/abc")
+        );
+
+        let mut cleared = st.clone();
+        apply_one(
+            &mut cleared,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            Some("did:plc:me"),
+        );
+        assert_eq!(cleared["favourited"], json!(false));
+        assert!(cleared.get("vaak_bsky_like_record").is_none());
     }
 }

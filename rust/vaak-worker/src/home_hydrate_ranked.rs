@@ -146,10 +146,18 @@ fn bsky_text_to_html(plain: &str, raw_json: &str) -> String {
         let (Some(start), Some(end), Some(uri)) = (start, end, uri) else {
             continue;
         };
-        if start >= end || end > bytes.len() || !uri.starts_with("http") {
+        if !uri.starts_with("http") || uri.contains("...") || uri.contains('…') {
             continue;
         }
-        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+        let mut end = end;
+        if end > bytes.len() {
+            if start < bytes.len() && end - bytes.len() <= 32 {
+                end = bytes.len();
+            } else {
+                continue;
+            }
+        }
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
             continue;
         }
         links.push((start, end, uri.to_string()));
@@ -329,6 +337,73 @@ fn host_from_url(url: &str) -> String {
     let host = host.split('@').next_back().unwrap_or(host);
     let host = host.split(':').next().unwrap_or(host);
     host.to_ascii_lowercase()
+}
+
+/// Mastodon `/ap/users/{snowflake}`, DID leftovers, and empty cache rows are
+/// not handles. PHP `ap_remote_actor_username_is_placeholder` uses the same rule.
+fn username_is_placeholder(username: &str) -> bool {
+    let username = username.trim().trim_start_matches('@');
+    if username.is_empty() || username.eq_ignore_ascii_case("user") {
+        return true;
+    }
+    let lower = username.to_ascii_lowercase();
+    if lower.starts_with("did:") || lower.starts_with("did%3a") {
+        return true;
+    }
+    username.len() >= 6 && username.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Visible username, display name, and acct for a remote actor.
+/// The actor URL's host wins over a boost row's host, so a girlcock.club
+/// author is never labeled `@snowflake@chaosfem.tw` just because that server
+/// boosted them. Numeric path ids stay off the card until preferredUsername
+/// is known.
+fn label_account_fields(
+    actor_id: &str,
+    username: &str,
+    display: &str,
+    host_hint: &str,
+) -> (String, String, String) {
+    let url_host = host_from_url(actor_id);
+    let host = if !url_host.is_empty() {
+        url_host
+    } else {
+        host_hint.trim().to_ascii_lowercase()
+    };
+    let raw = username.trim().trim_start_matches('@');
+    let from_path = actor_id
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('@');
+    let candidate = if raw.is_empty() { from_path } else { raw };
+    let placeholder = username_is_placeholder(candidate);
+    let username = if placeholder {
+        "user".to_string()
+    } else {
+        candidate.to_string()
+    };
+    let display_trim = display.trim();
+    let display = if !display_trim.is_empty() && !username_is_placeholder(display_trim) {
+        display_trim.to_string()
+    } else if placeholder {
+        if host.is_empty() {
+            "user".to_string()
+        } else {
+            host.clone()
+        }
+    } else {
+        username.clone()
+    };
+    let acct = if placeholder && !host.is_empty() {
+        host.clone()
+    } else if host.is_empty() {
+        username.clone()
+    } else {
+        format!("{username}@{host}")
+    };
+    (username, display, acct)
 }
 
 fn favicon_for_url(url: &str) -> String {
@@ -1247,10 +1322,10 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     if !cid.is_empty() {
         st["bsky_cid"] = json!(cid);
     }
-    let (liked, reposted, bookmarked, like_rec, repost_rec) = bsky_viewer_flags(&row.raw_json);
-    st["favourited"] = json!(liked);
-    st["reblogged"] = json!(reposted);
-    st["bookmarked"] = json!(bookmarked);
+    // Viewer like/repost/bookmark belongs to masto_* for the signed-in account.
+    // raw_json viewer.* is whoever last ingested the post and must not be baked
+    // onto every local account's envelope.
+    let (_, _, _, like_rec, repost_rec) = bsky_viewer_flags(&row.raw_json);
     if !like_rec.is_empty() {
         st["vaak_bsky_like_record"] = json!(like_rec);
     }
@@ -1297,36 +1372,17 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
 }
 
 fn actor_to_account(actor: &ActorRow) -> Value {
-    let host = if actor.host.is_empty() {
-        host_from_url(&actor.actor_id)
-    } else {
-        actor.host.clone()
-    };
-    let username = if actor.username.is_empty() {
-        actor
-            .actor_id
-            .rsplit('/')
-            .next()
-            .unwrap_or("unknown")
-            .to_string()
-    } else {
-        actor.username.clone()
-    };
-    let acct = if host.is_empty() {
-        username.clone()
-    } else {
-        format!("{username}@{host}")
-    };
-    let display = if actor.display_name.trim().is_empty() {
-        username.as_str()
-    } else {
-        actor.display_name.trim()
-    };
+    let (username, display, acct) = label_account_fields(
+        &actor.actor_id,
+        &actor.username,
+        &actor.display_name,
+        &actor.host,
+    );
     let mut account = empty_account(
         &actor.actor_id,
         &username,
         &acct,
-        display,
+        &display,
         &actor.actor_id,
         &actor.icon,
     );
@@ -1383,27 +1439,13 @@ fn materialize_event_create(row: &EventRow, actor: Option<&ActorRow>) -> Value {
     let account = if let Some(a) = actor {
         actor_to_account(a)
     } else {
-        let host = if row.host.is_empty() {
-            host_from_url(&row.actor_id)
-        } else {
-            row.host.clone()
-        };
-        let username = row
-            .actor_id
-            .rsplit('/')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
-        let acct = if host.is_empty() {
-            username.clone()
-        } else {
-            format!("{username}@{host}")
-        };
+        let (username, display, acct) =
+            label_account_fields(&row.actor_id, "", "", &row.host);
         empty_account(
             &row.actor_id,
             &username,
             &acct,
-            &username,
+            &display,
             &row.actor_id,
             DEFAULT_AVATAR,
         )
@@ -1859,6 +1901,116 @@ fn attachment_urls_from_create_json(raw: &str) -> Vec<String> {
     out
 }
 
+/// Warm hydrate rows often keep a numeric `in_reply_to_id` and omit the parent
+/// URL. Profile paint reads `outbox_notes.in_reply_to` at request time, which
+/// is why self-replies thread there and show up loose on Home/Local/Federated.
+pub async fn stamp_missing_reply_parents(db: &Client, statuses: &mut [Value]) {
+    let mut wanted: Vec<String> = Vec::new();
+    for st in statuses.iter() {
+        if st
+            .get("vaak_in_reply_to_url")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let uri = crate::self_thread::status_object_uri(st);
+        if uri.starts_with("https://") {
+            wanted.push(uri);
+        }
+    }
+    if wanted.is_empty() {
+        return;
+    }
+    let mut variants = Vec::new();
+    for uri in &wanted {
+        variants.push(uri.clone());
+        variants.push(format!("{uri}/"));
+    }
+    variants.sort();
+    variants.dedup();
+    let mut by_uri: HashMap<String, String> = HashMap::new();
+    if let Ok(rows) = db
+        .query(
+            "SELECT id, COALESCE(in_reply_to, '') FROM outbox_notes WHERE id = ANY($1)",
+            &[&variants],
+        )
+        .await
+    {
+        for row in rows {
+            let id: String = row.get(0);
+            let parent = row.get::<_, String>(1).trim().trim_end_matches('/').to_string();
+            if parent.starts_with("https://") || parent.starts_with("at://") {
+                by_uri.insert(id.trim_end_matches('/').to_string(), parent);
+            }
+        }
+    }
+    let still: Vec<String> = wanted
+        .iter()
+        .filter(|uri| !by_uri.contains_key(uri.as_str()))
+        .cloned()
+        .collect();
+    if !still.is_empty() {
+        if let Ok(rows) = db
+            .query(
+                "SELECT DISTINCT ON (rtrim(object_id, '/'))
+                        rtrim(object_id, '/'), COALESCE(in_reply_to, '')
+                 FROM events
+                 WHERE type = 'Create' AND rtrim(object_id, '/') = ANY($1)
+                 ORDER BY rtrim(object_id, '/'), id DESC",
+                &[&still],
+            )
+            .await
+        {
+            for row in rows {
+                let id: String = row.get(0);
+                let parent = row.get::<_, String>(1).trim().trim_end_matches('/').to_string();
+                if parent.starts_with("https://") || parent.starts_with("at://") {
+                    by_uri.entry(id).or_insert(parent);
+                }
+            }
+        }
+    }
+    for st in statuses.iter_mut() {
+        if st
+            .get("vaak_in_reply_to_url")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let uri = crate::self_thread::status_object_uri(st);
+        if let Some(parent) = by_uri.get(&uri) {
+            st["vaak_in_reply_to_url"] = json!(parent);
+            if crate::self_thread::self_reply_parent_uri(st).is_some() {
+                st["vaak_self_thread"] = json!(true);
+            }
+        }
+    }
+}
+
+/// Create rows for self-reply parents that are not local outbox notes.
+pub async fn fetch_event_parent_statuses(
+    db: &Client,
+    uris: &[String],
+) -> Result<HashMap<String, Value>> {
+    let rows = fetch_creates_by_object(db, uris).await?;
+    let actor_ids: Vec<String> = rows
+        .values()
+        .map(|row| row.actor_id.clone())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let actors = fetch_actors_map(db, &actor_ids).await.unwrap_or_default();
+    let mut map = HashMap::new();
+    for (key, row) in rows {
+        let actor = actors.get(row.actor_id.trim_end_matches('/'));
+        map.insert(key, materialize_event_create(&row, actor));
+    }
+    Ok(map)
+}
+
 /// When parent + tip land in the same hydrate page, point in_reply_to_id at the
 /// parent's status id (snowflake) instead of the note URL.
 pub fn link_outbox_reply_ids(statuses: &mut [Value]) {
@@ -2172,6 +2324,176 @@ pub(crate) async fn fetch_bsky_map(db: &Client, uris: &[String]) -> Result<HashM
     Ok(map)
 }
 
+fn bsky_post_rkey(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches('/');
+    if url.is_empty() {
+        return None;
+    }
+    let at_marker = "/app.bsky.feed.post/";
+    if let Some(pos) = url.find(at_marker) {
+        let rkey = url[pos + at_marker.len()..]
+            .split(['?', '#', '/'])
+            .next()
+            .unwrap_or("");
+        if !rkey.is_empty() {
+            return Some(rkey.to_string());
+        }
+    }
+    if url.contains("bsky.app/profile/") {
+        if let Some(pos) = url.rfind("/post/") {
+            let rkey = url[pos + "/post/".len()..]
+                .split(['?', '#', '/'])
+                .next()
+                .unwrap_or("");
+            if !rkey.is_empty() {
+                return Some(rkey.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn bsky_at_post_uri(st: &Value) -> Option<String> {
+    for key in ["vaak_bsky_uri", "uri", "url"] {
+        let raw = st.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+        if raw.starts_with("at://") && raw.contains("/app.bsky.feed.post/") {
+            return Some(raw.trim_end_matches('/').to_string());
+        }
+    }
+    None
+}
+
+fn collect_bsky_link_keys(st: &Value, at_uris: &mut Vec<String>, rkeys: &mut Vec<String>) {
+    if !st.is_object() {
+        return;
+    }
+    if let Some(at) = bsky_at_post_uri(st) {
+        at_uris.push(at);
+    }
+    for key in ["vaak_bsky_uri", "uri", "url"] {
+        if let Some(raw) = st.get(key).and_then(|v| v.as_str()) {
+            if let Some(rkey) = bsky_post_rkey(raw) {
+                rkeys.push(rkey);
+            }
+        }
+    }
+    if let Some(reblog) = st.get("reblog") {
+        collect_bsky_link_keys(reblog, at_uris, rkeys);
+    }
+    if let Some(quoted) = st.get("quote").and_then(|q| q.get("quoted_status")) {
+        collect_bsky_link_keys(quoted, at_uris, rkeys);
+    }
+    if let Some(preview) = st.get("vaak_quote_preview") {
+        collect_bsky_link_keys(preview, at_uris, rkeys);
+    }
+}
+
+fn stamp_bsky_link_facets(
+    st: &mut Value,
+    by_uri: &HashMap<String, (String, Value)>,
+    by_rkey: &HashMap<String, (String, Value)>,
+) {
+    if !st.is_object() {
+        return;
+    }
+    let found = bsky_at_post_uri(st).and_then(|at| by_uri.get(&at).cloned()).or_else(|| {
+        for key in ["vaak_bsky_uri", "uri", "url"] {
+            if let Some(raw) = st.get(key).and_then(|v| v.as_str()) {
+                if let Some(rkey) = bsky_post_rkey(raw) {
+                    if let Some(hit) = by_rkey.get(&rkey) {
+                        return Some(hit.clone());
+                    }
+                }
+            }
+        }
+        None
+    });
+    if let Some((text, facets)) = found {
+        if let Some(obj) = st.as_object_mut() {
+            obj.insert("vaak_bsky_text".into(), json!(text));
+            obj.insert("vaak_bsky_facets".into(), facets);
+        }
+    }
+    if let Some(reblog) = st.get_mut("reblog") {
+        stamp_bsky_link_facets(reblog, by_uri, by_rkey);
+    }
+    if let Some(quoted) = st
+        .get_mut("quote")
+        .and_then(|q| q.get_mut("quoted_status"))
+    {
+        stamp_bsky_link_facets(quoted, by_uri, by_rkey);
+    }
+    if let Some(preview) = st.get_mut("vaak_quote_preview") {
+        stamp_bsky_link_facets(preview, by_uri, by_rkey);
+    }
+}
+
+/// Attach Bluesky link facets so shortened labels stay clickable at paint time.
+///
+/// Timeline, profile, and notification cards often only have the visible label
+/// (`host/path...`, no `https://`). The full target lives on `bsky_posts.raw_json`.
+pub async fn attach_bsky_link_facets(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let mut at_uris = Vec::new();
+    let mut rkeys = Vec::new();
+    for st in statuses.iter() {
+        collect_bsky_link_keys(st, &mut at_uris, &mut rkeys);
+    }
+    at_uris.sort();
+    at_uris.dedup();
+    rkeys.sort();
+    rkeys.dedup();
+    if at_uris.is_empty() && rkeys.is_empty() {
+        return Ok(());
+    }
+    let rows = db
+        .query(
+            "SELECT bsky_uri, COALESCE(text,''), COALESCE(raw_json,'')
+             FROM bsky_posts
+             WHERE bsky_uri = ANY($1)
+                OR split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($2)",
+            &[&at_uris, &rkeys],
+        )
+        .await
+        .context("select bsky link facets")?;
+    let mut by_uri: HashMap<String, (String, Value)> = HashMap::new();
+    let mut by_rkey: HashMap<String, (String, Value)> = HashMap::new();
+    for row in rows {
+        let uri: String = row.get(0);
+        let col_text: String = row.get(1);
+        let raw_s: String = row.get(2);
+        let raw: Value = serde_json::from_str(&raw_s).unwrap_or(Value::Null);
+        let record = raw.get("record");
+        let facets = record.and_then(|r| r.get("facets")).cloned().unwrap_or(Value::Null);
+        if !facets.as_array().is_some_and(|a| !a.is_empty()) {
+            continue;
+        }
+        let record_text = record
+            .and_then(|r| r.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let text = if record_text.is_empty() {
+            col_text
+        } else {
+            record_text.to_string()
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let packed = (text, facets);
+        if let Some(rkey) = bsky_post_rkey(&uri) {
+            by_rkey.insert(rkey, packed.clone());
+        }
+        by_uri.insert(uri, packed);
+    }
+    if by_uri.is_empty() && by_rkey.is_empty() {
+        return Ok(());
+    }
+    for st in statuses.iter_mut() {
+        stamp_bsky_link_facets(st, &by_uri, &by_rkey);
+    }
+    Ok(())
+}
+
 /// Resolve Bluesky DIDs to human handles from the durable actor-profile cache.
 /// Jetstream may persist a reply before the parent post/profile is hydrated;
 /// timeline chrome must never expose the DID in that window.
@@ -2214,6 +2536,10 @@ pub(crate) async fn fetch_bsky_map_for_targets(
             out.insert(target.clone(), row.clone());
         }
     }
+    // One scan for the whole page. A leading-wildcard LIKE per boost was a
+    // sequential read of bsky_posts (~100ms each). A 40-boost page then blew
+    // the 2.5s profile fetch and the tab painted as "End of profile".
+    let mut wanted: Vec<(String, String, String)> = Vec::new();
     for target in targets
         .iter()
         .filter(|target| target.starts_with("https://bsky.app/profile/"))
@@ -2224,30 +2550,65 @@ pub(crate) async fn fetch_bsky_map_for_targets(
         let Some((actor, rkey)) = rest.split_once("/post/") else {
             continue;
         };
+        let rkey = rkey.split(['?', '#']).next().unwrap_or("").trim();
         if actor.is_empty() || rkey.is_empty() {
             continue;
         }
-        let suffix = format!("%/{rkey}");
-        let row = db
-            .query_opt(
-                "SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE $1 AND lower(author_handle)=lower($2) LIMIT 1",
-                &[&suffix, &actor],
-            )
-            .await?;
-        let row = match row {
-            Some(row) => Some(row),
-            None => db
-                .query_opt(
-                    "SELECT bsky_uri FROM bsky_posts WHERE bsky_uri LIKE $1 LIMIT 1",
-                    &[&suffix],
-                )
-                .await?,
-        };
-        let Some(row) = row else { continue };
+        wanted.push((target.clone(), actor.to_string(), rkey.to_string()));
+    }
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    let mut rkeys: Vec<String> = wanted.iter().map(|(_, _, rkey)| rkey.clone()).collect();
+    rkeys.sort();
+    rkeys.dedup();
+    let rows = db
+        .query(
+            "SELECT bsky_uri, COALESCE(author_handle, '')
+             FROM bsky_posts
+             WHERE split_part(bsky_uri, '/app.bsky.feed.post/', 2) = ANY($1)",
+            &[&rkeys],
+        )
+        .await
+        .context("select bsky posts by rkey")?;
+    let mut by_rkey: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for row in rows {
         let uri: String = row.get(0);
-        let fetched = fetch_bsky_map(db, std::slice::from_ref(&uri)).await?;
+        let handle: String = row.get(1);
+        let Some(rkey) = uri.rsplit('/').next() else {
+            continue;
+        };
+        if rkey.is_empty() {
+            continue;
+        }
+        by_rkey
+            .entry(rkey.to_string())
+            .or_default()
+            .push((uri, handle));
+    }
+    let mut chosen: Vec<String> = Vec::new();
+    let mut target_uri: Vec<(String, String)> = Vec::new();
+    for (target, actor, rkey) in &wanted {
+        let Some(cands) = by_rkey.get(rkey) else {
+            continue;
+        };
+        let Some(uri) = cands
+            .iter()
+            .find(|(_, handle)| handle.eq_ignore_ascii_case(actor))
+            .or_else(|| cands.first())
+            .map(|(uri, _)| uri.clone())
+        else {
+            continue;
+        };
+        target_uri.push((target.clone(), uri.clone()));
+        chosen.push(uri);
+    }
+    chosen.sort();
+    chosen.dedup();
+    let fetched = fetch_bsky_map(db, &chosen).await?;
+    for (target, uri) in target_uri {
         if let Some(post) = fetched.get(&uri) {
-            out.insert(target.clone(), post.clone());
+            out.insert(target, post.clone());
         }
     }
     Ok(out)
@@ -2390,16 +2751,33 @@ async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<S
         let mut display_name: String = row.get(2);
         let mut icon: String = row.get(4);
         // Older remote_actors rows may retain a complete profile_json even
-        // when the denormalized label/avatar columns are blank.
+        // when the denormalized label/avatar columns are blank or still the
+        // numeric /ap/users/{id} segment.
         let mut emojis = Value::Array(Vec::new());
         if let Ok(profile) = serde_json::from_str::<Value>(&row.get::<_, String>(5)) {
-            if username.trim().is_empty() {
-                username = profile.get("preferredUsername").or_else(|| profile.get("username"))
-                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if username_is_placeholder(&username) {
+                if let Some(pref) = profile
+                    .get("preferredUsername")
+                    .or_else(|| profile.get("username"))
+                    .and_then(|v| v.as_str())
+                {
+                    let pref = pref.trim().trim_start_matches('@');
+                    if !username_is_placeholder(pref) {
+                        username = pref.to_string();
+                    }
+                }
             }
-            if display_name.trim().is_empty() {
-                display_name = profile.get("name").or_else(|| profile.get("displayName"))
-                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if display_name.trim().is_empty() || username_is_placeholder(&display_name) {
+                if let Some(name) = profile
+                    .get("name")
+                    .or_else(|| profile.get("displayName"))
+                    .and_then(|v| v.as_str())
+                {
+                    let name = name.trim();
+                    if !name.is_empty() && !username_is_placeholder(name) {
+                        display_name = name.to_string();
+                    }
+                }
             }
             if icon.trim().is_empty() {
                 icon = profile.get("icon").and_then(|v| v.get("url")).and_then(|v| v.as_str())
@@ -2457,6 +2835,248 @@ async fn fetch_local_profiles_map(
         );
     }
     Ok(map)
+}
+
+fn peer_avatar_override(actor: &str) -> Option<&'static str> {
+    match actor.trim().trim_end_matches('/') {
+        "https://waffles.baeddel.social/fediverse/blog/admin"
+        | "https://app.wafrn.net/fediverse/blog/admin" => {
+            Some("https://mkultra.monster/img/avatar/wafrn-approvals.webp")
+        }
+        _ => None,
+    }
+}
+
+fn asker_remote_handle(username: &str, host: &str) -> String {
+    let username = username.trim().trim_start_matches('@');
+    let host = host.trim().trim_start_matches('@');
+    if username.is_empty() {
+        return if host.is_empty() {
+            String::new()
+        } else {
+            format!("@{host}")
+        };
+    }
+    if host.is_empty() {
+        return format!("@{username}");
+    }
+    if (host.ends_with("brid.gy") || host == "brid.gy")
+        && username.contains('.')
+        && !username.to_ascii_lowercase().starts_with("did:")
+    {
+        return format!("@{username}");
+    }
+    format!("@{username}@{host}")
+}
+
+fn collect_ask_actors(st: &Value, out: &mut Vec<String>) {
+    if let Some(actor) = st
+        .get("vaak_ask")
+        .and_then(|ask| ask.get("ask_actor"))
+        .and_then(|v| v.as_str())
+    {
+        let actor = actor.trim().trim_end_matches('/');
+        if actor.starts_with("https://") {
+            out.push(actor.to_string());
+        }
+    }
+    if let Some(reblog) = st.get("reblog").filter(|v| v.is_object()) {
+        collect_ask_actors(reblog, out);
+    }
+    if let Some(quoted) = st
+        .get("quote")
+        .and_then(|q| q.get("quoted_status"))
+        .filter(|v| v.is_object())
+    {
+        collect_ask_actors(quoted, out);
+    }
+    if let Some(preview) = st.get("vaak_quote_preview").filter(|v| v.is_object()) {
+        collect_ask_actors(preview, out);
+    }
+}
+
+fn stamp_ask_identity(
+    st: &mut Value,
+    profiles: &HashMap<String, LocalProfile>,
+    actors: &HashMap<String, ActorRow>,
+    media: &HashMap<String, String>,
+) {
+    let actor = st
+        .get("vaak_ask")
+        .and_then(|ask| ask.get("ask_actor"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if actor.starts_with("https://") {
+        let (display, handle, avatar) = asker_identity(&actor, profiles, actors, media);
+        if let Some(ask) = st.get_mut("vaak_ask").and_then(|v| v.as_object_mut()) {
+            ask.insert("asker_display".into(), json!(display));
+            ask.insert("asker_handle".into(), json!(handle));
+            ask.insert("asker_avatar".into(), json!(avatar));
+        }
+    }
+    if st.get("reblog").map(|v| v.is_object()).unwrap_or(false) {
+        if let Some(reblog) = st.get_mut("reblog") {
+            stamp_ask_identity(reblog, profiles, actors, media);
+        }
+    }
+    if st
+        .get("quote")
+        .and_then(|q| q.get("quoted_status"))
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+    {
+        if let Some(quoted) = st
+            .get_mut("quote")
+            .and_then(|q| q.get_mut("quoted_status"))
+        {
+            stamp_ask_identity(quoted, profiles, actors, media);
+        }
+    }
+    if st
+        .get("vaak_quote_preview")
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+    {
+        if let Some(preview) = st.get_mut("vaak_quote_preview") {
+            stamp_ask_identity(preview, profiles, actors, media);
+        }
+    }
+}
+
+fn asker_identity(
+    actor: &str,
+    profiles: &HashMap<String, LocalProfile>,
+    actors: &HashMap<String, ActorRow>,
+    media: &HashMap<String, String>,
+) -> (String, String, String) {
+    let actor = actor.trim().trim_end_matches('/');
+    if let Some(username) = local_username_from_url(actor) {
+        let profile = profiles.get(&username);
+        let display = profile
+            .map(|p| p.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(username.as_str())
+            .to_string();
+        let avatar = if let Some(url) = peer_avatar_override(actor) {
+            url.to_string()
+        } else if let Some(icon) = profile.map(|p| p.icon_url.as_str()).filter(|u| u.starts_with("https://"))
+        {
+            icon.to_string()
+        } else {
+            LOCAL_DEFAULT_AVATAR.to_string()
+        };
+        return (display, format!("@{username}@mkultra.monster"), avatar);
+    }
+    let row = actors.get(actor);
+    let host = row
+        .map(|r| r.host.trim())
+        .filter(|host| !host.is_empty())
+        .map(|host| host.to_string())
+        .unwrap_or_else(|| host_from_url(actor));
+    let username = row
+        .map(|r| r.username.trim().trim_start_matches('@').to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| actor.rsplit('/').next().unwrap_or("user").to_string());
+    let display = row
+        .map(|r| r.display_name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| username.clone());
+    let avatar = if let Some(url) = peer_avatar_override(actor) {
+        url.to_string()
+    } else if let Some(icon) = row.map(|r| r.icon.as_str()).filter(|u| u.starts_with("https://")) {
+        icon.to_string()
+    } else {
+        media
+            .get(actor)
+            .cloned()
+            .filter(|url| url.starts_with("https://"))
+            .unwrap_or_else(|| DEFAULT_AVATAR.to_string())
+    };
+    (display, asker_remote_handle(&username, &host), avatar)
+}
+
+async fn fetch_remote_avatar_cache(
+    db: &Client,
+    actor_ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    if actor_ids.is_empty() {
+        return Ok(map);
+    }
+    let mut variants = Vec::new();
+    for actor in actor_ids {
+        let base = actor.trim().trim_end_matches('/').to_string();
+        if base.is_empty() {
+            continue;
+        }
+        variants.push(base.clone());
+        variants.push(format!("{base}/"));
+    }
+    variants.sort();
+    variants.dedup();
+    let rows = db
+        .query(
+            "SELECT actor_id, COALESCE(public_url,'')
+             FROM remote_media_cache
+             WHERE kind = 'avatar' AND actor_id = ANY($1)",
+            &[&variants],
+        )
+        .await
+        .context("select remote avatar cache for ask cards")?;
+    for row in rows {
+        let id: String = row.get(0);
+        let url: String = row.get(1);
+        if url.starts_with("https://") {
+            map.insert(id.trim_end_matches('/').to_string(), url);
+        }
+    }
+    Ok(map)
+}
+
+/// Fill Ask cards with the same name, `@user@host`, and avatar the profile
+/// Asks tab resolves at render time. Paint reads these fields; a miss keeps
+/// the URL-derived fallback in the painter.
+pub async fn attach_ask_identities(db: &Client, statuses: &mut [Value]) -> Result<()> {
+    let mut actors = Vec::new();
+    for st in statuses.iter() {
+        collect_ask_actors(st, &mut actors);
+    }
+    actors.sort();
+    actors.dedup();
+    if actors.is_empty() {
+        return Ok(());
+    }
+    let mut local_keys = Vec::new();
+    let mut remote = Vec::new();
+    for actor in &actors {
+        if let Some(username) = local_username_from_url(actor) {
+            local_keys.push(username);
+        } else {
+            remote.push(actor.clone());
+        }
+    }
+    let profiles = fetch_local_profiles_map(db, &local_keys).await?;
+    let actor_rows = fetch_actors_map(db, &remote).await?;
+    let missing_icons: Vec<String> = remote
+        .iter()
+        .filter(|actor| {
+            actor_rows
+                .get(actor.as_str())
+                .map(|row| !row.icon.starts_with("https://"))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    let media = fetch_remote_avatar_cache(db, &missing_icons)
+        .await
+        .unwrap_or_default();
+    for st in statuses.iter_mut() {
+        stamp_ask_identity(st, &profiles, &actor_rows, &media);
+    }
+    Ok(())
 }
 
 async fn fetch_outbox_map(db: &Client, ids: &[String]) -> Result<HashMap<String, OutboxRow>> {
@@ -2703,6 +3323,12 @@ fn materialize_announce(
             announce.actor_id.trim_end_matches('/').to_string()
         };
         thin.actor_id = orig.clone();
+        let orig_host = host_from_url(&orig);
+        if !orig_host.is_empty() {
+            // The cloned Announce row still carries the booster's host.
+            // The inner post belongs to target_actor.
+            thin.host = orig_host;
+        }
         let cactor = actors.get(orig.as_str());
         let mut st = materialize_event_create(&thin, cactor);
         // Use synth inner id so it never collides with outer announce id.
@@ -2791,17 +3417,12 @@ fn materialize_announce(
     })
 }
 
-/// PHP `ap_masto_status_from_reblog` + thin Create fallback (Local boosts).
-fn materialize_boost(
+fn finish_boost_wrapper(
     rb: &BoostRow,
-    create: Option<&EventRow>,
-    rss: Option<&RssRow>,
-    actors: &HashMap<String, ActorRow>,
+    mut inner: Value,
     local_profiles: &HashMap<String, LocalProfile>,
+    viewer_boosted: bool,
 ) -> Option<Value> {
-    if reblog_is_bsky_native(&rb.status_id, &rb.object_id) {
-        return None;
-    }
     let created = format_time(&rb.created_at);
     let outer_id = if !rb.boost_status_id.trim().is_empty() {
         rb.boost_status_id.clone()
@@ -2810,7 +3431,6 @@ fn materialize_boost(
     } else {
         return None;
     };
-
     let owner_actor = rb.owner_actor_id.trim_end_matches('/').to_string();
     let username = owner_actor
         .rsplit('/')
@@ -2830,76 +3450,11 @@ fn materialize_boost(
             DEFAULT_AVATAR,
         )
     };
-
-    let object_id = rb.object_id.trim_end_matches('/').to_string();
-    if create.is_none() && rss.is_none() {
-        // Keep unresolved local boosts out of visible timelines. The ranked
-        // worker will include them after the original object is cached.
-        return None;
-    }
-    let mut inner = if let Some(rss_row) = rss {
-        materialize_rss(rss_row)
-    } else if let Some(crow) = create {
-        let cactor = actors.get(crow.actor_id.trim_end_matches('/'));
-        materialize_event_create(crow, cactor)
-    } else {
-        // Thin degraded original (PHP stub when Create missing).
-        let target = if !rb.target_actor.trim().is_empty() {
-            rb.target_actor.trim_end_matches('/').to_string()
-        } else {
-            String::new()
-        };
-        let account = if !target.is_empty() {
-            if let Some(a) = actors.get(target.as_str()) {
-                actor_to_account(a)
-            } else {
-                let host = host_from_url(&target);
-                let uname = target
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("unknown")
-                    .to_string();
-                let acct = if host.is_empty() {
-                    uname.clone()
-                } else {
-                    format!("{uname}@{host}")
-                };
-                empty_account(&target, &uname, &acct, &uname, &target, DEFAULT_AVATAR)
-            }
-        } else {
-            empty_account("unknown", "unknown", "unknown", "unknown", "", DEFAULT_AVATAR)
-        };
-        let uri = if object_id.is_empty() {
-            rb.status_id.as_str()
-        } else {
-            object_id.as_str()
-        };
-        let inner_id = if !rb.status_id.is_empty() {
-            rb.status_id.clone()
-        } else {
-            announce_inner_synth_id(&created, uri)
-        };
-        let mut st = base_status(
-            &inner_id,
-            &created,
-            "<p></p>",
-            uri,
-            uri,
-            account,
-            Vec::new(),
-            None,
-        );
-        st["reblogged"] = json!(true);
-        st["vaak_degraded"] = json!(true);
-        st["vaak_degraded_reason"] = json!("boost_original_missing");
-        st
-    };
-
     // Unwrap nested boosts — wrapper always points at the original Note.
     if let Some(nested) = inner.get("reblog").filter(|v| v.is_object()).cloned() {
         inner = nested;
     }
-    inner["reblogged"] = json!(true);
+    inner["reblogged"] = json!(viewer_boosted);
     inner["reblog"] = Value::Null;
 
     let announce_uri = rb.announce_activity_id.trim();
@@ -2931,7 +3486,7 @@ fn materialize_boost(
         "favourites_count": 0,
         "edited_at": Value::Null,
         "favourited": false,
-        "reblogged": true,
+        "reblogged": viewer_boosted,
         "muted": false,
         "bookmarked": false,
         "pinned": false,
@@ -2947,6 +3502,630 @@ fn materialize_boost(
         "poll": Value::Null,
         "vaak_boost_row_id": rb.id,
     }))
+}
+
+/// PHP `ap_masto_status_from_reblog` + thin Create fallback (Local boosts).
+fn materialize_boost(
+    rb: &BoostRow,
+    create: Option<&EventRow>,
+    rss: Option<&RssRow>,
+    actors: &HashMap<String, ActorRow>,
+    local_profiles: &HashMap<String, LocalProfile>,
+    viewer_owner_id: i64,
+) -> Option<Value> {
+    if reblog_is_bsky_native(&rb.status_id, &rb.object_id) {
+        return None;
+    }
+    let created = format_time(&rb.created_at);
+    let object_id = rb.object_id.trim_end_matches('/').to_string();
+    if create.is_none() && rss.is_none() {
+        // Keep unresolved local boosts out of visible timelines. The ranked
+        // worker will include them after the original object is cached.
+        return None;
+    }
+    // Another account's boost row can still render the card. reblogged means
+    // the viewer boosted it, which the read-time masto_* overlay also enforces.
+    let viewer_boosted = viewer_owner_id > 0 && rb.owner_user_id == viewer_owner_id;
+    let inner = if let Some(rss_row) = rss {
+        materialize_rss(rss_row)
+    } else if let Some(crow) = create {
+        let cactor = actors.get(crow.actor_id.trim_end_matches('/'));
+        materialize_event_create(crow, cactor)
+    } else {
+        // Thin degraded original (PHP stub when Create missing).
+        let target = if !rb.target_actor.trim().is_empty() {
+            rb.target_actor.trim_end_matches('/').to_string()
+        } else {
+            String::new()
+        };
+        let account = if !target.is_empty() {
+            if let Some(a) = actors.get(target.as_str()) {
+                actor_to_account(a)
+            } else {
+                let (uname, display, acct) = label_account_fields(&target, "", "", "");
+                empty_account(&target, &uname, &acct, &display, &target, DEFAULT_AVATAR)
+            }
+        } else {
+            empty_account("unknown", "unknown", "unknown", "unknown", "", DEFAULT_AVATAR)
+        };
+        let uri = if object_id.is_empty() {
+            rb.status_id.as_str()
+        } else {
+            object_id.as_str()
+        };
+        let inner_id = if !rb.status_id.is_empty() {
+            rb.status_id.clone()
+        } else {
+            announce_inner_synth_id(&created, uri)
+        };
+        let mut st = base_status(
+            &inner_id,
+            &created,
+            "<p></p>",
+            uri,
+            uri,
+            account,
+            Vec::new(),
+            None,
+        );
+        st["reblogged"] = json!(viewer_boosted);
+        st["vaak_degraded"] = json!(true);
+        st["vaak_degraded_reason"] = json!("boost_original_missing");
+        st
+    };
+
+    finish_boost_wrapper(rb, inner, local_profiles, viewer_boosted)
+}
+
+fn looks_like_object_url(url: &str) -> bool {
+    let u = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "/statuses/",
+        "/status/",
+        "/notes/",
+        "/objects/",
+        "/object/",
+        "/videos/",
+        "/video/",
+        "/comments/",
+        "/comment/",
+        "/posts/",
+        "/post/",
+        "/p/",
+    ];
+    MARKERS.iter().any(|marker| u.contains(marker))
+}
+
+/// Prefer the boosted person's actor IRI. A status, note, or PeerTube video
+/// URL cannot drive a hovercard.
+fn preferred_actor_iri(target_actor: &str, create_actor: &str) -> Option<String> {
+    for raw in [target_actor, create_actor] {
+        let actor = raw.trim().trim_end_matches('/').to_string();
+        if actor.starts_with("https://") && !looks_like_object_url(&actor) {
+            return Some(actor);
+        }
+    }
+    None
+}
+
+fn boost_card_is_paintable(st: &Value) -> bool {
+    let inner = st.get("reblog").filter(|v| v.is_object()).unwrap_or(st);
+    if inner
+        .get("vaak_degraded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let plain = strip_tags_simple(inner.get("content").and_then(|v| v.as_str()).unwrap_or(""))
+        .trim()
+        .to_string();
+    if !plain.is_empty()
+        && !matches!(
+            plain.as_str(),
+            "(boost)" | "(attachment)" | "(media)" | "(quote)"
+        )
+    {
+        return true;
+    }
+    if inner
+        .get("media_attachments")
+        .and_then(|v| v.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if inner.get("card").is_some_and(|v| v.is_object()) {
+        return true;
+    }
+    if inner.get("poll").is_some_and(|v| v.is_object()) {
+        return true;
+    }
+    if inner.get("quote").is_some() || inner.get("vaak_quote_preview").is_some() {
+        return true;
+    }
+    plain.eq_ignore_ascii_case("(poll)")
+}
+
+fn boost_actor_is_profile(st: &Value) -> bool {
+    let inner = st.get("reblog").filter(|v| v.is_object()).unwrap_or(st);
+    let account = inner.get("account").unwrap_or(&Value::Null);
+    let id = account.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if id.starts_with("rss-feed:") {
+        return true;
+    }
+    let uri = account
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| account.get("url").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if uri.starts_with("https://bsky.app/profile/") && !uri.contains("/post/") {
+        return true;
+    }
+    uri.starts_with("https://") && !looks_like_object_url(uri)
+}
+
+fn stamp_local_boost_author(st: &mut Value, profiles: &HashMap<String, LocalProfile>) {
+    let Some(inner) = st.get_mut("reblog").filter(|v| v.is_object()) else {
+        return;
+    };
+    let uri = inner
+        .get("account")
+        .and_then(|account| account.get("uri").or_else(|| account.get("url")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(username) = local_username_from_url(&uri) else {
+        return;
+    };
+    let actor = format!("{LOCAL_ACTOR_PREFIX}{username}");
+    if let Some(obj) = inner.as_object_mut() {
+        obj.insert(
+            "account".into(),
+            local_account_from_profile(&actor, &username, profiles),
+        );
+    }
+}
+
+pub(crate) struct ProfileBoostPage {
+    pub statuses: Vec<Value>,
+    pub next_offset: i64,
+    pub has_more: bool,
+}
+
+async fn profile_owner_user_id(db: &Client, actor_url: &str) -> Result<i64> {
+    let Some(username) = local_username_from_url(actor_url) else {
+        return Ok(0);
+    };
+    let row = db
+        .query_opt(
+            "SELECT id FROM ap_users WHERE lower(username) = $1 LIMIT 1",
+            &[&username],
+        )
+        .await
+        .context("select profile owner id")?;
+    let Some(row) = row else {
+        return Ok(0);
+    };
+    Ok(row
+        .try_get::<_, i64>(0)
+        .unwrap_or_else(|_| i64::from(row.try_get::<_, i32>(0).unwrap_or(0))))
+}
+
+async fn fetch_profile_reblog_rows(
+    db: &Client,
+    actor_url: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<BoostRow>> {
+    let actor_slash = format!("{}/", actor_url.trim_end_matches('/'));
+    let actor = actor_url.trim_end_matches('/').to_string();
+    let rows = db
+        .query(
+            "SELECT id, owner_user_id, owner_actor_id, status_id, boost_status_id,
+                    object_id, target_actor, announce_activity_id, created_at
+             FROM (
+               SELECT DISTINCT ON (
+                 CASE WHEN btrim(COALESCE(object_id, '')) = '' THEN COALESCE(status_id, '')
+                      ELSE rtrim(object_id, '/') END
+               )
+                 id,
+                 owner_user_id,
+                 COALESCE(owner_actor_id, '') AS owner_actor_id,
+                 COALESCE(status_id, '') AS status_id,
+                 COALESCE(boost_status_id, '') AS boost_status_id,
+                 COALESCE(object_id, '') AS object_id,
+                 COALESCE(target_actor, '') AS target_actor,
+                 COALESCE(announce_activity_id, '') AS announce_activity_id,
+                 COALESCE(created_at, '') AS created_at
+               FROM masto_reblogs
+               WHERE owner_actor_id = $1 OR owner_actor_id = $2
+               ORDER BY
+                 CASE WHEN btrim(COALESCE(object_id, '')) = '' THEN COALESCE(status_id, '')
+                      ELSE rtrim(object_id, '/') END,
+                 created_at DESC, id DESC
+             ) AS profile_boosts
+             ORDER BY created_at DESC, id DESC
+             LIMIT $3 OFFSET $4",
+            &[&actor, &actor_slash, &limit, &offset],
+        )
+        .await
+        .context("select profile masto_reblogs")?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row
+            .try_get::<_, i64>(0)
+            .unwrap_or_else(|_| i64::from(row.try_get::<_, i32>(0).unwrap_or(0)));
+        let owner_user_id = row
+            .try_get::<_, i64>(1)
+            .unwrap_or_else(|_| i64::from(row.try_get::<_, i32>(1).unwrap_or(0)));
+        out.push(BoostRow {
+            id,
+            owner_user_id,
+            owner_actor_id: row.get(2),
+            status_id: row.get(3),
+            boost_status_id: row.get(4),
+            object_id: row.get(5),
+            target_actor: row.get(6),
+            announce_activity_id: row.get(7),
+            created_at: row.get(8),
+        });
+    }
+    Ok(out)
+}
+
+async fn fetch_best_boost_objects(
+    db: &Client,
+    object_ids: &[String],
+) -> Result<HashMap<String, EventRow>> {
+    let mut map = HashMap::new();
+    if object_ids.is_empty() {
+        return Ok(map);
+    }
+    let mut targets: Vec<String> = object_ids
+        .iter()
+        .map(|oid| oid.trim().trim_end_matches('/').to_string())
+        .filter(|oid| !oid.is_empty())
+        .collect();
+    targets.sort();
+    targets.dedup();
+    let rows = db
+        .query(
+            "SELECT DISTINCT ON (rtrim(object_id, '/'))
+                    id, COALESCE(type,''), COALESCE(actor_id,''), COALESCE(object_id,''),
+                    COALESCE(summary,''), COALESCE(media_urls,'[]'),
+                    COALESCE(created_at::text,''), COALESCE(sensitive, 0),
+                    COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,''),
+                    COALESCE(in_reply_to,'')
+             FROM events
+             WHERE type IN ('Create', 'Update', 'Note')
+               AND rtrim(object_id, '/') = ANY($1)
+             ORDER BY rtrim(object_id, '/'),
+               CASE
+                 WHEN length(btrim(COALESCE(summary, ''))) > 0
+                   OR COALESCE(media_urls, '[]') NOT IN ('', '[]') THEN 0
+                 ELSE 1
+               END,
+               CASE type WHEN 'Create' THEN 0 WHEN 'Update' THEN 1 ELSE 2 END,
+               id DESC",
+            &[&targets],
+        )
+        .await
+        .context("select boost original events")?;
+    for row in rows {
+        let id: i64 = row.get(0);
+        let sensitive = row.try_get::<_, i64>(7).unwrap_or(0) != 0;
+        let object_id: String = row.get(3);
+        let key = object_id.trim_end_matches('/').to_string();
+        map.insert(
+            key,
+            EventRow {
+                id,
+                event_type: row.get(1),
+                actor_id: row.get(2),
+                object_id,
+                summary: row.get(4),
+                media_urls: row.get(5),
+                created_at: row.get(6),
+                sensitive,
+                spoiler_text: row.get(8),
+                host: row.get(9),
+                target_actor: row.get(10),
+                in_reply_to: row.get(11),
+                ask_actor: String::new(),
+                ask_question: String::new(),
+                ask_answer: String::new(),
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn reblog_rss_id(rb: &BoostRow) -> Option<i64> {
+    rss_item_id_from_key(&rb.status_id)
+        .or_else(|| rss_item_id_from_key(&rb.object_id))
+        .or_else(|| rss_item_id_from_key(&rb.boost_status_id))
+}
+
+fn reblog_bsky_target(rb: &BoostRow) -> Option<String> {
+    if !reblog_is_bsky_native(&rb.status_id, &rb.object_id) {
+        return None;
+    }
+    for key in [&rb.object_id, &rb.status_id, &rb.boost_status_id] {
+        let key = key.trim();
+        if key.starts_with("https://bsky.app/profile/") || key.starts_with("at://") {
+            return Some(key.to_string());
+        }
+    }
+    None
+}
+
+async fn materialize_profile_reblog_window(
+    db: &Client,
+    rows: &[BoostRow],
+    viewer_owner_id: i64,
+    profile_owner_id: i64,
+) -> Result<Vec<Option<Value>>> {
+    // RSS items belong to the profile owner. Guests and other local accounts
+    // do not see them; the row is still consumed so the cursor keeps moving.
+    let show_rss = viewer_owner_id > 0 && viewer_owner_id == profile_owner_id;
+    let mut rss_ids = Vec::new();
+    let mut bsky_targets = Vec::new();
+    let mut object_ids = Vec::new();
+    for rb in rows {
+        if let Some(id) = reblog_rss_id(rb) {
+            if show_rss {
+                rss_ids.push(id);
+            }
+            continue;
+        }
+        if let Some(target) = reblog_bsky_target(rb) {
+            bsky_targets.push(target);
+            continue;
+        }
+        let oid = rb.object_id.trim().trim_end_matches('/').to_string();
+        if !oid.is_empty() {
+            object_ids.push(oid);
+        }
+    }
+    rss_ids.sort_unstable();
+    rss_ids.dedup();
+    bsky_targets.sort();
+    bsky_targets.dedup();
+    object_ids.sort();
+    object_ids.dedup();
+
+    let rss_map = if show_rss {
+        fetch_rss_map(db, &rss_ids, profile_owner_id).await?
+    } else {
+        HashMap::new()
+    };
+    let bsky_map = fetch_bsky_map_for_targets(db, &bsky_targets).await?;
+    let events = fetch_best_boost_objects(db, &object_ids).await?;
+    let mut actor_ids = Vec::new();
+    let mut local_keys = Vec::new();
+    for rb in rows {
+        if let Some(actor) = preferred_actor_iri(&rb.target_actor, "") {
+            actor_ids.push(actor);
+        }
+        if let Some(username) = local_username_from_url(&rb.owner_actor_id) {
+            local_keys.push(username);
+        }
+    }
+    for event in events.values() {
+        if let Some(actor) = preferred_actor_iri(&event.target_actor, &event.actor_id) {
+            actor_ids.push(actor.clone());
+        }
+        actor_ids.push(event.actor_id.trim_end_matches('/').to_string());
+        if let Some(username) = local_username_from_url(&event.actor_id) {
+            local_keys.push(username);
+        }
+    }
+    for oid in &object_ids {
+        if let Some(username) = oid
+            .rsplit_once("/notes/")
+            .and_then(|(prefix, _)| local_username_from_url(prefix))
+        {
+            local_keys.push(username);
+        }
+    }
+    actor_ids.sort();
+    actor_ids.dedup();
+    let actors = fetch_actors_map(db, &actor_ids).await?;
+    let local_profiles = fetch_local_profiles_map(db, &local_keys).await?;
+    let outbox = fetch_outbox_map(db, &object_ids).await?;
+
+    let mut painted = Vec::with_capacity(rows.len());
+    for rb in rows {
+        if let Some(rss_id) = reblog_rss_id(rb) {
+            if !show_rss {
+                painted.push(None);
+                continue;
+            }
+            let Some(rss) = rss_map.get(&rss_id) else {
+                painted.push(None);
+                continue;
+            };
+            let card = materialize_boost(
+                rb,
+                None,
+                Some(rss),
+                &actors,
+                &local_profiles,
+                viewer_owner_id,
+            );
+            painted.push(card.filter(|st| boost_card_is_paintable(st) && boost_actor_is_profile(st)));
+            continue;
+        }
+        if let Some(target) = reblog_bsky_target(rb) {
+            let Some(post) = bsky_map.get(&target) else {
+                painted.push(None);
+                continue;
+            };
+            let inner = materialize_bsky(post);
+            let card = finish_boost_wrapper(
+                rb,
+                inner,
+                &local_profiles,
+                viewer_owner_id > 0 && rb.owner_user_id == viewer_owner_id,
+            );
+            painted.push(card.filter(|st| boost_card_is_paintable(st) && boost_actor_is_profile(st)));
+            continue;
+        }
+        let oid = rb.object_id.trim().trim_end_matches('/');
+        let mut card = None;
+        if let Some(event) = events.get(oid) {
+            let mut event = event.clone();
+            if let Some(actor) = preferred_actor_iri(&rb.target_actor, &event.actor_id) {
+                event.actor_id = actor;
+            }
+            card = materialize_boost(
+                rb,
+                Some(&event),
+                None,
+                &actors,
+                &local_profiles,
+                viewer_owner_id,
+            );
+        }
+        if card.as_ref().map(|st| !boost_card_is_paintable(st)).unwrap_or(true) {
+            if let Some(note) = outbox.get(oid) {
+                let owner_name = local_username_from_url(&rb.owner_actor_id).unwrap_or_default();
+                let inner = materialize_outbox(note, &owner_name, &local_profiles);
+                card = finish_boost_wrapper(
+                    rb,
+                    inner,
+                    &local_profiles,
+                    viewer_owner_id > 0 && rb.owner_user_id == viewer_owner_id,
+                );
+            }
+        }
+        if let Some(st) = card.as_mut() {
+            stamp_local_boost_author(st, &local_profiles);
+        }
+        painted.push(card.filter(|st| boost_card_is_paintable(st) && boost_actor_is_profile(st)));
+    }
+    Ok(painted)
+}
+
+/// Profile Boosts tab. Pages `masto_reblogs` for this local actor and hydrates
+/// each row with the same RSS / Bluesky / Fediverse materializers as the timelines.
+pub(crate) async fn load_profile_boost_page(
+    db: &Client,
+    actor_url: &str,
+    viewer_owner_id: i64,
+    limit: i64,
+    offset: i64,
+) -> Result<ProfileBoostPage> {
+    let limit = limit.clamp(1, 50);
+    let mut cursor = offset.max(0);
+    let profile_owner_id = profile_owner_user_id(db, actor_url).await?;
+    let mut statuses = Vec::new();
+    let mut scanned = 0i64;
+    let scan_cap = 160i64;
+    let mut exhausted = false;
+    while (statuses.len() as i64) < limit && scanned < scan_cap && !exhausted {
+        let batch = 40i64.min(scan_cap - scanned).max(1);
+        let rows = fetch_profile_reblog_rows(db, actor_url, batch, cursor).await?;
+        if rows.is_empty() {
+            exhausted = true;
+            break;
+        }
+        let full = rows.len() as i64 == batch;
+        let hydrated =
+            materialize_profile_reblog_window(db, &rows, viewer_owner_id, profile_owner_id).await?;
+        let mut took = 0i64;
+        for item in hydrated {
+            took += 1;
+            scanned += 1;
+            if let Some(st) = item {
+                statuses.push(st);
+                if statuses.len() as i64 >= limit || scanned >= scan_cap {
+                    break;
+                }
+            } else if scanned >= scan_cap {
+                break;
+            }
+        }
+        cursor += took;
+        if took < rows.len() as i64 {
+            exhausted = false;
+            break;
+        }
+        if !full {
+            exhausted = true;
+        }
+    }
+    Ok(ProfileBoostPage {
+        statuses,
+        next_offset: cursor,
+        has_more: !exhausted,
+    })
+}
+
+/// True when the card cannot show a human handle without a fetch.
+/// A missing row whose URL already ends in `/users/alice` is fine.
+/// `/ap/users/{snowflake}` is not.
+fn actor_needs_label_fetch(actor_id: &str, username: Option<&str>) -> bool {
+    let actor_id = actor_id.trim().trim_end_matches('/');
+    if !actor_id.starts_with("https://") || local_username_from_url(actor_id).is_some() {
+        return false;
+    }
+    match username.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => username_is_placeholder(name),
+        None => username_is_placeholder(actor_id.rsplit('/').next().unwrap_or("")),
+    }
+}
+
+/// Signed-fetch a few actors whose cached username is still a snowflake or
+/// missing, then re-read `remote_actors`. Timeline paint must not invent
+/// `@1168…@booster.host`. This runs on the background hydrate, not on an
+/// Ice Cubes request. Extra ids are left for the next pass once these land.
+async fn resolve_missing_actor_labels(
+    db: &Client,
+    actor_ids: &[String],
+    mut actors: HashMap<String, ActorRow>,
+) -> HashMap<String, ActorRow> {
+    let mut need = Vec::new();
+    for raw in actor_ids {
+        let id = raw.trim().trim_end_matches('/').to_string();
+        let stored = actors.get(&id).map(|row| row.username.as_str());
+        if actor_needs_label_fetch(&id, stored) {
+            need.push(id);
+        }
+    }
+    need.sort();
+    need.dedup();
+    if need.is_empty() {
+        return actors;
+    }
+    // One timeline head can mention many unknown servers. Keep the warm loop
+    // inside its interval; the actor-warm worker continues anything past this.
+    const MAX_INLINE: usize = 4;
+    let inline: Vec<String> = need.into_iter().take(MAX_INLINE).collect();
+    let jobs: Vec<crate::ap_actor_warm::WarmJob> = inline
+        .iter()
+        .map(|actor_id| crate::ap_actor_warm::WarmJob {
+            actor_id: actor_id.clone(),
+            actor: String::new(),
+            ts: chrono::Utc::now().timestamp(),
+            source: "hydrate-label".into(),
+        })
+        .collect();
+    match crate::ap_actor_warm::process_batch(&jobs).await {
+        Ok((warmed, failed)) if failed > 0 => {
+            tracing::warn!(warmed, failed, "hydrate actor label resolve");
+        }
+        Err(e) => tracing::warn!(error = %e, "hydrate actor label resolve failed"),
+        _ => {}
+    }
+    if let Ok(refreshed) = fetch_actors_map(db, &inline).await {
+        for (k, row) in refreshed {
+            actors.insert(k, row);
+        }
+    }
+    actors
 }
 
 /// Materialize Mastodon statuses from a view's ranked head and write
@@ -3098,6 +4277,7 @@ pub async fn warm_view(
     actor_ids.sort();
     actor_ids.dedup();
     let actors_map = fetch_actors_map(&db, &actor_ids).await?;
+    let actors_map = resolve_missing_actor_labels(&db, &actor_ids, actors_map).await;
     let mut outbox_map = fetch_outbox_map(&db, &outbox_ids).await?;
     let mut ask_ids: Vec<String> = events_map.values().map(|e| e.object_id.clone()).collect();
     ask_ids.extend(outbox_map.keys().cloned());
@@ -3207,7 +4387,7 @@ pub async fn warm_view(
                     .or_else(|| rss_item_id_from_key(&rb.object_id))
                     .or_else(|| rss_item_id_from_key(&rb.boost_status_id))
                     .and_then(|id| rss_map.get(&id));
-                materialize_boost(rb, create, rss, &actors_map, &local_profiles)
+                materialize_boost(rb, create, rss, &actors_map, &local_profiles, owner_user_id)
             }),
             _ => None,
         };
@@ -3579,6 +4759,7 @@ pub fn report_json(r: &WarmReport) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn quote_target_reads_activitypub_quote_field() {
@@ -3679,6 +4860,45 @@ mod tests {
         assert_eq!(rss_item_id_from_key("local:rss-boost:42:1"), Some(42));
         assert_eq!(rss_item_id_from_key("rss:7"), Some(7));
         assert!(!reblog_is_bsky_native("12345", "https://example.com/notes/1"));
+    }
+
+    #[test]
+    fn profile_boost_actor_iri_prefers_account_over_status() {
+        assert!(looks_like_object_url(
+            "https://video.example/videos/abc"
+        ));
+        assert!(looks_like_object_url(
+            "https://mastodon.social/users/alice/statuses/1"
+        ));
+        assert!(!looks_like_object_url(
+            "https://video.example/accounts/alice"
+        ));
+        assert!(!looks_like_object_url(
+            "https://peertube.example/accounts/kara"
+        ));
+        assert!(!looks_like_object_url(
+            "https://bsky.app/profile/alice.bsky.social"
+        ));
+        assert!(looks_like_object_url(
+            "https://bsky.app/profile/alice.bsky.social/post/rkey"
+        ));
+        assert_eq!(
+            preferred_actor_iri(
+                "https://peertube.example/accounts/kara",
+                "https://peertube.example/videos/watch/abc"
+            )
+            .as_deref(),
+            Some("https://peertube.example/accounts/kara")
+        );
+        assert_eq!(
+            preferred_actor_iri("", "https://mastodon.social/users/alice").as_deref(),
+            Some("https://mastodon.social/users/alice")
+        );
+        assert!(preferred_actor_iri(
+            "https://mastodon.social/users/alice/statuses/9",
+            "https://mastodon.social/notes/9"
+        )
+        .is_none());
     }
 
     #[test]
@@ -3804,6 +5024,116 @@ mod tests {
         assert_eq!(status["quote"]["state"], "accepted");
         assert_eq!(status["quote"]["quoted_status"]["url"], "https://example.test/posts/9");
         assert_eq!(status["content"], "<p>My commentary</p>");
+    }
+
+    fn snowflake_announce_fixture() -> (EventRow, ActorRow) {
+        let announce = EventRow {
+            id: 771326,
+            event_type: "Announce".into(),
+            actor_id: "https://chaosfem.tw/ap/users/115588256704766337".into(),
+            object_id: "https://girlcock.club/ap/users/116852566102382097/statuses/117407313948738303".into(),
+            summary: "hidden".into(),
+            media_urls: "[]".into(),
+            created_at: "2026-10-09T00:20:00Z".into(),
+            sensitive: true,
+            spoiler_text: "Sensitive content".into(),
+            host: "chaosfem.tw".into(),
+            target_actor: "https://girlcock.club/ap/users/116852566102382097".into(),
+            in_reply_to: String::new(),
+            ask_actor: String::new(),
+            ask_question: String::new(),
+            ask_answer: String::new(),
+        };
+        let booster = ActorRow {
+            actor_id: announce.actor_id.clone(),
+            username: "anhedonie".into(),
+            display_name: "merzbow and chill".into(),
+            host: "chaosfem.tw".into(),
+            icon: "https://cdn.example/booster.webp".into(),
+            emojis: serde_json::Value::Array(Vec::new()),
+        };
+        (announce, booster)
+    }
+
+    #[test]
+    fn boost_of_numeric_actor_does_not_borrow_booster_host() {
+        let (announce, booster) = snowflake_announce_fixture();
+        let st = materialize_announce(&announce, Some(&booster), None, &HashMap::new());
+        let inner = &st["reblog"]["account"];
+        assert_eq!(st["account"]["acct"], "anhedonie@chaosfem.tw");
+        assert_eq!(st["account"]["display_name"], "merzbow and chill");
+        assert_eq!(inner["acct"], "girlcock.club");
+        assert_eq!(inner["display_name"], "girlcock.club");
+        assert_eq!(inner["username"], "user");
+        assert_eq!(
+            inner["uri"],
+            "https://girlcock.club/ap/users/116852566102382097"
+        );
+        assert!(!inner["acct"].as_str().unwrap_or("").contains("chaosfem"));
+        assert!(!inner["display_name"].as_str().unwrap_or("").chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn resolved_numeric_actor_uses_preferred_username() {
+        let (announce, booster) = snowflake_announce_fixture();
+        let mut actors = HashMap::new();
+        actors.insert(
+            announce.target_actor.clone(),
+            ActorRow {
+                actor_id: announce.target_actor.clone(),
+                username: "anarchautistic".into(),
+                display_name: "smoking".into(),
+                host: "chaosfem.tw".into(),
+                icon: "https://cdn.example/author.webp".into(),
+                emojis: serde_json::Value::Array(Vec::new()),
+            },
+        );
+        let st = materialize_announce(&announce, Some(&booster), None, &actors);
+        let inner = &st["reblog"]["account"];
+        assert_eq!(inner["username"], "anarchautistic");
+        assert_eq!(inner["display_name"], "smoking");
+        assert_eq!(inner["acct"], "anarchautistic@girlcock.club");
+    }
+
+    #[test]
+    fn label_fetch_is_only_for_placeholder_handles() {
+        assert!(actor_needs_label_fetch(
+            "https://girlcock.club/ap/users/116852566102382097",
+            None
+        ));
+        assert!(!actor_needs_label_fetch(
+            "https://robot.villas/users/the_standard",
+            None
+        ));
+        assert!(!actor_needs_label_fetch(
+            "https://chaosfem.tw/ap/users/115588256704766337",
+            Some("anhedonie")
+        ));
+        assert!(actor_needs_label_fetch(
+            "https://girlcock.club/ap/users/116852566102382097",
+            Some("116852566102382097")
+        ));
+        assert!(!actor_needs_label_fetch(
+            "https://mkultra.monster/users/cmdr_nova",
+            None
+        ));
+    }
+
+    #[test]
+    fn stored_snowflake_username_stays_off_the_card() {
+        let actor = ActorRow {
+            actor_id: "https://girlcock.club/ap/users/116852566102382097".into(),
+            username: "116852566102382097".into(),
+            display_name: "116852566102382097".into(),
+            host: "girlcock.club".into(),
+            icon: String::new(),
+            emojis: serde_json::Value::Array(Vec::new()),
+        };
+        let account = actor_to_account(&actor);
+        assert_eq!(account["acct"], "girlcock.club");
+        assert_eq!(account["display_name"], "girlcock.club");
+        assert_eq!(account["username"], "user");
+        assert_eq!(account["uri"], actor.actor_id);
     }
 
     #[test]

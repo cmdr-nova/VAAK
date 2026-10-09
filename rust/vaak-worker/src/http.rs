@@ -489,8 +489,24 @@ async fn shadow_notif_embed(
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner).await {
             crate::notif_embed::stamp_viewer_moderation_tree(&mut status, &moderation);
         }
+        let _ = crate::interaction_flags::apply_to_statuses(
+            &db,
+            owner,
+            std::slice::from_mut(&mut status),
+        )
+        .await;
+        let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(
+            &db,
+            std::slice::from_mut(&mut status),
+        )
+        .await;
+        let _ = crate::home_hydrate_ranked::attach_ask_identities(
+            &db,
+            std::slice::from_mut(&mut status),
+        )
+        .await;
     }
-    let html = crate::notif_embed::paint_lean_embed_from(&status, hide, "mentions", &viewer);
+    let html = crate::notif_embed::paint_lean_embed_from(&status, hide, "mentions", &viewer, true);
     if html.is_empty() {
         return (
             StatusCode::NOT_FOUND,

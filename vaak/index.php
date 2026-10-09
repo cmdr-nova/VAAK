@@ -267,11 +267,33 @@ if ($mode !== 'register' && $mode !== 'login' && $mode !== 'forgot' && $mode !==
 }
 
 // Pretty local profiles: /vaak/users/{key} (and Caddy ?local_key= rewrites).
+// An explicit app view on that path is a rail/search/settings navigation.
+// Query-only links (?view=home) stay under /users/{key} in browsers that
+// ignore <base> for "?…" URLs, and the profile boot would paint the profile
+// again. Send those to /vaak/ and keep tab/refresh profile URLs here.
 $vaakPrettyKey = function_exists('ap_vaak_pretty_profile_key_from_request')
     ? ap_vaak_pretty_profile_key_from_request()
     : null;
 if ($vaakPrettyKey !== null && $mode === '') {
-    ap_vaak_boot_pretty_profile($vaakPrettyKey);
+    $vaakPrettyAppView = strtolower(preg_replace('/[^a-z_]/', '', (string) ($_GET['view'] ?? '')) ?? '');
+    if ($vaakPrettyAppView !== '' && $vaakPrettyAppView !== 'remote_profile') {
+        $vaakPrettyMethod = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+        if ($vaakPrettyMethod === 'GET' || $vaakPrettyMethod === 'HEAD') {
+            $vaakPrettyQs = $_GET;
+            unset($vaakPrettyQs['local_key'], $vaakPrettyQs['vaak_local_key']);
+            $vaakPrettyTarget = '/vaak/';
+            if ($vaakPrettyQs !== []) {
+                $vaakPrettyTarget .= '?' . http_build_query($vaakPrettyQs);
+            }
+            header('Cache-Control: private, no-store');
+            header('Location: ' . $vaakPrettyTarget, true, 302);
+            exit;
+        }
+        // POST (account switch, and any form aimed at an app view) must reach
+        // the app. Falling through skips the profile boot below.
+    } else {
+        ap_vaak_boot_pretty_profile($vaakPrettyKey);
+    }
 }
 
 // Flash messages from PRG redirects (forgot / reset password).

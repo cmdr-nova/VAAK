@@ -1940,6 +1940,16 @@ function ap_masto_relationship_for_account_id(string $accountId): array
         $muting = function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, ap_db_masto_owner_user_id());
     }
 
+    $requested = false;
+    if (!$following && is_string($actor) && $actor !== ''
+        && function_exists('ap_follow_request_pending')
+        && function_exists('ap_masto_session_actor_id')) {
+        $sessionActor = ap_masto_session_actor_id();
+        if ($sessionActor !== '') {
+            $requested = ap_follow_request_pending($actor, $sessionActor);
+        }
+    }
+
     return [
         'id' => $accountId,
         'following' => $following,
@@ -1950,7 +1960,7 @@ function ap_masto_relationship_for_account_id(string $accountId): array
         'blocked_by' => false,
         'muting' => $muting,
         'muting_notifications' => $muting,
-        'requested' => false,
+        'requested' => $requested,
         'domain_blocking' => false,
         'endorsed' => false,
         'note' => '',
@@ -4587,6 +4597,19 @@ function ap_masto_status_from_mention(array $row): array
             $quoteEnt = ap_masto_quote_entity($quoteObjectUrl, 0, false, true);
         }
     }
+    // Mentions store the public bsky.app permalink on uri/url and the AT record
+    // on activity_id. Keep the at:// so Boost can target the record without a
+    // handle lookup. Handle permalinks still paint a boost button via object ref.
+    $bskyAtUri = '';
+    $activityForAt = trim((string) ($row['activity_id'] ?? ''));
+    if (str_starts_with($activityForAt, 'at://') && str_contains($activityForAt, '/app.bsky.feed.post/')) {
+        $cut = strstr($activityForAt, '?', true);
+        $bskyAtUri = $cut !== false ? $cut : $activityForAt;
+        $hash = strstr($bskyAtUri, '#', true);
+        if ($hash !== false) {
+            $bskyAtUri = $hash;
+        }
+    }
     $bodyContent = $pack['content'];
     if (is_array($quoteEnt)) {
         $plainBody = trim(html_entity_decode(strip_tags((string) $bodyContent), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -4652,6 +4675,9 @@ function ap_masto_status_from_mention(array $row): array
     ];
     if (is_array($quoteEnt) && is_string($quoteObjectUrl) && $quoteObjectUrl !== '') {
         $status['quote_url'] = $quoteObjectUrl;
+    }
+    if ($bskyAtUri !== '') {
+        $status['vaak_bsky_uri'] = $bskyAtUri;
     }
     $status = ap_masto_apply_interaction_flags($status);
     return function_exists('ap_normalize_status')
@@ -6220,6 +6246,96 @@ function ap_masto_timeline_home_axum_since_html_fetch(int $sinceTs, int $limit =
 }
 
 /**
+ * Local / Federated live-poll HTML from the Rust painter.
+ *
+ * A miss, including a warm head with nothing newer, returns null so PHP can
+ * still query posts that fan-out stored before the hydrate envelope rebuilt.
+ *
+ * @return array{html:string,newest:int,count:int,source:string}|null
+ */
+function ap_masto_timeline_chrono_axum_since_html_fetch(string $view, int $sinceTs, int $limit = 20, int $ownerUserId = 0): ?array
+{
+    $view = strtolower(trim($view));
+    if ($view !== 'local' && $view !== 'feed') {
+        return null;
+    }
+    $enabled = getenv('VAAK_PUBLIC_NEWER_AXUM');
+    $enabled = ($enabled === false || $enabled === '')
+        ? true
+        : !in_array(strtolower(trim((string) $enabled)), ['0', 'false', 'off', 'no'], true);
+    if (!$enabled || $sinceTs <= 0 || !function_exists('curl_init')) {
+        return null;
+    }
+    if ($ownerUserId < 1 && function_exists('admin_owner_user_id')) {
+        $ownerUserId = (int) admin_owner_user_id();
+    }
+    if ($ownerUserId < 1 && function_exists('ap_db_masto_owner_user_id')) {
+        $ownerUserId = (int) ap_db_masto_owner_user_id();
+    }
+    if ($ownerUserId < 1) {
+        return null;
+    }
+    $base = getenv('VAAK_SHADOW_HTTP');
+    $base = is_string($base) && trim($base) !== ''
+        ? rtrim(trim($base), '/')
+        : 'http://127.0.0.1:8787';
+    $host = parse_url($base, PHP_URL_HOST);
+    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) {
+        return null;
+    }
+    $url = $base . '/shadow/' . $view . '-since-html?' . http_build_query([
+        'owner_id' => $ownerUserId,
+        'since_ts' => max(0, $sinceTs),
+        'limit' => max(1, min(40, $limit)),
+    ]);
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return null;
+    }
+    $started = microtime(true);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => 120,
+        CURLOPT_TIMEOUT_MS => 700,
+        CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close'],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    if (!is_string($raw) || $code !== 200) {
+        return null;
+    }
+    $headers = substr($raw, 0, $headerSize);
+    $body = substr($raw, $headerSize);
+    $cache = '';
+    $newest = $sinceTs;
+    $count = 0;
+    foreach (preg_split('/\r\n|\n|\r/', $headers) ?: [] as $line) {
+        if (stripos($line, 'X-VAAK-TL-Cache:') === 0) {
+            $cache = trim(substr($line, strlen('X-VAAK-TL-Cache:')));
+        } elseif (stripos($line, 'X-Newest:') === 0) {
+            $newest = max($newest, (int) trim(substr($line, strlen('X-Newest:'))));
+        } elseif (stripos($line, 'X-New-Count:') === 0) {
+            $count = max(0, (int) trim(substr($line, strlen('X-New-Count:'))));
+        }
+    }
+    if (stripos($cache, 'axum-chrono-since-html') === false || $count < 1 || trim($body) === '') {
+        return null;
+    }
+    if (function_exists('ap_timing_record')) {
+        ap_timing_record('timelines.' . $view . '.axum_since_html_fetch', (microtime(true) - $started) * 1000.0);
+    }
+    return [
+        'html' => $body,
+        'newest' => $newest,
+        'count' => $count,
+        'source' => 'axum-chrono-since-html',
+    ];
+}
+
+/**
  * Best-effort prime of Home hydrate Redis so HTML Axum assist can hit next time.
  */
 function ap_masto_timeline_home_hydrate_warm_async(int $ownerUserId, int $limit = 15): void
@@ -6354,6 +6470,20 @@ function ap_masto_notifications_fetch(int $limit = 40, ?string $maxId = null, ?s
                 $recordNotifTiming('cache_stale', $notifStartedAt);
                 $recordNotifTiming('total', $notifStartedAt);
                 return $items;
+            }
+        }
+        // Exact page missed. Reuse the warm head before locking a database rebuild.
+        // exclude_types stays here: those envelopes are not exclude-filtered.
+        // A short scroll page is rejected so Ice Cubes does not stop early.
+        if ($exclude === [] && function_exists('ap_masto_notifications_axum_fetch')) {
+            $axumItems = ap_masto_notifications_axum_fetch($limit, $maxId, $sinceId, $types);
+            if (is_array($axumItems) && $axumItems !== []
+                && ($maxId === null || $maxId === '' || count($axumItems) >= $limit)) {
+                $GLOBALS['ap_notif_list_cache_hit'] = true;
+                $GLOBALS['ap_notif_list_source'] = 'axum-notif-api';
+                $recordNotifTiming('axum', $notifStartedAt);
+                $recordNotifTiming('total', $notifStartedAt);
+                return $axumItems;
             }
         }
         // Coalesce cold notification list rebuilds after idle.

@@ -3053,7 +3053,12 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         return ['ok' => false, 'error' => 'Header URL must be https://'];
     }
 
-    $manually = !empty($fields['manually_approves']) ? 1 : 0;
+    if (array_key_exists('manually_approves', $fields)) {
+        $manually = !empty($fields['manually_approves']) ? 1 : 0;
+    } else {
+        // Partial saves (one preference at a time) must not unlock a private account.
+        $manually = !empty($existingProfile['manually_approves']) ? 1 : 0;
+    }
     $discoverable = array_key_exists('discoverable', $fields) ? (!empty($fields['discoverable']) ? 1 : 0) : 1;
     $indexable = array_key_exists('indexable', $fields) ? (!empty($fields['indexable']) ? 1 : 0) : 1;
     $collectionConsent = array_key_exists('collection_consent', $fields)
@@ -3188,7 +3193,8 @@ function ap_profile_actor_url(string $actorKey = 'cmdr_nova'): string
 
 /**
  * Public identity URLs that count for rel=me verification.
- * ActivityPub actor IRI on mkultra plus the on-VAAK pretty profile on vaak.monster.
+ * ActivityPub actor IRI, the on-VAAK profile at /vaak/users/{key},
+ * and the old vaak.monster profile links. Old links still verify.
  *
  * @return list<string>
  */
@@ -3201,9 +3207,11 @@ function ap_profile_identity_urls(string $actorKey = 'cmdr_nova'): array
     $enc = rawurlencode($actorKey);
     return [
         'https://mkultra.monster/users/' . $enc,
-        'https://vaak.monster/users/' . $enc,
-        'https://www.vaak.monster/users/' . $enc,
+        'https://mkultra.monster/vaak/users/' . $enc,
         'https://mkultra.monster/@' . $enc,
+        'https://vaak.monster/users/' . $enc,
+        'https://vaak.monster/vaak/users/' . $enc,
+        'https://www.vaak.monster/users/' . $enc,
     ];
 }
 
@@ -3841,7 +3849,17 @@ function ap_profile_store_uploaded_image(array $file, string $kind): array
     $outPath = null;
 
     // Convert static raster to WebP when GD supports it (skip GIF to preserve animation).
-    $canWebp = function_exists('imagewebp') && $mime !== 'image/gif';
+    // An avatar that already carries a Pluraldawn member list must stay byte-for-byte.
+    // Recompression wipes the bits the timeline reads back.
+    $keepPluraldawn = false;
+    if ($kind === 'avatar' && ($mime === 'image/png' || $mime === 'image/webp')) {
+        require_once __DIR__ . '/ap-pluraldawn.php';
+        $original = @file_get_contents($tmp);
+        if (is_string($original) && $original !== '' && ap_pluraldawn_members_from_image($original) !== []) {
+            $keepPluraldawn = true;
+        }
+    }
+    $canWebp = function_exists('imagewebp') && $mime !== 'image/gif' && !$keepPluraldawn;
     if ($canWebp) {
         $im = null;
         if ($mime === 'image/jpeg' && function_exists('imagecreatefromjpeg')) {
@@ -5431,6 +5449,56 @@ function ap_follow_request_get(int $id, string $ownerActorId): ?array
     }
 }
 
+/** True when this actor is a local account that approves followers manually. */
+function ap_actor_requires_follow_approval(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if (!preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $actorId, $m)) {
+        return false;
+    }
+    $profile = ap_profile_get($m[1]);
+    return !empty($profile['manually_approves']);
+}
+
+/** Pending follow request from $actorId to the local owner, if one exists. */
+function ap_follow_request_pending(string $ownerActorId, string $actorId): bool
+{
+    $ownerActorId = rtrim(trim($ownerActorId), '/');
+    $actorId = rtrim(trim($actorId), '/');
+    if ($ownerActorId === '' || $actorId === '') {
+        return false;
+    }
+    try {
+        $st = ap_db()->prepare(
+            "SELECT 1 FROM ap_follow_requests
+             WHERE owner_actor_id IN (?, ?) AND actor_id IN (?, ?) AND status = 'pending'
+             LIMIT 1"
+        );
+        $st->execute([$ownerActorId, $ownerActorId . '/', $actorId, $actorId . '/']);
+        return (bool) $st->fetchColumn();
+    } catch (Throwable $e) {
+        error_log('[ap-db] follow_request_pending: ' . $e->getMessage());
+        return false;
+    }
+}
+
+function ap_follow_request_remove(string $ownerActorId, string $actorId): void
+{
+    $ownerActorId = rtrim(trim($ownerActorId), '/');
+    $actorId = rtrim(trim($actorId), '/');
+    if ($ownerActorId === '' || $actorId === '') {
+        return;
+    }
+    try {
+        ap_db()->prepare(
+            "DELETE FROM ap_follow_requests
+             WHERE owner_actor_id IN (?, ?) AND actor_id IN (?, ?) AND status = 'pending'"
+        )->execute([$ownerActorId, $ownerActorId . '/', $actorId, $actorId . '/']);
+    } catch (Throwable $e) {
+        error_log('[ap-db] follow_request_remove: ' . $e->getMessage());
+    }
+}
+
 function ap_follow_request_set_status(int $id, string $ownerActorId, string $status): bool
 {
     $status = in_array($status, ['accepted', 'rejected'], true) ? $status : 'pending';
@@ -6867,11 +6935,27 @@ function ap_outbox_media_count(string $actorKey): int
 
 function ap_outbox_count_for_actor(string $actorKey): int
 {
-    $prefix = 'https://mkultra.monster/users/' . rawurlencode(strtolower(trim($actorKey))) . '/';
+    $actorKey = strtolower(trim($actorKey));
+    if ($actorKey === '') {
+        return 0;
+    }
+    // Profile badges call this on every tab. Same 60s window as media/reply counts.
+    $key = 'vaak:profile:outbox-count:v1:' . $actorKey;
+    if (function_exists('ap_redis_json_get')) {
+        $cached = ap_redis_json_get($key);
+        if (is_array($cached) && isset($cached['count'])) {
+            return max(0, (int) $cached['count']);
+        }
+    }
+    $prefix = 'https://mkultra.monster/users/' . rawurlencode($actorKey) . '/';
     try {
         $st = ap_db()->prepare('SELECT COUNT(*) FROM outbox_notes WHERE id LIKE ?');
         $st->execute([$prefix . '%']);
-        return (int) $st->fetchColumn();
+        $count = max(0, (int) $st->fetchColumn());
+        if (function_exists('ap_redis_json_set')) {
+            ap_redis_json_set($key, ['count' => $count], 60);
+        }
+        return $count;
     } catch (Throwable $e) {
         return 0;
     }
@@ -8471,6 +8555,10 @@ function ap_block_list_cached(bool $refresh = false): array
 function ap_block_cache_clear(): void
 {
     ap_block_list_cached(true);
+    // Server mute/block applies to every local account's notifications.
+    if (function_exists('ap_notification_projection_invalidate_all')) {
+        ap_notification_projection_invalidate_all();
+    }
 }
 
 function ap_block_normalize_domain(string $raw): ?string
@@ -8910,8 +8998,18 @@ function ap_is_globally_muted_actor(?string $actorId, ?string $host = null): boo
         }
         if (($b['scope'] ?? '') === 'actor' && $actorId !== '') {
             $val = rtrim((string) ($b['value'] ?? ''), '/');
-            if ($val !== '' && (isset($aliasSet[$val]) || ap_actor_moderation_refs_match($actorId, $val))) {
+            if ($val === '') {
+                continue;
+            }
+            if (isset($aliasSet[$val]) || ap_actor_moderation_refs_match($actorId, $val)) {
                 return true;
+            }
+            // Server mutes are stored as the canonical /users IRI. Cards and
+            // some notification actors only carry the web /@ profile.
+            foreach (ap_moderation_syntactic_refs($actorId) as $alias) {
+                if (strcasecmp(rtrim((string) $alias, '/'), $val) === 0) {
+                    return true;
+                }
             }
         }
         if (($b['scope'] ?? '') === 'domain' && $host !== '') {
@@ -10824,6 +10922,12 @@ function ap_user_blocks_cache_clear(?int $ownerUserId = null): void
         ap_redis_delete('vaak:relset:v1:blocks-actors:' . $ownerUserId);
     }
     ap_timeline_cache_invalidate_owner($ownerUserId);
+    if (function_exists('ap_notification_projection_invalidate_owner')) {
+        ap_notification_projection_invalidate_owner($ownerUserId);
+    }
+    if (function_exists('ap_masto_notifications_unread_invalidate')) {
+        ap_masto_notifications_unread_invalidate($ownerUserId);
+    }
 }
 
 function ap_user_is_blocked(?string $actorId, ?string $host, int $ownerUserId): bool
@@ -11172,6 +11276,286 @@ function ap_actor_is_content_blocked(?string $actorId, ?string $host = null, ?in
         return false;
     }
     return ap_user_is_blocked($actorId, $host, $ownerUserId);
+}
+
+/**
+ * vaak.monster only serves the profile page. Moderation rows use the
+ * mkultra.monster actor IRI.
+ */
+function ap_search_canonical_actor(string $actorId): string
+{
+    $actorId = rtrim(trim($actorId), '/');
+    if (preg_match('#^https://(?:www\.)?vaak\.monster/(?:vaak/users/|users/|@)([A-Za-z0-9_]+)$#i', $actorId, $m)) {
+        return 'https://mkultra.monster/users/' . strtolower((string) $m[1]);
+    }
+    return $actorId;
+}
+
+/**
+ * @return list<string>
+ */
+function ap_search_actor_ref_list(string $raw): array
+{
+    $raw = rtrim(trim($raw), '/');
+    if ($raw === '' || ctype_digit($raw)) {
+        return [];
+    }
+    $isActor = str_starts_with($raw, 'https://')
+        || str_starts_with($raw, 'http://')
+        || str_starts_with($raw, 'did:')
+        || preg_match('/^@?[A-Za-z0-9_.\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/', $raw) === 1;
+    if (!$isActor) {
+        return [];
+    }
+    $canon = ap_search_canonical_actor($raw);
+    $out = [$raw];
+    if ($canon !== '' && strcasecmp($canon, $raw) !== 0) {
+        $out[] = $canon;
+    }
+    return $out;
+}
+
+/**
+ * @return array{refs:array<string,bool>,acct:string}
+ */
+function ap_search_owner_identity(int $ownerUserId): array
+{
+    static $cache = [];
+    if ($ownerUserId < 1) {
+        return ['refs' => [], 'acct' => ''];
+    }
+    if (isset($cache[$ownerUserId])) {
+        return $cache[$ownerUserId];
+    }
+    $refs = [];
+    $acct = '';
+    $actor = '';
+    $key = '';
+    if ((int) ($GLOBALS['vaak_owner_id'] ?? 0) === $ownerUserId) {
+        $actor = rtrim((string) ($GLOBALS['vaak_actor_id'] ?? ''), '/');
+        $key = strtolower((string) ($GLOBALS['vaak_actor_key'] ?? ''));
+    }
+    if ($actor === '' && $key === '') {
+        try {
+            $st = ap_db()->prepare('SELECT actor_id, actor_key FROM ap_users WHERE id = ? LIMIT 1');
+            $st->execute([$ownerUserId]);
+            $row = $st->fetch();
+            if (is_array($row)) {
+                $actor = rtrim((string) ($row['actor_id'] ?? ''), '/');
+                $key = strtolower((string) ($row['actor_key'] ?? ''));
+            }
+        } catch (Throwable $e) {
+            $actor = '';
+            $key = '';
+        }
+    }
+    if ($actor !== '') {
+        $refs[strtolower($actor)] = true;
+        foreach (ap_moderation_syntactic_refs($actor) as $ref) {
+            $ref = strtolower(rtrim((string) $ref, '/'));
+            if ($ref !== '') {
+                $refs[$ref] = true;
+            }
+        }
+    }
+    if ($key !== '') {
+        $acct = $key;
+        $refs['acct:' . $key] = true;
+        $refs['acct:' . $key . '@mkultra.monster'] = true;
+        $refs['acct:' . $key . '@vaak.monster'] = true;
+        $refs['https://mkultra.monster/users/' . $key] = true;
+        $refs['https://vaak.monster/users/' . $key] = true;
+        $refs['https://www.vaak.monster/users/' . $key] = true;
+    }
+    $identity = ['refs' => $refs, 'acct' => $acct];
+    if ($refs !== []) {
+        $cache[$ownerUserId] = $identity;
+    }
+    return $identity;
+}
+
+/**
+ * @param list<string> $refs
+ */
+function ap_search_refs_are_self(array $refs, string $acct, int $ownerUserId): bool
+{
+    if ($ownerUserId < 1) {
+        return false;
+    }
+    $set = ap_search_owner_identity($ownerUserId)['refs'];
+    if ($set === []) {
+        return false;
+    }
+    foreach ($refs as $ref) {
+        $key = strtolower(rtrim((string) $ref, '/'));
+        if ($key !== '' && isset($set[$key])) {
+            return true;
+        }
+    }
+    $acct = strtolower(ltrim(trim($acct), '@'));
+    return $acct !== '' && isset($set['acct:' . $acct]);
+}
+
+/**
+ * Personal and server-wide mutes and blocks. Mute phrases are separate.
+ * Owner 0 still applies server-wide rules. The viewer's own account stays visible.
+ */
+function ap_search_actor_hidden(string $actorId, int $ownerUserId): bool
+{
+    $refs = ap_search_actor_ref_list($actorId);
+    if ($refs === []) {
+        return false;
+    }
+    if (ap_search_refs_are_self($refs, '', $ownerUserId)) {
+        return false;
+    }
+    // /@name and /users/name are the same actor. Server mutes match the stored
+    // form, which is usually /users/name, while search rows often only have /@name.
+    $seen = [];
+    foreach ($refs as $ref) {
+        $cands = [$ref];
+        foreach (ap_moderation_syntactic_refs($ref) as $alt) {
+            $cands[] = rtrim((string) $alt, '/');
+        }
+        foreach ($cands as $one) {
+            $one = rtrim($one, '/');
+            if ($one === '' || isset($seen[$one])) {
+                continue;
+            }
+            $seen[$one] = true;
+            if (ap_row_is_hidden($one, null, $ownerUserId)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * @param array<string,mixed> $acc
+ */
+function ap_search_account_hidden(array $acc, int $ownerUserId): bool
+{
+    $refs = [];
+    foreach (['uri', 'url', 'id'] as $key) {
+        foreach (ap_search_actor_ref_list((string) ($acc[$key] ?? '')) as $ref) {
+            $refs[] = $ref;
+        }
+    }
+    $acct = ltrim(trim((string) ($acc['acct'] ?? '')), '@');
+    $host = '';
+    if (preg_match('/^([^@\s]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})$/', $acct, $m)) {
+        $user = strtolower((string) $m[1]);
+        $host = strtolower((string) $m[2]);
+        if ($host === 'vaak.monster' || $host === 'www.vaak.monster') {
+            $refs[] = 'https://mkultra.monster/users/' . $user;
+            $host = 'mkultra.monster';
+        }
+    }
+    if (ap_search_refs_are_self($refs, $acct, $ownerUserId)) {
+        return false;
+    }
+    foreach ($refs as $ref) {
+        if (ap_search_actor_hidden($ref, $ownerUserId)) {
+            return true;
+        }
+    }
+    if ($host !== '') {
+        return ap_row_is_hidden(null, $host, $ownerUserId);
+    }
+    return false;
+}
+
+/**
+ * @param array<string,mixed> $st
+ */
+function ap_search_status_hidden(array $st, int $ownerUserId): bool
+{
+    $accounts = [];
+    if (is_array($st['account'] ?? null)) {
+        $accounts[] = $st['account'];
+    }
+    foreach (['reblog', 'quote'] as $nest) {
+        if (is_array($st[$nest] ?? null) && is_array($st[$nest]['account'] ?? null)) {
+            $accounts[] = $st[$nest]['account'];
+        }
+        $nestedDid = trim((string) (is_array($st[$nest] ?? null) ? ($st[$nest]['author_did'] ?? '') : ''));
+        if ($nestedDid !== '' && ap_search_actor_hidden($nestedDid, $ownerUserId)) {
+            return true;
+        }
+    }
+    foreach ($accounts as $acc) {
+        if (is_array($acc) && ap_search_account_hidden($acc, $ownerUserId)) {
+            return true;
+        }
+    }
+    $did = trim((string) ($st['author_did'] ?? ''));
+    return $did !== '' && ap_search_actor_hidden($did, $ownerUserId);
+}
+
+/**
+ * @param list<mixed> $accounts
+ * @return list<array<string,mixed>>
+ */
+function ap_search_filter_accounts(array $accounts, int $ownerUserId, int $limit): array
+{
+    $limit = max(1, $limit);
+    $out = [];
+    foreach ($accounts as $acc) {
+        if (!is_array($acc) || ap_search_account_hidden($acc, $ownerUserId)) {
+            continue;
+        }
+        $out[] = $acc;
+        if (count($out) >= $limit) {
+            break;
+        }
+    }
+    return $out;
+}
+
+/**
+ * @param list<mixed> $statuses
+ * @return list<array<string,mixed>>
+ */
+function ap_search_filter_statuses(array $statuses, int $ownerUserId, int $limit): array
+{
+    $limit = max(1, $limit);
+    $out = [];
+    foreach ($statuses as $st) {
+        if (!is_array($st) || ap_search_status_hidden($st, $ownerUserId)) {
+            continue;
+        }
+        $out[] = $st;
+        if (count($out) >= $limit) {
+            break;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Hashtags are not actors. Shared search caches stay unfiltered; call this after the read.
+ *
+ * @param array<string,mixed> $bundle
+ * @return array<string,mixed>
+ */
+function ap_search_filter_bundle(array $bundle, int $ownerUserId, int $limit): array
+{
+    $limit = max(1, $limit);
+    $bundle['accounts'] = ap_search_filter_accounts(
+        is_array($bundle['accounts'] ?? null) ? $bundle['accounts'] : [],
+        $ownerUserId,
+        $limit
+    );
+    $bundle['statuses'] = ap_search_filter_statuses(
+        is_array($bundle['statuses'] ?? null) ? $bundle['statuses'] : [],
+        $ownerUserId,
+        $limit
+    );
+    if (is_array($bundle['hashtags'] ?? null) && count($bundle['hashtags']) > $limit) {
+        $bundle['hashtags'] = array_slice($bundle['hashtags'], 0, $limit);
+    }
+    return $bundle;
 }
 
 /* ----------------- Muted words / phrases (per-user timeline filter) ----------------- */
@@ -14919,10 +15303,38 @@ function ap_remote_actor_normalize_username(?string $username): ?string
 /**
  * @param array{username?:?string,display_name?:?string,host?:?string,icon_source_url?:?string,image_source_url?:?string} $fields
  */
+/**
+ * vaak.monster is the UI mask, not an ActivityPub host. A local actor IRI
+ * is not a remote account either. Search must not grow @user@vaak.monster.
+ */
+function ap_remote_actor_id_is_unfederated_local(string $actorId): bool
+{
+    $actorId = rtrim(trim($actorId), '/');
+    $host = strtolower((string) (parse_url($actorId, PHP_URL_HOST) ?: ''));
+    if ($host === 'vaak.monster' || $host === 'www.vaak.monster') {
+        return true;
+    }
+    if ($host !== 'mkultra.monster' && $host !== 'www.mkultra.monster') {
+        return false;
+    }
+    $path = (string) (parse_url($actorId, PHP_URL_PATH) ?: '');
+    if (!preg_match('#^/(?:users|@|vaak/users)/([A-Za-z0-9_]+)$#', $path, $m)) {
+        return false;
+    }
+    $key = strtolower($m[1]);
+    if ($key === 'cmdr_nova') {
+        return true;
+    }
+    return function_exists('ap_local_user_by_username') && is_array(ap_local_user_by_username($key));
+}
+
 function ap_remote_actor_upsert(string $actorId, array $fields): void
 {
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return;
+    }
+    if (ap_remote_actor_id_is_unfederated_local($actorId)) {
         return;
     }
     $existing = ap_remote_actor_get($actorId);
@@ -15031,6 +15443,9 @@ function ap_remote_actor_ensure(string $actorId, bool $allowFetch = true): ?arra
 {
     $actorId = rtrim(trim($actorId), '/');
     if ($actorId === '' || !str_starts_with($actorId, 'https://')) {
+        return null;
+    }
+    if (ap_remote_actor_id_is_unfederated_local($actorId)) {
         return null;
     }
     static $memo = [];

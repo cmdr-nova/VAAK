@@ -143,6 +143,18 @@ function ap_rss_display_title(string $title): string
 }
 
 /**
+ * external-preview.redd.it answers hotlink requests with 403. The timeline
+ * painter also matches the substring "preview.redd.it/" and rewrites an
+ * alphanumeric file stem to i.redd.it, which 404s. Drop the poster. The
+ * title stays. Native preview.redd.it still upgrades below.
+ */
+function ap_rss_image_host_unusable(string $url): bool
+{
+    $host = strtolower((string) (parse_url(trim($url), PHP_URL_HOST) ?: ''));
+    return $host === 'external-preview.redd.it';
+}
+
+/**
  * Prefer a full-size image URL for timeline media (Reddit previews → i.redd.it, bump tiny widths).
  */
 function ap_rss_upgrade_image_url(string $url): string
@@ -151,12 +163,15 @@ function ap_rss_upgrade_image_url(string $url): string
     if ($url === '' || !preg_match('#^https://#i', $url)) {
         return '';
     }
+    if (ap_rss_image_host_unusable($url)) {
+        return '';
+    }
     // preview.redd.it/<id>.<ext>?… → i.redd.it/<id>.<ext> (full image for native posts)
     if (preg_match('#^https://preview\.redd\.it/([A-Za-z0-9]+)(\.[A-Za-z0-9]+)(?:\?|$)#i', $url, $m)) {
         return 'https://i.redd.it/' . $m[1] . $m[2];
     }
     // Tiny Reddit thumbs: raise width so the media row is usable even before re-poll.
-    if (preg_match('#^https://(?:external-)?preview\.redd\.it/#i', $url)
+    if (preg_match('#^https://preview\.redd\.it/#i', $url)
         && preg_match('/[?&]width=(\d+)/i', $url, $wm)
         && (int) $wm[1] < 640
     ) {
@@ -231,12 +246,65 @@ function ap_rss_pick_best_image(array $candidates): string
         if (preg_match('/[?&]width=1[0-4]\d\b/i', $url)) {
             $score -= 30;
         }
+        if (ap_rss_url_is_video($url)) {
+            continue;
+        }
         if ($score > $bestScore) {
             $bestScore = $score;
             $best = $url;
         }
     }
     return $best;
+}
+
+/** True when a media or enclosure URL is a video file or a video player. */
+function ap_rss_url_is_video(string $url): bool
+{
+    $url = trim($url);
+    if ($url === '') {
+        return false;
+    }
+    if (preg_match('#(?:^|//)v\.redd\.it/#i', $url)) {
+        return true;
+    }
+    if (preg_match('#(?:^|//)(?:www\.)?(?:youtube\.com/(?:watch\?|v/|embed/|shorts/)|youtu\.be/)#i', $url)) {
+        return true;
+    }
+    if (preg_match('#(?:^|//)player\.vimeo\.com/video/#i', $url)) {
+        return true;
+    }
+    return (bool) preg_match('~\.(?:mp4|webm|mov|m4v|m3u8)(?:$|[?#])~i', $url);
+}
+
+function ap_rss_type_is_video(string $type, string $medium = ''): bool
+{
+    $type = strtolower(trim($type));
+    $medium = strtolower(trim($medium));
+    return $medium === 'video' || str_starts_with($type, 'video/');
+}
+
+/**
+ * The item itself is a video. A sentence that merely links to a watch page stays.
+ */
+function ap_rss_html_is_video(string $html): bool
+{
+    $html = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    if ($html === '') {
+        return false;
+    }
+    if (preg_match('/<video\b/i', $html)) {
+        return true;
+    }
+    if (preg_match('/<source\b[^>]*\btype\s*=\s*["\']?\s*video\//i', $html)) {
+        return true;
+    }
+    if (preg_match('#https?://v\.redd\.it/#i', $html)) {
+        return true;
+    }
+    if (preg_match('#<iframe\b[^>]+src\s*=\s*["\'][^"\']*(?:youtube\.com/embed/|youtube-nocookie\.com/embed/|player\.vimeo\.com/)#i', $html)) {
+        return true;
+    }
+    return false;
 }
 
 /** Pull Reddit selftext from Atom/RSS HTML (`<div class="md">…</div>`). */
@@ -707,7 +775,7 @@ function ap_rss_remove_feed(int $ownerUserId, int $feedId): array
 /**
  * @return array{ok:bool,error?:string,added?:int,unchanged?:bool}
  */
-function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null): array
+function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null, bool $force = false): array
 {
     ap_rss_migrate();
     $feed = ap_rss_feed_by_id($feedId, $ownerUserId);
@@ -716,8 +784,8 @@ function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null): array
     }
     $fetch = ap_rss_http_get(
         (string) $feed['feed_url'],
-        (string) ($feed['etag'] ?? ''),
-        (string) ($feed['last_modified'] ?? '')
+        $force ? '' : (string) ($feed['etag'] ?? ''),
+        $force ? '' : (string) ($feed['last_modified'] ?? '')
     );
     if ($fetch['status'] === 304) {
         ap_db()->prepare(
@@ -767,7 +835,7 @@ function ap_rss_refresh_feed(int $feedId, ?int $ownerUserId = null): array
 }
 
 /**
- * @param list<array{guid:string,url:string,title:string,summary_text:string,image_url:string,published_at:?string}> $items
+ * @param list<array{guid:string,url:string,title:string,summary_text:string,image_url:string,published_at:?string,video?:bool}> $items
  */
 function ap_rss_upsert_items(int $feedId, array $items): int
 {
@@ -782,9 +850,14 @@ function ap_rss_upsert_items(int $feedId, array $items): int
            url = EXCLUDED.url,
            title = EXCLUDED.title,
            summary_text = CASE WHEN EXCLUDED.summary_text <> \'\' THEN EXCLUDED.summary_text ELSE rss_items.summary_text END,
-           image_url = CASE WHEN EXCLUDED.image_url <> \'\' THEN EXCLUDED.image_url ELSE rss_items.image_url END,
+           image_url = CASE
+             WHEN EXCLUDED.image_url <> \'\' THEN EXCLUDED.image_url
+             WHEN rss_items.image_url ILIKE \'%://external-preview.redd.it/%\' THEN \'\'
+             ELSE rss_items.image_url
+           END,
            published_at = COALESCE(EXCLUDED.published_at, rss_items.published_at)'
     );
+    $del = ap_db()->prepare('DELETE FROM rss_items WHERE feed_id = ? AND guid = ?');
     $n = 0;
     foreach ($items as $it) {
         if (++$n > 80) {
@@ -794,14 +867,23 @@ function ap_rss_upsert_items(int $feedId, array $items): int
         if ($guid === '') {
             continue;
         }
+        $guid = mb_substr($guid, 0, 800);
+        if (!empty($it['video'])) {
+            $del->execute([$feedId, $guid]);
+            continue;
+        }
         $pub = $it['published_at'] ?? null;
+        $image = mb_substr((string) ($it['image_url'] ?? ''), 0, 2000);
+        if (ap_rss_image_host_unusable($image)) {
+            $image = '';
+        }
         $st->execute([
             $feedId,
-            mb_substr($guid, 0, 800),
+            $guid,
             mb_substr((string) ($it['url'] ?? ''), 0, 2000),
             mb_substr((string) ($it['title'] ?? ''), 0, 500),
             mb_substr((string) ($it['summary_text'] ?? ''), 0, 4000),
-            mb_substr((string) ($it['image_url'] ?? ''), 0, 2000),
+            $image,
             is_string($pub) && $pub !== '' ? $pub : null,
         ]);
     }
@@ -1719,13 +1801,18 @@ function ap_rss_parse_rss_item(DOMXPath $xp, DOMElement $item): array
     $candidates = ap_rss_images_from_html($htmlBlob);
     $mediaThumb = trim((string) $xp->evaluate('string(.//media:thumbnail/@url)', $item));
     $mediaContent = trim((string) $xp->evaluate('string(.//media:content/@url)', $item));
-    if ($mediaContent !== '') {
+    $mediaType = trim((string) $xp->evaluate('string(.//media:content/@type)', $item));
+    $mediaMedium = trim((string) $xp->evaluate('string(.//media:content/@medium)', $item));
+    $video = ap_rss_html_is_video($htmlBlob)
+        || ap_rss_type_is_video($mediaType, $mediaMedium)
+        || ap_rss_url_is_video($mediaContent);
+    if ($mediaContent !== '' && !$video) {
         $candidates[] = $mediaContent;
     }
-    if ($mediaThumb !== '') {
+    if ($mediaThumb !== '' && !ap_rss_url_is_video($mediaThumb)) {
         $candidates[] = $mediaThumb;
     }
-    // RSS enclosure (image/*)
+    // RSS enclosure (image/*). Video enclosures drop the whole item.
     foreach ($xp->query('./enclosure', $item) ?: [] as $enc) {
         if (!($enc instanceof DOMElement)) {
             continue;
@@ -1733,6 +1820,10 @@ function ap_rss_parse_rss_item(DOMXPath $xp, DOMElement $item): array
         $encUrl = trim((string) $enc->getAttribute('url'));
         $encType = strtolower(trim((string) $enc->getAttribute('type')));
         if ($encUrl === '' || !preg_match('#^https://#i', $encUrl)) {
+            continue;
+        }
+        if (ap_rss_type_is_video($encType) || ap_rss_url_is_video($encUrl)) {
+            $video = true;
             continue;
         }
         if ($encType === '' || str_starts_with($encType, 'image/') || preg_match('/\.(jpe?g|png|webp|gif)(?:$|[?#])/i', $encUrl)) {
@@ -1745,8 +1836,9 @@ function ap_rss_parse_rss_item(DOMXPath $xp, DOMElement $item): array
         'url' => $itemUrl,
         'title' => $title,
         'summary_text' => ap_rss_summary_from_html($htmlBlob, $itemUrl),
-        'image_url' => ap_rss_pick_best_image($candidates),
+        'image_url' => $video ? '' : ap_rss_pick_best_image($candidates),
         'published_at' => $published,
+        'video' => $video,
     ];
 }
 
@@ -1781,10 +1873,19 @@ function ap_rss_parse_atom_entry(DOMXPath $xp, DOMElement $entry): array
     $candidates = ap_rss_images_from_html($summaryHtml);
     $mediaThumb = trim((string) $xp->evaluate('string(.//media:thumbnail/@url)', $entry));
     $mediaContent = trim((string) $xp->evaluate('string(.//media:content/@url)', $entry));
-    if ($mediaContent !== '') {
+    $mediaType = trim((string) $xp->evaluate('string(.//media:content/@type)', $entry));
+    $mediaMedium = trim((string) $xp->evaluate('string(.//media:content/@medium)', $entry));
+    $encType = trim((string) $xp->evaluate('string(./atom:link[@rel="enclosure"]/@type)', $entry));
+    $encUrl = trim((string) $xp->evaluate('string(./atom:link[@rel="enclosure"]/@href)', $entry));
+    $video = ap_rss_html_is_video($summaryHtml)
+        || ap_rss_type_is_video($mediaType, $mediaMedium)
+        || ap_rss_url_is_video($mediaContent)
+        || ap_rss_type_is_video($encType)
+        || ap_rss_url_is_video($encUrl);
+    if ($mediaContent !== '' && !$video) {
         $candidates[] = $mediaContent;
     }
-    if ($mediaThumb !== '') {
+    if ($mediaThumb !== '' && !ap_rss_url_is_video($mediaThumb)) {
         $candidates[] = $mediaThumb;
     }
     $itemUrl = preg_match('#^https://#i', $link) ? $link : (preg_match('#^https://#i', $guid) ? $guid : '');
@@ -1793,8 +1894,9 @@ function ap_rss_parse_atom_entry(DOMXPath $xp, DOMElement $entry): array
         'url' => $itemUrl,
         'title' => $title,
         'summary_text' => ap_rss_summary_from_html($summaryHtml, $itemUrl),
-        'image_url' => ap_rss_pick_best_image($candidates),
+        'image_url' => $video ? '' : ap_rss_pick_best_image($candidates),
         'published_at' => $published,
+        'video' => $video,
     ];
 }
 

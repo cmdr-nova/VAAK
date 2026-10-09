@@ -2894,15 +2894,21 @@ function ap_bsky_post_observations_migrate(?PDO $db = null): void
             PRIMARY KEY (bsky_uri, owner_user_id)
         )");
         $db->exec('CREATE INDEX IF NOT EXISTS idx_bsky_post_observations_owner_time ON bsky_post_observations (owner_user_id, last_seen_at DESC)');
-        if ($driver === 'pgsql') {
-            $db->exec("INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
-                SELECT bsky_uri, owner_user_id, COALESCE(seen_at, NOW()::text), COALESCE(seen_at, NOW()::text)
-                FROM bsky_posts WHERE owner_user_id IS NOT NULL
-                ON CONFLICT (bsky_uri, owner_user_id) DO NOTHING");
-        } else {
-            $db->exec("INSERT OR IGNORE INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
-                SELECT bsky_uri, owner_user_id, COALESCE(seen_at, datetime('now')), COALESCE(seen_at, datetime('now'))
-                FROM bsky_posts WHERE owner_user_id IS NOT NULL");
+        // The backfill reads every owned Bluesky row. A web profile was paying
+        // that once per PHP-FPM worker (about 5s) before the header could paint.
+        // Live ingest records new rows via ap_bsky_post_observation_touch.
+        // CLI maintenance can still fill historical rows.
+        if (PHP_SAPI === 'cli') {
+            if ($driver === 'pgsql') {
+                $db->exec("INSERT INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
+                    SELECT bsky_uri, owner_user_id, COALESCE(seen_at, NOW()::text), COALESCE(seen_at, NOW()::text)
+                    FROM bsky_posts WHERE owner_user_id IS NOT NULL
+                    ON CONFLICT (bsky_uri, owner_user_id) DO NOTHING");
+            } else {
+                $db->exec("INSERT OR IGNORE INTO bsky_post_observations (bsky_uri, owner_user_id, first_seen_at, last_seen_at)
+                    SELECT bsky_uri, owner_user_id, COALESCE(seen_at, datetime('now')), COALESCE(seen_at, datetime('now'))
+                    FROM bsky_posts WHERE owner_user_id IS NOT NULL");
+            }
         }
     } catch (Throwable $e) {
         error_log('[ap-bsky] post observations migration failed: ' . $e->getMessage());
@@ -3309,6 +3315,73 @@ function ap_bsky_post_embed_compact(?array $embed): ?array
 }
 
 /**
+ * Keep Bluesky rich-text facets that point at a real URL.
+ *
+ * The visible post text is often a shortened label (`bsky.app/profile/…` or
+ * `host/path...`) with no scheme. The facet URI is the only correct href.
+ * Byte offsets are into `$text` after an optional leading-whitespace shift.
+ *
+ * @param list<array<string,mixed>> $facets
+ * @return list<array<string,mixed>>
+ */
+function ap_bsky_compact_facets(array $facets, string $text, int $byteShift = 0): array
+{
+    $max = strlen($text);
+    $out = [];
+    foreach ($facets as $facet) {
+        if (!is_array($facet) || !is_array($facet['index'] ?? null)) {
+            continue;
+        }
+        $start = (int) ($facet['index']['byteStart'] ?? -1) - $byteShift;
+        $end = (int) ($facet['index']['byteEnd'] ?? -1) - $byteShift;
+        if ($start < 0 || $end <= $start || $end > $max) {
+            continue;
+        }
+        $featuresIn = is_array($facet['features'] ?? null) ? $facet['features'] : [];
+        $features = [];
+        foreach ($featuresIn as $feat) {
+            if (!is_array($feat)) {
+                continue;
+            }
+            $type = (string) ($feat['$type'] ?? '');
+            if (str_contains($type, '#link')) {
+                $uri = trim((string) ($feat['uri'] ?? ''));
+                if (str_starts_with($uri, 'http') && !str_contains($uri, '...') && !str_contains($uri, '…')) {
+                    $features[] = [
+                        '$type' => 'app.bsky.richtext.facet#link',
+                        'uri' => $uri,
+                    ];
+                }
+            } elseif (str_contains($type, '#mention')) {
+                $did = trim((string) ($feat['did'] ?? ''));
+                if (str_starts_with($did, 'did:')) {
+                    $features[] = [
+                        '$type' => 'app.bsky.richtext.facet#mention',
+                        'did' => $did,
+                    ];
+                }
+            } elseif (str_contains($type, '#tag')) {
+                $tag = trim((string) ($feat['tag'] ?? ''));
+                if ($tag !== '') {
+                    $features[] = [
+                        '$type' => 'app.bsky.richtext.facet#tag',
+                        'tag' => $tag,
+                    ];
+                }
+            }
+        }
+        if ($features === []) {
+            continue;
+        }
+        $out[] = [
+            'index' => ['byteStart' => $start, 'byteEnd' => $end],
+            'features' => $features,
+        ];
+    }
+    return $out;
+}
+
+/**
  * Upsert a durable Bluesky post body from a FeedViewPost or PostView.
  *
  * @param array<string,mixed> $itemOrPost
@@ -3330,9 +3403,14 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
     }
     ap_bsky_posts_migrate();
     $record = is_array($post['record'] ?? null) ? $post['record'] : [];
-    $text = trim((string) ($record['text'] ?? ''));
+    $originalText = (string) ($record['text'] ?? '');
+    $leadBytes = strlen($originalText) - strlen(ltrim($originalText));
+    $text = trim($originalText);
+    $facetLimit = strlen($text);
     if (mb_strlen($text) > AP_BSKY_POST_TEXT_MAX) {
-        $text = mb_substr($text, 0, AP_BSKY_POST_TEXT_MAX - 1) . '…';
+        $prefix = mb_substr($text, 0, AP_BSKY_POST_TEXT_MAX - 1);
+        $facetLimit = strlen($prefix);
+        $text = $prefix . '…';
     }
     $replyParent = null;
     $replyRoot = null;
@@ -3452,6 +3530,31 @@ function ap_bsky_post_upsert_from_feed_item(array $itemOrPost, ?int $ownerUserId
         }
     }
     $isNew = false;
+    // Bluesky shortens link labels in `text` and keeps the real target on the
+    // facet. Dropping facets made those labels plain, scheme-less, and unusable.
+    $facetText = substr($text, 0, $facetLimit);
+    $compactFacets = ap_bsky_compact_facets(
+        is_array($record['facets'] ?? null) ? $record['facets'] : [],
+        $facetText,
+        $leadBytes
+    );
+    if ($compactFacets === [] && (str_contains($facetText, '...') || str_contains($facetText, '…'))) {
+        try {
+            $prevFacetSt = ap_db()->prepare('SELECT raw_json FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+            $prevFacetSt->execute([$uri]);
+            $prevFacetJson = $prevFacetSt->fetchColumn();
+            if (is_string($prevFacetJson) && $prevFacetJson !== '') {
+                $prevFacetRaw = json_decode($prevFacetJson, true);
+                $prevFacets = is_array($prevFacetRaw['record']['facets'] ?? null) ? $prevFacetRaw['record']['facets'] : [];
+                $compactFacets = ap_bsky_compact_facets($prevFacets, $facetText, 0);
+            }
+        } catch (Throwable $e) {
+            // A thin re-upsert can continue without facets.
+        }
+    }
+    if ($compactFacets !== []) {
+        $raw['record']['facets'] = $compactFacets;
+    }
     try {
         $chk = ap_db()->prepare('SELECT 1 FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
         $chk->execute([$uri]);

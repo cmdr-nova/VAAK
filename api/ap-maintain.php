@@ -20,12 +20,16 @@
  */
 declare(strict_types=1);
 
-if (PHP_SAPI !== 'cli') {
+if (PHP_SAPI !== 'cli' && !defined('AP_MAINTAIN_LIB_ONLY')) {
     fwrite(STDERR, "CLI only\n");
     exit(1);
 }
 
 require_once __DIR__ . '/ap-db.php';
+
+if (defined('AP_MAINTAIN_LIB_ONLY')) {
+    return;
+}
 
 $dryRun = false;
 $vacuum = false;
@@ -137,6 +141,17 @@ SQL);
     $db->exec('CREATE INDEX IF NOT EXISTS idx_ap_cold_archive_time ON ap_cold_archive(occurred_at DESC)');
 }
 
+/** @return list<array{table:string,time:string,states:list<string>}> */
+function ap_maintain_queue_retention_plan(): array
+{
+    return [
+        ['table' => 'ap_publish_delivery_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
+        ['table' => 'ap_fanout_delivery_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
+        ['table' => 'ap_media_warm_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
+        ['table' => 'bsky_actor_refresh_queue', 'time' => 'queued_at', 'states' => ['succeeded', 'failed']],
+    ];
+}
+
 /** @param list<string> $states */
 function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn, array $states, string $cutoff, bool $isPostgres): int
 {
@@ -145,10 +160,12 @@ function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn,
         'ap_media_warm_queue', 'bsky_actor_refresh_queue', 'events',
     ];
     if (!in_array($table, $allowed, true)) return 0;
+    // Bind status first, then the age cutoff. The same order is used by the
+    // DELETE that follows, so the cold archive cannot keep a different set.
     $params = [$cutoff];
     $where = "{$timeColumn} < ?";
     if ($states !== []) {
-        $where .= ' AND status IN (' . implode(',', array_fill(0, count($states), '?')) . ')';
+        $where = 'status IN (' . implode(',', array_fill(0, count($states), '?')) . ') AND ' . $where;
         $params = array_merge($states, [$cutoff]);
     }
     $rows = $db->prepare("SELECT * FROM {$table} WHERE {$where}");
@@ -161,6 +178,13 @@ function ap_maintain_archive_expired(PDO $db, string $table, string $timeColumn,
     $count = 0;
     foreach ($rows->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
         $id = (string) ($row['id'] ?? '');
+        if ($id === '') {
+            $owner = (string) ($row['owner_user_id'] ?? '');
+            $actor = (string) ($row['actor_ref'] ?? '');
+            if ($owner !== '' && $actor !== '') {
+                $id = $owner . ':' . $actor;
+            }
+        }
         if ($id === '') continue;
         $payload = json_encode($row, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if (!is_string($payload)) continue;
@@ -243,12 +267,7 @@ try {
         // due-job scans remain fast. User action rows are retained longer for
         // troubleshooting and are deliberately handled separately below.
         $queueCutoff = $nowUtc->modify('-' . $queueDays . ' days')->format('c');
-        $queuePrunes = [
-            ['table' => 'ap_publish_delivery_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
-            ['table' => 'ap_fanout_delivery_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
-            ['table' => 'ap_media_warm_queue', 'time' => 'updated_at', 'states' => ['succeeded', 'failed']],
-            ['table' => 'bsky_actor_refresh_queue', 'time' => 'queued_at', 'states' => ['succeeded', 'failed']],
-        ];
+        $queuePrunes = ap_maintain_queue_retention_plan();
         foreach ($queuePrunes as $queuePrune) {
             try {
                 $stateSql = implode(',', array_fill(0, count($queuePrune['states']), '?'));
@@ -433,6 +452,19 @@ try {
         } catch (Throwable $e) {
             $stats['errors']++;
             $log('bsky_posts prune error: ' . $e->getMessage());
+        }
+
+        if (!$dryRun) {
+            try {
+                if (!function_exists('ap_search_fts_forget_missing')) {
+                    require_once __DIR__ . '/ap-search-fts.php';
+                }
+                $dropped = function_exists('ap_search_fts_forget_missing') ? ap_search_fts_forget_missing() : 0;
+                $caught = function_exists('ap_search_fts_catch_up_events') ? ap_search_fts_catch_up_events(1500, 40) : 0;
+                $log('search index dropped_missing=' . $dropped . ' indexed_events=' . $caught);
+            } catch (Throwable $e) {
+                $log('search index maintain error: ' . $e->getMessage());
+            }
         }
 
         // --- Soft-deleted mentions (keep live notification history) ---

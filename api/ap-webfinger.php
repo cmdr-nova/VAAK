@@ -26,9 +26,10 @@ if (is_array($wfCached) && isset($wfCached['subject'], $wfCached['links'])) {
 
 $username = null;
 
-// acct:user@mkultra.monster (accept cmdr-nova as an input alias, but always
-// return the canonical underscore subject and actor URL).
-if (preg_match('/^acct:([a-z0-9_-]+)@mkultra\.monster$/i', $norm, $m)) {
+// acct:user@mkultra.monster. The old mask host is accepted as input.
+// The subject and actor URL stay on mkultra.monster.
+// cmdr-nova is an input alias for cmdr_nova.
+if (preg_match('/^acct:([a-z0-9_-]+)@(?:mkultra\.monster|vaak\.monster|www\.vaak\.monster)$/i', $norm, $m)) {
     $candidate = str_replace('-', '_', $m[1]);
     if ($candidate === 'cmdr_nova' || preg_match('/^[a-z][a-z0-9_]{1,29}$/', $candidate)) {
         $username = $candidate;
@@ -37,8 +38,9 @@ if (preg_match('/^acct:([a-z0-9_-]+)@mkultra\.monster$/i', $norm, $m)) {
 
 // https://mkultra.monster/users/{user} or /@{user}
 if ($username === null) {
-    if (preg_match('#^https://mkultra\.monster/users/([a-zA-Z][a-zA-Z0-9_]{1,29})/?$#', $resource, $m)
+    if (preg_match('#^https://mkultra\.monster/(?:vaak/)?users/([a-zA-Z][a-zA-Z0-9_]{1,29})/?$#', $resource, $m)
         || preg_match('#^https://mkultra\.monster/@([a-zA-Z][a-zA-Z0-9_]{1,29})/?$#', $resource, $m)
+        || preg_match('#^https://(?:www\.)?vaak\.monster/(?:vaak/)?users/([a-zA-Z][a-zA-Z0-9_]{1,29})/?$#', $resource, $m)
     ) {
         $username = strtolower($m[1]);
     }

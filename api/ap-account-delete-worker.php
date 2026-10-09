@@ -1,7 +1,23 @@
 <?php
 /** Background cleanup for a confirmed local account deletion. */
 declare(strict_types=1);
-if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
+if (PHP_SAPI !== 'cli' && !defined('AP_ACCOUNT_DELETE_LIB_ONLY')) { http_response_code(404); exit; }
+
+/** Remove local relationship and profile rows after the account's posts are gone. */
+function ap_account_delete_local_relationships(PDO $db, string $actorId, string $actorKey): void
+{
+    foreach ([
+        ['DELETE FROM followers WHERE owner_actor_id = ? OR actor_id = ?', [$actorId, $actorId]],
+        ['DELETE FROM following WHERE owner_actor_id = ? OR actor_id = ?', [$actorId, $actorId]],
+        ['DELETE FROM actor_profile WHERE actor_key = ?', [$actorKey]],
+    ] as [$sql, $params]) {
+        try { $db->prepare($sql)->execute($params); } catch (Throwable $e) { error_log('[account-delete] cleanup: ' . $e->getMessage()); }
+    }
+}
+
+if (defined('AP_ACCOUNT_DELETE_LIB_ONLY')) {
+    return;
+}
 $userId = (int) ($argv[1] ?? 0);
 if ($userId < 1) exit(1);
 define('AP_INBOX_LIB_ONLY', true);
@@ -32,13 +48,7 @@ try {
     }
 
     // Remove local relationships and profile data after posts are gone.
-    foreach ([
-        ['DELETE FROM followers WHERE owner_actor_id = ? OR actor_id = ?', [$actorId, $actorId]],
-        ['DELETE FROM following WHERE owner_actor_id = ? OR actor_id = ?', [$actorId, $actorId]],
-        ['DELETE FROM actor_profile WHERE actor_key = ?', [$actorKey]],
-    ] as [$sql, $params]) {
-        try { ap_db()->prepare($sql)->execute($params); } catch (Throwable $e) { error_log('[account-delete] cleanup: ' . $e->getMessage()); }
-    }
+    ap_account_delete_local_relationships(ap_db(), $actorId, $actorKey);
     ap_log('account_delete_cleanup actor=' . $actorKey . ' user_id=' . $userId);
 } catch (Throwable $e) {
     error_log('[account-delete] worker failed: ' . $e->getMessage());

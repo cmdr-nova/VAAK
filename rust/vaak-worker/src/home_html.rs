@@ -26,6 +26,54 @@ pub struct HomeHtmlReport {
     pub newest_ts: i64,
 }
 
+async fn load_self_thread_parents(
+    db: &tokio_postgres::Client,
+    slice: &mut [serde_json::Value],
+) -> std::collections::HashMap<String, serde_json::Value> {
+    crate::home_hydrate_ranked::stamp_missing_reply_parents(db, slice).await;
+    let need = missing_self_reply_parent_uris(slice);
+    let mut extra = std::collections::HashMap::new();
+    if need.is_empty() {
+        return extra;
+    }
+    if let Ok(fetched) = crate::profile_html::fetch_outbox_statuses_by_uris(db, &need).await {
+        extra = fetched;
+    }
+    let missing: Vec<String> = need
+        .into_iter()
+        .filter(|uri| !extra.contains_key(uri.trim().trim_end_matches('/')))
+        .collect();
+    if !missing.is_empty() {
+        if let Ok(events) =
+            crate::home_hydrate_ranked::fetch_event_parent_statuses(db, &missing).await
+        {
+            for (key, value) in events {
+                extra.entry(key).or_insert(value);
+            }
+        }
+    }
+    // Bluesky self-replies name an at:// parent that is often off the current
+    // page. Load that cached post only; do not fetch it from the network.
+    let at_uris: Vec<String> = missing
+        .iter()
+        .filter(|uri| {
+            uri.starts_with("at://") && !extra.contains_key(uri.trim().trim_end_matches('/'))
+        })
+        .cloned()
+        .collect();
+    if !at_uris.is_empty() {
+        if let Ok(map) = crate::home_hydrate_ranked::fetch_bsky_map(db, &at_uris).await {
+            for (uri, row) in map {
+                let key = uri.trim().trim_end_matches('/').to_string();
+                extra
+                    .entry(key)
+                    .or_insert_with(|| crate::home_hydrate_ranked::materialize_bsky(&row));
+            }
+        }
+    }
+    extra
+}
+
 pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> String {
     let Ok(db) = db::connect(&cfg.database_url).await else {
         return String::new();
@@ -55,6 +103,28 @@ pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> Strin
         "https://mkultra.monster/users/{}",
         username.to_ascii_lowercase()
     )
+}
+
+async fn stamp_ask_identities(
+    db: &tokio_postgres::Client,
+    slice: &mut [serde_json::Value],
+    extra: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    let _ = crate::home_hydrate_ranked::attach_ask_identities(db, slice).await;
+    if extra.is_empty() {
+        return;
+    }
+    let keys: Vec<String> = extra.keys().cloned().collect();
+    let mut vals = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if let Some(value) = extra.remove(key) {
+            vals.push(value);
+        }
+    }
+    let _ = crate::home_hydrate_ranked::attach_ask_identities(db, &mut vals).await;
+    for (key, value) in keys.into_iter().zip(vals) {
+        extra.insert(key, value);
+    }
 }
 
 async fn attach_visible_polls(
@@ -152,16 +222,28 @@ pub async fn tl_html_fill(
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
         // Self-thread parents not in this hydrate window (common on Home).
-        let need = missing_self_reply_parent_uris(&slice);
-        if !need.is_empty() {
-            if let Ok(fetched) =
-                crate::profile_html::fetch_outbox_statuses_by_uris(&db, &need).await
-            {
-                extra_parents = fetched;
-            }
-        }
+        extra_parents = load_self_thread_parents(&db, &mut slice).await;
+        let _ = crate::interaction_flags::apply_to_status_map(
+            &db,
+            owner_user_id,
+            &mut extra_parents,
+        )
+        .await;
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
         attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
+        let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut slice).await;
+        if !extra_parents.is_empty() {
+            let keys: Vec<String> = extra_parents.keys().cloned().collect();
+            let mut vals: Vec<serde_json::Value> = keys
+                .iter()
+                .filter_map(|key| extra_parents.remove(key))
+                .collect();
+            let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut vals).await;
+            for (key, value) in keys.into_iter().zip(vals) {
+                extra_parents.insert(key, value);
+            }
+        }
+        stamp_ask_identities(&db, &mut slice, &mut extra_parents).await;
     }
 
     let units = plan_feed_paint_units(&slice, &extra_parents);
@@ -183,7 +265,10 @@ pub async fn tl_html_fill(
         html,
         count: painted,
         has_more: painted >= limit || !exhausted || looks_like_warm_head || report.filtered,
-        next_offset: offset + painted,
+        // A self-reply paints as one card but consumes the parent row too.
+        // Advance by source rows. Advancing by painted cards repeats that
+        // parent as the first post under the loading placeholder.
+        next_offset: end,
         source: format!("axum-{view}-html:{}", report.source),
         hydrate_key: report.redis_key,
         newest_ts: 0,
@@ -222,14 +307,17 @@ pub async fn home_html_since(
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
-        let need = missing_self_reply_parent_uris(&slice);
-        if !need.is_empty() {
-            if let Ok(fetched) = crate::profile_html::fetch_outbox_statuses_by_uris(&db, &need).await {
-                extra_parents = fetched;
-            }
-        }
+        extra_parents = load_self_thread_parents(&db, &mut slice).await;
+        let _ = crate::interaction_flags::apply_to_status_map(
+            &db,
+            owner_user_id,
+            &mut extra_parents,
+        )
+        .await;
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
         attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
+        let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut slice).await;
+        stamp_ask_identities(&db, &mut slice, &mut extra_parents).await;
     }
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {
@@ -281,14 +369,17 @@ pub async fn tl_html_since(
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
-        let need = missing_self_reply_parent_uris(&slice);
-        if !need.is_empty() {
-            if let Ok(fetched) = crate::profile_html::fetch_outbox_statuses_by_uris(&db, &need).await {
-                extra_parents = fetched;
-            }
-        }
+        extra_parents = load_self_thread_parents(&db, &mut slice).await;
+        let _ = crate::interaction_flags::apply_to_status_map(
+            &db,
+            owner_user_id,
+            &mut extra_parents,
+        )
+        .await;
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut slice);
         attach_visible_polls(&db, &mut slice, &mut extra_parents, &viewer_actor).await;
+        let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut slice).await;
+        stamp_ask_identities(&db, &mut slice, &mut extra_parents).await;
     }
     let units = plan_feed_paint_units(&slice, &extra_parents);
     let paint = |st: &serde_json::Value, from: &str, viewer: &str| {

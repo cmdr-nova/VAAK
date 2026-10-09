@@ -755,6 +755,39 @@ function ap_media_as2_attachments(array $rows): array
 }
 
 /**
+ * Normalize an object key the same way a delete does, without reading R2
+ * credentials or sending a request.
+ */
+function ap_r2_normalize_object_key(string $key, string $prefix = 'mkultra/'): string
+{
+    if ($prefix !== '' && !str_starts_with($key, $prefix)) {
+        $key = ltrim($prefix, '/') . ltrim($key, '/');
+    }
+    return ltrim($key, '/');
+}
+
+/**
+ * Scheduled cleanup may delete remote cache objects. Local post media is
+ * allowed only when the caller passes an explicit retention flag.
+ *
+ * @return 'cache'|'local'|'refuse'
+ */
+function ap_r2_cleanup_key_decision(string $key, bool $allowLocalMedia = false, string $prefix = 'mkultra/'): string
+{
+    $key = ap_r2_normalize_object_key($key, $prefix);
+    if ($key === '' || str_contains($key, '..')) {
+        return 'refuse';
+    }
+    if (str_starts_with($key, 'mkultra/cache/')) {
+        return 'cache';
+    }
+    if ($allowLocalMedia && str_starts_with($key, 'mkultra/media/')) {
+        return 'local';
+    }
+    return 'refuse';
+}
+
+/**
  * AWS Signature V4 DELETE Object from R2.
  *
  * @return array{ok:bool,error?:string}
@@ -766,17 +799,11 @@ function ap_r2_delete_object(string $key, bool $allowLocalMedia = false): array
         return ['ok' => false, 'error' => 'R2 is not configured on this server'];
     }
     $prefix = (string) ($cfg['S3_KEY_PREFIX'] ?? 'mkultra/');
-    if ($prefix !== '' && !str_starts_with($key, $prefix)) {
-        $key = ltrim($prefix, '/') . ltrim($key, '/');
-    }
-    $key = ltrim($key, '/');
-    $isCache = str_starts_with($key, 'mkultra/cache/');
-    $isLocalMedia = str_starts_with($key, 'mkultra/media/');
-    if ($key === '' || str_contains($key, '..') || (!$isCache && !($allowLocalMedia && $isLocalMedia))) {
-        // Scheduled cleanup may only delete remote cache objects. Local media
-        // is permitted only from an explicit per-user retention action.
+    $decision = ap_r2_cleanup_key_decision($key, $allowLocalMedia, $prefix);
+    if ($decision === 'refuse') {
         return ['ok' => false, 'error' => 'Refusing to delete key outside allowed media prefixes'];
     }
+    $key = ap_r2_normalize_object_key($key, $prefix);
 
     $bucket = $cfg['S3_BUCKET'];
     $region = $cfg['S3_REGION'] !== '' ? $cfg['S3_REGION'] : 'auto';
@@ -1651,7 +1678,8 @@ function ap_remote_post_media_cleanup(int $unusedDays = 30, int $limit = 200, in
         $st->execute(); $rows = $st->fetchAll() ?: [];
         $remove = static function (array $row) use (&$deleted, &$errors, &$bytesDeleted): bool {
             $key = (string) ($row['s3_key'] ?? '');
-            if ($key !== '' && !str_contains(ltrim($key, '/'), 'cache/post-media/')) { $errors++; return false; }
+            $normalized = ap_r2_normalize_object_key($key);
+            if ($key !== '' && (ap_r2_cleanup_key_decision($key) !== 'cache' || !str_contains($normalized, 'cache/post-media/'))) { $errors++; return false; }
             if ($key !== '') { $result = ap_r2_delete_object($key); if (empty($result['ok'])) { $errors++; return false; } }
             ap_db()->prepare('DELETE FROM remote_post_media_cache WHERE id = ?')->execute([(int) ($row['id'] ?? 0)]);
             $deleted++;
