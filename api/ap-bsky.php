@@ -4275,36 +4275,42 @@ function ap_bsky_posts_for_home(
 }
 
 /**
- * Cheap Home-rank keys (uri + time + dual-publish twin). No JSON decode.
+ * Cheap Home-rank keys for every followed Bluesky account.
+ * $perAuthor is the recent-post cap for each DID, not a cap on the follow graph.
+ * Observations also store suggested posts, so Home reads bsky_graph_sync follows.
  *
  * @return list<array{uri:string,indexed_at:string,fediverse_id:string,author_did:string}>
  */
 function ap_bsky_home_rank_keys(
     int $ownerUserId,
-    int $limit = 80,
+    int $perAuthor = 25,
     ?string $excludeAuthorDid = null
 ): array {
     if ($ownerUserId < 1) {
         return [];
     }
     ap_bsky_posts_migrate();
-    $limit = max(1, min(120, $limit));
+    $perAuthor = max(1, min(25, $perAuthor));
     try {
         $sql = 'SELECT p.bsky_uri, p.indexed_at, p.author_did, l.fediverse_id
-                FROM bsky_posts p
+                FROM bsky_graph_sync g
+                JOIN LATERAL (
+                  SELECT bsky_uri, indexed_at, author_did, updated_at
+                  FROM bsky_posts
+                  WHERE author_did = g.target_did
+                    AND text IS NOT NULL
+                  ORDER BY indexed_at DESC
+                  LIMIT ?
+                ) p ON true
                 LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-                WHERE EXISTS (
-                    SELECT 1 FROM bsky_post_observations o
-                    WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = ?
-                )
-                  AND p.text IS NOT NULL';
-        $bind = [$ownerUserId];
+                WHERE g.owner_user_id = ?
+                  AND g.kind = \'follow\'';
+        $bind = [$perAuthor, $ownerUserId];
         if (is_string($excludeAuthorDid) && str_starts_with($excludeAuthorDid, 'did:')) {
-            $sql .= ' AND p.author_did <> ?';
+            $sql .= ' AND g.target_did <> ?';
             $bind[] = $excludeAuthorDid;
         }
-        $sql .= ' ORDER BY p.indexed_at DESC, p.updated_at DESC LIMIT ?';
-        $bind[] = $limit;
+        $sql .= ' ORDER BY p.indexed_at DESC, p.updated_at DESC';
         $st = ap_db()->prepare($sql);
         $st->execute($bind);
         $out = [];

@@ -31,17 +31,12 @@ use crate::notif;
 use crate::redis_util;
 
 const CACHE_VERSION: &str = "v13";
-// Home mix guardrails: keep the feed lively without allowing one source to
-// drown everything else. Bluesky is slightly favored because it has the
-// highest activity rate; Fediverse, followed hashtags, and RSS remain visible.
-const HOME_BSKY_MAX_RATIO: f64 = 0.60;
+// Home mix guardrails. Followed accounts on both networks all contribute
+// their recent posts (PER_ACTOR_CAP). RSS stays a smaller later-page share.
+// Ranking, hashtags, the federated floor, and blocks still apply.
 const HOME_RSS_MAX_RATIO: f64 = 0.28;
 const HOME_FOLLOWED_TAG_CAP: usize = 72;
 const HOME_TTL_SECS: u64 = 600;
-/// Fediverse rows older than this, relative to the next Bluesky row, stay
-/// behind the fresh head. The 60% cap must not drag last month's posts up
-/// between posts from the last hour.
-const HOME_STALE_FEDI_GAP_SECS: i64 = 48 * 3600;
 /// When a follow graph has fewer than this many posts from the last two days,
 /// fill the rest with recent public federated posts.
 const HOME_FLOOR_MIN_FRESH: usize = 40;
@@ -52,7 +47,11 @@ const HOME_FLOOR_PER_HOST: usize = 3;
 /// Own outbox rows older than this are history, not a Home head.
 const HOME_OWN_MAX_AGE_SECS: i64 = 7 * 24 * 3600;
 /// Deep Home scroll head (0.7.25). Was 160 — scrolling past ~100–200 hit End of timeline.
+/// Local and Federated only. Home uses HOME_MAX_TIMELINE so followed posts are not sampled away.
 const MAX_TIMELINE: usize = 400;
+/// Every followed account's recent posts, plus hashtags, the floor, and own notes.
+/// Fan-out uses the same ceiling so a new post does not chop the follow set back down.
+pub(crate) const HOME_MAX_TIMELINE: usize = 16_000;
 const PER_ACTOR_CAP: usize = 25;
 
 fn env_flag_default_true(name: &str) -> bool {
@@ -439,14 +438,12 @@ async fn fetch_home_events(
         }
         if seen.insert(a.to_string()) {
             actor_ids.push(a.to_string());
-            actor_ids.push(format!("{a}/"));
         }
     }
     if !self_actor.is_empty() {
         let s = self_actor.trim_end_matches('/');
         if seen.insert(s.to_string()) {
             actor_ids.push(s.to_string());
-            actor_ids.push(format!("{s}/"));
         }
     }
     if actor_ids.is_empty() {
@@ -455,32 +452,41 @@ async fn fetch_home_events(
 
     let mut items = Vec::new();
     let mut per_actor: HashMap<String, usize> = HashMap::new();
-    for chunk in actor_ids.chunks(400) {
+    let per_actor_limit = PER_ACTOR_CAP as i64;
+    // One global LIMIT across a chunk kept the loudest accounts and dropped
+    // everyone else. Each follow gets its own recent page instead.
+    for chunk in actor_ids.chunks(80) {
         let rows = db
             .query(
-                "SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
-                        COALESCE(object_id, ''), COALESCE(target_actor, '')
-                 FROM events
-                 WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
-                   AND action_taken = ANY(ARRAY['log','local_observe'])
-                   AND actor_id = ANY($1)
-                   AND (
-                     type <> 'Announce'
-                     OR COALESCE(summary, '') <> ''
-                     OR COALESCE(media_urls, '') NOT IN ('', '[]')
-                     OR (
-                       COALESCE(object_id, '') <> ''
-                       AND EXISTS (
-                         SELECT 1 FROM events original
-                         WHERE original.type = 'Create'
-                           AND original.action_taken = ANY(ARRAY['log','local_observe'])
-                           AND original.object_id = events.object_id
+                "SELECT e.id, e.type, e.actor_id, e.summary, e.media_urls, e.created_at,
+                        e.visibility, e.object_id, e.target_actor
+                 FROM unnest($1::text[]) AS f(actor_id)
+                 JOIN LATERAL (
+                   SELECT id, type, actor_id, summary, media_urls, created_at, visibility,
+                          COALESCE(object_id, '') AS object_id,
+                          COALESCE(target_actor, '') AS target_actor
+                   FROM events
+                   WHERE actor_id IN (f.actor_id, f.actor_id || '/')
+                     AND type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
+                     AND action_taken = ANY(ARRAY['log','local_observe'])
+                     AND (
+                       type <> 'Announce'
+                       OR COALESCE(summary, '') <> ''
+                       OR COALESCE(media_urls, '') NOT IN ('', '[]')
+                       OR (
+                         COALESCE(object_id, '') <> ''
+                         AND EXISTS (
+                           SELECT 1 FROM events original
+                           WHERE original.type = 'Create'
+                             AND original.action_taken = ANY(ARRAY['log','local_observe'])
+                             AND original.object_id = events.object_id
+                         )
                        )
                      )
-                   )
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 240",
-                &[&chunk],
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT $2
+                 ) e ON true",
+                &[&chunk, &per_actor_limit],
             )
             .await
             .context("select home follow events")?;
@@ -758,10 +764,16 @@ async fn fetch_federated_floor(
     Ok(out)
 }
 
-fn rank_from_timeline(mut items: Vec<TimelineItem>) -> Vec<Value> {
+fn rank_from_timeline(items: Vec<TimelineItem>) -> Vec<Value> {
+    rank_from_timeline_capped(items, Some(MAX_TIMELINE))
+}
+
+fn rank_from_timeline_capped(mut items: Vec<TimelineItem>, max_items: Option<usize>) -> Vec<Value> {
     items.sort_by(|a, b| b.sort.cmp(&a.sort));
-    if items.len() > MAX_TIMELINE {
-        items.truncate(MAX_TIMELINE);
+    if let Some(max_items) = max_items {
+        if items.len() > max_items {
+            items.truncate(max_items);
+        }
     }
     // Quote-boost dual publish: same actor Create/Quote + Announce of one
     // object_id → keep the Create/Quote card, drop the self-Announce.
@@ -904,13 +916,12 @@ async fn fetch_bsky_keys(
     db: &Client,
     owner: i64,
     exclude_did: Option<&str>,
-    limit: i64,
 ) -> Result<Vec<BskyKey>> {
-    let limit = limit.clamp(1, 120);
+    let per_actor = PER_ACTOR_CAP as i64;
     // Home Bluesky is the owner's follow graph. bsky_post_observations also
     // records suggested posts, and those were taking the recent slots on
     // accounts with a smaller follow list. Read the newest posts per followed
-    // DID from the existing author index, then keep the global newest page.
+    // DID. There is no global LIMIT: a 120-row cap dropped the rest of the graph.
     let rows = if let Some(did) = exclude_did.filter(|d| d.starts_with("did:")) {
         db.query(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
@@ -923,15 +934,14 @@ async fn fetch_bsky_keys(
                WHERE author_did = g.target_did
                  AND text IS NOT NULL
                ORDER BY indexed_at DESC
-               LIMIT 25
+               LIMIT $3
              ) p ON true
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE g.owner_user_id = $1
                AND g.kind = 'follow'
                AND g.target_did <> $2
-             ORDER BY p.indexed_at DESC, p.updated_at DESC
-             LIMIT $3",
-            &[&owner, &did, &limit],
+             ORDER BY p.indexed_at DESC, p.updated_at DESC",
+            &[&owner, &did, &per_actor],
         )
         .await
     } else {
@@ -946,14 +956,13 @@ async fn fetch_bsky_keys(
                WHERE author_did = g.target_did
                  AND text IS NOT NULL
                ORDER BY indexed_at DESC
-               LIMIT 25
+               LIMIT $2
              ) p ON true
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE g.owner_user_id = $1
                AND g.kind = 'follow'
-             ORDER BY p.indexed_at DESC, p.updated_at DESC
-             LIMIT $2",
-            &[&owner, &limit],
+             ORDER BY p.indexed_at DESC, p.updated_at DESC",
+            &[&owner, &per_actor],
         )
         .await
     }
@@ -1089,13 +1098,6 @@ fn ranked_row_sort(row: &Value) -> i64 {
     row.get("sort").and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
-fn bsky_ratio_allows(out_len: usize, bsky_emitted: usize) -> bool {
-    if out_len == 0 {
-        return true;
-    }
-    (bsky_emitted + 1) as f64 / (out_len + 1) as f64 <= HOME_BSKY_MAX_RATIO
-}
-
 fn merge_bsky_ranked(
     ranked: Vec<Value>,
     bsky: &[BskyKey],
@@ -1151,42 +1153,24 @@ fn merge_bsky_ranked(
         return ranked;
     }
     if ranked.is_empty() {
-        return queued.into_iter().take(80).collect();
+        return queued;
     }
-    // Higher placement sort wins. The 60% cap still stops a Bluesky burst
-    // from filling the page; a blocked Bluesky row waits for the next slot.
-    let mut out = Vec::new();
+    // Higher placement sort wins. Both follow graphs are kept; a share cap
+    // used to drop Bluesky once it passed ~60% of the list.
+    let mut out = Vec::with_capacity(ranked.len() + queued.len());
     let mut fi = 0usize;
     let mut bi = 0usize;
-    let mut bsky_emitted = 0usize;
-    while fi < ranked.len() || bi < queued.len() {
-        let bsky_sort = queued.get(bi).map(ranked_row_sort);
-        let fedi_sort = ranked.get(fi).map(ranked_row_sort);
-        let bsky_wins = match (bsky_sort, fedi_sort) {
-            (Some(bs), Some(fs)) => bs >= fs,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        // A stale follow or own note must not take a fresh slot just because
-        // Bluesky would otherwise pass 60%. Leave it until the fresh rows
-        // are placed.
-        let fedi_is_stale = match (bsky_sort, fedi_sort) {
-            (Some(bs), Some(fs)) => bs.saturating_sub(fs) > HOME_STALE_FEDI_GAP_SECS,
-            _ => false,
-        };
-        if bsky_wins && (bsky_ratio_allows(out.len(), bsky_emitted) || fedi_is_stale) {
+    while fi < ranked.len() && bi < queued.len() {
+        if ranked_row_sort(&queued[bi]) >= ranked_row_sort(&ranked[fi]) {
             out.push(queued[bi].clone());
             bi += 1;
-            bsky_emitted += 1;
-            continue;
-        }
-        if fi < ranked.len() {
+        } else {
             out.push(ranked[fi].clone());
             fi += 1;
-            continue;
         }
-        break;
     }
+    out.extend(queued.iter().skip(bi).cloned());
+    out.extend(ranked.iter().skip(fi).cloned());
     out
 }
 
@@ -2795,10 +2779,10 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
         apply_favourite_rank(&mut timeline, &actor_weights, &tag_weights);
     }
 
-    let mut ranked = rank_from_timeline(timeline);
+    let mut ranked = rank_from_timeline_capped(timeline, None);
 
     let own_did = load_own_did(&db, owner_user_id).await?;
-    let mut bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref(), 160).await?;
+    let mut bsky = fetch_bsky_keys(&db, owner_user_id, own_did.as_deref()).await?;
     if !followed_tags.is_empty() {
         let mut existing: HashSet<String> = bsky.iter().map(|row| row.uri.clone()).collect();
         for row in fetch_bsky_followed_tag_keys(
@@ -2827,6 +2811,9 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
                 "native home rss merge skipped"
             ),
         }
+    }
+    if ranked.len() > HOME_MAX_TIMELINE {
+        ranked.truncate(HOME_MAX_TIMELINE);
     }
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
@@ -3196,7 +3183,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_bsky_follows_sort_and_keeps_ratio() {
+    fn merge_bsky_keeps_every_followed_post() {
         let hidden = hidden::HiddenSets::default();
         let fresh = merge_bsky_ranked(
             vec![json!({"k":"event","id":"1","s":"fediverse","sort": 1_700_000_100})],
@@ -3211,11 +3198,12 @@ mod tests {
             &hidden,
         );
         assert_eq!(lead[0]["k"], json!("bsky"));
+        assert_eq!(lead.len(), 2);
 
-        let fedi: Vec<Value> = (0..10)
+        let fedi: Vec<Value> = (0..2)
             .map(|i| json!({"k":"event","id": format!("{i}"), "s":"fediverse","sort": 1_000 - i}))
             .collect();
-        let bsky: Vec<BskyKey> = (0..10)
+        let bsky: Vec<BskyKey> = (0..8)
             .map(|i| bsky_key(&format!("at://did:x/app.bsky.feed.post/{i}"), "did:x", 2_000 - i, 2_000 - i))
             .collect();
         let merged = merge_bsky_ranked(fedi, &bsky, &hidden);
@@ -3223,12 +3211,16 @@ mod tests {
             .iter()
             .filter(|row| row.get("k").and_then(|v| v.as_str()) == Some("bsky"))
             .count();
-        assert!(!merged.is_empty());
-        assert!(
-            (bsky_n as f64) / (merged.len() as f64) <= HOME_BSKY_MAX_RATIO + 0.001,
-            "bsky {bsky_n} of {}",
-            merged.len()
+        assert_eq!(merged.len(), 10);
+        assert_eq!(bsky_n, 8, "followed Bluesky posts must stay in the mix");
+        assert!(merged[..8].iter().all(|row| row["k"] == json!("bsky")));
+
+        let only = merge_bsky_ranked(
+            Vec::new(),
+            &[bsky_key("at://did:x/app.bsky.feed.post/only", "did:x", 50, 50)],
+            &hidden,
         );
+        assert_eq!(only.len(), 1);
     }
 
     #[test]

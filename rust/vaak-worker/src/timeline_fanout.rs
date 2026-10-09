@@ -239,7 +239,12 @@ fn copy_ranked_row(row: &Value) -> Option<Value> {
 
 /// Place one ranked row. Returns the rewritten list. A k:id or object twin
 /// that is already present is left where the ranker put it.
-fn place_ranked_rows(old: &[Value], new_entry: Value, mode: PlaceMode) -> Vec<Value> {
+fn place_ranked_rows(
+    old: &[Value],
+    new_entry: Value,
+    mode: PlaceMode,
+    max_ranked: usize,
+) -> Vec<Value> {
     let new_k = new_entry.get("k").and_then(|v| v.as_str()).unwrap_or("");
     let new_id = new_entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let new_key = format!("{new_k}:{new_id}");
@@ -263,7 +268,7 @@ fn place_ranked_rows(old: &[Value], new_entry: Value, mode: PlaceMode) -> Vec<Va
         copied.push(item);
     }
     if already {
-        copied.truncate(MAX_RANKED);
+        copied.truncate(max_ranked);
         return copied;
     }
     // Pre-deploy lists have no sort at all, so keep the old front insert.
@@ -275,7 +280,7 @@ fn place_ranked_rows(old: &[Value], new_entry: Value, mode: PlaceMode) -> Vec<Va
     } else {
         PlaceMode::Front
     };
-    let mut ranked = Vec::with_capacity(copied.len().saturating_add(1).min(MAX_RANKED));
+    let mut ranked = Vec::with_capacity(copied.len().saturating_add(1).min(max_ranked));
     if mode == PlaceMode::BySort {
         let new_sort = row_sort(&new_entry).unwrap_or(0);
         let mut inserted = false;
@@ -285,23 +290,23 @@ fn place_ranked_rows(old: &[Value], new_entry: Value, mode: PlaceMode) -> Vec<Va
                 inserted = true;
             }
             ranked.push(row);
-            if ranked.len() >= MAX_RANKED {
+            if ranked.len() >= max_ranked {
                 break;
             }
         }
-        if !inserted && ranked.len() < MAX_RANKED {
+        if !inserted && ranked.len() < max_ranked {
             ranked.push(new_entry);
         }
     } else {
         ranked.push(new_entry);
         for row in copied {
             ranked.push(row);
-            if ranked.len() >= MAX_RANKED {
+            if ranked.len() >= max_ranked {
                 break;
             }
         }
     }
-    ranked.truncate(MAX_RANKED);
+    ranked.truncate(max_ranked);
     ranked
 }
 
@@ -461,7 +466,12 @@ async fn prepend_owner(
                 entry["sort"] = json!(sort);
             }
         }
-        let ranked = place_ranked_rows(&old_ranked, entry, mode);
+        let cap = if view == "home" {
+            crate::ranked_warm::HOME_MAX_TIMELINE
+        } else {
+            MAX_RANKED
+        };
+        let ranked = place_ranked_rows(&old_ranked, entry, mode, cap);
 
         let mut source_counts: HashMap<String, i64> = HashMap::new();
         for row in &ranked {
@@ -961,7 +971,7 @@ mod tests {
             json!({"k":"event","id":"2","s":"fediverse","sort": 100}),
         ];
         let new_entry = json!({"k":"event","id":"3","s":"fediverse","sort": 150});
-        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort, MAX_RANKED);
         assert_eq!(out[0]["id"], "1");
         assert_eq!(out[1]["id"], "3");
         assert_eq!(out[2]["id"], "2");
@@ -977,7 +987,7 @@ mod tests {
             json!({"k":"event","id":"2","s":"fediverse","sort": 100}),
         ];
         let new_entry = json!({"k":"event","id":"3","s":"fediverse","sort": 150});
-        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort, MAX_RANKED);
         let ids: Vec<_> = out.iter().filter_map(|row| row.get("id").and_then(|v| v.as_str())).collect();
         assert_eq!(ids, vec!["1", "3", "9", "2"]);
     }
@@ -986,7 +996,7 @@ mod tests {
     fn home_insert_stays_at_front_until_rows_have_sort() {
         let old = vec![json!({"k":"event","id":"1","s":"fediverse"})];
         let new_entry = json!({"k":"event","id":"2","s":"fediverse","sort": 50});
-        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort, MAX_RANKED);
         assert_eq!(out[0]["id"], "2");
         assert_eq!(out[1]["id"], "1");
     }
@@ -995,7 +1005,7 @@ mod tests {
     fn home_insert_skips_object_twin() {
         let old = vec![json!({"k":"event","id":"1","s":"fediverse","o":"https://example.test/n/1","sort": 10})];
         let new_entry = json!({"k":"bsky","id":"at://did/app.bsky.feed.post/1","s":"bluesky","o":"https://example.test/n/1","sort": 99});
-        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort);
+        let out = place_ranked_rows(&old, new_entry, PlaceMode::BySort, MAX_RANKED);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["k"], "event");
     }

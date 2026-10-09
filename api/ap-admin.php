@@ -300,10 +300,22 @@ if (
     } elseif (function_exists('ap_vaak_pretty_profile_key_from_request')) {
         $earlyLocalKey = ap_vaak_pretty_profile_key_from_request();
     }
+    // Edit/reply from a profile card is ?view=remote_profile&edit_note={note}
+    // with no actor. <base href="/vaak/"> sends that to /vaak/, which paints
+    // "No actor URL" under the composer. The note URL still names the profile.
+    if (!is_string($earlyLocalKey) || $earlyLocalKey === '') {
+        foreach (['edit_note', 'reply_to', 'quote_object'] as $earlyNoteKey) {
+            $earlyNote = trim((string) ($_GET[$earlyNoteKey] ?? ''));
+            if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)(?:/|$)#i', $earlyNote, $earlyNm)) {
+                $earlyLocalKey = strtolower($earlyNm[1]);
+                break;
+            }
+        }
+    }
     if (is_string($earlyLocalKey) && $earlyLocalKey !== '') {
         $earlyReqPath = rtrim((string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?: ''), '/') ?: '/';
         $earlyCanonQ = [];
-        foreach (['tab', 'post', 'from'] as $earlyCanonKey) {
+        foreach (['tab', 'post', 'from', 'compose', 'edit_note', 'reply_to', 'quote_object', 'draft_id', 'mention', 'cw', 'sensitive', 'to'] as $earlyCanonKey) {
             $earlyCanonVal = trim((string) ($_GET[$earlyCanonKey] ?? ''));
             if ($earlyCanonVal !== '') {
                 $earlyCanonQ[$earlyCanonKey] = $earlyCanonVal;
@@ -7926,6 +7938,13 @@ function admin_tl_rank_entry(array $item): ?array
 {
     $kind = (string) ($item['kind'] ?? '');
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    $stamp = static function (array $entry) use ($item): array {
+        $sort = (int) ($item['sort'] ?? 0);
+        if ($sort > 0) {
+            $entry['sort'] = $sort;
+        }
+        return $entry;
+    };
     if ($kind === 'event') {
         $id = (string) (int) ($row['id'] ?? 0);
         if ($id === '0') {
@@ -7944,23 +7963,23 @@ function admin_tl_rank_entry(array $item): ?array
             $source = !empty($item['from_tag']) ? 'hashtag' : 'fediverse';
         }
         $entry['s'] = $source;
-        return $entry;
+        return $stamp($entry);
     }
     if ($kind === 'outbox') {
         $id = rtrim((string) ($row['id'] ?? ''), '/');
-        return $id !== '' ? ['k' => 'outbox', 'id' => $id, 's' => 'local'] : null;
+        return $id !== '' ? $stamp(['k' => 'outbox', 'id' => $id, 's' => 'local']) : null;
     }
     if ($kind === 'boost') {
         $id = (string) ($row['status_id'] ?? '');
-        return $id !== '' ? ['k' => 'boost', 'id' => $id, 's' => 'boost'] : null;
+        return $id !== '' ? $stamp(['k' => 'boost', 'id' => $id, 's' => 'boost']) : null;
     }
     if ($kind === 'bsky') {
         $id = (string) ($row['bsky_uri'] ?? ($row['post']['uri'] ?? ''));
-        return $id !== '' ? ['k' => 'bsky', 'id' => $id, 's' => 'bluesky'] : null;
+        return $id !== '' ? $stamp(['k' => 'bsky', 'id' => $id, 's' => 'bluesky']) : null;
     }
     if ($kind === 'rss') {
         $id = (string) (int) ($row['id'] ?? 0);
-        return $id !== '0' ? ['k' => 'rss', 'id' => $id, 's' => 'rss'] : null;
+        return $id !== '0' ? $stamp(['k' => 'rss', 'id' => $id, 's' => 'rss']) : null;
     }
     return null;
 }
@@ -9049,11 +9068,65 @@ function admin_home_apply_follower_fallback(array $timeline, int $pageSize = 15)
 
 
 /**
- * Merge cached Bluesky Home candidates into the ranked Home set. Keep the
- * share bounded at ~60% with light spacing, but allow Bluesky cards on page one.
+ * Recent stored posts for every followed Fediverse actor.
+ * A single ORDER BY ... LIMIT across the whole list keeps only the loudest accounts.
  *
- * @param list<array{k:string,id:string,t?:int}> $ranked
- * @return list<array{k:string,id:string,t?:int}>
+ * @param list<string> $actorIds
+ * @return list<array<string,mixed>>
+ */
+function admin_home_follow_event_rows(array $actorIds, int $perActor = 25): array
+{
+    $unique = [];
+    foreach ($actorIds as $id) {
+        $id = rtrim(trim((string) $id), '/');
+        if ($id === '' || !str_starts_with($id, 'https://') || str_contains($id, 'bsky.app/')) {
+            continue;
+        }
+        $unique[$id] = true;
+    }
+    if ($unique === []) {
+        return [];
+    }
+    $perActor = max(1, min(25, $perActor));
+    $out = [];
+    foreach (array_chunk(array_keys($unique), 80) as $chunk) {
+        $values = implode(',', array_fill(0, count($chunk), '(CAST(? AS text))'));
+        $sql = "SELECT e.id, e.type, e.actor_id, e.object_id, e.summary, e.media_urls, e.created_at,
+                       e.action_taken, e.spoiler_text, e.sensitive, e.visibility, e.host, e.in_reply_to
+                FROM (VALUES $values) AS f(actor_id)
+                JOIN LATERAL (
+                  SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
+                         action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
+                  FROM events
+                  WHERE actor_id IN (f.actor_id, f.actor_id || '/')
+                    AND type IN ('Create', 'Announce', 'Quote', 'QuotePost')
+                    AND action_taken IN ('log', 'local_observe')
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?
+                ) e ON true";
+        try {
+            $st = ap_db()->prepare($sql);
+            $params = $chunk;
+            $params[] = $perActor;
+            $st->execute($params);
+            foreach ($st->fetchAll() ?: [] as $row) {
+                if (is_array($row)) {
+                    $out[] = $row;
+                }
+            }
+        } catch (Throwable $e) {
+            error_log('[ap-admin] home follow events: ' . $e->getMessage());
+        }
+    }
+    return $out;
+}
+
+/**
+ * Merge followed Bluesky posts into the ranked Home set by sort time.
+ * Every followed account is included. A ~60% share cap used to drop the rest.
+ *
+ * @param list<array{k:string,id:string,t?:int,sort?:int}> $ranked
+ * @return list<array{k:string,id:string,t?:int,sort?:int}>
  */
 function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
 {
@@ -9067,7 +9140,7 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
             $ownDid = (string) ($sess['did'] ?? '');
         }
     }
-    $keys = ap_bsky_home_rank_keys($ownerUserId, 120, $ownDid !== '' ? $ownDid : null);
+    $keys = ap_bsky_home_rank_keys($ownerUserId, 25, $ownDid !== '' ? $ownDid : null);
     if ($keys === []) {
         return $ranked;
     }
@@ -9084,6 +9157,10 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
             $seenFedi[rtrim($id, '/')] = true;
         } elseif ($k === 'bsky') {
             $seenBsky[$id] = true;
+        }
+        $object = rtrim((string) ($row['o'] ?? ''), '/');
+        if ($object !== '') {
+            $seenFedi[$object] = true;
         }
     }
     $queued = [];
@@ -9103,40 +9180,47 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
                 continue;
             }
         }
-        $queued[] = ['k' => 'bsky', 'id' => $uri];
+        $entry = [
+            'k' => 'bsky',
+            'id' => $uri,
+            's' => 'bluesky',
+            'sort' => strtotime((string) ($row['indexed_at'] ?? '')) ?: 0,
+        ];
+        if ($fedi !== '') {
+            $entry['o'] = $fedi;
+        }
+        $queued[] = $entry;
         $seenBsky[$uri] = true;
     }
     if ($queued === []) {
         return $ranked;
     }
-    // No Fediverse head (muted follows / empty AP graph) — Bluesky-only Home seed.
     if ($ranked === []) {
-        return array_slice($queued, 0, 80);
+        return $queued;
     }
-    $tail = $ranked;
     $out = [];
-    $qi = 0;
-    $bskyEmitted = 0;
-    $sinceBsky = 1;
-    $flush = static function () use (&$out, &$queued, &$qi, &$bskyEmitted, &$sinceBsky): void {
-        while (isset($queued[$qi])) {
-            if ($sinceBsky < 1 && $out !== []) {
-                break;
-            }
-            if ($out !== [] && ($bskyEmitted + 1) / max(1, count($out) + 1) > 0.60) {
-                break;
-            }
-            $out[] = $queued[$qi];
-            $qi++;
-            $bskyEmitted++;
-            $sinceBsky = 0;
+    $fi = 0;
+    $bi = 0;
+    $fediCount = count($ranked);
+    $bskyCount = count($queued);
+    while ($fi < $fediCount && $bi < $bskyCount) {
+        $fediSort = (int) ($ranked[$fi]['sort'] ?? 0);
+        $bskySort = (int) ($queued[$bi]['sort'] ?? 0);
+        if ($bskySort >= $fediSort) {
+            $out[] = $queued[$bi];
+            $bi++;
+        } else {
+            $out[] = $ranked[$fi];
+            $fi++;
         }
-    };
-    $flush(); // allow Bluesky in the initial Home page
-    foreach ($tail as $item) {
-        $out[] = $item;
-        $sinceBsky++;
-        $flush();
+    }
+    while ($bi < $bskyCount) {
+        $out[] = $queued[$bi];
+        $bi++;
+    }
+    while ($fi < $fediCount) {
+        $out[] = $ranked[$fi];
+        $fi++;
     }
     return $out;
 }
@@ -9510,41 +9594,27 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
         if ($actorIds !== []) {
             try {
                 $perActor = [];
-                foreach (array_chunk(array_keys($actorIds), 400) as $chunk) {
-                    $ph = implode(',', array_fill(0, count($chunk), '?'));
-                    $st = $db->prepare(
-                        "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
-                                action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
-                         FROM events
-                         WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
-                           AND (action_taken = 'log' OR action_taken = 'local_observe')
-                           AND actor_id IN ($ph)
-                         ORDER BY created_at DESC, id DESC
-                         LIMIT 240"
-                    );
-                    $st->execute($chunk);
-                    foreach ($st->fetchAll() ?: [] as $erow) {
-                        if (!is_array($erow)) {
-                            continue;
-                        }
-                        if ($ownerUserId > 0 && admin_timeline_row_hidden($erow, $ownerUserId)) {
-                            continue;
-                        }
-                        if (function_exists('admin_event_is_empty_private_stub') && admin_event_is_empty_private_stub($erow)) {
-                            continue;
-                        }
-                        $aid = rtrim((string) ($erow['actor_id'] ?? ''), '/');
-                        $n = $perActor[$aid] ?? 0;
-                        if ($n >= 25) {
-                            continue; // keep lean seed diverse
-                        }
-                        $perActor[$aid] = $n + 1;
-                        $timeline[] = [
-                            'kind' => 'event',
-                            'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
-                            'row' => $erow,
-                        ];
+                foreach (admin_home_follow_event_rows(array_keys($actorIds)) as $erow) {
+                    if (!is_array($erow)) {
+                        continue;
                     }
+                    if ($ownerUserId > 0 && admin_timeline_row_hidden($erow, $ownerUserId)) {
+                        continue;
+                    }
+                    if (function_exists('admin_event_is_empty_private_stub') && admin_event_is_empty_private_stub($erow)) {
+                        continue;
+                    }
+                    $aid = rtrim((string) ($erow['actor_id'] ?? ''), '/');
+                    $n = $perActor[$aid] ?? 0;
+                    if ($n >= 25) {
+                        continue; // keep lean seed diverse
+                    }
+                    $perActor[$aid] = $n + 1;
+                    $timeline[] = [
+                        'kind' => 'event',
+                        'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: 0,
+                        'row' => $erow,
+                    ];
                 }
             } catch (Throwable $e) {
                 // fall through to outbox seed
@@ -9606,7 +9676,8 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
         }
     } else {
         usort($timeline, static fn($a, $b) => $b['sort'] <=> $a['sort']);
-        if (count($timeline) > 160) {
+        // Home keeps every follow's recent posts. Local and Federated stay short.
+        if ($view !== 'home' && count($timeline) > 160) {
             $timeline = array_slice($timeline, 0, 160);
         }
     }
@@ -9620,6 +9691,9 @@ function admin_tl_lean_ranked_warm(string $view, array $following, string $cache
                 // Surface first RSS after ~8 posts (was full pageSize ~15).
                 $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerUserId, 5);
             }
+        }
+        if (count($ranked) > 16000) {
+            $ranked = array_slice($ranked, 0, 16000);
         }
     }
     if ($ranked !== []) {
@@ -10521,43 +10595,14 @@ function admin_tl_extend_ranked(string $view, array $following, array $ranked, i
         // keep that case deterministic and chronological within this window.
         usort($homeCand, static fn($a, $b) => ((int) ($b['sort'] ?? 0)) <=> ((int) ($a['sort'] ?? 0)));
         $homeCand = admin_tl_rank_from_timeline($homeCand);
-        // Soft-space Bluesky in the extend window (~50%, ≥1 fedi between).
-        $bskyEmitted = 0;
-        $sinceBsky = 1; // allow a Bluesky card first in the extend window
-        $deferred = [];
+        // Rank order already mixes both networks. A share cap used to drop
+        // followed Bluesky posts once they passed ~60% of this window.
         foreach ($homeCand as $cand) {
-            $isBsky = ((string) ($cand['k'] ?? '')) === 'bsky';
-            if ($isBsky) {
-                if (($sinceBsky < 1 && $added !== [])
-                    || (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.60)
-                ) {
-                    $deferred[] = $cand;
-                    continue;
-                }
-                $bskyEmitted++;
-                $sinceBsky = 0;
-            } else {
-                $sinceBsky++;
-                while ($deferred !== []) {
-                    if ($sinceBsky < 1) {
-                        break;
-                    }
-                    if (($bskyEmitted + 1) / max(1, count($added) + 1) > 0.60) {
-                        break;
-                    }
-                    $d = array_shift($deferred);
-                    $added[] = $d;
-                    $bskyEmitted++;
-                    $sinceBsky = 0;
-                }
-            }
             $added[] = $cand;
             if (count($added) >= $want) {
                 break;
             }
         }
-        // Leave excess deferred Bluesky for a later extend window (keeps mix
-        // chronological with fedi still available in the retention window).
         if (
             $homeAlgorithmEnabled
             && $added !== []
@@ -10796,32 +10841,7 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         }
         $homeRaw = [];
         if ($homeActorIds) {
-            $idList = array_keys($homeActorIds);
-            // SQLite caps variables; chunk if needed
-            $chunks = array_chunk($idList, 400);
-            foreach ($chunks as $chunk) {
-                $ph = implode(',', array_fill(0, count($chunk), '?'));
-                try {
-                    // Ranked index seed — enough for several infinite-scroll
-                    // pages without scanning 300 full event rows on every miss.
-                    $st = $db->prepare(
-                        "SELECT id, type, actor_id, object_id, summary, media_urls, created_at,
-                                action_taken, spoiler_text, sensitive, visibility, host, in_reply_to
-                         FROM events
-                         WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
-                           AND (action_taken = 'log' OR action_taken = 'local_observe')
-                           AND actor_id IN ($ph)
-                         ORDER BY created_at DESC, id DESC
-                         LIMIT 120"
-                    );
-                    $st->execute($chunk);
-                    foreach ($st->fetchAll() ?: [] as $erow) {
-                        $homeRaw[] = $erow;
-                    }
-                } catch (Throwable $e) {
-                    error_log('[ap-admin] home events: ' . $e->getMessage());
-                }
-            }
+            $homeRaw = admin_home_follow_event_rows(array_keys($homeActorIds));
             usort($homeRaw, static function ($a, $b) {
                 $cmp = strcmp((string) ($b['created_at'] ?? ''), (string) ($a['created_at'] ?? ''));
                 if ($cmp !== 0) {
@@ -10829,7 +10849,6 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
                 }
                 return ((int) ($b['id'] ?? 0)) <=> ((int) ($a['id'] ?? 0));
             });
-            $homeRaw = array_slice($homeRaw, 0, 120);
             // Quote-boost dual publish → one card (prefer Create/Quote over self-Announce).
             if (function_exists('ap_events_collapse_self_announces')) {
                 $homeRaw = ap_events_collapse_self_announces($homeRaw);
@@ -11187,6 +11206,9 @@ if (!$wantNewerPoll && !$adminTlFromCache && ($view === 'home' || ($isPartial &&
         if ($homeAlgorithmEnabled && function_exists('admin_home_queue_rss_after_first_page')) {
             // Surface first RSS after ~8 posts so feeds are visible without a long scroll.
             $ranked = admin_home_queue_rss_after_first_page($ranked, $homeOwnerId, 5);
+        }
+        if (count($ranked) > 16000) {
+            $ranked = array_slice($ranked, 0, 16000);
         }
         $GLOBALS['admin_home_queued_bsky'] = count($ranked) > $beforeBsky;
         admin_tl_cache_put($ck, $ranked);
@@ -26806,9 +26828,14 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <button class="btn btn-primary" type="submit" style="width:100%;margin-top:.55rem">Search</button>
       </form>
     </div>
+    <?php
+      // A direct Search load is a full document. Do not paint the warm trends
+      // cache before the results column is parsed — same deferral as admin pages.
+      $vaakDeferTrendsPaint = $view === 'search' || in_array($view, $vaakAdminOnlyViews, true);
+    ?>
     <div id="trends-sidebar"
          data-deferred="1"
-         data-paint-after="<?= in_array($view, $vaakAdminOnlyViews, true) ? '1' : '0' ?>"
+         data-paint-after="<?= $vaakDeferTrendsPaint ? '1' : '0' ?>"
          data-from="<?= h($view) ?>"
          data-cached-age="0"
          data-stale="0">
@@ -26829,7 +26856,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
         </div>
     </div>
-    <?php if (!in_array($view, $vaakAdminOnlyViews, true)): ?>
+    <?php if (empty($vaakDeferTrendsPaint)): ?>
     <script>
     (function () {
       var box = document.getElementById('trends-sidebar');
@@ -34897,8 +34924,8 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   document.addEventListener('click', function (ev) {
     var action = ev.target && ev.target.closest && ev.target.closest('.post-action-menu__body .menu-action');
     if (!action) return;
-    // Keep the menu for client-only edit (opens compose without navigation).
-    if (action.classList.contains('js-edit-post')) return;
+    // The portaled overflow is painted above the compose modal. Close it
+    // before Edit opens the pop-out, or the menu covers the composer.
     vaakClosePostActionMenus();
   }, true);
 
@@ -38407,12 +38434,45 @@ window.apAdminToast = function (msg, isErr) {
     return extra;
   }
 
+  // Hashtags and trend rows link to Search without data-vaak-soft-nav.
+  // A normal click would reload the document and paint the right rail again.
+  function searchExtraFromAnchor(link) {
+    if (!link || link.target === '_blank' || link.hasAttribute('download')) return null;
+    let url;
+    try { url = new URL(link.href, window.location.href); } catch (e) { return null; }
+    if (url.origin !== window.location.origin) return null;
+    const path = url.pathname.replace(/\/+$/, '');
+    if (path !== '/vaak' && !path.endsWith('/vaak/index.php')) return null;
+    const view = (url.searchParams.get('view') || '').replace(/[^a-z_]/g, '');
+    if (view !== 'search') return null;
+    const q = (url.searchParams.get('q') || '').trim();
+    if (/^https:\/\//i.test(q)) return null;
+    const extra = {};
+    if (q) extra.q = q;
+    const type = (url.searchParams.get('type') || '').replace(/[^a-z]/g, '');
+    if (type) extra.type = type;
+    if (url.searchParams.get('resolve')) extra.resolve = '1';
+    return extra;
+  }
+
   function profileTargetFromAnchor(link) {
     if (!link || link.target === '_blank' || link.hasAttribute('download')) return null;
     let url;
     try { url = new URL(link.href, window.location.href); } catch (e) { return null; }
     if (url.origin !== window.location.origin) return null;
     if (/\/notes\//.test(url.pathname)) return null;
+    // Reply, quote, and edit on a profile card are ?view=remote_profile&compose=1.
+    // On /vaak/users/{key} those query-only hrefs resolve back onto the profile,
+    // and soft-nav would reload this profile and drop the composer params.
+    const rawHref = (link.getAttribute && link.getAttribute('href')) || '';
+    if (/[?&](?:compose|reply_to|quote_object|edit_note|draft_id)=/.test(rawHref)
+        || url.searchParams.has('compose')
+        || (url.searchParams.get('reply_to') || '') !== ''
+        || (url.searchParams.get('quote_object') || '') !== ''
+        || (url.searchParams.get('edit_note') || '') !== ''
+        || (url.searchParams.get('draft_id') || '') !== '') {
+      return null;
+    }
     // ?view=home (and Settings, Notices, …) on a pretty profile URL is an app
     // navigation. Browsers that ignore <base> for "?…" links still resolve the
     // path to /vaak/users/{key}; treating that as "open this profile" traps
@@ -38856,13 +38916,41 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  // Search forms are GET documents. Submitting one used to rebuild both rails
+  // and paint trends before the results. Soft-nav swaps the center column and
+  // leaves the rail alone, the same way Home and the library pages do.
+  // A pasted https post link still full-loads so the permalink redirect can run.
+  document.addEventListener('submit', (ev) => {
+    const form = ev.target;
+    if (!form || !form.querySelector) return;
+    const method = String(form.getAttribute('method') || 'get').toLowerCase();
+    if (method !== 'get') return;
+    const viewInput = form.querySelector('input[name="view"]');
+    if (!viewInput || String(viewInput.value || '') !== 'search') return;
+    if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+    const qInput = form.querySelector('input[name="q"]');
+    const q = qInput ? String(qInput.value || '').trim() : '';
+    if (/^https:\/\//i.test(q)) return;
+    ev.preventDefault();
+    const typeEl = form.querySelector('input[name="type"]:checked');
+    const resolveEl = form.querySelector('input[name="resolve"]');
+    const extra = {};
+    if (q) extra.q = q;
+    if (typeEl && typeEl.value) extra.type = String(typeEl.value);
+    if (resolveEl && resolveEl.checked) extra.resolve = '1';
+    const railQ = document.querySelector('.rail-right input[name="q"]');
+    if (railQ && railQ !== qInput) railQ.value = q;
+    softNavTo('search', true, '', extra);
+  }, true);
+
   document.addEventListener('click', (ev) => {
     if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
     const link = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
     if (!link || link.target === '_blank') return;
     const view = link.getAttribute('data-vaak-soft-nav') || '';
-    const profile = (!window.vaakGuestProfile && !SOFT_VIEWS.has(view)) ? profileTargetFromAnchor(link) : null;
-    if (!SOFT_VIEWS.has(view) && !profile) return;
+    const searchExtra = view ? null : searchExtraFromAnchor(link);
+    const profile = (!window.vaakGuestProfile && !SOFT_VIEWS.has(view) && !searchExtra) ? profileTargetFromAnchor(link) : null;
+    if (!SOFT_VIEWS.has(view) && !profile && !searchExtra) return;
     // Mobile drawer already started soft-nav on pointerup — swallow the click
     // that would otherwise hit Mentions content behind the closing rail.
     if (Date.now() < softNavTouchGuard) {
@@ -38875,6 +38963,7 @@ window.apAdminToast = function (msg, isErr) {
     ev.stopPropagation();
     if (typeof ev.stopImmediatePropagation === 'function') ev.stopImmediatePropagation();
     if (SOFT_VIEWS.has(view)) softNavTo(view, true, link.getAttribute('data-notif-filter') || '', softNavExtrasFromLink(link));
+    else if (searchExtra) softNavTo('search', true, '', searchExtra);
     else softNavProfile(profile, true);
   }, true);
 
@@ -39443,8 +39532,9 @@ window.apAdminToast = function (msg, isErr) {
 
   window.novaLoadDeferredTrends = loadDeferredTrends;
   // The page no longer renders trends in PHP. A warm session cache paints
-  // immediately on ordinary pages. Admin documents are full reloads, so the
-  // center column paints with the skeleton first and the rail fills after.
+  // immediately on ordinary pages. Search and admin documents are full
+  // reloads, so the center column paints with the skeleton first and the
+  // rail fills after.
   var trendsBox = document.getElementById('trends-sidebar');
   if (trendsBox && trendsBox.getAttribute('data-paint-after') === '1') {
     var paintTrendsAfter = function () { loadDeferredTrends(false); };
@@ -40793,6 +40883,11 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const qb = form.querySelector('.quote-block');
     if (qb) qb.remove();
     try {
+      const beforeClose = new URL(window.location.href);
+      const noteForProfile = beforeClose.searchParams.get('edit_note')
+        || beforeClose.searchParams.get('reply_to')
+        || beforeClose.searchParams.get('quote_object')
+        || '';
       const href = (typeof window.vaakAppHistoryUrl === 'function')
         ? window.vaakAppHistoryUrl((u) => {
             ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
@@ -40802,6 +40897,16 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
             ['compose', 'quote_object', 'quote_status_id', 'reply_to', 'to', 'mention', 'cw', 'sensitive', 'edit_note', 'draft_id'].forEach((k) => u.searchParams.delete(k));
             return u.pathname + u.search + u.hash;
           })();
+      const stripped = new URL(href, window.location.origin);
+      const actorLeft = (stripped.searchParams.get('actor') || '').replace(/\/$/, '');
+      const bareProfile = (stripped.pathname === '/vaak' || stripped.pathname === '/vaak/' || stripped.pathname === '/vaak/index.php')
+        && (stripped.searchParams.get('view') || '') === 'remote_profile'
+        && !/^https:\/\//i.test(actorLeft);
+      const profileKey = String(noteForProfile).match(/^https:\/\/mkultra\.monster\/users\/([A-Za-z0-9_]+)\//i);
+      if (bareProfile && profileKey) {
+        window.location.assign('/vaak/users/' + profileKey[1]);
+        return;
+      }
       window.history.replaceState({}, '', href);
     } catch (e) {}
   }
@@ -41482,7 +41587,11 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const replyTo = composeField('#compose-in-reply-to', liveForm);
     if (replyTo) {
       replyTo.value = '';
-      if (replyTo.parentElement) replyTo.parentElement.style.display = 'none';
+      // The field is a direct child of #compose-form. Hiding that parent
+      // removes the whole composer and leaves only the "Edit post" heading.
+      const wrap = replyTo.parentElement;
+      const wrapIsForm = !!(wrap && (wrap === liveForm || wrap.id === 'compose-form' || wrap.classList.contains('composer')));
+      if (wrap && !wrapIsForm) wrap.style.display = 'none';
       else replyTo.style.display = 'none';
     }
     const toActor = composeField('#compose-to-actor', liveForm);
@@ -41522,7 +41631,23 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     const returnView = btn.getAttribute('data-return-view') || 'outbox';
     const fallbackHref = btn.getAttribute('href') || '';
     const goFullPageEdit = () => {
-      if (fallbackHref) window.location.assign(fallbackHref);
+      if (!fallbackHref) return;
+      let dest = fallbackHref;
+      try {
+        const url = new URL(fallbackHref, window.location.href);
+        const view = (url.searchParams.get('view') || '').replace(/[^a-z_]/g, '');
+        if (view === 'remote_profile') {
+          const note = url.searchParams.get('edit_note') || noteId || '';
+          const actorMatch = String(note).match(/^(https:\/\/mkultra\.monster\/users\/[A-Za-z0-9_]+)\//i);
+          const key = actorMatch && actorMatch[1].match(/\/users\/([A-Za-z0-9_]+)$/i);
+          if (key) {
+            url.pathname = '/vaak/users/' + key[1];
+            url.searchParams.set('actor', actorMatch[1]);
+          }
+        }
+        dest = url.pathname + url.search;
+      } catch (e) {}
+      window.location.assign(dest);
     };
     let panel = getComposePanel();
     // Timeline pages render one shared composer inline. Move that actual panel
@@ -41583,7 +41708,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       return;
     }
     // Authoritative load: masto_statuses.content_text (blank lines intact)
-    fetch('?op=edit_draft&note_id=' + encodeURIComponent(noteId), {
+    // Absolute: on /vaak/users/{key} a query-only ?op= hits the profile document.
+    fetch('/vaak/?op=edit_draft&note_id=' + encodeURIComponent(noteId), {
       credentials: 'same-origin',
       headers: { 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       cache: 'no-store'
@@ -41619,6 +41745,17 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
     // openEditComposer keeps regressing to an empty Compose/Post shell after
     // soft-nav composer adoption (seen again in 0.3.36–0.3.38).
     const href = btn.getAttribute('href') || '';
+    let hrefView = (btn.getAttribute('data-return-view') || '').replace(/[^a-z_]/g, '');
+    try {
+      const parsedView = new URL(href, window.location.href).searchParams.get('view') || '';
+      if (parsedView) hrefView = parsedView.replace(/[^a-z_]/g, '');
+    } catch (e) {}
+    // Profile already has the pop-out. Loading ?edit_note= refreshes the
+    // profile and opens an empty composer over it.
+    if (hrefView === 'remote_profile' && modal) {
+      openEditComposer(btn);
+      return;
+    }
     if (href) {
       window.location.assign(href);
       return;
