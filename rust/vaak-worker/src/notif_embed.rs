@@ -445,14 +445,161 @@ fn parse_hashtag_token(after: &str) -> Option<&str> {
     Some(&after[..len])
 }
 
+/// First scheme-less `host/path` in `rest` that is safe to prefix with https://.
+///
+/// Bluesky often shows `bsky.app/profile/…` or `example.com/a/b` with no scheme.
+/// A token that still contains `...` or `…` is a shortened label, not a URL:
+/// linking it would send people to a made-up address. Those need a facet URI.
+fn find_bare_host_path(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Hosts are ASCII. Stepping one byte into ‘ or ↩ panics on the slice.
+        if !b.is_ascii() {
+            i += 1;
+            while i < bytes.len() && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
+                i += 1;
+            }
+            continue;
+        }
+        let boundary = i == 0
+            || !matches!(
+                bytes[i - 1],
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'_'
+                    | b'@'
+                    | b'/'
+                    | b'.'
+                    | b'-'
+                    | b'%'
+                    | b'='
+            );
+        if boundary {
+            if let Some(len) = match_bare_host_path(&rest[i..]) {
+                if len > 0 {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn match_bare_host_path(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let first = *bytes.first()?;
+    if !first.is_ascii_alphanumeric() {
+        return None;
+    }
+    let mut i = 0usize;
+    let mut dots = 0usize;
+    let mut label_len = 0usize;
+    let mut saw_alpha = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphanumeric() || c == b'-' {
+            if c.is_ascii_alphabetic() {
+                saw_alpha = true;
+            }
+            label_len += 1;
+            if label_len > 63 {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'.' {
+            if label_len == 0 {
+                return None;
+            }
+            dots += 1;
+            label_len = 0;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if dots < 1 || label_len < 2 || !saw_alpha {
+        return None;
+    }
+    let host = &s[..i];
+    let tld = host.rsplit('.').next().unwrap_or("");
+    if tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if bytes.get(i) != Some(&b'/') {
+        return None;
+    }
+    let mut end = i + 1;
+    if end >= bytes.len() {
+        return None;
+    }
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_whitespace() || c == b'<' || c == b'>' || c == b'"' || c == b'\'' {
+            break;
+        }
+        end += 1;
+    }
+    if end <= i + 1 {
+        return None;
+    }
+    let raw = &s[..end];
+    // `host/path...` is a shortened Bluesky label. Stripping the dots would
+    // invent https://host/path and drop the fact that the target was cut off.
+    if raw.contains("...") || raw.contains('…') || raw.contains("..") {
+        return None;
+    }
+    let (core, _) = strip_trailing_url_punct(raw);
+    if core.len() <= i + 1 {
+        return None;
+    }
+    Some(core.len())
+}
+
 /// Linkify bare URLs, @mentions, and #hashtags in a text segment.
 /// Parity target: PHP `admin_linkify_body_html` (lean — no DB mention resolution).
 fn linkify_text_segment(text: &str, from: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let Some(tick) = rest.find('`') else {
+            out.push_str(&linkify_text_segment_raw(rest, from));
+            break;
+        };
+        let after = &rest[tick + 1..];
+        if let Some(close) = after.find('`') {
+            let inner = &after[..close];
+            if !inner.is_empty()
+                && !inner.contains('\n')
+                && !inner.contains('\r')
+                && !inner.trim().is_empty()
+            {
+                out.push_str(&linkify_text_segment_raw(&rest[..tick], from));
+                out.push_str("<code>");
+                out.push_str(inner);
+                out.push_str("</code>");
+                rest = &after[close + 1..];
+                continue;
+            }
+        }
+        out.push_str(&linkify_text_segment_raw(&rest[..tick + 1], from));
+        rest = &rest[tick + 1..];
+    }
+    out
+}
+
+fn linkify_text_segment_raw(text: &str, from: &str) -> String {
     if !text.contains("http://")
         && !text.contains("https://")
         && !text.contains("www.")
         && !text.contains('@')
         && !text.contains('#')
+        && find_bare_host_path(text).is_none()
     {
         return text.to_string();
     }
@@ -479,6 +626,9 @@ fn linkify_text_segment(text: &str, from: &str) -> String {
                 }
                 consider(&mut cand, p, LinkifyKind::Url { needs_https });
             }
+        }
+        if let Some(p) = find_bare_host_path(rest) {
+            consider(&mut cand, p, LinkifyKind::Url { needs_https: true });
         }
 
         let bytes = rest.as_bytes();
@@ -571,7 +721,13 @@ fn linkify_text_segment(text: &str, from: &str) -> String {
                 let end = after
                     .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
                     .unwrap_or(after.len());
-                let (core, trail) = strip_trailing_url_punct(&after[..end]);
+                let raw_tok = &after[..end];
+                if raw_tok.contains("...") || raw_tok.contains('…') {
+                    out.push_str(raw_tok);
+                    i += rel + end;
+                    continue;
+                }
+                let (core, trail) = strip_trailing_url_punct(raw_tok);
                 let mut href = if needs_https {
                     format!("https://{core}")
                 } else {
@@ -901,6 +1057,219 @@ fn normalize_feed_paragraphs(html: &str) -> String {
     out
 }
 
+/// Space between paragraph breaks on feed cards.
+///
+/// The page stylesheet uses the same `0.45em`. Stamping it on every paragraph
+/// after the first keeps the gap when that stylesheet is tightened again.
+const FEED_PARAGRAPH_GAP: &str = "0.45em";
+
+fn inject_paragraph_gap(tag: &str) -> String {
+    let lower = tag.to_ascii_lowercase();
+    if lower.contains("margin-top:") {
+        return tag.to_string();
+    }
+    if let Some(rel) = lower.find("style=\"") {
+        let insert_at = rel + "style=\"".len();
+        let mut s = String::with_capacity(tag.len() + FEED_PARAGRAPH_GAP.len() + 12);
+        s.push_str(&tag[..insert_at]);
+        s.push_str("margin-top:");
+        s.push_str(FEED_PARAGRAPH_GAP);
+        s.push(';');
+        s.push_str(&tag[insert_at..]);
+        return s;
+    }
+    if let Some(idx) = tag.rfind('>') {
+        let mut s = String::with_capacity(tag.len() + FEED_PARAGRAPH_GAP.len() + 24);
+        s.push_str(&tag[..idx]);
+        s.push_str(" style=\"margin-top:");
+        s.push_str(FEED_PARAGRAPH_GAP);
+        s.push_str("\">");
+        return s;
+    }
+    tag.to_string()
+}
+
+/// Add the feed paragraph gap to every `<p>` after the first.
+fn stamp_paragraph_gaps(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 48);
+    let mut i = 0usize;
+    let mut seen_p = false;
+    while i < html.len() {
+        if html.as_bytes()[i] == b'<' {
+            if let Some(end_rel) = html[i..].find('>') {
+                let tag_end = i + end_rel + 1;
+                let tag = &html[i..tag_end];
+                let lower = tag.to_ascii_lowercase();
+                let name = html_tag_name(tag);
+                if !lower.starts_with("</") && name == "p" {
+                    if seen_p {
+                        out.push_str(&inject_paragraph_gap(tag));
+                    } else {
+                        out.push_str(tag);
+                        seen_p = true;
+                    }
+                } else {
+                    out.push_str(tag);
+                }
+                i = tag_end;
+                continue;
+            }
+        }
+        let ch = html[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn facet_anchor(href: &str, label_html: &str) -> String {
+    format!(
+        "<a class=\"ext-link\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">{label_html}</a>",
+        esc(href)
+    )
+}
+
+fn html_escape_min(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Swap shortened Bluesky labels for anchors whose href is the facet URI.
+///
+/// The label may be `bsky.app/profile/name...` with no scheme. The facet URI
+/// is the full `https://` target. A truncated label is never used as the href.
+fn apply_bsky_facet_anchors(content: &str, status: &Value) -> String {
+    let text = status
+        .get("vaak_bsky_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Some(facets) = status.get("vaak_bsky_facets").and_then(|v| v.as_array()) else {
+        return content.to_string();
+    };
+    if text.is_empty() || facets.is_empty() || content.is_empty() {
+        return content.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut reps: Vec<(String, String)> = Vec::new();
+    for facet in facets {
+        let start = facet
+            .get("index")
+            .and_then(|v| v.get("byteStart"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let end = facet
+            .get("index")
+            .and_then(|v| v.get("byteEnd"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let uri = facet.get("features").and_then(|v| v.as_array()).and_then(|features| {
+            features.iter().find_map(|feature| {
+                let kind = feature.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+                if kind.ends_with("#link") {
+                    feature.get("uri").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })
+        });
+        let (Some(start), Some(end), Some(uri)) = (start, end, uri) else {
+            continue;
+        };
+        if !uri.starts_with("http") || uri.contains("...") || uri.contains('…') {
+            continue;
+        }
+        // Bluesky sometimes stores a facet end a few bytes past the text we
+        // kept (a trailing ellipsis that did not fit). Clamp a small overshoot
+        // so the visible label still links. A range that starts past the text
+        // is a different post and stays plain.
+        let mut end = end;
+        if end > bytes.len() {
+            if start < bytes.len() && end - bytes.len() <= 32 {
+                end = bytes.len();
+            } else {
+                continue;
+            }
+        }
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        let label = &text[start..end];
+        if label.len() < 8 || !label.contains('.') || !label.contains('/') {
+            continue;
+        }
+        if content.contains(&format!("href=\"{}\"", esc(uri))) {
+            continue;
+        }
+        reps.push((label.to_string(), uri.to_string()));
+    }
+    if reps.is_empty() {
+        return content.to_string();
+    }
+    reps.sort_by_key(|(label, _)| std::cmp::Reverse(label.len()));
+    replace_labels_outside_anchors(content, &reps)
+}
+
+fn replace_labels_outside_anchors(html: &str, reps: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while !rest.is_empty() {
+        let lower = rest.to_ascii_lowercase();
+        let a_rel = lower.find("<a ").or_else(|| lower.find("<a>"));
+        if let Some(a_rel) = a_rel {
+            if let Some(close_rel) = lower[a_rel..].find("</a>") {
+                let close = a_rel + close_rel + "</a>".len();
+                out.push_str(&replace_labels_plain(&rest[..a_rel], reps));
+                out.push_str(&rest[a_rel..close]);
+                rest = &rest[close..];
+                continue;
+            }
+        }
+        out.push_str(&replace_labels_plain(rest, reps));
+        break;
+    }
+    out
+}
+
+fn replace_labels_plain(text: &str, reps: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        let mut best: Option<(usize, usize, String, String)> = None;
+        for (label, href) in reps {
+            let mut consider = |start: usize, matched: &str, label_html: String| {
+                let end = start + matched.len();
+                let replace = match &best {
+                    Some((prev, _, _, _)) => start < *prev,
+                    None => true,
+                };
+                if replace {
+                    best = Some((start, end, href.clone(), label_html));
+                }
+            };
+            if let Some(p) = text[i..].find(label) {
+                consider(i + p, label, esc(label));
+            }
+            let escaped = html_escape_min(label);
+            if escaped != *label {
+                if let Some(p) = text[i..].find(&escaped) {
+                    let html = escaped.clone();
+                    consider(i + p, &escaped, html);
+                }
+            }
+        }
+        let Some((start, end, href, label_html)) = best else {
+            out.push_str(&text[i..]);
+            break;
+        };
+        out.push_str(&text[i..start]);
+        out.push_str(&facet_anchor(&href, &label_html));
+        i = end;
+    }
+    out
+}
+
 /// Prepare Mastodon/AP content HTML for lean feed paint: normalize paragraphs,
 /// rewrite mention/hashtag/ext anchors in-app, and linkify bare URLs.
 fn prepare_feed_body_html(html: &str, from: &str) -> String {
@@ -949,7 +1318,7 @@ fn prepare_feed_body_html(html: &str, from: &str) -> String {
             break;
         }
     }
-    out
+    stamp_paragraph_gaps(&out)
 }
 
 fn youtube_id_ok(id: &str) -> bool {
@@ -1079,13 +1448,80 @@ fn youtube_preview_from_status(st: &Value) -> Option<(String, String, String, St
     }
     let content = st.get("content").and_then(|v| v.as_str()).unwrap_or("");
     for url in first_https_urls_from_text(content) {
-        if let Some(id) = youtube_id_from_url(&url) {
-            return Some((
-                id.clone(),
-                youtube_watch_url(&id),
-                "YouTube video".to_string(),
-                youtube_thumb_url(&id),
-            ));
+        if let Some(hit) = youtube_hit(&url) {
+            return Some(hit);
+        }
+    }
+    // Facet hrefs survive in content HTML (`<a href="https://youtu.be/...">`)
+    // after strip_tags drops them. A shortened label has no https:// at all;
+    // the facet URI is the only complete target.
+    if let Some(hit) = youtube_from_hrefs(content) {
+        return Some(hit);
+    }
+    if let Some(hit) = youtube_from_facets(st) {
+        return Some(hit);
+    }
+    None
+}
+
+fn youtube_hit(url: &str) -> Option<(String, String, String, String)> {
+    if url.contains("...") || url.contains('…') {
+        return None;
+    }
+    let id = youtube_id_from_url(url)?;
+    Some((
+        id.clone(),
+        youtube_watch_url(&id),
+        "YouTube video".to_string(),
+        youtube_thumb_url(&id),
+    ))
+}
+
+fn youtube_from_hrefs(html: &str) -> Option<(String, String, String, String)> {
+    let lower = html.to_ascii_lowercase();
+    let mut search = 0usize;
+    while let Some(rel) = lower[search..].find("href=") {
+        let start = search + rel + "href=".len();
+        let quote = html.as_bytes().get(start).copied().unwrap_or(0);
+        if quote != b'"' && quote != b'\'' {
+            search = start.max(search + 1);
+            continue;
+        }
+        let val_start = start + 1;
+        if val_start > html.len() {
+            break;
+        }
+        let rest = &html[val_start..];
+        let end_rel = rest.find(quote as char).unwrap_or(rest.len());
+        let url = rest[..end_rel].replace("&amp;", "&");
+        if let Some(hit) = youtube_hit(&url) {
+            return Some(hit);
+        }
+        search = val_start + end_rel;
+        if search >= html.len() {
+            break;
+        }
+    }
+    None
+}
+
+fn youtube_from_facets(st: &Value) -> Option<(String, String, String, String)> {
+    let facets = st.get("vaak_bsky_facets").and_then(|v| v.as_array())?;
+    for facet in facets {
+        let uri = facet.get("features").and_then(|v| v.as_array()).and_then(|features| {
+            features.iter().find_map(|feature| {
+                let kind = feature.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+                if kind.ends_with("#link") {
+                    feature.get("uri").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })
+        });
+        if let Some(uri) = uri {
+            if let Some(hit) = youtube_hit(uri) {
+                return Some(hit);
+            }
         }
     }
     None
@@ -1923,7 +2359,7 @@ fn paint_moderation_overflow(
             }
         ));
         let copy_href = format!(
-            "https://vaak.monster/vaak/?view=status&object={}&from={}",
+            "https://mkultra.monster/vaak/?view=status&object={}&from={}",
             urlencoding_encode(object),
             urlencoding_encode(from_q)
         );
@@ -2400,8 +2836,11 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 .get("vaak_bsky_repost_record")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let reposted = boosted || !repost_rec.is_empty();
-            let liked = fav || !like_rec.is_empty();
+            // Active state is this viewer's masto_* row only. vaak_bsky_*_record
+            // is the ingesting account's appview viewer state and must not mark
+            // the button after logout, unlike, or an account switch.
+            let reposted = boosted;
+            let liked = fav;
             let bm_sid = if sid.is_empty() && !at.is_empty() {
                 let mut hasher = Sha256::new();
                 hasher.update(at.as_bytes());
@@ -3031,46 +3470,130 @@ fn ask_card_parts(content: &str) -> Option<(String, String)> {
     if header.is_empty() || question.is_empty() {
         return None;
     }
-    let card = format!(
-        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\"><div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{}</div><blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote></div></div>",
-        header,
-        esc(&question).replace('\n', "<br>")
-    );
+    let card = ask_question_card("", &ask_label_block("", &header, ""), &question);
     Some((card, answer))
 }
 
-fn ask_card_html(content: &str) -> Option<String> {
-    ask_card_parts(content).map(|(card, _)| card)
+fn ask_host_from_url(url: &str) -> String {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))
+        .unwrap_or("");
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.split('@').next_back().unwrap_or(host);
+    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
+}
+
+fn ask_label_block(actor: &str, display: &str, handle: &str) -> String {
+    let handle = handle.trim();
+    let name = {
+        let display = display.trim();
+        if !display.is_empty() {
+            display.to_string()
+        } else if !handle.is_empty() {
+            handle.to_string()
+        } else {
+            "Someone".to_string()
+        }
+    };
+    let mut inner = esc(&name);
+    if !handle.is_empty() && !name.eq_ignore_ascii_case(handle) {
+        inner.push_str(
+            " <span class=\"ask-handle\" style=\"font-weight:500;opacity:.85\">",
+        );
+        inner.push_str(&esc(handle));
+        inner.push_str("</span>");
+    }
+    inner.push_str(" asked");
+    if actor.starts_with("https://") {
+        format!(
+            "<a class=\"ask-label\" href=\"{}\" style=\"display:inline-block;font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7);text-decoration:none\">{}</a>",
+            esc(actor.trim().trim_end_matches('/')),
+            inner
+        )
+    } else {
+        format!(
+            "<div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{}</div>",
+            inner
+        )
+    }
+}
+
+fn ask_avatar_html(url: &str) -> String {
+    if !url.starts_with("https://") {
+        return String::new();
+    }
+    format!(
+        "<img class=\"ask-avatar\" src=\"{}\" alt=\"\" width=\"32\" height=\"32\" loading=\"lazy\" referrerpolicy=\"no-referrer\" style=\"border-radius:50%;object-fit:cover;flex:0 0 auto\">",
+        esc(url)
+    )
+}
+
+fn ask_question_card(avatar_html: &str, label_html: &str, question: &str) -> String {
+    format!(
+        "<div class=\"ask-container\" style=\"display:flex;gap:.65rem;align-items:flex-start;margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\">{avatar}<div class=\"ask-body\" style=\"min-width:0;flex:1 1 auto\">{label}<blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{question}</blockquote></div></div>",
+        avatar = avatar_html,
+        label = label_html,
+        question = esc(question).replace('\n', "<br>")
+    )
 }
 
 fn ask_card_from_status(status: &Value) -> Option<(String, String)> {
     let ask = status.get("vaak_ask")?.as_object()?;
     let question = ask.get("ask_question")?.as_str()?.trim();
     if question.is_empty() { return None; }
-    let actor = ask.get("ask_actor").and_then(|v| v.as_str()).unwrap_or("");
-    let label = actor.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("Someone");
-    let answer = ask.get("ask_answer").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let label_html = if actor.starts_with("https://") {
-        format!("<a class=\"ask-label\" href=\"{}\" style=\"display:inline-block;font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7);text-decoration:none\">{} asked</a>", esc(actor), esc(label))
+    let actor = ask.get("ask_actor").and_then(|v| v.as_str()).unwrap_or("").trim().trim_end_matches('/');
+    let stamped_display = ask.get("asker_display").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let stamped_handle = ask.get("asker_handle").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let stamped_avatar = ask.get("asker_avatar").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let (display, handle, avatar) = if !stamped_display.is_empty()
+        || !stamped_handle.is_empty()
+        || !stamped_avatar.is_empty()
+    {
+        (
+            stamped_display.to_string(),
+            stamped_handle.to_string(),
+            stamped_avatar.to_string(),
+        )
+    } else if actor.starts_with("https://") {
+        let username = actor.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("user");
+        let host = ask_host_from_url(actor);
+        let handle = if host.is_empty() {
+            format!("@{username}")
+        } else {
+            format!("@{username}@{host}")
+        };
+        (
+            username.to_string(),
+            handle,
+            "https://mkultra.monster/img/avatar/default.webp".to_string(),
+        )
     } else {
-        format!("<div class=\"ask-label\" style=\"font-weight:700;margin-bottom:.4rem;color:var(--primary,#ff70c7)\">{} asked</div>", esc(label))
+        ("Someone".to_string(), String::new(), String::new())
     };
-    Some((format!(
-        "<div class=\"ask-container\" style=\"margin:.35rem 0 .65rem;padding:.7rem .8rem;border:1px solid var(--primary,#ff70c7);border-radius:8px;background:var(--primary-dim,rgba(255,112,199,.12))\"><div class=\"ask-body\">{}<blockquote class=\"ask-text\" style=\"margin:0;padding:.15rem 0 .15rem .75rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</blockquote></div></div>",
-        label_html, esc(question).replace('\n', "<br>")
-    ), answer.to_string()))
+    let answer = ask.get("ask_answer").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let card = ask_question_card(
+        &ask_avatar_html(&avatar),
+        &ask_label_block(actor, &display, &handle),
+        question,
+    );
+    Some((card, answer.to_string()))
 }
 
-fn ask_answer_html(answer: &str) -> String {
+/// Profile Asks paint the answer as the post body under the question card.
+/// The timeline used to add a divider and a second quote bar around it.
+fn ask_answer_html(answer: &str, from: &str) -> String {
     let answer = answer.trim();
     if answer.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<hr class=\"ask-divider\" style=\"margin:.7rem 0;border:0;border-top:1px solid var(--primary,#ff70c7)\"><div class=\"ask-answer ask-answer--standalone\" style=\"margin:.7rem 0 .35rem;padding:.15rem 0 .15rem .8rem;border-left:3px solid var(--primary,#ff70c7);white-space:pre-wrap\">{}</div>",
-            esc(answer).replace('\n', "<br>")
-        )
+        return String::new();
     }
+    if content_looks_like_html(answer) {
+        let prepared = prepare_feed_body_html(answer, from);
+        return format!("<div class=\"body feed-body feed-body--html\">{prepared}</div>");
+    }
+    let linked = linkify_text_segment(&esc(answer), from);
+    format!("<div class=\"body feed-body\" style=\"white-space:pre-wrap\">{linked}</div>")
 }
 
 /// Drop the Ice Cubes parent teaser (`↩` + up to 140 chars, then a blank line)
@@ -3120,15 +3643,19 @@ fn drop_leading_reply_bake_paragraph(html: &str) -> Option<String> {
 /// Full post actions (reply, quote, boost, like, bookmark). Overflow needs a
 /// viewer actor; [`paint_lean_embed_from`] is the path that has one.
 pub fn paint_lean_embed(status: &Value, hide_header: bool) -> String {
-    paint_lean_embed_from(status, hide_header, "mentions", "")
+    paint_lean_embed_from(status, hide_header, "mentions", "", true)
 }
 
 /// Lean status card HTML with `from=` deep-link context (Mentions nest or Home fill).
+///
+/// `show_actions` is false for a post nested inside a quote-boost. The action
+/// bar belongs to the quoting post, on Notifications and on timelines.
 pub fn paint_lean_embed_from(
     status: &Value,
     hide_header: bool,
     from: &str,
     viewer_actor: &str,
+    show_actions: bool,
 ) -> String {
     let account = status.get("account").cloned().unwrap_or(Value::Null);
     let acct = account
@@ -3347,7 +3874,8 @@ pub fn paint_lean_embed_from(
     // Prefer original status HTML (mentions/hashtags/links + correct entities).
     // strip_tags+esc dropped <a> and double-encoded &#039; / &quot; into visible codes (0.7.13).
     // 0.7.14: rewrite anchors in-app, linkify bare URLs, tighten breaks, paint OG cards.
-    let content_trim = content_html.trim();
+    let facet_html = apply_bsky_facet_anchors(content_html.trim(), status);
+    let content_trim = facet_html.as_str();
     let poll_html = poll_block_html(status, from);
     // Local poll posts store the sentinel "(poll)" when the question text is empty.
     let poll_sentinel = !poll_html.is_empty() && plain.trim() == "(poll)";
@@ -3357,7 +3885,7 @@ pub fn paint_lean_embed_from(
         .or_else(|| ask_card_parts(content_trim))
     {
         body_inner.push_str(&ask_html);
-        body_inner.push_str(&ask_answer_html(&answer));
+        body_inner.push_str(&ask_answer_html(&answer, from));
     } else if content_looks_like_html(content_trim) {
         let prepared = prepare_feed_body_html(content_trim, from);
         body_inner.push_str(&format!(
@@ -3415,11 +3943,10 @@ pub fn paint_lean_embed_from(
         .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
     {
         let q = normalized_quote_preview(q_raw);
-        // Quote-boosts in Notifications keep the same action row as the outer
-        // reply, including overflow. Downgrading the nest to Open-only dropped
-        // Boost / Block / Mute / Report on scrolled Fediverse quotes.
+        // The quoted post is context. Its reply, boost, like, and overflow
+        // rows stay on the quote-boost that contains it.
         let quote_from = if from.is_empty() { "mentions" } else { from };
-        let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor);
+        let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor, false);
         inner.push_str(&format!(
             "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{q_html}</div>"
         ));
@@ -3428,9 +3955,11 @@ pub fn paint_lean_embed_from(
     // Full action bar on Home / Local / Federated / profiles / outbox and
     // Notifications. PHP's notification cards expose the same interaction
     // set as timeline cards: reply, quote, boost, favourite, and bookmark.
-    if matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox" | "mentions") {
+    // Nested quotes pass show_actions=false so only the quote-boost is actionable.
+    // The Open fallback is an action row too; a quoted post keeps its timestamp link.
+    if show_actions && matches!(from, "home" | "local" | "feed" | "remote_profile" | "outbox" | "mentions") {
         inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
-    } else if !uri.is_empty() {
+    } else if show_actions && !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
         let open = format!(
             "?view=status&object={}&from={}",
@@ -3496,9 +4025,10 @@ pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str)
                 .unwrap_or("");
             let booster_label = if booster_ref.starts_with("https://") {
                 format!(
-                    "<a href=\"?view=remote_profile&amp;actor={}&amp;from={}\" style=\"color:inherit;text-decoration:none\">{}</a>",
+                    "<a href=\"?view=remote_profile&amp;actor={}&amp;from={}\" data-profile-hover-actor=\"{}\" style=\"color:inherit;text-decoration:none\">{}</a>",
                     urlencoding_encode(booster_ref),
                     urlencoding_encode(from_q),
+                    esc(booster_ref),
                     esc(booster_name)
                 )
             } else {
@@ -3519,7 +4049,7 @@ pub fn paint_lean_feed_card_opts(status: &Value, from: &str, viewer_actor: &str)
     // so timeline items stay `<article class="tweet">` peers (matching PHP).
     // Boost chrome must live *inside* that article with class tweet-boost — wrapping
     // in a div breaks `.timeline-feed #timeline-items > article.tweet` separators.
-    let painted = paint_lean_embed_from(&st, false, from_q, viewer_actor);
+    let painted = paint_lean_embed_from(&st, false, from_q, viewer_actor, true);
     let article = if let Some(start) = painted.find("<article") {
         if let Some(end) = painted.rfind("</article>") {
             painted[start..end + "</article>".len()].to_string()
@@ -3682,6 +4212,182 @@ mod tests {
     }
 
     #[test]
+    fn hyphenated_https_host_stays_one_link_and_backticks_become_code() {
+        let raw = "https://doc.rust-lang.org/cargo/reference/timings.html";
+        let out = linkify_text_segment(raw, "status");
+        assert!(
+            out.contains("href=\"https://doc.rust-lang.org/cargo/reference/timings.html\""),
+            "{out}"
+        );
+        assert!(!out.contains("rust-https://"), "{out}");
+        assert!(!out.contains("https://lang.org"), "{out}");
+        let html = prepare_feed_body_html(
+            "<p>run `cargo build --timings`. docs at <a href=\"https://doc.rust-lang.org/cargo/reference/timings.html\" target=\"_blank\" rel=\"nofollow noopener noreferrer\">https://doc.rust-lang.org/cargo/reference/timings.html</a></p>",
+            "status",
+        );
+        assert!(html.contains("<code>cargo build --timings</code>"), "{html}");
+        assert!(!html.contains("`cargo"), "{html}");
+        assert!(
+            html.contains("https://doc.rust-lang.org/cargo/reference/timings.html"),
+            "{html}"
+        );
+        assert!(!html.contains("rust-https://"), "{html}");
+        assert!(!html.contains("https://lang.org"), "{html}");
+    }
+
+    #[test]
+    fn linkifies_scheme_less_host_paths_and_keeps_truncated_labels_plain() {
+        let out = linkify_text_segment(
+            "see bsky.app/profile/alice.bsky.social/post/3abc and skytrace.aly.town/profile/did:...",
+            "home",
+        );
+        assert!(
+            out.contains("bsky.app/profile/alice.bsky.social/post/3abc")
+                && (out.contains("https://bsky.app/profile/alice.bsky.social/post/3abc")
+                    || out.contains("https%3A%2F%2Fbsky.app%2Fprofile%2Falice.bsky.social%2Fpost%2F3abc")),
+            "complete scheme-less url: {out}"
+        );
+        assert!(
+            out.contains("skytrace.aly.town/profile/did:...")
+                && !out.contains("skytrace.aly.town/profile/did\""),
+            "truncated label must not become a fake url: {out}"
+        );
+        assert!(
+            !out.contains("href=\"https://skytrace.aly.town"),
+            "truncated label must stay plain: {out}"
+        );
+    }
+
+    #[test]
+    fn linkify_survives_multibyte_text_around_urls() {
+        let curly = "5 Burning Questions We Have About the Ending of ‘Carrie’";
+        let arrow = "↩ I like how Clearsky doesn't appear to work anymore";
+        let mixed = "‘note’ bsky.app/profile/alice.bsky.social/post/3abc then skytrace.aly.town/profile/did:...";
+        for sample in [curly, arrow, mixed] {
+            let _ = linkify_text_segment(sample, "home");
+            let _ = prepare_feed_body_html(&format!("<p>{sample}</p>"), "home");
+        }
+        let out = linkify_text_segment(mixed, "home");
+        assert!(
+            out.contains("https://bsky.app/profile/alice.bsky.social/post/3abc")
+                || out.contains("https%3A%2F%2Fbsky.app%2Fprofile%2Falice.bsky.social%2Fpost%2F3abc"),
+            "{out}"
+        );
+        assert!(!out.contains("href=\"https://skytrace.aly.town"), "{out}");
+    }
+
+    #[test]
+    fn facet_uri_makes_truncated_bluesky_label_clickable() {
+        let st = json!({
+            "vaak_bsky_text": "see bsky.app/profile/maxm...",
+            "vaak_bsky_facets": [{
+                "index": {"byteStart": 4, "byteEnd": 28},
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": "https://bsky.app/profile/maxmuller94.bsky.social/post/3mlthxg6gjk2e"
+                }]
+            }]
+        });
+        let html = apply_bsky_facet_anchors("see bsky.app/profile/maxm...", &st);
+        assert!(
+            html.contains("href=\"https://bsky.app/profile/maxmuller94.bsky.social/post/3mlthxg6gjk2e\""),
+            "{html}"
+        );
+        assert!(html.contains(">bsky.app/profile/maxm...</a>"), "{html}");
+        assert!(!html.contains("href=\"https://bsky.app/profile/maxm..."), "{html}");
+        let painted = paint_lean_embed_from(
+            &json!({
+                "id": "1",
+                "uri": "at://did:plc:example/app.bsky.feed.post/abc",
+                "content": "<p>see bsky.app/profile/maxm...</p>",
+                "created_at": "2026-10-07T12:00:00.000Z",
+                "account": {"acct": "fox.bsky.social", "display_name": "Fox", "url": "https://bsky.app/profile/fox.bsky.social"},
+                "vaak_bsky_text": "see bsky.app/profile/maxm...",
+                "vaak_bsky_facets": st["vaak_bsky_facets"]
+            }),
+            true,
+            "mentions",
+            "",
+            true,
+        );
+        assert!(
+            painted.contains("bsky.app/profile/maxm...</a>")
+                && (painted.contains("https://bsky.app/profile/maxmuller94.bsky.social/post/3mlthxg6gjk2e")
+                    || painted.contains("https%3A%2F%2Fbsky.app%2Fprofile%2Fmaxmuller94.bsky.social%2Fpost%2F3mlthxg6gjk2e")),
+            "{painted}"
+        );
+        assert!(painted.contains("margin:0 0 0.45em") || !painted.contains("0.35em"), "{painted}");
+    }
+
+    #[test]
+    fn bsky_youtube_facet_overshoot_links_visible_label() {
+        let text = "watch youtube.com/watch?v=ujkD...";
+        let st = json!({
+            "vaak_bsky_text": text,
+            "vaak_bsky_facets": [{
+                "index": {"byteStart": 6, "byteEnd": text.len() + 3},
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": "https://youtube.com/watch?v=ujkD4SxPKOI&is=abc"
+                }]
+            }]
+        });
+        let html = apply_bsky_facet_anchors(text, &st);
+        assert!(html.contains("href=\"https://youtube.com/watch?v=ujkD4SxPKOI&amp;is=abc\""), "{html}");
+        assert!(html.contains(">youtube.com/watch?v=ujkD...</a>"), "{html}");
+        let far = json!({
+            "vaak_bsky_text": text,
+            "vaak_bsky_facets": [{
+                "index": {"byteStart": 6, "byteEnd": text.len() + 400},
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": "https://youtube.com/watch?v=ujkD4SxPKOI"
+                }]
+            }]
+        });
+        let plain = apply_bsky_facet_anchors(text, &far);
+        assert!(!plain.contains("href=\"https://youtube.com"), "{plain}");
+    }
+
+    #[test]
+    fn bsky_youtube_facet_paints_playable_card() {
+        let st = json!({
+            "id": "1",
+            "uri": "at://did:plc:example/app.bsky.feed.post/abc",
+            "content": "<p>youtube.com/watch?v=ujkD...</p>",
+            "created_at": "2026-10-08T12:00:00.000Z",
+            "account": {
+                "acct": "fox.bsky.social",
+                "display_name": "Fox",
+                "url": "https://bsky.app/profile/fox.bsky.social"
+            },
+            "media_attachments": [],
+            "vaak_bsky_text": "youtube.com/watch?v=ujkD...",
+            "vaak_bsky_facets": [{
+                "index": {"byteStart": 0, "byteEnd": 27},
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#link",
+                    "uri": "https://youtube.com/watch?v=ujkD4SxPKOI&is=abc"
+                }]
+            }]
+        });
+        let html = paint_lean_embed_from(&st, false, "home", "", true);
+        assert!(html.contains("data-youtube-id=\"ujkD4SxPKOI\""), "{html}");
+        assert!(html.contains("data-youtube-play"), "{html}");
+        assert!(html.contains("youtube-link-card"), "{html}");
+        assert!(html.contains(">youtube.com/watch?v=ujkD...</a>"), "{html}");
+        assert!(!html.contains("href=\"https://youtube.com/watch?v=ujkD..."), "{html}");
+        let mut with_media = st.clone();
+        with_media["media_attachments"] = json!([{
+            "type": "image",
+            "url": "https://example.com/a.jpg"
+        }]);
+        let media_html = paint_lean_embed_from(&with_media, false, "home", "", true);
+        assert!(!media_html.contains("youtube-link-card"), "{media_html}");
+        assert!(media_html.contains(">youtube.com/watch?v=ujkD...</a>"), "{media_html}");
+    }
+
+    #[test]
     fn linkifies_plain_handles_and_hashtags() {
         let out = linkify_text_segment(
             "hi @alice@mastodon.social and @bob.bsky.social see #fediverse",
@@ -3757,6 +4463,7 @@ mod tests {
             true,
             "mentions",
             "https://mkultra.monster/users/cmdr_nova",
+            true,
         );
         assert!(html.contains("in reply to"), "{html}");
         assert!(html.contains("@cmdr_nova"), "{html}");
@@ -3768,7 +4475,7 @@ mod tests {
             !html.contains("i don") && !html.contains("display properly"),
             "baked parent preview must not be painted beside in-reply-to: {html}"
         );
-        let home = paint_lean_embed_from(&st, false, "home", "");
+        let home = paint_lean_embed_from(&st, false, "home", "", true);
         assert!(
             home.contains("display properly"),
             "Home must keep the teaser; only Mentions nests strip it: {home}"
@@ -3870,6 +4577,36 @@ mod tests {
         assert!(html.contains("data-bsky-action=\"bookmark\""), "{html}");
         assert!(html.contains("cw-gate"), "Bluesky sensitive must gate: {html}");
         assert!(html.contains("class=\"mention\"") && html.contains("@alice.bsky.social"), "{html}");
+        assert!(html.contains("aria-pressed=\"true\""), "stored like must stay pressed: {html}");
+    }
+
+    #[test]
+    fn bsky_ingest_record_does_not_mark_another_account() {
+        let st = json!({
+            "id": "bsky:abc",
+            "uri": "at://did:plc:test/app.bsky.feed.post/rkey1",
+            "url": "https://bsky.app/profile/did:plc:test/post/rkey1",
+            "content": "<p>hello</p>",
+            "created_at": "2026-10-05T05:00:00.000Z",
+            "source": "bluesky",
+            "bsky_cid": "cid123",
+            "favourited": false,
+            "reblogged": false,
+            "bookmarked": false,
+            "vaak_bsky_like_record": "at://did:plc:other/app.bsky.feed.like/abc",
+            "vaak_bsky_repost_record": "at://did:plc:other/app.bsky.feed.repost/abc",
+            "account": {
+                "acct": "test.bsky.social",
+                "display_name": "Test",
+                "avatar": "https://example.com/a.png",
+                "uri": "https://bsky.app/profile/test.bsky.social"
+            },
+            "media_attachments": []
+        });
+        let html = paint_lean_feed_card(&st);
+        assert!(!html.contains("Unlike"), "foreign like record must not stick: {html}");
+        assert!(!html.contains("Undo boost"), "foreign repost record must not stick: {html}");
+        assert!(html.contains("aria-pressed=\"false\""), "{html}");
     }
 
     #[test]
@@ -3973,8 +4710,12 @@ mod tests {
         let para = prepare_feed_body_html("<p>one<br />\n<br />\ntwo</p>", "home");
         let lower = para.to_ascii_lowercase();
         assert!(
-            lower.matches("<p>").count() >= 2,
+            lower.matches("<p>").count() + lower.matches("<p ").count() >= 2,
             "double br should become separate p tags: {para}"
+        );
+        assert!(
+            para.contains("margin-top:0.45em"),
+            "paragraph break keeps 0.45em: {para}"
         );
         assert!(
             !lower.contains("<br><br>") && !lower.contains("<br /><br"),
@@ -3985,7 +4726,7 @@ mod tests {
         let tight = prepare_feed_body_html("<p>one<br /><br /><br />two</p>", "home");
         let lower_t = tight.to_ascii_lowercase();
         assert!(
-            lower_t.matches("<p>").count() >= 2,
+            lower_t.matches("<p>").count() + lower_t.matches("<p ").count() >= 2,
             "3+ breaks should still become paragraphs: {tight}"
         );
         assert!(tight.contains("one") && tight.contains("two"), "{tight}");
@@ -3995,6 +4736,10 @@ mod tests {
         let soft_l = soft.to_ascii_lowercase();
         assert_eq!(soft_l.matches("<p>").count(), 1, "soft br stays one p: {soft}");
         assert!(soft_l.contains("<br"), "soft br preserved: {soft}");
+        assert!(
+            !soft.contains("margin-top:"),
+            "a single paragraph does not add the break gap: {soft}"
+        );
     }
 
     #[test]
@@ -4038,14 +4783,16 @@ mod tests {
     #[test]
     fn does_not_explode_sibling_paragraphs() {
         let html = prepare_feed_body_html("<p>a</p><p>b<br><br>c</p>", "home");
+        let lower = html.to_ascii_lowercase();
         assert_eq!(
-            html.to_ascii_lowercase().matches("<p>").count(),
-            html.to_ascii_lowercase().matches("</p>").count(),
+            lower.matches("<p>").count() + lower.matches("<p ").count(),
+            lower.matches("</p>").count(),
             "{html}"
         );
         // Second paragraph splits safely; first stays intact.
         assert!(html.contains("<p>a</p>"), "{html}");
-        assert!(html.contains("<p>b</p>") && html.contains("<p>c</p>"), "{html}");
+        assert!(html.contains(">b</p>") && html.contains(">c</p>"), "{html}");
+        assert_eq!(html.matches("margin-top:0.45em").count(), 2, "{html}");
         assert!(!html.contains("<p>b<p>"), "no nested p smash: {html}");
     }
 
@@ -4210,6 +4957,11 @@ mod tests {
         assert!(html.contains("nested"), "quoted_status envelope must render its nested body: {html}");
         assert!(html.contains("outer.jpg"), "envelope media must survive quote normalization: {html}");
         assert!(!html.contains("class=\"link-card\""), "should dedupe OG card: {html}");
+        assert_eq!(
+            html.matches("class=\"tweet-actions\"").count(),
+            1,
+            "timeline quote-boosts keep actions on the quoting post only: {html}"
+        );
     }
 
     #[test]
@@ -4577,14 +5329,28 @@ mod tests {
             "created_at": "2026-10-05T05:00:00.000Z",
             "account": {"acct":"cmdr_nova","display_name":"Cmdr Nova","avatar":"https://example.com/a.png","uri":"https://mkultra.monster/users/cmdr_nova"},
             "media_attachments": [],
-            "vaak_ask": {"ask_actor":"https://example.com/users/asker","ask_question":"What is VAAK?","ask_answer":"A social wire."}
+            "vaak_ask": {
+                "ask_actor":"https://example.com/users/asker",
+                "ask_question":"What is VAAK?",
+                "ask_answer":"A social wire.",
+                "asker_display":"Asker Name",
+                "asker_handle":"@asker@example.com",
+                "asker_avatar":"https://example.com/asker.png"
+            }
         });
         let html = paint_lean_feed_card(&st);
         assert!(html.contains("ask-container"), "{html}");
+        assert!(html.contains("ask-avatar"), "{html}");
+        assert!(html.contains("https://example.com/asker.png"), "{html}");
+        assert!(html.contains("Asker Name"), "{html}");
+        assert!(html.contains("@asker@example.com"), "{html}");
+        assert!(html.contains("ask-handle"), "{html}");
         assert!(html.contains("What is VAAK?"), "{html}");
         assert!(html.contains("A social wire."), "{html}");
-        assert!(html.contains("ask-divider"), "{html}");
-        assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
+        assert!(!html.contains("ask-divider"), "{html}");
+        assert!(!html.contains("ask-answer"), "{html}");
+        assert!(html.contains("feed-body"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
         assert!(!html.contains("legacy flattened ask"), "{html}");
     }
 
@@ -4599,8 +5365,10 @@ mod tests {
         assert!(html.contains("ask-container"), "{html}");
         assert!(html.contains("What is VAAK?"), "{html}");
         assert!(html.contains("A social bridge."), "{html}");
-        assert!(html.contains("ask-divider"), "{html}");
-        assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
+        assert!(html.contains("@asker@example.test asked"), "{html}");
+        assert!(!html.contains("ask-divider"), "{html}");
+        assert!(!html.contains("ask-answer"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
     }
 
     #[test]
@@ -4614,7 +5382,9 @@ mod tests {
         assert!(html.contains("ask-container"), "{html}");
         assert!(html.contains("thoughts on crows and ravens?"), "{html}");
         assert!(html.contains("give them shiny stuff"), "{html}");
-        assert!(html.find("ask-container").unwrap() < html.find("ask-answer").unwrap(), "{html}");
+        assert!(html.contains("anonymous asked"), "{html}");
+        assert!(!html.contains("ask-divider"), "{html}");
+        assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
     }
 
 }

@@ -112,23 +112,6 @@ fn empty_account(actor_url: &str, username: &str, display: &str, avatar: &str) -
     })
 }
 
-fn actor_username_from_object_url(url: &str) -> String {
-    let parts: Vec<&str> = url.trim_end_matches('/').split('/').collect();
-    for marker in ["statuses", "posts", "notes", "objects"] {
-        if let Some(pos) = parts.iter().position(|part| part.eq_ignore_ascii_case(marker)) {
-            if pos > 0 && !parts[pos - 1].is_empty() {
-                return parts[pos - 1].trim_start_matches('@').to_string();
-            }
-        }
-    }
-    parts
-        .iter()
-        .rev()
-        .find(|part| !part.is_empty())
-        .map(|part| part.trim_start_matches('@').to_string())
-        .unwrap_or_else(|| "unknown".into())
-}
-
 /// Mastodon-style video attachments need an image poster; browsers ignore an
 /// MP4 used directly as `<video poster>`. Keep profile tabs in parity with the
 /// Home hydrate path.
@@ -241,14 +224,6 @@ fn quote_target_from_raw_create(raw: &str) -> String {
         }
     }
     String::new()
-}
-
-struct AnnouncePaintRow {
-    id: i64,
-    actor_id: String,
-    object_id: String,
-    created_at: String,
-    summary: String,
 }
 
 async fn load_viewer_actor(db: &Client, owner_id: i64) -> Result<String> {
@@ -563,43 +538,6 @@ async fn fetch_outbox_tab(
     Ok(out)
 }
 
-async fn fetch_boosts_tab(
-    db: &Client,
-    actor_url: &str,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<AnnouncePaintRow>> {
-    let actor_slash = format!("{actor_url}/");
-    let rows = db
-        .query(
-            "SELECT id, COALESCE(actor_id, ''), COALESCE(object_id, ''),
-                    COALESCE(created_at::text, ''), COALESCE(summary, '')
-             FROM (
-               SELECT DISTINCT ON (object_id) *
-               FROM events
-               WHERE type = 'Announce' AND (actor_id = $1 OR actor_id = $2)
-               ORDER BY object_id,
-                 CASE WHEN action_taken = 'boost_ok' THEN 0 ELSE 1 END,
-                 created_at DESC, id DESC
-             ) AS profile_events
-             ORDER BY created_at DESC, id DESC
-             LIMIT $3 OFFSET $4",
-            &[&actor_url, &actor_slash, &limit, &offset],
-        )
-        .await
-        .context("select profile Announce events")?;
-    Ok(rows
-        .into_iter()
-        .map(|row| AnnouncePaintRow {
-            id: row.get(0),
-            actor_id: row.get(1),
-            object_id: row.get(2),
-            created_at: row.get(3),
-            summary: row.get(4),
-        })
-        .collect())
-}
-
 fn materialize_outbox_status(row: &OutboxPaintRow, account: &Value) -> Value {
     let created = format_published(&row.published);
     let content = if !row.content.trim().is_empty() {
@@ -693,233 +631,6 @@ fn html_escape_text(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn materialize_announce_status(
-    ann: &AnnouncePaintRow,
-    booster: &Value,
-    inner: Option<Value>,
-) -> Value {
-    let created = format_published(&ann.created_at);
-    let object_id = ann.object_id.trim_end_matches('/');
-    let mut inner_st = inner.unwrap_or_else(|| {
-        let plain = ann.summary.trim();
-        let content = if plain.is_empty() || plain.eq_ignore_ascii_case("(boost)") {
-            String::new()
-        } else {
-            format!("<p>{}</p>", html_escape_text(plain))
-        };
-        let thin_acct = {
-            let username = actor_username_from_object_url(object_id);
-            // Prefer /users/{name}/notes/… username.
-            let uname = if let Some(rest) = object_id.strip_prefix(LOCAL_ACTOR_PREFIX) {
-                rest.split('/').next().unwrap_or(&username)
-            } else {
-                username.as_str()
-            };
-            empty_account(object_id, uname, uname, DEFAULT_AVATAR)
-        };
-        json!({
-            "id": format!("boost-inner:{}", ann.id),
-            "created_at": created,
-            "sensitive": false,
-            "spoiler_text": "",
-            "visibility": "public",
-            "uri": object_id,
-            "url": object_id,
-            "content": content,
-            "account": thin_acct,
-            "media_attachments": [],
-            "reblog": Value::Null,
-            "favourited": false,
-            "reblogged": false,
-            "bookmarked": false,
-            "pinned": false,
-        })
-    });
-    inner_st["reblog"] = Value::Null;
-    if object_id.starts_with("https://") {
-        inner_st["uri"] = json!(object_id);
-        inner_st["url"] = json!(object_id);
-    }
-    let uri = if object_id.is_empty() {
-        format!("{}#announce-{}", ann.actor_id.trim_end_matches('/'), ann.id)
-    } else {
-        format!("{object_id}#announce-{}", ann.id)
-    };
-    json!({
-        "id": format!("announce:{}", ann.id),
-        "created_at": created,
-        "sensitive": false,
-        "spoiler_text": "",
-        "visibility": "public",
-        "uri": uri,
-        "url": if object_id.is_empty() { ann.actor_id.trim_end_matches('/').to_string() } else { object_id.to_string() },
-        "content": "",
-        "account": booster,
-        "media_attachments": [],
-        "reblog": inner_st,
-        "favourited": false,
-        "reblogged": false,
-        "bookmarked": false,
-        "pinned": false,
-        "vaak_announce_event_id": ann.id,
-    })
-}
-
-async fn hydrate_announce_inners(
-    db: &Client,
-    anns: &[AnnouncePaintRow],
-) -> Result<std::collections::HashMap<String, Value>> {
-    let mut map = std::collections::HashMap::new();
-    let mut note_ids = Vec::new();
-    for a in anns {
-        let oid = a.object_id.trim_end_matches('/');
-        if oid.starts_with(LOCAL_ACTOR_PREFIX) && oid.contains("/notes/") {
-            note_ids.push(oid.to_string());
-            note_ids.push(format!("{oid}/"));
-        }
-    }
-    for a in anns {
-        let oid = a.object_id.trim_end_matches('/');
-        if !oid.is_empty() {
-            note_ids.push(oid.to_string());
-            note_ids.push(format!("{oid}/"));
-        }
-    }
-    note_ids.sort();
-    note_ids.dedup();
-    let rows = db
-        .query(
-            "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
-                    COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
-             FROM outbox_notes WHERE id = ANY($1)",
-            &[&note_ids],
-        )
-        .await
-        .context("select announce inner outbox")?;
-    // Batch masto for local_id when present.
-    let mut paint_rows = Vec::new();
-    for row in rows {
-        paint_rows.push(OutboxPaintRow {
-            id: row.get(0),
-            published: row.get(1),
-            content: row.get(2),
-            raw_create_json: row.get(3),
-            in_reply_to: row.get(4),
-            local_id: None,
-            spoiler_text: String::new(),
-            sensitive: false,
-            visibility: "public".into(),
-            content_text: String::new(),
-            pinned: false,
-            ask_actor: String::new(),
-            ask_question: String::new(),
-            ask_answer: String::new(),
-            quote_object: String::new(),
-        });
-    }
-    let mut variants = note_ids.clone();
-    if !variants.is_empty() {
-        if let Ok(masto) = db
-            .query(
-                "SELECT note_id, local_id, COALESCE(spoiler_text, ''), COALESCE(sensitive, 0),
-                        COALESCE(visibility, 'public'), COALESCE(content_text, '')
-                 FROM masto_statuses WHERE note_id = ANY($1)",
-                &[&variants],
-            )
-            .await
-        {
-            let mut by_note = std::collections::HashMap::new();
-            for m in masto {
-                let note_id: String = m.get(0);
-                let sens_i: i64 = m.get(3);
-                by_note.insert(
-                    note_id.trim_end_matches('/').to_string(),
-                    (
-                        m.get::<_, i64>(1),
-                        m.get::<_, String>(2),
-                        sens_i != 0,
-                        m.get::<_, String>(4),
-                        m.get::<_, String>(5),
-                    ),
-                );
-            }
-            for r in &mut paint_rows {
-                let key = r.id.trim_end_matches('/').to_string();
-                if let Some((lid, spoiler, sens, vis, ctext)) = by_note.get(&key) {
-                    r.local_id = Some(*lid);
-                    r.spoiler_text = spoiler.clone();
-                    r.sensitive = *sens;
-                    r.visibility = vis.clone();
-                    r.content_text = ctext.clone();
-                }
-            }
-        }
-    }
-    // Remote originals live in the event ledger rather than outbox_notes.
-    // Hydrate those Create rows so profile boosts do not degrade to empty
-    // synthetic cards.
-    if let Ok(events) = db
-        .query(
-            "SELECT id, actor_id, object_id, COALESCE(summary,''),
-                    COALESCE(created_at::text,''), COALESCE(host,'')
-             FROM events
-             WHERE type = 'Create' AND object_id = ANY($1)
-             ORDER BY id DESC",
-            &[&variants],
-        )
-        .await
-    {
-        for event in events {
-            let object_id: String = event.get(2);
-            let key = object_id.trim_end_matches('/').to_string();
-            if map.contains_key(&key) {
-                continue;
-            }
-            let actor_id: String = event.get(1);
-            let username = actor_username_from_object_url(&actor_id);
-            let summary: String = event.get(3);
-            let content = if summary.trim().is_empty() {
-                String::new()
-            } else {
-                format!("<p>{}</p>", html_escape_text(&summary))
-            };
-            let inner = json!({
-                "id": format!("event-inner:{}", event.get::<_, i64>(0)),
-                "created_at": format_published(&event.get::<_, String>(4)),
-                "sensitive": false,
-                "spoiler_text": "",
-                "visibility": "public",
-                "uri": key,
-                "url": key,
-                "content": content,
-                "account": empty_account(&actor_id, &username, &username, DEFAULT_AVATAR),
-                "media_attachments": [],
-                "reblog": Value::Null,
-                "favourited": false,
-                "reblogged": false,
-                "bookmarked": false,
-                "pinned": false,
-            });
-            map.insert(key, inner);
-        }
-    }
-    for r in &paint_rows {
-        let key = r.id.trim_end_matches('/').to_string();
-        let username = key
-            .strip_prefix(LOCAL_ACTOR_PREFIX)
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or("unknown");
-        let account = empty_account(
-            &format!("{LOCAL_ACTOR_PREFIX}{username}"),
-            username,
-            username,
-            DEFAULT_AVATAR,
-        );
-        map.insert(key, materialize_outbox_status(r, &account));
-    }
-    Ok(map)
-}
-
 /// Build local profile tab HTML (posts / replies / media / boosts).
 pub async fn profile_html_fill(
     cfg: &Config,
@@ -952,19 +663,23 @@ pub async fn profile_html_fill(
 
     let mut statuses: Vec<Value> = Vec::new();
     let mut has_more = false;
+    let mut boost_cursor: Option<i64> = None;
 
     if tab == "boosts" {
-        let mut rows = fetch_boosts_tab(&db, &actor, fetch_n, offset).await?;
-        if rows.len() as i64 > limit {
-            has_more = true;
-            rows.truncate(limit as usize);
-        }
-        let inners = hydrate_announce_inners(&db, &rows).await?;
-        for ann in &rows {
-            let oid = ann.object_id.trim_end_matches('/');
-            let inner = inners.get(oid).cloned();
-            statuses.push(materialize_announce_status(ann, &account, inner));
-        }
+        // Durable masto_reblogs history, hydrated like Home/Local (RSS, Bluesky,
+        // cached Fediverse creates). The cursor counts source rows, including
+        // ones skipped because the original is not cached.
+        let page = crate::home_hydrate_ranked::load_profile_boost_page(
+            &db,
+            &actor,
+            viewer_owner_id,
+            limit,
+            offset,
+        )
+        .await?;
+        statuses = page.statuses;
+        has_more = page.has_more;
+        boost_cursor = Some(page.next_offset);
     } else {
         let mut rows = fetch_outbox_tab(&db, &prefix, &tab, fetch_n, offset).await?;
         if rows.len() as i64 > limit {
@@ -977,6 +692,26 @@ pub async fn profile_html_fill(
     }
 
     if statuses.is_empty() {
+        // An empty Axum body makes PHP fall back to the short Announce list.
+        // Keep the source cursor on the wire when this page had nothing to paint.
+        if tab == "boosts" {
+            if has_more || offset > 0 {
+                return Ok(Some(ProfileHtmlReport {
+                    html: "<!--profile-boosts-skip-->".into(),
+                    count: 0,
+                    has_more,
+                    next_offset: boost_cursor.unwrap_or(offset).max(0) as usize,
+                    source: "axum-profile-html".into(),
+                }));
+            }
+            return Ok(Some(ProfileHtmlReport {
+                html: "<div class=\"empty\">No boosts yet.</div>".into(),
+                count: 0,
+                has_more: false,
+                next_offset: 0,
+                source: "axum-profile-html".into(),
+            }));
+        }
         return Ok(None);
     }
 
@@ -987,8 +722,10 @@ pub async fn profile_html_fill(
     let _ = crate::home_hydrate_ranked::hydrate_local_quote_targets(&db, &mut statuses).await;
 
     // Live fav/boost/bookmark from masto_* (same as Home lean / Ice Cubes, 0.7.19).
+    // owner 0 still clears baked flags so a signed-out profile does not keep
+    // another account's like or boost.
+    let _ = crate::interaction_flags::apply_to_statuses(&db, viewer_owner_id, &mut statuses).await;
     if viewer_owner_id > 0 {
-        let _ = crate::interaction_flags::apply_to_statuses(&db, viewer_owner_id, &mut statuses).await;
         if let Ok(moderation) =
             crate::hidden::load_viewer_moderation(&db, viewer_owner_id).await
         {
@@ -1006,11 +743,19 @@ pub async fn profile_html_fill(
             if let Ok(fetched) = fetch_outbox_statuses_by_uris(&db, &need).await {
                 extra_parents = fetched;
             }
+            let _ = crate::interaction_flags::apply_to_status_map(
+                &db,
+                viewer_owner_id,
+                &mut extra_parents,
+            )
+            .await;
         }
         // Point in_reply_to_id at parent status id when parent is present.
         crate::home_hydrate_ranked::link_outbox_reply_ids(&mut statuses);
     }
     let _ = crate::home_hydrate_ranked::attach_polls(&db, &mut statuses, &viewer_actor).await;
+    let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut statuses).await;
+    let _ = crate::home_hydrate_ranked::attach_ask_identities(&db, &mut statuses).await;
     if !extra_parents.is_empty() {
         let keys: Vec<String> = extra_parents.keys().cloned().collect();
         let mut vals = Vec::with_capacity(keys.len());
@@ -1020,6 +765,7 @@ pub async fn profile_html_fill(
             }
         }
         let _ = crate::home_hydrate_ranked::attach_polls(&db, &mut vals, &viewer_actor).await;
+        let _ = crate::home_hydrate_ranked::attach_ask_identities(&db, &mut vals).await;
         for (key, value) in keys.into_iter().zip(vals) {
             extra_parents.insert(key, value);
         }
@@ -1028,14 +774,29 @@ pub async fn profile_html_fill(
     let paint = |st: &Value, from: &str, viewer: &str| paint_lean_feed_card_opts(st, from, viewer);
     let (html, painted) = paint_feed_units(&units, "remote_profile", &viewer_actor, &paint);
     if painted == 0 {
+        if tab == "boosts" {
+            return Ok(Some(ProfileHtmlReport {
+                html: "<!--profile-boosts-skip-->".into(),
+                count: 0,
+                has_more,
+                next_offset: boost_cursor.unwrap_or(offset).max(0) as usize,
+                source: "axum-profile-html".into(),
+            }));
+        }
         return Ok(None);
     }
 
+    let next_offset = if let Some(cursor) = boost_cursor {
+        cursor.max(0) as usize
+    } else {
+        // Same rule as Home: collapsed self-reply parents still consume a row.
+        (offset as usize) + statuses.len()
+    };
     Ok(Some(ProfileHtmlReport {
         html,
         count: painted,
         has_more,
-        next_offset: (offset as usize) + painted,
+        next_offset,
         source: "axum-profile-html".into(),
     }))
 }

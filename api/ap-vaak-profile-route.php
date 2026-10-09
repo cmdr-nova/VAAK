@@ -2,9 +2,13 @@
 /**
  * Pretty local profile routing for on-VAAK surfaces.
  *
- * Canonical app path:  /vaak/users/{key}  (mkultra.monster and vaak.monster)
- * Public alias:        /users/{key}       (vaak.monster only — domain mask)
- * Federation / HTML:   /users/{key}       (mkultra.monster — unchanged)
+ * Canonical app path:  /vaak/users/{key} on mkultra.monster.
+ * vaak.monster redirects to that host. /users/{key} and /@{key} on
+ * mkultra.monster stay the actor profile a browser gets when Mastodon
+ * opens "View profile".
+ * Federation JSON:     same /users/{key} URL when Accept prefers
+ *                      activity+json or ld+json. Callers check Accept
+ *                      before booting. Notes, inbox, and feeds stay put.
  */
 declare(strict_types=1);
 
@@ -32,6 +36,19 @@ function ap_vaak_normalize_actor_key(string $raw): string
 }
 
 /**
+ * True for a browser navigation that should see the on-VAAK profile.
+ * Writes and the Jekyll export stay on the legacy profile handlers.
+ */
+function ap_vaak_browser_profile_navigation(): bool
+{
+    $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    if ($method !== 'GET' && $method !== 'HEAD') {
+        return false;
+    }
+    return strtolower((string) ($_GET['format'] ?? '')) !== 'jekyll';
+}
+
+/**
  * If this request is a bare local profile page, return the actor_key.
  * Notes/inbox/feeds/subpaths return null so AP/HTML handlers keep them.
  */
@@ -45,15 +62,24 @@ function ap_vaak_pretty_profile_key_from_request(): ?string
     if (preg_match('#^/vaak/users/([A-Za-z0-9_]+)/?$#', $path, $m)) {
         return strtolower($m[1]);
     }
-    // Domain-mask alias — only on vaak.monster (mkultra /users stays AP + public HTML).
-    if (ap_vaak_is_vaak_host() && preg_match('#^/users/([A-Za-z0-9_]+)/?$#', $path, $m)) {
-        return strtolower($m[1]);
+    if (!preg_match('#^/(?:users/|@)([A-Za-z0-9_]+)/?$#', $path, $m)) {
+        return null;
     }
-    return null;
+    $key = strtolower($m[1]);
+    // vaak.monster /users/{key} is the domain-mask alias for every method.
+    if (ap_vaak_is_vaak_host() && str_starts_with($path, '/users/')) {
+        return $key;
+    }
+    // mkultra /users/{key} and /@{key} are the links Mastodon opens.
+    // A browser gets the on-VAAK guest view. Subpaths never match here.
+    if (!ap_vaak_browser_profile_navigation()) {
+        return null;
+    }
+    return $key;
 }
 
 /**
- * Host-aware pretty profile path for local accounts.
+ * Pretty profile path for local accounts. Always the /vaak/ app path.
  *
  * @param array<string, scalar|null> $query
  */
@@ -61,11 +87,9 @@ function ap_vaak_pretty_profile_path(string $actorKey, array $query = []): strin
 {
     $actorKey = ap_vaak_normalize_actor_key($actorKey);
     if ($actorKey === '') {
-        return ap_vaak_is_vaak_host() ? '/vaak/' : '/vaak/?view=home';
+        return '/vaak/?view=home';
     }
-    $path = ap_vaak_is_vaak_host()
-        ? '/users/' . rawurlencode($actorKey)
-        : '/vaak/users/' . rawurlencode($actorKey);
+    $path = '/vaak/users/' . rawurlencode($actorKey);
     $q = [];
     foreach ($query as $key => $value) {
         if ($value === null || $value === '') {

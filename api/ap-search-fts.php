@@ -397,51 +397,146 @@ function ap_search_fts_query(string $q, int $limit = 40, string $tagName = ''): 
         return [];
     }
     ap_search_fts_maybe_backfill_slice();
+    ap_search_fts_maybe_index_recent_events();
     $match = ap_search_fts_match_query($q, $tagName);
     if ($match === null) {
         return [];
     }
-    $limit = max(1, min(80, $limit));
+    // Web search pages a mixed Fediverse and Bluesky window. Callers ask for
+    // about three hits per status and stop once that window is full. 180 keeps
+    // the later pages in the same ranking. The old 80 clamp ended the mix early.
+    $limit = max(1, min(180, $limit));
     try {
-        if (ap_search_fts_driver() === 'pgsql') {
-            $tsquery = ap_search_fts_postgres_query($match);
-            $st = ap_db()->prepare(
-                "SELECT source, source_pk, object_id, created_at,
-                        ts_rank_cd(body_tsv, to_tsquery('simple', ?)) AS rank
-                 FROM ap_search_docs
-                 WHERE body_tsv @@ to_tsquery('simple', ?)
-                 ORDER BY rank DESC, created_at DESC
-                 LIMIT ?"
-            );
-            $st->execute([$tsquery, $tsquery, $limit]);
-        } else {
-        // bm25: lower is better; order by rank then recency
-            $st = ap_db()->prepare(
-                "SELECT d.source, d.source_pk, d.object_id, d.created_at,
-                        bm25(ap_search_fts) AS rank
-                 FROM ap_search_fts
-                 JOIN ap_search_docs d ON d.id = ap_search_fts.rowid
-                 WHERE ap_search_fts MATCH ?
-                 ORDER BY rank ASC, d.created_at DESC
-                 LIMIT ?"
-            );
-            $st->execute([$match, $limit]);
-        }
-        $out = [];
-        foreach ($st->fetchAll() ?: [] as $row) {
-            $out[] = [
-                'source' => (string) ($row['source'] ?? ''),
-                'source_pk' => (int) ($row['source_pk'] ?? 0),
-                'object_id' => isset($row['object_id']) ? (string) $row['object_id'] : null,
-                'created_at' => (string) ($row['created_at'] ?? ''),
-                'rank' => (float) ($row['rank'] ?? 0),
-            ];
-        }
-        return $out;
+        $pgsql = ap_search_fts_driver() === 'pgsql';
+        $fedi = ap_search_fts_ranked_hits($match, $tagName, $limit, 'fedi', $pgsql);
+        $bsky = ap_search_fts_ranked_hits($match, $tagName, $limit, 'bsky', $pgsql);
+        return ap_search_fts_blend_networks($fedi, $bsky, $limit, $pgsql);
     } catch (Throwable $e) {
         error_log('[ap-search-fts] query: ' . $e->getMessage());
         return [];
     }
+}
+
+/**
+ * Ranked hits from one network. Deleted posts are left out.
+ *
+ * @param 'fedi'|'bsky' $network
+ * @return list<array{source:string,source_pk:int,object_id:?string,created_at:string,rank:float}>
+ */
+function ap_search_fts_ranked_hits(string $match, string $tagName, int $limit, string $network, bool $pgsql): array
+{
+    $sourceSql = $network === 'bsky'
+        ? "d.source = 'bsky_post'"
+        : "d.source IN ('event', 'mention', 'status')";
+    $liveSql = $network === 'bsky'
+        ? "EXISTS (SELECT 1 FROM bsky_posts b WHERE b.bsky_uri = d.object_id)"
+        : "(
+            (d.source = 'event' AND EXISTS (SELECT 1 FROM events e WHERE e.id = d.source_pk))
+         OR (d.source = 'mention' AND EXISTS (SELECT 1 FROM mentions m WHERE m.id = d.source_pk AND m.deleted_at IS NULL))
+         OR (d.source = 'status' AND EXISTS (SELECT 1 FROM masto_statuses s WHERE s.local_id = d.source_pk))
+         )";
+    $tagLike = null;
+    $safeTag = mb_strtolower(preg_replace('/[^\p{L}\p{N}_]/u', '', $tagName) ?? '');
+    if ($safeTag !== '') {
+        $tagLike = '%#' . str_replace(['%', '_'], ['\\%', '\\_'], $safeTag) . '%';
+    }
+    $tagSql = $tagLike !== null ? " AND d.body ILIKE ? ESCAPE '\\'" : '';
+    if (!$pgsql && $tagLike !== null) {
+        $tagSql = " AND lower(d.body) LIKE ? ESCAPE '\\'";
+    }
+    if ($pgsql) {
+        $tsquery = ap_search_fts_postgres_query($match);
+        $st = ap_db()->prepare(
+            "SELECT d.source, d.source_pk, d.object_id, d.created_at,
+                    ts_rank_cd(d.body_tsv, to_tsquery('simple', ?)) AS rank
+             FROM ap_search_docs d
+             WHERE d.body_tsv @@ to_tsquery('simple', ?)
+               AND $sourceSql
+               AND $liveSql
+               $tagSql
+             ORDER BY rank DESC, d.created_at DESC
+             LIMIT ?"
+        );
+        $params = [$tsquery, $tsquery];
+        if ($tagLike !== null) {
+            $params[] = $tagLike;
+        }
+        $params[] = $limit;
+        $st->execute($params);
+    } else {
+        $st = ap_db()->prepare(
+            "SELECT d.source, d.source_pk, d.object_id, d.created_at,
+                    bm25(ap_search_fts) AS rank
+             FROM ap_search_fts
+             JOIN ap_search_docs d ON d.id = ap_search_fts.rowid
+             WHERE ap_search_fts MATCH ?
+               AND $sourceSql
+               AND $liveSql
+               $tagSql
+             ORDER BY rank ASC, d.created_at DESC
+             LIMIT ?"
+        );
+        $params = [$match];
+        if ($tagLike !== null) {
+            $params[] = $tagLike;
+        }
+        $params[] = $limit;
+        $st->execute($params);
+    }
+    $out = [];
+    foreach ($st->fetchAll() ?: [] as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $out[] = [
+            'source' => (string) ($row['source'] ?? ''),
+            'source_pk' => (int) ($row['source_pk'] ?? 0),
+            'object_id' => isset($row['object_id']) ? (string) $row['object_id'] : null,
+            'created_at' => (string) ($row['created_at'] ?? ''),
+            'rank' => (float) ($row['rank'] ?? 0),
+        ];
+    }
+    return $out;
+}
+
+/**
+ * Alternate the two ranked lists so neither network fills the window alone.
+ * The stronger first hit stays first. A one-sided match is returned as-is.
+ *
+ * @param list<array{source:string,source_pk:int,object_id:?string,created_at:string,rank:float}> $fedi
+ * @param list<array{source:string,source_pk:int,object_id:?string,created_at:string,rank:float}> $bsky
+ * @return list<array{source:string,source_pk:int,object_id:?string,created_at:string,rank:float}>
+ */
+function ap_search_fts_blend_networks(array $fedi, array $bsky, int $limit, bool $higherRankIsBetter): array
+{
+    if ($fedi === []) {
+        return array_slice($bsky, 0, $limit);
+    }
+    if ($bsky === []) {
+        return array_slice($fedi, 0, $limit);
+    }
+    $fediFirst = $higherRankIsBetter
+        ? ((float) $fedi[0]['rank'] >= (float) $bsky[0]['rank'])
+        : ((float) $fedi[0]['rank'] <= (float) $bsky[0]['rank']);
+    $out = [];
+    $a = 0;
+    $b = 0;
+    $turnFedi = $fediFirst;
+    while (count($out) < $limit) {
+        if ($turnFedi && $a < count($fedi)) {
+            $out[] = $fedi[$a++];
+        } elseif (!$turnFedi && $b < count($bsky)) {
+            $out[] = $bsky[$b++];
+        } elseif ($a < count($fedi)) {
+            $out[] = $fedi[$a++];
+        } elseif ($b < count($bsky)) {
+            $out[] = $bsky[$b++];
+        } else {
+            break;
+        }
+        $turnFedi = !$turnFedi;
+    }
+    return $out;
 }
 
 /**
@@ -565,6 +660,159 @@ function ap_search_fts_backfill(int $batch = 2500): array
         error_log('[ap-search-fts] backfill: ' . $e->getMessage());
     }
     return $stats;
+}
+
+/**
+ * Index Fediverse events inserted after the last full pass.
+ *
+ * The firehose writer does not update this index. A search only catches the
+ * newest gap, and only when the newest stored event is missing, so a query
+ * does not walk the whole history.
+ */
+function ap_search_fts_maybe_index_recent_events(): void
+{
+    static $last = 0.0;
+    $now = microtime(true);
+    if ($now - $last < 3.0) {
+        return;
+    }
+    $last = $now;
+    if (!ap_search_fts_available()) {
+        return;
+    }
+    try {
+        $db = ap_db();
+        $latest = $db->query(
+            "SELECT id FROM events
+             WHERE type IN ('Create', 'Announce', 'Update', 'Quote', 'QuotePost')
+               AND action_taken IN ('log', 'local_observe', 'compose', 'local_fav_update')
+               AND summary IS NOT NULL AND summary <> ''
+             ORDER BY id DESC
+             LIMIT 1"
+        )->fetchColumn();
+        $latestId = (int) $latest;
+        if ($latestId <= 0) {
+            return;
+        }
+        $have = $db->prepare("SELECT 1 FROM ap_search_docs WHERE source = 'event' AND source_pk = ?");
+        $have->execute([$latestId]);
+        if ($have->fetchColumn()) {
+            return;
+        }
+        $floor = max(0, $latestId - 12000);
+        $st = $db->prepare(
+            "SELECT * FROM events
+             WHERE id > ?
+               AND type IN ('Create', 'Announce', 'Update', 'Quote', 'QuotePost')
+               AND action_taken IN ('log', 'local_observe', 'compose', 'local_fav_update')
+               AND summary IS NOT NULL AND summary <> ''
+               AND NOT EXISTS (
+                    SELECT 1 FROM ap_search_docs d
+                    WHERE d.source = 'event' AND d.source_pk = events.id
+               )
+             ORDER BY id DESC
+             LIMIT 200"
+        );
+        $st->execute([$floor]);
+        foreach ($st->fetchAll() ?: [] as $row) {
+            if (is_array($row)) {
+                ap_search_fts_index_event_row($row);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-search-fts] recent events: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Walk forward from the stored cursor. Maintenance uses this to catch posts
+ * the search-time slice did not reach. Safe to call repeatedly.
+ */
+function ap_search_fts_catch_up_events(int $batch = 1000, int $maxBatches = 20): int
+{
+    if (!ap_search_fts_available()) {
+        return 0;
+    }
+    $batch = max(100, min(5000, $batch));
+    $maxBatches = max(1, min(400, $maxBatches));
+    $cursor = (int) (ap_search_fts_meta_get('event_index_id') ?? '0');
+    $indexed = 0;
+    try {
+        $db = ap_db();
+        $st = $db->prepare(
+            "SELECT * FROM events
+             WHERE id > ?
+               AND type IN ('Create', 'Announce', 'Update', 'Quote', 'QuotePost')
+               AND action_taken IN ('log', 'local_observe', 'compose', 'local_fav_update')
+               AND summary IS NOT NULL AND summary <> ''
+             ORDER BY id ASC
+             LIMIT ?"
+        );
+        for ($i = 0; $i < $maxBatches; $i++) {
+            $st->execute([$cursor, $batch]);
+            $rows = $st->fetchAll() ?: [];
+            if ($rows === []) {
+                break;
+            }
+            foreach ($rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+                ap_search_fts_index_event_row($row);
+                $id = (int) ($row['id'] ?? 0);
+                if ($id > $cursor) {
+                    $cursor = $id;
+                }
+                $indexed++;
+            }
+            ap_search_fts_meta_set('event_index_id', (string) $cursor);
+            if (count($rows) < $batch) {
+                break;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-search-fts] catch up events: ' . $e->getMessage());
+    }
+    return $indexed;
+}
+
+/**
+ * Drop index rows whose posts are gone. Retention deletes the post first.
+ */
+function ap_search_fts_forget_missing(): int
+{
+    if (!ap_search_fts_available()) {
+        return 0;
+    }
+    $dropped = 0;
+    try {
+        $db = ap_db();
+        foreach ([
+            "DELETE FROM ap_search_docs d
+             WHERE d.source = 'event'
+               AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id = d.source_pk)",
+            "DELETE FROM ap_search_docs d
+             WHERE d.source = 'mention'
+               AND NOT EXISTS (
+                    SELECT 1 FROM mentions m
+                    WHERE m.id = d.source_pk AND m.deleted_at IS NULL
+               )",
+            "DELETE FROM ap_search_docs d
+             WHERE d.source = 'status'
+               AND NOT EXISTS (SELECT 1 FROM masto_statuses s WHERE s.local_id = d.source_pk)",
+            "DELETE FROM ap_search_docs d
+             WHERE d.source = 'bsky_post'
+               AND NOT EXISTS (SELECT 1 FROM bsky_posts b WHERE b.bsky_uri = d.object_id)",
+        ] as $sql) {
+            $n = $db->exec($sql);
+            if (is_int($n) && $n > 0) {
+                $dropped += $n;
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-search-fts] forget missing: ' . $e->getMessage());
+    }
+    return $dropped;
 }
 
 /**

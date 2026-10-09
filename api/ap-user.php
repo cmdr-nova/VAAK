@@ -50,8 +50,8 @@ if ($username === '') {
     exit;
 }
 
-// On vaak.monster, bare /users/{key} is the on-VAAK profile (logged-in or guest).
-// mkultra.monster /users/{key} stays public HTML + ActivityPub negotiation.
+// Bare /users/{key} and /@{key} HTML is the on-VAAK profile (guest when logged out).
+// ActivityPub JSON stays on this URL when Accept prefers activity+json / ld+json.
 require_once __DIR__ . '/ap-vaak-profile-route.php';
 $acceptEarly = strtolower((string) ($_SERVER['HTTP_ACCEPT'] ?? ''));
 $wantsApEarly = function_exists('ap_user_wants_activitypub')

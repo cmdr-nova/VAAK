@@ -2698,9 +2698,18 @@ function ap_masto_api(string $method, string $path): void
             define('AP_INBOX_LIB_ONLY', true);
             require_once __DIR__ . '/ap-inbox.php';
         }
-        $accounts = ap_masto_search_accounts($q, $resolve, $limit);
+        $want = max(1, min(40, $limit));
+        $fetch = min(80, max($want, $want * 4));
+        $accounts = ap_masto_search_accounts($q, $resolve, $fetch);
         if ($followingOnly) {
             $accounts = ap_masto_filter_accounts_following($accounts);
+        }
+        // Account search is not stored per viewer. Hide mutes and blocks after the read.
+        $ownerId = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+        if (function_exists('ap_search_filter_accounts')) {
+            $accounts = ap_search_filter_accounts($accounts, $ownerId, $want);
+        } else {
+            $accounts = array_slice($accounts, 0, $want);
         }
         ap_masto_json($accounts);
         return;
@@ -2718,9 +2727,16 @@ function ap_masto_api(string $method, string $path): void
             define('AP_INBOX_LIB_ONLY', true);
             require_once __DIR__ . '/ap-inbox.php';
         }
-        $result = ap_masto_search($q, $type, $resolve, $limit);
+        $want = max(1, min(40, $limit));
+        $fetch = min(40, max($want, $want * 2));
+        $result = ap_masto_search($q, $type, $resolve, $fetch);
         if ($followingOnly && !empty($result['accounts']) && is_array($result['accounts'])) {
             $result['accounts'] = ap_masto_filter_accounts_following($result['accounts']);
+        }
+        // vaak:search: has no viewer id. Filter this response only.
+        $ownerId = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+        if (function_exists('ap_search_filter_bundle')) {
+            $result = ap_search_filter_bundle($result, $ownerId, $want);
         }
         if ($path === '/api/v1/search') {
             // v1 returned hashtags as strings

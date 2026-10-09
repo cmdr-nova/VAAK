@@ -311,7 +311,8 @@ function ap_ask_parse_compact_text(string $text): ?array
             return null;
         }
     }
-    if ($asker === '' || $question === '' || !str_contains($asker, '@')) {
+    $anonymous = strcasecmp(trim($asker), 'anonymous') === 0;
+    if ($asker === '' || $question === '' || (!$anonymous && !str_contains($asker, '@'))) {
         return null;
     }
     return [

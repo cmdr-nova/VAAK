@@ -265,6 +265,17 @@ fn group_notification_rows(rows: &[Value]) -> Vec<GroupedNotif> {
     out
 }
 
+fn hover_attr_for_account(acct: &Value) -> String {
+    let uri = acct.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+    let url = acct.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let actor = follow_target(uri, url);
+    if actor.starts_with("https://") {
+        format!(" data-profile-hover-actor=\"{}\"", esc(&actor))
+    } else {
+        String::new()
+    }
+}
+
 fn avatar_img_html(acct: &Value) -> String {
     let avatar = acct
         .get("avatar")
@@ -277,8 +288,9 @@ fn avatar_img_html(acct: &Value) -> String {
         "https://mkultra.monster/img/avatar/default.webp"
     };
     format!(
-        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\">",
-        esc(av_src)
+        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\"{}>",
+        esc(av_src),
+        hover_attr_for_account(acct)
     )
 }
 
@@ -313,12 +325,14 @@ fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
     for acct in g.accounts.iter().take(6) {
         let href = profile_href_for(acct);
         let img = avatar_img_html(acct);
+        let hover = hover_attr_for_account(acct);
         if href.is_empty() {
             stack.push_str(&img);
         } else {
             stack.push_str(&format!(
-                "<a href=\"{}\" title=\"Open profile\" style=\"margin-right:-.35rem;text-decoration:none\">{}</a>",
+                "<a href=\"{}\" title=\"Open profile\"{} style=\"margin-right:-.35rem;text-decoration:none\">{}</a>",
                 esc(&href),
+                hover,
                 img
             ));
         }
@@ -329,7 +343,7 @@ fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
     if let Some(st) = g.row.get("status").filter(|v| v.is_object()) {
         let uri = status_uri_of(&g.row);
         if !uri.is_empty() {
-            body.push_str(&paint_lean_embed_from(st, false, "mentions", viewer_actor));
+            body.push_str(&paint_lean_embed_from(st, false, "mentions", viewer_actor, true));
         }
     }
 
@@ -625,14 +639,17 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     } else {
         "https://mkultra.monster/img/avatar/default.webp"
     };
+    let hover = hover_attr_for_account(&account);
     let av_img = format!(
-        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\">",
-        esc(av_src)
+        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\"{}>",
+        esc(av_src),
+        hover
     );
     let av_block = if !profile_href.is_empty() {
         format!(
-            "<a href=\"{}\" title=\"Open profile\" style=\"text-decoration:none\">{}</a>",
+            "<a href=\"{}\" title=\"Open profile\"{} style=\"text-decoration:none\">{}</a>",
             esc(&profile_href),
+            hover,
             av_img
         )
     } else {
@@ -640,8 +657,9 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     };
     let who = if !profile_href.is_empty() {
         format!(
-            "<a class=\"who\" href=\"{h}\" style=\"color:inherit;text-decoration:none\">{d}</a><a class=\"meta\" href=\"{h}\" style=\"color:var(--muted);text-decoration:none\"> @{a}</a>",
+            "<a class=\"who\" href=\"{h}\"{hover} style=\"color:inherit;text-decoration:none\">{d}</a><a class=\"meta\" href=\"{h}\"{hover} style=\"color:var(--muted);text-decoration:none\"> @{a}</a>",
             h = esc(&profile_href),
+            hover = hover,
             d = esc(display),
             a = esc(acct)
         )
@@ -694,7 +712,7 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
             "mention" | "quote" | "favourite" | "reblog" | "update" | "poll" | "status" | "bite"
         ) && !status_uri.is_empty()
         {
-            body.push_str(&paint_lean_embed_from(st, hide_header, "mentions", viewer_actor));
+            body.push_str(&paint_lean_embed_from(st, hide_header, "mentions", viewer_actor, true));
         } else {
             let plain = strip_tags(st.get("content").and_then(|v| v.as_str()).unwrap_or(""))
                 .trim()
@@ -796,6 +814,30 @@ pub async fn mentions_html_fill(
                 }
             }
         }
+        // Notification envelopes do not carry this viewer's fav/boost/bookmark.
+        let mut nested = Vec::new();
+        let mut nested_at = Vec::new();
+        for (idx, item) in report.items.iter().enumerate() {
+            if let Some(st) = item.get("status").filter(|v| v.is_object()) {
+                nested.push(st.clone());
+                nested_at.push(idx);
+            }
+        }
+        if !nested.is_empty() {
+            let _ = crate::interaction_flags::apply_to_statuses(
+                &db,
+                owner_user_id,
+                &mut nested,
+            )
+            .await;
+            let _ = crate::home_hydrate_ranked::attach_bsky_link_facets(&db, &mut nested).await;
+            let _ = crate::home_hydrate_ranked::attach_ask_identities(&db, &mut nested).await;
+            for (idx, st) in nested_at.into_iter().zip(nested) {
+                if let Some(slot) = report.items[idx].get_mut("status") {
+                    *slot = st;
+                }
+            }
+        }
     }
 
     // Also write nest fragment cache while painting so PHP/Axum embed path stays warm.
@@ -853,7 +895,7 @@ pub async fn mentions_html_fill(
             if !uri.is_empty() {
                 let key =
                     notif_embed::frag_key(owner_user_id, uri, hide, fav, reblog, bookmarked, sid);
-                let frag = paint_lean_embed_from(st, hide, "mentions", &viewer_actor);
+                let frag = paint_lean_embed_from(st, hide, "mentions", &viewer_actor, true);
                 if let Some(ref mut r) = redis {
                     let _ = notif_embed::set_embed_html(r, &key, &frag).await;
                 }
@@ -935,6 +977,11 @@ mod tests {
         assert!(html.contains("tweet-notif-grouped"));
         assert!(html.contains("2 people liked your post"));
         assert!(html.contains("notification-avatar-stack"));
+        assert!(html.contains("data-profile-hover-actor=\"https://example.com/users/a\""));
+        assert!(html.contains("data-profile-hover-actor=\"https://example.com/users/b\""));
+        let single = paint_notif_card(&rows[0], "");
+        assert!(single.contains("data-profile-hover-actor=\"https://example.com/users/a\""));
+        assert!(single.matches("data-profile-hover-actor=\"https://example.com/users/a\"").count() >= 3);
     }
 
     #[test]
@@ -1051,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn fediverse_quote_boost_keeps_actions_on_the_nested_post() {
+    fn fediverse_quote_boost_actions_stay_on_the_quoting_post() {
         let row = json!({
             "id": "80",
             "type": "quote",
@@ -1081,8 +1128,30 @@ mod tests {
             }
         });
         let html = paint_notif_card(&row, "https://mkultra.monster/users/cmdr_nova");
-        assert!(html.matches("name=\"action\" value=\"reblog_status\"").count() >= 2, "outer quote and nested post need boost: {html}");
-        assert!(html.matches("post-action-menu").count() >= 2, "outer quote and nested post need overflow: {html}");
+        assert_eq!(
+            html.matches("name=\"action\" value=\"reblog_status\"").count(),
+            1,
+            "only the quote-boost gets a boost action: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"post-action-menu\"").count(),
+            1,
+            "only the quote-boost gets an overflow menu: {html}"
+        );
+        let nested_at = html
+            .find("data-timeline-key=\"1\"")
+            .expect("quoted post");
+        let nested_end = html[nested_at..]
+            .find("</article>")
+            .map(|n| nested_at + n)
+            .unwrap_or(html.len());
+        let nested = &html[nested_at..nested_end];
+        assert!(
+            !nested.contains("tweet-actions") && !nested.contains("reblog_status"),
+            "quoted post has no action bar: {nested}"
+        );
+        assert!(html.contains("quoting you"), "{html}");
+        assert!(html.contains("original"), "quoted post stays visible: {html}");
         assert!(html.contains("https://labyrinth.zone/users/scooter"), "{html}");
         assert!(!html.contains("Follow back"), "quote cards do not follow back: {html}");
     }

@@ -1244,8 +1244,14 @@ function ap_route_verified_activity(array $activity, int $bytes): string
         if ($followTarget !== null) {
             ap_request_actor_set((string) $followTarget['actor_key']);
             $ok = ap_local_accept_and_follow_back($activity);
-            ap_metrics_record('Follow', $actorId, $objectId, ap_local_actor_id(), $bytes, $ok ? 'local_accept_followback' : 'local_follow_fail', null);
-            if ($ok && is_string($actorId) && $actorId !== '') {
+            $pendingFollow = $ok
+                && function_exists('ap_profile_get')
+                && !empty(ap_profile_get((string) ($followTarget['actor_key'] ?? ''))['manually_approves']);
+            $followAction = $pendingFollow
+                ? 'local_follow_pending'
+                : ($ok ? 'local_accept_followback' : 'local_follow_fail');
+            ap_metrics_record('Follow', $actorId, $objectId, ap_local_actor_id(), $bytes, $followAction, null);
+            if ($ok && !$pendingFollow && is_string($actorId) && $actorId !== '') {
                 try {
                     require_once __DIR__ . '/ap-webpush.php';
                     $nid = null;
@@ -1271,7 +1277,7 @@ function ap_route_verified_activity(array $activity, int $bytes): string
                     error_log('[ap-webpush] follow hook: ' . $e->getMessage());
                 }
             }
-            return $ok ? 'local_accept_followback' : 'local_follow_fail';
+            return $followAction;
         }
     }
 
@@ -3400,12 +3406,22 @@ function ap_follow_request_decide(array $request, bool $approve): array
         ],
         'to' => [$follower],
     ];
-    $ok = ap_deliver_signed_json($inbox, $activity, ap_local_key_id(), ap_local_priv_path(), 5.0);
-    if (!$ok && $sharedInbox !== '' && $sharedInbox !== $inbox) {
-        $ok = ap_deliver_signed_json($sharedInbox, $activity, ap_local_key_id(), ap_local_priv_path(), 5.0);
+    $isLocalFollower = (bool) preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $follower);
+    if ($isLocalFollower) {
+        // Same instance: update the graphs here. Do not POST Accept/Reject to our own inbox.
+        $ok = true;
+    } else {
+        $ok = ap_deliver_signed_json($inbox, $activity, ap_local_key_id(), ap_local_priv_path(), 5.0);
+        if (!$ok && $sharedInbox !== '' && $sharedInbox !== $inbox) {
+            $ok = ap_deliver_signed_json($sharedInbox, $activity, ap_local_key_id(), ap_local_priv_path(), 5.0);
+        }
     }
     if ($approve) {
         ap_follower_upsert($follower, $inbox, $sharedInbox, (string) ($request['username'] ?? ''), $localId);
+        if ($isLocalFollower && function_exists('ap_following_upsert')) {
+            // The requester's following row is created only once the private account approves.
+            ap_following_upsert($localId, $follower);
+        }
     }
     $status = $approve ? 'accepted' : 'rejected';
     $saved = function_exists('ap_follow_request_set_status')
@@ -3432,6 +3448,28 @@ function ap_resolve_actor_ref(string $input): ?string
     if (preg_match('/^@?([A-Za-z0-9_.\-]+)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})$/', $handle, $m)) {
         $user = $m[1];
         $host = strtolower($m[2]);
+        // vaak.monster only serves the app. Local people live on mkultra.monster.
+        // Resolve those handles here so search never WebFingers the mask.
+        $localKey = strtolower(str_replace('-', '_', $user));
+        $localKey = preg_replace('/[^a-z0-9_]/', '', $localKey) ?? '';
+        $ourHost = in_array($host, ['mkultra.monster', 'www.mkultra.monster', 'vaak.monster', 'www.vaak.monster'], true);
+        if ($ourHost && $localKey !== '') {
+            if (!function_exists('ap_local_user_by_username') && is_file(__DIR__ . '/ap-db.php')) {
+                require_once __DIR__ . '/ap-db.php';
+            }
+            $localRow = function_exists('ap_local_user_by_username')
+                ? ap_local_user_by_username($localKey)
+                : null;
+            if (is_array($localRow) || $localKey === 'cmdr_nova') {
+                $key = is_array($localRow) ? (string) ($localRow['actor_key'] ?? $localKey) : 'cmdr_nova';
+                return 'https://mkultra.monster/users/' . rawurlencode($key !== '' ? $key : $localKey);
+            }
+            // The mask is not a federated instance. Unknown @user@mkultra.monster
+            // still falls through (Bridgy aliases such as val3r1e).
+            if ($host === 'vaak.monster' || $host === 'www.vaak.monster') {
+                return null;
+            }
+        }
         if (!ap_host_resolves_public($host)) {
             return null;
         }
@@ -3673,12 +3711,28 @@ function ap_follow_remote_actor(string $actorId, bool $respectRateLimit = true, 
             $sessionKey = (string) $sm[1];
         }
         if ($targetKey !== '' && $targetKey !== $sessionKey) {
+            $sessionName = $sessionKey !== '' ? $sessionKey : basename(parse_url($localId, PHP_URL_PATH) ?: '');
+            if (function_exists('ap_actor_requires_follow_approval') && ap_actor_requires_follow_approval($targetId)) {
+                if (function_exists('ap_follow_request_pending') && ap_follow_request_pending($targetId, $localId)) {
+                    ap_log('follow_local_pending_already target=' . ap_short($targetId) . ' from=' . ap_short($localId));
+                    return ['ok' => true, 'follow_id' => null, 'already' => true, 'requested' => true];
+                }
+                $stored = function_exists('ap_follow_request_upsert')
+                    ? ap_follow_request_upsert($targetId, $localId, $localId . '/inbox', null, $sessionName, $backId)
+                    : false;
+                if (!$stored) {
+                    return ['ok' => false, 'error' => 'Could not store the follow request'];
+                }
+                ap_metrics_record('Follow', $localId, $backId, $targetId, 0, 'manual_follow_request', $targetId);
+                ap_log('follow_local_pending target=' . ap_short($targetId) . ' from=' . ap_short($localId));
+                return ['ok' => true, 'follow_id' => $backId, 'already' => false, 'requested' => true];
+            }
             ap_following_upsert($targetId, $localId);
             ap_follower_upsert(
                 $localId,
                 $localId . '/inbox',
                 null,
-                $sessionKey !== '' ? $sessionKey : basename(parse_url($localId, PHP_URL_PATH) ?: ''),
+                $sessionName,
                 $targetId
             );
             ap_metrics_record('Follow', $localId, $backId, $targetId, 0, 'manual_follow_local', $targetId);
@@ -3795,6 +3849,10 @@ function ap_unfollow_remote_actor(
     if (!$isFollowing && !$forceDeliver) {
         foreach (array_keys($wantAliases) as $a) {
             ap_following_remove($a, $localId);
+            if (function_exists('ap_follow_request_remove')
+                && preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+$#', $a)) {
+                ap_follow_request_remove($a, $localId);
+            }
         }
         return ['ok' => true, 'already' => true];
     }
@@ -3807,6 +3865,9 @@ function ap_unfollow_remote_actor(
     if (preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', $targetId)) {
         ap_following_remove($targetId, $localId);
         ap_follower_remove($localId, $targetId);
+        if (function_exists('ap_follow_request_remove')) {
+            ap_follow_request_remove($targetId, $localId);
+        }
         ap_metrics_record('Undo', $localId, $targetId, $targetId, 0, 'manual_unfollow_local', null);
         ap_log('unfollow_local_ok target=' . ap_short($targetId) . ' from=' . ap_short($localId));
         return ['ok' => true, 'already' => false];
