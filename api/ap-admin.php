@@ -13481,7 +13481,7 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
     $openable = $inAppHref !== '' && $inAppHref !== '#';
     $html = '<div class="quote-block' . ($openable ? ' quote-block--openable' : '') . '"'
         . ($openable
-            ? ' data-href="' . h($inAppHref) . '" role="link" tabindex="0" title="Open quoted post"'
+            ? ' data-href="' . h($inAppHref) . '" role="link" tabindex="0" aria-label="Open quoted post"'
             : '')
         . '><span class="qt-label">Quoted</span>';
     if ($acct !== '') {
@@ -17914,10 +17914,10 @@ function admin_render_masto_status_card(
                 ?>
                 <?php if ($isBsky && $actorRef !== '' && $profileAppHref !== ''): ?>
                   <a href="<?= h($profileAppHref) ?>" style="text-decoration:none">
-                    <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($display) ?>"<?= admin_profile_hover_attr($actorRef) ?>>
+                    <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'"<?= admin_profile_hover_attr($actorRef) ?>>
                   </a>
                 <?php else: ?>
-                  <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'" title="<?= h($display) ?>">
+                  <img class="tweet-av" src="<?= h($avSrc) ?>" alt="" width="40" height="40" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.onerror=null;this.src='<?= h($fallbackAv) ?>'">
                 <?php endif; ?>
               <?php elseif ($actorRef !== '' && !$isLocal && $profileAppHref !== ''): ?>
                 <a href="<?= h($profileAppHref) ?>" style="text-decoration:none"><?= admin_avatar_img($actorRef) ?></a>
@@ -22135,7 +22135,7 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
     <article class="tweet tweet-notif tweet-notif-<?= h($nType) ?>">
     <div class="tweet-hd">
       <?php if ($profileHref !== ''): ?>
-        <a href="<?= h($profileHref) ?>" title="Open profile" style="text-decoration:none"><?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?></a>
+        <a href="<?= h($profileHref) ?>" aria-label="Open profile" style="text-decoration:none"><?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?></a>
       <?php else: ?>
         <?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?>
       <?php endif; ?>
@@ -23684,7 +23684,7 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
             $ref = function_exists('admin_account_actor_ref') ? admin_account_actor_ref($acct) : (string) ($acct['uri'] ?? $acct['url'] ?? '');
             $href = $ref !== '' ? '?view=remote_profile&actor=' . rawurlencode($ref) . '&from=mentions' : '';
             $avatar = admin_avatar_img($ref !== '' ? $ref : null);
-            echo $href !== '' ? '<a href="' . h($href) . '" title="Open profile" style="margin-right:-.35rem">' . $avatar . '</a>' : $avatar;
+            echo $href !== '' ? '<a href="' . h($href) . '" aria-label="Open profile" style="margin-right:-.35rem">' . $avatar . '</a>' : $avatar;
             if (++$shown >= 6) {
                 break;
             }
@@ -26653,7 +26653,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             ? ap_vaak_pretty_profile_path((string) $vaakActorKey)
             : ('/users/' . rawurlencode((string) $vaakActorKey));
       ?>
-      <a class="brand-avatar-link" href="<?= h($brandProfileHref) ?>" title="View profile" aria-label="View profile">
+      <a class="brand-avatar-link" href="<?= h($brandProfileHref) ?>" aria-label="View profile">
         <?= admin_avatar_img($vaakActorId, 'brand-avatar', false) ?>
       </a>
       <div class="meta brand-signed-in" style="margin:.35rem 0 0;font-size:.72rem;line-height:1.3">signed in as <?= h($vaakHandle) ?></div>
@@ -42598,6 +42598,25 @@ if (VIEW === 'analytics') loadAnalytics();
     mo.observe(document.body, { childList: true, subtree: true });
   }
   window.vaakSilencePinnedMedia = silencePinned;
+})();
+</script>
+<script>
+// Cached fragments can still contain old titles. Handle avatars on demand so
+// infinite-scroll/notification updates need no full-document scans or observer.
+(function () {
+  const avatars = 'img.tweet-av, img[class*="avatar"], img.featured-av, img.phyrian-dossier-av';
+  document.addEventListener('pointerover', function (ev) {
+    const avatar = ev.target.closest && ev.target.closest(avatars);
+    if (!avatar) return;
+    // An empty title explicitly blocks inherited ancestor titles as well.
+    if (avatar.getAttribute('title') !== '') avatar.setAttribute('title', '');
+    const link = avatar.closest('a, button');
+    if (link && link.hasAttribute('title')) {
+      const label = link.getAttribute('title');
+      if (label && !link.hasAttribute('aria-label')) link.setAttribute('aria-label', label);
+      link.removeAttribute('title');
+    }
+  }, true);
 })();
 </script>
 <script>
