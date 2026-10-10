@@ -12,7 +12,7 @@
 //! Replaces `bin/home-timeline-warm.php` chronological merge which dropped the
 //! ranked RSS/Bluesky mix on Home.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -1261,6 +1261,265 @@ fn materialize_rss(row: &RssRow) -> Value {
     st
 }
 
+/// Same author posting the same external link twice (a Bluesky client
+/// double-submit, usually a YouTube video a second apart) should occupy one
+/// Home slot. Pure quote embeds are not external posts: a quoted YouTube URL
+/// nested inside `embed.record` must not collapse the comment.
+pub(crate) fn bsky_external_repeat_token(author_did: &str, hint: &str) -> Option<String> {
+    let author = author_did.trim();
+    let hint = hint.trim();
+    if author.is_empty() || hint.is_empty() {
+        return None;
+    }
+    let target = if hint.starts_with('{') {
+        outer_external_uri(hint)?
+    } else {
+        hint.to_string()
+    };
+    let token = if let Some(id) = youtube_id_in(&target) {
+        format!("yt:{id}")
+    } else if target.starts_with("http://") || target.starts_with("https://") {
+        let norm = normalize_external_url(&target);
+        if norm.is_empty() {
+            return None;
+        }
+        norm
+    } else if looks_like_youtube_id(&target) {
+        format!("yt:{target}")
+    } else {
+        return None;
+    };
+    Some(format!("{author}|{token}"))
+}
+
+fn outer_external_uri(embed_json: &str) -> Option<String> {
+    let embed: Value = serde_json::from_str(embed_json).ok()?;
+    let etype = embed
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if etype.contains("record") && !etype.contains("external") && !etype.contains("recordwithmedia")
+    {
+        return None;
+    }
+    let external = if etype.contains("recordwithmedia") {
+        embed.get("media").and_then(|media| media.get("external"))
+    } else {
+        embed.get("external")
+    }?;
+    let uri = external.get("uri").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        Some(uri.to_string())
+    } else {
+        None
+    }
+}
+
+fn youtube_id_in(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for marker in [
+        "watch?v=",
+        "youtu.be/",
+        "youtube.com/shorts/",
+        "youtube.com/embed/",
+        "youtube-nocookie.com/embed/",
+    ] {
+        let Some(pos) = lower.find(marker) else {
+            continue;
+        };
+        let rest = &text[pos + marker.len()..];
+        let id: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if looks_like_youtube_id(&id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn looks_like_youtube_id(id: &str) -> bool {
+    (6..=20).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn normalize_external_url(url: &str) -> String {
+    let url = url.trim();
+    let Some((base, query)) = url.split_once('?') else {
+        return url.trim_end_matches('/').to_string();
+    };
+    let mut kept = Vec::new();
+    for pair in query.split('&') {
+        let key = pair.split('=').next().unwrap_or("").to_ascii_lowercase();
+        if key.is_empty()
+            || key == "is"
+            || key == "si"
+            || key == "feature"
+            || key == "fbclid"
+            || key.starts_with("utm_")
+        {
+            continue;
+        }
+        kept.push(pair);
+    }
+    kept.sort_unstable();
+    if kept.is_empty() {
+        base.trim_end_matches('/').to_string()
+    } else {
+        format!("{}?{}", base.trim_end_matches('/'), kept.join("&"))
+    }
+}
+
+/// Bluesky quote posts store the quoted record on `embed`. Home was painting
+/// only the comment. Lists and starter packs stay on the collection-card path.
+fn bsky_quote_status_from_embed(embed_json: &str) -> Option<Value> {
+    let embed: Value = serde_json::from_str(embed_json).ok()?;
+    if !embed.is_object() {
+        return None;
+    }
+    let etype = embed
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !etype.contains("record") {
+        return None;
+    }
+    let record = embed.get("record").filter(|v| v.is_object())?;
+    let record = if etype.contains("recordwithmedia") {
+        record.get("record").filter(|v| v.is_object()).unwrap_or(record)
+    } else if record.get("record").is_some_and(|inner| {
+        inner.get("author").is_some() || inner.get("value").is_some() || inner.get("text").is_some()
+    }) {
+        record.get("record").unwrap_or(record)
+    } else {
+        record
+    };
+    let vtype = record
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if vtype.contains("generatorview")
+        || vtype.contains("listview")
+        || vtype.contains("starterpack")
+        || vtype.contains("labelerview")
+    {
+        return None;
+    }
+    let uri = record
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if uri.contains("/app.bsky.graph.list/") || uri.contains("/app.bsky.graph.starterpack/") {
+        return None;
+    }
+    let unavailable = vtype.contains("notfound") || vtype.contains("blocked") || vtype.contains("detached");
+    if !unavailable && !uri.starts_with("at://") {
+        return None;
+    }
+    let value = record.get("value").filter(|v| v.is_object()).unwrap_or(record);
+    let value_type = value
+        .get("$type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !unavailable && !value_type.is_empty() && !value_type.contains("feed.post") {
+        return None;
+    }
+    let author = record.get("author").filter(|v| v.is_object());
+    let handle = author
+        .and_then(|a| a.get("handle"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let did = author
+        .and_then(|a| a.get("did"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let mut display = author
+        .and_then(|a| a.get("displayName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let avatar = author
+        .and_then(|a| a.get("avatar"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let text = if unavailable {
+        if vtype.contains("blocked") {
+            "Quoted post is blocked"
+        } else {
+            "Quoted post unavailable"
+        }
+    } else {
+        value
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| record.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim()
+    };
+    if unavailable && display.is_empty() {
+        display = "Unavailable".into();
+    }
+    let profile = if !handle.is_empty() {
+        format!("https://bsky.app/profile/{handle}")
+    } else if !did.is_empty() {
+        format!("https://bsky.app/profile/{did}")
+    } else {
+        "https://bsky.app/".into()
+    };
+    let acct = if !handle.is_empty() {
+        handle.to_string()
+    } else if !did.is_empty() {
+        did.to_string()
+    } else {
+        "quoted".into()
+    };
+    let account_id = if !did.is_empty() { did } else { profile.as_str() };
+    let account = empty_account(account_id, &acct, &acct, &display, &profile, avatar);
+    let https = if uri.starts_with("at://") {
+        bsky_https_url(&uri, handle)
+    } else {
+        "https://bsky.app/".into()
+    };
+    let media_embed = record
+        .get("embeds")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .or_else(|| value.get("embed"));
+    let media_json = media_embed
+        .map(|v| serde_json::to_string(v).unwrap_or_default())
+        .unwrap_or_default();
+    let (media, card) = if media_json.is_empty() {
+        (Vec::new(), None)
+    } else {
+        bsky_media_and_card(&media_json, if uri.is_empty() { "quote" } else { &uri })
+    };
+    let status_id = if uri.is_empty() { "quote:unavailable" } else { &uri };
+    let mut st = base_status(
+        status_id,
+        "",
+        &plain_to_html(text),
+        if uri.is_empty() { "https://bsky.app/" } else { &uri },
+        &https,
+        account,
+        media,
+        card,
+    );
+    st["source"] = json!("bluesky");
+    Some(st)
+}
+
 pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     let handle = row.author_handle.trim();
     let did = row.author_did.trim();
@@ -1332,6 +1591,15 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     if !repost_rec.is_empty() {
         st["vaak_bsky_repost_record"] = json!(repost_rec);
     }
+    if let Some(quoted) = bsky_quote_status_from_embed(&row.embed_json) {
+        let quote_id = quoted.get("uri").cloned().unwrap_or(Value::Null);
+        st["vaak_quote_preview"] = quoted.clone();
+        st["quote"] = json!({
+            "state": "accepted",
+            "quoted_status": quoted,
+            "quoted_status_id": quote_id,
+        });
+    }
     if bsky_is_sensitive(&row.raw_json) {
         st["sensitive"] = json!(true);
         if st
@@ -1352,6 +1620,11 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     // A valid Bluesky record may contain no text (for example a list/record
     // embed). Never paint that as an empty timeline card; retain a clickable
     // permalink as the minimum useful representation.
+    let has_quote = st
+        .get("quote")
+        .and_then(|q| q.get("quoted_status"))
+        .map(|v| v.is_object())
+        .unwrap_or(false);
     if row.text.trim().is_empty()
         && st
             .get("media_attachments")
@@ -1359,6 +1632,7 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
             .map(|a| a.is_empty())
             .unwrap_or(true)
         && st.get("card").map(|v| v.is_null()).unwrap_or(true)
+        && !has_quote
     {
         st["card"] = json!({
             "url": https_url,
@@ -4318,6 +4592,7 @@ pub async fn warm_view(
 
     let mut statuses = Vec::new();
     let mut kinds: HashMap<String, usize> = HashMap::new();
+    let mut seen_external: HashSet<String> = HashSet::new();
     for e in &head {
         let st = match (view, e.kind.as_str()) {
             ("home", "rss") => {
@@ -4397,6 +4672,17 @@ pub async fn warm_view(
             // envelopes cannot leak blocked actors into the Rust timeline.
             if crate::hidden::status_hidden(&st, &hidden) {
                 continue;
+            }
+            if view == "home" && e.kind == "bsky" {
+                if let Some(row) = bsky_map.get(&e.id) {
+                    if let Some(token) =
+                        bsky_external_repeat_token(&row.author_did, &row.embed_json)
+                    {
+                        if !seen_external.insert(token) {
+                            continue;
+                        }
+                    }
+                }
             }
             *kinds.entry(e.kind.clone()).or_insert(0) += 1;
             statuses.push(st);
@@ -5159,6 +5445,98 @@ mod tests {
         assert_eq!(emojis.as_array().map(Vec::len), Some(1));
         assert_eq!(emojis[0]["shortcode"], "spark");
         assert_eq!(emojis[0]["static_url"], "https://cdn.example/spark.png");
+    }
+
+    fn sample_bsky_row(text: &str, embed_json: &str) -> BskyRow {
+        BskyRow {
+            uri: "at://did:plc:76q57jzidgkngaubnawq727j/app.bsky.feed.post/3mxi5vdigg22q".into(),
+            author_did: "did:plc:76q57jzidgkngaubnawq727j".into(),
+            author_handle: "rosalei.bsky.social".into(),
+            author_display: "Carrie Leilani".into(),
+            author_avatar: String::new(),
+            indexed_at: "2026-10-09T22:40:00Z".into(),
+            published_at: "2026-10-09T22:40:00Z".into(),
+            text: text.into(),
+            embed_json: embed_json.into(),
+            raw_json: "{}".into(),
+            like_count: 0,
+            repost_count: 0,
+            reply_count: 0,
+        }
+    }
+
+    #[test]
+    fn bsky_record_view_quote_is_not_a_standalone_post() {
+        let embed = r#"{
+            "$type":"app.bsky.embed.record#view",
+            "record":{
+                "uri":"at://did:plc:rtsipa7hvj4bw6a3d4itlqoo/app.bsky.feed.post/3mxi5djeiqs2g",
+                "author":{"did":"did:plc:rtsipa7hvj4bw6a3d4itlqoo","handle":"augmented3.bsky.social","displayName":"Augmented"},
+                "value":{"$type":"app.bsky.feed.post","text":"Wisdom, rectitude are concepts that hold."}
+            }
+        }"#;
+        let status = materialize_bsky(&sample_bsky_row(
+            "I can understand the concept of dynamic opposition.",
+            embed,
+        ));
+        let quoted = status["quote"]["quoted_status"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(quoted.contains("Wisdom, rectitude"));
+        assert!(status["vaak_quote_preview"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Wisdom, rectitude"));
+        assert_eq!(
+            status["quote"]["quoted_status"]["account"]["acct"],
+            "augmented3.bsky.social"
+        );
+        assert!(status.get("card").map(|v| v.is_null()).unwrap_or(false));
+    }
+
+    #[test]
+    fn bsky_starter_pack_embed_is_not_a_quote() {
+        let embed = r#"{
+            "$type":"app.bsky.embed.record#view",
+            "record":{
+                "$type":"app.bsky.graph.starterpack#view",
+                "uri":"at://did:plc:x/app.bsky.graph.starterpack/abc",
+                "name":"Pack"
+            }
+        }"#;
+        let status = materialize_bsky(&sample_bsky_row("", embed));
+        assert!(status.get("quote").map(|v| v.is_null()).unwrap_or(false));
+        assert!(status.get("vaak_quote_preview").is_none());
+        assert_eq!(status["card"]["vaak_collection_kind"], "starter_pack");
+    }
+
+    #[test]
+    fn same_youtube_with_tracking_params_shares_one_home_token() {
+        let author = "did:plc:76q57jzidgkngaubnawq727j";
+        let a = bsky_external_repeat_token(
+            author,
+            "https://www.youtube.com/watch?v=7t1U1fcEODc&is=abc",
+        )
+        .expect("first url");
+        let b = bsky_external_repeat_token(
+            author,
+            "https://youtube.com/watch?v=7t1U1fcEODc&si=zzz&feature=share",
+        )
+        .expect("second url");
+        assert_eq!(a, b);
+        let other = bsky_external_repeat_token(
+            author,
+            "https://www.youtube.com/watch?v=JyECrGp-Sw8",
+        )
+        .expect("different video");
+        assert_ne!(a, other);
+        let quote = r#"{"$type":"app.bsky.embed.record#view","record":{"uri":"at://did:plc:q/app.bsky.feed.post/x","author":{"handle":"q.bsky.social"},"value":{"$type":"app.bsky.feed.post","text":"quoted","embed":{"external":{"uri":"https://www.youtube.com/watch?v=7t1U1fcEODc"}}}}}"#;
+        assert!(bsky_external_repeat_token(author, quote).is_none());
+        let with_media = r#"{"$type":"app.bsky.embed.recordWithMedia#view","media":{"$type":"app.bsky.embed.external#view","external":{"uri":"https://www.youtube.com/watch?v=7t1U1fcEODc&is=1"}},"record":{"uri":"at://did:plc:q/app.bsky.feed.post/x","author":{"handle":"q.bsky.social"},"value":{"$type":"app.bsky.feed.post","text":"quoted"}}}"#;
+        assert_eq!(
+            bsky_external_repeat_token(author, with_media).as_deref(),
+            Some(a.as_str())
+        );
     }
 
     #[test]
