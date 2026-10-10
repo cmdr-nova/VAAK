@@ -8519,7 +8519,7 @@ function admin_home_cached_recommendation_items(
                 return false;
             }
             $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
-            if ($object === '' || isset($seen[$object]) || isset(ap_home_recommendation_interacted_objects($ownerUserId, [$object])[$object])) {
+            if ($object === '' || isset($seen[$object])) {
                 return false;
             }
             $item = [
@@ -8590,7 +8590,9 @@ function admin_home_cached_recommendation_items(
                     $params[] = gmdate('c', $beforeTs);
                 }
                 $st->execute($params);
-                foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+                $seen += ap_home_recommendation_interacted_objects($ownerUserId, array_column($rows, 'object_id'));
+                foreach ($rows as $row) {
                     if ($added >= $foafBudget) {
                         break;
                     }
@@ -8624,7 +8626,9 @@ function admin_home_cached_recommendation_items(
                     $params[] = gmdate('c', $beforeTs);
                 }
                 $st->execute($params);
-                foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+                $seen += ap_home_recommendation_interacted_objects($ownerUserId, array_column($rows, 'object_id'));
+                foreach ($rows as $row) {
                     if ($added >= $maxAdded) {
                         break;
                     }
@@ -8644,7 +8648,9 @@ function admin_home_cached_recommendation_items(
                 $params[] = gmdate('c', $beforeTs);
             }
             $st->execute($params);
-            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
+                $seen += ap_home_recommendation_interacted_objects($ownerUserId, array_column($rows, 'object_id'));
+                foreach ($rows as $row) {
                 if ($added >= $maxAdded) {
                     break;
                 }

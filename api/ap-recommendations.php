@@ -9,25 +9,39 @@ function ap_home_recommendation_interacted_objects(int $owner, array $objects): 
     $db = ap_db();
     $pgsql = $db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql';
     $json = static fn(string $column, string $path): string => $pgsql
-        ? "NULLIF($column,'')::jsonb #>> '{" . str_replace('.', ',', $path) . "}'"
+        ? "$column #>> '{" . str_replace('.', ',', $path) . "}'"
         : "json_extract(NULLIF($column,''), '$.$path')";
-    $quote = 'COALESCE(' . $json('o.raw_create_json', 'object.quote') . ',' . $json('o.raw_create_json', 'object.quoteUrl') . ',' . $json('o.raw_create_json', 'object._misskey_quote') . ", '')";
-    $signalObject = $json('s.metadata_json', 'object_id');
-    $signalUri = $json('s.metadata_json', 'uri');
+    $doc = static fn(string $column): string => $pgsql ? "NULLIF($column,'')::jsonb" : "NULLIF($column,'')";
+    $noteDoc = $doc('o.raw_create_json');
+    $signalDoc = $doc('s.metadata_json');
+    $quote = 'COALESCE(' . $json('n.doc', 'object.quote') . ',' . $json('n.doc', 'object.quoteUrl') . ',' . $json('n.doc', 'object._misskey_quote') . ", '')";
+    $signalObject = $json('s.doc', 'object_id');
+    $signalUri = $json('s.doc', 'uri');
     $consumed = [];
     foreach (array_chunk($objects, 200) as $chunk) {
         $candidates = implode(' UNION ALL ', array_fill(0, count($chunk), 'SELECT ? AS object_id'));
-        $sql = "WITH candidates AS ($candidates), viewer AS (SELECT id,actor_id FROM ap_users WHERE id=?)
-            SELECT c.object_id FROM candidates c, viewer v WHERE
-            EXISTS (SELECT 1 FROM masto_favourites f WHERE f.owner_user_id=v.id AND f.object_id IN (c.object_id,c.object_id || '/'))
-            OR EXISTS (SELECT 1 FROM masto_bookmarks b WHERE b.owner_user_id=v.id AND b.object_id IN (c.object_id,c.object_id || '/'))
-            OR EXISTS (SELECT 1 FROM masto_reblogs b WHERE b.owner_user_id=v.id AND b.object_id IN (c.object_id,c.object_id || '/'))
-            OR EXISTS (SELECT 1 FROM outbox_notes o WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'
-                AND (o.in_reply_to IN (c.object_id,c.object_id || '/') OR rtrim($quote,'/')=c.object_id))
-            OR EXISTS (SELECT 1 FROM quote_authorizations q WHERE rtrim(q.requester_actor,'/')=rtrim(v.actor_id,'/') AND q.quoted_note_id IN (c.object_id,c.object_id || '/'))
-            OR EXISTS (SELECT 1 FROM ap_user_signals s WHERE s.owner_user_id=v.id AND s.weight>0
-                AND s.signal_type IN ('like','favourite','boost','reblog','reply','quote','bookmark')
-                AND (s.target_key IN (c.object_id,c.object_id || '/') OR rtrim(COALESCE($signalObject,''),'/')=c.object_id OR rtrim(COALESCE($signalUri,''),'/')=c.object_id))";
+        $sql = "WITH candidates AS ($candidates), viewer AS (SELECT id,actor_id FROM ap_users WHERE id=?),
+            own_notes AS MATERIALIZED (
+                SELECT o.in_reply_to,$noteDoc AS doc FROM outbox_notes o, viewer v
+                WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'
+            ),
+            signals AS MATERIALIZED (
+                SELECT s.target_key,$signalDoc AS doc FROM ap_user_signals s, viewer v
+                WHERE s.owner_user_id=v.id AND s.weight>0
+                  AND s.signal_type IN ('like','favourite','boost','reblog','reply','quote','bookmark')
+            ),
+            interactions AS MATERIALIZED (
+                SELECT rtrim(f.object_id,'/') AS object_id FROM masto_favourites f, viewer v WHERE f.owner_user_id=v.id
+                UNION ALL SELECT rtrim(b.object_id,'/') FROM masto_bookmarks b, viewer v WHERE b.owner_user_id=v.id
+                UNION ALL SELECT rtrim(b.object_id,'/') FROM masto_reblogs b, viewer v WHERE b.owner_user_id=v.id
+                UNION ALL SELECT rtrim(n.in_reply_to,'/') FROM own_notes n
+                UNION ALL SELECT rtrim($quote,'/') FROM own_notes n
+                UNION ALL SELECT rtrim(q.quoted_note_id,'/') FROM quote_authorizations q, viewer v WHERE rtrim(q.requester_actor,'/')=rtrim(v.actor_id,'/')
+                UNION ALL SELECT rtrim(s.target_key,'/') FROM signals s
+                UNION ALL SELECT rtrim($signalObject,'/') FROM signals s
+                UNION ALL SELECT rtrim($signalUri,'/') FROM signals s
+            )
+            SELECT DISTINCT c.object_id FROM candidates c JOIN interactions i ON i.object_id=c.object_id";
         $st = $db->prepare($sql);
         $st->execute([...$chunk, $owner]);
         foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $object) $consumed[(string) $object] = true;
