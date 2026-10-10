@@ -1469,6 +1469,7 @@ async fn fetch_local_timeline(db: &Client) -> Result<Vec<TimelineItem>> {
             "SELECT id, published, COALESCE(raw_create_json, '')
              FROM outbox_notes
              WHERE id LIKE 'https://mkultra.monster/users/%/notes/%'
+               AND COALESCE(visibility, 'public') = 'public'
              ORDER BY published DESC
              LIMIT 160",
             &[],
@@ -1544,6 +1545,7 @@ async fn fetch_federated_events(
              FROM events
              WHERE type = ANY(ARRAY['Create','Announce','Quote','QuotePost'])
                AND action_taken = ANY(ARRAY['log','local_observe'])
+               AND COALESCE(visibility, 'public') = 'public'
              ORDER BY created_at DESC, id DESC
              LIMIT 160",
             &[],

@@ -15065,6 +15065,9 @@ function admin_local_timeline_item_allowed(array $item): bool
 {
     $kind = (string) ($item['kind'] ?? '');
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if (ap_normalize_visibility($row['visibility'] ?? 'public') !== 'public') {
+        return false;
+    }
     if ($kind === 'outbox') {
         return vaak_is_local_url((string) ($row['id'] ?? ''))
             && !admin_outbox_is_bsky_import($row);
@@ -15096,9 +15099,11 @@ function admin_federated_timeline_item_allowed(array $item): bool
 {
     $kind = (string) ($item['kind'] ?? '');
     $row = is_array($item['row'] ?? null) ? $item['row'] : [];
+    if (ap_normalize_visibility($row['visibility'] ?? 'public') !== 'public') {
+        return false;
+    }
     if ($kind === 'outbox') {
         return vaak_is_local_url((string) ($row['id'] ?? ''))
-            && ap_normalize_visibility($row['visibility'] ?? 'public') !== 'local'
             && !admin_outbox_is_bsky_import($row);
     }
     if ($kind === 'boost') {
@@ -23252,6 +23257,11 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
     if (function_exists('ap_db_masto_owner_user_id')) {
         $ownerUserId = (int) ap_db_masto_owner_user_id();
     }
+    if ((function_exists('ap_visibility_status_hidden') && ap_visibility_status_hidden($status, $ownerUserId))
+        || !ap_visibility_status_audience_allowed($status, $ownerUserId)) {
+        // Handled as an empty card, so the caller cannot fall back to stale HTML.
+        return true;
+    }
     $flagBits = (!empty($status['favourited']) ? '1' : '0')
         . (!empty($status['reblogged']) ? '1' : '0')
         . (!empty($status['bookmarked']) ? '1' : '0');
@@ -23288,24 +23298,9 @@ function admin_notif_try_embed_status_card(?array $status, array $followingIds, 
         echo $axumHtml;
         return true;
     }
-    $axumConfirmedMiss = is_string($axumHtml) && $axumHtml === '';
 
-    if (!$axumConfirmedMiss && function_exists('ap_redis_client')) {
-        try {
-            $redis = ap_redis_client('cache');
-            if ($redis) {
-                $hit = $redis->get($fragKey);
-                if (is_string($hit) && $hit !== '') {
-                    $fragMemo[$fragKey] = $hit;
-                    $track('hit_redis');
-                    echo $hit;
-                    return true;
-                }
-            }
-        } catch (Throwable $e) {
-            // paint fresh
-        }
-    }
+    // Stored HTML cannot recheck current audiences, blocks, mutes or media
+    // settings. On worker failure, render the supplied status afresh below.
 
     // Mentions reply rows bake "↩ parent\n\nreply" into content for Ice Cubes.
     // Shared-card ↩ chrome already shows the parent — strip the bake so the nest

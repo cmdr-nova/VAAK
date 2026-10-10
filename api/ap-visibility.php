@@ -93,33 +93,7 @@ function ap_visibility_filter_statuses(array $statuses, int $ownerUserId): array
         if (!is_array($status)) {
             continue;
         }
-        $accounts = [];
-        $account = $status['account'] ?? null;
-        if (is_array($account)) {
-            foreach (['uri', 'url', 'id'] as $field) {
-                $actor = trim((string) ($account[$field] ?? ''));
-                if ($actor !== '') {
-                    $accounts[] = $actor;
-                }
-            }
-        }
-        $nested = $status['reblog'] ?? ($status['quote'] ?? null);
-        if (is_array($nested) && is_array($nested['account'] ?? null)) {
-            foreach (['uri', 'url', 'id'] as $field) {
-                $actor = trim((string) ($nested['account'][$field] ?? ''));
-                if ($actor !== '') {
-                    $accounts[] = $actor;
-                }
-            }
-        }
-        $hidden = false;
-        foreach (array_unique($accounts) as $actor) {
-            if (ap_visibility_actor_hidden($actor, $ownerUserId)) {
-                $hidden = true;
-                break;
-            }
-        }
-        if ($hidden) {
+        if (ap_visibility_status_hidden($status, $ownerUserId)) {
             continue;
         }
         $key = ap_visibility_status_key($status);
@@ -132,4 +106,134 @@ function ap_visibility_filter_statuses(array $statuses, int $ownerUserId): array
         $out[] = $status;
     }
     return $out;
+}
+
+/** Apply moderation to the whole card, including nested boosts and quotes. */
+function ap_visibility_status_hidden(array $status, int $ownerUserId, int $depth = 0): bool
+{
+    if ($depth > 16) {
+        return true;
+    }
+    foreach (['uri', 'url', 'id'] as $field) {
+        $actor = trim((string) ($status['account'][$field] ?? ''));
+        if ($actor !== '' && ap_visibility_actor_hidden($actor, $ownerUserId)) {
+            return true;
+        }
+    }
+    if (function_exists('ap_muted_words_match') && ap_muted_words_match(
+        $ownerUserId, (string) ($status['content'] ?? ''), (string) ($status['spoiler_text'] ?? '')
+    ) !== null) {
+        return true;
+    }
+    foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+        $child = $status[$field] ?? null;
+        if (!is_array($child)) {
+            continue;
+        }
+        $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+            : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+        if (ap_visibility_status_hidden($child, $ownerUserId, $depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** A public discovery wrapper must not smuggle a restricted nested post. */
+function ap_visibility_public_status(array $status, int $depth = 0): bool
+{
+    if ($depth > 16) {
+        return false;
+    }
+    $visibility = strtolower((string) ($status['visibility'] ?? 'public'));
+    if (!in_array($visibility, $depth === 0 ? ['public'] : ['public', 'unlisted'], true)) {
+        return false;
+    }
+    foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+        $child = $status[$field] ?? null;
+        if (!is_array($child)) {
+            continue;
+        }
+        $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+            : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+        if (!ap_visibility_public_status($child, $depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Recheck durable audiences when PHP must paint a cached notification. */
+function ap_visibility_status_audience_allowed(array $status, int $ownerUserId, int $depth = 0): bool
+{
+    if ($depth > 16) {
+        return false;
+    }
+    try {
+        $uri = rtrim(explode('#', trim((string) ($status['uri'] ?? $status['url'] ?? '')), 2)[0], '/');
+        $visibility = strtolower((string) ($status['visibility'] ?? 'public'));
+        $author = rtrim((string) ($status['account']['uri'] ?? ''), '/');
+        $recipients = [];
+        if (str_starts_with($uri, 'https://') || str_starts_with($uri, 'http://')) {
+            $db = ap_db();
+            $query = $db->prepare("SELECT visibility, actor_id FROM events WHERE object_id IN (?, ?)
+                AND type IN ('Create','Update','Quote','QuotePost')
+                AND action_taken IN ('log','local_observe','local_fav_update') ORDER BY id DESC LIMIT 1");
+            $query->execute([$uri, $uri . '/']);
+            if ($row = $query->fetch()) {
+                $visibility = strtolower((string) ($row['visibility'] ?? 'public'));
+                $author = rtrim((string) ($row['actor_id'] ?? ''), '/');
+            }
+            $query = $db->prepare('SELECT visibility, to_json, cc_json FROM outbox_notes WHERE id IN (?, ?) LIMIT 1');
+            $query->execute([$uri, $uri . '/']);
+            $local = $query->fetch();
+            if ($local) {
+                $visibility = strtolower((string) ($local['visibility'] ?? 'public'));
+                $author = explode('/notes/', $uri, 2)[0];
+                $recipients = array_merge(json_decode((string) ($local['to_json'] ?? '[]'), true) ?: [], json_decode((string) ($local['cc_json'] ?? '[]'), true) ?: []);
+            } elseif (str_starts_with($uri, 'https://mkultra.monster/users/') && str_contains($uri, '/notes/')) {
+                return false;
+            }
+        }
+        if (!in_array($visibility, ['public', 'unlisted'], true)) {
+            $viewer = $ownerUserId > 0 ? rtrim(ap_db_owner_actor_id_for_user_id($ownerUserId), '/') : '';
+            if ($viewer === '') {
+                return false;
+            }
+            $allowed = $author === $viewer || in_array($viewer, array_map(static fn ($v) => rtrim((string) $v, '/'), $recipients), true);
+            if (!$allowed && $visibility === 'local') {
+                $allowed = str_starts_with($author, 'https://mkultra.monster/users/');
+            }
+            if (!$allowed) {
+                $query = ap_db()->prepare("SELECT 1 FROM mentions WHERE owner_user_id = ? AND deleted_at IS NULL
+                    AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id IN (?, ?) LIMIT 1");
+                $query->execute([$ownerUserId, $uri, $uri . '/']);
+                $allowed = (bool) $query->fetchColumn();
+            }
+            if (!$allowed && in_array($visibility, ['private', 'followers', 'followers_only'], true)) {
+                $table = str_starts_with($author, 'https://mkultra.monster/users/') ? 'followers' : 'following';
+                $query = ap_db()->prepare("SELECT 1 FROM {$table} WHERE owner_actor_id IN (?, ?) AND actor_id IN (?, ?) LIMIT 1");
+                $query->execute($table === 'followers' ? [$author, $author . '/', $viewer, $viewer . '/'] : [$viewer, $viewer . '/', $author, $author . '/']);
+                $allowed = (bool) $query->fetchColumn();
+            }
+            if (!$allowed) {
+                return false;
+            }
+        }
+        foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+            $child = $status[$field] ?? null;
+            if (!is_array($child)) {
+                continue;
+            }
+            $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+                : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+            if (!ap_visibility_status_audience_allowed($child, $ownerUserId, $depth + 1)) {
+                return false;
+            }
+        }
+        return true;
+    } catch (Throwable $e) {
+        // An unavailable policy store must not revive stale private HTML.
+        return false;
+    }
 }

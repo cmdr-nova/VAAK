@@ -1516,6 +1516,7 @@ fn bsky_quote_status_from_embed(embed_json: &str) -> Option<Value> {
         media,
         card,
     );
+    st["sensitive"] = json!(bsky_is_sensitive(&record.to_string()) || bsky_is_sensitive(&json!({"record": value}).to_string()));
     st["source"] = json!("bluesky");
     Some(st)
 }
@@ -1602,15 +1603,6 @@ pub(crate) fn materialize_bsky(row: &BskyRow) -> Value {
     }
     if bsky_is_sensitive(&row.raw_json) {
         st["sensitive"] = json!(true);
-        if st
-            .get("spoiler_text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        {
-            st["spoiler_text"] = json!("Sensitive content");
-        }
         st["vaak_bsky_sensitive"] = json!(true);
     }
     let parent = bsky_reply_parent_uri(&row.raw_json);
@@ -2337,13 +2329,19 @@ fn strip_tags_simple(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn html_entity_decode(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
+pub(crate) fn html_entity_decode(s: &str) -> String {
+    static ENTITIES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ENTITIES.get_or_init(|| regex::Regex::new(r"&(#(?:[xX][0-9a-fA-F]+|[0-9]+)|amp|lt|gt|quot|apos|nbsp);").unwrap());
+    re.replace_all(s, |caps: &regex::Captures| {
+        let token = &caps[1];
+        let named = match token { "amp" => Some('&'), "lt" => Some('<'), "gt" => Some('>'), "quot" => Some('"'), "apos" => Some('\''), "nbsp" => Some(' '), _ => None };
+        let decoded = named.or_else(|| {
+            let numeric = token.strip_prefix('#')?;
+            let code = if let Some(hex) = numeric.strip_prefix('x').or_else(|| numeric.strip_prefix('X')) { u32::from_str_radix(hex,16).ok()? } else { numeric.parse().ok()? };
+            char::from_u32(code)
+        });
+        decoded.map(|c| c.to_string()).unwrap_or_else(|| caps[0].to_string())
+    }).into_owned()
 }
 
 fn link_header(statuses: &[Value], limit: i64, view: &str) -> String {
@@ -4700,6 +4698,9 @@ pub async fn warm_view(
     // the HTML path still repeats this cheaply at paint time for cache misses.
     let _ = crate::link_preview::attach_cached_cards(&db, &mut statuses).await;
 
+    // Never cache restricted or muted nested context after quote hydration.
+    crate::audience::filter_statuses(&db, owner_user_id, crate::audience::Surface::timeline(view), &mut statuses).await?;
+    statuses.retain(|st| !crate::hidden::status_hidden(st, &hidden));
     let mut stored = Vec::new();
     let now = chrono::Utc::now().timestamp();
     for &limit in &limits {
@@ -5572,4 +5573,27 @@ mod tests {
         });
         assert!(crate::hidden::status_hidden(&status, &hidden));
     }
+}
+
+#[cfg(test)]
+mod privacy_regressions {
+ use super::*;
+ #[test]
+ fn quoted_blocked_author_should_be_hidden() {
+  let mut hidden=crate::hidden::HiddenSets::default();
+  hidden.user_blocked_actors.insert("https://bsky.app/profile/blocked.bsky.social".into());
+  let status=json!({"account":{"uri":"https://bsky.app/profile/friend.bsky.social"},"quote":{"quoted_status":{"account":{"uri":"https://bsky.app/profile/blocked.bsky.social"},"content":"blocked author content"}}});
+  assert!(crate::hidden::status_hidden(&status,&hidden), "Blocked author remains visible inside quote");
+ }
+ #[test]
+ fn quoted_porn_label_should_mark_nested_status_sensitive() {
+  let embed=json!({"$type":"app.bsky.embed.record#view","record":{"$type":"app.bsky.embed.record#viewRecord","uri":"at://did:plc:test/app.bsky.feed.post/x","author":{"did":"did:plc:test","handle":"example.bsky.social"},"value":{"$type":"app.bsky.feed.post","text":"labelled quote"},"labels":[{"val":"porn"}],"embeds":[{"$type":"app.bsky.embed.images#view","images":[{"fullsize":"https://cdn.example/explicit.jpg","thumb":"https://cdn.example/thumb.jpg","alt":""}]}]}});
+  let quoted=bsky_quote_status_from_embed(&embed.to_string()).expect("quote parsed");
+  assert_eq!(quoted["media_attachments"].as_array().unwrap().len(),1);
+  assert_eq!(quoted["sensitive"],json!(true),"Quoted porn label lost; media is rendered without CW gate");
+  let mut self_labelled = embed.clone();
+  self_labelled["record"]["labels"] = json!([]);
+  self_labelled["record"]["value"]["labels"] = json!({"$type":"com.atproto.label.defs#selfLabels", "values":[{"val":"porn"}]});
+  assert_eq!(bsky_quote_status_from_embed(&self_labelled.to_string()).unwrap()["sensitive"], json!(true));
+ }
 }

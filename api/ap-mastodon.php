@@ -201,6 +201,11 @@ function ap_masto_timeline_base_url(string $path): string
  */
 function ap_masto_json_timeline(array $statuses, string $path, int $limit, array $extraQuery = []): void
 {
+    if ($path === '/api/v1/timelines/home') {
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+    }
     if ($statuses) {
         $first = (string) ($statuses[0]['id'] ?? '');
         $last = (string) ($statuses[count($statuses) - 1]['id'] ?? '');
@@ -257,6 +262,11 @@ function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?
         if ($age >= 0 && $age < $ttlSec && is_string($redisCached['body']) && $redisCached['body'] !== '') {
             http_response_code(200);
             header('Content-Type: application/json; charset=utf-8');
+            if ($path === '/api/v1/timelines/home') {
+                header('Cache-Control: no-store, no-cache, must-revalidate');
+                header('Pragma: no-cache');
+                header('Expires: 0');
+            }
             header('X-VAAK-TL-Cache: redis');
             if (!empty($redisCached['link'])) header('Link: ' . (string) $redisCached['link']);
             echo $redisCached['body'];
@@ -287,6 +297,11 @@ function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?
     $link = is_file($metaFile) ? trim((string) @file_get_contents($metaFile)) : '';
     http_response_code(200);
     header('Content-Type: application/json; charset=utf-8');
+    if ($path === '/api/v1/timelines/home') {
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('Pragma: no-cache');
+        header('Expires: 0');
+    }
     header('X-VAAK-TL-Cache: hit');
     if ($link !== '') {
         header('Link: ' . $link);
@@ -1636,7 +1651,11 @@ function ap_masto_api(string $method, string $path): void
         if ($sinceId !== null && $sinceId !== '' && !ctype_digit($sinceId)) {
             $sinceId = null;
         }
-        $chronoExtra = ['mode' => 'chrono'];
+        // Version the mobile feed namespace when its composition changes so
+        // stale pre-fix pages cannot mask restored follow/tag/Bluesky rows.
+        // Bump after mobile-feed composition changes so cached RSS wrappers
+        // from the previous compatibility page cannot be served again.
+        $chronoExtra = ['mode' => 'chrono-v3'];
         if (ap_masto_timeline_cache_try('/api/v1/timelines/home', $limit, $maxId, $sinceId, $chronoExtra)) {
             return;
         }
@@ -1794,6 +1813,9 @@ function ap_masto_api(string $method, string $path): void
             $after = ($sinceId !== null && $sinceId !== '') ? ap_masto_status_created_at_by_id((int) $sinceId) : null;
             foreach ($rows as $r) {
                 $status = ap_masto_status_from_row($r);
+                if (!ap_visibility_public_status($status)) {
+                    continue;
+                }
                 $ts = (string) ($status['created_at'] ?? '');
                 if ($before !== null && $ts !== '' && strcmp($ts, $before) >= 0) {
                     continue;

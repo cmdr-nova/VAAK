@@ -2211,10 +2211,7 @@ fn reply_mention_query(status: &Value, viewer_actor: &str) -> String {
 /// Stamp mute/block flags onto statuses (and nested reblogs) for lean ⋯ menus.
 pub fn stamp_viewer_moderation(statuses: &mut [Value], moderation: &crate::hidden::ViewerModeration) {
     for st in statuses.iter_mut() {
-        stamp_viewer_moderation_one(st, moderation);
-        if let Some(reblog) = st.get_mut("reblog").filter(|v| v.is_object()) {
-            stamp_viewer_moderation_one(reblog, moderation);
-        }
+        stamp_viewer_moderation_tree(st, moderation);
     }
 }
 
@@ -2223,33 +2220,26 @@ pub fn stamp_viewer_moderation_tree(
     status: &mut Value,
     moderation: &crate::hidden::ViewerModeration,
 ) {
-    stamp_viewer_moderation_one(status, moderation);
-    if let Some(reblog) = status.get_mut("reblog").filter(|v| v.is_object()) {
-        stamp_viewer_moderation_one(reblog, moderation);
-    }
-    stamp_nested_quote(status.get_mut("quote"), moderation);
-    stamp_nested_quote(status.get_mut("vaak_quote_preview"), moderation);
+    stamp_moderation_at(status, moderation, 0);
 }
 
-fn stamp_nested_quote(
-    quote: Option<&mut Value>,
-    moderation: &crate::hidden::ViewerModeration,
-) {
-    let Some(quote) = quote.filter(|v| v.is_object()) else {
-        return;
-    };
-    if quote.get("quoted_status").is_some() {
-        if let Some(quoted) = quote.get_mut("quoted_status").filter(|v| v.is_object()) {
-            stamp_viewer_moderation_one(quoted, moderation);
-        }
-        return;
-    }
-    if quote.get("account").is_some() || quote.get("uri").is_some() || quote.get("url").is_some() {
-        stamp_viewer_moderation_one(quote, moderation);
+fn stamp_moderation_at(status: &mut Value, moderation: &crate::hidden::ViewerModeration, depth: usize) {
+    if depth > 16 { return; }
+    stamp_viewer_moderation_one(status, moderation);
+    for field in ["reblog", "quote", "vaak_quote_preview"] {
+        let Some(child) = status.get_mut(field).filter(|v| v.is_object()) else { continue; };
+        if child.get("quoted_status").is_some() {
+            if let Some(st) = child.get_mut("quoted_status") { stamp_moderation_at(st, moderation, depth + 1); }
+        } else if child.get("status").is_some() {
+            if let Some(st) = child.get_mut("status") { stamp_moderation_at(st, moderation, depth + 1); }
+        } else { stamp_moderation_at(child, moderation, depth + 1); }
     }
 }
 
 fn stamp_viewer_moderation_one(status: &mut Value, moderation: &crate::hidden::ViewerModeration) {
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert("_vaak_auto_unblur_sensitive".into(), Value::Bool(moderation.auto_unblur_sensitive));
+    }
     let actor = status_account_actor(status);
     if actor.is_empty() || !actor.starts_with("https://") {
         return;
@@ -3921,7 +3911,10 @@ pub fn paint_lean_embed_from(
         ));
     }
 
-    if sensitive && !body_inner.is_empty() {
+    // Older Bluesky envelopes used a synthetic warning as spoiler text.
+    let generated_warning = bsky && json_flag(status, "vaak_bsky_sensitive") && spoiler == "Sensitive content";
+    let auto_unblur = (spoiler.is_empty() || generated_warning) && json_flag(status, "_vaak_auto_unblur_sensitive");
+    if sensitive && !auto_unblur && !body_inner.is_empty() {
         let label = if spoiler.is_empty() {
             "Sensitive content".to_string()
         } else {
@@ -5387,4 +5380,30 @@ mod tests {
         assert!(html.find("ask-container").unwrap() < html.find("feed-body").unwrap(), "{html}");
     }
 
+}
+
+#[cfg(test)]
+mod privacy_settings_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn auto_unblur_applies_to_sensitive_media_but_keeps_explicit_warnings() {
+        let mut st = json!({"uri":"https://remote.test/posts/1","content":"<p>body</p>","sensitive":true,"spoiler_text":"","account":{"uri":"https://remote.test/users/a","acct":"a"}});
+        let mut moderation = crate::hidden::ViewerModeration::default();
+        stamp_viewer_moderation_tree(&mut st, &moderation);
+        assert!(paint_lean_feed_card(&st).contains("cw-gate"));
+        moderation.auto_unblur_sensitive = true;
+        stamp_viewer_moderation_tree(&mut st, &moderation);
+        assert!(!paint_lean_feed_card(&st).contains("cw-gate"));
+        st["spoiler_text"] = json!("Explicit warning");
+        assert!(paint_lean_feed_card(&st).contains("cw-gate"));
+    }
+    #[test]
+    fn preference_reaches_quotes_inside_boosts() {
+        let mut st = json!({"reblog":{"quote":{"quoted_status":{"content":"nested", "sensitive":true}}}});
+        let mut moderation = crate::hidden::ViewerModeration::default();
+        moderation.auto_unblur_sensitive = true;
+        stamp_viewer_moderation_tree(&mut st, &moderation);
+        assert_eq!(st["reblog"]["quote"]["quoted_status"]["_vaak_auto_unblur_sensitive"], json!(true));
+    }
 }
