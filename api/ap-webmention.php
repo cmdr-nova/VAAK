@@ -22,6 +22,8 @@ if ($method === 'GET') {
     if ($target === null) {
         ap_webmention_error('target is required', 400);
     }
+    if (!ap_webmention_target_exists($target)) { ap_webmention_error('target is not a public local profile or post', 404); }
+    if (!ap_webmention_target_enabled($target)) { ap_webmention_error('Webmentions are disabled for this profile', 410); }
     $st = ap_db()->prepare(
         'SELECT id, source_url, target_url, source_title, source_content, source_author, source_published, verified_at
          FROM webmentions WHERE target_url = ? ORDER BY verified_at DESC, id DESC LIMIT 100'

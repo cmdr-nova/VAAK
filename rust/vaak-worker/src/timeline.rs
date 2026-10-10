@@ -51,6 +51,7 @@ pub struct HomeHydrateReport {
     pub since_id: Option<String>,
     pub redis_key: String,
     pub cache_hit: bool,
+    pub algorithm_enabled: Option<bool>,
     pub age_secs: Option<i64>,
     pub fresh: bool,
     pub n: usize,
@@ -166,6 +167,7 @@ async fn read_hydrate_envelope(
             .map(str::to_string),
         redis_key,
         cache_hit: false,
+        algorithm_enabled: None,
         age_secs: None,
         fresh: false,
         n: 0,
@@ -179,6 +181,7 @@ async fn read_hydrate_envelope(
         report.note = "hydrate cache miss (run bin/home-timeline-warm.php or wait for Ice Cubes head poll)";
         return Ok(report);
     };
+    report.algorithm_enabled = env.get("algorithm_enabled").and_then(Value::as_bool);
     let created = env.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
     let age = if created > 0 {
         Some(chrono::Utc::now().timestamp() - created)
@@ -291,8 +294,22 @@ pub async fn view_hydrate(
         // Moderation changes must invalidate stale cached envelopes at read
         // time, not only when the fan-out worker happens to rewarm them.
         let moderation_db = crate::db::connect(&cfg.database_url).await?;
-        let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id).await?;
         let before = report.items.len();
+        if view == "home" {
+            let enabled = crate::recommendations::algorithm_enabled(&moderation_db, owner_user_id).await?;
+            if report.algorithm_enabled != Some(enabled) {
+                report.cache_hit = false;
+                report.fresh = false;
+                report.items.clear();
+                report.n = 0;
+                report.link = None;
+                report.note = "Home algorithm preference changed; regenerate envelope";
+                return Ok(report);
+            }
+            crate::recommendations::filter_statuses(&moderation_db, owner_user_id, &mut report.items).await?;
+        }
+        crate::home_hydrate_ranked::refresh_local_accounts(&moderation_db, &mut report.items).await?;
+        let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id).await?;
         report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
         report.filtered = report.items.len() != before;
         report.n = report.items.len();
@@ -780,6 +797,7 @@ pub async fn home_shadow(cfg: &Config, owner_user_id: i64, limit: usize) -> Resu
             since_id: None,
             redis_key: home_timeline_redis_key(owner_user_id, limit as i64, None),
             cache_hit: false,
+            algorithm_enabled: None,
             age_secs: None,
             fresh: false,
             n: 0,

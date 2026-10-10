@@ -251,12 +251,21 @@ function ap_masto_timeline_cache_key(string $path, int $limit, ?string $sinceId,
  */
 function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?string $sinceId, array $extraQuery = [], int $ttlSec = 45): bool
 {
+    // Home settings must be checked even when the Rust path misses.
+    if ($path === '/api/v1/timelines/home' && $extraQuery !== []) {
+        $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+        $extraQuery['algorithm_enabled'] = ap_masto_home_algorithm_enabled($owner);
+    }
     // Only cache "head" polls (no max_id scroll pages) — those are Ice Cubes' frequent refresh.
     if ($maxId !== null && $maxId !== '') {
         return false;
     }
     $redisKey = ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery);
     $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
+    if ($path === '/api/v1/timelines/home' && is_array($redisCached)) {
+        $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+        if (($redisCached['algorithm_enabled'] ?? null) !== ap_masto_home_algorithm_enabled($owner)) $redisCached = null;
+    }
     if (is_array($redisCached) && isset($redisCached['created_at'], $redisCached['body'])) {
         $age = time() - (int) $redisCached['created_at'];
         if ($age >= 0 && $age < $ttlSec && is_string($redisCached['body']) && $redisCached['body'] !== '') {
@@ -285,6 +294,7 @@ function ap_masto_timeline_cache_try(string $path, int $limit, ?string $maxId, ?
     if (!is_file($file)) {
         return false;
     }
+    if ($path === '/api/v1/timelines/home' && trim((string) @file_get_contents($file . '.algorithm')) !== (ap_masto_home_algorithm_enabled($owner) ? 'on' : 'off')) return false;
     $age = time() - (int) @filemtime($file);
     if ($age < 0 || $age >= $ttlSec) {
         return false;
@@ -443,6 +453,7 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
         return;
     }
     $owner = function_exists('ap_db_masto_owner_user_id') ? ap_db_masto_owner_user_id() : 0;
+    if ($path === '/api/v1/timelines/home' && $extraQuery !== []) { $extraQuery['algorithm_enabled'] = ap_masto_home_algorithm_enabled($owner); }
     $key = hash('sha256', json_encode([
         'u' => $owner,
         'p' => $path,
@@ -481,10 +492,12 @@ function ap_masto_timeline_cache_store(array $statuses, string $path, int $limit
         $redisTtl = ($path === '/api/v1/timelines/home') ? 300 : 45;
         ap_redis_json_set(ap_masto_timeline_cache_key($path, $limit, $sinceId, $extraQuery), [
             'created_at' => time(), 'body' => $json, 'link' => $link,
+            'algorithm_enabled' => $path === '/api/v1/timelines/home' ? ap_masto_home_algorithm_enabled($owner) : null,
         ], max(5, min(600, $redisTtl)));
     }
     @file_put_contents($file, $json, LOCK_EX);
     @file_put_contents($file . '.link', $link, LOCK_EX);
+    if ($path === '/api/v1/timelines/home') @file_put_contents($file . '.algorithm', ap_masto_home_algorithm_enabled($owner) ? 'on' : 'off', LOCK_EX);
 }
 
 function ap_masto_input(): array
@@ -2833,4 +2846,12 @@ function ap_masto_api(string $method, string $path): void
     }
 
     ap_masto_json(['error' => 'Not found', 'path' => $path], 404);
+}
+
+function ap_masto_home_algorithm_enabled(int $owner): bool
+{
+    $st = ap_db()->prepare('SELECT COALESCE(p.algorithm_enabled,1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE u.id=?');
+    $st->execute([$owner]);
+    $value = $st->fetchColumn();
+    return $value === false || (int) $value !== 0;
 }

@@ -2602,6 +2602,8 @@ async fn apply_cached_recommendations(
                 )
                 .await
             {
+                let candidates: Vec<String> = rows.iter().map(|r| r.get::<_, String>(2)).collect();
+                state.seen_objects.extend(crate::recommendations::interacted_objects(db, owner, &candidates).await?);
                 for row in rows {
                     if state.added >= foaf_budget {
                         break;
@@ -2650,6 +2652,8 @@ async fn apply_cached_recommendations(
                 .await
             };
             if let Ok(rows) = rows {
+                let candidates: Vec<String> = rows.iter().map(|r| r.get::<_, String>(2)).collect();
+                state.seen_objects.extend(crate::recommendations::interacted_objects(db, owner, &candidates).await?);
                 for row in rows {
                     if state.added >= max_added {
                         break;
@@ -2677,6 +2681,8 @@ async fn apply_cached_recommendations(
         )
         .await
     {
+        let candidates: Vec<String> = rows.iter().map(|r| r.get::<_, String>(2)).collect();
+        state.seen_objects.extend(crate::recommendations::interacted_objects(db, owner, &candidates).await?);
         for row in rows {
             if state.added >= max_added {
                 break;

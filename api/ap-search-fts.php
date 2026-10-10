@@ -435,6 +435,12 @@ function ap_search_fts_ranked_hits(string $match, string $tagName, int $limit, s
          OR (d.source = 'mention' AND EXISTS (SELECT 1 FROM mentions m WHERE m.id = d.source_pk AND m.deleted_at IS NULL))
          OR (d.source = 'status' AND EXISTS (SELECT 1 FROM masto_statuses s WHERE s.local_id = d.source_pk))
          )";
+    $owner = function_exists('ap_db_masto_owner_user_id') ? (int) ap_db_masto_owner_user_id() : 0;
+    // Read canonical preferences so old indexed docs cannot bypass an opt-out.
+    $liveSql .= " AND NOT EXISTS (SELECT 1 FROM ap_users u JOIN actor_profile p ON p.actor_key=u.actor_key
+        WHERE COALESCE(p.indexable,1)=0 AND u.id<>$owner
+          AND (substr(d.object_id,1,length(rtrim(u.actor_id,'/') || '/notes/'))=rtrim(u.actor_id,'/') || '/notes/'
+            OR (d.source='event' AND EXISTS (SELECT 1 FROM events e WHERE e.id=d.source_pk AND rtrim(e.actor_id,'/')=rtrim(u.actor_id,'/')))))";
     $tagLike = null;
     $safeTag = mb_strtolower(preg_replace('/[^\p{L}\p{N}_]/u', '', $tagName) ?? '');
     if ($safeTag !== '') {

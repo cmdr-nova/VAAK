@@ -425,9 +425,13 @@ pub async fn project(
                 ts_rank_cd(body_tsv, to_tsquery('simple', $1))::double precision AS rank
          FROM ap_search_docs
          WHERE body_tsv @@ to_tsquery('simple', $1)
+           AND NOT EXISTS (SELECT 1 FROM ap_users u JOIN actor_profile p ON p.actor_key=u.actor_key
+             WHERE COALESCE(p.indexable,1)=0 AND u.id<>$3
+               AND (substr(ap_search_docs.object_id,1,length(rtrim(u.actor_id,'/') || '/notes/'))=rtrim(u.actor_id,'/') || '/notes/'
+                 OR (ap_search_docs.source='event' AND EXISTS (SELECT 1 FROM events e WHERE e.id=ap_search_docs.source_pk AND rtrim(e.actor_id,'/')=rtrim(u.actor_id,'/')))))
          ORDER BY rank DESC, created_at DESC
          LIMIT $2",
-        &[&tsquery, &(limit * 3).min(240)],
+        &[&tsquery, &(limit * 3).min(240), &owner_id],
     ).await.context("query search FTS")?;
     let mut rows = Vec::with_capacity(candidates.len());
     for row in candidates {
@@ -457,6 +461,7 @@ pub async fn project(
             statuses.push(status);
         }
     }
+    crate::home_hydrate_ranked::refresh_local_accounts(&db, &mut statuses).await?;
     let hashtags = if kind == "hashtags" { hashtag_rows(&db, owner_id, tag.unwrap_or(query), limit).await.unwrap_or_default() } else { Vec::new() };
     Ok(SearchResults { owner_id, actor_key, query: query.to_string(), query_type: kind,
         normalized_query: Some(match_query), rows, statuses, accounts: Vec::new(), hashtags, redirect_url: None, privacy_filtered: true,
