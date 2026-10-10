@@ -11,20 +11,28 @@ pub async fn algorithm_enabled(db: &Client, owner: i64) -> Result<bool> {
 
 pub const INTERACTED_SQL: &str = r#"
 WITH candidates AS (SELECT unnest($2::text[]) AS object_id),
-viewer AS (SELECT actor_id FROM ap_users WHERE id=$1)
-SELECT c.object_id FROM candidates c WHERE
- EXISTS (SELECT 1 FROM masto_favourites f WHERE f.owner_user_id=$1 AND (f.object_id=c.object_id OR f.object_id=c.object_id || '/'))
- OR EXISTS (SELECT 1 FROM masto_bookmarks b WHERE b.owner_user_id=$1 AND (b.object_id=c.object_id OR b.object_id=c.object_id || '/'))
- OR EXISTS (SELECT 1 FROM masto_reblogs b WHERE b.owner_user_id=$1 AND (b.object_id=c.object_id OR b.object_id=c.object_id || '/'))
- OR EXISTS (SELECT 1 FROM outbox_notes o, viewer v WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'
-   AND (o.in_reply_to IN (c.object_id,c.object_id || '/')
-     OR rtrim(COALESCE(NULLIF(o.raw_create_json,'')::jsonb #>> '{object,quote}', NULLIF(o.raw_create_json,'')::jsonb #>> '{object,quoteUrl}', NULLIF(o.raw_create_json,'')::jsonb #>> '{object,_misskey_quote}', ''),'/')=c.object_id))
- OR EXISTS (SELECT 1 FROM quote_authorizations q, viewer v WHERE rtrim(q.requester_actor,'/')=rtrim(v.actor_id,'/') AND q.quoted_note_id IN (c.object_id,c.object_id || '/'))
- OR EXISTS (SELECT 1 FROM ap_user_signals s WHERE s.owner_user_id=$1 AND s.weight>0
+viewer AS (SELECT id,actor_id FROM ap_users WHERE id=$1),
+own_notes AS MATERIALIZED (
+ SELECT o.in_reply_to, NULLIF(o.raw_create_json,'')::jsonb AS doc FROM outbox_notes o, viewer v
+ WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'
+),
+signals AS MATERIALIZED (
+ SELECT s.target_key,NULLIF(s.metadata_json,'')::jsonb AS doc FROM ap_user_signals s, viewer v
+ WHERE s.owner_user_id=v.id AND s.weight>0
    AND s.signal_type IN ('like','favourite','boost','reblog','reply','quote','bookmark')
-   AND (s.target_key IN (c.object_id,c.object_id || '/')
-     OR rtrim(COALESCE(NULLIF(s.metadata_json,'')::jsonb ->> 'object_id',''),'/')=c.object_id
-     OR rtrim(COALESCE(NULLIF(s.metadata_json,'')::jsonb ->> 'uri',''),'/')=c.object_id))
+),
+interactions AS MATERIALIZED (
+ SELECT rtrim(f.object_id,'/') AS object_id FROM masto_favourites f, viewer v WHERE f.owner_user_id=v.id
+ UNION ALL SELECT rtrim(b.object_id,'/') FROM masto_bookmarks b, viewer v WHERE b.owner_user_id=v.id
+ UNION ALL SELECT rtrim(b.object_id,'/') FROM masto_reblogs b, viewer v WHERE b.owner_user_id=v.id
+ UNION ALL SELECT rtrim(n.in_reply_to,'/') FROM own_notes n
+ UNION ALL SELECT rtrim(COALESCE(n.doc #>> '{object,quote}',n.doc #>> '{object,quoteUrl}',n.doc #>> '{object,_misskey_quote}',''),'/') FROM own_notes n
+ UNION ALL SELECT rtrim(q.quoted_note_id,'/') FROM quote_authorizations q, viewer v WHERE rtrim(q.requester_actor,'/')=rtrim(v.actor_id,'/')
+ UNION ALL SELECT rtrim(s.target_key,'/') FROM signals s
+ UNION ALL SELECT rtrim(s.doc ->> 'object_id','/') FROM signals s
+ UNION ALL SELECT rtrim(s.doc ->> 'uri','/') FROM signals s
+)
+SELECT DISTINCT c.object_id FROM candidates c JOIN interactions i ON i.object_id=c.object_id
 "#;
 
 pub async fn interacted_objects(db: &Client, owner: i64, objects: &[String]) -> Result<HashSet<String>> {
