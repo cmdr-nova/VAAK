@@ -4197,9 +4197,18 @@ function ap_known_shared_inboxes(int $limit = 40): array
         'SELECT host, COUNT(*) AS c FROM events WHERE host IS NOT NULL AND host != \'\' GROUP BY host ORDER BY c DESC LIMIT 80'
     )->fetchAll();
     $inboxes = [];
+    // Wafrn friend servers are delivered via ap_wafrn_friend_inboxes() (correct shared inbox path);
+    // guessing https://HOST/inbox for them only produces HTTP 405.
+    $friendHosts = [];
+    foreach (ap_wafrn_friend_inboxes(40) as $friendInbox) {
+        $friendHost = parse_url($friendInbox, PHP_URL_HOST);
+        if (is_string($friendHost) && $friendHost !== '') {
+            $friendHosts[strtolower($friendHost)] = true;
+        }
+    }
     foreach ($rows as $row) {
         $host = strtolower((string) ($row['host'] ?? ''));
-        if ($host === '' || $host === 'mkultra.monster') {
+        if ($host === '' || $host === 'mkultra.monster' || isset($friendHosts[$host])) {
             continue;
         }
         // Skip obviously non-AP / broken /inbox guesses
@@ -4271,7 +4280,8 @@ function ap_wafrn_friend_inboxes(int $limit = 20): array
             continue;
         }
         $path = trim((string) ($parts['path'] ?? ''), '/');
-        $inbox = 'https://' . $host . ($path !== '' ? '/' . $path : '/inbox');
+        // Wafrn does not accept POST on /inbox (405); its shared inbox is /fediverse/sharedInbox.
+        $inbox = 'https://' . $host . ($path !== '' ? '/' . $path : '/fediverse/sharedInbox');
         if (!ap_is_blocked_inbox($inbox)) {
             $out[$inbox] = true;
         }
