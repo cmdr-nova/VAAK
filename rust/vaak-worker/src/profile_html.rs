@@ -352,6 +352,7 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
             st["vaak_quote_preview"] = quoted.clone();
         }
     }
+    crate::home_hydrate_ranked::refresh_local_accounts(db, statuses).await?;
     Ok(())
 }
 

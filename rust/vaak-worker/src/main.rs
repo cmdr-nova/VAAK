@@ -22,6 +22,7 @@ mod profile_html;
 mod phyrian;
 mod ranked;
 mod ranked_warm;
+mod recommendations;
 mod redis_util;
 mod self_thread;
 mod actor_warm;

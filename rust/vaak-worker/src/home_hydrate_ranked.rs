@@ -932,6 +932,7 @@ fn rss_item_id_from_key(value: &str) -> Option<i64> {
 struct RankedEntry {
     kind: String,
     id: String,
+    source: String,
 }
 
 struct RssRow {
@@ -1141,6 +1142,9 @@ struct AskContext {
 struct LocalProfile {
     display_name: String,
     icon_url: String,
+    automated: bool,
+    discoverable: bool,
+    indexable: bool,
 }
 
 #[derive(Clone)]
@@ -1914,7 +1918,13 @@ fn local_account_from_profile(
     } else {
         (username.to_string(), LOCAL_DEFAULT_AVATAR.to_string())
     };
-    empty_account(actor_url, username, username, &display, actor_url, &avatar)
+    let mut account = empty_account(actor_url, username, username, &display, actor_url, &avatar);
+    if let Some(p) = profiles.get(&key) {
+        account["bot"] = json!(p.automated);
+        account["discoverable"] = json!(p.discoverable);
+        account["indexable"] = json!(p.indexable);
+    }
+    account
 }
 
 fn materialize_outbox(
@@ -2058,6 +2068,8 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
         &[&local_targets],
     ).await.context("select local quote targets")?;
+    let local_keys: Vec<String> = local_targets.iter().filter_map(|uri| uri.strip_prefix(LOCAL_ACTOR_PREFIX).and_then(|rest| rest.split('/').next()).map(str::to_string)).collect();
+    let profiles = fetch_local_profiles_map(db, &local_keys).await?;
     let mut by_target = HashMap::new();
     for row in rows {
         let id: String = row.get(0);
@@ -2070,7 +2082,7 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
             "uri": id,
             "url": id,
             "content": row.get::<_, String>(1),
-            "account": empty_account(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, username, username, &format!("{LOCAL_ACTOR_PREFIX}{username}"), LOCAL_DEFAULT_AVATAR),
+            "account": local_account_from_profile(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, &profiles),
             "media_attachments": media,
         }));
     }
@@ -2383,6 +2395,7 @@ async fn load_ranked_head_for_view(
     owner: i64,
     want: usize,
     view: &str,
+    algorithm_on: bool,
 ) -> Result<(Vec<RankedEntry>, String)> {
     let view = normalize_view(view);
     let index_key = format!("vaak:timeline:owner-index:v1:{owner}");
@@ -2397,6 +2410,7 @@ async fn load_ranked_head_for_view(
     // on a stale 160-item fan-out head while a fresh 400+ ranked warm exists.
     let mut best: Option<(String, Value, usize, i64)> = None;
     for logical in &logicals {
+        if view == "home" && !home_logical_matches_algorithm(logical, algorithm_on) { continue; }
         let rk = ranked_redis_key(logical);
         let Some(env) = redis_util::json_get(redis, &rk).await? else {
             continue;
@@ -2447,7 +2461,8 @@ async fn load_ranked_head_for_view(
         if kind.is_empty() || id.is_empty() {
             continue;
         }
-        out.push(RankedEntry { kind, id });
+        let source = it.get("s").and_then(Value::as_str).unwrap_or("").to_string();
+        out.push(RankedEntry { kind, id, source });
     }
     Ok((out, logical))
 }
@@ -2458,7 +2473,7 @@ async fn load_ranked_head(
     owner: i64,
     want: usize,
 ) -> Result<(Vec<RankedEntry>, String)> {
-    load_ranked_head_for_view(redis, owner, want, "home").await
+    load_ranked_head_for_view(redis, owner, want, "home", true).await
 }
 
 async fn fetch_rss_map(db: &Client, ids: &[i64], owner: i64) -> Result<HashMap<i64, RssRow>> {
@@ -3089,7 +3104,7 @@ async fn fetch_local_profiles_map(
     keys.dedup();
     let rows = db
         .query(
-            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, '')
+            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, ''), COALESCE(automated,0), COALESCE(discoverable,1), COALESCE(indexable,1)
              FROM actor_profile
              WHERE lower(actor_key) = ANY($1)",
             &[&keys],
@@ -3103,6 +3118,9 @@ async fn fetch_local_profiles_map(
             LocalProfile {
                 display_name: row.get(1),
                 icon_url: row.get(2),
+                automated: row.get::<_, i32>(3) != 0,
+                discoverable: row.get::<_, i32>(4) != 0,
+                indexable: row.get::<_, i32>(5) != 0,
             },
         );
     }
@@ -4422,9 +4440,11 @@ pub async fn warm_view(
     limits.dedup();
     let want = *limits.iter().max().unwrap_or(&MAX_HYDRATE_LIMIT) as usize;
 
+    let db = crate::db::connect(&cfg.database_url).await?;
+    let algorithm_on = crate::recommendations::algorithm_enabled(&db, owner_user_id).await?;
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
     let (head, _logical) =
-        load_ranked_head_for_view(&mut redis, owner_user_id, want.max(80), view).await?;
+        load_ranked_head_for_view(&mut redis, owner_user_id, want.max(80), view, algorithm_on).await?;
     let ranked_n = head.len();
 
     let mut rss_ids = Vec::new();
@@ -4465,7 +4485,6 @@ pub async fn warm_view(
     boost_ids.sort();
     boost_ids.dedup();
 
-    let db = crate::db::connect(&cfg.database_url).await?;
     let hidden = crate::hidden::load_hidden_sets(&db, owner_user_id).await?;
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
@@ -4664,7 +4683,8 @@ pub async fn warm_view(
             }),
             _ => None,
         };
-        if let Some(st) = st {
+        if let Some(mut st) = st {
+            if e.source == "recommendation" { st["vaak_home_source"] = json!("recommendation"); }
             // Ranked caches can briefly contain an item from before a mute or
             // instance block changed. Filter again at hydration so stale
             // envelopes cannot leak blocked actors into the Rust timeline.
@@ -4690,6 +4710,7 @@ pub async fn warm_view(
         }
     }
     let _ = hydrate_local_quote_targets(&db, &mut statuses).await;
+    crate::recommendations::filter_statuses(&db, owner_user_id, &mut statuses).await?;
     link_outbox_reply_ids(&mut statuses);
 
     // Hydrated timelines are consumed directly by Mastodon-compatible clients
@@ -4710,6 +4731,7 @@ pub async fn warm_view(
         let key = timeline::timeline_hydrate_redis_key(view, owner_user_id, limit, None);
         let envelope = json!({
             "created_at": now,
+            "algorithm_enabled": algorithm_on,
             "body": body,
             "link": link,
         });
@@ -5596,4 +5618,59 @@ mod privacy_regressions {
   self_labelled["record"]["value"]["labels"] = json!({"$type":"com.atproto.label.defs#selfLabels", "values":[{"val":"porn"}]});
   assert_eq!(bsky_quote_status_from_embed(&self_labelled.to_string()).unwrap()["sensitive"], json!(true));
  }
+}
+
+fn home_logical_matches_algorithm(logical: &str, enabled: bool) -> bool {
+    logical.contains(if enabled { "_aon_" } else { "_aoff_" })
+}
+
+/// Repair local identity in cached notifications/statuses without remote fetches.
+pub(crate) async fn refresh_local_accounts(db: &Client, values: &mut [Value]) -> Result<()> {
+    fn keys(value: &Value, out: &mut Vec<String>, depth: usize) {
+        if depth > 12 { return; }
+        if let Some(account) = value.get("account") {
+            if let Some(key) = account.get("uri").or_else(|| account.get("url")).and_then(Value::as_str).and_then(local_username_from_url) { out.push(key); }
+        }
+        if let Some(obj) = value.as_object() { for child in obj.values().filter(|v| v.is_object()) { keys(child, out, depth+1); } }
+    }
+    fn update(value: &mut Value, profiles: &HashMap<String, LocalProfile>, depth: usize) {
+        if depth > 12 { return; }
+        if let Some(account) = value.get_mut("account") {
+            if let Some(key) = account.get("uri").or_else(|| account.get("url")).and_then(Value::as_str).and_then(local_username_from_url) {
+                let actor = format!("{LOCAL_ACTOR_PREFIX}{key}");
+                let fresh = local_account_from_profile(&actor, &key, profiles);
+                for field in ["acct", "username", "display_name", "avatar", "avatar_static", "bot", "discoverable", "indexable"] {
+                    if let Some(v) = fresh.get(field) { account[field] = v.clone(); }
+                }
+            }
+        }
+        if let Some(obj) = value.as_object_mut() { for child in obj.values_mut().filter(|v| v.is_object()) { update(child, profiles, depth+1); } }
+    }
+    let mut local_keys = Vec::new();
+    for value in values.iter() { keys(value, &mut local_keys, 0); }
+    let profiles = fetch_local_profiles_map(db, &local_keys).await?;
+    for value in values { update(value, &profiles, 0); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod settings_regression_tests {
+    use super::*;
+    #[test]
+    fn ranked_algorithm_modes_do_not_cross() {
+        assert!(!home_logical_matches_algorithm("v9_home_u1_aon_abc", false));
+        assert!(home_logical_matches_algorithm("v9_home_u1_aoff_abc", false));
+        assert!(!home_logical_matches_algorithm("v9_home_u1_aoff_abc", true));
+        assert!(!home_logical_matches_algorithm("v9_local_u1_ana_abc", true));
+    }
+    #[test]
+    fn local_quote_account_uses_saved_identity_and_preferences() {
+        let profiles = HashMap::from([("alice".into(), LocalProfile { display_name:"Alice".into(), icon_url:"https://example.test/avatar.png".into(), automated:true, discoverable:false, indexable:false })]);
+        let account = local_account_from_profile("https://mkultra.monster/users/alice", "alice", &profiles);
+        assert_eq!(account["acct"], "alice");
+        assert_eq!(account["avatar"], "https://example.test/avatar.png");
+        assert_eq!(account["bot"], true);
+        assert_eq!(account["discoverable"], false);
+        assert_eq!(account["indexable"], false);
+    }
 }

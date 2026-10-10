@@ -1,0 +1,26 @@
+{
+  "users": [[201,"https://mkultra.monster/users/alice_1"],[202,"https://mkultra.monster/users/alicex1"]],
+  "favourites": [[201,"https://remote.test/posts/favourite/"],[202,"https://remote.test/posts/other-owner"]],
+  "bookmarks": [[201,"https://remote.test/posts/bookmark"]],
+  "reblogs": [[201,"https://remote.test/posts/boost"]],
+  "outbox": [
+    ["https://mkultra.monster/users/alice_1/notes/reply","https://remote.test/posts/reply/","{}"],
+    ["https://mkultra.monster/users/alice_1/notes/quote",null,"{\"object\":{\"quote\":\"https://remote.test/posts/quote\"}}"],
+    ["https://mkultra.monster/users/alicex1/notes/quote",null,"{\"object\":{\"quote\":\"https://remote.test/posts/other-quote\"}}"]
+  ],
+  "authorizations": [["https://mkultra.monster/users/alice_1","https://remote.test/posts/authorized-quote"]],
+  "signals": [
+    [201,"like","https://remote.test/posts/queued",1,"{}"],
+    [201,"like","https://remote.test/posts/queued",-1,"{}"],
+    [201,"bookmark","1234",1,"{\"object_id\":\"https://remote.test/posts/metadata/\"}"],
+    [201,"boost","5678",1,"{\"uri\":\"https://remote.test/posts/uri\"}"],
+    [201,"impression","https://remote.test/posts/passive",1,"{}"],
+    [201,"click","https://remote.test/posts/click",1,"{}"],
+    [201,"dwell","https://remote.test/posts/dwell",1,"{}"],
+    [201,"follow","https://remote.test/posts/follow",1,"{}"],
+    [201,"like","https://remote.test/posts/undo-only",-1,"{}"],
+    [202,"like","https://remote.test/posts/other-signal",1,"{}"]
+  ],
+  "consumed": ["favourite","bookmark","boost","reply","quote","authorized-quote","queued","metadata","uri"],
+  "unseen": ["passive","click","dwell","follow","undo-only","other-owner","other-quote","other-signal","unseen"]
+}

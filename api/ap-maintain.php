@@ -339,10 +339,10 @@ try {
                 $actorId = 'https://mkultra.monster/users/' . $actorKey;
                 $stOld = $db->prepare(
                     'SELECT local_id, note_id FROM masto_statuses
-                     WHERE note_id LIKE ? AND published < ?
+                     WHERE substr(note_id,1,length(?)) = ? AND published < ?
                      ORDER BY published ASC, local_id ASC LIMIT 50'
                 );
-                $stOld->execute([$actorId . '/notes/%', $retentionCutoff]);
+                $stOld->execute([$actorId . '/notes/', $actorId . '/notes/', $retentionCutoff]);
                 $oldRows = $stOld->fetchAll() ?: [];
                 if (!$oldRows) {
                     continue;

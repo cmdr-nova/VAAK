@@ -8519,7 +8519,7 @@ function admin_home_cached_recommendation_items(
                 return false;
             }
             $object = rtrim((string) ($row['object_id'] ?? $row['id'] ?? ''), '/');
-            if ($object === '' || isset($seen[$object])) {
+            if ($object === '' || isset($seen[$object]) || isset(ap_home_recommendation_interacted_objects($ownerUserId, [$object])[$object])) {
                 return false;
             }
             $item = [
@@ -10230,6 +10230,7 @@ function admin_tl_hydrate(array $slice): array
                 'kind' => 'event',
                 'sort' => strtotime((string) ($erow['created_at'] ?? '')) ?: (int) ($erow['id'] ?? 0),
                 'row' => $erow,
+                'home_source' => (string) ($entry['s'] ?? ''),
             ];
             if (!empty($entry['t'])) {
                 $item['from_tag'] = true;
@@ -10298,6 +10299,14 @@ function admin_tl_hydrate(array $slice): array
             static fn(array $item): bool => !admin_timeline_item_hidden_by_moderation($item, $ownerUserId)
         ));
     }
+    $objects = [];
+    foreach ($items as $item) {
+        if (($item['home_source'] ?? '') === 'recommendation') $objects[] = (string) ($item['row']['object_id'] ?? '');
+    }
+    $consumed = ap_home_recommendation_interacted_objects($ownerUserId, $objects);
+    $items = array_values(array_filter($items, static fn(array $item): bool =>
+        ($item['home_source'] ?? '') !== 'recommendation' || !isset($consumed[rtrim((string) ($item['row']['object_id'] ?? ''), '/')])
+    ));
     return $items;
 }
 

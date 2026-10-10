@@ -6,6 +6,7 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/ap-redis.php';
+require_once __DIR__ . '/ap-recommendations.php';
 
 /**
  * Runtime feature switches. Values come from the process environment so an
@@ -2979,7 +2980,7 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
     // Partial callers (maintenance/tests and future API clients) must not
     // erase unrelated profile fields when changing one preference.
     $existingProfile = ap_profile_get($actorKey);
-    $forumSignature = trim(ap_fix_utf8((string) ($fields['forum_signature'] ?? '')));
+    $forumSignature = trim(ap_fix_utf8((string) ($fields['forum_signature'] ?? ($existingProfile['forum_signature'] ?? ''))));
     if (mb_strlen($forumSignature) > 500 || preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $forumSignature)) {
         return ['ok' => false, 'error' => 'Forum signature must be plain text with at most 500 characters.'];
     }
@@ -3059,11 +3060,11 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         // Partial saves (one preference at a time) must not unlock a private account.
         $manually = !empty($existingProfile['manually_approves']) ? 1 : 0;
     }
-    $discoverable = array_key_exists('discoverable', $fields) ? (!empty($fields['discoverable']) ? 1 : 0) : 1;
-    $indexable = array_key_exists('indexable', $fields) ? (!empty($fields['indexable']) ? 1 : 0) : 1;
+    $discoverable = array_key_exists('discoverable', $fields) ? (!empty($fields['discoverable']) ? 1 : 0) : (int) ($existingProfile['discoverable'] ?? 1);
+    $indexable = array_key_exists('indexable', $fields) ? (!empty($fields['indexable']) ? 1 : 0) : (int) ($existingProfile['indexable'] ?? 1);
     $collectionConsent = array_key_exists('collection_consent', $fields)
         ? (!empty($fields['collection_consent']) ? 1 : 0)
-        : 1;
+        : (int) ($existingProfile['collection_consent'] ?? 1);
     if (array_key_exists('vanity_verified', $fields)) {
         $vanityVerified = !empty($fields['vanity_verified']) ? 1 : 0;
     } else {
@@ -3176,11 +3177,18 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         ap_db_now(),
     ]);
 
-    // Public JSON snapshot for homepage bake / clients (best-effort).
-    ap_profile_export_public_cache($actorKey);
     if (function_exists('ap_redis_delete')) {
         ap_redis_delete('vaak:profile:v1:' . hash('sha256', trim($actorKey)));
     }
+    if ((bool) ($existingProfile['algorithm_enabled'] ?? true) !== (bool) $algorithmEnabled) {
+        $ownerQuery = ap_db()->prepare('SELECT id FROM ap_users WHERE actor_key = ?');
+        $ownerQuery->execute([$actorKey]);
+        $ownerUserId = (int) $ownerQuery->fetchColumn();
+        ap_timeline_cache_invalidate_owner($ownerUserId);
+        ap_timeline_home_hydrate_invalidate_owner($ownerUserId);
+    }
+    // Export only after invalidating the old profile snapshot.
+    ap_profile_export_public_cache($actorKey);
 
     return ['ok' => true];
 }
@@ -3579,6 +3587,8 @@ function ap_profile_masto_fields(bool $forSource = false, string $actorKey = 'cm
 /** Write /assets/data/ap-cmdr-nova.json next to the static site (best-effort). */
 function ap_profile_export_public_cache(string $actorKey = 'cmdr_nova'): void
 {
+    // This fixed-name static snapshot belongs to the site owner's homepage.
+    if ($actorKey !== 'cmdr_nova') return;
     try {
         $p = ap_profile_get($actorKey);
         $payload = [
@@ -4054,7 +4064,8 @@ function ap_actor_as2_document(string $actorKey, string $publicKeyPem, bool $ric
             $ctxExtra,
         ],
         'id' => $id,
-        'type' => 'Person',
+        // Mastodon derives its bot flag from the AS2 actor type.
+        'type' => !empty($p['automated']) ? 'Service' : 'Person',
         'preferredUsername' => $actorKey,
         'name' => $displayName,
         'summary' => $p['summary'] !== '' ? $p['summary'] : ('<p>@' . $actorKey . '@mkultra.monster</p>'),
@@ -6103,6 +6114,7 @@ function ap_outbox_store(array $note): void
         $kind,
         $visibility,
     ]);
+    ap_home_recommendation_record_publication($note, is_array($decoded) ? $decoded : []);
 }
 
 function ap_blog_slug(string $title, string $suffix = ''): string
@@ -7760,6 +7772,14 @@ function ap_timeline_cache_invalidate_owner(int $ownerUserId): void
 {
     if ($ownerUserId > 0 && function_exists('admin_tl_cache_clear_owner')) {
         admin_tl_cache_clear_owner($ownerUserId);
+    } elseif ($ownerUserId > 0 && function_exists('ap_redis_json_get')) {
+        $indexKey = 'vaak:timeline:owner-index:v1:' . $ownerUserId;
+        foreach (ap_redis_json_get($indexKey) ?? [] as $logical) {
+            if (is_string($logical) && function_exists('ap_redis_delete')) {
+                ap_redis_delete(ap_timeline_ranked_redis_key($logical));
+            }
+        }
+        ap_redis_delete($indexKey);
     }
 }
 
