@@ -3104,7 +3104,7 @@ async fn fetch_local_profiles_map(
     keys.dedup();
     let rows = db
         .query(
-            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, ''), COALESCE(automated,0), COALESCE(discoverable,1), COALESCE(indexable,1)
+            "SELECT lower(actor_key), COALESCE(name, ''), COALESCE(icon_url, ''), COALESCE(automated,0)::integer, COALESCE(discoverable,1)::integer, COALESCE(indexable,1)::integer
              FROM actor_profile
              WHERE lower(actor_key) = ANY($1)",
             &[&keys],

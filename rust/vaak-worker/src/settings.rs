@@ -41,12 +41,12 @@ pub async fn project(cfg: &crate::config::Config, owner_id: i64) -> Result<Setti
     let row = db
         .query_opt(
             "SELECT u.actor_key, p.name, p.summary, p.attachment_json, p.icon_url, p.image_url,
-                    p.manually_approves, p.discoverable, p.indexable, p.collection_consent,
-                    p.vanity_verified, p.auto_follow_back, p.anti_ai_marker,
-                    p.auto_unblur_sensitive, p.auto_delete_posts_7d, p.automated,
+                    p.manually_approves::integer, p.discoverable::integer, p.indexable::integer, p.collection_consent::integer,
+                    p.vanity_verified::integer, p.auto_follow_back::integer, p.anti_ai_marker::integer,
+                    p.auto_unblur_sensitive::integer, p.auto_delete_posts_7d::integer, p.automated::integer,
                     p.reply_policy, p.quote_policy, p.forum_signature, p.profile_badges,
-                    p.hide_profile_replies, p.hide_profile_boosts, p.algorithm_enabled,
-                    p.downranking_enabled, p.asks_enabled, p.webmentions_enabled, p.updated_at
+                    p.hide_profile_replies::integer, p.hide_profile_boosts::integer, p.algorithm_enabled::integer,
+                    p.downranking_enabled::integer, p.asks_enabled::integer, p.webmentions_enabled::integer, p.updated_at
              FROM ap_users u
              JOIN actor_profile p ON p.actor_key = u.actor_key
              WHERE u.id = $1 AND u.disabled_at IS NULL",

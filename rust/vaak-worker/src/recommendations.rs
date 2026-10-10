@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use tokio_postgres::Client;
 
 pub async fn algorithm_enabled(db: &Client, owner: i64) -> Result<bool> {
-    let row = db.query_opt("SELECT COALESCE(p.algorithm_enabled,1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE u.id=$1", &[&owner]).await?;
+    let row = db.query_opt("SELECT COALESCE(p.algorithm_enabled,1)::integer FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE u.id=$1", &[&owner]).await?;
     Ok(row.map(|r| r.get::<_, i32>(0) != 0).unwrap_or(true))
 }
 

@@ -260,7 +260,7 @@ async fn load_algorithm_enabled(db: &Client, actor_key: &str) -> Result<bool> {
     }
     let row = db
         .query_opt(
-            "SELECT algorithm_enabled FROM actor_profile WHERE actor_key = $1 LIMIT 1",
+            "SELECT algorithm_enabled::integer FROM actor_profile WHERE actor_key = $1 LIMIT 1",
             &[&actor_key],
         )
         .await
@@ -1591,7 +1591,7 @@ async fn load_downranking_enabled(db: &Client, actor_key: &str) -> Result<bool> 
     }
     let row = db
         .query_opt(
-            "SELECT downranking_enabled FROM actor_profile WHERE actor_key = $1 LIMIT 1",
+            "SELECT downranking_enabled::integer FROM actor_profile WHERE actor_key = $1 LIMIT 1",
             &[&actor_key],
         )
         .await
