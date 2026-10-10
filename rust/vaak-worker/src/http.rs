@@ -443,19 +443,8 @@ async fn shadow_notif_embed(
         }
     };
 
-    match redis_util_get_string(&mut redis, &key).await {
-        Ok(Some(html)) if !html.is_empty() => return embed_html_response(html, "redis"),
-        Ok(_) => {}
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    }
-
-    // Miss → lean paint from Mentions envelope status JSON.
+    // Render from the JSON envelope after checking live viewer policy. HTML
+    // fragments cannot safely outlive changes to audiences, mutes or settings.
     let status = match crate::notif_embed::find_status_in_notif_envelopes(&mut redis, owner, &uri)
         .await
     {
@@ -485,6 +474,18 @@ async fn shadow_notif_embed(
     // overflow for the signed-in actor.
     let viewer = crate::home_html::load_viewer_actor(&state.cfg, owner).await;
     let mut status = status;
+    let checked = async {
+        let db = crate::db::connect(&state.cfg.database_url).await?;
+        let mut items = vec![serde_json::json!({"status": status.clone()})];
+        crate::audience::filter_notifications(&db, owner, &mut items).await?;
+        anyhow::Ok(!items.is_empty())
+    }.await;
+    match checked {
+        Ok(true) => {},
+        Ok(false) => return embed_html_response("<!--notification-filtered-->".into(), "policy"),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+
     if let Ok(db) = crate::db::connect(&state.cfg.database_url).await {
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner).await {
             crate::notif_embed::stamp_viewer_moderation_tree(&mut status, &moderation);
@@ -811,15 +812,6 @@ async fn shadow_mentions_html(
         )
             .into_response(),
     }
-}
-
-async fn redis_util_get_string(
-    redis: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-) -> anyhow::Result<Option<String>> {
-    use redis::AsyncCommands;
-    let v: Option<String> = redis.get(key).await?;
-    Ok(v)
 }
 
 async fn shadow_notif(

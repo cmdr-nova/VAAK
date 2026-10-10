@@ -310,7 +310,7 @@ async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Value]) -> Res
         .cloned()
         .collect();
     let rows = db.query(
-        "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
+        "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1) AND COALESCE(visibility, 'public') IN ('public','unlisted')",
         &[&local_targets],
     ).await.context("select local quote targets")?;
     let mut by_target = std::collections::HashMap::new();
@@ -371,7 +371,7 @@ async fn fetch_outbox_tab(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
-                 WHERE id LIKE $1 AND raw_create_json LIKE '%\"attachment\"%'
+                 WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE '%\"attachment\"%'
                  ORDER BY published DESC
                  LIMIT $2 OFFSET $3",
                 &[&like, &limit, &offset],
@@ -384,7 +384,7 @@ async fn fetch_outbox_tab(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
-                 WHERE id LIKE $1
+                 WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
                    AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
                    AND in_reply_to NOT LIKE $2
                  ORDER BY published DESC
@@ -399,7 +399,7 @@ async fn fetch_outbox_tab(
                 "SELECT id, COALESCE(published::text, ''), COALESCE(content, ''),
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
-                 WHERE id LIKE $1
+                 WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
                    AND (
                      in_reply_to IS NULL OR btrim(in_reply_to) = ''
                      OR in_reply_to LIKE $2
@@ -770,6 +770,12 @@ pub async fn profile_html_fill(
             extra_parents.insert(key, value);
         }
     }
+    // Apply after quote and self-thread hydration, including off-page parents.
+    let source_count = statuses.len();
+    let hidden = crate::hidden::load_hidden_sets(&db, viewer_owner_id).await?;
+    crate::audience::filter_statuses(&db, viewer_owner_id, crate::audience::Surface::Profile, &mut statuses).await?;
+    statuses.retain(|st| !crate::hidden::status_hidden_on_profile(st, &hidden));
+    crate::audience::filter_parents(&db, viewer_owner_id, crate::audience::Surface::Profile, &mut extra_parents).await?;
     let units = plan_feed_paint_units(&statuses, &extra_parents);
     let paint = |st: &Value, from: &str, viewer: &str| paint_lean_feed_card_opts(st, from, viewer);
     let (html, painted) = paint_feed_units(&units, "remote_profile", &viewer_actor, &paint);
@@ -783,14 +789,18 @@ pub async fn profile_html_fill(
                 source: "axum-profile-html".into(),
             }));
         }
-        return Ok(None);
+        return Ok(Some(ProfileHtmlReport {
+            html: "<!--profile-filtered-->".into(), count: 0, has_more,
+            next_offset: offset.max(0) as usize + source_count,
+            source: "axum-profile-html".into(),
+        }));
     }
 
     let next_offset = if let Some(cursor) = boost_cursor {
         cursor.max(0) as usize
     } else {
         // Same rule as Home: collapsed self-reply parents still consume a row.
-        (offset as usize) + statuses.len()
+        (offset as usize) + source_count
     };
     Ok(Some(ProfileHtmlReport {
         html,

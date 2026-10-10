@@ -7,6 +7,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/ap-link-preview.php';
 require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-normalize.php';
+require_once __DIR__ . '/ap-visibility.php';
 
 /**
  * Mastodon account id for the token/session-bound local user.
@@ -103,7 +104,28 @@ function ap_masto_local_user_by_account_id(string $accountId): ?array
         );
         $st->execute([(int) $accountId]);
         $row = $st->fetch();
-        return is_array($row) ? $row : null;
+        if (is_array($row)) {
+            return $row;
+        }
+        // Older Ice Cubes sessions retain the CRC-style account id that was
+        // issued before local users received their ap_users id. Resolve the
+        // persisted account-id → actor mapping directly. Do not call
+        // ap_masto_actor_id_from_account_id() here: that reverse resolver
+        // intentionally calls this helper first, so doing so would recurse
+        // until PHP exhausts its memory during timeline requests.
+        $map = ap_db()->prepare('SELECT actor_id FROM masto_account_actors WHERE account_id = ? LIMIT 1');
+        $map->execute([$accountId]);
+        $mappedActor = $map->fetchColumn();
+        if (is_string($mappedActor)
+            && preg_match('#^https://mkultra\.monster/users/([A-Za-z0-9_]+)$#', rtrim($mappedActor, '/'), $m)) {
+            $st = ap_db()->prepare(
+                'SELECT * FROM ap_users WHERE lower(actor_key) = ? AND disabled_at IS NULL LIMIT 1'
+            );
+            $st->execute([strtolower($m[1])]);
+            $mapped = $st->fetch();
+            return is_array($mapped) ? $mapped : null;
+        }
+        return null;
     } catch (Throwable $e) {
         return null;
     }
@@ -196,6 +218,7 @@ function ap_masto_account(): array
     $displayName = function_exists('ap_profile_display_name')
         ? ap_profile_display_name($actorKey, true)
         : ((string) ($p['name'] ?? '') ?: $username);
+    $profileUrl = 'https://vaak.monster/users/' . rawurlencode($actorKey);
     return [
         'id' => $accountId,
         'username' => $username,
@@ -208,7 +231,9 @@ function ap_masto_account(): array
         'group' => false,
         'created_at' => $created,
         'note' => $note,
-        'url' => $actorId,
+        // Keep the ActivityPub actor IRI in `uri`, but point Mastodon's
+        // human-facing “View on instance” link at the canonical VAAK profile.
+        'url' => $profileUrl,
         'uri' => $actorId,
         'avatar' => $avatar,
         'avatar_static' => $avatar,
@@ -256,6 +281,7 @@ function ap_masto_account_from_user(array $user): array
         ? ap_profile_display_name($actorKey, true)
         : ((string) ($p['name'] ?? '') ?: $username);
     $fields = function_exists('ap_profile_masto_fields') ? ap_profile_masto_fields(false, $actorKey) : [];
+    $profileUrl = 'https://vaak.monster/users/' . rawurlencode($actorKey);
     return [
         'id' => $accountId,
         'username' => $username,
@@ -268,7 +294,7 @@ function ap_masto_account_from_user(array $user): array
         'group' => false,
         'created_at' => '2018-01-01T00:00:00.000Z',
         'note' => $note,
-        'url' => $actorId,
+        'url' => $profileUrl,
         'uri' => $actorId,
         'avatar' => $avatar,
         'avatar_static' => $avatar,
@@ -2276,10 +2302,12 @@ function ap_masto_actor_id_from_account_id(string $accountId): ?string
     foreach (ap_dm_conversations(100) as $c) {
         $candidates[] = (string) $c['peer_actor_id'];
     }
-    // Recent event actors (federated faces)
-    foreach (ap_db()->query("SELECT DISTINCT actor_id FROM events WHERE actor_id IS NOT NULL ORDER BY id DESC LIMIT 800")->fetchAll() as $r) {
-        $candidates[] = (string) $r['actor_id'];
-    }
+    // Do not scan/group the entire events table here. This resolver is used
+    // while serializing mobile timeline cards, and an unresolved remote ID
+    // would otherwise turn every Home request into a multi-second full-table
+    // scan. Persisted account mappings, remote actors, follows, and DMs cover
+    // the normal cases; unresolved IDs can safely remain unresolved for the
+    // API response and be hydrated later.
     $seen = [];
     foreach ($candidates as $a) {
         $a = rtrim(trim($a), '/');
@@ -4597,19 +4625,6 @@ function ap_masto_status_from_mention(array $row): array
             $quoteEnt = ap_masto_quote_entity($quoteObjectUrl, 0, false, true);
         }
     }
-    // Mentions store the public bsky.app permalink on uri/url and the AT record
-    // on activity_id. Keep the at:// so Boost can target the record without a
-    // handle lookup. Handle permalinks still paint a boost button via object ref.
-    $bskyAtUri = '';
-    $activityForAt = trim((string) ($row['activity_id'] ?? ''));
-    if (str_starts_with($activityForAt, 'at://') && str_contains($activityForAt, '/app.bsky.feed.post/')) {
-        $cut = strstr($activityForAt, '?', true);
-        $bskyAtUri = $cut !== false ? $cut : $activityForAt;
-        $hash = strstr($bskyAtUri, '#', true);
-        if ($hash !== false) {
-            $bskyAtUri = $hash;
-        }
-    }
     $bodyContent = $pack['content'];
     if (is_array($quoteEnt)) {
         $plainBody = trim(html_entity_decode(strip_tags((string) $bodyContent), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
@@ -4675,9 +4690,6 @@ function ap_masto_status_from_mention(array $row): array
     ];
     if (is_array($quoteEnt) && is_string($quoteObjectUrl) && $quoteObjectUrl !== '') {
         $status['quote_url'] = $quoteObjectUrl;
-    }
-    if ($bskyAtUri !== '') {
-        $status['vaak_bsky_uri'] = $bskyAtUri;
     }
     $status = ap_masto_apply_interaction_flags($status);
     return function_exists('ap_normalize_status')
@@ -5900,6 +5912,34 @@ function ap_masto_notifications_axum_fetch(
     if (!is_array($decoded) || !array_is_list($decoded)) {
         return null;
     }
+    // A small Rust hydrate envelope can be a confirmed-but-incomplete empty
+    // result while the larger ranked Home head already contains newly ranked
+    // items from Bluesky, Fediverse, local, RSS, or recommendations.  Probe
+    // the ranked head before declaring the poll empty.
+    if ($decoded === [] && function_exists('ap_masto_timeline_home_axum_fetch')) {
+        $head = ap_masto_timeline_home_axum_fetch(40, $ownerUserId);
+        if (is_array($head)) {
+            $statuses = [];
+            $newest = $sinceTs;
+            foreach ($head as $row) {
+                if (!is_array($row)) continue;
+                $ts = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
+                if ($ts > $sinceTs) {
+                    $statuses[] = $row;
+                    $newest = max($newest, $ts);
+                }
+            }
+            usort($statuses, static function (array $a, array $b): int {
+                return (strtotime((string) ($b['created_at'] ?? '')) ?: 0)
+                    <=> (strtotime((string) ($a['created_at'] ?? '')) ?: 0);
+            });
+            return [
+                'statuses' => array_slice($statuses, 0, $limit),
+                'newest' => $newest,
+                'source' => 'axum-ranked-head-empty-fallback',
+            ];
+        }
+    }
     /** @var list<array<string,mixed>> $items */
     $items = [];
     foreach ($decoded as $row) {
@@ -6128,7 +6168,39 @@ function ap_masto_timeline_home_axum_since_fetch(int $sinceTs, int $limit = 20, 
     if (function_exists('ap_timing_record')) {
         ap_timing_record('timelines.home.axum_since_fetch', (float) $ms);
     }
+    // Older worker binaries only expose the head hydrate endpoint.  Keep the
+    // newer poller useful during a rolling Rust deploy by filtering that warm
+    // head locally instead of dropping all the way to the slow/incomplete PG
+    // event query.  The head is ranked, so this preserves Bluesky, RSS,
+    // hashtag, recommendation, and followed-content sources.
     if ($code !== 200 || !is_string($body)) {
+        if (function_exists('ap_masto_timeline_home_axum_fetch')) {
+            $head = ap_masto_timeline_home_axum_fetch(40, $ownerUserId);
+            if (is_array($head)) {
+                $statuses = [];
+                $newest = $sinceTs;
+                foreach ($head as $row) {
+                    if (!is_array($row)) {
+                        continue;
+                    }
+                    $created = (string) ($row['created_at'] ?? '');
+                    $ts = $created !== '' ? (int) strtotime($created) : 0;
+                    if ($ts > $sinceTs) {
+                        $statuses[] = $row;
+                        $newest = max($newest, $ts);
+                    }
+                }
+                usort($statuses, static function (array $a, array $b): int {
+                    return ((int) strtotime((string) ($b['created_at'] ?? ''))) <=>
+                        ((int) strtotime((string) ($a['created_at'] ?? '')));
+                });
+                return [
+                    'statuses' => array_slice($statuses, 0, $limit),
+                    'newest' => $newest,
+                    'source' => 'axum-ranked-head-fallback',
+                ];
+            }
+        }
         return null;
     }
     if (stripos($cacheHdr, 'axum-ranked-since') === false) {
@@ -8311,7 +8383,7 @@ function ap_masto_peertube_prefer_create_event(array $row): array
     return is_array($memo[$objectId]) ? $memo[$objectId] : $row;
 }
 
-function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId = null, ?string $sinceId = null, bool $onlyMedia = false): array
+function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId = null, ?string $sinceId = null, bool $onlyMedia = false, bool $mobile = false): array
 {
     $startedAt = microtime(true);
     // Mobile clients paginate through a filtered view (blocks, mutes, dedupe,
@@ -8331,10 +8403,26 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
         "action_taken IN ('log', 'local_observe')",
     ];
 
+    if ($mode !== 'home') {
+        $where[] = "COALESCE(visibility, 'public') = 'public'";
+    }
+
     if ($mode === 'home') {
-        $following = ap_following_list();
+        // Always scope the graph to the OAuth/session actor.  The implicit
+        // legacy fallback can otherwise select cmdr_nova when Ice Cubes is
+        // authenticated as another local account, making Home appear empty.
+        $ownerActor = function_exists('ap_masto_session_actor_id')
+            ? ap_masto_session_actor_id()
+            : '';
+        $following = ap_following_list($ownerActor !== '' ? $ownerActor : null);
         if (!$following) {
             return [];
+        }
+        // The mobile compatibility feed must stay responsive on broad follow
+        // graphs. A bounded actor window avoids giant IN clauses and leaves
+        // the web/ranked Home path completely unchanged.
+        if ($mobile && count($following) > 100) {
+            $following = array_slice($following, 0, 100);
         }
         // Exact actor match via IN (uses idx_events_actor_created). Host-wide
         // expansion only for true instance actors (…/actor), NOT Bridgy Fed.
@@ -8436,7 +8524,9 @@ function ap_masto_timeline_events(string $mode, int $limit = 40, ?string $maxId 
     // timeouts). Home needs some over-fetch for follow-graph sparsity, but not
     // the old limit*4→800 stampede that made every Home refresh multi-second.
     $sqlLimit = $mode === 'home'
-        ? (int) min(240, max($limit * 2, $limit + 40))
+        ? ($mobile
+            ? (int) min(30, max($limit, $limit + 5))
+            : (int) min(240, max($limit * 2, $limit + 40)))
         : (int) min(200, max($limit * 2, $limit + 24));
     $sql = 'SELECT * FROM events WHERE ' . implode(' AND ', $where)
         . ' ORDER BY created_at DESC, id DESC LIMIT ' . $sqlLimit;
@@ -8651,7 +8741,7 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
             continue;
         }
         // Public timeline: skip DMs
-        if (in_array(($status['visibility'] ?? ''), ['direct', 'local'], true)) {
+        if (($status['visibility'] ?? 'public') !== 'public') {
             continue;
         }
         $local[] = $status;
@@ -8676,6 +8766,9 @@ function ap_masto_timeline_public_merged(int $limit = 40, ?string $maxId = null,
     $ownLocalEmitted = 0;
     $ownBoostEmitted = 0;
     foreach ($all as $status) {
+        if (!ap_visibility_public_status($status)) {
+            continue;
+        }
         $ts = (string) ($status['created_at'] ?? '');
         if ($before !== null && $ts !== '' && strcmp($ts, $before) >= 0) {
             continue;
@@ -8748,10 +8841,52 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     // Page follows with the real cursor (head-fetch + PHP filter starved remotes on page 2+).
     // Pass a modest cap — ap_masto_timeline_events already over-fetches for home.
     // limit*4 here + *4 inside was hydrating 160+ statuses (~4–5s) for Ice Cubes Home.
+    // Ice Cubes requests 50 statuses, but hydrating 80 followed events can
+    // exceed the app's request timeout on a broad follow graph. Keep the
+    // mobile compatibility path bounded; the web Home feed has its own
+    // ranked/algorithmic budget and is not affected by this cap.
     $remoteCap = $standardApi
-        ? min(80, max($limit * 2, $limit + 20))
+        ? min(30, max(20, min($limit, 30)))
         : max($limit + 10, 40);
-    $remote = ap_masto_timeline_events('home', $remoteCap, $maxId, $sinceId, false);
+    $remote = ap_masto_timeline_events('home', $remoteCap, $maxId, $sinceId, false, $standardApi);
+    // Mastodon-compatible clients receive a chronological feed, but connected
+    // Bluesky follows are part of that user's non-algorithmic Home contract as
+    // well. Use the already-warmed following cache only; never make a network
+    // request on the mobile API path.
+    $bsky = [];
+    // Keep the Mastodon-compatible mobile feed reliable while Bluesky
+    // observation hydration/migrations are running. The web Home timeline
+    // still performs its normal ranked Bluesky merge; this only omits the
+    // optional Bluesky addition from Ice Cubes' chronological API response.
+    if (false && $standardApi && ($maxId === null || $maxId === '') && function_exists('ap_db_masto_owner_user_id')) {
+        $ownerId = (int) ap_db_masto_owner_user_id();
+        if ($ownerId > 0) {
+            if (!function_exists('ap_bsky_following_feed') && is_file(__DIR__ . '/ap-bsky.php')) {
+                require_once __DIR__ . '/ap-bsky.php';
+            }
+            $bskyCacheReady = function_exists('ap_bsky_tl_cache_key')
+                && function_exists('ap_bsky_tl_cache_get')
+                && ap_bsky_tl_cache_get(ap_bsky_tl_cache_key($ownerId, 'following', null, false), 900) !== null;
+            if ($bskyCacheReady && function_exists('ap_bsky_following_feed') && function_exists('ap_masto_bsky_trend_status')) {
+                try {
+                    $feed = ap_bsky_following_feed($ownerId, min(40, max($limit, 20)), null, null, false, '');
+                    foreach ((array) ($feed['feed'] ?? []) as $item) {
+                        $post = is_array($item) && is_array($item['post'] ?? null) ? $item['post'] : null;
+                        if ($post === null) {
+                            continue;
+                        }
+                        $status = ap_masto_bsky_trend_status($post);
+                        if (is_array($status)) {
+                            $status['_from_bsky_follow'] = true;
+                            $bsky[] = $status;
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // A cold/failed Bluesky cache must not break Fediverse Home.
+                }
+            }
+        }
+    }
     // Own posts/boosts: spice, not the whole plate — fetch a small cursor window then cap.
     $ownCap = max(1, min(3, (int) ceil($limit * 0.2)));
     $localRows = ap_masto_statuses_recent(max($ownCap * 3, 12), $before, $after);
@@ -8761,13 +8896,26 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
     }
     // Own boosts appear as Mastodon reblog wrappers in Home
     $boosts = ap_masto_own_reblogs_as_statuses(max($ownCap * 3, 12), $maxId);
+    if ($standardApi) {
+        // RSS boosts are VAAK-local synthetic statuses and cannot be rendered
+        // by Mastodon clients such as Ice Cubes. Keep them on VAAK's web Home
+        // feed, but omit their rss:/rss-boost: wrappers from this API path.
+        $boosts = array_values(array_filter($boosts, static function (array $status): bool {
+            $id = (string) ($status['id'] ?? '');
+            $reblogId = is_array($status['reblog'] ?? null)
+                ? (string) (($status['reblog']['id'] ?? ''))
+                : '';
+            return !str_starts_with($id, 'rss-boost:')
+                && !str_starts_with($reblogId, 'rss:');
+        }));
+    }
 
     // Followed hashtags land in Home, but stay a spice mix — not the main course.
     // Cap conversion + deprioritize vs follows/own posts when assembling the page.
     $tagPosts = [];
-    if ($standardApi) {
-        // Followed-tag recommendations are a VAAK web enhancement, not part of
-        // the Mastodon-compatible Home contract consumed by mobile clients.
+    if (false) {
+        // Kept as a guard for emergency rollback; followed tags are also part
+        // of the chronological mobile Home contract.
         $tagPosts = [];
     } else {
     try {
@@ -8859,7 +9007,7 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
         return $ts;
     };
 
-    $all = array_merge($remote, $local, $boosts, $tagPosts);
+    $all = array_merge($remote, $local, $boosts, $tagPosts, $bsky);
     if (function_exists('ap_masto_collapse_self_announce_statuses')) {
         $all = ap_masto_collapse_self_announce_statuses($all);
     }
@@ -8955,8 +9103,9 @@ function ap_masto_timeline_home_merged(int $limit = 40, ?string $maxId = null, ?
                 continue;
             }
         }
-        // Strip internal flag before JSON leaves the API
+        // Strip internal flags before JSON leaves the API.
         unset($status['_from_followed_tag']);
+        unset($status['_from_bsky_follow']);
         $out[] = $status;
         if ($isTag) {
             $tagEmitted++;

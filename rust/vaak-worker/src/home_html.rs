@@ -29,12 +29,14 @@ pub struct HomeHtmlReport {
 async fn load_self_thread_parents(
     db: &tokio_postgres::Client,
     slice: &mut [serde_json::Value],
-) -> std::collections::HashMap<String, serde_json::Value> {
+    owner: i64,
+    view: &str,
+) -> anyhow::Result<std::collections::HashMap<String, serde_json::Value>> {
     crate::home_hydrate_ranked::stamp_missing_reply_parents(db, slice).await;
     let need = missing_self_reply_parent_uris(slice);
     let mut extra = std::collections::HashMap::new();
     if need.is_empty() {
-        return extra;
+        return Ok(extra);
     }
     if let Ok(fetched) = crate::profile_html::fetch_outbox_statuses_by_uris(db, &need).await {
         extra = fetched;
@@ -71,7 +73,8 @@ async fn load_self_thread_parents(
             }
         }
     }
-    extra
+    crate::audience::filter_parents(db, owner, crate::audience::Surface::timeline(view), &mut extra).await?;
+    Ok(extra)
 }
 
 pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> String {
@@ -222,7 +225,7 @@ pub async fn tl_html_fill(
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
         // Self-thread parents not in this hydrate window (common on Home).
-        extra_parents = load_self_thread_parents(&db, &mut slice).await;
+        extra_parents = load_self_thread_parents(&db, &mut slice, owner_user_id, view).await?;
         let _ = crate::interaction_flags::apply_to_status_map(
             &db,
             owner_user_id,
@@ -307,7 +310,7 @@ pub async fn home_html_since(
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
-        extra_parents = load_self_thread_parents(&db, &mut slice).await;
+        extra_parents = load_self_thread_parents(&db, &mut slice, owner_user_id, "home").await?;
         let _ = crate::interaction_flags::apply_to_status_map(
             &db,
             owner_user_id,
@@ -369,7 +372,7 @@ pub async fn tl_html_since(
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             crate::notif_embed::stamp_viewer_moderation(&mut slice, &moderation);
         }
-        extra_parents = load_self_thread_parents(&db, &mut slice).await;
+        extra_parents = load_self_thread_parents(&db, &mut slice, owner_user_id, view).await?;
         let _ = crate::interaction_flags::apply_to_status_map(
             &db,
             owner_user_id,

@@ -5,6 +5,7 @@ mod ap_actor_warm;
 mod config;
 mod db;
 mod hidden;
+mod audience;
 mod http;
 mod jetstream;
 mod account_switch;

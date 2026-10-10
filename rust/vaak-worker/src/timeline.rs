@@ -291,9 +291,7 @@ pub async fn view_hydrate(
         // Moderation changes must invalidate stale cached envelopes at read
         // time, not only when the fan-out worker happens to rewarm them.
         let moderation_db = crate::db::connect(&cfg.database_url).await?;
-        let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id)
-            .await
-            .unwrap_or_default();
+        let hidden = crate::hidden::load_hidden_sets(&moderation_db, owner_user_id).await?;
         let before = report.items.len();
         report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
         report.filtered = report.items.len() != before;
@@ -312,6 +310,10 @@ pub async fn view_hydrate(
             &mut report.items,
         )
         .await;
+        crate::audience::filter_statuses(&moderation_db, owner_user_id, crate::audience::Surface::timeline(view), &mut report.items).await?;
+        report.items.retain(|status| !crate::hidden::status_hidden(status, &hidden));
+        report.filtered = report.items.len() != before;
+        report.n = report.items.len();
     }
     Ok(report)
 }
@@ -647,9 +649,9 @@ pub async fn home_since(
     report.ranked_ok = true;
 
     // Prefer the larger hydrate head (Ice Cubes / warm job writes 15 and 40).
-    let mut hydrate = read_home_hydrate(&mut redis, owner_user_id, 40, None).await?;
+    let mut hydrate = home_hydrate(cfg, owner_user_id, 40, None).await?;
     if !hydrate.cache_hit {
-        hydrate = read_home_hydrate(&mut redis, owner_user_id, 15, None).await?;
+        hydrate = home_hydrate(cfg, owner_user_id, 15, None).await?;
     }
     report.hydrate_key = Some(hydrate.redis_key.clone());
     if !hydrate.cache_hit {

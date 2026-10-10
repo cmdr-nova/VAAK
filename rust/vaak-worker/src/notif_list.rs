@@ -592,7 +592,7 @@ pub async fn notifications_shadow(
     let now = chrono::Utc::now().timestamp();
     if let Some(payload) = cached {
         let ts = payload.get("ts").and_then(|v| v.as_i64());
-        let items = payload
+        let mut items = payload
             .get("items")
             .and_then(|v| v.as_array())
             .cloned()
@@ -602,6 +602,8 @@ pub async fn notifications_shadow(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let db = crate::db::connect(&cfg.database_url).await?;
+        crate::audience::filter_notifications(&db, owner_user_id, &mut items).await?;
         return Ok(NotificationsShadowReport {
             owner_user_id,
             limit,

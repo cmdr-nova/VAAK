@@ -7018,7 +7018,7 @@ function ap_local_profile_tab_page(
         } elseif ($tab === 'media') {
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
-                 WHERE id LIKE ? AND raw_create_json LIKE '%\"attachment\"%'
+                 WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public' AND raw_create_json LIKE '%\"attachment\"%'
                  ORDER BY published DESC LIMIT ? OFFSET ?"
             );
             $st->execute([$prefix . '%', $limit + 1, $offset]);
@@ -7026,7 +7026,7 @@ function ap_local_profile_tab_page(
         } elseif ($tab === 'replies') {
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
-                 WHERE id LIKE ?
+                 WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
                    AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
                  ORDER BY published DESC LIMIT ? OFFSET ?"
             );
@@ -7035,7 +7035,7 @@ function ap_local_profile_tab_page(
         } else {
             $st = $db->prepare(
                 "SELECT * FROM outbox_notes
-                 WHERE id LIKE ?
+                 WHERE id LIKE ? AND COALESCE(visibility, 'public') = 'public'
                    AND (in_reply_to IS NULL OR btrim(in_reply_to) = '')
                  ORDER BY published DESC LIMIT ? OFFSET ?"
             );
