@@ -882,9 +882,29 @@ struct BskyKey {
     author_did: String,
     author_handle: String,
     text: String,
+    /// Top-level external URL or YouTube id. Empty for quotes and plain text.
+    external: String,
     indexed_at: i64,
     sort: i64,
 }
+
+/// Hint for `bsky_external_repeat_token`. Only a top-level `embed.external`
+/// counts: `embed.record` (and `recordWithMedia`, whose type contains
+/// `embed.record`) must stay so a quoted YouTube URL does not drop the comment.
+/// The CASE looks at the type prefix; the substring then reads the full embed.
+const BSKY_EXTERNAL_HINT_SQL: &str = r#"COALESCE(CASE
+  WHEN left(COALESCE(p.embed_json, ''), 180) LIKE '%embed.external%'
+   AND left(COALESCE(p.embed_json, ''), 180) NOT LIKE '%embed.record%'
+  THEN COALESCE(
+    substring(p.embed_json from '(?i)youtube\.com/watch\?v=([A-Za-z0-9_-]{6,20})'),
+    substring(p.embed_json from '(?i)youtu\.be/([A-Za-z0-9_-]{6,20})'),
+    substring(p.embed_json from '(?i)youtube\.com/shorts/([A-Za-z0-9_-]{6,20})'),
+    substring(p.embed_json from '(?i)youtube\.com/embed/([A-Za-z0-9_-]{6,20})'),
+    substring(p.embed_json from '(?i)youtube-nocookie\.com/embed/([A-Za-z0-9_-]{6,20})'),
+    substring(p.embed_json from '"uri"[[:space:]]*:[[:space:]]*"(https?://[^"]+)"')
+  )
+  ELSE ''
+END, '')"#;
 
 fn bsky_key_from_row(row: &tokio_postgres::Row) -> Result<Option<BskyKey>> {
     let uri: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
@@ -901,12 +921,14 @@ fn bsky_key_from_row(row: &tokio_postgres::Row) -> Result<Option<BskyKey>> {
     let author_handle: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
     let text: String = row.try_get::<_, Option<String>>(4)?.unwrap_or_default();
     let indexed_raw: String = row.try_get::<_, Option<String>>(5)?.unwrap_or_default();
+    let external: String = row.try_get::<_, Option<String>>(6)?.unwrap_or_default();
     Ok(Some(BskyKey {
         uri,
         fedi,
         author_did,
         author_handle,
         text,
+        external,
         indexed_at: parse_ts(&indexed_raw),
         sort: 0,
     }))
@@ -923,13 +945,13 @@ async fn fetch_bsky_keys(
     // accounts with a smaller follow list. Read the newest posts per followed
     // DID. There is no global LIMIT: a 120-row cap dropped the rest of the graph.
     let rows = if let Some(did) = exclude_did.filter(|d| d.starts_with("did:")) {
-        db.query(
+        let sql = format!(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
                     COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
-                    COALESCE(p.indexed_at::text, '')
+                    COALESCE(p.indexed_at::text, ''), {BSKY_EXTERNAL_HINT_SQL}
              FROM bsky_graph_sync g
              JOIN LATERAL (
-               SELECT bsky_uri, author_did, author_handle, text, indexed_at, updated_at
+               SELECT bsky_uri, author_did, author_handle, text, indexed_at, updated_at, embed_json
                FROM bsky_posts
                WHERE author_did = g.target_did
                  AND text IS NOT NULL
@@ -940,18 +962,17 @@ async fn fetch_bsky_keys(
              WHERE g.owner_user_id = $1
                AND g.kind = 'follow'
                AND g.target_did <> $2
-             ORDER BY p.indexed_at DESC, p.updated_at DESC",
-            &[&owner, &did, &per_actor],
-        )
-        .await
+             ORDER BY p.indexed_at DESC, p.updated_at DESC"
+        );
+        db.query(&sql, &[&owner, &did, &per_actor]).await
     } else {
-        db.query(
+        let sql = format!(
             "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
                     COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
-                    COALESCE(p.indexed_at::text, '')
+                    COALESCE(p.indexed_at::text, ''), {BSKY_EXTERNAL_HINT_SQL}
              FROM bsky_graph_sync g
              JOIN LATERAL (
-               SELECT bsky_uri, author_did, author_handle, text, indexed_at, updated_at
+               SELECT bsky_uri, author_did, author_handle, text, indexed_at, updated_at, embed_json
                FROM bsky_posts
                WHERE author_did = g.target_did
                  AND text IS NOT NULL
@@ -961,10 +982,9 @@ async fn fetch_bsky_keys(
              LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
              WHERE g.owner_user_id = $1
                AND g.kind = 'follow'
-             ORDER BY p.indexed_at DESC, p.updated_at DESC",
-            &[&owner, &per_actor],
-        )
-        .await
+             ORDER BY p.indexed_at DESC, p.updated_at DESC"
+        );
+        db.query(&sql, &[&owner, &per_actor]).await
     }
     .context("select bsky home rank keys")?;
     let mut out = Vec::new();
@@ -985,23 +1005,23 @@ async fn fetch_bsky_followed_tag_keys(
     if owner < 1 || tags.is_empty() {
         return Ok(Vec::new());
     }
+    let sql = format!(
+        "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
+                COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
+                COALESCE(p.indexed_at::text, ''), {BSKY_EXTERNAL_HINT_SQL}
+         FROM bsky_posts p
+         LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
+         WHERE EXISTS (
+           SELECT 1 FROM bsky_post_observations o
+           WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = $1
+         )
+           AND p.text IS NOT NULL
+           AND p.indexed_at::timestamptz >= NOW() - INTERVAL '14 days'
+         ORDER BY p.indexed_at DESC, p.updated_at DESC
+         LIMIT 400"
+    );
     let rows = db
-        .query(
-            "SELECT p.bsky_uri, COALESCE(l.fediverse_id, ''), COALESCE(p.author_did, ''),
-                    COALESCE(p.author_handle, ''), COALESCE(p.text, ''),
-                    COALESCE(p.indexed_at::text, '')
-             FROM bsky_posts p
-             LEFT JOIN bsky_post_links l ON l.bsky_uri = p.bsky_uri
-             WHERE EXISTS (
-               SELECT 1 FROM bsky_post_observations o
-               WHERE o.bsky_uri = p.bsky_uri AND o.owner_user_id = $1
-             )
-               AND p.text IS NOT NULL
-               AND p.indexed_at::timestamptz >= NOW() - INTERVAL '14 days'
-             ORDER BY p.indexed_at DESC, p.updated_at DESC
-             LIMIT 400",
-            &[&owner],
-        )
+        .query(&sql, &[&owner])
         .await
         .context("select bsky followed hashtag keys")?;
     let wanted: HashSet<&str> = tags.iter().map(String::as_str).collect();
@@ -1077,6 +1097,22 @@ fn stamp_bsky_sort(
     if rank {
         keys.sort_by(|a, b| b.sort.cmp(&a.sort).then(b.indexed_at.cmp(&a.indexed_at)));
     }
+}
+
+/// Drop a later post when the same author already contributed the same
+/// external link. Call after `stamp_bsky_sort` so the higher-ranked copy stays.
+/// The SQL per-author LIMIT can still spend a slot on the duplicate; that is
+/// cheaper than letting Home paint the same video twice.
+fn collapse_repeated_external_posts(keys: &mut Vec<BskyKey>) {
+    let mut seen = HashSet::new();
+    keys.retain(|key| {
+        let Some(token) =
+            home_hydrate_ranked::bsky_external_repeat_token(&key.author_did, &key.external)
+        else {
+            return true;
+        };
+        seen.insert(token)
+    });
 }
 
 fn bsky_author_hidden(hidden: &hidden::HiddenSets, author_did: &str) -> bool {
@@ -2800,6 +2836,7 @@ pub async fn warm_home_native(cfg: &Config, owner_user_id: i64) -> Result<String
     }
     // Algorithm-off leaves both maps empty, so this keeps indexed_at order.
     stamp_bsky_sort(&mut bsky, &actor_weights, &tag_weights);
+    collapse_repeated_external_posts(&mut bsky);
     ranked = merge_bsky_ranked(ranked, &bsky, &hidden);
 
     if algorithm_on {
@@ -3134,6 +3171,7 @@ mod tests {
             author_did: did.into(),
             author_handle: String::new(),
             text: String::new(),
+            external: String::new(),
             indexed_at,
             sort,
         }
@@ -3221,6 +3259,31 @@ mod tests {
             &hidden,
         );
         assert_eq!(only.len(), 1);
+    }
+
+    #[test]
+    fn collapse_repeated_external_keeps_the_higher_ranked_copy() {
+        let mut first = bsky_key("at://did:rosa/app.bsky.feed.post/a", "did:rosa", 200, 200);
+        first.external = "7t1U1fcEODc".into();
+        let mut second = bsky_key("at://did:rosa/app.bsky.feed.post/b", "did:rosa", 199, 199);
+        second.external = "https://www.youtube.com/watch?v=7t1U1fcEODc&is=abc".into();
+        let mut other_video = bsky_key("at://did:rosa/app.bsky.feed.post/c", "did:rosa", 198, 198);
+        other_video.external = "JyECrGp-Sw8".into();
+        let mut other_author = bsky_key("at://did:other/app.bsky.feed.post/d", "did:other", 197, 197);
+        other_author.external = "7t1U1fcEODc".into();
+        let quote = bsky_key("at://did:rosa/app.bsky.feed.post/q", "did:rosa", 196, 196);
+        let mut keys = vec![first, second, other_video, other_author, quote];
+        collapse_repeated_external_posts(&mut keys);
+        let uris: Vec<&str> = keys.iter().map(|key| key.uri.as_str()).collect();
+        assert_eq!(
+            uris,
+            vec![
+                "at://did:rosa/app.bsky.feed.post/a",
+                "at://did:rosa/app.bsky.feed.post/c",
+                "at://did:other/app.bsky.feed.post/d",
+                "at://did:rosa/app.bsky.feed.post/q",
+            ]
+        );
     }
 
     #[test]
