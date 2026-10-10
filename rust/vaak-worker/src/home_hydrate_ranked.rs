@@ -5624,38 +5624,115 @@ fn home_logical_matches_algorithm(logical: &str, enabled: bool) -> bool {
     logical.contains(if enabled { "_aon_" } else { "_aoff_" })
 }
 
-/// Repair local identity in cached notifications/statuses without remote fetches.
+/// Accept only Bluesky actor/post URL namespaces, never a bare display handle.
+fn linked_bsky_ref(raw: &str) -> Option<String> {
+    let tail = raw.strip_prefix("https://bsky.app/profile/")
+        .or_else(|| raw.strip_prefix("https://bsky.brid.gy/ap/"))
+        .or_else(|| raw.strip_prefix("at://"))?;
+    let reference = tail.split(['/', '?', '#']).next().unwrap_or("");
+    if reference.is_empty() { None } else { Some(reference.to_ascii_lowercase()) }
+}
+
+fn account_local_key(value: &Value, aliases: &HashMap<String, String>) -> Option<String> {
+    let account = value.get("account")?;
+    for field in ["uri", "url"] {
+        if let Some(raw) = account.get(field).and_then(Value::as_str) {
+            if let Some(key) = local_username_from_url(raw) { return Some(key); }
+            if let Some(key) = linked_bsky_ref(raw).and_then(|r| aliases.get(&r)) { return Some(key.clone()); }
+        }
+    }
+    None
+}
+
+fn refresh_account_tree(value: &mut Value, profiles: &HashMap<String, LocalProfile>, aliases: &HashMap<String, String>, depth: usize) {
+    if depth > 12 { return; }
+    if let Some(key) = account_local_key(value, aliases) {
+        // Do not manufacture default identity when a local profile is absent.
+        if profiles.contains_key(&key) {
+            let actor = format!("{LOCAL_ACTOR_PREFIX}{key}");
+            let fresh = local_account_from_profile(&actor, &key, profiles);
+            if let Some(account) = value.get_mut("account") {
+                let local = ["uri", "url"].iter().any(|f| account.get(*f).and_then(Value::as_str).and_then(local_username_from_url).is_some());
+                // Linked Bluesky copies keep their account/status IDs, handles and URLs.
+                let fields: &[&str] = if local { &["acct", "username", "display_name", "avatar", "avatar_static", "bot", "discoverable", "indexable"] }
+                    else { &["display_name", "avatar", "avatar_static"] };
+                for field in fields { if let Some(v) = fresh.get(*field) { account[*field] = v.clone(); } }
+            }
+        }
+    }
+    match value {
+        Value::Object(obj) => { for child in obj.values_mut() { refresh_account_tree(child, profiles, aliases, depth+1); } }
+        Value::Array(items) => { for child in items { refresh_account_tree(child, profiles, aliases, depth+1); } }
+        _ => {}
+    }
+}
+
+/// Repair saved local identity, including verified connected Bluesky accounts.
 pub(crate) async fn refresh_local_accounts(db: &Client, values: &mut [Value]) -> Result<()> {
-    fn keys(value: &Value, out: &mut Vec<String>, depth: usize) {
+    fn keys(value: &Value, local: &mut Vec<String>, bsky: &mut Vec<String>, depth: usize) {
         if depth > 12 { return; }
         if let Some(account) = value.get("account") {
-            if let Some(key) = account.get("uri").or_else(|| account.get("url")).and_then(Value::as_str).and_then(local_username_from_url) { out.push(key); }
-        }
-        if let Some(obj) = value.as_object() { for child in obj.values().filter(|v| v.is_object()) { keys(child, out, depth+1); } }
-    }
-    fn update(value: &mut Value, profiles: &HashMap<String, LocalProfile>, depth: usize) {
-        if depth > 12 { return; }
-        if let Some(account) = value.get_mut("account") {
-            if let Some(key) = account.get("uri").or_else(|| account.get("url")).and_then(Value::as_str).and_then(local_username_from_url) {
-                let actor = format!("{LOCAL_ACTOR_PREFIX}{key}");
-                let fresh = local_account_from_profile(&actor, &key, profiles);
-                for field in ["acct", "username", "display_name", "avatar", "avatar_static", "bot", "discoverable", "indexable"] {
-                    if let Some(v) = fresh.get(field) { account[field] = v.clone(); }
+            for field in ["uri", "url"] {
+                if let Some(raw) = account.get(field).and_then(Value::as_str) {
+                    if let Some(key) = local_username_from_url(raw) { local.push(key); }
+                    if let Some(reference) = linked_bsky_ref(raw) { bsky.push(reference); }
                 }
             }
         }
-        if let Some(obj) = value.as_object_mut() { for child in obj.values_mut().filter(|v| v.is_object()) { update(child, profiles, depth+1); } }
+        match value {
+            Value::Object(obj) => { for child in obj.values() { keys(child, local, bsky, depth+1); } }
+            Value::Array(items) => { for child in items { keys(child, local, bsky, depth+1); } }
+            _ => {}
+        }
     }
     let mut local_keys = Vec::new();
-    for value in values.iter() { keys(value, &mut local_keys, 0); }
+    let mut bsky_refs = Vec::new();
+    for value in values.iter() { keys(value, &mut local_keys, &mut bsky_refs, 0); }
+    bsky_refs.sort(); bsky_refs.dedup();
+    let mut aliases = HashMap::new();
+    if !bsky_refs.is_empty() {
+        let rows = db.query(
+            "SELECT lower(u.actor_key), lower(s.handle), lower(s.did)
+             FROM bsky_sessions s JOIN ap_users u ON u.id = s.owner_user_id
+             WHERE u.disabled_at IS NULL AND (lower(s.handle) = ANY($1) OR lower(s.did) = ANY($1))",
+            &[&bsky_refs],
+        ).await.context("resolve connected Bluesky account avatars")?;
+        for row in rows {
+            let key: String = row.get(0);
+            local_keys.push(key.clone());
+            for idx in [1, 2] { let reference: String = row.get(idx); if !reference.is_empty() { aliases.insert(reference, key.clone()); } }
+        }
+    }
     let profiles = fetch_local_profiles_map(db, &local_keys).await?;
-    for value in values { update(value, &profiles, 0); }
+    for value in values { refresh_account_tree(value, &profiles, &aliases, 0); }
     Ok(())
 }
 
 #[cfg(test)]
 mod settings_regression_tests {
     use super::*;
+    #[test]
+    fn connected_bluesky_quote_uses_local_avatar_without_rewriting_identity() {
+        let profiles = HashMap::from([("alice".into(), LocalProfile { display_name:"Alice".into(), icon_url:"https://example.test/local.webp".into(), automated:false, discoverable:true, indexable:true })]);
+        let aliases = HashMap::from([("alice.bsky.test".into(), "alice".into()), ("did:plc:alice".into(), "alice".into())]);
+        let mut notification = json!({"account":{"url":"https://bsky.app/profile/stranger.test","avatar":"https://example.test/remote.webp"}, "status":{"quote":{"quoted_status":{"uri":"https://bsky.app/profile/alice.bsky.test/post/abc", "account":{"url":"https://bsky.app/profile/alice.bsky.test","acct":"alice.bsky.test","id":"bsky:alice"}}}}});
+        refresh_account_tree(&mut notification, &profiles, &aliases, 0);
+        let quoted = &notification["status"]["quote"]["quoted_status"];
+        assert_eq!(quoted["account"]["avatar"], "https://example.test/local.webp");
+        assert_eq!(quoted["account"]["avatar_static"], "https://example.test/local.webp");
+        assert_eq!(quoted["account"]["acct"], "alice.bsky.test");
+        assert_eq!(quoted["account"]["id"], "bsky:alice");
+        assert_eq!(quoted["uri"], "https://bsky.app/profile/alice.bsky.test/post/abc");
+        assert_eq!(notification["account"]["avatar"], "https://example.test/remote.webp");
+        let mut did_quote = json!({"account":{"uri":"https://bsky.app/profile/did:plc:alice","url":"https://example.test/profile"}});
+        refresh_account_tree(&mut did_quote, &profiles, &aliases, 0);
+        assert_eq!(did_quote["account"]["avatar"], "https://example.test/local.webp");
+        assert_eq!(linked_bsky_ref("https://bsky.app.evil.test/profile/alice.bsky.test"), None);
+        assert_eq!(linked_bsky_ref("https://evil.test/alice.bsky.test"), None);
+        let mut unlinked = json!({"account":{"url":"https://bsky.app/profile/other.test","acct":"alice.bsky.test"}});
+        refresh_account_tree(&mut unlinked, &profiles, &aliases, 0);
+        assert!(unlinked["account"].get("avatar").is_none());
+    }
     #[test]
     fn ranked_algorithm_modes_do_not_cross() {
         assert!(!home_logical_matches_algorithm("v9_home_u1_aon_abc", false));

@@ -1210,6 +1210,20 @@ function ap_masto_quote_entity(?string $quoteObjectUrl, int $depth = 0, bool $al
                     : [],
                 'source' => 'bluesky',
             ];
+            // A quote of a connected Bluesky copy uses the owner's saved avatar.
+            // Keep the Bluesky account/status IDs and URLs intact.
+            $linkedOwner = ap_masto_notif_bsky_owner_user_id($quoteObjectUrl);
+            if ($linkedOwner < 1 && $handle !== '') {
+                $linkedOwner = ap_masto_notif_bsky_owner_user_id($handle);
+            }
+            if ($linkedOwner > 0) {
+                $localAccount = ap_masto_account_for_local_url(ap_db_owner_actor_id_for_user_id($linkedOwner));
+                foreach (['avatar', 'avatar_static', 'display_name'] as $field) {
+                    if (isset($localAccount[$field])) {
+                        $quoted['account'][$field] = $localAccount[$field];
+                    }
+                }
+            }
             if (is_array($prev['card'] ?? null)) {
                 $quoted['card'] = $prev['card'];
             }
