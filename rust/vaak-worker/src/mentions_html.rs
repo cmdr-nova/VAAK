@@ -330,7 +330,7 @@ fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
             stack.push_str(&img);
         } else {
             stack.push_str(&format!(
-                "<a href=\"{}\" title=\"Open profile\"{} style=\"margin-right:-.35rem;text-decoration:none\">{}</a>",
+                "<a href=\"{}\" aria-label=\"Open profile\"{} style=\"margin-right:-.35rem;text-decoration:none\">{}</a>",
                 esc(&href),
                 hover,
                 img
@@ -647,7 +647,7 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     );
     let av_block = if !profile_href.is_empty() {
         format!(
-            "<a href=\"{}\" title=\"Open profile\"{} style=\"text-decoration:none\">{}</a>",
+            "<a href=\"{}\" aria-label=\"Open profile\"{} style=\"text-decoration:none\">{}</a>",
             esc(&profile_href),
             hover,
             av_img
