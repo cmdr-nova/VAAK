@@ -6336,6 +6336,29 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
     exit;
 }
 
+/** Neutral loading markup shared by full renders and lazy navigation. */
+function admin_trends_loading_html(): string
+{
+    return <<<'HTML'
+        <div class="side-card" aria-busy="true" aria-label="Loading trending tags">
+          <h3>Trending tags</h3>
+          <div class="trends-skeleton" aria-hidden="true">
+            <div class="trends-skeleton-row"></div>
+            <div class="trends-skeleton-row"></div>
+            <div class="trends-skeleton-row" style="width:72%"></div>
+          </div>
+        </div>
+        <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
+          <h3>Trending posts</h3>
+          <div class="trends-skeleton" aria-hidden="true">
+            <div class="trends-skeleton-row wide"></div>
+            <div class="trends-skeleton-row wide" style="width:80%"></div>
+            <div class="trends-skeleton-row" style="width:60%"></div>
+          </div>
+        </div>
+HTML;
+}
+
 /**
  * Render right-rail trending modules from disk cache (optionally stale).
  *
@@ -27108,6 +27131,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     .trends-skeleton-row { height:1.15rem; border:1px solid var(--border); border-radius:8px; background:linear-gradient(100deg,var(--panel) 30%,#202420 45%,var(--panel) 60%); background-size:220% 100%; animation:timeline-shimmer 1.1s linear infinite; }
     .trends-skeleton-row.wide { height:2.4rem; }
     @keyframes timeline-shimmer { to { background-position:-220% 0; } }
+    @media (prefers-reduced-motion: reduce) { .trends-skeleton-row { animation:none; } }
     .blocks-section {
       margin: 1rem 0 1.25rem;
       border: 1px solid var(--border);
@@ -27835,22 +27859,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
          data-from="<?= h($view) ?>"
          data-cached-age="0"
          data-stale="0">
-        <div class="side-card" aria-busy="true" aria-label="Loading trending tags">
-          <h3>Trending tags</h3>
-          <div class="trends-skeleton" aria-hidden="true">
-            <div class="trends-skeleton-row"></div>
-            <div class="trends-skeleton-row"></div>
-            <div class="trends-skeleton-row" style="width:72%"></div>
-          </div>
-        </div>
-        <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
-          <h3>Trending posts</h3>
-          <div class="trends-skeleton" aria-hidden="true">
-            <div class="trends-skeleton-row wide"></div>
-            <div class="trends-skeleton-row wide" style="width:80%"></div>
-            <div class="trends-skeleton-row" style="width:60%"></div>
-          </div>
-        </div>
+<?= admin_trends_loading_html() ?>
     </div>
 
   </aside>
@@ -38996,7 +39005,7 @@ window.vaakBootStatusThread();
     syncTimelineKindFlags();
     if (nextView === viewName && !push) return true;
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
@@ -39017,12 +39026,14 @@ window.vaakBootStatusThread();
         cache: 'no-store'
       });
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
+        if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('tabSwap');
         return false;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const html = await res.text();
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
+        if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
         window.vaakRedirectToLogin('tabSwap-html');
         return false;
       }
@@ -39304,7 +39315,7 @@ window.vaakBootStatusThread();
     leaving = true;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     // Absolute /vaak/ path: relative ?view= on /users/{key} would reload the profile
     // when <base> is missing; with <base href="/vaak/"> it works, but stay explicit.
@@ -39891,7 +39902,7 @@ window.vaakBootStatusThread();
     if (push !== false) saveViewPosition();
     busy = true;
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     stopProfileScroll();
@@ -39918,6 +39929,7 @@ window.vaakBootStatusThread();
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
         if (window.vaakGuestProfile) { goFull(); return; }
         leaving = true;
+        if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('profile');
         else goFull();
         return;
@@ -39928,6 +39940,7 @@ window.vaakBootStatusThread();
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
         if (window.vaakGuestProfile) { goFull(); return; }
         leaving = true;
+        if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('profile-html');
         else goFull();
         return;
@@ -40034,7 +40047,7 @@ window.vaakBootStatusThread();
     if (push !== false) saveViewPosition();
     busy = true;
     window.__vaakNavigationPending = true;
-    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends(true);
     // Always abort prior Mentions scroll work — including Mentions→Mentions
     // filter swaps — so loadInitial cannot append twice onto a live shell.
     if (typeof window.vaakAbortNotifScroll === 'function') {
@@ -40091,6 +40104,7 @@ window.vaakBootStatusThread();
       });
       if (res.status === 401 || res.headers.get('X-VAAK-Auth') === 'required') {
         leaving = true;
+        if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav');
         else hardNav(view, filter, extra);
         return;
@@ -40112,6 +40126,7 @@ window.vaakBootStatusThread();
       const html = await res.text();
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(html)) {
         leaving = true;
+        if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav-html');
         else hardNav(view, filter, extra);
         return;
@@ -40741,6 +40756,12 @@ window.vaakBootStatusThread();
   let mutationPending = false;
   let suspended = false;
   let wasHidden = document.hidden;
+  const loadingHtml = <?= json_encode(admin_trends_loading_html()) ?>;
+  function showLoading(box) {
+    if (!box || mutationPending || !visible(box)) return;
+    if (!box.querySelector('.trends-skeleton')) box.innerHTML = loadingHtml;
+    box.setAttribute('aria-busy', 'true');
+  }
   try { sessionStorage.removeItem('vaak.trends.html.v3'); } catch (e) {}
 
   function contextKey(box) {
@@ -40773,6 +40794,7 @@ window.vaakBootStatusThread();
     const controller = new AbortController();
     pending = { controller: controller, key: key };
     let discardedOffscreen = false;
+    showLoading(box);
     box.dataset.deferred = 'loading';
     box.setAttribute('aria-busy', 'true');
     // Current policy, without forcing global collection/network work.
@@ -40810,6 +40832,7 @@ window.vaakBootStatusThread();
     const key = contextKey(box);
     if (force || (pending && pending.key !== key) || (loadedKey && loadedKey !== key)) invalidate();
     if (mutationPending || !visible(box) || loadedKey === key || (pending && pending.key === key) || scheduled) return;
+    showLoading(box);
     scheduled = true;
     const ticket = {};
     scheduleTicket = ticket;
@@ -40834,7 +40857,10 @@ window.vaakBootStatusThread();
     else afterPaint();
   }
 
-  window.novaInvalidateDeferredTrends = invalidate;
+  window.novaInvalidateDeferredTrends = (loading) => {
+    invalidate();
+    if (loading === true) showLoading(document.getElementById('trends-sidebar'));
+  };
   window.novaLoadDeferredTrends = loadDeferredTrends;
   window.novaSetDeferredTrendsView = (view) => {
     const box = document.getElementById('trends-sidebar');
