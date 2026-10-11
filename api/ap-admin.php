@@ -6460,7 +6460,13 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $maxAge = 0;
     $anyStale = false;
     $anyHit = false;
-    $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    // current_user starts a session even after the AJAX entry point closed it.
+    // Keep the fresh identity read, but release its lock before cache/policy I/O.
+    try {
+        $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    } finally {
+        if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    }
     $viewerId = is_array($viewer) ? (int) ($viewer['id'] ?? 0) : 0;
     // Global raw trend data remains cached; HTML must be authorized anew each request.
     $cachedKinds = [];
@@ -6477,7 +6483,11 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         $cachedKinds[$kind] = $row;
     }
     // Resolve the viewer and policies after cache I/O; cache data never authorizes a card.
-    $currentViewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    try {
+        $currentViewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    } finally {
+        if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    }
     if ((int) ($currentViewer['id'] ?? 0) !== $viewerId) return '';
     $downrankRefs = admin_trend_downrank_ref_set($viewerId);
     foreach (['tags' => 10, 'statuses' => 5] as $kind => $limit) {
@@ -38997,6 +39007,7 @@ window.vaakBootStatusThread();
     // keep the timeline status area free of a second loader.
     if (status) status.textContent = '';
     items.classList.add('timeline-swapping');
+    let sidebarInstalled = false;
     try {
       const url = '?view=' + encodeURIComponent(nextView)
         + '&partial=1&offset=0&limit=' + encodeURIComponent(String(limit || 15));
@@ -39115,6 +39126,7 @@ window.vaakBootStatusThread();
           && typeof window.vaakSetCurrentViewTitle === 'function') window.vaakSetCurrentViewTitle(nextView);
       if (items.isConnected && document.getElementById('timeline-items') === items
           && typeof window.novaSetDeferredTrendsView === 'function') window.novaSetDeferredTrendsView(nextView);
+      sidebarInstalled = true;
       return true;
     } catch (e) {
       window.location.href = '?view=' + encodeURIComponent(nextView);
@@ -39129,6 +39141,10 @@ window.vaakBootStatusThread();
       bindNewPostsBtn();
       ensureTimelinePollTimer();
       syncTimelineStreamVisibility();
+      if (sidebarInstalled && items && items.isConnected && document.getElementById('timeline-items') === items
+          && items.dataset.view === nextView && typeof window.novaLoadDeferredTrends === 'function') {
+        window.novaLoadDeferredTrends(false);
+      }
       // Timeline tabs are swapped in-place, so the shared capture-phase
       // navigation handler has no full-page `pageshow` event to clear its
       // indicator.  Hide it when the partial swap (or its error path) ends.
@@ -39964,6 +39980,7 @@ window.vaakBootStatusThread();
         window.__vaakNavigationPending = false;
         if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
         drainQueuedNavigation();
+        if (typeof window.novaLoadDeferredTrends === 'function') window.novaLoadDeferredTrends(false);
       }
     }
   }
@@ -40202,6 +40219,7 @@ window.vaakBootStatusThread();
         window.__vaakNavigationPending = false;
         if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
         drainQueuedNavigation();
+        if (typeof window.novaLoadDeferredTrends === 'function') window.novaLoadDeferredTrends(false);
       }
     }
   }
@@ -40718,6 +40736,7 @@ window.vaakBootStatusThread();
   let generation = 0;
   let pending = null;
   let scheduled = false;
+  let scheduleTicket = null;
   let loadedKey = '';
   let mutationPending = false;
   let suspended = false;
@@ -40735,6 +40754,8 @@ window.vaakBootStatusThread();
   }
   function invalidate() {
     ++generation;
+    scheduled = false;
+    scheduleTicket = null;
     if (pending) pending.controller.abort();
     pending = null;
     loadedKey = '';
@@ -40751,6 +40772,7 @@ window.vaakBootStatusThread();
     const current = generation;
     const controller = new AbortController();
     pending = { controller: controller, key: key };
+    let discardedOffscreen = false;
     box.dataset.deferred = 'loading';
     box.setAttribute('aria-busy', 'true');
     // Current policy, without forcing global collection/network work.
@@ -40763,7 +40785,8 @@ window.vaakBootStatusThread();
       const stale = res.headers.get('X-Vaak-Trends-Stale') === '1';
       return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
     }).then((payload) => {
-      if (current !== generation || !visible(box) || document.getElementById('trends-sidebar') !== box || contextKey(box) !== key) return;
+      if (current !== generation || document.getElementById('trends-sidebar') !== box || contextKey(box) !== key) return;
+      if (!visible(box)) { discardedOffscreen = true; return; }
       box.innerHTML = payload.html;
       loadedKey = key;
       box.dataset.deferred = '0';
@@ -40776,6 +40799,9 @@ window.vaakBootStatusThread();
     }).finally(() => {
       if (current === generation && box.isConnected) box.setAttribute('aria-busy', 'false');
       if (pending && pending.controller === controller) pending = null;
+      // A resize/intersection callback may have coalesced while this response
+      // was finishing. Re-arm only discarded, visible responses, never errors.
+      if (discardedOffscreen && current === generation && visible(box)) loadDeferredTrends(false);
     });
   }
   function loadDeferredTrends(force) {
@@ -40785,10 +40811,18 @@ window.vaakBootStatusThread();
     if (force || (pending && pending.key !== key) || (loadedKey && loadedKey !== key)) invalidate();
     if (mutationPending || !visible(box) || loadedKey === key || (pending && pending.key === key) || scheduled) return;
     scheduled = true;
+    const ticket = {};
+    scheduleTicket = ticket;
     // Parsing and two paints put the main column first on every full/soft page.
     // Idle scheduling keeps a reply/timeline refresh ahead of sidebar work.
     const idle = () => {
-      const run = () => { scheduled = false; fetchTrends(); };
+      if (scheduleTicket !== ticket) return;
+      const run = () => {
+        if (scheduleTicket !== ticket) return;
+        scheduled = false;
+        scheduleTicket = null;
+        fetchTrends();
+      };
       if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 });
       else setTimeout(run, 120);
     };
