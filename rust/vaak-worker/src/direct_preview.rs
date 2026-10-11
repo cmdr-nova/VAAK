@@ -40,7 +40,7 @@ fn query(input:&str)->Result<BTreeMap<String,String>>{
   if !key.is_empty(){values.insert(key,decode_form(value)?);}
  }Ok(values)
 }
-fn normalize(input:&str)->Result<String>{
+pub(crate) fn normalize(input:&str)->Result<String>{
  let input=crate::library::card::php_trim(input);
  let short=regex::Regex::new(r"(?i)^https?://(?:www\.)?(?:youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{6,})").unwrap();
  if let Some(cap)=short.captures(input){return Ok(format!("https://www.youtube.com/watch?v={}",&cap[1]))}
@@ -49,7 +49,7 @@ fn normalize(input:&str)->Result<String>{
  Ok(input.to_owned())
 }
 
-fn youtube_from_linked_html(html:&str)->Result<Option<Value>>{
+pub(crate) fn youtube_from_linked_html(html:&str)->Result<Option<Value>>{
  let hrefs=regex::Regex::new(r#"(?i)href="(https?://[^"]*)""#).unwrap();
  let id_pattern=regex::Regex::new(r"^https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{6,})").unwrap();
  for href in hrefs.captures_iter(html){
@@ -97,20 +97,57 @@ pub(crate) fn extract_url(input:&str)->Result<Option<String>>{
   return Ok(Some(canonical(&normalize(raw)?)?));
  }Ok(None)
 }
-fn public_ipv4(ip:Ipv4Addr)->Result<bool>{
+pub(crate) fn public_ipv4(ip:Ipv4Addr)->Result<bool>{
  let [a,b,_,_]=ip.octets();
  // PHP FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE (IPv4).
  if a==0||a==10||a==127||a>=240||(a==169&&b==254)||(a==172&&(16..=31).contains(&b))||(a==192&&b==168){return Ok(false)}
  Ok(true)
 }
-async fn eligible(url:&str,dns:&dyn PreviewDns)->Result<bool>{
+pub(crate) async fn eligible(url:&str,dns:&dyn PreviewDns)->Result<bool>{
  if url.len()>2000{return Ok(false)}let parsed=reqwest::Url::parse(url)?;let host=parsed.host_str().context("preview hostname missing")?;
  if host=="localhost"||host.ends_with(".localhost")||host.ends_with(".local"){return Ok(false)}
  let answers=if let Ok(ip)=host.parse::<Ipv4Addr>(){vec![ip]}else{dns.ipv4(host).await?};
  if answers.is_empty(){bail!("PHP fallback: unknown preview DNS eligibility")}
  for ip in answers{if !public_ipv4(ip)?{return Ok(false)}}Ok(true)
 }
-fn masto_card(row:&Value)->Option<Value>{
+/// Raw profile/quoted helpers use cache-only lookup: eligibility still precedes
+/// SQL, but a miss never fetches, warms, or consumes either preview budget.
+pub(crate) async fn resolve_cache_only(db:&Client,dns:&dyn PreviewDns,text:&str,now:chrono::DateTime<chrono::Utc>)->Result<Option<Value>>{
+ resolve_cache_only_guarded(db,dns,text,now,None).await
+}
+struct GuardedCacheDns<'a>{db:&'a Client,dns:&'a dyn PreviewDns,grant:&'a dyn crate::profile_enrichment::CurrentEnrichmentGrant}
+impl PreviewDns for GuardedCacheDns<'_>{fn ipv4<'a>(&'a self,host:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async move{self.grant.require_current(self.db).await?;let result=self.dns.ipv4(host).await?;self.grant.require_current(self.db).await?;Ok(result)})}}
+pub(crate) async fn resolve_cache_only_guarded(db:&Client,dns:&dyn PreviewDns,text:&str,now:chrono::DateTime<chrono::Utc>,grant:Option<&dyn crate::profile_enrichment::CurrentEnrichmentGrant>)->Result<Option<Value>>{
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+
+ let Some(url)=extract_url(text)?else{return Ok(None)};
+ let key=normalize(&url)?;
+ let allowed=if let Some(grant)=grant{eligible(&key,&GuardedCacheDns{db,dns,grant}).await?}else{eligible(&key,dns).await?};if !allowed{return Ok(None)}
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+ let row=db.query_opt("SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1 LIMIT 1",&[&key]).await?;
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+ if let Some(row)=row{
+  let row:Value=row.get(0);let expiry=s(&row,"expires_at");
+  let expired=if expiry.is_empty(){false}else{
+   chrono::DateTime::parse_from_rfc3339(expiry).or_else(|_|chrono::NaiveDateTime::parse_from_str(expiry,"%Y-%m-%d %H:%M:%S").map(|v|v.and_utc().fixed_offset())).context("PHP fallback: cache-only preview expiry grammar")?.timestamp()<now.timestamp()
+  };
+  if !expired {
+   if row.get("status").and_then(Value::as_str).unwrap_or("ok")!="ok"{return Ok(None)}
+   let mut card=serde_json::Map::new();
+   card.insert("url".into(),Value::String(s(&row,"url").into()));
+   for key in ["title","description","image","provider_name","provider_url"]{
+    let value=row.get(key).unwrap_or(&Value::Null);
+    if !value.is_null()&&!value.is_string(){bail!("PHP fallback: cache-only preview scalar type")}
+    card.insert(key.into(),value.clone());
+   }
+   card.insert("type".into(),Value::String(row.get("type").and_then(Value::as_str).unwrap_or("link").into()));
+   card.insert("status".into(),Value::String("ok".into()));
+   return Ok(Some(Value::Object(card)))
+  }
+ }
+ youtube_from_linked_html(&format!("<a href=\"{}\"></a>",crate::library::actions::esc(&key)))
+}
+pub(crate) fn masto_card(row:&Value)->Option<Value>{
  if row.get("status").and_then(Value::as_str).unwrap_or("ok")!="ok"||s(row,"url").is_empty(){return None}
  let kind=row.get("type").and_then(Value::as_str).unwrap_or("link");let kind=if matches!(kind,"link"|"photo"|"video"|"rich"){kind}else{"link"};
  Some(json!({"url":s(row,"url"),"title":s(row,"title"),"description":s(row,"description"),"image":row.get("image").filter(|v|v.is_string()).cloned().unwrap_or(Value::Null),"provider_name":s(row,"provider_name"),"provider_url":s(row,"provider_url"),"type":kind,"status":"ok","width":if kind=="video"{480}else{0},"height":if kind=="video"{270}else{0}}))
@@ -121,7 +158,7 @@ fn masto_card(row:&Value)->Option<Value>{
 // action context, grant, or capability to publish source HTML.
 struct PreviewContext {plain:String,linked_html:String,poll_suppressed:bool,now:chrono::DateTime<chrono::Utc>}
 
-fn preview_plain(st:&Value,answer:Option<&str>)->String{
+pub(crate) fn preview_plain(st:&Value,answer:Option<&str>)->String{
  let quoted=st.get("quote").and_then(|v|v.get("quoted_status")).filter(|v|v.is_object());
  let quoted_plain=quoted.map(|q|crate::library::body::scrub_as2(&crate::library::body::html_to_plain(s(q,"content"))));
  let mut plain=crate::library::body::strip_raw_quotes(&crate::library::body::scrub_as2(&crate::library::body::html_to_plain(s(st,"content"))),quoted_plain.as_deref());
@@ -131,13 +168,18 @@ fn preview_plain(st:&Value,answer:Option<&str>)->String{
 }
 
 pub(crate) async fn resolve(db:&Client,dns:&dyn PreviewDns,status:&Value,original_content:Option<&str>,facts:&crate::library::card::CardFacts,budget:&mut i64)->Result<Option<Value>>{
+ resolve_guarded(db,dns,status,original_content,facts,budget,None).await
+}
+
+/// Guard actual DNS/cache awaits; pure preview branches use enclosing final admission.
+pub(crate) async fn resolve_guarded(db:&Client,dns:&dyn PreviewDns,status:&Value,original_content:Option<&str>,facts:&crate::library::card::CardFacts,budget:&mut i64,grant:Option<&dyn crate::profile_enrichment::CurrentEnrichmentGrant>)->Result<Option<Value>>{
  let st=if s(status,"content").is_empty(){status.get("reblog").filter(|v|v.is_object()).unwrap_or(status)}else{status};
  let media=st.get("media_attachments").and_then(Value::as_array).is_some_and(|v|!v.is_empty());
  let note=if s(st,"uri").is_empty(){s(st,"url")}else{s(st,"uri")};
  if media||facts.poll_row.as_ref().is_some_and(|row|!crate::library::card::poll_html(row,note,facts).is_empty()){return Ok(None)}
  let plain=preview_plain(st,facts.ask_row.as_ref().map(|ask|s(ask,"_body_answer")));
  let linked_html=if plain.is_empty(){String::new()}else{crate::library::card::linked_body_html(&plain,st,facts)?};
- resolve_prepared(db,dns,st,original_content,&PreviewContext{plain,linked_html,poll_suppressed:false,now:facts.now},budget).await
+ resolve_prepared(db,dns,st,original_content,&PreviewContext{plain,linked_html,poll_suppressed:false,now:facts.now},budget,grant).await
 }
 
 pub(crate) async fn resolve_late_omitted(db:&Client,dns:&dyn PreviewDns,status:&Value,original_content:Option<&str>,owner_actor:&str,return_view:&str,budget:&mut i64)->Result<()> {
@@ -160,11 +202,11 @@ pub(crate) async fn resolve_late_omitted(db:&Client,dns:&dyn PreviewDns,status:&
  let emojis=crate::library::facts::emoji_maps(db,&display).await?;
  let actor=crate::library::card::account_actor_ref(&display["account"]);let emojis=emojis.get(&actor).cloned().unwrap_or_default();
  let linked_html=if plain.is_empty(){String::new()}else{crate::library::card::linked_body_presentation(&plain,&display,return_view,owner_actor,&emojis)?};
- let _=resolve_prepared(db,dns,&display,original_content,&PreviewContext{plain,linked_html,poll_suppressed,now:chrono::Utc::now()},budget).await?;
+ let _=resolve_prepared(db,dns,&display,original_content,&PreviewContext{plain,linked_html,poll_suppressed,now:chrono::Utc::now()},budget,None).await?;
  Ok(())
 }
 
-async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_content:Option<&str>,context:&PreviewContext,budget:&mut i64)->Result<Option<Value>>{
+async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_content:Option<&str>,context:&PreviewContext,budget:&mut i64,grant:Option<&dyn crate::profile_enrichment::CurrentEnrichmentGrant>)->Result<Option<Value>>{
  if context.poll_suppressed||st.get("media_attachments").and_then(Value::as_array).is_some_and(|media|!media.is_empty()){return Ok(None)}
  let quoted=st.get("quote").and_then(|v|v.get("quoted_status")).filter(|v|v.is_object());
  let quoted_url=quoted.map(|q|if s(q,"uri").starts_with("https://"){s(q,"uri")}else{s(q,"url")}).unwrap_or("");
@@ -190,8 +232,14 @@ async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_cont
  // for_url normalizes again before eligibility (not just cache lookup).
  // In particular the extracted YouTube canonical key loses www, while the
  // helper restores it; DNS must inspect the hostname actually used by PHP.
- if !eligible(&key,dns).await?{bail!("PHP fallback: rejected URL warm branch")}
- if let Some(row)=db.query_opt("SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1 LIMIT 1",&[&key]).await?{
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+ let eligibility=eligible(&key,dns).await;
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+ if !eligibility?{bail!("PHP fallback: rejected URL warm branch")}
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+ let row=db.query_opt("SELECT to_jsonb(c) FROM link_preview_cards c WHERE url=$1 LIMIT 1",&[&key]).await;
+ if let Some(grant)=grant{grant.require_current(db).await?;}
+ if let Some(row)=row?{
   let row:Value=row.get(0);let expiry=s(&row,"expires_at");
   if !expiry.is_empty(){let expiry=chrono::DateTime::parse_from_rfc3339(expiry).or_else(|_|chrono::NaiveDateTime::parse_from_str(expiry,"%Y-%m-%d %H:%M:%S").map(|v|v.and_utc().fixed_offset())).context("PHP fallback: preview expiry grammar")?;
    if expiry.timestamp()<context.now.timestamp(){bail!("PHP fallback: expired preview fetch/warm")}}
@@ -203,6 +251,31 @@ async fn resolve_prepared(db:&Client,dns:&dyn PreviewDns,st:&Value,original_cont
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[tokio::test]
+ #[ignore="opt-in disposable PostgreSQL actual PHP cache-only preview differential"]
+ async fn actual_profile_cache_only_preview_replay(){
+  let connection=std::env::var("LIBRARY_FIXTURE_DB").expect("disposable PG");assert!(connection.contains("/tmp/"));
+  let input:Value=serde_json::from_slice(&std::fs::read("/tmp/vaak-local-profile-preview-cache-reference.json").unwrap()).unwrap();
+  let db=crate::db::connect(&connection).await.unwrap();let mut output=Vec::new();
+  struct PublicDns;impl PreviewDns for PublicDns{fn ipv4<'a>(&'a self,_:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async{Ok(vec![Ipv4Addr::new(8,8,8,8)])})}}
+  for width in ["INTEGER","BIGINT"]{
+   let schema=format!("profile_cache_{}_{}",width.to_lowercase(),std::process::id());
+   db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema}")).await.unwrap();
+   let columns=input["current_schema_by_width"][width]["link_preview_cards"].as_array().unwrap();
+   let definitions=columns.iter().map(|column|format!("{} {}",column["column_name"].as_str().unwrap(),column["data_type"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+   db.batch_execute(&format!("CREATE TABLE link_preview_cards({definitions})")).await.unwrap();
+   for capture in input["captures"].as_array().unwrap().iter().filter(|row|row["width"]==width){
+    db.batch_execute("TRUNCATE link_preview_cards").await.unwrap();
+    for row in capture["current_tables"]["link_preview_cards"].as_array().unwrap(){let raw=serde_json::to_string(row).unwrap();db.execute("INSERT INTO link_preview_cards SELECT * FROM jsonb_populate_record(NULL::link_preview_cards,$1::text::jsonb)",&[&raw]).await.unwrap();}
+    let now=chrono::DateTime::from_timestamp(capture["rendered_at"].as_i64().unwrap(),0).unwrap();
+    let card=resolve_cache_only(&db,&PublicDns,capture["source_text"].as_str().unwrap(),now).await.unwrap();
+    assert_eq!(serde_json::to_value(&card).unwrap(),capture["php"]["raw_card"],"{width} {:?}",capture["case"]);
+    output.push(json!({"width":width,"case":capture["case"],"card":card}));
+   }
+   db.batch_execute(&format!("SET search_path TO public;DROP SCHEMA {schema} CASCADE")).await.unwrap();
+  }
+  assert_eq!(output.len(),16);std::fs::write("/tmp/vaak-profile-cache-only-native.json",serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+ }
  #[test]
  fn actual_php_selector_controls()->Result<()> {
   use std::io::Write;
@@ -230,6 +303,9 @@ mod tests {
 #[derive(serde::Serialize)]
 pub(crate) struct PreviewState {initial:i64,remaining:i64,attempts:usize}
 impl PreviewState {
+ pub(crate) fn attempts(&self)->usize{self.attempts}
+ pub(crate) fn initial(&self)->i64{self.initial}
+ pub(crate) fn remaining(&self)->i64{self.remaining}
  pub(crate) fn from_remaining(initial:i64,remaining:i64,source_count:usize)->Result<Self>{
   let attempts=if initial>0 {
    if remaining<0||remaining>initial{bail!("invalid private preview state")}

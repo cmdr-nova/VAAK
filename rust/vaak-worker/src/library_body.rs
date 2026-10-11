@@ -1,26 +1,47 @@
 //! Canonical text components for Library; DB-resolved mention and emoji facts
 //! must be supplied by the authenticated page assembler before those branches.
+// Immutable compiled patterns only; request text, source facts and results
+// remain uncached. Each callsite retains exactly its original regex literal.
+macro_rules! static_regex { ($pattern:literal) => {{
+ static REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+ REGEX.get_or_init(||regex::Regex::new($pattern).unwrap())
+ }}; }
+
 use anyhow::{bail, Result};
 use super::actions::{esc, query};
+
+/// Exact shared painter Ask-body precedence (ap-admin.php:17681-17726).
+/// Caller-provided current Ask facts establish the component; HTML does not
+/// establish source identity or audience. Preserve the original HTML for the
+/// duplicate-container removal even after current own plaintext was loaded.
+pub(crate) fn ask_plain_body(plain:&str,original_html:&str,answer:&str,card_nonempty:bool)->String{
+    let answer=super::card::php_trim(answer);
+    let mut text=if !answer.is_empty(){answer.to_owned()}else if card_nonempty&&static_regex!(r"(?iu)\basked\b").is_match(plain){String::new()}else{plain.to_owned()};
+    if card_nonempty&&original_html.contains("ask-container"){
+        let stripped=static_regex!(r#"<div class="ask-container\b[^>]*>[\s\S]*?<div class="ask-body\b[^>]*>[\s\S]*?</div>\s*</div>"#).replace_all(original_html,"");
+        if stripped.as_ref()!=original_html{let from_html=html_to_plain(&stripped);if !from_html.is_empty(){text=from_html;}}
+    }
+    text
+}
 
 /// Pure legacy text repairs. Cache-backed bare-handle discovery remains a
 /// separate server fact; these functions never guess an actor identity.
 pub(crate) fn repair_bridgy(text: &str) -> String {
-    regex::Regex::new(r"@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})@bsky\.brid\.gy\b").unwrap().replace_all(text,"@$1").into_owned()
+    static_regex!(r"@([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})@bsky\.brid\.gy\b").replace_all(text,"@$1").into_owned()
 }
 pub(crate) fn repair_at_tags(text: &str) -> String {
-    let text=regex::Regex::new(r"(?i)@#([\p{L}\p{N}_]+)@(?:[a-z0-9.-]+\.[a-z]{2,})").unwrap().replace_all(text,"#$1").into_owned();
-    regex::Regex::new(r"@#([\p{L}\p{N}_]+)").unwrap().replace_all(&text,"#$1").into_owned()
+    let text=static_regex!(r"(?i)@#([\p{L}\p{N}_]+)@(?:[a-z0-9.-]+\.[a-z]{2,})").replace_all(text,"#$1").into_owned();
+    static_regex!(r"@#([\p{L}\p{N}_]+)").replace_all(&text,"#$1").into_owned()
 }
 pub(crate) fn unglue_mentions(text: &str, known: &[String]) -> String {
-    let pattern=regex::Regex::new(r"(^|[^\w@])(@[\w]+@(?:[a-z0-9-]+\.)+[a-z]{2,})").unwrap();
+    let pattern=static_regex!(r"(^|[^\w@])(@[\w]+@(?:[a-z0-9-]+\.)+[a-z]{2,})");
     let split=|input:&str,pattern:&regex::Regex|pattern.replace_all(input,|cap:&regex::Captures|{
         let next=&input[cap.get(0).unwrap().end()..];
         if next.chars().next().is_some_and(|c| c.is_numeric() || (c.is_uppercase() && c.is_alphabetic())) {format!("{} ",&cap[0])}else{cap[0].to_owned()}
     }).into_owned();
     let mut output=split(text,&pattern);
     let mut names=std::collections::HashMap::new();
-    for name in known {let name=name.trim();if !name.is_empty()&&regex::Regex::new(r"^\w+$").unwrap().is_match(name){names.insert(name.to_lowercase(),name.to_owned());}}
+    for name in known {let name=name.trim();if !name.is_empty()&&static_regex!(r"^\w+$").is_match(name){names.insert(name.to_lowercase(),name.to_owned());}}
     let mut names=names.into_values().collect::<Vec<_>>();names.sort_by_key(|name|std::cmp::Reverse(name.len()));
     for name in names {let pattern=regex::Regex::new(&format!(r"(^|[^\w@])@({})",regex::escape(&name))).unwrap();output=split(&output,&pattern);}
     output
@@ -36,8 +57,8 @@ pub(crate) fn unglue_hashtags(text: &str) -> String {
 
 pub(crate) fn expand_url_mentions(text: &str) -> String {
     let mut hosts:std::collections::HashMap<String,Vec<String>>=std::collections::HashMap::new();
-    let urls=regex::Regex::new(r"(?i)https://([^/\s]+)(/[^\s<]*)?").unwrap();
-    let paths=regex::Regex::new(r"/(?:@|users/)([^/]+)(?:/|$)").unwrap();
+    let urls=static_regex!(r"(?i)https://([^/\s]+)(/[^\s<]*)?");
+    let paths=static_regex!(r"/(?:@|users/)([^/]+)(?:/|$)");
     for url in urls.captures_iter(text) {
         if let Some(path)=paths.captures(url.get(2).map(|m|m.as_str()).unwrap_or("")){
             let raw=path[1].as_bytes();let mut decoded=Vec::new();let mut i=0;
@@ -49,7 +70,7 @@ pub(crate) fn expand_url_mentions(text: &str) -> String {
             }
         }
     }
-    let pattern=regex::Regex::new(r"(^|[^A-Za-z0-9_@/])@([A-Za-z0-9_]{2,40})").unwrap();
+    let pattern=static_regex!(r"(^|[^A-Za-z0-9_@/])@([A-Za-z0-9_]{2,40})");
     pattern.replace_all(text,|cap:&regex::Captures|{
         let tail=&text[cap.get(0).unwrap().end()..];
         if tail.chars().next().is_some_and(|c|c.is_ascii_alphanumeric()||c=='_'||c=='@'){return cap[0].to_owned();}
@@ -73,7 +94,7 @@ pub(crate) fn unglue_host_mentions(text:&str,owner_actor:&str,extra:&[String])->
 
 pub(crate) fn repair_known_text(text:&str,owner_actor:&str)->String {
     let mut protected=Vec::new();
-    let code=regex::Regex::new(r"`([^`\r\n]+)`").unwrap();
+    let code=static_regex!(r"`([^`\r\n]+)`");
     let text=code.replace_all(text,|cap:&regex::Captures|{
         if super::card::php_trim(&cap[1]).is_empty(){return cap[0].to_owned();}
         let key=format!("\u{1}C{}\u{1}",protected.len());protected.push((key.clone(),cap[0].to_owned()));key
@@ -86,15 +107,15 @@ pub(crate) fn repair_known_text(text:&str,owner_actor:&str)->String {
 }
 
 fn fix_utf8(text:&str)->String {
-    if !regex::Regex::new(r"â.|Ã.|Â.|ðŸ").unwrap().is_match(text){return text.into();}
+    if !static_regex!(r"â.|Ã.|Â.|ðŸ").is_match(text){return text.into();}
     let bytes=text.chars().map(|c|if u32::from(c)<=255{c as u8}else{b'?'}).collect::<Vec<_>>();
-    if let Ok(value)=String::from_utf8(bytes){if !value.is_empty()&&!regex::Regex::new(r"â.|Ã.").unwrap().is_match(&value){return value;}}
+    if let Ok(value)=String::from_utf8(bytes){if !value.is_empty()&&!static_regex!(r"â.|Ã.").is_match(&value){return value;}}
     let mut value=text.to_owned();
     for (old,new) in [("â€™","’"),("â€˜","‘"),("â€œ","“"),("â€\u{9d}","”"),("â€”","—"),("â€“","–"),("â€¦","…"),("Â","")]{value=value.replace(old,new);}
     value
 }
 fn strip_tags(text:&str)->String {
-    regex::Regex::new(r"(?s)<!--.*?-->|<[^>]*>").unwrap().replace_all(text,"").into_owned()
+    static_regex!(r"(?s)<!--.*?-->|<[^>]*>").replace_all(text,"").into_owned()
 }
 fn attribute(attrs:&str,name:&str)->String {
     regex::Regex::new(&format!(r#"(?i)\b{}\s*=\s*["']([^"']*)["']"#,regex::escape(name))).unwrap().captures(attrs).map(|cap|cap[1].to_owned()).unwrap_or_default()
@@ -102,11 +123,11 @@ fn attribute(attrs:&str,name:&str)->String {
 fn acct_from_href(href:&str,fallback:&str)->Option<String> {
     if !href.starts_with("https://"){return None;}
     let url=reqwest::Url::parse(href).ok()?;let host=url.host_str()?.to_lowercase();
-    let path=regex::Regex::new(r"/(?:@|users/)([^/]+)/?$").unwrap();
+    let path=static_regex!(r"/(?:@|users/)([^/]+)/?$");
     let mut user=if let Some(cap)=path.captures(url.path()){
         let raw=cap[1].as_bytes();let mut bytes=Vec::new();let mut i=0;
         while i<raw.len(){if raw[i]==b'%'&&i+2<raw.len(){if let Ok(n)=u8::from_str_radix(std::str::from_utf8(&raw[i+1..i+3]).unwrap_or(""),16){bytes.push(n);i+=3;continue;}}bytes.push(raw[i]);i+=1;}String::from_utf8_lossy(&bytes).into_owned()
-    }else{let user=fallback.trim_start_matches('@');if user.matches('@').count()==1&&regex::Regex::new(r"^[^@]+@[^@]+\.[^@]+$").unwrap().is_match(user){user.to_owned()}else{user.split('@').next().unwrap_or("").to_owned()}};
+    }else{let user=fallback.trim_start_matches('@');if user.matches('@').count()==1&&static_regex!(r"^[^@]+@[^@]+\.[^@]+$").is_match(user){user.to_owned()}else{user.split('@').next().unwrap_or("").to_owned()}};
     user=user.trim_start_matches('@').to_owned();if user.is_empty(){return None;}
     if (host=="brid.gy"||host.ends_with(".brid.gy"))&&user.contains('.')&&!user.to_lowercase().starts_with("did:"){Some(user)}else{Some(format!("{user}@{host}"))}
 }
@@ -114,7 +135,7 @@ fn acct_from_href(href:&str,fallback:&str)->Option<String> {
 pub(crate) fn html_to_plain(input:&str)->String {
     let mut html=fix_utf8(input);
     if html.contains('<'){
-        html=regex::Regex::new(r"(?is)<a\b([^>]*)>(.*?)</a>").unwrap().replace_all(&html,|cap:&regex::Captures|{
+        html=static_regex!(r"(?is)<a\b([^>]*)>(.*?)</a>").replace_all(&html,|cap:&regex::Captures|{
             let inner=crate::home_hydrate_ranked::html_entity_decode(&strip_tags(&cap[2]));
             let inner=super::card::php_trim(&inner).to_owned();
             let href=crate::home_hydrate_ranked::html_entity_decode(&attribute(&cap[1],"href"));
@@ -122,53 +143,53 @@ pub(crate) fn html_to_plain(input:&str)->String {
             let class=attribute(&cap[1],"class").to_lowercase();let rel=attribute(&cap[1],"rel").to_lowercase();
             let path=reqwest::Url::parse(&href).ok().map(|url|url.path().to_lowercase()).unwrap_or_default();
             if class.contains("hashtag")||rel.contains("tag")||path.contains("/tags/")||inner.starts_with('#'){
-                return regex::Regex::new(r"#([\p{L}\p{N}_]+)").unwrap().captures(&inner).map(|cap|format!("#{}",&cap[1])).unwrap_or_else(||if inner.is_empty(){href}else{inner});
+                return static_regex!(r"#([\p{L}\p{N}_]+)").captures(&inner).map(|cap|format!("#{}",&cap[1])).unwrap_or_else(||if inner.is_empty(){href}else{inner});
             }
             if (class.contains("mention")||inner.starts_with('@')||class.contains("u-url"))&&href.starts_with("https://"){
-                if regex::Regex::new(r"^@[\w.-]+@[\w.-]+\.[\w.-]+$").unwrap().is_match(&inner){return inner;}
+                if static_regex!(r"^@[\w.-]+@[\w.-]+\.[\w.-]+$").is_match(&inner){return inner;}
                 let bridgy=reqwest::Url::parse(&href).ok().and_then(|url|url.host_str().map(|host|host=="brid.gy"||host.ends_with(".brid.gy"))).unwrap_or(false);
-                if bridgy&&regex::Regex::new(r"^@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$").unwrap().is_match(&inner){return inner;}
+                if bridgy&&static_regex!(r"^@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$").is_match(&inner){return inner;}
                 let fallback=inner.strip_prefix('@').unwrap_or(&inner);
                 if !fallback.starts_with('#'){if let Some(acct)=acct_from_href(&href,fallback){if !acct.starts_with('#'){return format!("@{acct}");}}}
             }
             if inner.is_empty(){href}else{inner}
         }).into_owned();
-        html=regex::Regex::new(r#"(?i)<span\b[^>]*class="[^"]*\bquote-inline\b[^"]*"[^>]*>"#).unwrap().replace_all(&html,"\n\n").into_owned();
-        html=regex::Regex::new(r"(?i)<\s*br\s*/?\s*>").unwrap().replace_all(&html,"\n").into_owned();
-        html=regex::Regex::new(r"(?i)<\s*/\s*(?:p|div|li|tr|h[1-6]|blockquote)\s*>").unwrap().replace_all(&html,"\n\n").into_owned();
+        html=static_regex!(r#"(?i)<span\b[^>]*class="[^"]*\bquote-inline\b[^"]*"[^>]*>"#).replace_all(&html,"\n\n").into_owned();
+        html=static_regex!(r"(?i)<\s*br\s*/?\s*>").replace_all(&html,"\n").into_owned();
+        html=static_regex!(r"(?i)<\s*/\s*(?:p|div|li|tr|h[1-6]|blockquote)\s*>").replace_all(&html,"\n\n").into_owned();
         html=strip_tags(&html);
     }
     html=crate::home_hydrate_ranked::html_entity_decode(&html);
-    html=regex::Regex::new(r"[ \t]+").unwrap().replace_all(&html," ").into_owned();
-    html=super::card::php_trim(&regex::Regex::new(r"\n{3,}").unwrap().replace_all(&html,"\n\n")).to_owned();
+    html=static_regex!(r"[ \t]+").replace_all(&html," ").into_owned();
+    html=super::card::php_trim(&static_regex!(r"\n{3,}").replace_all(&html,"\n\n")).to_owned();
     repair_at_tags(&unglue_hashtags(&expand_url_mentions(&unglue_mentions(&html,&[]))))
 }
 
 pub(crate) fn looks_like_as2(text:&str)->bool {
     let text=text.trim_start_matches(|c|matches!(c,' '|'\t'|'\n'|'\r'|'\0'|'\x0B'));
-    regex::Regex::new(r"↪\s*QT(?:Create|Announce|Update|Note|QuotePost)\b").unwrap().is_match(text)
+    static_regex!(r"↪\s*QT(?:Create|Announce|Update|Note|QuotePost)\b").is_match(text)
         ||text.contains("QuoteAuthorization")||text.contains("interactionPolicy")
         ||(text.starts_with(['{','['])&&(text.contains("\"@context\"")||(text.contains("\"type\"")&&text.contains("\"attributedTo\""))||text.contains("activitystreams")))
 }
 pub(crate) fn scrub_as2(text:&str)->String {
     let text=super::card::php_trim(text);if !looks_like_as2(text){return text.into();}
-    if let Some(marker)=regex::Regex::new(r"\n\n↪\s*QT|\n↪\s*QT").unwrap().find(text){let kept=super::card::php_trim(&text[..marker.start()]);if !kept.is_empty()&&!looks_like_as2(kept){return kept.into();}}
+    if let Some(marker)=static_regex!(r"\n\n↪\s*QT|\n↪\s*QT").find(text){let kept=super::card::php_trim(&text[..marker.start()]);if !kept.is_empty()&&!looks_like_as2(kept){return kept.into();}}
     String::new()
 }
 pub(crate) fn strip_raw_quotes(input:&str,quoted:Option<&str>)->String {
     let mut text=super::card::php_trim(input).to_owned();if looks_like_as2(&text){text=scrub_as2(&text);}
-    let qt=regex::Regex::new(r"(?:^|\n)\s*(?:↪|➡|→)?\s*QT(Create|Announce|Update|Note|QuotePost|\b)").unwrap();
+    let qt=static_regex!(r"(?:^|\n)\s*(?:↪|➡|→)?\s*QT(Create|Announce|Update|Note|QuotePost|\b)");
     text=super::card::php_trim(&qt.replace_all(&text,|cap:&regex::Captures|format!("\n↪ QT{}",&cap[1]))).to_owned();
-    if let Some(marker)=regex::Regex::new(r"(?:^|\n)\s*(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b").unwrap().find(&text){text=super::card::php_trim(&text[..marker.start()]).to_owned();}
-    text=super::card::php_trim(&regex::Regex::new(r"(?:^|\n)\s*RE:\s*https://[^\s<>]+").unwrap().replace_all(&text,"")).to_owned();
+    if let Some(marker)=static_regex!(r"(?:^|\n)\s*(?:↪|➡|→)\s*QT(?:Create|Announce|Update|Note|QuotePost)?\b").find(&text){text=super::card::php_trim(&text[..marker.start()]).to_owned();}
+    text=super::card::php_trim(&static_regex!(r"(?:^|\n)\s*RE:\s*https://[^\s<>]+").replace_all(&text,"")).to_owned();
     if let Some(q)=quoted.map(super::card::php_trim).filter(|q|!q.is_empty()){if text.eq_ignore_ascii_case(q)||super::card::php_trim(&text.replace(q,"")).is_empty(){text.clear();}}
     text
 }
 
 pub(crate) fn linked_text(text: &str, view: &str) -> Result<String> {
     let text = crate::home_hydrate_ranked::html_entity_decode(super::card::php_trim(text));
-    let url = regex::Regex::new(r#"(?i)^(?:https?://[^\s<]+|www\.[^\s<]+|(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s<>\"']+)"#).unwrap();
-    let tag = regex::Regex::new(r"^#([\p{L}\p{N}_]{1,100})").unwrap();
+    let url = static_regex!(r#"(?i)^(?:https?://[^\s<]+|www\.[^\s<]+|(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s<>\"']+)"#);
+    let tag = static_regex!(r"^#([\p{L}\p{N}_]{1,100})");
     let mut output = String::new();
     let mut index = 0;
     while index < text.len() {
@@ -239,7 +260,7 @@ pub(crate) fn linked_text_mentions(text:&str,view:&str,mentions:&[serde_json::Va
         let rest=&text[index..];let previous=text[..index].chars().next_back();
         // Let the existing code/URL parser paint protected spans as a unit.
         if rest.starts_with('`') {if let Some(end)=rest[1..].find('`'){let code=&rest[..end+2];output.push_str(&linked_text(code,view)?);index+=end+2;continue;}}
-        let url=regex::Regex::new(r"^https?://[^\s<]+").unwrap();
+        let url=static_regex!(r"^https?://[^\s<]+");
         if let Some(found)=url.find(rest){output.push_str(&linked_text(found.as_str(),view)?);index+=found.end();continue;}
         if rest.starts_with('@')&&previous.is_none_or(|c|!(c.is_ascii_alphanumeric()||c=='_'||c=='/')){
             let candidate=list.iter().find(|(acct,_,_)|acct.contains('@')&&rest.starts_with(&format!("@{acct}")))
@@ -247,7 +268,7 @@ pub(crate) fn linked_text_mentions(text:&str,view:&str,mentions:&[serde_json::Va
             if let Some((acct,user,url))=candidate{
                 let full=acct.contains('@')&&rest.starts_with(&format!("@{acct}"));
                 let raw=if full{acct}else{user};
-                let local=regex::Regex::new(r"(?i)^https://mkultra\.monster/users/[A-Za-z0-9_]+$").unwrap().is_match(url);
+                let local=static_regex!(r"(?i)^https://mkultra\.monster/users/[A-Za-z0-9_]+$").is_match(url);
                 let label=if full&&!local{acct}else{user};
                 let href=if let Some(user)=url.strip_prefix("search://"){format!("?view=search&q={}&type=accounts&resolve=1",query(&format!("@{user}")))}else if url.trim_end_matches('/')==owner_actor.trim_end_matches('/'){"?view=outbox".into()}else if local{format!("/vaak/users/{}?from={}",query(url.rsplit('/').next().unwrap_or("")),query(view))}else{format!("/vaak/?view=remote_profile&actor={}&from={}",query(url),query(view))};
                 output.push_str(&format!("<a class=\"mention\" href=\"{}\">@{}</a>",esc(&href),esc(label)));index+=raw.len()+1;continue;
@@ -271,7 +292,7 @@ pub(crate) fn linked_text_mentions(text:&str,view:&str,mentions:&[serde_json::Va
 /// Known server cache emoji URLs only. Display names escape each plain span;
 /// body HTML uses the canonical PHP shortcode boundary grammar.
 pub(crate) fn emojis(text: &str, map: &std::collections::HashMap<String,String>, display: bool) -> String {
-    let pattern = regex::Regex::new(r":([A-Za-z0-9_-]{1,80}):").unwrap();
+    let pattern = static_regex!(r":([A-Za-z0-9_-]{1,80}):");
     let mut output = String::new();
     let mut index = 0;
     for captures in pattern.captures_iter(text) {
@@ -316,7 +337,7 @@ pub(crate) fn facets(html: &str, status: &serde_json::Value) -> String {
     }
     let mut replacements=replacements.into_iter().collect::<Vec<_>>();
     replacements.sort_by_key(|(label,_)|std::cmp::Reverse(label.len()));
-    let anchors=regex::Regex::new(r"(?is)<a\b[^>]*>.*?</a>").unwrap();
+    let anchors=static_regex!(r"(?is)<a\b[^>]*>.*?</a>");
     let mut html=html.to_owned();
     for (label,uri) in replacements {
         let visible=esc(&label);
@@ -333,11 +354,11 @@ fn is_status_url(url: &str) -> bool {
     let canonical=if url.starts_with("https://") {
         reqwest::Url::parse(url).ok().is_some_and(|parsed|{
             let path=parsed.path();
-            !regex::Regex::new(r"(?i)^/(?:@|users/)[^/]+/?$").unwrap().is_match(path)
-                &&regex::Regex::new(r"(?i)/(?:statuses|notes|objects|notice|post|posts|p)/|/@[^/]+/[A-Za-z0-9_-]+").unwrap().is_match(path)
+            !static_regex!(r"(?i)^/(?:@|users/)[^/]+/?$").is_match(path)
+                &&static_regex!(r"(?i)/(?:statuses|notes|objects|notice|post|posts|p)/|/@[^/]+/[A-Za-z0-9_-]+").is_match(path)
         })
     } else {false};
-    canonical||regex::Regex::new(r"(?i)^https://(?:bsky\.app/profile/[^/]+/post/|[^/]+/(?:users|@)[^/]+/(?:statuses|posts)/[0-9]+|[^/]+/ap/(?:users|actor)s?/[^/]+/statuses/)").unwrap().is_match(url)
+    canonical||static_regex!(r"(?i)^https://(?:bsky\.app/profile/[^/]+/post/|[^/]+/(?:users|@)[^/]+/(?:statuses|posts)/[0-9]+|[^/]+/ap/(?:users|actor)s?/[^/]+/statuses/)").is_match(url)
 }
 
 #[cfg(test)]

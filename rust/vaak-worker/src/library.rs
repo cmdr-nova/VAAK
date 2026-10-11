@@ -23,10 +23,16 @@ pub(crate) mod own;
 pub(crate) mod rss;
 #[path = "library_bsky.rs"]
 pub(crate) mod bsky;
+#[path="library_bsky_normalize.rs"]
+pub(crate) mod bsky_normalize;
 #[path = "library_card.rs"]
 pub(crate) mod card;
 #[path = "library_body.rs"]
 pub(crate) mod body;
+#[path = "library_preview.rs"]
+pub(crate) mod preview;
+#[path = "library_selection.rs"]
+pub(crate) mod selection;
 
 #[derive(Debug, Serialize)]
 pub struct FavouritesProjection {
@@ -114,7 +120,7 @@ pub async fn bookmarks(cfg: &crate::config::Config, owner_id: i64, offset: i64, 
         &[&owner_id, &folder_id],
     ).await.context("count fediverse bookmarks")?.get(0);
     let bsky_rows = optional_cache_rows(&db,
-        "SELECT c.post_json, c.bookmarked_at FROM bsky_bookmark_cache c WHERE c.owner_user_id = $1::bigint
+        "SELECT c.post_json, c.bookmarked_at, c.bookmark_uri FROM bsky_bookmark_cache c WHERE c.owner_user_id = $1::bigint
          AND ($4::bigint IS NULL OR EXISTS (
            SELECT 1 FROM vaak_bookmark_folder_items fi
            LEFT JOIN masto_bookmarks mb ON mb.owner_user_id = c.owner_user_id AND mb.status_id = fi.status_id
@@ -124,7 +130,7 @@ pub async fn bookmarks(cfg: &crate::config::Config, owner_id: i64, offset: i64, 
          ORDER BY c.bookmarked_at DESC, c.bookmark_uri DESC OFFSET $2 LIMIT $3",
         &[&owner_id, &offset, &limit, &folder_id],
     ).await?;
-    let bsky_rows = cached_posts(bsky_rows, "bookmarked_at")?;
+    let bsky_rows = cached_bookmark_posts(bsky_rows,folder_id.unwrap_or(0),offset,limit)?;
     let total_bsky: i64 = optional_cache_count(&db,"SELECT COUNT(*) FROM bsky_bookmark_cache c WHERE c.owner_user_id = $1::bigint AND ($2::bigint IS NULL OR EXISTS (SELECT 1 FROM vaak_bookmark_folder_items fi LEFT JOIN masto_bookmarks mb ON mb.owner_user_id = c.owner_user_id AND mb.status_id = fi.status_id WHERE fi.folder_id = $2::bigint AND fi.owner_user_id = $1::bigint AND (fi.status_id = c.bookmark_uri OR mb.object_id = c.bookmark_uri)))", &[&owner_id, &folder_id]).await?;
     Ok(BookmarksProjection { owner_id, fedi_rows, bsky_rows, total_fedi, total_bsky, offset, limit, has_more_fedi: offset + limit < total_fedi, has_more_bsky: offset + limit < total_bsky, source: "vaak-worker-shadow", note: "Read-only bookmarks projection; PHP remains the folder and bookmark mutation owner." })
 }
@@ -183,4 +189,21 @@ fn cached_posts(rows: Vec<tokio_postgres::Row>, timestamp: &str) -> Result<Vec<V
         posts.push(post);
     }
     Ok(posts)
+}
+
+// Preserve raw sidecar ordinals before malformed JSON omissions. These fields
+// describe producer selection; only the private renderer's current SQL grant
+// can admit a card or any effect from them.
+fn cached_bookmark_posts(rows:Vec<tokio_postgres::Row>,folder:i64,offset:i64,limit:i64)->Result<Vec<Value>>{
+ let mut posts=Vec::new();
+ for (ordinal,row) in rows.into_iter().enumerate(){
+  let raw:String=row.try_get(0).context("decode bookmark protocol post")?;
+  let Ok(mut post)=serde_json::from_str::<Value>(&raw) else{continue};
+  if let Some(object)=post.as_object_mut(){
+   object.insert("bookmarked_at".into(),Value::String(row.try_get(1)?));
+   object.insert("_native_source_binding".into(),serde_json::json!({"producer_kind":"bookmarks_bsky_data","selected_kind":"bsky","reference":row.try_get::<_,String>(2)?,"selected_ordinal":ordinal,"folder_id":folder,"offset":offset,"limit":limit}));
+  }
+  posts.push(post);
+ }
+ Ok(posts)
 }

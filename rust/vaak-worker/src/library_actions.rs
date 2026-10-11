@@ -127,13 +127,13 @@ pub fn render_fedi_actions(ctx: &FediActionContext, authenticated_owner: i64) ->
     render_actions_core(ctx,None,true)
 }
 
-pub(crate) fn render_direct_actions(ctx:&FediActionContext,owner:i64,show_open:bool,profile_actor:&str)->Result<String>{
+pub(crate) fn render_direct_actions(ctx:&FediActionContext,owner:i64,_show_open:bool,profile_actor:&str)->Result<String>{
     if owner<1||ctx.owner_id!=owner{bail!("direct action owner mismatch")}
     if ctx.return_view.is_empty()||ctx.return_view.len()>64||!ctx.return_view.bytes().all(|b|b.is_ascii_lowercase()||b==b'_'){bail!("invalid direct action origin")}
-    render_actions_core(ctx,Some(profile_actor),show_open)
+    render_actions_core(ctx,Some(profile_actor),false)
 }
 
-fn render_actions_core(ctx:&FediActionContext,direct:Option<&str>,show_open:bool)->Result<String>{
+fn render_actions_core(ctx:&FediActionContext,direct:Option<&str>,_show_open:bool)->Result<String>{
     if ctx.moderation.is_self { bail!("own posts require the canonical own-post action branch"); }
     let view = esc(&ctx.return_view);
     let mut action_base = format!("?view={view}");
@@ -146,7 +146,6 @@ fn render_actions_core(ctx:&FediActionContext,direct:Option<&str>,show_open:bool
     let actor = &ctx.actor_id;
     let mut html = String::from("<div class=\"tweet-actions\">");
     if !uri.is_empty() {
-        if show_open {html.push_str(&format!("<a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Open</a>", esc(&status_href(uri, &ctx.return_view))));}
         let actor_to = if actor.is_empty() { String::new() } else { format!("&amp;to={}", query(actor)) };
         html.push_str(&format!("<a class=\"icon-btn\" href=\"?view={view}&amp;compose=1&amp;reply_to={}{}{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>", query(&open_target(uri)), actor_to, reply_suffix(&ctx.reply_mentions, &ctx.spoiler, ctx.sensitive)));
     }
@@ -159,7 +158,12 @@ fn render_actions_core(ctx:&FediActionContext,direct:Option<&str>,show_open:bool
         let label = if ctx.bookmarked { "Bookmark folders" } else { "Bookmark" };
         html.push_str(&format!("<form method=\"post\" action=\"{action_base}\" style=\"display:inline\">{}{}{}{}<button class=\"icon-btn{}\" type=\"submit\" title=\"{label}\" aria-label=\"{label}\" data-bm-picker=\"{}\"><i class=\"ph{} ph-bookmark-simple\" aria-hidden=\"true\"></i></button></form>", hidden("action", if ctx.bookmarked { "unbookmark_status" } else { "bookmark_status" }), hidden("return_view", &ctx.return_view), hidden("status_id", sid), hidden("object_id", uri), if ctx.bookmarked { " on" } else { "" }, u8::from(ctx.bookmarked), if ctx.bookmarked { "-fill" } else { "" }));
     }
-    if !uri.is_empty() { html.push_str(&format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"meta\" title=\"Open on remote instance\">Remote</a>", esc(&ctx.remote_url))); }
+    // The PHP generic status painter keeps navigation for AT/non-HTTPS
+    // objects in a separate GET-only menu before the moderation controls.
+    // Direct/profile presentation has its own explicit navigation policy.
+    if direct.is_none() && !uri.is_empty() && !uri.starts_with("https://") {
+        html.push_str(&read_only_overflow_mode(uri,&ctx.return_view,&ctx.remote_url,true));
+    }
     html.push_str(&render_moderation(ctx));
     html.push_str("</div>");
     Ok(html)
@@ -174,11 +178,14 @@ fn engagement_form(ctx: &FediActionContext, action_base: &str, kind: &str) -> St
     format!("<form method=\"post\" action=\"{action_base}\" style=\"display:inline\">{}{}{}{}{}<button class=\"icon-btn{}{}\" type=\"submit\" data-eng=\"1\" data-eng-count=\"{count}\" title=\"{label}\" aria-label=\"{label}{}\"><i class=\"ph{} {icon}\" aria-hidden=\"true\"></i>{}</button></form>", hidden("action", action), hidden("return_view", &ctx.return_view), hidden("status_id", &ctx.status_id), hidden("object_id", &ctx.object_id), hidden("target_actor", &ctx.actor_id), if on { " on" } else { "" }, if count > 0 { " has-count" } else { "" }, if count > 0 { format!(" ({})", compact_count(count)) } else { String::new() }, if on && kind == "favourite" { "-fill" } else { "" }, count_html(count))
 }
 
-fn moderation_form(ctx: &FediActionContext, action: &str, field: &str, value: &str, label: &str, title: &str) -> String {
-    format!("<form method=\"post\" action=\"?view={}\">{}{}{}{}{}{}<button class=\"menu-action\" type=\"submit\"{}>{label}</button></form>", esc(&ctx.return_view), hidden("csrf", &ctx.csrf), hidden("action", action), hidden("return_view", &ctx.return_view), hidden("return_from", &ctx.return_view), hidden("return_actor", ctx.actor_id.trim_end_matches('/')), hidden(field, value), if title.is_empty() { String::new() } else { format!(" title=\"{}\"", esc(title)) })
+fn moderation_form(ctx: &FediActionContext, action: &str, field: &str, value: &str, label: &str, title: &str, return_from:&str) -> String {
+    format!("<form method=\"post\" action=\"?view={}\">{}{}{}{}{}{}<button class=\"menu-action\" type=\"submit\"{}>{label}</button></form>", esc(&ctx.return_view), hidden("csrf", &ctx.csrf), hidden("action", action), hidden("return_view", &ctx.return_view), hidden("return_from", return_from), hidden("return_actor", ctx.actor_id.trim_end_matches('/')), hidden(field, value), if title.is_empty() { String::new() } else { format!(" title=\"{}\"", esc(title)) })
 }
 
-pub(crate) fn render_moderation(ctx: &FediActionContext) -> String {
+pub(crate) fn render_moderation(ctx: &FediActionContext) -> String {render_moderation_with_from(ctx,&ctx.return_view)}
+
+pub(crate) fn render_moderation_with_from(ctx: &FediActionContext,return_from:&str) -> String {
+    let link_from=if return_from.is_empty(){&ctx.return_view}else{return_from};
     let actor = ctx.actor_id.trim_end_matches('/');
     let state = &ctx.moderation;
     if state.is_self { return String::new(); }
@@ -186,21 +193,21 @@ pub(crate) fn render_moderation(ctx: &FediActionContext) -> String {
     let lower = actor.to_lowercase();
     let fedi = actor.starts_with("https://") && !lower.contains("bsky.app") && !lower.starts_with("https://bsky.");
     if fedi && state.personal_block_id.is_none() { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=dms&amp;peer={}\">DM</a>", query(actor))); }
-    if state.is_local || state.is_wafrn { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=ask&amp;target_actor={}&amp;from={}\">Ask</a>", query(actor), query(&ctx.return_view))); }
+    if state.is_local || state.is_wafrn { menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=ask&amp;target_actor={}&amp;from={}\">Ask</a>", query(actor), query(link_from))); }
     if ctx.object_id.starts_with("https://") {
-        menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a><a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)), esc(&ctx.object_id), if ctx.object_id.to_lowercase().contains("bsky.app") { "Open on Bluesky" } else { "Remote" }));
+        menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\">Open</a><a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>", esc(&status_href(&ctx.object_id, &ctx.return_view)), esc(if ctx.remote_url.starts_with("https://"){&ctx.remote_url}else{&ctx.object_id}), if ctx.object_id.to_lowercase().contains("bsky.app") { "Open on Bluesky" } else { "Remote" }));
     }
     if actor.starts_with("https://") {
         if state.is_local_admin {
             menu.push_str("<span class=\"menu-action menu-action-disabled\" aria-disabled=\"true\" title=\"Administrators cannot be blocked\">Admin account — cannot be blocked</span>");
         } else if let Some(id) = state.personal_block_id {
-            menu.push_str(&moderation_form(ctx, "user_block_remove", "id", &id.to_string(), "Unblock", "Hide from your timelines only"));
+            menu.push_str(&moderation_form(ctx, "user_block_remove", "id", &id.to_string(), "Unblock", "Hide from your timelines only",return_from));
         } else {
-            menu.push_str(&moderation_form(ctx, "user_block_add", "target", actor, "Block", "Hide from your timelines only"));
+            menu.push_str(&moderation_form(ctx, "user_block_add", "target", actor, "Block", "Hide from your timelines only",return_from));
         }
-        menu.push_str(&moderation_form(ctx, if state.muted { "unmute_remote" } else { "mute_remote" }, "actor_id", actor, if state.muted { "Unmute" } else { "Mute" }, "Hide from your Home / Federated / Notifications"));
-        menu.push_str(&moderation_form(ctx, if state.deprioritized { "undeprioritize_remote" } else { "deprioritize_remote" }, "actor_id", actor, if state.deprioritized { "Stop deprioritizing" } else { "Deprioritize on Home" }, ""));
-        menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=report&amp;report_target={}{}&amp;from={}\">Report user</a>", query(actor), if ctx.object_id.starts_with("http") { format!("&amp;report_object={}",query(&ctx.object_id)) } else { String::new() }, query(&ctx.return_view)));
+        menu.push_str(&moderation_form(ctx, if state.muted { "unmute_remote" } else { "mute_remote" }, "actor_id", actor, if state.muted { "Unmute" } else { "Mute" }, "Hide from your Home / Federated / Notifications",return_from));
+        menu.push_str(&moderation_form(ctx, if state.deprioritized { "undeprioritize_remote" } else { "deprioritize_remote" }, "actor_id", actor, if state.deprioritized { "Stop deprioritizing" } else { "Deprioritize on Home" }, "",return_from));
+        menu.push_str(&format!("<a class=\"menu-action\" href=\"?view=report&amp;report_target={}{}&amp;from={}\">Report user</a>", query(actor), if ctx.object_id.starts_with("http") { format!("&amp;report_object={}",query(&ctx.object_id)) } else { String::new() }, query(link_from)));
     }
     if state.is_admin && !actor.is_empty() {
         if !menu.is_empty() { menu.push_str("<div class=\"menu-action-sep\" role=\"separator\" aria-hidden=\"true\"></div>"); }
@@ -220,7 +227,8 @@ pub(crate) fn render_moderation(ctx: &FediActionContext) -> String {
         }
         menu.push_str(&format!("<a class=\"menu-action\" href=\"/vaak/?view=moderation&amp;actor={}&amp;from={}\">Open in moderation panel</a>", query(actor), query(&ctx.return_view)));
     }
-    if menu.is_empty() { String::new() } else { format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>") }
+    if menu.is_empty() { String::new() } else { if menu.is_empty(){return String::new()}
+ format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>") }
 }
 
 #[cfg(test)]
@@ -290,4 +298,13 @@ mod tests {
         let tokenize = |s: &str| regex::Regex::new(r"<[^>]+>|[^<]+").unwrap().find_iter(s).map(|m| m.as_str().trim().to_owned()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
         assert_eq!(tokenize(&render_fedi_actions(&ctx, 1).unwrap()), tokenize(php_actions));
     }
+}
+
+/// Public navigation only; never delegates to authenticated moderation forms.
+pub(crate) fn read_only_overflow(uri:&str,view:&str,remote:&str)->String{read_only_overflow_mode(uri,view,remote,true)}
+pub(crate) fn read_only_overflow_mode(uri:&str,view:&str,remote:&str,show_open:bool)->String{
+ if uri.is_empty(){return String::new()}let mut menu=if show_open{format!("<a class=\"menu-action\" href=\"{}\">Open</a>",esc(&status_href(uri,view)))}else{String::new()};
+ if remote.starts_with("https://")||remote.starts_with("http://"){menu.push_str(&format!("<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Remote</a>",esc(remote)));}
+ if menu.is_empty(){return String::new()}
+ format!("<details class=\"post-action-menu\"><summary class=\"icon-btn\" title=\"More actions\" aria-label=\"More actions\">⋯</summary><div class=\"post-action-menu__body\">{menu}</div></details>")
 }

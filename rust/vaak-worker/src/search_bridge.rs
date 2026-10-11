@@ -12,6 +12,7 @@ const MAX_REPLY:usize=8*1024*1024;
 struct Batch {
     protocol_version:u8,
     status_preview_budget:i64,
+    #[serde(default)] bsky_budget_deadline:Option<f64>,
     owner_id:i64,
     csrf:String,
     bsky_enabled:bool,
@@ -19,6 +20,7 @@ struct Batch {
     hashtags:Vec<Value>,
     statuses:Vec<Value>,
     #[serde(default)] bsky_bookmarks:Vec<BookmarkState>,
+    #[serde(default)] collector:Option<crate::search_context::selection::SearchCollectorDescriptor>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,11 +61,14 @@ fn decode(bytes:&[u8])->anyhow::Result<Batch>{
 }
 
 async fn paint(db:&tokio_postgres::Client,batch:Batch,deps:&crate::direct_preview::PreviewDependencies<'_>)->anyhow::Result<Reply>{
+    paint_with_warm(db,batch,deps,None).await
+}
+async fn paint_with_warm(db:&tokio_postgres::Client,batch:Batch,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->anyhow::Result<Reply>{
     let identity=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&batch.owner_id]).await?.ok_or_else(||anyhow::anyhow!("inactive Search bridge owner"))?;
     let actor:String=identity.try_get(0)?;let key:String=identity.try_get(1)?;
     let source_counts=SourceCounts{accounts:batch.accounts.len(),hashtags:batch.hashtags.len(),statuses:batch.statuses.len()};
     let states=batch.bsky_bookmarks.into_iter().map(|value|(value.uri,value.did,value.bookmarked)).collect();
-    let session=crate::search_context::SearchSession::from_php_session(batch.owner_id,batch.csrf,batch.bsky_enabled)?.with_native_bookmarks(db,states).await?;
+    let session=crate::search_context::SearchSession::from_php_session(batch.owner_id,batch.csrf,batch.bsky_enabled)?.with_bridge_identity(actor,key).with_native_bookmarks(db,states).await?.with_collector(db,batch.collector,&batch.statuses).await?.with_warm_context(warm);
     // One bounded resolver per account section, including an empty section: it also
     // rechecks the current owner when no status card is present.
     let components=crate::search_components::ComponentContext::load(db,Some(batch.owner_id),&batch.accounts).await?;
@@ -72,37 +77,51 @@ async fn paint(db:&tokio_postgres::Client,batch:Batch,deps:&crate::direct_previe
     let (mut admitted,remaining)=crate::search_context::admit_for_render_with_preview(db,&session,batch.statuses,batch.status_preview_budget,deps.dns).await?;
     #[cfg(test)] if let Some(clock)=deps.render_clock{for token in &mut admitted{token.set_render_clock(clock);}}
     let statuses=admitted.iter().map(|token|crate::library::card::render_search_admitted(token).map(|html|StatusCard{source_index:token.source_index(),html})).collect::<anyhow::Result<Vec<_>>>()?;
-    let current=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&batch.owner_id]).await?.ok_or_else(||anyhow::anyhow!("Search bridge owner changed"))?;
-    if current.try_get::<_,String>(0)?!=actor||current.try_get::<_,String>(1)?!=key{anyhow::bail!("Search bridge identity changed during assembly")}
+    // The session binds the original bridge identity into context final checks;
+    // painting and serialization after its fresh complete window contain no await.
     Ok(Reply{protocol_version:1,status_preview_state:crate::direct_preview::PreviewState::from_remaining(batch.status_preview_budget,remaining,source_counts.statuses)?,ok:true,source_counts,accounts,hashtags,statuses})
 }
 
 pub(crate) async fn render(cfg:&crate::config::Config,headers:HeaderMap,bytes:Bytes)->Response{
-    render_request(&cfg.database_url,enabled_secret().as_deref(),headers,bytes).await
+    render_request_with_warm(&cfg.database_url,enabled_secret().as_deref(),headers,bytes,&crate::direct_preview::PreviewDependencies::production(),None,Some(cfg)).await
 }
 async fn render_request(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes)->Response{
     render_request_with_dependencies(database_url,secret,headers,bytes,&crate::direct_preview::PreviewDependencies::production()).await
 }
 async fn render_request_with_dependencies(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>)->Response{
+    render_request_with_warm(database_url,secret,headers,bytes,deps,None,None).await
+}
+async fn render_request_with_warm(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,cfg:Option<&crate::config::Config>)->Response{
+    let mut response=render_request_with_warm_inner(database_url,secret,headers,bytes,deps,warm,cfg).await;
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("private, no-store"));response
+}
+async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,cfg:Option<&crate::config::Config>)->Response{
     let Some(secret)=secret else{return StatusCode::NOT_FOUND.into_response()};
     if !authorized(&headers,secret){return StatusCode::UNAUTHORIZED.into_response()}
     let batch=match decode(&bytes){Ok(batch)=>batch,Err(_)=>return (StatusCode::BAD_REQUEST,axum::Json(json!({"fallback":true,"error":"invalid batch"}))).into_response()};
+    if batch.bsky_budget_deadline.is_some_and(|value|!value.is_finite()){return StatusCode::BAD_REQUEST.into_response()}
+    if cfg.is_some()&&!batch.statuses.is_empty()&&batch.collector.is_none(){return (StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()}
+    let warm=warm.or_else(||cfg.map(|cfg|crate::library::bridge::native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>>=async{
         let db=crate::db::connect(database_url).await?;
-        let reply=paint(&db,batch,deps).await?;
+        let reply=paint_with_warm(&db,batch,deps,warm).await?;
         let bytes=serde_json::to_vec(&reply)?;
         if bytes.len()>MAX_REPLY{anyhow::bail!("Search reply limit")}
         Ok(bytes)
     }.await;
     match result{
         Ok(bytes)=>(StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),
-        Err(_)=>{tracing::debug!("Search whole-batch PHP fallback");(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()},
+        Err(_error)=>{#[cfg(test)]eprintln!("Search fixture fallback: {_error:#}");tracing::debug!("Search whole-batch PHP fallback");(StatusCode::UNPROCESSABLE_ENTITY,axum::Json(json!({"fallback":true}))).into_response()},
     }
 }
 
 #[cfg(test)]
 pub(crate) async fn fixture_request(database_url:&str,secret:&str,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>)->Response {
     render_request_with_dependencies(database_url,Some(secret),headers,bytes,deps).await
+}
+#[cfg(test)]
+pub(crate) async fn fixture_request_with_warm(database_url:&str,secret:&str,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Response {
+    render_request_with_warm(database_url,Some(secret),headers,bytes,deps,Some(warm),None).await
 }
 
 #[cfg(test)] mod tests{

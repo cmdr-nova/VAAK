@@ -56,6 +56,7 @@ register_shutdown_function(static function (): void {
 });
 
 require_once dirname(__DIR__) . '/api/ap-auth.php';
+require_once dirname(__DIR__) . '/api/ap-registration-approvals.php';
 require_once dirname(__DIR__) . '/api/ap-version.php';
 require_once dirname(__DIR__) . '/api/ap-vaak-profile-route.php';
 
@@ -370,18 +371,23 @@ if ($isAuthPost) {
             $mode = 'login';
         }
     } elseif ($postAction === 'register' || $mode === 'register') {
-        $res = ap_auth_register(
-            (string) ($_POST['invite'] ?? ''),
-            (string) ($_POST['username'] ?? ''),
-            (string) ($_POST['password'] ?? ''),
-            (string) ($_POST['email'] ?? '')
-        );
-        if (!empty($res['ok'])) {
+        $application = ap_registration_approvals_enabled() && trim((string) ($_POST['invite'] ?? '')) === '';
+        $res = $application
+            ? ap_registration_submit((string) ($_POST['username'] ?? ''), (string) ($_POST['password'] ?? ''),
+                (string) ($_POST['email'] ?? ''), (string) ($_POST['csrf'] ?? ''))
+            : ap_auth_register((string) ($_POST['invite'] ?? ''), (string) ($_POST['username'] ?? ''),
+                (string) ($_POST['password'] ?? ''), (string) ($_POST['email'] ?? ''));
+        if (!empty($res['ok']) && empty($res['pending'])) {
             header('Location: /vaak/?view=home', true, 302);
             exit;
         }
-        $error = $res['error'] ?? 'Registration failed.';
-        $mode = 'register';
+        if (!empty($res['pending'])) {
+            $notice = 'Application submitted. You can log in after an administrator approves your account.';
+            $mode = 'login';
+        } else {
+            $error = $res['error'] ?? 'Registration failed.';
+            $mode = 'register';
+        }
     } elseif ($postAction === 'verify_2fa' || $mode === '2fa') {
         ap_auth_start_session();
         $nextPath = function_exists('ap_vaak_safe_next_path')
@@ -719,8 +725,8 @@ ASCII;
       <form method="post" action="/vaak/?mode=register" autocomplete="on">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
         <input type="hidden" name="action" value="register">
-        <label for="invite">Invite code</label>
-        <input id="invite" name="invite" required autocomplete="off" placeholder="ABCD-EF12"
+        <label for="invite">Invite code<?= ap_registration_approvals_enabled() ? ' (optional; without one, apply for approval)' : '' ?></label>
+        <input id="invite" name="invite" <?= ap_registration_approvals_enabled() ? '' : 'required' ?> autocomplete="off" placeholder="ABCD-EF12"
                value="<?= htmlspecialchars((string) ($_POST['invite'] ?? $_GET['invite'] ?? ''), ENT_QUOTES, 'UTF-8') ?>">
         <label for="username">Username</label>
         <input id="username" name="username" required autocomplete="username" pattern="[A-Za-z][A-Za-z0-9_]{1,29}"
@@ -732,7 +738,7 @@ ASCII;
         <label for="password">Password</label>
         <input id="password" name="password" type="password" required minlength="10" autocomplete="new-password"
                placeholder="at least 10 characters">
-        <button type="submit">Create account</button>
+        <button type="submit"><?= ap_registration_approvals_enabled() ? 'Register or apply' : 'Create account' ?></button>
       </form>
       <p class="switch">Have an account? <a href="/vaak/?mode=login">Log in</a></p>
     <?php else: ?>

@@ -8,15 +8,18 @@ use tokio_postgres::Client;
 pub(crate) enum DirectRoute {Status,RemoteProfile}
 /// Presentation intent only. No role, recipient, mute or permission decision.
 #[derive(Clone)]
-pub(crate) struct DirectPresentation {focused:bool,show_open:bool,hide_header:bool,profile_actor:String,root_preview:Option<Value>}
+pub(crate) struct DirectPresentation {focused:bool,show_open:bool,hide_header:bool,profile_actor:String,root_preview:Option<Value>,pending_quote:Option<std::sync::Arc<crate::profile_quote_warm::PendingQuotePresentation>>,pending_quote_suppressed:bool}
 impl DirectPresentation {
+ pub(crate) fn pending_quote_suppressed(&self)->bool{self.pending_quote_suppressed}
+ pub(crate) fn pending_quote(&self)->Option<&crate::profile_quote_warm::PendingQuotePresentation>{self.pending_quote.as_deref()}
  pub(crate) fn root_preview(&self)->Option<&Value>{self.root_preview.as_ref()}
  pub(crate) fn focused(&self)->bool{self.focused}
  pub(crate) fn show_open(&self)->bool{self.show_open}
  pub(crate) fn hide_header(&self)->bool{self.hide_header}
  pub(crate) fn profile_actor(&self)->&str{&self.profile_actor}
 }
-pub(crate) struct DirectSession {route:DirectRoute,owner:i64,csrf:String,return_view:String,lazy_media:bool,status_preview_budget:i64,presentation:DirectPresentation}
+#[derive(Clone)]
+pub(crate) struct DirectSession {route:DirectRoute,owner:i64,csrf:String,return_view:String,lazy_media:bool,status_preview_budget:i64,quote_preview_budget:Option<i64>,warm_context:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,profile_bsky:Option<crate::profile_bsky::ProfileBskyPresentation>,presentation:DirectPresentation}
 impl DirectSession {
  pub(crate) fn from_php_session(owner:i64,csrf:String,route:DirectRoute,return_view:String,focused:bool,show_open:bool,hide_header:bool,lazy_media:bool,profile_actor:String)->Result<Self>{
   if owner<1||csrf.is_empty(){bail!("PHP fallback: guest uses canonical legacy profile provider")}
@@ -24,16 +27,25 @@ impl DirectSession {
   if focused&&!matches!(route,DirectRoute::Status){bail!("invalid canonical direct focus")}
   if matches!(route,DirectRoute::RemoteProfile)&&return_view!="remote_profile"{bail!("profile painter requires canonical direct return context")}
   if !profile_actor.is_empty(){let url=reqwest::Url::parse(&profile_actor).context("invalid profile presentation origin")?;if profile_actor.len()>2048||!matches!(url.scheme(),"https"|"http")||!url.username().is_empty()||url.password().is_some()||url.fragment().is_some(){bail!("invalid profile presentation origin")}}
-  Ok(Self{route,owner,csrf,return_view,lazy_media,status_preview_budget:3,presentation:DirectPresentation{focused,show_open,hide_header,profile_actor,root_preview:None}})
+  Ok(Self{route,owner,csrf,return_view,lazy_media,status_preview_budget:3,quote_preview_budget:None,warm_context:None,profile_bsky:None,presentation:DirectPresentation{focused,show_open,hide_header,profile_actor,root_preview:None,pending_quote:None,pending_quote_suppressed:false}})
  }
+ pub(crate) fn with_suppressed_pending_quote(mut self)->Self{self.presentation.pending_quote_suppressed=true;self}
+ pub(crate) fn with_profile_bsky(mut self,context:crate::profile_bsky::ProfileBskyPresentation)->Result<Self>{if !matches!(self.route,DirectRoute::RemoteProfile)||context.owner()!=self.owner{bail!("profile protocol capability requires bound owner/profile route")}self.profile_bsky=Some(context);Ok(self)}
+ pub(crate) fn profile_bsky(&self)->Option<&crate::profile_bsky::ProfileBskyPresentation>{self.profile_bsky.as_ref()}
+ pub(crate) fn with_pending_quote(mut self,quote:std::sync::Arc<crate::profile_quote_warm::PendingQuotePresentation>)->Self{self.presentation.pending_quote=Some(quote);self}
+ pub(crate) fn with_warm_context(mut self,context:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Self{self.warm_context=Some(context);self}
+ pub(crate) fn with_quote_preview_budget(mut self,budget:i64)->Self{self.quote_preview_budget=Some(budget);self}
+ pub(crate) fn status_preview_budget(&self)->i64{self.status_preview_budget}
+ pub(crate) fn quote_preview_budget(&self)->Option<i64>{self.quote_preview_budget}
  pub(crate) fn with_status_preview_budget(mut self,budget:i64)->Result<Self>{if !(0..=100).contains(&budget){bail!("invalid trusted preview budget")}self.status_preview_budget=budget;Ok(self)}
 }
 impl crate::library::facts::PresentationSession for DirectSession {
+ fn warm_context(&self)->Option<&crate::profile_enrichment::WarmContext>{self.warm_context.as_deref()}
  fn csrf(&self)->&str{&self.csrf}
  fn return_view(&self)->&str{&self.return_view}
- fn bsky_enabled(&self)->bool{false}
+ fn bsky_enabled(&self)->bool{self.profile_bsky.as_ref().is_some_and(|context|context.enabled())}
  fn lazy_media(&self)->bool{self.lazy_media}
- fn bsky_bookmark_state(&self,_:&Value)->Option<bool>{None}
+ fn bsky_bookmark_state(&self,status:&Value)->Option<bool>{self.profile_bsky.as_ref().and_then(|context|context.bookmark(status))}
 }
 /// Final source and current facts bound together; no JSON constructor.
 pub(crate) struct AdmittedDirectStatus {source_index:usize,status:Value,facts:crate::library::card::CardFacts,presentation:DirectPresentation}
@@ -45,7 +57,7 @@ impl AdmittedDirectStatus {
 }
 fn text<'a>(v:&'a Value,key:&str)->&'a str{v.get(key).and_then(Value::as_str).unwrap_or("")}
 fn children(value:&Value)->Vec<(&str,&Value)>{["reblog","quote","vaak_quote_preview"].iter().filter_map(|key|value.get(*key).filter(|v|v.is_object()).map(|v|(*key,v.get("quoted_status").or_else(||v.get("status")).filter(|v|v.is_object()).unwrap_or(v)))).collect()}
-fn local_outbox_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<bool>>+Send+'a>>{
+pub(crate) fn local_outbox_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<bool>>+Send+'a>>{
  Box::pin(async move{
   if depth>16{return Ok(false)}
   let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
@@ -56,7 +68,7 @@ fn local_outbox_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::
   Ok(true)
  })
 }
-fn current_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<bool>>+Send+'a>>{
+pub(crate) fn current_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<bool>>+Send+'a>>{
  Box::pin(async move{
   if depth>16{return Ok(false)}
   let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
@@ -75,7 +87,25 @@ fn current_tree<'a>(db:&'a Client,status:&'a Value,depth:usize)->std::pin::Pin<B
  })
 }
 fn contains_quote(status:&Value,depth:usize)->bool {depth>16||status.get("quote").is_some()||status.get("vaak_quote_preview").is_some()||children(status).iter().any(|(_,child)|contains_quote(child,depth+1))}
-fn supported_tree(status:&Value,depth:usize)->Result<()> {
+/// Same durable predicates as local_outbox_tree/current_tree, read together at
+/// a profile stage boundary. Values and authority results are never memoized.
+pub(crate) async fn profile_trees_current(db:&Client,statuses:&[&Value])->Result<bool>{
+ fn collect(status:&Value,depth:usize,current:bool,items:&mut std::collections::BTreeMap<String,(bool,bool)>)->bool{
+  if depth>16{return false}
+  let uri=crate::library::card::php_trim(status.get("uri").or_else(||status.get("url")).and_then(Value::as_str).unwrap_or("")).split('#').next().unwrap_or("").trim_end_matches('/');
+  let mut child_current=current;
+  if uri.is_empty(){if current&&!(matches!(text(status,"state"),"pending"|"accepted"|"fallback")&&["account","content","text","media","media_attachments"].iter().all(|key|status.get(*key).is_none())){return false}child_current=false;}
+  else{let local=regex::Regex::new(r"^https://mkultra\.monster/users/[^/]+/notes/").unwrap().is_match(uri);let entry=items.entry(uri.into()).or_insert((local,false));entry.1|=current;}
+  children(status).iter().all(|(_,child)|collect(child,depth+1,child_current,items))
+ }
+ let mut items=std::collections::BTreeMap::new();for status in statuses{if !collect(status,0,true,&mut items){return Ok(false)}}
+ if items.is_empty(){return Ok(true)}
+ let input=Value::Array(items.iter().map(|(uri,(local,current))|serde_json::json!({"uri":uri,"local":local,"current":current})).collect());
+ let rows=db.query("SELECT CASE WHEN (i->>'local')::boolean THEN EXISTS(SELECT 1 FROM outbox_notes WHERE id IN (i->>'uri',(i->>'uri')||'/')) AND (NOT (i->>'current')::boolean OR EXISTS(SELECT 1 FROM masto_statuses WHERE rtrim(note_id,'/')=i->>'uri')) WHEN NOT (i->>'current')::boolean THEN true WHEN e.type IS NOT NULL THEN COALESCE(e.action_taken,'')<>'deleted' AND e.type NOT IN ('Delete','Tombstone') WHEN m.id IS NOT NULL THEN COALESCE(m.deleted_at::text,'') IN ('','0') ELSE false END FROM jsonb_array_elements($1::jsonb) i LEFT JOIN LATERAL (SELECT type,action_taken FROM events WHERE object_id IN (i->>'uri',(i->>'uri')||'/') AND (type IN ('Create','Update','Delete','Tombstone') OR (type IN ('Quote','QuotePost') AND NOT EXISTS(SELECT 1 FROM events note_source WHERE note_source.object_id IN (i->>'uri',(i->>'uri')||'/') AND note_source.type IN ('Create','Update')))) ORDER BY id DESC LIMIT 1) e ON true LEFT JOIN LATERAL (SELECT id,deleted_at FROM mentions WHERE object_id IN (i->>'uri',(i->>'uri')||'/') ORDER BY id DESC LIMIT 1) m ON true",&[&input]).await?;
+ Ok(rows.len()==items.len()&&rows.iter().all(|row|row.get::<_,bool>(0)))
+}
+fn supported_tree(status:&Value,depth:usize)->Result<()> {supported_tree_mode(status,depth,false,false)}
+fn supported_tree_mode(status:&Value,depth:usize,plain_quote_effects:bool,pending_quote:bool)->Result<()> {
  if depth>16{bail!("PHP fallback: direct source depth")}
  // PHP null-coalesces uri to url; the shared native painter requires the
  // normalized string shape. Preserve the canonical request for this shape.
@@ -87,11 +117,11 @@ fn supported_tree(status:&Value,depth:usize)->Result<()> {
  if status.get("record").is_some_and(Value::is_object)||status.get("vaak_bsky_text").is_some_and(|value|value.as_str().is_none_or(|text|!text.is_empty()))||status.get("vaak_bsky_facets").is_some_and(|value|value.as_array().is_none_or(|facets|!facets.is_empty())){bail!("PHP fallback: direct facet bundle normalization")}
  for (field,child) in children(status){
   if field=="quote" {
-   if !child.get("account").is_some_and(Value::is_object){bail!("PHP fallback: pending or late direct quote recovery")}
+   if !child.get("account").is_some_and(Value::is_object){if pending_quote&&depth==0{continue}bail!("PHP fallback: pending or late direct quote recovery")}
    let plain=crate::library::body::scrub_as2(&crate::library::body::html_to_plain(text(child,"content")));
-   if child.get("media_attachments").and_then(Value::as_array).is_none_or(Vec::is_empty)&&!child.get("card").is_some_and(Value::is_object)&&!crate::library::card::php_trim(&plain).is_empty(){bail!("PHP fallback: direct dynamic quote preview effects")}
+   if child.get("media_attachments").and_then(Value::as_array).is_none_or(Vec::is_empty)&&!child.get("card").is_some_and(Value::is_object)&&!crate::library::card::php_trim(&plain).is_empty()&&!plain_quote_effects{bail!("PHP fallback: direct dynamic quote preview effects")}
   }
-  supported_tree(child,depth+1)?;
+  supported_tree_mode(child,depth+1,plain_quote_effects,false)?;
  }Ok(())
 }
 async fn status_root_content_blocked(db:&Client,owner:i64,status:&Value)->Result<bool>{
@@ -109,22 +139,26 @@ async fn status_root_content_blocked(db:&Client,owner:i64,status:&Value)->Result
 /// Profile target/header admission remains a separate future producer gate;
 /// presentation origin cannot serve as profile authority.
 
-pub(crate) struct DirectBatch {cards:Vec<AdmittedDirectStatus>,status_preview_budget:i64,status_preview_budget_changed:bool}
-impl DirectBatch {pub(crate) fn final_status_preview_budget(&self)->i64{self.status_preview_budget} pub(crate) fn status_preview_budget_changed(&self)->bool{self.status_preview_budget_changed}}
+pub(crate) struct DirectBatch {cards:Vec<AdmittedDirectStatus>,status_preview_budget:i64,status_preview_budget_changed:bool,quote_state:Option<crate::profile_quote_state::QuotePreviewState>}
+impl DirectBatch {#[cfg(test)] pub(crate) fn set_render_clock_for_fixture(&mut self,clock:chrono::DateTime<chrono::Utc>){for card in &mut self.cards{card.facts.now=clock;}} pub(crate) fn quote_state(&self)->Option<&crate::profile_quote_state::QuotePreviewState>{self.quote_state.as_ref()} pub(crate) fn final_status_preview_budget(&self)->i64{self.status_preview_budget} pub(crate) fn status_preview_budget_changed(&self)->bool{self.status_preview_budget_changed}}
 impl std::ops::Deref for DirectBatch {type Target=[AdmittedDirectStatus];fn deref(&self)->&Self::Target{&self.cards}}
 impl std::ops::DerefMut for DirectBatch {fn deref_mut(&mut self)->&mut Self::Target{&mut self.cards}}
 pub(crate) async fn admit_for_render(db:&Client,session:&DirectSession,statuses:Vec<Value>)->Result<DirectBatch>{admit_for_render_with_dns(db,session,statuses,&crate::direct_preview::SystemDns).await}
+async fn filter_direct_session(db:&Client,session:&DirectSession,statuses:&mut Vec<Value>)->Result<()>{
+ if matches!(session.route,DirectRoute::RemoteProfile){crate::audience::filter_profile_statuses(db,session.owner,crate::audience::Surface::Direct,statuses).await}else{crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Direct,statuses).await}
+}
 pub(crate) async fn admit_for_render_with_dns(db:&Client,session:&DirectSession,statuses:Vec<Value>,dns:&dyn crate::direct_preview::PreviewDns)->Result<DirectBatch>{
+ if let Some(context)=session.profile_bsky(){context.require_current(db).await?;}
  if statuses.len()>100{bail!("direct card batch exceeds canonical bound")}
  let owner=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("inactive direct owner")?;
  let actor:String=owner.get(0);let key:String=owner.get(1);
  let profile=db.query_opt("SELECT to_jsonb(p) FROM actor_profile p WHERE actor_key=$1 LIMIT 1",&[&key]).await?.map(|row|row.get::<_,Value>(0)).unwrap_or(Value::Null);
  let auto_unblur=crate::library::card::boolean(&profile,"auto_unblur_sensitive");
- let mut output=Vec::new();let mut budget=session.status_preview_budget;
+ let mut output=Vec::new();let mut budget=session.status_preview_budget;let mut quote_state=session.quote_preview_budget.map(crate::profile_quote_state::QuotePreviewState::new);
  if statuses.iter().map(|v|v.to_string().len()).sum::<usize>()>4*1024*1024{bail!("direct batch source size")}
  for (source_index,status) in statuses.into_iter().enumerate(){
   if matches!(session.route,DirectRoute::Status)&&status_root_content_blocked(db,session.owner,&status).await?{continue}
-  supported_tree(&status,0)?;
+  supported_tree_mode(&status,0,quote_state.is_some(),(session.presentation.pending_quote.is_some()||session.presentation.pending_quote_suppressed))?;
   if !local_outbox_tree(db,&status,0).await?{continue}
   if status.get("reblog").is_some_and(Value::is_object)&&!text(&status,"content").is_empty()&&(text(&status,"content")=="0"||crate::library::card::php_trim(&crate::library::body::html_to_plain(text(&status,"content"))).is_empty()){bail!("PHP fallback: boost wrapper empty normalization")}
   let original_displayed=if text(&status,"content").is_empty(){status.get("reblog").filter(|v|v.is_object()).unwrap_or(&status)}else{&status};
@@ -132,13 +166,14 @@ pub(crate) async fn admit_for_render_with_dns(db:&Client,session:&DirectSession,
   let original_content=original_displayed.get("content").filter(|v|!v.is_null()).and_then(Value::as_str).map(str::to_owned);
   let source=if text(&status,"content").is_empty(){status.get("reblog").filter(|v|v.is_object()).unwrap_or(&status)}else{&status};
   if crate::library::source::thin(source){bail!("PHP fallback: direct thin source hydration")}
-  let mut checked=vec![status];crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Direct,&mut checked).await?;let Some(mut status)=checked.pop()else{continue};
+  let mut checked=vec![status];filter_direct_session(db,session,&mut checked).await?;let Some(mut status)=checked.pop()else{continue};
   if !current_tree(db,&status,0).await?{crate::direct_preview::resolve_late_omitted(db,dns,&status,original_content.as_deref(),&actor,&session.return_view,&mut budget).await?;continue}
   // Saved-origin quote chrome retains PHP's nested Library policy. Until that
   // separate branch is measured, preserve the entire canonical request.
   if matches!(session.return_view.as_str(),"bookmarks"|"favourites")&&contains_quote(&status,0){bail!("PHP fallback: saved-origin direct quote policy")}
   crate::interaction_flags::apply_to_statuses(db,session.owner,std::slice::from_mut(&mut status)).await?;
   let mut facts=crate::library::facts::resolve(db,session.owner,&actor,&status,session,auto_unblur).await?;
+  #[cfg(test)] if let Some(clock)=session.warm_context.as_deref().and_then(|warm|warm.fixture_clock()){facts.now=clock;}
   // The genuine painter resolves boost state from the incoming displayed SID
   // before own-action canonicalization. PHP prefetch queries numeric SIDs only;
   // the broad API object-alias flag is not this card-stage decision.
@@ -160,18 +195,19 @@ pub(crate) async fn admit_for_render_with_dns(db:&Client,session:&DirectSession,
   }
   if !current_tree(db,&status,0).await?{
    if !local_outbox_tree(db,&status,0).await?{continue}
-   let mut current=vec![status];crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Direct,&mut current).await?;
+   let mut current=vec![status];filter_direct_session(db,session,&mut current).await?;
    if let Some(status)=current.pop(){crate::direct_preview::resolve_late_omitted(db,dns,&status,original_content.as_deref(),&actor,&session.return_view,&mut budget).await?;}continue
   }
   if matches!(session.route,DirectRoute::Status)&&status_root_content_blocked(db,session.owner,&status).await?{continue}
-  let mut checked=vec![status];crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Direct,&mut checked).await?;
-  if let Some(status)=checked.pop(){let current=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("direct owner changed")?;if current.get::<_,String>(0)!=actor||current.get::<_,String>(1)!=key{bail!("direct identity changed during assembly")}
+  let mut checked=vec![status];filter_direct_session(db,session,&mut checked).await?;
+  if let Some(mut status)=checked.pop(){let current=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("direct owner changed")?;if current.get::<_,String>(0)!=actor||current.get::<_,String>(1)!=key{bail!("direct identity changed during assembly")}
+   if let Some(state)=quote_state.as_mut(){if session.presentation.pending_quote_suppressed{}else if let Some(pending)=session.presentation.pending_quote(){state.apply_pending_text(pending.preview_text())?;}else{state.prepare_status_with_context(db,dns,&mut status,facts.now,session.warm_context.as_deref()).await?;}}
    let mut presentation=session.presentation.clone();presentation.root_preview=crate::direct_preview::resolve(db,dns,&status,original_content.as_deref(),&facts,&mut budget).await?;
    // DNS/cache reads can suspend assembly. PHP also applies its final gate
    // after preview resolution; a late denial retains the consumed budget.
    if !current_tree(db,&status,0).await?{continue}
    if matches!(session.route,DirectRoute::Status)&&status_root_content_blocked(db,session.owner,&status).await?{continue}
-   let mut final_checked=vec![status];crate::audience::filter_statuses(db,session.owner,crate::audience::Surface::Direct,&mut final_checked).await?;
+   let mut final_checked=vec![status];filter_direct_session(db,session,&mut final_checked).await?;
    let Some(status)=final_checked.pop()else{continue};
    let final_owner=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("direct owner changed after preview")?;
    if final_owner.get::<_,String>(0)!=actor||final_owner.get::<_,String>(1)!=key{bail!("direct identity changed after preview")}
@@ -179,7 +215,8 @@ pub(crate) async fn admit_for_render_with_dns(db:&Client,session:&DirectSession,
  }
  let final_owner=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner]).await?.context("direct owner changed before batch publication")?;
  if final_owner.get::<_,String>(0)!=actor||final_owner.get::<_,String>(1)!=key{bail!("direct identity changed before batch publication")}
- Ok(DirectBatch{cards:output,status_preview_budget:budget,status_preview_budget_changed:budget!=session.status_preview_budget})
+ if let Some(context)=session.profile_bsky(){context.require_current(db).await?;}
+ Ok(DirectBatch{cards:output,status_preview_budget:budget,status_preview_budget_changed:budget!=session.status_preview_budget,quote_state})
 }
 
 #[cfg(test)]

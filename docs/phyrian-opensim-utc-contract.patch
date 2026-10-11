@@ -1,0 +1,80 @@
+--- a/index.php
++++ b/index.php
+@@ -571,7 +571,7 @@
+ 
+ function pdo(array $config): PDO
+ {
+-    return new PDO(
++    $db = new PDO(
+         $config['dsn'],
+         $config['user'],
+         $config['password'],
+@@ -581,6 +581,10 @@
+             PDO::ATTR_EMULATE_PREPARES => false,
+         ]
+     );
++    // TIMESTAMP values must share PHP's UTC clock; no stored rows are rewritten.
++    $db->exec("SET SESSION time_zone = '+00:00'");
++    date_default_timezone_set('UTC');
++    return $db;
+ }
+ 
+ function status_for_resonance(int $resonance, string $current, ?string $strain): string
+@@ -948,6 +952,21 @@
+     }
+     if (!empty($row['is_admin'])) {
+         $player['is_admin'] = true;
++    }
++    return $player;
++}
++
++/** Explicit UTC bridge timestamp; ordinary HUD/public readout remains unchanged. */
++function bridge_public_player(array $row): array
++{
++    $player = public_player($row);
++    $raw = $player['last_decay_at'];
++    if (is_string($raw) && $raw !== '') {
++        $instant = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $raw, new DateTimeZone('UTC'));
++        $errors = DateTimeImmutable::getLastErrors();
++        if ($instant !== false && ($errors === false || ($errors['warning_count'] === 0 && $errors['error_count'] === 0))) {
++            $player['last_decay_at'] = $instant->format('Y-m-d\TH:i:s\Z');
++        }
+     }
+     return $player;
+ }
+@@ -1240,7 +1259,7 @@
+             }
+             respond(200, [
+                 'ok' => true,
+-                'player' => public_player($player),
++                'player' => bridge_public_player($player),
+                 'daily_claimed_today' => $claimedToday,
+                 'vaak_linked' => avatar_has_vaak_link($db, $uuid),
+             ]);
+@@ -1269,7 +1288,7 @@
+                     'already_full' => true,
+                     'granted' => 0,
+                     'bridge_bonus' => $bridgeBonus,
+-                    'player' => public_player($player),
++                    'player' => bridge_public_player($player),
+                     'daily_claimed_today' => true,
+                     'message' => 'Active resonance is already full.',
+                 ]);
+@@ -1284,7 +1303,7 @@
+                 respond(409, [
+                     'ok' => false,
+                     'error' => 'Already checked in today',
+-                    'player' => public_player($player),
++                    'player' => bridge_public_player($player),
+                     'daily_claimed_today' => true,
+                 ]);
+             }
+@@ -1328,7 +1347,7 @@
+                 'ok' => true,
+                 'granted' => $actual,
+                 'bridge_bonus' => $bridgeBonus,
+-                'player' => public_player($updated),
++                'player' => bridge_public_player($updated),
+                 'daily_claimed_today' => true,
+                 'message' => $msg,
+             ]);

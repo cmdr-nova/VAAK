@@ -7,11 +7,25 @@ use super::{actions::{Counts, ModerationContext}, card::CardFacts};
 /// Presentation only: implementations are constructed by authenticated server
 /// bridges. This interface cannot grant audience access or construct a token.
 pub(crate) trait PresentationSession {
+    fn warm_context(&self)->Option<&crate::profile_enrichment::WarmContext>{None}
     fn csrf(&self) -> &str;
     fn return_view(&self) -> &str;
     fn bsky_enabled(&self) -> bool;
     fn lazy_media(&self) -> bool;
     fn bsky_bookmark_state(&self, status: &Value) -> Option<bool>;
+}
+
+/// Enrichment is bound to one currently admitted source by the assembler.
+/// This wrapper carries presentation preferences only; the WarmContext's
+/// private current-source grant controls every actor/media effect.
+pub(crate) struct BoundPresentationSession<'a,T:PresentationSession>{pub(crate) session:&'a T,pub(crate) warm:std::sync::Arc<crate::profile_enrichment::WarmContext>}
+impl<T:PresentationSession> PresentationSession for BoundPresentationSession<'_,T>{
+ fn warm_context(&self)->Option<&crate::profile_enrichment::WarmContext>{Some(&self.warm)}
+ fn csrf(&self)->&str{self.session.csrf()}
+ fn return_view(&self)->&str{self.session.return_view()}
+ fn bsky_enabled(&self)->bool{self.session.bsky_enabled()}
+ fn lazy_media(&self)->bool{self.session.lazy_media()}
+ fn bsky_bookmark_state(&self,status:&Value)->Option<bool>{self.session.bsky_bookmark_state(status)}
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str { v.get(key).and_then(Value::as_str).unwrap_or("") }
@@ -66,7 +80,7 @@ fn reply_seeds(status: &Value, owner_actor: &str, owner_key: &str) -> Vec<String
 
 /// Match PHP's current trusted directory plus additive DB overrides. Missing
 /// directory IO is a fallback boundary, not permission to omit Ask actions.
-async fn wafrn_host_known(db: &Client, actor: &str) -> Result<bool> {
+pub(crate) async fn wafrn_host_known(db: &Client, actor: &str) -> Result<bool> {
     let mut raw = match std::env::var("VAAK_WAFRN_FRIEND_HOSTS").ok().filter(|s| !s.trim().is_empty()) {
         Some(raw) => raw,
         None => {
@@ -92,19 +106,27 @@ async fn wafrn_host_known(db: &Client, actor: &str) -> Result<bool> {
 }
 
 pub(crate) async fn local_counts(db: &Client, note: &str, sid: &str) -> Result<Counts> {
+    local_counts_mode(db,note,sid,true).await
+}
+pub(crate) async fn local_public_counts(db:&Client,note:&str,sid:&str)->Result<Counts>{
+    local_counts_mode(db,note,sid,false).await
+}
+async fn local_counts_mode(db:&Client,note:&str,sid:&str,include_bookmarks:bool)->Result<Counts>{
     let note = super::card::php_trim(note).trim_end_matches('/');
     if note.is_empty() || !note.contains("/notes/") { return Ok(Counts::default()); }
     let sid = super::card::php_trim(sid);
     let sid = if sid.is_empty() {note} else {sid};
     let slash = format!("{note}/"); let keys = vec![note.to_owned(),slash];
-    let row = db.query_one("SELECT
+    let bookmark_count=if include_bookmarks {"(SELECT count(*) FROM masto_bookmarks WHERE status_id=$2 OR object_id=ANY($1))"} else {"0::bigint"};
+    let query=format!("SELECT
       (SELECT count(DISTINCT rtrim(actor_id,'/')) FROM events WHERE type='Like' AND object_id=ANY($1)) +
       (SELECT count(*) FROM masto_favourites WHERE status_id=$2 OR object_id=ANY($1)),
       (SELECT count(DISTINCT rtrim(actor_id,'/')) FROM events WHERE type='Announce' AND object_id=ANY($1)) +
       (SELECT count(*) FROM masto_reblogs WHERE status_id=$2 OR object_id=ANY($1)),
       GREATEST((SELECT count(*) FROM events WHERE rtrim(quote_object,'/')=$3),
         (SELECT count(*) FROM quote_authorizations WHERE deleted_at IS NULL AND quoted_note_id=ANY($1))),
-      (SELECT count(*) FROM masto_bookmarks WHERE status_id=$2 OR object_id=ANY($1))", &[&keys,&sid,&note]).await.context("current local Library engagement")?;
+      {bookmark_count}");
+    let row=db.query_one(&query, &[&keys,&sid,&note]).await.context("current local Library engagement")?;
     let mut counts = Counts { favourites:row.get(0), reblogs:row.get(1), quotes:row.get(2), bookmarks:row.get(3) };
     if counts.quotes == 0 { counts.quotes = db.query_one("SELECT count(*) FROM events WHERE type='Create' AND summary LIKE $1 AND object_id IS DISTINCT FROM $2 AND object_id IS DISTINCT FROM $3", &[&format!("%{note}%"),&keys[0],&keys[1]]).await?.get(0); }
     if let Some(row) = db.query_opt("SELECT p.like_count::bigint,p.repost_count::bigint,p.quote_count::bigint FROM bsky_crossposts c JOIN bsky_posts p ON p.bsky_uri=c.bsky_uri WHERE c.note_id=ANY($1) ORDER BY c.created_at DESC NULLS LAST LIMIT 1", &[&keys]).await? {
@@ -125,7 +147,14 @@ pub(crate) async fn emoji_maps(db:&Client,status:&Value)->Result<std::collection
     Ok(maps)
 }
 
-async fn avatar(db:&Client,status:&Value,actor:&str)->Result<String> {
+pub(crate) async fn avatar(db:&Client,status:&Value,actor:&str)->Result<String>{avatar_with_context(db,status,actor,None).await}
+pub(crate) async fn avatar_with_context(db:&Client,status:&Value,actor:&str,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<String> {
+    if let Some(url)=warm.and_then(|context|context.cached_avatar(actor)){return Ok(url)}
+    let result=avatar_current(db,status,actor,warm).await?;
+    if let Some(context)=warm{context.cache_avatar(actor,&result)}
+    Ok(result)
+}
+async fn avatar_current(db:&Client,status:&Value,actor:&str,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<String>{
     if matches!(s(status,"source"),"rss"|"bluesky") || status.get("bsky_post").is_some_and(Value::is_object) {
         let direct=s(&status["account"],"avatar");
         if direct.starts_with("https://")||direct.starts_with("http://"){return Ok(direct.into());}
@@ -143,13 +172,25 @@ async fn avatar(db:&Client,status:&Value,actor:&str)->Result<String> {
             let url:String=row.get(0);if reqwest::Url::parse(&url).is_ok_and(|u|u.scheme()=="https"){return Ok(url);}
         }
     }
+    if let Some(context)=warm{
+        context.actor_checked(db,actor).await?;
+        let row=crate::profile_identity::lookup_actor(db,context.cfg(),actor).await?;
+        if let Some(icon)=row.as_ref().map(|row|s(row,"icon_source_url")).filter(|icon|!icon.is_empty()){
+            context.media_checked(db,actor).await?;
+            if let Some(source)=crate::profile_enrichment::sanitize_profile_url(icon)?{return Ok(source)}
+        }
+        return Ok("https://mkultra.monster/img/avatar/default.webp".into())
+    }
     // The PHP painter enqueues actor/media warm jobs on a cold avatar. Native
     // read-only sources cannot silently lose those effects or hotlink a stale
     // status account snapshot; use the complete canonical fallback branch.
     anyhow::bail!("PHP fallback: cold remote avatar requires authoritative alias lookup and async actor/media warming")
 }
 
-async fn ask_identity(db:&Client,mut ask:Value)->Result<Value>{
+pub(crate) async fn ask_identity_with_context(db:&Client,ask:Value,warm:Option<&crate::profile_enrichment::WarmContext>)->Result<Value>{
+    if let Some(context)=warm{crate::profile_identity::ask_identity(db,context,ask).await}else{ask_identity(db,ask).await}
+}
+pub(crate) async fn ask_identity(db:&Client,mut ask:Value)->Result<Value>{
     let actor=super::card::php_trim(s(&ask,"asker_actor")).trim_end_matches('/').to_owned();
     let fallback="https://mkultra.monster/img/avatar/default.webp";
     let (display,handle,avatar)=if !actor.starts_with("https://") {
@@ -215,9 +256,9 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
         let current=db.query_opt("SELECT content_text FROM masto_statuses WHERE rtrim(note_id,'/')=$1 LIMIT 1",&[&uri]).await?.context("PHP fallback: local Ask answer requires current canonical note normalization")?;
         let answer:String=current.get(0);
         if super::card::php_trim(&answer).is_empty()||matches!(answer.as_str(),"(quote)"|"(media)"|"(poll)"){anyhow::bail!("PHP fallback: local Ask placeholder answer needs canonical source recovery");}
-        ask["answer"]=serde_json::json!(answer);Some(ask_identity(db,ask).await?)
+        ask["answer"]=serde_json::json!(answer);Some(ask_identity_with_context(db,ask,session.warm_context()).await?)
     }else if let Some(row)=db.query_opt("SELECT ask_actor,ask_question,ask_answer FROM mentions WHERE rtrim(object_id,'/')=$1 AND deleted_at IS NULL AND ask_question<>'' ORDER BY id DESC LIMIT 1",&[&uri]).await? {
-        Some(ask_identity(db,serde_json::json!({"asker_actor":row.get::<_,Option<String>>(0).unwrap_or_default(),"question":row.get::<_,String>(1),"answer":row.get::<_,Option<String>>(2).unwrap_or_default()})).await?)
+        Some(ask_identity_with_context(db,serde_json::json!({"asker_actor":row.get::<_,Option<String>>(0).unwrap_or_default(),"question":row.get::<_,String>(1),"answer":row.get::<_,Option<String>>(2).unwrap_or_default()}),session.warm_context()).await?)
     }else if st.get("vaak_ask").is_some_and(Value::is_object) {
         anyhow::bail!("PHP fallback: compact Ask source needs canonical current parse/normalization");
     }else{None};
@@ -242,7 +283,7 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
     let sid=super::card::scalar_string(st,"id");
     let sid=super::card::php_trim(&sid);
     let current_action_counts=if let Some(own)=own.as_ref(){Some(own.counts.clone())}else if uri.contains("/notes/"){Some(local_counts(db,uri,if !sid.is_empty()&&sid.bytes().all(|byte|byte.is_ascii_digit()){sid}else{""}).await?)}else{None};
-    Ok(CardFacts { current_action_counts, bsky:super::bsky::resolve_with_bookmark_state(db,owner_id,st,session.bsky_enabled(),session.bsky_bookmark_state(st)).await?, owner_id,owner_actor:owner_actor.into(),return_view:session.return_view().into(),auto_unblur_sensitive:auto_unblur,resolved_avatar:avatar(db,st,actor).await?,csrf:session.csrf().into(),favourited:flag(st,"favourited"),bookmarked:flag(st,"bookmarked"),boosted:flag(st,"reblogged"),moderation,poll_row,ask_row,now:chrono::Utc::now(),lazy_media:session.lazy_media(),own,reply_mentions:reply_seeds(st,owner_actor,&key),rss_row:None,rss_quote_row,rss_quoted,emoji_by_actor:emoji_maps(db,status).await? })
+    Ok(CardFacts { current_action_counts, bsky:super::bsky::resolve_with_bookmark_state(db,owner_id,st,session.bsky_enabled(),session.bsky_bookmark_state(st)).await?, owner_id,owner_actor:owner_actor.into(),return_view:session.return_view().into(),auto_unblur_sensitive:auto_unblur,resolved_avatar:avatar_with_context(db,st,actor,session.warm_context()).await?,csrf:session.csrf().into(),favourited:flag(st,"favourited"),bookmarked:flag(st,"bookmarked"),boosted:flag(st,"reblogged"),moderation,poll_row,ask_row,now:chrono::Utc::now(),lazy_media:session.lazy_media(),own,reply_mentions:reply_seeds(st,owner_actor,&key),rss_row:None,rss_quote_row,rss_quoted,emoji_by_actor:emoji_maps(db,status).await? })
 }
 
 #[cfg(test)] mod tests {

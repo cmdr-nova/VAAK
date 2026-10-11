@@ -2,6 +2,13 @@
 //! This is not the lean timeline renderer. Missing branches return errors so
 //! they cannot silently discard a feature during differential development.
 
+// Immutable compiled patterns only; request text, source facts and results
+// remain uncached. Each callsite retains exactly its original regex literal.
+macro_rules! static_regex { ($pattern:literal) => {{
+ static REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+ REGEX.get_or_init(||regex::Regex::new($pattern).unwrap())
+ }}; }
+
 use anyhow::{bail, Result};
 use serde_json::Value;
 use super::actions::{esc, query, Counts, FediActionContext, ModerationContext};
@@ -61,7 +68,7 @@ pub(crate) fn integer(v: &Value, key: &str) -> i64 {
     match v.get(key).unwrap_or(&Value::Null) {
         Value::Bool(value) => i64::from(*value),
         Value::Number(value) => value.as_i64().unwrap_or_else(|| value.as_f64().unwrap_or(0.0) as i64),
-        Value::String(value) => regex::Regex::new(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?").unwrap()
+        Value::String(value) => static_regex!(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
             .find(value.trim_start()).and_then(|number| number.as_str().parse::<f64>().ok()).unwrap_or(0.0) as i64,
         Value::Array(value) => i64::from(!value.is_empty()),
         Value::Object(value) => i64::from(!value.is_empty()),
@@ -101,9 +108,9 @@ pub(crate) fn linked_body_presentation(text:&str,status:&Value,view:&str,owner_a
 }
 pub(crate) fn account_actor_ref(account:&Value)->String {
     let uri=string(account,"uri").trim_end_matches('/');let url=string(account,"url").trim_end_matches('/');
-    if uri.starts_with("https://")&&!regex::Regex::new(r"/@[^/]+$").unwrap().is_match(uri){return uri.into();}
+    if uri.starts_with("https://")&&!static_regex!(r"/@[^/]+$").is_match(uri){return uri.into();}
     if url.starts_with("https://") {
-        if let Some(captures)=regex::Regex::new(r"^(https://[^/]+)/@([^/]+)$").unwrap().captures(url){
+        if let Some(captures)=static_regex!(r"^(https://[^/]+)/@([^/]+)$").captures(url){
             let raw=captures[2].as_bytes();let mut bytes=Vec::new();let mut index=0;
             while index<raw.len(){if raw[index]==b'%'&&index+2<raw.len(){if let Some(byte)=std::str::from_utf8(&raw[index+1..index+3]).ok().and_then(|hex|u8::from_str_radix(hex,16).ok()){bytes.push(byte);index+=3;continue;}}bytes.push(raw[index]);index+=1;}
             let mut name=String::new();for byte in bytes{if byte.is_ascii_alphanumeric()||b"-._~".contains(&byte){name.push(byte as char);}else{name.push_str(&format!("%{byte:02X}"));}}
@@ -114,7 +121,7 @@ pub(crate) fn account_actor_ref(account:&Value)->String {
     if !uri.is_empty(){uri.into()}else{url.into()}
 }
 
-fn profile_href(actor: &str, view: &str) -> String {
+pub(crate) fn profile_href(actor: &str, view: &str) -> String {
     if let Some(key) = actor.strip_prefix("https://mkultra.monster/users/").filter(|key| !key.contains('/')) {
         if view.is_empty()||view=="home"{format!("/vaak/users/{}",query(key))}else{format!("/vaak/users/{}?from={}", query(key), query(view))}
     } else { format!("/vaak/?view=remote_profile&actor={}&from={}", query(actor), query(view)) }
@@ -139,10 +146,10 @@ fn remote_object_web_url(object: &str, hint: Option<&Value>) -> Result<String> {
         _ => {}
     }
     if object.starts_with("https://") && !object.is_empty() { candidates.push(object); }
-    let redirect = regex::Regex::new(r"(?i)^https://bsky\.brid\.gy/r/(https://bsky\.app/.+)$").unwrap();
-    let embedded = regex::Regex::new(r"(?i)at://(did:[^/]+)/app\.bsky\.feed\.post/([A-Za-z0-9]+)").unwrap();
-    let threads = regex::Regex::new(r"(?i)^https://(?:www\.)?threads\.(?:net|com)/@([^/?#]+)").unwrap();
-    let numeric_threads = regex::Regex::new(r"(?i)^https://(?:www\.)?threads\.net/ap/users/(\d+)").unwrap();
+    let redirect = static_regex!(r"(?i)^https://bsky\.brid\.gy/r/(https://bsky\.app/.+)$");
+    let embedded = static_regex!(r"(?i)at://(did:[^/]+)/app\.bsky\.feed\.post/([A-Za-z0-9]+)");
+    let threads = static_regex!(r"(?i)^https://(?:www\.)?threads\.(?:net|com)/@([^/?#]+)");
+    let numeric_threads = static_regex!(r"(?i)^https://(?:www\.)?threads\.net/ap/users/(\d+)");
     for candidate in candidates {
         if let Some(capture) = redirect.captures(candidate) { return Ok(capture[1].to_owned()); }
         if candidate.starts_with("https://bsky.app/") { return Ok(candidate.to_owned()); }
@@ -167,7 +174,7 @@ fn remote_object_web_url(object: &str, hint: Option<&Value>) -> Result<String> {
     Ok(object.to_owned())
 }
 
-fn remote_object_href(object: &str, hint: Option<&Value>) -> Result<String> {
+pub(crate) fn remote_object_href(object: &str, hint: Option<&Value>) -> Result<String> {
     let mapped = remote_object_web_url(object, hint)?;
     if !mapped.is_empty() { return Ok(mapped); }
     // admin_remote_object_href's fallback executes only when its genuine
@@ -213,7 +220,8 @@ fn image_poster(url: &str) -> bool {
     matches!(path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif") || url.contains("cdn.bsky.app/") || url.contains("/img/") || url.contains("thumbnail")
 }
 
-pub(crate) fn media_row(media: &[Value], lazy: bool) -> String {
+pub(crate) fn media_row(media: &[Value], lazy: bool) -> String {media_row_mode(media,lazy,false)}
+fn media_row_mode(media: &[Value], lazy: bool, silent:bool) -> String {
     let mut cells = Vec::new();
     for att in media {
         let url = att.get("url").or_else(|| att.get("preview_url")).and_then(Value::as_str).unwrap_or("");
@@ -225,12 +233,12 @@ pub(crate) fn media_row(media: &[Value], lazy: bool) -> String {
         if media_kind(url, &mime, "video") {
             let mut poster = if image_poster(preview) { preview.to_owned() } else { String::new() };
             if poster.is_empty() {
-                let re = regex::Regex::new(r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$").unwrap();
+                let re = static_regex!(r"(?i)^(https://.+)/original/([^/?#]+)\.(mp4|m4v|mov|webm)([?#].*)?$");
                 if let Some(c) = re.captures(url) { poster = format!("{}/small/{}.png", &c[1], &c[2]); }
             }
             let hls = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase().ends_with(".m3u8") || matches!(mime.as_str(), "application/x-mpegurl" | "application/vnd.apple.mpegurl");
             let source = if hls { format!(" data-hls-src=\"{}\"{}", esc(url), if lazy { " preload=\"none\"" } else { "" }) } else if lazy { format!(" data-src=\"{}\" preload=\"none\"", esc(url)) } else { format!(" src=\"{}\"", esc(url)) };
-            cells.push(format!("<video class=\"media-video\" data-media-warm-url=\"{}\"{source} controls loop playsinline{}{} referrerpolicy=\"no-referrer\"></video>", esc(if poster.is_empty() { url } else { &poster }), if lazy { "" } else { " preload=\"metadata\"" }, if poster.is_empty() { String::new() } else { format!(" poster=\"{}\"", esc(&poster)) }));
+            cells.push(format!("<video class=\"media-video\" data-media-warm-url=\"{}\"{source} controls loop playsinline{}{}{} referrerpolicy=\"no-referrer\"></video>", esc(if poster.is_empty() { url } else { &poster }), if lazy { "" } else { " preload=\"metadata\"" }, if silent { " muted" } else { "" }, if poster.is_empty() { String::new() } else { format!(" poster=\"{}\"", esc(&poster)) }));
         } else if media_kind(url, &mime, "audio") {
             cells.push(format!("<div class=\"media-audio-card\" role=\"group\" aria-label=\"Audio post\"><img class=\"media-audio-art\" src=\"/api/assets/audio-post-default.jpg\" alt=\"\" loading=\"lazy\" decoding=\"async\"><audio class=\"media-audio\" src=\"{}\" controls preload=\"metadata\"></audio></div>", esc(url)));
         } else {
@@ -245,18 +253,18 @@ pub(crate) fn media_row(media: &[Value], lazy: bool) -> String {
 fn status_candidates(value:&str)->std::collections::HashSet<String>{
     let value=value.trim().trim_end_matches('/');let mut candidates=vec![value.to_owned()];
     if let Some(parent)=value.strip_suffix("/activity"){candidates.push(parent.trim_end_matches('/').to_owned());}
-    if let Some(cap)=regex::Regex::new(r"^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$").unwrap().captures(value){
+    if let Some(cap)=static_regex!(r"^(https://[^/]+)/@([^/]+)/([A-Za-z0-9_-]+)$").captures(value){
         let user=query(&cap[2]);for prefix in ["users","ap/users"]{for kind in ["statuses","posts","notes"]{candidates.push(format!("{}/{}/{}/{}/{}",&cap[1],prefix,user,kind,&cap[3]));}}
         candidates.push(format!("{}/notes/{}",&cap[1],&cap[3]));
     }
-    if let Some(cap)=regex::Regex::new(r"^(https://[^/]+)/(?:ap/)?users/([^/]+)/(?:statuses|posts|notes)/([A-Za-z0-9_-]+)$").unwrap().captures(value){
+    if let Some(cap)=static_regex!(r"^(https://[^/]+)/(?:ap/)?users/([^/]+)/(?:statuses|posts|notes)/([A-Za-z0-9_-]+)$").captures(value){
         let raw=cap[2].as_bytes();let mut bytes=Vec::new();let mut i=0;
         while i<raw.len(){if raw[i]==b'%'&&i+2<raw.len(){if let Ok(n)=u8::from_str_radix(std::str::from_utf8(&raw[i+1..i+3]).unwrap_or(""),16){bytes.push(n);i+=3;continue;}}bytes.push(raw[i]);i+=1;}
         candidates.push(format!("{}/@{}/{}",&cap[1],String::from_utf8_lossy(&bytes),&cap[3]));
         for prefix in ["users","ap/users"]{for kind in ["statuses","posts","notes"]{candidates.push(format!("{}/{}/{}/{}/{}",&cap[1],prefix,&cap[2],kind,&cap[3]));}}
         candidates.push(format!("{}/notes/{}",&cap[1],&cap[3]));
     }
-    if let Some(cap)=regex::Regex::new(r"(?i)^(https://[^\s]+/statuses/[^/]+)/QuotePost/?$").unwrap().captures(value){candidates.push(cap[1].to_owned());}
+    if let Some(cap)=static_regex!(r"(?i)^(https://[^\s]+/statuses/[^/]+)/QuotePost/?$").captures(value){candidates.push(cap[1].to_owned());}
     candidates.into_iter().filter(|v|v.starts_with("https://")).map(|v|v.trim_end_matches('/').to_lowercase()).collect()
 }
 pub(crate) fn status_urls_equivalent(a:&str,b:&str)->bool {
@@ -264,7 +272,7 @@ pub(crate) fn status_urls_equivalent(a:&str,b:&str)->bool {
     if !a.starts_with("https://")||!b.starts_with("https://"){return false;}
     if a.eq_ignore_ascii_case(b){return true;}
     if let (Ok(a_url),Ok(b_url))=(reqwest::Url::parse(a),reqwest::Url::parse(b)){
-        if a_url.host_str()==b_url.host_str(){let id=regex::Regex::new(r"/@[^/]+/([0-9]+)$|/(?:statuses|posts|notes)/([0-9]+)$").unwrap();
+        if a_url.host_str()==b_url.host_str(){let id=static_regex!(r"/@[^/]+/([0-9]+)$|/(?:statuses|posts|notes)/([0-9]+)$");
             let extract=|value:&str|id.captures(value).and_then(|cap|cap.get(1).or_else(||cap.get(2)).map(|m|m.as_str().to_owned()));
             if let (Some(a),Some(b))=(extract(a),extract(b)){if a==b{return true;}}
         }
@@ -272,7 +280,8 @@ pub(crate) fn status_urls_equivalent(a:&str,b:&str)->bool {
     !status_candidates(a).is_disjoint(&status_candidates(b))
 }
 
-fn quote_card(status: &Value, facts: &CardFacts) -> Result<String> {
+fn quote_card(status: &Value, facts: &CardFacts) -> Result<String> {quote_card_mode(status,facts,false)}
+fn quote_card_mode(status: &Value, facts: &CardFacts,silent:bool) -> Result<String> {
     if let Some(row)=facts.rss_quote_row.as_ref() {
         // Source adapter binds this row to the current quoted mirror and owner.
         super::rss::normalize(row,facts.owner_id)?;
@@ -307,7 +316,7 @@ fn quote_card(status: &Value, facts: &CardFacts) -> Result<String> {
             }
             item
         }).collect::<Vec<_>>();
-        let row = media_row(&normalized, facts.lazy_media);
+        let row = media_row_mode(&normalized, facts.lazy_media,silent);
         if !row.is_empty() {
             let row = format!("<div class=\"quote-media\" style=\"margin-top:.45rem\">{row}</div>");
             if boolean(status,"sensitive") || !php_trim(string(status,"spoiler_text")).is_empty() {
@@ -332,14 +341,17 @@ fn poll_options(row:&Value)->Vec<(String,i64)>{
 }
 pub(crate) fn poll_has_options(row:&Value)->bool{!poll_options(row).is_empty()}
 pub(crate) fn poll_html(row: &Value, note: &str, facts: &CardFacts) -> String {
+    poll_html_mode(row,note,facts,false)
+}
+pub(crate) fn poll_html_mode(row: &Value, note: &str, facts: &CardFacts, read_only:bool) -> String {
     let opts=poll_options(row);
     if opts.is_empty() { return String::new(); }
     let local_id = integer(row, "local_id");
     let expires = chrono::DateTime::parse_from_rfc3339(string(row, "expires_at")).ok();
     let expired = expires.is_some_and(|time| time <= facts.now);
     let voters: Value = serde_json::from_str(string(row, "voters_json")).unwrap_or(Value::Null);
-    let voted = voters.as_array().into_iter().flatten().filter_map(Value::as_str).any(|v| v.trim_end_matches('/') == facts.owner_actor.trim_end_matches('/'));
-    let results = expired || voted || local_id <= 0;
+    let voted = !facts.owner_actor.trim_end_matches('/').is_empty() && voters.as_array().into_iter().flatten().filter_map(Value::as_str).any(|v| v.trim_end_matches('/') == facts.owner_actor.trim_end_matches('/'));
+    let results = read_only || expired || voted || local_id <= 0;
     let mut votes = integer(row, "votes_count");
     if votes <= 0 { votes = opts.iter().map(|(_, votes)| votes).sum(); }
     let label = if expired { "Poll · closed" } else if voted { "Poll · voted" } else { "Poll" };
@@ -368,6 +380,10 @@ pub(crate) fn poll_html(row: &Value, note: &str, facts: &CardFacts) -> String {
     html.push_str("</div>"); html
 }
 
+fn numeric_reply_without_url(status:&Value)->bool {
+    status.get("in_reply_to_id").and_then(Value::as_str).is_some_and(|id|!id.is_empty()&&id.bytes().all(|byte|byte.is_ascii_digit()))
+        && ["vaak_in_reply_to_url","in_reply_to"].iter().all(|key|status.get(*key).is_none_or(|value|value.is_null()||value.as_str()==Some("")))
+}
 fn reply_meta(status: &Value, view: &str) -> Result<String> {
     if status.get("vaak_ask").is_some_and(Value::is_object) { return Ok(String::new()); }
     if let Some(parent)=status.get("vaak_reply_parent").filter(|v|v.is_object()) {
@@ -384,11 +400,12 @@ fn reply_meta(status: &Value, view: &str) -> Result<String> {
         if !href.is_empty()&&href!="#"{html.push_str(&format!("<a href=\"{}\">{}</a>",esc(&href),esc(link_text)));}else{html.push_str(&esc(link_text));}
         html.push_str("</div>");return Ok(html);
     }
+    if numeric_reply_without_url(status){return Ok(String::new())}
     if ["vaak_in_reply_to_url","in_reply_to","in_reply_to_id"].iter().any(|key|!string(status,key).is_empty()) { bail!("reply URL metadata requires current event/profile cache facts"); }
     Ok(String::new())
 }
 
-fn ask_html(row: &Value) -> Result<String> {
+pub(crate) fn ask_html(row: &Value) -> Result<String> {
     let actor = row.get("asker_actor").or_else(||row.get("ask_actor")).and_then(Value::as_str).unwrap_or("");
     let actor = php_trim(actor).trim_end_matches('/');
     if !actor.is_empty() && row.get("asker_display").is_none() { bail!("Ask requires server-resolved canonical actor identity"); }
@@ -409,7 +426,7 @@ fn ask_html(row: &Value) -> Result<String> {
 }
 
 pub(crate) fn link_preview(card: &Value) -> Result<String> { link_preview_mode(card, true) }
-fn link_preview_mode(card: &Value, interactive: bool) -> Result<String> {
+pub(crate) fn link_preview_mode(card: &Value, interactive: bool) -> Result<String> {
     let uri = string(card, "url");
     if uri.is_empty() || card.get("status").and_then(Value::as_str).is_some_and(|s| s != "ok") { return Ok(String::new()); }
     let youtube_id = reqwest::Url::parse(uri).ok().and_then(|url| {
@@ -418,7 +435,7 @@ fn link_preview_mode(card: &Value, interactive: bool) -> Result<String> {
             else if matches!(host.as_str(),"youtube.com"|"www.youtube.com") && url.path().starts_with("/shorts/") { url.path().trim_start_matches("/shorts/").to_owned() }
             else if matches!(host.as_str(),"youtube.com"|"www.youtube.com") && url.path()=="/watch" { url.query_pairs().filter(|(key,_)|key=="v").last().map(|(_,value)|value.into_owned()).unwrap_or_default() }
             else { String::new() };
-        regex::Regex::new(r"^[A-Za-z0-9_-]{6,}").unwrap().find(&raw).map(|id|id.as_str().to_owned())
+        static_regex!(r"^[A-Za-z0-9_-]{6,}").find(&raw).map(|id|id.as_str().to_owned())
     });
     if let Some(id) = youtube_id {
         let image = string(card,"image");
@@ -450,6 +467,9 @@ pub(super) fn render(status: &Value, facts: &CardFacts) -> Result<String> {
 }
 
 fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_context::DirectPresentation>,prepared_preview:Option<&Option<Value>>)->Result<String>{
+    render_core_mode(status,facts,direct,prepared_preview,false,false)
+}
+fn render_core_mode(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_context::DirectPresentation>,prepared_preview:Option<&Option<Value>>,read_only:bool,silent:bool)->Result<String>{
     if status.get("media_attachments").and_then(Value::as_array).is_some_and(|media| media.iter().any(|attachment|
         attachment.get("url").and_then(Value::as_str).unwrap_or("").is_empty()
             && !attachment.get("preview_url").and_then(Value::as_str).unwrap_or("").is_empty())) {
@@ -481,7 +501,13 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
     if string(st, "id").starts_with("rss:") && !is_rss { bail!("fresh owner RSS row required"); }
     let is_local = actor.trim_end_matches('/') == facts.owner_actor.trim_end_matches('/');
     if is_local && facts.own.is_none() { bail!("own-post actions require current owner DB facts"); }
-    if st.get("in_reply_to_id").is_some_and(|v| !v.is_null()) && st.get("vaak_reply_parent").is_none() { bail!("degraded/reply-parent branch not yet ported"); }
+    if st.get("in_reply_to_id").is_some_and(|v| !v.is_null()) && st.get("vaak_reply_parent").is_none() {
+        // The canonical PHP chrome cannot turn a numeric Mastodon parent ID
+        // into a URL. With no represented parent URL/preview it emits no reply
+        // context. Do not invent a parent or fetch an unrelated numeric ID.
+        let numeric_only=numeric_reply_without_url(st);
+        if !numeric_only {bail!("degraded/reply-parent branch not yet ported")}
+    }
     let acct = if account.get("acct").is_some() { string(account, "acct") } else { "?" };
     let display = if account.get("display_name").is_some() { string(account, "display_name") } else { acct };
     let emoji_map = facts.emoji_by_actor.get(actor).cloned().unwrap_or_default();
@@ -523,7 +549,7 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
     html.push_str("</div></div>");
     }
     html.push_str(&reply_meta(st,&facts.return_view)?);
-    if !st.get("quote").and_then(|quote|quote.get("quoted_status")).is_some_and(Value::is_object) && regex::Regex::new(r"↪\s*QT").unwrap().is_match(&plain(string(st,"content"))) {
+    if !direct.is_some_and(|presentation|presentation.pending_quote_suppressed()) && direct.and_then(|presentation|presentation.pending_quote()).is_none() && !st.get("quote").and_then(|quote|quote.get("quoted_status")).is_some_and(Value::is_object) && static_regex!(r"↪\s*QT").is_match(&plain(string(st,"content"))) {
         bail!("raw QT fallback requires canonical quote source assembly before painting");
     }
     let quoted_plain=st.get("quote").and_then(|quote|quote.get("quoted_status")).filter(|quoted|quoted.is_object()).map(|quoted|plain(string(quoted,"content")));
@@ -532,7 +558,7 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
         let answer = php_trim(ask.get("_body_answer").or_else(|| ask.get("answer")).and_then(Value::as_str).unwrap_or(""));
         if !answer.is_empty() { text = answer.to_owned(); }
     }
-    if regex::Regex::new(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").unwrap().is_match(php_trim(&text)){text.clear();}
+    if static_regex!(r"(?i)^\((?:attachment|media|poll|quote|boost)\)$").is_match(php_trim(&text)){text.clear();}
     let mut body = String::new();
     if let Some(ask) = facts.ask_row.as_ref().or_else(|| st.get("vaak_ask")) {
         // The shared PHP painter renders the answer as the post body, while
@@ -545,12 +571,14 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
     let media = st.get("media_attachments").and_then(Value::as_array).cloned().unwrap_or_default();
     let paint_media = st.get("quote").and_then(|quote| quote.get("quoted_status")).filter(|quoted| quoted.is_object())
         .map(|quoted| crate::quote_media::outer_attachments_for_quote(st, quoted)).unwrap_or_else(|| media.clone());
-    body.push_str(&media_row(&paint_media, facts.lazy_media));
+    body.push_str(&media_row_mode(&paint_media, facts.lazy_media,silent));
     if let Some(quote) = st.get("quote").filter(|quote|quote.is_object()) {
-        if let Some(quoted) = quote.get("quoted_status").filter(|v| v.is_object()) { body.push_str(&quote_card(quoted, facts)?); }
+        if let Some(quoted) = quote.get("quoted_status").filter(|v| v.is_object()) { body.push_str(&quote_card_mode(quoted, facts,silent)?); }
+        else if let Some(pending)=direct.and_then(|presentation|presentation.pending_quote()){body.push_str(&pending.render(facts)?);}
+        else if direct.is_some_and(|presentation|presentation.pending_quote_suppressed()) {}
         else { bail!("pending/synthetic/fallback quote branch not yet ported"); }
     }
-    let poll = facts.poll_row.as_ref().map(|row| poll_html(row, uri, facts)).unwrap_or_default();
+    let poll = facts.poll_row.as_ref().map(|row| poll_html_mode(row, uri, facts,read_only)).unwrap_or_default();
     body.push_str(&poll);
     if media.is_empty() && poll.is_empty() {
         let quoted=st.get("quote").and_then(|quote|quote.get("quoted_status")).filter(|quote|quote.is_object());
@@ -560,7 +588,19 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
     if degraded { body = format!("<div class=\"body feed-body meta vaak-degraded\"><span class=\"{}\">{}</span><a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">Open on remote</a></div>",if boost_hydrate {"boost-hydrate-status"}else{"create-hydrate-status"},if boost_hydrate {"Loading boosted post…"}else{"Loading post…"}, esc(uri)); }
     html.push_str(&cw_gate(string(st, "spoiler_text"), boolean(st, "sensitive") || !php_trim(string(st, "spoiler_text")).is_empty(), &body, facts.auto_unblur_sensitive));
     let ctx = FediActionContext { owner_id: facts.owner_id, status_id: scalar_string(st, "id"), object_id: uri.into(), actor_id: actor.into(), remote_url: remote_object_href(uri, st.get("url"))?, return_view: facts.return_view.clone(), reply_mentions: if facts.reply_mentions.is_empty() { vec![super::actions::reply_mention_handle(actor, acct, &facts.owner_actor)] } else { facts.reply_mentions.clone() }, spoiler: string(st, "spoiler_text").into(), sensitive: boolean(st, "sensitive"), favourited: facts.favourited, bookmarked: facts.bookmarked, boosted: facts.boosted, counts: action_counts(st,facts), csrf: facts.csrf.clone(), moderation: facts.moderation.clone() };
-    if is_bsky && facts.bsky.as_ref().is_some_and(|context|context.enabled) { html.push_str(&super::bsky::normalized_actions(st,facts)?); }
+    if read_only {
+        html.push_str("<div class=\"tweet-actions\">");
+        if !ctx.status_id.is_empty()&&!uri.is_empty(){
+            for (count,icon,label) in [(ctx.counts.quotes,"ph-quotes","Quotes"),(ctx.counts.reblogs,"ph-repeat","Boosts"),(ctx.counts.favourites,"ph-heart","Likes")] {
+                if count<=0{continue}
+                let compact=super::actions::compact_count(count);
+                html.push_str(&format!("<span class=\"meta has-count\" aria-label=\"{}\"><i class=\"ph {icon}\" aria-hidden=\"true\"></i><span class=\"action-count\" aria-hidden=\"true\">{compact}</span></span>",esc(&format!("{label} ({compact})"))));
+            }
+        }
+        html.push_str(&super::actions::read_only_overflow(uri,&facts.return_view,&ctx.remote_url));
+        html.push_str("</div>");
+    }
+    else if is_bsky && facts.bsky.as_ref().is_some_and(|context|context.enabled) { html.push_str(&super::bsky::normalized_actions(st,facts,direct.map(|options|options.show_open()).unwrap_or(true))?); }
     else if is_bsky { html.push_str(&super::actions::render_fedi_actions(&ctx,facts.owner_id)?); }
     else if is_rss { html.push_str(&super::rss::actions(st,facts)?); }
     else if is_local {
@@ -572,7 +612,7 @@ fn render_core(status:&Value,facts:&CardFacts,direct:Option<&crate::direct_conte
             let mut action_facts=facts.clone();
             action_facts.return_view=if options.focused(){"status".into()}else if facts.return_view=="status"{"home".into()}else{facts.return_view.clone()};
             html.push_str(&super::own::render_direct(uri,actor,&action_facts,&own,if options.focused(){&facts.return_view}else{""})?);
-        }else{html.push_str(&super::own::render(uri, actor, facts, &own)?);}
+        }else{html.push_str(&super::own::render_presentation(uri, actor, facts, &own,string(st,"visibility"))?);}
     }
     else { if let Some(options)=direct{html.push_str(&super::actions::render_direct_actions(&ctx,facts.owner_id,options.show_open(),options.profile_actor())?);}else{html.push_str(&super::actions::render_fedi_actions(&ctx, facts.owner_id)?);} }
     html.push_str("</article>"); Ok(html)
@@ -584,6 +624,14 @@ pub(crate) fn render_admitted(status: &super::context::AdmittedStatus) -> Result
     render_core(status.status(), status.facts(),None,status.root_preview())
 }
 pub(crate) fn render_search_admitted(status:&crate::search_context::AdmittedSearchStatus)->Result<String>{render_core(status.status(),status.facts(),None,status.root_preview())}
+pub(crate) fn render_guest_profile_admitted(status:&crate::profile_context::AdmittedGuestProfileStatus)->Result<String>{
+    let facts=status.facts();
+    // Shared guest proof is AP-only. Raw/imported protocol painters have a
+    // separate read-only capability; never enter an authenticated early return.
+    crate::library::context::require_ap_preview_protocol(status.status(),0)?;
+    if facts.owner_id!=0||!facts.owner_actor.is_empty()||!facts.csrf.is_empty()||facts.own.is_some(){bail!("guest profile requires separate public presentation facts")}
+    render_core_mode(status.status(),facts,None,status.root_preview(),true,false)
+}
 pub(crate) fn render_direct_admitted(status:&crate::direct_context::AdmittedDirectStatus)->Result<String>{render_core(status.status(),status.facts(),Some(status.presentation()),None)}
 
 #[cfg(test)]
@@ -642,7 +690,7 @@ mod tests {
         for (name,fixture) in reference["degradedcards"].as_object().unwrap().iter().chain(reference["raw_quote_cards"].as_object().unwrap().iter()) {
             let facts=CardFacts { current_action_counts:None, bsky:None,owner_id:1,owner_actor:"https://mkultra.monster/users/fixture".into(),return_view:"bookmarks".into(),auto_unblur_sensitive:false,resolved_avatar:string(fixture,"avatar").into(),csrf:"fixture-csrf-token".into(),favourited:false,bookmarked:false,boosted:false,own:None,rss_row:None,rss_quote_row:None,rss_quoted:false,emoji_by_actor:Default::default(),reply_mentions:Vec::new(),moderation:Default::default(),poll_row:None,ask_row:None,now:chrono::DateTime::from_timestamp(integer(fixture,"rendered_at"),0).unwrap(),lazy_media:false };
             if name=="qt_comment" {assert!(render(&fixture["status"],&facts).unwrap_err().to_string().contains("raw QT fallback"));continue;}
-            let tokens=|s:&str|regex::Regex::new(r"<[^>]+>|[^<]+").unwrap().find_iter(s).map(|token|php_trim(token.as_str()).to_owned()).filter(|token|!token.is_empty()).collect::<Vec<_>>();
+            let tokens=|s:&str|static_regex!(r"<[^>]+>|[^<]+").find_iter(s).map(|token|php_trim(token.as_str()).to_owned()).filter(|token|!token.is_empty()).collect::<Vec<_>>();
             assert_eq!(tokens(&render(&fixture["status"],&facts).unwrap()),tokens(string(fixture,"html")),"actual PHP degraded shared card {name}");
         }
         for fixture in reference["url_aliases"].as_array().unwrap(){assert_eq!(status_urls_equivalent(string(fixture,"a"),string(fixture,"b")),boolean(fixture,"equivalent"),"actual presentation status aliases");}
@@ -664,7 +712,7 @@ mod tests {
         let output = std::process::Command::new(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/php-policy-test")).arg(file).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let reference: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let tokenize = |s: &str| regex::Regex::new(r"<[^>]+>|[^<]+").unwrap().find_iter(s).map(|m| php_trim(m.as_str()).to_owned()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
+        let tokenize = |s: &str| static_regex!(r"<[^>]+>|[^<]+").find_iter(s).map(|m| php_trim(m.as_str()).to_owned()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
 
         for (name, capture) in reference["captures"].as_object().unwrap() {
             if reference_file == "search-render-reference-capture.php" && string(capture,"kind") != "status" { continue; }
@@ -702,3 +750,7 @@ mod tests {
         assert!(cw_gate("", true, "", false).contains("sensitive media"));
     }
 }
+
+/// Pinned feed presentation is scoped to the admitted card, including quote media.
+pub(crate) fn render_pinned_direct(status:&crate::direct_context::AdmittedDirectStatus)->Result<String>{render_core_mode(status.status(),status.facts(),Some(status.presentation()),None,false,true)}
+pub(crate) fn render_pinned_guest(status:&crate::profile_context::AdmittedGuestProfileStatus)->Result<String>{let facts=status.facts();crate::library::context::require_ap_preview_protocol(status.status(),0)?;if facts.owner_id!=0||!facts.owner_actor.is_empty()||!facts.csrf.is_empty()||facts.own.is_some(){bail!("guest pinned card requires public facts")}render_core_mode(status.status(),facts,None,status.root_preview(),true,true)}

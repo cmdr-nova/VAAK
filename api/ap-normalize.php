@@ -246,7 +246,7 @@ function ap_normalize_status(array $status): array
  * @param array<string,mixed> $eventRow events table row
  * @return array<string,mixed>|null
  */
-function ap_normalize_from_activitypub_event(array $eventRow): ?array
+function ap_normalize_from_activitypub_event(array $eventRow, ?string $profileBoostActor = null): ?array
 {
     if (!function_exists('ap_masto_status_from_event')) {
         require_once __DIR__ . '/ap-masto-entities.php';
@@ -254,7 +254,7 @@ function ap_normalize_from_activitypub_event(array $eventRow): ?array
     if (!function_exists('ap_masto_status_from_event')) {
         return null;
     }
-    $st = ap_masto_status_from_event($eventRow);
+    $st = ap_masto_status_from_event($eventRow, $profileBoostActor);
     if (is_array($st)) {
         $evType = strtolower((string) ($eventRow['type'] ?? ''));
         if (

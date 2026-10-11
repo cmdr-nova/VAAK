@@ -25,11 +25,12 @@ fn b64(bytes: &[u8]) -> String {
     output
 }
 pub(super) fn render(note: &str, actor: &str, facts: &CardFacts, own: &OwnFacts) -> Result<String> {
-    render_core(note,actor,facts,own,"")
+    render_core(note,actor,facts,own,"",None)
 }
 
-pub(crate) fn render_direct(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,from:&str)->Result<String>{render_core(note,actor,facts,own,from)}
-fn render_core(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,from:&str)->Result<String>{
+pub(crate) fn render_direct(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,from:&str)->Result<String>{render_core(note,actor,facts,own,from,None)}
+pub(crate) fn render_presentation(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,incoming_visibility:&str)->Result<String>{render_core(note,actor,facts,own,"",Some(incoming_visibility))}
+fn render_core(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,from:&str,visibility:Option<&str>)->Result<String>{
     if facts.owner_id < 1 || actor.trim_end_matches('/') != facts.owner_actor.trim_end_matches('/')
         || !note.starts_with(&format!("{}/notes/",facts.owner_actor.trim_end_matches('/'))) {
         bail!("Own Library actions require the current authenticated note owner");
@@ -37,7 +38,7 @@ fn render_core(note:&str,actor:&str,facts:&CardFacts,own:&OwnFacts,from:&str)->R
     let view=&facts.return_view; let mut action_url=format!("?view={}",query(view));
     if view=="status"{action_url.push_str(&format!("&object={}",query(note)));if !from.is_empty(){action_url.push_str(&format!("&from={}",query(from)));}}
     let numeric=!own.status_id.is_empty() && own.status_id.bytes().all(|byte|byte.is_ascii_digit());
-    let can_share=!matches!(own.visibility.as_str(),"private"|"direct"|"followers");
+    let can_share=!matches!(visibility.unwrap_or(own.visibility.as_str()),"private"|"direct"|"followers");
     let cw=super::actions::reply_suffix(&[],&own.spoiler,own.sensitive);
     let mut html=format!("<div class=\"tweet-actions\"><a class=\"icon-btn\" href=\"?view={}&amp;compose=1&amp;reply_to={}{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",esc(view),query(note),cw);
     let form = |action: &str, target_actor: bool| -> String {

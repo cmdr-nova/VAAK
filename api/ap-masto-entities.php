@@ -3289,6 +3289,18 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
         // focus post. PeerTube transcoding endpoints can be particularly slow.
         return $isNoteRow ? $existing : null;
     }
+    // An instance-signed GET can return a restricted object. Its availability
+    // does not make its audience public; preserve the same to/cc classification
+    // used by inbox ingestion, including recipients on a Create envelope.
+    $fetchedVisibility = function_exists('ap_visibility_from_activity')
+        ? ap_visibility_from_activity($doc)
+        : 'private';
+    // This global observation helper has no caller/recipient capability, and
+    // events cannot retain a direct object's full recipients. Do not turn a
+    // successful authorized fetch into follower access to restricted content.
+    if (!isset($restVisibility) && !in_array($fetchedVisibility, ['public', 'unlisted'], true)) {
+        return null;
+    }
     if (($doc['type'] ?? '') === 'Create' && isset($doc['object']) && is_array($doc['object'])) {
         $doc = $doc['object'];
     }
@@ -3350,7 +3362,7 @@ function ap_masto_ensure_remote_note_event(string $objectUrl): ?array
     $sensitive = !empty($doc['sensitive']);
     $visibility = isset($restVisibility) && is_string($restVisibility)
         ? $restVisibility
-        : 'public';
+        : $fetchedVisibility;
 
     // Repair older PeerTube rows that cached the first advertised web-video
     // MP4, which may be explicitly audio-only. The extractor now selects an
@@ -7625,7 +7637,7 @@ function ap_masto_announce_original_actor(array $row, bool $allowFetch = false):
 /**
  * Status entity from a public inbound events row (Create firehose / following feed).
  */
-function ap_masto_status_from_event(array $row): ?array
+function ap_masto_status_from_event(array $row, ?string $profileBoostActor = null): ?array
 {
     $eventId = (int) ($row['id'] ?? 0);
     if ($eventId <= 0) {
@@ -7643,7 +7655,23 @@ function ap_masto_status_from_event(array $row): ?array
     // Other local instance accounts must remain resolvable for fav/boost/etc.
     $sessionActor = function_exists('ap_local_actor_id') ? rtrim(ap_local_actor_id(), '/') : '';
     if ($sessionActor !== '' && rtrim($actorId, '/') === $sessionActor) {
-        return null;
+        // Only the validated local profile Boosts caller may display its own
+        // ledger entry. This changes presentation, never the inner audience.
+        // Payload fields and return_view cannot opt into this exception.
+        $profileBoostActor = $profileBoostActor === null ? '' : rtrim(trim($profileBoostActor), '/');
+        $allowProfileBoost = false;
+        if (($row['type'] ?? '') === 'Announce' && $profileBoostActor === $sessionActor) {
+            try {
+                $current = ap_db()->prepare("SELECT id FROM events WHERE id = ? AND type = 'Announce' AND actor_id = ? AND COALESCE(object_id, '') = ? LIMIT 1");
+                $current->execute([$eventId, $actorId, (string) ($row['object_id'] ?? '')]);
+                $allowProfileBoost = $current->fetchColumn() !== false;
+            } catch (Throwable $e) {
+                $allowProfileBoost = false;
+            }
+        }
+        if (!$allowProfileBoost) {
+            return null;
+        }
     }
 
     $account = ap_masto_remote_account($actorId);
@@ -9765,6 +9793,7 @@ function ap_masto_search_query_parts(string $q): array
 /** @return list<array<string,mixed>> */
 function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
 {
+    $escapeSql = ap_masto_search_like_escape_sql();
     if (trim($q) === '') {
         return [];
     }
@@ -9999,9 +10028,9 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
             "SELECT actor_id FROM ap_users
              WHERE disabled_at IS NULL
                AND (
-                 lower(username) LIKE ? ESCAPE '\\'
-                 OR lower(actor_key) LIKE ? ESCAPE '\\'
-                 OR lower(actor_id) LIKE ? ESCAPE '\\'
+                 lower(username) LIKE ? $escapeSql
+                 OR lower(actor_key) LIKE ? $escapeSql
+                 OR lower(actor_id) LIKE ? $escapeSql
                )
              ORDER BY id ASC LIMIT ?"
         );
@@ -10091,10 +10120,10 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     try {
         $st = ap_db()->prepare(
             "SELECT actor_id FROM remote_actors
-             WHERE lower(COALESCE(username,'')) LIKE ? ESCAPE '\\'
-                OR lower(COALESCE(display_name,'')) LIKE ? ESCAPE '\\'
-                OR lower(COALESCE(host,'')) LIKE ? ESCAPE '\\'
-                OR lower(actor_id) LIKE ? ESCAPE '\\'
+             WHERE lower(COALESCE(username,'')) LIKE ? $escapeSql
+                OR lower(COALESCE(display_name,'')) LIKE ? $escapeSql
+                OR lower(COALESCE(host,'')) LIKE ? $escapeSql
+                OR lower(actor_id) LIKE ? $escapeSql
              ORDER BY updated_at DESC LIMIT ?"
         );
         $st->execute([$like, $like, $like, $like, $limit * 2]);
@@ -10109,9 +10138,9 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     try {
         $st = ap_db()->prepare(
             "SELECT actor_id FROM followers
-             WHERE lower(COALESCE(username,'')) LIKE ? ESCAPE '\\'
-                OR lower(COALESCE(host,'')) LIKE ? ESCAPE '\\'
-                OR lower(actor_id) LIKE ? ESCAPE '\\'
+             WHERE lower(COALESCE(username,'')) LIKE ? $escapeSql
+                OR lower(COALESCE(host,'')) LIKE ? $escapeSql
+                OR lower(actor_id) LIKE ? $escapeSql
              LIMIT ?"
         );
         $st->execute([$like, $like, $like, $limit * 2]);
@@ -10124,8 +10153,8 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
     try {
         $st = ap_db()->prepare(
             "SELECT actor_id FROM following
-             WHERE lower(COALESCE(host,'')) LIKE ? ESCAPE '\\'
-                OR lower(actor_id) LIKE ? ESCAPE '\\'
+             WHERE lower(COALESCE(host,'')) LIKE ? $escapeSql
+                OR lower(actor_id) LIKE ? $escapeSql
              LIMIT ?"
         );
         $st->execute([$like, $like, $limit * 2]);
@@ -10141,7 +10170,7 @@ function ap_masto_search_accounts(string $q, bool $resolve, int $limit): array
         $st = ap_db()->prepare(
             "SELECT DISTINCT actor_id FROM mentions
              WHERE deleted_at IS NULL AND actor_id IS NOT NULL
-               AND (lower(actor_id) LIKE ? ESCAPE '\\' OR lower(COALESCE(content,'')) LIKE ? ESCAPE '\\')
+               AND (lower(actor_id) LIKE ? $escapeSql OR lower(COALESCE(content,'')) LIKE ? $escapeSql)
              ORDER BY id DESC LIMIT ?"
         );
         $st->execute([$like, $like, $limit * 2]);
@@ -10378,7 +10407,7 @@ const AP_MASTO_TRENDS_CACHE_TTL = 7200; // 2 hours
 /**
  * @return array{path:string,ttl:int}
  */
-function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId): bool
+function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId, bool $includeDeprioritized = true): bool
 {
     if ($actor === '') {
         return false;
@@ -10425,7 +10454,7 @@ function ap_masto_trend_actor_hidden(string $actor, int $ownerUserId): bool
     if (function_exists('ap_is_muted_actor') && ap_is_muted_actor($actor, $ownerUserId)) {
         return true;
     }
-    if (function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($actor, $ownerUserId)) {
+    if ($includeDeprioritized && function_exists('ap_is_deprioritized_actor') && ap_is_deprioritized_actor($actor, $ownerUserId)) {
         return true;
     }
     return function_exists('ap_row_is_hidden') && ap_row_is_hidden($actor, $host, $ownerUserId);
@@ -10455,11 +10484,11 @@ function ap_masto_trend_item_actors(array $item): array
 }
 
 /** @param list<string> $actors */
-function ap_masto_trend_item_hidden(array $item, int $ownerUserId, array $actors = []): bool
+function ap_masto_trend_item_hidden(array $item, int $ownerUserId, array $actors = [], bool $includeDeprioritized = true): bool
 {
     $actors = $actors !== [] ? $actors : ap_masto_trend_item_actors($item);
     foreach ($actors as $actor) {
-        if (ap_masto_trend_actor_hidden((string) $actor, $ownerUserId)) {
+        if (ap_masto_trend_actor_hidden((string) $actor, $ownerUserId, $includeDeprioritized)) {
             return true;
         }
     }
@@ -12348,6 +12377,7 @@ function ap_masto_suggestions_v1(int $limit = 40): array
  */
 function ap_masto_timeline_hashtag_local(array $tagNames, int $limit = 20, ?string $maxId = null): array
 {
+    $escapeSql = ap_masto_search_like_escape_sql();
     $limit = max(1, min(40, $limit));
     $names = [];
     foreach ($tagNames as $n) {
@@ -12366,9 +12396,9 @@ function ap_masto_timeline_hashtag_local(array $tagNames, int $limit = 20, ?stri
     $ors = [];
     $params = [];
     foreach ($names as $n) {
-        $ors[] = 'lower(content_text) LIKE ? ESCAPE \'\\\'';
+        $ors[] = 'lower(content_text) LIKE ? ' . $escapeSql;
         $params[] = '%#' . str_replace(['%', '_'], ['\\%', '\\_'], $n) . '%';
-        $ors[] = 'lower(COALESCE(spoiler_text,\'\')) LIKE ? ESCAPE \'\\\'';
+        $ors[] = 'lower(COALESCE(spoiler_text,\'\')) LIKE ? ' . $escapeSql;
         $params[] = '%#' . str_replace(['%', '_'], ['\\%', '\\_'], $n) . '%';
     }
     try {
@@ -12411,7 +12441,7 @@ function ap_masto_timeline_hashtag_local(array $tagNames, int $limit = 20, ?stri
     $ors = [];
     $params = [];
     foreach ($names as $n) {
-        $ors[] = 'lower(COALESCE(content,\'\')) LIKE ? ESCAPE \'\\\'';
+        $ors[] = 'lower(COALESCE(content,\'\')) LIKE ? ' . $escapeSql;
         $params[] = '%#' . str_replace(['%', '_'], ['\\%', '\\_'], $n) . '%';
     }
     try {
@@ -12502,6 +12532,7 @@ function ap_masto_status_has_tag(array $status, string $tagName): bool
  */
 function ap_masto_followed_tag_event_rows(int $limit = 80, ?int $ownerUserId = null): array
 {
+    $escapeSql = ap_masto_search_like_escape_sql();
     $limit = max(1, min(200, $limit));
     $tags = [];
     foreach (ap_masto_followed_tags(0, $ownerUserId) as $tag) {
@@ -12519,7 +12550,7 @@ function ap_masto_followed_tag_event_rows(int $limit = 80, ?int $ownerUserId = n
     $ors = [];
     $params = [];
     foreach ($names as $n) {
-        $ors[] = 'lower(summary) LIKE ? ESCAPE \'\\\'';
+        $ors[] = 'lower(summary) LIKE ? ' . $escapeSql;
         $params[] = '%#' . str_replace(['%', '_'], ['\\%', '\\_'], $n) . '%';
     }
     $sql = "SELECT * FROM events
@@ -12679,6 +12710,18 @@ function ap_masto_timeline_hashtag(string $name, int $limit = 20, ?string $maxId
  *
  * @return list<array<string,mixed>>
  */
+/** PostgreSQL PDO scans backslash escapes while counting placeholders.
+ * An explicit E-string with two SQL backslashes preserves the intended single
+ * LIKE escape character and keeps every following parameter visible to PDO.
+ * SQLite retains its ordinary one-character literal.
+ */
+function ap_masto_search_like_escape_sql(): string
+{
+    return ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql'
+        ? "ESCAPE E'\\\\'"
+        : "ESCAPE '\\'";
+}
+
 function ap_masto_search_statuses(string $q, int $limit): array
 {
     $q = trim(ap_fix_utf8($q));
@@ -12689,6 +12732,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
         $q = mb_substr($q, 0, 200);
     }
     $qLower = mb_strtolower($q);
+    $escapeSql = ap_masto_search_like_escape_sql();
     // Only explicit #tag queries use hashtag-precision mode.
     // Bare words (linux, queuing, …) stay normal FTS text search so posts
     // without a #hashtag still match.
@@ -12899,7 +12943,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
                 $needle = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $qLower) . '%';
                 $bskySt = ap_db()->prepare(
                     'SELECT raw_json FROM bsky_posts
-                     WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE \'\\\'
+                     WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ' . $escapeSql . '
                      ORDER BY published_at DESC LIMIT ?'
                 );
                 $bskySt->execute([gmdate('c', time() - (30 * 86400)), $needle, max(40, ($limit - count($out)) * 3)]);
@@ -12940,8 +12984,8 @@ function ap_masto_search_statuses(string $q, int $limit): array
     try {
         $st = ap_db()->prepare(
             "SELECT * FROM masto_statuses
-             WHERE lower(content_text) LIKE ? ESCAPE '\\'
-                OR lower(COALESCE(spoiler_text,'')) LIKE ? ESCAPE '\\'
+             WHERE lower(content_text) LIKE ? $escapeSql
+                OR lower(COALESCE(spoiler_text,'')) LIKE ? $escapeSql
              ORDER BY local_id DESC LIMIT ?"
         );
         $st->execute([$like, $like, $limit]);
@@ -12958,7 +13002,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
     try {
         $st = ap_db()->prepare(
             "SELECT * FROM mentions
-             WHERE deleted_at IS NULL AND lower(COALESCE(content,'')) LIKE ? ESCAPE '\\'
+             WHERE deleted_at IS NULL AND lower(COALESCE(content,'')) LIKE ? $escapeSql
              ORDER BY id DESC LIMIT ?"
         );
         $st->execute([$like, $limit]);
@@ -12978,7 +13022,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
         $st = ap_db()->prepare(
             "SELECT * FROM events
              WHERE summary IS NOT NULL AND summary != ''
-               AND lower(summary) LIKE ? ESCAPE '\\'
+               AND lower(summary) LIKE ? $escapeSql
                AND lower(COALESCE(type,'')) IN ('create','update','announce','note')
              ORDER BY id DESC LIMIT ?"
         );
@@ -13029,7 +13073,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
         $needle = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $qLower) . '%';
         $bskySt = ap_db()->prepare(
             'SELECT raw_json FROM bsky_posts
-             WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ESCAPE \'\\\'
+             WHERE published_at >= ? AND text IS NOT NULL AND lower(text) LIKE ? ' . $escapeSql . '
              ORDER BY published_at DESC LIMIT ?'
         );
         $bskySt->execute([gmdate('c', time() - (30 * 86400)), $needle, max(80, $limit * 5)]);
@@ -13061,6 +13105,7 @@ function ap_masto_search_statuses(string $q, int $limit): array
 /** True if hashtag was recently seen in local cache (cheap existence check). */
 function ap_masto_search_tag_seen(string $name): bool
 {
+    $escapeSql = ap_masto_search_like_escape_sql();
     $name = ap_masto_normalize_tag_name($name);
     if ($name === '') {
         return false;
@@ -13074,7 +13119,7 @@ function ap_masto_search_tag_seen(string $name): bool
     $needle = '%#' . str_replace(['%', '_'], ['\\%', '\\_'], $name) . '%';
     try {
         $st = ap_db()->prepare(
-            "SELECT 1 FROM events WHERE summary IS NOT NULL AND lower(summary) LIKE ? ESCAPE '\\' LIMIT 1"
+            "SELECT 1 FROM events WHERE summary IS NOT NULL AND lower(summary) LIKE ? $escapeSql LIMIT 1"
         );
         $st->execute([$needle]);
         if ($st->fetchColumn()) {
@@ -13085,7 +13130,7 @@ function ap_masto_search_tag_seen(string $name): bool
     }
     try {
         $st = ap_db()->prepare(
-            "SELECT 1 FROM outbox_notes WHERE lower(COALESCE(content,'')) LIKE ? ESCAPE '\\' LIMIT 1"
+            "SELECT 1 FROM outbox_notes WHERE lower(COALESCE(content,'')) LIKE ? $escapeSql LIMIT 1"
         );
         $st->execute([$needle]);
         if ($st->fetchColumn()) {

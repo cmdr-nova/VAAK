@@ -16,6 +16,7 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 struct Batch {
     protocol_version: u8,
     status_preview_budget: i64,
+    #[serde(default)] bsky_budget_deadline:Option<f64>,
     owner_id: i64,
     csrf: String,
     return_view: String,
@@ -25,6 +26,7 @@ struct Batch {
     lazy_media: bool,
     #[serde(default)]
     bsky_bookmarks: Vec<BookmarkState>,
+    #[serde(default)] saved_sources:Vec<super::selection::SavedSourceDescriptor>,
     statuses: Vec<Value>,
 }
 
@@ -104,11 +106,24 @@ fn decode(bytes: &[u8]) -> anyhow::Result<Batch> {
     Ok(batch)
 }
 
+pub(crate) fn native_warm(cfg:&crate::config::Config,deadline:Option<f64>)->std::sync::Arc<crate::profile_enrichment::WarmContext>{
+ std::sync::Arc::new(crate::profile_enrichment::WarmContext::new(cfg.clone(),std::sync::Arc::new(crate::profile_warm::ProcessWarmTransport::configured()))
+ .with_preview_context(std::sync::Arc::new(crate::profile_preview_fetch::PreviewFetchContext::new(std::sync::Arc::new(crate::profile_preview_transport::ProcessPreviewTransport::configured(cfg.clone())))))
+ .with_quote_context(std::sync::Arc::new(crate::profile_quote_warm::QuoteWarmContext::new(std::sync::Arc::new(crate::profile_quote_warm::ProcessQuoteTransport::configured(cfg.clone()))).with_bsky_budget_deadline(deadline))))
+}
+
 pub(crate) async fn render(cfg: &crate::config::Config, headers: HeaderMap, bytes: Bytes) -> Response {
     let secret=enabled_secret();
-    render_request(&cfg.database_url,secret.as_deref(),headers,bytes,&crate::direct_preview::PreviewDependencies::production()).await
+    render_request_with_warm(&cfg.database_url,secret.as_deref(),headers,bytes,&crate::direct_preview::PreviewDependencies::production(),None,Some(cfg)).await
 }
 async fn render_request(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>)->Response {
+    render_request_with_warm(database_url,secret,headers,bytes,deps,None,None).await
+}
+async fn render_request_with_warm(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,cfg:Option<&crate::config::Config>)->Response {
+    let mut response=render_request_with_warm_inner(database_url,secret,headers,bytes,deps,warm,cfg).await;
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("private, no-store"));response
+}
+async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,cfg:Option<&crate::config::Config>)->Response {
     let Some(secret)=secret else{return StatusCode::NOT_FOUND.into_response()};
     if !authorize(&headers, &secret) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -118,13 +133,20 @@ async fn render_request(database_url:&str,secret:Option<&str>,headers:HeaderMap,
         Err(_) => return (StatusCode::BAD_REQUEST,
             Json(json!({"fallback": true, "error": "invalid batch"}))).into_response(),
     };
+    if batch.bsky_budget_deadline.is_some_and(|value|!value.is_finite()){return StatusCode::BAD_REQUEST.into_response()}
+    // Ordinary production enrichment requires an enclosing saved producer
+    // capability for every supplied source, including sources later omitted.
+    // Diagnostic fixture routes pass no production Config and remain separate.
+    if cfg.is_some()&&!batch.statuses.is_empty()&&batch.saved_sources.is_empty(){return (StatusCode::UNPROCESSABLE_ENTITY,Json(json!({"fallback":true}))).into_response()}
+    if super::selection::validate_descriptors(&batch.saved_sources,batch.statuses.len(),&batch.return_view).is_err(){return (StatusCode::UNPROCESSABLE_ENTITY,Json(json!({"fallback":true}))).into_response()}
+    let warm=warm.or_else(||cfg.map(|cfg|native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>> = async {
         let source_count=batch.statuses.len();let initial=batch.status_preview_budget;
         let db = crate::db::connect(database_url).await?;
         let states = batch.bsky_bookmarks.into_iter().map(|s| (s.uri, s.did, s.bookmarked)).collect();
         let session = super::context::TrustedSession::from_php_session(
             batch.owner_id, batch.csrf, batch.return_view, batch.bsky_enabled,
-        )?.with_lazy_media(batch.lazy_media).with_bsky_bookmarks(&db, states).await?;
+        )?.with_lazy_media(batch.lazy_media).with_bsky_bookmarks(&db, states).await?.with_saved_sources(&db,batch.saved_sources,source_count).await?.with_warm_context(warm);
         let (mut statuses,remaining)=super::context::admit_for_render_with_preview(&db,&session,batch.statuses,initial,deps.dns).await?;
         #[cfg(test)] if let Some(clock)=deps.render_clock{for token in &mut statuses{token.set_render_clock(clock);}}
         let cards=statuses.iter().map(|token|super::card::render_admitted(token).map(|html|json!({"source_index":token.source_index(),"html":html}))).collect::<anyhow::Result<Vec<_>>>()?;
@@ -136,6 +158,7 @@ async fn render_request(database_url:&str,secret:Option<&str>,headers:HeaderMap,
     match result {
         Ok(bytes) => (StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),
         Err(_error) => {
+            #[cfg(test)] eprintln!("Library fixture fallback: {_error:#}");
             tracing::debug!("Library whole-batch PHP fallback");
             (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"fallback": true}))).into_response()
         }
@@ -145,6 +168,10 @@ async fn render_request(database_url:&str,secret:Option<&str>,headers:HeaderMap,
 #[cfg(test)]
 pub(crate) async fn fixture_request(database_url:&str,secret:&str,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>)->Response {
     render_request(database_url,Some(secret),headers,bytes,deps).await
+}
+#[cfg(test)]
+pub(crate) async fn fixture_request_with_warm(database_url:&str,secret:&str,headers:HeaderMap,bytes:Bytes,deps:&crate::direct_preview::PreviewDependencies<'_>,warm:std::sync::Arc<crate::profile_enrichment::WarmContext>)->Response {
+    render_request_with_warm(database_url,Some(secret),headers,bytes,deps,Some(warm),None).await
 }
 
 #[cfg(test)] mod tests{
@@ -168,6 +195,13 @@ pub(crate) async fn fixture_request(database_url:&str,secret:&str,headers:Header
   assert!(decode(value.to_string().as_bytes()).unwrap().lazy_media);
   for setting in [true,false]{value["lazy_media"]=json!(setting);assert_eq!(decode(value.to_string().as_bytes()).unwrap().lazy_media,setting);}
   for malformed in [json!("false"),json!(0),json!(null)]{value["lazy_media"]=malformed;assert!(decode(value.to_string().as_bytes()).is_err());}
+ }
+ #[test]fn nullable_existing_bsky_deadline_is_strict(){
+  let mut value=json!({"protocol_version":1,"status_preview_budget":3,"owner_id":1,"csrf":"canonical","return_view":"bookmarks","bsky_enabled":false,"statuses":[]});
+  assert!(decode(value.to_string().as_bytes()).unwrap().bsky_budget_deadline.is_none());
+  value["bsky_budget_deadline"]=json!(null);assert!(decode(value.to_string().as_bytes()).unwrap().bsky_budget_deadline.is_none());
+  value["bsky_budget_deadline"]=json!(1791673200.025);assert_eq!(decode(value.to_string().as_bytes()).unwrap().bsky_budget_deadline,Some(1791673200.025));
+  for invalid in [json!("1791673200.025"),json!(true),json!([])]{value["bsky_budget_deadline"]=invalid;assert!(decode(value.to_string().as_bytes()).is_err());}
  }
  #[test]fn strict_session_and_body_limits(){let mut v=json!({"protocol_version":1,"status_preview_budget":3,"owner_id":1,"csrf":"canonical","return_view":"bookmarks","bsky_enabled":false,"statuses":[]});assert!(decode(v.to_string().as_bytes()).is_ok());v["is_admin"]=json!(true);assert!(decode(v.to_string().as_bytes()).is_err());v.as_object_mut().unwrap().remove("is_admin");v["owner_id"]=json!(0);assert!(decode(v.to_string().as_bytes()).is_err());assert!(decode(&vec![b' ';MAX_BYTES+1]).is_err());v["owner_id"]=json!(1);v["statuses"]=json!(vec![json!({});101]);assert!(decode(v.to_string().as_bytes()).is_err());}
 }

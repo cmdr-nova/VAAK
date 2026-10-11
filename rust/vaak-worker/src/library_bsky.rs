@@ -221,21 +221,21 @@ pub(crate) fn normalized_attrs(status:&Value)->String{
     format!(" data-bsky-uri=\"{}\" data-bsky-cid=\"{}\" data-rank-platform=\"bsky\" data-rank-key=\"{}\" data-rank-actor=\"{}\"",esc(uri),esc(s(post,"cid")),esc(uri),esc(did))
 }
 /// Complete action subtree for the enabled normalized Bluesky branch.
-pub(crate) fn normalized_actions(status:&Value,facts:&CardFacts)->Result<String>{
+pub(crate) fn normalized_actions(status:&Value,facts:&CardFacts,show_open:bool)->Result<String>{
     let b=facts.bsky.as_ref().ok_or_else(||anyhow::anyhow!("current Bluesky session/bookmark facts missing"))?;
     if !b.enabled{bail!("disabled Bluesky requires canonical generic action branch");}
     let post=post_view(status);if !post.is_object(){bail!("authoritative full PostView missing");}
     let uri=s(post,"uri");let object=https_uri(uri)?;let actor=s(&status["account"],"uri");let view=&facts.return_view;
     let liked=b.confirmed_like.unwrap_or(facts.favourited||!b.like_record.is_empty());let bookmarked=facts.bookmarked||b.bookmarked;
-    let mut html=format!("<div class=\"tweet-actions\"><a class=\"btn btn-ghost\" href=\"?view=status&amp;object={}&amp;from={}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Open</a>",query(&object),query(view));
+    let mut html=String::from("<div class=\"tweet-actions\">");
     let mentions=if facts.reply_mentions.is_empty(){vec![s(&status["account"],"acct").to_owned()]}else{facts.reply_mentions.clone()};
     html.push_str(&format!("<a class=\"icon-btn\" href=\"?view={}&amp;compose=1&amp;reply_to={}&amp;to={}{}\" title=\"Reply\" aria-label=\"Reply\"><i class=\"ph ph-arrow-bend-up-left\" aria-hidden=\"true\"></i></a>",esc(view),query(&object),query(actor),super::actions::reply_suffix(&mentions,s(status,"spoiler_text"),yes(status,"sensitive"))));
     html.push_str(&quote(&object,view,n(post,"quoteCount").max(n(status,"quotes_count")),false,false));
     html.push_str(&button("repost",post,facts,b,&object,view,!b.repost_record.is_empty(),n(post,"repostCount").max(n(status,"reblogs_count")),false,false));
     html.push_str(&button("like",post,facts,b,&object,view,liked,n(post,"likeCount").max(n(status,"favourites_count")),false,false));
     html.push_str(&button("bookmark",post,facts,b,&object,view,bookmarked,0,false,false));
-    html.push_str(&format!("<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"meta\" title=\"Open on remote instance\">Remote</a>",esc(s(status,"url"))));
     let moderation=super::actions::render_moderation(&FediActionContext{owner_id:facts.owner_id,status_id:s(status,"id").into(),object_id:uri.into(),actor_id:actor.into(),remote_url:s(status,"url").into(),return_view:view.clone(),reply_mentions:mentions,spoiler:s(status,"spoiler_text").into(),sensitive:yes(status,"sensitive"),favourited:liked,bookmarked,boosted:false,counts:Counts::default(),csrf:facts.csrf.clone(),moderation:facts.moderation.clone()});
+    if moderation.is_empty()||!uri.starts_with("https://"){html.push_str(&super::actions::read_only_overflow_mode(uri,view,&super::card::remote_object_href(uri,status.get("url"))?,show_open));}
     // PHP report-object transport only admits HTTP object targets, never AT URIs.
     html.push_str(&moderation.replace(&format!("&amp;report_object={}",query(uri)),""));
     html.push_str("</div>");Ok(html)

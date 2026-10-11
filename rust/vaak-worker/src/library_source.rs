@@ -34,25 +34,20 @@ pub(crate) fn preserve_saved(source: &Value, mut fresh: Value) -> Value {
 pub(crate) async fn hydrate(db: &Client,statuses:Vec<Value>)->Result<Vec<Value>>{hydrate_depth(db,statuses,0).await}
 async fn hydrate_depth(db: &Client, mut statuses: Vec<Value>,depth:usize) -> Result<Vec<Value>> {
     if depth>16{bail!("PHP fallback: nested source depth exceeds canonical limit");}
-    for status in &mut statuses{
+    let mut projected_bsky=std::collections::HashSet::new();
+    for (index,status) in statuses.iter_mut().enumerate(){
         if status.get("post").is_some_and(Value::is_object){
-            let original=status.clone();let post=&original["post"];
-            let uri=s(post,"uri");let did=s(&post["author"],"did");let handle=s(&post["author"],"handle");
-            if super::mixed::bsky_at_uri(uri).is_none()||!did.starts_with("did:")||handle.is_empty()||!post.get("record").is_some_and(Value::is_object){bail!("PHP fallback: legacy FeedView needs canonical current author/PostView normalization");}
-            // Admission metadata only: legacy rendering consumes the untouched
-            // full FeedView item, not this scaffold as a normalized card.
-            use sha2::{Digest,Sha256};
-            status["id"]=serde_json::json!(format!("bsky:{}",&hex::encode(Sha256::digest(uri.as_bytes()))[..32]));
-            status["uri"]=serde_json::json!(uri);status["source"]=serde_json::json!("bluesky");status["visibility"]=serde_json::json!("public");
-            status["content"]=serde_json::json!(super::actions::esc(s(&post["record"],"text")));
-            status["account"]=serde_json::json!({"uri":format!("https://bsky.app/profile/{did}"),"url":format!("https://bsky.app/profile/{handle}"),"acct":handle,"avatar":s(&post["author"],"avatar")});
-            status["bsky_post"]=original;
+            *status=super::bsky_normalize::complete_plain(status)?;projected_bsky.insert(index);
         }
     }
     let targets = statuses.iter().filter_map(|st| super::mixed::bsky_at_uri(s(st, "uri"))).collect::<Vec<_>>();
     let mut bsky=std::collections::HashMap::<String,String>::new();
     if !targets.is_empty() {for row in db.query("SELECT bsky_uri,raw_json FROM bsky_posts WHERE bsky_uri=ANY($1)",&[&targets]).await?{bsky.insert(row.get(0),row.get(1));}}
-    for status in &mut statuses {
+    for (index,status) in statuses.iter_mut().enumerate() {
+        // Complete raw FeedView entries were validated above. Their owner
+        // saved-cache selection is separately retained by SavedEntryGrant;
+        // an assembled convenience URI must not send them through AP refresh.
+        if projected_bsky.contains(&index){continue}
         if let Some(uri) = super::mixed::bsky_at_uri(s(status, "uri")) {
             let Some(raw) = bsky.get(&uri) else { bail!("PHP fallback: Bluesky source needs AppView hydration (shared fetch budget 3)"); };
             let raw:Value=serde_json::from_str(raw).context("PHP fallback: malformed Bluesky cache source")?;
