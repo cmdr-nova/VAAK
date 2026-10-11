@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use anyhow::Context;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -14,6 +15,7 @@ const MAX_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Batch {
+    #[serde(default)] canonical_saved_only:bool,
     protocol_version: u8,
     status_preview_budget: i64,
     #[serde(default)] bsky_budget_deadline:Option<f64>,
@@ -27,7 +29,7 @@ struct Batch {
     #[serde(default)]
     bsky_bookmarks: Vec<BookmarkState>,
     #[serde(default)] saved_sources:Vec<super::selection::SavedSourceDescriptor>,
-    statuses: Vec<Value>,
+    #[serde(default)] statuses: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +85,7 @@ fn decode(bytes: &[u8]) -> anyhow::Result<Batch> {
         anyhow::bail!("batch body limit");
     }
     let batch: Batch = serde_json::from_slice(bytes)?;
+    if batch.canonical_saved_only&&(!batch.statuses.is_empty()||batch.return_view!="bookmarks"||batch.saved_sources.is_empty()||batch.saved_sources.len()>40||batch.saved_sources.iter().enumerate().any(|(i,d)|d.selected_ordinal!=i||d.selected_kind!="fedi"||!matches!(d.producer_kind.as_str(),"bookmarks_fedi"|"bookmarks_fedi_data"))){anyhow::bail!("invalid descriptor-only canonical batch")}
     if batch.protocol_version!=1 || batch.bsky_bookmarks.len() > 100 || batch.statuses.len() > 100
         || batch.csrf.len() > 4096 || batch.csrf.is_empty() || batch.owner_id < 1
         || !matches!(batch.return_view.as_str(), "bookmarks" | "favourites") {
@@ -138,18 +141,34 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
     // capability for every supplied source, including sources later omitted.
     // Diagnostic fixture routes pass no production Config and remain separate.
     if cfg.is_some()&&!batch.statuses.is_empty()&&batch.saved_sources.is_empty(){return (StatusCode::UNPROCESSABLE_ENTITY,Json(json!({"fallback":true}))).into_response()}
-    if super::selection::validate_descriptors(&batch.saved_sources,batch.statuses.len(),&batch.return_view).is_err(){return (StatusCode::UNPROCESSABLE_ENTITY,Json(json!({"fallback":true}))).into_response()}
+    let source_count=if batch.canonical_saved_only{batch.saved_sources.len()}else{batch.statuses.len()};
+    if super::selection::validate_descriptors(&batch.saved_sources,source_count,&batch.return_view).is_err(){return (StatusCode::UNPROCESSABLE_ENTITY,Json(json!({"fallback":true}))).into_response()}
     let warm=warm.or_else(||cfg.map(|cfg|native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>> = async {
-        let source_count=batch.statuses.len();let initial=batch.status_preview_budget;
+        let initial=batch.status_preview_budget;
         let db = crate::db::connect(database_url).await?;
         let states = batch.bsky_bookmarks.into_iter().map(|s| (s.uri, s.did, s.bookmarked)).collect();
         let session = super::context::TrustedSession::from_php_session(
             batch.owner_id, batch.csrf, batch.return_view, batch.bsky_enabled,
-        )?.with_lazy_media(batch.lazy_media).with_bsky_bookmarks(&db, states).await?.with_saved_sources(&db,batch.saved_sources,source_count).await?.with_warm_context(warm);
-        let (mut statuses,remaining)=super::context::admit_for_render_with_preview(&db,&session,batch.statuses,initial,deps.dns).await?;
+        )?.with_lazy_media(batch.lazy_media).with_bsky_bookmarks(&db, states).await?.with_saved_sources(&db,batch.saved_sources,source_count).await?.with_warm_context(if batch.canonical_saved_only{None}else{warm});
+        let mut projections=Vec::new();let mut sources=batch.statuses;
+        if batch.canonical_saved_only{
+            for index in 0..source_count{
+                let selected=super::context::SelectedLibrarySearchSource::canonical_bookmark(&db,&session,index).await?;
+                let mut projection=crate::profile_materialize::project_library_search_source(&db,selected).await?;
+                if !projection.warm_local_without_io(){anyhow::bail!("unsupported canonical local effects/cache")}
+                projection.complete_local_sql_presentation(&db).await?;
+                if !projection.qualified_warm_local(){anyhow::bail!("unsupported canonical local presentation")}
+                let mut status=projection.status().context("canonical source omitted")?.clone();
+                if status["id"]!=projection.original_source()["id"]||status["uri"]!=projection.original_source()["uri"]{anyhow::bail!("resolved canonical local SID/exact note changed")}
+                crate::interaction_flags::apply_to_statuses(&db,batch.owner_id,std::slice::from_mut(&mut status)).await?;
+                status["bookmarked"]=Value::Bool(true);sources.push(status);projections.push(projection);
+            }
+        }
+        let (mut statuses,remaining)=super::context::admit_for_render_with_preview(&db,&session,sources,initial,deps.dns).await?;
         #[cfg(test)] if let Some(clock)=deps.render_clock{for token in &mut statuses{token.set_render_clock(clock);}}
         let cards=statuses.iter().map(|token|super::card::render_admitted(token).map(|html|json!({"source_index":token.source_index(),"html":html}))).collect::<anyhow::Result<Vec<_>>>()?;
+        for projection in &projections{projection.require_current(&db).await?;}
         let state=crate::direct_preview::PreviewState::from_remaining(initial,remaining,source_count)?;
         let bytes=serde_json::to_vec(&json!({"ok":true,"protocol_version":1,"source_count":source_count,"cards":cards,"status_preview_state":state}))?;
         if bytes.len()>8*1024*1024{anyhow::bail!("Library reply limit")}

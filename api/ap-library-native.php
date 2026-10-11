@@ -136,3 +136,51 @@ function ap_library_native_render_batch(array $statuses, string $view, array $sa
     ap_native_preview_commit_state($reply['status_preview_state']);
     return $html;
 }
+
+/** Descriptor-only local resolver. A failed/unsupported whole batch leaves the
+ * original raw rows to the unchanged current canonical PHP mapper. */
+function ap_library_native_render_saved_local(array $rows, string $producer, int $owner, int $folder, int $offset, int $limit, ?bool &$attempted = null): ?string
+{
+    $attempted = false;
+    if (!ap_library_native_enabled() || !array_is_list($rows) || $rows === [] || count($rows) > 40
+        || !in_array($producer, ['bookmarks_fedi', 'bookmarks_fedi_data'], true)) return null;
+    $user = ap_auth_current_user();
+    if (!is_array($user) || (int) ($user['id'] ?? 0) !== $owner || !empty($user['is_guest'])) return null;
+    $url = (string) (getenv('VAAK_LIBRARY_NATIVE_URL') ?: 'http://127.0.0.1:8787/internal/library/render');
+    if (!ap_library_native_url_allowed($url) || !function_exists('curl_init')) return null;
+    $savedSources = [];
+    foreach ($rows as $ordinal => $row) {
+        if (!is_array($row) || !isset($row['id'])) return null;
+        $savedSources[] = ['source_index' => $ordinal, 'producer_kind' => $producer,
+            'selected_kind' => 'fedi', 'reference' => (string) $row['id'],
+            'selected_ordinal' => $ordinal, 'folder_id' => $folder, 'offset' => $offset, 'limit' => $limit];
+    }
+    $initial = ap_native_preview_effective_budget();
+    try {
+        $body = json_encode(['protocol_version' => 1, 'canonical_saved_only' => true,
+            'status_preview_budget' => $initial, 'owner_id' => $owner,
+            'csrf' => ap_auth_csrf_token(), 'return_view' => 'bookmarks',
+            'lazy_media' => !empty($GLOBALS['admin_bookmark_lazy_media']), 'bsky_enabled' => false,
+            'saved_sources' => $savedSources], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    } catch (Throwable $error) { return null; }
+    $response = '';
+    $ch = curl_init($url);
+    if ($ch === false) return null;
+    curl_setopt_array($ch, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $body,
+        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'X-VAAK-Library-Token: ' . getenv('VAAK_LIBRARY_NATIVE_SECRET')],
+        CURLOPT_RETURNTRANSFER => false, CURLOPT_FOLLOWLOCATION => false, CURLOPT_MAXREDIRS => 0,
+        CURLOPT_WRITEFUNCTION => static function ($ch, string $chunk) use (&$response): int {
+            if (strlen($response) + strlen($chunk) > 8 * 1024 * 1024) return 0;
+            $response .= $chunk; return strlen($chunk);
+        },
+        CURLOPT_CONNECTTIMEOUT_MS => 200, CURLOPT_TIMEOUT_MS => 3000,
+        CURLOPT_PROXY => '', CURLOPT_PROTOCOLS => CURLPROTO_HTTP]);
+    $attempted = true;
+    $success = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
+    if ($success === false || $code !== 200 || !is_string($response) || strlen($response) > 8 * 1024 * 1024) return null;
+    $reply = json_decode($response, true);
+    $html = is_array($reply) ? ap_library_native_validate_reply($reply, count($savedSources), $initial) : null;
+    if ($html === null) return null;
+    ap_native_preview_commit_state($reply['status_preview_state']);
+    return $html;
+}

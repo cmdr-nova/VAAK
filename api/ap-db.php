@@ -2653,6 +2653,7 @@ function ap_profile_badge_catalog(bool $includeAdmin = true): array
 {
     $catalog = [
         'admin' => ['label' => 'Admin', 'emoji' => '🛡️'],
+        'supporter' => ['label' => 'Supporter', 'emoji' => '💜'],
         'rainbow' => ['label' => 'Rainbow pride', 'emoji' => '🏳️‍🌈'],
         'trans' => ['label' => 'Trans pride', 'emoji' => '🏳️‍⚧️'],
         'bi' => ['label' => 'Bisexual pride', 'emoji' => '🩷💜💙'],
@@ -2717,13 +2718,14 @@ function ap_profile_normalize_badges(mixed $badges, bool $allowAdmin = true): ar
     if (!is_array($badges)) {
         return [];
     }
-    $out = [];
+    $earned = count(array_filter($badges, fn($b) => is_string($b) && trim($b) === 'supporter')) > 0;
+    $out = $earned ? ['supporter'] : [];
     foreach ($badges as $badge) {
         $key = is_string($badge) ? trim($badge) : '';
         if ($key !== '' && isset($allowed[$key]) && !in_array($key, $out, true)) {
             $out[] = $key;
         }
-        if (count($out) >= 6) {
+        if (count($out) >= (in_array('supporter', $out, true) ? 7 : 6)) {
             break;
         }
     }
@@ -2755,11 +2757,33 @@ function ap_profile_ensure_default(PDO $db): void
     ]);
 }
 
+/** Supporter flair is authoritative only when a paid reward was consumed by this account. */
+function ap_profile_supporter_awarded(string $actorKey): bool
+{
+    try {
+        $db=ap_db();
+        $present=$db->getAttribute(PDO::ATTR_DRIVER_NAME)==='pgsql'
+            ? $db->query("SELECT to_regclass('ap_supporter_codes') IS NOT NULL")->fetchColumn()
+            : $db->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ap_supporter_codes'")->fetchColumn();
+        if (!$present) return false;
+        $st=$db->prepare('SELECT 1 FROM ap_supporter_codes c JOIN ap_users u ON u.id=c.used_by WHERE u.actor_key=? AND u.disabled_at IS NULL AND c.used_at IS NOT NULL LIMIT 1');
+        $st->execute([$actorKey]);return (bool)$st->fetchColumn();
+    } catch(Throwable $e) { return false; } // Unprovisioned staged table fails closed.
+}
+function ap_profile_authorized_badges(mixed $badges,string $actorKey): array
+{
+    $out=ap_profile_normalize_badges($badges);
+    $out=array_slice(array_values(array_diff($out,['supporter'])),0,6);
+    if (ap_profile_supporter_awarded($actorKey)) array_unshift($out,'supporter');
+    return $out;
+}
+
 function ap_profile_get(string $actorKey = 'cmdr_nova'): array
 {
     $profileCacheKey = 'vaak:profile:v1:' . hash('sha256', trim($actorKey));
     $cached = function_exists('ap_redis_json_get') ? ap_redis_json_get($profileCacheKey) : null;
     if (is_array($cached) && isset($cached['actor_key'], $cached['name'], $cached['summary'])) {
+$cached['profile_badges']=ap_profile_authorized_badges($cached['profile_badges'] ?? [],$actorKey);
         return $cached;
     }
     $stmt = ap_db()->prepare('SELECT * FROM actor_profile WHERE actor_key = ?');
@@ -2811,7 +2835,7 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
         'reply_policy' => in_array((string) ($row['reply_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['reply_policy'] : 'anyone',
         'quote_policy' => in_array((string) ($row['quote_policy'] ?? 'anyone'), ['anyone', 'followers', 'nobody'], true) ? (string) $row['quote_policy'] : 'anyone',
         'forum_signature' => trim((string) ($row['forum_signature'] ?? '')),
-        'profile_badges' => ap_profile_normalize_badges($row['profile_badges'] ?? []),
+        'profile_badges' => ap_profile_authorized_badges($row['profile_badges'] ?? [],$actorKey),
         'hide_profile_replies' => array_key_exists('hide_profile_replies', $row)
             ? !empty($row['hide_profile_replies'])
             : false,
@@ -3097,6 +3121,8 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
     $profileBadges = array_key_exists('profile_badges', $fields)
         ? ap_profile_normalize_badges($fields['profile_badges'], $actorKey === 'cmdr_nova')
         : ap_profile_normalize_badges($existingProfile['profile_badges'] ?? [], $actorKey === 'cmdr_nova');
+    $profileBadges = array_values(array_diff($profileBadges, ['supporter']));
+    if (in_array('supporter',ap_profile_normalize_badges($existingProfile['profile_badges'] ?? []),true) && ap_profile_supporter_awarded($actorKey)) array_unshift($profileBadges, 'supporter');
     $hideProfileReplies = array_key_exists('hide_profile_replies', $fields)
         ? (!empty($fields['hide_profile_replies']) ? 1 : 0)
         : (!empty($existingProfile['hide_profile_replies']) ? 1 : 0);
@@ -5055,7 +5081,9 @@ function ap_metrics_record(
             // 0.6.70/0.6.71: Create/Announce/Quote* from a followed actor → followers' Home ranked.
             if (
                 in_array($type, ['Create', 'Announce', 'Quote', 'QuotePost'], true)
-                && in_array($actionTaken, ['log', 'local_observe'], true)
+                && (in_array($actionTaken, ['log', 'local_observe'], true)
+                    || ($actionTaken === 'compose' && $visibility === 'public'
+                        && ap_timeline_actor_is_local((string) $actorId)))
                 && is_string($actorId)
                 && $actorId !== ''
             ) {

@@ -84,12 +84,16 @@ function vaak_bookmark_folders_list(int $ownerUserId): array
     }
     vaak_bookmark_folders_ensure_schema();
     try {
+        $match = vaak_bookmark_folder_fedi_match_sql();
         $st = ap_db()->prepare(
-            'SELECT f.*,
-                    (SELECT COUNT(*) FROM vaak_bookmark_folder_items i WHERE i.folder_id = f.id) AS item_count
+            "SELECT f.*,
+                    (SELECT COUNT(DISTINCT COALESCE('saved:' || CAST(b.id AS TEXT), 'raw:' || fi.status_id))
+                     FROM vaak_bookmark_folder_items fi
+                     LEFT JOIN masto_bookmarks b ON b.owner_user_id = fi.owner_user_id AND {$match}
+                     WHERE fi.folder_id = f.id AND fi.owner_user_id = f.owner_user_id) AS item_count
              FROM vaak_bookmark_folders f
              WHERE f.owner_user_id = ?
-             ORDER BY f.position ASC, f.id ASC'
+             ORDER BY f.position ASC, f.id ASC"
         );
         $st->execute([$ownerUserId]);
         return $st->fetchAll() ?: [];
@@ -164,6 +168,96 @@ function vaak_bookmark_folder_delete(int $folderId, int $ownerUserId): array
     }
 }
 
+/** Owner binding is supplied by each caller's folder/save join; no audience grant. */
+function vaak_bookmark_folder_fedi_match_sql(): string
+{
+    if (ap_db()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+        return "(fi.status_id = b.status_id OR fi.status_id = b.object_id
+          OR (fi.status_id LIKE 'https://%' AND rtrim(fi.status_id, '/') = rtrim(b.object_id, '/'))
+          OR EXISTS(SELECT 1 FROM events e WHERE rtrim(e.object_id, '/') = rtrim(b.object_id, '/')
+            AND ((e.id >= 0 AND e.id < 1000000 AND fi.status_id = CAST(3000000 + e.id AS TEXT))
+              OR (CAST(fi.status_id AS INTEGER) >= 1000000000000000000
+                AND CAST((CAST(fi.status_id AS INTEGER) % 1000000000) / 100000000 AS INTEGER) = 1
+                AND CAST(fi.status_id AS INTEGER) % 100000000 = e.id)))
+          OR EXISTS(SELECT 1 FROM masto_statuses s WHERE rtrim(s.note_id, '/') = rtrim(b.object_id, '/')
+            AND s.local_id > 0 AND s.local_id < 2000000
+            AND fi.status_id = CAST(s.local_id AS TEXT)))";
+    }
+    return <<<'SQL'
+(fi.status_id = b.status_id OR fi.status_id = b.object_id
+ OR (fi.status_id LIKE 'https://%' AND rtrim(fi.status_id, '/') = rtrim(b.object_id, '/'))
+ OR EXISTS (
+   SELECT 1 FROM events folder_event
+   WHERE (folder_event.object_id = rtrim(b.object_id, '/') OR folder_event.object_id = rtrim(b.object_id, '/') || '/')
+     AND ((folder_event.id >= 0 AND folder_event.id < 1000000 AND fi.status_id = (3000000 + folder_event.id)::text)
+       OR (CASE WHEN fi.status_id ~ '^[0-9]{18,19}$' THEN fi.status_id::numeric ELSE NULL END) >= 1000000000000000000
+         AND mod(floor(((CASE WHEN fi.status_id ~ '^[0-9]{18,19}$' THEN fi.status_id::numeric ELSE NULL END) % 1000000000) / 100000000), 10) = 1
+         AND mod((CASE WHEN fi.status_id ~ '^[0-9]{18,19}$' THEN fi.status_id::numeric ELSE NULL END), 100000000) = folder_event.id)
+ )
+ OR EXISTS (
+   SELECT 1 FROM masto_statuses folder_local
+   WHERE (folder_local.note_id = rtrim(b.object_id, '/') OR folder_local.note_id = rtrim(b.object_id, '/') || '/')
+     AND folder_local.local_id > 0 AND folder_local.local_id < 2000000
+     AND fi.status_id = folder_local.local_id::text
+ ))
+SQL;
+}
+
+/** Resolve only owned saved keys; source IDs are locators, never permissions. */
+function vaak_bookmark_folder_saved_keys(string $statusId, int $ownerUserId, ?string $objectId = null): array
+{
+    $keys = [$statusId];
+    $objects = [];
+    if (is_string($objectId) && $objectId !== '') $objects[] = $objectId;
+    if (str_starts_with($statusId, 'https://') || str_starts_with($statusId, 'at://')) $objects[] = $statusId;
+    if (ctype_digit($statusId)) {
+        // Read source identity without hydrating media or fetching a remote actor.
+        if (function_exists('ap_masto_event_id_from_status_id')) {
+            $eventId = ap_masto_event_id_from_status_id((int) $statusId);
+            if ($eventId !== null) {
+                $st = ap_db()->prepare('SELECT object_id FROM events WHERE id = ?');
+                $st->execute([$eventId]);
+                $object = $st->fetchColumn();
+                if (is_string($object) && $object !== '') $objects[] = $object;
+            }
+        }
+        if (function_exists('ap_masto_local_row_from_public_id')) {
+            $local = ap_masto_local_row_from_public_id((int) $statusId);
+            if (is_array($local) && !empty($local['note_id'])) $objects[] = (string) $local['note_id'];
+        }
+    }
+    $objectKeys = [];
+    foreach ($objects as $object) {
+        $objectKeys = array_merge($objectKeys, function_exists('ap_masto_object_id_lookup_keys')
+            ? ap_masto_object_id_lookup_keys($object) : [$object]);
+    }
+    $objectKeys = array_values(array_unique($objectKeys));
+    $sql = 'SELECT status_id, object_id FROM masto_bookmarks WHERE owner_user_id = ? AND (status_id = ?';
+    $params = [$ownerUserId, $statusId];
+    if ($objectKeys !== []) {
+        $sql .= ' OR object_id IN (' . implode(',', array_fill(0, count($objectKeys), '?')) . ')';
+        $params = array_merge($params, $objectKeys);
+    }
+    $st = ap_db()->prepare($sql . ')');
+    $st->execute($params);
+    $savedRows = $st->fetchAll() ?: [];
+    foreach ($savedRows as $row) {
+        $keys[] = (string) $row['status_id'];
+        if (!empty($row['object_id'])) $keys[] = (string) $row['object_id'];
+    }
+    $keys = array_merge($keys, $objectKeys);
+    if ($savedRows !== []) {
+        $savedIds = array_column($savedRows, 'status_id');
+        $match = vaak_bookmark_folder_fedi_match_sql();
+        $historic = ap_db()->prepare('SELECT DISTINCT fi.status_id FROM vaak_bookmark_folder_items fi
+            JOIN masto_bookmarks b ON b.owner_user_id = fi.owner_user_id AND ' . $match . '
+            WHERE fi.owner_user_id = ? AND b.status_id IN (' . implode(',', array_fill(0, count($savedIds), '?')) . ')');
+        $historic->execute(array_merge([$ownerUserId], $savedIds));
+        foreach ($historic->fetchAll(PDO::FETCH_COLUMN) ?: [] as $key) $keys[] = (string) $key;
+    }
+    return array_values(array_unique(array_filter($keys, static fn($key) => $key !== '')));
+}
+
 /**
  * Ensure bookmarked, then add to folder.
  *
@@ -186,6 +280,11 @@ function vaak_bookmark_folder_add_status(
         $check->execute([$folderId, $ownerUserId]);
         if (!$check->fetchColumn()) {
             return ['ok' => false, 'error' => 'Folder not found.'];
+        }
+        if (function_exists('ap_masto_canonical_interaction_keys')) {
+            $canonical = ap_masto_canonical_interaction_keys($statusId, (string) ($objectId ?? ''));
+            $statusId = $canonical['status_id'];
+            $objectId = $canonical['object_id'] !== '' ? $canonical['object_id'] : $objectId;
         }
         if (function_exists('ap_masto_bookmark_add')) {
             ap_masto_bookmark_add($statusId, $objectId, $ownerUserId);
@@ -219,11 +318,13 @@ function vaak_bookmark_folder_remove_status(int $folderId, string $statusId, int
     }
     vaak_bookmark_folders_ensure_schema();
     try {
+        $keys = vaak_bookmark_folder_saved_keys($statusId, $ownerUserId);
         $st = ap_db()->prepare(
             'DELETE FROM vaak_bookmark_folder_items
-             WHERE folder_id = ? AND owner_user_id = ? AND status_id = ?'
+             WHERE folder_id = ? AND owner_user_id = ? AND status_id IN ('
+             . implode(',', array_fill(0, count($keys), '?')) . ')'
         );
-        $st->execute([$folderId, $ownerUserId, $statusId]);
+        $st->execute(array_merge([$folderId, $ownerUserId], $keys));
         return ['ok' => true];
     } catch (Throwable $e) {
         error_log('[vaak-bm-folders] remove: ' . $e->getMessage());

@@ -14,12 +14,13 @@ pub(crate) fn complete_plain(item:&Value)->Result<Value>{
  let key=uri.rsplit('/').next().unwrap_or("");let account_url=format!("https://bsky.app/profile/{}",super::actions::query(handle));
  let created=if s(record,"createdAt").is_empty(){s(post,"indexedAt")}else{s(record,"createdAt")};
  if created.is_empty(){bail!("PHP fallback: Bluesky source needs effect-clock created_at")}
+ let sensitive=super::bsky::sensitive(post);
  let mut status=json!({"id":uri,"url":format!("{account_url}/post/{}",super::actions::query(key)),"uri":uri,
  "content":super::actions::esc(text).replace('\n',"<br>\n"),"created_at":created,"visibility":"public","language":"en",
  "account":{"id":did,"url":account_url,"username":handle,"acct":handle,"display_name":display,"avatar":s(author,"avatar"),"avatar_static":s(author,"avatar"),"uri":format!("https://bsky.app/profile/{did}")},
  "reblogs_count":super::card::integer(post,"repostCount"),"favourites_count":super::card::integer(post,"likeCount"),"replies_count":super::card::integer(post,"replyCount"),
  "media_attachments":[],"reblog":null,"quote":null,"source":"bluesky","author_did":did,"trend_actors":[did],"bsky_post":post,"bsky_cid":s(post,"cid"),
- "sensitive":super::bsky::sensitive(post),"spoiler_text":"","in_reply_to_id":null,"in_reply_to_account_id":null});
+ "sensitive":sensitive,"spoiler_text":if sensitive {"Sensitive content"} else {""},"in_reply_to_id":null,"in_reply_to_account_id":null});
  if let Some(value)=item.get("_vaak_feed_source"){status["vaak_feed_source"]=value.clone()}
  Ok(status)
 }

@@ -39,7 +39,7 @@ reference_load($root.'/ap-db.php',['ap_fix_utf8','ap_quote_ld_context','ap_note_
 preg_match_all('/^function (ap_masto_[a-zA-Z0-9_]+)\(/m',(string)file_get_contents($root.'/ap-masto-entities.php'),$entityNames);
 reference_load($root.'/ap-masto-entities.php',$entityNames[1]);
 reference_load($root.'/ap-rss.php',['ap_rss_item_by_id','ap_rss_local_status_id','ap_rss_parse_local_status_id']);
-reference_load($root.'/ap-bookmark-folders.php',['vaak_bookmark_folders_ensure_schema','vaak_bookmark_folders_list','vaak_bookmark_folder_create','vaak_bookmark_folder_delete','vaak_bookmark_folder_add_status','vaak_bookmark_folder_remove_status','vaak_bookmark_folders_on_unbookmark','vaak_bookmark_folders_for_status']);
+reference_load($root.'/ap-bookmark-folders.php',['vaak_bookmark_folder_fedi_match_sql','vaak_bookmark_folder_saved_keys','vaak_bookmark_folders_ensure_schema','vaak_bookmark_folders_list','vaak_bookmark_folder_create','vaak_bookmark_folder_delete','vaak_bookmark_folder_add_status','vaak_bookmark_folder_remove_status','vaak_bookmark_folders_on_unbookmark','vaak_bookmark_folders_for_status']);
 /** Exact source spans, checked sentinels; no copied/reimplemented controller. */
 function source_span(string $source,string $start,string $end): string {
     $a=strpos($source,$start);$b=$a===false?false:strpos($source,$end,$a+strlen($start));
@@ -87,12 +87,13 @@ $db->exec("CREATE TABLE ap_users(id INTEGER PRIMARY KEY,actor_id TEXT);INSERT IN
 CREATE TABLE rss_feeds(id INTEGER PRIMARY KEY,owner_user_id INTEGER,title TEXT,favicon_url TEXT,site_url TEXT,feed_url TEXT);INSERT INTO rss_feeds VALUES(1,201,'A','','','https://feed.test/a'),(2,202,'B','','','https://feed.test/b');
 CREATE TABLE rss_items(id INTEGER PRIMARY KEY,feed_id INTEGER);INSERT INTO rss_items VALUES(11,1),(22,2);
 CREATE TABLE masto_favourites(owner_user_id INTEGER,owner_actor_id TEXT,status_id TEXT,object_id TEXT,target_actor TEXT,like_activity_id TEXT,created_at TEXT,PRIMARY KEY(owner_user_id,status_id));
-CREATE TABLE masto_bookmarks(owner_user_id INTEGER,owner_actor_id TEXT,status_id TEXT,object_id TEXT,created_at TEXT,PRIMARY KEY(owner_user_id,status_id));
+CREATE TABLE masto_bookmarks(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_user_id INTEGER,owner_actor_id TEXT,status_id TEXT,object_id TEXT,created_at TEXT,UNIQUE(owner_user_id,status_id));
 CREATE TABLE masto_reblogs(owner_user_id INTEGER,owner_actor_id TEXT,status_id TEXT,boost_status_id TEXT,object_id TEXT,target_actor TEXT,announce_activity_id TEXT,created_at TEXT,PRIMARY KEY(owner_user_id,status_id));
 CREATE TABLE vaak_bookmark_folders(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_user_id INTEGER,title TEXT,position INTEGER,created_at TEXT,updated_at TEXT);
 CREATE TABLE invalidations(owner INTEGER,view TEXT);
 CREATE TABLE masto_statuses(local_id INTEGER PRIMARY KEY,note_id TEXT,visibility TEXT,content_text TEXT,spoiler_text TEXT,sensitive INTEGER,edited_at TEXT,published TEXT,create_id TEXT);
 INSERT INTO masto_statuses(local_id,note_id,visibility) VALUES(1,'https://local.test/users/a/notes/aaa','private'),(2,'https://local.test/users/b/notes/bbb','public'),(3,'https://local.test/users/a/notes/ddd','direct');
+CREATE TABLE events(id INTEGER PRIMARY KEY, object_id TEXT);
 CREATE TABLE masto_media(local_id INTEGER PRIMARY KEY,status_local_id INTEGER,owner_user_id INTEGER,mime TEXT,public_url TEXT);
 CREATE TABLE outbox_notes(id TEXT PRIMARY KEY,content TEXT,raw_create_json TEXT,to_json TEXT,cc_json TEXT,in_reply_to TEXT);
 INSERT INTO outbox_notes VALUES('https://local.test/users/a/notes/aaa','old','{}','[\"https://local.test/users/a/followers\"]','[]',NULL);

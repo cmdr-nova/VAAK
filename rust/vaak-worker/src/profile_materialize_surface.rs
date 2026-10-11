@@ -27,6 +27,27 @@ impl crate::profile_enrichment::CurrentEnrichmentGrant for SurfaceCompletionGran
     }
 }
 impl CanonicalProjection {
+    pub(crate) fn qualified_warm_local(&self)->bool{self.complete&&self.warm_local_without_io()}
+    pub(crate) fn warm_local_without_io(&self)->bool{self.effects.is_empty()&&self.cache.is_empty()&&self.status.as_ref().is_some_and(|status|status["poll"].is_null()&&status["in_reply_to_id"].is_null()&&!status["quote"].is_object())}
+    /// Local saved pages have no external completion or writer in this slice.
+    /// Read the exact full graph lists into the dependency journal in one pure
+    /// SQL phase; refresh the complete capability before and after that phase.
+    /// The final response still refreshes both that journal and source policy.
+    pub(crate) async fn complete_local_sql_presentation(&mut self,db:&Client)->Result<()>{
+        if !self.warm_local_without_io(){bail!("unsupported saved local SQL presentation")}
+        self.require_current(db).await?;
+        if let Some(status)=self.status.as_mut(){
+            for task in &self.graphs{
+                if !task.actor.starts_with("https://mkultra.monster/users/"){bail!("nonlocal saved graph completion")}
+                for kind in ["followers","following"]{
+                    let sql=if kind=="followers"{"SELECT to_jsonb(f) FROM followers f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') ORDER BY followed_at DESC"}else{"SELECT to_jsonb(f) FROM following f WHERE owner_actor_id IN($1::jsonb->>'actor',($1::jsonb->>'actor')||'/') ORDER BY followed_at DESC"};
+                    let key=json!({"actor":task.actor.trim_end_matches('/')});let rows=Dependency::read(db,sql,&key).await?;
+                    apply_graph_count(status,&task.actor,kind,rows.len());self.ledger.dependencies.push(Dependency::new(sql,key,rows));
+                }
+            }
+        }
+        self.complete=true;self.require_current(db).await
+    }
     pub(crate) fn status(&self)->Option<&Value>{self.status.as_ref()}
     pub(crate) fn original_source(&self)->&Value{self.selected.source()}
     pub(crate) fn original_saved_sid(&self)->&str{self.selected.original_saved_sid()}

@@ -31,6 +31,7 @@ function ap_auth_notify_operator_registration(string $username,int $id,bool $app
 const AP_AUTH_CSRF_KEY = '_vaak_csrf';
 foreach (['ap_db_driver','ap_db_last_insert_id','ap_local_user_by_username'] as $fn) approval_load(dirname(__DIR__).'/ap-db.php',$fn);
 foreach (['ap_auth_username_ok','ap_auth_csrf_ok','ap_auth_user_by_id','ap_auth_user_by_login','ap_auth_verify_credentials','ap_auth_invite_lookup','ap_auth_create_account_row','ap_auth_provision_registered_account','ap_auth_register'] as $fn) approval_load(dirname(__DIR__).'/ap-auth.php',$fn);
+foreach (['ap_supporter_enabled','ap_supporter_schema','ap_supporter_email_hash','ap_supporter_issue','ap_supporter_code_hash','ap_supporter_available','ap_supporter_award','ap_supporter_invalidate','ap_supporter_redeem'] as $fn) approval_load(dirname(__DIR__).'/ap-supporter.php',$fn);
 foreach (['ap_registration_approvals_enabled','ap_registration_approvals_schema','ap_registration_approvals_lock','ap_registration_submit','ap_registration_current_admin','ap_registration_applications_list','ap_registration_decide'] as $fn) approval_load(dirname(__DIR__).'/ap-registration-approvals.php',$fn);
 function check(bool $ok,string $label): void { if (!$ok) throw new RuntimeException($label); $GLOBALS['checks'][]=$label; }
 if (getenv('APPROVAL_REFERENCE_SETUP_ONLY') === '1') return;

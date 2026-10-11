@@ -49,6 +49,17 @@ pub(crate) async fn resolve(db:&Client,dns:&dyn crate::direct_preview::PreviewDn
   fn ipv4<'a>(&'a self,_:&'a str)->Pin<Box<dyn Future<Output=Result<Vec<Ipv4Addr>>>+Send+'a>>{Box::pin(async move{
    self.calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);let db=crate::db::connect(&self.url).await?;
    match self.mutation{
+    "authority_follower_removed"=>{db.execute("DELETE FROM following WHERE owner_actor_id='https://mkultra.monster/users/fixture'",&[]).await?;},
+    "authority_recipient_removed"=>{db.execute("DELETE FROM mentions WHERE owner_user_id::bigint=1",&[]).await?;},
+    "authority_personal_block"=>{db.execute("INSERT INTO ap_user_blocks(id,owner_user_id,scope,value) SELECT 991,1,'actor',actor_id FROM events WHERE id::bigint=100",&[]).await?;},
+    "authority_personal_mute"=>{db.execute("INSERT INTO ap_mutes(owner_user_id,actor_id) SELECT 1,actor_id FROM events WHERE id::bigint=100",&[]).await?;},
+    "authority_server_block"=>{db.execute("INSERT INTO ap_blocks(id,scope,value,kind) SELECT 991,'actor',actor_id,'block' FROM events WHERE id::bigint=100",&[]).await?;},
+    "authority_server_mute"=>{db.execute("INSERT INTO ap_blocks(id,scope,value,kind) SELECT 991,'actor',actor_id,'mute' FROM events WHERE id::bigint=100",&[]).await?;},
+    "authority_word"=>{db.execute("INSERT INTO ap_muted_words(id,owner_user_id,phrase) VALUES(991,1,'Saved public text')",&[]).await?;},
+    "authority_unblur"=>{db.execute("UPDATE actor_profile SET auto_unblur_sensitive=1 WHERE actor_key='fixture'",&[]).await?;},
+    "favourite_removed"=>{db.execute("DELETE FROM masto_favourites WHERE owner_user_id::bigint=1",&[]).await?;},
+    "favourite_window_shift"=>{db.execute("INSERT INTO masto_favourites(id,owner_user_id,status_id,object_id,created_at) VALUES(9999,1,'late-window-row','https://remote.test/late-window','2027-01-01')",&[]).await?;},
+    "favourite_unpainted_row"=>{db.execute("INSERT INTO masto_favourites(id,owner_user_id,status_id,object_id,created_at) VALUES(9999,1,'late-hidden-row','rss:999999','2025-01-01')",&[]).await?;},
     "bookmark_removed"=>{db.execute("DELETE FROM masto_bookmarks WHERE owner_user_id::bigint=1",&[]).await?;},
     "owner_revoked"=>{db.execute("UPDATE ap_users SET disabled_at='2026-10-11' WHERE id::bigint=1",&[]).await?;},
     "network_window_shift"=>{db.execute("INSERT INTO masto_bookmarks(id,owner_user_id,status_id,object_id,created_at) VALUES(9999,1,'late-window-row','https://remote.test/late-window','2027-01-01')",&[]).await?;},
@@ -66,9 +77,10 @@ pub(crate) async fn resolve(db:&Client,dns:&dyn crate::direct_preview::PreviewDn
   let baseline:Value=serde_json::from_slice(&std::fs::read(std::env::var("VAAK_SAVED_FAULT_REFERENCE")?)?)?;
   let request_prefix=std::env::var("VAAK_SAVED_FAULT_REQUEST_PREFIX")?;
   let dburl=std::env::var("VAAK_SAVED_FAULT_DB")?;let admin=crate::db::connect(&dburl).await?;let mut results=Vec::new();
-  let mutations=if std::env::var("VAAK_SAVED_NETWORK_FAULTS").ok().as_deref()==Some("1"){vec!["bookmark_removed","bsky_cache_removed","bsky_disconnected","bsky_reconnected","owner_revoked","network_window_shift","network_cursor_sentinel"]}else{vec!["bookmark_removed","bsky_cache_removed","bsky_disconnected","bsky_reconnected"]};
+  let authority=std::env::var("VAAK_LIBRARY_AUTHORITY_FAULTS").ok().as_deref()==Some("1");
+  let mutations=if authority{vec!["authority_follower_removed","authority_recipient_removed","authority_personal_block","authority_personal_mute","authority_server_block","authority_server_mute","authority_word","authority_unblur"]}else if std::env::var("VAAK_FAVOURITE_FAULTS").ok().as_deref()==Some("1"){vec!["favourite_removed","owner_revoked","favourite_window_shift","favourite_unpainted_row"]}else if std::env::var("VAAK_SAVED_NETWORK_FAULTS").ok().as_deref()==Some("1"){vec!["bookmark_removed","bsky_cache_removed","bsky_disconnected","bsky_reconnected","owner_revoked","network_window_shift","network_cursor_sentinel"]}else{vec!["bookmark_removed","bsky_cache_removed","bsky_disconnected","bsky_reconnected"]};
   for width in ["INTEGER","BIGINT"]{for mutation in mutations.iter().copied(){
-   let bsky=mutation.starts_with("bsky_");let case=if bsky{"saved_bsky"}else{"saved_ap"};
+   let bsky=mutation.starts_with("bsky_");let case=if authority{match mutation{"authority_follower_removed"=>"private_follower","authority_recipient_removed"=>"direct_recipient",_=>"public"}}else if bsky{"saved_bsky"}else{"saved_ap"};
    let snapshot=baseline["captures"].as_array().unwrap().iter().find(|row|row["width"]==width&&row["case"]==case).context("actual saved fixture capture")?;
    let schema=format!("saved_fault_{}_{}_{}",width.to_ascii_lowercase(),std::process::id(),mutation);
    admin.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema}")).await?;
@@ -83,24 +95,29 @@ pub(crate) async fn resolve(db:&Client,dns:&dyn crate::direct_preview::PreviewDn
     admin.batch_execute("INSERT INTO bsky_sessions(owner_user_id,handle,did,pds_host,access_jwt_enc,refresh_jwt_enc,connected_at,updated_at) VALUES(1,'viewer.test','did:plc:viewer','https://pds.test','fixture-not-credentials','fixture-not-credentials','2026-10-10','2026-10-10')").await?;
     let lines=std::fs::read_to_string(format!("{request_prefix}-{}-requests.jsonl",width.to_ascii_lowercase()))?;
     let request=lines.lines().map(|line|serde_json::from_str::<Value>(line).unwrap()).find(|request|{
-     let body=&request["request"];if bsky{body["statuses"][0]["post"].is_object()&&body["statuses"].as_array().is_some_and(|items|items.len()==1)}else{body["statuses"][0]["id"]=="saved-ap-123"&&body["saved_sources"][0]["folder_id"]==0&&body["statuses"].as_array().is_some_and(|items|items.len()==1)}
+     let body=&request["request"];if bsky{body["statuses"][0]["post"].is_object()&&body["statuses"].as_array().is_some_and(|items|items.len()==1)}else{body["statuses"][0]["id"]=="saved-ap-123"&&(!authority||body["statuses"][0]["visibility"]==snapshot["actual_entry_calls"][0]["entries"][0]["item"]["visibility"])&&body["saved_sources"][0]["folder_id"]==0&&body["statuses"].as_array().is_some_and(|items|items.len()==1)}
     }).context("actual native private batch")?;
     let mut body=request["request"].clone();body.as_object_mut().unwrap().remove("_fixture_path");
     // Distinct fault-only source URL, retained in the test artifact. This
     // invokes actual eligible DNS; it does not substitute a preview result.
     if bsky{body["statuses"][0]["post"]["record"]["text"]=serde_json::json!("Saved public text https://withdrawal-preview.test/page");}
     else{body["statuses"][0]["content"]=serde_json::json!("<p>Saved public text https://withdrawal-preview.test/page</p>");}
+    if authority{admin.batch_execute("INSERT INTO link_preview_cards(url,title,description,type,status,expires_at) VALUES('https://withdrawal-preview.test/page','Current cached authority preview','Current stored metadata','link','ok','2099-01-01T00:00:00Z')").await?;}
     let dns=MutationDns{url:url.clone(),mutation,calls:0.into()};let clock=chrono::DateTime::from_timestamp(1791673200,0).unwrap();let deps=crate::direct_preview::PreviewDependencies{dns:&dns,render_clock:Some(clock)};
     let cfg=crate::config::Config{database_url:url.clone(),redis_url:"redis://127.0.0.1:1/0".into(),redis_queue_url:"redis://127.0.0.1:1/1".into(),jetstream_state:std::path::PathBuf::new(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:std::path::PathBuf::new(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};
     let warm=Arc::new(crate::profile_enrichment::WarmContext::new(cfg,Arc::new(NoWorkers)).with_fixture_clock(clock));
     let mut headers=axum::http::HeaderMap::new();headers.insert("X-VAAK-Library-Token","saved-fault-private-token-0000000001".parse()?);
     let response=crate::library::bridge::fixture_request_with_warm(&url,"saved-fault-private-token-0000000001",headers,axum::body::Bytes::from(serde_json::to_vec(&body)?),&deps,warm.clone()).await;
-    anyhow::ensure!(response.status()==axum::http::StatusCode::UNPROCESSABLE_ENTITY,"mutation did not reject native publication");
+    let irrelevant_preference=mutation=="authority_unblur";
+    let expected_status=if irrelevant_preference{200}else{422};
+    anyhow::ensure!(response.status().as_u16()==expected_status,"unexpected publication for {mutation}");
     anyhow::ensure!(response.headers().get(axum::http::header::CACHE_CONTROL).and_then(|value|value.to_str().ok())==Some("private, no-store"),"private failure cache policy");
-    let reply:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024).await?)?;
-    anyhow::ensure!(reply==serde_json::json!({"fallback":true})&&dns.calls.load(std::sync::atomic::Ordering::SeqCst)==1,"actual DNS/reply path");
+    let reply:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),8*1024*1024).await?)?;
+    anyhow::ensure!(dns.calls.load(std::sync::atomic::Ordering::SeqCst)==1,"actual DNS path");
+    if irrelevant_preference{anyhow::ensure!(reply["cards"].as_array().is_some_and(|cards|cards.len()==1),"non-sensitive preference control omitted ordinary card");}
+    else{anyhow::ensure!(reply==serde_json::json!({"fallback":true}),"actual private fallback reply");}
     anyhow::ensure!(warm.requested_actors().is_empty()&&warm.requested_media().is_empty(),"unrelated enrichment effect");
-    Ok(serde_json::json!({"width":width,"mutation":mutation,"request":body,"reply":reply,"native_status":422,"dns_calls":1,"actor_warm":[],"media_warm":[],"scope":"actual private handler + server-owned DNS-time current SQL revocation; declared source text extension/session/worker delivery; ordinary PHP fallback paint is outside this fault gate"}))
+    Ok(serde_json::json!({"width":width,"mutation":mutation,"request":body,"reply":reply,"native_status":expected_status,"dns_calls":1,"positive_non_sensitive_preference_control":irrelevant_preference,"actor_warm":[],"media_warm":[],"scope":"actual private handler + server-owned DNS-time current SQL revocation; declared source text extension/session/worker delivery; ordinary PHP fallback paint is outside this fault gate"}))
    }.await;
    admin.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;results.push(run?);
   }}

@@ -1716,6 +1716,13 @@ function ap_masto_status_media_attachments(int $statusLocalId): array
 
 function ap_masto_instance_v1(): array
 {
+    if (!function_exists('ap_registration_approvals_enabled')) {
+        require_once __DIR__ . '/ap-registration-approvals.php';
+    }
+    $applicationsOpen = ap_registration_approvals_enabled();
+    $description = $applicationsOpen
+        ? 'ActivityPub / Mastodon-compatible instance (NovaLandia). Account applications require administrator approval.'
+        : 'Invite-only ActivityPub / Mastodon-compatible instance (NovaLandia).';
     // Admin contact stays cmdr_nova regardless of any request session/token.
     $contactUser = null;
     try {
@@ -1737,8 +1744,8 @@ function ap_masto_instance_v1(): array
     return [
         'uri' => 'mkultra.monster',
         'title' => 'NovaLandia',
-        'short_description' => 'Invite-only ActivityPub / Mastodon-compatible instance (NovaLandia).',
-        'description' => 'Invite-only ActivityPub / Mastodon-compatible instance (NovaLandia).',
+        'short_description' => $description,
+        'description' => $description,
         'email' => 'cmdr-nova@mkultra.monster',
         // 4.5 + api_versions.mastodon≥7 → Ice Cubes uses native quote cards (Status.quote)
         'version' => '4.5.0 (compatible; vaak)',
@@ -1752,9 +1759,9 @@ function ap_masto_instance_v1(): array
         ],
         'thumbnail' => $account['avatar'],
         'languages' => ['en'],
-        'registrations' => false,
-        'approval_required' => false,
-        'invites_enabled' => true,
+        'registrations' => $applicationsOpen,
+        'approval_required' => $applicationsOpen,
+        'invites_enabled' => !$applicationsOpen,
         'configuration' => [
             'statuses' => [
                 'max_characters' => 2000,
@@ -1828,10 +1835,13 @@ function ap_masto_instance_v2(): array
             ],
         ],
         'registrations' => [
-            'enabled' => false,
-            'approval_required' => false,
+            'enabled' => $v1['registrations'],
+            'approval_required' => $v1['approval_required'],
             'message' => null,
-        ],
+        ] + ($v1['registrations'] ? [
+            'reason_required' => false,
+            'url' => 'https://mkultra.monster/vaak/?mode=register',
+        ] : []),
         'contact' => [
             'email' => 'cmdr-nova@mkultra.monster',
             'account' => $v1['contact_account'],
@@ -13410,14 +13420,25 @@ function ap_masto_resolve_status_interaction(int $statusId): ?array
 /**
  * @return list<array<string,mixed>>
  */
-function ap_masto_favourites_list(int $limit = 40, ?string $maxId = null): array
+function ap_masto_favourites_list(int $limit = 40, ?string $maxId = null, ?array $nativeWindow = null, ?array $sourceRows = null): array
 {
     $limit = max(1, min(80, $limit));
     $out = [];
-    foreach (ap_masto_favourite_rows($limit, $maxId) as $row) {
+    foreach (($sourceRows ?? ap_masto_favourite_rows($limit, $maxId)) as $rawOrdinal => $row) {
         $status = ap_masto_interaction_row_to_status($row, 'favourited');
         if ($status === null) {
             continue;
+        }
+        // Raw provenance precedes hydration omissions and the controller's
+        // Bluesky filtering/slice. The private Rust renderer independently
+        // binds this pointer to the complete current owner SQL window.
+        if ($nativeWindow !== null) {
+            $status['_native_source_binding'] = [
+                'producer_kind' => $sourceRows === null ? 'favourites_fedi' : 'favourites_fedi_data',
+                'selected_kind' => 'fedi', 'reference' => (string) $row['id'],
+                'selected_ordinal' => (int) $rawOrdinal, 'folder_id' => 0,
+                'offset' => (int) $nativeWindow['offset'], 'limit' => (int) $nativeWindow['limit'],
+            ];
         }
         $out[] = $status;
         if (count($out) >= $limit) {
