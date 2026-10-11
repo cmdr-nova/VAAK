@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Verify actual extracted composer value selection and GET-only menu declarations."""
+import argparse, pathlib, subprocess, json, hashlib, re
+parser=argparse.ArgumentParser();parser.add_argument('--source',default=str(pathlib.Path(__file__).resolve().parents[1]/'ap-admin.php'));parser.add_argument('--baseline',required=True);parser.add_argument('--output',default='/tmp/vaak-blog-condition-review.json');args=parser.parse_args()
+s=pathlib.Path(args.source).read_text();before=pathlib.Path(args.baseline).read_text()
+a=s.index('          // Keep the submitted draft');z=s.index('          $blogShadow =',a);condition=s[a:z]
+a=s.index('function admin_post_navigation_menu_html(');z=s.index('/** Permission-aware actor actions',a);helper=s[a:z]
+code='''<?php function h($v){return htmlspecialchars((string)$v,ENT_QUOTES|ENT_SUBSTITUTE,"UTF-8");} HELPER $cases=[['success-null',null,false],['success-empty','',false],['validation','A title required',true],['storage-failure','Could not save',true],['publish-failure','Draft saved, but publishing failed',true]];$rows=[];foreach($cases as [$name,$error,$expected]){foreach(['new','existing','saved-publish-retry'] as $mode){$_SERVER['REQUEST_METHOD']='POST';$_POST=['action'=>'blog_save','blog_title'=>'<Title>','blog_category'=>'category','blog_body'=>"Body\\n**bold**",'blog_tags'=>'#raw, #Tags','blog_slug'=>$mode==='existing'?'existing-slug':''];$editingDraft=null;$blog=$mode==='saved-publish-retry'?['slug'=>'saved-new-slug']:null;CONDITION if($blogSubmitted!==$expected)throw new Exception($name.' flag');if($expected&&$blogEditor['body_markdown']!==$_POST['blog_body'])throw new Exception('lost body');if($expected&&$blogEditorTags!==$_POST['blog_tags'])throw new Exception('lost tags');if(!$expected&&$blogEditor!==[])throw new Exception('success retained submitted text');if($expected&&$mode==='saved-publish-retry'&&$blogEditor['slug']!=='saved-new-slug')throw new Exception('retry duplicates draft');if($expected&&$mode==='existing'&&$blogEditor['slug']!=='existing-slug')throw new Exception('lost slug');$rows[]=['case'=>$name,'mode'=>$mode,'submitted'=>$blogSubmitted];}}$menus=[];foreach([['','','Open',false],['?view=status&object=x','https://remote.test/x','Open',false],['','https://remote.test/x','Open',false],['https://site.test/?a=1&b=2','','Open',true]] as $params)$menus[]=admin_post_navigation_menu_html(...$params);echo json_encode(['cases'=>$rows,'menus'=>$menus]);'''.replace('HELPER',helper).replace('CONDITION',condition)
+v=json.loads(subprocess.check_output(['php'],input=code.encode()))
+assert v['menus'][0]==''
+assert '&amp;' in v['menus'][1] and '&amp;' in v['menus'][3]
+assert 'target="_blank"' in v['menus'][3]
+assert all('<form' not in h for h in v['menus'])
+def action(src):
+ a=src.index("    if ($action === 'blog_save') {");z=src.index("    if ($action === 'poll_vote')",a);return src[a:z]
+assert action(s)==action(before),'blog_save controller changed'
+v.update({'condition_count':len(v['cases']),'helper_cases':len(v['menus']),'source_sha256':hashlib.sha256(s.encode()).hexdigest(),'condition_sha256':hashlib.sha256(condition.encode()).hexdigest(),'helper_sha256':hashlib.sha256(helper.encode()).hexdigest(),'unchanged_blog_save_controller_sha256':hashlib.sha256(action(s).encode()).hexdigest(),'boundaries':['actual extracted value-selection and GET-only helper declarations','no auth/SAPI/database/publishing execution','blog_save controller bytes equal baseline Git HEAD']})
+pathlib.Path(args.output).write_text(json.dumps(v,indent=2));print('PASS 15 form-value condition cases + 4 GET-only menu cases')

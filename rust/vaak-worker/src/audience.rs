@@ -4,6 +4,21 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
+// Request-owned SQL plans only. Every lookup still executes against current
+// rows, and fresh backend/schema identity prevents cross-fixture plan reuse.
+tokio::task_local! { static PROFILE_PLANS: std::cell::RefCell<HashMap<(usize,i32,Vec<String>),tokio_postgres::Statement>>; }
+pub(crate) async fn profile_reader_scope<F:std::future::Future>(future:F)->F::Output{
+ PROFILE_PLANS.scope(std::cell::RefCell::new(HashMap::new()),future).await
+}
+async fn profile_plan(db:&Client,sql:&str)->Result<Option<tokio_postgres::Statement>>{
+ if PROFILE_PLANS.try_with(|_|()).is_err(){return Ok(None)}
+ let identity=db.query_one("SELECT pg_backend_pid(),current_schemas(true)",&[]).await?;
+ let key=(db as *const Client as usize,identity.get::<_,i32>(0),identity.get::<_,Vec<String>>(1));
+ if let Some(plan)=PROFILE_PLANS.with(|plans|plans.borrow().get(&key).cloned()){return Ok(Some(plan))}
+ let plan=db.prepare(sql).await?;
+ PROFILE_PLANS.with(|plans|{let mut plans=plans.borrow_mut();if plans.len()<8{plans.insert(key,plan.clone());}});Ok(Some(plan))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Home, Profile, Local, Federated,
@@ -200,6 +215,31 @@ pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses
     Ok(())
 }
 
+/// Private profile stage reader. It uses the same current-record predicates as
+/// audience_records, in one fresh SQL snapshot rather than five round trips.
+/// It never retains an authority decision across an enrichment await.
+pub(crate) async fn filter_profile_statuses(db:&Client,owner:i64,surface:Surface,statuses:&mut Vec<Value>)->Result<()>{
+    anyhow::ensure!(matches!(surface,Surface::Direct),"profile audience reader requires explicit profile policy");
+    if statuses.is_empty(){return Ok(())}
+    let mut ids=HashSet::new();let mut aliases=HashSet::new();for status in statuses.iter(){collect(status,&mut ids,0);collect_requested_quote_aliases(status,&mut aliases,0);}
+    let ids=ids.into_iter().collect::<Vec<_>>();let variants=ids.iter().flat_map(|id|[id.clone(),format!("{id}/")]).collect::<Vec<_>>();let aliases=aliases.into_iter().collect::<Vec<_>>();
+    const SQL:&str="WITH viewer AS (SELECT rtrim(split_part(btrim(actor_id,$4),'#',1),'/') AS actor FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL AND $1::bigint>0), event_rows AS (SELECT DISTINCT ON (rtrim(object_id,'/')) rtrim(object_id,'/') AS object_id,COALESCE(visibility,'public') AS visibility,rtrim(COALESCE(actor_id,''),'/') AS actor_id FROM events e WHERE (e.type IN ('Create','Update') OR (e.type IN ('Quote','QuotePost') AND NOT EXISTS(SELECT 1 FROM events note_source WHERE note_source.object_id IN (rtrim(e.object_id,'/'),rtrim(e.object_id,'/')||'/') AND note_source.type IN ('Create','Update')))) AND action_taken=ANY(ARRAY['log','local_observe','local_fav_update']) AND object_id=ANY($2) ORDER BY rtrim(object_id,'/'),id DESC), outbox_rows AS (SELECT id,COALESCE(visibility,'public') AS visibility,COALESCE(to_json,'[]') AS to_json,COALESCE(cc_json,'[]') AS cc_json FROM outbox_notes WHERE id=ANY($2)), alias_rows AS (SELECT DISTINCT rtrim(e.object_id,'/') AS object_id FROM events e WHERE rtrim(e.object_id,'/')=ANY($3) AND (e.type IN ('Delete','Tombstone') OR (e.type IN ('Create','Update') AND e.action_taken='deleted') OR (e.type='Announce' AND COALESCE(e.action_taken,'')<>'deleted' AND COALESCE(e.visibility,'public')<>'public' AND NOT EXISTS(SELECT 1 FROM events original WHERE rtrim(original.object_id,'/')=rtrim(e.object_id,'/') AND original.type IN ('Create','Update'))))), mention_rows AS (SELECT object_id FROM mentions WHERE owner_user_id=$1::bigint AND deleted_at IS NULL AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id=ANY($2) AND EXISTS(SELECT 1 FROM viewer WHERE actor<>'')), followed AS (SELECT rtrim(owner_actor_id,'/') AS actor FROM followers WHERE rtrim(actor_id,'/')=(SELECT actor FROM viewer LIMIT 1) AND EXISTS(SELECT 1 FROM viewer WHERE actor<>'') UNION SELECT rtrim(actor_id,'/') FROM following WHERE rtrim(owner_actor_id,'/')=(SELECT actor FROM viewer LIMIT 1) AND actor_id NOT LIKE 'https://mkultra.monster/users/%' AND EXISTS(SELECT 1 FROM viewer WHERE actor<>'')) SELECT (SELECT COALESCE(jsonb_agg(jsonb_build_array(object_id,visibility,actor_id)),'[]'::jsonb) FROM event_rows),(SELECT COALESCE(jsonb_agg(jsonb_build_array(id,visibility,to_json,cc_json)),'[]'::jsonb) FROM outbox_rows),(SELECT COALESCE(jsonb_agg(object_id),'[]'::jsonb) FROM alias_rows),(SELECT actor FROM viewer LIMIT 1),(SELECT COALESCE(jsonb_agg(object_id),'[]'::jsonb) FROM mention_rows),(SELECT COALESCE(jsonb_agg(actor),'[]'::jsonb) FROM followed)";
+    let plan=profile_plan(db,SQL).await?;
+    let whitespace=" \t\n\r\u{b}\u{c}\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+    let parameters:&[&(dyn tokio_postgres::types::ToSql+Sync)]=&[&owner,&variants,&aliases,&whitespace];
+    let row=if let Some(plan)=plan{db.query_one(&plan,parameters).await?}else{db.query_one(SQL,parameters).await?};
+    let mut records=HashMap::new();let events:Value=row.get(0);for event in events.as_array().expect("SQL array"){records.insert(event[0].as_str().unwrap().into(),Audience{visibility:event[1].as_str().unwrap().into(),author:event[2].as_str().unwrap().into(),..Default::default()});}
+    let outbox:Value=row.get(1);let mut local_aliases=HashMap::<String,(String,HashSet<String>)>::new();for note in outbox.as_array().expect("SQL array"){
+        let id=key(note[0].as_str().unwrap());let mut recipients=HashSet::new();for column in [2,3]{if let Ok(Value::Array(values))=serde_json::from_str::<Value>(note[column].as_str().unwrap()){for value in values{if let Some(recipient)=value.as_str(){recipients.insert(key(recipient));}}}}
+        let effective=(note[1].as_str().unwrap().trim().to_ascii_lowercase(),recipients.clone());if let Some(previous)=local_aliases.insert(id.clone(),effective.clone()){anyhow::ensure!(previous==effective,"PHP fallback: conflicting canonical/slash current audience rows");}
+        let author=id.split("/notes/").next().unwrap_or("").into();records.insert(id,Audience{visibility:note[1].as_str().unwrap().into(),author,recipients,denied:false});
+    }
+    let denied:Value=row.get(2);for alias in denied.as_array().expect("SQL array"){records.insert(alias.as_str().unwrap().into(),Audience{denied:true,..Default::default()});}
+    let viewer=key(&row.get::<_,Option<String>>(3).unwrap_or_default());let mentions:Value=row.get(4);for mention in mentions.as_array().expect("SQL array"){if let Some(record)=records.get_mut(&key(mention.as_str().unwrap())){record.recipients.insert(viewer.clone());}}
+    let followed:Value=row.get(5);let following=followed.as_array().expect("SQL array").iter().map(|actor|actor.as_str().unwrap().to_owned()).collect::<HashSet<_>>();
+    statuses.retain(|status|tree_allowed(status,&records,&viewer,&following,surface,0));Ok(())
+}
+
 fn stamp_visibility(st: &mut Value, records: &HashMap<String, Audience>, depth: usize) {
     if depth > 16 { return; }
     let id = key(st.get("uri").or_else(|| st.get("url")).and_then(Value::as_str).unwrap_or(""));
@@ -238,6 +278,38 @@ pub async fn filter_parents(db: &Client, owner: i64, surface: Surface, parents: 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    #[ignore="opt-in actual PHP audience and request-owned plan schema proof"]
+    async fn actual_profile_audience_php_and_plan_schema(){
+        let connection=std::env::var("LIBRARY_FIXTURE_DB").unwrap();assert!(connection.contains("/tmp/"));let db=crate::db::connect(&connection).await.unwrap();
+        let reference:Value=serde_json::from_slice(&std::fs::read("/tmp/vaak-profile-audience-current-reference.json").unwrap()).unwrap();
+        let first=format!("profile_audience_plan_{}_a",std::process::id());let second=format!("profile_audience_plan_{}_b",std::process::id());
+        for schema in [&first,&second]{db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};CREATE TABLE ap_users(id BIGINT,actor_id TEXT,disabled_at TEXT);CREATE TABLE events(id BIGINT,object_id TEXT,visibility TEXT,actor_id TEXT,type TEXT,action_taken TEXT);CREATE TABLE outbox_notes(id TEXT,visibility TEXT,to_json TEXT,cc_json TEXT);CREATE TABLE mentions(owner_user_id BIGINT,object_id TEXT,deleted_at TEXT,activity_type TEXT);CREATE TABLE followers(owner_actor_id TEXT,actor_id TEXT);CREATE TABLE following(owner_actor_id TEXT,actor_id TEXT);INSERT INTO ap_users VALUES(1,'https://mkultra.monster/users/fixture',NULL),(2,'https://mkultra.monster/users/other',NULL)")).await.unwrap();}
+        profile_reader_scope(async {
+            db.batch_execute(&format!("SET search_path={first}")).await.unwrap();
+            for capture in reference["captures"].as_array().unwrap(){
+                db.batch_execute("TRUNCATE outbox_notes,mentions,followers,following,events").await.unwrap();
+                for note in capture["outbox"].as_array().unwrap(){db.execute("INSERT INTO outbox_notes VALUES($1,$2,$3,$4)",&[&note["id"].as_str().unwrap(),&note["visibility"].as_str().unwrap(),&note["to_json"].as_str().unwrap(),&note["cc_json"].as_str().unwrap()]).await.unwrap();}
+                let uri=capture["source"]["uri"].as_str().unwrap();let case=capture["case"].as_str().unwrap();
+                if case=="private_follower"{db.batch_execute("INSERT INTO followers VALUES('https://mkultra.monster/users/fixture','https://mkultra.monster/users/other')").await.unwrap();}
+                if case=="direct_mention"{db.execute("INSERT INTO mentions VALUES(2,$1,NULL,'Create')",&[&uri]).await.unwrap();}
+                for owner in [0,1,2]{let mut statuses=vec![capture["source"].clone()];let result=filter_profile_statuses(&db,owner,Surface::Direct,&mut statuses).await;if case.starts_with("canonical_"){assert!(result.is_err(),"conflicting alias must fall back");}else{result.unwrap();assert_eq!(statuses.len()==1,capture["decisions"][owner as usize].as_bool().unwrap(),"actual PHP {case}/{owner}");}}
+            }
+            // Identical effective recipients remain native despite JSON order,
+            // whitespace, duplicate recipient and to/cc placement differences.
+            db.batch_execute("TRUNCATE outbox_notes;INSERT INTO outbox_notes VALUES('https://mkultra.monster/users/fixture/notes/audience','direct','[\"https://mkultra.monster/users/other/\",\"https://remote.test/recipient\"]','[]'),('https://mkultra.monster/users/fixture/notes/audience/',' DIRECT ','[]','[\"https://remote.test/recipient\",\"https://mkultra.monster/users/other\",\"https://remote.test/recipient\"]')").await.unwrap();
+            let mut same=vec![reference["captures"][0]["source"].clone()];filter_profile_statuses(&db,2,Surface::Direct,&mut same).await.unwrap();assert_eq!(same.len(),1);
+            // Same request plan cache, same client, different current schema:
+            // the first schema allows and the second denies the same URI.
+            let source=reference["captures"][0]["source"].clone();let uri=source["uri"].as_str().unwrap();
+            db.batch_execute("TRUNCATE outbox_notes").await.unwrap();db.execute("INSERT INTO outbox_notes VALUES($1,'public','[]','[]')",&[&uri]).await.unwrap();
+            let mut statuses=vec![source.clone()];filter_profile_statuses(&db,0,Surface::Direct,&mut statuses).await.unwrap();assert_eq!(statuses.len(),1);
+            db.batch_execute(&format!("SET search_path={second}")).await.unwrap();db.execute("INSERT INTO outbox_notes VALUES($1,'private','[]','[]')",&[&uri]).await.unwrap();
+            let mut statuses=vec![source];filter_profile_statuses(&db,0,Surface::Direct,&mut statuses).await.unwrap();assert!(statuses.is_empty());
+        }).await;
+        db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {first},{second} CASCADE")).await.unwrap();
+    }
 
     #[test]
     fn positional_admission_preserves_duplicates_and_independent_nested_grants() {

@@ -4,9 +4,9 @@
   <img src="docs/assets/vaak-readme-mascot.png" alt="VAAK mascot" width="480">
 </p>
 
-**Current release:** alpha **0.8.33** · 2026-10-11
+**Current release:** alpha **0.8.34** · 2026-10-11
 
-Release changes and migration limits: [0.8.33 notes](docs/RELEASE-0.8.33.md).
+Release changes and migration limits: [0.8.34 notes](docs/RELEASE-0.8.34.md).
 
 VAAK (pronounced “vaak”) is a multi-user social web client for the Fediverse, with an optional Bluesky / AT Protocol connection. One interface for reading, posting, following, moderating, and carrying a conversation across both networks.
 
@@ -98,6 +98,6 @@ This repository is the public source mirror. Live accounts and profiles belong t
 
 ## Status
 
-Active alpha. **0.8.33** is the version in `api/ap-version.php`. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
+Active alpha. **0.8.34** is the version in `api/ap-version.php`. Federation and Bluesky behavior vary by remote software. Performance work favors warm caches, bounded queues, and safe fallbacks over making a remote API a hard dependency for every screen.
 
 Version labels in the app come from `api/ap-version.php` (channel, semver, date).

@@ -1242,6 +1242,54 @@ function ap_actor_ensure_keypair(string $actorKey): array
     return ['ok' => true, 'created' => true, 'paths' => $paths];
 }
 
+/** Create an account inside the caller's transaction; never changes the session. */
+function ap_auth_create_account_row(PDO $db, string $username, string $email, string $hash, string $now): int
+{
+    if (!$db->inTransaction()) throw new LogicException('Account creation requires a transaction.');
+    if (ap_db_driver($db) === 'pgsql') {
+        $db->exec('LOCK TABLE ap_users IN SHARE ROW EXCLUSIVE MODE');
+    } else {
+        $db->exec('UPDATE ap_users SET updated_at = updated_at WHERE id = -1');
+    }
+    $collision = $db->prepare("SELECT 1 FROM ap_users WHERE lower(username)=lower(?) OR (? <> '' AND lower(email)=lower(?))");
+    $collision->execute([$username, $email, $email]);
+    if ($collision->fetchColumn()) throw new RuntimeException('Account collision.');
+    $actorId = 'https://mkultra.monster/users/' . rawurlencode($username);
+    $db->prepare(
+        'INSERT INTO ap_users
+         (username, email, password_hash, actor_key, actor_id, is_admin, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 0, ?, ?)'
+    )->execute([
+        $username,
+        $email !== '' ? $email : null,
+        $hash,
+        $username,
+        $actorId,
+        $now,
+        $now,
+    ]);
+    $uid = ap_db_last_insert_id('ap_users', 'id', $db);
+    // Minimal profile row
+    $db->prepare(
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(actor_key) DO NOTHING'
+    )->execute([$username, $username, '', '[]', $now]);
+    return $uid;
+}
+
+/** Provision the same effects; return the known key-generation outcome for approval warnings. */
+function ap_auth_provision_registered_account(string $username, int $uid, bool $approved = false): array
+{
+    $keys = ap_actor_ensure_keypair($username);
+    if (empty($keys['ok'])) {
+        error_log('[ap-auth] register keygen failed for ' . $username . ': ' . ($keys['error'] ?? 'unknown'));
+    }
+    ap_auth_operator_follow_new_user($username);
+    ap_auth_notify_operator_registration($username, $uid, $approved);
+    return ['ok' => !empty($keys['ok'])];
+}
+
 /**
  * Register with invite. Provisions actor PEM keypair (Slice E).
  *
@@ -1278,35 +1326,19 @@ function ap_auth_register(string $inviteCode, string $username, string $password
             return ['ok' => false, 'error' => 'Email already in use.'];
         }
     }
-    $hash = password_hash($password, PASSWORD_DEFAULT);
+    try {
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+    } catch (Throwable $e) {
+        return ['ok' => false, 'error' => 'Could not hash password. Use a password without unsupported bytes.'];
+    }
     if (!is_string($hash)) {
         return ['ok' => false, 'error' => 'Could not hash password.'];
     }
     $now = ap_db_now();
-    $actorId = 'https://mkultra.monster/users/' . rawurlencode($username);
     $db = ap_db();
     try {
         $db->beginTransaction();
-        $db->prepare(
-            'INSERT INTO ap_users
-             (username, email, password_hash, actor_key, actor_id, is_admin, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 0, ?, ?)'
-        )->execute([
-            $username,
-            $email !== '' ? $email : null,
-            $hash,
-            $username,
-            $actorId,
-            $now,
-            $now,
-        ]);
-        $uid = ap_db_last_insert_id('ap_users', 'id', $db);
-        // Minimal profile row
-        $db->prepare(
-            'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, updated_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(actor_key) DO NOTHING'
-        )->execute([$username, $username, '', '[]', $now]);
+        $uid = ap_auth_create_account_row($db, $username, $email, $hash, $now);
         $inviteId = (int) (($inv['invite']['id'] ?? 0));
         $inviteUse = $db->prepare(
             'UPDATE ap_invite_codes SET used_by = ?, used_at = ? WHERE id = ? AND used_at IS NULL'
@@ -1316,13 +1348,7 @@ function ap_auth_register(string $inviteCode, string $username, string $password
             throw new RuntimeException('Invite race — already used.');
         }
         $db->commit();
-        $keys = ap_actor_ensure_keypair($username);
-        if (empty($keys['ok'])) {
-            error_log('[ap-auth] register keygen failed for ' . $username . ': ' . ($keys['error'] ?? 'unknown'));
-        }
-        // Operator monitoring: cmdr_nova follows the new account (not the reverse).
-        ap_auth_operator_follow_new_user($username);
-        ap_auth_notify_operator_registration($username, $uid);
+        ap_auth_provision_registered_account($username, $uid);
         $user = ap_auth_user_by_id($uid);
         if ($user === null) {
             return ['ok' => false, 'error' => 'Account created but could not load user.'];
@@ -1338,8 +1364,8 @@ function ap_auth_register(string $inviteCode, string $username, string $password
     }
 }
 
-/** Notify only cmdr_nova when an invite creates a new local account. */
-function ap_auth_notify_operator_registration(string $username, int $userId): void
+/** Notify only cmdr_nova when registration creates a new local account. */
+function ap_auth_notify_operator_registration(string $username, int $userId, bool $approved = false): void
 {
     if ($userId < 1 || strtolower(trim($username)) === 'cmdr_nova') {
         return;
@@ -1354,6 +1380,7 @@ function ap_auth_notify_operator_registration(string $username, int $userId): vo
     $actorId = 'https://mkultra.monster/users/' . rawurlencode($username);
     $objectId = $actorId . '#registration-' . $userId;
     $activityId = 'https://mkultra.monster/vaak/registrations/' . $userId;
+    $registrationText = 'New VAAK user @' . $username . ($approved ? ' registered with administrator approval.' : ' registered using an invite.');
     try {
         ap_mention_store([
             'owner_user_id' => $operatorUserId,
@@ -1363,7 +1390,7 @@ function ap_auth_notify_operator_registration(string $username, int $userId): vo
             'type' => 'Note',
             'actor_id' => $actorId,
             'object_id' => $objectId,
-            'content' => '@cmdr_nova@mkultra.monster — New VAAK user @' . $username . ' registered using an invite.',
+            'content' => '@cmdr_nova@mkultra.monster — ' . $registrationText,
             'in_reply_to' => null,
             'media_urls' => [],
             'spoiler_text' => '',
@@ -1380,7 +1407,7 @@ function ap_auth_notify_operator_registration(string $username, int $userId): vo
             ? ap_masto_notification_id_for_mention((int) ($row['id'] ?? 0), (string) ($row['created_at'] ?? ''))
             : null;
         if (function_exists('ap_webpush_notify_event')) {
-            ap_webpush_notify_event('mention', $actorId, $nid, 'New VAAK user @' . $username . ' registered using an invite.', $operatorUserId);
+            ap_webpush_notify_event('mention', $actorId, $nid, $registrationText, $operatorUserId);
         }
     } catch (Throwable $e) {
         error_log('[ap-auth] registration notification failed for ' . $username . ': ' . $e->getMessage());

@@ -61,6 +61,10 @@ function direct_partial_dispatch(array $status,string $slot,string $origin='home
  ${$variable}=$status;$followingIds=[];$stFrom=$origin;$GLOBALS['view']='status';ob_start();eval($match[0]);return (string)ob_get_clean();
 }
 function direct_legacy_before_function():void {
+ // Current saved/Search producer bootstrap uses current PHP painters only;
+ // it does not execute this baseline's historical event comparison tail.
+ // Keep that separate historical oracle mandatory for the baseline itself.
+ if(getenv('ROOT_LIBRARY_SEARCH_PRODUCER_BOOTSTRAP')==='1')return;
  $path='/tmp/vaak-search-loader-before-admin.php';$source=file_get_contents($path);
  if(!preg_match('/^function admin_render_event_tweet\(.*?^}/ms',$source,$match))throw new RuntimeException('actual historical event painter missing');
  eval(str_replace('function admin_render_event_tweet(','function direct_old_event_tweet(',$match[0]));

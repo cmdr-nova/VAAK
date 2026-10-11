@@ -1749,18 +1749,37 @@ fn paint_status_link_card(st: &Value) -> String {
     String::new()
 }
 
-/// Tiny helpers over the `regex` crate without threading Regex objects everywhere.
-fn lazy_regex_is_match(pattern: &str, hay: &str) -> bool {
-    regex::Regex::new(pattern)
-        .map(|re| re.is_match(hay))
-        .unwrap_or(false)
+/// Immutable compiled patterns shared by the lean card painter. Only patterns
+/// are retained; each call still evaluates its current input.
+fn literal_regex(pattern: &'static str) -> Option<&'static regex::Regex> {
+    static PATTERNS: std::sync::OnceLock<std::collections::HashMap<&'static str, regex::Regex>> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            r"(?i)^https://[^/]+/(?:users/[^/]+|@[^/]+)/(?:statuses|posts)/",
+            r"(?i)^https://bsky\.app/profile/[^/]+/post/",
+            r"(?i)^https://[^/]+/ap/(?:users|actors?)/[^/]+/statuses/",
+            r"(?i)^https://[^/]+/@[^/]+/\d+",
+            r"(?i)(<br\s*/?>\s*){3,}",
+            r"(?i)<br\s*/?>",
+            r"(?i)&nbsp;",
+            r"(?i)<p(?:\s[^>]*)?>\s*(?:<br\s*/?>\s*)*</p>",
+        ].into_iter().filter_map(|p| regex::Regex::new(p).ok().map(|r| (p,r))).collect()
+    }).get(pattern)
 }
 
-fn lazy_regex_replace_all(pattern: &str, hay: &str, rep: &str) -> String {
-    match regex::Regex::new(pattern) {
-        Ok(re) => re.replace_all(hay, rep).into_owned(),
-        Err(_) => hay.to_string(),
-    }
+#[cfg(test)]
+thread_local! { static LEGACY_LITERAL_REGEX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn lazy_regex_is_match(pattern: &'static str, hay: &str) -> bool {
+    #[cfg(test)]
+    if LEGACY_LITERAL_REGEX.with(|v| v.get()) { return regex::Regex::new(pattern).map(|re|re.is_match(hay)).unwrap_or(false); }
+    literal_regex(pattern).map(|re| re.is_match(hay)).unwrap_or_else(||regex::Regex::new(pattern).map(|re|re.is_match(hay)).unwrap_or(false))
+}
+
+fn lazy_regex_replace_all(pattern: &'static str, hay: &str, rep: &str) -> String {
+    #[cfg(test)]
+    if LEGACY_LITERAL_REGEX.with(|v| v.get()) { return regex::Regex::new(pattern).map(|re|re.replace_all(hay,rep).into_owned()).unwrap_or_else(|_|hay.to_string()); }
+    literal_regex(pattern).map(|re| re.replace_all(hay, rep).into_owned()).unwrap_or_else(||regex::Regex::new(pattern).map(|re|re.replace_all(hay,rep).into_owned()).unwrap_or_else(|_|hay.to_string()))
 }
 
 fn relative_time(created_at: &str) -> String {
@@ -2337,7 +2356,7 @@ fn paint_moderation_overflow(
             "<a class=\"menu-action\" href=\"{}\">Open</a>",
             esc(&open)
         ));
-        let remote = remote_object_href(object, "");
+        let remote = remote_object_href(object, status.get("url").and_then(Value::as_str).unwrap_or(""));
         if remote.starts_with("http://") || remote.starts_with("https://") {
         menu.push_str(&format!(
             "<a class=\"menu-action\" href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\">{}</a>",
@@ -3047,34 +3066,16 @@ fn paint_lean_timeline_actions(status: &Value, from: &str, viewer_actor: &str) -
                 paint_moderation_overflow(from_q, actor_ref, uri, viewer_actor, status);
             if !mod_menu.is_empty() {
                 actions.push_str(&mod_menu);
-            } else if !bsky {
-                // Guest / thin shells: keep a Remote link when we have no ⋯ menu.
-                let remote = remote_object_href(uri, url_hint);
-                if remote.starts_with("http://") || remote.starts_with("https://") {
-                    actions.push_str(&format!(
-                        "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"meta\" title=\"Open on remote instance\">Remote</a>",
-                        esc(&remote)
-                    ));
-                }
+            } else {
+                actions.push_str(&crate::library::actions::read_only_overflow(uri,from_q,&remote_object_href(uri,url_hint)));
             }
         }
     }
 
     if actions.is_empty() {
-        // Fallback Open when we lack ids (thin shells).
-        if !uri.is_empty() {
-            let open = format!(
-                "?view=status&object={}&from={}",
-                urlencoding_encode(uri),
-                urlencoding_encode(from_q)
-            );
-            return format!(
-                "<div class=\"tweet-actions\"><a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Open</a></div>",
-                esc(&open)
-            );
-        }
-        return String::new();
+        return if uri.is_empty(){String::new()}else{format!("<div class=\"tweet-actions\">{}</div>",crate::library::actions::read_only_overflow(uri,from_q,&remote_object_href(uri,url_hint)))};
     }
+
     format!("<div class=\"tweet-actions\">{actions}</div>")
 }
 
@@ -3955,15 +3956,7 @@ pub fn paint_lean_embed_from(
         inner.push_str(&paint_lean_timeline_actions(status, from, viewer_actor));
     } else if show_actions && !uri.is_empty() {
         let from_q = if from.is_empty() { "mentions" } else { from };
-        let open = format!(
-            "?view=status&object={}&from={}",
-            urlencoding_encode(uri),
-            urlencoding_encode(from_q)
-        );
-        inner.push_str(&format!(
-            "<div class=\"tweet-actions\"><a class=\"btn btn-ghost\" href=\"{}\" style=\"padding:.25rem .7rem;font-size:.8rem\">Open</a></div>",
-            esc(&open)
-        ));
+        inner.push_str(&format!("<div class=\"tweet-actions\">{}</div>",crate::library::actions::read_only_overflow(uri,from_q,&remote_object_href(uri,status.get("url").and_then(Value::as_str).unwrap_or("")))));
     }
 
     let wrap_class = if hide_header {
@@ -4114,6 +4107,29 @@ pub async fn set_embed_html(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "finite painter timing comparison, no source or authority IO"]
+    fn literal_regex_same_card_paint_cohort() {
+        let inputs = (0..50).map(|i| serde_json::json!({
+            "id": i.to_string(), "uri": format!("https://example.test/users/x/statuses/{i}"),
+            "content": "<p dir=\"auto\">α &amp; β&nbsp;<br><br><br>second <a href=\"https://bsky.app/profile/x/post/y\">link</a></p><p><br></p>",
+            "created_at":"2000-01-01T00:00:00Z", "visibility":"public",
+            "account":{"acct":"x@example.test","display_name":"X","uri":"https://example.test/users/x","avatar":"https://example.test/a.png"},
+            "media_attachments":[], "card":null
+        })).collect::<Vec<_>>();
+        let mut outputs = Vec::new();
+        let mut timings = Vec::new();
+        for legacy in [true, false] {
+            LEGACY_LITERAL_REGEX.with(|v| v.set(legacy));
+            let start = std::time::Instant::now();
+            let html = inputs.iter().map(|s|super::paint_lean_feed_card_opts(s,"home","https://mkultra.monster/users/viewer")).collect::<Vec<_>>();
+            timings.push(start.elapsed().as_micros()); outputs.push(html);
+        }
+        LEGACY_LITERAL_REGEX.with(|v| v.set(false));
+        assert_eq!(outputs[0],outputs[1]);
+        eprintln!("literal_regex_paint_cohort cards=50 exact_html=true legacy_us={} cached_us={}",timings[0],timings[1]);
+    }
+
     use super::*;
     use serde_json::json;
 

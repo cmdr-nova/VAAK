@@ -83,7 +83,7 @@ function ap_library_native_validate_reply(array $reply, int $count, int $initial
     return $html;
 }
 /** Return complete HTML or null; the caller paints the same assembled sources. */
-function ap_library_native_render_batch(array $statuses, string $view): ?string
+function ap_library_native_render_batch(array $statuses, string $view, array $savedSources = []): ?string
 {
     if (!ap_library_native_enabled() || !in_array($view, ['bookmarks', 'favourites'], true)
         || !array_is_list($statuses) || count($statuses) > 100 || !function_exists('ap_auth_current_user')) return null;
@@ -103,10 +103,14 @@ function ap_library_native_render_batch(array $statuses, string $view): ?string
     $initial = ap_native_preview_effective_budget();
     try {
     json_encode($statuses, JSON_THROW_ON_ERROR);
+    $bskyRemaining = function_exists('ap_bsky_budget_remaining') ? ap_bsky_budget_remaining() : null;
+    if ($bskyRemaining !== null && ((!is_float($bskyRemaining) && !is_int($bskyRemaining)) || !is_finite((float)$bskyRemaining))) return null;
     $body = json_encode(['protocol_version' => 1, 'status_preview_budget' => $initial,
+        'bsky_budget_deadline' => $bskyRemaining === null ? null : microtime(true) + $bskyRemaining,
         'owner_id' => (int) $user['id'], 'csrf' => ap_auth_csrf_token(),
         'return_view' => $view, 'lazy_media' => !empty($GLOBALS['admin_bookmark_lazy_media']), 'bsky_enabled' => function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled(),
         'bsky_bookmarks' => ap_library_native_bsky_bookmark_states($statuses, (int) $user['id']),
+        'saved_sources' => $savedSources,
         'statuses' => array_values($statuses)], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
     } catch (Throwable $error) {
         return null;

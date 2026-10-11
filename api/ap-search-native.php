@@ -147,7 +147,7 @@ function ap_search_native_validate_reply(array $reply, array $counts, int $initi
 }
 
 /** All selected sections succeed together, or the caller paints its original PHP rows. */
-function ap_search_native_render_batch(array $accounts, array $hashtags, array $statuses): ?array
+function ap_search_native_render_batch(array $accounts, array $hashtags, array $statuses, ?array $collector = null): ?array
 {
     if (!ap_search_native_enabled() || !function_exists('ap_auth_current_user')
         || !function_exists('ap_auth_csrf_token') || !function_exists('curl_init')) {
@@ -180,10 +180,13 @@ function ap_search_native_render_batch(array $accounts, array $hashtags, array $
         // Strictly encode originals first: invalid authority bytes must never be repaired for admission.
         json_encode([$accounts, $hashtags, $statuses], JSON_THROW_ON_ERROR);
         $assembled = array_map('ap_search_native_assemble_status', $statuses);
+        $bskyRemaining = function_exists('ap_bsky_budget_remaining') ? ap_bsky_budget_remaining() : null;
+        if ($bskyRemaining !== null && ((!is_float($bskyRemaining) && !is_int($bskyRemaining)) || !is_finite((float)$bskyRemaining))) return null;
         $body = json_encode(['protocol_version' => 1, 'status_preview_budget' => $initial,
+            'bsky_budget_deadline' => $bskyRemaining === null ? null : microtime(true) + $bskyRemaining,
             'owner_id' => (int) $user['id'], 'csrf' => ap_auth_csrf_token(),
             'bsky_enabled' => function_exists('ap_bsky_tab_enabled') && ap_bsky_tab_enabled(),
-            'accounts' => $accounts, 'hashtags' => $hashtags, 'statuses' => $assembled,
+            'accounts' => $accounts, 'hashtags' => $hashtags, 'statuses' => $assembled, 'collector' => $collector,
             'bsky_bookmarks' => ap_search_native_bsky_bookmark_states($assembled, (int) $user['id'])],
             JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
         if (strlen($body) > 2 * 1024 * 1024) {

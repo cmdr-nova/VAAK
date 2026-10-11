@@ -35,6 +35,8 @@ register_shutdown_function(static function () use ($vaakRequestStartedAt): void 
     ap_slow_route_record($route, (microtime(true) - $vaakRequestStartedAt) * 1000.0);
 });
 require_once __DIR__ . '/ap-auth.php';
+require_once __DIR__ . '/ap-registration-approvals.php';
+require_once __DIR__ . '/ap-admin-native.php';
 require_once __DIR__ . '/ap-library-native.php';
 require_once __DIR__ . '/ap-search-native.php';
 require_once __DIR__ . '/ap-version.php';
@@ -377,7 +379,7 @@ if ($view === 'gallery' || $view === 'vakktok') {
 // Admin-only surfaces (Guestbook / Support / Analytics / Moderation / …)
 $vaakAdminOnlyViews = [
     'moderation', 'blocks', 'relays', 'stats', 'queue_health', 'invites', 'users', 'policies',
-    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers',
+    'guestbook', 'support', 'analytics', 'downranking', 'downranked', 'friend_servers', 'approvals',
 ];
 // Security is under You for every account (own OAuth tokens / password).
 if (in_array($view, $vaakAdminOnlyViews, true) && !$vaakIsAdmin) {
@@ -966,7 +968,7 @@ $vaakAdminOnlyActions = [
         'block_add', 'block_actor', 'block_domain', 'unblock',
         'relay_add', 'relay_enable', 'relay_disable', 'relay_remove',
         'report_dismiss', 'report_ignore', 'report_reopen', 'report_note',
-        'invite_create',
+        'invite_create', 'registration_approve', 'registration_reject',
         'user_ban', 'user_unban',
         'policies_save_privacy', 'policies_save_conduct', 'policies_save_rules',
         'downrank_term_add', 'downrank_term_delete', 'downrank_signal_clear', 'downrank_term_preview',
@@ -4244,6 +4246,12 @@ $vaakAdminOnlyActions = [
                 $error = $res['error'] ?? 'Could not save notice.';
             }
         }
+    } elseif ($action === 'registration_approve' || $action === 'registration_reject') {
+        $view = 'approvals';
+        $res = ap_registration_decide((int) ($_POST['application_id'] ?? 0),
+            $action === 'registration_approve' ? 'approved' : 'rejected', $csrfToken);
+        if (!empty($res['ok'])) $notice = !empty($res['provisioning_failed']) ? 'Account approved; provisioning needs operator attention.' : (!empty($res['already_decided']) ? 'Application already decided.' : 'Application decided.');
+        else $error = (string) ($res['error'] ?? 'Could not decide application.');
     } elseif ($action === 'invite_create') {
         $view = 'invites';
         if (!$vaakIsAdmin) {
@@ -5110,6 +5118,7 @@ function admin_render_library_entries(array $entries, string $returnView): void
     $nativeHtml = null;
     if (ap_library_native_enabled()) {
         $sources = [];
+        $savedSources = [];
         foreach ($entries as &$entry) {
             if (!is_array($entry) || !is_array($entry['item'] ?? null)) continue;
             if (($entry['kind'] ?? '') !== 'bsky' && !str_starts_with((string) ($entry['item']['id'] ?? ''), 'rss:')) {
@@ -5117,11 +5126,14 @@ function admin_render_library_entries(array $entries, string $returnView): void
             }
             // The assembled cached source is a separate value. Canonical PHP
             // fallback preserves its original quote state and lookup behavior.
+            if (is_array($entry['native_source_binding'] ?? null)) {
+                $savedSources[] = ['source_index' => count($sources)] + $entry['native_source_binding'];
+            }
             $sources[] = ap_library_native_assemble_status($entry['item']);
         }
         unset($entry);
         $prepared = true;
-        $nativeHtml = ap_library_native_render_batch($sources, $returnView);
+        $nativeHtml = ap_library_native_render_batch($sources, $returnView, $savedSources);
     }
     if ($nativeHtml !== null) {
         echo $nativeHtml;
@@ -5146,7 +5158,13 @@ function admin_render_library_network_items(array $items, string $network, strin
 {
     $entries = [];
     foreach ($items as $item) {
-        if (is_array($item)) $entries[] = ['kind' => $network, 'item' => $item];
+        if (is_array($item)) {
+            $binding = is_array($item['_native_source_binding'] ?? null) ? $item['_native_source_binding'] : null;
+            unset($item['_native_source_binding']);
+            $entry = ['kind' => $network, 'item' => $item];
+            if ($binding !== null) $entry['native_source_binding'] = $binding;
+            $entries[] = $entry;
+        }
     }
     admin_render_library_entries($entries, $returnView);
 }
@@ -5223,10 +5241,11 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
             : (is_array($data['fedi_rows'] ?? null) ? $data['fedi_rows'] : []);
         $items = [];
         if ($network === 'fedi') {
-            foreach ($sourceRows as $row) {
+            foreach ($sourceRows as $rawOrdinal => $row) {
                 if (is_array($row) && function_exists('ap_masto_interaction_row_to_status')) {
                     $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
                     if (is_array($status)) {
+                        $status['_native_source_binding'] = ['producer_kind' => 'bookmarks_fedi_data', 'selected_kind' => 'fedi', 'reference' => (string) $row['id'], 'selected_ordinal' => (int) $rawOrdinal, 'folder_id' => $folderId, 'offset' => $offset, 'limit' => $limit];
                         $items[] = $status;
                     }
                 }
@@ -5280,12 +5299,13 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
             $hasMore = count($raw) > $limit;
             $raw = array_slice($raw, 0, $limit);
             $rawCount = count($raw);
-            foreach ($raw as $row) {
+            foreach ($raw as $rawOrdinal => $row) {
                 if (!is_array($row) || !function_exists('ap_masto_interaction_row_to_status')) {
                     continue;
                 }
                 $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
                 if (is_array($status)) {
+                    $status['_native_source_binding'] = ['producer_kind' => 'bookmarks_fedi', 'selected_kind' => 'fedi', 'reference' => (string) $row['id'], 'selected_ordinal' => (int) $rawOrdinal, 'folder_id' => $folderId, 'offset' => $offset, 'limit' => $limit];
                     $items[] = $status;
                 }
             }
@@ -5325,7 +5345,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
             $hasMore = count($raw) > $limit;
             $raw = array_slice($raw, 0, $limit);
             $rawCount = count($raw);
-            foreach ($raw as $row) {
+            foreach ($raw as $rawOrdinal => $row) {
                 if (!is_array($row)) {
                     continue;
                 }
@@ -5339,6 +5359,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
                     ap_bsky_bookmark_owner_state_set((string) $row['bookmark_uri'], $ownerUserId, true);
                 }
                 $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
+                $item['_native_source_binding'] = ['producer_kind' => 'bookmarks_bsky', 'selected_kind' => 'bsky', 'reference' => (string) $row['bookmark_uri'], 'selected_ordinal' => (int) $rawOrdinal, 'folder_id' => $folderId, 'offset' => $offset, 'limit' => $limit];
                 $items[] = $item;
             }
         }
@@ -5578,21 +5599,28 @@ function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $off
             }
         }
         $items = [];
-        foreach ($keys as $key) {
+        foreach ($keys as $selectedOrdinal => $key) {
             if (!is_array($key)) {
                 continue;
             }
+            // Bind the collector ordinal separately from emitted source_index:
+            // missing hydrated rows can omit cards without changing the window.
+            $nativeBinding = ['producer_kind' => 'bookmarks_mixed',
+                'selected_ordinal' => $selectedOrdinal,
+                'selected_kind' => (string) ($key['kind'] ?? ''),
+                'reference' => (string) ($key['ref'] ?? ''),
+                'folder_id' => $folderId, 'offset' => $offset, 'limit' => $limit];
             if (($key['kind'] ?? '') === 'bsky') {
                 $item = $bskyByUri[(string) ($key['ref'] ?? '')] ?? null;
                 if (is_array($item)) {
-                    $items[] = ['kind' => 'bsky', 'item' => $item];
+                    $items[] = ['kind' => 'bsky', 'item' => $item, 'native_source_binding' => $nativeBinding];
                 }
             } else {
                 $row = $fediById[(int) ($key['ref'] ?? 0)] ?? null;
                 if (is_array($row) && function_exists('ap_masto_interaction_row_to_status')) {
                     $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
                     if (is_array($status)) {
-                        $items[] = ['kind' => 'fedi', 'item' => $status];
+                        $items[] = ['kind' => 'fedi', 'item' => $status, 'native_source_binding' => $nativeBinding];
                     }
                 }
             }
@@ -6276,6 +6304,20 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'home_suggestions') {
  *
  * @return array<string,bool>
  */
+/** Cache-only identity aliases; current policy rows stay separate from identity mapping. */
+function admin_trend_actor_refs(string $actor): array
+{
+    $actor = ap_search_canonical_actor($actor);
+    $out = [];
+    foreach (ap_actor_moderation_aliases($actor) as $alias) {
+        foreach (ap_moderation_syntactic_refs((string) $alias) as $ref) {
+            $ref = rtrim((string) $ref, '/');
+            if ($ref !== '' && !ctype_digit($ref)) $out[$ref] = true;
+        }
+    }
+    return array_keys($out);
+}
+
 function admin_trend_downrank_ref_set(int $ownerUserId): array
 {
     if ($ownerUserId < 1) {
@@ -6283,18 +6325,28 @@ function admin_trend_downrank_ref_set(int $ownerUserId): array
     }
     $set = [];
     $now = time();
-    foreach (admin_home_suppression_map($ownerUserId) as $actor => $row) {
+    $preference = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
+    $preference->execute([$ownerUserId]);
+    $temporaryEnabled = (bool) $preference->fetchColumn();
+    foreach ($temporaryEnabled ? admin_home_suppression_map($ownerUserId) : [] as $actor => $row) {
         if ((int) ($row['until'] ?? 0) <= $now) {
             continue;
         }
-        $refs = function_exists('ap_moderation_syntactic_refs')
-            ? ap_moderation_syntactic_refs((string) $actor)
-            : [(string) $actor];
+        $refs = admin_trend_actor_refs((string) $actor);
         foreach ($refs as $ref) {
             $ref = strtolower(rtrim((string) $ref, '/'));
             if ($ref !== '' && !ctype_digit($ref)) {
                 $set[$ref] = true;
             }
+        }
+    }
+    // Read the current manual choices directly; never inherit a cached HTML decision.
+    $st = ap_db()->prepare('SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = ?');
+    $st->execute([$ownerUserId]);
+    foreach ($st->fetchAll() ?: [] as $row) {
+        foreach (admin_trend_actor_refs((string) ($row['actor_id'] ?? '')) as $ref) {
+            $ref = rtrim((string) $ref, '/');
+            if ($ref !== '' && !ctype_digit($ref)) $set['manual:' . $ref] = true;
         }
     }
     return $set;
@@ -6332,15 +6384,28 @@ function admin_trend_status_is_downranked(array $item, array $refs): bool
         if ($actor === '' || ctype_digit(rtrim($actor, '/'))) {
             continue;
         }
-        $candidates = function_exists('ap_moderation_syntactic_refs')
-            ? ap_moderation_syntactic_refs($actor)
-            : [$actor];
+        $candidates = admin_trend_actor_refs($actor);
         foreach ($candidates as $ref) {
+            if (isset($refs['manual:' . rtrim((string) $ref, '/')])) return true;
             $ref = strtolower(rtrim((string) $ref, '/'));
             if ($ref !== '' && isset($refs[$ref])) {
                 return true;
             }
         }
+    }
+    return false;
+}
+
+/** Keep cached candidates separate from this viewer's current policy decision. */
+function admin_trend_status_hidden(array $item, int $ownerUserId, array $refs, int $depth = 0): bool
+{
+    if ($depth > 16) return true;
+    if (ap_masto_trend_item_hidden($item, $ownerUserId, [], false)
+        || ap_search_status_hidden($item, $ownerUserId)
+        || admin_trend_status_is_downranked($item, $refs)) return true;
+    foreach (['reblog', 'quote'] as $nest) {
+        if (is_array($item[$nest] ?? null)
+            && admin_trend_status_hidden($item[$nest], $ownerUserId, $refs, $depth + 1)) return true;
     }
     return false;
 }
@@ -6355,16 +6420,8 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $anyHit = false;
     $viewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
     $viewerId = is_array($viewer) ? (int) ($viewer['id'] ?? 0) : 0;
-    $downrankRefs = null;
-    // v3 drops fragments painted before mute/block filtering. Old keys expire on their own.
-    $fragmentKey = 'vaak:fragment:trends:v3:' . hash('sha256', $viewForTrends . ':' . $viewerId);
-    if (!$bypassFragment && function_exists('ap_redis_json_get')) {
-        $cachedFragment = ap_redis_json_get($fragmentKey);
-        if (is_array($cachedFragment) && is_string($cachedFragment['html'] ?? null)) {
-            $meta = is_array($cachedFragment['meta'] ?? null) ? $cachedFragment['meta'] : null;
-            return (string) $cachedFragment['html'];
-        }
-    }
+    // Global raw trend data remains cached; HTML must be authorized anew each request.
+    $cachedKinds = [];
     foreach (['tags' => 10, 'statuses' => 5] as $kind => $limit) {
         $row = function_exists('ap_masto_trends_cache_read')
             ? ap_masto_trends_cache_read($kind, 1, $allowStale)
@@ -6375,29 +6432,25 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         $anyHit = true;
         $maxAge = max($maxAge, (int) ($row['age'] ?? 0));
         $anyStale = $anyStale || !empty($row['stale']);
+        $cachedKinds[$kind] = $row;
+    }
+    // Resolve the viewer and policies after cache I/O; cache data never authorizes a card.
+    $currentViewer = function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    if ((int) ($currentViewer['id'] ?? 0) !== $viewerId) return '';
+    $downrankRefs = admin_trend_downrank_ref_set($viewerId);
+    foreach (['tags' => 10, 'statuses' => 5] as $kind => $limit) {
+        $row = $cachedKinds[$kind] ?? null;
+        if (!is_array($row)) continue;
         $items = [];
         foreach ($row['items'] as $candidate) {
             if (!is_array($candidate)) {
                 continue;
             }
-            if ($viewerId > 0 && function_exists('ap_masto_trend_item_hidden')
-                && ap_masto_trend_item_hidden($candidate, $viewerId)) {
+            if ($kind === 'statuses') {
+                if (admin_trend_status_hidden($candidate, $viewerId, $downrankRefs)) continue;
+            } elseif (ap_masto_trend_item_hidden($candidate, $viewerId, [], false)
+                || admin_trend_status_is_downranked($candidate, $downrankRefs)) {
                 continue;
-            }
-            // Trend cards expose the web @ profile. Server mutes are stored as the
-            // canonical /users IRI, and quote authors are not in the trend actor list.
-            if ($kind === 'statuses' && $viewerId > 0 && function_exists('ap_search_status_hidden')
-                && ap_search_status_hidden($candidate, $viewerId)) {
-                continue;
-            }
-            // Home downrank is per viewer. The shared trends cache stays global.
-            if ($kind === 'statuses' && $viewerId > 0) {
-                if ($downrankRefs === null) {
-                    $downrankRefs = admin_trend_downrank_ref_set($viewerId);
-                }
-                if ($downrankRefs !== [] && admin_trend_status_is_downranked($candidate, $downrankRefs)) {
-                    continue;
-                }
             }
             // Skip bare-domain link cards (host only, no title/path context).
             $items[] = $candidate;
@@ -6477,9 +6530,6 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         }
     }
     $html .= '</div>';
-    if (function_exists('ap_redis_json_set')) {
-        ap_redis_json_set($fragmentKey, ['html' => $html, 'meta' => $meta], 30);
-    }
     return $html;
 }
 
@@ -6525,7 +6575,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
     }
     $age = (int) ($meta['age'] ?? 0);
     $stale = !empty($meta['stale']) ? '1' : '0';
-    header('Cache-Control: private, max-age=60');
+    header('Cache-Control: private, no-store');
     header('X-Vaak-Trends-Age: ' . $age);
     header('X-Vaak-Trends-Stale: ' . $stale);
     echo $html;
@@ -12241,7 +12291,33 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
         $tagMore = count($allTags) > ($offset + $limit);
         $tags = array_slice($allTags, $offset, $limit);
     }
+    // Private native association is derived from the actual published ranked
+    // cache, not from an independently supplied status list. Public source and
+    // cursor arithmetic above remain the PHP collector's exact values.
+    $nativeCollector = null;
+    if ($needStatuses && $statuses !== [] && isset($searchCachePath) && is_file($searchCachePath) && !is_link($searchCachePath)) {
+        $nativeBytes = @file_get_contents($searchCachePath);
+        $nativeCache = is_string($nativeBytes) && strlen($nativeBytes) <= 2 * 1024 * 1024 ? json_decode($nativeBytes, true) : null;
+        if (is_array($nativeCache) && !empty($nativeCache['have_statuses']) && is_array($nativeCache['statuses'] ?? null) && count($nativeCache['statuses']) <= 121) {
+            $ordinals = []; $afterOrdinal = -1;
+            foreach ($statuses as $status) {
+                $found = null;
+                foreach ($nativeCache['statuses'] as $ordinal => $candidate) {
+                    if ($ordinal > $afterOrdinal && json_encode($candidate) === json_encode($status)) { $found = $ordinal; break; }
+                }
+                if ($found === null) { $ordinals = []; break; }
+                $ordinals[] = $found; $afterOrdinal = $found;
+            }
+            if (count($ordinals) === count($statuses)) {
+                $nativeCollector = ['normalized_query' => mb_strtolower($sq), 'resolve' => $sresolve,
+                    'cache_location' => $searchCacheDir === '/var/lib/mkultra/ap/search-cache' ? 'primary' : 'temporary',
+                    'cache_sha256' => hash('sha256', $nativeBytes), 'offset' => $offset, 'limit' => $limit,
+                    'selected_ordinals' => $ordinals];
+            }
+        }
+    }
     return [
+        '_native_collector' => $nativeCollector,
         'accounts' => $accounts,
         'hashtags' => $tags,
         'statuses' => $statuses,
@@ -12592,7 +12668,8 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
     $native = ap_search_native_render_batch(
         ($stype === '' || $stype === 'accounts') ? $accounts : [],
         ($stype === '' || $stype === 'hashtags') ? $tags : [],
-        ($stype === '' || $stype === 'statuses') ? $statuses : []
+        ($stype === '' || $stype === 'statuses') ? $statuses : [],
+        is_array($sresults['_native_collector'] ?? null) ? $sresults['_native_collector'] : null
     );
     if (($stype === '' || $stype === 'accounts') && $accounts !== []) {
         $acctMore = !empty($more['accounts']);
@@ -12684,7 +12761,8 @@ function admin_search_page_fragment(string $q, string $section, bool $resolve, i
     $native = ap_search_native_render_batch(
         $section === 'accounts' ? $rows : [],
         $section === 'hashtags' ? $rows : [],
-        $section === 'statuses' ? $rows : []
+        $section === 'statuses' ? $rows : [],
+        is_array($bundle['_native_collector'] ?? null) ? $bundle['_native_collector'] : null
     );
     ob_start();
     echo '<div data-search-fragment data-section="' . h($section) . '" data-offset="' . (int) ($offset + count($rows))
@@ -12958,6 +13036,7 @@ function view_title(string $view): string
         'blocks' => 'Server blocks',
         'muted_words' => 'Profile',
         'invites' => 'Invites',
+        'approvals' => 'Approvals',
         'policies' => 'Policies',
         'relays' => 'Relays',
         'outbox' => 'Your posts',
@@ -15452,6 +15531,9 @@ function admin_cw_gate_html(string $spoilerText, bool $sensitive, string $innerH
  */
 function admin_poll_block_html(string $noteId, bool $interactive = true, string $returnView = 'home'): string
 {
+    // Guest mode is established by the PHP public-profile session gate, never
+    // by post JSON or a browser-supplied renderer option.
+    if (!empty($GLOBALS['vaak_guest_profile'])) $interactive = false;
     $returnView = preg_replace('/[^a-z_]/', '', $returnView) ?: 'home';
     $noteId = rtrim(trim($noteId), '/');
     if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
@@ -15792,7 +15874,7 @@ function admin_home_rank_tracking_attrs(string $platform, string $targetKey, str
         . ' data-rank-actor="' . h(mb_substr($targetActor, 0, 2048)) . '"';
 }
 
-function admin_render_event_tweet(array $e, array $followingIds, string $returnView, bool $fromFollowedTag = false): void
+function admin_render_event_tweet(array $e, array $followingIds, string $returnView, bool $fromFollowedTag = false, ?string $profileBoostActor = null): void
 {
     // Hide empty followers-only firehose stubs (no body to show).
     if (admin_event_is_empty_private_stub($e)) {
@@ -15801,7 +15883,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     // Inbound Announce → shared Mastodon reblog card only.
     // Normalize null usually means hidden/blocked booster — do not paint legacy dialect.
     if (strtolower((string) ($e['type'] ?? '')) === 'announce') {
-        admin_try_render_announce_shared_card($e, $followingIds, $returnView, true);
+        admin_try_render_announce_shared_card($e, $followingIds, $returnView, true, $profileBoostActor);
         return;
     }
     // Create/Update → shared Mastodon status card first.
@@ -16271,7 +16353,7 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
                 ]) ?>
               <?php else: ?>
               <?php if ($objectId !== '' && $isOwnEvent): ?>
-                <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
+                <?= admin_post_navigation_menu_html(admin_status_href($objectId, $returnView)) ?>
               <?php endif; ?>
               <?php if ($canReply): ?>
                 <?php
@@ -16440,9 +16522,28 @@ function admin_global_domain_control(string $host): ?array
         : null;
 }
 
-/** Permission-aware actor actions used by posts, profiles, and DMs. */
-function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = ''): string
+/** Navigation-only overflow for guest and minimal post cards; never adds mutations. */
+function admin_post_navigation_menu_html(string $openHref, string $remoteHref = '', string $openLabel = 'Open', bool $externalOpen = false): string
 {
+    $menu = '';
+    if ($openHref !== '') {
+        $menu .= '<a class="menu-action" href="' . h($openHref) . '"'
+            . ($externalOpen ? ' target="_blank" rel="noopener noreferrer"' : '') . '>' . h($openLabel) . '</a>';
+    }
+    if ($remoteHref !== '') {
+        $menu .= '<a class="menu-action" href="' . h($remoteHref) . '" target="_blank" rel="noopener noreferrer">Remote</a>';
+    }
+    return $menu !== '' ? '<details class="post-action-menu">'
+        . '<summary class="icon-btn" title="More actions" aria-label="More actions">⋯</summary>'
+        . '<div class="post-action-menu__body">' . $menu . '</div></details>' : '';
+}
+
+/** Permission-aware actor actions used by posts, profiles, and DMs. */
+function block_quick_actions(?string $actorId, ?string $host, string $returnView, int $ownerUserId = 0, bool $isAdmin = false, string $returnFrom = '', string $objectId = '', mixed $objectUrlHint = null): string
+{
+    if (!empty($GLOBALS['vaak_guest_profile'])) {
+        return '';
+    }
     $html = '';
     $actorId = is_string($actorId) ? rtrim($actorId, '/') : '';
     $host = is_string($host) ? strtolower(trim($host)) : '';
@@ -16517,7 +16618,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     if (!$isSelf && $objectId !== '' && str_starts_with($objectId, 'https://')) {
         $menu .= '<a class="menu-action" href="' . h(admin_status_href($objectId, $returnView)) . '">Open</a>';
         $isBskyObject = str_contains(strtolower($objectId), 'bsky.app');
-        $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId)) . '" target="_blank" rel="noopener noreferrer">'
+        $menu .= '<a class="menu-action" href="' . h(admin_remote_object_href($objectId, $objectUrlHint)) . '" target="_blank" rel="noopener noreferrer">'
             . ($isBskyObject ? 'Open on Bluesky' : 'Remote') . '</a>';
     }
     // Personal mute/block first — available to every signed-in user, including admins.
@@ -17449,6 +17550,7 @@ function admin_render_masto_status_card(
     bool $hideHeader = false
 
 ): void {
+    $readOnlyGuest = !empty($GLOBALS['vaak_guest_profile']);
     $directSurface = $focused || in_array($returnView, ['status', 'remote_profile'], true)
         || ($GLOBALS['view'] ?? '') === 'status';
     if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)) {
@@ -17913,6 +18015,16 @@ function admin_render_masto_status_card(
                 $pendingUrl = '';
             }
         }
+        // A retained canonical child can be denied by current durable policy.
+        // Suppress recovery and warming as well as its HTML; cached presentation
+        // never grants permission to fetch a previously private/deleted target.
+        $pendingPolicySource = $GLOBALS['vaak_quote_policy_statuses'][admin_library_quote_policy_key($pendingUrl)] ?? null;
+        if (is_array($pendingPolicySource)
+            && (!function_exists('ap_visibility_status_audience_allowed')
+                || !ap_visibility_status_audience_allowed($pendingPolicySource, admin_owner_user_id()))) {
+            $pendingUrl = '';
+            $fallbackQuoteOpts = null;
+        }
         // Cache hit for the quoted object → render a real quote card.
         // Includes GTS @handle/id → /ap/users/{numeric}/statuses/{id} bridge.
         if ($pendingUrl !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
@@ -18297,7 +18409,19 @@ function admin_render_masto_status_card(
               echo admin_cw_gate_html($cwSpoiler, $cwSensitive, $bodyInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($isRss): ?>
+              <?php if ($readOnlyGuest): ?>
+                <?php if ($sid !== '' && $uri !== ''):
+                  $guestCounts = admin_status_action_counts($st, is_array($bskyPostBlob) ? $bskyPostBlob : null, $uri, $sid);
+                  foreach (['quotes' => ['ph-quotes', 'Quotes'], 'reblogs' => ['ph-repeat', 'Boosts'], 'favourites' => ['ph-heart', 'Likes']] as $countKey => $countLabel):
+                    $guestCount = (int) ($guestCounts[$countKey] ?? 0);
+                    if ($guestCount <= 0) continue;
+                ?>
+                  <span class="meta has-count" aria-label="<?= h($countLabel[1] . ' (' . admin_format_compact_count($guestCount) . ')') ?>"><i class="ph <?= h($countLabel[0]) ?>" aria-hidden="true"></i><?= admin_action_count_html($guestCount) ?></span>
+                <?php endforeach; endif; ?>
+                <?php if ($uri !== ''): ?>
+                  <?= admin_post_navigation_menu_html($showOpen ? admin_status_href($uri, $returnView) : '', admin_remote_object_href($uri, $st['url'] ?? null)) ?>
+                <?php endif; ?>
+              <?php elseif ($isRss): ?>
                 <?php
                   $rssOverflow = '';
                   if ($uri !== '' && preg_match('#^https?://#i', $uri)) {
@@ -18403,9 +18527,6 @@ function admin_render_masto_status_card(
                     }
                 }
               ?>
-              <?php if ($showOpen && $uri !== ''): ?>
-                <a class="btn btn-ghost" href="<?= h(admin_status_href($uri, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-              <?php endif; ?>
               <?php if ($uri !== ''): ?>
                 <?php
                   $stMentionSeed = !$isLocal
@@ -18561,10 +18682,15 @@ function admin_render_masto_status_card(
                   <button class="icon-btn<?= $bm ? ' on' : '' ?>" type="submit" title="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $bm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $bm ? '1' : '0' ?>"><i class="ph<?= $bm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                 </form>
               <?php endif; ?>
-              <?php if ($uri !== ''): ?>
-                <a href="<?= h(admin_remote_object_href($uri, $st['url'] ?? null)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
-              <?php endif; ?>
-              <?= block_quick_actions($actorRef, short_host($actorRef), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $uri) ?>
+              <?php
+                $statusQuickActions = block_quick_actions($actorRef, short_host($actorRef), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $uri, $st['url'] ?? null);
+                // AT objects and own protocol profiles have no object navigation in
+                // the moderation menu. Keep their former links in a GET-only menu.
+                if ($uri !== '' && ($statusQuickActions === '' || !str_starts_with($uri, 'https://'))) {
+                    echo admin_post_navigation_menu_html($showOpen ? admin_status_href($uri, $returnView) : '', admin_remote_object_href($uri, $st['url'] ?? null));
+                }
+                echo $statusQuickActions;
+              ?>
               <?php endif; ?>
             </div>
           </article>
@@ -18634,7 +18760,8 @@ function admin_try_render_announce_shared_card(
     array $e,
     array $followingIds,
     string $returnView,
-    bool $skipSyncHydrate = true
+    bool $skipSyncHydrate = true,
+    ?string $profileBoostActor = null
 ): bool {
     if (!function_exists('ap_normalize_from_activitypub_event')
         || !function_exists('admin_render_masto_status_card')) {
@@ -18644,7 +18771,7 @@ function admin_try_render_announce_shared_card(
     if ($skipSyncHydrate) {
         $ann['_skip_announce_hydrate'] = true;
     }
-    $st = ap_normalize_from_activitypub_event($ann);
+    $st = ap_normalize_from_activitypub_event($ann, $profileBoostActor);
     if (!is_array($st)) {
         return false;
     }
@@ -19190,9 +19317,8 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
               echo admin_tweet_content_wrap($boostInner);
             ?>
             <div class="tweet-actions">
-              <?php if ($objectId !== ''): ?>
-                <a class="btn btn-ghost" href="<?= h(admin_status_href($objectId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                <a href="<?= h(admin_remote_object_href($objectId)) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open on remote instance">Remote</a>
+              <?php if ($objectId !== '' && (!empty($GLOBALS['vaak_guest_profile']) || (function_exists('vaak_is_own_url') && vaak_is_own_url($objectId)))): ?>
+                <?= admin_post_navigation_menu_html(admin_status_href($objectId, $returnView), admin_remote_object_href($objectId)) ?>
               <?php endif; ?>
               <?php if ($statusId !== '' && $objectId !== ''): ?>
                 <form method="post" action="?view=<?= h($returnView) ?>" style="display:inline">
@@ -19716,7 +19842,6 @@ function admin_render_outbox_card(array $n, string $returnView): void
                       $peerActionBase .= '&actor=' . rawurlencode($actor);
                   }
                 ?>
-                <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
                 <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;reply_to=<?= urlencode($noteId) ?><?= $actor !== '' ? '&amp;to=' . urlencode($actor) : '' ?><?= admin_reply_cw_query($ownSpoiler, $ownSensitive) ?>" title="Reply" aria-label="Reply"><i class="ph ph-arrow-bend-up-left" aria-hidden="true"></i></a>
                 <?php if ($peerCanBoostQuote): ?>
                   <a class="icon-btn" href="?view=<?= h($returnView) ?>&amp;compose=1&amp;quote_object=<?= urlencode($noteId) ?><?= $peerSid !== '' ? '&amp;quote_status_id=' . urlencode($peerSid) : '' ?>" title="Quote" aria-label="Quote"><i class="ph ph-quotes" aria-hidden="true"></i></a>
@@ -19760,11 +19885,9 @@ function admin_render_outbox_card(array $n, string $returnView): void
                     <button class="icon-btn<?= $peerBm ? ' on' : '' ?>" type="submit" title="<?= $peerBm ? 'Bookmark folders' : 'Bookmark' ?>" aria-label="<?= $peerBm ? 'Bookmark folders' : 'Bookmark' ?>" data-bm-picker="<?= $peerBm ? '1' : '0' ?>"><i class="ph<?= $peerBm ? '-fill' : '' ?> ph-bookmark-simple" aria-hidden="true"></i></button>
                   </form>
                 <?php endif; ?>
-                <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL (<?= h($ownVisLabel ?? 'Public') ?>)">Note</a>
                 <?= block_quick_actions($actor, short_host($actor), $returnView, admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), $returnView, $noteId) ?>
               <?php elseif ($noteId !== ''): ?>
-                <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, $returnView)) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
-                <a href="<?= h($noteId) ?>" target="_blank" rel="noopener noreferrer" class="meta" title="Open note URL">Note</a>
+                <?= admin_post_navigation_menu_html(admin_status_href($noteId, $returnView), $noteId) ?>
               <?php endif; ?>
             </div>
           </article>
@@ -20432,8 +20555,7 @@ function admin_render_rss_item(array $row, string $returnView): void
     echo '<article class="tweet" data-rss-item="' . $itemId . '" data-timeline-key="rss:' . $itemId . '">';
     echo '<div class="body feed-body">' . htmlspecialchars($title !== '' ? $title : 'RSS item', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>';
     if ($url !== '' && preg_match('#^https?://#i', $url)) {
-        echo '<div class="meta"><a href="' . htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
-            . '" target="_blank" rel="noopener noreferrer">Open</a></div>';
+        echo '<div class="tweet-actions">' . admin_post_navigation_menu_html($url, '', 'Open', true) . '</div>';
     }
     echo '</article>';
 }
@@ -21243,7 +21365,7 @@ if ($isPartial && $view === 'remote_profile') {
             $profileOffset,
             (int) ($vaakOwnerId ?? 0)
         );
-        if (is_array($axumProfile) && (string) ($axumProfile['html'] ?? '') !== '') {
+        if (is_array($axumProfile) && (!empty($axumProfile['complete_native']) || (string) ($axumProfile['html'] ?? '') !== '')) {
             header('X-Has-More: ' . (!empty($axumProfile['has_more']) ? '1' : '0'));
             header('X-Next-Offset: ' . (int) ($axumProfile['next_offset'] ?? ($profileOffset + $profileLimit)));
             header('X-TL-Cache: axum-profile-html');
@@ -21264,7 +21386,7 @@ if ($isPartial && $view === 'remote_profile') {
             continue;
         }
         if (strtolower((string) ($row['type'] ?? '')) === 'announce') {
-            admin_render_event_tweet($row, $followingIds, 'remote_profile');
+            admin_render_event_tweet($row, $followingIds, 'remote_profile', false, $profileTab === 'boosts' ? $profileActor : null);
         } elseif (!admin_try_render_outbox_shared_card($row, $followingIds, 'remote_profile')) {
             admin_render_outbox_card($row, 'remote_profile');
         }
@@ -23002,10 +23124,11 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
         }
       ?>
       <?php if (!$nEmbedded && $notifOpenUri !== '' && vaak_is_own_url($notifOpenUri) && str_contains($notifOpenUri, '/notes/')): ?>
-        <a class="btn btn-ghost btn-compact" href="?view=outbox&amp;focus=<?= urlencode($notifOpenUri) ?>">Open in Your posts</a>
+        <?= admin_post_navigation_menu_html('?view=outbox&focus=' . urlencode($notifOpenUri), '', 'Open in Your posts') ?>
       <?php elseif (!$nEmbedded && $notifOpenUri !== '' && !str_contains($notifOpenUri, '/bites-received/')): ?>
-        <a class="btn btn-ghost btn-compact" href="<?= h(admin_status_href($notifOpenUri, 'mentions')) ?>">Open</a>
-        <a href="<?= h(admin_remote_object_href($notifOpenUri)) ?>" target="_blank" rel="noopener noreferrer" class="meta">Remote</a>
+        <?php if (!in_array($nType, ['mention', 'quote'], true) || $nActorRef === ''): ?>
+          <?= admin_post_navigation_menu_html(admin_status_href($notifOpenUri, 'mentions'), admin_remote_object_href($notifOpenUri)) ?>
+        <?php endif; ?>
       <?php endif; ?>
       <?php if (!$nEmbedded && in_array($nType, ['mention', 'quote'], true) && $nActorRef !== ''): ?>
         <?= block_quick_actions($nActorRef, short_host($nActorRef), 'mentions', (int) admin_owner_user_id(), !empty($GLOBALS['vaak_is_admin']), 'mentions', $notifOpenUri !== '' ? $notifOpenUri : $nStatusUri) ?>
@@ -23364,8 +23487,18 @@ function admin_profile_html_axum_fetch(
     string $tab = 'posts',
     int $limit = 20,
     int $offset = 0,
-    int $ownerUserId = 0
+    int $ownerUserId = 0,
+    string $completeMode = 'append'
 ): ?array {
+    require_once __DIR__ . '/ap-profile-native.php';
+    if (!empty($GLOBALS['vaak_profile_full_fallback'])) return null;
+    if (ap_profile_complete_native_enabled()) {
+        // A rejected complete batch returns to PHP without trying the lean dialect.
+        return ap_profile_complete_fetch($actorUrl, $tab, $limit, $offset, $ownerUserId, $completeMode);
+    }
+    // The old lean endpoint has no authenticated guest presentation contract.
+    // Keep established public guests on the complete read-only PHP painter.
+    if (!empty($GLOBALS['vaak_guest_profile'])) return null;
     $enabled = getenv('VAAK_PROFILE_HTML_AXUM');
     $enabled = ($enabled === false || $enabled === '')
         ? true
@@ -24292,7 +24425,7 @@ function admin_render_notification_stream(array $rows, array $followingIds, arra
             echo '</div>';
         }
         if ($statusUrl !== '' && !$embedded) {
-            echo '<div class="tweet-actions"><a class="btn btn-ghost" href="' . h(admin_status_href($statusUrl, 'mentions')) . '" style="padding:.25rem .7rem;font-size:.8rem">Open</a></div>';
+            echo '<div class="tweet-actions">' . admin_post_navigation_menu_html(admin_status_href($statusUrl, 'mentions')) . '</div>';
         }
         echo '</article>';
     }
@@ -24965,7 +25098,20 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
     body.blog-fullscreen .main { width: 100%; max-width: none; }
     body.blog-fullscreen .main > .topbar { padding-inline: clamp(1rem, 4vw, 3rem); }
     body.blog-fullscreen .feed { width: 100%; max-width: 1100px; margin-inline: auto; padding-inline: clamp(1rem, 4vw, 3rem); }
+    @media (max-width: 700px), (max-width: 950px) and (max-height: 520px) {
+      body.blog-fullscreen .rail-left,
+      body.dm-fullscreen .rail-left { display: flex; }
+    }
     .blog-editor { max-width: 100%; }
+    .blog-formatting { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .75rem; }
+    .blog-formatting .btn { min-height: 2.5rem; }
+    .blog-link-fields { margin-top: .5rem; }
+    .blog-link-fields[hidden] { display: none; }
+    .blog-link-fields .blog-fields { margin-bottom: .5rem; }
+    .blog-editor label { display: block; margin-top: .75rem; }
+    .blog-editor .blog-fields label { margin-top: 0; }
+    .blog-editor .blog-fields input { margin-top: .25rem; }
+    .blog-editor .blog-format-status { min-height: 1.5em; }
     .blog-editor input,
     .blog-editor textarea { display: block; width: 100%; max-width: 100%; }
     .blog-editor textarea { min-height: min(62vh, 44rem); resize: vertical; line-height: 1.6; }
@@ -27347,6 +27493,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
             <?php endif; ?>
           </a>
           <a class="<?= $view === 'blocks' ? 'active' : '' ?>" href="/vaak/?view=blocks"><span class="ico">⊘</span><span class="label">Server blocks</span></a>
+          <a class="<?= $view === 'approvals' ? 'active' : '' ?>" href="/vaak/?view=approvals"><span class="ico">✓</span><span class="label">Approvals</span></a>
           <a class="<?= $view === 'invites' ? 'active' : '' ?>" href="/vaak/?view=invites"><span class="ico">✦</span><span class="label">Invites</span></a>
           <a class="<?= $view === 'users' ? 'active' : '' ?>" href="/vaak/?view=users"><span class="ico"><i class="ph ph-users-three" aria-hidden="true"></i></span><span class="label">Users</span></a>
           <a class="<?= $view === 'policies' ? 'active' : '' ?>" href="/vaak/?view=policies"><span class="ico">§</span><span class="label">Policies</span></a>
@@ -27417,25 +27564,7 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
           </div>
         </div>
     </div>
-    <?php if (empty($vaakDeferTrendsPaint)): ?>
-    <script>
-    (function () {
-      var box = document.getElementById('trends-sidebar');
-      if (!box || box.getAttribute('data-deferred') === '0') return;
-      try {
-        var raw = sessionStorage.getItem('vaak.trends.html.v3');
-        if (!raw) return;
-        var data = JSON.parse(raw);
-        if (!data || typeof data.html !== 'string' || !data.html.trim()) return;
-        var ageMs = Date.now() - (Number(data.at) || 0);
-        box.innerHTML = data.html;
-        box.setAttribute('data-deferred', '0');
-        if (ageMs >= 15 * 60 * 1000) box.setAttribute('data-stale', '1');
-        else box.setAttribute('data-cached-age', String(Math.max(0, Math.round(ageMs / 1000))));
-      } catch (e) {}
-    })();
-    </script>
-    <?php endif; ?>
+
   </aside>
   <?php endif; ?>
 
@@ -27530,6 +27659,21 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           if (!is_array($editingDraft) || (string) ($editingDraft['status'] ?? '') !== 'draft') {
               $editingDraft = null;
           }
+          // Keep the submitted draft after validation/storage/publishing failures.
+          $blogSubmitted = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
+              && (string) ($_POST['action'] ?? '') === 'blog_save' && is_string($error) && $error !== '';
+          $blogEditor = $blogSubmitted ? [
+              'slug' => (string) ($_POST['blog_slug'] ?? ''),
+              'title' => (string) ($_POST['blog_title'] ?? ''),
+              'category' => (string) ($_POST['blog_category'] ?? ''),
+              'body_markdown' => (string) ($_POST['blog_body'] ?? ''),
+          ] : ($editingDraft ?? []);
+          // A newly saved draft whose publication failed must update that draft on retry.
+          if ($blogSubmitted && empty($blogEditor['slug']) && isset($blog) && is_array($blog)) {
+              $blogEditor['slug'] = (string) ($blog['slug'] ?? '');
+          }
+          $blogEditorTags = $blogSubmitted ? (string) ($_POST['blog_tags'] ?? '')
+              : implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) ($editingDraft['tags'] ?? [])));
           $blogShadow = admin_you_projection_axum_fetch('blog', (int) $vaakOwnerId, 100);
           if (is_array($blogShadow)) {
               $blogRows = array_map(static function (array $row): array {
@@ -27560,19 +27704,39 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           <section class="side-card blog-editor">
             <div class="meta">Long-form publishing · Markdown-compatible (**bold**, *italics*, headings, lists, and links)</div>
             <h2>Write a blog post</h2>
-            <form method="post" action="?view=blog">
+            <form method="post" action="?view=blog" data-blog-editor>
               <input type="hidden" name="action" value="blog_save">
               <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
-              <?php if ($editingDraft): ?><input type="hidden" name="blog_slug" value="<?= h((string) $editingDraft['slug']) ?>"><?php endif; ?>
+              <?php if (!empty($blogEditor['slug'])): ?><input type="hidden" name="blog_slug" value="<?= h((string) $blogEditor['slug']) ?>"><?php endif; ?>
               <div class="blog-fields">
-                <input name="blog_title" maxlength="240" required placeholder="Title" value="<?= h((string) ($editingDraft['title'] ?? '')) ?>">
-                <input name="blog_category" maxlength="120" placeholder="Category" value="<?= h((string) ($editingDraft['category'] ?? '')) ?>">
+                <label>Title<input name="blog_title" maxlength="240" required placeholder="Title" value="<?= h((string) ($blogEditor['title'] ?? '')) ?>"></label>
+                <label>Category<input name="blog_category" maxlength="120" placeholder="Category" value="<?= h((string) ($blogEditor['category'] ?? '')) ?>"></label>
               </div>
-              <textarea name="blog_body" maxlength="200000" required placeholder="Write your post…" style="margin-top:.75rem"><?= h((string) ($editingDraft['body_markdown'] ?? '')) ?></textarea>
-              <input name="blog_tags" maxlength="500" placeholder="Hashtags, separated by spaces or commas" value="<?= h(implode(' ', array_map(static fn($tag): string => '#' . (string) $tag, (array) ($editingDraft['tags'] ?? [])))) ?>" style="margin-top:.75rem">
+              <div class="blog-formatting" role="group" aria-label="Format blog text">
+                <button class="btn btn-ghost" type="button" data-blog-format="bold" title="Bold (Ctrl/Command+B)"><strong>Bold</strong></button>
+                <button class="btn btn-ghost" type="button" data-blog-format="italic" title="Italic (Ctrl/Command+I)"><em>Italic</em></button>
+                <button class="btn btn-ghost" type="button" data-blog-format="heading1">Heading</button>
+                <button class="btn btn-ghost" type="button" data-blog-format="heading2">Subheading</button>
+                <button class="btn btn-ghost" type="button" data-blog-format="heading3">Small heading</button>
+                <button class="btn btn-ghost" type="button" data-blog-format="list">Bullet list</button>
+                <button class="btn btn-ghost" type="button" data-blog-format="link" aria-expanded="false" aria-controls="blog-link-fields" title="Link (Ctrl/Command+K)">Link</button>
+              </div>
+              <div class="blog-link-fields" id="blog-link-fields" hidden>
+                <div class="blog-fields">
+                  <label>Link text<input type="text" data-blog-link-text maxlength="2000"></label>
+                  <label>HTTPS address<input type="url" data-blog-link-url placeholder="https://example.org" maxlength="4000"></label>
+                </div>
+                <button class="btn btn-ghost" type="button" data-blog-link-insert>Insert link</button>
+                <button class="btn btn-ghost" type="button" data-blog-link-cancel>Cancel</button>
+              </div>
+              <label for="blog-body">Post content</label>
+              <textarea id="blog-body" name="blog_body" maxlength="200000" required placeholder="Write your post…" aria-describedby="blog-format-help blog-format-status"><?= h((string) ($blogEditor['body_markdown'] ?? '')) ?></textarea>
+              <p class="meta" id="blog-format-help">Select text, then choose a format. Headings and lists apply to whole lines. Links must use HTTPS. You can also write Markdown directly.</p>
+              <div class="meta blog-format-status" id="blog-format-status" role="status" aria-live="polite"></div>
+              <label>Hashtags<input name="blog_tags" maxlength="500" placeholder="Hashtags, separated by spaces or commas" value="<?= h($blogEditorTags) ?>"></label>
               <div class="composer-actions">
                 <span class="meta">Published posts appear under Blog on your HTML profile. The timeline receives a title content warning and a short excerpt.</span>
-                <button class="btn btn-ghost" name="blog_publish" value="0" type="submit"><?= $editingDraft ? 'Update draft' : 'Save draft' ?></button>
+                <button class="btn btn-ghost" name="blog_publish" value="0" type="submit"><?= !empty($blogEditor['slug']) ? 'Update draft' : 'Save draft' ?></button>
                 <button class="btn btn-primary" name="blog_publish" value="1" type="submit">Publish</button>
               </div>
             </form>
@@ -28924,6 +29088,10 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
       <?php elseif ($view === 'users'): ?>
         <?php if (empty($vaakIsAdmin)): ?>
           <div class="empty">Admin only.</div>
+        <?php elseif (($adminNativeBody = ap_admin_native_read_body('users')) !== null): ?>
+          <?= $adminNativeBody ?>
+        <?php elseif (!ap_registration_current_admin(ap_db())): ?>
+          <div class="empty">Admin only.</div>
         <?php else: ?>
           <?php
             $usersSearch = trim((string) ($_GET['q'] ?? $_POST['users_q'] ?? ''));
@@ -29296,9 +29464,41 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           </form>
         <?php endif; ?>
 
-      <?php elseif ($view === 'invites'): ?>
-        <?php if (empty($vaakIsAdmin)): ?>
+      <?php elseif ($view === 'approvals'): ?>
+        <?php if (!ap_registration_current_admin(ap_db())): ?>
           <div class="empty">Admin only.</div>
+        <?php elseif (($adminNativeBody = ap_admin_native_read_body('approvals', max(0,(int)($_GET['approval_offset']??0)))) !== null): ?>
+          <?= $adminNativeBody ?>
+        <?php else: ?>
+          <p class="meta"><?= ap_registration_approvals_enabled() ? 'Applications require approval before an account is created.' : 'Registration applications are closed. Invite registration continues as usual.' ?></p>
+          <?php $applicationOffset = max(0, (int) ($_GET['approval_offset'] ?? 0)); $applicationRows = ap_registration_applications_list($applicationOffset); ?>
+          <?php if ($applicationRows === []): ?><div class="empty">No applications.</div><?php endif; ?>
+          <?php foreach ($applicationRows as $application): ?>
+            <article class="card">
+              <strong><?= h((string) $application['username']) ?></strong>
+              <p><?= h((string) ($application['email'] ?? '')) ?></p>
+              <p class="meta"><?= h((string) $application['created_at']) ?> · <?= h((string) $application['status']) ?></p>
+              <?php if ($application['status'] === 'pending' && ap_registration_approvals_enabled()): ?>
+                <form method="post" action="?view=approvals">
+                  <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+                  <input type="hidden" name="application_id" value="<?= (int) $application['id'] ?>">
+                  <button class="btn" name="action" value="registration_approve">Approve</button>
+                  <button class="btn" name="action" value="registration_reject">Reject</button>
+                </form>
+              <?php endif; ?>
+            </article>
+          <?php endforeach; ?>
+          <nav aria-label="Application pages">
+            <?php if ($applicationOffset > 0): ?><a class="btn" href="?view=approvals&amp;approval_offset=<?= max(0, $applicationOffset - 100) ?>">Previous</a><?php endif; ?>
+            <?php if (count($applicationRows) === 100): ?><a class="btn" href="?view=approvals&amp;approval_offset=<?= $applicationOffset + 100 ?>">Next</a><?php endif; ?>
+          </nav>
+        <?php endif; ?>
+
+      <?php elseif ($view === 'invites'): ?>
+        <?php if (!ap_registration_current_admin(ap_db())): ?>
+          <div class="empty">Admin only.</div>
+        <?php elseif (($adminNativeBody = ap_admin_native_read_body('invites')) !== null): ?>
+          <?= $adminNativeBody ?>
         <?php else: ?>
           <?php $inviteRows = ap_auth_invites_list(100); ?>
           <div class="meta" style="margin-bottom:1rem">
@@ -31321,7 +31521,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
                       <div class="body"><?= $content ?></div>
                       <?php if ($oid !== ''): ?>
                         <div class="tweet-actions">
-                          <a href="<?= h(admin_status_href($oid, 'lists')) ?>">Open</a>
+                          <?= admin_post_navigation_menu_html(admin_status_href($oid, 'lists')) ?>
                         </div>
                       <?php endif; ?>
                     </article>
@@ -32313,6 +32513,21 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
 
       <?php elseif ($view === 'remote_profile'): ?>
         <?php
+          require_once __DIR__ . '/ap-profile-native.php';
+          $rpNativeWhole = null;
+          $rpNativeWholeCandidate = ap_profile_complete_native_enabled()
+              && preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+/?$#', trim((string) ($_GET['actor'] ?? '')));
+          if ($rpNativeWholeCandidate) {
+              $rpNativeWhole = ap_profile_full_fetch((string) ($_GET['actor'] ?? ''), (string) ($_GET['tab'] ?? 'posts'), (string) ($_GET['from'] ?? ''), (string) ($_GET['post'] ?? ''), !empty($GLOBALS['vaak_profile_shell']), (int) $vaakOwnerId);
+          }
+          // A failed whole fragment keeps its complete PHP caller, with no
+          // second native card/lean attempt inside that fallback request.
+          $GLOBALS['vaak_profile_full_fallback'] = $rpNativeWholeCandidate && $rpNativeWhole === null;
+        ?>
+        <?php if ($rpNativeWhole !== null): ?>
+          <?= $rpNativeWhole['html'] ?>
+        <?php else: ?>
+        <?php
           $rpFrom = preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? '')) ?: '';
           $rpBackHref = match ($rpFrom) {
               'mentions' => '?view=mentions',
@@ -33072,6 +33287,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           $rpLocalPageLimit = 12;
           $rpLocalNextOffset = 0;
           $rpAxumHtml = null;
+          $rpCompleteSourceCount = null;
           $rpAxumCache = '';
           $rpLocalPageItems = [];
           // Prefer Axum lean HTML for every local timeline tab (0.7.18; always-on 0.7.23).
@@ -33083,10 +33299,12 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
                   $rpTab,
                   (int) $rpLocalPageLimit,
                   0,
-                  (int) ($vaakOwnerId ?? 0)
+                  (int) ($vaakOwnerId ?? 0),
+                  'first_paint'
               );
-              if (is_array($rpAxumFill) && (string) ($rpAxumFill['html'] ?? '') !== '') {
+              if (is_array($rpAxumFill) && (!empty($rpAxumFill['complete_native']) || (string) ($rpAxumFill['html'] ?? '') !== '')) {
                   $rpAxumHtml = (string) $rpAxumFill['html'];
+                  $rpCompleteSourceCount = !empty($rpAxumFill['complete_native']) ? (int) $rpAxumFill['source_count'] : null;
                   $rpLocalHasMore = !empty($rpAxumFill['has_more']);
                   $rpLocalNextOffset = (int) ($rpAxumFill['next_offset'] ?? $rpLocalPageLimit);
                   $rpAxumCache = 'axum-profile-html';
@@ -33749,7 +33967,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
               <?php endforeach; ?>
             <?php endif; ?>
           <?php elseif ($rpIsLocal || $rpOutboxPosts || $rpBskyPosts): ?>
-            <?php if ($rpTabItems[$rpTab] === [] && $rpAxumHtml === null && ($rpLocalPageItems ?? []) === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
+            <?php if ($rpTabItems[$rpTab] === [] && ($rpAxumHtml === null || ($rpAxumHtml === '' && $rpCompleteSourceCount === 0)) && ($rpLocalPageItems ?? []) === []): ?><div class="empty">No <?= h($rpTab) ?> available.</div><?php endif; ?>
             <?php if ($rpIsLocal): ?><div id="timeline-items" data-view="remote_profile" data-actor="<?= h($rpActor) ?>" data-tab="<?= h($rpTab) ?>" data-offset="<?= (int) $rpLocalNextOffset ?>" data-limit="<?= (int) $rpLocalPageLimit ?>" data-has-more="<?= $rpLocalHasMore ? '1' : '0' ?>" data-newest="0"<?= $rpAxumCache !== '' ? ' data-tl-cache="' . h($rpAxumCache) . '"' : '' ?>>
             <?php endif; ?>
             <?php if ($rpAxumHtml !== null): ?>
@@ -33771,7 +33989,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
               <?php if (isset($n['post']) && is_array($n['post'])): ?>
                 <?php admin_render_bsky_feed_item($n, 'following', 'remote_profile'); ?>
               <?php elseif (isset($n['type']) && strtolower((string) $n['type']) === 'announce'): ?>
-                <?php admin_render_event_tweet($n, $followingIds, 'remote_profile'); ?>
+                <?php admin_render_event_tweet($n, $followingIds, 'remote_profile', false, $rpIsLocal && $rpTab === 'boosts' ? $rpActor : null); ?>
               <?php elseif (is_array($n) && admin_try_render_outbox_shared_card($n, $followingIds, 'remote_profile')): ?>
               <?php else: ?>
                 <?php if (is_array($n)) admin_render_outbox_card($n, 'remote_profile'); ?>
@@ -33797,6 +34015,8 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           </div>
           <?php endif; /* !rpContentBlocked */ ?>
         <?php endif; ?>
+        <?php endif; /* complete native whole fragment or PHP fallback */ ?>
+        <?php unset($GLOBALS['vaak_profile_full_fallback']); ?>
 
       <?php elseif ($view === 'queue'): ?>
         <?php
@@ -34041,7 +34261,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
               <?php endif; ?>
               <div class="tweet-actions">
                 <?php if ($noteId !== '' && $noteAlive): ?>
-                  <a class="btn btn-ghost" href="<?= h(admin_status_href($noteId, 'queue')) ?>" style="padding:.25rem .7rem;font-size:.8rem">Open</a>
+                  <?= admin_post_navigation_menu_html(admin_status_href($noteId, 'queue')) ?>
                   <?php
                     $queueOwnProfile = function_exists('ap_vaak_pretty_profile_path')
                         ? ap_vaak_pretty_profile_path((string) ($vaakActorKey ?? ''), [])
@@ -38716,6 +38936,11 @@ window.apAdminToast = function (msg, isErr) {
       a.classList.toggle('active', linkView === current);
     });
     if (typeof window.vaakSyncNavSelection === 'function') window.vaakSyncNavSelection();
+    const trends = document.getElementById('trends-sidebar');
+    if (trends) {
+      trends.dataset.from = view;
+      if (typeof window.novaLoadDeferredTrends === 'function') window.novaLoadDeferredTrends(false);
+    }
     if (view === 'mentions') {
       const badge = document.getElementById('notif-badge');
       if (badge) { badge.hidden = true; badge.textContent = ''; }
@@ -39963,134 +40188,61 @@ window.apAdminToast = function (msg, isErr) {
 })();
 </script>
 <script>
-// Trends sidebar: show cached HTML immediately (SSR and/or sessionStorage),
-// and only quietly refresh in the background about every 15 minutes.
+// Cached global candidates are cheap; viewer-specific HTML is always revalidated.
 (function () {
-  const STORE_KEY = 'vaak.trends.html.v3';
-  const CLIENT_TTL_MS = 15 * 60 * 1000;
-
-  function readStore() {
-    try {
-      const raw = sessionStorage.getItem(STORE_KEY);
-      if (!raw) return null;
-      const data = JSON.parse(raw);
-      if (!data || typeof data.html !== 'string' || !data.html.trim()) return null;
-      return data;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function writeStore(html, ageSec) {
-    try {
-      sessionStorage.setItem(STORE_KEY, JSON.stringify({
-        html: html,
-        at: Date.now(),
-        age: typeof ageSec === 'number' ? ageSec : 0
-      }));
-    } catch (e) {}
-  }
-
-  function applyHtml(box, html, ageSec, stale) {
-    if (!box || !html || !String(html).trim()) return false;
-    box.innerHTML = html;
-    box.dataset.deferred = '0';
-    if (typeof ageSec === 'number') box.dataset.cachedAge = String(ageSec);
-    box.dataset.stale = stale ? '1' : '0';
-    return true;
-  }
-
-  function fetchTrends(box, opts) {
-    opts = opts || {};
-    const from = box.dataset.from || 'home';
-    const refresh = !!opts.refresh;
-    const url = '?ajax=trends&from=' + encodeURIComponent(from)
-      + '&frag=3'
-      + (refresh ? '&refresh=1' : '');
-    box.dataset.deferred = box.dataset.deferred === '0' ? '0' : 'loading';
-    return fetch(url, {
-      credentials: 'same-origin',
-      headers: { 'Accept': 'text/html' },
-      cache: refresh ? 'no-store' : 'default'
-    }).then((res) => {
-      if (!res.ok) return { html: '', age: 0, stale: true };
-      const age = parseInt(res.headers.get('X-Vaak-Trends-Age') || '0', 10) || 0;
-      const stale = (res.headers.get('X-Vaak-Trends-Stale') || '0') === '1';
-      return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
-    }).then((payload) => {
-      if (payload.html && payload.html.trim()) {
-        applyHtml(box, payload.html, payload.age, payload.stale);
-        writeStore(payload.html, payload.age);
-      } else if (box.dataset.deferred !== '0') {
-        box.dataset.deferred = '1';
-      }
-      return payload;
-    }).catch(() => {
-      if (box.dataset.deferred !== '0') box.dataset.deferred = '1';
-      return null;
-    });
-  }
+  let generation = 0;
+  let pending = null;
+  try { sessionStorage.removeItem('vaak.trends.html.v3'); } catch (e) {}
 
   function loadDeferredTrends(force) {
     const box = document.getElementById('trends-sidebar');
     if (!box) return;
-
-    const stored = readStore();
-    const storedAgeMs = stored ? (Date.now() - (stored.at || 0)) : Infinity;
-    const storedFresh = stored && storedAgeMs < CLIENT_TTL_MS;
-
-    // Prefer session cache for instant paint across page navigations.
-    if (storedFresh && box.dataset.deferred !== '0') {
-      applyHtml(box, stored.html, stored.age || 0, false);
-    } else if (stored && box.dataset.deferred !== '0') {
-      // Stale session cache still beats a skeleton while we refresh.
-      applyHtml(box, stored.html, stored.age || 0, true);
-    }
-
-    const hasPaint = box.dataset.deferred === '0' && box.innerHTML.trim() !== '';
-    const serverAgeSec = parseInt(box.dataset.cachedAge || '0', 10) || 0;
-    const serverStale = box.dataset.stale === '1';
-    const serverFresh = hasPaint && !serverStale && serverAgeSec < (15 * 60);
-    if (serverFresh && !storedFresh) {
-      // Seed session cache from SSR so the next page nav is instant.
-      writeStore(box.innerHTML, serverAgeSec);
-    }
-    const needRefresh = !!force
-      || !hasPaint
-      || serverStale
-      || (!serverFresh && !storedFresh);
-
-    if (!needRefresh) return;
-
-    const run = () => { fetchTrends(box, { refresh: !!force && !hasPaint }); };
-    if (hasPaint) {
-      // Quiet background refresh — don't block interaction.
-      if ('requestIdleCallback' in window) {
-        requestIdleCallback(run, { timeout: 4000 });
-      } else {
-        setTimeout(run, 600);
-      }
-    } else {
-      run();
-    }
+    const current = ++generation;
+    if (pending) pending.abort();
+    pending = new AbortController();
+    const controller = pending;
+    const from = box.dataset.from || 'home';
+    box.dataset.deferred = 'loading';
+    box.innerHTML = '';
+    // Refresh here means current policy; it does not force global collection/network work.
+    return fetch('?ajax=trends&from=' + encodeURIComponent(from) + '&frag=4', {
+      credentials: 'same-origin', headers: { 'Accept': 'text/html' },
+      cache: 'no-store', signal: controller.signal
+    }).then((res) => {
+      if (!res.ok) throw new Error('Trending request failed');
+      const age = parseInt(res.headers.get('X-Vaak-Trends-Age') || '0', 10) || 0;
+      const stale = res.headers.get('X-Vaak-Trends-Stale') === '1';
+      return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
+    }).then((payload) => {
+      if (current !== generation || !box.isConnected || document.getElementById('trends-sidebar') !== box) return;
+      box.innerHTML = payload.html;
+      box.dataset.deferred = '0';
+      box.dataset.cachedAge = String(payload.age);
+      box.dataset.stale = payload.stale ? '1' : '0';
+    }).catch(() => {
+      if (current !== generation || !box.isConnected) return;
+      // A failed policy check must not keep a previous viewer's or policy's cards.
+      box.innerHTML = '';
+      box.dataset.deferred = '1';
+    }).finally(() => { if (pending === controller) pending = null; });
   }
 
   window.novaLoadDeferredTrends = loadDeferredTrends;
-  // The page no longer renders trends in PHP. A warm session cache paints
-  // immediately on ordinary pages. Search and admin documents are full
-  // reloads, so the center column paints with the skeleton first and the
-  // rail fills after.
+  window.addEventListener('pagehide', () => {
+    ++generation;
+    if (pending) pending.abort();
+    const box = document.getElementById('trends-sidebar');
+    if (box) { box.innerHTML = ''; box.dataset.deferred = '1'; }
+  });
+  window.addEventListener('pageshow', (event) => { if (event.persisted) loadDeferredTrends(false); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadDeferredTrends(false); });
   var trendsBox = document.getElementById('trends-sidebar');
   if (trendsBox && trendsBox.getAttribute('data-paint-after') === '1') {
     var paintTrendsAfter = function () { loadDeferredTrends(false); };
     if (window.requestAnimationFrame) {
       requestAnimationFrame(function () { requestAnimationFrame(paintTrendsAfter); });
-    } else {
-      setTimeout(paintTrendsAfter, 0);
-    }
-  } else {
-    loadDeferredTrends(false);
-  }
+    } else { setTimeout(paintTrendsAfter, 0); }
+  } else { loadDeferredTrends(false); }
 
   // Bookmarks are an intentionally selective hot set: warm only a few
   // already-visible preview variants during idle time. Ordinary timelines
@@ -40241,6 +40393,97 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
       }, 120);
     });
   }
+})();
+</script>
+
+<script>
+// Delegated handlers also work when the Blog page arrives through soft navigation.
+(() => {
+  let linkSelection = null;
+  function editor(target) { return target.closest('[data-blog-editor]'); }
+  function replace(form, start, end, text, selectionStart, selectionEnd) {
+    const body = form.elements.blog_body;
+    if (body.value.length - (end - start) + text.length > body.maxLength) {
+      form.querySelector('.blog-format-status').textContent = 'This formatting would exceed the 200,000 character limit.';
+      return false;
+    }
+    const scroll = body.scrollTop;
+    body.focus();
+    body.setSelectionRange(start, end);
+    // insertText preserves the textarea's native undo history where supported.
+    // setRangeText keeps formatting available in engines without that command.
+    const inserted = typeof document.execCommand === 'function'
+      && document.execCommand('insertText', false, text);
+    if (!inserted) {
+      body.setRangeText(text, start, end, 'end');
+      body.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    body.setSelectionRange(selectionStart, selectionEnd);
+    body.scrollTop = scroll;
+    form.querySelector('.blog-format-status').textContent = '';
+    return true;
+  }
+  function closeLink(form) {
+    form.querySelector('.blog-link-fields').hidden = true;
+    form.querySelector('[data-blog-format="link"]').setAttribute('aria-expanded', 'false');
+    linkSelection = null;
+    form.elements.blog_body.focus();
+  }
+  function format(form, kind) {
+    const body = form.elements.blog_body, start = body.selectionStart, end = body.selectionEnd;
+    if (kind === 'link') {
+      linkSelection = { form, start, end, value: body.value };
+      form.querySelector('.blog-link-fields').hidden = false;
+      form.querySelector('[data-blog-format="link"]').setAttribute('aria-expanded', 'true');
+      form.querySelector('[data-blog-link-text]').value = body.value.slice(start, end);
+      form.querySelector('[data-blog-link-url]').value = '';
+      form.querySelector('[data-blog-link-text]').focus();
+      return;
+    }
+    if (kind === 'bold' || kind === 'italic') {
+      const marker = kind === 'bold' ? '**' : '*', selected = body.value.slice(start, end) || 'text';
+      replace(form, start, end, marker + selected + marker, start + marker.length, start + marker.length + selected.length);
+      return;
+    }
+    const lineStart = start === 0 ? 0 : body.value.lastIndexOf('\n', start - 1) + 1;
+    const last = end > start && body.value[end - 1] === '\n' ? end - 1 : end;
+    const next = body.value.indexOf('\n', last), lineEnd = next < 0 ? body.value.length : next;
+    const prefix = kind === 'list' ? '- ' : '#'.repeat(Number(kind.slice(-1))) + ' ';
+    const text = body.value.slice(lineStart, lineEnd).split('\n').map(line => prefix + line.replace(/^(?:#{1,3} |[-*] )/, '')).join('\n');
+    replace(form, lineStart, lineEnd, text, lineStart, lineStart + text.length);
+  }
+  document.addEventListener('click', event => {
+    const button = event.target.closest('[data-blog-format], [data-blog-link-insert], [data-blog-link-cancel]');
+    if (!button) return;
+    const form = editor(button); if (!form) return;
+    if (button.hasAttribute('data-blog-format')) { format(form, button.dataset.blogFormat); return; }
+    if (button.hasAttribute('data-blog-link-cancel')) { closeLink(form); return; }
+    const label = form.querySelector('[data-blog-link-text]').value.trim();
+    const url = form.querySelector('[data-blog-link-url]').value.trim();
+    // Match the server's intentionally small Markdown link syntax.
+    if (!label || /[\]\r\n]/.test(label) || !/^https:\/\/[^\s)]+$/.test(url)) {
+      form.querySelector('.blog-format-status').textContent = 'Enter link text without a closing bracket, and an HTTPS address without spaces or a closing parenthesis.';
+      return;
+    }
+    const saved = linkSelection;
+    if (!saved || saved.form !== form || saved.value !== form.elements.blog_body.value) {
+      form.querySelector('.blog-format-status').textContent = 'The post changed. Select the text and open Link again.';
+      return;
+    }
+    const text = '[' + label + '](' + url + ')';
+    if (replace(form, saved.start, saved.end, text, saved.start + 1, saved.start + 1 + label.length)) {
+      form.querySelector('.blog-link-fields').hidden = true;
+      form.querySelector('[data-blog-format="link"]').setAttribute('aria-expanded', 'false');
+      linkSelection = null;
+    }
+  });
+  document.addEventListener('keydown', event => {
+    const form = editor(event.target); if (!form) return;
+    if (event.key === 'Escape' && !form.querySelector('.blog-link-fields').hidden) { event.preventDefault(); closeLink(form); return; }
+    if (event.target !== form.elements.blog_body || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+    const kind = { b: 'bold', i: 'italic', k: 'link' }[event.key.toLowerCase()];
+    if (kind) { event.preventDefault(); format(form, kind); }
+  });
 })();
 </script>
 

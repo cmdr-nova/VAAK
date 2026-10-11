@@ -16,6 +16,9 @@ pub(crate) struct TrustedSession {
     bsky_enabled: bool,
     lazy_media: bool,
     bsky_bookmarks: std::collections::HashMap<String,bool>,
+    bsky_did:String,
+    warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,
+    saved_sources:std::collections::HashMap<usize,std::sync::Arc<super::selection::SavedEntryGrant>>,
 }
 
 impl TrustedSession {
@@ -23,14 +26,14 @@ impl TrustedSession {
         if owner_id < 1 || csrf.is_empty() || !matches!(return_view.as_str(), "bookmarks" | "favourites") {
             anyhow::bail!("invalid canonical PHP Library session");
         }
-        Ok(Self { owner_id, csrf, return_view, bsky_enabled, lazy_media:true, bsky_bookmarks:Default::default() })
+        Ok(Self { owner_id, csrf, return_view, bsky_enabled, lazy_media:true, bsky_bookmarks:Default::default(),bsky_did:String::new(),warm:None,saved_sources:Default::default() })
     }
     pub(super) fn with_lazy_media(mut self, lazy_media:bool)->Self { self.lazy_media=lazy_media; self }
     pub(super) fn lazy_media(&self)->bool { self.lazy_media }
     pub(super) async fn with_bsky_bookmarks(mut self, db:&Client, states:Vec<(String,String,bool)>)->Result<Self>{
         if states.len()>100 {anyhow::bail!("bookmark provenance limit");}
-        if states.is_empty(){return Ok(self)}
-        let did=db.query_opt("SELECT did FROM bsky_sessions WHERE owner_user_id::bigint=$1 LIMIT 1",&[&self.owner_id]).await?.map(|r|r.get::<_,String>(0)).unwrap_or_default();
+        let did=current_bsky_did(db,self.owner_id).await?;
+        self.bsky_did=did.clone();
         for (uri,source_did,state) in states {
             if did.is_empty()||source_did!=did||!regex::Regex::new(r"^at://did:[^\s/?#]+/app\.bsky\.feed\.post/[^\s/?#]+$").unwrap().is_match(&uri)||uri.len()>2048||uri.chars().any(char::is_whitespace)||self.bsky_bookmarks.insert(uri,state).is_some(){anyhow::bail!("invalid current-owner bookmark provenance");}
         }
@@ -43,6 +46,123 @@ impl TrustedSession {
     pub(super) fn csrf(&self) -> &str { &self.csrf }
     pub(super) fn return_view(&self) -> &str { &self.return_view }
     pub(super) fn bsky_enabled(&self) -> bool {self.bsky_enabled}
+    pub(crate) fn owner_id(&self)->i64 {self.owner_id}
+    pub(crate) async fn require_bsky_current(&self,db:&Client)->Result<()>{require_bsky_did(db,self.owner_id,&self.bsky_did).await}
+    pub(crate) fn with_warm_context(mut self,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Self{self.warm=warm;self}
+    pub(crate) async fn with_saved_sources(mut self,db:&Client,descriptors:Vec<super::selection::SavedSourceDescriptor>,source_count:usize)->Result<Self>{
+        super::selection::validate_descriptors(&descriptors,source_count,&self.return_view)?;
+        for descriptor in descriptors{
+            if !matches!(descriptor.producer_kind.as_str(),"bookmarks_mixed"|"bookmarks_fedi"|"bookmarks_bsky"|"bookmarks_fedi_data"|"bookmarks_bsky_data")||self.return_view!="bookmarks"||descriptor.source_index>=source_count||self.saved_sources.contains_key(&descriptor.source_index){anyhow::bail!("invalid saved producer/source slot")}
+            let grant=if descriptor.producer_kind=="bookmarks_mixed"{super::selection::SavedEntryGrant::mixed(db,&self,descriptor.folder_id,descriptor.offset,descriptor.limit,descriptor.selected_ordinal,&descriptor.selected_kind,&descriptor.reference).await?}else{
+             if descriptor.producer_kind!=format!("bookmarks_{}",descriptor.selected_kind)&&descriptor.producer_kind!=format!("bookmarks_{}_data",descriptor.selected_kind){anyhow::bail!("network producer kind mismatch")}
+             super::selection::SavedEntryGrant::network(db,&self,descriptor.folder_id,descriptor.offset,descriptor.limit,descriptor.selected_ordinal,&descriptor.selected_kind,&descriptor.reference).await?
+            };
+            self.saved_sources.insert(descriptor.source_index,std::sync::Arc::new(grant));
+        }
+        Ok(self)
+    }
+}
+impl crate::profile_enrichment::CurrentEnrichmentGrant for SelectedLibrarySearchSource {
+ fn require_current<'a>(&'a self,db:&'a Client)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{Box::pin(async move{SelectedLibrarySearchSource::require_current(self,db).await})}
+}
+
+/// Current surface authority for the shared SQL projector. This capability is
+/// never deserialized and cannot be constructed from a cached presentation.
+pub(crate) struct SelectedLibrarySearchSource { inner: SelectedSurfaceSource,bsky_did:Option<String> }
+pub(crate) fn has_bsky_source(value:&Value)->bool{
+ if value.get("post").is_some_and(Value::is_object)||value.get("bsky_post").is_some_and(Value::is_object)||value.get("uri").and_then(Value::as_str).is_some_and(|uri|uri.starts_with("at://")){return true}
+ match value{Value::Object(map)=>map.values().filter(|value|value.is_object()||value.is_array()).any(has_bsky_source),Value::Array(values)=>values.iter().any(has_bsky_source),_=>false}
+}
+pub(crate) async fn require_bsky_did(db:&Client,owner:i64,did:&str)->Result<()>{
+ let current=current_bsky_did(db,owner).await?;
+ if current!=did{anyhow::bail!("surface Bluesky owner connection changed")};Ok(())
+}
+pub(crate) async fn current_bsky_did(db:&Client,owner:i64)->Result<String>{
+ if !db.query_one("SELECT to_regclass('bsky_sessions') IS NOT NULL",&[]).await?.get::<_,bool>(0){return Ok(String::new())}
+ Ok(db.query_opt("SELECT did FROM bsky_sessions WHERE owner_user_id::bigint=$1 LIMIT 1",&[&owner]).await?.map(|row|row.get::<_,String>(0)).unwrap_or_default())
+}
+enum SelectedSurfaceSource {
+    Library {owner:i64, actor:String, key:String, source:Value, saved_sid:String,association:Option<std::sync::Arc<super::selection::SavedEntryGrant>>},
+    Search {owner:i64, actor:String, key:String, source:Value, saved_sid:String,source_index:usize,association:Option<std::sync::Arc<crate::search_context::selection::SearchWindowGrant>>},
+}
+impl SelectedLibrarySearchSource {
+    pub(crate) async fn library(db:&Client,session:&TrustedSession,source:Value)->Result<Self>{
+        let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner_id]).await?.context("inactive Library selected source owner")?;
+        let bsky_did=has_bsky_source(&source).then(||session.bsky_did.clone());
+        let selected=Self{bsky_did,inner:SelectedSurfaceSource::Library{owner:session.owner_id,actor:row.get(0),key:row.get(1),saved_sid:super::card::scalar_string(&source,"id"),source,association:None}};
+        selected.require_current(db).await?;Ok(selected)
+    }
+    pub(crate) async fn library_saved(db:&Client,session:&TrustedSession,source:Value,association:std::sync::Arc<super::selection::SavedEntryGrant>)->Result<Self>{
+        if association.owner_id()!=session.owner_id(){anyhow::bail!("saved source owner differs from current session")}
+        association.require_current(db).await?;association.require_source_binding(&source)?;
+        let mut selected=Self::library(db,session,source).await?;
+        if let SelectedSurfaceSource::Library{association:binding,..}=&mut selected.inner{*binding=Some(association)}
+        selected.require_current(db).await?;Ok(selected)
+    }
+    pub(crate) async fn search(db:&Client,session:&crate::search_context::SearchSession,source:Value,source_index:usize)->Result<Self>{
+        let association=session.collector().cloned();
+        if let Some(association)=&association{if association.owner_id()!=session.owner_id(){anyhow::bail!("Search collector owner mismatch")}association.require_source_binding(source_index,&source)?;}else{
+            #[cfg(not(test))] anyhow::bail!("PHP fallback: Search enrichment requires enclosing collector association");
+            #[cfg(test)] if session.warm_context().and_then(|warm|warm.fixture_clock()).is_none(){anyhow::bail!("PHP fallback: Search enrichment requires enclosing collector association")}
+        }
+        let owner=session.owner_id();
+        let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.context("inactive Search selected source owner")?;
+        let bsky_did=has_bsky_source(&source).then(||session.bsky_did().to_owned());
+        let selected=Self{bsky_did,inner:SelectedSurfaceSource::Search{owner,actor:row.get(0),key:row.get(1),saved_sid:super::card::scalar_string(&source,"id"),source,source_index,association}};
+        selected.require_current(db).await?;Ok(selected)
+    }
+    pub(crate) fn owner_id(&self)->i64 {match &self.inner{SelectedSurfaceSource::Library{owner,..}|SelectedSurfaceSource::Search{owner,..}=>*owner}}
+    pub(crate) fn source(&self)->&Value {match &self.inner{SelectedSurfaceSource::Library{source,..}|SelectedSurfaceSource::Search{source,..}=>source}}
+    pub(crate) fn object_id(&self)->&str {
+        let root=self.source();
+        let displayed=root.get("reblog").filter(|value|value.is_object()&&root.get("content").and_then(Value::as_str).unwrap_or("").is_empty()).unwrap_or(root);
+        displayed.get("uri").or_else(||displayed.get("url")).and_then(Value::as_str).unwrap_or("")
+    }
+    pub(crate) fn original_saved_sid(&self)->&str {match &self.inner{SelectedSurfaceSource::Library{saved_sid,..}|SelectedSurfaceSource::Search{saved_sid,..}=>saved_sid}}
+    pub(crate) async fn require_current(&self,db:&Client)->Result<()> {
+        let (actor,key)=match &self.inner{SelectedSurfaceSource::Library{actor,key,..}|SelectedSurfaceSource::Search{actor,key,..}=>(actor,key)};
+        let owner=self.owner_id();
+        if let Some(did)=&self.bsky_did{require_bsky_did(db,owner,did).await?;}
+        // The actual Search window grant refreshes owner identity and recursive
+        // source/audience predicates for every candidate, including this exact
+        // bound entry. Do not run the identical single-source checks again.
+        // This is a fresh read at each invocation, never an allowed-result memo.
+        if let SelectedSurfaceSource::Search{source,source_index,association:Some(association),..}=&self.inner{
+            association.require_owner_binding(owner,actor,key)?;
+            association.require_source_binding(*source_index,source)?;
+            association.require_current(db).await?;
+            return Ok(())
+        }
+        let row=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&owner]).await?.context("selected surface owner withdrawn")?;
+        if row.get::<_,String>(0)!=*actor||row.get::<_,String>(1)!=*key{anyhow::bail!("selected surface owner changed")}
+        match &self.inner {
+            SelectedSurfaceSource::Library{source,association,..}=>{
+                if let Some(association)=association{association.require_current(db).await?;association.require_source_binding(source)?;}
+                if admit_indexed(db,owner,vec![(0,source.clone())]).await?.statuses.len()!=1{anyhow::bail!("selected Library source withdrawn")}
+            },
+            SelectedSurfaceSource::Search{source,source_index,association,..}=>{if let Some(association)=association{association.require_source_binding(*source_index,source)?;association.require_current(db).await?;}crate::search_context::require_selected_current(db,owner,actor,key,source).await?;},
+        }
+        Ok(())
+    }
+    /// Supplemental synchronous binding only: the caller must first refresh
+    /// the shared Search window after its owner/DID SQL checks and perform no
+    /// awaited operation between that refresh and these complete slot checks.
+    pub(crate) fn require_fresh_search_window(&self,proof:&crate::search_context::selection::FreshSearchWindow<'_>,did:&str)->Result<()> {
+        let SelectedSurfaceSource::Search{owner,actor,key,source,source_index,association:Some(association),..}=&self.inner else{anyhow::bail!("missing shared Search final capability")};
+        if self.bsky_did.as_deref().is_some_and(|captured|captured!=did){anyhow::bail!("Search final DID snapshot differs")}
+        proof.require_bound_source(association,*owner,actor,key,*source_index,source)
+    }
+    /// Native SQL projection is checked as a separate recursive source; an
+    /// original selected snapshot cannot grant access to newly recovered data.
+    pub(crate) async fn require_projected_current(&self,db:&Client,projected:&Value)->Result<()> {
+        self.require_current(db).await?;
+        let owner=self.owner_id();
+        match &self.inner {
+            SelectedSurfaceSource::Library{..}=>if admit_indexed(db,owner,vec![(0,projected.clone())]).await?.statuses.len()!=1{anyhow::bail!("native Library projection denied")},
+            SelectedSurfaceSource::Search{actor,key,..}=>crate::search_context::require_selected_current(db,owner,actor,key,projected).await?,
+        }
+        Ok(())
+    }
 }
 
 impl super::facts::PresentationSession for TrustedSession {
@@ -108,7 +228,15 @@ pub(crate) fn require_canonical_source_ids(status:&Value,depth:usize)->Result<()
 }
 pub(crate) fn require_ap_preview_protocol(status:&Value,depth:usize)->Result<()> {
     if depth>16{anyhow::bail!("PHP fallback: preview protocol depth")}
+    // RSS is normalized from a current owner-joined subscription before paint;
+    // its supplied media/card and article body follow the shared PHP painter.
+    // This is a presentation shape check, never RSS admission authority.
+    if is_rss(status){return Ok(())}
+    // Raw AppView entries use admin_render_bsky_feed_item's own embed painter;
+    // they never enter the AP status link-preview budget path.
+    if status.get("post").is_some_and(Value::is_object){return Ok(())}
     let uri=status.get("uri").and_then(Value::as_str).unwrap_or("");
+    if uri.starts_with("at://")&&status.get("source").and_then(Value::as_str)==Some("bluesky")&&status.get("bsky_post").is_some_and(Value::is_object){return Ok(())}
     let id=super::card::scalar_string(status,"id");
     if !uri.is_empty()&&!uri.starts_with("https://"){anyhow::bail!("PHP fallback: root-preview object URI lacks supported durable HTTPS identity");}
     if status.get("record").is_some_and(Value::is_object)||status.get("vaak_bsky_text").is_some_and(|value|value.as_str().is_none_or(|text|!text.is_empty()))||status.get("vaak_bsky_facets").is_some_and(|value|value.as_array().is_none_or(|facets|!facets.is_empty())){
@@ -141,6 +269,8 @@ pub(crate) async fn admit_for_render_with_preview(db:&Client,session:&TrustedSes
     admit_for_render_impl(db,session,statuses,Some((budget,dns))).await
 }
 async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<Value>,preview:Option<(i64,&dyn crate::direct_preview::PreviewDns)>)->Result<(Vec<AdmittedStatus>,i64)> {
+    let bsky_source=statuses.iter().any(has_bsky_source);
+    if bsky_source{session.require_bsky_current(db).await?;}
     let identity=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner_id]).await?.context("inactive Library painter owner")?;
     let actor:String=identity.get(0);let actor_key:String=identity.get(1);
     let mut budget=preview.map(|value|value.0).unwrap_or(0);
@@ -172,28 +302,46 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
     // the ordinary painter, with no root-preview budget effects (late210).
     let page = admit_indexed(db,session.owner_id,source_indices.into_iter().zip(hydrated).collect()).await?;
     let mut cards = Vec::new();
+    let mut source_grants=Vec::new();
     for (source_index,mut status) in page.source_indices.into_iter().zip(page.statuses) {
         let fresh_rss = rss_id(&status).and_then(|id| page.rss_rows.get(&id)).cloned();
         if let Some(row) = fresh_rss.as_ref() {
             status = super::rss::normalize(row,session.owner_id)?;
             crate::interaction_flags::apply_to_statuses(db,session.owner_id,std::slice::from_mut(&mut status)).await?;
         }
-        let mut facts = super::facts::resolve(db, session.owner_id, &page.owner_actor, &status, session, page.moderation.auto_unblur_sensitive).await?;
+        let source_grant=if session.warm.is_some(){
+            let selected=if let Some(association)=session.saved_sources.get(&source_index){SelectedLibrarySearchSource::library_saved(db,session,status.clone(),association.clone()).await?}else{
+                #[cfg(not(test))] {anyhow::bail!("PHP fallback: native Library enrichment requires enclosing saved producer association")}
+                #[cfg(test)] {if session.warm.as_ref().and_then(|warm|warm.fixture_clock()).is_none(){anyhow::bail!("PHP fallback: native Library enrichment requires enclosing saved producer association")}SelectedLibrarySearchSource::library(db,session,status.clone()).await?}
+            };
+            Some(std::sync::Arc::new(selected))
+        }else{None};
+        let mut facts = if let (Some(warm),Some(selected))=(&session.warm,&source_grant) {
+            let bound=super::facts::BoundPresentationSession{session,warm:warm.bound(selected.clone())};
+            super::facts::resolve(db,session.owner_id,&page.owner_actor,&status,&bound,page.moderation.auto_unblur_sensitive).await?
+        }else{super::facts::resolve(db, session.owner_id, &page.owner_actor, &status, session, page.moderation.auto_unblur_sensitive).await?};
         if let Some(sid)=incoming_ap_boost_sid(&status){facts.boosted=exact_incoming_boost(db,session.owner_id,&sid).await?;}
         facts.rss_row=fresh_rss;
         let inner=status.get("reblog").is_some_and(Value::is_object)&&status.get("content").and_then(Value::as_str).unwrap_or("").is_empty();
         let displayed=if inner{status.get_mut("reblog").unwrap()}else{&mut status};
-        if let Some(ask) = facts.ask_row.as_ref() {
+        // The PHP painter prefers current stored local plaintext and CW. Those
+        // additions must themselves pass muted-word/audience policy before paint.
+        if let Some(own) = facts.own.as_ref() {
+            if !own.plain.is_empty() && !matches!(own.plain.as_str(), "(quote)" | "(media)" | "(poll)") {
+                displayed["content"] = serde_json::json!(super::actions::esc(&own.plain));
+            }
+            displayed["spoiler_text"] = serde_json::json!(own.spoiler);
+            displayed["sensitive"] = serde_json::json!(own.sensitive);
+
+        }
+        if let Some(own)=facts.own.as_mut(){let raw=displayed.get("uri").and_then(Value::as_str).unwrap_or("");let exact=db.query_opt("SELECT local_id::bigint FROM masto_statuses WHERE note_id=$1 OR note_id=$2 LIMIT 1",&[&raw,&format!("{}/",raw.trim_end_matches('/'))]).await?;own.local_id=exact.map(|row|row.get::<_,i64>(0)).unwrap_or(0);}
+        if let Some(ask) = facts.ask_row.as_mut() {
             // Current stored questions and resolved identity replace cached Ask
             // metadata before the last source and policy decision.
             displayed["vaak_ask"] = ask.clone();
-            let answer = ask.get("_body_answer").and_then(Value::as_str);
-            if let Some(answer) = answer.filter(|value| !super::card::php_trim(value).is_empty()) {
-                displayed["content"] = serde_json::json!(super::actions::esc(super::card::php_trim(answer)));
-            } else if displayed.get("content").and_then(Value::as_str)
-                .is_some_and(|value| value.contains("ask-container")) {
-                anyhow::bail!("PHP fallback: Ask representation stripping requires canonical source/body normalization");
-            }
+            let plain=super::body::html_to_plain(displayed.get("content").and_then(Value::as_str).unwrap_or(""));
+            let body=super::body::ask_plain_body(&plain,originals.get(&source_index).and_then(|value|value.as_deref()).unwrap_or(""),ask.get("_body_answer").and_then(Value::as_str).unwrap_or(""),!super::card::ask_html(ask)?.is_empty());
+            displayed["content"]=serde_json::json!(super::actions::esc(&body));ask["_body_answer"]=serde_json::json!(body);
             let words_only = crate::hidden::HiddenSets {
                 muted_phrases: crate::hidden::load_library_hidden_sets(db, session.owner_id).await?.muted_phrases,
                 ..Default::default()
@@ -209,22 +357,6 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
                 if preview.is_some(){anyhow::bail!("PHP fallback: current Ask word omission preview state not certified");}
                 continue;
             }
-        }
-        // The PHP painter prefers current stored local plaintext and CW. Those
-        // additions must themselves pass muted-word/audience policy before paint.
-        if let Some(own) = facts.own.as_ref() {
-            let raw_uri=displayed.get("uri").and_then(Value::as_str).unwrap_or("");
-            if raw_uri.ends_with('/'){anyhow::bail!("PHP fallback: own trailing-slash presentation requires canonical lookup");}
-            let uri=raw_uri.trim_end_matches('/');
-            let snapshot=source_visibility.get(uri).map(String::as_str).unwrap_or("public");
-            let current=if own.visibility.is_empty(){"public"}else{own.visibility.as_str()};
-            if snapshot!=current{anyhow::bail!("PHP fallback: own cached/current visibility presentation conflicts");}
-            if !own.plain.is_empty() && !matches!(own.plain.as_str(), "(quote)" | "(media)" | "(poll)") {
-                displayed["content"] = serde_json::json!(super::actions::esc(&own.plain));
-            }
-            displayed["spoiler_text"] = serde_json::json!(own.spoiler);
-            displayed["sensitive"] = serde_json::json!(own.sensitive);
-            displayed["visibility"] = serde_json::json!(own.visibility);
         }
         if let Some(row)=facts.rss_quote_row.as_ref(){
             // Subscription metadata is owner-proven and current, but fresh
@@ -242,18 +374,22 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
                 let words_only=crate::hidden::HiddenSets { muted_phrases:crate::hidden::load_library_hidden_sets(db,session.owner_id).await?.muted_phrases,..Default::default() };
                 if crate::hidden::library_status_hidden(&status,&words_only) {if preview.is_some(){anyhow::bail!("PHP fallback: RSS word omission preview state not certified");}continue;}
             }
-            let root_preview=if let Some((_,dns))=preview {
+            let root_preview=if status.get("post").is_some_and(Value::is_object){None}else if let Some((_,dns))=preview {
                 require_ap_preview_protocol(&status,0)?;
-                    let card=crate::direct_preview::resolve(db,dns,&status,originals.get(&source_index).and_then(|value|value.as_deref()),&facts,&mut budget).await?;
+                    let original=originals.get(&source_index).and_then(|value|value.as_deref());
+                    let card=if let Some(grant)=&source_grant{super::preview::resolve_cached_current(db,dns,&status,original,&facts,&mut budget,grant.as_ref()).await?}else{crate::direct_preview::resolve(db,dns,&status,original,&facts,&mut budget).await?};
                     let rechecked=admit_indexed(db,session.owner_id,vec![(source_index,status.clone())]).await?;
                     if rechecked.statuses.is_empty(){continue}
                     Some(card)
             }else{None};
             cards.push(AdmittedStatus { source_index,status,facts,root_preview });
+            if let Some(grant)=source_grant{source_grants.push(grant)}
         }
     }
     let final_owner=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner_id]).await?.context("Library painter owner changed")?;
     if final_owner.get::<_,String>(0)!=actor||final_owner.get::<_,String>(1)!=actor_key{anyhow::bail!("Library identity changed during assembly")}
+    if bsky_source{session.require_bsky_current(db).await?;}
+    for grant in source_grants{grant.require_current(db).await?;}
     Ok((cards,budget))
 }
 

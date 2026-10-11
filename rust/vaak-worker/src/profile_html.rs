@@ -17,6 +17,36 @@ use crate::self_thread::{
 const DEFAULT_AVATAR: &str = "https://mkultra.monster/img/avatar/local-default.webp";
 const LOCAL_ACTOR_PREFIX: &str = "https://mkultra.monster/users/";
 
+/// Canonical PHP profile selection is an Announce ledger page. Preserve the
+/// complete selected SQL row and its ordinal before any materialization or
+/// audience/card omission; presentation cannot change the consumed cursor.
+async fn fetch_profile_boost_sources(
+    db: &Client,
+    actor_key: &str,
+    actor_url: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>> {
+    let actor_key = actor_key.trim().to_ascii_lowercase();
+    if actor_key.is_empty() { return Ok(Vec::new()); }
+    let canonical_actor = format!("{LOCAL_ACTOR_PREFIX}{}", urlencoding_encode(&actor_key));
+    let requested_actor = actor_url.trim().trim_end_matches('/');
+    let actor = if requested_actor.is_empty() { canonical_actor.as_str() } else { requested_actor };
+    let actor_slash = format!("{actor}/");
+    let rows = db.query(
+        "SELECT to_jsonb(profile_events) FROM (
+           SELECT DISTINCT ON (object_id) * FROM events
+           WHERE type = 'Announce' AND (actor_id = $1 OR actor_id = $2)
+           ORDER BY object_id,
+             CASE WHEN action_taken = 'boost_ok' THEN 0 ELSE 1 END,
+             created_at DESC, id DESC
+         ) AS profile_events
+         ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4",
+        &[&actor, &actor_slash, &limit, &offset],
+    ).await.context("select canonical local profile Announce ledger")?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
 fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -637,6 +667,10 @@ pub async fn profile_html_fill(
     limit: i64,
     offset: i64,
 ) -> Result<Option<ProfileHtmlReport>> {
+    // The legacy lean route cannot establish a guest presentation capability.
+    // Public guest callers use PHP until the private read-only profile path is
+    // independently bound and verified.
+    if viewer_owner_id <= 0 { return Ok(None); }
     let Some(username) = parse_local_actor(actor_url) else {
         return Ok(None);
     };
@@ -918,6 +952,109 @@ pub async fn fetch_outbox_statuses_by_uris(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_guest_profiles_require_readonly_php_without_io() -> Result<()> {
+        let cfg=Config{database_url:"invalid connection deliberately unavailable".into(),redis_url:String::new(),redis_queue_url:String::new(),jetstream_state:std::path::PathBuf::new(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:std::path::PathBuf::new(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};
+        for tab in ["posts","replies","boosts","media"] {
+            assert!(profile_html_fill(&cfg,0,"https://mkultra.monster/users/fixture",tab,12,0).await?.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires genuine current Boosts edge/caller captures and isolated PostgreSQL"]
+    async fn actual_profile_boost_contract_replay() -> Result<()> {
+        let url=std::env::var("PROFILE_FIXTURE_DB")?;
+        anyhow::ensure!(url.contains("/tmp/"),"isolated Unix socket required");
+        let db=crate::db::connect(&url).await?;
+        let reference:Value=serde_json::from_slice(&std::fs::read(std::env::var("PROFILE_BOOST_REFERENCE")?)?)?;
+        let mut output=Vec::new();
+        for width in ["INTEGER","BIGINT"] {
+            let schema=format!("profile_boost_contract_{}_{}",width.to_ascii_lowercase(),std::process::id());
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};SET synchronous_commit=off")).await?;
+            for (table,columns) in reference["current_schema_by_width"][width].as_object().context("actual schema missing")? {
+                let definitions=columns.as_array().unwrap().iter().map(|column|format!("{} {}",column["column_name"].as_str().unwrap(),column["data_type"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+                db.batch_execute(&format!("CREATE TABLE {table}({definitions})")).await?;
+            }
+            for (cohort, records) in [("provider",&reference["captures"]),("caller",&reference["callers"])] {
+                for capture in records.as_array().context("captures missing")?.iter().filter(|row|row["width"]==width) {
+                    for (table,rows) in capture["current_tables"].as_object().unwrap() {
+                        db.batch_execute(&format!("DELETE FROM {table}")).await?;
+                        for row in rows.as_array().unwrap(){db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"),&[row]).await?;}
+                    }
+                    let (key,actor)=if cohort=="provider"{(capture["input"]["key"].as_str().unwrap(),capture["input"]["actor"].as_str().unwrap())}else{(capture["profile_key"].as_str().unwrap(),capture["actor"].as_str().unwrap())};
+                    let pages=if cohort=="provider"{vec![("provider",&capture["page"],capture["paging"]["limit"].as_i64().unwrap(),capture["paging"]["offset"].as_i64().unwrap())]}else if capture["effective_tab"]=="boosts"{
+                        // Root-blocked append never enters a provider. This
+                        // source-level gate does not manufacture that call.
+                        let mut pages=vec![("full",&capture["full_selected"],12,0)];
+                        if capture["append"]["page"].is_object(){pages.push(("append",&capture["append"]["page"],10,3));}
+                        pages
+                    }else{Vec::new()};
+                    for (caller,expected,limit,offset) in pages {
+                        let limit=limit.clamp(1,50);let offset=offset.max(0);
+                        let mut rows=fetch_profile_boost_sources(&db,key,actor,limit+1,offset).await?;
+                        let has_more=rows.len()as i64>limit;rows.truncate(limit as usize);
+                        let next_offset=offset+rows.len()as i64;
+                        anyhow::ensure!(Value::Array(rows.clone())==expected["items"] && has_more==expected["has_more"].as_bool().unwrap() && next_offset==expected["next_offset"].as_i64().unwrap(),"actual Boosts rawsource/order/cursor mismatch {width}/{cohort}/{caller}/{key}/{actor}/{offset}");
+                        output.push(json!({"width":width,"state":capture["state"],"owner":capture["owner"],"cohort":cohort,"caller":caller,"actor_key":key,"requested_actor":actor,"limit":limit,"offset":offset,"selected_sources":rows,"source_count":rows.len(),"has_more":has_more,"next_offset":next_offset}));
+                    }
+                }
+            }
+            db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;
+        }
+        std::fs::write(std::env::var("PROFILE_BOOST_NATIVE_OUTPUT")?,serde_json::to_vec_pretty(&json!({"checks":output.len(),"captures":output,"scope":"actual canonical private Boosts provider and supplied effective caller page selection; not hide decision, admission, HTML or HTTP proof"}))?)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the retained four-tab extra72 artifact via PROFILE_BOOST_LEGACY_REFERENCE and isolated PostgreSQL"]
+    async fn actual_profile_boost_provider_replay() -> Result<()> {
+        let url = std::env::var("PROFILE_FIXTURE_DB")?;
+        anyhow::ensure!(url.contains("/tmp/"), "isolated Unix socket required");
+        let db = crate::db::connect(&url).await?;
+        let reference: Value = serde_json::from_slice(&std::fs::read(std::env::var("PROFILE_BOOST_LEGACY_REFERENCE")?)?)?;
+        let mut output = Vec::new();
+        for width in ["INTEGER", "BIGINT"] {
+            let schema = format!("profile_boost_native_{}_{}", width.to_ascii_lowercase(), std::process::id());
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};SET synchronous_commit=off")).await?;
+            for (table, columns) in reference["current_schema_by_width"][width].as_object().context("actual schema missing")? {
+                let definitions = columns.as_array().context("columns missing")?.iter().map(|column| format!("{} {}", column["column_name"].as_str().unwrap(), column["data_type"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+                db.batch_execute(&format!("CREATE TABLE {table}({definitions})")).await?;
+            }
+            for capture in reference["captures"].as_array().context("captures missing")?.iter().filter(|row| row["width"] == width && row["requested_tab"] == "boosts") {
+                for (table, rows) in capture["current_tables"].as_object().context("current tables missing")? {
+                    db.batch_execute(&format!("DELETE FROM {table}")).await?;
+                    for row in rows.as_array().unwrap() { db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"), &[row]).await?; }
+                }
+                let actor = capture["actor"].as_str().context("actor missing")?;
+                let offset = capture["paging"]["offset"].as_i64().context("offset missing")?;
+                for (caller, expected, limit, page_offset, selected_tab) in [
+                    ("provider", &capture["producer"], capture["paging"]["limit"].as_i64().context("limit missing")?, offset, "boosts"),
+                    ("full", &capture["full_selected"], 12, 0, "boosts"),
+                    ("append", &capture["append"]["page"], 10, offset, capture["append"]["effective_tab"].as_str().context("effective tab missing")?),
+                ] {
+                    // Hidden tab fallback belongs to the caller, not this
+                    // provider. Its Posts branch has its own genuine gate.
+                    if selected_tab != "boosts" { continue; }
+                    let limit = limit.clamp(1,50);
+                    let page_offset = page_offset.max(0);
+                    let actor_key = parse_local_actor(actor).context("local actor key missing")?;
+                    let mut rows = fetch_profile_boost_sources(&db, &actor_key, actor, limit+1, page_offset).await?;
+                    let has_more = rows.len() as i64 > limit;
+                    rows.truncate(limit as usize);
+                    let next_offset = page_offset + rows.len() as i64;
+                    let ids: Vec<Value> = rows.iter().map(|row|row["id"].clone()).collect();
+                    let expected_ids: Vec<Value> = expected["items"].as_array().context("actual items missing")?.iter().map(|row|row["id"].clone()).collect();
+                    anyhow::ensure!(ids==expected_ids && has_more==expected["has_more"].as_bool().context("has more missing")? && next_offset==expected["next_offset"].as_i64().context("next offset missing")?, "actual Boosts selection/cursor disagreement {width}/{caller}/{page_offset}");
+                    output.push(json!({"width":width,"owner":capture["owner"],"actor":actor,"caller":caller,"limit":limit,"offset":page_offset,"ids":ids,"selected_sources":rows,"source_count":rows.len(),"has_more":has_more,"next_offset":next_offset}));
+                }
+            }
+            db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;
+        }
+        std::fs::write(std::env::var("PROFILE_BOOST_NATIVE_OUTPUT")?,serde_json::to_vec_pretty(&json!({"checks":output.len(),"captures":output,"scope":"actual private Announce source selection; not card admission or HTTP parity"}))?)?;
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires genuine PHP profile provider captures and isolated PostgreSQL"]
