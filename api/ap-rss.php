@@ -138,7 +138,12 @@ function ap_rss_display_title(string $title): string
         '',
         $title
     );
-    $cleaned = trim((string) $cleaned, " \t\n\r\0\x0B\-–—|:");
+    // PHP trim uses a byte mask: UTF-8 dash bytes can corrupt adjacent names.
+    // Match the intended edge characters, keeping NBSP/thin-space text intact.
+    $edges = '[\x20\x09\x0A\x0D\x00\x0B\x5C\x2D\x{2013}\x{2014}\x7C\x3A]';
+    $cleaned = preg_replace('/^' . $edges . '+|' . $edges . '+$/u', '', (string) $cleaned);
+    // Invalid UTF-8 has no valid cleaned projection; retain the original title.
+    $cleaned = is_string($cleaned) ? $cleaned : '';
     return $cleaned !== '' ? $cleaned : $title;
 }
 
@@ -438,22 +443,25 @@ function ap_rss_mirror_note_ids_for_owner(int $ownerUserId): array
 }
 
 /** Look up an RSS item by the local mirror note created for boost/quote/fav. */
-function ap_rss_item_by_mirror_note_id(string $noteId): ?array
+function ap_rss_item_by_mirror_note_id(string $noteId, ?int $ownerUserId = null): ?array
 {
     ap_rss_migrate();
     $noteId = rtrim(trim($noteId), '/');
     if ($noteId === '' || !str_starts_with($noteId, 'https://')) {
         return null;
     }
+    $ownerClause = $ownerUserId !== null ? ' AND f.owner_user_id = ?' : '';
     $st = ap_db()->prepare(
         'SELECT i.*, f.title AS feed_title, f.favicon_url AS feed_favicon, f.site_url AS feed_site_url,
                 f.feed_url AS feed_url, f.owner_user_id, f.id AS feed_id
          FROM rss_items i
          JOIN rss_feeds f ON f.id = i.feed_id
-         WHERE i.mirror_note_id = ? OR i.mirror_note_id = ?
+         WHERE (i.mirror_note_id = ? OR i.mirror_note_id = ?)' . $ownerClause . '
          LIMIT 1'
     );
-    $st->execute([$noteId, $noteId . '/']);
+    $params = [$noteId, $noteId . '/'];
+    if ($ownerUserId !== null) $params[] = $ownerUserId;
+    $st->execute($params);
     $row = $st->fetch(PDO::FETCH_ASSOC);
     return is_array($row) ? $row : null;
 }

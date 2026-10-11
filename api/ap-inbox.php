@@ -5010,29 +5010,64 @@ function ap_deliver_signed_json(string $inboxUrl, array $activity, string $keyId
     ];
 
     $timeoutSec = max(1.0, min(30.0, $timeoutSec));
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'POST',
-            'timeout' => $timeoutSec,
-            'follow_location' => 0,
-            'header' => implode("\r\n", $headers) . "\r\n",
-            'content' => $body,
-            'ignore_errors' => true,
-        ],
-        'ssl' => [
-            'verify_peer' => true,
-            'verify_peer_name' => true,
-        ],
-    ]);
-    $resp = @file_get_contents($inboxUrl, false, $ctx);
-    $statusLine = $http_response_header[0] ?? '';
-    $ok = is_string($statusLine) && preg_match('/\s(2\d\d)\s/', $statusLine);
+    // Use cURL for outbound federation rather than PHP's stream wrapper. The
+    // wrapper can negotiate an unexpected HTTP version/address family and
+    // gives us little diagnostic detail when a remote inbox rejects a POST.
+    // Explicit HTTP/1.1 + IPv4 also matches most Mastodon/Wafrn clients while
+    // retaining the exact signed request-target.
+    $resp = false;
+    $status = 0;
+    $curlErr = '';
+    if (function_exists('curl_init')) {
+        $ch = curl_init($inboxUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $body,
+            CURLOPT_HTTPHEADER => array_merge($headers, ['Expect:']),
+            CURLOPT_CONNECTTIMEOUT_MS => (int) min(5000, max(1000, $timeoutSec * 1000)),
+            CURLOPT_TIMEOUT_MS => (int) max(1000, $timeoutSec * 1000),
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+        ]);
+        $resp = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $curlErr = trim((string) curl_error($ch));
+        curl_close($ch);
+    } else {
+        $ctx = stream_context_create([
+            'http' => [
+                'method' => 'POST',
+                'timeout' => $timeoutSec,
+                'follow_location' => 0,
+                'header' => implode("\r\n", $headers) . "\r\n",
+                'content' => $body,
+                'ignore_errors' => true,
+            ],
+            'ssl' => [
+                'verify_peer' => true,
+                'verify_peer_name' => true,
+            ],
+        ]);
+        $resp = @file_get_contents($inboxUrl, false, $ctx);
+        $statusLine = $http_response_header[0] ?? '';
+        if (is_string($statusLine) && preg_match('/\s(\d{3})\s/', $statusLine, $m)) {
+            $status = (int) $m[1];
+        }
+    }
+    $ok = $status >= 200 && $status < 300;
+    $statusLine = $status > 0 ? 'HTTP ' . $status : 'No HTTP response from inbox';
     if (!$ok) {
-        $GLOBALS['ap_delivery_last_error'] = trim($statusLine) !== ''
-            ? trim($statusLine) . (is_string($resp) && trim($resp) !== '' ? ' ' . ap_short($resp, 180) : '')
-            : 'No HTTP response from inbox';
+        $detail = $curlErr !== '' ? ' ' . $curlErr : '';
+        $GLOBALS['ap_delivery_last_error'] = $statusLine
+            . (is_string($resp) && trim($resp) !== '' ? ' ' . ap_short($resp, 180) : '')
+            . $detail;
         ap_log('deliver_fail inbox=' . ap_short($inboxUrl, 80) . ' status=' . ap_short($statusLine, 80)
-            . ' body=' . ap_short(is_string($resp) ? $resp : '', 120));
+            . ' body=' . ap_short(is_string($resp) ? $resp : '', 120)
+            . ($curlErr !== '' ? ' curl=' . ap_short($curlErr, 120) : ''));
     } elseif (is_string($resp) && $resp !== '' && $resp !== 'ok' && !str_starts_with(ltrim($resp), '{')) {
         // Akkoma often returns literal "ok"; anything else is worth logging at debug level
         ap_log('deliver_ok inbox=' . ap_short($inboxUrl, 80) . ' status=' . ap_short($statusLine, 40)
@@ -6708,10 +6743,10 @@ function ap_update_local_status(
     if (is_array($obRow)) {
         $toDec = json_decode((string) ($obRow['to_json'] ?? ''), true);
         $ccDec = json_decode((string) ($obRow['cc_json'] ?? ''), true);
-        if (is_array($toDec) && $toDec) {
+        if (is_array($toDec)) {
             $to = $toDec;
         }
-        if (is_array($ccDec) && $ccDec) {
+        if (is_array($ccDec)) {
             $cc = $ccDec;
         }
         if (!empty($obRow['in_reply_to'])) {
@@ -6999,10 +7034,10 @@ function ap_delete_local_status(int $localId): array
     if (is_array($obRow)) {
         $toDec = json_decode((string) ($obRow['to_json'] ?? ''), true);
         $ccDec = json_decode((string) ($obRow['cc_json'] ?? ''), true);
-        if (is_array($toDec) && $toDec) {
+        if (is_array($toDec)) {
             $to = $toDec;
         }
-        if (is_array($ccDec) && $ccDec) {
+        if (is_array($ccDec)) {
             $cc = $ccDec;
         }
     }

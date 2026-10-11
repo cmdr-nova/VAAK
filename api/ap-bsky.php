@@ -1381,6 +1381,9 @@ function ap_bsky_get_bookmarks_for_uris(int $ownerUserId, array $objectIds, int 
                 }
                 $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
                 $item['post']['viewer']['bookmarked'] = true;
+                if ((string) ($item['post']['uri'] ?? '') === (string) ($row['bookmark_uri'] ?? '')) {
+                    ap_bsky_bookmark_owner_state_set((string) $row['bookmark_uri'], $ownerUserId, true);
+                }
                 $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
                 $out[] = $item;
                 if (count($out) >= $limit) {
@@ -1816,6 +1819,7 @@ function ap_bsky_xrpc(
     $json = json_decode($body, true);
     if ($status >= 200 && $status < 300) {
         if (function_exists('ap_provider_circuit_success')) ap_provider_circuit_success($providerCircuit);
+        ap_bsky_authenticated_viewer_response($json, $bearer, $nsid);
         return ['ok' => true, 'status' => $status, 'json' => $json, 'body' => $body] + $rate;
     }
     $msg = is_array($json) ? (string) ($json['message'] ?? $json['error'] ?? '') : '';
@@ -2358,6 +2362,7 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false, int 
     $pds = rtrim((string) ($row['pds_host'] ?? AP_BSKY_DEFAULT_PDS), '/');
     $accessOk = is_string($access) && $access !== '' && !ap_bsky_jwt_expired($access);
     if (!$forceRefresh && $accessOk) {
+        ap_bsky_access_owner_register($access, $ownerUserId, (string) ($row['did'] ?? ''));
         return ['ok' => true, 'access' => $access];
     }
     if (ap_bsky_budget_exceeded()) {
@@ -2430,6 +2435,7 @@ function ap_bsky_access_token(int $ownerUserId, bool $forceRefresh = false, int 
     } catch (Throwable $e) {
         // still return token even if persist fails
     }
+    ap_bsky_access_owner_register($newAccess, $ownerUserId, (string) ($row['did'] ?? ''));
     return ['ok' => true, 'access' => $newAccess];
 }
 
@@ -4600,11 +4606,102 @@ function ap_bsky_enrich_feed_item_authors(array $postOrItem, int $ownerUserId = 
     return $postOrItem;
 }
 
-/**
- * Load one cached Bluesky post as a FeedViewPost-shaped item.
- *
- * @return array{post:array,reason?:array,bsky_uri:string}|null
- */
+/** Server-only request provenance; never read an owner marker from post JSON. */
+function ap_bsky_bookmark_owner_state(string $uri, int $ownerUserId): ?bool
+{
+    $state = $GLOBALS['vaak_bsky_bookmark_owner_state'][$ownerUserId][trim($uri)] ?? null;
+    if (!is_array($state)) return null;
+    $session = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($ownerUserId) : null;
+    $did = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    return ($state['did'] ?? null) === $did && is_bool($state['bookmarked'] ?? null) ? $state['bookmarked'] : null;
+}
+
+function ap_bsky_bookmark_owner_state_set(string $uri, int $ownerUserId, bool $bookmarked, int $priority = 1): void
+{
+    $uri = trim($uri);
+    if ($ownerUserId < 1 || !preg_match('~^at://[^/]+/app\.bsky\.feed\.post/[^/?#]+$~', $uri)) return;
+    $session = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($ownerUserId) : null;
+    $did = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+    $old = $GLOBALS['vaak_bsky_bookmark_owner_state'][$ownerUserId][$uri] ?? null;
+    if (is_array($old) && ($old['did'] ?? null) === $did && (int) ($old['priority'] ?? 0) > $priority) return;
+    $GLOBALS['vaak_bsky_bookmark_owner_state'][$ownerUserId][$uri] = ['did'=>$did,'bookmarked'=>$bookmarked,'priority'=>$priority];
+}
+
+/** Bind only server-decrypted session access credentials, including refresh. */
+function ap_bsky_access_owner_register(string $access, int $ownerUserId, string $did): void
+{
+    if ($access === '' || $ownerUserId < 1 || $did === '') return;
+    $key = hash('sha256', $access);
+    $existing = $GLOBALS['vaak_bsky_access_owners'][$key] ?? null;
+    if (is_array($existing) && (($existing['owner'] ?? 0) !== $ownerUserId || ($existing['did'] ?? '') !== $did)) {
+        $GLOBALS['vaak_bsky_access_owners'][$key] = false;
+        return;
+    }
+    if ($existing === false) return;
+    $GLOBALS['vaak_bsky_access_owners'][$key] = ['owner'=>$ownerUserId,'did'=>$did];
+}
+
+/** Successful authenticated response only; public/shared JSON has no authority. */
+function ap_bsky_authenticated_viewer_response(mixed $json, ?string $bearer, string $nsid): void
+{
+    if (!in_array($nsid, ['app.bsky.feed.getTimeline', 'app.bsky.feed.getAuthorFeed', 'app.bsky.feed.getFeed', 'app.bsky.feed.getListFeed', 'app.bsky.feed.getActorLikes', 'app.bsky.feed.getPosts', 'app.bsky.feed.getPostThread', 'app.bsky.bookmark.getBookmarks'], true)) return;
+    if (!is_string($bearer) || $bearer === '') return;
+    $context = $GLOBALS['vaak_bsky_access_owners'][hash('sha256', $bearer)] ?? null;
+    if (!is_array($context)) return;
+    $owner = (int) ($context['owner'] ?? 0);
+    $session = function_exists('ap_bsky_session_row') ? ap_bsky_session_row($owner) : null;
+    if (!is_array($session) || ($session['did'] ?? '') !== ($context['did'] ?? null)) return;
+    if (!is_array($json)) return;
+    $post = static function (mixed $value) use ($owner): void {
+        if (!is_array($value) || !is_string($value['uri'] ?? null) || !is_array($value['viewer'] ?? null)) return;
+        $viewer = $value['viewer'];
+        $flags = array_filter([$viewer['bookmarked'] ?? null, $viewer['bookmark'] ?? null], 'is_bool');
+        // Older AppViews omit these optional fields: absence is unknown, not an undo.
+        if ($flags !== []) ap_bsky_bookmark_owner_state_set($value['uri'], $owner, in_array(true, $flags, true), 2);
+    };
+    // Traverse response-defined PostViews only. User-supplied record/value JSON
+    // can contain arbitrary uri/viewer keys and must never establish provenance.
+    foreach (is_array($json['feed'] ?? null) ? $json['feed'] : [] as $item) $post(is_array($item) ? ($item['post'] ?? null) : null);
+    foreach (is_array($json['posts'] ?? null) ? $json['posts'] : [] as $item) $post($item);
+    $thread = static function (mixed $value, int $depth = 0) use (&$thread, $post): void {
+        if (!is_array($value) || $depth > 32) return;
+        $post($value['post'] ?? null);
+        if (is_array($value['parent'] ?? null)) $thread($value['parent'], $depth + 1);
+        foreach (is_array($value['replies'] ?? null) ? $value['replies'] : [] as $child) $thread($child, $depth + 1);
+    };
+    $thread($json['thread'] ?? null);
+    foreach (is_array($json['bookmarks'] ?? null) ? $json['bookmarks'] : [] as $row) {
+        $item = is_array($row) ? ($row['item'] ?? $row['post'] ?? null) : null;
+        if (is_array($item) && is_string($item['uri'] ?? null)) ap_bsky_bookmark_owner_state_set($item['uri'], $owner, true, 2);
+    }
+}
+
+/** Filter display-only engagement; retain authoritative remote policy fields. */
+function ap_bsky_viewer_for_owner(array $viewer, int $ownerUserId, string $postUri = ''): array
+{
+    $did = '';
+    if ($ownerUserId > 0 && function_exists('ap_bsky_session_row')) {
+        try {
+            $session = ap_bsky_session_row($ownerUserId);
+            $did = is_array($session) ? trim((string) ($session['did'] ?? '')) : '';
+        } catch (Throwable $e) {
+            $did = '';
+        }
+    }
+    foreach (['like' => 'app.bsky.feed.like', 'repost' => 'app.bsky.feed.repost'] as $key => $collection) {
+        $record = is_string($viewer[$key] ?? null) ? trim($viewer[$key]) : '';
+        if ($record === '') continue;
+        if ($did === '' || !preg_match('~^at://([^/]+)/([^/]+)/[^/?#]+$~', $record, $match)
+            || $match[1] !== $did || $match[2] !== $collection) {
+            unset($viewer[$key]);
+        }
+    }
+    unset($viewer['bookmark'], $viewer['bookmarked']);
+    if (ap_bsky_bookmark_owner_state($postUri, $ownerUserId) === true) $viewer['bookmarked'] = true;
+    return $viewer;
+}
+
+/** Load a cached PostView for owner-bound display; shared policy remains intact. */
 function ap_bsky_post_item_by_uri(string $bskyUri): ?array
 {
     $bskyUri = trim($bskyUri);
@@ -4652,6 +4749,9 @@ function ap_bsky_post_item_by_uri(string $bskyUri): ?array
             }
         }
         $ownerId = (int) ($GLOBALS['vaak_owner_id'] ?? 0);
+        if (is_array($item['post']['viewer'] ?? null)) {
+            $item['post']['viewer'] = ap_bsky_viewer_for_owner($item['post']['viewer'], $ownerId, (string) ($item['post']['uri'] ?? ''));
+        }
         return ap_bsky_enrich_feed_item_authors($item, $ownerId);
     } catch (Throwable $e) {
         return null;
@@ -6418,6 +6518,13 @@ function ap_bsky_post_as_quote_preview(array $post): ?array
     $url = $uri !== ''
         ? ap_bsky_https_url_from_at_uri($uri, $handle !== '' ? $handle : null)
         : 'https://bsky.app/';
+    // Keep full policy evidence request-local for later Library admission.
+    // The compact returned preview remains unchanged (including JSON callers).
+    if (!isset($GLOBALS['vaak_bsky_quote_policy_posts']) || !is_array($GLOBALS['vaak_bsky_quote_policy_posts'])) {
+        $GLOBALS['vaak_bsky_quote_policy_posts'] = [];
+    }
+    if ($uri !== '') $GLOBALS['vaak_bsky_quote_policy_posts'][$uri] = $post;
+    if ($url !== '') $GLOBALS['vaak_bsky_quote_policy_posts'][$url] = $post;
     $out = [
         'uri' => $uri !== '' ? $uri : null,
         'handle' => $handle,
@@ -6814,6 +6921,7 @@ function ap_bsky_create_bookmark(int $ownerUserId, array $subject): array
     if (function_exists('ap_bsky_bookmark_cache_clear')) {
         ap_bsky_bookmark_cache_clear($ownerUserId);
     }
+    ap_bsky_bookmark_owner_state_set($uri, $ownerUserId, true, 3);
     return ['ok' => true];
 }
 
@@ -6852,6 +6960,7 @@ function ap_bsky_delete_bookmark(int $ownerUserId, string $uri): array
     if (function_exists('ap_bsky_bookmark_cache_clear')) {
         ap_bsky_bookmark_cache_clear($ownerUserId, $uri);
     }
+    ap_bsky_bookmark_owner_state_set($uri, $ownerUserId, false, 3);
     return ['ok' => true];
 }
 
@@ -6917,7 +7026,7 @@ function ap_bsky_bookmark_cache_read(int $ownerUserId, int $limit): array
 {
     if ($ownerUserId < 1 || !ap_bsky_bookmark_cache_migrate()) return [];
     try {
-        $st = ap_db()->prepare('SELECT post_json, bookmarked_at FROM bsky_bookmark_cache WHERE owner_user_id = ? ORDER BY bookmarked_at DESC, bookmark_uri DESC LIMIT ?');
+        $st = ap_db()->prepare('SELECT post_json, bookmarked_at, bookmark_uri FROM bsky_bookmark_cache WHERE owner_user_id = ? ORDER BY bookmarked_at DESC, bookmark_uri DESC LIMIT ?');
         $st->bindValue(1, $ownerUserId, PDO::PARAM_INT);
         $st->bindValue(2, max(1, min(500, $limit)), PDO::PARAM_INT);
         $st->execute();
@@ -6927,6 +7036,9 @@ function ap_bsky_bookmark_cache_read(int $ownerUserId, int $limit): array
             if (!is_array($item) || !is_array($item['post'] ?? null)) continue;
             $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
             $item['post']['viewer']['bookmarked'] = true;
+            if ((string) ($item['post']['uri'] ?? '') === (string) ($row['bookmark_uri'] ?? '')) {
+                ap_bsky_bookmark_owner_state_set((string) $row['bookmark_uri'], $ownerUserId, true);
+            }
             $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
             $out[] = $item;
         }

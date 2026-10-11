@@ -1,0 +1,13 @@
+# VAAK alpha 0.8.33 — 2026-10-11
+
+This release corrects cached quote-media placement and privacy checks while continuing the Rust migration behind default-off Library/Search bridges. PHP remains the write owner and the canonical fallback for unsupported native sources. Private Direct rendering remains unregistered; no new surface is activated.
+
+Known quoted attachments now render in the nested quote instead of being repeated in the parent's media row. Distinct parent attachments stay with the parent. The reported cached Home case retains its explicit quote URL and recovers the represented original from an active cached Announce with separate current-source/audience checks. The parent content-warning gate now includes its quote; nested warnings and sensitive-media preferences remain intact. Thumbnail-only ambiguous full-card sources use PHP fallback.
+
+Local profile append now observes current personal/server content blocks before native or PHP source production. Mutes and muted words retain their established explicit-profile behavior. Rust's local Posts/Replies selection places all replies, including self-replies, under Replies. The inbox preserves explicitly empty recipient lists for Update/Delete, and the live outbound cURL federation transport is preserved in the public source.
+
+The migration work includes authenticated current-fact card rendering, exact incoming interaction IDs, Settings-aware privacy/moderation, strict preview state responses, and conservative source/IO boundaries. Library/Search's new render switches remain disabled unless explicitly configured; the existing live timelines and workers retain their current settings. Full remote-profile, Boosts and all-protocol parity are still separate work.
+
+Verification includes the final workspace regression (230 worker tests and three types tests, zero failures), 28 actual current-SQL quote hydration/audience controls, 21 focused quote tests, and 42 exact supported full cards with 24 declared PHP fallbacks. Earlier finite gates cover 1,352 actual Library/Search caller comparisons and 1,440 response rollback pairs; local profile source selection and append block controls are qualified in their checkpoint documents. These are bounded results, not a claim of complete Rust parity.
+
+Deployment artifacts are the release `vaak-worker` binary and 12 explicitly listed PHP runtime files. Internal docs, test fixtures, Rust source, configuration, credentials and environment files are excluded from the web-root payload. No new environment flags, explicit schema migration or blanket cache flush are part of this release.

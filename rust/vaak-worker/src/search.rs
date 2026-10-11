@@ -1,10 +1,9 @@
 //! Read-only indexed Search projection.
 //!
-//! This intentionally stops before Mastodon account/status serialization.  It
-//! mirrors PHP's ap_search_fts query construction and ordering, applies the
-//! viewer's current block/mute sets to event/mention candidates, and leaves
-//! account resolution and remote URL redirects on PHP until those fixtures
-//! have exact parity.
+//! The canonical query/ranked-candidate helper is verified separately from
+//! the older shadow projection and its lean account/status serializers.
+//! Source hydration, current Search admission, account resolution and remote
+//! URL handling remain separate PHP boundaries until their fixtures pass.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -12,6 +11,11 @@ use serde_json::{json, Value};
 use tokio_postgres::Client;
 
 use crate::hidden::HiddenSets;
+
+#[path = "search_query.rs"]
+mod query;
+#[path = "search_ranked.rs"]
+mod ranked;
 
 #[derive(Debug, Serialize)]
 pub struct SearchRow {
@@ -58,54 +62,16 @@ pub struct SearchHashtag {
 }
 
 /// Exact PHP ap_search_fts_match_query behavior for text queries.
-pub fn text_match_query(q: &str) -> Option<String> {
-    let q = q.trim();
-    if q.chars().count() < 2 {
-        return None;
-    }
-    let stripped: String = q
-        .chars()
-        .map(|c| match c {
-            '"' | '\'' | '*' | '(' | ')' | ':' | '^' => ' ',
-            _ => c,
-        })
-        .collect();
-    let mut tokens = Vec::new();
-    for part in stripped.split_whitespace() {
-        let token: String = part
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '_')
-            .flat_map(char::to_lowercase)
-            .collect();
-        if token.chars().count() < 2 || token.is_empty() {
-            continue;
-        }
-        tokens.push(format!("{token}*"));
-        if tokens.len() >= 8 {
-            break;
-        }
-    }
-    (!tokens.is_empty()).then(|| tokens.join(" AND "))
-}
+pub fn text_match_query(q: &str) -> Option<String> { query::text_match(q) }
 
-/// Exact PHP tag query behavior (`htag_NAME OR NAME`).
-pub fn tag_match_query(tag: &str) -> Option<String> {
-    let token: String = tag
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .flat_map(char::to_lowercase)
-        .collect();
-    (!token.is_empty()).then(|| format!("htag_{token} OR {token}"))
-}
+pub fn tag_match_query(tag: &str) -> Option<String> { query::tag_match(tag) }
 
-fn postgres_tsquery(match_query: &str) -> String {
-    match_query
-        .split_whitespace()
-        .map(|part| part.strip_suffix('*').map(|p| format!("{p}:*")).unwrap_or_else(|| part.to_string()))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" AND ", " & ")
-        .replace(" OR ", " | ")
+fn postgres_tsquery(value: &str) -> String { query::postgres_match(value) }
+
+/// Canonical ranked source slice only. It does not serialize or admit a status
+/// and is not a production Search replacement.
+pub(crate) async fn ranked_candidates(db: &Client, owner: i64, text: &str, tag: &str, limit: i64) -> Result<Vec<SearchRow>> {
+    ranked::candidates(db, owner, text, tag, limit).await
 }
 
 fn html_text(text: &str) -> String {

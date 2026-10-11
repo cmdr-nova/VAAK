@@ -11,6 +11,9 @@ pub struct HiddenSets {
     pub user_blocked_actors: HashSet<String>,
     pub user_blocked_domains: HashSet<String>,
     pub instance_blocked_actors: HashSet<String>,
+    /// PHP server mutes compare syntactic actor aliases case-insensitively;
+    /// personal mutes and personal/server blocks preserve URI path case.
+    pub instance_muted_actors: HashSet<String>,
     pub instance_blocked_domains: HashSet<String>,
     pub muted_phrases: Vec<String>,
 }
@@ -29,6 +32,7 @@ impl HiddenSets {
             if (!ignore_personal_mute && self.muted_actors.contains(&alias))
                 || self.user_blocked_actors.contains(&alias)
                 || self.instance_blocked_actors.contains(&alias)
+                || self.instance_muted_actors.contains(&alias.to_ascii_lowercase())
             {
                 return true;
             }
@@ -36,8 +40,8 @@ impl HiddenSets {
         let host = host_of(actor);
         if let Some(host) = host {
             let host_l = host.to_ascii_lowercase();
-            if self.user_blocked_domains.contains(&host_l)
-                || self.instance_blocked_domains.contains(&host_l)
+            if self.user_blocked_domains.iter().chain(self.instance_blocked_domains.iter())
+                .any(|domain| host_l == *domain || host_l.ends_with(&format!(".{domain}")))
             {
                 return true;
             }
@@ -53,6 +57,77 @@ pub fn status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
     status_hidden_at(status, hidden, 0, false)
 }
 
+/// Library consumes normalized cards together with their authoritative native
+/// source trees. Native author and remote block policy cannot be recovered from
+/// the compact quote HTML options, so inspect the retained payload recursively.
+pub fn library_status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
+    // Raw native protocol envelopes are authoritative too. Dispatch only the
+    // PostView/FeedView shapes; arbitrary normalized metadata is not native.
+    let post_view = |post:&Value| post.get("uri").and_then(Value::as_str).is_some_and(|uri|uri.starts_with("at://"))
+        && post.get("author").is_some_and(Value::is_object);
+    let raw_native = post_view(status) || status.get("post").is_some_and(post_view);
+    status_hidden(status, hidden) || (raw_native && native_tree_hidden(status, hidden, 0))
+        || library_native_sources_hidden(status, hidden, 0)
+}
+
+fn library_native_sources_hidden(status: &Value, hidden: &HiddenSets, depth: usize) -> bool {
+    if depth > 16 { return true; }
+    if let Some(preview) = status.get("vaak_quote_preview") {
+        let text = normalize_muted_text(preview.get("text").and_then(Value::as_str).unwrap_or(""));
+        if hidden.muted_phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase)) { return true; }
+    }
+    if status.get("bsky_post").filter(|value| value.is_object() || value.is_array())
+        .is_some_and(|native| native_tree_hidden(native, hidden, 0)) { return true; }
+    for field in ["reblog", "quote", "vaak_quote_preview"] {
+        if let Some(child) = status.get(field).filter(|value| value.is_object()) {
+            let child = child.get("quoted_status").or_else(||child.get("status")).filter(|value|value.is_object()).unwrap_or(child);
+            if library_native_sources_hidden(child, hidden, depth+1) { return true; }
+        }
+    }
+    false
+}
+
+fn native_tree_hidden(value: &Value, hidden: &HiddenSets, depth: usize) -> bool {
+    if depth > 16 { return true; }
+    match value {
+        Value::Array(items) => items.iter().any(|item| native_tree_hidden(item, hidden, depth + 1)),
+        Value::Object(object) => {
+            for key in ["author", "by"] {
+                if let Some(author) = object.get(key) {
+                    let did = author.get("did").and_then(Value::as_str).unwrap_or("").trim();
+                    let handle = author.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_lowercase();
+                    if (!did.is_empty() && hidden.is_hidden(did))
+                        || (!handle.is_empty() && hidden.is_hidden(&format!("https://bsky.app/profile/{handle}"))) {
+                        return true;
+                    }
+                }
+            }
+            if object.get("viewer").and_then(|viewer| viewer.get("blockedBy")).is_some_and(php_truthy)
+                || object.get("author").and_then(|author|author.get("viewer")).and_then(|viewer|viewer.get("blockedBy")).is_some_and(php_truthy) {
+                return true;
+            }
+            if let Some(text) = object.get("text").and_then(Value::as_str) {
+                let text = normalize_muted_text(text);
+                if hidden.muted_phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase)) { return true; }
+            }
+            object.values().filter(|child| child.is_object() || child.is_array())
+                .any(|child| native_tree_hidden(child, hidden, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn php_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|number| number != 0.0),
+        Value::String(value) => !value.is_empty() && value != "0",
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
 /// A directly opened profile may show its muted author, while nested authors
 /// still obey personal mutes. Blocks and muted words apply throughout.
 pub fn status_hidden_on_profile(status: &Value, hidden: &HiddenSets) -> bool {
@@ -61,6 +136,23 @@ pub fn status_hidden_on_profile(status: &Value, hidden: &HiddenSets) -> bool {
 
 fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_root: bool) -> bool {
     if depth > 16 { return true; }
+    // Flattened fallback previews sometimes have no account. Their object
+    // host still obeys domain blocks, including real subdomains.
+    for field in ["uri", "url"] {
+        if let Some(reference) = status.get(field).and_then(Value::as_str) {
+            if let Some(host) = host_of(reference) {
+                if hidden.user_blocked_domains.iter().chain(hidden.instance_blocked_domains.iter())
+                    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}"))) { return true; }
+            }
+        }
+    }
+    // Late Bluesky quote previews may carry only an AT URI plus a web handle,
+    // without account/did fields. The record URI is the trusted DID identity.
+    if let Some(uri) = status.get("uri").and_then(Value::as_str) {
+        if let Some(did) = uri.strip_prefix("at://").and_then(|rest| rest.split('/').next()).filter(|did| did.starts_with("did:")) {
+            if hidden.actor_hidden(did, profile_root && depth == 0) { return true; }
+        }
+    }
     if let Some(account) = status.get("account") {
         if ["uri", "url", "id"].iter().any(|field| account.get(field).and_then(Value::as_str).is_some_and(|actor| hidden.actor_hidden(actor, profile_root && depth == 0))) {
             return true;
@@ -93,44 +185,94 @@ fn normalize_muted_text(text: &str) -> String {
 }
 
 fn host_of(actor: &str) -> Option<String> {
-    let rest = actor.strip_prefix("https://")?;
-    let host = rest.split('/').next()?;
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
-    }
+    let url = reqwest::Url::parse(actor).ok()?;
+    if !matches!(url.scheme(), "http" | "https") { return None; }
+    url.host_str().map(|host| host.to_ascii_lowercase())
 }
 
 fn norm_actor(s: &str) -> String {
-    s.trim().trim_end_matches('/').to_ascii_lowercase()
+    s.trim().trim_end_matches('/').to_owned()
 }
 
-fn actor_aliases(s: &str) -> Vec<String> {
+pub(crate) fn actor_aliases(s: &str) -> Vec<String> {
     let actor = norm_actor(s);
-    if actor.is_empty() {
-        return Vec::new();
-    }
+    if actor.is_empty() { return Vec::new(); }
     let mut aliases = vec![actor.clone()];
-    if let Some(rest) = actor.strip_prefix("https://") {
-        let mut parts = rest.splitn(2, '/');
-        let host = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("").trim_matches('/');
-        if !host.is_empty() {
-            if let Some(name) = path.strip_prefix("users/") {
-                if !name.is_empty() {
-                    aliases.push(format!("https://{host}/@{name}"));
-                }
-            } else if let Some(name) = path.strip_prefix('@') {
-                if !name.is_empty() {
-                    aliases.push(format!("https://{host}/users/{name}"));
-                }
+    if actor.starts_with("did:") {
+        aliases.push(format!("https://bsky.app/profile/{actor}"));
+        aliases.push(format!("https://bsky.app/profile/{}", crate::library::actions::query(&actor)));
+    } else if let Some(captures) = regex::Regex::new(r"(?i)^https://bsky\.app/profile/([^/?#]+)$").unwrap().captures(&actor) {
+        let decoded = raw_percent_decode(&captures[1]);
+        aliases.push(decoded.clone());
+        aliases.push(format!("https://bsky.app/profile/{decoded}"));
+        aliases.push(format!("https://bsky.app/profile/{}", crate::library::actions::query(&decoded)));
+    } else if let Some(captures) = regex::Regex::new(r"(?i)^https://([^/]+)/(users/|@)([^/?#]+)$").unwrap().captures(&actor) {
+        let host = captures[1].to_ascii_lowercase();
+        let (decoded, encoded) = path_segment_forms(&captures[3]);
+        for variant in [decoded, encoded] {
+            if !variant.is_empty() && variant.bytes().all(|byte| byte.is_ascii_digit()) {
+                aliases.push(format!("https://{host}/{}{variant}", &captures[2]));
+            } else if !variant.is_empty() {
+                aliases.push(format!("https://{host}/users/{variant}"));
+                aliases.push(format!("https://{host}/@{variant}"));
             }
         }
     }
-    aliases.sort();
-    aliases.dedup();
-    aliases
+    aliases.sort(); aliases.dedup(); aliases
+}
+
+/// AP path segment forms decode unreserved bytes and valid UTF-8 names only.
+/// Encoded reserved delimiters retain their identity and never double-encode.
+pub(crate) fn path_segment_forms(raw: &str) -> (String, String) {
+    let bytes = raw.as_bytes();
+    let mut decoded = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let start = index;
+        let mut run = Vec::new();
+        while index + 2 < bytes.len() && bytes[index] == b'%' {
+            let Some(byte) = std::str::from_utf8(&bytes[index+1..index+3]).ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok()) else { break; };
+            run.push(byte);
+            index += 3;
+        }
+        if run.is_empty() {
+            let character = raw[index..].chars().next().expect("segment character");
+            decoded.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+        let render = |unicode: bool| {
+            let mut out = Vec::new();
+            for byte in &run {
+                if byte.is_ascii_alphanumeric() || b"._~-".contains(byte) || (unicode && *byte >= 128) {
+                    out.push(*byte);
+                } else { out.extend_from_slice(format!("%{byte:02X}").as_bytes()); }
+            }
+            out
+        };
+        let candidate = String::from_utf8(render(true)).unwrap_or_else(|_| {
+            String::from_utf8(render(false)).expect("escaped invalid byte run")
+        });
+        decoded.push_str(&candidate);
+        debug_assert!(index > start);
+    }
+    let mut encoded=String::new();
+    for byte in decoded.as_bytes(){if *byte>=128{encoded.push_str(&format!("%{byte:02X}"));}else{encoded.push(*byte as char);}}
+    (decoded,encoded)
+}
+
+pub(crate) fn raw_percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes(); let mut decoded = Vec::new(); let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) { decoded.push(byte); index += 3; continue; }
+            }
+        }
+        decoded.push(bytes[index]); index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 fn insert_actor_aliases(set: &mut HashSet<String>, actor: &str) {
@@ -144,7 +286,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
 
     let mute_rows = db
         .query(
-            "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1",
+            "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1::bigint",
             &[&owner_user_id],
         )
         .await
@@ -159,7 +301,7 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
 
     let user_block_rows = db
         .query(
-            "SELECT scope, value FROM ap_user_blocks WHERE owner_user_id = $1",
+            "SELECT scope, value FROM ap_user_blocks WHERE owner_user_id = $1::bigint",
             &[&owner_user_id],
         )
         .await
@@ -185,17 +327,20 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     }
 
     let inst_rows = db
-        .query("SELECT scope, value FROM ap_blocks", &[])
+        .query("SELECT scope, value, COALESCE(to_jsonb(ap_blocks)->>'kind', 'block') FROM ap_blocks", &[])
         .await
         .context("select ap_blocks")?;
     for row in inst_rows {
         let scope: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
         let value: String = row.try_get::<_, Option<String>>(1)?.unwrap_or_default();
+        let kind: String = row.try_get(2)?;
         match scope.as_str() {
             "actor" => {
                 let a = norm_actor(&value);
                 if !a.is_empty() {
-                    insert_actor_aliases(&mut sets.instance_blocked_actors, &a);
+                    if kind == "mute" {
+                        for alias in actor_aliases(&a) { sets.instance_muted_actors.insert(alias.to_ascii_lowercase()); }
+                    } else { insert_actor_aliases(&mut sets.instance_blocked_actors, &a); }
                 }
             }
             "domain" => {
@@ -209,10 +354,28 @@ pub async fn load_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenS
     }
 
     if owner_user_id > 0 {
-        for row in db.query("SELECT phrase FROM ap_muted_words WHERE owner_user_id = $1", &[&owner_user_id]).await.context("load muted words")? {
+        for row in db.query("SELECT phrase FROM ap_muted_words WHERE owner_user_id = $1::bigint", &[&owner_user_id]).await.context("load muted words")? {
             let phrase: String = row.get(0);
             let phrase = normalize_muted_text(&phrase);
             if !phrase.is_empty() { sets.muted_phrases.push(phrase); }
+        }
+    }
+    Ok(sets)
+}
+
+/// Library reads are authenticated and additionally obey the owner's durable
+/// Bluesky moderation set. These rows include native blocks, mutes and subscribed
+/// moderation lists. Absence in older schemas is an error, never an empty set.
+pub async fn load_library_hidden_sets(db: &Client, owner_user_id: i64) -> Result<HiddenSets> {
+    if owner_user_id < 1 { anyhow::bail!("Library moderation requires an owner"); }
+    let mut sets = load_hidden_sets(db, owner_user_id).await?;
+    for row in db.query("SELECT DISTINCT did FROM bsky_hide_dids WHERE owner_user_id::bigint = $1", &[&owner_user_id])
+        .await.context("read current Library Bluesky moderation")? {
+        let did: Option<String> = row.try_get(0)?;
+        let did = norm_actor(&did.unwrap_or_default());
+        if !did.is_empty() {
+            sets.user_blocked_actors.insert(did.clone());
+            sets.user_blocked_actors.insert(format!("https://bsky.app/profile/{did}"));
         }
     }
     Ok(sets)
@@ -276,7 +439,7 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
     }
     let mute_rows = db
         .query(
-            "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1",
+            "SELECT actor_id FROM ap_mutes WHERE owner_user_id = $1::bigint",
             &[&owner_user_id],
         )
         .await
@@ -290,8 +453,8 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
     }
     let block_rows = db
         .query(
-            "SELECT id, value FROM ap_user_blocks
-             WHERE owner_user_id = $1 AND scope = 'actor'",
+            "SELECT id::bigint, value FROM ap_user_blocks
+             WHERE owner_user_id = $1::bigint AND scope = 'actor'",
             &[&owner_user_id],
         )
         .await
@@ -306,7 +469,7 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
     }
     if let Ok(rows) = db
         .query(
-            "SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = $1",
+            "SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = $1::bigint",
             &[&owner_user_id],
         )
         .await
@@ -319,7 +482,7 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
     if let Ok(row) = db
         .query_opt(
             "SELECT COALESCE(handle, ''), COALESCE(did, '')
-             FROM bsky_sessions WHERE owner_user_id = $1 LIMIT 1",
+             FROM bsky_sessions WHERE owner_user_id = $1::bigint LIMIT 1",
             &[&owner_user_id],
         )
         .await
@@ -336,8 +499,8 @@ pub async fn load_viewer_moderation(db: &Client, owner_user_id: i64) -> Result<V
         }
     }
     if let Some(row) = db.query_opt(
-        "SELECT COALESCE(p.auto_unblur_sensitive, 0)::bigint FROM ap_users u
-         JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = $1 AND u.disabled_at IS NULL",
+        "SELECT COALESCE(p.auto_unblur_sensitive::bigint, 0) FROM ap_users u
+         JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = $1::bigint AND u.disabled_at IS NULL",
         &[&owner_user_id],
     ).await? {
         out.auto_unblur_sensitive = row.get::<_, i64>(0) != 0;
@@ -353,7 +516,7 @@ pub async fn is_favourited(db: &Client, owner_user_id: i64, object_id: &str) -> 
     let row = db
         .query_opt(
             "SELECT 1 FROM masto_favourites
-             WHERE owner_user_id = $1 AND (object_id = $2 OR object_id = $3)
+             WHERE owner_user_id = $1::bigint AND (object_id = $2 OR object_id = $3)
              LIMIT 1",
             &[&owner_user_id, &object_id, &format!("{object_id}/")],
         )
@@ -367,11 +530,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn moderation_matches_actor_url_aliases_case_insensitively() {
+    fn moderation_preserves_actor_path_case_and_expands_structural_aliases() {
         let mut hidden = HiddenSets::default();
         insert_actor_aliases(&mut hidden.muted_actors, "https://mas.corq.co/users/rogue_corq");
         assert!(hidden.is_hidden("https://mas.corq.co/users/rogue_corq/"));
-        assert!(hidden.is_hidden("https://MAS.CORQ.CO/@ROGUE_CORQ"));
+        assert!(hidden.is_hidden("https://MAS.CORQ.CO/@rogue_corq"));
+        assert!(!hidden.is_hidden("https://mas.corq.co/@ROGUE_CORQ"));
         assert!(!hidden.is_hidden("https://mas.corq.co/users/other"));
     }
 }
@@ -379,7 +543,7 @@ mod tests {
 pub async fn load_post_subscriptions(db: &Client, owner_user_id: i64) -> Result<HashSet<String>> {
     let rows = db
         .query(
-            "SELECT target_actor_id FROM ap_post_subscriptions WHERE owner_user_id = $1",
+            "SELECT target_actor_id FROM ap_post_subscriptions WHERE owner_user_id = $1::bigint",
             &[&owner_user_id],
         )
         .await
@@ -435,6 +599,68 @@ mod privacy_tests {
     use super::*;
     use serde_json::json;
     #[test]
+    fn actual_php_actor_aliases_preserve_numeric_and_encoded_identity_boundaries() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/migration-library-component-capture.php");
+        let output = std::process::Command::new(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/php-policy-test")).arg(file).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reference: Value = serde_json::from_slice(&output.stdout).unwrap();
+        for (actor, expected) in reference["actors"].as_object().unwrap() {
+            let expected: HashSet<String> = expected.as_array().unwrap().iter().map(|alias| alias.as_str().unwrap().trim_end_matches('/').to_owned()).collect();
+            assert_eq!(actor_aliases(actor).into_iter().collect::<HashSet<_>>(), expected, "actual PHP aliases {actor}");
+        }
+    }
+    #[test]
+    fn library_preserves_native_quote_author_remote_policy_and_text_checks() {
+        let hidden = HiddenSets { user_blocked_actors: HashSet::from(["did:plc:hidden".into()]),
+            muted_phrases: vec!["secret phrase".into()], ..Default::default() };
+        let clean = json!({"account":{"uri":"https://allowed.test/users/a"},"bsky_post":{
+            "uri":"at://did:plc:allowed/app.bsky.feed.post/a", "author":{"did":"did:plc:allowed"},
+            "record":{"text":"clean"},"embed":{"record":{"record":{"author":{"did":"did:plc:allowed"},"value":{"text":"clean"}}}}}});
+        assert!(!library_status_hidden(&clean, &hidden));
+        let mut nested = clean.clone();
+        nested["bsky_post"]["embed"]["record"]["record"]["author"]["did"] = json!("did:plc:hidden");
+        assert!(library_status_hidden(&nested, &hidden));
+        let mut blocked = clean.clone();
+        blocked["bsky_post"]["author"]["viewer"] = json!({"blockedBy":true});
+        assert!(library_status_hidden(&blocked, &hidden));
+        blocked["bsky_post"]["author"]["viewer"] = json!({"blockedBy":false,"muted":true,"blocking":"stale"});
+        assert!(!library_status_hidden(&blocked, &hidden));
+        let mut phrase = clean.clone();
+        phrase["bsky_post"]["record"]["text"] = json!("SECRET phrase");
+        assert!(library_status_hidden(&phrase, &hidden));
+        assert!(library_status_hidden(&json!({"vaak_quote_preview":{"text":"secret phrase"}}), &hidden));
+        assert!(library_status_hidden(&json!({"bsky_post":{"author":{"did":"did:plc:hidden"}}}), &hidden));
+    }
+    #[test]
+    fn raw_post_and_feed_views_keep_native_author_text_and_remote_policy() {
+        let mut hidden=HiddenSets::default();hidden.user_blocked_actors.insert("did:plc:hidden".into());hidden.muted_phrases.push("hidden & phrase".into());
+        let base=serde_json::json!({"uri":"at://did:plc:allowed/app.bsky.feed.post/key","author":{"did":"did:plc:allowed"},"record":{"text":"allowed"}});
+        assert!(!library_status_hidden(&base,&hidden));
+        let mut nested=base.clone();nested["embed"]=serde_json::json!({"record":{"author":{"did":"did:plc:hidden"}}});assert!(library_status_hidden(&nested,&hidden));
+        let mut words=base.clone();words["record"]["text"]=serde_json::json!("hidden & phrase");assert!(library_status_hidden(&words,&hidden));
+        let mut blocked=base.clone();blocked["author"]["viewer"]=serde_json::json!({"blockedBy":true});assert!(library_status_hidden(&blocked,&hidden));
+        let feed=serde_json::json!({"post":base,"reason":{"by":{"did":"did:plc:hidden"}}});assert!(library_status_hidden(&feed,&hidden));
+    }
+
+    #[test]
+    fn native_handle_is_lowercased_without_changing_activitypub_path_case() {
+        let mut hidden=HiddenSets::default();hidden.user_blocked_actors.insert("https://bsky.app/profile/alice.test".into());
+        let native=serde_json::json!({"account":{"uri":"https://allowed.test/users/a"},"bsky_post":{"author":{"handle":" ALICE.TEST "}}});
+        assert!(library_status_hidden(&native,&hidden));
+        hidden.user_blocked_actors.insert("https://ap.test/users/alice".into());
+        assert!(!hidden.is_hidden("https://ap.test/users/Alice"));
+    }
+
+    #[test]
+    fn library_native_depth_is_scoped_to_authoritative_post_roots() {
+        let hidden=HiddenSets::default();
+        let chain=|depth:usize| { let mut node=json!({}); for _ in 0..depth { node=json!({"child":node}); } node };
+        for depth in [14,15,16] { assert!(!library_status_hidden(&json!({"bsky_post":chain(depth)}),&hidden)); }
+        assert!(library_status_hidden(&json!({"bsky_post":chain(17)}),&hidden));
+        assert!(!library_status_hidden(&json!({"metadata":chain(18)}),&hidden));
+        assert!(!library_status_hidden(&json!({"metadata":{"viewer":{"blockedBy":true}}}),&hidden));
+    }
+    #[test]
     fn muted_words_filter_body_warning_and_nested_network_cards() {
         let hidden = HiddenSets { muted_phrases: vec!["spoiler phrase".into(), "cats & dogs".into()], ..Default::default() };
         assert!(status_hidden(&json!({"content":"<p>SPOILER <em>phrase</em></p>"}), &hidden));
@@ -450,6 +676,27 @@ mod privacy_tests {
     fn blocked_domain_in_quote_cannot_hide_behind_allowed_author() {
         let hidden = HiddenSets { user_blocked_domains: HashSet::from(["blocked.test".into()]), ..Default::default() };
         assert!(status_hidden(&json!({"account":{"uri":"https://friend.test/users/a"},"vaak_quote_preview":{"status":{"account":{"url":"https://blocked.test/@b"}}}}), &hidden));
+        assert!(status_hidden(&json!({"account":{"uri":"https://friend.test/users/a"},"vaak_quote_preview":{"url":"https://sub.blocked.test/posts/q", "acct":"@author@blocked.test", "text":"hidden preview"}}), &hidden));
+    }
+    #[test]
+    fn domain_suffix_blocks_real_subdomains_without_overmatching() {
+        let hidden = HiddenSets { user_blocked_domains: HashSet::from(["blocked.test".into()]), ..Default::default() };
+        for host in ["blocked.test", "media.blocked.test", "DEEP.media.blocked.test"] {
+            assert!(hidden.is_hidden(&format!("https://{host}/users/alice")));
+        }
+        assert!(!hidden.is_hidden("https://notblocked.test/users/alice"));
+        assert!(!hidden.is_hidden("https://blocked.test.evil.test/users/alice"));
+        assert!(hidden.is_hidden("http://sub.blocked.test:8080/users/alice/"));
+        assert!(hidden.is_hidden("HTTPS://BLOCKED.TEST/users/alice"));
+    }
+    #[test]
+    fn library_bluesky_did_and_nested_normalized_actor_are_hidden() {
+        let did = "did:plc:blocked";
+        let hidden = HiddenSets { user_blocked_actors: HashSet::from([did.into(), format!("https://bsky.app/profile/{did}")]), ..Default::default() };
+        assert!(status_hidden(&json!({"account":{"id":did,"uri":format!("https://bsky.app/profile/{did}")}}), &hidden));
+        assert!(status_hidden(&json!({"quote":{"quoted_status":{"account":{"id":did}}}}), &hidden));
+        assert!(hidden.is_hidden("https://bsky.app/profile/did%3Aplc%3Ablocked/"));
+        assert!(status_hidden(&json!({"vaak_quote_preview":{"uri":"at://did:plc:blocked/app.bsky.feed.post/k", "url":"https://bsky.app/profile/new-handle.test/post/k", "handle":"new-handle.test"}}), &hidden));
     }
 }
 

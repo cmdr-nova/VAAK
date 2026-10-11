@@ -177,9 +177,12 @@ function ap_visibility_status_audience_allowed(array $status, int $ownerUserId, 
         if (str_starts_with($uri, 'https://') || str_starts_with($uri, 'http://')) {
             $db = ap_db();
             $query = $db->prepare("SELECT visibility, actor_id FROM events WHERE object_id IN (?, ?)
-                AND type IN ('Create','Update','Quote','QuotePost')
+                AND (type IN ('Create','Update')
+                    OR (type IN ('Quote','QuotePost') AND NOT EXISTS (
+                        SELECT 1 FROM events note_source WHERE note_source.object_id IN (?, ?)
+                            AND note_source.type IN ('Create','Update'))))
                 AND action_taken IN ('log','local_observe','local_fav_update') ORDER BY id DESC LIMIT 1");
-            $query->execute([$uri, $uri . '/']);
+            $query->execute([$uri, $uri . '/', $uri, $uri . '/']);
             if ($row = $query->fetch()) {
                 $visibility = strtolower((string) ($row['visibility'] ?? 'public'));
                 $author = rtrim((string) ($row['actor_id'] ?? ''), '/');

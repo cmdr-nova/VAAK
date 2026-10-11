@@ -35,6 +35,8 @@ register_shutdown_function(static function () use ($vaakRequestStartedAt): void 
     ap_slow_route_record($route, (microtime(true) - $vaakRequestStartedAt) * 1000.0);
 });
 require_once __DIR__ . '/ap-auth.php';
+require_once __DIR__ . '/ap-library-native.php';
+require_once __DIR__ . '/ap-search-native.php';
 require_once __DIR__ . '/ap-version.php';
 require_once __DIR__ . '/ap-collections.php'; // Library → Collections (starter packs)
 require_once __DIR__ . '/ap-lists.php'; // Library → Lists (private follow subsets)
@@ -1631,14 +1633,30 @@ $vaakAdminOnlyActions = [
                 $error = $res['error'] ?? 'Could not delete folder.';
             }
         } elseif ($action === 'bookmark_folder_add') {
-            $res = vaak_bookmark_folder_add_status(
+            $folderStatusId = trim((string) ($_POST['status_id'] ?? ''));
+            $folderObjectId = trim((string) ($_POST['object_id'] ?? ''));
+            $folderRssKey = str_starts_with($folderStatusId, 'rss:') ? $folderStatusId
+                : (str_starts_with($folderObjectId, 'rss:') ? $folderObjectId : '');
+            $folderRssAllowed = true;
+            if ($folderRssKey !== '') {
+                if (!function_exists('ap_rss_item_by_id')) {
+                    require_once __DIR__ . '/ap-rss.php';
+                }
+                $folderRssId = ap_rss_parse_local_status_id($folderRssKey);
+                $folderRssAllowed = $folderRssId > 0
+                    && is_array(ap_rss_item_by_id($folderRssId, $vaakOwnerId));
+                if ($folderRssAllowed) {
+                    $folderStatusId = $folderObjectId = ap_rss_local_status_id($folderRssId);
+                }
+            }
+            $res = $folderRssAllowed ? vaak_bookmark_folder_add_status(
                 (int) ($_POST['folder_id'] ?? 0),
-                (string) ($_POST['status_id'] ?? ''),
+                $folderStatusId,
                 $vaakOwnerId,
-                trim((string) ($_POST['object_id'] ?? '')) ?: null
-            );
+                $folderObjectId !== '' ? $folderObjectId : null
+            ) : ['ok' => false, 'error' => 'RSS item not found.'];
             $payload = $res + [
-                'status_id' => (string) ($_POST['status_id'] ?? ''),
+                'status_id' => $folderStatusId,
                 'folder_id' => (int) ($_POST['folder_id'] ?? 0),
             ];
             if (!empty($res['ok'])) {
@@ -5015,22 +5033,12 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
         header('X-VAAK-Fragment: axum-data');
         echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . (!empty($favData['has_more_fedi']) ? '1' : '0') . '">';
         $GLOBALS['admin_library_fetch_budget'] = 3;
-        foreach ($items as $item) admin_render_library_status_card($item, 'favourites');
+        admin_render_library_network_items($items, 'fedi', 'favourites');
         echo '</div>';
         exit;
     }
     $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
-    if (is_array($axumFrag = admin_library_fragment_axum_fetch('favourites_fedi', $vaakOwnerId, $fragSuffix))) {
-        header('X-Has-More: ' . (!empty($axumFrag['has_more']) ? '1' : '0'));
-        header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
-    }
-    if (function_exists('ap_redis_library_html_get')) {
-        $fragHit = ap_redis_library_html_get('favourites_fedi', $vaakOwnerId, $fragSuffix);
-        if (is_array($fragHit)) {
-            header('X-Has-More: ' . (!empty($fragHit['has_more']) ? '1' : '0'));
-            header('X-VAAK-Fragment: hit'); echo $fragHit['html']; exit;
-        }
-    }
+    // Raw HTML lacks a status/policy manifest; re-render structured saves below.
     $rows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list($offset + $limit + 20, null) : [];
     $rows = array_values(array_filter($rows, static function ($st): bool {
         if (!is_array($st)) {
@@ -5048,9 +5056,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     ob_start();
     echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
     $GLOBALS['admin_library_fetch_budget'] = 3;
-    foreach ($items as $item) {
-        admin_render_library_status_card($item, 'favourites');
-    }
+    admin_render_library_network_items($items, 'fedi', 'favourites');
     echo '</div>';
     $html = ob_get_clean();
     if (function_exists('ap_redis_library_html_set')) {
@@ -5060,33 +5066,10 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
     exit;
 }
 
-/** Cache-only Rust fast path; PHP remains the renderer/cache writer on miss. */
+/** Legacy raw HTML has no policy manifest and must never revive revoked access. */
 function admin_library_fragment_axum_fetch(string $kind, int $ownerUserId, string $suffix): ?array
 {
-    $kind = strtolower(trim($kind));
-    if (!in_array($kind, ['favourites_fedi', 'favourites_bsky', 'bookmarks_fedi', 'bookmarks_bsky'], true)
-        || $ownerUserId < 1 || $suffix === '' || strlen($suffix) > 256
-        || !function_exists('curl_init')) return null;
-    $base = getenv('VAAK_SHADOW_HTTP');
-    $base = is_string($base) && trim($base) !== '' ? rtrim(trim($base), '/') : 'http://127.0.0.1:8787';
-    $host = parse_url($base, PHP_URL_HOST);
-    if (!is_string($host) || !in_array(strtolower($host), ['127.0.0.1', 'localhost', '::1'], true)) return null;
-    $ch = curl_init($base . '/shadow/library-fragment?' . http_build_query([
-        'owner_id' => $ownerUserId, 'library_kind' => $kind, 'library_suffix' => $suffix,
-    ]));
-    if ($ch === false) return null;
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HEADER => true, CURLOPT_CONNECTTIMEOUT_MS => 80, CURLOPT_TIMEOUT_MS => 350, CURLOPT_HTTPHEADER => ['Accept: text/html', 'Connection: close']]);
-    $raw = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    curl_close($ch);
-    if ($code !== 200 || !is_string($raw)) return null;
-    $headers = [];
-    foreach (explode("\r\n", substr($raw, 0, $headerSize)) as $line) {
-        if (str_contains($line, ':')) { [$name, $value] = array_map('trim', explode(':', $line, 2)); $headers[strtolower($name)] = $value; }
-    }
-    $html = substr($raw, $headerSize);
-    return is_string($html) && $html !== '' ? ['html' => $html, 'has_more' => (($headers['x-has-more'] ?? '') === '1')] : null;
+    return null;
 }
 
 /** Structured read-only Favourites projection; PHP still hydrates/cards/writes. */
@@ -5114,6 +5097,58 @@ function admin_library_data_axum_fetch(int $ownerUserId, int $offset = 0, int $l
 function admin_scroll_loading_html(): string
 {
     return '<span class="timeline-status-loading"><span class="vaak-spinner" aria-hidden="true"></span><span>Loading…</span></span>';
+}
+
+/**
+ * Render a complete Library batch, retaining canonical sources for PHP fallback.
+ * Callers retain source cursors, empty states, headings and page fetch budgets.
+ * @param list<array{kind:string,item:array<string,mixed>}> $entries
+ */
+function admin_render_library_entries(array $entries, string $returnView): void
+{
+    $prepared = false;
+    $nativeHtml = null;
+    if (ap_library_native_enabled()) {
+        $sources = [];
+        foreach ($entries as &$entry) {
+            if (!is_array($entry) || !is_array($entry['item'] ?? null)) continue;
+            if (($entry['kind'] ?? '') !== 'bsky' && !str_starts_with((string) ($entry['item']['id'] ?? ''), 'rss:')) {
+                $entry['item'] = admin_library_status_enrich($entry['item']);
+            }
+            // The assembled cached source is a separate value. Canonical PHP
+            // fallback preserves its original quote state and lookup behavior.
+            $sources[] = ap_library_native_assemble_status($entry['item']);
+        }
+        unset($entry);
+        $prepared = true;
+        $nativeHtml = ap_library_native_render_batch($sources, $returnView);
+    }
+    if ($nativeHtml !== null) {
+        echo $nativeHtml;
+        return;
+    }
+    foreach ($entries as $entry) {
+        if (!is_array($entry) || !is_array($entry['item'] ?? null)) continue;
+        if (($entry['kind'] ?? '') === 'bsky') {
+            admin_render_bsky_feed_item($entry['item'], 'following', $returnView);
+        } elseif ($prepared && !str_starts_with((string) ($entry['item']['id'] ?? ''), 'rss:')) {
+            if (admin_library_status_allowed($entry['item'], admin_owner_user_id())) {
+                admin_render_masto_status_card($entry['item'], [], $returnView, false, true);
+            }
+        } else {
+            admin_render_library_status_card($entry['item'], $returnView);
+        }
+    }
+}
+
+/** @param list<array<string,mixed>> $items */
+function admin_render_library_network_items(array $items, string $network, string $returnView): void
+{
+    $entries = [];
+    foreach ($items as $item) {
+        if (is_array($item)) $entries[] = ['kind' => $network, 'item' => $item];
+    }
+    admin_render_library_entries($entries, $returnView);
 }
 
 /**
@@ -5151,16 +5186,7 @@ function admin_bookmark_fragment_markup(string $network, array $items, int $next
         if (!$bsky) {
             $GLOBALS['admin_library_fetch_budget'] = 3;
         }
-        foreach ($items as $item) {
-            if (!is_array($item)) {
-                continue;
-            }
-            if ($bsky) {
-                admin_render_bsky_feed_item($item, 'following', 'bookmarks');
-            } else {
-                admin_render_library_status_card($item, 'bookmarks');
-            }
-        }
+        admin_render_library_network_items($items, $network, 'bookmarks');
     }
     echo '</div>';
     return (string) ob_get_clean();
@@ -5215,23 +5241,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
         $hasMore = $network === 'bsky' ? !empty($data['has_more_bsky']) : !empty($data['has_more_fedi']);
         return $wrap($items, $offset + count($sourceRows), $hasMore, 'axum-data');
     }
-    if (is_array($cached = admin_library_fragment_axum_fetch($kind, $ownerUserId, $suffix))) {
-        return [
-            'html' => (string) $cached['html'],
-            'has_more' => !empty($cached['has_more']),
-            'source' => 'axum-cache',
-        ];
-    }
-    if (function_exists('ap_redis_library_html_get')) {
-        $hit = ap_redis_library_html_get($kind, $ownerUserId, $suffix);
-        if (is_array($hit) && is_string($hit['html'] ?? null) && $hit['html'] !== '') {
-            return [
-                'html' => $hit['html'],
-                'has_more' => !empty($hit['has_more']),
-                'source' => 'hit',
-            ];
-        }
-    }
+    // Raw HTML cannot be re-authorized after policy changes; use structured rows.
     $refreshing = false;
     $items = [];
     $rawCount = 0;
@@ -5288,7 +5298,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
             }
             if ($folderId > 0) {
                 $st = ap_db()->prepare(
-                    "SELECT c.post_json, c.bookmarked_at
+                    "SELECT c.post_json, c.bookmarked_at, c.bookmark_uri
                      FROM bsky_bookmark_cache c
                      WHERE c.owner_user_id = ?
                        AND EXISTS (
@@ -5304,7 +5314,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
                 $st->execute([$ownerUserId, $folderId, $offset, $limit + 1]);
             } else {
                 $st = ap_db()->prepare(
-                    'SELECT post_json, bookmarked_at FROM bsky_bookmark_cache
+                    'SELECT post_json, bookmarked_at, bookmark_uri FROM bsky_bookmark_cache
                      WHERE owner_user_id = ?
                      ORDER BY bookmarked_at DESC, bookmark_uri DESC
                      OFFSET ? LIMIT ?'
@@ -5325,6 +5335,9 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
                 }
                 $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
                 $item['post']['viewer']['bookmarked'] = true;
+                if (function_exists('ap_bsky_bookmark_owner_state_set') && (string) ($item['post']['uri'] ?? '') === (string) ($row['bookmark_uri'] ?? '')) {
+                    ap_bsky_bookmark_owner_state_set((string) $row['bookmark_uri'], $ownerUserId, true);
+                }
                 $item['_vaak_bookmarked_at'] = (string) ($row['bookmarked_at'] ?? '');
                 $items[] = $item;
             }
@@ -5408,16 +5421,7 @@ function admin_bookmark_mixed_markup(array $items, int $nextOffset, int $limit, 
     } else {
         $GLOBALS['admin_bookmark_lazy_media'] = true;
         $GLOBALS['admin_library_fetch_budget'] = 3;
-        foreach ($items as $entry) {
-            if (!is_array($entry) || !is_array($entry['item'] ?? null)) {
-                continue;
-            }
-            if (($entry['kind'] ?? '') === 'bsky') {
-                admin_render_bsky_feed_item($entry['item'], 'following', 'bookmarks');
-            } else {
-                admin_render_library_status_card($entry['item'], 'bookmarks');
-            }
-        }
+        admin_render_library_entries($items, 'bookmarks');
         $GLOBALS['admin_bookmark_lazy_media'] = false;
     }
     echo '</div>';
@@ -5566,6 +5570,9 @@ function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $off
                 if (is_array($item) && is_array($item['post'] ?? null)) {
                     $item['post']['viewer'] = is_array($item['post']['viewer'] ?? null) ? $item['post']['viewer'] : [];
                     $item['post']['viewer']['bookmarked'] = true;
+                if (function_exists('ap_bsky_bookmark_owner_state_set') && (string) ($item['post']['uri'] ?? '') === (string) ($row['bookmark_uri'] ?? '')) {
+                    ap_bsky_bookmark_owner_state_set((string) $row['bookmark_uri'], $ownerUserId, true);
+                }
                     $bskyByUri[(string) ($row['bookmark_uri'] ?? '')] = $item;
                 }
             }
@@ -5915,7 +5922,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
             echo '<div class="empty" data-bsky-favourite-empty>No cached Bluesky favourites yet. They will appear after the background sync completes.</div>';
         } else {
             if ($offset === 0) echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
-            foreach ($items as $item) admin_render_bsky_feed_item($item, 'following', 'favourites');
+            admin_render_library_network_items($items, 'bsky', 'favourites');
         }
         echo '</div>';
         header('X-Has-More: ' . ($hasMore ? '1' : '0'));
@@ -5924,19 +5931,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
         exit;
     }
     $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
-    if (is_array($axumFrag = admin_library_fragment_axum_fetch('favourites_bsky', $vaakOwnerId, $fragSuffix))) {
-        header('X-Has-More: ' . (!empty($axumFrag['has_more']) ? '1' : '0'));
-        header('X-VAAK-Fragment: axum-cache'); echo $axumFrag['html']; exit;
-    }
-    if (function_exists('ap_redis_library_html_get')) {
-        $fragHit = ap_redis_library_html_get('favourites_bsky', $vaakOwnerId, $fragSuffix);
-        if (is_array($fragHit)) {
-            header('X-Has-More: ' . (!empty($fragHit['has_more']) ? '1' : '0'));
-            header('X-VAAK-Fragment: hit');
-            echo $fragHit['html'];
-            exit;
-        }
-    }
+    // Re-render structured cached posts so current settings and moderation apply.
     $items = [];
     $hasMore = false;
     $refreshing = false;
@@ -5966,9 +5961,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_bsky') {
             }
             echo '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Bluesky favourites</h3>';
         }
-        foreach ($items as $item) {
-            admin_render_bsky_feed_item($item, 'following', 'favourites');
-        }
+        admin_render_library_network_items($items, 'bsky', 'favourites');
     }
     echo '</div>';
     $html = ob_get_clean();
@@ -6042,9 +6035,7 @@ if (isset($_GET['partial'], $_GET['shell'])
                 $GLOBALS['admin_library_fetch_budget'] = 3;
                 echo '<div data-fedi-favourites-fragment data-offset="' . (int) count($favList)
                     . '" data-limit="20" data-has-more="' . ($favHasMore ? '1' : '0') . '">';
-                foreach ($favList as $st) {
-                    admin_render_library_status_card($st, 'favourites');
-                }
+                admin_render_library_network_items($favList, 'fedi', 'favourites');
                 echo '<div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
                     . ($favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites') . '</div></div>';
             }
@@ -12107,8 +12098,9 @@ function admin_search_local_account(string $key): ?array
 
 /**
  * Web search used by the full page, soft-nav, and the scroll fragment.
- * The short public cache stores the unfiltered status and tag windows and has
- * no viewer id. Accounts are not cached. Mutes and blocks are applied after the read.
+ * The short cache binds its status window to the current viewer. Accounts are
+ * not cached. Current source/audience/indexability and actor policy are checked
+ * after reads; requested hashtag results are recounted from eligible live rows.
  * Statuses stay one mixed Bluesky and Fediverse list.
  *
  * @return array{
@@ -12156,7 +12148,7 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
     // A new text search stays fresh. The next pages, and repeated tag clicks,
     // reuse this window so the scroll does not run the index again.
     $allowCacheRead = $offset > 0 || str_starts_with($sq, '#');
-    $searchCacheKey = hash('sha256', 'mf2|' . mb_strtolower($sq) . '|' . ($sresolve ? '1' : '0') . '|' . $statusFetch . '|' . $tagFetch);
+    $searchCacheKey = hash('sha256', 'mf3|' . admin_owner_user_id() . '|' . mb_strtolower($sq) . '|' . ($sresolve ? '1' : '0') . '|' . $statusFetch . '|' . $tagFetch);
     $searchCacheDir = '/var/lib/mkultra/ap/search-cache';
     if (!is_dir($searchCacheDir) || !is_writable($searchCacheDir)) {
         $searchCacheDir = sys_get_temp_dir() . '/vaak-search-cache';
@@ -12170,7 +12162,9 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
             && is_array($cachedSearch['hashtags'] ?? null)
             && is_array($cachedSearch['statuses'] ?? null)) {
             $bundle['have_statuses'] = !empty($cachedSearch['have_statuses']);
-            $bundle['have_tags'] = !empty($cachedSearch['have_tags']);
+            // Cached tag entities have no source authority. Recount current
+            // permitted rows so audience/indexing withdrawal cannot leak tags.
+            $bundle['have_tags'] = false;
             if ($bundle['have_statuses']) {
                 $bundle['statuses'] = $cachedSearch['statuses'];
             }
@@ -12257,6 +12251,179 @@ function admin_search_run(string $sq, string $stype, bool $sresolve, int $limit 
             'statuses' => $stMore,
         ],
     ];
+}
+
+/** Current Search admission of every source the shared painter will display. */
+function admin_search_render_context_allowed(array $status,int $owner,array $hydrated,array $previews): bool
+{
+    try {
+        $currentRows=ap_search_local_indexing_rows();
+        if ($currentRows===null || !ap_search_status_allowed($status,$owner,0,$currentRows)) return false;
+        foreach ($hydrated as $child) {
+            if (is_array($child) && !ap_search_status_allowed($child,$owner,0,$currentRows)) return false;
+        }
+        foreach ($previews as $preview) {
+            if (!is_array($preview)) continue;
+            $url=(string)($preview['url']??$preview['uri']??'');
+            $key=rtrim(explode('#',trim($url),2)[0],'/');
+            $nativeUri=(string)($preview['uri']??'');
+            $native=is_array($preview['post']??null)?$preview['post']:
+                ($GLOBALS['vaak_bsky_quote_policy_posts'][$nativeUri]??$GLOBALS['vaak_bsky_quote_policy_posts'][$url]??null);
+            $source=$GLOBALS['vaak_quote_policy_statuses'][$key]??null;
+            if (!is_array($source) && is_array($native)) {
+                $post=is_array($native['post']??null)?$native['post']:$native;
+                $source=['uri'=>(string)($post['uri']??''),'visibility'=>'public','bsky_post'=>$native,
+                    'author_did'=>(string)($post['author']['did']??''),'account'=>['uri'=>(string)($post['author']['did']??'')]];
+            }
+            if (!is_array($source) && $url!=='' && function_exists('ap_masto_lookup_status_by_object_url')) {
+                $source=ap_masto_lookup_status_by_object_url($url,0,false,true);
+            }
+            if (!empty($preview['is_rss'])) {
+                $evidence=$GLOBALS['vaak_rss_quote_policy_rows'][$url]??null;
+                if (!is_array($evidence) || !function_exists('ap_rss_item_by_id')
+                    || !is_array(ap_rss_item_by_id((int)($evidence['id']??0),$owner))) return false;
+            }
+            if (is_array($source)) {
+                if (!ap_search_status_allowed($source,$owner,0,$currentRows)) return false;
+            } elseif (trim((string)($preview['text']??''))!=='' || !empty($preview['media'])) {
+                // Body-bearing compact previews need retained source authority.
+                return false;
+            }
+        }
+        return true;
+    } catch (Throwable $e) { return false; }
+}
+
+/** Direct threads suppress blocked root authors; mute/word rules permit explicit opens. */
+function admin_direct_status_content_blocked(array $status): bool
+{
+    $author = rtrim((string) (($status['account']['uri'] ?? null) ?: ($status['account']['url'] ?? '')), '/');
+    return $author !== '' && function_exists('ap_actor_is_content_blocked')
+        && ap_actor_is_content_blocked($author, null, admin_owner_user_id());
+}
+
+function admin_direct_event_content_blocked(array $event): bool
+{
+    $author = rtrim((string) ($event['actor_id'] ?? ''), '/');
+    return $author !== '' && function_exists('ap_actor_is_content_blocked')
+        && ap_actor_is_content_blocked($author, null, admin_owner_user_id());
+}
+
+/** Keep context order and count only the cards available for display. */
+function admin_direct_filter_blocked_statuses(array $cards): array
+{
+    $out = [];
+    foreach ($cards as $card) {
+        if (is_array($card) && !admin_direct_status_content_blocked($card)) $out[] = $card;
+    }
+    return $out;
+}
+
+function admin_render_direct_status_card(array $status, array $followingIds, string $returnView, bool $focused, bool $showOpen): void
+{
+    if (!admin_direct_status_content_blocked($status)) {
+        admin_render_masto_status_card($status, $followingIds, $returnView, $focused, $showOpen);
+    }
+}
+
+/** Direct opens retain mute/word behavior, but never bypass durable audiences. */
+function admin_direct_status_allowed(array $status, int $owner, int $depth = 0): bool
+{
+    if ($depth > 16 || !function_exists('ap_visibility_status_audience_allowed')) return false;
+    try {
+        $uri = rtrim(explode('#', trim((string) ($status['uri'] ?? $status['url'] ?? '')), 2)[0], '/');
+        $raw = $status['bsky_post'] ?? null;
+        $post = is_array($raw['post'] ?? null) ? $raw['post'] : $raw;
+        $at = is_array($post) ? (string) ($post['uri'] ?? '') : '';
+        if ($at === '' && str_starts_with($uri, 'at://')) $at = $uri;
+        if ($at !== '') {
+            $st = ap_db()->prepare('SELECT 1 FROM bsky_posts WHERE bsky_uri = ? LIMIT 1');
+            $st->execute([$at]);
+            if (!$st->fetchColumn()) return false;
+        } elseif (preg_match('#^https://mkultra\.monster/users/[^/]+/notes/#', $uri)) {
+            $st = ap_db()->prepare("SELECT note_id FROM masto_statuses WHERE rtrim(note_id, '/') = ? LIMIT 1");
+            $st->execute([$uri]);
+            if (!$st->fetchColumn()) return false;
+        } elseif ($uri !== '') {
+            $st = ap_db()->prepare("SELECT type, action_taken FROM events WHERE object_id IN (?, ?)
+                AND (type IN ('Create','Update','Delete','Tombstone')
+                    OR (type IN ('Quote','QuotePost') AND NOT EXISTS (
+                        SELECT 1 FROM events note_source WHERE note_source.object_id IN (?, ?)
+                            AND note_source.type IN ('Create','Update'))))
+                ORDER BY id DESC LIMIT 1");
+            $st->execute([$uri, $uri . '/', $uri, $uri . '/']);
+            $row = $st->fetch();
+            if (is_array($row)) {
+                if (($row['action_taken'] ?? '') === 'deleted'
+                    || in_array($row['type'] ?? '', ['Delete', 'Tombstone'], true)) return false;
+            } else {
+                $st = ap_db()->prepare('SELECT deleted_at FROM mentions WHERE object_id IN (?, ?) ORDER BY id DESC LIMIT 1');
+                $st->execute([$uri, $uri . '/']);
+                $row = $st->fetch();
+                if (!is_array($row) || !empty($row['deleted_at'])) return false;
+            }
+        } else {
+            // State-only quote descriptors paint harmless pending chrome.
+            return in_array($status['state'] ?? '', ['pending', 'accepted', 'fallback'], true)
+                && !array_key_exists('account', $status) && !array_key_exists('content', $status)
+                && !array_key_exists('text', $status) && !array_key_exists('media', $status)
+                && !array_key_exists('media_attachments', $status);
+        }
+        $root = $status;
+        unset($root['reblog'], $root['quote'], $root['vaak_quote_preview']);
+        if (!ap_visibility_status_audience_allowed($root, $owner)) return false;
+        foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+            $child = $status[$field] ?? null;
+            if (!is_array($child)) continue;
+            $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+                : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+            if (!admin_direct_status_allowed($child, $owner, $depth + 1)) return false;
+        }
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/** Bind compact/recovered quote bodies to the same direct-open audience rule. */
+function admin_direct_render_context_allowed(array $status, int $owner, array $hydrated, array $previews): bool
+{
+    try {
+        if (!admin_direct_status_allowed($status, $owner)) return false;
+        foreach ($hydrated as $child) {
+            if (is_array($child) && !admin_direct_status_allowed($child, $owner)) return false;
+        }
+        foreach ($previews as $preview) {
+            if (!is_array($preview)) continue;
+            $url = (string) ($preview['url'] ?? $preview['uri'] ?? '');
+            $key = rtrim(explode('#', trim($url), 2)[0], '/');
+            $nativeUri = (string) ($preview['uri'] ?? '');
+            $native = is_array($preview['post'] ?? null) ? $preview['post']
+                : ($GLOBALS['vaak_bsky_quote_policy_posts'][$nativeUri] ?? $GLOBALS['vaak_bsky_quote_policy_posts'][$url] ?? null);
+            $source = $GLOBALS['vaak_quote_policy_statuses'][$key] ?? null;
+            if (!is_array($source) && is_array($native)) {
+                $post = is_array($native['post'] ?? null) ? $native['post'] : $native;
+                $source = ['uri' => (string) ($post['uri'] ?? ''), 'visibility' => 'public', 'bsky_post' => $native,
+                    'account' => ['uri' => (string) ($post['author']['did'] ?? '')]];
+            }
+            if (!is_array($source) && $url !== '' && function_exists('ap_masto_lookup_status_by_object_url')) {
+                $source = ap_masto_lookup_status_by_object_url($url, 0, false, true);
+            }
+            if (!empty($preview['is_rss'])) {
+                $evidence = $GLOBALS['vaak_rss_quote_policy_rows'][$url] ?? null;
+                if (!is_array($evidence) || !function_exists('ap_rss_item_by_id')
+                    || !is_array(ap_rss_item_by_id((int) ($evidence['id'] ?? 0), $owner))) return false;
+            }
+            if (is_array($source)) {
+                if (!admin_direct_status_allowed($source, $owner)) return false;
+            } elseif (trim((string) ($preview['text'] ?? '')) !== '' || !empty($preview['media'])) {
+                return false;
+            }
+        }
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
 }
 
 function admin_search_viewer_username(): string
@@ -12422,13 +12589,22 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
     $tags = is_array($sresults['hashtags'] ?? null) ? $sresults['hashtags'] : [];
     $statuses = is_array($sresults['statuses'] ?? null) ? $sresults['statuses'] : [];
     $limit = max(1, $limit);
+    $native = ap_search_native_render_batch(
+        ($stype === '' || $stype === 'accounts') ? $accounts : [],
+        ($stype === '' || $stype === 'hashtags') ? $tags : [],
+        ($stype === '' || $stype === 'statuses') ? $statuses : []
+    );
     if (($stype === '' || $stype === 'accounts') && $accounts !== []) {
         $acctMore = !empty($more['accounts']);
         echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Accounts</h3>';
         admin_search_open_list('accounts', $sq, $sresolve, count($accounts), $limit, $acctMore);
-        foreach ($accounts as $acc) {
-            if (is_array($acc)) {
-                admin_search_render_account($acc, $followingIds);
+        if ($native !== null) {
+            echo $native['accounts'];
+        } else {
+            foreach ($accounts as $acc) {
+                if (is_array($acc)) {
+                    admin_search_render_account($acc, $followingIds);
+                }
             }
         }
         admin_search_sentinel($acctMore);
@@ -12438,9 +12614,13 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
         $tagMore = !empty($more['hashtags']);
         echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Hashtags</h3>';
         admin_search_open_list('hashtags', $sq, $sresolve, count($tags), $limit, $tagMore);
-        foreach ($tags as $tag) {
-            if (is_array($tag)) {
-                admin_search_render_hashtag($tag);
+        if ($native !== null) {
+            echo $native['hashtags'];
+        } else {
+            foreach ($tags as $tag) {
+                if (is_array($tag)) {
+                    admin_search_render_hashtag($tag);
+                }
             }
         }
         admin_search_sentinel($tagMore);
@@ -12451,9 +12631,13 @@ function admin_search_render_sections(array $sresults, string $sq, string $stype
         echo '<h3 style="font-size:.95rem;color:var(--muted);margin:1rem 0 .5rem">Posts</h3>';
         echo '<div class="meta" style="margin:0 0 .75rem">Open a post for the full thread · reply / boost / like / quote from the card or detail view</div>';
         admin_search_open_list('statuses', $sq, $sresolve, count($statuses), $limit, $stMore);
-        foreach ($statuses as $st) {
-            if (is_array($st)) {
-                admin_render_masto_status_card($st, $followingIds, 'search', false, true);
+        if ($native !== null) {
+            echo $native['statuses'];
+        } else {
+            foreach ($statuses as $st) {
+                if (is_array($st)) {
+                    admin_render_masto_status_card($st, $followingIds, 'search', false, true);
+                }
             }
         }
         admin_search_sentinel($stMore);
@@ -12497,19 +12681,28 @@ function admin_search_page_fragment(string $q, string $section, bool $resolve, i
     if (!is_array($followingIds)) {
         $followingIds = [];
     }
+    $native = ap_search_native_render_batch(
+        $section === 'accounts' ? $rows : [],
+        $section === 'hashtags' ? $rows : [],
+        $section === 'statuses' ? $rows : []
+    );
     ob_start();
     echo '<div data-search-fragment data-section="' . h($section) . '" data-offset="' . (int) ($offset + count($rows))
         . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
-    foreach ($rows as $row) {
-        if (!is_array($row)) {
-            continue;
-        }
-        if ($section === 'accounts') {
-            admin_search_render_account($row, $followingIds);
-        } elseif ($section === 'hashtags') {
-            admin_search_render_hashtag($row);
-        } else {
-            admin_render_masto_status_card($row, $followingIds, 'search', false, true);
+    if ($native !== null) {
+        echo $native[$section];
+    } else {
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            if ($section === 'accounts') {
+                admin_search_render_account($row, $followingIds);
+            } elseif ($section === 'hashtags') {
+                admin_search_render_hashtag($row);
+            } else {
+                admin_render_masto_status_card($row, $followingIds, 'search', false, true);
+            }
         }
     }
     echo '</div>';
@@ -13462,6 +13655,16 @@ function admin_split_quote_summary(string $summaryRaw): ?array
  */
 function admin_quote_card_html(array $opts, string $returnView = 'home'): string
 {
+    // A canonical source retained during quote assembly can have lost its
+    // current audience grant. Check it before article preview IO; unknown
+    // descriptors still use the existing recovery and final freshness gates.
+    $quotePolicyKey = admin_library_quote_policy_key((string) ($opts['url'] ?? ''));
+    $quotePolicySource = $GLOBALS['vaak_quote_policy_statuses'][$quotePolicyKey] ?? null;
+    if (is_array($quotePolicySource)
+        && (!function_exists('ap_visibility_status_audience_allowed')
+            || !ap_visibility_status_audience_allowed($quotePolicySource, admin_owner_user_id()))) return '';
+    if (in_array($returnView, ['bookmarks', 'favourites'], true)
+        && !admin_library_render_context_allowed(['source' => 'rss'], admin_owner_user_id(), [], [$opts], '')) return '';
     $acct = trim((string) ($opts['acct'] ?? ''));
     $text = trim((string) ($opts['text'] ?? ''));
     $url = trim((string) ($opts['url'] ?? ''));
@@ -13582,16 +13785,30 @@ function admin_quote_card_html(array $opts, string $returnView = 'home'): string
  */
 function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): array
 {
+    foreach ([$st['uri'] ?? '', $st['url'] ?? '', $fallbackUrl] as $policyRef) {
+        $policyKey = admin_library_quote_policy_key((string) $policyRef);
+        if ($policyKey !== '') $GLOBALS['vaak_quote_policy_statuses'][$policyKey] = $st;
+    }
     $acct = (string) ($st['account']['acct'] ?? '');
     $noteUrl = trim((string) ($st['url'] ?? ($st['uri'] ?? $fallbackUrl)));
     $rssItem = null;
-    if ($noteUrl !== '' && function_exists('ap_rss_item_by_mirror_note_id')) {
-        $rssItem = ap_rss_item_by_mirror_note_id($noteUrl);
+    $rssOwner = function_exists('admin_owner_user_id') ? admin_owner_user_id() : 0;
+    $syntheticRss = str_starts_with((string) ($st['id'] ?? ''), 'rss:')
+        || ($st['source'] ?? '') === 'rss' || array_key_exists('vaak_rss_item_id', $st);
+    if ($syntheticRss && $rssOwner > 0 && function_exists('ap_rss_item_by_id')) {
+        $rssId = str_starts_with((string) ($st['id'] ?? ''), 'rss:')
+            ? (function_exists('ap_rss_parse_local_status_id') ? ap_rss_parse_local_status_id((string) $st['id']) : 0)
+            : (is_int($st['vaak_rss_item_id'] ?? null) ? $st['vaak_rss_item_id'] : 0);
+        $rssItem = $rssId > 0 ? ap_rss_item_by_id($rssId, $rssOwner) : null;
+    }
+    if ($rssItem === null && !$syntheticRss && $rssOwner > 0 && $noteUrl !== '' && function_exists('ap_rss_item_by_mirror_note_id')) {
+        $rssItem = ap_rss_item_by_mirror_note_id($noteUrl, $rssOwner);
         if ($rssItem === null && !empty($st['id']) && is_string($st['id']) && str_starts_with($st['id'], 'https://')) {
-            $rssItem = ap_rss_item_by_mirror_note_id((string) $st['id']);
+            $rssItem = ap_rss_item_by_mirror_note_id((string) $st['id'], $rssOwner);
         }
     }
     if (is_array($rssItem)) {
+        $GLOBALS['vaak_rss_quote_policy_rows'][$noteUrl] = $rssItem;
         $feedTitle = function_exists('ap_rss_display_title')
             ? ap_rss_display_title((string) ($rssItem['feed_title'] ?? ''))
             : trim((string) ($rssItem['feed_title'] ?? 'RSS'));
@@ -13666,6 +13883,8 @@ function admin_quote_opts_from_status(array $st, string $fallbackUrl = ''): arra
     }
     $spoiler = trim((string) ($st['spoiler_text'] ?? ''));
     $sensitive = !empty($st['sensitive']) || $spoiler !== '';
+    $outputKey = admin_library_quote_policy_key($url);
+    if ($outputKey !== '') $GLOBALS['vaak_quote_policy_statuses'][$outputKey] = $st;
     return [
         'acct' => $acct !== '' ? ('@' . ltrim($acct, '@')) : '',
         'text' => $text,
@@ -13705,6 +13924,11 @@ function admin_quote_opts_from_bsky(array $prev, string $fallbackUrl = ''): arra
             'image' => (string) ($ext['thumb'] ?? $ext['image'] ?? ''),
             'provider_name' => '',
         ];
+    }
+    if (!is_array($prev['post'] ?? null)) {
+        $policyPost = $GLOBALS['vaak_bsky_quote_policy_posts'][(string) ($prev['uri'] ?? '')]
+            ?? $GLOBALS['vaak_bsky_quote_policy_posts'][(string) ($prev['url'] ?? '')] ?? null;
+        if (is_array($policyPost)) $prev['post'] = $policyPost;
     }
     $sensitive = false;
     $spoiler = '';
@@ -15588,6 +15812,10 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
     if (admin_try_render_event_shared_card($e, $followingIds, $returnView)) {
         return;
     }
+    $directLegacy = in_array($returnView, ['status', 'remote_profile'], true)
+        || ($GLOBALS['view'] ?? '') === 'status';
+    if ($directLegacy) ob_start();
+    try {
     $canReply = feed_event_can_reply($e);
     $replyObjectId = feed_event_reply_object_id($e);
     $summaryRaw = html_entity_decode((string) ($e['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
@@ -16091,6 +16319,21 @@ function admin_render_event_tweet(array $e, array $followingIds, string $returnV
             </div>
           </article>
     <?php
+    } catch (Throwable $e) {
+        if ($directLegacy) ob_end_clean();
+        throw $e;
+    }
+    if ($directLegacy) {
+        $legacyHtml = (string) ob_get_clean();
+        $legacyRoot = ['uri' => $objectId, 'visibility' => (string) ($e['visibility'] ?? 'public'),
+            'account' => ['uri' => $aid]];
+        $lateFallback = isset($lateParts) && is_array($lateParts) && !is_array($quotedStatus)
+            ? ['url' => $quotedStatusUrl, 'text' => (string) ($qFallbackText ?? '')] : null;
+        if (admin_direct_render_context_allowed($legacyRoot, admin_owner_user_id(),
+            [$quotedStatus], [$quotedBsky, $quoteOpts ?? null, $lateOpts ?? null, $lateFallback])) {
+            echo $legacyHtml;
+        }
+    }
 }
 
 /** True when host is this VAAK/home instance (never offer "Block instance" for it). */
@@ -16226,7 +16469,7 @@ function block_quick_actions(?string $actorId, ?string $host, string $returnView
     // therefore never offered (or accepted) against an admin actor.
     $isLocalAdmin = $actorId !== '' && function_exists('admin_is_local_admin_actor')
         && admin_is_local_admin_actor($actorId);
-    if (!$isSelf && str_contains($host, 'bsky.app') && function_exists('ap_bsky_session_row')) {
+    if (!$isSelf && $host === 'bsky.app' && strtolower((string) (parse_url($actorId, PHP_URL_HOST) ?? '')) === 'bsky.app' && function_exists('ap_bsky_session_row')) {
         $bs = ap_bsky_session_row($ownerUserId);
         $pathHandle = trim((string) (parse_url($actorId, PHP_URL_PATH) ?? ''), '/');
         $pathHandle = preg_replace('~^profile/~', '', $pathHandle) ?? $pathHandle;
@@ -16912,7 +17155,7 @@ function admin_reply_mention_handle(?string $actorId, ?string $acctHint = null):
     }
     // Bluesky profile URLs: prefer the handle path segment over actor_handle()'s
     // @handle@bsky.app form so seeds stay consistent with facet extracts.
-    if (preg_match('#^https://bsky\.app/profile/([^/?#]+)#i', $actorId, $pm)) {
+    if (preg_match('~^https://bsky\.app/profile/([^/?#]+)~i', $actorId, $pm)) {
         $seg = rawurldecode($pm[1]);
         if ($seg !== '' && !str_starts_with($seg, 'did:')) {
             return admin_reply_mention_normalize('@' . $seg);
@@ -17204,7 +17447,18 @@ function admin_render_masto_status_card(
     bool $focused = false,
     bool $showOpen = true,
     bool $hideHeader = false
+
 ): void {
+    $directSurface = $focused || in_array($returnView, ['status', 'remote_profile'], true)
+        || ($GLOBALS['view'] ?? '') === 'status';
+    if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)) {
+        $st = admin_library_bind_rss_sources($st, admin_owner_user_id());
+        if ($st === null) return;
+    }
+    if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)
+        && empty($st['vaak_rss_item_id']) && ($st['source'] ?? '') !== 'rss'
+        && !str_starts_with((string) ($st['id'] ?? ''), 'rss:')
+        && !admin_library_status_allowed($st, admin_owner_user_id())) return;
     // All surfaces (Home, standalone status, notifications, and profiles) use
     // the same Ask normalizer.  Remote Wafrn Asks are ordinary Note text, so
     // normalize here as a final boundary guard when a caller skipped the
@@ -17257,6 +17511,11 @@ function admin_render_masto_status_card(
         }
         $st = $st['reblog'];
     }
+    // Match the displayed source after canonical boost unwrap. Audience checks
+    // permit cold public recovery, unlike the final durable freshness gate,
+    // and must precede preview requests for denied roots or known quote children.
+    if (($directSurface || $returnView === 'search') && (!function_exists('ap_visibility_status_audience_allowed')
+        || !ap_visibility_status_audience_allowed($st, admin_owner_user_id()))) return;
     $acct = (string) ($st['account']['acct'] ?? '?');
     $display = (string) ($st['account']['display_name'] ?? $acct);
     $actorRef = function_exists('admin_account_actor_ref')
@@ -17308,19 +17567,45 @@ function admin_render_masto_status_card(
     $plain = admin_html_to_plain((string) ($st['content'] ?? ''));
     $isLocalEarly = !$isRss && !$isBsky && $uri !== '' && vaak_is_own_url($uri);
     $mentionsLean = !empty($GLOBALS['admin_mentions_lean_embed']);
+    $refreshOwnWarning = $returnView === 'search'
+        || (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true));
     // Local posts: prefer stored plain text so blank lines match compose / remotes.
     // Mentions lean embeds skip this round-trip when HTML→plain already has body.
-    if ($isLocalEarly && !($mentionsLean && $plain !== '')) {
+    if ($isLocalEarly && ($refreshOwnWarning || !($mentionsLean && $plain !== ''))) {
         try {
-            $pst = ap_db()->prepare(
-                'SELECT content_text FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1'
-            );
-            $pst->execute([$uri, rtrim($uri, '/') . '/']);
-            $dbPlainEarly = (string) ($pst->fetchColumn() ?: '');
-            if ($dbPlainEarly !== '' && !in_array($dbPlainEarly, ['(quote)', '(media)', '(poll)'], true)) {
+            if ($refreshOwnWarning) {
+                // A warm Search/Library entity can predate an edit. Bind its warning to
+                // the same current own row used for the displayed plain body.
+                $pst = ap_db()->prepare(
+                    'SELECT content_text, spoiler_text, sensitive FROM masto_statuses
+                     WHERE note_id = ? OR note_id = ? LIMIT 1'
+                );
+                $ownNoteRoot = rtrim($uri, '/');
+                $pst->execute([$ownNoteRoot, $ownNoteRoot . '/']);
+                $currentOwnRow = $pst->fetch();
+                if (!is_array($currentOwnRow)) {
+                    return;
+                }
+                $st['spoiler_text'] = (string) ($currentOwnRow['spoiler_text'] ?? '');
+                $st['sensitive'] = !empty($currentOwnRow['sensitive']);
+                $dbPlainEarly = (string) ($currentOwnRow['content_text'] ?? '');
+            } else {
+                $pst = ap_db()->prepare(
+                    'SELECT content_text FROM masto_statuses WHERE note_id = ? OR note_id = ? LIMIT 1'
+                );
+                $pst->execute([$uri, rtrim($uri, '/') . '/']);
+                $dbPlainEarly = (string) ($pst->fetchColumn() ?? '');
+            }
+            if (!($mentionsLean && $plain !== '') && $dbPlainEarly !== ''
+                && !in_array($dbPlainEarly, ['(quote)', '(media)', '(poll)'], true)) {
                 $plain = $dbPlainEarly;
             }
         } catch (Throwable $e) {
+            if ($refreshOwnWarning) {
+                // Current warning authority is unavailable; never paint the
+                // potentially unfolded cached own body on Search/Library.
+                return;
+            }
             // keep HTML→plain
         }
     }
@@ -17436,6 +17721,31 @@ function admin_render_masto_status_card(
         $bodyInner .= $askCardHtml;
     }
     $quote = is_array($st['quote'] ?? null) ? $st['quote'] : null;
+    // Prepare the existing cache-only synthetic quote lookup before media
+    // partitioning, so the resolved quoted asset is never painted on the root.
+    if (is_array($quote['quoted_status'] ?? null)) {
+        $qst = $quote['quoted_status'];
+        $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
+        $qacct = (string) ($qst['account']['acct'] ?? '');
+        $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
+        // Rust may have cached the quote envelope before the remote target was
+        // hydrated. If it is still the synthetic empty “quoted” account,
+        // resolve the canonical Fediverse object through PHP's authoritative
+        // status lookup before painting the card.
+        $syntheticQuote = $qplain === ''
+            && ($qacct === '' || strtolower(ltrim($qacct, '@')) === 'quoted')
+            && $quri !== '';
+        if ($syntheticQuote && function_exists('ap_masto_lookup_status_by_object_url')) {
+            $resolvedQuote = ap_masto_lookup_status_by_object_url($quri, 0, false, true);
+            if (is_array($resolvedQuote)) {
+                $qst = $resolvedQuote;
+                $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
+                $qacct = (string) ($qst['account']['acct'] ?? '');
+                $quri = (string) ($qst['uri'] ?? $qst['url'] ?? $quri);
+            }
+        }
+        $quote['quoted_status'] = $qst;
+    }
     // Card-only for quotes / quote-boosts: never paint raw ↪ QT / AS2 / RE: lines
     // in feed-body. The nest (or QT-line fallback card) owns that payload.
     $quotedPlainForStrip = null;
@@ -17524,7 +17834,12 @@ function admin_render_masto_status_card(
     // Quote-boosts: commentary media belongs with the outer text, above the
     // nested quoted post (text+media or media-only). Same order for fedi + Bluesky.
     if ($media) {
-        $bodyInner .= admin_media_row_html($media);
+        // Warm cached statuses can still contain quote assets flattened into
+        // the parent. Filter exact nested copies without moving parent media.
+        $paintMedia = function_exists('ap_masto_outer_media_without_quote_duplicates')
+            ? ap_masto_outer_media_without_quote_duplicates(['media_attachments' => $media, 'quote' => $quote])
+            : $media;
+        $bodyInner .= admin_media_row_html($paintMedia);
     }
 
     // URL of any quote card we paint — used to suppress a duplicate OG link-card
@@ -17538,22 +17853,6 @@ function admin_render_masto_status_card(
         }
         $qacct = (string) ($qst['account']['acct'] ?? '');
         $quri = (string) ($qst['uri'] ?? $qst['url'] ?? '');
-        // Rust may have cached the quote envelope before the remote target was
-        // hydrated. If it is still the synthetic empty “quoted” account,
-        // resolve the canonical Fediverse object through PHP's authoritative
-        // status lookup before painting the card.
-        $syntheticQuote = $qplain === ''
-            && ($qacct === '' || strtolower(ltrim($qacct, '@')) === 'quoted')
-            && $quri !== '';
-        if ($syntheticQuote && function_exists('ap_masto_lookup_status_by_object_url')) {
-            $resolvedQuote = ap_masto_lookup_status_by_object_url($quri, 0, false, true);
-            if (is_array($resolvedQuote)) {
-                $qst = $resolvedQuote;
-                $qplain = admin_html_to_plain((string) ($qst['content'] ?? ''));
-                $qacct = (string) ($qst['account']['acct'] ?? '');
-                $quri = (string) ($qst['uri'] ?? $qst['url'] ?? $quri);
-            }
-        }
         $qMentions = [];
         if (!empty($qst['mentions']) && is_array($qst['mentions'])) {
             foreach ($qst['mentions'] as $qm) {
@@ -17900,6 +18199,24 @@ function admin_render_masto_status_card(
             . ' data-object-id="' . h($uri) . '"'
             . ' data-return-view="' . h($returnView) . '"';
     }
+    // Detail passes its originating action view (often home), so also bind the
+    // actual controller route. This covers full and AJAX thread cards.
+    if ($directSurface && !admin_direct_render_context_allowed($st, admin_owner_user_id(),
+            [$qst ?? null, $pendingQuoted ?? null, $resolvedQuote ?? null],
+            [$qOpts ?? null, $bskyQ ?? null, $bskyPending ?? null, $preview ?? null, $fallbackQuoteOpts ?? null])) return;
+    // Search has its own actor-only moderation and current source/audience
+    // gate, after recovery and before any HTML. Word mutes remain timeline-only.
+    if (!$directSurface && $returnView === 'search' && !admin_search_render_context_allowed($st, admin_owner_user_id(),
+        [$qst ?? null, $pendingQuoted ?? null, $resolvedQuote ?? null],
+        [$qOpts ?? null, $bskyQ ?? null, $bskyPending ?? null, $preview ?? null, $fallbackQuoteOpts ?? null])) return;
+    // Late cache/quote recovery can introduce content absent at Library ingress.
+    // Recheck those fully hydrated objects before the first byte of card output.
+    if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)) {
+        if (!admin_library_render_context_allowed($st, admin_owner_user_id(),
+            [$qst ?? null, $pendingQuoted ?? null, $resolvedQuote ?? null],
+            [$bskyQ ?? null, $bskyPending ?? null, $preview ?? null, $fallbackQuoteOpts ?? null],
+            $plain)) return;
+    }
     ?>
           <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '" data-timeline-key="rss:' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
             <?php if ($boostHeader !== ''): ?><?= $boostHeader ?><?php endif; ?>
@@ -18114,7 +18431,11 @@ function admin_render_masto_status_card(
                           $stBskyAt = $converted;
                       }
                   }
+                  $stBskyLocalBookmarked = $bm;
                   $stBskyViewer = is_array($bskyPostBlob['viewer'] ?? null) ? $bskyPostBlob['viewer'] : [];
+                  if (function_exists('ap_bsky_viewer_for_owner')) {
+                      $stBskyViewer = ap_bsky_viewer_for_owner($stBskyViewer, (int) ($GLOBALS['vaak_owner_id'] ?? 0), $stBskyAt);
+                  }
                   if ($stBskyViewer !== []) {
                       $stBskyLikeRecord = is_string($stBskyViewer['like'] ?? null) ? (string) $stBskyViewer['like'] : '';
                       $stBskyRepostRecord = is_string($stBskyViewer['repost'] ?? null) ? (string) $stBskyViewer['repost'] : '';
@@ -18136,6 +18457,9 @@ function admin_render_masto_status_card(
                           }
                           $stBskyViewer = is_array($stBskyItem['post']['viewer'] ?? null)
                               ? $stBskyItem['post']['viewer'] : [];
+                          if (function_exists('ap_bsky_viewer_for_owner')) {
+                              $stBskyViewer = ap_bsky_viewer_for_owner($stBskyViewer, (int) ($GLOBALS['vaak_owner_id'] ?? 0), $stBskyAt);
+                          }
                           $stBskyLikeRecord = is_string($stBskyViewer['like'] ?? null)
                               ? (string) $stBskyViewer['like'] : $stBskyLikeRecord;
                           $stBskyRepostRecord = is_string($stBskyViewer['repost'] ?? null)
@@ -18146,6 +18470,8 @@ function admin_render_masto_status_card(
                           }
                       }
                   }
+                  $stBskyBookmarkState = function_exists('ap_bsky_bookmark_owner_state') ? ap_bsky_bookmark_owner_state($stBskyAt, (int) ($GLOBALS['vaak_owner_id'] ?? 0)) : null;
+                  if ($stBskyBookmarkState !== null) $bm = $stBskyLocalBookmarked || $stBskyBookmarkState;
                   $stBskyBmKeys = $stBskyAt !== ''
                       ? admin_bsky_bookmark_keys($stBskyAt, (int) ($GLOBALS['vaak_owner_id'] ?? 0))
                       : ['status_id' => $sid, 'object_id' => $uri];
@@ -18321,6 +18647,10 @@ function admin_try_render_announce_shared_card(
     $st = ap_normalize_from_activitypub_event($ann);
     if (!is_array($st)) {
         return false;
+    }
+    if (in_array($returnView, ['bookmarks', 'favourites'], true)
+        && !admin_library_status_allowed($st, admin_owner_user_id())) {
+        return true; // Rejected, not a request to try the legacy renderer.
     }
     admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
     return true;
@@ -19582,6 +19912,10 @@ function admin_try_render_bsky_shared_card(array $item, array $followingIds, str
     ) {
         return false;
     }
+    if (in_array($returnView, ['bookmarks', 'favourites'], true)
+        && !admin_library_status_allowed($st, admin_owner_user_id())) {
+        return true; // Denied cards must not fall through to the legacy painter.
+    }
     admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
     return true;
 }
@@ -19596,6 +19930,10 @@ function admin_try_render_bsky_shared_card(array $item, array $followingIds, str
 function admin_render_bsky_feed_item(array $item, string $feedKey = 'following', string $context = 'bluesky'): void
 {
     $returnView = admin_bsky_context_return_view($context);
+    if (in_array($returnView, ['bookmarks', 'favourites'], true)
+        && !admin_library_bsky_item_allowed($item, admin_owner_user_id())) {
+        return;
+    }
     $followingIds = is_array($GLOBALS['vaak_following_ids'] ?? null)
         ? $GLOBALS['vaak_following_ids']
         : [];
@@ -19640,11 +19978,15 @@ function admin_render_bsky_feed_item(array $item, string $feedKey = 'following',
     $uri = (string) ($post['uri'] ?? '');
     $cid = (string) ($post['cid'] ?? '');
     $viewer = is_array($post['viewer'] ?? null) ? $post['viewer'] : [];
+    if (function_exists('ap_bsky_viewer_for_owner')) {
+        $viewer = ap_bsky_viewer_for_owner($viewer, (int) ($GLOBALS['vaak_owner_id'] ?? 0), $uri);
+    }
     $likeRecord = is_string($viewer['like'] ?? null) ? (string) $viewer['like'] : '';
     $repostRecord = is_string($viewer['repost'] ?? null) ? (string) $viewer['repost'] : '';
     $liked = $likeRecord !== '';
     $reposted = $repostRecord !== '';
-    $bookmarked = !empty($viewer['bookmarked']) || !empty($viewer['bookmark']);
+    $bookmarkOwnerState = function_exists('ap_bsky_bookmark_owner_state') ? ap_bsky_bookmark_owner_state($uri, (int) ($GLOBALS['vaak_owner_id'] ?? 0)) : null;
+    $bookmarked = $bookmarkOwnerState ?? (!empty($viewer['bookmarked']) || !empty($viewer['bookmark']));
     // Local VAAK fav/bookmark rows win over stale AppView viewer flags (search → Open).
     if ($uri !== '') {
         $localBmKeys = function_exists('admin_bsky_bookmark_keys')
@@ -20260,8 +20602,8 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
             'allow_fetch' => true,
             'max_ancestor_depth' => 12,
         ]);
-        $stAncestors = is_array($ctx['ancestors'] ?? null) ? $ctx['ancestors'] : [];
-        $stDescendants = is_array($ctx['descendants'] ?? null) ? $ctx['descendants'] : [];
+        $stAncestors = admin_direct_filter_blocked_statuses(is_array($ctx['ancestors'] ?? null) ? $ctx['ancestors'] : []);
+        $stDescendants = admin_direct_filter_blocked_statuses(is_array($ctx['descendants'] ?? null) ? $ctx['descendants'] : []);
     }
     if ($wantFocus) {
         // Re-load local/event after ensure above
@@ -20283,10 +20625,13 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
             if (function_exists('ap_masto_status_flags_prefetch') && !empty($focusLocal['id'])) {
                 ap_masto_status_flags_prefetch([(string) $focusLocal['id']]);
             }
-            admin_render_masto_status_card($focusLocal, $followingIds, $stFrom, true, false);
+            admin_render_direct_status_card($focusLocal, $followingIds, $stFrom, true, false);
             exit;
         }
         if (is_array($focusEvent)) {
+            if (admin_direct_event_content_blocked($focusEvent)) {
+                exit;
+            }
             if (admin_try_render_event_shared_card($focusEvent, $followingIds, $stFrom, true, false)) {
                 exit;
             }
@@ -20315,7 +20660,7 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
                 . count($stAncestors) . ' earlier in thread</div>';
             foreach ($stAncestors as $anc) {
                 if (is_array($anc)) {
-                    admin_render_masto_status_card($anc, $followingIds, $stFrom, false, true);
+                    admin_render_direct_status_card($anc, $followingIds, $stFrom, false, true);
                 }
             }
         }
@@ -20328,7 +20673,7 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
                 . count($stDescendants) . ' replies</div>';
             foreach ($stDescendants as $desc) {
                 if (is_array($desc)) {
-                    admin_render_masto_status_card($desc, $followingIds, $stFrom, false, true);
+                    admin_render_direct_status_card($desc, $followingIds, $stFrom, false, true);
                 }
             }
         }
@@ -20874,6 +21219,15 @@ if ($isPartial && $view === 'remote_profile') {
         exit;
     }
     $profileKey = strtolower($pm[1]);
+    // Match the canonical local identity used by the selected outbox prefix.
+    // Explicit profile access permits mutes, but must retain content blocks.
+    $contentBlockActor = 'https://mkultra.monster/users/' . $profileKey;
+    if (function_exists('ap_actor_is_content_blocked')
+        && ap_actor_is_content_blocked($contentBlockActor, 'mkultra.monster', (int) ($vaakOwnerId ?? 0))) {
+        header('X-Has-More: 0');
+        header('X-Next-Offset: ' . $profileOffset);
+        exit;
+    }
     $profilePrefs = function_exists('ap_profile_get') ? ap_profile_get($profileKey) : [];
     $hideProfileReplies = !empty($profilePrefs['hide_profile_replies']);
     $hideProfileBoosts = !empty($profilePrefs['hide_profile_boosts']);
@@ -21947,6 +22301,201 @@ function admin_library_status_enrich(array $st): array
     return $apply($fresh);
 }
 
+/** Bind every synthetic RSS source to fresh current-owner subscription data. */
+function admin_library_bind_rss_sources(array $value, int $ownerUserId, int $depth = 0): ?array
+{
+    if ($ownerUserId < 1 || $depth > 128) return null;
+    $sid = is_string($value['id'] ?? null) ? $value['id'] : '';
+    $rss = str_starts_with($sid, 'rss:') || ($value['source'] ?? '') === 'rss'
+        || array_key_exists('vaak_rss_item_id', $value);
+    if ($rss) {
+        $id = str_starts_with($sid, 'rss:')
+            ? (function_exists('ap_rss_parse_local_status_id') ? ap_rss_parse_local_status_id($sid) : 0)
+            : (is_int($value['vaak_rss_item_id'] ?? null) ? $value['vaak_rss_item_id'] : 0);
+        $row = $id > 0 && function_exists('ap_rss_item_by_id') ? ap_rss_item_by_id($id, $ownerUserId) : null;
+        if (!is_array($row) || !function_exists('ap_rss_item_to_masto_status')) return null;
+        $fresh = ap_rss_item_to_masto_status($row);
+        if (!is_array($fresh) || !function_exists('ap_muted_words_match')
+            || ap_muted_words_match($ownerUserId, (string) ($fresh['content'] ?? ''), '') !== null) return null;
+        return $fresh;
+    }
+    foreach ($value as $key => $child) {
+        if (!is_array($child)) continue;
+        $fresh = admin_library_bind_rss_sources($child, $ownerUserId, $depth + 1);
+        if ($fresh === null) return null;
+        if ($key === 'vaak_quote_preview' && (($fresh['source'] ?? '') === 'rss')) {
+            // Compact chrome keeps its options shape; its subscription fields
+            // and retained permission evidence are rebuilt from the fresh row.
+            $fresh = admin_quote_opts_from_status($fresh, (string) ($fresh['uri'] ?? ''));
+        }
+        $value[$key] = $fresh;
+    }
+    return $value;
+}
+
+/** Withdrawn note sources cannot be revived by a complete saved snapshot. */
+function admin_library_status_not_deleted(array $status, int $depth = 0): bool
+{
+    if ($depth > 16) return false;
+    try {
+        $uri = admin_library_quote_policy_key((string) ($status['uri'] ?? $status['url'] ?? ''));
+        if ($uri !== '') {
+            // Undo of a Like/Announce is an interaction withdrawal, not a
+            // deletion of the still-live original note represented by a save.
+            $q = ap_db()->prepare("SELECT type, action_taken FROM events WHERE object_id IN (?, ?)
+                AND (type IN ('Create','Update','Delete','Tombstone')
+                    OR (type IN ('Quote','QuotePost') AND NOT EXISTS (
+                        SELECT 1 FROM events note_source WHERE note_source.object_id IN (?, ?)
+                            AND note_source.type IN ('Create','Update'))))
+                ORDER BY id DESC LIMIT 1");
+            $q->execute([$uri, $uri . '/', $uri, $uri . '/']);
+            $row = $q->fetch();
+            if (is_array($row)) {
+                if (($row['action_taken'] ?? '') === 'deleted'
+                    || in_array($row['type'] ?? '', ['Delete', 'Tombstone'], true)) return false;
+            } else {
+                $q = ap_db()->prepare('SELECT deleted_at FROM mentions WHERE object_id IN (?, ?) ORDER BY id DESC LIMIT 1');
+                $q->execute([$uri, $uri . '/']);
+                $row = $q->fetch();
+                if (is_array($row) && !empty($row['deleted_at'])) return false;
+            }
+        }
+        foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+            $child = $status[$field] ?? null;
+            if (!is_array($child)) continue;
+            $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+                : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+            if (!admin_library_status_not_deleted($child, $depth + 1)) return false;
+        }
+        // Ordinary complete public saves without known current source rows
+        // retain their existing audience/actor/word admission behavior.
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/** Recheck a hydrated saved card against current policy, including every embed. */
+function admin_library_status_allowed(array $status, int $ownerUserId): bool
+{
+    if ($ownerUserId < 1 || !function_exists('ap_visibility_status_hidden')
+        || !function_exists('ap_visibility_status_audience_allowed')) {
+        return false;
+    }
+    try {
+        $status = admin_library_bind_rss_sources($status, $ownerUserId);
+        if ($status === null || !admin_library_status_not_deleted($status)) return false;
+        if (is_array($status['bsky_post'] ?? null)
+            && !admin_library_bsky_item_allowed($status['bsky_post'], $ownerUserId)) {
+            return false;
+        }
+        return !ap_visibility_status_hidden($status, $ownerUserId)
+            && ap_visibility_status_audience_allowed($status, $ownerUserId);
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/** Same URI key for retained quote evidence and the later compact options. */
+function admin_library_quote_policy_key(string $reference): string
+{
+    return rtrim(explode('#', trim($reference), 2)[0], '/');
+}
+
+/** Final saved-card admission after shared painter recovered quoted objects. */
+function admin_library_render_context_allowed(array $status, int $ownerUserId, array $hydrated, array $previews, string $plain): bool
+{
+    try {
+        $rss = !empty($status['vaak_rss_item_id']) || ($status['source'] ?? '') === 'rss'
+            || str_starts_with((string) ($status['id'] ?? ''), 'rss:');
+        if (!$rss && !admin_library_status_allowed($status, $ownerUserId)) return false;
+        if ($ownerUserId < 1 || ap_muted_words_match($ownerUserId, $plain, (string) ($status['spoiler_text'] ?? '')) !== null) return false;
+        foreach ($hydrated as $child) {
+            if (is_array($child) && !admin_library_status_allowed($child, $ownerUserId)) return false;
+        }
+        foreach ($previews as $child) {
+            if (!is_array($child)) continue;
+            $url = (string) ($child['url'] ?? $child['uri'] ?? '');
+            $nativeUri = trim((string) ($child['uri'] ?? ''));
+            $nativePost = is_array($child['post'] ?? null) ? $child['post']
+                : ($GLOBALS['vaak_bsky_quote_policy_posts'][$nativeUri] ?? $GLOBALS['vaak_bsky_quote_policy_posts'][$url] ?? null);
+            if (is_array($nativePost) && !admin_library_bsky_item_allowed($nativePost, $ownerUserId)) return false;
+            if (empty($child['is_rss']) && $url !== '' && ap_visibility_actor_hidden($url, $ownerUserId)) return false;
+            $retained = $GLOBALS['vaak_quote_policy_statuses'][admin_library_quote_policy_key($url)] ?? null;
+            if (is_array($retained) && empty($child['is_rss']) && !admin_library_status_allowed($retained, $ownerUserId)) return false;
+            if ($url !== '' && empty($child['is_rss']) && function_exists('ap_masto_lookup_status_by_object_url')) {
+                $cached = ap_masto_lookup_status_by_object_url($url, 0, false);
+                if (is_array($cached) && !admin_library_status_allowed($cached, $ownerUserId)) return false;
+            }
+            $actor = trim((string) ($child['did'] ?? ($nativePost['author']['did'] ?? '')));
+            if ($actor === '' && str_starts_with($nativeUri, 'at://') && function_exists('ap_bsky_at_uri_from_any_url')) {
+                $at = ap_bsky_at_uri_from_any_url($nativeUri);
+                if (is_string($at) && preg_match('~^at://(did:[^/]+)/~', $at, $m)) $actor = $m[1];
+            }
+            if ($actor !== '' && str_starts_with($actor, 'did:')
+                && !admin_library_bsky_item_allowed(['author' => ['did' => $actor]], $ownerUserId)) return false;
+            $handle = trim((string) ($child['handle'] ?? ''));
+            $normalized = ['uri' => $url, 'content' => (string) ($child['text'] ?? ''),
+                'account' => is_array($child['account'] ?? null) ? $child['account']
+                    : ['uri' => $actor, 'url' => $handle !== '' ? 'https://bsky.app/profile/' . $handle : '']];
+            if (!empty($child['is_rss'])) {
+                // An options marker is not proof of subscription ownership.
+                $rssEvidence = $GLOBALS['vaak_rss_quote_policy_rows'][$url] ?? null;
+                $rssId = is_array($rssEvidence) ? (int) ($rssEvidence['id'] ?? 0) : 0;
+                $rssCurrent = $rssId > 0 && function_exists('ap_rss_item_by_id') ? ap_rss_item_by_id($rssId, $ownerUserId) : null;
+                if (!is_array($rssCurrent) || !admin_library_status_allowed($normalized, $ownerUserId)) return false;
+                if (ap_muted_words_match($ownerUserId, $normalized['content']) !== null) return false;
+            } elseif (!admin_library_status_allowed($normalized, $ownerUserId)) return false;
+        }
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+/**
+ * Native Bluesky embeds retain DIDs even when the normalized card has a web alias.
+ * Walk PostView/RecordView, repost authors and nested quotes before either painter.
+ * Labels remain under the existing sensitive/CW renderer and saved unblur setting.
+ */
+function admin_library_bsky_item_allowed(array $item, int $ownerUserId, int $depth = 0): bool
+{
+    if ($ownerUserId < 1 || $depth > 16 || !function_exists('ap_visibility_actor_hidden')
+        || !function_exists('ap_muted_words_match')) {
+        return false;
+    }
+    try {
+        foreach (['author', 'by'] as $key) {
+            $author = is_array($item[$key] ?? null) ? $item[$key] : [];
+            $did = trim((string) ($author['did'] ?? ''));
+            $handle = strtolower(trim((string) ($author['handle'] ?? '')));
+            if ($did !== '') {
+                // The cached native helper can fail open on DB errors. Library
+                // checks the current owner row directly and catches failure below.
+                if (function_exists('ap_bsky_graph_sync_migrate')) ap_bsky_graph_sync_migrate();
+                $q = ap_db()->prepare('SELECT 1 FROM bsky_hide_dids WHERE owner_user_id = ? AND did = ? LIMIT 1');
+                $q->execute([$ownerUserId, $did]);
+                if ($q->fetchColumn()) return false;
+            }
+            foreach (array_filter([$did, $did !== '' ? 'https://bsky.app/profile/' . $did : '',
+                $handle !== '' ? 'https://bsky.app/profile/' . $handle : '']) as $actor) {
+                if (ap_visibility_actor_hidden($actor, $ownerUserId)) return false;
+            }
+        }
+        // Owner blocking/muted flags in an old AppView snapshot are stale after
+        // settings actions. Current owner tables above are authoritative.
+        if (!empty($item['viewer']['blockedBy'])
+            || !empty($item['author']['viewer']['blockedBy'])) return false;
+        if (ap_muted_words_match($ownerUserId, (string) ($item['text'] ?? ''), '') !== null) return false;
+        foreach ($item as $value) {
+            if (is_array($value) && !admin_library_bsky_item_allowed($value, $ownerUserId, $depth + 1)) return false;
+        }
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 /**
  * Shared-card paint path for Favourites / Bookmarks (and folder soft-nav).
  * RSS keeps its dedicated card; everything else enriches then uses the
@@ -21957,23 +22506,25 @@ function admin_library_status_enrich(array $st): array
 function admin_render_library_status_card(array $st, string $returnView = 'favourites'): void
 {
     $sid = (string) ($st['id'] ?? '');
-    if (str_starts_with($sid, 'rss:')
-        && function_exists('ap_rss_parse_local_status_id')
-        && function_exists('ap_rss_item_by_id')
-        && function_exists('admin_render_rss_item')
-    ) {
-        $rssId = ap_rss_parse_local_status_id($sid);
-        $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
-        $rssRow = $rssId > 0 ? ap_rss_item_by_id($rssId, $owner > 0 ? $owner : null) : null;
-        if (is_array($rssRow)) {
-            admin_render_rss_item($rssRow, $returnView);
-            return;
+    $owner = function_exists('admin_owner_user_id') ? (int) admin_owner_user_id() : 0;
+    if ($owner < 1) return;
+    if (str_starts_with($sid, 'rss:')) {
+        // No unscoped lookup or snapshot fallback for foreign/deleted RSS items.
+        try {
+            $rssId = function_exists('ap_rss_parse_local_status_id') ? ap_rss_parse_local_status_id($sid) : 0;
+            $rssRow = $rssId > 0 && function_exists('ap_rss_item_by_id') ? ap_rss_item_by_id($rssId, $owner) : null;
+            if (is_array($rssRow) && function_exists('admin_render_rss_item')) {
+                admin_render_rss_item($rssRow, $returnView);
+            }
+        } catch (Throwable $e) {
+            // Fail closed; a private subscription snapshot is not an AS2 status.
         }
+        return;
     }
     $st = admin_library_status_enrich($st);
+    if (!admin_library_status_allowed($st, $owner)) return;
     if (function_exists('admin_render_masto_status_card')) {
         admin_render_masto_status_card($st, [], $returnView, false, true);
-        return;
     }
 }
 
@@ -27542,7 +28093,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           <?php else: ?>
             <?php $GLOBALS['admin_library_fetch_budget'] = 3; ?>
             <div data-fedi-favourites-fragment data-offset="<?= (int) count($favList) ?>" data-limit="20" data-has-more="<?= $favHasMore ? '1' : '0' ?>">
-              <?php foreach ($favList as $st): admin_render_library_status_card($st, 'favourites'); endforeach; ?>
+              <?php admin_render_library_network_items($favList, 'fedi', 'favourites'); ?>
               <div data-fedi-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center"><?= $favHasMore ? 'Scroll for more…' : 'End of Fediverse favourites' ?></div>
             </div>
           <?php endif; ?>
@@ -31485,25 +32036,8 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
               $stDescendants = [];
           }
           // Drop thread posts from blocked accounts (mute alone still shows in threads).
-          if (function_exists('ap_actor_is_content_blocked')) {
-              $stOwnerFilter = admin_owner_user_id();
-              $stFilterBlocked = static function (array $cards) use ($stOwnerFilter): array {
-                  $out = [];
-                  foreach ($cards as $card) {
-                      if (!is_array($card)) {
-                          continue;
-                      }
-                      $uri = rtrim((string) (($card['account']['uri'] ?? null) ?: ($card['account']['url'] ?? '')), '/');
-                      if ($uri !== '' && ap_actor_is_content_blocked($uri, null, $stOwnerFilter)) {
-                          continue;
-                      }
-                      $out[] = $card;
-                  }
-                  return $out;
-              };
-              $stAncestors = $stFilterBlocked($stAncestors);
-              $stDescendants = $stFilterBlocked($stDescendants);
-          }
+          $stAncestors = admin_direct_filter_blocked_statuses($stAncestors);
+          $stDescendants = admin_direct_filter_blocked_statuses($stDescendants);
           // Context providers do not all guarantee a stable order. Keep the
           // focused thread chronological: oldest ancestor first, newest reply
           // last, matching the main timeline's ascending conversation flow.
@@ -31574,8 +32108,8 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
                   'allow_fetch' => true,
                   'max_ancestor_depth' => 12,
               ]);
-              $stAncestors = is_array($ctx['ancestors'] ?? null) ? $ctx['ancestors'] : [];
-              $stDescendants = is_array($ctx['descendants'] ?? null) ? $ctx['descendants'] : $stDescendants;
+              $stAncestors = admin_direct_filter_blocked_statuses(is_array($ctx['ancestors'] ?? null) ? $ctx['ancestors'] : []);
+              $stDescendants = admin_direct_filter_blocked_statuses(is_array($ctx['descendants'] ?? null) ? $ctx['descendants'] : $stDescendants);
               $stMaybeMoreThread = false;
               $stMaybeMoreReplies = false;
           }
@@ -31590,9 +32124,9 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           } elseif (is_array($stEvent)) {
               $stAuthor = rtrim((string) ($stEvent['actor_id'] ?? ''), '/');
           }
-          $stContentBlocked = $stAuthor !== ''
-              && function_exists('ap_actor_is_content_blocked')
-              && ap_actor_is_content_blocked($stAuthor, null, admin_owner_user_id());
+          $stContentBlocked = is_array($stLocalStatus)
+              ? admin_direct_status_content_blocked($stLocalStatus)
+              : (is_array($stEvent) && admin_direct_event_content_blocked($stEvent));
         ?>
         <?php if ($stContentBlocked): ?>
           <div class="empty">
@@ -39128,14 +39662,13 @@ window.apAdminToast = function (msg, isErr) {
         } else {
           const cards = next.querySelectorAll('article.tweet');
           const keep = ensureSentinel();
-          if (cards.length === 0) {
-            current.dataset.hasMore = '0';
-          } else {
-            cards.forEach((card) => current.insertBefore(card, keep));
-            current.dataset.offset = next.dataset.offset || String(offset);
-            current.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
-          }
+          cards.forEach((card) => current.insertBefore(card, keep));
+          current.dataset.offset = next.dataset.offset || String(offset);
+          current.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
+          // A filtered page can consume source rows without painting cards.
+          if (cards.length === 0 && !(parseInt(current.dataset.offset, 10) > offset)) current.dataset.hasMore = '0';
         }
+        if (replace && next.querySelectorAll('article.tweet').length === 0 && !(parseInt(current.dataset.offset, 10) > offset)) current.dataset.hasMore = '0';
         current.dataset.loaded = '1';
         const sentinel = ensureSentinel();
         const hasMore = current.dataset.hasMore === '1';
@@ -39186,13 +39719,10 @@ window.apAdminToast = function (msg, isErr) {
         if (!next) return;
         const cards = next.querySelectorAll('article.tweet');
         clearLibraryLoading(sentinel, '');
-        if (cards.length === 0) {
-          frag.dataset.hasMore = '0';
-        } else {
-          cards.forEach((card) => frag.insertBefore(card, sentinel));
-          frag.dataset.offset = next.dataset.offset || String(offset + cards.length);
-          frag.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
-        }
+        cards.forEach((card) => frag.insertBefore(card, sentinel));
+        frag.dataset.offset = next.dataset.offset || String(offset + cards.length);
+        frag.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
+        if (cards.length === 0 && !(parseInt(frag.dataset.offset, 10) > offset)) frag.dataset.hasMore = '0';
         const hasMore = frag.dataset.hasMore === '1';
         clearLibraryLoading(sentinel, hasMore ? 'Scroll for more…' : 'End of Fediverse favourites');
         if (hasMore && sentinel) {
@@ -39268,14 +39798,12 @@ window.apAdminToast = function (msg, isErr) {
           fragment = next;
         } else {
           const cards = next.querySelectorAll('article.tweet');
-          if (cards.length === 0) {
-            fragment.dataset.hasMore = '0';
-          } else {
-            cards.forEach((card) => slot.insertBefore(card, status));
-            fragment.dataset.offset = next.dataset.offset || fragment.dataset.offset || '0';
-            fragment.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
-          }
+          cards.forEach((card) => slot.insertBefore(card, status));
+          fragment.dataset.offset = next.dataset.offset || fragment.dataset.offset || '0';
+          fragment.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
+          if (cards.length === 0 && !(parseInt(fragment.dataset.offset, 10) > offset)) fragment.dataset.hasMore = '0';
         }
+        if (replace && next.querySelectorAll('article.tweet').length === 0 && !(parseInt(fragment.dataset.offset, 10) > offset)) fragment.dataset.hasMore = '0';
         const hasMore = !!(fragment && fragment.dataset.hasMore === '1');
         const empty = fragment && fragment.querySelector('[data-bookmark-empty]');
         clearLibraryLoading(status, empty ? '' : (hasMore ? 'Scroll for more…' : 'End of bookmarks'));
@@ -39335,7 +39863,14 @@ window.apAdminToast = function (msg, isErr) {
           const cards = next.querySelectorAll(':scope > article.tweet');
           clearLibraryLoading(sentinel, '');
           if (cards.length === 0) {
-            list.dataset.hasMore = '0';
+            const rawNextOffset = next.dataset.offset || '';
+            const nextOffset = Number(rawNextOffset);
+            if (/^\d+$/.test(rawNextOffset) && Number.isSafeInteger(nextOffset) && nextOffset > offset) {
+              list.dataset.offset = rawNextOffset;
+              list.dataset.hasMore = next.dataset.hasMore || res.headers.get('X-Has-More') || '0';
+            } else {
+              list.dataset.hasMore = '0';
+            }
           } else {
             cards.forEach((card) => list.insertBefore(card, sentinel));
             list.dataset.offset = next.dataset.offset || String(offset + cards.length);

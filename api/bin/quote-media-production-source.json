@@ -1,0 +1,49 @@
+{
+  "provenance": {
+    "host": "<prod-host>",
+    "database": "novalandia",
+    "transaction": "BEGIN READ ONLY/ROLLBACK",
+    "raw_as2_retained": false,
+    "public_as2_response": {
+      "error": "Request not signed"
+    },
+    "exact_redis_cache_keys": "3 empty GET results; no scan"
+  },
+  "events": [
+    {
+      "id": 813631,
+      "created_at": "2026-10-10T23:45:44+00:00",
+      "type": "Create",
+      "actor_id": "https://lgbtqia.space/ap/users/116789814625970174",
+      "object_id": "https://lgbtqia.space/ap/users/116789814625970174/statuses/117419274534170489",
+      "target_actor": null,
+      "host": "lgbtqia.space",
+      "bytes": 6521,
+      "action_taken": "log",
+      "summary": "RE: https://lgbtqia.space/@alice/117418829058105216\n\nFind the joys. Life is short💖\n\n#littlejoys #whimsy #findthejoysineverydaylivin #joy #laughter #love\n\n↪ QT @alice@lgbtqia.space: Happy Saturday 🩷\n\nDon't forget to wimsy 😋",
+      "media_urls": "[\"https://cdn2.miau.pub/media_attachments/files/117/418/821/758/171/621/original/71535357c1f9fd5e.jpg\"]",
+      "in_reply_to": null,
+      "spoiler_text": "",
+      "sensitive": 0,
+      "visibility": "public"
+    },
+    {
+      "id": 812195,
+      "created_at": "2026-10-10T22:06:59+00:00",
+      "type": "Announce",
+      "actor_id": "https://yiff.life/users/celestestormysea",
+      "object_id": "https://lgbtqia.space/users/alice/statuses/117418829058105216",
+      "target_actor": "https://lgbtqia.space/users/alice",
+      "host": "yiff.life",
+      "bytes": 464,
+      "action_taken": "log",
+      "summary": "Happy Saturday 🩷\n\nDon't forget to wimsy 😋",
+      "media_urls": "[\"https://cdn2.miau.pub/media_attachments/files/117/418/821/758/171/621/original/71535357c1f9fd5e.jpg\"]",
+      "in_reply_to": null,
+      "spoiler_text": "",
+      "sensitive": 0,
+      "visibility": "public"
+    }
+  ],
+  "cache_map": []
+}

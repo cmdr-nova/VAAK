@@ -3215,9 +3215,10 @@ fn attachment_paint_kind(att: &Value, url: &str) -> &'static str {
 }
 
 fn media_row_html(st: &Value) -> String {
-    let Some(atts) = st.get("media_attachments").and_then(|v| v.as_array()) else {
-        return String::new();
-    };
+    let quote = st.get("quote").filter(|value| value.is_object())
+        .or_else(|| st.get("vaak_quote_preview").filter(|value| value.is_object()));
+    let atts = quote.map(|quote| crate::quote_media::outer_attachments_for_quote(st, &normalized_quote_preview(quote)))
+        .unwrap_or_else(|| crate::quote_media::outer_attachments(st));
     let mut cells = Vec::new();
     for att in atts.iter().take(4) {
         let url = att
@@ -3911,6 +3912,22 @@ pub fn paint_lean_embed_from(
         ));
     }
 
+    // Nested quote preview when present (lean — no link-card / poll / ask).
+    if let Some(q_raw) = status
+        .get("quote")
+        .filter(|v| v.is_object())
+        .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
+    {
+        let q = normalized_quote_preview(q_raw);
+        // The quoted post is context. Its reply, boost, like, and overflow
+        // rows stay on the quote-boost that contains it.
+        let quote_from = if from.is_empty() { "mentions" } else { from };
+        let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor, false);
+        body_inner.push_str(&format!(
+            "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{q_html}</div>"
+        ));
+    }
+
     // Older Bluesky envelopes used a synthetic warning as spoiler text.
     let generated_warning = bsky && json_flag(status, "vaak_bsky_sensitive") && spoiler == "Sensitive content";
     let auto_unblur = (spoiler.is_empty() || generated_warning) && json_flag(status, "_vaak_auto_unblur_sensitive");
@@ -3927,22 +3944,6 @@ pub fn paint_lean_embed_from(
         ));
     } else {
         inner.push_str(&body_inner);
-    }
-
-    // Nested quote preview when present (lean — no link-card / poll / ask).
-    if let Some(q_raw) = status
-        .get("quote")
-        .filter(|v| v.is_object())
-        .or_else(|| status.get("vaak_quote_preview").filter(|v| v.is_object()))
-    {
-        let q = normalized_quote_preview(q_raw);
-        // The quoted post is context. Its reply, boost, like, and overflow
-        // rows stay on the quote-boost that contains it.
-        let quote_from = if from.is_empty() { "mentions" } else { from };
-        let q_html = paint_lean_embed_from(&q, false, quote_from, viewer_actor, false);
-        inner.push_str(&format!(
-            "<div class=\"quote-block\" style=\"margin-top:.55rem;background:transparent;border:0;padding:0;border-radius:0;color:inherit\">{q_html}</div>"
-        ));
     }
 
     // Full action bar on Home / Local / Federated / profiles / outbox and
@@ -4955,6 +4956,41 @@ mod tests {
             1,
             "timeline quote-boosts keep actions on the quoting post only: {html}"
         );
+    }
+
+    #[test]
+    fn flattened_quote_media_stays_inside_quote_warning_on_shared_surfaces() {
+        let status = json!({
+            "id":"outer", "uri":"https://outer.test/users/a/statuses/1", "content":"commentary",
+            "account":{"acct":"a","display_name":"A"},
+            "media_attachments":[{"type":"image","url":"https://media.test/parent.jpg"},{"type":"image","url":"https://media.test/quoted.jpg"}],
+            "quote":{"quoted_status":{"id":"quoted","uri":"https://quoted.test/users/b/statuses/2","content":"quoted text","account":{"acct":"b","display_name":"B"},"sensitive":true,"spoiler_text":"Quoted warning","media_attachments":[{"type":"image","url":"https://media.test/quoted.jpg"}]}}
+        });
+        for surface in ["home", "local", "feed", "remote_profile", "outbox", "mentions"] {
+            let html = paint_lean_feed_card_opts(&status, surface, "");
+            let quote = html.find("class=\"quote-block\"").unwrap();
+            assert!(html.find("https://media.test/parent.jpg").unwrap() < quote, "parent asset lost on {surface}");
+            assert!(html.find("https://media.test/quoted.jpg").unwrap() > quote, "quoted asset escaped nest on {surface}");
+            assert!(html.find("Quoted warning").unwrap() > quote, "quoted warning escaped nest on {surface}");
+            assert_eq!(html.matches("class=\"media-row media-count-1\"").count(), 2, "distinct parent and quoted rows on {surface}");
+        }
+        let mut parent_warning = status.clone();
+        parent_warning["sensitive"] = json!(true);
+        parent_warning["spoiler_text"] = json!("Parent warning");
+        parent_warning["_vaak_auto_unblur_sensitive"] = json!(true);
+        let html = paint_lean_feed_card(&parent_warning);
+        let parent_gate = html.find("Parent warning").unwrap();
+        let quote = html.find("class=\"quote-block\"").unwrap();
+        assert!(parent_gate < quote);
+        assert!(html[quote..].find("</details>").is_some(), "quoted content stays within explicit parent warning");
+        assert_eq!(html.matches("class=\"cw-gate\"").count(), 2, "parent and child warnings remain separate");
+        parent_warning["spoiler_text"] = json!("");
+        let html = paint_lean_feed_card(&parent_warning);
+        assert_eq!(html.matches("class=\"cw-gate\"").count(), 1, "auto-unblur opens generic parent sensitivity but keeps child's explicit warning");
+        let mut unresolved = status;
+        unresolved["quote"]["quoted_status"]["media_attachments"] = json!([]);
+        let html = paint_lean_feed_card(&unresolved);
+        assert!(html.find("https://media.test/quoted.jpg").unwrap() < html.find("class=\"quote-block\"").unwrap(), "unproved ownership must not move parent media");
     }
 
     #[test]

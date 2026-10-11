@@ -5,7 +5,18 @@ use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Surface { Home, Profile, Local, Federated }
+pub enum Surface {
+    Home, Profile, Local, Federated,
+    /// Saved posts are direct references, not public discovery. Authorized
+    /// private/direct/unlisted posts remain readable; stale cache metadata
+    /// never overrides current durable recipients or accepted followers.
+    Library,
+    /// Search reuses direct-reference durable audiences only. Current indexing
+    /// consent, source freshness and Search actor policy are separate gates.
+    Search,
+    /// Explicit profile/detail references: durable grants without discovery suppression.
+    Direct,
+}
 
 impl Surface {
     pub fn timeline(view: &str) -> Self {
@@ -15,6 +26,7 @@ impl Surface {
 
 #[derive(Default)]
 struct Audience {
+    denied: bool,
     visibility: String,
     author: String,
     recipients: HashSet<String>,
@@ -23,6 +35,7 @@ struct Audience {
 fn key(uri: &str) -> String { uri.trim().split('#').next().unwrap_or("").trim_end_matches('/').to_string() }
 
 fn allowed(a: &Audience, viewer: &str, following: &HashSet<String>, surface: Surface, nested: bool) -> bool {
+    if a.denied { return false; }
     let vis = a.visibility.trim().to_ascii_lowercase();
     // Public timeline discovery excludes unlisted posts. A quote is a direct
     // reference, so its public/unlisted target remains readable.
@@ -48,17 +61,35 @@ fn children(st: &Value) -> Vec<&Value> {
     out
 }
 
+fn requested_quote_aliases(st: &Value) -> Vec<String> {
+    st.get("vaak_quote_requested_uri").and_then(Value::as_str)
+        .filter(|uri| uri.starts_with("https://"))
+        .map(crate::home_hydrate_ranked::quote_object_candidates).unwrap_or_default()
+}
+
+fn collect_requested_quote_aliases(st: &Value, aliases: &mut HashSet<String>, depth: usize) {
+    if depth > 16 { return; }
+    aliases.extend(requested_quote_aliases(st));
+    for child in children(st) { collect_requested_quote_aliases(child, aliases, depth + 1); }
+}
+
 fn collect(st: &Value, ids: &mut HashSet<String>, depth: usize) {
     if depth > 16 { return; }
     if let Some(uri) = st.get("uri").or_else(|| st.get("url")).and_then(Value::as_str) {
         let id = key(uri);
         if id.starts_with("https://") || id.starts_with("http://") { ids.insert(id); }
     }
+    for alias in requested_quote_aliases(st) { ids.insert(alias); }
     for child in children(st) { collect(child, ids, depth + 1); }
 }
 
 fn tree_allowed(st: &Value, records: &HashMap<String, Audience>, viewer: &str, following: &HashSet<String>, surface: Surface, depth: usize) -> bool {
     if depth > 16 { return false; }
+    // Requested aliases only add constraints. They never provide a fallback
+    // audience or grant to a different canonical object.
+    for alias in requested_quote_aliases(st) {
+        if records.get(&alias).is_some_and(|record| !allowed(record, viewer, following, surface, depth > 0)) { return false; }
+    }
     let id = key(st.get("uri").or_else(|| st.get("url")).and_then(Value::as_str).unwrap_or(""));
     if let Some(a) = records.get(&id) {
         if !allowed(a, viewer, following, surface, depth > 0) { return false; }
@@ -77,8 +108,7 @@ fn tree_allowed(st: &Value, records: &HashMap<String, Audience>, viewer: &str, f
     children(st).into_iter().all(|child| tree_allowed(child, records, viewer, following, surface, depth + 1))
 }
 
-pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses: &mut Vec<Value>) -> Result<()> {
-    if statuses.is_empty() { return Ok(()); }
+async fn audience_records(db: &Client, owner: i64, statuses: &[Value]) -> Result<(HashMap<String, Audience>, String, HashSet<String>)> {
     let mut ids = HashSet::new();
     for st in statuses.iter() { collect(st, &mut ids, 0); }
     let ids: Vec<String> = ids.into_iter().collect();
@@ -87,7 +117,7 @@ pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses
     for row in db.query(
         "SELECT DISTINCT ON (rtrim(object_id, '/')) rtrim(object_id, '/'),
                 COALESCE(visibility, 'public'), rtrim(COALESCE(actor_id, ''), '/')
-         FROM events WHERE type = ANY(ARRAY['Create','Update','Quote','QuotePost'])
+         FROM events e WHERE (e.type IN ('Create','Update') OR (e.type IN ('Quote','QuotePost') AND NOT EXISTS (SELECT 1 FROM events note_source WHERE note_source.object_id IN (rtrim(e.object_id, '/'), rtrim(e.object_id, '/') || '/') AND note_source.type IN ('Create','Update'))))
            AND action_taken = ANY(ARRAY['log','local_observe','local_fav_update'])
            AND (object_id = ANY($1) OR object_id = ANY($2))
          ORDER BY rtrim(object_id, '/'), id DESC",
@@ -108,17 +138,30 @@ pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses
             }
         }
         let author = id.split("/notes/").next().unwrap_or("").to_string();
-        records.insert(id, Audience { visibility: row.get(1), author, recipients });
+        records.insert(id, Audience { visibility: row.get(1), author, recipients, denied:false });
+    }
+    let mut quote_aliases = HashSet::new();
+    for status in statuses { collect_requested_quote_aliases(status, &mut quote_aliases, 0); }
+    let quote_aliases: Vec<String> = quote_aliases.into_iter().collect();
+    if !quote_aliases.is_empty() {
+        for row in db.query(
+            "SELECT DISTINCT rtrim(e.object_id,'/') FROM events e WHERE rtrim(e.object_id,'/') = ANY($1)
+             AND (e.type IN ('Delete','Tombstone') OR (e.type IN ('Create','Update') AND e.action_taken = 'deleted')
+               OR (e.type = 'Announce' AND COALESCE(e.action_taken,'') <> 'deleted' AND COALESCE(e.visibility,'public') <> 'public'
+                 AND NOT EXISTS (SELECT 1 FROM events original WHERE rtrim(original.object_id,'/') = rtrim(e.object_id,'/') AND original.type IN ('Create','Update'))))", &[&quote_aliases]
+        ).await? {
+            records.insert(row.get(0), Audience { denied:true, ..Default::default() });
+        }
     }
     let mut viewer = String::new();
     let mut following = HashSet::new();
     if owner > 0 {
-        if let Some(row) = db.query_opt("SELECT actor_id FROM ap_users WHERE id = $1 AND disabled_at IS NULL", &[&owner]).await? {
+        if let Some(row) = db.query_opt("SELECT actor_id FROM ap_users WHERE id = $1::bigint AND disabled_at IS NULL", &[&owner]).await? {
             viewer = key(&row.get::<_, String>(0));
         }
         if !viewer.is_empty() {
             // An owner-scoped delivered mention is proof of an explicit recipient.
-            for row in db.query("SELECT object_id FROM mentions WHERE owner_user_id = $1 AND deleted_at IS NULL AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id = ANY($2)", &[&owner, &variants]).await? {
+            for row in db.query("SELECT object_id FROM mentions WHERE owner_user_id = $1::bigint AND deleted_at IS NULL AND activity_type IN ('Create','Update','Quote','QuotePost') AND object_id = ANY($2)", &[&owner, &variants]).await? {
                 let id = key(&row.get::<_, String>(0));
                 if let Some(a) = records.get_mut(&id) { a.recipients.insert(viewer.clone()); }
             }
@@ -131,8 +174,29 @@ pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses
             ).await? { following.insert(row.get::<_, String>(0)); }
         }
     }
+    Ok((records, viewer, following))
+}
+
+/// Positional decisions from the same bounded current-record engine. No source
+/// JSON is stamped or matched back to another snapshot.
+pub(crate) async fn admission_mask(db:&Client,owner:i64,surface:Surface,statuses:&[Value])->Result<Vec<bool>> {
+    if statuses.is_empty(){return Ok(Vec::new())}
+    let (records,viewer,following)=audience_records(db,owner,statuses).await?;
+    Ok(positional_decisions(statuses,&records,&viewer,&following,surface))
+}
+fn positional_decisions(statuses:&[Value],records:&HashMap<String,Audience>,viewer:&str,following:&HashSet<String>,surface:Surface)->Vec<bool>{
+    statuses.iter().map(|status|tree_allowed(status,records,viewer,following,surface,0)).collect()
+}
+
+pub async fn filter_statuses(db: &Client, owner: i64, surface: Surface, statuses: &mut Vec<Value>) -> Result<()> {
+    if statuses.is_empty() { return Ok(()); }
+    let (records,viewer,following)=audience_records(db,owner,statuses).await?;
     statuses.retain(|st| tree_allowed(st, &records, &viewer, &following, surface, 0));
-    for st in statuses { stamp_visibility(st, &records, 0); }
+    // Direct-reference painters preserve canonical source labels/actions.
+    // Current records above still decide every grant, including nested targets.
+    if !matches!(surface, Surface::Library | Surface::Search | Surface::Direct) {
+        for st in statuses { stamp_visibility(st, &records, 0); }
+    }
     Ok(())
 }
 
@@ -176,6 +240,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn positional_admission_preserves_duplicates_and_independent_nested_grants() {
+        let uri="https://remote.example/notes/public";
+        let private="https://remote.example/notes/private";
+        let records=HashMap::from([(uri.into(),Audience{visibility:"public".into(),..Default::default()}),(private.into(),Audience{visibility:"direct".into(),..Default::default()})]);
+        let statuses=vec![json!({"id":"same","uri":uri,"content":"first"}),json!({"id":"same","uri":uri,"content":"second","quote":{"quoted_status":{"uri":private}}}),json!({"id":"same","uri":uri,"content":"third"}),json!({"id":"same","uri":uri,"content":"first"})];
+        let original=statuses.clone();
+        assert_eq!(positional_decisions(&statuses,&records,"",&HashSet::new(),Surface::Library),vec![true,false,true,true]);
+        assert_eq!(statuses,original);
+    }
+
+    #[test]
     fn private_audiences_require_accepted_follow_or_explicit_recipient() {
         let a = Audience { visibility: "private".into(), author: "https://mkultra.monster/users/alice".into(), ..Default::default() };
         let viewer = "https://mkultra.monster/users/bob";
@@ -206,6 +281,21 @@ mod tests {
         let records = HashMap::from([(uri.into(), Audience {visibility:"private".into(), ..Default::default()})]);
         assert!(!tree_allowed(&st, &records, "", &HashSet::new(), Surface::Home, 0));
         assert!(!tree_allowed(&json!({"uri":uri,"visibility":"public"}), &HashMap::new(), "", &HashSet::new(), Surface::Home, 0));
+    }
+    #[test]
+    fn library_preserves_authorized_saved_audiences_and_rejects_revocation() {
+        let viewer = "https://mkultra.monster/users/viewer";
+        let author = "https://mkultra.monster/users/author";
+        let mut a = Audience { visibility: "private".into(), author: author.into(), ..Default::default() };
+        assert!(!allowed(&a, viewer, &HashSet::new(), Surface::Library, false));
+        assert!(allowed(&a, viewer, &HashSet::from([author.into()]), Surface::Library, false));
+        a.visibility = "direct".into();
+        assert!(!allowed(&a, viewer, &HashSet::from([author.into()]), Surface::Library, false));
+        a.recipients.insert(viewer.into());
+        assert!(allowed(&a, viewer, &HashSet::new(), Surface::Library, false));
+        a.visibility = "unlisted".into();
+        assert!(allowed(&a, viewer, &HashSet::new(), Surface::Library, false));
+        assert!(!allowed(&a, viewer, &HashSet::new(), Surface::Profile, false));
     }
 }
 

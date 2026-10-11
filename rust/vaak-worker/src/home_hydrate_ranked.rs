@@ -1814,10 +1814,19 @@ fn split_quote_summary(summary: &str) -> (String, Option<Value>) {
     if quoted.is_empty() {
         return (commentary.to_string(), None);
     }
-    let url = regex::Regex::new(r"https://[^\s<>]+")
+    let mut commentary = commentary.to_string();
+    // The inbox preserves the explicit quote URL on a leading RE: line,
+    // while the QT excerpt itself can contain no URL at all. Keep that
+    // identity for cache resolution and remove the duplicate body preamble.
+    let re_prefix = regex::Regex::new(r"(?s)^RE:\s*(https://[^\s<>]+)\s*(?:\n|$)").unwrap();
+    let explicit_url = re_prefix.captures(&commentary).map(|capture| (
+        capture[1].to_string(), capture.get(0).unwrap().end()
+    ));
+    let url = explicit_url.as_ref().map(|(url, _)| url.clone()).or_else(|| regex::Regex::new(r"https://[^\s<>]+")
         .ok()
-        .and_then(|r| r.find(quoted).map(|m| m.as_str().trim_end_matches(['.', ',', ')']).to_string()))
+        .and_then(|r| r.find(quoted).map(|m| m.as_str().trim_end_matches(['.', ',', ')']).to_string())))
         .unwrap_or_default();
+    if let Some((_, end)) = explicit_url { commentary = commentary[end..].trim().to_string(); }
     let acct = acct.trim_start_matches('@');
     let display = if acct.is_empty() { "Quoted post" } else { acct };
     let account_url = if url.is_empty() { String::new() } else { url.clone() };
@@ -1856,7 +1865,7 @@ fn split_quote_summary(summary: &str) -> (String, Option<Value>) {
     if let Some(obj) = preview.as_object_mut() {
         obj.insert("source".into(), json!("quote-summary"));
     }
-    (commentary.to_string(), Some(preview))
+    (commentary, Some(preview))
 }
 
 fn local_username_from_url(url: &str) -> Option<String> {
@@ -2099,16 +2108,21 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         })
         .cloned()
         .collect();
-    let fed_quotes = fetch_creates_by_object(db, &fed_targets)
+    let fed_quotes = fetch_quote_events_by_object(db, &fed_targets)
         .await
         .unwrap_or_default();
-    let fed_actor_ids: Vec<String> = fed_quotes.values().map(|row| row.actor_id.clone()).collect();
+    let fed_actor_ids: Vec<String> = fed_quotes.values().flat_map(|row| [row.actor_id.clone(), row.target_actor.clone()]).collect();
     let fed_actors = fetch_actors_map(db, &fed_actor_ids)
         .await
         .unwrap_or_default();
     for (target, event) in fed_quotes {
         let actor = fed_actors.get(event.actor_id.trim_end_matches('/'));
-        let mut quoted = materialize_event_create(&event, actor);
+        let mut quoted = if event.event_type == "Announce" {
+            materialize_announce(&event, actor, None, &fed_actors)["reblog"].clone()
+        } else { materialize_event_create(&event, actor) };
+        // Preserve the requested alias separately from the canonical inner
+        // object URI used by current-source and audience checks.
+        quoted["vaak_quote_requested_uri"] = json!(target);
         let internal_url = format!(
             "?view=status&object={}&from=home",
             urlencoding_encode(&target)
@@ -2134,10 +2148,18 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
     for st in statuses.iter_mut() {
         let target = st.get("quote").and_then(|q| q.get("quoted_status"))
             .and_then(|q| q.get("uri")).and_then(|v| v.as_str()).unwrap_or("")
-            .trim_end_matches('/');
-        if let Some(quoted) = by_target.get(target) {
+            .trim_end_matches('/').to_string();
+        if let Some(quoted) = by_target.get(&target) {
             st["quote"]["quoted_status"] = quoted.clone();
             st["vaak_quote_preview"] = quoted.clone();
+        }
+        if fed_targets.contains(&target) {
+            // Also bind unresolved previews to denial checks on the requested
+            // aliases: absent recovery must not expose flattened private media.
+            st["quote"]["quoted_status"]["vaak_quote_requested_uri"] = json!(target);
+            if st.get("vaak_quote_preview").is_some_and(Value::is_object) {
+                st["vaak_quote_preview"]["vaak_quote_requested_uri"] = json!(target);
+            }
         }
     }
     Ok(())
@@ -2342,18 +2364,7 @@ fn strip_tags_simple(html: &str) -> String {
 }
 
 pub(crate) fn html_entity_decode(s: &str) -> String {
-    static ENTITIES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = ENTITIES.get_or_init(|| regex::Regex::new(r"&(#(?:[xX][0-9a-fA-F]+|[0-9]+)|amp|lt|gt|quot|apos|nbsp);").unwrap());
-    re.replace_all(s, |caps: &regex::Captures| {
-        let token = &caps[1];
-        let named = match token { "amp" => Some('&'), "lt" => Some('<'), "gt" => Some('>'), "quot" => Some('"'), "apos" => Some('\''), "nbsp" => Some(' '), _ => None };
-        let decoded = named.or_else(|| {
-            let numeric = token.strip_prefix('#')?;
-            let code = if let Some(hex) = numeric.strip_prefix('x').or_else(|| numeric.strip_prefix('X')) { u32::from_str_radix(hex,16).ok()? } else { numeric.parse().ok()? };
-            char::from_u32(code)
-        });
-        decoded.map(|c| c.to_string()).unwrap_or_else(|| caps[0].to_string())
-    }).into_owned()
+    crate::html_entities::decode(s)
 }
 
 fn link_header(statuses: &[Value], limit: i64, view: &str) -> String {
@@ -2966,9 +2977,9 @@ async fn fetch_creates_by_object(
     let rows = db
         .query(
             "SELECT DISTINCT ON (rtrim(object_id, '/'))
-                    id, COALESCE(type,''), COALESCE(actor_id,''), COALESCE(object_id,''),
+                    id::bigint, COALESCE(type,''), COALESCE(actor_id,''), COALESCE(object_id,''),
                     COALESCE(summary,''), COALESCE(media_urls,'[]'),
-                    COALESCE(created_at::text,''), COALESCE(sensitive, 0),
+                    COALESCE(created_at::text,''), COALESCE(sensitive, 0)::bigint,
                     COALESCE(spoiler_text,''), COALESCE(host,''), COALESCE(target_actor,''), COALESCE(in_reply_to,'')
              FROM events
              WHERE type = 'Create' AND rtrim(object_id, '/') = ANY($1)
@@ -3004,6 +3015,59 @@ async fn fetch_creates_by_object(
         );
     }
     Ok(map)
+}
+
+pub(crate) fn quote_object_candidates(target: &str) -> Vec<String> {
+    let target = target.trim_end_matches('/');
+    let mut candidates = vec![target.to_owned()];
+    // The same literal web/object alias used by PHP's object lookup. Do not
+    // guess numeric actors, cross-host identities or unrelated URL variants.
+    if let Some(capture) = regex::Regex::new(r"^(https://[^/?#]+)/@([A-Za-z0-9_.-]+)/([A-Za-z0-9_-]+)$").unwrap().captures(target) {
+        candidates.push(format!("{}/users/{}/statuses/{}", &capture[1], &capture[2], &capture[3]));
+    }
+    candidates
+}
+
+/// A quote can reference a cached original represented only by an Announce.
+/// Keep existing exact Creates first; recovery is cache-only and requires the
+/// Announce's explicit original actor to match its actual canonical object.
+async fn fetch_quote_events_by_object(db: &Client, targets: &[String]) -> Result<HashMap<String, EventRow>> {
+    let mut found = fetch_creates_by_object(db, targets).await?;
+    let missing: Vec<_> = targets.iter().filter(|target| !found.contains_key(target.as_str())).collect();
+    let candidates: Vec<String> = missing.iter().flat_map(|target| quote_object_candidates(target)).collect();
+    if candidates.is_empty() { return Ok(found); }
+    let rows = db.query(
+        "SELECT id::bigint, COALESCE(type,''), COALESCE(actor_id,''), COALESCE(object_id,''),
+                COALESCE(summary,''), COALESCE(media_urls,'[]'), COALESCE(created_at::text,''),
+                COALESCE(sensitive,0)::bigint, COALESCE(spoiler_text,''), COALESCE(host,''),
+                COALESCE(target_actor,''), COALESCE(in_reply_to,'')
+         FROM events e WHERE rtrim(object_id,'/') = ANY($1)
+           AND COALESCE(action_taken,'') <> 'deleted'
+           AND (type = 'Create' OR (type = 'Announce' AND visibility = 'public'
+             AND target_actor LIKE 'https://%' AND left(rtrim(object_id,'/'), length(rtrim(target_actor,'/') || '/statuses/')) = rtrim(target_actor,'/') || '/statuses/'))
+           AND NOT EXISTS (SELECT 1 FROM events d WHERE rtrim(d.object_id,'/') = rtrim(e.object_id,'/')
+             AND (d.type IN ('Delete','Tombstone') OR (d.type IN ('Create','Update') AND d.action_taken = 'deleted')))
+         ORDER BY CASE type WHEN 'Create' THEN 0 ELSE 1 END, id DESC", &[&candidates]
+    ).await.context("select cached quote originals and explicit Announce originals")?;
+    let events: Vec<EventRow> = rows.iter().map(|row| EventRow {
+        id:row.get(0), event_type:row.get(1), actor_id:row.get(2), object_id:row.get(3), summary:row.get(4),
+        media_urls:row.get(5), created_at:row.get(6), sensitive:row.get::<_,i64>(7)!=0,
+        spoiler_text:row.get(8), host:row.get(9), target_actor:row.get(10), in_reply_to:row.get(11),
+        ask_actor:String::new(), ask_question:String::new(), ask_answer:String::new(),
+    }).collect();
+    let invalid_aliases = db.query(
+        "SELECT DISTINCT rtrim(object_id,'/') FROM events WHERE rtrim(object_id,'/') = ANY($1)
+         AND (type IN ('Delete','Tombstone') OR (type IN ('Create','Update') AND action_taken = 'deleted'))", &[&candidates]
+    ).await.context("check requested and canonical quote deletion aliases")?;
+    let invalid_aliases: std::collections::HashSet<String> = invalid_aliases.iter().map(|row| row.get(0)).collect();
+    for target in missing {
+        let aliases = quote_object_candidates(target);
+        if aliases.iter().any(|alias| invalid_aliases.contains(alias)) { continue; }
+        if let Some(event) = events.iter().find(|event| aliases.iter().any(|alias| alias == event.object_id.trim_end_matches('/'))) {
+            found.insert(target.clone(), event.clone());
+        }
+    }
+    Ok(found)
 }
 
 async fn fetch_actors_map(db: &Client, actor_ids: &[String]) -> Result<HashMap<String, ActorRow>> {
@@ -5069,6 +5133,92 @@ pub fn report_json(r: &WarmReport) -> Value {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    #[ignore = "requires sanitized production quote rows and isolated genuine PostgreSQL schemas"]
+    async fn actual_quote_media_hydration_audience_replay() -> Result<()> {
+        let url = std::env::var("QUOTE_MEDIA_FIXTURE_DB")?;
+        anyhow::ensure!(url.contains("/tmp/"), "isolated Unix socket required");
+        let db = crate::db::connect(&url).await?;
+        let production:Value = serde_json::from_slice(&std::fs::read("/tmp/vaak-quote-media-production-sanitized.json")?)?;
+        let schema_reference:Value = serde_json::from_slice(&std::fs::read("/tmp/vaak-quote-media-placement-schema-reference.json")?)?;
+        let placement:Value = serde_json::from_slice(&std::fs::read("/tmp/vaak-quote-media-placement-final-reference.json")?)?;
+        let mut output = Vec::new();
+        for width in ["INTEGER", "BIGINT"] {
+            let schema = format!("quote_media_native_{}_{}", width.to_ascii_lowercase(), std::process::id());
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};SET synchronous_commit=off")).await?;
+            for (table, columns) in schema_reference["current_schema_by_width"][width].as_object().context("actual schema missing")? {
+                let definitions = columns.as_array().unwrap().iter().map(|column| format!("{} {}", column["column_name"].as_str().unwrap(), column["data_type"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+                db.batch_execute(&format!("CREATE TABLE {table}({definitions})")).await?;
+            }
+            // Canonical events DDL (ap-db.php) includes this original-actor
+            // projection; the full-card-only reference never needed it.
+            db.batch_execute("ALTER TABLE events ADD COLUMN target_actor TEXT").await?;
+            let db_source = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/ap-db.php"))?;
+            let queue_pattern = regex::Regex::new(r"(?s)CREATE TABLE IF NOT EXISTS ap_media_warm_queue \(.*?\n\);")?;
+            let queue_ddl = queue_pattern.find(&db_source).context("production media queue DDL missing")?.as_str()
+                .replace("INTEGER PRIMARY KEY AUTOINCREMENT", &format!("{width} GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"));
+            db.batch_execute(&queue_ddl).await?;
+            let base = placement["captures"].as_array().unwrap().iter().find(|capture| capture["width"]==width).unwrap();
+            for case in ["production_public", "private_announce", "canonical_delete", "alias_delete", "exact_create_deleted", "alias_private_create", "canonical_private_create", "underscore_target_mismatch", "active_plus_undone", "create_plus_undone", "undo_only", "unlisted_undone", "quoted_cw", "parent_cw"] {
+                for (table, rows) in base["current_tables"].as_object().unwrap() {
+                    db.batch_execute(&format!("DELETE FROM {table}")).await?;
+                    for row in rows.as_array().unwrap() { db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"), &[row]).await?; }
+                }
+                db.batch_execute("DELETE FROM events").await?;
+                let mut events = production["events"].as_array().unwrap().clone();
+                let mut extra = events[1].clone(); extra["id"] = json!(900001);
+                match case {
+                    "private_announce" => events[1]["visibility"] = json!("private"),
+                    "canonical_delete" | "alias_delete" => { extra["type"]=json!("Delete"); if case=="alias_delete" {extra["object_id"]=json!("https://lgbtqia.space/@alice/117418829058105216");} events.push(extra); },
+                    "exact_create_deleted" | "alias_private_create" | "canonical_private_create" => { extra["type"]=json!("Create");extra["actor_id"]=extra["target_actor"].clone();if case!="canonical_private_create"{extra["object_id"]=json!("https://lgbtqia.space/@alice/117418829058105216");}if case=="exact_create_deleted"{extra["action_taken"]=json!("deleted");}else{extra["visibility"]=json!("private");}events.push(extra); },
+                    "underscore_target_mismatch" => events[1]["target_actor"]=json!("https://lgbtqia.space/users/a_ice"),
+                    "active_plus_undone" | "unlisted_undone" => {extra["action_taken"]=json!("deleted");if case=="unlisted_undone"{extra["visibility"]=json!("unlisted");}events.push(extra);},
+                    "create_plus_undone" => {extra["type"]=json!("Create");extra["actor_id"]=extra["target_actor"].clone();events.push(extra);events[1]["action_taken"]=json!("deleted");},
+                    "undo_only" => events[1]["action_taken"]=json!("deleted"),
+                    "quoted_cw" => {events[1]["sensitive"]=json!(1);events[1]["spoiler_text"]=json!("Quoted warning");},
+                    "parent_cw" => {events[0]["sensitive"]=json!(1);events[0]["spoiler_text"]=json!("Parent warning");},
+                    _ => {},
+                }
+                for event in &events { db.execute("INSERT INTO events SELECT * FROM jsonb_populate_record(NULL::events,$1)", &[event]).await?; }
+                let source=&events[0];let text=|key:&str|source[key].as_str().unwrap_or("").to_string();
+                let outer=EventRow{id:source["id"].as_i64().unwrap(),event_type:text("type"),actor_id:text("actor_id"),object_id:text("object_id"),summary:text("summary"),media_urls:text("media_urls"),created_at:text("created_at"),sensitive:source["sensitive"].as_i64().unwrap_or(0)!=0,spoiler_text:text("spoiler_text"),host:text("host"),target_actor:text("target_actor"),in_reply_to:text("in_reply_to"),ask_actor:String::new(),ask_question:String::new(),ask_answer:String::new()};
+                let original_status=materialize_event_create(&outer,None);
+                if case=="production_public" { fetch_quote_events_by_object(&db,&["https://lgbtqia.space/@alice/117418829058105216".to_string()]).await.context("actual production quote recovery diagnostic")?; }
+                let mut statuses=vec![original_status.clone()];
+                hydrate_local_quote_targets(&db,&mut statuses).await?;
+                let hydrated=statuses[0].clone();
+                crate::audience::filter_statuses(&db,1,crate::audience::Surface::Home,&mut statuses).await?;
+                let admitted=!statuses.is_empty();
+                let expected_admitted=!matches!(case,"private_announce"|"canonical_delete"|"alias_delete"|"exact_create_deleted"|"alias_private_create"|"canonical_private_create");
+                anyhow::ensure!(admitted==expected_admitted,"actual quote audience disagreement {width}/{case}");
+                let html=statuses.first().map(|status|crate::notif_embed::paint_lean_feed_card_opts(status,"home","")).unwrap_or_default();
+                if case=="production_public" { std::fs::write("/tmp/vaak-quote-media-production-hydration-diagnostic.json",serde_json::to_vec_pretty(&json!({"width":width,"original_status":original_status,"hydrated":hydrated,"html":html}))?)?; }
+                let asset="https://cdn2.miau.pub/media_attachments/files/117/418/821/758/171/621/original/71535357c1f9fd5e.jpg";
+                if admitted && !matches!(case,"underscore_target_mismatch"|"undo_only") {
+                    let quote=html.find("class=\"quote-block\"").context("quote missing")?;
+                    anyhow::ensure!(html.find(asset).context("asset missing")?>quote,"quoted asset outside quote {width}/{case}");
+                    anyhow::ensure!(hydrated["quote"]["quoted_status"]["uri"]==production["events"][1]["object_id"],"canonical quoted source changed");
+                    anyhow::ensure!(hydrated["quote"]["quoted_status"]["vaak_quote_requested_uri"]=="https://lgbtqia.space/@alice/117418829058105216","requested quote identity lost");
+                    if case=="quoted_cw"{anyhow::ensure!(html.find("Quoted warning").unwrap()>quote,"quoted warning outside nest");}
+                }
+                anyhow::ensure!(admitted||!html.contains(asset),"denied quoted media published");
+                output.push(json!({"width":width,"case":case,"current_events":events,"original_status":original_status,"hydrated_status":hydrated,"admitted":admitted,"html":html}));
+            }
+            db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;
+        }
+        std::fs::write("/tmp/vaak-quote-media-hydration-audience-native.json",serde_json::to_vec_pretty(&json!({"checks":output.len(),"captures":output}))?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn leading_re_quote_identity_requires_recognized_quote_excerpt() {
+        let plain = "RE: https://remote.test/@alice/123\n\nOrdinary commentary";
+        assert_eq!(split_quote_summary(plain), (plain.to_string(), None));
+        let (commentary, quote) = split_quote_summary("RE: https://remote.test/@alice/123\n\nParent commentary\n\n↪ QT @alice@remote.test: Child without a URL");
+        assert_eq!(commentary, "Parent commentary");
+        assert_eq!(quote.unwrap()["url"], "https://remote.test/@alice/123");
+    }
 
     #[test]
     fn quote_target_reads_activitypub_quote_field() {
