@@ -69,16 +69,16 @@ pub async fn favourites(cfg: &crate::config::Config, owner_id: i64, offset: i64,
     let db = crate::db::connect(&cfg.database_url).await.context("connect favourites projection")?;
     let offset = offset.max(0);
     let limit = limit.clamp(10, 40);
+    // PHP first hydrates up to clamp(offset + limit + 20, 1, 80)
+    // successful rows from twice that raw count, then excludes Bluesky and
+    // slices. SQL OFFSET, protocol filtering or an added tie-break changes it.
+    let raw_limit = (offset.saturating_add(limit).saturating_add(20)).clamp(1, 80) * 2;
     let fedi_rows = db.query(
         "SELECT id::bigint, owner_user_id::bigint, owner_actor_id, status_id, object_id, target_actor, like_activity_id, created_at
-         FROM masto_favourites
-         WHERE owner_user_id = $1::bigint
-           AND status_id NOT LIKE 'bsky:%'
-           AND object_id NOT LIKE 'at://%'
-           AND object_id NOT LIKE '%bsky.app/%'
-         ORDER BY created_at DESC, id DESC OFFSET $2 LIMIT $3",
-        &[&owner_id, &offset, &limit],
-    ).await.context("query fediverse favourites")?
+         FROM masto_favourites WHERE owner_user_id = $1::bigint
+         ORDER BY created_at DESC LIMIT $2",
+        &[&owner_id, &raw_limit],
+    ).await.context("query exact raw favourite hydration window")?
       .into_iter().map(|r| r_to_json(&r)).collect::<Result<Vec<_>>>()?;
     let total_fedi: i64 = db.query_one(
         "SELECT COUNT(*) FROM masto_favourites WHERE owner_user_id = $1::bigint AND status_id NOT LIKE 'bsky:%' AND object_id NOT LIKE 'at://%' AND object_id NOT LIKE '%bsky.app/%'",
@@ -98,8 +98,8 @@ pub async fn bookmarks(cfg: &crate::config::Config, owner_id: i64, offset: i64, 
     let db = crate::db::connect(&cfg.database_url).await.context("connect bookmarks projection")?;
     let offset = offset.max(0);
     let limit = limit.clamp(10, 40);
-    let fedi_rows = db.query(
-        "SELECT b.id::bigint, b.owner_user_id::bigint, b.owner_actor_id, b.status_id, b.object_id, b.created_at
+    let folder_match = folder_fedi_match_sql();
+    let fedi_sql = format!("SELECT b.id::bigint, b.owner_user_id::bigint, b.owner_actor_id, b.status_id, b.object_id, b.created_at
          FROM masto_bookmarks b
          WHERE b.owner_user_id = $1::bigint
            AND b.status_id NOT LIKE 'bsky:%'
@@ -108,15 +108,16 @@ pub async fn bookmarks(cfg: &crate::config::Config, owner_id: i64, offset: i64, 
            AND ($4::bigint IS NULL OR EXISTS (
              SELECT 1 FROM vaak_bookmark_folder_items fi
              WHERE fi.folder_id = $4::bigint AND fi.owner_user_id = $1::bigint
-               AND (fi.status_id = b.status_id OR fi.status_id = b.object_id)
+               AND {folder_match}
            ))
-         ORDER BY b.created_at DESC, b.id DESC OFFSET $2 LIMIT $3",
+         ORDER BY b.created_at DESC, b.id DESC OFFSET $2 LIMIT $3");
+    let fedi_rows = db.query(&fedi_sql,
         &[&owner_id, &offset, &limit, &folder_id],
     ).await.context("query fediverse bookmarks")?
       .into_iter().map(|r| bookmark_row_to_json(&r)).collect::<Result<Vec<_>>>()?;
-    let total_fedi: i64 = db.query_one(
-        "SELECT COUNT(*) FROM masto_bookmarks b WHERE b.owner_user_id = $1::bigint AND b.status_id NOT LIKE 'bsky:%' AND b.object_id NOT LIKE 'at://%' AND b.object_id NOT LIKE '%bsky.app/%'
-         AND ($2::bigint IS NULL OR EXISTS (SELECT 1 FROM vaak_bookmark_folder_items fi WHERE fi.folder_id = $2::bigint AND fi.owner_user_id = $1::bigint AND (fi.status_id = b.status_id OR fi.status_id = b.object_id)))",
+    let count_sql = format!("SELECT COUNT(*) FROM masto_bookmarks b WHERE b.owner_user_id = $1::bigint AND b.status_id NOT LIKE 'bsky:%' AND b.object_id NOT LIKE 'at://%' AND b.object_id NOT LIKE '%bsky.app/%'
+         AND ($2::bigint IS NULL OR EXISTS (SELECT 1 FROM vaak_bookmark_folder_items fi WHERE fi.folder_id = $2::bigint AND fi.owner_user_id = $1::bigint AND {folder_match}))");
+    let total_fedi: i64 = db.query_one(&count_sql,
         &[&owner_id, &folder_id],
     ).await.context("count fediverse bookmarks")?.get(0);
     let bsky_rows = optional_cache_rows(&db,
@@ -207,3 +208,21 @@ fn cached_bookmark_posts(rows:Vec<tokio_postgres::Row>,folder:i64,offset:i64,lim
  }
  Ok(posts)
 }
+
+/// Cached identity association only; callers bind folder and saved-row owners.
+pub(crate) fn folder_fedi_match_sql() -> &'static str { r#"(fi.status_id = b.status_id OR fi.status_id = b.object_id
+ OR (fi.status_id LIKE 'https://%' AND rtrim(fi.status_id, '/') = rtrim(b.object_id, '/'))
+ OR EXISTS (
+   SELECT 1 FROM events folder_event
+   WHERE (folder_event.object_id = rtrim(b.object_id, '/') OR folder_event.object_id = rtrim(b.object_id, '/') || '/')
+     AND ((folder_event.id >= 0 AND folder_event.id < 1000000 AND fi.status_id = (3000000 + folder_event.id)::text)
+       OR (CASE WHEN fi.status_id ~ '^[0-9]{18,19}$' THEN fi.status_id::numeric ELSE NULL END) >= 1000000000000000000
+         AND mod(floor(((CASE WHEN fi.status_id ~ '^[0-9]{18,19}$' THEN fi.status_id::numeric ELSE NULL END) % 1000000000) / 100000000), 10) = 1
+         AND mod((CASE WHEN fi.status_id ~ '^[0-9]{18,19}$' THEN fi.status_id::numeric ELSE NULL END), 100000000) = folder_event.id)
+ )
+ OR EXISTS (
+   SELECT 1 FROM masto_statuses folder_local
+   WHERE (folder_local.note_id = rtrim(b.object_id, '/') OR folder_local.note_id = rtrim(b.object_id, '/') || '/')
+     AND folder_local.local_id > 0 AND folder_local.local_id < 2000000
+     AND fi.status_id = folder_local.local_id::text
+ ))"# }

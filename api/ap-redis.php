@@ -14,7 +14,8 @@ function ap_redis_client(string $purpose = 'cache'): ?Redis
     static $attempted = [];
     $purpose = $purpose === 'queue' ? 'queue' : 'cache';
     if (($attempted[$purpose] ?? false) === true) {
-        return $clients[$purpose] instanceof Redis ? $clients[$purpose] : null;
+        $client = $clients[$purpose] ?? null;
+        return $client instanceof Redis ? $client : null;
     }
     $attempted[$purpose] = true;
     if (!class_exists('Redis')) {

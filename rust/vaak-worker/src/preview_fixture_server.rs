@@ -40,6 +40,11 @@ async fn library_data(State(state):State<Arc<FixtureState>>,axum::extract::Query
  // Actual structured producer, selected only by this explicit disposable
  // fixture configuration. The renderer independently enforces current grants.
  let cfg=crate::config::Config{database_url:state.database_url.clone(),redis_url:"redis://127.0.0.1:1/0".into(),redis_queue_url:"redis://127.0.0.1:1/1".into(),jetstream_state:std::path::PathBuf::new(),default_owner_id:1,bsky_public_api:String::new(),notif_cache_dir:std::path::PathBuf::new(),phyrian_mutation_token:None,phyrian_bridge_url:String::new(),phyrian_bridge_secret:None};
+ if query.library_kind.as_deref()==Some("favourites"){
+  return match crate::library::favourites(&cfg,query.owner_id,query.offset.unwrap_or(0),query.limit.unwrap_or(20)).await{
+   Ok(value)=>axum::Json(value).into_response(),Err(error)=>{eprintln!("Actual fixture favourite data: {error}");StatusCode::INTERNAL_SERVER_ERROR.into_response()}
+  }
+ }
  if query.library_kind.as_deref()!=Some("bookmarks"){return StatusCode::BAD_REQUEST.into_response()}
  match crate::library::bookmarks(&cfg,query.owner_id,query.offset.unwrap_or(0),query.limit.unwrap_or(20),query.folder_id.filter(|id|*id>0)).await{
   Ok(value)=>axum::Json(value).into_response(),Err(error)=>{eprintln!("Actual fixture Library data: {error}");StatusCode::INTERNAL_SERVER_ERROR.into_response()}

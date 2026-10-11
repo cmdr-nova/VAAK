@@ -22,7 +22,7 @@ SELECT kind, ref FROM (
  AND ($2::bigint = 0 OR EXISTS (
    SELECT 1 FROM vaak_bookmark_folder_items fi
    WHERE fi.folder_id::bigint = $2 AND fi.owner_user_id = b.owner_user_id
-   AND (fi.status_id = b.status_id OR fi.status_id = b.object_id)))
+   AND {folder_fedi_match}))
  UNION ALL
  SELECT 'fedi' AS kind, b.created_at::timestamptz AS ts, b.id::text AS ref
  FROM masto_bookmarks b
@@ -31,7 +31,7 @@ SELECT kind, ref FROM (
  AND ($2::bigint = 0 OR EXISTS (
    SELECT 1 FROM vaak_bookmark_folder_items fi
    WHERE fi.folder_id::bigint = $2 AND fi.owner_user_id = b.owner_user_id
-   AND (fi.status_id = b.status_id OR fi.status_id = b.object_id)))
+   AND {folder_fedi_match}))
  AND NOT EXISTS (
    SELECT 1 FROM bsky_bookmark_cache c
    WHERE c.owner_user_id = b.owner_user_id
@@ -45,6 +45,11 @@ SELECT kind, ref FROM (
  AND ($2::bigint = 0 OR c.bookmark_uri = ANY($3::text[]))
 ) mixed ORDER BY ts DESC, ref DESC OFFSET $4 LIMIT $5
 "#;
+
+/// Projection and current saved-entry grant use the same owner-bound identity SQL.
+pub(crate) fn mixed_keys_sql() -> String {
+    MIXED_KEYS_SQL.replace("{folder_fedi_match}", super::folder_fedi_match_sql())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MixedKey {
@@ -112,7 +117,8 @@ pub async fn project(cfg: &crate::config::Config, owner_id: i64, folder_id: i64,
             }
         }
     }
-    let keys = db.query(MIXED_KEYS_SQL, &[&owner_id, &folder_id, &folder_uris, &offset, &(limit + 1)])
+    let sql = mixed_keys_sql();
+    let keys = db.query(&sql, &[&owner_id, &folder_id, &folder_uris, &offset, &(limit + 1)])
         .await.context("read chronological mixed bookmark keys")?
         .into_iter().map(|row| MixedKey { kind: row.get(0), reference: row.get(1) }).collect();
     let (keys, next_offset, has_more) = slice_source_keys(keys, offset, limit);

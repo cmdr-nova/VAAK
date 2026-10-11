@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fixture-only, every PHP invocation: keep real mbstring/PDO/OpenSSL; deny outbound/process APIs.
+set -euo pipefail
+supporter_php_args=(-d disable_functions=exec,shell_exec,system,passthru,proc_open,popen,curl_init,fsockopen,pfsockopen,stream_socket_client,socket_create -d allow_url_fopen=0)
+if [[ -n "${VAAK_TEST_PHP_AUDIT_PREPEND:-}" ]]; then
+  supporter_php_args+=(-d "auto_prepend_file=$VAAK_TEST_PHP_AUDIT_PREPEND")
+fi
+exec /usr/bin/php8.3 "${supporter_php_args[@]}" "$@"

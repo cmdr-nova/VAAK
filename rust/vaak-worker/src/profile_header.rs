@@ -57,6 +57,14 @@ async fn exists_table(db:&Client,table:&str)->Result<bool>{Ok(db.query_one("SELE
 async fn optional_rows(db:&Client,table:&str,sql:&str,args:&[&(dyn tokio_postgres::types::ToSql+Sync)])->Result<Vec<Value>>{
  if !exists_table(db,table).await?{return Ok(vec![])}Ok(db.query(sql,args).await?.iter().map(|r|r.get(0)).collect())
 }
+async fn supporter_awarded(db:&Client,key:&str)->Result<bool>{
+ if !exists_table(db,"ap_supporter_codes").await?{return Ok(false)}
+ Ok(db.query_one("SELECT EXISTS(SELECT 1 FROM ap_supporter_codes c JOIN ap_users u ON u.id=c.used_by WHERE u.actor_key=$1 AND u.disabled_at IS NULL AND c.used_at IS NOT NULL)",&[&key]).await?.get(0))
+}
+async fn authorized_badges(db:&Client,key:&str,raw:&Value)->Result<Vec<String>>{
+ let mut badges=normalize_badges(raw);badges.retain(|b|b!="supporter");badges.truncate(6);
+ if supporter_awarded(db,key).await?{badges.insert(0,"supporter".into());}Ok(badges)
+}
 async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{
  let aliases=vec![actor.trim_end_matches('/').to_owned(),format!("{}/",actor.trim_end_matches('/')),viewer.trim_end_matches('/').to_owned(),format!("{}/",viewer.trim_end_matches('/'))];
  let owners=vec![owner.to_string(),target.to_string()];let mut result=serde_json::Map::new();
@@ -67,6 +75,7 @@ async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&st
   ("ap_post_subscriptions","j->>'owner_user_id'=ANY($2)"),("ap_user_blocks","j->>'owner_user_id'=ANY($2)"),
   ("ap_mutes","j->>'owner_user_id'=ANY($2)"),("ap_deprioritized_actors","j->>'owner_user_id'=ANY($2)"),
   ("remote_custom_emojis","j->>'host'='mkultra.monster'"),
+  ("ap_supporter_codes","j->>'used_by'=ANY($2) AND j->>'used_at' IS NOT NULL"),
   ("ap_sl_links","j->>'owner_user_id'=ANY($2)"),("ap_wow_links","j->>'owner_user_id'=ANY($2)"),
   ("phyrian_bridge_links","j->>'owner_user_id'=ANY($2)"),("bsky_sessions","j->>'owner_user_id'=ANY($2) OR j->>'owner_user_id' IN(SELECT id::text FROM ap_users WHERE lower(actor_key)=$3 OR lower(username)=$3)"),
   ("bsky_graph_sync","(j->>'owner_user_id'=ANY($2) OR j->>'owner_user_id' IN(SELECT id::text FROM ap_users WHERE lower(actor_key)=$3 OR lower(username)=$3)) AND j->>'kind'='meta' AND j->>'target_did'='graph_sync_v1'"),
@@ -74,7 +83,12 @@ async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&st
   if blocked&&!matches!(table,"ap_users"|"ap_user_blocks"|"ap_mutes"|"ap_deprioritized_actors"){continue}
   if !exists_table(db,table).await?{result.insert(table.into(),Value::Null);continue;}
   // Bind both arrays explicitly even where a scoped predicate needs only one.
-  let sql=format!("SELECT jsonb_build_object('count',COUNT(*),'digest',md5(COALESCE(string_agg(j::text,'' ORDER BY j::text),''))) FROM (SELECT to_jsonb(t) j FROM {table} t) q WHERE ($1::text[] IS NOT NULL AND $2::text[] IS NOT NULL AND $3::text IS NOT NULL) AND ({condition})");
+  // The grant dependency remains the complete current row digest. Restrict
+  // conversion to the same two account IDs first so its existing partial
+  // used_by index can avoid scanning every issued reward. Preserve the bound
+  // text-array contract used by the other dependency predicates.
+  let scoped=if table=="ap_supporter_codes"{" WHERE used_by=ANY($2::text[]::bigint[]) AND used_at IS NOT NULL"}else{""};
+  let sql=format!("SELECT jsonb_build_object('count',COUNT(*),'digest',md5(COALESCE(string_agg(j::text,'' ORDER BY j::text),''))) FROM (SELECT to_jsonb(t) j FROM {table} t{scoped}) q WHERE ($1::text[] IS NOT NULL AND $2::text[] IS NOT NULL AND $3::text IS NOT NULL) AND ({condition})");
   result.insert(table.into(),db.query_one(&sql,&[&aliases,&owners,&key]).await?.get(0));
  }
  result.insert("key".into(),json!(key));Ok(Value::Object(result))
@@ -126,7 +140,8 @@ async fn resolve_local(db:&Client,key:&str,actor:&str,owner:i64,owner_actor:Stri
  let mut name=card::php_trim(s(&profile,"name")).to_owned();if name.is_empty(){name=key.into();}if card::boolean(&profile,"vanity_verified"){name.push_str(" ✓");}
  let avatar=sanitized_url(s(&profile,"icon_url"));let banner=sanitized_url(s(&profile,"image_url")).or_else(||avatar.clone());
  let fields=profile["attachment"].as_array().cloned().unwrap_or_default();
- let badges=normalize_badges(&profile["profile_badges"]);let mut emoji=HashMap::new();for row in db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]).await?{let k:String=row.get(0);let u:String=row.get(1);if !k.is_empty()&&u.starts_with("https://"){emoji.insert(k,u);}}
+ let badges=authorized_badges(db,key,&profile["profile_badges"]).await?;
+ let mut emoji=HashMap::new();for row in db.query("SELECT shortcode,url FROM remote_custom_emojis WHERE host='mkultra.monster'",&[]).await?{let k:String=row.get(0);let u:String=row.get(1);if !k.is_empty()&&u.starts_with("https://"){emoji.insert(k,u);}}
  let mut links=Vec::new();for(table,alias,extra)in[("ap_sl_links","l",""),("ap_wow_links","l",""),("phyrian_bridge_links","l"," AND l.status='verified' AND l.unlinked_at IS NULL")]{let sql=format!("SELECT to_jsonb({alias}) FROM {table} {alias} INNER JOIN ap_users u ON u.id=l.owner_user_id WHERE u.actor_key=$1 AND u.disabled_at IS NULL{extra} LIMIT 1");links.push(optional_rows(db,table,&sql,&[&key]).await?.into_iter().next());}
  let tab_href=format!("/vaak/users/{}{}tab=",q(key),if from.is_empty(){"?".into()}else{format!("?from={}&",form_query(&from))});
  let combined=cache::combined(db,key,counts.followers,counts.following,warm.is_some()).await?;counts.followers=combined.followers;counts.following=combined.following;
@@ -181,7 +196,7 @@ fn profile_defaults(key:&str)->Value{
  json!({"actor_key":key,"name":key,"summary":summary,"attachment":attachment,"icon_url":null,"image_url":null,"manually_approves":false,"discoverable":true,"indexable":true,"collection_consent":true,"vanity_verified":false,"auto_follow_back":false,"anti_ai_marker":false,"auto_unblur_sensitive":false,"auto_delete_posts_7d":false,"automated":false,"reply_policy":"anyone","quote_policy":"anyone","forum_signature":"","profile_badges":[],"hide_profile_replies":false,"hide_profile_boosts":false,"algorithm_enabled":true,"downranking_enabled":true,"asks_enabled":true,"webmentions_enabled":true,"updated_at":null})
 }
 fn sanitized_url(raw:&str)->Option<String>{crate::profile_identity::sanitized_profile_url(raw)}
-fn normalize_badges(value:&Value)->Vec<String>{let decoded=if let Some(raw)=value.as_str(){serde_json::from_str::<Value>(raw).unwrap_or(Value::Null)}else{value.clone()};let mut result=Vec::new();for v in decoded.as_array().into_iter().flatten(){let k=card::php_trim(v.as_str().unwrap_or(""));if BADGES.iter().any(|b|b.0==k)&&!result.iter().any(|v|v==k){result.push(k.into());}if result.len()==6{break;}}result}
+fn normalize_badges(value:&Value)->Vec<String>{let decoded=if let Some(raw)=value.as_str(){serde_json::from_str::<Value>(raw).unwrap_or(Value::Null)}else{value.clone()};let mut result=Vec::new();if decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="supporter"))){result.push("supporter".to_string());}for v in decoded.as_array().into_iter().flatten(){let k=card::php_trim(v.as_str().unwrap_or(""));if BADGES.iter().any(|b|b.0==k)&&!result.iter().any(|v|v==k){result.push(k.into());}if result.len()==if result.iter().any(|v|v=="supporter"){7}else{6}{break;}}result}
 fn hidden(name:&str,value:&str)->String{format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">",h(value))}
 fn post_form(f:&HeaderFacts,action:&str,extra:&str,attrs:&str,button:&str)->String{
  format!("<form method=\"post\" action=\"?view=remote_profile&amp;actor={}&amp;from={}\" style=\"display:inline\"{attrs}>{}{}{}{}{}{extra}{button}</form>",form_query(&f.actor),form_query(&f.from),hidden("action",action),hidden("return_view","remote_profile"),hidden("return_actor",&f.actor),hidden("return_from",&f.from),if action=="bite_remote"{String::new()}else{hidden("actor_id",&f.actor)})
@@ -323,6 +338,7 @@ mod tests{
 
 const BADGES:&[(&str,&str,&str)]=&[
  ("admin","Admin","🛡️"),
+ ("supporter","Supporter","💜"),
  ("rainbow","Rainbow pride","🏳️‍🌈"),
  ("trans","Trans pride","🏳️‍⚧️"),
  ("bi","Bisexual pride","🩷💜💙"),
@@ -370,3 +386,61 @@ const BADGES:&[(&str,&str,&str)]=&[
  ("dice","Dice goblin","🎲"),
  ("minecraft","Minecraft builder","⛏️"),
 ];
+
+#[cfg(test)]
+mod supporter_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires explicitly generated PHP Supporter badge corpus"]
+    fn supporter_badges_php_corpus() {
+        let path=std::env::var("SUPPORTER_BADGE_REFERENCE").expect("actual PHP corpus required");
+        let data:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        for row in data["cases"].as_array().unwrap() {
+            let expected:Vec<String>=serde_json::from_value(row["expected"].clone()).unwrap();
+            assert_eq!(normalize_badges(&row["input"]),expected,"{}",row["input"]);
+        }
+        let b=BADGES.iter().find(|b|b.0=="supporter").unwrap();
+        assert_eq!(b.1,data["supporter"]["label"].as_str().unwrap());
+        assert_eq!(b.2,data["supporter"]["emoji"].as_str().unwrap());
+    }
+    #[test]
+    fn supporter_badges_preserve_six_ordinary_slots() {
+        assert_eq!(normalize_badges(&json!(["cat","dog","coffee","tea","bookworm","gamer","music"," supporter "])),
+            vec!["supporter","cat","dog","coffee","tea","bookworm","gamer"]);
+        assert_eq!(normalize_badges(&json!([null,7,"unknown"," cat ","cat",{},"supporter"])),vec!["supporter","cat"]);
+        assert!(normalize_badges(&json!("malformed json")).is_empty());
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated local PostgreSQL fixture"]
+    async fn supporter_current_sql_grants() -> Result<()> {
+        let url=std::env::var("SUPPORTER_TEST_DATABASE_URL")?;
+        let(db,connection)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await?;
+        let connection_task=tokio::spawn(async move {connection.await});
+        for width in ["SERIAL","BIGSERIAL"] {
+            let schema=format!("supporter_native_{}_{}",std::process::id(),width.to_ascii_lowercase());
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema};CREATE TABLE ap_users(id {width} PRIMARY KEY,username TEXT,actor_key TEXT,disabled_at TEXT);INSERT INTO ap_users(username,actor_key)VALUES('paid','paid'),('unpaid','unpaid');")).await?;
+            assert!(!supporter_awarded(&db,"paid").await?);
+            db.batch_execute("CREATE TABLE ap_supporter_codes(code_hash TEXT,used_by BIGINT,used_at TEXT);INSERT INTO ap_supporter_codes VALUES('fixture',1,'now');").await?;
+            assert!(supporter_awarded(&db,"paid").await?);
+            let plain=json!(["cat","dog","coffee","tea","bookworm","gamer"]);
+            assert_eq!(authorized_badges(&db,"paid",&plain).await?,vec!["supporter","cat","dog","coffee","tea","bookworm","gamer"]);
+            assert_eq!(authorized_badges(&db,"paid",&Value::Null).await?,vec!["supporter"]);
+            assert_eq!(authorized_badges(&db,"unpaid",&json!([" supporter ","cat"])).await?,vec!["cat"]);
+            assert!(!supporter_awarded(&db,"unpaid").await?);
+            let before=header_dependencies(&db,"paid","https://mkultra.monster/users/paid",2,"https://mkultra.monster/users/unpaid",1,false).await?;
+            db.batch_execute("UPDATE ap_supporter_codes SET used_by=NULL,used_at=NULL").await?;
+            assert!(!supporter_awarded(&db,"paid").await?);
+            let after=header_dependencies(&db,"paid","https://mkultra.monster/users/paid",2,"https://mkultra.monster/users/unpaid",1,false).await?;
+            assert_ne!(before,after,"late grant withdrawal must invalidate header admission");
+            assert_eq!(authorized_badges(&db,"paid",&json!(["supporter","cat"])).await?,vec!["cat"]);
+            db.batch_execute("UPDATE ap_supporter_codes SET used_by=1,used_at='now'").await?;
+            let active=header_dependencies(&db,"paid","https://mkultra.monster/users/paid",2,"https://mkultra.monster/users/unpaid",1,false).await?;
+            db.batch_execute("UPDATE ap_users SET disabled_at='now' WHERE id=1").await?;
+            assert!(!supporter_awarded(&db,"paid").await?);
+            assert_ne!(active,header_dependencies(&db,"paid","https://mkultra.monster/users/paid",2,"https://mkultra.monster/users/unpaid",1,false).await?,"subject disablement invalidates other viewer admission");
+            db.batch_execute(&format!("SET search_path TO public;DROP SCHEMA {schema} CASCADE")).await?;
+        }
+        drop(db);connection_task.await??;Ok(())
+    }
+
+}

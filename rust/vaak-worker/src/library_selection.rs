@@ -21,8 +21,8 @@ pub(crate) fn validate_descriptors(descriptors:&[SavedSourceDescriptor],source_c
  if descriptors.len()!=source_count||!matches!(view,"bookmarks"|"favourites"){anyhow::bail!("incomplete saved producer/source vector")}
  let first=&descriptors[0];let mut previous=None;let mut keys=std::collections::HashSet::new();
  for (index,descriptor) in descriptors.iter().enumerate(){
-  if descriptor.source_index!=index||!matches!(descriptor.producer_kind.as_str(),"bookmarks_mixed"|"bookmarks_fedi"|"bookmarks_bsky"|"bookmarks_fedi_data"|"bookmarks_bsky_data")
-   ||(view!="bookmarks")||descriptor.producer_kind!=first.producer_kind
+  if descriptor.source_index!=index||!matches!(descriptor.producer_kind.as_str(),"bookmarks_mixed"|"bookmarks_fedi"|"bookmarks_bsky"|"bookmarks_fedi_data"|"bookmarks_bsky_data"|"favourites_fedi"|"favourites_fedi_data")
+   ||((descriptor.producer_kind.starts_with("bookmarks_") && view!="bookmarks") || (descriptor.producer_kind.starts_with("favourites_") && view!="favourites"))||descriptor.producer_kind!=first.producer_kind
    ||(descriptor.folder_id,descriptor.offset,descriptor.limit)!=(first.folder_id,first.offset,first.limit)
    ||previous.is_some_and(|ordinal|descriptor.selected_ordinal<=ordinal)
    ||!keys.insert((descriptor.selected_kind.as_str(),descriptor.reference.as_str())) {
@@ -35,7 +35,7 @@ pub(crate) fn validate_descriptors(descriptors:&[SavedSourceDescriptor],source_c
 
 pub(crate) struct SavedEntryGrant {
  owner:i64,folder:i64,offset:i64,limit:i64,kind:String,reference:String,
- window:Vec<(String,String)>,folder_uris:Vec<String>,row:Value,network_rows:Option<Vec<Value>>,
+ window:Vec<(String,String)>,folder_uris:Vec<String>,row:Value,network_rows:Option<Vec<Value>>,favourite:bool,
 }
 impl SavedEntryGrant {
  /// Pointer is transport provenance, not authority: independently rerun the
@@ -47,7 +47,7 @@ impl SavedEntryGrant {
   let window=Self::window(db,owner,folder,offset,limit,&folder_uris).await?;
   if window.get(ordinal).map(|key|(key.0.as_str(),key.1.as_str()))!=Some((kind,reference)){anyhow::bail!("saved entry not at current owner window ordinal")}
   let row=Self::row(db,owner,kind,reference).await?.context("saved owner entry withdrawn")?;
-  Ok(Self{owner,folder,offset,limit,kind:kind.into(),reference:reference.into(),window,folder_uris,row,network_rows:None})
+  Ok(Self{owner,folder,offset,limit,kind:kind.into(),reference:reference.into(),window,folder_uris,row,network_rows:None,favourite:false})
  }
  /// Exact PHP network SQL page, retaining raw ordinal before hydration.
  pub(crate) async fn network(db:&Client,session:&super::context::TrustedSession,folder:i64,offset:i64,limit:i64,ordinal:usize,kind:&str,reference:&str)->Result<Self>{
@@ -57,16 +57,31 @@ impl SavedEntryGrant {
   let keys=rows.iter().map(|row|Ok((kind.to_owned(),if kind=="fedi"{row["id"].as_i64().context("network saved row ID")?.to_string()}else{row["bookmark_uri"].as_str().context("network saved URI")?.to_owned()}))).collect::<Result<Vec<_>>>()?;
   if keys.get(ordinal).map(|key|(key.0.as_str(),key.1.as_str()))!=Some((kind,reference)){anyhow::bail!("saved network source not at current raw ordinal")}
   let row=rows.get(ordinal).context("network source row")?.clone();
-  Ok(Self{owner,folder,offset,limit,kind:kind.into(),reference:reference.into(),window:keys,folder_uris:Vec::new(),row,network_rows:Some(rows)})
+  Ok(Self{owner,folder,offset,limit,kind:kind.into(),reference:reference.into(),window:keys,folder_uris:Vec::new(),row,network_rows:Some(rows),favourite:false})
+ }
+ /// Favourite selection differs from bookmark SQL paging: retain the whole
+ /// raw hydration window, including omitted rows and unpainted candidates.
+ pub(crate) async fn favourite(db:&Client,session:&super::context::TrustedSession,offset:i64,limit:i64,ordinal:usize,reference:&str)->Result<Self>{
+  if offset<0||!(10..=40).contains(&limit)||reference.is_empty()||reference.len()>32{anyhow::bail!("invalid favourite source window")}
+  let owner=session.owner_id();let rows=Self::favourite_rows(db,owner,offset,limit).await?;
+  let keys=rows.iter().map(|row|Ok(("fedi".to_owned(),row["id"].as_i64().context("favourite raw row ID")?.to_string()))).collect::<Result<Vec<_>>>()?;
+  if keys.get(ordinal).map(|key|key.1.as_str())!=Some(reference){anyhow::bail!("favourite source is not at its current raw ordinal")}
+  let row=rows.get(ordinal).context("favourite source row")?.clone();
+  Ok(Self{owner,folder:0,offset,limit,kind:"fedi".into(),reference:reference.into(),window:keys,folder_uris:Vec::new(),row,network_rows:Some(rows),favourite:true})
+ }
+ async fn favourite_rows(db:&Client,owner:i64,offset:i64,limit:i64)->Result<Vec<Value>>{
+  let fetch=offset.saturating_add(limit).saturating_add(20).clamp(1,80)*2;
+  Ok(db.query("SELECT to_jsonb(f) FROM masto_favourites f WHERE f.owner_user_id::bigint=$1 ORDER BY f.created_at DESC LIMIT $2",&[&owner,&fetch]).await?.into_iter().map(|row|row.get(0)).collect())
  }
  async fn network_rows(db:&Client,owner:i64,folder:i64,offset:i64,limit:i64,kind:&str)->Result<Vec<Value>>{
-  let sql=if kind=="fedi"{r#"SELECT to_jsonb(b) FROM masto_bookmarks b WHERE b.owner_user_id::bigint=$1
+  let folder_match=super::folder_fedi_match_sql();
+  let sql=if kind=="fedi"{format!(r#"SELECT to_jsonb(b) FROM masto_bookmarks b WHERE b.owner_user_id::bigint=$1
    AND b.status_id NOT LIKE 'bsky:%' AND b.object_id NOT LIKE 'at://%' AND b.object_id NOT LIKE '%bsky.app/%'
-   AND ($2::bigint=0 OR EXISTS(SELECT 1 FROM vaak_bookmark_folder_items fi WHERE fi.folder_id::bigint=$2 AND fi.owner_user_id=b.owner_user_id AND (fi.status_id=b.status_id OR fi.status_id=b.object_id)))
-   ORDER BY b.created_at DESC,b.id DESC OFFSET $3 LIMIT $4"#}else{r#"SELECT to_jsonb(c) FROM bsky_bookmark_cache c WHERE c.owner_user_id::bigint=$1
+   AND ($2::bigint=0 OR EXISTS(SELECT 1 FROM vaak_bookmark_folder_items fi WHERE fi.folder_id::bigint=$2 AND fi.owner_user_id=b.owner_user_id AND {folder_match}))
+   ORDER BY b.created_at DESC,b.id DESC OFFSET $3 LIMIT $4"#)}else{r#"SELECT to_jsonb(c) FROM bsky_bookmark_cache c WHERE c.owner_user_id::bigint=$1
    AND ($2::bigint=0 OR EXISTS(SELECT 1 FROM vaak_bookmark_folder_items fi LEFT JOIN masto_bookmarks mb ON mb.owner_user_id=c.owner_user_id AND mb.status_id=fi.status_id WHERE fi.folder_id::bigint=$2 AND fi.owner_user_id=c.owner_user_id AND (fi.status_id=c.bookmark_uri OR mb.object_id=c.bookmark_uri)))
-   ORDER BY c.bookmarked_at DESC,c.bookmark_uri DESC OFFSET $3 LIMIT $4"#};
-  Ok(db.query(sql,&[&owner,&folder,&offset,&(limit+1)]).await?.into_iter().map(|row|row.get(0)).collect())
+   ORDER BY c.bookmarked_at DESC,c.bookmark_uri DESC OFFSET $3 LIMIT $4"#.to_owned()};
+  Ok(db.query(&sql,&[&owner,&folder,&offset,&(limit+1)]).await?.into_iter().map(|row|row.get(0)).collect())
  }
  async fn folder_uris(db:&Client,owner:i64,folder:i64)->Result<Vec<String>>{
   if folder==0{return Ok(Vec::new())}
@@ -77,7 +92,8 @@ impl SavedEntryGrant {
   uris.sort();Ok(uris)
  }
  async fn window(db:&Client,owner:i64,folder:i64,offset:i64,limit:i64,uris:&Vec<String>)->Result<Vec<(String,String)>>{
-  Ok(db.query(super::mixed::MIXED_KEYS_SQL,&[&owner,&folder,uris,&offset,&(limit+1)]).await?.into_iter().take(limit as usize).map(|row|(row.get(0),row.get(1))).collect())
+  let sql=super::mixed::mixed_keys_sql();
+  Ok(db.query(&sql,&[&owner,&folder,uris,&offset,&(limit+1)]).await?.into_iter().take(limit as usize).map(|row|(row.get(0),row.get(1))).collect())
  }
  async fn row(db:&Client,owner:i64,kind:&str,reference:&str)->Result<Option<Value>>{
   if kind=="fedi"{
@@ -90,6 +106,7 @@ impl SavedEntryGrant {
  pub(crate) fn kind(&self)->&str{&self.kind}
  pub(crate) fn reference(&self)->&str{&self.reference}
  pub(crate) fn owner_id(&self)->i64{self.owner}
+ pub(crate) fn emitted_network_count(&self)->Option<usize>{self.network_rows.as_ref().filter(|_|!self.favourite).map(|rows|rows.len().min(self.limit as usize))}
  pub(crate) fn require_source_binding(&self,status:&Value)->Result<()> {
   if self.kind=="bsky"{
    let post=status.get("post").or_else(||status.get("bsky_post_view")).or_else(||status.get("bsky_post").map(|value|value.get("post").unwrap_or(value)));
@@ -109,7 +126,7 @@ impl SavedEntryGrant {
   Ok(())
  }
  pub(crate) async fn require_current(&self,db:&Client)->Result<()> {
-  if let Some(rows)=&self.network_rows{if Self::network_rows(db,self.owner,self.folder,self.offset,self.limit,&self.kind).await?.as_slice()!=rows.as_slice(){anyhow::bail!("saved network current raw window changed")}return Ok(())}
+  if let Some(rows)=&self.network_rows{let current=if self.favourite{Self::favourite_rows(db,self.owner,self.offset,self.limit).await?}else{Self::network_rows(db,self.owner,self.folder,self.offset,self.limit,&self.kind).await?};if current.as_slice()!=rows.as_slice(){anyhow::bail!("saved network current raw window changed")}return Ok(())}
   let uris=Self::folder_uris(db,self.owner,self.folder).await?;
   if uris!=self.folder_uris||Self::window(db,self.owner,self.folder,self.offset,self.limit,&uris).await?!=self.window||Self::row(db,self.owner,&self.kind,&self.reference).await?.as_ref()!=Some(&self.row){anyhow::bail!("saved owner/folder/window/source association changed")}
   Ok(())

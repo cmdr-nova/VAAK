@@ -218,7 +218,11 @@ pub(crate) fn render_moderation_with_from(ctx: &FediActionContext,return_from:&s
                     menu.push_str(&format!("<form method=\"post\" action=\"?view=blocks\">{}{}{}<button class=\"menu-action\" type=\"submit\">Remove user {kind} (server)</button></form>", hidden("csrf", &ctx.csrf), hidden("action", "unblock"), hidden("id", &state.global_id.to_string())));
                 } else {
                     let confirm = if kind == "mute" { "return confirm('Mute this user for everyone on Vaak?');".to_owned() } else {
-                        let message = "Block this user server-wide? VAAK will reject their federation (HTTP 403) and stop delivering to them.";
+                        let message = if lower.contains("bsky.app/profile/") || lower.starts_with("did:") {
+                            "Block this Bluesky user server-wide on VAAK? Everyone on this instance will stop seeing them. This also blocks them for you personally (and syncs that personal block to your Bluesky account if connected). Other VAAK users’ Bluesky blocklists are left alone."
+                        } else {
+                            "Block this user server-wide? VAAK will reject their federation (HTTP 403) and stop delivering to them."
+                        };
                         format!("return confirm({});", esc(&serde_json::to_string(message).unwrap()))
                     };
                     menu.push_str(&format!("<form method=\"post\" action=\"?view=blocks\" onsubmit=\"{confirm}\">{}{}{}{}<button class=\"menu-action{}\" type=\"submit\">{} this user (server)</button></form>", hidden("csrf", &ctx.csrf), hidden("action", "block_actor"), hidden("kind", kind), hidden("actor_id", actor), if kind == "block" { " danger" } else { "" }, if kind == "block" { "Block" } else { "Mute" }));

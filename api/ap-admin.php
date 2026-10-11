@@ -1869,6 +1869,8 @@ $vaakAdminOnlyActions = [
                 'action' => 'reply',
                 'kind' => $isQuote ? 'quote' : 'post',
                 'return_view' => $returnView,
+                'note_id' => $error === null ? (string) ($result['note_id'] ?? '') : '',
+                'published' => $error === null ? (string) ($result['published'] ?? '') : '',
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             exit;
         }
@@ -2277,6 +2279,12 @@ $vaakAdminOnlyActions = [
         } else {
             $error = $result['error'] ?? 'Update failed.';
         }
+    } elseif ($action === 'redeem_supporter') {
+        require_once __DIR__ . '/ap-registration-approvals.php';
+        $reward = ap_supporter_redeem((string) ($_POST['supporter_code'] ?? ''), (string) ($_POST['csrf'] ?? ''));
+        if (!empty($reward['ok'])) $notice = 'Supporter badge awarded. Thank you for supporting VAAK.';
+        else $error = (string) ($reward['error'] ?? 'Could not redeem reward.');
+        $view = 'profile';
     } elseif ($action === 'save_profile') {
         $fieldNames = $_POST['field_name'] ?? [];
         $fieldValues = $_POST['field_value'] ?? [];
@@ -5023,54 +5031,56 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'bookmark_folders') {
     exit;
 }
 
-// Lightweight JSON for nav badge / tab title polling (before heavy feed queries)
-if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
-    header('Content-Type: text/html; charset=utf-8');
-    header('Cache-Control: no-store');
-    $offset = max(0, (int) ($_GET['offset'] ?? 0));
-    $limit = max(10, min(40, (int) ($_GET['limit'] ?? 20)));
-    if (is_array($favData = admin_library_data_axum_fetch($vaakOwnerId, $offset, $limit))) {
-        $items = [];
-        foreach ($favData['fedi_rows'] as $favRow) {
-            if (is_array($favRow) && function_exists('ap_masto_interaction_row_to_status')) {
-                $status = ap_masto_interaction_row_to_status($favRow, 'favourited');
-                if (is_array($status)) $items[] = $status;
-            }
-        }
-        header('X-Has-More: ' . (!empty($favData['has_more_fedi']) ? '1' : '0'));
-        header('X-VAAK-Fragment: axum-data');
-        echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . (!empty($favData['has_more_fedi']) ? '1' : '0') . '">';
-        $GLOBALS['admin_library_fetch_budget'] = 3;
-        admin_render_library_network_items($items, 'fedi', 'favourites');
-        echo '</div>';
-        exit;
-    }
-    $fragSuffix = 'offset=' . $offset . '|limit=' . $limit;
-    // Raw HTML lacks a status/policy manifest; re-render structured saves below.
-    $rows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list($offset + $limit + 20, null) : [];
+/** Exact PHP favourite hydration/filter/page contract, shared by both producers. */
+function admin_favourite_fedi_page(int $ownerUserId, int $offset = 0, int $limit = 20): array
+{
+    $offset = max(0, $offset);
+    $limit = max(10, min(40, $limit));
+    $data = admin_library_data_axum_fetch($ownerUserId, $offset, $limit);
+    $sourceRows = is_array($data) ? $data['fedi_rows'] : null;
+    $rows = function_exists('ap_masto_favourites_list')
+        ? ap_masto_favourites_list($offset + $limit + 20, null,
+            ['offset' => $offset, 'limit' => $limit], $sourceRows) : [];
+    $hydratedCount = count($rows);
     $rows = array_values(array_filter($rows, static function ($st): bool {
-        if (!is_array($st)) {
-            return false;
-        }
+        if (!is_array($st)) return false;
         $sid = (string) ($st['id'] ?? '');
         $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
-        return !(str_starts_with($sid, 'bsky:')
-            || str_starts_with($uri, 'at://')
+        return !(str_starts_with($sid, 'bsky:') || str_starts_with($uri, 'at://')
             || str_contains($uri, 'bsky.app/'));
     }));
-    $items = array_slice($rows, $offset, $limit);
-    $hasMore = count($rows) > ($offset + $limit);
-    header('X-Has-More: ' . ($hasMore ? '1' : '0'));
+    return ['items' => array_slice($rows, $offset, $limit), 'hydrated_count' => $hydratedCount,
+        'has_more' => count($rows) > ($offset + $limit),
+        'source' => is_array($data) ? 'axum-data' : 'miss'];
+}
+
+function admin_favourite_fedi_fragment(int $ownerUserId, int $offset = 0, int $limit = 20): array
+{
+    $offset = max(0, $offset);
+    $limit = max(10, min(40, $limit));
+    $page = admin_favourite_fedi_page($ownerUserId, $offset, $limit);
+    $items = $page['items'];
+    $hasMore = $page['has_more'];
     ob_start();
     echo '<div data-fedi-favourites-fragment data-offset="' . (int) ($offset + count($items)) . '" data-limit="' . (int) $limit . '" data-has-more="' . ($hasMore ? '1' : '0') . '">';
     $GLOBALS['admin_library_fetch_budget'] = 3;
     admin_render_library_network_items($items, 'fedi', 'favourites');
     echo '</div>';
-    $html = ob_get_clean();
-    if (function_exists('ap_redis_library_html_set')) {
-        ap_redis_library_html_set('favourites_fedi', $vaakOwnerId, $fragSuffix, $html, $hasMore);
+    $html = (string) ob_get_clean();
+    if (function_exists('ap_redis_library_html_set') && $page['source'] === 'miss') {
+        ap_redis_library_html_set('favourites_fedi', $ownerUserId, 'offset=' . $offset . '|limit=' . $limit, $html, $hasMore);
     }
-    echo $html;
+    return ['html' => $html, 'has_more' => $hasMore, 'source' => $page['source']];
+}
+
+if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'favourites_fedi') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    $frag = admin_favourite_fedi_fragment((int) $vaakOwnerId,
+        (int) ($_GET['offset'] ?? 0), (int) ($_GET['limit'] ?? 20));
+    header('X-Has-More: ' . ($frag['has_more'] ? '1' : '0'));
+    if ($frag['source'] === 'axum-data') header('X-VAAK-Fragment: axum-data');
+    echo $frag['html'];
     exit;
 }
 
@@ -5116,7 +5126,7 @@ function admin_render_library_entries(array $entries, string $returnView): void
 {
     $prepared = false;
     $nativeHtml = null;
-    if (ap_library_native_enabled()) {
+    if (ap_library_native_enabled() && empty($GLOBALS['admin_library_force_php'])) {
         $sources = [];
         $savedSources = [];
         foreach ($entries as &$entry) {
@@ -5216,20 +5226,38 @@ function admin_bookmark_fragment_markup(string $network, array $items, int $next
  *
  * @return array{html:string,has_more:bool,source:string}
  */
+function admin_bookmark_native_fragment_markup(string $html, int $next, int $limit, bool $hasMore, bool $firstPage): string
+{
+    return '<div data-fedi-bookmark-fragment data-offset="' . $next . '" data-limit="' . $limit
+        . '" data-has-more="' . ($hasMore ? '1' : '0') . '">'
+        . ($firstPage ? '<h3 style="font-size:.95rem;color:var(--muted);margin:0 0 .5rem">Fediverse bookmarks</h3>' : '')
+        . $html . '</div>';
+}
+
 function admin_bookmark_network_fragment(string $network, int $ownerUserId, int $folderId, int $offset, int $limit): array
 {
+    $folderFediMatch = vaak_bookmark_folder_fedi_match_sql();
     $network = $network === 'bsky' ? 'bsky' : 'fedi';
     $offset = max(0, $offset);
     $limit = max(10, min(40, $limit));
     $folderId = max(0, $folderId);
     $kind = $network === 'bsky' ? 'bookmarks_bsky' : 'bookmarks_fedi';
     $suffix = 'folder=' . $folderId . '|offset=' . $offset . '|limit=' . $limit;
-    $wrap = static function (array $items, int $next, bool $hasMore, string $source, bool $refreshing = false) use ($network, $limit, $folderId, $offset): array {
-        return [
-            'html' => admin_bookmark_fragment_markup($network, $items, $next, $limit, $hasMore, $folderId, $offset === 0, $refreshing),
-            'has_more' => $hasMore,
-            'source' => $source,
-        ];
+    $canonicalFallback = false;
+    $wrap = static function (array $items, int $next, bool $hasMore, string $source, bool $refreshing = false) use ($network, $limit, $folderId, $offset, &$canonicalFallback): array {
+        $hadOverride = array_key_exists('admin_library_force_php', $GLOBALS);
+        $previousOverride = $GLOBALS['admin_library_force_php'] ?? null;
+        if ($canonicalFallback) $GLOBALS['admin_library_force_php'] = true;
+        try {
+            return [
+                'html' => admin_bookmark_fragment_markup($network, $items, $next, $limit, $hasMore, $folderId, $offset === 0, $refreshing),
+                'has_more' => $hasMore,
+                'source' => $source,
+            ];
+        } finally {
+            if ($hadOverride) $GLOBALS['admin_library_force_php'] = $previousOverride;
+            else unset($GLOBALS['admin_library_force_php']);
+        }
     };
     if ($ownerUserId < 1) {
         return $wrap([], $offset, false, 'empty');
@@ -5241,6 +5269,13 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
             : (is_array($data['fedi_rows'] ?? null) ? $data['fedi_rows'] : []);
         $items = [];
         if ($network === 'fedi') {
+            $canonicalAttempted = false;
+            $native = ap_library_native_render_saved_local($sourceRows, 'bookmarks_fedi_data', $ownerUserId, $folderId, $offset, $limit, $canonicalAttempted);
+            $canonicalFallback = $canonicalAttempted && $native === null;
+            if ($native !== null) {
+                $hasMore = !empty($data['has_more_fedi']);
+                return ['html' => admin_bookmark_native_fragment_markup($native, $offset + count($sourceRows), $limit, $hasMore, $offset === 0), 'has_more' => $hasMore, 'source' => 'axum-canonical-local'];
+            }
             foreach ($sourceRows as $rawOrdinal => $row) {
                 if (is_array($row) && function_exists('ap_masto_interaction_row_to_status')) {
                     $status = ap_masto_interaction_row_to_status($row, 'bookmarked');
@@ -5277,7 +5312,7 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
                        AND EXISTS (
                          SELECT 1 FROM vaak_bookmark_folder_items fi
                          WHERE fi.folder_id = ? AND fi.owner_user_id = b.owner_user_id
-                           AND (fi.status_id = b.status_id OR fi.status_id = b.object_id)
+                           AND {$folderFediMatch}
                        )
                      ORDER BY b.created_at DESC, b.id DESC
                      OFFSET ? LIMIT ?"
@@ -5299,6 +5334,12 @@ function admin_bookmark_network_fragment(string $network, int $ownerUserId, int 
             $hasMore = count($raw) > $limit;
             $raw = array_slice($raw, 0, $limit);
             $rawCount = count($raw);
+            $canonicalAttempted = false;
+            $native = ap_library_native_render_saved_local($raw, 'bookmarks_fedi', $ownerUserId, $folderId, $offset, $limit, $canonicalAttempted);
+            $canonicalFallback = $canonicalAttempted && $native === null;
+            if ($native !== null) {
+                return ['html' => admin_bookmark_native_fragment_markup($native, $offset + $rawCount, $limit, $hasMore, $offset === 0), 'has_more' => $hasMore, 'source' => 'php-rows-native-canonical-local'];
+            }
             foreach ($raw as $rawOrdinal => $row) {
                 if (!is_array($row) || !function_exists('ap_masto_interaction_row_to_status')) {
                     continue;
@@ -5454,6 +5495,7 @@ function admin_bookmark_mixed_markup(array $items, int $nextOffset, int $limit, 
  */
 function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $offset, int $limit): array
 {
+    $folderFediMatch = vaak_bookmark_folder_fedi_match_sql();
     $offset = max(0, $offset);
     $limit = max(10, min(40, $limit));
     $folderId = max(0, $folderId);
@@ -5479,11 +5521,11 @@ function admin_bookmark_mixed_fragment(int $ownerUserId, int $folderId, int $off
         $params = [$ownerUserId];
         $fediFolder = '';
         if ($folderId > 0) {
-            $fediFolder = ' AND EXISTS (
+            $fediFolder = " AND EXISTS (
                 SELECT 1 FROM vaak_bookmark_folder_items fi
                 WHERE fi.folder_id = ? AND fi.owner_user_id = b.owner_user_id
-                  AND (fi.status_id = b.status_id OR fi.status_id = b.object_id)
-            )';
+                  AND {$folderFediMatch}
+            )";
             $params[] = $folderId;
         }
         // Bluesky rows whose at:// is missing from bsky_bookmark_cache still
@@ -6044,7 +6086,7 @@ if (isset($_GET['partial'], $_GET['shell'])
                 . '<div data-bsky-favourites-sentinel class="meta" style="padding:1rem 0 2rem;text-align:center">'
                 . admin_scroll_loading_html() . '</div></div>';
         } else {
-            $favRows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list(40, null) : [];
+            $favRows = function_exists('ap_masto_favourites_list') ? ap_masto_favourites_list(40, null, ['offset' => 0, 'limit' => 20]) : [];
             $favRows = array_values(array_filter($favRows, static function ($st): bool {
                 if (!is_array($st)) {
                     return false;
@@ -19354,8 +19396,8 @@ function admin_render_boost_card(array $rb, array $followingIds, string $returnV
 /**
  * Prefer the shared Mastodon status card for a local outbox note so profile /
  * Local timeline posts get the same reply/boost/quote/like/bookmark/⋯ actions
- * as Home. Falls through for guests, Bluesky imports, and notes without a
- * masto_statuses row.
+ * as Home. Falls through for guests and Bluesky imports.
+ * Missing/withdrawn local status mappings are suppressed.
  *
  * @param array<string,mixed> $n outbox_notes row
  * @param array<int|string,mixed> $followingIds
@@ -19384,21 +19426,121 @@ function admin_try_render_outbox_shared_card(array $n, array $followingIds, stri
         || (function_exists('vaak_is_local_url') && !vaak_is_local_url($noteId))) {
         return false;
     }
+    $bufferLevel = ob_get_level();
     try {
         $row = ap_masto_status_by_note_id($noteId);
         if (!is_array($row)) {
-            return false;
+            return true; // Withdrawn/incomplete local source cannot authorize legacy HTML.
         }
         $st = ap_masto_status_from_row($row, true, false);
         if (!is_array($st) || trim((string) ($st['id'] ?? '')) === '') {
-            return false;
+            return true;
         }
-        admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+        if (!admin_outbox_status_current_allowed($st, $returnView)) {
+            return true; // Suppressed current source; never fall through to a legacy card.
+        }
+        if (!admin_render_local_self_thread($n, $st, $followingIds, $returnView)) {
+            // A hidden parent does not authorize a stale standalone tip.
+            // Hold body/media/actions until all painter work has completed,
+            // then reread the current durable tip and nested source policy.
+            ob_start();
+            admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
+            $html = (string) ob_get_clean();
+            if (admin_outbox_status_current_allowed($st, $returnView)) echo $html;
+        }
         return true;
     } catch (Throwable $e) {
-        error_log('[ap-admin] outbox shared card: ' . $e->getMessage());
+        while (ob_get_level() > $bufferLevel) ob_end_clean();
+        error_log('[ap-admin] current local card suppressed after policy/paint failure');
+        return true; // A policy failure must never revive legacy local HTML.
+    }
+}
+
+/** Current audience/moderation and discovery admission for a cached local card. */
+function admin_outbox_status_current_allowed(array $status, string $view): bool
+{
+    return ap_visibility_status_audience_allowed($status, admin_owner_user_id())
+        && !ap_visibility_status_hidden($status, admin_owner_user_id())
+        && (!in_array($view, ['local', 'feed'], true) || admin_outbox_current_public_status($status));
+}
+
+/** Preserve public/unlisted nested-quote rules using current durable visibility. */
+function admin_outbox_current_public_status(array $status, int $depth = 0): bool
+{
+    if ($depth > 16) return false;
+    try {
+        $uri = rtrim(explode('#', trim((string) ($status['uri'] ?? $status['url'] ?? '')), 2)[0], '/');
+        $visibility = strtolower((string) ($status['visibility'] ?? 'public'));
+        if (preg_match('#^https://mkultra\.monster/users/[^/]+/notes/#', $uri)) {
+            $query = ap_db()->prepare('SELECT visibility FROM outbox_notes WHERE id IN (?, ?) LIMIT 1');
+            $query->execute([$uri, $uri . '/']);
+            $row = $query->fetch();
+            if (!is_array($row)) return false;
+            $visibility = strtolower((string) ($row['visibility'] ?? 'public'));
+        } elseif (str_starts_with($uri, 'https://') || str_starts_with($uri, 'http://')) {
+            $query = ap_db()->prepare("SELECT visibility FROM events WHERE object_id IN (?, ?)
+                AND (type IN ('Create','Update')
+                    OR (type IN ('Quote','QuotePost') AND NOT EXISTS (
+                        SELECT 1 FROM events note_source WHERE note_source.object_id IN (?, ?)
+                            AND note_source.type IN ('Create','Update'))))
+                AND action_taken IN ('log','local_observe','local_fav_update') ORDER BY id DESC LIMIT 1");
+            $query->execute([$uri, $uri . '/', $uri, $uri . '/']);
+            if ($row = $query->fetch()) $visibility = strtolower((string) ($row['visibility'] ?? 'public'));
+        }
+        if (!in_array($visibility, $depth === 0 ? ['public'] : ['public', 'unlisted'], true)) return false;
+        foreach (['reblog', 'quote', 'vaak_quote_preview'] as $field) {
+            $child = $status[$field] ?? null;
+            if (!is_array($child)) continue;
+            $child = is_array($child['quoted_status'] ?? null) ? $child['quoted_status']
+                : (is_array($child['status'] ?? null) ? $child['status'] : $child);
+            if (!admin_outbox_current_public_status($child, $depth + 1)) return false;
+        }
+        return true;
+    } catch (Throwable $e) { return false; }
+}
+
+/** Paint a current local self-reply with its visible parent, including media. */
+function admin_render_local_self_thread(array $n, array $tip, array $followingIds, string $view): bool
+{
+    $tipId = rtrim(trim((string) ($n['id'] ?? '')), '/');
+    $parentId = rtrim(trim((string) ($n['in_reply_to'] ?? '')), '/');
+    if (!in_array($view, ['home', 'local', 'feed'], true)
+        || $parentId === '' || $parentId === $tipId
+        || !str_contains($tipId, '/notes/') || !str_contains($parentId, '/notes/')
+        || explode('/notes/', $tipId, 2)[0] !== explode('/notes/', $parentId, 2)[0]) {
         return false;
     }
+    $st = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id IN (?, ?) LIMIT 1');
+    $st->execute([$parentId, $parentId . '/']);
+    $parentRow = $st->fetch();
+    if (!is_array($parentRow)) return false;
+    $parentMasto = ap_masto_status_by_note_id((string) $parentRow['id']);
+    if (!is_array($parentMasto)) return false;
+    $parent = ap_masto_status_from_row($parentMasto, true, false);
+    if (!is_array($parent)) return false;
+    foreach ([$parent, $tip] as $status) {
+        if (!admin_outbox_status_current_allowed($status, $view)) {
+            return false;
+        }
+    }
+    $segments = [];
+    foreach ([$parent, $tip] as $status) {
+        ob_start();
+        admin_render_masto_status_card($status, $followingIds, $view, false, true);
+        $card = trim((string) ob_get_clean());
+        if (!preg_match('~^<article\b[^>]*>(.*)</article>$~s', $card, $m)) return false;
+        $segments[] = $m[1];
+    }
+    // Painting can read previews and policy. Recheck both durable sources
+    // after all painter work, immediately before emitting the wrapper.
+    foreach ([$parent, $tip] as $status) {
+        if (!admin_outbox_status_current_allowed($status, $view)) return false;
+    }
+    echo '<article class="tweet tweet-thread">'
+        . '<div class="tweet-thread-seg tweet-thread-seg--ancestor" data-note-id="' . h($parentId) . '">' . $segments[0] . '</div>'
+        . '<div class="tweet-thread-rail" aria-hidden="true"></div>'
+        . '<div class="tweet-thread-seg tweet-thread-seg--tip" data-note-id="' . h($tipId) . '">' . $segments[1] . '</div></article>';
+    return true;
 }
 
 /**
@@ -20516,6 +20658,17 @@ function admin_render_timeline_item(array $item, array $followingIds, string $re
             // Hidden/session/empty — skip. Do not resurrect remote_boost_card dialect.
             return;
         }
+        // A queued local compose event points to a durable outbox source.
+        // Use that source so fresh Home replies retain the same thread/media
+        // painter as Local; a current policy denial suppresses the card.
+        $localObject = rtrim((string) ($row['object_id'] ?? ''), '/');
+        if (($row['action_taken'] ?? '') === 'compose'
+            && preg_match('#^https://mkultra\.monster/users/[A-Za-z0-9_]+/notes/[^/]+$#', $localObject)) {
+            $localSource = ap_db()->prepare('SELECT * FROM outbox_notes WHERE id IN (?, ?) LIMIT 1');
+            $localSource->execute([$localObject, $localObject . '/']);
+            $localNote = $localSource->fetch();
+            if (!is_array($localNote) || admin_try_render_outbox_shared_card($localNote, $followingIds, $returnView)) return;
+        }
         if ($fromTag) {
             $row['_from_followed_tag'] = true;
         }
@@ -20599,6 +20752,99 @@ function admin_timeline_status_ids(array $items): array
     return $ids;
 }
 
+/** Render only a just-published own reply belonging to this open thread.
+ * Both query IDs are locators; current durable state supplies authority.
+ */
+function admin_status_published_reply_html(string $object, string $note, array $followingIds, string $from): ?string
+{
+    try {
+        if (!vaak_is_own_url($note) || !str_starts_with($object, 'https://')) return null;
+        $focus = ap_masto_lookup_status_by_object_url($object, 0, false, true);
+        $row = ap_masto_status_by_note_id($note);
+        if (!is_array($focus) || !is_array($row)) return null;
+        $reply = ap_masto_status_from_row($row, true, false);
+        $allowed = static fn(array $status): bool => admin_direct_status_allowed($status, admin_owner_user_id())
+            && !admin_direct_status_content_blocked($status);
+        if (!$allowed($focus) || !$allowed($reply)) return null;
+        $parent = ap_db()->prepare('SELECT in_reply_to FROM outbox_notes WHERE id = ?');
+        $parent->execute([$note]);
+        $cursor = rtrim((string) ($parent->fetchColumn() ?: ''), '/');
+        $focusKey = rtrim((string) ($focus['uri'] ?? $focus['url'] ?? $object), '/');
+        $seen = [];
+        $lineage = [];
+        for ($depth = 0; $cursor !== '' && $cursor !== $focusKey && $depth < 12; $depth++) {
+            if (isset($seen[$cursor])) return null;
+            $seen[$cursor] = true;
+            $ancestor = ap_masto_lookup_status_by_object_url($cursor, 0, false, true);
+            if (!is_array($ancestor) || !$allowed($ancestor)) return null;
+            $lineage[] = $ancestor;
+            $parent->execute([$cursor]);
+            $next = $parent->fetchColumn();
+            if ($next === false) {
+                $event = ap_event_by_object_id($cursor);
+                $next = is_array($event) ? ($event['in_reply_to'] ?? '') : '';
+            }
+            $cursor = rtrim((string) $next, '/');
+        }
+        if ($cursor !== $focusKey) return null;
+        $level = ob_get_level();
+        ob_start();
+        try {
+            admin_render_direct_status_card($reply, $followingIds, $from, false, true);
+            $html = (string) ob_get_clean();
+        } catch (Throwable $e) {
+            while (ob_get_level() > $level) ob_end_clean();
+            return null;
+        }
+        // Canonical painter may enrich quotes. Recheck root/reply after painting.
+        if (!$allowed($focus) || !$allowed($reply)) return null;
+        foreach ($lineage as $ancestor) if (!$allowed($ancestor)) return null;
+        return $html;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+if ($isPartial && $view === 'status' && (string) ($_GET['thread'] ?? '') === 'published') {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: private, no-store');
+    require_once __DIR__ . '/ap-masto-entities.php';
+    $html = admin_status_published_reply_html(trim((string) ($_GET['object'] ?? '')),
+        trim((string) ($_GET['note_id'] ?? '')), $followingIds,
+        preg_replace('/[^a-z_]/', '', (string) ($_GET['from'] ?? 'home')) ?: 'home');
+    if ($html === null) { http_response_code(404); exit; }
+    echo $html;
+    exit;
+}
+
+// Reuse the complete canonical Status template as a center-column shell.
+if ($isPartial && $view === 'status' && (string) ($_GET['shell'] ?? '') === '1') {
+    require_once __DIR__ . '/ap-masto-entities.php';
+    $shellObject = trim((string) ($_GET['object'] ?? ''));
+    $shellMirror = function_exists('ap_rss_item_by_mirror_note_id') ? ap_rss_item_by_mirror_note_id($shellObject) : null;
+    if (is_array($shellMirror)) {
+        $article = trim((string) ($shellMirror['url'] ?? ''));
+        $target = str_starts_with($article, 'https://') ? $article : '/vaak/?view=rss';
+        header('Cache-Control: private, no-store');
+        header('X-VAAK-Redirect: ' . $target);
+        header('X-VAAK-View: status');
+        exit;
+    }
+    $shellSource = str_starts_with($shellObject, 'https://')
+        ? ap_masto_lookup_status_by_object_url($shellObject, 0, false, true) : null;
+    if ((is_array($shellSource) && (!admin_direct_status_allowed($shellSource, admin_owner_user_id())
+            || admin_direct_status_content_blocked($shellSource)))
+        || (vaak_is_local_url($shellObject) && !is_array($shellSource))) {
+        header('Cache-Control: private, no-store');
+        http_response_code(404);
+        exit;
+    }
+    $GLOBALS['vaak_status_shell'] = true;
+    $GLOBALS['vaak_status_shell_ob'] = ob_get_level();
+    ob_start();
+    if (function_exists('ap_auth_session_write_close')) ap_auth_session_write_close();
+}
+
 // AJAX fragment: Status Open — ancestors and/or replies (Mastodon-style progressive load)
 if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     $stObject = trim((string) ($_GET['object'] ?? ''));
@@ -20655,6 +20901,16 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
     } catch (Throwable $e) {
         error_log('[ap-admin] status thread partial: ' . $e->getMessage());
     }
+    // A known private/deleted/blocked source cannot authorize even a remote
+    // ensure. Unknown remote focus resolution retains its existing explicit
+    // Open path; context discovery still waits for the final source gate below.
+    $knownThreadSource = ap_masto_lookup_status_by_object_url($stObject, 0, false, true);
+    if ((is_array($knownThreadSource) && (!admin_direct_status_allowed($knownThreadSource, admin_owner_user_id())
+            || admin_direct_status_content_blocked($knownThreadSource)))
+        || (!is_array($knownThreadSource) && (is_array($stLocalStatus) || is_array($stEvent)))) {
+        http_response_code(404);
+        exit;
+    }
     // Live reply poll (while viewing a thread): skip focus re-ensure; just refresh context.
     $isThreadPoll = isset($_GET['poll']) && (string) $_GET['poll'] === '1' && $wantReplies && !$wantAncestors && !$wantFocus;
     // Always (re)fetch the focus/source Note first so in_reply_to + body are populated
@@ -20675,6 +20931,14 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         } catch (Throwable $e) {
             error_log('[ap-admin] thread focus ensure: ' . $e->getMessage());
         }
+    }
+    // Context discovery requires current access to the source post. A cached
+    // focus identifier alone cannot authorize ancestor/reply requests.
+    $sourceStatus = ap_masto_lookup_status_by_object_url($stObject, 0, false, true);
+    if (!is_array($sourceStatus) || !admin_direct_status_allowed($sourceStatus, admin_owner_user_id())
+        || admin_direct_status_content_blocked($sourceStatus)) {
+        http_response_code(404);
+        exit;
     }
     // Pull remote Mastodon context so parents + replies not yet in our firehose can appear
     if (($wantAncestors || $wantReplies) && function_exists('ap_masto_fetch_remote_context_uris')) {
@@ -20717,9 +20981,11 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         } catch (Throwable $e) {
         }
     }
+    $threadOutputLevel = ob_get_level();
+    ob_start();
     $stAncestors = [];
     $stDescendants = [];
-    if ($stStatusId !== '') {
+    if ($stStatusId !== '' && ($wantAncestors || $wantReplies)) {
         $ctx = ap_masto_status_context((int) $stStatusId, [
             'allow_fetch' => true,
             'max_ancestor_depth' => 12,
@@ -20727,6 +20993,17 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
         $stAncestors = admin_direct_filter_blocked_statuses(is_array($ctx['ancestors'] ?? null) ? $ctx['ancestors'] : []);
         $stDescendants = admin_direct_filter_blocked_statuses(is_array($ctx['descendants'] ?? null) ? $ctx['descendants'] : []);
     }
+    $emitThread = static function () use ($sourceStatus, $threadOutputLevel): void {
+        $html = (string) ob_get_clean();
+        if (!admin_direct_status_allowed($sourceStatus, admin_owner_user_id())
+            || admin_direct_status_content_blocked($sourceStatus)) {
+            while (ob_get_level() > $threadOutputLevel) ob_end_clean();
+            http_response_code(404);
+            exit;
+        }
+        echo $html;
+        exit;
+    };
     if ($wantFocus) {
         // Re-load local/event after ensure above
         $focusLocal = null;
@@ -20748,22 +21025,22 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
                 ap_masto_status_flags_prefetch([(string) $focusLocal['id']]);
             }
             admin_render_direct_status_card($focusLocal, $followingIds, $stFrom, true, false);
-            exit;
+            $emitThread();
         }
         if (is_array($focusEvent)) {
             if (admin_direct_event_content_blocked($focusEvent)) {
-                exit;
+                $emitThread();
             }
             if (admin_try_render_event_shared_card($focusEvent, $followingIds, $stFrom, true, false)) {
-                exit;
+                $emitThread();
             }
             admin_render_event_tweet($focusEvent, $followingIds, $stFrom);
-            exit;
+            $emitThread();
         }
         echo '<div class="meta">Couldn’t load this post yet. '
             . '<a href="?view=status&amp;object=' . h(urlencode($stObject))
             . '&amp;from=' . h($stFrom) . '&amp;refresh_thread=1">Retry</a></div>';
-        exit;
+        $emitThread();
     }
     if (function_exists('ap_masto_status_flags_prefetch')) {
         $ids = [];
@@ -20800,7 +21077,7 @@ if ($isPartial && $view === 'status' && isset($_GET['thread'])) {
             }
         }
     }
-    exit;
+    $emitThread();
 }
 
 /**
@@ -20890,7 +21167,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                     'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
                     'row' => $n,
                 ];
-                if ($item['sort'] <= $sinceTs || admin_timeline_item_muted_by_words($item)) {
+                if ($item['sort'] < $sinceTs
+                    || ($view === 'local' && !admin_local_timeline_item_allowed($item))
+                    || admin_timeline_item_muted_by_words($item)) {
                     continue;
                 }
                 $seen['o:' . $nid] = true;
@@ -20903,7 +21182,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                 $st = $db->prepare(
                     "SELECT {$leanEventCols} FROM events
                      WHERE type IN ('Create', 'Announce', 'Quote', 'QuotePost')
-                       AND action_taken IN ('log', 'local_observe')
+                       AND action_taken IN ('log', 'local_observe', 'compose')
                        AND actor_id LIKE 'https://mkultra.monster/users/%'
                        AND created_at > ?
                      ORDER BY created_at DESC, id DESC
@@ -20976,7 +21255,8 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
             $st = $db->prepare(
                 "SELECT {$leanEventCols} FROM events
                  WHERE type IN ('Create', 'Quote', 'QuotePost')
-                   AND action_taken IN ('log', 'local_observe')
+                   AND action_taken IN ('log', 'local_observe', 'compose')
+                   AND visibility = 'public'
                    AND actor_id LIKE 'https://mkultra.monster/users/%'
                    AND created_at > ?
                  ORDER BY created_at DESC, id DESC
@@ -21016,7 +21296,9 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
                         'sort' => strtotime((string) ($n['published'] ?? '')) ?: 0,
                         'row' => $n,
                     ];
-                    if ($item['sort'] <= $sinceTs || admin_timeline_item_muted_by_words($item)) {
+                    if ($item['sort'] < $sinceTs
+                    || ($view === 'local' && !admin_local_timeline_item_allowed($item))
+                    || admin_timeline_item_muted_by_words($item)) {
                         continue;
                     }
                     $seen['o:' . $nid] = true;
@@ -21590,10 +21872,11 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         }
         $newerT0 = microtime(true);
         $newerLimit = max(8, min(30, $tlLimit));
+        $freshAfterPost = (string) ($_GET['fresh_post'] ?? '') === '1';
         // Prefer the native Rust/Axum HTML painter for live Home inserts, just
         // as the initial/fill paths do. This prevents a successful Axum poll
         // from silently falling back to PHP's legacy Open/Remote action bar.
-        if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_since_html_fetch')) {
+        if (!$freshAfterPost && $view === 'home' && function_exists('ap_masto_timeline_home_axum_since_html_fetch')) {
             $axumHtml = ap_masto_timeline_home_axum_since_html_fetch(
                 $sinceTs,
                 $newerLimit,
@@ -21613,7 +21896,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         // Local and Federated use the same Rust painter when the warm head
         // already contains newer rows. A miss keeps the PHP query so a post
         // that fan-out has not hydrated yet is not hidden.
-        if (($view === 'local' || $view === 'feed')
+        if (!$freshAfterPost && ($view === 'local' || $view === 'feed')
             && function_exists('ap_masto_timeline_chrono_axum_since_html_fetch')) {
             $axumHtml = ap_masto_timeline_chrono_axum_since_html_fetch(
                 $view,
@@ -21634,7 +21917,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         }
         // Home: prefer Axum ranked+hydrate since (0.6.74). Confirmed empty must
         // short-circuit — do not fall through to multi-chunk PG fetch.
-        if ($view === 'home' && function_exists('ap_masto_timeline_home_axum_since_fetch')) {
+        if (!$freshAfterPost && $view === 'home' && function_exists('ap_masto_timeline_home_axum_since_fetch')) {
             $axumSince = ap_masto_timeline_home_axum_since_fetch(
                 $sinceTs,
                 $newerLimit,
@@ -27536,14 +27819,9 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <button class="btn btn-primary" type="submit" style="width:100%;margin-top:.55rem">Search</button>
       </form>
     </div>
-    <?php
-      // A direct Search load is a full document. Do not paint the warm trends
-      // cache before the results column is parsed — same deferral as admin pages.
-      $vaakDeferTrendsPaint = $view === 'search' || in_array($view, $vaakAdminOnlyViews, true);
-    ?>
     <div id="trends-sidebar"
          data-deferred="1"
-         data-paint-after="<?= $vaakDeferTrendsPaint ? '1' : '0' ?>"
+         data-paint-after="1"
          data-from="<?= h($view) ?>"
          data-cached-age="0"
          data-stale="0">
@@ -27570,19 +27848,22 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
 
 <?php endif; ?>
 <?php
-if (!empty($GLOBALS['vaak_profile_shell'])) {
-    $shellOb = (int) ($GLOBALS['vaak_profile_shell_ob'] ?? 0);
+if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell'])) {
+    $shellOb = (int) ($GLOBALS['vaak_profile_shell_ob'] ?? $GLOBALS['vaak_status_shell_ob'] ?? 0);
     while (ob_get_level() > $shellOb) {
         ob_end_clean();
     }
     if (!headers_sent()) {
         header('Content-Type: text/html; charset=utf-8');
         header('Cache-Control: no-store');
-        header('X-VAAK-View: remote_profile');
+        header('X-VAAK-View: ' . (!empty($GLOBALS['vaak_status_shell']) ? 'status' : 'remote_profile'));
     }
+    // Keep the center column buffered until canonical cards finish. Their
+    // action bars can reopen the session for CSRF after the early write-close.
+    ob_start();
 }
 ?>
-<?php if (empty($GLOBALS['vaak_profile_shell'])): ?>
+<?php if (empty($GLOBALS['vaak_profile_shell']) && empty($GLOBALS['vaak_status_shell'])): ?>
   <section class="main">
 <?php endif; ?>
     <div class="topbar<?= in_array($view, ['home', 'local', 'feed'], true) ? ' topbar-timeline' : '' ?>">
@@ -28224,33 +28505,11 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
 
         <?php if ($favNet === 'fedi'): ?>
           <?php
-            $favData = admin_library_data_axum_fetch($vaakOwnerId, 0, 40);
-            if (is_array($favData)) {
-                $favRows = [];
-                foreach ($favData['fedi_rows'] as $favRow) {
-                    if (is_array($favRow) && function_exists('ap_masto_interaction_row_to_status')) {
-                        $status = ap_masto_interaction_row_to_status($favRow, 'favourited');
-                        if (is_array($status)) $favRows[] = $status;
-                    }
-                }
-                $favHasMore = !empty($favData['has_more_fedi']);
-            } else {
-                $favRows = ap_masto_favourites_list(40, null);
-                $favHasMore = count($favRows) > 20;
-            }
-            // Bluesky likes mirrored into masto_favourites only have URL stubs.
-            $favRows = array_values(array_filter($favRows, static function ($st): bool {
-                if (!is_array($st)) {
-                    return false;
-                }
-                $sid = (string) ($st['id'] ?? '');
-                $uri = (string) ($st['uri'] ?? $st['url'] ?? '');
-                return !(str_starts_with($sid, 'bsky:')
-                    || str_starts_with($uri, 'at://')
-                    || str_contains($uri, 'bsky.app/'));
-            }));
-            $favHasMore = $favHasMore || count($favRows) > 20;
-            $favList = array_slice($favRows, 0, 20);
+            $favPage = admin_favourite_fedi_page((int) $vaakOwnerId, 0, 20);
+            $favList = $favPage['items'];
+            // The full PHP shell historically tests the hydrated count before
+            // protocol exclusion; soft navigation/AJAX use the filtered count.
+            $favHasMore = $favPage['hydrated_count'] > 20;
           ?>
           <?php if (!$favList): ?>
             <?= admin_mascot_empty('No Fediverse favourites yet.') ?>
@@ -29931,6 +30190,16 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
             <?php endforeach; ?>
           </div>
         <?php endif; ?>
+        <?php if (getenv('VAAK_SUPPORTER_CODES') === '1'): ?>
+        <form method="post" class="supporter-reward-form">
+          <input type="hidden" name="csrf" value="<?= h(ap_auth_csrf_token()) ?>">
+          <input type="hidden" name="action" value="redeem_supporter">
+          <label for="supporter-code">Supporter reward code</label>
+          <input id="supporter-code" name="supporter_code" autocomplete="off" maxlength="64" required>
+          <div class="meta">Paid Clearance supporters can redeem their code using the same account email. This awards a local Supporter badge.</div>
+          <button type="submit">Redeem Supporter code</button>
+        </form>
+        <?php endif; ?>
         <form class="composer profile-form" method="post" action="?view=profile" enctype="multipart/form-data">
           <input type="hidden" name="action" value="save_profile">
           <div class="profile-preview">
@@ -30007,9 +30276,9 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
           <textarea id="pf-forum-signature" name="forum_signature" maxlength="500" rows="3" placeholder="Shown below your Discuss posts…"><?= h((string) ($profile['forum_signature'] ?? '')) ?></textarea>
           <div class="meta" style="margin:.25rem 0 .75rem">Plain text only. HTML, scripts, and control characters are rejected.</div>
 
-          <?php $profileBadgeCatalog = ap_profile_badge_catalog($vaakActorKey === 'cmdr_nova'); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? [], $vaakActorKey === 'cmdr_nova'); ?>
+          <?php $profileBadgeCatalog = ap_profile_badge_catalog($vaakActorKey === 'cmdr_nova'); unset($profileBadgeCatalog['supporter']); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? [], $vaakActorKey === 'cmdr_nova'); ?>
           <details style="border:1px solid var(--border);border-radius:10px;padding:.55rem .75rem;margin:0 0 1rem">
-            <summary style="cursor:pointer;color:var(--text);font-weight:650">Profile badges <span class="meta">(up to 6 · <?= count($selectedProfileBadges) ?> selected)</span></summary>
+            <summary style="cursor:pointer;color:var(--text);font-weight:650">Profile badges <span class="meta">(up to 6 · <?= count(array_diff($selectedProfileBadges, ['supporter'])) ?> selected)</span></summary>
             <fieldset style="border:0;padding:.55rem 0 0;margin:0">
             <div class="meta" style="margin:0 0 .65rem">Optional flair shown on your HTML profile only. These badges are not federated.</div>
             <div class="meta" style="margin:0 0 .65rem">These badges are part of a test and more will be coming soon.</div>
@@ -35417,7 +35686,26 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
       <?php endif; ?>
       <button type="button" class="feed-top-btn" id="feed-top-btn" title="Back to top" aria-label="Back to top">↑</button>
     <?php endif; ?>
-<?php if (!empty($GLOBALS['vaak_profile_shell'])) { exit; } ?>
+<?php
+if (!empty($GLOBALS['vaak_status_shell'])) {
+    $statusShellHtml = (string) ob_get_clean();
+    $statusShellSource = ap_masto_lookup_status_by_object_url((string) ($stObject ?? ''), 0, false, true);
+    if (((is_array($shellSource ?? null) || is_array($stEvent ?? null) || is_array($stLocalStatus ?? null))
+            && !is_array($statusShellSource))
+        || (is_array($statusShellSource) && (!admin_direct_status_allowed($statusShellSource, admin_owner_user_id())
+            || admin_direct_status_content_blocked($statusShellSource)))) {
+        http_response_code(404);
+        exit;
+    }
+    echo $statusShellHtml;
+    exit;
+}
+if (!empty($GLOBALS['vaak_profile_shell'])) {
+    $profileShellHtml = (string) ob_get_clean();
+    echo $profileShellHtml;
+    exit;
+}
+?>
   </section>
 </div>
 
@@ -35462,7 +35750,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     // and account surfaces must leave the pretty profile route; otherwise a
     // soft-nav updates the content but a hard refresh re-enters remote_profile.
     const timelineViews = new Set(['home', 'local', 'feed']);
-    const appViews = new Set(['home', 'local', 'feed', 'mentions', 'asks', 'dms', 'favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists', 'profile', 'blog', 'rss', 'phyrian', 'queue', 'drafts', 'search']);
+    const appViews = new Set(['home', 'local', 'feed', 'mentions', 'asks', 'dms', 'favourites', 'bookmarks', 'followers', 'following', 'tags', 'collections', 'lists', 'profile', 'blog', 'rss', 'phyrian', 'queue', 'drafts', 'search', 'status']);
     const nextView = u.searchParams.get('view') || '';
     if (window.vaakIsPrettyProfilePath(original.pathname) && appViews.has(nextView)) {
       u.pathname = '/vaak/';
@@ -35894,9 +36182,28 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
   window.vaakSyncNavSelection();
 
   // Notification + DM badges and tab title
-  const notifView = <?= json_encode($view === 'mentions') ?>;
-  const dmView = <?= json_encode($view === 'dms') ?>;
-  const notifBaseTitle = <?= json_encode('VAAK · ' . view_title($view)) ?>;
+  let notifView = <?= json_encode($view === 'mentions') ?>;
+  let dmView = <?= json_encode($view === 'dms') ?>;
+  let notifBaseTitle = <?= json_encode('VAAK · ' . view_title($view)) ?>;
+  const canonicalViewTitles = <?= json_encode(array_combine($titleViews = ['home', 'local', 'feed', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status', 'remote_profile', 'rss', 'dms', 'blog'], array_map('view_title', $titleViews))) ?>;
+  let titleNotifCount = 0;
+  let titleDmCount = 0;
+  function renderCurrentInboxTitle() {
+    const n = notifView ? 0 : titleNotifCount;
+    const d = dmView ? 0 : titleDmCount;
+    const bits = [];
+    if (n > 0) bits.push(n > 99 ? '99+' : String(n));
+    if (d > 0) bits.push('✉' + (d > 99 ? '99+' : String(d)));
+    document.title = (bits.length ? '(' + bits.join(' · ') + ') ' : '') + notifBaseTitle;
+    setBadge(notifBadge, n);
+    setBadge(dmBadge, d);
+  }
+  window.vaakSetCurrentViewTitle = function (view, label) {
+    notifView = view === 'mentions';
+    dmView = view === 'dms';
+    notifBaseTitle = 'VAAK · ' + (label || canonicalViewTitles[view] || view);
+    renderCurrentInboxTitle();
+  };
   const notifBadge = document.getElementById('notif-badge');
   const dmBadge = document.getElementById('dm-badge');
   const phyrianBadge = document.getElementById('nav-phyrian-badge');
@@ -35959,12 +36266,9 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     if (opts && Object.prototype.hasOwnProperty.call(opts, 'phyrianPending')) {
       applyPhyrianPending(opts.phyrianPending);
     }
-    const titleBits = [];
-    if (n > 0 && !notifView) titleBits.push(n > 99 ? '99+' : String(n));
-    if (d > 0 && !dmView) titleBits.push('✉' + (d > 99 ? '99+' : String(d)));
-    document.title = titleBits.length
-      ? ('(' + titleBits.join(' · ') + ') ' + notifBaseTitle)
-      : notifBaseTitle;
+    titleNotifCount = Math.max(0, parseInt(notifCount, 10) || 0);
+    titleDmCount = Math.max(0, parseInt(dmCount, 10) || 0);
+    renderCurrentInboxTitle();
     // Tip tracking: only advance from a real unread tip; when caught up, pin to read marker.
     if (n > 0 && notifEventId !== '0') {
       if (lastNotifEventId === '' || lastNotifEventId === '0'
@@ -37161,12 +37465,17 @@ window.apAdminToast = function (msg, isErr) {
   });
 })();
 </script>
-<?php if ($view === 'status'): ?>
 <script>
 (function () {
+let stopThread = null;
+window.vaakStopStatusThread = function () { if (stopThread) stopThread(); stopThread = null; };
+window.vaakBootStatusThread = function () {
+  window.vaakStopStatusThread();
+  if (!document.querySelector('.status-back')) return false;
   /** Cancel all thread hydrate/poll fetches when leaving Status (Home click, back, etc.). */
   let threadAlive = true;
   let threadAbort = new AbortController();
+  const threadEvents = new AbortController();
   let replyPollTimer = null;
   let replyPollInterval = null;
   let replyPollBusy = false;
@@ -37175,15 +37484,17 @@ window.apAdminToast = function (msg, isErr) {
   function killThreadWork() {
     if (!threadAlive) return;
     threadAlive = false;
+    threadEvents.abort();
     try { threadAbort.abort(); } catch (e) {}
     if (replyPollTimer) { clearTimeout(replyPollTimer); replyPollTimer = null; }
     if (replyPollInterval) { clearInterval(replyPollInterval); replyPollInterval = null; }
     replyPollBusy = false;
   }
 
+  stopThread = killThreadWork;
   // Full navigation away from this page — abort before the next view competes for PHP-FPM.
-  window.addEventListener('pagehide', killThreadWork);
-  window.addEventListener('beforeunload', killThreadWork);
+  window.addEventListener('pagehide', killThreadWork, { signal: threadEvents.signal });
+  window.addEventListener('beforeunload', killThreadWork, { signal: threadEvents.signal });
   document.addEventListener('click', (ev) => {
     const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
     if (!a) return;
@@ -37191,10 +37502,12 @@ window.apAdminToast = function (msg, isErr) {
     if (a.target && a.target !== '' && a.target !== '_self') return;
     const href = a.getAttribute('href') || '';
     if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+    // Opening the shared composer stays within the same thread.
+    if (/[?&](?:compose=|view=compose(?:&|$))/.test(href)) return;
     // Same-page status refresh / Retry — keep work alive.
     if (href.indexOf('view=status') !== -1 && href.indexOf('object=') !== -1) return;
     killThreadWork();
-  }, true);
+  }, { capture: true, signal: threadEvents.signal });
 
   function threadFetch(url, init) {
     if (!threadAlive) return Promise.reject(new DOMException('Thread left', 'AbortError'));
@@ -37221,7 +37534,10 @@ window.apAdminToast = function (msg, isErr) {
       const after = focus.getBoundingClientRect().top;
       const delta = after - before;
       if (Math.abs(delta) > 1) {
-        window.scrollBy(0, delta);
+        const feed = focus.closest('.feed');
+        const overflow = feed ? getComputedStyle(feed).overflowY : '';
+        if (feed && (overflow === 'auto' || overflow === 'scroll')) feed.scrollTop += delta;
+        else window.scrollBy(0, delta);
       }
     }
   }
@@ -37266,8 +37582,7 @@ window.apAdminToast = function (msg, isErr) {
             if (loading) loading.remove();
             return;
           }
-          box.innerHTML = html;
-          box.dataset.seenCount = String(newCount);
+          mergeNewReplies(box, html);
         }
         if (typeof window.novaEnhanceTweetFolds === 'function') {
           window.novaEnhanceTweetFolds(box);
@@ -37386,15 +37701,15 @@ window.apAdminToast = function (msg, isErr) {
   /** Object URL key for a reply card (used to detect newly arrived replies). */
   function replyCardKey(el) {
     if (!el || !el.querySelector) return '';
-    const link = el.querySelector('a[href*="object="]');
-    if (link) {
-      const href = link.getAttribute('href') || '';
-      const m = href.match(/[?&]object=([^&]+)/);
-      if (m) {
-        try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
-      }
+    const sourceKey = el.dataset.noteId || el.dataset.objectId;
+    if (sourceKey) return sourceKey;
+    for (const link of el.querySelectorAll('a[href*="object="]')) {
+      try {
+        const object = new URL(link.href, window.location.href).searchParams.get('object');
+        if (object) return object;
+      } catch (e) {}
     }
-    return (el.id || '') || ('txt:' + (el.textContent || '').slice(0, 64));
+    return el.id || '';
   }
 
   function mergeNewReplies(box, html) {
@@ -37414,8 +37729,8 @@ window.apAdminToast = function (msg, isErr) {
     const added = [];
     incoming.forEach((el) => {
       const k = replyCardKey(el);
-      if (!k || known[k]) return;
-      known[k] = true;
+      if (k && known[k]) return;
+      if (k) known[k] = true;
       added.push(el);
     });
     if (!added.length) {
@@ -37470,6 +37785,34 @@ window.apAdminToast = function (msg, isErr) {
       .finally(() => { replyPollBusy = false; });
   }
 
+  window.vaakHydrateEditedThreadPost = async function (noteId) {
+    if (!threadAlive || !noteId) return false;
+    const old = Array.from(document.querySelectorAll('section.main article.tweet'))
+      .find(card => replyCardKey(card) === noteId);
+    if (!old) return false;
+    const res = await threadFetch('/vaak/?view=status&partial=1&thread=focus&object=' + encodeURIComponent(noteId));
+    if (!res.ok || !threadAlive || !old.isConnected) return false;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = await res.text();
+    const card = tmp.querySelector('article.tweet');
+    if (!card || !threadAlive || !old.isConnected) return false;
+    withFocusAnchor(() => old.replaceWith(card));
+    if (typeof window.novaEnhanceTweetFolds === 'function') window.novaEnhanceTweetFolds(card);
+    return true;
+  };
+  window.vaakHydratePublishedThreadReply = async function (noteId) {
+    if (!threadAlive) return false;
+    const box = document.getElementById('status-thread-descendants');
+    if (!box || !box.dataset.object || !noteId) return false;
+    const res = await threadFetch('/vaak/?view=status&partial=1&thread=published&object='
+      + encodeURIComponent(box.dataset.object) + '&note_id=' + encodeURIComponent(noteId)
+      + '&from=' + encodeURIComponent(box.dataset.from || 'home'));
+    if (!res.ok || !threadAlive || !box.isConnected) return false;
+    const html = await res.text();
+    if (!threadAlive || !box.isConnected) return false;
+    withFocusAnchor(() => mergeNewReplies(box, html));
+    return true;
+  };
   loadFocusThenThread();
   // Live replies: wait for first hydrate, then quiet origin rechecks.
   replyPollTimer = setTimeout(pollThreadReplies, 20000);
@@ -37484,10 +37827,12 @@ window.apAdminToast = function (msg, isErr) {
       return;
     }
     pollThreadReplies();
-  });
+  }, { signal: threadEvents.signal });
+  return true;
+};
+window.vaakBootStatusThread();
 })();
 </script>
-<?php endif; ?>
 
 <script>
 (function () {
@@ -37711,7 +38056,9 @@ window.apAdminToast = function (msg, isErr) {
   let newestTs = parseInt(items.dataset.newest || '0', 10) || Math.floor(Date.now() / 1000);
   let pendingHtml = '';
   let pendingCount = 0;
+  let pendingSourceCount = 0;
   let pollBusy = false;
+  let timelineGeneration = 0;
   let tabSwapBusy = false;
   // Long-lived SSE requests consume PHP-FPM workers even when idle. Keep the
   // bounded polling fallback as the default; operators can opt into SSE only
@@ -37752,36 +38099,52 @@ window.apAdminToast = function (msg, isErr) {
     root.insertBefore(ptrEl, root.firstChild);
   }
 
+  function timelineCardKey(el) {
+    if (!el || !el.getAttribute) return '';
+    const timelineKey = el.getAttribute('data-timeline-key') || '';
+    if (timelineKey) return 'timeline:' + timelineKey;
+    const tip = el.querySelector('.tweet-thread-seg--tip') || el;
+    const rid = tip.getAttribute('data-rss-item') || '';
+    if (rid) return 'rss:' + rid;
+    const bskyUri = tip.getAttribute('data-bsky-uri') || '';
+    if (bskyUri) return 'bsky:' + bskyUri;
+    const noteId = tip.getAttribute('data-note-id') || '';
+    if (noteId) return noteId.replace(/\/$/, '');
+    const link = tip.querySelector('a[href*="object="]');
+    if (link) {
+      const m = (link.getAttribute('href') || '').match(/[?&]object=([^&]+)/);
+      if (m) {
+        try { return decodeURIComponent(m[1]).replace(/\/$/, ''); } catch (e) {}
+      }
+    }
+    return 'node:' + (tip.textContent || '').slice(0, 64);
+  }
+
   function seenKeys() {
     const keys = {};
-    items.querySelectorAll('[data-timeline-key]').forEach((el) => {
-      const timelineKey = el.getAttribute('data-timeline-key') || '';
-      if (timelineKey) keys['timeline:' + timelineKey] = true;
-    });
-    // RSS: lean Axum + PHP shared cards stamp data-rss-item; newer=1 used to
-    // re-paint the same item with different who/text so textContent keys missed.
-    items.querySelectorAll('article[data-rss-item]').forEach((el) => {
-      const rid = el.getAttribute('data-rss-item') || '';
-      if (rid) keys['rss:' + rid] = true;
-    });
-    items.querySelectorAll('a[href*="object="]').forEach((a) => {
-      const href = a.getAttribute('href') || '';
-      const m = href.match(/[?&]object=([^&]+)/);
-      if (m) keys[decodeURIComponent(m[1])] = true;
-    });
-    items.querySelectorAll('article[data-bsky-uri]').forEach((el) => {
-      const uri = el.getAttribute('data-bsky-uri') || '';
-      if (uri) keys['bsky:' + uri] = true;
-    });
-    items.querySelectorAll('[data-note-id]').forEach((el) => {
-      const noteId = el.getAttribute('data-note-id') || '';
-      if (noteId) keys['note:' + noteId.replace(/\/$/, '')] = true;
-    });
-    items.querySelectorAll('article.tweet').forEach((el, i) => {
-      // Keep this fallback identical to filterNewHtml(); the element id is
-      // not stable between the optimistic card and the polling response.
-      keys['node:' + (el.textContent || '').slice(0, 64)] = true;
-    });
+    const add = (scope) => {
+      scope.querySelectorAll('article.tweet, .tweet-thread-seg').forEach((el) => {
+        const key = timelineCardKey(el);
+        if (key) keys[key] = true;
+        const timelineKey = el.getAttribute('data-timeline-key') || '';
+        if (timelineKey) keys['timeline:' + timelineKey] = true;
+        const rid = el.getAttribute('data-rss-item') || '';
+        if (rid) keys['rss:' + rid] = true;
+        const bsky = el.getAttribute('data-bsky-uri') || '';
+        if (bsky) keys['bsky:' + bsky] = true;
+        const note = el.getAttribute('data-note-id') || '';
+        if (note) keys[note.replace(/\/$/, '')] = true;
+        el.querySelectorAll('a[href*="object="]').forEach((link) => {
+          const m = (link.getAttribute('href') || '').match(/[?&]object=([^&]+)/);
+          if (m) { try { keys[decodeURIComponent(m[1]).replace(/\/$/, '')] = true; } catch (e) {} }
+        });
+      });
+    };
+    add(items);
+    // Poll overlap also includes cards waiting behind the New posts button.
+    const pending = document.createElement('div');
+    pending.innerHTML = pendingHtml;
+    add(pending);
     return keys;
   }
 
@@ -37789,41 +38152,41 @@ window.apAdminToast = function (msg, isErr) {
     const wrap = document.createElement('div');
     wrap.innerHTML = (html || '').trim();
     const known = seenKeys();
-    const keep = [];
+    // Raw selected entries and painted thread wrappers are different counts.
+    // Count new top-level source entries before folding their shared parent.
+    const sourceKnown = Object.assign({}, known);
+    let sourceCount = 0;
     Array.from(wrap.children).forEach((el) => {
-      let key = '';
-      if (el.getAttribute) {
-        const timelineKey = el.getAttribute('data-timeline-key') || '';
-        if (timelineKey) key = 'timeline:' + timelineKey;
-      }
-      if (!key && el.getAttribute) {
-        const rid = el.getAttribute('data-rss-item') || '';
-        if (rid) key = 'rss:' + rid;
-      }
-      const link = !key && el.querySelector && el.querySelector('a[href*="object="]');
-      if (link) {
-        const href = link.getAttribute('href') || '';
-        const m = href.match(/[?&]object=([^&]+)/);
-        if (m) key = decodeURIComponent(m[1]);
-      }
-      if (!key && el.getAttribute) {
-        const bskyUri = el.getAttribute('data-bsky-uri') || '';
-        if (bskyUri) key = 'bsky:' + bskyUri;
-      }
-      if (!key && el.getAttribute) {
-        const noteId = el.getAttribute('data-note-id') || '';
-        if (noteId) key = 'note:' + noteId.replace(/\/$/, '');
-      }
-      if (!key) {
-        key = 'node:' + (el.textContent || '').slice(0, 64);
-      }
-      if (known[key]) return;
-      known[key] = true;
-      keep.push(el);
+      const key = timelineCardKey(el);
+      if (!sourceKnown[key]) { sourceKnown[key] = true; sourceCount++; }
     });
     const out = document.createElement('div');
-    keep.forEach((el) => out.appendChild(el));
-    return { html: out.innerHTML, count: keep.length };
+    Array.from(wrap.children).forEach((el) => {
+      const key = timelineCardKey(el);
+      if (known[key]) return;
+      known[key] = true;
+      out.appendChild(el);
+    });
+    out.querySelectorAll('article.tweet-thread .tweet-thread-seg--ancestor').forEach((ancestor) => {
+      const key = timelineCardKey(ancestor);
+      Array.from(out.children).forEach((candidate) => {
+        if (!candidate.classList.contains('tweet-thread') && timelineCardKey(candidate) === key) candidate.remove();
+      });
+    });
+    return { html: out.innerHTML, count: out.children.length, sourceCount };
+  }
+
+  function reconcileThreadAncestors(scope) {
+    // A freshly returned thread owns its ancestor. Remove the already painted
+    // standalone parent only when the new thread is actually inserted.
+    scope.querySelectorAll('article.tweet-thread').forEach((thread) => {
+      thread.querySelectorAll('.tweet-thread-seg--ancestor').forEach((ancestor) => {
+        const key = timelineCardKey(ancestor);
+        Array.from(items.children).forEach((existing) => {
+          if (timelineCardKey(existing) === key) existing.remove();
+        });
+      });
+    });
   }
 
   function nearTop() {
@@ -37872,12 +38235,16 @@ window.apAdminToast = function (msg, isErr) {
       return;
     }
     const html = pendingHtml;
-    const count = pendingCount;
+    const count = pendingSourceCount || pendingCount;
     pendingHtml = '';
     pendingCount = 0;
+    pendingSourceCount = 0;
     updateNewBtn();
     const prevHeight = sc.height();
     const prevTop = sc.top();
+    const incoming = document.createElement('div');
+    incoming.innerHTML = html;
+    reconcileThreadAncestors(incoming);
     items.insertAdjacentHTML('afterbegin', html);
     offset += count;
     items.dataset.offset = String(offset);
@@ -37895,20 +38262,38 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
-  async function pollNewer() {
+  let pollPromise = null;
+  async function pollNewer(options) {
+    const force = !!(options && options.freshPost);
+    while (pollPromise) {
+      await pollPromise;
+      if (!force) return;
+    }
+    pollPromise = performPollNewer(options);
+    try { await pollPromise; } finally { pollPromise = null; }
+  }
+
+  async function performPollNewer(options) {
+    const force = !!(options && options.freshPost);
     // Every standard timeline may poll, but the server scopes the query to
     // the active view (Home, Local, or Federated).
     if (!['home', 'local', 'feed'].includes(viewName)) return;
     if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
-    if (pollBusy || document.hidden) return;
+    if (pollBusy || (document.hidden && !force)) return;
     if (!items || !items.isConnected) return;
+    const requestItems = items;
+    const requestView = viewName;
+    const requestGeneration = timelineGeneration;
+    const publishedTs = options && options.published ? Math.floor(Date.parse(options.published) / 1000) : 0;
+    const since = force && publishedTs > 0 ? Math.min(newestTs, publishedTs - 1) : newestTs;
     pollBusy = true;
     const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     const abortTimer = ac ? window.setTimeout(() => { try { ac.abort(); } catch (e) {} }, 20000) : 0;
     try {
       const url = '?view=' + encodeURIComponent(viewName)
-        + '&partial=1&newer=1&since=' + encodeURIComponent(String(newestTs))
+        + '&partial=1&newer=1&since=' + encodeURIComponent(String(since))
+        + (force ? '&fresh_post=1' : '')
         + '&limit=' + encodeURIComponent(String(Math.min(24, limit)));
       const res = await fetch(url, {
         credentials: 'same-origin',
@@ -37921,10 +38306,12 @@ window.apAdminToast = function (msg, isErr) {
         return;
       }
       if (!res.ok) return;
+      if (items !== requestItems || viewName !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
       const newestHdr = parseInt(res.headers.get('X-Newest') || '0', 10);
       if (newestHdr > newestTs) newestTs = newestHdr;
       items.dataset.newest = String(newestTs);
       const raw = await res.text();
+      if (items !== requestItems || viewName !== requestView || timelineGeneration !== requestGeneration || !requestItems.isConnected) return;
       if (typeof window.vaakLooksLikeLoginHtml === 'function' && window.vaakLooksLikeLoginHtml(raw)) {
         window.vaakRedirectToLogin('poll-html');
         return;
@@ -37934,6 +38321,7 @@ window.apAdminToast = function (msg, isErr) {
       if (!filtered.count) return;
       pendingHtml = filtered.html + pendingHtml;
       pendingCount += filtered.count;
+      pendingSourceCount += filtered.sourceCount;
       updateNewBtn();
     } catch (e) {
       // quiet — Refresh still works; abort/timeout must not stick pollBusy
@@ -38486,6 +38874,7 @@ window.apAdminToast = function (msg, isErr) {
           if (!filtered.count) return;
           pendingHtml = filtered.html + pendingHtml;
           pendingCount += filtered.count;
+      pendingSourceCount += filtered.sourceCount;
           updateNewBtn();
         } catch (e) {}
       });
@@ -38546,11 +38935,13 @@ window.apAdminToast = function (msg, isErr) {
   setTimeout(() => { pollNewer(); syncTimelineStreamVisibility(); }, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
-  window.novaRefreshTimelinePreservingPosition = async function () {
-    await pollNewer();
+  window.novaRefreshTimelinePreservingPosition = async function (options) {
+    if (!items || !items.isConnected || !['home', 'local', 'feed'].includes(viewName)) return false;
+    await pollNewer(options);
     // insertPending keeps the currently visible content anchored by the exact
     // height added above it whenever the reader is away from the feed head.
     insertPending({ scrollToTop: false });
+    return true;
   };
 
   function loadDeferredSuggestions() {
@@ -38595,6 +38986,7 @@ window.apAdminToast = function (msg, isErr) {
     syncTimelineKindFlags();
     if (nextView === viewName && !push) return true;
     window.__vaakNavigationPending = true;
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
     // The old view's stream/fallback poll must not keep running while the
     // replacement timeline is being rendered.
     stopTimelineStream();
@@ -38626,10 +39018,12 @@ window.apAdminToast = function (msg, isErr) {
       hasMore = res.headers.get('X-Has-More') === '1';
       const nextOff = parseInt(res.headers.get('X-Next-Offset') || String(limit), 10);
       offset = nextOff > 0 ? nextOff : limit;
+      timelineGeneration++;
       viewName = nextView;
       syncTimelineKindFlags();
       pendingHtml = '';
       pendingCount = 0;
+      pendingSourceCount = 0;
       updateNewBtn();
       items.innerHTML = html;
       items.dataset.view = nextView;
@@ -38717,7 +39111,10 @@ window.apAdminToast = function (msg, isErr) {
             })();
         history.pushState({ vaakTl: nextView }, '', href);
       }
-      document.title = (TL_TITLES[nextView] || nextView) + ' · VAAK';
+      if (items.isConnected && document.getElementById('timeline-items') === items
+          && typeof window.vaakSetCurrentViewTitle === 'function') window.vaakSetCurrentViewTitle(nextView);
+      if (items.isConnected && document.getElementById('timeline-items') === items
+          && typeof window.novaSetDeferredTrendsView === 'function') window.novaSetDeferredTrendsView(nextView);
       return true;
     } catch (e) {
       window.location.href = '?view=' + encodeURIComponent(nextView);
@@ -38739,6 +39136,19 @@ window.apAdminToast = function (msg, isErr) {
     }
   }
 
+  window.vaakRestoreTimelinePosition = async function (position) {
+    const restoreItems = items;
+    const generation = timelineGeneration;
+    const target = Math.max(0, Number(position.offset) || 0);
+    while (hasMore && offset < target && items === restoreItems && items.isConnected
+        && generation === timelineGeneration) {
+      if (loading) { await new Promise(resolve => setTimeout(resolve, 30)); continue; }
+      const previous = offset;
+      await loadMore();
+      if (offset <= previous) break;
+    }
+    return items === restoreItems && items.isConnected && generation === timelineGeneration;
+  };
   window.vaakSwapTimelineView = swapTimelineView;
   window.vaakBootTimeline = function (nextView) {
     // Soft-nav landed on a timeline page while this boot script is still alive.
@@ -38754,6 +39164,7 @@ window.apAdminToast = function (msg, isErr) {
     status = document.getElementById('timeline-status');
     sentinel = document.getElementById('timeline-sentinel');
     if (!items) return false;
+    timelineGeneration++;
     viewName = items.dataset.view || nextView;
     syncTimelineKindFlags();
     offset = parseInt(items.dataset.offset || '0', 10) || 0;
@@ -38769,6 +39180,7 @@ window.apAdminToast = function (msg, isErr) {
     }
     pendingHtml = '';
     pendingCount = 0;
+    pendingSourceCount = 0;
     notifMaxId = items.dataset.maxId || '';
     notifFilter = items.dataset.filter || 'all';
     bskyCursor = items.dataset.cursor || '';
@@ -38851,12 +39263,12 @@ window.apAdminToast = function (msg, isErr) {
 // Soft-nav for primary left-rail / timeline destinations. Keeps rails + CSS;
 // swaps section.main. Falls back to full navigation when a shell or boot is missing.
 (function () {
-  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search']);
+  const SOFT_VIEWS = new Set(['home', 'local', 'feed', 'mentions', 'outbox', 'favourites', 'bookmarks', 'following', 'followers', 'search', 'status']);
   const TL_TITLES = {
     home: 'Home', local: 'Local', feed: 'Federation feed',
     mentions: 'Notifications', outbox: 'Your posts',
     favourites: 'Favourites', bookmarks: 'Bookmarks',
-    following: 'Following', followers: 'Followers', search: 'Search'
+    following: 'Following', followers: 'Followers', search: 'Search', status: 'Post'
   };
   let busy = false;
   let leaving = false;
@@ -38876,6 +39288,7 @@ window.apAdminToast = function (msg, isErr) {
     leaving = true;
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     window.__vaakNavigationPending = true;
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     // Absolute /vaak/ path: relative ?view= on /users/{key} would reload the profile
     // when <base> is missing; with <base href="/vaak/"> it works, but stay explicit.
@@ -38925,7 +39338,7 @@ window.apAdminToast = function (msg, isErr) {
     document.body.classList.remove('dm-fullscreen', 'dm-peer-open', 'blog-fullscreen');
     if (view === 'dms') document.body.classList.add('dm-fullscreen');
     else if (view === 'blog') document.body.classList.add('blog-fullscreen');
-    document.title = (TL_TITLES[view] || view) + ' · VAAK';
+    if (typeof window.vaakSetCurrentViewTitle === 'function') window.vaakSetCurrentViewTitle(view);
     const mobileTitle = document.querySelector('.mobile-topbar__title');
     if (mobileTitle) mobileTitle.innerHTML = '<span>VAAK</span> · ' + (TL_TITLES[view] || view);
     document.querySelectorAll('#admin-rail-left a[href*="view="]').forEach((a) => {
@@ -38939,7 +39352,8 @@ window.apAdminToast = function (msg, isErr) {
     const trends = document.getElementById('trends-sidebar');
     if (trends) {
       trends.dataset.from = view;
-      if (typeof window.novaLoadDeferredTrends === 'function') window.novaLoadDeferredTrends(false);
+      if (typeof window.novaSetDeferredTrendsView === 'function') window.novaSetDeferredTrendsView(view);
+      else if (typeof window.novaLoadDeferredTrends === 'function') window.novaLoadDeferredTrends(false);
     }
     if (view === 'mentions') {
       const badge = document.getElementById('notif-badge');
@@ -39173,11 +39587,25 @@ window.apAdminToast = function (msg, isErr) {
     io.observe(sentinel);
   }
 
+  function statusViewFromAnchor(link) {
+    if (!link || link.hasAttribute('download') || (link.target && link.target !== '_self')) return '';
+    try {
+      const u = new URL(link.href, window.location.href);
+      if (u.origin !== window.location.origin || !['/vaak/', '/vaak'].includes(u.pathname)) return '';
+      return u.searchParams.get('view') === 'status' && u.searchParams.get('object') ? 'status' : '';
+    } catch (e) { return ''; }
+  }
+
   function softNavExtrasFromLink(link) {
     const extra = {};
     if (!link) return extra;
     const linkUrl = new URL(link.href, window.location.href);
-    const view = link.getAttribute('data-vaak-soft-nav') || '';
+    const view = link.getAttribute('data-vaak-soft-nav') || statusViewFromAnchor(link);
+    if (view === 'status') {
+      extra.object = linkUrl.searchParams.get('object') || '';
+      extra.from = linkUrl.searchParams.get('from') || 'home';
+      if (linkUrl.searchParams.get('refresh_thread')) extra.refresh_thread = '1';
+    }
     if (view === 'favourites') {
       extra.network = link.getAttribute('data-fav-network')
         || linkUrl.searchParams.get('network')
@@ -39341,6 +39769,64 @@ window.apAdminToast = function (msg, isErr) {
     io.observe(sentinel);
   }
 
+  // The soft controller restores fresh canonical content itself. Browser auto
+  // restoration otherwise races the newly installed column on popstate.
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+
+  function positionCardKey(card) {
+    if (!card) return '';
+    if (card.dataset.noteId || card.dataset.objectId) return card.dataset.noteId || card.dataset.objectId;
+    // Canonical cards expose their source in their own actions, while embedded
+    // quotes/body/author links can refer to an entirely different post.
+    for (const link of card.querySelectorAll('.tweet-actions a[href]')) {
+      if (link.closest('article.tweet') !== card || link.closest('.quote-post, .tweet-quote')) continue;
+      try {
+        const url = new URL(link.getAttribute('href'), location.href);
+        if (url.origin === location.origin && url.searchParams.get('view') === 'status'
+            && url.searchParams.get('object')) return url.searchParams.get('object');
+      } catch (e) {}
+    }
+    return card.id || '';
+  }
+
+  function saveViewPosition() {
+    const feed = document.querySelector('section.main .feed');
+    const items = document.getElementById('timeline-items');
+    const style = feed ? getComputedStyle(feed) : null;
+    const inFeed = style && ['auto', 'scroll'].includes(style.overflowY);
+    const bounds = inFeed ? feed.getBoundingClientRect() : { top: 0 };
+    const anchor = items ? Array.from(items.children).find(el => el.getBoundingClientRect().bottom > bounds.top) : null;
+    const position = { top: feed ? feed.scrollTop : 0, window: window.scrollY || 0,
+      offset: items ? Number(items.dataset.offset) || 0 : 0,
+      anchor: positionCardKey(anchor),
+      anchorTop: anchor ? anchor.getBoundingClientRect().top - bounds.top : 0 };
+    history.replaceState(Object.assign({}, history.state || {}, { vaakPosition: position }), '', location.href);
+  }
+
+  async function restoreViewPosition(main, position) {
+    if (!position) return;
+    if (main.querySelector('#timeline-items') && typeof window.vaakRestoreTimelinePosition === 'function') {
+      // A profile fallback can have its own loader while the generic timeline
+      // closure still points to a detached view. Do not discard saved offsets
+      // merely because that loader cannot restore this installed column.
+      await window.vaakRestoreTimelinePosition(position);
+    }
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (!main.isConnected || document.querySelector('section.main') !== main) return;
+    const feed = main.querySelector('.feed');
+    const inFeed = feed && ['auto', 'scroll'].includes(getComputedStyle(feed).overflowY);
+    const anchor = position.anchor ? Array.from(main.querySelectorAll('#timeline-items > *'))
+      .find(el => positionCardKey(el) === position.anchor) : null;
+    if (feed) feed.scrollTop = Math.max(0, Number(position.top) || 0);
+    window.scrollTo(0, Math.max(0, Number(position.window) || 0));
+    if (anchor) {
+      const delta = anchor.getBoundingClientRect().top - (inFeed ? feed.getBoundingClientRect().top : 0)
+        - (Number(position.anchorTop) || 0);
+      if (inFeed) feed.scrollTop += delta;
+      else window.scrollBy(0, delta);
+    }
+  }
+
   function parkComposer() {
     if (typeof window.vaakParkComposerForSoftNav === 'function') {
       try { window.vaakParkComposerForSoftNav(); } catch (e) {}
@@ -39365,6 +39851,7 @@ window.apAdminToast = function (msg, isErr) {
   }
 
   async function softNavProfile(targetOrHref, push) {
+    const restorePosition = push === false && history.state ? history.state.vaakPosition : null;
     let target = targetOrHref;
     if (typeof targetOrHref === 'string') {
       const stub = document.createElement('a');
@@ -39385,8 +39872,10 @@ window.apAdminToast = function (msg, isErr) {
       window.location.assign(target.historyHref || '/vaak/');
       return;
     }
+    if (push !== false) saveViewPosition();
     busy = true;
     window.__vaakNavigationPending = true;
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
     if (typeof window.vaakCloseMobileNav === 'function') window.vaakCloseMobileNav();
     if (typeof window.vaakShowLoading === 'function') window.vaakShowLoading('Loading…');
     stopProfileScroll();
@@ -39394,6 +39883,7 @@ window.apAdminToast = function (msg, isErr) {
       try { window.vaakAbortNotifScroll(); } catch (e) {}
     }
     parkComposer();
+    if (typeof window.vaakStopStatusThread === 'function') window.vaakStopStatusThread();
     try { main.innerHTML = '<div class="vaak-soft-loading" role="status" aria-live="polite" aria-busy="true"></div>'; } catch (e) {}
     try {
       let url = '?view=remote_profile&partial=1&shell=1&actor=' + encodeURIComponent(target.actor);
@@ -39431,7 +39921,7 @@ window.apAdminToast = function (msg, isErr) {
       document.body.classList.remove('dm-fullscreen', 'dm-peer-open', 'blog-fullscreen');
       const h1 = main.querySelector('.topbar h1');
       const title = h1 ? String(h1.textContent || '').trim() : 'Profile';
-      document.title = (title || 'Profile') + ' · VAAK';
+      if (typeof window.vaakSetCurrentViewTitle === 'function') window.vaakSetCurrentViewTitle('remote_profile', title || 'Profile');
       const mobileTitle = document.querySelector('.mobile-topbar__title');
       if (mobileTitle) mobileTitle.textContent = 'VAAK · ' + (title || 'Profile');
       document.querySelectorAll('#admin-rail-left a.active').forEach((a) => a.classList.remove('active'));
@@ -39460,6 +39950,9 @@ window.apAdminToast = function (msg, isErr) {
         bindProfileScrollFallback(main);
       }
       bindFeedTopBtn(main);
+      await restoreViewPosition(main, restorePosition);
+      if (main.isConnected && document.querySelector('section.main') === main
+          && typeof window.novaSetDeferredTrendsView === 'function') window.novaSetDeferredTrendsView('remote_profile');
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       window.__vaakNavigationPending = false;
     } catch (e) {
@@ -39480,6 +39973,7 @@ window.apAdminToast = function (msg, isErr) {
     view = String(view || '');
     filter = filter == null ? '' : String(filter);
     extra = extra && typeof extra === 'object' ? extra : {};
+    const restorePosition = push === false && history.state ? history.state.vaakPosition : null;
     if (!SOFT_VIEWS.has(view)) return;
     stopProfileScroll();
     // Stuck leaving (hardNav same-URL no-op) used to make every later Home tap
@@ -39520,8 +40014,10 @@ window.apAdminToast = function (msg, isErr) {
     const main = document.querySelector('section.main');
     if (!main) { hardNav(view, filter, extra); return; }
 
+    if (push !== false) saveViewPosition();
     busy = true;
     window.__vaakNavigationPending = true;
+    if (typeof window.novaInvalidateDeferredTrends === 'function') window.novaInvalidateDeferredTrends();
     // Always abort prior Mentions scroll work — including Mentions→Mentions
     // filter swaps — so loadInitial cannot append twice onto a live shell.
     if (typeof window.vaakAbortNotifScroll === 'function') {
@@ -39545,6 +40041,7 @@ window.apAdminToast = function (msg, isErr) {
         }
       }
     }
+    if (typeof window.vaakStopStatusThread === 'function') window.vaakStopStatusThread();
     // Replace main immediately so slow shells show a spinner instead of stale content.
     try {
       // Keep the shell visually empty while the detached global indicator
@@ -39554,6 +40051,10 @@ window.apAdminToast = function (msg, isErr) {
     try {
       let url = '/vaak/?view=' + encodeURIComponent(view) + '&partial=1&shell=1&limit='
         + encodeURIComponent(view === 'mentions' ? '12' : (view === 'outbox' ? '20' : '15'));
+      if (view === 'status') {
+        url += '&object=' + encodeURIComponent(extra.object || '') + '&from=' + encodeURIComponent(extra.from || 'home');
+        if (extra.refresh_thread) url += '&refresh_thread=1';
+      }
       if (view === 'mentions' && filter) url += '&notification_filter=' + encodeURIComponent(filter);
       if (view === 'favourites' && extra.network) url += '&network=' + encodeURIComponent(extra.network);
       if ((view === 'following' || view === 'followers') && extra.network) {
@@ -39575,6 +40076,18 @@ window.apAdminToast = function (msg, isErr) {
         leaving = true;
         if (typeof window.vaakRedirectToLogin === 'function') window.vaakRedirectToLogin('softNav');
         else hardNav(view, filter, extra);
+        return;
+      }
+      if (view === 'status' && res.headers.get('X-VAAK-Redirect')) {
+        const target = new URL(res.headers.get('X-VAAK-Redirect'), location.href);
+        if (!['https:', 'http:'].includes(target.protocol)) throw new Error('invalid-post-redirect');
+        leaving = true;
+        location.assign(target.href);
+        return;
+      }
+      if (view === 'status' && res.status === 404) {
+        main.innerHTML = '<div class="empty">This post is unavailable.</div>';
+        updateChrome(view);
         return;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -39609,6 +40122,11 @@ window.apAdminToast = function (msg, isErr) {
         const href = (typeof window.vaakAppHistoryUrl === 'function')
           ? window.vaakAppHistoryUrl((u) => {
               u.searchParams.set('view', view);
+              if (view === 'status') {
+                u.searchParams.set('object', extra.object || '');
+                u.searchParams.set('from', extra.from || 'home');
+              } else { u.searchParams.delete('object'); u.searchParams.delete('from'); }
+              u.searchParams.delete('refresh_thread');
               u.searchParams.delete('_r');
               if (view === 'mentions' && filter && filter !== 'all') u.searchParams.set('notification_filter', filter);
               else u.searchParams.delete('notification_filter');
@@ -39649,7 +40167,9 @@ window.apAdminToast = function (msg, isErr) {
         if (foldRoot) window.novaEnhanceTweetFolds(foldRoot);
       }
       bindFeedTopBtn(main);
-      if (view === 'mentions') {
+      if (view === 'status') {
+        if (typeof window.vaakBootStatusThread !== 'function' || !window.vaakBootStatusThread()) throw new Error('status-boot');
+      } else if (view === 'mentions') {
         bindNotifScroll(main);
       } else if (['favourites', 'bookmarks'].includes(view)) {
         bootLibraryView(view, main);
@@ -39671,6 +40191,7 @@ window.apAdminToast = function (msg, isErr) {
           bindGenericScroll(view, main);
         }
       }
+      await restoreViewPosition(main, restorePosition);
       if (typeof window.vaakHideLoading === 'function') window.vaakHideLoading();
       window.__vaakNavigationPending = false;
     } catch (e) {
@@ -39716,7 +40237,7 @@ window.apAdminToast = function (msg, isErr) {
     if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
     const link = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
     if (!link || link.target === '_blank') return;
-    const view = link.getAttribute('data-vaak-soft-nav') || '';
+    const view = link.getAttribute('data-vaak-soft-nav') || statusViewFromAnchor(link);
     const searchExtra = view ? null : searchExtraFromAnchor(link);
     const profile = (!window.vaakGuestProfile && !SOFT_VIEWS.has(view) && !searchExtra) ? profileTargetFromAnchor(link) : null;
     if (!SOFT_VIEWS.has(view) && !profile && !searchExtra) return;
@@ -39745,7 +40266,7 @@ window.apAdminToast = function (msg, isErr) {
     if (!rail || !rail.classList.contains('mobile-open')) return;
     const link = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
     if (!link || link.target === '_blank' || !rail.contains(link)) return;
-    const view = link.getAttribute('data-vaak-soft-nav') || '';
+    const view = link.getAttribute('data-vaak-soft-nav') || statusViewFromAnchor(link);
     const profile = (!window.vaakGuestProfile && !SOFT_VIEWS.has(view)) ? profileTargetFromAnchor(link) : null;
     if (!SOFT_VIEWS.has(view) && !profile) return;
     softNavTouchGuard = Date.now() + 800;
@@ -39782,6 +40303,10 @@ window.apAdminToast = function (msg, isErr) {
       return;
     }
     const extra = {};
+    if (view === 'status') {
+      extra.object = u.searchParams.get('object') || '';
+      extra.from = u.searchParams.get('from') || 'home';
+    }
     if (view === 'favourites') extra.network = u.searchParams.get('network') || 'fedi';
     if (view === 'following' || view === 'followers') {
       extra.network = u.searchParams.get('network') || 'all';
@@ -40192,20 +40717,44 @@ window.apAdminToast = function (msg, isErr) {
 (function () {
   let generation = 0;
   let pending = null;
+  let scheduled = false;
+  let loadedKey = '';
+  let mutationPending = false;
+  let suspended = false;
+  let wasHidden = document.hidden;
   try { sessionStorage.removeItem('vaak.trends.html.v3'); } catch (e) {}
 
-  function loadDeferredTrends(force) {
+  function contextKey(box) {
+    return (box.dataset.from || 'home') + '\n' + location.pathname + location.search;
+  }
+  function visible(box) {
+    if (suspended || document.hidden || !box || !box.isConnected) return false;
+    const rect = box.getBoundingClientRect();
+    return box.getClientRects().length > 0 && rect.width > 0
+      && rect.bottom >= 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+  }
+  function invalidate() {
+    ++generation;
+    if (pending) pending.controller.abort();
+    pending = null;
+    loadedKey = '';
     const box = document.getElementById('trends-sidebar');
-    if (!box) return;
-    const current = ++generation;
-    if (pending) pending.abort();
-    pending = new AbortController();
-    const controller = pending;
-    const from = box.dataset.from || 'home';
+    if (box) { box.innerHTML = ''; box.dataset.deferred = '1'; box.setAttribute('aria-busy', 'false'); }
+  }
+  function fetchTrends() {
+    const box = document.getElementById('trends-sidebar');
+    if (mutationPending || !visible(box)) return;
+    if (window.__vaakNavigationPending) return;
+    const key = contextKey(box);
+    if (loadedKey === key || (pending && pending.key === key)) return;
+    if (pending || loadedKey) invalidate();
+    const current = generation;
+    const controller = new AbortController();
+    pending = { controller: controller, key: key };
     box.dataset.deferred = 'loading';
-    box.innerHTML = '';
-    // Refresh here means current policy; it does not force global collection/network work.
-    return fetch('?ajax=trends&from=' + encodeURIComponent(from) + '&frag=4', {
+    box.setAttribute('aria-busy', 'true');
+    // Current policy, without forcing global collection/network work.
+    fetch('?ajax=trends&from=' + encodeURIComponent(box.dataset.from || 'home') + '&frag=4', {
       credentials: 'same-origin', headers: { 'Accept': 'text/html' },
       cache: 'no-store', signal: controller.signal
     }).then((res) => {
@@ -40214,47 +40763,105 @@ window.apAdminToast = function (msg, isErr) {
       const stale = res.headers.get('X-Vaak-Trends-Stale') === '1';
       return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
     }).then((payload) => {
-      if (current !== generation || !box.isConnected || document.getElementById('trends-sidebar') !== box) return;
+      if (current !== generation || !visible(box) || document.getElementById('trends-sidebar') !== box || contextKey(box) !== key) return;
       box.innerHTML = payload.html;
+      loadedKey = key;
       box.dataset.deferred = '0';
       box.dataset.cachedAge = String(payload.age);
       box.dataset.stale = payload.stale ? '1' : '0';
     }).catch(() => {
       if (current !== generation || !box.isConnected) return;
-      // A failed policy check must not keep a previous viewer's or policy's cards.
-      box.innerHTML = '';
+      box.innerHTML = '<div class="side-card" role="status">Trending could not load. <button type="button" data-trends-retry>Retry</button></div>';
       box.dataset.deferred = '1';
-    }).finally(() => { if (pending === controller) pending = null; });
+    }).finally(() => {
+      if (current === generation && box.isConnected) box.setAttribute('aria-busy', 'false');
+      if (pending && pending.controller === controller) pending = null;
+    });
+  }
+  function loadDeferredTrends(force) {
+    const box = document.getElementById('trends-sidebar');
+    if (!box) return;
+    const key = contextKey(box);
+    if (force || (pending && pending.key !== key) || (loadedKey && loadedKey !== key)) invalidate();
+    if (mutationPending || !visible(box) || loadedKey === key || (pending && pending.key === key) || scheduled) return;
+    scheduled = true;
+    // Parsing and two paints put the main column first on every full/soft page.
+    // Idle scheduling keeps a reply/timeline refresh ahead of sidebar work.
+    const idle = () => {
+      const run = () => { scheduled = false; fetchTrends(); };
+      if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 });
+      else setTimeout(run, 120);
+    };
+    const afterPaint = () => {
+      if (window.requestAnimationFrame) requestAnimationFrame(() => requestAnimationFrame(idle));
+      else setTimeout(idle, 0);
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', afterPaint, { once: true });
+    else afterPaint();
   }
 
+  window.novaInvalidateDeferredTrends = invalidate;
   window.novaLoadDeferredTrends = loadDeferredTrends;
-  window.addEventListener('pagehide', () => {
-    ++generation;
-    if (pending) pending.abort();
+  window.novaSetDeferredTrendsView = (view) => {
     const box = document.getElementById('trends-sidebar');
-    if (box) { box.innerHTML = ''; box.dataset.deferred = '1'; }
+    if (box) box.dataset.from = String(view || 'home');
+    loadDeferredTrends(false);
+  };
+  window.addEventListener('pagehide', () => { suspended = true; invalidate(); });
+  window.addEventListener('pageshow', (event) => {
+    suspended = false;
+    if (event.persisted) { mutationPending = false; loadDeferredTrends(true); }
   });
-  window.addEventListener('pageshow', (event) => { if (event.persisted) loadDeferredTrends(false); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadDeferredTrends(false); });
-  var trendsBox = document.getElementById('trends-sidebar');
-  if (trendsBox && trendsBox.getAttribute('data-paint-after') === '1') {
-    var paintTrendsAfter = function () { loadDeferredTrends(false); };
-    if (window.requestAnimationFrame) {
-      requestAnimationFrame(function () { requestAnimationFrame(paintTrendsAfter); });
-    } else { setTimeout(paintTrendsAfter, 0); }
-  } else { loadDeferredTrends(false); }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { wasHidden = true; invalidate(); }
+    else if (wasHidden) { wasHidden = false; loadDeferredTrends(true); }
+  });
+  // Policy forms navigate after submission. Remove old cards immediately; do
+  // not race that POST with a GET using the previous policy. Replies are exempt.
+  document.addEventListener('submit', (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || form.method.toLowerCase() !== 'post') return;
+    const action = (form.querySelector('[name="action"]') || {}).value || '';
+    if (/^(?:user_block_|block_|unblock$|mute_|unmute_|muted_word_|deprioritize_|undeprioritize_|downrank_|moderation_list_|list_mod_action$|user_ban$|user_unban$|switch_account|save_profile$)/.test(action)) {
+      mutationPending = true;
+      invalidate();
+      queueMicrotask(() => {
+        if (event.defaultPrevented) { mutationPending = false; loadDeferredTrends(true); }
+      });
+    }
+  }, true);
+  document.addEventListener('click', (event) => {
+    if (!(event.target instanceof Element)) return;
+    if (event.target.closest('[data-trends-retry]')) loadDeferredTrends(true);
+    const link = event.target.closest('a[href]');
+    if (link && /[?&]logout=1(?:&|$)/.test(link.getAttribute('href') || '')) { mutationPending = true; invalidate(); }
+  });
+  window.addEventListener('resize', () => {
+    const box = document.getElementById('trends-sidebar');
+    if (!visible(box)) invalidate();
+    else loadDeferredTrends(false);
+  }, { passive: true });
+  window.addEventListener('scroll', () => loadDeferredTrends(false), { passive: true });
+  const trendsBox = document.getElementById('trends-sidebar');
+  if (trendsBox && 'IntersectionObserver' in window) {
+    const observer = new IntersectionObserver(() => loadDeferredTrends(false));
+    observer.observe(trendsBox);
+  }
+  loadDeferredTrends(false);
 
   // Bookmarks are an intentionally selective hot set: warm only a few
   // already-visible preview variants during idle time. Ordinary timelines
   // remain browser-lazy, and Save-Data users are never pulled into a
   // background media request.
-  if (viewName === 'bookmarks' && !navigator.connection?.saveData) {
+  const bookmarkedMediaSlot = document.getElementById('bookmarks-slot');
+  if (bookmarkedMediaSlot && !navigator.connection?.saveData) {
     const warmBookmarkedMedia = () => {
-      const urls = [...document.querySelectorAll('[data-media-warm-url]')]
+      if (!bookmarkedMediaSlot.isConnected || document.getElementById('bookmarks-slot') !== bookmarkedMediaSlot) return;
+      const urls = [...bookmarkedMediaSlot.querySelectorAll('[data-media-warm-url]')]
         .map((node) => node.getAttribute('data-media-warm-url') || '')
         .filter((url, index, all) => /^https:\/\//i.test(url) && all.indexOf(url) === index)
         .slice(0, 3);
-      urls.forEach((url) => { const image = new Image(); image.decoding = 'async'; image.src = url; });
+      urls.forEach((url) => { const image = new Image(); image.decoding = 'async'; image.referrerPolicy = 'no-referrer'; image.src = url; });
     };
     if ('requestIdleCallback' in window) requestIdleCallback(warmBookmarkedMedia, { timeout: 2500 });
     else setTimeout(warmBookmarkedMedia, 1200);
@@ -41695,7 +42302,7 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         window.location.assign('/vaak/users/' + profileKey[1]);
         return;
       }
-      window.history.replaceState({}, '', href);
+      window.history.replaceState(Object.assign({}, window.history.state || {}), '', href);
     } catch (e) {}
   }
   async function closeModal() {
@@ -42729,6 +43336,17 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         // current timeline/media surface in place so browsing can continue.
         return;
       }
+      if (document.querySelector('.status-back')) {
+        if (mode === 'edit_status' && typeof window.vaakHydrateEditedThreadPost === 'function') {
+          Promise.resolve(window.vaakHydrateEditedThreadPost(editingNoteId)).catch(() => {});
+        }
+        if (mode !== 'edit_status' && data.note_id && typeof window.vaakHydratePublishedThreadReply === 'function') {
+          Promise.resolve(window.vaakHydratePublishedThreadReply(data.note_id)).catch(() => {});
+        }
+        // The committed reply is reconciled within this thread; never rebuild
+        // the page or its rails when a fragment is unavailable.
+        return;
+      }
       // Soft-insert posts, replies, and quote-posts into the live timeline.
       // When the reader is down-feed, preserve the same visible content while
       // adding the new card above it instead of jumping back to the feed head.
@@ -42737,7 +43355,8 @@ $showComposeFab = empty($GLOBALS['vaak_guest_profile'])
         // committed locally and federation is durable-queued, so closing the
         // composer must not wait for a timeline rebuild.
         if (typeof window.novaRefreshTimelinePreservingPosition === 'function') {
-          Promise.resolve(window.novaRefreshTimelinePreservingPosition()).catch(() => {});
+          Promise.resolve(window.novaRefreshTimelinePreservingPosition({ freshPost: true, published: data.published }))
+            .then((refreshed) => { if (refreshed === false) window.location.reload(); }).catch(() => {});
         } else {
           Promise.resolve(window.novaPollTimeline()).then(() => {
             if (typeof window.novaInsertPendingTimeline === 'function') {
