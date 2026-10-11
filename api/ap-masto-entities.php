@@ -5973,34 +5973,9 @@ function ap_masto_notifications_axum_fetch(
     if (!is_array($decoded) || !array_is_list($decoded)) {
         return null;
     }
-    // A small Rust hydrate envelope can be a confirmed-but-incomplete empty
-    // result while the larger ranked Home head already contains newly ranked
-    // items from Bluesky, Fediverse, local, RSS, or recommendations.  Probe
-    // the ranked head before declaring the poll empty.
-    if ($decoded === [] && function_exists('ap_masto_timeline_home_axum_fetch')) {
-        $head = ap_masto_timeline_home_axum_fetch(40, $ownerUserId);
-        if (is_array($head)) {
-            $statuses = [];
-            $newest = $sinceTs;
-            foreach ($head as $row) {
-                if (!is_array($row)) continue;
-                $ts = strtotime((string) ($row['created_at'] ?? '')) ?: 0;
-                if ($ts > $sinceTs) {
-                    $statuses[] = $row;
-                    $newest = max($newest, $ts);
-                }
-            }
-            usort($statuses, static function (array $a, array $b): int {
-                return (strtotime((string) ($b['created_at'] ?? '')) ?: 0)
-                    <=> (strtotime((string) ($a['created_at'] ?? '')) ?: 0);
-            });
-            return [
-                'statuses' => array_slice($statuses, 0, $limit),
-                'newest' => $newest,
-                'source' => 'axum-ranked-head-empty-fallback',
-            ];
-        }
-    }
+    // A confirmed empty notification list is a quiet account/page, not a Home
+    // timeline miss. Keep the notification-list contract and avoid an unrelated
+    // ranked Home request (which cannot supply notification entities).
     /** @var list<array<string,mixed>> $items */
     $items = [];
     foreach ($decoded as $row) {
