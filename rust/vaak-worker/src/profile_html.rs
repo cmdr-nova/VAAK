@@ -364,8 +364,8 @@ async fn fetch_outbox_tab(
     offset: i64,
 ) -> Result<Vec<OutboxPaintRow>> {
     let like = format!("{prefix}%");
-    // Mastodon semantics: Posts = originals + self-replies; Replies = replies to others.
-    let self_notes_like = format!("{prefix}notes/%");
+    // Match the PHP profile page provider: every nonempty reply, including
+    // a self-reply, belongs to Replies rather than Posts.
     let rows = match tab {
         "media" => {
             db.query(
@@ -387,10 +387,9 @@ async fn fetch_outbox_tab(
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
                    AND in_reply_to IS NOT NULL AND btrim(in_reply_to) <> ''
-                   AND in_reply_to NOT LIKE $2
                  ORDER BY published DESC
-                 LIMIT $3 OFFSET $4",
-                &[&like, &self_notes_like, &limit, &offset],
+                 LIMIT $2 OFFSET $3",
+                &[&like, &limit, &offset],
             )
             .await
             .context("select outbox replies tab")?
@@ -401,13 +400,10 @@ async fn fetch_outbox_tab(
                         COALESCE(raw_create_json, ''), COALESCE(in_reply_to, '')
                  FROM outbox_notes
                  WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public'
-                   AND (
-                     in_reply_to IS NULL OR btrim(in_reply_to) = ''
-                     OR in_reply_to LIKE $2
-                   )
+                   AND (in_reply_to IS NULL OR btrim(in_reply_to) = '')
                  ORDER BY published DESC
-                 LIMIT $3 OFFSET $4",
-                &[&like, &self_notes_like, &limit, &offset],
+                 LIMIT $2 OFFSET $3",
+                &[&like, &limit, &offset],
             )
             .await
             .context("select outbox posts tab")?
@@ -477,7 +473,7 @@ async fn fetch_outbox_tab(
 
     let masto = db
         .query(
-            "SELECT note_id, local_id, COALESCE(spoiler_text, ''), COALESCE(sensitive, 0),
+            "SELECT note_id, local_id::bigint, COALESCE(spoiler_text, ''), COALESCE(sensitive, 0)::bigint,
                     COALESCE(visibility, 'public'), COALESCE(content_text, '')
              FROM masto_statuses
              WHERE note_id = ANY($1)",
@@ -492,7 +488,7 @@ async fn fetch_outbox_tab(
     for row in masto {
         let note_id: String = row.get(0);
         let local_id: i64 = row.get(1);
-        // masto_statuses.sensitive is bigint (SQLite legacy), not int4.
+        // The projection accepts both declared INTEGER and BIGINT schemas.
         let sens_i: i64 = row.get(3);
         let key = note_id.trim_end_matches('/').to_string();
         by_note.insert(
@@ -922,6 +918,84 @@ pub async fn fetch_outbox_statuses_by_uris(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires genuine PHP profile provider captures and isolated PostgreSQL"]
+    async fn actual_profile_outbox_provider_replay() -> Result<()> {
+        let url = std::env::var("PROFILE_FIXTURE_DB")?;
+        anyhow::ensure!(url.contains("/tmp/"), "isolated Unix socket required");
+        let db = crate::db::connect(&url).await?;
+        let reference: Value = serde_json::from_slice(&std::fs::read(std::env::var("PROFILE_PROVIDER_REFERENCE")?)?)?;
+        let mut output = Vec::new();
+        for width in ["INTEGER", "BIGINT"] {
+            let schema = format!("profile_provider_native_{}_{}", width.to_ascii_lowercase(), std::process::id());
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema};SET synchronous_commit=off")).await?;
+            for (table, columns) in reference["current_schema_by_width"][width].as_object().context("actual schema missing")? {
+                let definitions = columns.as_array().context("columns missing")?.iter().map(|column| format!("{} {}", column["column_name"].as_str().unwrap(), column["data_type"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+                db.batch_execute(&format!("CREATE TABLE {table}({definitions})")).await?;
+            }
+            for capture in reference["captures"].as_array().context("captures missing")?.iter().filter(|row| row["width"] == width && row["requested_tab"] != "boosts") {
+                for (table, rows) in capture["current_tables"].as_object().context("current tables missing")? {
+                    db.batch_execute(&format!("DELETE FROM {table}")).await?;
+                    for row in rows.as_array().unwrap() {
+                        db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"), &[row]).await?;
+                    }
+                }
+                let actor = capture["actor"].as_str().context("actor missing")?;
+                let prefix = format!("{actor}/");
+                let tab = capture["requested_tab"].as_str().unwrap();
+                let offset = capture["paging"]["offset"].as_i64().unwrap();
+                for (caller, expected, limit, page_offset, selected_tab) in [
+                    ("provider", &capture["producer"], capture["paging"]["limit"].as_i64().unwrap(), offset, tab),
+                    ("full", &capture["full_selected"], 12, 0, tab),
+                    ("append", &capture["append"]["page"], 10, offset, capture["append"]["effective_tab"].as_str().unwrap()),
+                ] {
+                    // Retain the original selection SQL as a diagnostic only;
+                    // corrected admission uses the actual private fetch below.
+                    let old_selection = if selected_tab == "posts" || selected_tab == "replies" {
+                        let old_predicate = if selected_tab == "posts" { "(in_reply_to IS NULL OR btrim(in_reply_to) = '' OR in_reply_to LIKE $2)" } else { "in_reply_to IS NOT NULL AND btrim(in_reply_to) <> '' AND in_reply_to NOT LIKE $2" };
+                        let like = format!("{prefix}%");
+                        let self_like = format!("{prefix}notes/%");
+                        let old_rows = db.query(&format!("SELECT id FROM outbox_notes WHERE id LIKE $1 AND COALESCE(visibility, 'public') = 'public' AND {old_predicate} ORDER BY published DESC LIMIT $3 OFFSET $4"), &[&like, &self_like, &(limit + 1), &page_offset]).await?;
+                        let old_has_more = old_rows.len() as i64 > limit;
+                        let old_ids = old_rows.iter().take(limit as usize).map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+                        json!({"ids":old_ids,"has_more":old_has_more,"next_offset":page_offset + old_ids.len() as i64,"scope":"preserved original selection SQL diagnostic; not old painter/admission proof"})
+                    } else { Value::Null };
+                    let mut rows = fetch_outbox_tab(&db, &prefix, selected_tab, limit + 1, page_offset).await?;
+                    let has_more = rows.len() as i64 > limit;
+                    rows.truncate(limit as usize);
+                    let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+                    let expected_ids = expected["items"].as_array().context("actual items missing")?.iter().map(|row| row["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+                    let next_offset = page_offset + rows.len() as i64;
+                    output.push(json!({"width":width,"owner":capture["owner"],"actor":actor,"requested_tab":tab,"selected_tab":selected_tab,"caller":caller,"limit":limit,"offset":page_offset,"ids":ids,"source_count":rows.len(),"has_more":has_more,"next_offset":next_offset,"original_selection_diagnostic":old_selection}));
+                    anyhow::ensure!(ids == expected_ids && has_more == expected["has_more"].as_bool().unwrap() && next_offset == expected["next_offset"].as_i64().unwrap(), "actual profile source/cursor disagreement: {width}/{caller}/{tab}/{offset}");
+                }
+            }
+            for capture in reference["alias_controls"].as_array().context("alias controls missing")?.iter().filter(|row| row["width"] == width && row["tab"] != "boosts") {
+                for (table, rows) in capture["current_tables"].as_object().context("alias current tables missing")? {
+                    db.batch_execute(&format!("DELETE FROM {table}")).await?;
+                    for row in rows.as_array().unwrap() {
+                        db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"), &[row]).await?;
+                    }
+                }
+                let key = capture["input"]["key"].as_str().unwrap().trim().to_ascii_lowercase();
+                let prefix = format!("https://mkultra.monster/users/{key}/");
+                let tab = capture["tab"].as_str().unwrap();
+                let mut rows = fetch_outbox_tab(&db, &prefix, tab, 4, 0).await?;
+                let has_more = rows.len() > 3;
+                rows.truncate(3);
+                let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+                let expected = &capture["page"];
+                let expected_ids = expected["items"].as_array().unwrap().iter().map(|row| row["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+                let next_offset = rows.len() as i64;
+                anyhow::ensure!(ids == expected_ids && has_more == expected["has_more"].as_bool().unwrap() && next_offset == expected["next_offset"].as_i64().unwrap(), "actual alias source/cursor disagreement: {width}/{tab}");
+                output.push(json!({"width":width,"input":capture["input"],"selected_tab":tab,"caller":"provider_alias","ids":ids,"source_count":rows.len(),"has_more":has_more,"next_offset":next_offset}));
+            }
+            db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;
+        }
+        std::fs::write(std::env::var("PROFILE_PROVIDER_NATIVE_OUTPUT")?, serde_json::to_vec_pretty(&json!({"comparisons":output.len(),"captures":output}))?)?;
+        Ok(())
+    }
 
     #[test]
     fn quote_target_reads_nested_quote_url() {

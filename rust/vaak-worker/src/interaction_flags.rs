@@ -151,7 +151,7 @@ async fn load_viewer_did(db: &Client, owner: i64) -> Option<String> {
     }
     let row = db
         .query_opt(
-            "SELECT did FROM bsky_sessions WHERE owner_user_id = $1",
+            "SELECT did FROM bsky_sessions WHERE owner_user_id = $1::bigint",
             &[&owner],
         )
         .await
@@ -181,7 +181,7 @@ async fn load_hits(
         for row in db
             .query(
                 "SELECT status_id FROM masto_favourites
-                 WHERE owner_user_id = $1 AND status_id = ANY($2)",
+                 WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
                 &[&owner, &status_ids],
             )
             .await
@@ -193,7 +193,7 @@ async fn load_hits(
         for row in db
             .query(
                 "SELECT status_id FROM masto_bookmarks
-                 WHERE owner_user_id = $1 AND status_id = ANY($2)",
+                 WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
                 &[&owner, &status_ids],
             )
             .await
@@ -205,7 +205,7 @@ async fn load_hits(
         for row in db
             .query(
                 "SELECT status_id FROM masto_reblogs
-                 WHERE owner_user_id = $1 AND status_id = ANY($2)",
+                 WHERE owner_user_id = $1::bigint AND status_id = ANY($2)",
                 &[&owner, &status_ids],
             )
             .await
@@ -220,7 +220,7 @@ async fn load_hits(
         for row in db
             .query(
                 "SELECT object_id FROM masto_favourites
-                 WHERE owner_user_id = $1 AND object_id = ANY($2)",
+                 WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
                 &[&owner, &object_ids],
             )
             .await
@@ -234,7 +234,7 @@ async fn load_hits(
         for row in db
             .query(
                 "SELECT object_id FROM masto_bookmarks
-                 WHERE owner_user_id = $1 AND object_id = ANY($2)",
+                 WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
                 &[&owner, &object_ids],
             )
             .await
@@ -248,7 +248,7 @@ async fn load_hits(
         for row in db
             .query(
                 "SELECT object_id FROM masto_reblogs
-                 WHERE owner_user_id = $1 AND object_id = ANY($2)",
+                 WHERE owner_user_id = $1::bigint AND object_id = ANY($2)",
                 &[&owner, &object_ids],
             )
             .await

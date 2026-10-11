@@ -1,0 +1,36 @@
+<?php
+declare(strict_types=1);
+/** Current actual PHP direct policy/card oracle, never native-generated HTML. */
+// Declare production-shaped role and moderation columns before the inherited
+// corpus first calls the real cached administrator lookup. Only fixture SQL
+// transport is changed; actual PHP helpers and painter remain untouched.
+$roleBootstrap=(string)file_get_contents(__DIR__.'/remote-profile-policy-baseline.php');
+$transportDeclaration=<<<'PHP'
+$transport=str_replace("'ap_users'=>'id INTEGER,actor_id TEXT'", "'ap_users'=>'id INTEGER,actor_id TEXT,is_admin INTEGER DEFAULT 0,actor_key TEXT'",$transport);
+$transport=str_replace('INSERT INTO ap_users VALUES(', 'INSERT INTO ap_users(id,actor_id) VALUES(',$transport);
+$transport=str_replace("INSERT INTO ap_users(id,actor_id) VALUES(1,'https://mkultra.monster/users/fixture'),(2,'https://mkultra.monster/users/other')", "INSERT INTO ap_users(id,actor_id,actor_key) VALUES(1,'https://mkultra.monster/users/fixture','fixture'),(2,'https://mkultra.monster/users/other','other')",$transport);
+$transport=str_replace("'fixture_blocks'=>'owner_user_id INTEGER,scope TEXT,value TEXT'", "'fixture_blocks'=>'owner_user_id INTEGER,scope TEXT,value TEXT,id INTEGER DEFAULT 7,created_at TEXT DEFAULT NULL'",$transport);
+$transport=str_replace('INSERT INTO fixture_blocks VALUES(', 'INSERT INTO fixture_blocks(owner_user_id,scope,value) VALUES(',$transport);
+PHP;
+$anchor="\$transport=str_replace('function vaak_actor_id(): string'";
+$offset=strpos($roleBootstrap,$anchor);if($offset===false)throw new RuntimeException('fixture transport declaration boundary');
+$roleBootstrap=substr_replace($roleBootstrap,$transportDeclaration."\n",$offset,0);
+$captureAnchor="\$capture=file_get_contents(__DIR__.'/search-render-reference-capture.php');";
+ $captureOffset=strpos($roleBootstrap,$captureAnchor);if($captureOffset===false)throw new RuntimeException('search SQL transport boundary');
+ $captureEnd=strpos($roleBootstrap,"\n",$captureOffset);
+ $skipDuplicate=<<<'PHP'
+$capture=str_replace("ap_db()->exec('ALTER TABLE ap_users ADD COLUMN actor_key TEXT');",'',$capture);
+PHP;
+ $roleBootstrap=substr_replace($roleBootstrap,"\n".$skipDuplicate,$captureEnd,0);
+$roleResolved='';foreach(token_get_all($roleBootstrap) as $token)$roleResolved.=is_array($token)&&$token[0]===T_DIR?var_export(__DIR__,true):(is_array($token)?$token[1]:$token);
+$rolePath='/tmp/vaak-remote-direct-policy-role-bootstrap.php';file_put_contents($rolePath,$roleResolved);
+$path=__DIR__.'/remote-direct-card-reference.php';$code=(string)file_get_contents($path);$code=str_replace("\$bootstrapPath=__DIR__.'/remote-profile-policy-baseline.php';",'$bootstrapPath='.var_export($rolePath,true).';',$code);$end=strpos($code,"\n\$rows=[];\$checks=0;");if($end===false)throw new RuntimeException('setup boundary');$resolved='';foreach(token_get_all(substr($code,0,$end)) as $token)$resolved.=is_array($token)&&$token[0]===T_DIR?var_export(__DIR__,true):(is_array($token)?$token[1]:$token);eval(substr($resolved,5));
+reference_load(dirname(__DIR__).'/ap-db.php',['ap_events_mark_object_deleted','ap_events_mark_interaction_undone','ap_user_block_find','ap_html_to_plain_text','ap_acct_from_actor_href','ap_plain_unglue_mentions','ap_plain_expand_bare_mentions_from_urls','ap_plain_unglue_hashtags']);
+$rows=[];$checks=0;
+foreach(['INTEGER','BIGINT'] as $width){$schema='remote_direct_nested_saved_quote_'.strtolower($width);$pg->exec('DROP SCHEMA IF EXISTS '.$schema.' CASCADE;CREATE SCHEMA '.$schema.';SET search_path='.$schema);
+try{foreach($tables as $table=>$snapshot){$defs=[];foreach($snapshot['columns'] as $column)$defs[]=$column['name'].' '.(str_contains(strtoupper($column['type']),'INT')||($table==='actor_profile'&&$column['name']==='indexable')?$width:'TEXT');$pg->exec('CREATE TABLE '.$table.'('.implode(',',$defs).')');$names=array_column($snapshot['columns'],'name');$insert=$pg->prepare('INSERT INTO '.$table.'('.implode(',',$names).') VALUES('.implode(',',array_fill(0,count($names),'?')).')');foreach($snapshot['rows'] as $row)$insert->execute(array_values($row));}$GLOBALS['fixture_db']=$pg;
+foreach(['none','block','mute','word'] as $rule)foreach(['home','remote_profile','bookmarks','favourites'] as $origin){$case=$cases['quote_supplied_media'];caller_restore($case['context']);direct_bind(1);$inner=$case['status'];$child=&$inner['quote']['quoted_status'];$child['uri']=$child['url']='https://nested-direct.test/notes/boost-quote';$child['account']=['id'=>'https://nested-direct.test/users/bob','uri'=>'https://nested-direct.test/users/bob','url'=>'https://nested-direct.test/@bob','acct'=>'bob@nested-direct.test','display_name'=>'Distinct nested Bob'];$child['content']='Nested saved quote marker';$actor=$child['account']['uri'];$pg->prepare("INSERT INTO events(id,object_id,type,action_taken,visibility,actor_id) VALUES(20000,?,'Create','log','public',?)")->execute([$child['uri'],$actor]);unset($child);$source=$corpus['status_boost']['status'];$source['content']='';$source['reblog']=$inner;
+if($rule==='block')$pg->prepare('INSERT INTO fixture_blocks(owner_user_id,scope,value) VALUES(?,?,?)')->execute([1,'actor',$actor]);if($rule==='mute')$pg->prepare('INSERT INTO fixture_mutes VALUES(?,?)')->execute([1,$actor]);if($rule==='word')$pg->prepare('INSERT INTO fixture_words VALUES(?,?)')->execute([1,ap_muted_words_normalize_haystack('Nested saved quote marker')]);
+$GLOBALS['view']=$origin==='remote_profile'?'remote_profile':'status';$_GET=[];$GLOBALS['admin_status_link_preview_budget']=3;$clock=$GLOBALS['fixture_render_clock'];$original=json_encode($source,JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR);$capture=caller_capture(static function()use($source,$origin){admin_render_masto_status_card($source,[],$origin,$origin!=='remote_profile',true);});$capture['effects']['status_link_preview_budget']=$GLOBALS['admin_status_link_preview_budget'];$visible=str_contains($capture['html'],'Nested saved quote marker');$expected=$rule==='none'||!in_array($origin,['bookmarks','favourites'],true);if($visible!==$expected||!str_contains($capture['html'],'<article'))throw new RuntimeException('actual nested saved quote visibility '.$origin.'/'.$rule);if($original!==json_encode($source,JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR))throw new RuntimeException('source mutated');$checks+=3;$current=[];foreach($pg->query("SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema()")->fetchAll(PDO::FETCH_COLUMN) as $table)$current[$table]=$pg->query('SELECT * FROM '.$table)->fetchAll();$rows[]=['width'=>$width,'case'=>'boost_saved_quote_'.$rule,'context'=>['owner'=>1,'csrf'=>'fixture-csrf-token','route'=>$GLOBALS['view'],'return_view'=>$origin,'focused'=>$origin!=='remote_profile','show_open'=>true,'rendered_at'=>$clock],'source'=>$source,'initial_status_budget'=>3,'current_tables'=>$current,'quoted_body_visible'=>$visible,'php'=>$capture];}
+}finally{$GLOBALS['fixture_db']=$sqlite;$pg->exec('DROP SCHEMA '.$schema.' CASCADE');}}
+$path=$argv[1]??'/tmp/vaak-remote-direct-nested-saved-quote-reference.json';file_put_contents($path,json_encode(['checks'=>$checks,'captures'=>$rows,'bootstrap_tables'=>$tables],JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR));echo 'remote-direct-nested-saved-quote-reference PASS '.$checks.' controls; '.count($rows).' captures; '.$path."\n";

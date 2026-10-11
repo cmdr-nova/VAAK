@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Run policy fixtures with real mbstring; never substitute Unicode polyfills.
+set -euo pipefail
+php_runtime="${VAAK_TEST_PHP_BINARY:-php}"
+if "$php_runtime" -r 'exit(extension_loaded("mbstring") ? 0 : 1);'; then
+    exec "$php_runtime" "$@"
+fi
+mbstring_extension="${VAAK_TEST_MBSTRING_EXTENSION:-/tmp/vaak-php-mbstring-test/usr/lib/php/20230831/mbstring.so}"
+if [[ ! -f "$mbstring_extension" ]]; then
+    echo 'Policy tests require a real compatible PHP mbstring extension. Set VAAK_TEST_MBSTRING_EXTENSION to its extracted .so path.' >&2
+    exit 2
+fi
+exec "$php_runtime" -d "extension=$mbstring_extension" "$@"

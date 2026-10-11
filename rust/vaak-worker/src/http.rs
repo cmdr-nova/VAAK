@@ -11,7 +11,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
@@ -121,7 +120,7 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
     let state = AppState {
         cfg: Arc::new(cfg),
     };
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/shadow/notif", get(shadow_notif))
         .route("/shadow/notifications", get(shadow_notifications))
@@ -171,7 +170,10 @@ pub async fn serve(cfg: Config, bind: SocketAddr) -> Result<()> {
         .route("/shadow/local-since-html", get(shadow_local_since_html))
         .route("/shadow/feed-since-html", get(shadow_feed_since_html))
         .route("/api/v1/notifications", get(shadow_notifications_masto))
-        .with_state(state);
+        ;
+    if crate::library::bridge::enabled(){app=app.route("/internal/library/render",post(internal_library_render).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)));}
+    if crate::search_bridge::enabled(){app=app.route("/internal/search/render",post(internal_search_render).layer(axum::extract::DefaultBodyLimit::max(2*1024*1024)));}
+    let app=app.with_state(state);
 
     tracing::info!(%bind, "vaak-worker shadow HTTP listening");
     let listener = tokio::net::TcpListener::bind(bind)
@@ -227,11 +229,10 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-/// Return a previously-rendered PHP Library fragment without touching the
-/// database or remote services. A miss is deliberately a 404 so the caller
-/// can fall back to the existing PHP renderer.
+/// Legacy HTML has no status/policy manifest. Force the existing PHP fallback
+/// to re-render structured saves and check current durable audience/moderation.
 async fn shadow_library_fragment(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Query(q): Query<OwnerQuery>,
 ) -> impl IntoResponse {
     let owner = q.owner_id.filter(|v| *v > 0).unwrap_or(0);
@@ -244,39 +245,7 @@ async fn shadow_library_fragment(
     {
         return (StatusCode::BAD_REQUEST, "invalid library fragment query").into_response();
     }
-    let mut digest = Sha256::new();
-    digest.update(suffix.as_bytes());
-    let key = format!(
-        "vaak:fragment:lib:v1:{kind}:{owner}:{}",
-        hex::encode(digest.finalize())
-    );
-    let mut redis = match crate::redis_util::connect(&state.cfg.redis_url).await {
-        Ok(conn) => conn,
-        Err(_) => return (StatusCode::NOT_FOUND, "library fragment unavailable").into_response(),
-    };
-    let payload = match crate::redis_util::json_get(&mut redis, &key).await {
-        Ok(Some(v)) => v,
-        _ => return (StatusCode::NOT_FOUND, "library fragment miss").into_response(),
-    };
-    let Some(html) = payload.get("html").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
-        return (StatusCode::NOT_FOUND, "library fragment miss").into_response();
-    };
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    headers.insert(
-        axum::http::HeaderName::from_static("x-vaak-library-fragment"),
-        axum::http::HeaderValue::from_static("redis"),
-    );
-    if let Some(has_more) = payload.get("has_more").and_then(|v| v.as_bool()) {
-        headers.insert(
-            axum::http::HeaderName::from_static("x-has-more"),
-            axum::http::HeaderValue::from_static(if has_more { "1" } else { "0" }),
-        );
-    }
-    (StatusCode::OK, headers, html.to_owned()).into_response()
+    (StatusCode::NOT_FOUND, "library fragment requires current policy validation").into_response()
 }
 
 async fn internal_phyrian_mutate(
@@ -1291,4 +1260,39 @@ async fn shadow_phyrian(
     let include_directory = truthy(q.fetch.as_deref());
     let limit = q.limit.unwrap_or(40);
     json_result(crate::phyrian::dossier(&state.cfg, owner, include_directory, limit).await)
+}
+
+#[cfg(test)]
+mod library_cache_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_library_html_is_never_returned() {
+        // No store can be contacted: a raw HTML cache has no policy manifest.
+        let state = AppState { cfg: Arc::new(Config {
+            database_url: "disabled-for-test".into(), redis_url: "disabled-for-test".into(),
+            redis_queue_url: "disabled-for-test".into(), jetstream_state: "/tmp/unused".into(),
+            default_owner_id: 201, bsky_public_api: "disabled-for-test".into(),
+            notif_cache_dir: "/tmp/unused".into(), phyrian_mutation_token: None,
+            phyrian_bridge_url: "disabled-for-test".into(), phyrian_bridge_secret: None,
+        }) };
+        for kind in ["favourites_fedi", "favourites_bsky", "bookmarks_fedi", "bookmarks_bsky"] {
+            let q: OwnerQuery = serde_json::from_value(serde_json::json!({
+                "owner_id": 201, "library_kind": kind, "library_suffix": "offset=0|limit=20"
+            })).unwrap();
+            let response = shadow_library_fragment(State(state.clone()), Query(q)).await.into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{kind}");
+            assert!(!response.headers().contains_key("x-vaak-library-fragment"));
+            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(body.as_ref(), b"library fragment requires current policy validation");
+        }
+    }
+}
+
+async fn internal_library_render(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{
+    crate::library::bridge::render(&state.cfg,headers,bytes).await
+}
+
+async fn internal_search_render(State(state):State<AppState>,headers:axum::http::HeaderMap,bytes:axum::body::Bytes)->axum::response::Response{
+    crate::search_bridge::render(&state.cfg,headers,bytes).await
 }

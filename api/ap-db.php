@@ -7411,10 +7411,14 @@ function ap_follow_lists_reset_memo(?string $ownerActorId = null): void
     ];
     if ($uid > 0) {
         $keys[] = 'vaak:relset:v1:following:' . $uid . ':rich';
+        $keys[] = 'vaak:relset:v2:following:' . $uid . ':rich';
         $keys[] = 'vaak:relset:v1:following:' . $uid . ':bare';
         $keys[] = 'vaak:relset:v1:followers:' . $uid . ':rich';
+        $keys[] = 'vaak:relset:v2:followers:' . $uid . ':rich';
         $keys[] = 'vaak:relset:v1:followers:' . $uid . ':bare';
         $keys[] = 'vaak:relset:v1:blocks-actors:' . $uid;
+        $keys[] = 'vaak:relset:v2:blocks-actors:' . $uid;
+        $keys[] = 'vaak:relset:v3:blocks-actors:' . $uid;
         $keys[] = 'vaak:bsky:followed-handles:' . $uid;
     }
     ap_redis_delete(...$keys);
@@ -7484,6 +7488,9 @@ function ap_actor_id_membership_map(array $rows, bool $richAliases = true): arra
         $map[$aid] = true;
         $map[$aid . '/'] = true;
         $map[(string) $row['actor_id']] = true;
+        if ($richAliases) {
+            foreach (ap_moderation_syntactic_refs($aid) as $ref) $map[$ref] = true;
+        }
         if (!$richAliases) {
             continue;
         }
@@ -7503,18 +7510,18 @@ function ap_actor_id_membership_map(array $rows, bool $richAliases = true): arra
         }
         if ($uname === '') {
             $path = (string) (parse_url($aid, PHP_URL_PATH) ?? '');
-            if (preg_match('#/(?:users|@)([^/]+)/?$#i', $path, $pm)
-                && !ctype_digit(rawurldecode($pm[1]))) {
-                $uname = rawurldecode($pm[1]);
+            if (preg_match('~/(?:users/|@)([^/?#]+)/?$~i', $path, $pm)) {
+                $uname = ap_moderation_path_segment_forms($pm[1])[0];
             }
         }
-        if ($uname !== '' && ctype_digit($uname)) {
+        if ($uname !== '' && (ctype_digit($uname) || strpbrk($uname, '/?#') !== false)) {
             $uname = '';
         }
         if ($host !== '' && $uname !== '') {
-            $map['https://' . $host . '/@' . $uname] = true;
-            $map['https://' . $host . '/users/' . $uname] = true;
-            $map['https://' . $host . '/users/' . rawurlencode($uname)] = true;
+            foreach (ap_moderation_path_segment_forms($uname) as $form) {
+                $map['https://' . $host . '/@' . $form] = true;
+                $map['https://' . $host . '/users/' . $form] = true;
+            }
         }
         $bskyDid = trim((string) ($row['bsky_did'] ?? ''));
         if (str_starts_with($bskyDid, 'did:')) {
@@ -7563,7 +7570,7 @@ function ap_following_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
     $useRedis = $ownerUserId > 0
         && function_exists('ap_redis_relsets_enabled')
         && ap_redis_relsets_enabled();
-    $redisKey = $useRedis ? ('vaak:relset:v1:following:' . $ownerUserId . ':' . $mode) : '';
+    $redisKey = $useRedis ? ('vaak:relset:' . ($richAliases ? 'v2' : 'v1') . ':following:' . $ownerUserId . ':' . $mode) : '';
     $holdRelLock = false;
     $relLock = '';
     if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
@@ -7645,7 +7652,7 @@ function ap_followers_id_set(?string $ownerActorId = null, ?int $ownerUserId = n
     $useRedis = $ownerUserId > 0
         && function_exists('ap_redis_relsets_enabled')
         && ap_redis_relsets_enabled();
-    $redisKey = $useRedis ? ('vaak:relset:v1:followers:' . $ownerUserId . ':' . $mode) : '';
+    $redisKey = $useRedis ? ('vaak:relset:' . ($richAliases ? 'v2' : 'v1') . ':followers:' . $ownerUserId . ':' . $mode) : '';
     $holdRelLock = false;
     $relLock = '';
     if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
@@ -7707,7 +7714,7 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
         return $GLOBALS['ap_relset_memo'][$memoKey];
     }
     $useRedis = function_exists('ap_redis_relsets_enabled') && ap_redis_relsets_enabled();
-    $redisKey = $useRedis ? ('vaak:relset:v1:blocks-actors:' . $ownerUserId) : '';
+    $redisKey = $useRedis ? ('vaak:relset:v3:blocks-actors:' . $ownerUserId) : '';
     if ($redisKey !== '' && function_exists('ap_redis_json_get')) {
         $cached = ap_redis_json_get($redisKey);
         if (is_array($cached)) {
@@ -7729,7 +7736,7 @@ function ap_blocks_actor_id_set(int $ownerUserId): array
         if ($v === '') {
             continue;
         }
-        foreach (ap_actor_moderation_aliases($v) as $alias) {
+        foreach (array_unique(array_merge(ap_actor_moderation_aliases($v), ap_moderation_syntactic_refs($v))) as $alias) {
             $map[$alias] = true;
             $map[$alias . '/'] = true;
         }
@@ -7756,8 +7763,10 @@ function ap_following_id_set_invalidate_owner(int $ownerUserId): void
     if (function_exists('ap_redis_delete')) {
         ap_redis_delete(
             'vaak:relset:v1:following:' . $ownerUserId . ':rich',
+            'vaak:relset:v2:following:' . $ownerUserId . ':rich',
             'vaak:relset:v1:following:' . $ownerUserId . ':bare',
             'vaak:relset:v1:followers:' . $ownerUserId . ':rich',
+            'vaak:relset:v2:followers:' . $ownerUserId . ':rich',
             'vaak:relset:v1:followers:' . $ownerUserId . ':bare',
             'vaak:bsky:followed-handles:' . $ownerUserId
         );
@@ -8585,6 +8594,8 @@ function ap_block_list_cached(bool $refresh = false): array
 function ap_block_cache_clear(): void
 {
     ap_block_list_cached(true);
+    // Reset the compact server actor-set memo and exactly its old/new keys.
+    ap_server_blocked_actors_set(true);
     // Server mute/block applies to every local account's notifications.
     if (function_exists('ap_notification_projection_invalidate_all')) {
         ap_notification_projection_invalidate_all();
@@ -8942,13 +8953,13 @@ function ap_server_blocked_actors_set(bool $refresh = false): array
     if ($refresh) {
         $cache = null;
         if (function_exists('ap_redis_delete')) {
-            ap_redis_delete('vaak:moderation:server-blocks:v1');
+            ap_redis_delete('vaak:moderation:server-blocks:v1', 'vaak:moderation:server-blocks:v2', 'vaak:moderation:server-blocks:v3');
         }
     }
     if (is_array($cache)) {
         return $cache;
     }
-    $redisKey = 'vaak:moderation:server-blocks:v1';
+    $redisKey = 'vaak:moderation:server-blocks:v3';
     if (function_exists('ap_redis_json_get')) {
         $hit = ap_redis_json_get($redisKey);
         if (is_array($hit)) {
@@ -9036,9 +9047,11 @@ function ap_is_globally_muted_actor(?string $actorId, ?string $host = null): boo
             }
             // Server mutes are stored as the canonical /users IRI. Cards and
             // some notification actors only carry the web /@ profile.
+            // Expand both sides: a stored encoded canonical actor must also
+            // match its literal/web candidate. Only global mutes ignore case.
             foreach (ap_moderation_syntactic_refs($actorId) as $alias) {
-                if (strcasecmp(rtrim((string) $alias, '/'), $val) === 0) {
-                    return true;
+                foreach (ap_moderation_syntactic_refs($val) as $storedAlias) {
+                    if (strcasecmp(rtrim((string) $alias, '/'), rtrim((string) $storedAlias, '/')) === 0) return true;
                 }
             }
         }
@@ -9960,6 +9973,38 @@ function ap_mutes_list(int $ownerUserId): array
  *
  * @return list<string>
  */
+/**
+ * Decode only unreserved escapes and valid UTF-8 username bytes. Reserved
+ * delimiters and invalid byte escapes remain URI data, never syntax or U+FFFD.
+ * Encoding the alternate form preserves retained %XX instead of double encoding.
+ * @return list<string>
+ */
+function ap_moderation_path_segment_forms(string $segment): array
+{
+    $decoded = preg_replace_callback('/(?:%[0-9a-f]{2})+/i', static function (array $m): string {
+        $bytes = rawurldecode($m[0]);
+        $candidate = '';
+        for ($i = 0; $i < strlen($bytes); $i++) {
+            $c = $bytes[$i];
+            $candidate .= preg_match('/[A-Za-z0-9._~-]/', $c) || ord($c) >= 128
+                ? $c : sprintf('%%%02X', ord($c));
+        }
+        if (preg_match('//u', $candidate) === 1) return $candidate;
+        $safe = '';
+        for ($i = 0; $i < strlen($bytes); $i++) {
+            $c = $bytes[$i];
+            $safe .= preg_match('/[A-Za-z0-9._~-]/', $c) ? $c : sprintf('%%%02X', ord($c));
+        }
+        return $safe;
+    }, $segment) ?? $segment;
+    $encoded = '';
+    for ($i = 0; $i < strlen($decoded); $i++) {
+        $c = $decoded[$i];
+        $encoded .= ord($c) >= 128 ? sprintf('%%%02X', ord($c)) : $c;
+    }
+    return array_values(array_unique([$decoded, $encoded]));
+}
+
 function ap_moderation_syntactic_refs(string $actorId): array
 {
     $actorId = rtrim(trim($actorId), '/');
@@ -9977,14 +10022,15 @@ function ap_moderation_syntactic_refs(string $actorId): array
             $out[] = 'https://bsky.app/profile/' . $part;
             $out[] = 'https://bsky.app/profile/' . rawurlencode($part);
         }
-    } elseif (preg_match('#^(https://[^/]+)/(?:users|@)([^/]+)$#i', $actorId, $m)) {
+    } elseif (preg_match('~^(https://[^/]+)/(users/|@)([^/?#]+)$~i', $actorId, $m)) {
         $host = strtolower($m[1]);
-        $user = rawurldecode($m[2]);
-        if ($user !== '' && !ctype_digit($user)) {
-            $out[] = $host . '/users/' . $user;
-            $out[] = $host . '/@' . $user;
-            $out[] = $host . '/users/' . rawurlencode($user);
-            $out[] = $host . '/@' . rawurlencode($user);
+        foreach (ap_moderation_path_segment_forms($m[3]) as $user) {
+            if ($user !== '' && ctype_digit($user)) {
+                $out[] = $host . '/' . $m[2] . $user; // same URI shape only
+            } elseif ($user !== '') {
+                $out[] = $host . '/users/' . $user;
+                $out[] = $host . '/@' . $user;
+            }
         }
     }
     $uniq = [];
@@ -10009,12 +10055,12 @@ function ap_mutes_set_cached(int $ownerUserId, bool $refresh = false): array
     }
     if ($refresh) {
         unset($cache[$ownerUserId]);
-        if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:v2:' . $ownerUserId);
+        if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:v2:' . $ownerUserId, 'vaak:moderation:mutes:v3:' . $ownerUserId, 'vaak:moderation:mutes:v4:' . $ownerUserId);
         if (function_exists('ap_redis_delete')) ap_redis_delete('vaak:moderation:mutes:' . $ownerUserId);
     }
     if (!isset($cache[$ownerUserId])) {
-        // v2 expands stored mute aliases once so list checks stay O(1).
-        $redisKey = 'vaak:moderation:mutes:v2:' . $ownerUserId;
+        // v4 preserves reserved escapes; reject older expanded alias maps.
+        $redisKey = 'vaak:moderation:mutes:v4:' . $ownerUserId;
         $redisCached = function_exists('ap_redis_json_get') ? ap_redis_json_get($redisKey) : null;
         if (is_array($redisCached)) {
             if (function_exists('ap_redis_relset_metric')) {
@@ -10949,7 +10995,7 @@ function ap_user_blocks_cache_clear(?int $ownerUserId = null): void
         unset($GLOBALS['ap_relset_memo'][$ownerUserId . '|blocks-actors']);
     }
     if (function_exists('ap_redis_delete')) {
-        ap_redis_delete('vaak:relset:v1:blocks-actors:' . $ownerUserId);
+        ap_redis_delete('vaak:relset:v1:blocks-actors:' . $ownerUserId, 'vaak:relset:v2:blocks-actors:' . $ownerUserId, 'vaak:relset:v3:blocks-actors:' . $ownerUserId);
     }
     ap_timeline_cache_invalidate_owner($ownerUserId);
     if (function_exists('ap_notification_projection_invalidate_owner')) {
@@ -11547,12 +11593,105 @@ function ap_search_filter_accounts(array $accounts, int $ownerUserId, int $limit
  * @param list<mixed> $statuses
  * @return list<array<string,mixed>>
  */
+/** Load preferences once per Search operation, never across cache reads/mutations. */
+function ap_search_local_indexing_rows(): ?array
+{
+    try {
+        $rows = ap_db()->query("SELECT u.id,u.actor_id,COALESCE(p.indexable,1) AS indexable
+            FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key")->fetchAll();
+        $out=[];
+        foreach ($rows as $row) $out[ap_search_canonical_actor((string)$row['actor_id'])]=$row;
+        return $out;
+    } catch (Throwable $e) { return null; }
+}
+
+/** Current local indexing consent, including the canonical author exception. */
+function ap_search_indexing_allowed(string $author, int $ownerUserId, ?array $currentRows=null): bool
+{
+    $author = ap_search_canonical_actor($author);
+    if ($author === '') return true;
+    if ($currentRows!==null) {
+        $row=$currentRows[$author]??null;
+        return !is_array($row)||(int)$row['id']===$ownerUserId||(int)$row['indexable']!==0;
+    }
+    try {
+        $st = ap_db()->prepare("SELECT u.id, COALESCE(p.indexable,1) AS indexable FROM ap_users u
+            LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE rtrim(u.actor_id,'/')=? LIMIT 1");
+        $st->execute([$author]); $row=$st->fetch();
+        return !is_array($row) || (int)$row['id']===$ownerUserId || (int)$row['indexable']!==0;
+    } catch (Throwable $e) { return false; }
+}
+
+/** Current Search source and actor admission; Search intentionally omits word mutes. */
+function ap_search_status_allowed(array $status, int $ownerUserId, int $depth=0, ?array $currentRows=null): bool
+{
+    if ($depth>16 || !function_exists('ap_visibility_status_audience_allowed') || ap_search_status_hidden($status,$ownerUserId)) return false;
+    try {
+        $uri=rtrim(explode('#',trim((string)($status['uri']??$status['url']??'')),2)[0],'/');
+        $author=ap_search_canonical_actor((string)($status['account']['uri']??$status['account']['url']??''));
+        $raw=$status['bsky_post']??null; $post=is_array($raw['post']??null)?$raw['post']:$raw;
+        $at=is_array($post)?(string)($post['uri']??''):'';
+        if ($at==='' && str_starts_with($uri,'at://')) $at=$uri;
+        if ($at!=='') {
+            $st=ap_db()->prepare('SELECT 1 FROM bsky_posts WHERE bsky_uri=? LIMIT 1');$st->execute([$at]);
+            if (!$st->fetchColumn()) return false;
+        } elseif (preg_match('#^https://mkultra\.monster/users/[^/]+/notes/#',$uri)) {
+            $st=ap_db()->prepare("SELECT note_id FROM masto_statuses WHERE rtrim(note_id,'/')=? LIMIT 1");$st->execute([$uri]);
+            if (!$st->fetchColumn()) return false; $author=explode('/notes/',$uri,2)[0];
+        } elseif ($uri!=='') {
+            $st=ap_db()->prepare("SELECT actor_id,type,action_taken FROM events WHERE object_id IN (?,?)
+                AND (type IN ('Create','Update','Delete','Tombstone')
+                    OR (type IN ('Quote','QuotePost') AND NOT EXISTS (
+                        SELECT 1 FROM events note_source WHERE note_source.object_id IN (?, ?)
+                            AND note_source.type IN ('Create','Update')))) ORDER BY id DESC LIMIT 1");
+            $st->execute([$uri,$uri.'/',$uri,$uri.'/']);$row=$st->fetch();
+            if (is_array($row)) {
+                if (($row['action_taken']??'')==='deleted' || in_array($row['type']??'',['Delete','Tombstone'],true)) return false;
+                $author=ap_search_canonical_actor((string)($row['actor_id']??$author));
+            } else {
+                $st=ap_db()->prepare('SELECT actor_id,deleted_at FROM mentions WHERE object_id IN (?,?) ORDER BY id DESC LIMIT 1');$st->execute([$uri,$uri.'/']);$row=$st->fetch();
+                if (!is_array($row)||!empty($row['deleted_at'])) return false;
+                $author=ap_search_canonical_actor((string)($row['actor_id']??$author));
+            }
+        } else return false;
+        if (!ap_search_indexing_allowed($author,$ownerUserId,$currentRows)||!ap_visibility_status_audience_allowed($status,$ownerUserId)) return false;
+        foreach (['reblog','quote','vaak_quote_preview'] as $field) {
+            $child=$status[$field]??null;if (!is_array($child)) continue;
+            $child=is_array($child['quoted_status']??null)?$child['quoted_status']:(is_array($child['status']??null)?$child['status']:$child);
+            // A state-only quote descriptor paints pending/unavailable chrome;
+            // its eventual recovered body passes the final Search painter gate.
+            if ($field==='quote' && !is_array($child['account']??null)
+                && !array_key_exists('uri',$child) && !array_key_exists('url',$child)
+                && !array_key_exists('content',$child) && !array_key_exists('text',$child)
+                && !array_key_exists('media',$child) && !array_key_exists('media_attachments',$child)
+                && in_array($child['state']??'', ['pending','accepted','fallback'],true)) continue;
+            if (!ap_search_status_allowed($child,$ownerUserId,$depth+1,$currentRows)) return false;
+        }
+        return true;
+    } catch (Throwable $e) { return false; }
+}
+
+/** Tag corpus rows are current source rows, not cached status snapshots. */
+function ap_search_tag_row_allowed(array $row,string $source,int $ownerUserId, ?array $currentRows=null): bool
+{
+    if (!function_exists('ap_visibility_status_audience_allowed')) return false;
+    $uri=(string)($source==='outbox'?($row['id']??''):($row['object_id']??''));
+    $author=$source==='outbox'?explode('/notes/',$uri,2)[0]:(string)($row['actor_id']??'');
+    if ($uri===''||$author===''||!empty($row['deleted_at'])||($row['action_taken']??'')==='deleted') return false;
+    $status=['uri'=>$uri,'visibility'=>(string)($row['visibility']??'public'),'account'=>['uri'=>$author]];
+    if ($source!=='outbox') return ap_search_status_allowed($status,$ownerUserId,0,$currentRows);
+    return ap_search_indexing_allowed($author,$ownerUserId,$currentRows)&&!ap_search_status_hidden($status,$ownerUserId)
+        &&ap_visibility_status_audience_allowed($status,$ownerUserId);
+}
+
 function ap_search_filter_statuses(array $statuses, int $ownerUserId, int $limit): array
 {
     $limit = max(1, $limit);
+    $currentRows=ap_search_local_indexing_rows();
+    if ($currentRows===null) return [];
     $out = [];
     foreach ($statuses as $st) {
-        if (!is_array($st) || ap_search_status_hidden($st, $ownerUserId)) {
+        if (!is_array($st) || ap_search_status_hidden($st, $ownerUserId) || !ap_search_status_allowed($st, $ownerUserId, 0, $currentRows)) {
             continue;
         }
         $out[] = $st;

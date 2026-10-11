@@ -9,6 +9,32 @@ require_once __DIR__ . '/ap-asks.php';
 require_once __DIR__ . '/ap-normalize.php';
 require_once __DIR__ . '/ap-visibility.php';
 
+/** Remove only exact quoted-asset copies from a parent's flattened media list. */
+function ap_masto_outer_media_without_quote_duplicates(array $status): array
+{
+    $outer = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
+    $envelope = is_array($status['quote'] ?? null) ? $status['quote'] : null;
+    if ($envelope === null || !is_array($envelope['quoted_status'] ?? null)) {
+        return $outer;
+    }
+    $quoted = $envelope['quoted_status'];
+    $media = is_array($quoted['media_attachments'] ?? null) ? $quoted['media_attachments'] : [];
+    $assetUrl = static function ($attachment): ?string {
+        if (!is_array($attachment)) return null;
+        $url = is_string($attachment['url'] ?? null) ? $attachment['url'] : null;
+        return is_string($url) && str_starts_with($url, 'https://') ? $url : null;
+    };
+    $quotedUrls = [];
+    foreach ($media as $attachment) {
+        $url = $assetUrl($attachment);
+        if ($url !== null) $quotedUrls[$url] = true;
+    }
+    return array_values(array_filter($outer, static function ($attachment) use ($assetUrl, $quotedUrls): bool {
+        $url = $assetUrl($attachment);
+        return $url === null || !isset($quotedUrls[$url]);
+    }));
+}
+
 /**
  * Mastodon account id for the token/session-bound local user.
  * cmdr_nova stays stable as "1"; other locals use ap_users.id.
@@ -2035,7 +2061,6 @@ function ap_masto_remote_account_acct_key(string $actorId): ?string
         }
     } catch (Throwable $e) {
         // ignore
-        $GLOBALS['ap_followed_tags_cache'][$ownerUserId] = [];
     }
     if ($uname === '' && preg_match('#/(?:users|@)([^/]+)/?$#i', $actorId, $m)) {
         $pathUname = rawurldecode((string) $m[1]);
@@ -7948,43 +7973,9 @@ function ap_masto_status_from_event(array $row): ?array
                         }
                     }
                 }
-                // Bridge pattern: some AP bridges only put the quoted attachment on
-                // the outer event's media_urls. Move into the nest when the quoted
-                // status itself has no media (keep intentional outer+quote media when
-                // both sides already have attachments).
-                $qSt = is_array($status['quote']['quoted_status'] ?? null)
-                    ? $status['quote']['quoted_status']
-                    : null;
-                $qMedia = is_array($qSt['media_attachments'] ?? null) ? $qSt['media_attachments'] : [];
-                $outerMedia = is_array($status['media_attachments'] ?? null) ? $status['media_attachments'] : [];
-                if ($qSt !== null && $qMedia === [] && $outerMedia !== []) {
-                    $status['quote']['quoted_status']['media_attachments'] = $outerMedia;
-                    $status['media_attachments'] = [];
-                } elseif ($qSt !== null && $qMedia !== [] && $outerMedia !== []) {
-                    // Same asset on both sides → keep it inside the nest only.
-                    $qUrls = [];
-                    foreach ($qMedia as $qm) {
-                        if (!is_array($qm)) {
-                            continue;
-                        }
-                        $u = rtrim((string) ($qm['url'] ?? $qm['preview_url'] ?? ''), '/');
-                        if ($u !== '') {
-                            $qUrls[$u] = true;
-                        }
-                    }
-                    if ($qUrls !== []) {
-                        $status['media_attachments'] = array_values(array_filter(
-                            $outerMedia,
-                            static function ($om) use ($qUrls): bool {
-                                if (!is_array($om)) {
-                                    return false;
-                                }
-                                $u = rtrim((string) ($om['url'] ?? $om['preview_url'] ?? ''), '/');
-                                return $u === '' || !isset($qUrls[$u]);
-                            }
-                        ));
-                    }
-                }
+                // A quoted status with no attachment metadata does not establish
+                // ownership of the parent's media. Keep distinct parent assets.
+                $status['media_attachments'] = ap_masto_outer_media_without_quote_duplicates($status);
             }
         }
     }
@@ -9525,14 +9516,17 @@ function ap_masto_search(string $q, ?string $type = null, bool $resolve = false,
         $type = null;
     }
     $searchCacheKey = 'vaak:search:' . hash('sha256', (string) json_encode([
-        'q' => mb_strtolower($q), 'type' => $type, 'resolve' => $resolve, 'limit' => $limit,
+        'owner' => ap_db_masto_owner_user_id(), 'q' => mb_strtolower($q), 'type' => $type, 'resolve' => $resolve, 'limit' => $limit,
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    $parts = ap_masto_search_query_parts($q);
     $cachedSearch = ap_redis_json_get($searchCacheKey);
     if (is_array($cachedSearch)
         && isset($cachedSearch['accounts'], $cachedSearch['statuses'], $cachedSearch['hashtags'])) {
-        return $cachedSearch;
+        if (($type === null || $type === 'hashtags') && !($type === null && !empty($parts['is_host']))) {
+            $cachedSearch['hashtags'] = ap_masto_search_hashtags($q, $limit);
+        }
+        return ap_search_filter_bundle($cachedSearch, ap_db_masto_owner_user_id(), $limit);
     }
-    $parts = ap_masto_search_query_parts($q);
     $wantAccounts = $type === null || $type === 'accounts';
     $wantTags = $type === null || $type === 'hashtags';
     $wantStatuses = $type === null || $type === 'statuses';
@@ -10167,6 +10161,8 @@ function ap_masto_search_hashtags(string $q, int $limit): array
 {
     $q = ltrim(trim($q), '#');
     $qLower = mb_strtolower($q);
+    $currentRows=ap_search_local_indexing_rows();
+    if ($currentRows===null) return [];
     $counts = [];
 
     $ingest = static function (string $text) use (&$counts): void {
@@ -10187,8 +10183,9 @@ function ap_masto_search_hashtags(string $q, int $limit): array
 
     try {
         foreach (ap_db()->query(
-            "SELECT content FROM outbox_notes ORDER BY published DESC LIMIT 400"
+            "SELECT id,content,visibility FROM outbox_notes ORDER BY published DESC LIMIT 400"
         )->fetchAll() as $row) {
+            if (!ap_search_tag_row_allowed($row, 'outbox', ap_db_masto_owner_user_id(), $currentRows)) continue;
             $ingest((string) ($row['content'] ?? ''));
         }
     } catch (Throwable $e) {
@@ -10196,8 +10193,9 @@ function ap_masto_search_hashtags(string $q, int $limit): array
     }
     try {
         foreach (ap_db()->query(
-            "SELECT summary FROM events WHERE summary IS NOT NULL AND summary != '' ORDER BY id DESC LIMIT 600"
+            "SELECT id,object_id,actor_id,visibility,type,action_taken,summary FROM events WHERE summary IS NOT NULL AND summary != '' ORDER BY id DESC LIMIT 600"
         )->fetchAll() as $row) {
+            if (!ap_search_tag_row_allowed($row, 'event', ap_db_masto_owner_user_id(), $currentRows)) continue;
             $ingest(html_entity_decode((string) ($row['summary'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
         }
     } catch (Throwable $e) {
@@ -10205,8 +10203,9 @@ function ap_masto_search_hashtags(string $q, int $limit): array
     }
     try {
         foreach (ap_db()->query(
-            "SELECT content FROM mentions WHERE deleted_at IS NULL AND content IS NOT NULL ORDER BY id DESC LIMIT 300"
+            "SELECT id,object_id,actor_id,deleted_at,content FROM mentions WHERE deleted_at IS NULL AND content IS NOT NULL ORDER BY id DESC LIMIT 300"
         )->fetchAll() as $row) {
+            if (!ap_search_tag_row_allowed($row, 'mention', ap_db_masto_owner_user_id(), $currentRows)) continue;
             $ingest((string) ($row['content'] ?? ''));
         }
     } catch (Throwable $e) {
