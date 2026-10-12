@@ -6,7 +6,7 @@
     "auto_unblur_sensitive", "auto_delete_posts_7d", "automated",
     "reply_policy", "quote_policy", "forum_signature", "profile_badges",
     "hide_profile_replies", "hide_profile_boosts", "algorithm_enabled",
-    "downranking_enabled", "asks_enabled", "webmentions_enabled", "updated_at"
+    "downranking_enabled", "asks_enabled", "webmentions_enabled", "updated_at", "trending_enabled"
   ],
   "write_owner": "php",
   "mutation_enabled": false

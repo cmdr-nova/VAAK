@@ -667,6 +667,14 @@ SQL);
         error_log('[ap-db] algorithm preference column not provisioned: ' . $e->getMessage());
     }
     try {
+        $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'trending_enabled'")->fetchColumn();
+        if (!$hasColumn) {
+            $db->exec('ALTER TABLE actor_profile ADD COLUMN trending_enabled INTEGER NOT NULL DEFAULT 1');
+        }
+    } catch (Throwable $e) {
+        error_log('[ap-db] trending display preference column not provisioned: ' . $e->getMessage());
+    }
+    try {
         $hasColumn = (bool) $db->query("SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'actor_profile' AND column_name = 'downranking_enabled'")->fetchColumn();
         if (!$hasColumn) {
             $db->exec('ALTER TABLE actor_profile ADD COLUMN downranking_enabled INTEGER NOT NULL DEFAULT 1');
@@ -962,6 +970,7 @@ CREATE TABLE IF NOT EXISTS actor_profile (
     hide_profile_replies INTEGER NOT NULL DEFAULT 0,
     hide_profile_boosts INTEGER NOT NULL DEFAULT 0,
     algorithm_enabled INTEGER NOT NULL DEFAULT 1,
+    trending_enabled INTEGER NOT NULL DEFAULT 1,
     downranking_enabled INTEGER NOT NULL DEFAULT 1,
     asks_enabled INTEGER NOT NULL DEFAULT 1,
     webmentions_enabled INTEGER NOT NULL DEFAULT 1,
@@ -1066,6 +1075,9 @@ SQL);
     }
     if (!in_array('algorithm_enabled', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN algorithm_enabled INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!in_array('trending_enabled', $profileNames, true)) {
+        $db->exec('ALTER TABLE actor_profile ADD COLUMN trending_enabled INTEGER NOT NULL DEFAULT 1');
     }
     if (!in_array('downranking_enabled', $profileNames, true)) {
         $db->exec('ALTER TABLE actor_profile ADD COLUMN downranking_enabled INTEGER NOT NULL DEFAULT 1');
@@ -2641,6 +2653,7 @@ function ap_profile_defaults(string $actorKey = 'cmdr_nova'): array
         'hide_profile_replies' => false,
         'hide_profile_boosts' => false,
         'algorithm_enabled' => true,
+        'trending_enabled' => true,
         'downranking_enabled' => true,
         'asks_enabled' => true,
         'webmentions_enabled' => true,
@@ -2791,7 +2804,8 @@ function ap_profile_get(string $actorKey = 'cmdr_nova'): array
 {
     $profileCacheKey = 'vaak:profile:v1:' . hash('sha256', trim($actorKey));
     $cached = function_exists('ap_redis_json_get') ? ap_redis_json_get($profileCacheKey) : null;
-    if (is_array($cached) && isset($cached['actor_key'], $cached['name'], $cached['summary'])) {
+    if (is_array($cached) && isset($cached['actor_key'], $cached['name'], $cached['summary'])
+        && isset($cached['trending_enabled']) && is_bool($cached['trending_enabled'])) {
 $cached['profile_badges']=ap_profile_authorized_badges($cached['profile_badges'] ?? [],$actorKey);
         return $cached;
     }
@@ -2854,6 +2868,9 @@ $cached['profile_badges']=ap_profile_authorized_badges($cached['profile_badges']
             : false,
         'algorithm_enabled' => array_key_exists('algorithm_enabled', $row)
             ? !empty($row['algorithm_enabled'])
+            : true,
+        'trending_enabled' => isset($row['trending_enabled'])
+            ? !empty($row['trending_enabled'])
             : true,
         'downranking_enabled' => array_key_exists('downranking_enabled', $row)
             ? !empty($row['downranking_enabled'])
@@ -2948,7 +2965,7 @@ function ap_profile_plain_bio_to_html(string $plain): string
 /**
  * Persist profile fields. Returns ['ok'=>true] or ['ok'=>false,'error'=>...].
  *
- * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool,algorithm_enabled?:bool,downranking_enabled?:bool,asks_enabled?:bool,webmentions_enabled?:bool} $fields
+ * @param array{name?:string,summary?:string,attachment?:array,icon_url?:?string,image_url?:?string,manually_approves?:bool,discoverable?:bool,indexable?:bool,collection_consent?:bool,vanity_verified?:bool,auto_follow_back?:bool,anti_ai_marker?:bool,auto_delete_posts_7d?:bool,automated?:bool,reply_policy?:string,quote_policy?:string,profile_badges?:array,hide_profile_replies?:bool,hide_profile_boosts?:bool,algorithm_enabled?:bool,trending_enabled?:bool,downranking_enabled?:bool,asks_enabled?:bool,webmentions_enabled?:bool} $fields
  */
 /**
  * Serialize profile writes per actor. Profile saves intentionally build a
@@ -3140,6 +3157,9 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
     $algorithmEnabled = array_key_exists('algorithm_enabled', $fields)
         ? (!empty($fields['algorithm_enabled']) ? 1 : 0)
         : (!empty($existingProfile['algorithm_enabled']) ? 1 : 0);
+    $trendingEnabled = array_key_exists('trending_enabled', $fields)
+        ? (!empty($fields['trending_enabled']) ? 1 : 0)
+        : (!array_key_exists('trending_enabled', $existingProfile) || !empty($existingProfile['trending_enabled']) ? 1 : 0);
     $downrankingEnabled = array_key_exists('downranking_enabled', $fields)
         ? (!empty($fields['downranking_enabled']) ? 1 : 0)
         : (!empty($existingProfile['downranking_enabled']) ? 1 : 0);
@@ -3151,8 +3171,8 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         : (!empty($existingProfile['webmentions_enabled']) ? 1 : 0);
 
     $stmt = ap_db()->prepare(
-        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, asks_enabled, webmentions_enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        'INSERT INTO actor_profile (actor_key, name, summary, attachment_json, icon_url, image_url, manually_approves, discoverable, indexable, collection_consent, vanity_verified, auto_follow_back, anti_ai_marker, auto_unblur_sensitive, auto_delete_posts_7d, automated, reply_policy, quote_policy, forum_signature, profile_badges, hide_profile_replies, hide_profile_boosts, algorithm_enabled, downranking_enabled, asks_enabled, webmentions_enabled, trending_enabled, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(actor_key) DO UPDATE SET
            name = excluded.name,
            summary = excluded.summary,
@@ -3176,6 +3196,7 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
            hide_profile_replies = excluded.hide_profile_replies,
            hide_profile_boosts = excluded.hide_profile_boosts,
            algorithm_enabled = excluded.algorithm_enabled,
+           trending_enabled = excluded.trending_enabled,
            downranking_enabled = excluded.downranking_enabled,
            asks_enabled = excluded.asks_enabled,
            webmentions_enabled = excluded.webmentions_enabled,
@@ -3208,6 +3229,7 @@ function ap_profile_save_unlocked(array $fields, string $actorKey = 'cmdr_nova')
         $downrankingEnabled,
         $asksEnabled,
         $webmentionsEnabled,
+        $trendingEnabled,
         ap_db_now(),
     ]);
 

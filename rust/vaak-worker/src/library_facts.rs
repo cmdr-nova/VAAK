@@ -126,7 +126,21 @@ async fn local_counts_mode(db:&Client,note:&str,sid:&str,include_bookmarks:bool)
       GREATEST((SELECT count(*) FROM events WHERE rtrim(quote_object,'/')=$3),
         (SELECT count(*) FROM quote_authorizations WHERE deleted_at IS NULL AND quoted_note_id=ANY($1))),
       {bookmark_count}");
-    let row=db.query_one(&query, &[&keys,&sid,&note]).await.context("current local Library engagement")?;
+    let row = match db.query_one(&query, &[&keys, &sid, &note]).await {
+        Ok(row) => row,
+        Err(error) if error.code() == Some(&tokio_postgres::error::SqlState::UNDEFINED_COLUMN) => {
+            // PHP treats events.quote_object as optional on older schemas.
+            // Retain authorization/summary sources and every mandatory count;
+            // another missing required column still errors on the retry.
+            let without_event_quotes = query.replace(
+                "(SELECT count(*) FROM events WHERE rtrim(quote_object,'/')=$3)",
+                "0::bigint",
+            );
+            db.query_one(&without_event_quotes, &[&keys, &sid]).await
+                .context("current local Library engagement without optional event quotes")?
+        }
+        Err(error) => return Err(error).context("current local Library engagement"),
+    };
     let mut counts = Counts { favourites:row.get(0), reblogs:row.get(1), quotes:row.get(2), bookmarks:row.get(3) };
     if counts.quotes == 0 { counts.quotes = db.query_one("SELECT count(*) FROM events WHERE type='Create' AND summary LIKE $1 AND object_id IS DISTINCT FROM $2 AND object_id IS DISTINCT FROM $3", &[&format!("%{note}%"),&keys[0],&keys[1]]).await?.get(0); }
     if let Some(row) = db.query_opt("SELECT p.like_count::bigint,p.repost_count::bigint,p.quote_count::bigint FROM bsky_crossposts c JOIN bsky_posts p ON p.bsky_uri=c.bsky_uri WHERE c.note_id=ANY($1) ORDER BY c.created_at DESC NULLS LAST LIMIT 1", &[&keys]).await? {
@@ -333,6 +347,46 @@ pub(crate) async fn resolve(db: &Client, owner_id: i64, owner_actor: &str, statu
         assert_eq!(output.len(),28,"20 nonzero/edge count and eight current Ask identity captures");
         assert!(differences.is_empty(),"{}",differences.join("\n"));
     }
+    #[tokio::test]
+    #[ignore = "requires genuine optional-quote PHP captures and owned PostgreSQL"]
+    async fn optional_event_quote_column_matches_genuine_php() {
+        let path=std::env::var("LIBRARY_OPTIONAL_QUOTE_CAPTURE").expect("actual PHP capture path");
+        let reference:Value=serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let url=std::env::var("LIBRARY_FIXTURE_DB").expect("owned PostgreSQL URL");
+        assert!(url.contains("/tmp/"));
+        let db=crate::db::connect(&url).await.unwrap();
+        let mut output=Vec::new();
+        for (index,case) in reference["captures"].as_array().unwrap().iter().enumerate() {
+            let schema=format!("library_optional_quote_native_{}_{}",std::process::id(),index);
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema}")).await.unwrap();
+            for (table,columns) in case["current_schema"].as_object().unwrap() {
+                assert!(table.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'));
+                let definitions=columns.as_array().unwrap().iter().map(|column| {
+                    let name=s(column,"name");let kind=s(column,"type");
+                    assert!(name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'));
+                    assert!(matches!(kind,"INTEGER"|"BIGINT"|"TEXT"));format!("{name} {kind}")
+                }).collect::<Vec<_>>().join(",");
+                db.batch_execute(&format!("CREATE TABLE {table}({definitions})")).await.unwrap();
+            }
+            for (table,rows) in case["current_tables"].as_object().unwrap() {
+                for row in rows.as_array().unwrap(){db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"),&[row]).await.unwrap();}
+            }
+            let source=&case["source"];
+            let actual=serde_json::to_value(local_counts(&db,s(source,"note_id"),s(source,"status_id")).await.unwrap()).unwrap();
+            output.push(serde_json::json!({"width":case["width"],"case":case["case"],"php":case["php"],"native":actual}));
+            // Missing mandatory action state must remain an error, even after
+            // the optional-column retry; no zero-facts authority is fabricated.
+            db.batch_execute("ALTER TABLE masto_favourites RENAME COLUMN status_id TO unavailable_status_id").await.unwrap();
+            let required_failed=local_counts(&db,s(source,"note_id"),s(source,"status_id")).await.is_err();
+            db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await.unwrap();
+            assert_eq!(actual,case["php"],"{}/{}",case["width"],case["case"]);
+            assert!(required_failed,"required count column became optional");
+        }
+        let output_path=std::env::var("LIBRARY_OPTIONAL_QUOTE_OUTPUT").expect("owned output path");
+        std::fs::write(output_path,serde_json::to_vec_pretty(&output).unwrap()).unwrap();
+        assert_eq!(output.len(),12);
+    }
+
     #[test] fn own_action_ids_match_actual_php_snowflake_and_preserve_source() {
         let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let code=r#"require $argv[1].'/api/bin/migration-reference-functions.php';reference_load($argv[1].'/api/ap-masto-entities.php',['ap_masto_snowflake_id']);echo json_encode([ap_masto_snowflake_id('2026-10-10T12:00:00Z',9,0),ap_masto_snowflake_id('2026-10-10T14:00:00+02:00',100000009,0)]);"#;
