@@ -10872,7 +10872,7 @@ function ap_masto_trend_tag_current_rows(array $sources): array
     if (count($sources) > 6700) return [];
     $defs = [
         'event' => ['events', 'id', 'id,object_id,actor_id,visibility,type,action_taken,summary,spoiler_text,created_at'],
-        'mention' => ['mentions', 'id', 'id,object_id,actor_id,visibility,deleted_at,content,spoiler_text,created_at'],
+        'mention' => ['mentions', 'id', '*'],
         'outbox' => ['outbox_notes', 'id', 'id,visibility,content,raw_create_json,published'],
         'bsky' => ['bsky_posts', 'bsky_uri', 'bsky_uri,text,published_at,author_did'],
     ];
@@ -11163,7 +11163,7 @@ function ap_masto_trend_tag_canonical_rows(array $entries): ?array
                 AND NOT EXISTS(SELECT 1 FROM events n WHERE n.object_id IN (rtrim(e.object_id,'/'),rtrim(e.object_id,'/')||'/') AND n.type IN ('Create','Update'))))) current_source WHERE latest=1";
             $st=ap_db()->prepare($sql);$st->execute($refs);
             foreach($st->fetchAll()?:[] as $row)$out['events'][rtrim((string)$row['object_id'],'/')]=$row;
-            $st=ap_db()->prepare("SELECT * FROM (SELECT object_id,actor_id,visibility,deleted_at,content,spoiler_text,
+            $st=ap_db()->prepare("SELECT * FROM (SELECT mentions.*,
                 ROW_NUMBER() OVER(PARTITION BY rtrim(object_id,'/') ORDER BY id DESC) AS latest
                 FROM mentions WHERE object_id IN ($marks)) current_source WHERE latest=1");$st->execute($refs);
             foreach($st->fetchAll()?:[] as $row)$out['mentions'][rtrim((string)$row['object_id'],'/')]=$row;
@@ -11466,7 +11466,7 @@ function ap_masto_trend_link_current_rows(array $sources): array
     if (count($sources) > 7200) return [];
     $defs = [
         'event' => ['events', 'id', 'id,object_id,actor_id,visibility,type,action_taken,summary,spoiler_text,created_at'],
-        'mention' => ['mentions', 'id', 'id,object_id,actor_id,visibility,deleted_at,content,spoiler_text,created_at'],
+        'mention' => ['mentions', 'id', '*'],
         'outbox' => ['outbox_notes', 'id', 'id,visibility,content,raw_create_json,published'],
         'bsky' => ['bsky_posts', 'bsky_uri', 'bsky_uri,text,published_at,author_did'],
     ];
