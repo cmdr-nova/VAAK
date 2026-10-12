@@ -372,8 +372,36 @@ fn raw_scalar_quote_target(object:&Value,plain:&str)->Result<Option<String>>{
    return Ok(Some(crate::library::card::php_trim(target).trim_end_matches('/').into()));
   }
  }
+ // FEP object links identify a target only. Their payload does not supply
+ // child presentation or permission: prepare_raw_quote still resolves the
+ // current canonical source and rechecks its audience and source ledger.
+ if let Some(target)=raw_quote_tag_target(object)?{
+  if target.starts_with("https://bsky.app/"){bail!("PHP fallback: raw Bluesky quote normalization incomplete")}
+  return Ok(Some(crate::library::card::php_trim(target).trim_end_matches('/').into()));
+ }
  if raw_quote_summary_present(plain)||raw_quote_tag_present(object)||object.get("quoteObject").is_some_and(|value|!value.is_null()){
   bail!("PHP fallback: raw summary/tag quote pack requires native assembly")
+ }
+ Ok(None)
+}
+fn raw_quote_tag_target(object:&Value)->Result<Option<&str>>{
+ let Some(tags)=object.get("tag")else{return Ok(None)};
+ // PHP accepts either one Link object or an associative/list tag collection.
+ // Its isset(type/href) test wraps only non-null fields as a singleton.
+ let tags=if let Some(tags)=tags.as_array(){tags.iter().collect::<Vec<_>>()}else if let Some(tags)=tags.as_object(){
+  if ["type","href"].iter().any(|key|tags.get(*key).is_some_and(|value|!value.is_null())){vec![object.get("tag").unwrap()]}else{
+   // Value object keys are sorted; PHP preserves insertion order. Multiple
+   // associative tag objects need raw-order decoding before native takeover.
+   if tags.values().filter(|tag|tag.is_object()).count()>1{bail!("PHP fallback: associative quote tag order requires raw decoding")}
+   tags.values().collect()
+  }
+ }else{return Ok(None)};
+ for tag in tags{
+  if !tag.is_object(){continue}
+  let rel=tag.get("rel");
+  let rels=if let Some(rels)=rel.and_then(Value::as_array){rels.iter().collect::<Vec<_>>()}else if let Some(rels)=rel.and_then(Value::as_object){rels.values().collect()}else{rel.into_iter().collect()};
+  let is_quote=rels.into_iter().any(|rel|rel.as_str().is_some_and(|rel|rel.contains("quote")));
+  if is_quote{if let Some(href)=tag.get("href").and_then(Value::as_str).filter(|href|href.starts_with("https://")){return Ok(Some(href))}}
  }
  Ok(None)
 }
@@ -770,6 +798,60 @@ async fn prepare_ordered_profile_page_inner(db:&Client,viewer:&crate::profile_ma
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn actual_php_fep_tag_quote_targets()->Result<()>{
+  let script=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/bin/profile-tag-target-reference.php");
+  let output=std::process::Command::new("php").arg(script).output()?;
+  anyhow::ensure!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+  let reference:Value=serde_json::from_slice(&output.stdout)?;
+  for row in reference["captures"].as_array().unwrap(){
+   let expected=row["php_pack"]["url"].as_str().map(|url|crate::library::card::php_trim(url).trim_end_matches('/').to_owned());
+   assert_eq!(raw_scalar_quote_target(&row["object"],row["plain"].as_str().unwrap())?,expected,"{}",row["case"]);
+  }
+  assert!(raw_scalar_quote_target(&serde_json::json!({"tag":{"z":{"rel":"quote","href":"https://first.test/n"},"a":{"rel":"quote","href":"https://second.test/n"}}}),"body").is_err());
+  // A target-bearing tag never enables an unimplemented Bluesky projector.
+  assert!(raw_scalar_quote_target(&serde_json::json!({"tag":[{"rel":"quote","href":"https://bsky.app/profile/a/post/b"}]}),"body").is_err());
+  Ok(())
+ }
+ #[tokio::test]
+ #[ignore="actual PHP raw-card FEP target oracle with disposable PostgreSQL"]
+ async fn actual_php_fep_tag_raw_profile_cards()->Result<()>{
+  let input:Value=serde_json::from_slice(&std::fs::read(std::env::var("PROFILE_TAG_REFERENCE")?)?)?;
+  let connection=std::env::var("LIBRARY_FIXTURE_DB")?;anyhow::ensure!(connection.contains("/tmp/"),"owned fixture database required");
+  let db=crate::db::connect(&connection).await?;let mut output=Vec::new();
+  for width in ["INTEGER","BIGINT"]{
+   let schema=format!("profile_tag_native_{}_{}",width.to_lowercase(),std::process::id());
+   db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path={schema}")).await?;
+   let result:Result<()>=async{
+    for(table,columns)in input["current_schema_by_width"][width].as_object().unwrap(){
+     let defs=columns.as_array().unwrap().iter().map(|column|format!("{} {}",column["column_name"].as_str().unwrap(),column["data_type"].as_str().unwrap())).collect::<Vec<_>>().join(",");
+     db.batch_execute(&format!("CREATE TABLE {table}({defs})")).await?;
+    }
+    for capture in input["captures"].as_array().unwrap().iter().filter(|capture|capture["width"]==width){
+     for(table,rows)in capture["current_tables"].as_object().unwrap(){
+      db.batch_execute(&format!("DELETE FROM {table}")).await?;
+      for row in rows.as_array().unwrap(){let text=serde_json::to_string(row)?;db.execute(&format!("INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1::text::jsonb)"),&[&text]).await?;}
+     }
+     let session=GuestProfileSession::from_php_guest_profile("fixture".into(),"https://mkultra.monster/users/fixture".into(),false,0)?;
+     let selection=crate::profile_source::select(&db,"fixture","https://mkultra.monster/users/fixture","posts",1,0).await?;
+     anyhow::ensure!(selection.rows().first()==Some(&capture["source"]),"actual first raw source binding");
+     let mut batch=admit_guest_raw_with_dns(&db,&session,selection,&crate::direct_preview::SystemDns).await?;
+     anyhow::ensure!(batch.cards.len()==1,"selected raw card must be prepared natively");
+     batch.cards[0].1.facts.card.now=chrono::DateTime::from_timestamp(capture["context"]["rendered_at"].as_i64().unwrap(),0).unwrap();
+     let html=crate::profile_raw::render(&batch.cards[0].1)?;batch.require_current(&db).await?;
+     // Source encoding and child audience remain live after preparation.
+     let note=capture["source"]["id"].as_str().unwrap();
+     db.execute("UPDATE outbox_notes SET content=content||' withdrawn after preparation' WHERE id=$1",&[&note]).await?;
+     anyhow::ensure!(batch.require_current(&db).await.is_err(),"edited parent must reject publication");
+     output.push(serde_json::json!({"width":width,"case":capture["case"],"variant":capture["variant"],"html":html,"source_withdrawal_rejected":true}));
+    }
+    Ok(())
+   }.await;
+   db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await?;result?;
+  }
+  std::fs::write(std::env::var("PROFILE_TAG_NATIVE")?,serde_json::to_vec_pretty(&output)?)?;
+  anyhow::ensure!(output.len()==32,"complete both-width fixture coverage");Ok(())
+ }
  struct RejectDns;
  impl crate::direct_preview::PreviewDns for RejectDns{
   fn ipv4<'a>(&'a self,_:&'a str)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<Vec<std::net::Ipv4Addr>>>+Send+'a>>{Box::pin(async{panic!("mismatched quote capability reached DNS")})}
