@@ -2074,7 +2074,9 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         .cloned()
         .collect();
     let rows = db.query(
-        "SELECT id, COALESCE(content, ''), COALESCE(raw_create_json, '') FROM outbox_notes WHERE id = ANY($1)",
+        "SELECT o.id, COALESCE(o.content,''), COALESCE(o.raw_create_json,''), COALESCE(m.spoiler_text,''), COALESCE(m.sensitive,0)::bigint
+         FROM outbox_notes o LEFT JOIN LATERAL (SELECT spoiler_text,sensitive FROM masto_statuses WHERE note_id=o.id OR note_id=o.id||'/' ORDER BY CASE WHEN note_id=o.id THEN 0 ELSE 1 END,local_id DESC LIMIT 1) m ON true
+         WHERE o.id=ANY($1)",
         &[&local_targets],
     ).await.context("select local quote targets")?;
     let local_keys: Vec<String> = local_targets.iter().filter_map(|uri| uri.strip_prefix(LOCAL_ACTOR_PREFIX).and_then(|rest| rest.split('/').next()).map(str::to_string)).collect();
@@ -2085,12 +2087,19 @@ pub(crate) async fn hydrate_local_quote_targets(db: &Client, statuses: &mut [Val
         let id = id.trim_end_matches('/').to_string();
         let username = id.strip_prefix(LOCAL_ACTOR_PREFIX)
             .and_then(|rest| rest.split('/').next()).unwrap_or("quoted");
-        let media = media_from_urls(&serde_json::to_string(&attachment_urls_from_create_json(&row.get::<_, String>(2))).unwrap_or_else(|_| "[]".into()), &id);
+        let raw:String=row.get(2);
+        let media = media_from_urls(&serde_json::to_string(&attachment_urls_from_create_json(&raw)).unwrap_or_else(|_| "[]".into()), &id);
+        let object=serde_json::from_str::<Value>(&raw).ok().and_then(|value|value.get("object").cloned());
+        // Explicit current raw empty/false clears older cached presentation.
+        let spoiler=object.as_ref().and_then(|value|value.get("summary")).map(|value|value.as_str().unwrap_or("").to_owned()).unwrap_or_else(||row.get::<_,String>(3));
+        let sensitive=object.as_ref().and_then(|value|value.get("sensitive")).map(|value|value.as_bool().unwrap_or(false)).unwrap_or_else(||row.get::<_,i64>(4)!=0);
         by_target.insert(id.clone(), json!({
             "id": id,
             "uri": id,
             "url": id,
             "content": row.get::<_, String>(1),
+            "spoiler_text": spoiler,
+            "sensitive": sensitive,
             "account": local_account_from_profile(&format!("{LOCAL_ACTOR_PREFIX}{username}"), username, &profiles),
             "media_attachments": media,
         }));
@@ -3575,7 +3584,7 @@ async fn fetch_ask_context_map(db: &Client, object_ids: &[String]) -> Result<Has
 async fn load_owner_username(db: &Client, owner: i64) -> Result<String> {
     let row = db
         .query_opt(
-            "SELECT COALESCE(username,'cmdr_nova') FROM ap_users WHERE id = $1",
+            "SELECT COALESCE(username,'cmdr_nova') FROM ap_users WHERE id = $1::bigint",
             &[&owner],
         )
         .await?;
@@ -4549,7 +4558,8 @@ pub async fn warm_view(
     boost_ids.sort();
     boost_ids.dedup();
 
-    let hidden = crate::hidden::load_hidden_sets(&db, owner_user_id).await?;
+    let mut hidden = crate::hidden::load_hidden_sets(&db, owner_user_id).await?;
+    crate::hidden::load_ordinary_owned_notes(&db, owner_user_id, &outbox_ids, &mut hidden).await?;
     let owner_username = load_owner_username(&db, owner_user_id).await?;
     let mut rss_map = fetch_rss_map(&db, &rss_ids, owner_user_id).await?;
     let bsky_map = fetch_bsky_map(&db, &bsky_uris).await?;
@@ -4752,7 +4762,7 @@ pub async fn warm_view(
             // Ranked caches can briefly contain an item from before a mute or
             // instance block changed. Filter again at hydration so stale
             // envelopes cannot leak blocked actors into the Rust timeline.
-            if crate::hidden::status_hidden(&st, &hidden) {
+            if crate::hidden::ordinary_status_hidden(&st, &hidden) {
                 continue;
             }
             if view == "home" && e.kind == "bsky" {
@@ -4785,7 +4795,9 @@ pub async fn warm_view(
 
     // Never cache restricted or muted nested context after quote hydration.
     crate::audience::filter_statuses(&db, owner_user_id, crate::audience::Surface::timeline(view), &mut statuses).await?;
-    statuses.retain(|st| !crate::hidden::status_hidden(st, &hidden));
+    let selected:Vec<String> = statuses.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
+    crate::hidden::load_ordinary_owned_notes(&db, owner_user_id, &selected, &mut hidden).await?;
+    statuses.retain(|st| !crate::hidden::ordinary_status_hidden(st, &hidden));
     let mut stored = Vec::new();
     let now = chrono::Utc::now().timestamp();
     for &limit in &limits {

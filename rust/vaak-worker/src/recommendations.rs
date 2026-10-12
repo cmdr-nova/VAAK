@@ -5,13 +5,13 @@ use std::collections::HashSet;
 use tokio_postgres::Client;
 
 pub async fn algorithm_enabled(db: &Client, owner: i64) -> Result<bool> {
-    let row = db.query_opt("SELECT COALESCE(p.algorithm_enabled,1)::integer FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE u.id=$1", &[&owner]).await?;
+    let row = db.query_opt("SELECT COALESCE(p.algorithm_enabled,1)::integer FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE u.id=$1::bigint", &[&owner]).await?;
     Ok(row.map(|r| r.get::<_, i32>(0) != 0).unwrap_or(true))
 }
 
 pub const INTERACTED_SQL: &str = r#"
 WITH candidates AS (SELECT unnest($2::text[]) AS object_id),
-viewer AS (SELECT id,actor_id FROM ap_users WHERE id=$1),
+viewer AS (SELECT id,actor_id FROM ap_users WHERE id=$1::bigint),
 own_notes AS MATERIALIZED (
  SELECT o.in_reply_to, NULLIF(o.raw_create_json,'')::jsonb AS doc FROM outbox_notes o, viewer v
  WHERE substr(o.id,1,length(rtrim(v.actor_id,'/') || '/notes/'))=rtrim(v.actor_id,'/') || '/notes/'

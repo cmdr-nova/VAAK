@@ -16,6 +16,8 @@ pub struct HiddenSets {
     pub instance_muted_actors: HashSet<String>,
     pub instance_blocked_domains: HashSet<String>,
     pub muted_phrases: Vec<String>,
+    /// Populated only for selected canonical local outbox objects on ordinary surfaces.
+    pub ordinary_owned_notes: HashMap<String, String>,
 }
 
 impl HiddenSets {
@@ -54,8 +56,46 @@ impl HiddenSets {
 /// Cached envelopes can outlive a mute/block change, so both the card author
 /// and a boost/reblog's underlying author must be checked at read time.
 pub fn status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
-    status_hidden_at(status, hidden, 0, false)
+    status_hidden_at(status, hidden, 0, false, false)
 }
+
+/// Word mutes on ordinary posts may exempt a proven own root. Discovery uses status_hidden.
+pub fn ordinary_status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
+    ordinary_ask_questions_hidden(status, hidden, 0) || status_hidden_at(status, hidden, 0, false, true)
+}
+
+pub fn ordinary_status_hidden_on_profile(status: &Value, hidden: &HiddenSets) -> bool {
+    ordinary_ask_questions_hidden(status, hidden, 0) || status_hidden_at(status, hidden, 0, true, true)
+}
+
+fn ordinary_ask_questions_hidden(status:&Value,hidden:&HiddenSets,depth:usize)->bool {
+    if depth>16{return true}
+    let question=status.get("vaak_ask").and_then(|ask|ask.get("question").or_else(||ask.get("ask_question"))).and_then(Value::as_str).unwrap_or("");
+    let text=normalize_muted_text(question);
+    if hidden.muted_phrases.iter().any(|phrase|!phrase.is_empty()&&text.contains(phrase)){return true}
+    ["reblog","quote","vaak_quote_preview"].iter().any(|field|status.get(field).filter(|child|child.is_object()).is_some_and(|child|{
+        let child=child.get("quoted_status").filter(|value|value.is_object()).or_else(||child.get("status").filter(|value|value.is_object())).unwrap_or(child);
+        ordinary_ask_questions_hidden(child,hidden,depth+1)
+    }))
+}
+
+/// Obtain grants from current durable ownership, never a cached account or client flag.
+/// Only requested canonical IDs are read, in bounded batches; no owner-wide history scan.
+pub async fn load_ordinary_owned_notes(db: &Client, owner: i64, ids: &[String], hidden: &mut HiddenSets) -> Result<()> {
+    hidden.ordinary_owned_notes.clear();
+    if owner < 1 || hidden.muted_phrases.is_empty() { return Ok(()); }
+    let mut variants: Vec<String> = ids.iter().flat_map(|id| { let key=id.trim().trim_end_matches('/'); [key.to_owned(),format!("{key}/")] }).filter(|id|!id.is_empty()).collect();
+    variants.sort(); variants.dedup();
+    for batch in variants.chunks(200) {
+        let selected=batch.to_vec();
+        for row in db.query(ORDINARY_OWNED_NOTES_SQL, &[&owner,&selected]).await.context("selected ordinary local ownership")? {
+            let id:String=row.get(0); let actor:String=row.get(1); hidden.ordinary_owned_notes.insert(id, actor);
+        }
+    }
+    Ok(())
+}
+
+pub const ORDINARY_OWNED_NOTES_SQL: &str = "SELECT DISTINCT rtrim(o.id,'/'),rtrim(u.actor_id,'/') FROM outbox_notes o JOIN ap_users u ON u.id=$1::bigint AND u.disabled_at IS NULL AND $1::bigint>0 WHERE o.id=ANY($2) AND rtrim(u.actor_id,'/')<>'' AND left(o.id,length(rtrim(u.actor_id,'/')||'/notes/'))=rtrim(u.actor_id,'/')||'/notes/'";
 
 /// Library consumes normalized cards together with their authoritative native
 /// source trees. Native author and remote block policy cannot be recovered from
@@ -67,6 +107,17 @@ pub fn library_status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
         && post.get("author").is_some_and(Value::is_object);
     let raw_native = post_view(status) || status.get("post").is_some_and(post_view);
     status_hidden(status, hidden) || (raw_native && native_tree_hidden(status, hidden, 0))
+        || library_native_sources_hidden(status, hidden, 0)
+}
+
+/// Library local canonical roots may opt in; retained foreign native and quote trees remain strict.
+pub fn ordinary_library_status_hidden(status: &Value, hidden: &HiddenSets) -> bool {
+    // Raw native protocol envelopes are authoritative too. Dispatch only the
+    // PostView/FeedView shapes; arbitrary normalized metadata is not native.
+    let post_view = |post:&Value| post.get("uri").and_then(Value::as_str).is_some_and(|uri|uri.starts_with("at://"))
+        && post.get("author").is_some_and(Value::is_object);
+    let raw_native = post_view(status) || status.get("post").is_some_and(post_view);
+    ordinary_status_hidden(status, hidden) || (raw_native && native_tree_hidden(status, hidden, 0))
         || library_native_sources_hidden(status, hidden, 0)
 }
 
@@ -131,10 +182,10 @@ fn php_truthy(value: &Value) -> bool {
 /// A directly opened profile may show its muted author, while nested authors
 /// still obey personal mutes. Blocks and muted words apply throughout.
 pub fn status_hidden_on_profile(status: &Value, hidden: &HiddenSets) -> bool {
-    status_hidden_at(status, hidden, 0, true)
+    status_hidden_at(status, hidden, 0, true, false)
 }
 
-fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_root: bool) -> bool {
+fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_root: bool, ordinary_root: bool) -> bool {
     if depth > 16 { return true; }
     // Flattened fallback previews sometimes have no account. Their object
     // host still obeys domain blocks, including real subdomains.
@@ -161,14 +212,18 @@ fn status_hidden_at(status: &Value, hidden: &HiddenSets, depth: usize, profile_r
     let text = ["content", "spoiler_text"].iter()
         .filter_map(|field| status.get(field).and_then(Value::as_str))
         .map(normalize_muted_text).collect::<Vec<_>>().join(" ");
-    if hidden.muted_phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase)) { return true; }
+    let exempt = ordinary_root && depth == 0 && status.get("uri").and_then(Value::as_str)
+        .and_then(|uri| hidden.ordinary_owned_notes.get(uri.trim().trim_end_matches('/')))
+        .is_some_and(|actor| status.get("account").and_then(|account|account.get("uri")).and_then(Value::as_str)
+            .is_some_and(|candidate|candidate.trim().trim_end_matches('/')==actor));
+    if !exempt && hidden.muted_phrases.iter().any(|phrase| !phrase.is_empty() && text.contains(phrase)) { return true; }
     if let Some(reblog) = status.get("reblog").filter(|v| v.is_object()) {
-        if status_hidden_at(reblog, hidden, depth + 1, false) { return true; }
+        if status_hidden_at(reblog, hidden, depth + 1, false, false) { return true; }
     }
     for field in ["quote", "vaak_quote_preview"] {
         if let Some(quote) = status.get(field).filter(|v| v.is_object()) {
             let nested = quote.get("quoted_status").or_else(|| quote.get("status")).filter(|v| v.is_object()).unwrap_or(quote);
-            if status_hidden_at(nested, hidden, depth + 1, false) { return true; }
+            if status_hidden_at(nested, hidden, depth + 1, false, false) { return true; }
         }
     }
     false
@@ -376,6 +431,42 @@ pub async fn load_library_hidden_sets(db: &Client, owner_user_id: i64) -> Result
         if !did.is_empty() {
             sets.user_blocked_actors.insert(did.clone());
             sets.user_blocked_actors.insert(format!("https://bsky.app/profile/{did}"));
+        }
+    }
+    Ok(sets)
+}
+
+/// Canonical proof-only reader: one fresh SQL snapshot of the same five
+/// tables. This stores no decisions and uses the same actor/domain/word
+/// normalization as the ordinary reader; absent tables remain query errors.
+pub(crate) async fn load_canonical_library_hidden_sets(db:&Client,owner:i64)->Result<HiddenSets>{
+    if owner<1{anyhow::bail!("Library moderation requires an owner")}
+    let rows=db.query("SELECT 'mute' AS source, NULL::text AS scope, actor_id::text AS value, NULL::text AS kind FROM ap_mutes WHERE owner_user_id=$1::bigint
+        UNION ALL SELECT 'user',scope::text,value::text,NULL::text FROM ap_user_blocks WHERE owner_user_id=$1::bigint
+        UNION ALL SELECT 'instance',scope::text,value::text,COALESCE(to_jsonb(ap_blocks)->>'kind','block') FROM ap_blocks
+        UNION ALL SELECT 'word',NULL::text,phrase::text,NULL::text FROM ap_muted_words WHERE owner_user_id=$1::bigint
+        UNION ALL SELECT DISTINCT 'bsky',NULL::text,did::text,NULL::text FROM bsky_hide_dids WHERE owner_user_id::bigint=$1",&[&owner]).await.context("read current canonical Library moderation")?;
+    let mut sets=HiddenSets::default();
+    for row in rows{
+        let source:String=row.try_get(0)?;
+        let value:String=row.try_get::<_,Option<String>>(2)?.unwrap_or_default();
+        match source.as_str(){
+            "mute"=>{let actor=norm_actor(&value);if !actor.is_empty(){insert_actor_aliases(&mut sets.muted_actors,&actor)}},
+            "word"=>{let phrase=normalize_muted_text(&row.try_get::<_,String>(2)?);if !phrase.is_empty(){sets.muted_phrases.push(phrase)}},
+            "bsky"=>{let did=norm_actor(&value);if !did.is_empty(){sets.user_blocked_actors.insert(did.clone());sets.user_blocked_actors.insert(format!("https://bsky.app/profile/{did}"));}},
+            "user"|"instance"=>{
+                let scope:String=row.try_get::<_,Option<String>>(1)?.unwrap_or_default();
+                if scope=="actor"{
+                    let actor=norm_actor(&value);if actor.is_empty(){continue}
+                    if source=="user"{insert_actor_aliases(&mut sets.user_blocked_actors,&actor)}
+                    else if row.try_get::<_,String>(3)?=="mute"{for alias in actor_aliases(&actor){sets.instance_muted_actors.insert(alias.to_ascii_lowercase());}}
+                    else{insert_actor_aliases(&mut sets.instance_blocked_actors,&actor)}
+                }else if scope=="domain"{
+                    let host=value.trim().trim_start_matches('.').to_ascii_lowercase();if host.is_empty(){continue}
+                    if source=="user"{sets.user_blocked_domains.insert(host);}else{sets.instance_blocked_domains.insert(host);}
+                }
+            },
+            _=>anyhow::bail!("unknown canonical moderation source"),
         }
     }
     Ok(sets)
@@ -711,4 +802,87 @@ mod profile_mute_tests {
         assert!(!status_hidden_on_profile(&json!({"account":{"uri":author},"content":"profile post"}), &hidden));
         assert!(status_hidden_on_profile(&json!({"account":{"uri":"https://friend.test/users/bob"},"quote":{"quoted_status":{"account":{"uri":author},"content":"muted quote"}}}), &hidden));
     }
+}
+
+#[cfg(test)]
+mod canonical_policy_differential {
+    use super::*;
+    fn same(actual:&HiddenSets,reference:&HiddenSets){
+        assert_eq!(actual.muted_actors,reference.muted_actors);
+        assert_eq!(actual.user_blocked_actors,reference.user_blocked_actors);
+        assert_eq!(actual.user_blocked_domains,reference.user_blocked_domains);
+        assert_eq!(actual.instance_blocked_actors,reference.instance_blocked_actors);
+        assert_eq!(actual.instance_muted_actors,reference.instance_muted_actors);
+        assert_eq!(actual.instance_blocked_domains,reference.instance_blocked_domains);
+        let mut a=actual.muted_phrases.clone();let mut b=reference.muted_phrases.clone();a.sort();b.sort();assert_eq!(a,b);
+    }
+    /// Compare the actual original five-table reader against the combined
+    /// reader on both schema widths and live mutations, not a mirrored oracle.
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL fixture"]
+    async fn combined_policy_matches_original_current_reader(){
+        let url=std::env::var("VAAK_CANONICAL_POLICY_TEST_DATABASE_URL").expect("explicit isolated fixture database required");
+        let db=crate::db::connect(&url).await.unwrap();
+        for width in ["INTEGER","BIGINT"]{
+            let schema=format!("library_proof_policy_{}_{}",std::process::id(),width.to_ascii_lowercase());
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema};
+                CREATE TABLE ap_mutes(owner_user_id {width},actor_id TEXT);
+                CREATE TABLE ap_user_blocks(owner_user_id {width},scope TEXT,value TEXT);
+                CREATE TABLE ap_blocks(scope TEXT,value TEXT,kind TEXT);
+                CREATE TABLE ap_muted_words(owner_user_id {width},phrase TEXT);
+                CREATE TABLE bsky_hide_dids(owner_user_id {width},did TEXT);
+                INSERT INTO ap_mutes VALUES(1,' https://Example.test/users/Case/ '),(1,''),(1,NULL),(2,'https://outside.test/users/other');
+                INSERT INTO ap_user_blocks VALUES(1,'actor','https://blocked.test/@User/'),(1,'domain',' .SUB.Blocked.test '),(1,'actor',' '),(1,'unknown','ignored'),(2,'actor','https://other.test/u');
+                INSERT INTO ap_blocks VALUES('actor','https://INSTANCE.test/users/Mute/','mute'),('actor','https://instance.test/users/Block/','block'),('domain','.SERVER.test',NULL),('actor','',NULL),('unknown','ignored','block');
+                INSERT INTO ap_muted_words VALUES(1,' Cats &amp; DOGS '),(1,''),(2,'other viewer');
+                INSERT INTO bsky_hide_dids VALUES(1,' did:plc:blocked/ '),(1,'did:plc:blocked/'),(1,NULL),(1,''),(2,'did:plc:other');")).await.unwrap();
+            for owner in [1,2]{
+                let a=load_canonical_library_hidden_sets(&db,owner).await.unwrap();let b=load_library_hidden_sets(&db,owner).await.unwrap();same(&a,&b);
+                for card in [serde_json::json!({"account":{"uri":"https://Example.test/users/Case/"}}),serde_json::json!({"quote":{"quoted_status":{"account":{"uri":"https://instance.test/users/mute"}}}}),serde_json::json!({"content":"Cats &amp; dogs"}),serde_json::json!({"uri":"https://sub.server.test/notes/1"}),serde_json::json!({"post":{"uri":"at://did:plc:blocked/app.bsky.feed.post/a","author":{"did":"did:plc:blocked"}}})]{assert_eq!(library_status_hidden(&card,&a),library_status_hidden(&card,&b));}
+            }
+            db.batch_execute("DELETE FROM ap_mutes;DELETE FROM ap_user_blocks;DELETE FROM ap_blocks;DELETE FROM ap_muted_words;DELETE FROM bsky_hide_dids;").await.unwrap();
+            same(&load_canonical_library_hidden_sets(&db,1).await.unwrap(),&load_library_hidden_sets(&db,1).await.unwrap());
+            db.batch_execute("INSERT INTO ap_muted_words VALUES(1,'new withdrawal');INSERT INTO ap_blocks VALUES('actor','https://late.test/users/a','mute');").await.unwrap();
+            let current=load_canonical_library_hidden_sets(&db,1).await.unwrap();same(&current,&load_library_hidden_sets(&db,1).await.unwrap());assert!(library_status_hidden(&serde_json::json!({"content":"NEW withdrawal"}),&current));
+            assert!(load_canonical_library_hidden_sets(&db,0).await.is_err());assert!(load_library_hidden_sets(&db,0).await.is_err());
+            db.batch_execute("DROP TABLE ap_muted_words").await.unwrap();assert!(load_canonical_library_hidden_sets(&db,1).await.is_err());assert!(load_library_hidden_sets(&db,1).await.is_err());
+            db.batch_execute(&format!("SET search_path TO public;DROP SCHEMA {schema} CASCADE")).await.unwrap();
+        }
+    }
+    #[test]
+    fn ordinary_own_word_scope_preserves_discovery_foreign_nested_and_actor_policy() {
+        let actor="https://fixture.test/users/own_name";
+        let uri=format!("{actor}/notes/media");
+        let mut hidden=HiddenSets{muted_phrases:vec!["café & dogs".into()],ordinary_owned_notes:HashMap::from([(uri.clone(),actor.into())]),..Default::default()};
+        let own=serde_json::json!({"uri":uri,"account":{"uri":actor},"content":"<p>CAFÉ &amp; dogs</p>","media_attachments":[{"type":"image"}]});
+        assert!(status_hidden(&own,&hidden));assert!(!ordinary_status_hidden(&own,&hidden));
+        let mut text=own.clone();text["media_attachments"]=serde_json::json!([]);assert!(!ordinary_status_hidden(&text,&hidden));
+        let mut peer=own.clone();peer["uri"]=serde_json::json!("https://fixture.test/users/peer/notes/peer");assert!(ordinary_status_hidden(&peer,&hidden));
+        let mut forged=own.clone();forged["account"]["uri"]=serde_json::json!("https://fixture.test/users/peer");assert!(ordinary_status_hidden(&forged,&hidden));
+        for field in ["quote","vaak_quote_preview"] {let mut nested=own.clone();nested[field]=serde_json::json!({"status":peer});assert!(ordinary_status_hidden(&nested,&hidden));}
+        let mut reblog=own.clone();reblog["reblog"]=peer.clone();assert!(ordinary_status_hidden(&reblog,&hidden));
+        hidden.user_blocked_actors.insert(actor.into());assert!(ordinary_status_hidden(&own,&hidden));hidden.user_blocked_actors.clear();
+        hidden.instance_muted_actors.insert(actor.into());assert!(ordinary_status_hidden(&own,&hidden));hidden.instance_muted_actors.clear();
+        hidden.user_blocked_domains.insert("fixture.test".into());assert!(ordinary_status_hidden(&own,&hidden));
+    }
+
+    #[tokio::test]
+    #[ignore="requires isolated PostgreSQL fixture"]
+    async fn ordinary_own_word_current_sql_both_widths() {
+        let url=std::env::var("VAAK_CANONICAL_POLICY_TEST_DATABASE_URL").expect("explicit isolated fixture required");
+        let db=crate::db::connect(&url).await.unwrap();
+        for width in ["INTEGER","BIGINT"] {
+            let schema=format!("ordinary_words_{}_{}",std::process::id(),width.to_ascii_lowercase());
+            db.batch_execute(&format!("CREATE SCHEMA {schema}; SET search_path={schema};CREATE TABLE ap_users(id {width},actor_id TEXT,disabled_at TEXT);CREATE TABLE outbox_notes(id TEXT);INSERT INTO ap_users VALUES(1,'https://fixture.test/users/own_name',NULL),(2,'https://fixture.test/users/ownXname',NULL);INSERT INTO outbox_notes VALUES('https://fixture.test/users/own_name/notes/media'),('https://fixture.test/users/ownXname/notes/peer')")).await.unwrap();
+            let ids=vec!["https://fixture.test/users/own_name/notes/media".into(),"https://fixture.test/users/ownXname/notes/peer".into()];
+            let mut hidden=HiddenSets{muted_phrases:vec!["café & dogs".into()],..Default::default()};
+            load_ordinary_owned_notes(&db,1,&ids,&mut hidden).await.unwrap();assert_eq!(hidden.ordinary_owned_notes.len(),1);
+            let own=serde_json::json!({"uri":ids[0],"account":{"uri":"https://fixture.test/users/own_name"},"content":"CAFÉ &amp; dogs"});
+            assert!(!ordinary_status_hidden(&own,&hidden));assert!(status_hidden(&own,&hidden));
+            db.batch_execute("UPDATE ap_users SET disabled_at='now' WHERE id=1").await.unwrap();load_ordinary_owned_notes(&db,1,&ids,&mut hidden).await.unwrap();assert!(ordinary_status_hidden(&own,&hidden));
+            db.batch_execute("UPDATE ap_users SET disabled_at=NULL,actor_id='https://fixture.test/users/new_owner' WHERE id=1").await.unwrap();load_ordinary_owned_notes(&db,1,&ids,&mut hidden).await.unwrap();assert!(ordinary_status_hidden(&own,&hidden));
+            db.batch_execute(&format!("SET search_path=public;DROP SCHEMA {schema} CASCADE")).await.unwrap();
+        }
+    }
+
 }

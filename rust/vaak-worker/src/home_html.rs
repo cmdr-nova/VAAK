@@ -84,7 +84,7 @@ pub(crate) async fn load_viewer_actor(cfg: &Config, owner_user_id: i64) -> Strin
     let Ok(row) = db
         .query_opt(
             "SELECT COALESCE(NULLIF(trim(actor_id), ''), ''), COALESCE(username, '')
-             FROM ap_users WHERE id = $1 LIMIT 1",
+             FROM ap_users WHERE id = $1::bigint LIMIT 1",
             &[&owner_user_id],
         )
         .await

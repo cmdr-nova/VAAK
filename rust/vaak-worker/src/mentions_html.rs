@@ -13,7 +13,6 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::home_html::load_viewer_actor;
 use crate::notif_embed::{self, paint_lean_embed_from};
 
 
@@ -203,7 +202,12 @@ struct GroupedNotif {
 
 /// Collapse repeated favourite/reblog rows for the same status. Presentation
 /// only — does not change unread IDs or pagination tips (computed on raw items).
+#[cfg(test)]
 fn group_notification_rows(rows: &[Value]) -> Vec<GroupedNotif> {
+    group_notification_rows_with_facts(rows, &GroupingFacts::default())
+}
+
+fn group_notification_rows_with_facts(rows: &[Value], facts: &GroupingFacts) -> Vec<GroupedNotif> {
     use std::collections::HashMap;
     let mut out: Vec<GroupedNotif> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -215,11 +219,11 @@ fn group_notification_rows(rows: &[Value]) -> Vec<GroupedNotif> {
         }
         let acct = row.get("account").cloned().unwrap_or(Value::Null);
         let ident = if acct.is_object() {
-            account_identity_key(&acct)
+            resolved_identity(&acct, facts)
         } else {
             format!("anon:{}", out.len())
         };
-        let group_key = notification_group_key(row);
+        let group_key = resolved_group_key(row, facts);
         let map_key = group_key
             .clone()
             .unwrap_or_else(|| format!("single:{}", row.get("id").and_then(|v| v.as_str()).unwrap_or("x")));
@@ -252,7 +256,7 @@ fn group_notification_rows(rows: &[Value]) -> Vec<GroupedNotif> {
         } else if acct.is_object() && account_is_local(&acct) {
             // Prefer local VAAK face over Bluesky twin for the same identity.
             for existing in out[idx].accounts.iter_mut() {
-                if account_identity_key(existing) == ident && !account_is_local(existing) {
+                if resolved_identity(existing, facts) == ident && !account_is_local(existing) {
                     *existing = acct.clone();
                     if let Some(obj) = out[idx].row.as_object_mut() {
                         obj.insert("account".into(), acct);
@@ -288,7 +292,7 @@ fn avatar_img_html(acct: &Value) -> String {
         "https://mkultra.monster/img/avatar/default.webp"
     };
     format!(
-        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\"{}>",
+        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\"{} onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\">",
         esc(av_src),
         hover_attr_for_account(acct)
     )
@@ -325,14 +329,12 @@ fn paint_grouped_card(g: &GroupedNotif, viewer_actor: &str) -> String {
     for acct in g.accounts.iter().take(6) {
         let href = profile_href_for(acct);
         let img = avatar_img_html(acct);
-        let hover = hover_attr_for_account(acct);
         if href.is_empty() {
             stack.push_str(&img);
         } else {
             stack.push_str(&format!(
-                "<a href=\"{}\" aria-label=\"Open profile\"{} style=\"margin-right:-.35rem;text-decoration:none\">{}</a>",
+                "<a href=\"{}\" aria-label=\"Open profile\" style=\"margin-right:-.35rem\">{}</a>",
                 esc(&href),
-                hover,
                 img
             ));
         }
@@ -591,6 +593,11 @@ fn paint_notif_card(n: &Value, viewer_actor: &str) -> String {
 fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<String>) -> String {
     let n_type = n.get("type").and_then(|v| v.as_str()).unwrap_or("mention");
     let account = n.get("account").cloned().unwrap_or(Value::Null);
+    let mut account = account;
+    if account_is_local(&account) {
+        let acct = account.get("acct").and_then(Value::as_str).unwrap_or("");
+        if !acct.is_empty() && !acct.contains('@') { account["acct"] = Value::from(format!("{acct}@mkultra.monster")); }
+    }
     let acct = account
         .get("acct")
         .and_then(|v| v.as_str())
@@ -641,15 +648,14 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     };
     let hover = hover_attr_for_account(&account);
     let av_img = format!(
-        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\"{}>",
+        "<img class=\"tweet-av\" src=\"{}\" alt=\"\" width=\"40\" height=\"40\" loading=\"lazy\" decoding=\"async\" referrerpolicy=\"no-referrer\"{} onerror=\"this.onerror=null;this.src='https://mkultra.monster/img/avatar/default.webp'\">",
         esc(av_src),
         hover
     );
     let av_block = if !profile_href.is_empty() {
         format!(
-            "<a href=\"{}\" aria-label=\"Open profile\"{} style=\"text-decoration:none\">{}</a>",
+            "<a href=\"{}\" aria-label=\"Open profile\" style=\"text-decoration:none\"{hover}>{}</a>",
             esc(&profile_href),
-            hover,
             av_img
         )
     } else {
@@ -657,9 +663,8 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     };
     let who = if !profile_href.is_empty() {
         format!(
-            "<a class=\"who\" href=\"{h}\"{hover} style=\"color:inherit;text-decoration:none\">{d}</a><a class=\"meta\" href=\"{h}\"{hover} style=\"color:var(--muted);text-decoration:none\"> @{a}</a>",
+            "<a class=\"who\" href=\"{h}\" style=\"color:inherit;text-decoration:none\"{hover}>{d}</a><a class=\"meta\" href=\"{h}\" style=\"color:var(--muted);text-decoration:none\"{hover}> @{a}</a>",
             h = esc(&profile_href),
-            hover = hover,
             d = esc(display),
             a = esc(acct)
         )
@@ -751,7 +756,7 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
                  <input type=\"hidden\" name=\"action\" value=\"follow_remote\">\
                  <input type=\"hidden\" name=\"return_view\" value=\"mentions\">\
                  <input type=\"hidden\" name=\"actor_id\" value=\"{actor}\">\
-                 <button class=\"btn btn-ghost\" type=\"submit\" style=\"padding:.25rem .7rem;font-size:.8rem\" title=\"Follow back\">Follow back</button></form>",
+                 <button class=\"btn btn-ghost\" type=\"submit\" style=\"padding:.25rem .7rem;font-size:.8rem\">Follow back</button></form>",
                 actor = esc(&actor),
             ));
         }
@@ -780,6 +785,182 @@ fn paint_notif_card_follows(n: &Value, viewer_actor: &str, following: &HashSet<S
     )
 }
 
+// HTML-only page facts. JSON notification clients retain notif_list's resolver.
+struct HtmlPage {
+    items: Vec<Value>,
+    primary_count: usize,
+    next_max_id: String,
+    source: String,
+    redis_key: String,
+}
+
+fn raw_page(payload: Value, key: String, source_suffix: &str, limit: usize, cursor: Option<&str>, from_head: bool) -> Result<Option<HtmlPage>> {
+    let Some(raw) = payload.get("items").and_then(Value::as_array) else { return Ok(None); };
+    // Malformed envelopes are not authoritative quiet-account pages.
+    if raw.iter().any(|n| !n.is_object() || n.get("id").and_then(Value::as_str).is_none()) { return Ok(None); }
+    let mut items = if from_head {
+        if let Some(cursor) = cursor {
+            let Some(tail) = crate::notif_list::full_page_after_cursor(raw, &digits_only(cursor), limit as i64) else { return Ok(None); };
+            tail
+        } else {
+            if raw.len() < limit { return Ok(None); }
+            raw.clone()
+        }
+    } else { raw.clone() };
+    items.truncate(limit);
+    let primary_count = items.len();
+    let next_max_id = items.iter().rev().find_map(|n| {
+        let raw = n.get("id")?.as_str()?;
+        let id = digits_only(raw);
+        (!raw.starts_with("phyrian") && !id.is_empty()).then_some(id)
+    }).unwrap_or_default();
+    let source = payload.get("source").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("redis");
+    Ok(Some(HtmlPage { items, primary_count, next_max_id, source: format!("{source}:{source_suffix}"), redis_key: key }))
+}
+
+async fn html_page_selected(cfg: &Config, owner: i64, limit: i64, types: &[String], max_id: Option<&str>) -> Result<Option<HtmlPage>> {
+    let mut redis = crate::redis_util::connect(&cfg.redis_url).await?;
+    let key = crate::notif_list::notifications_list_redis_key(owner, limit, max_id, None, types);
+    if let Some(payload) = crate::redis_util::json_get(&mut redis, &key).await? {
+        return raw_page(payload, key, "exact-raw", limit as usize, max_id, false);
+    }
+    // Select source consumption before policy admission. Never refill a selected
+    // raw page from older visible rows after a notifier becomes hidden.
+    for alt in crate::notif_list::warm_head_limits(limit) {
+        if max_id.is_none() && alt == limit { continue; }
+        let key = crate::notif_list::notifications_list_redis_key(owner, alt, None, None, types);
+        if let Some(payload) = crate::redis_util::json_get(&mut redis, &key).await? {
+            if let Some(page) = raw_page(payload, key, if max_id.is_some() { "max-raw" } else { "head-raw" }, limit as usize, max_id, true)? { return Ok(Some(page)); }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Default)]
+struct GroupingFacts {
+    identities: std::collections::HashMap<String, String>,
+    statuses: std::collections::HashMap<String, String>,
+}
+
+fn account_ref(acct: &Value) -> String {
+    acct.get("uri").and_then(Value::as_str).or_else(|| acct.get("url").and_then(Value::as_str)).unwrap_or("").trim().trim_end_matches('/').to_string()
+}
+fn resolved_identity(acct: &Value, facts: &GroupingFacts) -> String {
+    facts.identities.get(&account_ref(acct)).cloned().unwrap_or_else(|| account_identity_key(acct))
+}
+fn resolved_group_key(n: &Value, facts: &GroupingFacts) -> Option<String> {
+    let kind = n.get("type").and_then(Value::as_str).unwrap_or("");
+    if !matches!(kind, "favourite" | "reblog") { return None; }
+    let uri = status_uri_of(n);
+    if uri.is_empty() { return None; }
+    Some(format!("{kind}:{}", facts.statuses.get(&uri).unwrap_or(&uri)))
+}
+fn unique_fact(map: &mut std::collections::HashMap<String, String>, key: String, value: String) -> Result<()> {
+    if let Some(old) = map.insert(key, value.clone()) { anyhow::ensure!(old == value, "ambiguous notification grouping fact"); }
+    Ok(())
+}
+fn bsky_profile_ref(raw: &str) -> Option<String> {
+    if raw.starts_with("did:") { return Some(raw.to_string()); }
+    raw.strip_prefix("https://bsky.app/profile/").map(|s| percent_decode(s.split('/').next().unwrap_or(s)))
+}
+async fn grouping_facts(db: &tokio_postgres::Client, items: &[Value]) -> Result<GroupingFacts> {
+    let mut facts = GroupingFacts::default();
+    let refs: Vec<String> = items.iter().filter_map(|n| n.get("account").map(account_ref)).collect();
+    let local: Vec<String> = refs.iter().filter(|s| s.starts_with("https://mkultra.monster/users/")).cloned().collect();
+    if !local.is_empty() {
+        for row in db.query("SELECT rtrim(actor_id, '/'), id::text FROM ap_users WHERE rtrim(actor_id, '/') = ANY($1)", &[&local]).await? {
+            unique_fact(&mut facts.identities, row.get(0), format!("vaak:{}", row.get::<_, String>(1)))?;
+        }
+    }
+    let bsky: Vec<String> = refs.iter().filter_map(|s| bsky_profile_ref(s)).collect();
+    if !bsky.is_empty() {
+        let handles: Vec<String> = bsky.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let rows = db.query("SELECT owner_user_id::text, did, lower(handle) FROM bsky_sessions WHERE did = ANY($1) OR lower(handle) = ANY($2)", &[&bsky, &handles]).await?;
+        for reference in &refs {
+            let Some(probe) = bsky_profile_ref(reference) else { continue; };
+            for row in &rows {
+                let did: String = row.get(1); let handle: String = row.get(2);
+                if (probe.starts_with("did:") && probe == did) || (!probe.starts_with("did:") && probe.to_ascii_lowercase() == handle) {
+                    unique_fact(&mut facts.identities, reference.clone(), format!("vaak:{}", row.get::<_, String>(0)))?;
+                }
+            }
+        }
+    }
+    let mut probes = std::collections::HashMap::<String, String>::new();
+    for item in items {
+        if notification_group_key(item).is_none() { continue; }
+        let uri = status_uri_of(item);
+        if uri.starts_with("at://did:") { probes.insert(uri.clone(), uri); }
+        else if let Some(rest) = uri.strip_prefix("https://bsky.app/profile/") {
+            let fields: Vec<_> = rest.split('/').collect();
+            // Handle-to-DID resolution may require producer/network facts not in
+            // this bounded renderer. Preserve whole PHP recovery for that case.
+            anyhow::ensure!(fields.len() == 3 && fields[0].starts_with("did:") && fields[1] == "post", "unsupported notification status grouping alias");
+            let at = format!("at://{}/app.bsky.feed.post/{}", fields[0], fields[2]);
+            probes.insert(uri, at);
+        } else if uri.starts_with("at://") {
+            anyhow::bail!("unsupported notification status grouping repo");
+        }
+    }
+    if !probes.is_empty() {
+        let ats: Vec<String> = probes.values().cloned().collect();
+        let cross = db.query("SELECT bsky_uri, note_id FROM bsky_crossposts WHERE bsky_uri = ANY($1)", &[&ats]).await?;
+        let links = db.query("SELECT bsky_uri, COALESCE(fediverse_id, ap_object_id, '') FROM bsky_post_links WHERE bsky_uri = ANY($1)", &[&ats]).await?;
+        let mut mapped = std::collections::HashMap::new();
+        for row in cross { let note: String = row.get(1); if note.starts_with("https://") { unique_fact(&mut mapped, row.get(0), note.trim_end_matches('/').to_string())?; } }
+        for row in links {
+            let at: String = row.get(0); let note: String = row.get(1);
+            if !mapped.contains_key(&at) && note.starts_with("https://") && note.contains("/notes/") { unique_fact(&mut mapped, at, note.trim_end_matches('/').to_string())?; }
+        }
+        for (uri, at) in probes { if let Some(note) = mapped.get(&at) { facts.statuses.insert(uri, note.clone()); } }
+    }
+    Ok(facts)
+}
+
+async fn active_viewer_actor(db: &tokio_postgres::Client, owner: i64) -> Result<String> {
+    let row = db.query_opt("SELECT actor_id FROM ap_users WHERE id::bigint=$1 AND disabled_at IS NULL", &[&owner]).await?.ok_or_else(|| anyhow::anyhow!("inactive notification owner"))?;
+    let actor: String = row.try_get::<_, Option<String>>(0)?.unwrap_or_default();
+    anyhow::ensure!(actor.starts_with("https://"), "notification owner actor missing");
+    Ok(actor.trim_end_matches('/').to_string())
+}
+
+async fn require_active_owner(db: &tokio_postgres::Client, owner: i64) -> Result<()> {
+    let active: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM ap_users WHERE id::bigint=$1 AND disabled_at IS NULL)", &[&owner]).await?.get(0);
+    anyhow::ensure!(active, "notification owner no longer active");
+    Ok(())
+}
+
+// Canonical grouping never grants visibility to an original or mapped source.
+// Recheck both source forms after all other awaited enrichment/cache writes.
+async fn final_page_admission(db: &tokio_postgres::Client, owner: i64, items: &mut Vec<Value>, facts: &GroupingFacts) -> Result<()> {
+    require_active_owner(db, owner).await?;
+    let mut checks = Vec::new();
+    let mut required = vec![1_usize; items.len()];
+    for (index, item) in items.iter().enumerate() {
+        let mut original = item.clone(); original["_html_source_index"] = Value::from(index); original["_html_original"] = Value::Bool(true); checks.push(original);
+        let uri = status_uri_of(item);
+        if let Some(canonical) = facts.statuses.get(&uri).filter(|key| key.as_str() != uri.as_str()) {
+            let mut canonical_item = item.clone(); canonical_item["_html_source_index"] = Value::from(index); canonical_item["_html_original"] = Value::Bool(false);
+            if let Some(status) = canonical_item.get_mut("status") { status["uri"] = Value::from(canonical.clone()); status["url"] = Value::from(canonical.clone()); }
+            checks.push(canonical_item); required[index] += 1;
+        }
+    }
+    crate::audience::filter_notifications(db, owner, &mut checks).await?;
+    let mut granted = vec![0_usize; items.len()];
+    let mut refreshed = std::collections::HashMap::new();
+    for mut item in checks {
+        let index = item["_html_source_index"].as_u64().ok_or_else(|| anyhow::anyhow!("notification source index lost"))? as usize;
+        anyhow::ensure!(index < items.len(), "notification source index changed");
+        item.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid admitted notification"))?.remove("_html_source_index");
+        granted[index] += 1;
+        let original = item.get("_html_original").and_then(Value::as_bool) == Some(true);
+        item.as_object_mut().unwrap().remove("_html_original");
+        if original { refreshed.insert(index, item); }
+    }
+    *items = (0..items.len()).filter(|index| granted[*index] == required[*index]).filter_map(|index| refreshed.remove(&index)).collect();
+    Ok(())
+}
+
 /// Build Mentions fill HTML from the warm Redis list (404-equivalent via Result miss).
 pub async fn mentions_html_fill(
     cfg: &Config,
@@ -789,23 +970,18 @@ pub async fn mentions_html_fill(
     max_id: Option<&str>,
 ) -> Result<Option<MentionsHtmlReport>> {
     let limit = limit.clamp(1, 60);
-    // Same warm-head slice as `/api/v1/notifications`. A short tail stays a miss.
-    let mut report = crate::notif_list::notifications_shadow_resolved(
-        cfg,
-        owner_user_id,
-        limit,
-        types,
-        max_id,
-        None,
-    )
-    .await?;
-    if !report.cache_hit {
-        return Ok(None);
+    let Some(mut report) = html_page_selected(cfg, owner_user_id, limit, types, max_id).await? else { return Ok(None); };
+    let policy_db = crate::db::connect(&cfg.database_url).await?;
+    require_active_owner(&policy_db, owner_user_id).await?;
+    // A pending first-All Phyrian offer still needs the actual PHP producer.
+    if max_id.is_none() && types.is_empty() {
+        let pending: bool = policy_db.query_one("SELECT EXISTS(SELECT 1 FROM phyrian_requests WHERE to_owner_id::bigint=$1 AND status='pending')", &[&owner_user_id]).await?.get(0);
+        if pending { return Ok(None); }
     }
+    crate::audience::filter_notifications(&policy_db, owner_user_id, &mut report.items).await?;
 
     // Replies and quote-boosts need the signed-in actor or the ⋯ menu is omitted.
-    let viewer_actor = load_viewer_actor(cfg, owner_user_id).await;
-    let following = load_viewer_follows(cfg, owner_user_id, &viewer_actor).await;
+    let viewer_actor = active_viewer_actor(&policy_db, owner_user_id).await?;
     if let Ok(db) = crate::db::connect(&cfg.database_url).await {
         if let Ok(moderation) = crate::hidden::load_viewer_moderation(&db, owner_user_id).await {
             for item in report.items.iter_mut() {
@@ -844,31 +1020,14 @@ pub async fn mentions_html_fill(
     let mut redis = crate::redis_util::connect(&cfg.redis_url).await.ok();
 
     let mut html = String::with_capacity(report.items.len() * 800);
-    let mut tip_id = String::new();
-    let mut next_max_id = String::new();
+    let next_max_id = report.next_max_id.clone();
 
-    // Tip / next_max from raw rows (grouping is presentation-only).
+    // Fragment warming uses only initially admitted rows. The response is
+    // granted again below after the awaited writes; raw consumption is separate.
     for item in &report.items {
         if !item.is_object() {
             continue;
         }
-        let raw_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let digits = digits_only(raw_id);
-        if tip_id.is_empty()
-            && !digits.is_empty()
-            && !raw_id.starts_with("phyrian")
-            && !item
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .starts_with("phyrian_")
-        {
-            tip_id = digits.clone();
-        }
-        if !digits.is_empty() && !raw_id.starts_with("phyrian") {
-            next_max_id = digits;
-        }
-
         // Warm nest fragment key when status present (hide_header for mention/quote).
         if let Some(st) = item.get("status").filter(|v| v.is_object()) {
             let n_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -903,8 +1062,28 @@ pub async fn mentions_html_fill(
         }
     }
 
+    // All enrichment and Redis writes have finished. Facts are presentation-only;
+    // the last awaited operation grants both original and canonical sources.
+    let following = load_viewer_follows(cfg, owner_user_id, &viewer_actor).await;
+    anyhow::ensure!(active_viewer_actor(&policy_db, owner_user_id).await? == viewer_actor, "notification owner actor changed");
+    let facts = grouping_facts(&policy_db, &report.items).await?;
+    final_page_admission(&policy_db, owner_user_id, &mut report.items, &facts).await?;
+    let tip_id = report.items.iter().find_map(|item| {
+        let raw = item.get("id")?.as_str()?;
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let digits = digits_only(raw);
+        (!raw.starts_with("phyrian") && !kind.starts_with("phyrian_") && !digits.is_empty()).then_some(digits)
+    }).unwrap_or_default();
+
+    let grouped_rows = group_notification_rows_with_facts(&report.items, &facts);
+    // The current grouped embed uses the lean card painter. Genuine PHP
+    // captures require CSRF-bearing action forms and the local delete row ID.
+    // Recover this whole fragment until that complete card contract is native.
+    if grouped_rows.iter().any(|grouped| grouped.count > 1 && grouped.row.get("status").is_some_and(Value::is_object)) {
+        return Ok(None);
+    }
     // Like/boost avatar-stack grouping (0.7.3) — parity with PHP stream.
-    for grouped in group_notification_rows(&report.items) {
+    for grouped in grouped_rows {
         if grouped.count > 1 {
             html.push_str(&paint_grouped_card(&grouped, &viewer_actor));
         } else {
@@ -916,13 +1095,13 @@ pub async fn mentions_html_fill(
         }
     }
 
-    let has_more = report.count as i64 >= limit && !next_max_id.is_empty();
+    let has_more = report.primary_count as i64 >= limit && !next_max_id.is_empty();
     Ok(Some(MentionsHtmlReport {
         html,
         next_max_id,
         has_more,
         tip_id,
-        count: report.count,
+        count: report.items.len(),
         source: if report.source.is_empty() {
             "axum-mentions-html".into()
         } else {
@@ -1355,4 +1534,31 @@ mod tests {
         assert_eq!(warm_head_limits(12), vec![40, 30, 20, 12]);
         assert_eq!(warm_head_limits(40), vec![40, 30, 20]);
     }
+
+    #[test]
+    fn html_raw_selection_keeps_consumption_after_admission_removes_tail() {
+        let mut page = raw_page(json!({"items": [row("30"), row("20"), row("10")]}), "fixture".into(), "exact-raw", 3, None, false).unwrap().unwrap();
+        page.items.clear();
+        assert_eq!(page.primary_count, 3);
+        assert_eq!(page.next_max_id, "10");
+    }
+
+    #[test]
+    fn html_head_selection_requires_a_complete_raw_window() {
+        let payload = json!({"items": [row("30"), row("20"), row("10")]});
+        assert!(raw_page(payload.clone(), "fixture".into(), "max-raw", 2, Some("20"), true).unwrap().is_none());
+        assert!(raw_page(payload.clone(), "fixture".into(), "max-raw", 1, Some("15"), true).unwrap().is_none());
+        let page = raw_page(payload, "fixture".into(), "max-raw", 1, Some("20"), true).unwrap().unwrap();
+        assert_eq!(page.next_max_id, "10");
+        assert_eq!(page.primary_count, 1);
+    }
+
+    #[test]
+    fn html_exact_short_page_remains_authoritative() {
+        let page = raw_page(json!({"items": [row("10")]}), "fixture".into(), "exact-raw", 12, None, false).unwrap().unwrap();
+        assert_eq!(page.primary_count, 1);
+        assert_eq!(page.next_max_id, "10");
+        assert!(raw_page(json!({"items": [{"type": "follow"}]}), "fixture".into(), "exact-raw", 12, None, false).unwrap().is_none());
+    }
+
 }

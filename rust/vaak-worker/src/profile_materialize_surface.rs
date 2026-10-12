@@ -18,11 +18,11 @@ impl crate::profile_enrichment::CurrentEnrichmentGrant for SurfaceCompletionGran
     }
     fn require_current<'a>(&'a self,db:&'a Client)->std::pin::Pin<Box<dyn std::future::Future<Output=Result<()>>+Send+'a>>{
         Box::pin(async move{
-            self.selected.require_current(db).await?;if let Some(status)=&self.projected{self.selected.require_projected_current(db,status).await?;}
+            self.selected.require_projection_window(db,self.projected.as_ref()).await?;
             let dependencies=self.dependencies.lock().map_err(|_|anyhow::anyhow!("surface projection snapshot lock poisoned"))?.clone();
             for dependency in &self.static_counts{dependency.require_current()?;}
             require_dependencies(db,&dependencies,"PHP fallback: surface canonical projection changed").await?;
-            self.selected.require_current(db).await?;if let Some(status)=&self.projected{self.selected.require_projected_current(db,status).await?;}Ok(())
+            self.selected.require_projection_window(db,self.projected.as_ref()).await?;Ok(())
         })
     }
 }
@@ -52,7 +52,7 @@ impl CanonicalProjection {
     pub(crate) fn original_source(&self)->&Value{self.selected.source()}
     pub(crate) fn original_saved_sid(&self)->&str{self.selected.original_saved_sid()}
     pub(crate) fn effects(&self)->&[DeferredProjectionEffect]{&self.effects}
-    pub(crate) async fn require_current(&self,db:&Client)->Result<()>{self.selected.require_current(db).await?;if let Some(status)=&self.status{self.selected.require_projected_current(db,status).await?;}self.ledger.require_current(db).await?;self.selected.require_current(db).await?;if let Some(status)=&self.status{self.selected.require_projected_current(db,status).await?;}Ok(())}
+    pub(crate) async fn require_current(&self,db:&Client)->Result<()>{self.selected.require_projection_window(db,self.status.as_ref()).await?;self.ledger.require_current(db).await?;self.selected.require_projection_window(db,self.status.as_ref()).await?;Ok(())}
     pub(crate) fn current_grant_with_preview_receipts(&self)->(std::sync::Arc<dyn crate::profile_enrichment::CurrentEnrichmentGrant>,PreviewWriteJournal){
         let writes=PreviewWriteJournal(Default::default());let grant=SurfaceCompletionGrant{selected:self.selected.clone(),projected:self.status.clone(),dependencies:std::sync::Mutex::new(self.ledger.dependencies.clone()),static_counts:self.ledger.static_counts.clone(),writes:writes.clone()};(std::sync::Arc::new(grant),writes)
     }

@@ -146,11 +146,13 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
     let warm=warm.or_else(||cfg.map(|cfg|native_warm(cfg,batch.bsky_budget_deadline)));
     let result: anyhow::Result<Vec<u8>> = async {
         let initial=batch.status_preview_budget;
-        let db = crate::db::connect(database_url).await?;
+        let db = std::sync::Arc::new(crate::db::connect(database_url).await?);
         let states = batch.bsky_bookmarks.into_iter().map(|s| (s.uri, s.did, s.bookmarked)).collect();
-        let session = super::context::TrustedSession::from_php_session(
+        let mut session = super::context::TrustedSession::from_php_session(
             batch.owner_id, batch.csrf, batch.return_view, batch.bsky_enabled,
-        )?.with_lazy_media(batch.lazy_media).with_bsky_bookmarks(&db, states).await?.with_saved_sources(&db,batch.saved_sources,source_count).await?.with_warm_context(if batch.canonical_saved_only{None}else{warm});
+        )?.with_lazy_media(batch.lazy_media).with_bsky_bookmarks(&db, states).await?;
+        if batch.canonical_saved_only{session=session.with_canonical_queries(db.clone()).await?;}
+        let session=session.with_saved_sources(&db,batch.saved_sources,source_count).await?.with_warm_context(if batch.canonical_saved_only{None}else{warm});
         let mut projections=Vec::new();let mut sources=batch.statuses;
         if batch.canonical_saved_only{
             for index in 0..source_count{
@@ -178,6 +180,21 @@ async fn render_request_with_warm_inner(database_url:&str,secret:Option<&str>,he
         Ok(bytes) => (StatusCode::OK,[(axum::http::header::CONTENT_TYPE,"application/json")],bytes).into_response(),
         Err(_error) => {
             #[cfg(test)] eprintln!("Library fixture fallback: {_error:#}");
+            #[cfg(vaak_library_proof_20261011)] if std::env::var("VAAK_LIBRARY_FIXTURE_DIAGNOSTICS").as_deref()==Ok("1"){
+                // Private fixture diagnostic uses fixed stage labels only;
+                // never print error payloads, source text or session values.
+                let text=_error.to_string();
+                let code=if text.contains("projection dependency changed"){"projection_dependency"}
+                    else if text.contains("surface canonical projection changed"){"surface_dependency"}
+                    else if text.contains("canonical saved source changed"){"canonical_source"}
+                    else if text.contains("saved network current raw window changed"){"saved_window"}
+                    else if text.contains("unsupported canonical local presentation"){"local_presentation"}
+                    else if text.contains("canonical Library source or projection denied"){"policy_admission"}
+                    else if text.contains("unsupported canonical local feature"){"local_feature"}
+                    else if text.contains("source omitted"){"source_omitted"}
+                    else {"other_guard"};
+                eprintln!("Library fixture fallback stage: {code}");
+            }
             tracing::debug!("Library whole-batch PHP fallback");
             (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"fallback": true}))).into_response()
         }

@@ -5154,7 +5154,7 @@ function admin_render_library_entries(array $entries, string $returnView): void
         if (($entry['kind'] ?? '') === 'bsky') {
             admin_render_bsky_feed_item($entry['item'], 'following', $returnView);
         } elseif ($prepared && !str_starts_with((string) ($entry['item']['id'] ?? ''), 'rss:')) {
-            if (admin_library_status_allowed($entry['item'], admin_owner_user_id())) {
+            if (admin_library_status_allowed($entry['item'], admin_owner_user_id(), true)) {
                 admin_render_masto_status_card($entry['item'], [], $returnView, false, true);
             }
         } else {
@@ -6372,49 +6372,12 @@ HTML;
 /** Cache-only identity aliases; current policy rows stay separate from identity mapping. */
 function admin_trend_actor_refs(string $actor): array
 {
-    $actor = ap_search_canonical_actor($actor);
-    $out = [];
-    foreach (ap_actor_moderation_aliases($actor) as $alias) {
-        foreach (ap_moderation_syntactic_refs((string) $alias) as $ref) {
-            $ref = rtrim((string) $ref, '/');
-            if ($ref !== '' && !ctype_digit($ref)) $out[$ref] = true;
-        }
-    }
-    return array_keys($out);
+    return ap_masto_trend_actor_refs($actor);
 }
 
 function admin_trend_downrank_ref_set(int $ownerUserId): array
 {
-    if ($ownerUserId < 1) {
-        return [];
-    }
-    $set = [];
-    $now = time();
-    $preference = ap_db()->prepare('SELECT COALESCE(p.downranking_enabled, 1) FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key = u.actor_key WHERE u.id = ?');
-    $preference->execute([$ownerUserId]);
-    $temporaryEnabled = (bool) $preference->fetchColumn();
-    foreach ($temporaryEnabled ? admin_home_suppression_map($ownerUserId) : [] as $actor => $row) {
-        if ((int) ($row['until'] ?? 0) <= $now) {
-            continue;
-        }
-        $refs = admin_trend_actor_refs((string) $actor);
-        foreach ($refs as $ref) {
-            $ref = strtolower(rtrim((string) $ref, '/'));
-            if ($ref !== '' && !ctype_digit($ref)) {
-                $set[$ref] = true;
-            }
-        }
-    }
-    // Read the current manual choices directly; never inherit a cached HTML decision.
-    $st = ap_db()->prepare('SELECT actor_id FROM ap_deprioritized_actors WHERE owner_user_id = ?');
-    $st->execute([$ownerUserId]);
-    foreach ($st->fetchAll() ?: [] as $row) {
-        foreach (admin_trend_actor_refs((string) ($row['actor_id'] ?? '')) as $ref) {
-            $ref = rtrim((string) $ref, '/');
-            if ($ref !== '' && !ctype_digit($ref)) $set['manual:' . $ref] = true;
-        }
-    }
-    return $set;
+    return ap_masto_trend_downrank_ref_set($ownerUserId);
 }
 
 /**
@@ -6423,49 +6386,14 @@ function admin_trend_downrank_ref_set(int $ownerUserId): array
  */
 function admin_trend_status_is_downranked(array $item, array $refs): bool
 {
-    if ($refs === []) {
-        return false;
-    }
-    $raw = function_exists('ap_masto_trend_item_actors') ? ap_masto_trend_item_actors($item) : [];
-    $pull = static function ($account) use (&$raw): void {
-        if (!is_array($account)) {
-            return;
-        }
-        foreach (['uri', 'url', 'id'] as $key) {
-            $raw[] = (string) ($account[$key] ?? '');
-        }
-    };
-    $pull($item['account'] ?? null);
-    foreach (['reblog', 'quote'] as $nest) {
-        if (!is_array($item[$nest] ?? null)) {
-            continue;
-        }
-        $pull($item[$nest]['account'] ?? null);
-        $raw[] = (string) ($item[$nest]['author_did'] ?? '');
-    }
-    $raw[] = (string) ($item['author_did'] ?? '');
-    foreach ($raw as $actor) {
-        $actor = trim((string) $actor);
-        if ($actor === '' || ctype_digit(rtrim($actor, '/'))) {
-            continue;
-        }
-        $candidates = admin_trend_actor_refs($actor);
-        foreach ($candidates as $ref) {
-            if (isset($refs['manual:' . rtrim((string) $ref, '/')])) return true;
-            $ref = strtolower(rtrim((string) $ref, '/'));
-            if ($ref !== '' && isset($refs[$ref])) {
-                return true;
-            }
-        }
-    }
-    return false;
+    return ap_masto_trend_status_is_downranked($item, $refs);
 }
 
 /** Keep cached candidates separate from this viewer's current policy decision. */
 function admin_trend_status_hidden(array $item, int $ownerUserId, array $refs, int $depth = 0): bool
 {
     if ($depth > 16) return true;
-    if (ap_masto_trend_item_hidden($item, $ownerUserId, [], false)
+    if (ap_masto_trend_tree_hidden($item, $ownerUserId, $depth, $refs)
         || ap_search_status_hidden($item, $ownerUserId)
         || admin_trend_status_is_downranked($item, $refs)) return true;
     foreach (['reblog', 'quote'] as $nest) {
@@ -6495,7 +6423,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $cachedKinds = [];
     foreach (['tags' => 10, 'statuses' => 5] as $kind => $limit) {
         $row = function_exists('ap_masto_trends_cache_read')
-            ? ap_masto_trends_cache_read($kind, 1, $allowStale)
+            ? ap_masto_trends_cache_read($kind, 1, $allowStale, $viewerId)
             : null;
         if (!is_array($row)) {
             continue;
@@ -7690,11 +7618,8 @@ if (
                 if (!is_array($st)) {
                     continue;
                 }
-                if (function_exists('ap_row_matches_muted_words')) {
-                    $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
-                    if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) $vaakOwnerId)) {
-                        continue;
-                    }
+                if (ap_visibility_ordinary_status_hidden($st, (int) $vaakOwnerId)) {
+                    continue;
                 }
                 admin_render_masto_status_card($st, $followingIds, $view, false, true);
             }
@@ -9855,6 +9780,9 @@ function admin_timeline_item_muted_by_words(array $item): bool
             $extra[] = (string) ($ms['content_text'] ?? '');
             $extra[] = (string) ($ms['spoiler_text'] ?? '');
         }
+    }
+    if ($kind === 'outbox') {
+        return ap_ordinary_outbox_matches_muted_words($row, $extra, admin_owner_user_id());
     }
     return ap_row_matches_muted_words(
         $row,
@@ -17635,7 +17563,7 @@ function admin_render_masto_status_card(
     if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)
         && empty($st['vaak_rss_item_id']) && ($st['source'] ?? '') !== 'rss'
         && !str_starts_with((string) ($st['id'] ?? ''), 'rss:')
-        && !admin_library_status_allowed($st, admin_owner_user_id())) return;
+        && !admin_library_status_allowed($st, admin_owner_user_id(), true)) return;
     // All surfaces (Home, standalone status, notifications, and profiles) use
     // the same Ask normalizer.  Remote Wafrn Asks are ordinary Note text, so
     // normalize here as a final boundary guard when a caller skipped the
@@ -17887,9 +17815,9 @@ function admin_render_masto_status_card(
         );
         if (is_string($stripped) && $stripped !== (string) $st['content']) {
             $plainFromAsk = admin_html_to_plain($stripped);
-            if ($plainFromAsk !== '') {
-                $plain = $plainFromAsk;
-            }
+            // Empty stripped content is a genuine empty answer, not a
+            // reason to restore the flattened asker/question as answer text.
+            $plain = $plainFromAsk;
         }
     }
 
@@ -18396,13 +18324,17 @@ function admin_render_masto_status_card(
     if (!$directSurface && $returnView === 'search' && !admin_search_render_context_allowed($st, admin_owner_user_id(),
         [$qst ?? null, $pendingQuoted ?? null, $resolvedQuote ?? null],
         [$qOpts ?? null, $bskyQ ?? null, $bskyPending ?? null, $preview ?? null, $fallbackQuoteOpts ?? null])) return;
+    // Ordinary own-answer grants never exempt a separately resolved question.
+    if (!$directSurface && in_array($returnView, ['home','local','federated','remote_profile'], true)
+        && is_array($askRow) && ap_muted_words_match(admin_owner_user_id(),
+            (string)($askRow['question']??$askRow['ask_question']??'')) !== null) return;
     // Late cache/quote recovery can introduce content absent at Library ingress.
     // Recheck those fully hydrated objects before the first byte of card output.
     if (!$directSurface && in_array($returnView, ['bookmarks', 'favourites'], true)) {
         if (!admin_library_render_context_allowed($st, admin_owner_user_id(),
             [$qst ?? null, $pendingQuoted ?? null, $resolvedQuote ?? null],
             [$bskyQ ?? null, $bskyPending ?? null, $preview ?? null, $fallbackQuoteOpts ?? null],
-            $plain)) return;
+            $plain, is_array($askRow) ? $askRow : [])) return;
     }
     ?>
           <article class="tweet<?= $focused ? ' tweet-focus' : '' ?><?= ($boostHeader !== '' || $boostHydrate) ? ' tweet-boost' : '' ?><?= $isBsky ? ' tweet-bsky' : '' ?><?= $hideHeader ? ' tweet-embed-nohd' : '' ?>"<?= $focused ? ' id="status-focus"' : '' ?><?= $isRss && $rssItemId > 0 ? ' data-rss-item="' . (int) $rssItemId . '" data-timeline-key="rss:' . (int) $rssItemId . '"' : '' ?><?= $isBsky && str_starts_with($uri, 'at://') ? ' data-bsky-uri="' . h($uri) . '" data-bsky-cid="' . h($bskyCid) . '"' : '' ?><?= $createHydrateAttrs ?><?= $rankAttrs ?>>
@@ -18851,7 +18783,7 @@ function admin_try_render_announce_shared_card(
         return false;
     }
     if (in_array($returnView, ['bookmarks', 'favourites'], true)
-        && !admin_library_status_allowed($st, admin_owner_user_id())) {
+        && !admin_library_status_allowed($st, admin_owner_user_id(), true)) {
         return true; // Rejected, not a request to try the legacy renderer.
     }
     admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
@@ -19493,7 +19425,7 @@ function admin_try_render_outbox_shared_card(array $n, array $followingIds, stri
 function admin_outbox_status_current_allowed(array $status, string $view): bool
 {
     return ap_visibility_status_audience_allowed($status, admin_owner_user_id())
-        && !ap_visibility_status_hidden($status, admin_owner_user_id())
+        && !ap_visibility_ordinary_status_hidden($status, admin_owner_user_id())
         && (!in_array($view, ['local', 'feed'], true) || admin_outbox_current_public_status($status));
 }
 
@@ -20211,7 +20143,7 @@ function admin_try_render_bsky_shared_card(array $item, array $followingIds, str
         return false;
     }
     if (in_array($returnView, ['bookmarks', 'favourites'], true)
-        && !admin_library_status_allowed($st, admin_owner_user_id())) {
+        && !admin_library_status_allowed($st, admin_owner_user_id(), true)) {
         return true; // Denied cards must not fall through to the legacy painter.
     }
     admin_render_masto_status_card($st, $followingIds, $returnView, false, true);
@@ -21847,11 +21779,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                             if (!is_array($st)) {
                                 continue;
                             }
-                            if (function_exists('ap_row_matches_muted_words')) {
-                                $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
-                                if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) admin_owner_user_id())) {
-                                    continue;
-                                }
+                            if (ap_visibility_ordinary_status_hidden($st, (int) admin_owner_user_id())) {
+                                continue;
                             }
                             admin_render_masto_status_card($st, $followingIds, $view, false, true);
                             $streamCount++;
@@ -21996,11 +21925,8 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
                     if (!is_array($st)) {
                         continue;
                     }
-                    if (function_exists('ap_row_matches_muted_words')) {
-                        $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
-                        if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) admin_owner_user_id())) {
-                            continue;
-                        }
+                    if (ap_visibility_ordinary_status_hidden($st, (int) admin_owner_user_id())) {
+                        continue;
                     }
                     if (function_exists('admin_render_masto_status_card')) {
                         admin_render_masto_status_card($st, $followingIds, $view, false, true);
@@ -22814,7 +22740,7 @@ function admin_library_status_not_deleted(array $status, int $depth = 0): bool
 }
 
 /** Recheck a hydrated saved card against current policy, including every embed. */
-function admin_library_status_allowed(array $status, int $ownerUserId): bool
+function admin_library_status_allowed(array $status, int $ownerUserId, bool $ordinaryRoot = false): bool
 {
     if ($ownerUserId < 1 || !function_exists('ap_visibility_status_hidden')
         || !function_exists('ap_visibility_status_audience_allowed')) {
@@ -22823,11 +22749,12 @@ function admin_library_status_allowed(array $status, int $ownerUserId): bool
     try {
         $status = admin_library_bind_rss_sources($status, $ownerUserId);
         if ($status === null || !admin_library_status_not_deleted($status)) return false;
+        if (ap_ordinary_ask_questions_muted($status, $ownerUserId)) return false;
         if (is_array($status['bsky_post'] ?? null)
             && !admin_library_bsky_item_allowed($status['bsky_post'], $ownerUserId)) {
             return false;
         }
-        return !ap_visibility_status_hidden($status, $ownerUserId)
+        return !($ordinaryRoot ? ap_visibility_ordinary_status_hidden($status, $ownerUserId) : ap_visibility_status_hidden($status, $ownerUserId))
             && ap_visibility_status_audience_allowed($status, $ownerUserId);
     } catch (Throwable $e) {
         return false;
@@ -22841,13 +22768,18 @@ function admin_library_quote_policy_key(string $reference): string
 }
 
 /** Final saved-card admission after shared painter recovered quoted objects. */
-function admin_library_render_context_allowed(array $status, int $ownerUserId, array $hydrated, array $previews, string $plain): bool
+function admin_library_render_context_allowed(array $status, int $ownerUserId, array $hydrated, array $previews, string $plain, array $resolvedAsk = []): bool
 {
     try {
         $rss = !empty($status['vaak_rss_item_id']) || ($status['source'] ?? '') === 'rss'
             || str_starts_with((string) ($status['id'] ?? ''), 'rss:');
-        if (!$rss && !admin_library_status_allowed($status, $ownerUserId)) return false;
-        if ($ownerUserId < 1 || ap_muted_words_match($ownerUserId, $plain, (string) ($status['spoiler_text'] ?? '')) !== null) return false;
+        if (!$rss && !admin_library_status_allowed($status, $ownerUserId, true)) return false;
+        if ($ownerUserId < 1) return false;
+        // An Ask question is another source even when the local answer is ours.
+        $ask=$resolvedAsk !== [] ? $resolvedAsk : (is_array($status['vaak_ask']??null)?$status['vaak_ask']:[]);
+        if (ap_muted_words_match($ownerUserId,(string)($ask['question']??$ask['ask_question']??'')) !== null) return false;
+        if (ap_muted_words_match($ownerUserId, $plain, (string) ($status['spoiler_text'] ?? '')) !== null
+            && !ap_ordinary_note_owned((string)($status['uri']??''), $ownerUserId, (string)($status['account']['uri']??''))) return false;
         foreach ($hydrated as $child) {
             if (is_array($child) && !admin_library_status_allowed($child, $ownerUserId)) return false;
         }
@@ -22960,7 +22892,7 @@ function admin_render_library_status_card(array $st, string $returnView = 'favou
         return;
     }
     $st = admin_library_status_enrich($st);
-    if (!admin_library_status_allowed($st, $owner)) return;
+    if (!admin_library_status_allowed($st, $owner, true)) return;
     if (function_exists('admin_render_masto_status_card')) {
         admin_render_masto_status_card($st, [], $returnView, false, true);
     }
@@ -23124,15 +23056,15 @@ function admin_render_notification_card(array $n, array $followingIds, array $fo
     <article class="tweet tweet-notif tweet-notif-<?= h($nType) ?>">
     <div class="tweet-hd">
       <?php if ($profileHref !== ''): ?>
-        <a href="<?= h($profileHref) ?>" aria-label="Open profile" style="text-decoration:none"><?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?></a>
+        <a href="<?= h($profileHref) ?>" aria-label="Open profile" style="text-decoration:none"<?= admin_profile_hover_attr($nActorRef) ?>><?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?></a>
       <?php else: ?>
         <?= admin_avatar_img($nActorRef !== '' ? $nActorRef : null) ?>
       <?php endif; ?>
       <div class="tweet-hd-main">
         <div>
           <?php if ($profileHref !== ''): ?>
-            <a class="who" href="<?= h($profileHref) ?>" style="color:inherit;text-decoration:none"><?= admin_emoji_html($nDisplay !== '' ? $nDisplay : $nAcct, $nActorRef !== '' ? $nActorRef : null) ?></a>
-            <a class="meta" href="<?= h($profileHref) ?>" style="color:var(--muted);text-decoration:none"> @<?= h($nAcct) ?></a>
+            <a class="who" href="<?= h($profileHref) ?>" style="color:inherit;text-decoration:none"<?= admin_profile_hover_attr($nActorRef) ?>><?= admin_emoji_html($nDisplay !== '' ? $nDisplay : $nAcct, $nActorRef !== '' ? $nActorRef : null) ?></a>
+            <a class="meta" href="<?= h($profileHref) ?>" style="color:var(--muted);text-decoration:none"<?= admin_profile_hover_attr($nActorRef) ?>> @<?= h($nAcct) ?></a>
           <?php else: ?>
             <span class="who"><?= h($nAcct) ?></span>
           <?php endif; ?>
@@ -28377,11 +28309,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
                 if (!is_array($st) || !function_exists('admin_render_masto_status_card')) {
                     continue;
                 }
-                if (function_exists('ap_row_matches_muted_words')) {
-                    $blob = trim(strip_tags((string) ($st['content'] ?? '')) . "\n" . (string) ($st['spoiler_text'] ?? ''));
-                    if ($blob !== '' && ap_row_matches_muted_words(['summary' => $blob], 'event', [], (int) $vaakOwnerId)) {
-                        continue;
-                    }
+                if (ap_visibility_ordinary_status_hidden($st, (int) $vaakOwnerId)) {
+                    continue;
                 }
                 admin_render_masto_status_card($st, $followingIds, 'home', false, true);
                 if (empty($homeOnboard['active']) && $homeIndex === 5) {
@@ -30295,12 +30224,12 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
           <textarea id="pf-forum-signature" name="forum_signature" maxlength="500" rows="3" placeholder="Shown below your Discuss posts…"><?= h((string) ($profile['forum_signature'] ?? '')) ?></textarea>
           <div class="meta" style="margin:.25rem 0 .75rem">Plain text only. HTML, scripts, and control characters are rejected.</div>
 
-          <?php $profileBadgeCatalog = ap_profile_badge_catalog($vaakActorKey === 'cmdr_nova'); unset($profileBadgeCatalog['supporter']); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? [], $vaakActorKey === 'cmdr_nova'); ?>
+          <?php $profileBadgeCatalog = ap_profile_badge_catalog(false); unset($profileBadgeCatalog['supporter']); $selectedProfileBadges = ap_profile_normalize_badges($profile['profile_badges'] ?? [], false, false); ?>
           <details style="border:1px solid var(--border);border-radius:10px;padding:.55rem .75rem;margin:0 0 1rem">
             <summary style="cursor:pointer;color:var(--text);font-weight:650">Profile badges <span class="meta">(up to 6 · <?= count(array_diff($selectedProfileBadges, ['supporter'])) ?> selected)</span></summary>
             <fieldset style="border:0;padding:.55rem 0 0;margin:0">
             <div class="meta" style="margin:0 0 .65rem">Optional flair shown on your HTML profile only. These badges are not federated.</div>
-            <div class="meta" style="margin:0 0 .65rem">These badges are part of a test and more will be coming soon.</div>
+            <div class="meta" style="margin:0 0 .65rem">Admin and Supporter badges are assigned automatically from your account role and earned Supporter reward. They cannot be selected here.</div>
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.45rem .75rem">
               <?php foreach ($profileBadgeCatalog as $badgeKey => $badge): ?>
                 <label style="display:flex;align-items:center;gap:.4rem;margin:0;cursor:pointer">
@@ -36218,6 +36147,7 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     setBadge(dmBadge, d);
   }
   window.vaakSetCurrentViewTitle = function (view, label) {
+    cancelNotifPoll();
     notifView = view === 'mentions';
     dmView = view === 'dms';
     notifBaseTitle = 'VAAK · ' + (label || canonicalViewTitles[view] || view);
@@ -36310,34 +36240,62 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     dmId: <?= json_encode($dmLatestIdNav) ?>,
     phyrianPending: <?= (int) $phyrianPendingNav ?>,
   });
-  const pollNotif = async () => {
-    if (window.vaakGuestProfile) return;
-    try {
+  // A stalled badge request must not stop all future foreground polls.
+  // Bound fetch AND JSON decoding, coalesce triggers, and retain the last valid
+  // state on errors. A deadline race also releases an uncooperative transport.
+  let notifPollInFlight = null;
+  let notifPollGeneration = 0;
+  let notifPollSuspended = false;
+  const notifOwnerKey = () => String(window.VAAK_ACTOR_KEY || window.VAAK_USERNAME || '');
+  function cancelNotifPoll() {
+    notifPollGeneration += 1;
+    if (notifPollInFlight) notifPollInFlight.cancel();
+    notifPollInFlight = null;
+  }
+  const validUnreadCount = (value) => (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
+    || (typeof value === 'string' && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)));
+  const pollNotif = () => {
+    if (window.vaakGuestProfile || notifPollSuspended) return Promise.resolve();
+    if (notifPollInFlight) return notifPollInFlight.promise;
+    const generation = notifPollGeneration;
+    const ownerKey = notifOwnerKey();
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let finishDeadline;
+    const deadline = new Promise((resolve) => { finishDeadline = resolve; });
+    const flight = { cancel: () => { if (controller) controller.abort(); finishDeadline(null); }, promise: null };
+    const timer = setTimeout(flight.cancel, 5000);
+    const request = (async () => {
       const res = await fetch('?ajax=notif_unread', {
         credentials: 'same-origin',
         headers: { 'Accept': 'application/json' },
         cache: 'no-store',
+        signal: controller ? controller.signal : undefined,
       });
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const data = await res.json();
-      const count = data && data.count;
-      // Never fall back to overall latest_id when count is 0 — that was false-chiming
-      // and re-badging already-read Wafrn mentions after mark-read.
-      const unreadTip = (parseInt(count, 10) > 0 && data && data.latest_unread_id)
-        ? data.latest_unread_id
-        : '';
-      applyInboxUnread(count, data && data.dm_count, {
-        notifId: unreadTip,
-        lastReadId: data && data.last_read_id,
-        dmId: data && data.latest_dm_id,
-        phyrianPending: data && data.phyrian_pending,
-      });
-    } catch (e) {
-    }
+      if (!data || Array.isArray(data) || !validUnreadCount(data.count) || !validUnreadCount(data.dm_count)) return null;
+      return data;
+    })();
+    flight.promise = Promise.race([request, deadline]).then((data) => {
+      if (!data || notifPollInFlight !== flight || generation !== notifPollGeneration
+          || ownerKey !== notifOwnerKey() || window.vaakGuestProfile || notifPollSuspended) return;
+      // Only the real unread tip drives badge events; latest_id can be read.
+      const unreadTip = Number(data.count) > 0 && data.latest_unread_id ? data.latest_unread_id : '';
+      const opts = { notifId: unreadTip, lastReadId: data.last_read_id, dmId: data.latest_dm_id };
+      if (Object.prototype.hasOwnProperty.call(data, 'phyrian_pending') && validUnreadCount(data.phyrian_pending)) {
+        opts.phyrianPending = data.phyrian_pending;
+      }
+      applyInboxUnread(data.count, data.dm_count, opts);
+    }).catch(() => {}).finally(() => {
+      clearTimeout(timer);
+      if (notifPollInFlight === flight) notifPollInFlight = null;
+    });
+    notifPollInFlight = flight;
+    return flight.promise;
   };
   const notifPollMs = () => (document.visibilityState === 'visible' ? 12000 : 45000);
   const scheduleNotifPoll = () => {
-    if (window.vaakGuestProfile) return;
+    if (window.vaakGuestProfile || notifPollSuspended) return;
     if (notifPollTimer) clearTimeout(notifPollTimer);
     notifPollTimer = setTimeout(async () => {
       await pollNotif();
@@ -36354,6 +36312,17 @@ if (!empty($GLOBALS['vaak_profile_shell'])) {
     });
     // Mobile Safari often throttles timers; refresh badges when the hamburger opens.
     window.addEventListener('vaak:mobile-nav-open', () => { pollNotif(); });
+    window.addEventListener('pagehide', () => {
+      notifPollSuspended = true;
+      cancelNotifPoll();
+      if (notifPollTimer) clearTimeout(notifPollTimer);
+      notifPollTimer = null;
+    });
+    window.addEventListener('pageshow', () => {
+      notifPollSuspended = false;
+      pollNotif();
+      scheduleNotifPoll();
+    });
   }
   window.vaakPollNotif = pollNotif;
 })();
@@ -40791,7 +40760,7 @@ window.vaakBootStatusThread();
     if (loadedKey === key || (pending && pending.key === key)) return;
     if (pending || loadedKey) invalidate();
     const current = generation;
-    const controller = new AbortController();
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
     pending = { controller: controller, key: key };
     let discardedOffscreen = false;
     showLoading(box);

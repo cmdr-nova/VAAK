@@ -62,7 +62,9 @@ async fn supporter_awarded(db:&Client,key:&str)->Result<bool>{
  Ok(db.query_one("SELECT EXISTS(SELECT 1 FROM ap_supporter_codes c JOIN ap_users u ON u.id=c.used_by WHERE u.actor_key=$1 AND u.disabled_at IS NULL AND c.used_at IS NOT NULL)",&[&key]).await?.get(0))
 }
 async fn authorized_badges(db:&Client,key:&str,raw:&Value)->Result<Vec<String>>{
- let mut badges=normalize_badges(raw);badges.retain(|b|b!="supporter");badges.truncate(6);
+ let mut badges=normalize_selected_badges(raw,false);
+ let admin:bool=db.query_one("SELECT EXISTS(SELECT 1 FROM ap_users WHERE actor_key=$1 AND is_admin<>0 AND disabled_at IS NULL)",&[&key]).await?.get(0);
+ if admin{badges.insert(0,"admin".into());}
  if supporter_awarded(db,key).await?{badges.insert(0,"supporter".into());}Ok(badges)
 }
 async fn header_dependencies(db:&Client,key:&str,actor:&str,owner:i64,viewer:&str,target:i64,blocked:bool)->Result<Value>{
@@ -196,7 +198,8 @@ fn profile_defaults(key:&str)->Value{
  json!({"actor_key":key,"name":key,"summary":summary,"attachment":attachment,"icon_url":null,"image_url":null,"manually_approves":false,"discoverable":true,"indexable":true,"collection_consent":true,"vanity_verified":false,"auto_follow_back":false,"anti_ai_marker":false,"auto_unblur_sensitive":false,"auto_delete_posts_7d":false,"automated":false,"reply_policy":"anyone","quote_policy":"anyone","forum_signature":"","profile_badges":[],"hide_profile_replies":false,"hide_profile_boosts":false,"algorithm_enabled":true,"downranking_enabled":true,"asks_enabled":true,"webmentions_enabled":true,"updated_at":null})
 }
 fn sanitized_url(raw:&str)->Option<String>{crate::profile_identity::sanitized_profile_url(raw)}
-fn normalize_badges(value:&Value)->Vec<String>{let decoded=if let Some(raw)=value.as_str(){serde_json::from_str::<Value>(raw).unwrap_or(Value::Null)}else{value.clone()};let mut result=Vec::new();if decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="supporter"))){result.push("supporter".to_string());}for v in decoded.as_array().into_iter().flatten(){let k=card::php_trim(v.as_str().unwrap_or(""));if BADGES.iter().any(|b|b.0==k)&&!result.iter().any(|v|v==k){result.push(k.into());}if result.len()==if result.iter().any(|v|v=="supporter"){7}else{6}{break;}}result}
+fn normalize_badges(value:&Value)->Vec<String>{normalize_selected_badges(value,true)}
+fn normalize_selected_badges(value:&Value,reserved:bool)->Vec<String>{let decoded=if let Some(raw)=value.as_str(){serde_json::from_str::<Value>(raw).unwrap_or(Value::Null)}else{value.clone()};let mut result=Vec::new();if reserved&&decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="supporter"))){result.push("supporter".to_string());}if reserved&&decoded.as_array().is_some_and(|v|v.iter().any(|b|b.as_str().is_some_and(|s|card::php_trim(s)=="admin"))){result.push("admin".to_string());}let limit=6+result.len();for v in decoded.as_array().into_iter().flatten(){let k=card::php_trim(v.as_str().unwrap_or(""));if (reserved||!matches!(k,"admin"|"supporter"))&&BADGES.iter().any(|b|b.0==k)&&!result.iter().any(|v|v==k){result.push(k.into());}if result.len()==limit{break;}}result}
 fn hidden(name:&str,value:&str)->String{format!("<input type=\"hidden\" name=\"{name}\" value=\"{}\">",h(value))}
 fn post_form(f:&HeaderFacts,action:&str,extra:&str,attrs:&str,button:&str)->String{
  format!("<form method=\"post\" action=\"?view=remote_profile&amp;actor={}&amp;from={}\" style=\"display:inline\"{attrs}>{}{}{}{}{}{extra}{button}</form>",form_query(&f.actor),form_query(&f.from),hidden("action",action),hidden("return_view","remote_profile"),hidden("return_actor",&f.actor),hidden("return_from",&f.from),if action=="bite_remote"{String::new()}else{hidden("actor_id",&f.actor)})
@@ -418,7 +421,7 @@ mod supporter_tests {
         let connection_task=tokio::spawn(async move {connection.await});
         for width in ["SERIAL","BIGSERIAL"] {
             let schema=format!("supporter_native_{}_{}",std::process::id(),width.to_ascii_lowercase());
-            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema};CREATE TABLE ap_users(id {width} PRIMARY KEY,username TEXT,actor_key TEXT,disabled_at TEXT);INSERT INTO ap_users(username,actor_key)VALUES('paid','paid'),('unpaid','unpaid');")).await?;
+            db.batch_execute(&format!("CREATE SCHEMA {schema};SET search_path TO {schema};CREATE TABLE ap_users(id {width} PRIMARY KEY,username TEXT,actor_key TEXT,disabled_at TEXT,is_admin INTEGER NOT NULL DEFAULT 0);INSERT INTO ap_users(username,actor_key)VALUES('paid','paid'),('unpaid','unpaid');")).await?;
             assert!(!supporter_awarded(&db,"paid").await?);
             db.batch_execute("CREATE TABLE ap_supporter_codes(code_hash TEXT,used_by BIGINT,used_at TEXT);INSERT INTO ap_supporter_codes VALUES('fixture',1,'now');").await?;
             assert!(supporter_awarded(&db,"paid").await?);
@@ -427,6 +430,14 @@ mod supporter_tests {
             assert_eq!(authorized_badges(&db,"paid",&Value::Null).await?,vec!["supporter"]);
             assert_eq!(authorized_badges(&db,"unpaid",&json!([" supporter ","cat"])).await?,vec!["cat"]);
             assert!(!supporter_awarded(&db,"unpaid").await?);
+            let forged=json!(["admin","supporter","cat","dog","coffee","tea","bookworm","gamer"]);
+            assert_eq!(authorized_badges(&db,"unpaid",&forged).await?,vec!["cat","dog","coffee","tea","bookworm","gamer"]);
+            db.batch_execute("UPDATE ap_users SET is_admin=1 WHERE actor_key='unpaid'").await?;
+            assert_eq!(authorized_badges(&db,"unpaid",&forged).await?,vec!["admin","cat","dog","coffee","tea","bookworm","gamer"]);
+            let role_before=header_dependencies(&db,"unpaid","https://mkultra.monster/users/unpaid",1,"https://mkultra.monster/users/paid",2,false).await?;
+            db.batch_execute("UPDATE ap_users SET is_admin=0 WHERE actor_key='unpaid'").await?;
+            assert_eq!(authorized_badges(&db,"unpaid",&forged).await?,vec!["cat","dog","coffee","tea","bookworm","gamer"]);
+            assert_ne!(role_before,header_dependencies(&db,"unpaid","https://mkultra.monster/users/unpaid",1,"https://mkultra.monster/users/paid",2,false).await?,"late role withdrawal invalidates header admission");
             let before=header_dependencies(&db,"paid","https://mkultra.monster/users/paid",2,"https://mkultra.monster/users/unpaid",1,false).await?;
             db.batch_execute("UPDATE ap_supporter_codes SET used_by=NULL,used_at=NULL").await?;
             assert!(!supporter_awarded(&db,"paid").await?);

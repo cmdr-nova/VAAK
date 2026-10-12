@@ -3570,7 +3570,18 @@ fn ask_card_from_status(status: &Value) -> Option<(String, String)> {
         &ask_label_block(actor, &display, &handle),
         question,
     );
-    Some((card, answer.to_string()))
+    let answer = if !answer.is_empty() {
+        answer.to_string()
+    } else if let Some((_baked_question, baked_answer)) = ask_card_parts(status.get("content").and_then(Value::as_str).unwrap_or("")) {
+        // Imported/Wafrn bodies can already contain the question. Keep only
+        // the parser's answer rather than duplicating that question card.
+        baked_answer
+    } else if status.get("uri").and_then(Value::as_str).is_some_and(|uri|uri.starts_with("https://mkultra.monster/users/")&&uri.contains("/notes/")) {
+        // Local ap_asks has no stored answer field. Current normalized note
+        // content is the answer; existing answer paint still sanitizes/links it.
+        status.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string()
+    } else { String::new() };
+    Some((card, answer))
 }
 
 /// Profile Asks paint the answer as the post body under the question card.

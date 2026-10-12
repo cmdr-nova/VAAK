@@ -19,6 +19,7 @@ pub(crate) struct TrustedSession {
     bsky_did:String,
     warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>,
     saved_sources:std::collections::HashMap<usize,std::sync::Arc<super::selection::SavedEntryGrant>>,
+    canonical_queries:Option<std::sync::Arc<super::selection::CanonicalRequestQueries>>,
 }
 
 impl TrustedSession {
@@ -26,7 +27,7 @@ impl TrustedSession {
         if owner_id < 1 || csrf.is_empty() || !matches!(return_view.as_str(), "bookmarks" | "favourites") {
             anyhow::bail!("invalid canonical PHP Library session");
         }
-        Ok(Self { owner_id, csrf, return_view, bsky_enabled, lazy_media:true, bsky_bookmarks:Default::default(),bsky_did:String::new(),warm:None,saved_sources:Default::default() })
+        Ok(Self { owner_id, csrf, return_view, bsky_enabled, lazy_media:true, bsky_bookmarks:Default::default(),bsky_did:String::new(),warm:None,saved_sources:Default::default(),canonical_queries:None })
     }
     pub(super) fn with_lazy_media(mut self, lazy_media:bool)->Self { self.lazy_media=lazy_media; self }
     pub(super) fn lazy_media(&self)->bool { self.lazy_media }
@@ -49,6 +50,10 @@ impl TrustedSession {
     pub(crate) fn owner_id(&self)->i64 {self.owner_id}
     pub(crate) async fn require_bsky_current(&self,db:&Client)->Result<()>{require_bsky_did(db,self.owner_id,&self.bsky_did).await}
     pub(crate) fn with_warm_context(mut self,warm:Option<std::sync::Arc<crate::profile_enrichment::WarmContext>>)->Self{self.warm=warm;self}
+    pub(super) async fn with_canonical_queries(mut self,db:std::sync::Arc<Client>)->Result<Self>{
+        self.canonical_queries=Some(super::selection::CanonicalRequestQueries::new(db).await?);Ok(self)
+    }
+    pub(super) fn canonical_queries(&self)->Option<&std::sync::Arc<super::selection::CanonicalRequestQueries>>{self.canonical_queries.as_ref()}
     pub(crate) async fn with_saved_sources(mut self,db:&Client,descriptors:Vec<super::selection::SavedSourceDescriptor>,source_count:usize)->Result<Self>{
         super::selection::validate_descriptors(&descriptors,source_count,&self.return_view)?;
         for descriptor in descriptors{
@@ -97,7 +102,7 @@ impl SelectedLibrarySearchSource {
         if association.kind()!="fedi"||association.owner_id()!=session.owner_id(){anyhow::bail!("canonical saved owner/network mismatch")}
         association.require_current(db).await?;
         if association.emitted_network_count()!=Some(session.saved_sources.len()){anyhow::bail!("incomplete canonical saved page")}
-        let source=canonical_saved_local_source(db,association.row_snapshot()).await?;
+        let source=canonical_saved_local_source(db,association.row_snapshot(),association.canonical_queries()).await?;
         let identity=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[&session.owner_id]).await?.context("inactive canonical Library owner")?;
         let saved_sid=association.row_snapshot()["status_id"].as_str().context("saved SID missing")?.to_owned();
         let selected=Self{bsky_did:None,inner:SelectedSurfaceSource::CanonicalLibrary{owner:session.owner_id,actor:identity.get(0),key:identity.get(1),source,saved_sid,association}};
@@ -155,8 +160,8 @@ impl SelectedLibrarySearchSource {
         match &self.inner {
             SelectedSurfaceSource::CanonicalLibrary{source,association,..}=>{
                 association.require_current(db).await?;
-                if canonical_saved_local_source(db,association.row_snapshot()).await?!=*source{anyhow::bail!("canonical saved source changed")}
-                if admit_indexed(db,owner,vec![(0,source.clone())]).await?.statuses.len()!=1{anyhow::bail!("canonical saved source denied")}
+                if canonical_saved_local_source(db,association.row_snapshot(),association.canonical_queries()).await?!=*source{anyhow::bail!("canonical saved source changed")}
+                require_indexed_sources(db,owner,vec![(0,source.clone())]).await?;
             },
             SelectedSurfaceSource::Library{source,association,..}=>{
                 if let Some(association)=association{association.require_current(db).await?;association.require_source_binding(source)?;}
@@ -174,13 +179,35 @@ impl SelectedLibrarySearchSource {
         if self.bsky_did.as_deref().is_some_and(|captured|captured!=did){anyhow::bail!("Search final DID snapshot differs")}
         proof.require_bound_source(association,*owner,actor,key,*source_index,source)
     }
+    /// Refresh one original/projected proof window. Generic surfaces preserve
+    /// their existing guard schedule; only canonical descriptor ingress folds
+    /// adjacent duplicate source checks with no intervening I/O or effect.
+    pub(crate) async fn require_projection_window(&self,db:&Client,projected:Option<&Value>)->Result<()>{
+        if matches!(&self.inner,SelectedSurfaceSource::CanonicalLibrary{..}){
+            if let Some(projected)=projected{return self.require_projected_current(db,projected).await}
+            return self.require_current(db).await
+        }
+        self.require_current(db).await?;
+        if let Some(projected)=projected{self.require_projected_current(db,projected).await?;}
+        Ok(())
+    }
     /// Native SQL projection is checked as a separate recursive source; an
     /// original selected snapshot cannot grant access to newly recovered data.
     pub(crate) async fn require_projected_current(&self,db:&Client,projected:&Value)->Result<()> {
+        // Both trees are independently admitted from freshly read policy in
+        // one window. No effect or awaited dependency read separates them.
+        if let SelectedSurfaceSource::CanonicalLibrary{owner,actor,key,source,association,..}=&self.inner{
+            let identity=db.query_opt("SELECT actor_id,actor_key FROM ap_users WHERE id=$1::bigint AND disabled_at IS NULL",&[owner]).await?.context("selected surface owner withdrawn")?;
+            if identity.get::<_,String>(0)!=*actor||identity.get::<_,String>(1)!=*key{anyhow::bail!("selected surface owner changed")}
+            association.require_current(db).await?;
+            if canonical_saved_local_source(db,association.row_snapshot(),association.canonical_queries()).await?!=*source{anyhow::bail!("canonical saved source changed")}
+            return require_indexed_sources(db,*owner,vec![(0,source.clone()),(1,projected.clone())]).await
+        }
         self.require_current(db).await?;
         let owner=self.owner_id();
         match &self.inner {
-            SelectedSurfaceSource::CanonicalLibrary{..}|SelectedSurfaceSource::Library{..}=>if admit_indexed(db,owner,vec![(0,projected.clone())]).await?.statuses.len()!=1{anyhow::bail!("native Library projection denied")},
+            SelectedSurfaceSource::CanonicalLibrary{..}=>unreachable!(),
+            SelectedSurfaceSource::Library{..}=>if admit_indexed(db,owner,vec![(0,projected.clone())]).await?.statuses.len()!=1{anyhow::bail!("native Library projection denied")},
             SelectedSurfaceSource::Search{actor,key,..}=>crate::search_context::require_selected_current(db,owner,actor,key,projected).await?,
         }
         Ok(())
@@ -189,23 +216,36 @@ impl SelectedLibrarySearchSource {
 
 /// Only the first qualified local slice. Unsupported features retain the
 /// complete canonical PHP page; URL lookup never overrides SID precedence.
-async fn canonical_saved_local_source(db:&Client,saved:&Value)->Result<Value>{
+pub(super) const CANONICAL_SAVED_LOCAL_FACTS_SQL:&str=r#"SELECT to_jsonb(s),
+        (SELECT jsonb_agg(a.local_id::bigint) FROM masto_statuses a
+         WHERE a.note_id IN(rtrim(s.note_id,'/'),rtrim(s.note_id,'/')||'/')),
+        (SELECT to_jsonb(n) FROM outbox_notes n WHERE n.id=s.note_id),
+        EXISTS(SELECT 1 FROM masto_polls p WHERE p.status_local_id::bigint=s.local_id::bigint)
+        OR EXISTS(SELECT 1 FROM ap_asks a WHERE a.answer_note_id=s.note_id)
+        FROM masto_statuses s WHERE s.local_id::bigint=$1"#;
+async fn canonical_saved_local_source(db:&Client,saved:&Value,queries:Option<&std::sync::Arc<super::selection::CanonicalRequestQueries>>)->Result<Value>{
     let sid=saved["status_id"].as_str().context("saved local SID missing")?;
     let parsed=sid.parse::<i64>().context("saved local SID not numeric")?;
     if parsed<=0||parsed.to_string()!=sid{anyhow::bail!("unsupported saved local SID")}
     let local=if parsed<2_000_000{parsed}else if parsed>=1_000_000_000_000_000_000&&(parsed%1_000_000_000)/100_000_000==0{parsed%100_000_000}else{anyhow::bail!("unsupported local SID namespace")};
-    let row:Value=db.query_opt("SELECT to_jsonb(s) FROM masto_statuses s WHERE local_id::bigint=$1",&[&local]).await?.context("saved local SID absent")?.get(0);
+    // Resolve the exact SID, alias inventory, durable outbox and unsupported
+    // feature predicates in one fresh statement. These are retained facts,
+    // never cached permission: every current-source boundary reruns this SQL.
+    // A single snapshot also avoids assembling a local source from rows read
+    // on opposite sides of an edit or deletion.
+    let facts=if let Some(queries)=queries{queries.source_facts(db,local).await?}
+        else{db.query_opt(CANONICAL_SAVED_LOCAL_FACTS_SQL,&[&local]).await?}.context("saved local SID absent")?;
+    let row:Value=facts.get(0);
     let published=row["published"].as_str().context("local publication missing")?;
     let timestamp=chrono::DateTime::parse_from_rfc3339(published).context("unsupported local publication")?.timestamp();
     if parsed>=2_000_000&&(timestamp-parsed/1_000_000_000).abs()>180{anyhow::bail!("stale saved local snowflake")}
     let note=row["note_id"].as_str().context("local note missing")?;
-    let base=note.trim_end_matches('/');let slash=format!("{base}/");
-    let aliases=db.query("SELECT local_id::bigint FROM masto_statuses WHERE note_id IN($1,$2)",&[&base,&slash]).await?;
-    if aliases.len()!=1||aliases[0].get::<_,i64>(0)!=local{anyhow::bail!("ambiguous canonical local SID/note aliases")}
+    let aliases:Value=facts.get::<_,Option<Value>>(1).unwrap_or(Value::Null);
+    if aliases.as_array().is_none_or(|aliases|aliases.len()!=1||aliases[0].as_i64()!=Some(local)){anyhow::bail!("ambiguous canonical local SID/note aliases")}
     let object=super::card::php_trim(saved["object_id"].as_str().unwrap_or("")).trim_end_matches('/');
     let stripped=regex::Regex::new(r"#announce-[0-9]+$").unwrap().replace(object,"");
     if !note.starts_with("https://mkultra.monster/users/")||note.trim_end_matches('/')!=stripped.trim_end_matches('/'){anyhow::bail!("saved SID/object mismatch")}
-    let outbox:Value=db.query_opt("SELECT to_jsonb(n) FROM outbox_notes n WHERE id=$1",&[&note]).await?.context("durable local note missing")?.get(0);
+    let outbox:Value=facts.get::<_,Option<Value>>(2).context("durable local note missing")?;
     let raw:Value=serde_json::from_str(outbox["raw_create_json"].as_str().unwrap_or("")).context("local raw note malformed")?;
     let content=row["content_text"].as_str().unwrap_or("");
     if row["in_reply_to_local_id"].is_number()||!outbox["in_reply_to"].as_str().unwrap_or("").is_empty()
@@ -213,7 +253,7 @@ async fn canonical_saved_local_source(db:&Client,saved:&Value)->Result<Value>{
        ||content=="(quote)"||content=="(poll)"||content.contains('@')||content.contains('#'){
         anyhow::bail!("unsupported canonical local feature")
     }
-    if db.query_one("SELECT EXISTS(SELECT 1 FROM masto_polls WHERE status_local_id::bigint=$1) OR EXISTS(SELECT 1 FROM ap_asks WHERE answer_note_id=$2)",&[&local,&note]).await?.get::<_,bool>(0){anyhow::bail!("unsupported local poll/Ask")}
+    if facts.get::<_,bool>(3){anyhow::bail!("unsupported local poll/Ask")}
     let actor=note.split("/notes/").next().filter(|actor|*actor!=note).context("unsupported local author URL")?;
     let canonical_sid=timestamp.checked_mul(1_000_000_000).and_then(|v|v.checked_add(local%100_000_000)).context("local snowflake overflow")?.to_string();
     Ok(serde_json::json!({"id":canonical_sid,"uri":note,"url":note,"content":super::actions::esc(content),"spoiler_text":row["spoiler_text"],"visibility":row["visibility"],"account":{"uri":actor,"url":actor},"media_attachments":[],"bookmarked":true}))
@@ -402,10 +442,14 @@ async fn admit_for_render_impl(db:&Client,session:&TrustedSession,statuses:Vec<V
             };
             // The component answer is intentionally empty because the shared
             // painter renders the current answer in the post body.
-            let text = format!("{}\n{}",
-                ask.get("question").and_then(Value::as_str).unwrap_or(""),
-                ask.get("_body_answer").or_else(|| ask.get("answer"))
-                    .and_then(Value::as_str).unwrap_or(""));
+            let selected=vec![displayed.get("uri").and_then(Value::as_str).unwrap_or("").to_owned()];
+            let mut words_only=words_only;
+            crate::hidden::load_ordinary_owned_notes(db,session.owner_id,&selected,&mut words_only).await?;
+            let question=ask.get("question").and_then(Value::as_str).unwrap_or("");
+            let answer=ask.get("_body_answer").or_else(||ask.get("answer")).and_then(Value::as_str).unwrap_or("");
+            let owned=displayed.get("uri").and_then(Value::as_str).and_then(|uri|words_only.ordinary_owned_notes.get(uri.trim().trim_end_matches('/')))
+                .is_some_and(|actor|displayed.get("account").and_then(|account|account.get("uri")).and_then(Value::as_str).is_some_and(|candidate|candidate.trim().trim_end_matches('/')==actor));
+            let text=if owned {question.to_owned()} else {format!("{question}\n{answer}")};
             if crate::hidden::library_status_hidden(
                 &serde_json::json!({"content": super::actions::esc(&text)}), &words_only) {
                 if preview.is_some(){anyhow::bail!("PHP fallback: current Ask word omission preview state not certified");}
@@ -560,6 +604,22 @@ pub async fn admit(db: &Client, authenticated_owner: i64, statuses: Vec<Value>) 
     admit_indexed(db,authenticated_owner,statuses.into_iter().enumerate().collect()).await
 }
 async fn admit_indexed(db:&Client,authenticated_owner:i64,indexed:Vec<(usize,Value)>)->Result<AdmittedLibraryPage> {
+    admit_indexed_impl(db,authenticated_owner,indexed,true).await
+}
+
+/// A private proof-only boundary. Keep every admission predicate fresh, but
+/// do not fetch menu decoration or interaction flags which this caller would
+/// discard. The undecorated page never escapes this helper; the actual painter
+/// always uses admit_indexed above and obtains its complete current facts.
+async fn require_indexed_sources(db:&Client,authenticated_owner:i64,indexed:Vec<(usize,Value)>)->Result<()> {
+    let expected=indexed.len();
+    if admit_indexed_impl(db,authenticated_owner,indexed,false).await?.statuses.len()!=expected{
+        anyhow::bail!("canonical Library source or projection denied")
+    }
+    Ok(())
+}
+
+async fn admit_indexed_impl(db:&Client,authenticated_owner:i64,indexed:Vec<(usize,Value)>,decorate:bool)->Result<AdmittedLibraryPage> {
     if authenticated_owner < 1 { anyhow::bail!("Library admission requires an authenticated owner"); }
     let owner = db.query_opt("SELECT actor_id FROM ap_users WHERE id::bigint = $1 AND disabled_at IS NULL", &[&authenticated_owner])
         .await.context("resolve active Library owner")?.context("inactive Library owner")?;
@@ -567,8 +627,8 @@ async fn admit_indexed(db:&Client,authenticated_owner:i64,indexed:Vec<(usize,Val
     let mut bound=Vec::new();
     for (index,status) in indexed {if let Some(status)=bind_rss_sources(db,authenticated_owner,status,0).await?{bound.push((index,status));}}
     let (mut source_indices,mut statuses):(Vec<_>,Vec<_>)=bound.into_iter().unzip();
-    let hidden = crate::hidden::load_library_hidden_sets(db, authenticated_owner).await?;
-    let moderation = crate::hidden::load_viewer_moderation(db, authenticated_owner).await?;
+    let mut hidden = if decorate{crate::hidden::load_library_hidden_sets(db, authenticated_owner).await?}else{crate::hidden::load_canonical_library_hidden_sets(db, authenticated_owner).await?};
+    let moderation = if decorate{crate::hidden::load_viewer_moderation(db, authenticated_owner).await?}else{Default::default()};
     let mut rss_ids: Vec<i64> = statuses.iter().filter_map(rss_id).collect();
     rss_ids.sort(); rss_ids.dedup();
     let mut rss_rows = std::collections::HashMap::<i64, Value>::new();
@@ -592,10 +652,12 @@ async fn admit_indexed(db:&Client,authenticated_owner:i64,indexed:Vec<(usize,Val
     }
     let non_rss=live.iter().filter(|(_,status)|!is_rss(status)).map(|(_,status)|status.clone()).collect::<Vec<_>>();
     let decisions=crate::audience::admission_mask(db,authenticated_owner,crate::audience::Surface::Library,&non_rss).await?;
+    let selected:Vec<String> = non_rss.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
+    crate::hidden::load_ordinary_owned_notes(db, authenticated_owner, &selected, &mut hidden).await?;
     let mut decisions=decisions.into_iter();
-    let admitted=live.into_iter().filter(|(_,status)|is_rss(status)||(decisions.next().unwrap_or(false)&&!crate::hidden::library_status_hidden(status,&hidden))).collect::<Vec<_>>();
+    let admitted=live.into_iter().filter(|(_,status)|is_rss(status)||(decisions.next().unwrap_or(false)&&!crate::hidden::ordinary_library_status_hidden(status,&hidden))).collect::<Vec<_>>();
     (source_indices,statuses)=admitted.into_iter().unzip();
-    crate::interaction_flags::apply_to_statuses(db, authenticated_owner, &mut statuses).await?;
+    if decorate{crate::interaction_flags::apply_to_statuses(db, authenticated_owner, &mut statuses).await?;}
     Ok(AdmittedLibraryPage { owner_id: authenticated_owner, owner_actor, statuses, source_indices, moderation, rss_rows })
 }
 

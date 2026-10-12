@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
 
 use crate::config::Config;
-use crate::hidden::{self, HiddenSets};
+use crate::hidden;
 use crate::redis_util;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,15 +33,8 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
     let last_read = load_last_read_id(db, owner_user_id).await?;
     let owner_actor = load_owner_actor_id(db, owner_user_id).await?;
     let owner_actor_trim = owner_actor.trim_end_matches('/').to_string();
-    let hidden = hidden::load_hidden_sets(db, owner_user_id)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "hidden sets load failed; continuing without");
-            HiddenSets::default()
-        });
-    let subscriptions = hidden::load_post_subscriptions(db, owner_user_id)
-        .await
-        .unwrap_or_default();
+    let hidden = hidden::load_hidden_sets(db, owner_user_id).await?;
+    let subscriptions = hidden::load_post_subscriptions(db, owner_user_id).await?;
 
     let mut ids: Vec<String> = Vec::new();
     let mut mention_kept = 0_i64;
@@ -52,10 +45,10 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
 
     let mention_rows = db
         .query(
-            "SELECT id, created_at, activity_id, activity_type, type,
+            "SELECT id::bigint, created_at, activity_id, activity_type, type,
                     object_id, owner_actor_id, actor_id, content, in_reply_to
              FROM mentions
-             WHERE owner_user_id = $1 AND deleted_at IS NULL
+             WHERE owner_user_id = $1::bigint AND deleted_at IS NULL
              ORDER BY id DESC
              LIMIT 250",
             &[&owner_user_id],
@@ -131,12 +124,12 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
                     mention_skipped += 1;
                     continue;
                 }
-                match hidden::is_favourited(db, owner_user_id, &object_id).await {
-                    Ok(true) => {
+                match hidden::is_favourited(db, owner_user_id, &object_id).await? {
+                    true => {
                         update_kept += 1;
                         "update"
                     }
-                    _ => {
+                    false => {
                         mention_skipped += 1;
                         continue;
                     }
@@ -154,9 +147,24 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
         mention_kept += 1;
     }
 
+    // PHP retains legacy follow events when the current follower set is empty.
+    // Bluesky follows are independent of ActivityPub follower membership.
+    let follower_rows = db.query(
+        "SELECT actor_id FROM followers WHERE owner_actor_id = $1 OR owner_actor_id = $2",
+        &[&owner_actor_trim, &format!("{owner_actor_trim}/")],
+    ).await.context("select current followers")?;
+    let mut followers = std::collections::HashSet::new();
+    for row in follower_rows {
+        let actor: Option<String> = row.try_get(0)?;
+        if let Some(actor) = actor {
+            let actor = actor.trim().trim_end_matches('/');
+            if !actor.is_empty() { followers.insert(actor.to_string()); }
+        }
+    }
+
     let follow_rows = db
         .query(
-            "SELECT id, created_at, actor_id, action_taken FROM events
+            "SELECT id::bigint, created_at, actor_id, action_taken FROM events
              WHERE type = 'Follow'
                AND action_taken IN ('local_accept_followback', 'bsky_follow')
                AND (target_actor = $1 OR target_actor = $2)
@@ -174,6 +182,11 @@ pub async fn compute_unread(db: &Client, owner_user_id: i64, scan: i64) -> Resul
             .unwrap_or_default()
             .trim_end_matches('/')
             .to_string();
+        let action: String = row.try_get::<_, Option<String>>(3)?.unwrap_or_default();
+        if action == "local_accept_followback" && !actor_id.is_empty()
+            && !followers.is_empty() && !followers.contains(&actor_id) {
+            continue;
+        }
         // Skip self.
         if !actor_id.is_empty() && actor_id == owner_actor_trim {
             continue;
@@ -338,7 +351,7 @@ async fn load_last_read_id(db: &Client, owner_user_id: i64) -> Result<String> {
     let row = db
         .query_opt(
             "SELECT last_read_id FROM masto_markers
-             WHERE owner_user_id = $1 AND timeline = 'notifications'
+             WHERE owner_user_id = $1::bigint AND timeline = 'notifications'
              LIMIT 1",
             &[&owner_user_id],
         )
@@ -358,21 +371,15 @@ async fn load_last_read_id(db: &Client, owner_user_id: i64) -> Result<String> {
 }
 
 async fn load_owner_actor_id(db: &Client, owner_user_id: i64) -> Result<String> {
-    if let Ok(Some(row)) = db
-        .query_opt(
-            "SELECT actor_id FROM ap_users WHERE id = $1 LIMIT 1",
-            &[&owner_user_id],
-        )
-        .await
-    {
-        let actor: Option<String> = row.try_get(0).ok().flatten();
-        if let Some(actor) = actor {
-            if actor.starts_with("https://") {
-                return Ok(actor.trim_end_matches('/').to_string());
-            }
-        }
-    }
-    Ok("https://mkultra.monster/users/cmdr_nova".to_string())
+    let row = db.query_opt(
+        "SELECT actor_id FROM ap_users WHERE id = $1::bigint AND disabled_at IS NULL LIMIT 1",
+        &[&owner_user_id],
+    ).await.context("select current notification owner")?
+        .context("notification owner missing or disabled")?;
+    let actor: Option<String> = row.try_get(0)?;
+    let actor = actor.context("notification owner actor missing")?;
+    anyhow::ensure!(actor.starts_with("https://"), "notification owner actor invalid");
+    Ok(actor.trim_end_matches('/').to_string())
 }
 
 fn parse_epoch_secs(s: &str) -> Option<i64> {
@@ -406,26 +413,6 @@ fn shadow_redis_key(owner_user_id: i64, scan: i64, last_read: &str) -> String {
     format!("vaak:shadow:notifications:v1:unread:{owner_user_id}:{scan}:{hash}")
 }
 
-fn decimal_at_least(candidate: &str, watermark: &str) -> bool {
-    let candidate = candidate.trim_start_matches('0');
-    let watermark = watermark.trim_start_matches('0');
-    if watermark.is_empty() {
-        return true;
-    }
-    if candidate.is_empty() {
-        return false;
-    }
-    candidate.len() > watermark.len()
-        || (candidate.len() == watermark.len() && candidate >= watermark)
-}
-
-fn list_is_ready(list_latest: Option<&str>, badge_latest: &str) -> bool {
-    if badge_latest.is_empty() {
-        return true;
-    }
-    matches!(list_latest, Some(latest) if !latest.is_empty() && decimal_at_least(latest, badge_latest))
-}
-
 fn digits_only(raw: &str) -> String {
     let nid: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     if nid.is_empty() {
@@ -446,32 +433,6 @@ fn snowflake_is_unread(nid: &str, last_read: &str) -> bool {
     }
 }
 
-/// Unread ids the warmed Mentions list can already serve.
-///
-/// `ids` are newest-first. A missing list publishes nothing, so the nav badge
-/// cannot get ahead of the page. Ids newer than `list_latest` are left out;
-/// older unread ids still count.
-fn clamp_published_unread(ids: &[String], last_read: &str, list_latest: Option<&str>) -> (i64, String) {
-    let Some(list_latest) = list_latest.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (0, String::new());
-    };
-    let mut count = 0_i64;
-    let mut latest_unread = String::new();
-    for raw in ids {
-        let nid = digits_only(raw);
-        if !decimal_at_least(list_latest, &nid) {
-            continue;
-        }
-        if snowflake_is_unread(&nid, last_read) {
-            count += 1;
-            if latest_unread.is_empty() {
-                latest_unread = nid;
-            }
-        }
-    }
-    (count, latest_unread)
-}
-
 fn unread_cache_payload(state: &UnreadState) -> serde_json::Value {
     serde_json::json!({
         "c": state.count,
@@ -485,39 +446,6 @@ fn unread_cache_payload(state: &UnreadState) -> serde_json::Value {
         "hidden_skipped": state.hidden_skipped,
         "update_kept": state.update_kept,
     })
-}
-
-async fn list_watermark(
-    redis: &mut redis::aio::MultiplexedConnection,
-    owner_user_id: i64,
-) -> Result<Option<String>> {
-    let key = crate::notif_list::notifications_list_redis_key(
-        owner_user_id,
-        40,
-        None,
-        None,
-        &[],
-    );
-    let Some(payload) = redis_util::json_get(redis, &key).await? else {
-        return Ok(None);
-    };
-    let latest = payload
-        .get("latest_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            payload.get("items").and_then(|v| v.as_array()).and_then(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
-                    .filter(|id| id.chars().all(|c| c.is_ascii_digit()))
-                    .max_by(|a, b| {
-                        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
-                    })
-                    .map(str::to_string)
-            })
-        });
-    Ok(latest)
 }
 
 /// Compute + write Redis. When `live`, also writes the production notif key + file cache.
@@ -534,43 +462,22 @@ pub async fn compute_and_cache(
     }
 
     let mut redis = redis_util::connect(&cfg.redis_url).await?;
-    // Shadow keeps the raw scan. Live publish is clamped to the list watermark.
+    // Publish the current eligible scan independently of list page size or warmth.
+    // Recheck owner and marker before either cache is changed.
+    load_owner_actor_id(&db, owner_user_id).await?;
+    anyhow::ensure!(load_last_read_id(&db, owner_user_id).await? == state.last_read_id,
+        "notification read marker changed during scan");
     let raw_state = state.clone();
     let shadow_payload = unread_cache_payload(&raw_state);
     let shadow_key = shadow_redis_key(owner_user_id, raw_state.scan, &raw_state.last_read_id);
     redis_util::json_set(&mut redis, &shadow_key, &shadow_payload, 120).await?;
 
     let live_key = live_redis_key(owner_user_id, state.scan, &state.last_read_id);
-    let mut badge_deferred = false;
-    let mut list_latest_dbg: Option<String> = None;
     if live {
-        let list_latest = list_watermark(&mut redis, owner_user_id).await?;
-        list_latest_dbg = list_latest.clone();
-        if !list_is_ready(list_latest.as_deref(), &raw_state.latest_id) {
-            let (count, unread) = clamp_published_unread(
-                &raw_state.scanned_ids,
-                &raw_state.last_read_id,
-                list_latest.as_deref(),
-            );
-            state.count = count;
-            state.latest_unread_id = unread;
-            // Keep latest_id at the real tip. The published count is what clients paint.
-            badge_deferred = true;
-            tracing::info!(
-                owner = owner_user_id,
-                raw_count = raw_state.count,
-                published = count,
-                badge_latest = %raw_state.latest_id,
-                list_latest = ?list_latest,
-                "notif badge clamped until list cache reaches watermark"
-            );
-        }
         let payload = unread_cache_payload(&state);
-        // Always overwrite. Skipping the write left the previous count in Redis
-        // and the HTTP body still returned the unclamped count to PHP.
         redis_util::json_set(&mut redis, &live_key, &payload, 45).await?;
         write_file_cache(cfg, owner_user_id, &state.last_read_id, &payload)?;
-        tracing::info!(%live_key, count = state.count, deferred = badge_deferred, "notif live cache written");
+        tracing::info!(%live_key, count = state.count, "notif live cache written");
     }
 
     if compare {
@@ -588,11 +495,7 @@ pub async fn compute_and_cache(
         if let Some(obj) = v.as_object_mut() {
             obj.insert("live_mode".into(), serde_json::json!(live));
             obj.insert("live_redis_key".into(), serde_json::json!(live_key));
-            if badge_deferred {
-                obj.insert("badge_deferred".into(), serde_json::json!(true));
-                obj.insert("list_latest_id".into(), serde_json::json!(list_latest_dbg));
-                obj.insert("raw_count".into(), serde_json::json!(raw_state.count));
-            }
+
         }
         Ok(v)
     }
@@ -646,7 +549,7 @@ pub async fn run_once(
 pub async fn list_local_owner_ids(db: &Client) -> Result<Vec<i64>> {
     let rows = db
         .query(
-            "SELECT id FROM ap_users
+            "SELECT id::bigint FROM ap_users
              WHERE disabled_at IS NULL
              ORDER BY id ASC",
             &[],
@@ -706,7 +609,7 @@ pub async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_published_unread, decimal_at_least, list_is_ready, snowflake_id};
+    use super::{snowflake_id, snowflake_is_unread};
 
     #[test]
     fn snowflake_matches_php_shape() {
@@ -720,42 +623,11 @@ mod tests {
     }
 
     #[test]
-    fn watermark_compares_large_decimal_ids_without_float_loss() {
-        assert!(decimal_at_least("1000000000000000001", "1000000000000000000"));
-        assert!(!decimal_at_least("999999999999999999", "1000000000000000000"));
-        assert!(decimal_at_least("00042", "42"));
-        assert!(decimal_at_least("42", ""));
-        assert!(!list_is_ready(Some(""), "42"));
-        assert!(!list_is_ready(None, "42"));
-        assert!(list_is_ready(Some("42"), "42"));
-        assert!(list_is_ready(None, ""));
-    }
-
-    #[test]
-    fn badge_publish_stops_at_the_list_watermark() {
-        let ids = vec![
-            "1791371595600739639".to_string(),
-            "1791368209500001230".to_string(),
-            "1791359835500001227".to_string(),
-        ];
-        let last_read = "1791368209500001230";
-        let (count, unread) = clamp_published_unread(&ids, last_read, None);
-        assert_eq!(count, 0);
-        assert_eq!(unread, "");
-        let (count, unread) =
-            clamp_published_unread(&ids, last_read, Some("1791368209500001230"));
-        assert_eq!(count, 0, "follow ahead of the list must not badge");
-        assert_eq!(unread, "");
-        let (count, unread) =
-            clamp_published_unread(&ids, last_read, Some("1791371595600739639"));
-        assert_eq!(count, 1);
-        assert_eq!(unread, "1791371595600739639");
-        let (count, unread) = clamp_published_unread(
-            &["300".into(), "200".into(), "100".into()],
-            "50",
-            Some("200"),
-        );
-        assert_eq!(count, 2);
-        assert_eq!(unread, "200");
+    fn unread_marker_compares_large_decimal_ids_without_float_loss() {
+        assert!(snowflake_is_unread("1000000000000000001", "1000000000000000000"));
+        assert!(!snowflake_is_unread("1000000000000000000", "1000000000000000000"));
+        assert!(!snowflake_is_unread("999999999999999999", "1000000000000000000"));
+        assert!(snowflake_is_unread("42", "0"));
+        assert!(!snowflake_is_unread("0", "0"));
     }
 }
