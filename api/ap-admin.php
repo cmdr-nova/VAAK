@@ -191,6 +191,9 @@ if ($vaakGuestProfile) {
 }
 $GLOBALS['vaak_actor_key'] = $vaakActorKey;
 $GLOBALS['vaak_actor_id'] = $vaakActorId;
+$vaakTrendsDisplay = admin_trends_display_state($vaakUser);
+header('X-VAAK-Trends-Enabled: ' . ($vaakTrendsDisplay['enabled'] ? '1' : '0'));
+header('X-VAAK-Trends-Owner: ' . $vaakTrendsDisplay['owner']);
 if (!$vaakGuestProfile && function_exists('ap_request_actor_set')) {
     ap_request_actor_set($vaakActorKey);
 }
@@ -2365,6 +2368,9 @@ $vaakAdminOnlyActions = [
                 'hide_profile_replies' => !empty($_POST['hide_profile_replies']),
                 'hide_profile_boosts' => !empty($_POST['hide_profile_boosts']),
                 'algorithm_enabled' => !empty($_POST['algorithm_enabled']),
+                'trending_enabled' => array_key_exists('trending_enabled_present', $_POST)
+                    ? !empty($_POST['trending_enabled'])
+                    : (bool) (ap_profile_get($vaakActorKey)['trending_enabled'] ?? true),
                 'downranking_enabled' => !empty($_POST['downranking_enabled']),
                 'asks_enabled' => !empty($_POST['asks_enabled']),
                 'webmentions_enabled' => !empty($_POST['webmentions_enabled']),
@@ -6405,8 +6411,26 @@ function admin_trend_status_hidden(array $item, int $ownerUserId, array $refs, i
     return false;
 }
 
+/** Fresh local display preference, independent of cached candidate/HTML authority. */
+function admin_trends_display_state(?array $user = null): array
+{
+    $user ??= function_exists('ap_auth_current_user') ? ap_auth_current_user() : null;
+    $owner = is_array($user) ? (int) ($user['id'] ?? 0) : 0;
+    if ($owner < 1) return ['owner' => 0, 'enabled' => false];
+    try {
+        $q = ap_db()->prepare('SELECT u.id AS preference_owner, p.* FROM ap_users u LEFT JOIN actor_profile p ON p.actor_key=u.actor_key WHERE u.id=? AND u.disabled_at IS NULL');
+        $q->execute([$owner]);
+        $row = $q->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) return ['owner' => 0, 'enabled' => false];
+        return ['owner' => $owner, 'enabled' => !array_key_exists('trending_enabled', $row) || $row['trending_enabled'] === null || !empty($row['trending_enabled'])];
+    } catch (Throwable $e) {
+        return ['owner' => $owner, 'enabled' => false];
+    }
+}
+
 function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = true, ?array &$meta = null, bool $bypassFragment = false): string
 {
+    if (!admin_trends_display_state()['enabled']) { $meta = ['disabled' => true]; return ''; }
     $viewForTrends = preg_replace('/[^a-z_]/', '', $viewForTrends) ?: 'home';
     $trendTags = [];
     $trendStatuses = [];
@@ -6427,6 +6451,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         $row = function_exists('ap_masto_trends_cache_read')
             ? ap_masto_trends_cache_read($kind, 1, $allowStale, $viewerId)
             : null;
+        if (!admin_trends_display_state($viewer)['enabled']) { $meta = ['disabled' => true]; return ''; }
         if (!is_array($row)) {
             continue;
         }
@@ -6442,6 +6467,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
     }
     if ((int) ($currentViewer['id'] ?? 0) !== $viewerId) return '';
+    if (!admin_trends_display_state($currentViewer)['enabled']) { $meta = ['disabled' => true]; return ''; }
     $downrankRefs = admin_trend_downrank_ref_set($viewerId);
     foreach (['tags' => 5, 'statuses' => 5] as $kind => $limit) {
         $row = $cachedKinds[$kind] ?? null;
@@ -6535,11 +6561,16 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
         }
     }
     $html .= '</div>';
+    if (!admin_trends_display_state($currentViewer)['enabled']) { $meta = ['disabled' => true]; return ''; }
     return $html;
 }
 
 // Deferred trends sidebar (cache-first; background refresh when stale).
 if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
+    $displayState = admin_trends_display_state();
+    header('X-VAAK-Trends-Enabled: ' . ($displayState['enabled'] ? '1' : '0'));
+    header('X-VAAK-Trends-Owner: ' . $displayState['owner']);
+    if (!$displayState['enabled']) { header('Content-Type: text/html; charset=utf-8'); header('Cache-Control: no-store'); exit; }
     if (function_exists('ap_auth_session_write_close')) {
         ap_auth_session_write_close();
     } elseif (session_status() === PHP_SESSION_ACTIVE) {
@@ -6556,18 +6587,18 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
             if (function_exists('ap_masto_trends_tags')) {
                 ap_masto_trends_tags(5);
             }
-            if (function_exists('ap_masto_trends_statuses')) {
+            if (admin_trends_display_state()['enabled'] && function_exists('ap_masto_trends_statuses')) {
                 ap_masto_trends_statuses(5);
             }
             $html = admin_trends_sidebar_html($viewForTrends, true, $meta, true);
         } else {
             $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
-            if ($html === '') {
+            if ($html === '' && empty($meta['disabled'])) {
                 // Cold cache: compute once for this request.
                 if (function_exists('ap_masto_trends_tags')) {
                     ap_masto_trends_tags(5);
                 }
-                if (function_exists('ap_masto_trends_statuses')) {
+                if (admin_trends_display_state()['enabled'] && function_exists('ap_masto_trends_statuses')) {
                     ap_masto_trends_statuses(5);
                 }
                 $html = admin_trends_sidebar_html($viewForTrends, true, $meta);
@@ -6578,6 +6609,10 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
     } catch (Throwable $e) {
         error_log('[ap-admin] ajax trends: ' . $e->getMessage());
     }
+    $publishDisplay = admin_trends_display_state();
+    header('X-VAAK-Trends-Enabled: ' . ($publishDisplay['enabled'] ? '1' : '0'));
+    header('X-VAAK-Trends-Owner: ' . $publishDisplay['owner']);
+    if (!$publishDisplay['enabled'] || $publishDisplay['owner'] !== $displayState['owner']) $html = '';
     $age = (int) ($meta['age'] ?? 0);
     $stale = !empty($meta['stale']) ? '1' : '0';
     header('Cache-Control: private, no-store');
@@ -27787,13 +27822,17 @@ function admin_render_home_suggestions(array $suggestions, int $limit = 3, bool 
         <button class="btn btn-primary" type="submit" style="width:100%;margin-top:.55rem">Search</button>
       </form>
     </div>
+    <?php $vaakTrendsDisplay = admin_trends_display_state($vaakUser); ?>
     <div id="trends-sidebar"
+         data-enabled="<?= $vaakTrendsDisplay['enabled'] ? '1' : '0' ?>"
+         data-owner="<?= (int) $vaakTrendsDisplay['owner'] ?>"
+         <?= $vaakTrendsDisplay['enabled'] ? '' : 'hidden' ?>
          data-deferred="1"
          data-paint-after="1"
          data-from="<?= h($view) ?>"
          data-cached-age="0"
          data-stale="0">
-<?= admin_trends_loading_html() ?>
+<?= $vaakTrendsDisplay['enabled'] ? admin_trends_loading_html() : '' ?>
     </div>
 
   </aside>
@@ -30316,6 +30355,8 @@ if (!empty($GLOBALS['vaak_profile_shell']) || !empty($GLOBALS['vaak_status_shell
 
           <div class="checks">
             <label><input type="checkbox" name="algorithm_enabled" value="1" <?= !empty($profile['algorithm_enabled']) ? 'checked' : '' ?>> Use Home recommendations and algorithmic ranking</label>
+            <input type="hidden" name="trending_enabled_present" value="1">
+            <label><input type="checkbox" name="trending_enabled" value="1" <?= !array_key_exists('trending_enabled', $profile) || !empty($profile['trending_enabled']) ? 'checked' : '' ?>> Show trending tags and posts in the sidebar</label>
             <label><input type="checkbox" name="downranking_enabled" value="1" <?= !empty($profile['downranking_enabled']) ? 'checked' : '' ?>> Temporarily downrank posts matching admin-managed harassment vocabulary</label>
             <label><input type="checkbox" name="asks_enabled" value="1" <?= !array_key_exists('asks_enabled', $profile) || !empty($profile['asks_enabled']) ? 'checked' : '' ?>> Allow incoming Wafrn-compatible Asks</label>
             <label><input type="checkbox" name="webmentions_enabled" value="1" <?= !array_key_exists('webmentions_enabled', $profile) || !empty($profile['webmentions_enabled']) ? 'checked' : '' ?>> Receive Webmentions on public post notifications</label>
@@ -38253,6 +38294,26 @@ window.vaakBootStatusThread();
   }
 
   let pollPromise = null;
+  let lastTimelinePollAt = null;
+  let timelinePollSuspended = false;
+  let activeTimelinePollAbort = null;
+  let timelineCatchUpPending = false;
+  let timelinePollInvalidated = false;
+  const BACKGROUND_POLL_MS = 90000;
+  function pollTimelineAutomatically(options) {
+    if (timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy
+        || !items || !items.isConnected) return;
+    if (pollPromise || pollBusy) {
+      if (options && options.catchUp && !document.hidden && timelinePollInvalidated) timelineCatchUpPending = true;
+      return;
+    }
+    // Browsers may throttle background timers. Keep a single modest poll alive
+    // without holding an SSE connection or inserting cards into the reader's view.
+    const catchUp = !!(options && options.catchUp && !document.hidden);
+    const cadence = catchUp ? 5000 : (document.hidden ? BACKGROUND_POLL_MS : POLL_MS);
+    if (lastTimelinePollAt !== null && Date.now() - lastTimelinePollAt < cadence) return;
+    return pollNewer();
+  }
   async function pollNewer(options) {
     const force = !!(options && options.freshPost);
     while (pollPromise) {
@@ -38260,7 +38321,13 @@ window.vaakBootStatusThread();
       if (!force) return;
     }
     pollPromise = performPollNewer(options);
-    try { await pollPromise; } finally { pollPromise = null; }
+    try { await pollPromise; } finally {
+      pollPromise = null;
+      if (timelineCatchUpPending) {
+        timelineCatchUpPending = false;
+        pollTimelineAutomatically({ catchUp: true });
+      }
+    }
   }
 
   async function performPollNewer(options) {
@@ -38270,15 +38337,18 @@ window.vaakBootStatusThread();
     if (!['home', 'local', 'feed'].includes(viewName)) return;
     if (isNotifTimeline || isOutboxTimeline) return; // list views do not poll head rows.
     if (isBskyTimeline) return; // Bluesky uses cursor pages, not since= head polls.
-    if (pollBusy || (document.hidden && !force)) return;
+    if (pollBusy || timelinePollSuspended || window.__vaakNavigationPending || tabSwapBusy) return;
     if (!items || !items.isConnected) return;
     const requestItems = items;
     const requestView = viewName;
     const requestGeneration = timelineGeneration;
     const publishedTs = options && options.published ? Math.floor(Date.parse(options.published) / 1000) : 0;
     const since = force && publishedTs > 0 ? Math.min(newestTs, publishedTs - 1) : newestTs;
+    lastTimelinePollAt = Date.now();
+    timelinePollInvalidated = false;
     pollBusy = true;
     const ac = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    activeTimelinePollAbort = ac;
     const abortTimer = ac ? window.setTimeout(() => { try { ac.abort(); } catch (e) {} }, 20000) : 0;
     try {
       const url = '?view=' + encodeURIComponent(viewName)
@@ -38317,6 +38387,7 @@ window.vaakBootStatusThread();
       // quiet — Refresh still works; abort/timeout must not stick pollBusy
     } finally {
       if (abortTimer) window.clearTimeout(abortTimer);
+      if (activeTimelinePollAbort === ac) activeTimelinePollAbort = null;
       pollBusy = false;
     }
   }
@@ -38609,6 +38680,7 @@ window.vaakBootStatusThread();
       if (!nearTop()) return;
       const prevCursor = bskyCursor;
       items.innerHTML = html;
+      if (typeof window.novaSyncDeferredTrendsPolicy === 'function') window.novaSyncDeferredTrendsPolicy(res);
       const nextCur = res.headers.get('X-Next-Cursor') || prevCursor || '';
       if (nextCur) {
         bskyCursor = nextCur;
@@ -38832,8 +38904,12 @@ window.vaakBootStatusThread();
       stopTimelinePollTimer();
       return;
     }
+    if (timelinePollSuspended || window.__vaakNavigationPending || !items || !items.isConnected) {
+      stopTimelinePollTimer();
+      return;
+    }
     if (!streamFallbackTimer) {
-      streamFallbackTimer = window.setInterval(pollNewer, POLL_MS);
+      streamFallbackTimer = window.setInterval(pollTimelineAutomatically, POLL_MS);
     }
   }
   function scheduleStreamReconnect() {
@@ -38891,9 +38967,28 @@ window.vaakBootStatusThread();
   // browser may keep the old document alive briefly while the next timeline
   // is fetched, otherwise the old stream can occupy a PHP-FPM worker.
   window.addEventListener('pagehide', () => {
+    timelinePollSuspended = true;
+    timelineGeneration++;
     window.__vaakNavigationPending = true;
+    timelineCatchUpPending = false;
+    if (pollPromise || pollBusy) {
+      lastTimelinePollAt = null;
+      timelinePollInvalidated = true;
+    }
+    if (activeTimelinePollAbort) { try { activeTimelinePollAbort.abort(); } catch (e) {} }
     stopTimelineStream();
     stopTimelinePollTimer();
+  });
+  window.addEventListener('pageshow', (event) => {
+    if (!event.persisted) return;
+    timelinePollSuspended = false;
+    window.__vaakNavigationPending = false;
+    ensureTimelinePollTimer();
+    pollTimelineAutomatically({ catchUp: true });
+    syncTimelineStreamVisibility();
+  });
+  window.addEventListener('focus', () => {
+    if (!document.hidden) pollTimelineAutomatically({ catchUp: true });
   });
   if (['home', 'local', 'feed'].includes(viewName)) {
     // Keep a bounded timestamp poll even when SSE is enabled. Bluesky
@@ -38908,7 +39003,7 @@ window.vaakBootStatusThread();
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       ensureTimelinePollTimer();
-      pollNewer();
+      pollTimelineAutomatically({ catchUp: true });
       syncTimelineStreamVisibility();
     } else {
       stopTimelineStream();
@@ -38922,7 +39017,7 @@ window.vaakBootStatusThread();
     startTimelineStream();
   }
   sc.onScroll(syncTimelineStreamVisibility);
-  setTimeout(() => { pollNewer(); syncTimelineStreamVisibility(); }, 5000);
+  setTimeout(() => { pollTimelineAutomatically(); syncTimelineStreamVisibility(); }, 5000);
   window.novaPollTimeline = pollNewer;
   window.novaInsertPendingTimeline = insertPending;
   window.novaRefreshTimelinePreservingPosition = async function (options) {
@@ -39019,6 +39114,7 @@ window.vaakBootStatusThread();
       pendingSourceCount = 0;
       updateNewBtn();
       items.innerHTML = html;
+      if (typeof window.novaSyncDeferredTrendsPolicy === 'function') window.novaSyncDeferredTrendsPolicy(res);
       items.dataset.view = nextView;
       items.dataset.offset = String(offset);
       items.dataset.hasMore = hasMore ? '1' : '0';
@@ -39918,6 +40014,7 @@ window.vaakBootStatusThread();
       }
       parkComposer();
       main.innerHTML = html;
+      if (typeof window.novaSyncDeferredTrendsPolicy === 'function') window.novaSyncDeferredTrendsPolicy(res);
       document.body.classList.remove('dm-fullscreen', 'dm-peer-open', 'blog-fullscreen');
       const h1 = main.querySelector('.topbar h1');
       const title = h1 ? String(h1.textContent || '').trim() : 'Profile';
@@ -40108,6 +40205,7 @@ window.vaakBootStatusThread();
         try { window.vaakParkComposerForSoftNav(); } catch (e) {}
       }
       main.innerHTML = html;
+      if (typeof window.novaSyncDeferredTrendsPolicy === 'function') window.novaSyncDeferredTrendsPolicy(res);
       const loadedItems = main.querySelector('#timeline-items');
       if (loadedItems && loadedItems.dataset.view && loadedItems.dataset.view !== view) {
         throw new Error('shell-view-mismatch');
@@ -40736,10 +40834,10 @@ window.vaakBootStatusThread();
   try { sessionStorage.removeItem('vaak.trends.html.v3'); } catch (e) {}
 
   function contextKey(box) {
-    return (box.dataset.from || 'home') + '\n' + location.pathname + location.search;
+    return (box.dataset.owner || '0') + '\n' + (box.dataset.enabled || '0') + '\n' + (box.dataset.from || 'home') + '\n' + location.pathname + location.search;
   }
   function visible(box) {
-    if (suspended || document.hidden || !box || !box.isConnected) return false;
+    if (suspended || document.hidden || !box || !box.isConnected || box.dataset.enabled !== '1' || box.hidden) return false;
     const rect = box.getBoundingClientRect();
     return box.getClientRects().length > 0 && rect.width > 0
       && rect.bottom >= 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
@@ -40748,12 +40846,26 @@ window.vaakBootStatusThread();
     ++generation;
     scheduled = false;
     scheduleTicket = null;
-    if (pending) pending.controller.abort();
+    if (pending && pending.controller) pending.controller.abort();
     pending = null;
     loadedKey = '';
     const box = document.getElementById('trends-sidebar');
     if (box) { box.innerHTML = ''; box.dataset.deferred = '1'; box.setAttribute('aria-busy', 'false'); }
   }
+  function syncPolicy(res) {
+    const enabled = res.headers.get('X-VAAK-Trends-Enabled');
+    const owner = res.headers.get('X-VAAK-Trends-Owner');
+    const box = document.getElementById('trends-sidebar');
+    if (!box || mutationPending || !/^[01]$/.test(enabled || '') || !/^\d+$/.test(owner || '')) return;
+    if (box.dataset.enabled !== enabled || box.dataset.owner !== owner) {
+      invalidate();
+      box.dataset.enabled = enabled;
+      box.dataset.owner = owner;
+    }
+    box.hidden = enabled !== '1';
+    if (box.hidden) { box.innerHTML = ''; box.setAttribute('aria-busy', 'false'); }
+  }
+  window.novaSyncDeferredTrendsPolicy = syncPolicy;
   function fetchTrends() {
     const box = document.getElementById('trends-sidebar');
     if (mutationPending || !visible(box)) return;
@@ -40771,9 +40883,11 @@ window.vaakBootStatusThread();
     // Current policy, without forcing global collection/network work.
     fetch('?ajax=trends&from=' + encodeURIComponent(box.dataset.from || 'home') + '&frag=4', {
       credentials: 'same-origin', headers: { 'Accept': 'text/html' },
-      cache: 'no-store', signal: controller.signal
+      cache: 'no-store', ...(controller ? { signal: controller.signal } : {})
     }).then((res) => {
       if (!res.ok) throw new Error('Trending request failed');
+      if (current !== generation || document.getElementById('trends-sidebar') !== box || contextKey(box) !== key) throw new Error('Stale trending response');
+      syncPolicy(res);
       const age = parseInt(res.headers.get('X-Vaak-Trends-Age') || '0', 10) || 0;
       const stale = res.headers.get('X-Vaak-Trends-Stale') === '1';
       return res.text().then((html) => ({ html: html || '', age: age, stale: stale }));
@@ -40786,7 +40900,7 @@ window.vaakBootStatusThread();
       box.dataset.cachedAge = String(payload.age);
       box.dataset.stale = payload.stale ? '1' : '0';
     }).catch(() => {
-      if (current !== generation || !box.isConnected) return;
+      if (current !== generation || !visible(box) || contextKey(box) !== key) return;
       box.innerHTML = '<div class="side-card" role="status">Trending could not load. <button type="button" data-trends-retry>Retry</button></div>';
       box.dataset.deferred = '1';
     }).finally(() => {
