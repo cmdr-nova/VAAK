@@ -13437,3 +13437,101 @@ function ap_bsky_poll_all_notifications(int $limit = 50): array
         'errors' => $errors,
     ];
 }
+
+/** Home-only current local-mirror provenance; never XRPC or cached permissions. */
+function ap_bsky_home_mirror_segment_flags(array $uris): array
+{
+    $clean=[]; $out=[];
+    foreach($uris as $uri){$uri=rtrim(trim((string)$uri),'/');if(preg_match('~^at://(did:[^/]+)/app\.bsky\.feed\.post/[^/?#]+$~D',$uri)){$clean[$uri]=true;$out[$uri]=['mirror'=>false,'note_id'=>null,'canonical_note_id'=>null];}}
+    if(!$clean)return $out;
+    $db=ap_db(); $posts=[];
+    $load=static function(array $keys)use($db,&$posts):void{
+        foreach(array_chunk(array_values(array_unique($keys)),200)as $chunk){if(!$chunk)continue;$ph=implode(',',array_fill(0,count($chunk),'?'));
+            $st=$db->prepare("SELECT p.bsky_uri,p.author_did,p.reply_root,p.reply_parent,p.raw_json,c.note_id,c.owner_user_id,l.fediverse_id,l.ap_object_id FROM bsky_posts p LEFT JOIN bsky_crossposts c ON c.bsky_uri=p.bsky_uri LEFT JOIN bsky_post_links l ON l.bsky_uri=p.bsky_uri WHERE p.bsky_uri IN ($ph)");$st->execute($chunk);
+            foreach($st->fetchAll(PDO::FETCH_ASSOC)?:[]as $row){$posts[(string)$row['bsky_uri']]=$row;}
+        }
+    };
+    $load(array_keys($clean));$roots=[];$tipBudget=256;
+    foreach($posts as $uri=>$row){$root=trim((string)($row['reply_root']??''));$roots[$root!==''?$root:$uri]=true;}
+    ksort($roots,SORT_STRING);
+    // Indexed tips under selected roots are anchors, not authority for siblings.
+    foreach(array_chunk(array_keys($roots),200)as $chunk){if($tipBudget<1)break;$ph=implode(',',array_fill(0,count($chunk),'?'));$st=$db->prepare("SELECT p.bsky_uri FROM bsky_posts p WHERE (p.reply_root IN ($ph) OR p.bsky_uri IN ($ph)) AND EXISTS(SELECT 1 FROM bsky_crossposts c WHERE c.bsky_uri=p.bsky_uri) ORDER BY p.bsky_uri LIMIT $tipBudget");$st->execute(array_merge($chunk,$chunk));$tips=array_column($st->fetchAll(PDO::FETCH_ASSOC)?:[],'bsky_uri');$tipBudget-=count($tips);$load($tips);}
+    $load(array_keys($roots));
+    $claims=[];$notes=[];
+    foreach($posts as $uri=>$p){
+        if(!preg_match('~^at://(did:[^/]+)/app\.bsky\.feed\.post/[^/?#]+$~D',$uri,$m)||(string)($p['author_did']??'')!==$m[1])continue;
+        $record=json_decode((string)($p['raw_json']??''),true);$record=is_array($record)?($record['record']??$record['post']['record']??$record['value']??[]):[];
+        foreach([['note_id',(int)($p['owner_user_id']??0)],['fediverse_id',0],['ap_object_id',0],['record',0]]as [$key,$owner]){
+            $note=rtrim(trim((string)($key==='record'?($record['fediverseId']??''):($p[$key]??''))),'/');
+            if(!ap_bsky_is_local_note_id($note))continue;$claims[]=[$uri,$note,$m[1],$owner];$notes[$note]=true;
+        }
+    }
+    if(!$claims)return $out;
+    // Canonical identity survives local deletion; it cannot grant audience access.
+    $trustedMaps=[];
+    $owners=$db->query('SELECT u.id AS owner_user_id,u.actor_id,s.did FROM ap_users u LEFT JOIN bsky_sessions s ON s.owner_user_id=u.id')->fetchAll(PDO::FETCH_ASSOC)?:[];
+    foreach($claims as [$uri,$note,$did,$owner])foreach($owners as $user){
+        if($owner<1)continue;
+        if(!str_starts_with($note,rtrim((string)$user['actor_id'],'/').'/notes/'))continue;
+        if($owner>0?$owner===(int)$user['owner_user_id']:(string)($user['did']??'')===$did){if(isset($out[$uri]))$out[$uri]['canonical_note_id']=$note;$trustedMaps[$uri."\n".$note]=true;break;}
+    }
+    $local=[];
+    foreach(array_chunk(array_keys($notes),200)as $chunk){$ph=implode(',',array_fill(0,count($chunk),'?'));
+        $variants=[];foreach($chunk as $note){$variants[]=$note;$variants[]=$note.'/';}$ph=implode(',',array_fill(0,count($variants),'?'));
+        $st=$db->prepare("SELECT n.note_id,u.id AS owner_user_id,s.did,o.raw_create_json FROM (SELECT note_id FROM masto_statuses WHERE note_id IN ($ph) UNION SELECT id AS note_id FROM outbox_notes WHERE id IN ($ph)) n JOIN ap_users u ON substr(rtrim(n.note_id,'/'),1,length(rtrim(u.actor_id,'/'))+7)=rtrim(u.actor_id,'/')||'/notes/' LEFT JOIN bsky_sessions s ON s.owner_user_id=u.id LEFT JOIN outbox_notes o ON rtrim(o.id,'/')=rtrim(n.note_id,'/') WHERE u.disabled_at IS NULL ");$st->execute(array_merge($variants,$variants));
+        foreach($st->fetchAll(PDO::FETCH_ASSOC)?:[]as $row){$local[rtrim((string)$row['note_id'],'/')]=$row;}
+    }
+    $imports=[];foreach($claims as [$uri,$note,$did,$owner]){
+        $doc=json_decode((string)($local[$note]['raw_create_json']??''),true);$origin=is_array($doc)?(string)($doc['object']['vaakOrigin']??''):'';$sourceValid=is_array($doc)&&is_array($doc['object']??null);
+        $actor=strstr($note,'/notes/',true);if($origin==='bluesky'||(!$sourceValid&&$actor!==false&&$note===$actor.'/notes/'.substr(hash('sha256',$uri),0,16)))$imports[$uri."\n".$note]=true;
+    }
+    foreach($out as $uri=>&$flag)if(isset($imports[$uri."\n".($flag['canonical_note_id']??'')]))$flag['canonical_note_id']=null;unset($flag);
+    $anchors=[];
+    foreach($claims as [$uri,$note,$did,$owner]){
+        if(isset($imports[$uri."\n".$note]))continue;$l=$local[$note]??null;$mirror=false;
+        if(is_array($l)){$mirror=$owner>0?$owner===(int)$l['owner_user_id']:(string)($l['did']??'')===$did;}
+        if(!$mirror&&!isset($trustedMaps[$uri."\n".$note]))continue;
+        $raw=json_decode((string)($l['raw_create_json']??''),true);$obj=is_array($raw)?($raw['object']??$raw):[];$first=trim((string)($obj['blueskyUri']??''));
+        $anchors[]=[$uri,$note,$did,$first,$mirror];
+    }
+    // One bounded bulk ancestor read; no per-anchor/per-parent SQL loop.
+    $ancestorSeeds=[];foreach($anchors as [$uri,$note,$did,$first,$mirror]){if($first!==$uri&&trim((string)($posts[$uri]['reply_parent']??''))!=='')$ancestorSeeds[$uri]=true;}
+    $ancestorSeeds=array_keys($ancestorSeeds);sort($ancestorSeeds,SORT_STRING);$ancestorSeeds=array_slice($ancestorSeeds,0,256);
+    if($ancestorSeeds){$ph=implode(',',array_fill(0,count($ancestorSeeds),'?'));
+        $st=$db->prepare("WITH RECURSIVE lineage(bsky_uri,author_did,reply_root,reply_parent,raw_json) AS (SELECT bsky_uri,author_did,reply_root,reply_parent,raw_json FROM bsky_posts WHERE bsky_uri IN ($ph) UNION SELECT p.bsky_uri,p.author_did,p.reply_root,p.reply_parent,p.raw_json FROM bsky_posts p JOIN lineage a ON p.bsky_uri=a.reply_parent WHERE p.author_did=a.author_did AND (p.reply_root=a.reply_root OR p.bsky_uri=a.reply_root)) SELECT * FROM lineage LIMIT 2048");$st->execute($ancestorSeeds);
+        foreach($st->fetchAll(PDO::FETCH_ASSOC)?:[]as $row){$key=(string)$row['bsky_uri'];if(!isset($posts[$key]))$posts[$key]=$row;}
+    }
+    foreach($anchors as [$uri,$note,$did,$first,$mirror]){
+        $seen=[];$chain=[];$complete=false;$expectedRoot=trim((string)($posts[$uri]['reply_root']??''));
+        for($depth=0;$depth<256;$depth++){
+            if(isset($seen[$uri]))break;$seen[$uri]=true;$p=$posts[$uri]??null;
+            if(!is_array($p)||(string)($p['author_did']??'')!==$did||!str_starts_with($uri,'at://'.$did.'/app.bsky.feed.post/'))break;
+            if($chain&&$uri!==$expectedRoot&&trim((string)($p['reply_root']??''))!==$expectedRoot)break;
+            $raw=json_decode((string)($p['raw_json']??''),true);$record=is_array($raw)?($raw['record']??$raw['post']['record']??$raw['value']??[]):[];
+            $marker=rtrim(trim((string)($record['fediverseId']??'')),'/');
+            if($marker!==''&&$marker!==$note)break;
+            $chain[]=$uri;
+            // Stop at this note's first segment, never the enclosing remote root.
+            if(($first!==''&&$uri===$first)||rtrim((string)($record['fediverseId']??''),'/')===$note){$complete=true;break;}
+            $parent=trim((string)($p['reply_parent']??''));$root=trim((string)($p['reply_root']??''));
+            if($parent===''||$root===''||$uri===$root)break;
+            $uri=$parent;
+        }
+        // Direct anchor remains proven. Inheritance needs a complete own-note boundary.
+        $outUri=$chain[0]??'';if(isset($out[$outUri]))$out[$outUri]=['mirror'=>$mirror,'note_id'=>$mirror?$note:null,'canonical_note_id'=>$note];
+        if($complete)foreach($chain as $segment)if(isset($out[$segment]))$out[$segment]=['mirror'=>$mirror,'note_id'=>$mirror?$note:null,'canonical_note_id'=>$note];
+    }
+    return $out;
+}
+
+/** Home-only top-level return boundary, including stale ranked/hydrated envelopes. */
+function ap_bsky_home_filter_items(array $items, int $ownerUserId): array
+{
+    $uris=[];$keys=[];
+    foreach($items as $i=>$item){$row=is_array($item['row']??null)?$item['row']:$item;$uri=(string)($row['bsky_uri']??$row['post']['uri']??$row['uri']??'');$uri=rtrim(trim($uri),'/');if(str_starts_with($uri,'at://')){$keys[$i]=$uri;$uris[]=$uri;}}
+    if(!$uris)return $items;
+    $session=ap_db()->prepare('SELECT did FROM bsky_sessions WHERE owner_user_id=? LIMIT 1');$session->execute([$ownerUserId]);$own=(string)($session->fetchColumn()?:'');
+    $flags=ap_bsky_home_mirror_segment_flags($uris);$out=[];
+    foreach($items as $i=>$item){$uri=$keys[$i]??'';if($uri!==''&&(($own!==''&&str_starts_with($uri,'at://'.$own.'/'))||!empty($flags[$uri]['mirror'])||!empty($flags[$uri]['canonical_note_id'])))continue;$out[]=$item;}
+    return $out;
+}

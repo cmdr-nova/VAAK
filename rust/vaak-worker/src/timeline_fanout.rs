@@ -564,7 +564,7 @@ async fn bsky_observer_ids(db: &Client, did: &str, limit: i64) -> Result<Vec<i64
     }
     let rows = db
         .query(
-            "SELECT DISTINCT owner_user_id FROM (
+            "SELECT DISTINCT owner_user_id::bigint FROM (
                 SELECT owner_user_id FROM bsky_graph_sync
                  WHERE kind = 'follow' AND target_did = $1
                 UNION
@@ -735,6 +735,11 @@ async fn process_home_bsky(
         stats.skipped += 1;
         return Ok(stats);
     }
+    let mirrors = crate::home_bsky_mirrors::flags(db, &[uri.to_owned()]).await?;
+    if mirrors.get(uri).map(|flag| flag.mirror || flag.note_id.is_some()).unwrap_or(false) {
+        stats.skipped += 1;
+        return Ok(stats);
+    }
     let owners = bsky_observer_ids(db, did, max_recipients() as i64).await?;
     if owners.is_empty() {
         return Ok(stats);
@@ -742,6 +747,10 @@ async fn process_home_bsky(
     let do_rewarm = rewarm_max() > 0 && owners.len() <= rewarm_max();
     let bsky_profile = format!("https://bsky.app/profile/{did}");
     for owner in &owners {
+        if crate::home_bsky_mirrors::own_did(db, *owner).await?.as_deref() == Some(did) {
+            stats.skipped += 1;
+            continue;
+        }
         let hide = bsky_hidden_dids(db, *owner).await.unwrap_or_default();
         if hide.contains(did) {
             stats.skipped += 1;

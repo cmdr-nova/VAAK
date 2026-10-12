@@ -4798,6 +4798,9 @@ pub async fn warm_view(
     let selected:Vec<String> = statuses.iter().filter_map(|status|status.get("uri").and_then(Value::as_str).map(str::to_owned)).collect();
     crate::hidden::load_ordinary_owned_notes(&db, owner_user_id, &selected, &mut hidden).await?;
     statuses.retain(|st| !crate::hidden::ordinary_status_hidden(st, &hidden));
+    if view == "home" {
+        crate::home_bsky_mirrors::filter_statuses(&db, owner_user_id, &mut statuses).await?;
+    }
     let mut stored = Vec::new();
     let now = chrono::Utc::now().timestamp();
     for &limit in &limits {

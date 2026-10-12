@@ -7632,6 +7632,7 @@ if (
         $axumStatuses = ap_masto_timeline_home_axum_fetch($shellLimit, (int) $vaakOwnerId);
         if (is_array($axumStatuses) && $axumStatuses !== [] && function_exists('admin_render_masto_status_card')) {
             $flagIds = [];
+            if ($view === 'home') $axumStatuses = ap_bsky_home_filter_items($axumStatuses, (int) $vaakOwnerId);
             foreach ($axumStatuses as $st) {
                 if (!is_array($st)) {
                     continue;
@@ -7676,7 +7677,7 @@ if (
     }
     if (!$shellAxumHit && $adminTlFromCache && is_array($adminTlRankedCached) && $adminTlRankedCached !== []) {
         $shellKeys = array_slice($adminTlRankedCached, 0, $shellLimit);
-        $shellSlice = admin_tl_hydrate($shellKeys);
+        $shellSlice = admin_tl_hydrate($shellKeys, $view);
         if ($view === 'local') {
             $shellSlice = array_values(array_filter($shellSlice, 'admin_local_timeline_item_allowed'));
         } elseif ($view === 'feed') {
@@ -9225,6 +9226,8 @@ function admin_home_merge_bsky_ranked(array $ranked, int $ownerUserId): array
         }
     }
     $keys = ap_bsky_home_rank_keys($ownerUserId, 25, $ownDid !== '' ? $ownDid : null);
+    $mirrorFlags = ap_bsky_home_mirror_segment_flags(array_column($keys, 'uri'));
+    $keys = array_values(array_filter($keys, static fn(array $row): bool => empty($mirrorFlags[rtrim((string) ($row['uri'] ?? ''), '/')]['mirror']) && empty($mirrorFlags[rtrim((string) ($row['uri'] ?? ''), '/')]['canonical_note_id'])));
     if ($keys === []) {
         return $ranked;
     }
@@ -10124,7 +10127,7 @@ function admin_tl_cache_get(string $key, int $ttlSec = 300): ?array
  * @param list<array{k:string,id:string,t?:int}> $slice
  * @return list<array{kind:string,row:array<string,mixed>,from_tag?:bool,sort?:int}>
  */
-function admin_tl_hydrate(array $slice): array
+function admin_tl_hydrate(array $slice, string $view = ''): array
 {
     $items = [];
     $eventIds = [];
@@ -10394,7 +10397,7 @@ function admin_tl_hydrate(array $slice): array
     $items = array_values(array_filter($items, static fn(array $item): bool =>
         ($item['home_source'] ?? '') !== 'recommendation' || !isset($consumed[rtrim((string) ($item['row']['object_id'] ?? ''), '/')])
     ));
-    return $items;
+    return $view === 'home' ? ap_bsky_home_filter_items($items, $ownerUserId) : $items;
 }
 
 /**
@@ -11471,7 +11474,7 @@ if (
     ) {
         $axumHome = ap_masto_timeline_home_axum_fetch($tlLimit, (int) $vaakOwnerId);
         if (is_array($axumHome) && $axumHome !== []) {
-            $adminHomeAxumStatuses = $axumHome;
+            $adminHomeAxumStatuses = ap_bsky_home_filter_items($axumHome, (int) $vaakOwnerId);
             if ($adminTlFromCache && is_array($adminTlRankedCached)) {
                 $adminTlCachedHasMore = count($adminTlRankedCached) > $tlLimit;
             } else {
@@ -11527,7 +11530,7 @@ if (
 ) {
     $adminTlCachedTotal = count($adminTlRankedCached);
     $sliceKeys = array_slice($adminTlRankedCached, 0, $tlLimit);
-    $hydrated = admin_tl_hydrate($sliceKeys);
+    $hydrated = admin_tl_hydrate($sliceKeys, $view);
     $hydrateNotes = [];
     foreach ($hydrated as $it) {
         if (($it['kind'] ?? '') === 'outbox') {
@@ -21405,6 +21408,7 @@ function admin_tl_fetch_newer(string $view, array $following, int $sinceTs, int 
     }
 
     usort($out, static fn($a, $b) => $b['sort'] <=> $a['sort']);
+    if ($view === 'home') $out = ap_bsky_home_filter_items($out, $ownerId);
     return array_slice($out, 0, $limit);
 }
 
@@ -22071,7 +22075,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
         }
         $sliceKeys = array_slice($adminTlRankedCached, $tlOffset, $tlLimit);
         $hydrateT0 = microtime(true);
-        $slice = admin_tl_hydrate($sliceKeys);
+        $slice = admin_tl_hydrate($sliceKeys, $view);
         // Cached indexes can outlive a timeline-rule change. Re-assert the
         // Local boundary after hydration so stale entries cannot leak remote
         // actors back into the Local tab.
@@ -22121,7 +22125,7 @@ if ($isPartial && in_array($view, ['home', 'feed', 'local'], true)) {
             $ck = $adminTlCacheKey !== '' ? $adminTlCacheKey : admin_tl_cache_key($view, $following);
             admin_tl_cache_put($ck, $rankedMiss);
             $sliceKeys = array_slice($rankedMiss, $tlOffset, $tlLimit);
-            $slice = admin_tl_hydrate($sliceKeys);
+            $slice = admin_tl_hydrate($sliceKeys, $view);
             $hasMore = ($tlOffset + $tlLimit) < count($rankedMiss);
             $nextOffset = $tlOffset + $tlLimit;
         } else {

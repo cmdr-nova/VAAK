@@ -8528,6 +8528,9 @@ function ap_timeline_fanout_followers_home_bsky(string $uri, string $authorDid):
         return;
     }
 
+    $mirrorFlags = ap_bsky_home_mirror_segment_flags([$uri]);
+    if (!empty($mirrorFlags[$uri]['mirror']) || !empty($mirrorFlags[$uri]['canonical_note_id'])) return;
+
     if (ap_timeline_fanout_enqueue([
         'op' => 'home_bsky',
         'k' => 'bsky',
@@ -8565,6 +8568,9 @@ function ap_timeline_fanout_followers_home_bsky(string $uri, string $authorDid):
         if ($ownerUserId < 1) {
             continue;
         }
+        $ownSession = ap_db()->prepare('SELECT did FROM bsky_sessions WHERE owner_user_id=? LIMIT 1');
+        $ownSession->execute([$ownerUserId]);
+        if ((string) ($ownSession->fetchColumn() ?: '') === $authorDid) continue;
         if ($hideFn) {
             $hide = ap_bsky_hide_did_set($ownerUserId);
             if (isset($hide[$authorDid])) {

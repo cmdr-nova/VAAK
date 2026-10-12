@@ -333,6 +333,9 @@ pub async fn view_hydrate(
         let selected:Vec<String> = report.items.iter().filter_map(|status|status.get("uri").and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
         crate::hidden::load_ordinary_owned_notes(&moderation_db, owner_user_id, &selected, &mut hidden).await?;
         report.items.retain(|status| !crate::hidden::ordinary_status_hidden(status, &hidden));
+        if view == "home" {
+            crate::home_bsky_mirrors::filter_statuses(&moderation_db, owner_user_id, &mut report.items).await?;
+        }
         report.filtered = report.items.len() != before;
         report.n = report.items.len();
     }
