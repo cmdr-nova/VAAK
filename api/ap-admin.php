@@ -6346,6 +6346,8 @@ function admin_trends_loading_html(): string
             <div class="trends-skeleton-row"></div>
             <div class="trends-skeleton-row"></div>
             <div class="trends-skeleton-row" style="width:72%"></div>
+            <div class="trends-skeleton-row" style="width:86%"></div>
+            <div class="trends-skeleton-row" style="width:62%"></div>
           </div>
         </div>
         <div class="side-card" aria-busy="true" aria-label="Loading trending posts">
@@ -6421,7 +6423,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     $viewerId = is_array($viewer) ? (int) ($viewer['id'] ?? 0) : 0;
     // Global raw trend data remains cached; HTML must be authorized anew each request.
     $cachedKinds = [];
-    foreach (['tags' => 10, 'statuses' => 5] as $kind => $limit) {
+    foreach (['tags' => 5, 'statuses' => 5] as $kind => $limit) {
         $row = function_exists('ap_masto_trends_cache_read')
             ? ap_masto_trends_cache_read($kind, 1, $allowStale, $viewerId)
             : null;
@@ -6441,7 +6443,7 @@ function admin_trends_sidebar_html(string $viewForTrends, bool $allowStale = tru
     }
     if ((int) ($currentViewer['id'] ?? 0) !== $viewerId) return '';
     $downrankRefs = admin_trend_downrank_ref_set($viewerId);
-    foreach (['tags' => 10, 'statuses' => 5] as $kind => $limit) {
+    foreach (['tags' => 5, 'statuses' => 5] as $kind => $limit) {
         $row = $cachedKinds[$kind] ?? null;
         if (!is_array($row)) continue;
         $items = [];
@@ -6552,7 +6554,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
         if ($forceRefresh) {
             // Recompute now (caller asked), then render from fresh cache.
             if (function_exists('ap_masto_trends_tags')) {
-                ap_masto_trends_tags(10);
+                ap_masto_trends_tags(5);
             }
             if (function_exists('ap_masto_trends_statuses')) {
                 ap_masto_trends_statuses(5);
@@ -6563,7 +6565,7 @@ if (isset($_GET['ajax']) && (string) $_GET['ajax'] === 'trends') {
             if ($html === '') {
                 // Cold cache: compute once for this request.
                 if (function_exists('ap_masto_trends_tags')) {
-                    ap_masto_trends_tags(10);
+                    ap_masto_trends_tags(5);
                 }
                 if (function_exists('ap_masto_trends_statuses')) {
                     ap_masto_trends_statuses(5);
