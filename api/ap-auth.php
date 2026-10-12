@@ -1298,6 +1298,9 @@ function ap_auth_provision_registered_account(string $username, int $uid, bool $
 function ap_auth_register(string $inviteCode, string $username, string $password, string $email = ''): array
 {
     ap_auth_bootstrap();
+    require_once __DIR__ . '/ap-registration-approvals.php';
+    if (!ap_registration_accepting()) return ['ok'=>false,'error'=>'Registration is closed.'];
+    if (ap_registration_approvals_enabled()) return ['ok'=>false,'error'=>'Registration requires administrator approval.'];
     $inv = ap_auth_invite_lookup($inviteCode);
     if (empty($inv['ok'])) {
         return ['ok' => false, 'error' => $inv['error'] ?? 'Bad invite.'];
@@ -1338,6 +1341,9 @@ function ap_auth_register(string $inviteCode, string $username, string $password
     $db = ap_db();
     try {
         $db->beginTransaction();
+        if (ap_db_driver($db) === 'pgsql') $db->exec('LOCK TABLE ap_users IN SHARE ROW EXCLUSIVE MODE');
+        else $db->exec('UPDATE ap_users SET updated_at=updated_at WHERE id=-1');
+        if (!ap_registration_accepting($db, true) || ap_registration_approvals_enabled()) throw new RuntimeException('Registration closed.');
         $uid = ap_auth_create_account_row($db, $username, $email, $hash, $now);
         $inviteId = (int) (($inv['invite']['id'] ?? 0));
         $inviteUse = $db->prepare(

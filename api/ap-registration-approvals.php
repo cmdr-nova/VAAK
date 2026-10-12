@@ -14,6 +14,108 @@ function ap_registration_approvals_enabled(): bool
     return getenv('VAAK_REGISTRATION_APPROVALS') === '1';
 }
 
+/** Independent operator state. Missing migration preserves the existing open/invite policy. */
+function ap_registration_accepting(?PDO $db = null, bool $lock = false): bool
+{
+    $db = $db ?? ap_db();
+    try {
+        if (ap_db_driver($db) === 'pgsql' && $db->query("SELECT to_regclass('ap_registration_control')")->fetchColumn() === null) return true;
+        $sql = 'SELECT accepting FROM ap_registration_control WHERE id = 1';
+        if ($lock && ap_db_driver($db) === 'pgsql') $sql .= ' FOR UPDATE';
+        $value = $db->query($sql)->fetchColumn();
+        if ($value === false) {
+            if ($lock) throw new RuntimeException('Registration controls are not ready.');
+            return false;
+        }
+        return (int) $value === 1;
+    } catch (PDOException $e) {
+        // Only an absent pre-migration table permits the historical default.
+        if ((string) $e->getCode() === '42P01' || (ap_db_driver($db) === 'sqlite' && str_contains($e->getMessage(), 'no such table: ap_registration_control'))) {
+            if ($lock && $db->inTransaction() && ap_db_driver($db) === 'pgsql') throw $e;
+            return true;
+        }
+        return false;
+    }
+}
+
+/** No automatic migration: an operator installs the reviewed singleton schema first. */
+function ap_registration_set_accepting(bool $accepting, string $csrf): array
+{
+    if (!ap_auth_csrf_ok($csrf)) return ['ok'=>false,'error'=>'Session expired.'];
+    $db = ap_db();
+    if (!ap_registration_current_admin($db)) return ['ok'=>false,'error'=>'Admin only.'];
+    try {
+        ap_registration_approvals_schema($db);
+        $db->beginTransaction();
+        ap_registration_approvals_lock($db);
+        $admin = ap_registration_current_admin($db, true);
+        if (!$admin) throw new RuntimeException('Admin role changed.');
+        $st = $db->prepare('UPDATE ap_registration_control SET accepting=?, updated_at=?, updated_by=? WHERE id=1');
+        $st->execute([(int)$accepting, ap_db_now(), (int)$admin['id']]);
+        if ($st->rowCount() !== 1) throw new RuntimeException('Controls are not ready.');
+        $db->commit();
+        return ['ok'=>true,'accepting'=>$accepting];
+    } catch (Throwable $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        return ['ok'=>false,'error'=>'Could not change registration. Check registration control readiness.'];
+    }
+}
+
+/** Best effort, one attempt only by the winning decision; replay never re-sends mail. */
+function ap_registration_approval_mail(array $application): string
+{
+    $email = (string) ($application['email'] ?? '');
+    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) return 'no_email';
+    $username = (string) $application['username'];
+    if (!ap_auth_username_ok($username)) return 'failed';
+    // The parent bounds DNS, config loading, TLS and every SMTP operation together.
+    // No credentials enter argv, stdin, responses, or this controller's logs.
+    $process = null; $pipes = []; $result = ''; $complete = false;
+    $deadline = hrtime(true) / 1e9 + 5.0;
+    try {
+        if (!function_exists('proc_open')) return 'failed';
+        $php = function_exists('ap_php_cli_binary') ? ap_php_cli_binary() : '/usr/bin/php';
+        $process = @proc_open([$php, __DIR__.'/ap-registration-mail-worker.php'],
+            [0=>['pipe','r'],1=>['pipe','w'],2=>['file','/dev/null','a']], $pipes);
+        if (!is_resource($process)) return 'failed';
+        fwrite($pipes[0], json_encode(['username'=>$username,'email'=>$email]));
+        fclose($pipes[0]); unset($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        while (true) {
+            $result .= stream_get_contents($pipes[1], 256);
+            if (strlen($result) > 256) break;
+            $status = proc_get_status($process);
+            if (!$status['running']) {
+                // Exit may race the preceding nonblocking read; collect the final receipt.
+                $result .= stream_get_contents($pipes[1], max(0, 256 - strlen($result)));
+                $complete = strlen($result) <= 256;
+                break;
+            }
+            if (hrtime(true) / 1e9 >= $deadline) break;
+            usleep(10000);
+        }
+        return $complete && trim($result) === 'sent' ? 'sent' : 'failed';
+    } catch (Throwable $e) {
+        return 'failed';
+    } finally {
+        foreach ($pipes as $pipe) if (is_resource($pipe)) fclose($pipe);
+        if (is_resource($process)) {
+            if (!$complete) {
+                @proc_terminate($process);
+                // Exact owned child only; no shell, process-group or unrelated PID signaling.
+                $waitUntil = hrtime(true) / 1e9 + 0.1;
+                do {
+                    $status = proc_get_status($process);
+                    if (!$status['running']) break;
+                    usleep(10000);
+                } while (hrtime(true) / 1e9 < $waitUntil);
+                if ($status['running']) @proc_terminate($process, 9);
+            }
+            proc_close($process);
+        }
+    }
+}
+
 function ap_registration_approvals_schema(PDO $db): void
 {
     $id = ap_db_driver($db) === 'pgsql' ? 'BIGSERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT';
@@ -64,6 +166,7 @@ function ap_registration_submit(string $username, string $password, string $emai
 {
     if (!ap_registration_approvals_enabled()) return ['ok' => false, 'error' => 'Registration applications are closed.'];
     if (!ap_auth_csrf_ok($csrf)) return ['ok' => false, 'error' => 'Session expired — refresh and try again.'];
+    if (!ap_registration_accepting()) return ['ok'=>false,'error'=>'Registration is closed.'];
     $username = strtolower(trim($username));
     $password = trim($password);
     $email = trim($email);
@@ -83,6 +186,7 @@ function ap_registration_submit(string $username, string $password, string $emai
         if (ap_supporter_enabled()) ap_supporter_schema($db);
         $db->beginTransaction();
         ap_registration_approvals_lock($db);
+        if (!ap_registration_accepting($db, true)) throw new RuntimeException('Registration closed.');
         $supporterHash=null;
         if (trim($supporterCode)!=='') {
             if (!ap_supporter_enabled()) throw new RuntimeException('Rewards closed');
@@ -175,12 +279,13 @@ function ap_registration_decide(int $id, string $decision, string $csrf): array
         if (!empty($row['supporter_hash'])) ap_supporter_invalidate($db,$created[1]);
         try {
             $provision = ap_auth_provision_registered_account($created[0], $created[1], true);
-            if (empty($provision['ok'])) return ['ok' => true, 'provisioning_failed' => true];
+            if (empty($provision['ok'])) return ['ok' => true, 'provisioning_failed' => true, 'approval_email'=>'not_provisioned'];
         } catch (Throwable $e) {
             // The account is already committed. No credentials or private details in logs.
             error_log('[ap-approvals] Account approved; best-effort provisioning failed.');
-            return ['ok' => true, 'provisioning_failed' => true];
+            return ['ok' => true, 'provisioning_failed' => true, 'approval_email'=>'not_provisioned'];
         }
+        return ['ok'=>true,'approval_email'=>ap_registration_approval_mail($row)];
     }
     return ['ok' => true];
 }
