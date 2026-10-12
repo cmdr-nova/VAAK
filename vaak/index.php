@@ -727,10 +727,6 @@ ASCII;
       <form method="post" action="/vaak/?mode=register" autocomplete="on">
         <input type="hidden" name="csrf" value="<?= $csrf ?>">
         <input type="hidden" name="action" value="register">
-        <label for="invite"><?= ap_registration_approvals_enabled() ? 'Supporter code (optional)' : 'Invite code' ?></label>
-        <input id="invite" name="invite" <?= ap_registration_approvals_enabled() ? '' : 'required' ?> autocomplete="off" placeholder="ABCD-EF12"
-               value="<?= htmlspecialchars((string) ($_POST['invite'] ?? $_GET['invite'] ?? ''), ENT_QUOTES, 'UTF-8') ?>">
-        <?php if (ap_registration_approvals_enabled()): ?><p class="hint">Every application needs administrator approval. Paid Clearance supporters may enter a reward code for a Supporter badge, using the email they paid with. A code is not required.</p><?php endif; ?>
         <label for="username">Username</label>
         <input id="username" name="username" required autocomplete="username" pattern="[A-Za-z][A-Za-z0-9_]{1,29}"
                placeholder="your_name"
@@ -741,6 +737,10 @@ ASCII;
         <label for="password">Password</label>
         <input id="password" name="password" type="password" required minlength="10" autocomplete="new-password"
                placeholder="at least 10 characters">
+        <label for="invite"><?= ap_registration_approvals_enabled() ? 'Supporter code (optional)' : 'Invite code' ?></label>
+        <input id="invite" name="invite" <?= ap_registration_approvals_enabled() ? '' : 'required' ?> autocomplete="off" placeholder="ABCD-EF12"
+               value="<?= htmlspecialchars((string) ($_POST['invite'] ?? $_GET['invite'] ?? ''), ENT_QUOTES, 'UTF-8') ?>">
+        <?php if (ap_registration_approvals_enabled()): ?><p class="hint">Every application needs administrator approval. Paid Clearance supporters may enter a reward code for a Supporter badge, using the email they paid with. A code is not required.</p><?php endif; ?>
         <button type="submit"><?= ap_registration_approvals_enabled() ? 'Apply for an account' : 'Create account' ?></button>
       </form>
       <p class="switch">Have an account? <a href="/vaak/?mode=login">Log in</a></p>
